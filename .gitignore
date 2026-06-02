@@ -16,3 +16,6 @@
 
 /target
 Cargo.lock
+
+# Local-only — design docs / specs are kept on this machine, never uploaded to remote
+/docs/
