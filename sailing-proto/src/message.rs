@@ -557,16 +557,23 @@ pub struct ReadIndexResp<I> {
   from: I,
   index: Index,
   context: Bytes,
+  reject: bool,
 }
 
 impl<I: Copy> ReadIndexResp<I> {
   /// Construct.
-  pub fn new(term: Term, from: I, index: Index, context: Bytes) -> Self {
+  ///
+  /// `reject` is `true` when the leader is at its read back-pressure capacity and is declining
+  /// this forwarded read: the follower must clear its corresponding `forwarded_reads` entry (so
+  /// the read can be re-issued) and must NOT surface a `ReadState`, since `index` is meaningless
+  /// on a rejection.
+  pub fn new(term: Term, from: I, index: Index, context: Bytes, reject: bool) -> Self {
     Self {
       term,
       from,
       index,
       context,
+      reject,
     }
   }
 
@@ -592,6 +599,14 @@ impl<I: Copy> ReadIndexResp<I> {
   #[inline(always)]
   pub fn context(&self) -> &[u8] {
     &self.context
+  }
+
+  /// Whether the leader DECLINED this forwarded read (it was at read back-pressure capacity).
+  /// A rejecting response carries no usable `index`; the follower must clear the forwarded-read
+  /// entry for `context` and not emit a `ReadState`.
+  #[inline(always)]
+  pub const fn reject(&self) -> bool {
+    self.reject
   }
 }
 
@@ -750,14 +765,28 @@ mod term_test {
       1u64,
       crate::Index::new(42),
       bytes::Bytes::from_static(b"ctx"),
+      false,
     );
     assert_eq!(rir.term(), crate::Term::new(7));
     assert_eq!(rir.from(), 1u64);
     assert_eq!(rir.index(), crate::Index::new(42));
     assert_eq!(rir.context(), b"ctx");
+    assert!(!rir.reject());
     let m = Message::ReadIndexResp(rir);
     assert_eq!(m.term(), crate::Term::new(7));
     assert!(m.is_read_index_resp());
+
+    // A rejecting response carries the flag through the value (the wire form for these messages
+    // is the struct itself; the bool round-trips by construction).
+    let rejected = ReadIndexResp::new(
+      crate::Term::new(7),
+      1u64,
+      crate::Index::ZERO,
+      bytes::Bytes::from_static(b"ctx"),
+      true,
+    );
+    assert!(rejected.reject());
+    assert_eq!(rejected, rejected.clone());
   }
 
   #[test]

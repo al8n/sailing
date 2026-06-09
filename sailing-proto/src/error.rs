@@ -79,6 +79,12 @@ pub enum ReadIndexError {
   /// already-accepted read is never stranded.
   #[error("too many forwarded reads are already in flight")]
   TooManyInFlight,
+  /// This node is poisoned (a fatal storage/log fault left its commit/applied view untrustworthy),
+  /// so it suppresses all event emission. A read cannot be confirmed — no
+  /// [`Event::ReadState`](crate::Event::ReadState) will ever arrive — so the request is rejected
+  /// rather than silently accepted onto a path that never completes.
+  #[error("node is poisoned; reads cannot be confirmed")]
+  Poisoned,
 }
 
 /// Why constructing a [`crate::Config`] failed.

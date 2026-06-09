@@ -2508,7 +2508,7 @@ where
             // Forwarded read — reply ReadIndexResp to the originating follower.
             self.send(
               follower,
-              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, index, context)),
+              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, index, context, false)),
             );
           }
         }
@@ -2612,7 +2612,9 @@ where
               Some(follower) => {
                 self.send(
                   follower,
-                  Message::ReadIndexResp(crate::ReadIndexResp::new(term, me2, index, context)),
+                  Message::ReadIndexResp(crate::ReadIndexResp::new(
+                    term, me2, index, context, false,
+                  )),
                 );
               }
             }
@@ -2641,7 +2643,9 @@ where
               let (term, me2) = (self.term, me);
               self.send(
                 follower,
-                Message::ReadIndexResp(crate::ReadIndexResp::new(term, me2, commit, context)),
+                Message::ReadIndexResp(crate::ReadIndexResp::new(
+                  term, me2, commit, context, false,
+                )),
               );
             }
           }
@@ -2694,8 +2698,12 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    // A poisoned node suppresses `poll_event`, so no `ReadState` can ever be emitted. Returning
+    // `Ok(())` here would violate the `read_index` contract ("accepted onto a confirmation path"):
+    // the promised acknowledgement never arrives and the caller blocks forever. Reject up front,
+    // before any state change, so the caller learns no confirmation is coming.
     if self.poisoned {
-      return Ok(());
+      return Err(crate::ReadIndexError::Poisoned);
     }
     match self.role {
       Role::Leader => {
@@ -2792,10 +2800,24 @@ where
     if self.read_context_in_flight(&context) {
       return;
     }
-    // Leader-side read back-pressure (same bound as the local path): drop a forwarded read at
-    // capacity rather than grow the backlog without limit. The follower's `forwarded_reads` entry
-    // clears on its own term/leader change, so it can re-issue once the leader drains.
+    // Leader-side read back-pressure (same bound as the local path): at capacity we decline the
+    // forwarded read rather than grow the backlog without limit. We MUST tell the follower so it can
+    // clear its `forwarded_reads` entry — a bare drop would strand that entry until an unrelated
+    // term/leader change, leaving the originator blocked forever and the follower's slot consumed
+    // (eventually failing later reads with `TooManyInFlight`). The rejecting reply carries no usable
+    // index (`Index::ZERO`); the follower re-issues once the leader drains.
     if self.leader_reads_at_capacity() {
+      let (term, me) = (self.term, self.config.id());
+      self.send(
+        from,
+        Message::ReadIndexResp(crate::ReadIndexResp::new(
+          term,
+          me,
+          Index::ZERO,
+          context,
+          true,
+        )),
+      );
       return;
     }
     // Current-term-commit gate (same as the local path).
@@ -2838,11 +2860,19 @@ where
     // as identified by the ENVELOPE sender `from` (the transport peer) — never the self-reported
     // `resp.from()`, which a wrong peer could forge to the leader's id (R4 finding 3). `remove`
     // returning false rejects unsolicited / stale / already-completed contexts.
+    //
+    // The `remove` runs for BOTH outcomes: it is the authoritative clear of the in-flight slot. A
+    // rejecting response (leader at read back-pressure capacity) clears the strand exactly like a
+    // confirming one, but must NOT emit a `ReadState` — its `index` is meaningless. Clearing here
+    // lets the originator re-issue the same context (it is no longer a duplicate).
     if self.role != Role::Follower
       || self.leader != Some(from)
       || resp.from() != from
       || !self.forwarded_reads.remove(&ctx)
     {
+      return;
+    }
+    if resp.reject() {
       return;
     }
     self.emit_read_state(resp.index(), ctx);
@@ -3210,11 +3240,20 @@ where
     now: Instant,
     log: &mut L,
     stable: &mut S,
-    _tn: crate::TimeoutNow<I>,
+    tn: crate::TimeoutNow<I>,
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    // Authenticate the transfer order: only this node's CURRENT known leader may force a campaign.
+    // A forced campaign is deliberately disruptive — it skips PreVote and sets leader_transfer so
+    // granters bypass their CheckQuorum/PreVote lease — so a `TimeoutNow` from any other (authentic
+    // but non-leader) peer must NOT trigger it, or that peer could provoke a leadership change that
+    // the lease was specifically protecting against. `tn.leader()` is the sender, trustworthy by the
+    // `handle_message` sender-authenticity choke-point (`msg.from() == from`).
+    if self.leader != Some(tn.leader()) {
+      return;
+    }
     // A non-voter cannot be elected; ignore.
     if !self.tracker.is_voter(&self.config.id()) {
       return;
@@ -9280,6 +9319,7 @@ mod tests {
         1u64,
         crate::Index::new(5),
         ctx.clone(),
+        false,
       )),
     );
 
@@ -9594,6 +9634,27 @@ mod tests {
     let mut follower = Endpoint::new(cfg2, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
     let mut flog = crate::testkit::VecLog::default();
     let mut fstable = crate::testkit::NoopStable::default();
+    // The transfer target must already be a follower of node 1 AT THE LEADER'S TERM for the
+    // TimeoutNow to be honored (a TimeoutNow is now authenticated against the current known leader,
+    // and a real transfer target is caught up under that leader at its term). Establish leader=1,
+    // term=1 via a heartbeat-shaped AppendEntries so the equal-term TimeoutNow does not reset
+    // `leader` via higher-term adoption.
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut flog,
+      &mut fstable,
+      1u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        std::vec![],
+        crate::Index::ZERO,
+      )),
+    );
+    assert_eq!(follower.leader(), Some(1u64));
+    while follower.poll_message().is_some() {}
 
     // Deliver the TimeoutNow (term=1, from leader=1).
     follower.handle_message(
@@ -9848,11 +9909,27 @@ mod tests {
     let mut tlog = crate::testkit::VecLog::default();
     let mut tstable = crate::testkit::NoopStable::default();
 
-    // Arm a healthy election timer (simulating a live leader heartbeat was recently received).
-    target.arm_election_timer(Instant::ORIGIN);
-
-    // Set leader so lease check would normally block a vote.
-    target.leader = Some(1u64);
+    // A live leader-1 heartbeat at term 1: this both sets the known leader (so the lease would
+    // normally block a vote) AND advances the target to the leader's term, so the equal-term
+    // TimeoutNow below is authenticated against `leader == Some(1)` (a higher-term TimeoutNow would
+    // instead reset `leader` to None in the term pre-pass). It also arms a healthy election timer.
+    target.handle_message(
+      Instant::ORIGIN,
+      &mut tlog,
+      &mut tstable,
+      1u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        std::vec![],
+        crate::Index::ZERO,
+      )),
+    );
+    assert_eq!(target.leader(), Some(1u64));
+    assert_eq!(target.term(), crate::Term::new(1));
+    while target.poll_message().is_some() {}
 
     // Deliver TimeoutNow.
     target.handle_message(
@@ -11019,6 +11096,7 @@ mod tests {
         1u64,
         Index::ZERO,
         ctx.clone(),
+        false,
       )),
     );
     // Drain the ReadState event.
@@ -11029,6 +11107,255 @@ mod tests {
       ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
       Ok(()),
       "context is re-issuable after its ReadIndexResp"
+    );
+  }
+
+  /// R6-F1: a forced leader-transfer (`TimeoutNow`) is honored ONLY from this node's current known
+  /// leader. A `TimeoutNow` from any other (authentic-but-non-leader) peer must be ignored — it must
+  /// NOT start the disruptive, lease-bypassing forced campaign — while one from the real leader still
+  /// triggers it.
+  ///
+  /// FAILS-ON-OLD: without the `self.leader != Some(tn.leader())` guard, the non-leader `TimeoutNow`
+  /// makes the node a real Candidate at a bumped term (a wrong peer disrupting the cluster).
+  #[test]
+  fn timeout_now_is_authenticated_against_current_leader() {
+    use crate::{AppendEntries, Index, Term};
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_pre_vote(true)
+    .with_check_quorum(true);
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Establish leader node 1 at term 1 via a heartbeat-shaped AppendEntries (so the node is a real
+    // follower at term 1, not a fresh term-0 node — then an equal-term TimeoutNow triggers no term
+    // adoption in the pre-pass and we isolate the campaign-suppression).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    assert_eq!(ep.role(), Role::Follower);
+    assert_eq!(ep.leader(), Some(1u64));
+    assert_eq!(ep.term(), Term::new(1));
+    while ep.poll_message().is_some() {}
+
+    // (a) A TimeoutNow from a NON-leader peer (node 3) at the SAME term must be IGNORED: no campaign,
+    // term unchanged, still a follower, and no RequestVote emitted.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::TimeoutNow(crate::TimeoutNow::new(Term::new(1), 3u64)),
+    );
+    assert_eq!(
+      ep.role(),
+      Role::Follower,
+      "a TimeoutNow from a non-leader must not start a campaign"
+    );
+    assert_eq!(
+      ep.term(),
+      Term::new(1),
+      "an ignored same-term TimeoutNow must not bump the term"
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "an ignored TimeoutNow must emit no RequestVote"
+    );
+
+    // (b) A TimeoutNow from the CURRENT leader (node 1) still triggers the forced campaign: real
+    // Candidate, term bumped, leader_transfer RequestVotes broadcast.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::TimeoutNow(crate::TimeoutNow::new(Term::new(1), 1u64)),
+    );
+    assert!(
+      ep.role().is_candidate(),
+      "a TimeoutNow from the current leader must start a real campaign"
+    );
+    assert_eq!(
+      ep.term(),
+      crate::Term::new(2),
+      "the forced campaign bumps the term"
+    );
+    let mut saw_transfer_vote = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::RequestVote(rv) = out.message() {
+        assert!(!rv.pre_vote(), "forced campaign is a real vote");
+        assert!(rv.leader_transfer(), "forced campaign sets leader_transfer");
+        saw_transfer_vote = true;
+      }
+    }
+    assert!(
+      saw_transfer_vote,
+      "the leader-authorized TimeoutNow must broadcast RequestVote"
+    );
+  }
+
+  /// R6-F2: when the leader is at `MAX_LEADER_READS`, a forwarded `ReadIndex` is DECLINED with a
+  /// rejecting `ReadIndexResp` (not silently dropped), so the forwarding follower can clear its
+  /// `forwarded_reads` strand and re-issue the read.
+  ///
+  /// FAILS-ON-OLD: with the bare `return` at capacity the leader sends nothing; the follower never
+  /// learns and its `forwarded_reads` entry is stranded (the context stays a `DuplicateContext`).
+  #[test]
+  fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
+    use crate::{Index, ReadIndex, ReadIndexError};
+
+    // ── Leader half: at capacity, a forwarded ReadIndex yields a rejecting ReadIndexResp to ri.from.
+    let (mut leader, mut llog, mut lstable, lnow) = make_leader_with_current_term_commit();
+    // Saturate the leader's read backlog so `leader_reads_at_capacity()` holds.
+    for i in 0..MAX_LEADER_READS {
+      leader.pending_reads.push((
+        bytes::Bytes::copy_from_slice(&(i as u64).to_le_bytes()),
+        None,
+      ));
+    }
+    assert!(leader.leader_reads_at_capacity());
+    while leader.poll_message().is_some() {}
+
+    let fwd_ctx = bytes::Bytes::from_static(b"forwarded-at-capacity");
+    let leader_term = leader.term();
+    leader.handle_message(
+      lnow,
+      &mut llog,
+      &mut lstable,
+      2u64,
+      Message::ReadIndex(ReadIndex::new(leader_term, 2u64, fwd_ctx.clone())),
+    );
+    // Exactly one rejecting ReadIndexResp addressed back to the forwarder (node 2).
+    let mut reject_resp = None;
+    while let Some(out) = leader.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::ReadIndexResp(r) = out.message() {
+          reject_resp = Some(r.clone());
+        }
+      }
+    }
+    let reject_resp = reject_resp.expect("leader at capacity must reply with a ReadIndexResp");
+    assert!(
+      reject_resp.reject(),
+      "the at-capacity reply must carry reject=true"
+    );
+    assert_eq!(
+      reject_resp.context(),
+      fwd_ctx.as_ref(),
+      "the rejecting reply echoes the forwarded context"
+    );
+
+    // ── Follower half: receiving a rejecting ReadIndexResp clears the strand (no ReadState, and the
+    // context becomes re-issuable rather than a stuck DuplicateContext).
+    use crate::{AppendEntries, Config, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut follower = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut flog = crate::testkit::VecLog::default();
+    let mut fstable = crate::testkit::NoopStable::default();
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut flog,
+      &mut fstable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    assert_eq!(follower.leader(), Some(1u64));
+    while follower.poll_message().is_some() {}
+
+    let ctx = bytes::Bytes::from_static(b"strand-ctx");
+    assert_eq!(
+      follower.read_index(Instant::ORIGIN, &flog, &fstable, ctx.clone()),
+      Ok(()),
+      "the read forwards and records a forwarded_reads strand"
+    );
+    while follower.poll_message().is_some() {}
+    // A re-issue right now is a duplicate (strand still held).
+    assert_eq!(
+      follower.read_index(Instant::ORIGIN, &flog, &fstable, ctx.clone()),
+      Err(ReadIndexError::DuplicateContext),
+      "while the strand is held the context is a duplicate"
+    );
+
+    // The rejecting ReadIndexResp from the leader (node 1) clears the strand and emits NO ReadState.
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut flog,
+      &mut fstable,
+      1u64,
+      Message::ReadIndexResp(crate::ReadIndexResp::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        ctx.clone(),
+        true,
+      )),
+    );
+    assert!(
+      !follower.poll_all_events_any_read_state(),
+      "a rejecting ReadIndexResp must NOT emit a ReadState"
+    );
+    // Strand cleared: the SAME context is now accepted again (forwards anew), not DuplicateContext.
+    assert_eq!(
+      follower.read_index(Instant::ORIGIN, &flog, &fstable, ctx.clone()),
+      Ok(()),
+      "after a rejecting ReadIndexResp the context is re-issuable, not stranded"
+    );
+  }
+
+  /// R6-F3: a poisoned node's `read_index` returns `Err(Poisoned)` BEFORE any side effect. A poisoned
+  /// node suppresses `poll_event`, so a `ReadState` would never arrive; returning `Ok(())` would
+  /// strand the caller waiting on a confirmation that can never come.
+  ///
+  /// FAILS-ON-OLD: the old `if self.poisoned { return Ok(()) }` short-circuit returns `Ok`.
+  #[test]
+  fn poisoned_read_index_reports_poisoned_not_ok() {
+    use crate::{PoisonReason, ReadIndexError};
+    let (mut leader, log, stable, now) = make_leader_with_current_term_commit();
+    leader.poison(PoisonReason::LogTerm);
+    assert!(leader.is_poisoned());
+    let before = leader.poll_event().is_some();
+    assert!(!before, "no pending event before the poisoned read");
+    assert_eq!(
+      leader.read_index(now, &log, &stable, bytes::Bytes::from_static(b"ctx")),
+      Err(ReadIndexError::Poisoned),
+      "a poisoned node must reject the read, not falsely accept it"
+    );
+    // And no ReadState is queued (the poisoned node emits nothing).
+    assert!(
+      !leader.poll_all_events_any_read_state(),
+      "a poisoned read_index must not queue a ReadState"
     );
   }
 
@@ -11369,6 +11696,7 @@ mod tests {
         1u64,
         Index::new(5),
         bytes::Bytes::from_static(b"never-forwarded"),
+        false,
       )),
     );
     assert!(
@@ -11388,6 +11716,7 @@ mod tests {
         3u64,
         Index::new(5),
         ctx.clone(),
+        false,
       )),
     );
     assert!(
@@ -11406,6 +11735,7 @@ mod tests {
         1u64,
         Index::new(7),
         ctx.clone(),
+        false,
       )),
     );
     let read_states: std::vec::Vec<_> = {
@@ -11435,6 +11765,7 @@ mod tests {
         1u64,
         Index::new(7),
         ctx.clone(),
+        false,
       )),
     );
     assert!(
@@ -11696,6 +12027,7 @@ mod tests {
         2u64,
         Index::new(9),
         ctx.clone(),
+        false,
       )),
     );
     assert!(
@@ -11717,6 +12049,7 @@ mod tests {
         2u64,
         Index::new(9),
         ctx.clone(),
+        false,
       )),
     );
     let read_states: std::vec::Vec<_> = {
