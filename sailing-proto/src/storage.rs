@@ -150,13 +150,15 @@ pub trait LogStore {
   /// a crash in the window between the two leaves the log discarded with no snapshot to recover
   /// from, and the node has neither its old entries nor a usable snapshot.
   ///
-  /// An implementation that cannot guarantee this ordering MUST instead rely on **restart
-  /// re-sync**: on restart, if no durable snapshot is found, the node re-syncs the discarded
-  /// entries from the leader. This is safe because every discarded entry was below the leader's
-  /// commit (i.e. quorum-committed) at the time of the `restore`, so Leader Completeness
-  /// guarantees the leader still holds them and will re-replicate. Combined with commit
-  /// persistence, a restart recovers the real commit watermark and re-syncs correctly even
-  /// when the blob was not yet durable at crash time.
+  /// This ordering is **REQUIRED for crash-safety, not advisory**. The core does NOT silently
+  /// re-sync from a half-installed snapshot: if a crash leaves the log re-baselined
+  /// (`first_index() > 1`) with no durable snapshot to baseline the discarded prefix, the committed
+  /// entries below `first_index` are gone, so [`Endpoint::restart`](crate::Endpoint::restart)
+  /// **fail-stops** — it poisons (`PoisonReason::OrphanedLog`) rather than bootstrap from the static
+  /// config and serve a log whose committed prefix is unrecoverable. An implementation that cannot
+  /// order the two durabilities cannot crash-safely install snapshots; the node it leaves behind
+  /// after such a crash must be re-provisioned by the driver (wiped and re-added), not silently
+  /// recovered.
   fn restore(&mut self, last_index: Index, last_term: Term);
 
   /// Drain the next completion, if any.

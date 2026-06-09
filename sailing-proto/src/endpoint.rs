@@ -132,6 +132,12 @@ pub enum PoisonReason {
   /// invariants (empty voters, learner/voter overlap, bad `learners_next`, non-joint `auto_leave`).
   /// Installing it verbatim would corrupt the membership tracker; a correct leader never sends one.
   InvalidConfState,
+  /// On restart the durable log is re-baselined past index 1 (`first_index() > 1`) but no durable
+  /// snapshot exists to baseline the discarded prefix — committed entries below `first_index` are
+  /// unrecoverable. A conforming `LogStore` orders the `restore` re-baseline durability AFTER the
+  /// snapshot blob, so this is a durability-contract violation or disk corruption; fail-stop rather
+  /// than bootstrap from the static config and serve a log whose committed prefix is gone.
+  OrphanedLog,
 }
 
 impl PoisonReason {
@@ -152,6 +158,98 @@ impl PoisonReason {
       Self::CommittedTruncation => "committed_truncation",
       Self::NonContiguousAppend => "non_contiguous_append",
       Self::InvalidConfState => "invalid_conf_state",
+      Self::OrphanedLog => "orphaned_log",
+    }
+  }
+}
+
+/// The action [`Endpoint::restart`] must take to make the durable LOG consistent with the durable
+/// SNAPSHOT — the output of [`reconcile_restart_log`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RestartLogAction {
+  /// Already consistent (no snapshot + an uncompacted log, or the log already compacted exactly to
+  /// the snapshot boundary). No log mutation.
+  None,
+  /// Complete a deferred LOCAL-snapshot compaction: `compact(N)` drops `[..=N]` while PRESERVING the
+  /// committed tail above `N` for replay.
+  Compact(Index),
+  /// Complete an interrupted INSTALL re-baseline: `restore(N, term)` discards the (behind/divergent,
+  /// uncommitted) log and baselines at the snapshot.
+  Restore(Index, Term),
+  /// The durable state cannot be reconciled without discarding a committed entry — fail-stop.
+  Poison(PoisonReason),
+}
+
+/// Decide how `restart` reconciles the durable log with the durable snapshot, enforcing ONE safety
+/// invariant: a committed entry is NEVER discarded — committed `[1..=commit]` is
+/// `snapshot[1..=N] ++ log[N+1..=commit]`, so if the durable state implies a committed entry must be
+/// dropped, the result is [`RestartLogAction::Poison`].
+///
+/// This is a PURE, total function over the durable shape so it is exhaustively case-testable in
+/// isolation (every snapshot/log/commit combination maps to exactly one action by construction,
+/// rather than by ad-hoc cases). Two normal crash windows — a deferred `compact` and an interrupted
+/// install `restore` — both leave `first_index <= N` but must recover differently; the discriminator
+/// is whether the log still holds the snapshot boundary entry, gated on whether a committed tail sits
+/// above the snapshot.
+///
+/// Inputs:
+/// - `snap`: the durable snapshot `(N, last_term)`, or `None`.
+/// - `committed_in_log`: the highest committed index actually present in the log, i.e.
+///   `min(hard_state.commit, log.last_index())`.
+/// - `first_index` / `last_index`: the durable log bounds.
+/// - `boundary_term`: `Some(Ok(t))` if the boundary index `N` is in the log (term `t`);
+///   `Some(Err(()))` if reading it failed; `None` if `N` is not in the log. Only consulted when the
+///   log spans `N`.
+fn reconcile_restart_log(
+  snap: Option<(Index, Term)>,
+  committed_in_log: Index,
+  first_index: Index,
+  last_index: Index,
+  boundary_term: Option<Result<Term, ()>>,
+) -> RestartLogAction {
+  let Some((n, t)) = snap else {
+    // No durable snapshot: every committed entry must come from the log, so nothing may be compacted
+    // away. A compacted log (`first_index > 1`) with no snapshot has lost its committed prefix.
+    return if first_index > Index::new(1) {
+      RestartLogAction::Poison(PoisonReason::OrphanedLog)
+    } else {
+      RestartLogAction::None
+    };
+  };
+  if first_index > n.next() {
+    // Compacted PAST the snapshot: `[N+1 .. first_index-1]` has no baseline — committed prefix gone.
+    RestartLogAction::Poison(PoisonReason::OrphanedLog)
+  } else if first_index == n.next() {
+    // Already compacted exactly to the boundary; the log continues from the snapshot. Consistent.
+    RestartLogAction::None
+  } else if last_index < n {
+    // Log entirely below `N` (interrupted install re-baseline): it holds no entry above the snapshot,
+    // so `committed_in_log <= last_index < N` — nothing committed is lost. Re-baseline.
+    RestartLogAction::Restore(n, t)
+  } else {
+    // `first_index <= N <= last_index`: the boundary entry is present; its term decides.
+    match boundary_term {
+      Some(Ok(bt)) if bt == t => {
+        // Boundary matches — the log is the node's OWN committed log (local-compaction window).
+        // Compact to drop the snapshotted prefix while PRESERVING the committed tail above `N`.
+        RestartLogAction::Compact(n)
+      }
+      Some(Ok(_)) => {
+        // Boundary term MISMATCHES the snapshot. If a committed entry sits above `N`
+        // (`committed_in_log > N`), the committed history would diverge at/below a committed point —
+        // impossible in correct Raft → fatal corruption; poison rather than truncate the committed
+        // tail. Otherwise the divergent entries are uncommitted (interrupted install) — re-baseline.
+        if committed_in_log > n {
+          RestartLogAction::Poison(PoisonReason::OrphanedLog)
+        } else {
+          RestartLogAction::Restore(n, t)
+        }
+      }
+      _ => {
+        // `Err` (fatal boundary term-read fault — never an excuse to truncate) or `None` (caller
+        // contract violation: `N` is provably in `[first_index, last_index]` here). Poison.
+        RestartLogAction::Poison(PoisonReason::LogTerm)
+      }
     }
   }
 }
@@ -1381,7 +1479,13 @@ where
     // Restore from a durable snapshot first: the compacted log no longer holds entries
     // <= meta.last_index, so the SM baseline comes from the snapshot; we then replay only
     // the durable post-snapshot committed tail.
-    if let Some((meta, data)) = stable.snapshot() {
+    let snapshot = stable.snapshot();
+    // The snapshot boundary `(N, last_term)` is captured before the blob is consumed below so the
+    // log/snapshot boundary reconciliation can run afterward for both the present and absent cases.
+    let snap_nt: Option<(Index, Term)> = snapshot
+      .as_ref()
+      .map(|(meta, _)| (meta.last_index(), meta.last_term()));
+    if let Some((meta, data)) = snapshot {
       // Validate the durable snapshot's membership BEFORE decoding/restoring the SM or installing the
       // tracker (which copies the ConfState verbatim). A corrupt-on-disk or version-skewed snapshot
       // with an impossible membership poisons rather than recovering into an invalid configuration.
@@ -1412,6 +1516,40 @@ where
             poisoned = true;
             poison_reason = Some(PoisonReason::SnapshotDecode);
           }
+        }
+      }
+    }
+    // Reconcile the durable LOG boundary against the durable SNAPSHOT — for BOTH the snapshot-present
+    // and snapshot-absent cases — enforcing ONE safety invariant: NEVER discard a committed entry
+    // (committed `[1..=commit]` = `snapshot[1..=N] ++ log[N+1..=commit]`). The recovery action is
+    // chosen by the pure, exhaustively case-tested `reconcile_restart_log`; here we only apply it.
+    // Skipped if a snapshot step above already poisoned (e.g. corrupt blob, invalid ConfState).
+    if !poisoned {
+      // The highest committed index actually present in the log — the watermark that gates whether a
+      // discard would lose committed data.
+      let committed_in_log = core::cmp::min(hs.commit(), log.last_index());
+      // Read the boundary term ONLY when the snapshot index is inside the log; otherwise its absence
+      // is decided structurally from first_index/last_index.
+      let boundary_term = snap_nt.and_then(|(n, _)| {
+        if log.first_index() <= n && n <= log.last_index() {
+          Some(log.term(n).map_err(|_| ()))
+        } else {
+          None
+        }
+      });
+      match reconcile_restart_log(
+        snap_nt,
+        committed_in_log,
+        log.first_index(),
+        log.last_index(),
+        boundary_term,
+      ) {
+        RestartLogAction::None => {}
+        RestartLogAction::Compact(n) => log.compact(n),
+        RestartLogAction::Restore(n, term) => log.restore(n, term),
+        RestartLogAction::Poison(reason) => {
+          poisoned = true;
+          poison_reason = Some(reason);
         }
       }
     }
@@ -8074,6 +8212,575 @@ mod tests {
       ep.state_machine().count(),
       0,
       "no SM restore on an invalid-ConfState snapshot"
+    );
+  }
+
+  /// Regression (R13-F1 — `restart` fail-stops on an orphaned re-baselined log): the snapshot-install
+  /// durability window. If a crash leaves the log re-baselined (`first_index() > 1`, the `restore`
+  /// re-baseline reached disk) but the snapshot blob never became durable, the committed prefix below
+  /// `first_index` is gone. `restart` must NOT bootstrap from the static config and serve that log as
+  /// if its prefix were intact (which silently discards committed entries and corrupts apply state);
+  /// it must fail-stop. A conforming `LogStore` orders the re-baseline durability after the blob so
+  /// this never happens, but the core defends against a contract violation / disk corruption.
+  ///
+  /// MUTATION: drop the `else if log.first_index() > Index::new(1)` guard in `restart` → the node
+  /// bootstraps from the static config with an orphaned log and is not poisoned.
+  #[test]
+  fn restart_orphaned_log_without_snapshot_poisons() {
+    use crate::{Config, Index, Instant, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    // No durable snapshot is submitted (simulating a crash after `restore` reached disk but before
+    // the snapshot blob): `stable.snapshot()` is None.
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_state(Term::new(2), None, Index::new(7));
+
+    // The log was re-baselined to last_index=5 (first_index becomes 6) with nothing backing it.
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(5), Term::new(2));
+    assert!(log.first_index() > Index::new(1), "log is re-baselined");
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a re-baselined log with no durable snapshot must fail-stop, not bootstrap from static config"
+    );
+    assert_eq!(ep.poison_reason().map(|r| r.as_str()), Some("orphaned_log"));
+  }
+
+  /// Regression (R14-F1 — `restart` REPAIRS the log behind a durable snapshot): the EXPECTED
+  /// conforming-store crash window. `LogStore::restore` orders the re-baseline durability AFTER the
+  /// snapshot blob, so a crash can leave the blob durable while the log re-baseline never reached
+  /// disk — the log is then behind the snapshot (`first_index <= snapshot index`). The snapshot IS
+  /// durable, so restart must RECOVER (re-run `restore`), not fail-stop: poisoning here would kill a
+  /// node whose store followed the contract. Here the durable snapshot is at index 5 but the log is
+  /// fresh (never re-baselined); restart completes the re-baseline and comes up healthy at the
+  /// snapshot baseline.
+  ///
+  /// MUTATION: drop the `if log.first_index() <= snap_idx { log.restore(..) }` repair in `restart` →
+  /// the node comes up with `applied=5`/`commit=5` but a fresh, un-rebaselined log (`first_index=1`),
+  /// so the `first_index == 6` assertion fails.
+  #[test]
+  fn restart_log_behind_durable_snapshot_repairs() {
+    use crate::{Config, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_data = encode_count_snapshot(10);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(5));
+
+    // The log re-baseline never reached disk: a FRESH log (first_index=1), behind the snapshot at 5.
+    let mut log = crate::testkit::VecLog::default();
+    assert!(log.first_index() <= Index::new(5));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      !ep.is_poisoned(),
+      "a durable snapshot with a behind log must RECOVER (re-baseline), not fail-stop"
+    );
+    assert_eq!(
+      ep.applied,
+      Index::new(5),
+      "applied at the snapshot boundary"
+    );
+    assert_eq!(ep.commit, Index::new(5), "commit at the snapshot boundary");
+    assert_eq!(
+      ep.state_machine().count(),
+      10,
+      "SM restored to the snapshot baseline"
+    );
+    // The log was repaired to the snapshot baseline.
+    assert_eq!(
+      log.first_index(),
+      Index::new(6),
+      "log re-baselined to snapshot+1"
+    );
+  }
+
+  /// Regression (R14-F1 — `restart` fail-stops when the log is compacted PAST a durable snapshot):
+  /// if the durable snapshot is at index 5 but the log has been compacted beyond it
+  /// (`first_index > 6`), the committed prefix between the snapshot and the log baseline has no
+  /// snapshot to cover it — a conforming store keeps a snapshot at or above its compaction point, so
+  /// this is corruption / a lost newer snapshot. Restart must poison rather than serve a log whose
+  /// prefix is gone.
+  ///
+  /// MUTATION: drop the `else if log.first_index() > snap_idx.next()` poison in `restart` → the node
+  /// comes up serving a log with an uncovered committed prefix.
+  #[test]
+  fn restart_log_compacted_past_snapshot_poisons() {
+    use crate::{Config, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_data = encode_count_snapshot(10);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(9));
+
+    // The log is compacted to baseline 8 (first_index=9), PAST the snapshot at 5.
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(8), Term::new(2));
+    assert!(log.first_index() > Index::new(6));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a log compacted past the durable snapshot must fail-stop"
+    );
+    assert_eq!(ep.poison_reason().map(|r| r.as_str()), Some("orphaned_log"));
+  }
+
+  /// Regression (R15-F1 — the R14 repair must NOT truncate a committed tail): `first_index <= N` also
+  /// arises in the LOCAL-snapshot compaction window — the node snapshotted its OWN log at `N`, the
+  /// blob is durable, but the deferred `compact(N)` has not run, so the log still holds the committed
+  /// tail above `N`. Recovery here must `compact` (preserving the tail), NOT `restore` (which would
+  /// delete committed entries `N+1..C` — a safety violation). Here the durable snapshot is at 5 with a
+  /// durable, NOT-yet-compacted log holding entries 1..=7 and `HardState.commit=7`; restart must
+  /// compact through 5 and replay the committed tail 6,7.
+  ///
+  /// MUTATION: collapse the recovery branch back to an unconditional `log.restore(snap_idx, ..)` (the
+  /// R14 bug) → `restore(5)` deletes entries 6,7 and the node rolls back to the snapshot boundary
+  /// (applied=5, count=10, last_index=5) instead of replaying the committed tail.
+  #[test]
+  fn restart_local_snapshot_compaction_window_preserves_tail() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_data = encode_count_snapshot(10);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(7));
+
+    // The node snapshotted its OWN log at 5 (blob durable) but the deferred compact has NOT run: the
+    // log still holds the FULL committed log 1..=7, INCLUDING the tail 6,7 above the snapshot.
+    let mut log = crate::testkit::VecLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(2),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(3),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(4),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(5),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(6),
+        EntryKind::Normal,
+        encode_cmd(b"cmd6"),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(7),
+        EntryKind::Normal,
+        encode_cmd(b"cmd7"),
+      ),
+    ]);
+    assert_eq!(log.first_index(), Index::new(1), "log NOT yet compacted");
+    assert_eq!(log.last_index(), Index::new(7));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    // MUST recover by compacting (preserving the tail), NOT restore (which would truncate 6,7).
+    assert!(
+      !ep.is_poisoned(),
+      "the compaction-window restart must recover, not poison"
+    );
+    assert_eq!(
+      ep.applied,
+      Index::new(7),
+      "the committed tail 6,7 must be replayed (not truncated)"
+    );
+    assert_eq!(ep.commit, Index::new(7));
+    assert_eq!(
+      ep.state_machine().count(),
+      12,
+      "snapshot baseline 10 + 2 replayed tail entries (NOT rolled back to 10)"
+    );
+    assert_eq!(
+      log.first_index(),
+      Index::new(6),
+      "compacted through the snapshot boundary"
+    );
+    assert_eq!(
+      log.last_index(),
+      Index::new(7),
+      "the committed tail is preserved"
+    );
+  }
+
+  /// Regression (R16-F1 — a fatal boundary term-read at restart must poison, NOT truncate): the R15
+  /// compaction/install discriminator reads the boundary term `term(N)`. A `term()` `Err` is a FATAL
+  /// storage read failure (as everywhere else in the core), NOT evidence the boundary is absent.
+  /// Collapsing `Err` into "absent" (the old `.unwrap_or(false)`) would take the `restore` branch and
+  /// DELETE a committed tail that is actually present. Here the local-compaction-window log holds the
+  /// committed tail 1..=7 but `term(5)` fails; restart must poison `LogTerm` and leave the log intact.
+  ///
+  /// MUTATION: revert the `Err(_) => poison(LogTerm)` arm to fall through to `restore` (or restore the
+  /// `.unwrap_or(false)`) → the committed tail 6,7 is truncated instead of fail-stopping.
+  #[test]
+  fn restart_boundary_term_read_failure_poisons_not_truncates() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_data = encode_count_snapshot(10);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(7));
+
+    // Local compaction window: durable snapshot at 5, the log still holds the committed tail 1..=7 —
+    // but reading the boundary term `term(5)` FAILS (a storage fault).
+    let mut log = crate::testkit::FailTermLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(2),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(3),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(4),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(5),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(6),
+        EntryKind::Normal,
+        encode_cmd(b"cmd6"),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(7),
+        EntryKind::Normal,
+        encode_cmd(b"cmd7"),
+      ),
+    ]);
+    log.fail_term_at(Some(Index::new(5)));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    // A fatal boundary term-read must POISON, not silently restore over the committed tail.
+    assert!(ep.is_poisoned(), "a fatal boundary term-read must poison");
+    assert_eq!(ep.poison_reason().map(|r| r.as_str()), Some("log_term"));
+    // The committed tail must NOT have been truncated — no `restore` ran.
+    assert_eq!(
+      log.last_index(),
+      Index::new(7),
+      "the committed tail must not be truncated on a boundary term-read failure"
+    );
+  }
+
+  /// Completeness proof for the restart log/snapshot reconciliation: `reconcile_restart_log` is a
+  /// pure, total function over the durable shape, so we exhaustively map every distinct
+  /// `(snapshot, committed_in_log, first_index, last_index, boundary_term)` class to its action. This
+  /// covers EVERY branch of the function — the guarantee the per-shape ad-hoc cases never gave (they
+  /// missed a case for five review rounds, including a committed-tail truncation).
+  #[test]
+  fn reconcile_restart_log_is_exhaustive() {
+    use super::{RestartLogAction as A, reconcile_restart_log};
+    use crate::{Index, PoisonReason as P, Term};
+    let i = Index::new;
+    let n = i(5);
+    let t = Term::new(2);
+    let other = Term::new(3); // a boundary term that disagrees with the snapshot
+
+    // (snap, committed_in_log, first_index, last_index, boundary_term) -> expected action.
+    type Case = (
+      Option<(Index, Term)>,
+      Index,
+      Index,
+      Index,
+      Option<Result<Term, ()>>,
+      A,
+    );
+    let cases: &[Case] = &[
+      // ── No durable snapshot ──
+      (None, i(0), i(1), i(0), None, A::None), // fresh/empty log
+      (None, i(7), i(1), i(7), None, A::None), // uncompacted log with a committed range
+      (None, i(0), i(3), i(7), None, A::Poison(P::OrphanedLog)), // compacted, no snapshot → prefix gone
+      // ── Durable snapshot at N=5 ──
+      (
+        Some((n, t)),
+        i(0),
+        i(7),
+        i(9),
+        None,
+        A::Poison(P::OrphanedLog),
+      ), // first_index > N+1 → past
+      (Some((n, t)), i(5), i(6), i(9), None, A::None), // first_index == N+1 → consistent
+      (Some((n, t)), i(3), i(1), i(3), None, A::Restore(n, t)), // last_index < N → behind (install)
+      (Some((n, t)), i(5), i(3), i(7), Some(Ok(t)), A::Compact(n)), // boundary matches → compaction
+      (
+        Some((n, t)),
+        i(5),
+        i(3),
+        i(7),
+        Some(Ok(other)),
+        A::Restore(n, t),
+      ), // mismatch, committed <= N → restore
+      (
+        Some((n, t)),
+        i(7),
+        i(3),
+        i(7),
+        Some(Ok(other)),
+        A::Poison(P::OrphanedLog),
+      ), // mismatch, committed > N → corruption (would truncate a committed tail)
+      (
+        Some((n, t)),
+        i(5),
+        i(3),
+        i(7),
+        Some(Err(())),
+        A::Poison(P::LogTerm),
+      ), // fatal boundary term-read
+    ];
+
+    for (idx, (snap, cil, fi, li, bt, expected)) in cases.iter().enumerate() {
+      assert_eq!(
+        reconcile_restart_log(*snap, *cil, *fi, *li, *bt),
+        *expected,
+        "reconcile case {idx}"
+      );
+    }
+  }
+
+  /// Regression (R17-F1 — boundary-term mismatch over a COMMITTED tail must poison, not truncate):
+  /// the durable snapshot is at 5 (term 2), but the log holds 1..=7 with `term(5)=3` and
+  /// `HardState.commit=7`, so 6,7 are committed. A term mismatch at/below a committed index is
+  /// impossible in correct Raft — restart must poison (`OrphanedLog`) and leave the committed tail
+  /// intact, NOT re-baseline over it.
+  ///
+  /// MUTATION: drop the `committed_in_log > n` gate in `reconcile_restart_log` (always `Restore` on
+  /// mismatch) → restart re-baselines to 5 and truncates the committed tail 6,7.
+  #[test]
+  fn restart_committed_tail_boundary_mismatch_poisons_not_truncates() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_data = encode_count_snapshot(10);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(3), None, Index::new(7));
+
+    // Log 1..=7 with the boundary entry at 5 carrying term 3 — DISAGREEING with the snapshot's term 2
+    // — while commit=7 makes 6,7 committed.
+    let mut log = crate::testkit::VecLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(2),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(3),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(4),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(5),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(6),
+        EntryKind::Normal,
+        encode_cmd(b"cmd6"),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(7),
+        EntryKind::Normal,
+        encode_cmd(b"cmd7"),
+      ),
+    ]);
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a boundary mismatch over a committed tail is corruption — must poison"
+    );
+    assert_eq!(ep.poison_reason().map(|r| r.as_str()), Some("orphaned_log"));
+    assert_eq!(
+      log.last_index(),
+      Index::new(7),
+      "the committed tail must NOT be truncated"
     );
   }
 
