@@ -2,7 +2,9 @@
 //! bus and a virtual clock. M0 wires the loop; M1+ exercises real consensus through it.
 use crate::{LogSm, MemLog, MemStable};
 use core::time::Duration;
-use sailing_proto::{Config, Endpoint, Instant, LogStore, Message, Outgoing, Term};
+use sailing_proto::{
+  ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, Term,
+};
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   vec::Vec,
@@ -12,6 +14,11 @@ use std::{
 /// is drained from that node's event queue during `tick`. Used by snapshot tests to
 /// assert that `InstallSnapshot` was genuinely exercised.
 type SnapCount = u64;
+
+/// Per-node conf-change tally: incremented each time an `Event::ConfChanged`
+/// is drained from that node's event queue during `tick`. Used by membership tests to
+/// assert that conf changes were actually applied.
+type ConfChangedCount = u64;
 
 type Node = Endpoint<u64, LogSm>;
 
@@ -23,8 +30,14 @@ struct InFlight {
   message: Message<u64>,
 }
 
-/// A deterministic cluster. Node ids are `0..n`.
+/// A deterministic cluster. Node ids start at 0 and increase monotonically; nodes may
+/// be added mid-run. The parallel `Vec`s (nodes/logs/stables/configs/…) are indexed by
+/// position; `node_idx` maps id → Vec position for O(log n) lookups.
 pub struct Cluster {
+  /// Node ids, in Vec order (ids[i] is the id of the node at position i).
+  node_ids: Vec<u64>,
+  /// Reverse map: id → Vec position.
+  node_idx: BTreeMap<u64, usize>,
   nodes: Vec<Node>,
   logs: Vec<MemLog>,
   stables: Vec<MemStable<u64>>,
@@ -35,12 +48,20 @@ pub struct Cluster {
   /// Node ids that are fully partitioned: their outgoing messages are dropped and
   /// inbound messages to/from them are dropped. Init empty.
   isolated: BTreeSet<u64>,
+  /// Node ids that have been removed from the cluster. The agreement oracle skips
+  /// consistency checks for removed nodes' applied-log suffixes beyond the point of removal.
+  /// Removed nodes are kept in the Vec structures but are also `isolated` so they don't
+  /// receive further messages or participate in elections.
+  removed: BTreeSet<u64>,
   /// Double-vote tripwire: maps `(granter, term)` → `grantee`.
   /// A second distinct grantee for the same `(granter, term)` is a fatal bug.
   grants: BTreeMap<(u64, Term), u64>,
   /// Per-node count of `Event::SnapshotInstalled` events drained during `tick`.
   /// Monotonically incremented; reset to zero on `crash`+restart.
   snapshot_installs: Vec<SnapCount>,
+  /// Per-node count of `Event::ConfChanged` events drained during `tick`.
+  /// Monotonically incremented; never reset.
+  conf_changed: Vec<ConfChangedCount>,
 }
 
 impl Cluster {
@@ -57,6 +78,8 @@ impl Cluster {
     let mut logs = Vec::with_capacity(n);
     let mut stables = Vec::with_capacity(n);
     let mut configs = Vec::with_capacity(n);
+    let mut node_ids = Vec::with_capacity(n);
+    let mut node_idx = BTreeMap::new();
     let voters: Vec<u64> = (0..n as u64).collect();
     for id in 0..n as u64 {
       let base = Config::try_new(
@@ -76,9 +99,14 @@ impl Cluster {
       configs.push(cfg);
       logs.push(MemLog::new());
       stables.push(MemStable::new());
+      node_idx.insert(id, id as usize);
+      node_ids.push(id);
     }
     let snapshot_installs = vec![0u64; n];
+    let conf_changed = vec![0u64; n];
     Self {
+      node_ids,
+      node_idx,
       nodes,
       logs,
       stables,
@@ -86,14 +114,21 @@ impl Cluster {
       bus: VecDeque::new(),
       now: Instant::ORIGIN,
       isolated: BTreeSet::new(),
+      removed: BTreeSet::new(),
       grants: BTreeMap::new(),
       snapshot_installs,
+      conf_changed,
     }
   }
 
-  /// Number of nodes.
+  /// Number of nodes (including removed ones, which are kept in the Vec but isolated).
   pub fn size(&self) -> usize {
     self.nodes.len()
+  }
+
+  /// Number of live (non-removed) nodes.
+  pub fn live_size(&self) -> usize {
+    self.nodes.len() - self.removed.len()
   }
 
   /// The current virtual time.
@@ -104,11 +139,12 @@ impl Cluster {
   /// The id of a node that currently believes itself leader, if any.
   pub fn leader(&self) -> Option<u64> {
     self
-      .nodes
+      .node_ids
       .iter()
       .enumerate()
-      .find(|(_, n)| n.role().is_leader())
-      .map(|(i, _)| i as u64)
+      .filter(|(_, id)| !self.removed.contains(id))
+      .find(|(i, _)| self.nodes[*i].role().is_leader())
+      .map(|(_, &id)| id)
   }
 
   /// Tick until `predicate(self)` holds or `max_steps` elapse; returns whether it held.
@@ -122,13 +158,20 @@ impl Cluster {
     predicate(self)
   }
 
-  /// How many nodes currently believe themselves leader.
+  /// How many nodes currently believe themselves leader (among non-removed nodes).
   pub fn leader_count(&self) -> usize {
-    self.nodes.iter().filter(|n| n.role().is_leader()).count()
+    self
+      .node_ids
+      .iter()
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .filter(|(i, _)| self.nodes[*i].role().is_leader())
+      .count()
   }
 
-  /// The term of node `i`.
-  pub fn term_of(&self, i: usize) -> sailing_proto::Term {
+  /// The term of node `id`.
+  pub fn term_of(&self, id: u64) -> sailing_proto::Term {
+    let i = self.node_idx[&id];
     self.nodes[i].term()
   }
 
@@ -144,13 +187,15 @@ impl Cluster {
 
   /// The `first_index()` of node `id`'s durable log (advances after compaction).
   pub fn first_index_of(&self, id: u64) -> sailing_proto::Index {
-    self.logs[id as usize].first_index()
+    let i = self.node_idx[&id];
+    self.logs[i].first_index()
   }
 
   /// Total number of `Event::SnapshotInstalled` events observed for node `id` since
   /// cluster construction (or the last `crash`).
   pub fn snapshot_install_count(&self, id: u64) -> u64 {
-    self.snapshot_installs[id as usize]
+    let i = self.node_idx[&id];
+    self.snapshot_installs[i]
   }
 
   /// Total `Event::SnapshotInstalled` events across ALL nodes.
@@ -158,11 +203,35 @@ impl Cluster {
     self.snapshot_installs.iter().sum()
   }
 
+  /// Total number of `Event::ConfChanged` events observed for node `id` since
+  /// cluster construction.
+  pub fn conf_changed_count(&self, id: u64) -> u64 {
+    let i = self.node_idx[&id];
+    self.conf_changed[i]
+  }
+
+  /// Total `Event::ConfChanged` events across ALL live (non-removed) nodes.
+  pub fn total_conf_changed(&self) -> u64 {
+    self
+      .node_ids
+      .iter()
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .map(|(i, _)| self.conf_changed[i])
+      .sum()
+  }
+
+  /// Length of applied log for node `id`.
+  pub fn applied_len_of(&self, id: u64) -> usize {
+    let i = self.node_idx[&id];
+    self.nodes[i].state_machine().applied().len()
+  }
+
   /// Crash node `id`: lose all in-memory consensus state and any fsync still in-flight,
   /// but keep the durably-written store contents. The node is immediately restarted from
   /// its durable stores.
   pub fn crash(&mut self, id: u64) {
-    let i = id as usize;
+    let i = self.node_idx[&id];
     self.logs[i].discard_inflight();
     self.stables[i].discard_inflight();
     let cfg = self.configs[i].clone();
@@ -176,23 +245,182 @@ impl Cluster {
 
   /// Propose `data` on the current leader; returns the assigned index (or `None` if no leader).
   pub fn propose(&mut self, data: &[u8]) -> Option<sailing_proto::Index> {
-    let leader = self.leader()? as usize;
-    // Split into disjoint borrows: nodes[leader], logs[leader], stables[leader] are each in a
+    let leader = self.leader()?;
+    let i = self.node_idx[&leader];
+    // Split into disjoint borrows: nodes[i], logs[i], stables[i] are each in a
     // separate Vec, so borrowing them simultaneously is safe.
-    let log = &mut self.logs[leader];
-    let stable = &mut self.stables[leader];
-    self.nodes[leader]
+    let log = &mut self.logs[i];
+    let stable = &mut self.stables[i];
+    self.nodes[i]
       .propose(self.now, log, stable, &bytes::Bytes::copy_from_slice(data))
       .ok()
   }
 
-  /// True if every node's applied `(index, command)` sequence agrees as a prefix of the
-  /// longest — the core safety property.
+  /// Propose a v1 conf-change on the current leader; returns the assigned index (or `None`).
+  pub fn propose_conf_change(&mut self, cc: ConfChange<u64>) -> Option<sailing_proto::Index> {
+    let leader = self.leader()?;
+    let i = self.node_idx[&leader];
+    let log = &mut self.logs[i];
+    let stable = &mut self.stables[i];
+    self.nodes[i]
+      .propose_conf_change(self.now, log, stable, cc)
+      .ok()
+  }
+
+  /// Propose a v2 conf-change on the current leader; returns the assigned index (or `None`).
+  pub fn propose_conf_change_v2(&mut self, cc: ConfChangeV2<u64>) -> Option<sailing_proto::Index> {
+    let leader = self.leader()?;
+    let i = self.node_idx[&leader];
+    let log = &mut self.logs[i];
+    let stable = &mut self.stables[i];
+    self.nodes[i]
+      .propose_conf_change_v2(self.now, log, stable, cc)
+      .ok()
+  }
+
+  /// Add a new **voter** node with `id` mid-run.
+  ///
+  /// **Bootstrap rule:** the new node's `Endpoint` is constructed with `Config.voters` =
+  /// the current live voter set (NOT including `id`). This makes `is_voter(id) = false` in
+  /// the new node's own Tracker, so it cannot campaign and cannot disrupt the existing
+  /// leader. The new node learns its own membership (voter) by applying the replicated
+  /// `ConfChange(AddNode(id))` entry once the leader commits it.
+  ///
+  /// After wiring the new node into all parallel structures, this method proposes
+  /// `AddNode(id)` on the current leader. The leader commits it under the OLD quorum,
+  /// updates its Tracker, and replicates the full log (including the ConfChange entry) to
+  /// the new node, which applies it and gains voter status in its own view.
+  ///
+  /// Panics if no leader is available.
+  pub fn add_node(&mut self, id: u64) {
+    self.wire_new_node(id, false);
+    let cc = ConfChange::new(
+      sailing_proto::ConfChangeType::AddNode,
+      id,
+      bytes::Bytes::new(),
+    );
+    self
+      .propose_conf_change(cc)
+      .expect("add_node: a leader must be available to propose AddNode");
+  }
+
+  /// Add a new **learner** node with `id` mid-run.
+  ///
+  /// Same bootstrap rule as [`add_node`]: the new node starts as a non-voter observer.
+  /// After wiring it into the sim structures, proposes `AddLearnerNode(id)` on the leader.
+  ///
+  /// Panics if no leader is available.
+  pub fn add_learner(&mut self, id: u64) {
+    self.wire_new_node(id, false);
+    let cc = ConfChange::new(
+      sailing_proto::ConfChangeType::AddLearnerNode,
+      id,
+      bytes::Bytes::new(),
+    );
+    self
+      .propose_conf_change(cc)
+      .expect("add_learner: a leader must be available to propose AddLearnerNode");
+  }
+
+  /// Remove the node `id` from the cluster.
+  ///
+  /// Proposes `RemoveNode(id)` on the current leader. The change commits and is applied
+  /// by the majority under the current quorum; the node being removed receives the commit
+  /// and applies its own removal (gaining the U6 step-down: role → Follower, election timer
+  /// disarmed). Once applied, the node is no longer a voter in any tracker.
+  ///
+  /// **Agreement oracle handling:** the removed node is tracked in `self.removed` so that the
+  /// `agreement_holds` and `min_applied_len` oracles skip it — its applied log stopped
+  /// advancing after removal and the rest of the cluster legitimately advanced further.
+  /// The removed node is also `isolated` so it does not participate in future elections.
+  ///
+  /// Returns the proposal index. Panics if no leader is available.
+  pub fn remove_node(&mut self, id: u64) {
+    let cc = ConfChange::new(
+      sailing_proto::ConfChangeType::RemoveNode,
+      id,
+      bytes::Bytes::new(),
+    );
+    self
+      .propose_conf_change(cc)
+      .expect("remove_node: a leader must be available to propose RemoveNode");
+    // Mark the node as removed so the agreement oracle and min_applied_len skip it.
+    // Also isolate it so it does not send spurious RequestVotes after being removed but
+    // before applying the conf change in its own view (the U6 step-down fires when the
+    // ConfChange is applied; until then, the node is technically still a voter in its own
+    // view and its election timer is still armed). Isolation is a simulation convenience
+    // — a real cluster would rely on U6 to stop the removed node from campaigning.
+    self.removed.insert(id);
+    self.isolated.insert(id);
+  }
+
+  /// Wire a brand-new node `id` into the simulation's parallel structures WITHOUT
+  /// proposing any conf-change. Use this when the conf-change will be proposed separately
+  /// (e.g. a joint [`ConfChangeV2`] that adds this node alongside other changes).
+  ///
+  /// The node starts as a non-voting observer (bootstrap with the current voter set, not
+  /// including `id`) so it cannot campaign.
+  pub fn wire_joining_node(&mut self, id: u64) {
+    self.wire_new_node(id, false);
+  }
+
+  /// Mark node `id` as removed in the simulation's oracle state WITHOUT proposing any
+  /// conf-change. Use this after a joint conf change that removes a node, to inform the
+  /// `agreement_holds` and `min_applied_len` oracles that the node's applied log is allowed
+  /// to diverge from the live cluster. The node is also isolated.
+  ///
+  /// This is a simulation convenience — it does NOT interact with the Raft protocol.
+  pub fn mark_removed(&mut self, id: u64) {
+    self.removed.insert(id);
+    self.isolated.insert(id);
+  }
+
+  /// Wire a brand-new node (not yet in any membership set) into all the cluster's parallel
+  /// structures. Does NOT propose any conf-change — call `add_node`/`add_learner` for that.
+  fn wire_new_node(&mut self, id: u64, _is_learner: bool) {
+    // Gather the current live voter ids to use as the bootstrap seed.
+    // The new node starts knowing the current voters but is NOT itself a voter.
+    let current_voters: Vec<u64> = self
+      .node_ids
+      .iter()
+      .enumerate()
+      .filter(|(_, nid)| !self.removed.contains(nid))
+      .map(|(i, _)| self.node_ids[i])
+      .collect();
+
+    let base = Config::try_new_observer(
+      id,
+      current_voters,
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .expect("valid observer config");
+
+    let pos = self.nodes.len();
+    self.node_idx.insert(id, pos);
+    self.node_ids.push(id);
+
+    let ep = Endpoint::new(base.clone(), self.now, 0x5EED ^ id, LogSm::new());
+    self.nodes.push(ep);
+    self.logs.push(MemLog::new());
+    self.stables.push(MemStable::new());
+    self.configs.push(base);
+    self.snapshot_installs.push(0);
+    self.conf_changed.push(0);
+  }
+
+  /// True if every non-removed node's applied `(index, command)` sequence agrees as a
+  /// prefix of the longest — the core safety property.
+  ///
+  /// Removed nodes are excluded: their log stopped advancing at the point of removal, but
+  /// the rest of the cluster continued, so their suffix would legitimately diverge.
   pub fn agreement_holds(&self) -> bool {
     let logs: std::vec::Vec<&[(sailing_proto::Index, bytes::Bytes)]> = self
-      .nodes
+      .node_ids
       .iter()
-      .map(|n| n.state_machine().applied())
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .map(|(i, _)| self.nodes[i].state_machine().applied())
       .collect();
     let longest = logs.iter().map(|l| l.len()).max().unwrap_or(0);
     for k in 0..longest {
@@ -213,12 +441,14 @@ impl Cluster {
     true
   }
 
-  /// Shortest applied-log length across all nodes.
+  /// Shortest applied-log length across all non-removed nodes.
   pub fn min_applied_len(&self) -> usize {
     self
-      .nodes
+      .node_ids
       .iter()
-      .map(|n| n.state_machine().applied().len())
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .map(|(i, _)| self.nodes[i].state_machine().applied().len())
       .min()
       .unwrap_or(0)
   }
@@ -233,7 +463,8 @@ impl Cluster {
     }
     // Collect outgoing messages produced by completion handlers.
     for i in 0..self.nodes.len() {
-      if self.isolated.contains(&(i as u64)) {
+      let id = self.node_ids[i];
+      if self.isolated.contains(&id) {
         while self.nodes[i].poll_message().is_some() {}
       } else {
         while let Some(out) = self.nodes[i].poll_message() {
@@ -245,7 +476,7 @@ impl Cluster {
             if !a.reject() {
               assert!(
                 self.logs[i].last_index() >= a.match_index(),
-                "append-before-ack violated: node {i} acked {:?} but durable last_index is {:?}",
+                "append-before-ack violated: node {id} acked {:?} but durable last_index is {:?}",
                 a.match_index(),
                 self.logs[i].last_index(),
               );
@@ -256,7 +487,7 @@ impl Cluster {
           // appear a second time for a different candidate — that would be a double-vote.
           if let Message::VoteResp(vr) = &message {
             if !vr.reject() {
-              let from = i as u64;
+              let from = id;
               let term = vr.term();
               let grantee = to;
               match self.grants.get(&(from, term)) {
@@ -272,7 +503,7 @@ impl Cluster {
           }
           self.bus.push_back(InFlight {
             deliver_at: self.now,
-            from: i as u64,
+            from: id,
             to,
             message,
           });
@@ -281,6 +512,9 @@ impl Cluster {
       while let Some(ev) = self.nodes[i].poll_event() {
         if ev.is_snapshot_installed() {
           self.snapshot_installs[i] += 1;
+        }
+        if ev.is_conf_changed() {
+          self.conf_changed[i] += 1;
         }
       }
     }
@@ -296,12 +530,12 @@ impl Cluster {
       if m.deliver_at <= self.now {
         if self.isolated.contains(&m.from) || self.isolated.contains(&m.to) {
           // Drop silently — partition swallows it.
-        } else {
+        } else if let Some(&to_idx) = self.node_idx.get(&m.to) {
           delivered = true;
-          let to = m.to as usize;
-          let (log, stable) = (&mut self.logs[to], &mut self.stables[to]);
-          self.nodes[to].handle_message(self.now, log, stable, m.from, m.message);
+          let (log, stable) = (&mut self.logs[to_idx], &mut self.stables[to_idx]);
+          self.nodes[to_idx].handle_message(self.now, log, stable, m.from, m.message);
         }
+        // else: message to an unknown id (shouldn't happen, but drop safely)
       } else {
         rest.push_back(m);
       }
@@ -352,7 +586,8 @@ impl Cluster {
       // Skip isolated nodes: their outgoing messages are dropped (partition).
       let mut any_new = false;
       for i in 0..self.nodes.len() {
-        if self.isolated.contains(&(i as u64)) {
+        let id = self.node_ids[i];
+        if self.isolated.contains(&id) {
           // Drain and discard so the queue doesn't grow unboundedly.
           while self.nodes[i].poll_message().is_some() {}
         } else {
@@ -365,7 +600,7 @@ impl Cluster {
               if !a.reject() {
                 assert!(
                   self.logs[i].last_index() >= a.match_index(),
-                  "append-before-ack violated: node {i} acked {:?} but durable last_index is {:?}",
+                  "append-before-ack violated: node {id} acked {:?} but durable last_index is {:?}",
                   a.match_index(),
                   self.logs[i].last_index(),
                 );
@@ -374,7 +609,7 @@ impl Cluster {
             // ── Structural assertion (b): one-grant-per-(node,term) ──────────────
             if let Message::VoteResp(vr) = &message {
               if !vr.reject() {
-                let from = i as u64;
+                let from = id;
                 let term = vr.term();
                 let grantee = to;
                 match self.grants.get(&(from, term)) {
@@ -390,7 +625,7 @@ impl Cluster {
             }
             self.bus.push_back(InFlight {
               deliver_at: self.now,
-              from: i as u64,
+              from: id,
               to,
               message,
             });
@@ -400,6 +635,9 @@ impl Cluster {
           progressed = true;
           if ev.is_snapshot_installed() {
             self.snapshot_installs[i] += 1;
+          }
+          if ev.is_conf_changed() {
+            self.conf_changed[i] += 1;
           }
         }
       }

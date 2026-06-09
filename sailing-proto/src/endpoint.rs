@@ -808,13 +808,15 @@ where
       _ => {
         if self.election_deadline.is_some_and(|d| d <= now) {
           // A learner or removed node must never start an election.
-          // Leaving the timer disarmed for non-voters is intentional: they have no
-          // business holding an election timer (see U6 step-down and become_candidate
-          // defensive guard).
+          // Clear the deadline so `poll_timeout` returns `None` for this node and
+          // the sim's clock can advance past it. Non-voters do not re-arm — they
+          // resume their election timer only when a heartbeat arrives (which calls
+          // `arm_election_timer`).
+          self.election_deadline = None;
           if self.tracker.is_voter(&self.config.id()) {
             self.become_candidate(now, log, stable);
           }
-          // else: non-voter — timer expires silently; do not re-arm.
+          // else: non-voter — timer expires silently; deadline cleared above.
         }
       }
     }
@@ -1301,13 +1303,15 @@ where
     }
   }
 
-  /// M4 Task 6: a HeartbeatResp from a peer clears its probe pause and kicks off a new
-  /// send. This allows a stalled `Probe` peer (whose partial-batch send was never acked)
-  /// to resume replication on the next heartbeat round rather than waiting indefinitely.
+  /// M4 Task 6 + liveness fix: a HeartbeatResp from a peer clears its probe pause and
+  /// kicks off a new send. This allows a stalled `Probe` peer (whose partial-batch send was
+  /// never acked) to resume replication on the next heartbeat round rather than waiting
+  /// indefinitely.
   ///
-  /// LIVENESS (deferred to a later milestone): a Replicate peer whose entire in-flight window
-  /// is dropped with no further acks won't be re-probed by heartbeats — etcd sends an empty
-  /// MsgApp when Replicate && Inflights.full(). Revisit with snapshots.
+  /// Liveness fix (etcd `FreeFirstOne`): if the peer is in `Replicate` state with a full
+  /// in-flight window (all acks were lost during a partition), we free the oldest in-flight
+  /// slot. This lets the leader send one `AppendEntries` per heartbeat round so a healed
+  /// follower resumes on its own without requiring an unrelated client proposal.
   fn on_heartbeat_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     from: I,
@@ -1319,6 +1323,10 @@ where
     }
     if let Some(pr) = self.tracker.progress_mut(&from) {
       pr.clear_probe_pause();
+      // etcd FreeFirstOne: free one inflight slot so a Replicate peer whose in-flight window
+      // was lost (e.g. a healed partition, dropped MsgApps) can resume on the next heartbeat
+      // round instead of wedging until an unrelated proposal triggers a send.
+      pr.free_inflight_on_heartbeat();
     }
     self.maybe_send_append(from, log, stable);
   }

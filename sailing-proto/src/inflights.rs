@@ -46,6 +46,18 @@ impl Inflights {
     }
   }
 
+  /// Free the single oldest in-flight entry (front of the queue).
+  ///
+  /// Called by `Progress::free_inflight_on_heartbeat` (etcd `FreeFirstOne`) to let the
+  /// leader send one probe per heartbeat round to a `Replicate` peer whose in-flight window
+  /// is full because all acks were lost (e.g. a healed partition). No-op if the queue is
+  /// empty.
+  pub fn free_first_one(&mut self) {
+    if let Some((_, b)) = self.inflight.pop_front() {
+      self.bytes -= b;
+    }
+  }
+
   /// Drop all in-flight tracking (on a `Progress` reset / become-probe).
   pub fn reset(&mut self) {
     self.inflight.clear();
@@ -71,5 +83,37 @@ mod tests {
     assert!(!b.full());
     b.add(crate::Index::new(2), 10); // 20 bytes > 15
     assert!(b.full());
+  }
+
+  #[test]
+  fn free_first_one_unblocks_full_window() {
+    // Fill to capacity (count cap = 2).
+    let mut f = Inflights::new(2, 0);
+    f.add(crate::Index::new(1), 7);
+    f.add(crate::Index::new(2), 11);
+    assert!(f.full(), "window must be full after two adds");
+    let bytes_before = f.bytes;
+
+    // Free the oldest (front) entry.
+    f.free_first_one();
+    assert!(
+      !f.full(),
+      "window must have one free slot after free_first_one"
+    );
+    assert_eq!(
+      f.bytes,
+      bytes_before - 7,
+      "bytes must decrease by the freed entry's size"
+    );
+
+    // Freeing the second entry drains the window entirely.
+    f.free_first_one();
+    assert!(!f.full());
+    assert_eq!(f.bytes, 0);
+
+    // Calling on an empty queue is a safe no-op.
+    f.free_first_one();
+    assert_eq!(f.bytes, 0);
+    assert!(!f.full());
   }
 }

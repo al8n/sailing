@@ -155,6 +155,22 @@ impl Progress {
     self.msg_app_flow_paused = false;
   }
 
+  /// etcd `FreeFirstOne`: if this peer is in `Replicate` state with a full in-flight window
+  /// (because all acks were lost, e.g. during a partition), free the oldest in-flight slot so
+  /// the leader can send one new `AppendEntries` per heartbeat round.
+  ///
+  /// This is called on every `HeartbeatResp` so a healed/partitioned follower resumes
+  /// replication on its own via heartbeats instead of waiting for an unrelated client
+  /// proposal to trigger a send.
+  ///
+  /// No-op for `Probe` and `Snapshot` states (they have their own resume mechanisms) and
+  /// no-op when the window is not full (normal steady-state; the leader can already send).
+  pub fn free_inflight_on_heartbeat(&mut self) {
+    if self.state == ProgressState::Replicate && self.inflight.full() {
+      self.inflight.free_first_one();
+    }
+  }
+
   /// On a reject: back `next_index` off by one (floored at 1) and re-probe.
   pub fn decrement(&mut self) {
     self.next_index = Index::new(self.next_index.get().saturating_sub(1).max(1));
@@ -262,6 +278,53 @@ mod tests {
     assert_eq!(
       std::format!("{}", ProgressState::Snapshot(Index::new(0))),
       "snapshot"
+    );
+  }
+
+  // --- free_inflight_on_heartbeat (etcd FreeFirstOne) ---
+
+  #[test]
+  fn free_inflight_on_heartbeat_replicate_full_frees_one() {
+    // Replicate peer with inflight cap=2; fill it then call free_inflight_on_heartbeat.
+    let mut p = Progress::new(crate::Index::new(1), 2, 0);
+    p.become_replicate();
+    p.sent_entries(crate::Index::new(1), 10);
+    p.sent_entries(crate::Index::new(2), 20);
+    assert!(p.is_paused(), "window full => paused");
+
+    p.free_inflight_on_heartbeat();
+    assert!(
+      !p.is_paused(),
+      "one slot freed => Replicate peer is no longer paused"
+    );
+    // Calling again on non-full window is a no-op (does not corrupt state).
+    p.free_inflight_on_heartbeat();
+    assert!(!p.is_paused());
+  }
+
+  #[test]
+  fn free_inflight_on_heartbeat_probe_noop() {
+    // Probe state: free_inflight_on_heartbeat must not touch the probe-pause flag.
+    let mut p = Progress::new(crate::Index::new(1), 2, 0);
+    p.sent_entries(crate::Index::new(1), 10); // probe pause set
+    assert!(p.is_paused());
+    p.free_inflight_on_heartbeat(); // no-op for Probe
+    assert!(
+      p.is_paused(),
+      "Probe pause must not be cleared by free_inflight_on_heartbeat"
+    );
+  }
+
+  #[test]
+  fn free_inflight_on_heartbeat_snapshot_noop() {
+    // Snapshot state: always paused; free_inflight_on_heartbeat must be a no-op.
+    let mut p = Progress::new(crate::Index::new(1), 2, 0);
+    p.become_snapshot(crate::Index::new(10));
+    assert!(p.is_paused());
+    p.free_inflight_on_heartbeat(); // no-op for Snapshot
+    assert!(
+      p.is_paused(),
+      "Snapshot pause must not be cleared by free_inflight_on_heartbeat"
     );
   }
 }

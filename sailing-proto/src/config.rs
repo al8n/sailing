@@ -61,6 +61,43 @@ impl<I: NodeId> Config<I> {
     })
   }
 
+  /// Construct a configuration for a **joining (observer) node** whose own id is NOT yet
+  /// among the current voter set. Used when adding a new node mid-run: the bootstrap voter
+  /// seed is the *existing* cluster's voter list, which does not include the joining node's
+  /// id. This makes `is_voter(new_id) = false` in the new node's initial Tracker, so it
+  /// cannot campaign and cannot disrupt an existing election.
+  ///
+  /// Differs from [`try_new`] only by skipping the `id ∈ voters` validation.
+  pub fn try_new_observer(
+    id: I,
+    current_voters: Vec<I>,
+    election_timeout: Duration,
+    heartbeat_interval: Duration,
+  ) -> Result<Self, ConfigError> {
+    if heartbeat_interval.is_zero() {
+      return Err(ConfigError::ZeroHeartbeat);
+    }
+    if election_timeout <= heartbeat_interval {
+      return Err(ConfigError::ElectionNotGreaterThanHeartbeat {
+        election: election_timeout,
+        heartbeat: heartbeat_interval,
+      });
+    }
+    // Intentionally do NOT check `current_voters.contains(&id)` — the joining node
+    // is not a voter in the bootstrap seed by design.
+    Ok(Self {
+      id,
+      voters: current_voters,
+      election_timeout,
+      heartbeat_interval,
+      max_size_per_msg: 1024 * 1024, // 1 MiB default
+      max_inflight_msgs: 256,
+      max_inflight_bytes: 0,
+      snapshot_threshold: 10_000, // etcd default SnapshotCount
+      step_down_on_removal: true,
+    })
+  }
+
   /// This node's id.
   #[inline(always)]
   pub const fn id(&self) -> I {
