@@ -15,4 +15,7 @@ pub enum ConfigError {
   /// `heartbeat_interval` was zero.
   #[error("heartbeat interval must be non-zero")]
   ZeroHeartbeat,
+  /// The configured `id` was not present in the voter set.
+  #[error("id is not among the configured voters")]
+  IdNotAVoter,
 }

@@ -15,6 +15,9 @@ extern crate std;
 #[cfg(not(feature = "alloc"))]
 compile_error!("sailing-proto requires the `alloc` feature (it is enabled transitively by `std`)");
 
+mod prng;
+pub use prng::Prng;
+
 mod num;
 pub use num::{Index, Term};
 
@@ -55,3 +58,6 @@ pub use event::{Applied, Event, LeaderChanged};
 
 mod endpoint;
 pub use endpoint::{Endpoint, Role};
+
+#[cfg(test)]
+pub(crate) mod testkit;

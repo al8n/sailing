@@ -398,6 +398,36 @@ impl<I: Copy> Outgoing<I> {
   }
 }
 
+impl<I: Copy> Message<I> {
+  /// The term carried by this message (every variant carries one).
+  pub fn term(&self) -> crate::Term {
+    match self {
+      Self::AppendEntries(m) => m.term(),
+      Self::AppendResp(m) => m.term(),
+      Self::RequestVote(m) => m.term(),
+      Self::VoteResp(m) => m.term(),
+      Self::Heartbeat(m) => m.term(),
+      Self::HeartbeatResp(m) => m.term(),
+    }
+  }
+}
+
+#[cfg(test)]
+mod term_test {
+  use super::*;
+
+  #[test]
+  fn message_term() {
+    let m = Message::Heartbeat(Heartbeat::new(
+      crate::Term::new(5),
+      1u64,
+      crate::Index::ZERO,
+      bytes::Bytes::new(),
+    ));
+    assert_eq!(m.term(), crate::Term::new(5));
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;

@@ -1,20 +1,24 @@
 //! Endpoint configuration. Tuning is real `Duration` (not logical ticks); the election
 //! timeout is randomized per term from the seeded PRNG inside the `Endpoint`.
-use crate::error::ConfigError;
+use crate::{NodeId, error::ConfigError};
 use core::time::Duration;
+use std::vec::Vec;
 
-/// Static configuration for an [`crate::Endpoint`]. Generic param carries no bounds.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// Static configuration for an [`crate::Endpoint`]. Holds the initial voter set (dynamic
+/// membership via `ConfChange` is M6). `Clone`, not `Copy` (it owns the voter list).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config<I> {
   id: I,
+  voters: Vec<I>,
   election_timeout: Duration,
   heartbeat_interval: Duration,
 }
 
-impl<I: Copy> Config<I> {
-  /// Construct, validating that `election_timeout > heartbeat_interval > 0`.
+impl<I: NodeId> Config<I> {
+  /// Construct, validating timeouts and that `id` is among `voters`.
   pub fn try_new(
     id: I,
+    voters: Vec<I>,
     election_timeout: Duration,
     heartbeat_interval: Duration,
   ) -> Result<Self, ConfigError> {
@@ -27,8 +31,12 @@ impl<I: Copy> Config<I> {
         heartbeat: heartbeat_interval,
       });
     }
+    if !voters.contains(&id) {
+      return Err(ConfigError::IdNotAVoter);
+    }
     Ok(Self {
       id,
+      voters,
       election_timeout,
       heartbeat_interval,
     })
@@ -38,6 +46,24 @@ impl<I: Copy> Config<I> {
   #[inline(always)]
   pub const fn id(&self) -> I {
     self.id
+  }
+
+  /// The voter set.
+  #[inline(always)]
+  pub fn voters(&self) -> &[I] {
+    &self.voters
+  }
+
+  /// Whether `id` is a voter.
+  #[inline(always)]
+  pub fn is_voter(&self, id: I) -> bool {
+    self.voters.contains(&id)
+  }
+
+  /// Majority quorum size: `n/2 + 1`.
+  #[inline(always)]
+  pub fn quorum(&self) -> usize {
+    self.voters.len() / 2 + 1
   }
 
   /// The base election timeout (randomized per term at runtime).
@@ -59,9 +85,34 @@ mod tests {
   use core::time::Duration;
 
   #[test]
+  fn quorum_and_voters() {
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(c.quorum(), 2);
+    assert_eq!(c.voters(), &[1, 2, 3]);
+    assert!(c.is_voter(2u64));
+    // id must be among voters
+    assert!(
+      Config::try_new(
+        9u64,
+        std::vec![1u64, 2],
+        Duration::from_millis(1000),
+        Duration::from_millis(100)
+      )
+      .is_err()
+    );
+  }
+
+  #[test]
   fn config_validation_and_defaults() {
     let c = Config::try_new(
       1u64,
+      std::vec![1u64],
       Duration::from_millis(1000),
       Duration::from_millis(100),
     )
@@ -70,7 +121,12 @@ mod tests {
     assert_eq!(c.heartbeat_interval(), Duration::from_millis(100));
     // election timeout must exceed heartbeat interval
     assert!(matches!(
-      Config::try_new(1u64, Duration::from_millis(50), Duration::from_millis(100)),
+      Config::try_new(
+        1u64,
+        std::vec![1u64],
+        Duration::from_millis(50),
+        Duration::from_millis(100)
+      ),
       Err(ConfigError::ElectionNotGreaterThanHeartbeat { .. })
     ));
   }
