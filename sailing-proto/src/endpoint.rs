@@ -2268,7 +2268,11 @@ where
       votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
-      next_op_id: crate::OpId::ZERO,
+      // R45: seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
+      // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
+      // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup
+      // and every `>=` watermark check). The same boot_epoch namespaces forwarded-read tokens below.
+      next_op_id: crate::OpId::first_of_epoch(boot_epoch),
       pending: BTreeMap::new(),
       inflight_append_upto: BTreeMap::new(),
       poisoned,
@@ -14855,6 +14859,76 @@ mod tests {
       Some(now + Duration::from_secs(999)),
       "a legacy Unrecorded record DOES honor the operator's assume_prior"
     );
+  }
+
+  /// R45: `restart` seeds the op-id counter at seq 0 of THIS boot epoch, so a post-restart op id strictly
+  /// exceeds (and is unequal to) every prior incarnation's id — the by-construction basis for ignoring a
+  /// prior-incarnation storage completion that survives a crash. Fresh `new()` uses epoch 0.
+  ///
+  /// MUTATION: seed `next_op_id` at restart to `OpId::ZERO` instead of `first_of_epoch(boot_epoch)` → the
+  /// minted id is `{epoch:0, seq:0}`, colliding with a fresh node's / a prior incarnation's ids.
+  #[test]
+  fn restart_mints_epoch_scoped_op_ids() {
+    use crate::{Config, Instant, OpId};
+    use core::time::Duration;
+    let cfg = || {
+      Config::try_new(
+        1u64,
+        std::vec![1u64],
+        Duration::from_millis(1000),
+        Duration::from_millis(100),
+      )
+      .unwrap()
+    };
+    // Fresh node: epoch 0.
+    let mut fresh = Endpoint::new(
+      cfg(),
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+    );
+    assert_eq!(
+      fresh.mint_op_id_for_test(),
+      OpId::new(0),
+      "fresh node mints epoch-0 ids"
+    );
+    // Restart at boot_epoch 7: the first minted id is seq 0 of epoch 7.
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    let mut ep = Endpoint::restart(
+      cfg(),
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+      7,
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep.mint_op_id_for_test(),
+      OpId::first_of_epoch(7),
+      "a restart must mint ids in its own boot epoch, never colliding with a prior incarnation"
+    );
+  }
+
+  /// R45: `OpId` ordering is EPOCH-MAJOR — a higher boot epoch's FIRST id exceeds (and is unequal to) ANY
+  /// lower epoch's id. This is what makes a prior-incarnation completion (lower epoch) sort below every
+  /// current op (so it fails every `>=` durability-watermark check) and compare unequal (so it misses
+  /// every `pending`/inflight map lookup), with no explicit epoch check in the completion handlers.
+  ///
+  /// MUTATION: order `OpId` by `seq` first (or ignore `epoch`) → a prior incarnation's high-`seq` id can
+  /// exceed a new incarnation's `first_of_epoch`, reopening the stale-completion collision.
+  #[test]
+  fn op_id_is_epoch_major() {
+    use crate::OpId;
+    // A higher epoch's first id beats any amount of seq in a lower epoch.
+    assert!(OpId::first_of_epoch(2) > OpId::new(u64::MAX));
+    assert!(OpId::first_of_epoch(8) > OpId::first_of_epoch(7).next().next());
+    // Distinct epochs are never equal even at the same seq → map lookups can't collide across incarnations.
+    assert_ne!(OpId::new(0), OpId::first_of_epoch(1));
+    assert_ne!(OpId::first_of_epoch(1), OpId::first_of_epoch(2));
+    // Within an epoch, seq orders as usual.
+    assert!(OpId::first_of_epoch(3).next() > OpId::first_of_epoch(3));
   }
 
   /// R42: a recorded genuine-ZERO floor means "promised nothing" — it must NOT arm a degenerate `now+0`

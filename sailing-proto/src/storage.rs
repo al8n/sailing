@@ -6,30 +6,65 @@ use bytes::Bytes;
 use core::ops::Range;
 
 /// A storage-submission correlation id, echoed back on completion.
+///
+/// R45: an `OpId` carries the node's BOOT EPOCH (the strictly-increasing per-restart counter the driver
+/// supplies to [`Endpoint::restart`](crate::Endpoint::restart)) as its HIGH-ORDER component, with a
+/// per-incarnation `seq` as the low-order. This makes a completion enqueued by a PRIOR incarnation — one
+/// that survives into a new incarnation because the store did not clear its completion queue on crash —
+/// impossible to mistake for a current op: its lower `epoch` makes it UNEQUAL to (so it misses every
+/// `pending`/inflight map lookup) and STRICTLY LESS THAN (so it fails every `>=` durability-watermark
+/// check) every current-incarnation id. `epoch` is declared before `seq` so the derived `Ord` is
+/// epoch-major. (A fresh node uses epoch 0; `restart` seeds `seq=0` of the supplied boot epoch.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-#[repr(transparent)]
-pub struct OpId(u64);
+pub struct OpId {
+  epoch: u64,
+  seq: u64,
+}
 
 impl OpId {
-  /// The zero id.
-  pub const ZERO: Self = Self(0);
+  /// The zero id (epoch 0, seq 0) — the fresh-node seed and the watermark sentinel.
+  pub const ZERO: Self = Self { epoch: 0, seq: 0 };
 
-  /// Wrap a raw value.
+  /// An id with sequence `v` in epoch 0 — the store/test constructor (production ids come from
+  /// `mint_op_id`, seeded via [`Self::first_of_epoch`] at restart).
   #[inline(always)]
   pub const fn new(v: u64) -> Self {
-    Self(v)
+    Self { epoch: 0, seq: v }
   }
 
-  /// The raw value.
+  /// The first id (`seq = 0`) of boot `epoch` — seeded into the op-id counter at
+  /// [`Endpoint::restart`](crate::Endpoint::restart) so this incarnation's ids strictly exceed every prior
+  /// incarnation's (boot epochs strictly increase).
+  #[inline(always)]
+  pub const fn first_of_epoch(epoch: u64) -> Self {
+    Self { epoch, seq: 0 }
+  }
+
+  /// The boot epoch this id belongs to.
+  #[inline(always)]
+  pub const fn epoch(self) -> u64 {
+    self.epoch
+  }
+
+  /// The per-incarnation sequence number.
+  #[inline(always)]
+  pub const fn seq(self) -> u64 {
+    self.seq
+  }
+
+  /// The per-incarnation sequence number (alias of [`Self::seq`] retained for existing callers).
   #[inline(always)]
   pub const fn get(self) -> u64 {
-    self.0
+    self.seq
   }
 
-  /// The next id (saturating).
+  /// The next id in the SAME epoch (saturating `seq`).
   #[inline(always)]
   pub const fn next(self) -> Self {
-    Self(self.0.saturating_add(1))
+    Self {
+      epoch: self.epoch,
+      seq: self.seq.saturating_add(1),
+    }
   }
 }
 
