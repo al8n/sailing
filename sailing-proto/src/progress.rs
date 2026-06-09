@@ -190,6 +190,10 @@ impl Progress {
   }
 
   /// On a reject: back `next_index` off by one (floored at 1) and re-probe.
+  #[allow(
+    dead_code,
+    reason = "exercised by unit tests; kept for the back-off path"
+  )]
   pub fn decrement(&mut self) {
     self.next_index = Index::new(self.next_index.get().saturating_sub(1).max(1));
     self.state = ProgressState::Probe;

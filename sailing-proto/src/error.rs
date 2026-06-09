@@ -40,6 +40,33 @@ pub enum TransferError<I> {
   AlreadyLeader,
 }
 
+/// Why a [`read_index`](crate::Endpoint::read_index) request could not be issued.
+///
+/// A `read_index` that returns `Ok(())` has been accepted onto a confirmation path (the
+/// leader's heartbeat-quorum round, an immediate lease confirmation, or a forward to the
+/// known leader); the eventual [`Event::ReadState`](crate::Event::ReadState) (locally) or
+/// [`ReadIndexResp`](crate::ReadIndexResp) (when forwarded) is the only acknowledgement.
+/// An `Err` means **no** such acknowledgement will ever arrive for this call, so the caller
+/// must not block waiting for one.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ReadIndexError {
+  /// This node is a follower with no known leader to forward the read to, so the request
+  /// cannot be confirmed. Retry once a leader is known.
+  #[error("no known leader to confirm the read")]
+  NoLeader,
+  /// This node is a follower and `disable_proposal_forwarding` is set, so the read cannot be
+  /// forwarded to the leader. Issue the read on (or redirect it to) the leader directly.
+  #[error("proposal forwarding is disabled; cannot forward the read to the leader")]
+  ForwardingDisabled,
+  /// A read with this exact `context` is already in flight. The `context` is the sole
+  /// correlator between a request and its eventual `ReadState`/`ReadIndexResp`, so two
+  /// concurrent reads MUST use distinct contexts (including the empty context). Wait for the
+  /// in-flight read to confirm, or reissue with a unique context.
+  #[error("a read with this context is already in flight")]
+  DuplicateContext,
+}
+
 /// Why constructing a [`crate::Config`] failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

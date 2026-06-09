@@ -247,6 +247,11 @@ where
       config.max_inflight_bytes(),
     );
     let read_only_opt = config.read_only();
+    // A cross-field misconfiguration (e.g. `LeaseBased` without `check_quorum`) is handled by
+    // degradation, not rejection: the `LeaseBased` read path falls back to the Safe heartbeat
+    // round when `check_quorum` is off, so construction stays infallible and the same in all
+    // build profiles. `Config::validate()` is available for callers who want to opt into a
+    // strict pre-flight check.
     let mut ep = Self {
       config,
       fsm,
@@ -1017,6 +1022,8 @@ where
     // Never trust commit beyond the durable log; never below the snapshot baseline.
     let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
     let read_only_opt = config.read_only();
+    // Misconfiguration is handled by degradation, not rejection (see `Endpoint::new`); restart
+    // construction stays infallible and identical across build profiles.
     let mut ep = Self {
       config,
       fsm,
@@ -1179,6 +1186,11 @@ where
         // All pending work from the old term is now stale (spec §7). Drop it before any new
         // grant is recorded below — a fresh CastVote added by on_request_vote will survive.
         self.pending.clear();
+        // Drop all ReadIndex state too: a stale read confirmation must never leak across a term
+        // change. Mirrors `step_down_to_follower` / `become_leader` (read confirmation is
+        // leader-gated, so this is robustness, not a behavior change).
+        self.read_only.reset(self.config.read_only());
+        self.pending_reads.clear();
         // Abort any in-progress leader transfer — leadership is changing.
         self.lead_transferee = None;
         self.transfer_deadline = None;
@@ -1406,7 +1418,7 @@ where
     &mut self,
     _now: Instant,
     log: &mut L,
-    stable: &mut S,
+    stable: &S,
     cmd: &F::Command,
   ) -> Result<Index, crate::ProposeError<I>>
   where
@@ -2163,6 +2175,17 @@ where
 
   /// Initiate a linearizable read.
   ///
+  /// The `context` MUST uniquely identify each in-flight read — it is the **sole** correlator
+  /// between this request and the eventual [`Event::ReadState`](crate::Event::ReadState)
+  /// (locally) or [`ReadIndexResp`](crate::ReadIndexResp) (when forwarded to the leader).
+  /// Reusing a `context` that is already in flight (including the **empty** context for two
+  /// concurrent reads) returns [`ReadIndexError::DuplicateContext`]; the prior read's single
+  /// confirmation would otherwise be the only acknowledgement for both calls.
+  ///
+  /// `Ok(())` means the read was accepted onto a confirmation path; the caller should wait for
+  /// the matching `ReadState`/`ReadIndexResp`. An `Err` means **no** acknowledgement will ever
+  /// arrive for this call, so the caller must not block on one.
+  ///
   /// - **Leader, `ReadOnlySafe`:** records the read at the current commit index and
   ///   broadcasts a heartbeat round.  Once a voter quorum acks the round, emits
   ///   `Event::ReadState`.  If no current-term commit exists yet, defers until it does.
@@ -2170,53 +2193,80 @@ where
   ///   `check_quorum` is also enabled (relies on the CheckQuorum lease).  If
   ///   `check_quorum` is disabled the request degrades to the Safe path so the
   ///   misconfiguration is safe rather than silently non-linearizable.
-  /// - **Follower:** forwards a `ReadIndex` message to the known leader.  Dropped
-  ///   if no leader is known or `disable_proposal_forwarding` is set.
-  /// - **Candidate / PreCandidate:** dropped (no leader to confirm).
-  pub fn read_index<L, S>(&mut self, now: Instant, log: &mut L, _stable: &mut S, context: Bytes)
+  /// - **Follower:** forwards a `ReadIndex` message to the known leader.  Returns
+  ///   [`ReadIndexError::NoLeader`] if no leader is known, or
+  ///   [`ReadIndexError::ForwardingDisabled`] if `disable_proposal_forwarding` is set.
+  /// - **Candidate / PreCandidate:** returns [`ReadIndexError::NoLeader`] (no leader to confirm).
+  ///
+  /// A poisoned node returns `Ok(())` without effect (it is inert; the driver should already be
+  /// stopping on `poison_reason()`).
+  pub fn read_index<L, S>(
+    &mut self,
+    now: Instant,
+    log: &L,
+    _stable: &S,
+    context: Bytes,
+  ) -> Result<(), crate::ReadIndexError>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
     if self.poisoned {
-      return;
+      return Ok(());
     }
     match self.role {
       Role::Leader => {
+        // Reject a context that is already in flight (deferred or registered) so the caller
+        // is not left waiting forever for a confirmation that the prior read already owns.
+        if self.read_context_in_flight(&context) {
+          return Err(crate::ReadIndexError::DuplicateContext);
+        }
         // Current-term-commit gate.
         if !self.has_current_term_commit(log) {
           // Defer until the no-op commits.
           self.pending_reads.push((context, None));
-          return;
+          return Ok(());
         }
         self.do_leader_read(now, log, context, None);
+        Ok(())
       }
       Role::Follower => {
         // Forward to the leader if known and forwarding is not disabled.
         if self.config.disable_proposal_forwarding() {
-          return;
+          return Err(crate::ReadIndexError::ForwardingDisabled);
         }
         let Some(leader) = self.leader else {
-          return;
+          return Err(crate::ReadIndexError::NoLeader);
         };
         let (term, me) = (self.term, self.config.id());
         self.send(
           leader,
           Message::ReadIndex(crate::ReadIndex::new(term, me, context)),
         );
+        Ok(())
       }
       Role::Candidate | Role::PreCandidate => {
-        // No leader to confirm reads; drop.
+        // No leader to confirm reads.
+        Err(crate::ReadIndexError::NoLeader)
       }
     }
+  }
+
+  /// Whether a read with this exact `context` is already in flight on the leader — either
+  /// deferred awaiting the first current-term commit (`pending_reads`) or registered with the
+  /// heartbeat-ack tracker (`read_only`). Used by [`Self::read_index`] to surface
+  /// [`crate::ReadIndexError::DuplicateContext`] before any side effect.
+  fn read_context_in_flight(&self, context: &Bytes) -> bool {
+    self.pending_reads.iter().any(|(ctx, _)| ctx == context)
+      || self.read_only.acks_for(context.as_ref()).is_some()
   }
 
   /// Leader receives a forwarded `ReadIndex` from a follower.
   fn on_read_index<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Instant,
-    log: &mut L,
-    _stable: &mut S,
+    log: &L,
+    _stable: &S,
     ri: crate::ReadIndex<I>,
   ) {
     if !self.role.is_leader() {
@@ -2846,7 +2896,7 @@ mod tests {
     while ep.poll_event().is_some() {} // drain LeaderChanged
 
     let idx = ep
-      .propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"cmd"))
+      .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
       .unwrap();
     assert_eq!(idx, crate::Index::new(2)); // after the no-op at 1
     let mut appends = 0;
@@ -2957,7 +3007,7 @@ mod tests {
     while ep.poll_event().is_some() {}
 
     let idx = ep
-      .propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"x"))
+      .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
       .unwrap(); // index 2
     // Drain storage so the LeaderAppend for index 2 fires (advances self match_index to 2).
     ep.handle_storage(d, &mut log, &mut stable);
@@ -3192,13 +3242,8 @@ mod tests {
     let cmds: [&[u8]; 4] = [b"c0", b"c1", b"c2", b"c3"];
     const N: usize = 4;
     for cmd in cmds {
-      ep.propose(
-        d,
-        &mut log,
-        &mut stable,
-        &bytes::Bytes::copy_from_slice(cmd),
-      )
-      .unwrap();
+      ep.propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(cmd))
+        .unwrap();
       ep.handle_storage(d, &mut log, &mut stable);
       while ep.poll_message().is_some() {}
       while ep.poll_event().is_some() {}
@@ -3275,7 +3320,7 @@ mod tests {
     while ep.poll_message().is_some() {}
 
     // Now propose a Normal entry and drain storage so it commits.
-    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"cmd"))
+    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
       .unwrap();
     ep.handle_storage(d, &mut log, &mut stable);
 
@@ -3536,9 +3581,9 @@ mod tests {
     while ep.poll_event().is_some() {}
 
     // Propose two Normal entries (indices 2 and 3) and make them durable on the leader.
-    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"x"))
+    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
       .unwrap();
-    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"y"))
+    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"y"))
       .unwrap();
     ep.handle_storage(d, &mut log, &mut stable); // leader self-match → 3
     while ep.poll_message().is_some() {}
@@ -3656,12 +3701,7 @@ mod tests {
     // 2 AppendEntries before the window fills.
     for i in 0u8..5 {
       let _ = ep
-        .propose(
-          d,
-          &mut log,
-          &mut stable,
-          &bytes::Bytes::copy_from_slice(&[i]),
-        )
+        .propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(&[i]))
         .unwrap();
       ep.handle_storage(d, &mut log, &mut stable);
     }
@@ -3800,12 +3840,7 @@ mod tests {
     // (indexes 2 and 3) and then pauses; indexes 4 and 5 are held back.
     for i in 0u8..4 {
       let _ = ep
-        .propose(
-          d,
-          &mut log,
-          &mut stable,
-          &bytes::Bytes::copy_from_slice(&[i]),
-        )
+        .propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(&[i]))
         .unwrap();
       ep.handle_storage(d, &mut log, &mut stable);
     }
@@ -4194,21 +4229,11 @@ mod tests {
     // Now we add cmd1@2. After propose, maybe_send_append sends from next=1 (Probe unchanged):
     //   entries=[noop@1, cmd1@2], capped to 1 → sends [noop@1], last_sent=1, last_index=2 → partial → PAUSED.
     let _ = ep
-      .propose(
-        d,
-        &mut log,
-        &mut stable,
-        &bytes::Bytes::from_static(b"cmd1"),
-      )
+      .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd1"))
       .unwrap();
     ep.handle_storage(d, &mut log, &mut stable);
     let _ = ep
-      .propose(
-        d,
-        &mut log,
-        &mut stable,
-        &bytes::Bytes::from_static(b"cmd2"),
-      )
+      .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd2"))
       .unwrap();
     ep.handle_storage(d, &mut log, &mut stable);
     // Drain all messages from the propose phase (probe fires on first propose, then pauses).
@@ -4217,12 +4242,7 @@ mod tests {
     // Probe is now paused (partial batch was sent: noop@1 sent, but cmd1@2/cmd2@3 remain).
     // A new propose would call maybe_send_append → paused → no send.
     let _ = ep
-      .propose(
-        d,
-        &mut log,
-        &mut stable,
-        &bytes::Bytes::from_static(b"cmd3"),
-      )
+      .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd3"))
       .unwrap();
     ep.handle_storage(d, &mut log, &mut stable);
     let mut probe_blocked = true;
@@ -4345,7 +4365,7 @@ mod tests {
 
     // Now propose a new entry. The leader must emit an AppendEntries carrying it to peer 2.
     let _idx = ep
-      .propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"new"))
+      .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"new"))
       .unwrap();
     ep.handle_storage(d, &mut log, &mut stable);
 
@@ -4601,7 +4621,7 @@ mod tests {
     // Propose and commit `n` Normal entries one at a time.
     for i in 0..n {
       let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
-      let _ = ep.propose(d, &mut log, &mut stable, &cmd).unwrap();
+      let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
       // Drain storage each time to let the self-append complete (quorum=1: auto-commits).
       ep.handle_storage(d, &mut log, &mut stable);
       while ep.poll_message().is_some() {}
@@ -4724,7 +4744,7 @@ mod tests {
 
     for i in 0..n {
       let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
-      let _ = ep.propose(d, &mut log, &mut stable, &cmd).unwrap();
+      let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
       ep.handle_storage(d, &mut log, &mut stable);
       while ep.poll_message().is_some() {}
       while ep.poll_event().is_some() {}
@@ -4783,7 +4803,7 @@ mod tests {
     let d = crate::Instant::ORIGIN;
     for i in 0..4usize {
       let cmd = bytes::Bytes::copy_from_slice(&[100 + i as u8]);
-      let _ = ep.propose(d, &mut log, &mut stable, &cmd).unwrap();
+      let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
       ep.handle_storage(d, &mut log, &mut stable);
       while ep.poll_message().is_some() {}
       while ep.poll_event().is_some() {}
@@ -5879,7 +5899,7 @@ mod tests {
 
     // Propose 2 Normal entries (indices 2 and 3); drain storage so each commits and applies.
     for b in [b"a".as_slice(), b"b".as_slice()] {
-      ep.propose(d, &mut log, &mut stable, &bytes::Bytes::copy_from_slice(b))
+      ep.propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(b))
         .unwrap();
       ep.handle_storage(d, &mut log, &mut stable);
       while ep.poll_message().is_some() {}
@@ -7870,7 +7890,8 @@ mod tests {
     let (mut ep, mut log, mut stable, d) = make_leader_with_current_term_commit();
     let ctx = bytes::Bytes::from_static(b"read_1");
 
-    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("leader with a current-term commit must accept the read");
 
     // The leader should have broadcast heartbeats carrying ctx.
     let mut ctx_hb_count = 0usize;
@@ -7932,10 +7953,11 @@ mod tests {
   /// → no `ReadState` is emitted.
   #[test]
   fn stale_leader_cannot_confirm_read() {
-    let (mut ep, mut log, mut stable, d) = make_leader_with_current_term_commit();
+    let (mut ep, log, stable, d) = make_leader_with_current_term_commit();
     let ctx = bytes::Bytes::from_static(b"stale_read");
 
-    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("leader must accept the read (it just cannot confirm without a quorum)");
     while ep.poll_message().is_some() {}
     // No heartbeat acks arrive (partitioned).
     // No ReadState must be emitted.
@@ -8001,7 +8023,8 @@ mod tests {
     while ep.poll_message().is_some() {}
 
     let ctx = bytes::Bytes::from_static(b"lease_read");
-    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("LeaseBased + check_quorum leader must accept the read");
 
     // No heartbeats should have been sent for the read round.
     let mut hb_with_ctx = false;
@@ -8027,11 +8050,13 @@ mod tests {
     assert_eq!(rs.context().as_ref(), ctx.as_ref());
   }
 
-  /// Test: LeaseBased without check_quorum degrades to Safe.
+  /// Test: LeaseBased without check_quorum degrades to Safe (all build profiles).
   ///
   /// A leader configured `read_only=LeaseBased` but `check_quorum=false` must
   /// NOT confirm the read immediately.  It must behave like Safe: broadcast a
   /// heartbeat round and wait for a quorum of acks before emitting ReadState.
+  /// Construction is infallible and behaves identically in debug and release — the
+  /// combination is handled by degradation, not rejection.
   #[test]
   fn lease_based_without_check_quorum_degrades_to_safe() {
     use core::time::Duration;
@@ -8085,7 +8110,8 @@ mod tests {
     while ep.poll_message().is_some() {}
 
     let ctx = bytes::Bytes::from_static(b"degraded_lease_read");
-    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("leader must accept the read (degraded LeaseBased → Safe)");
 
     // Must NOT emit ReadState immediately (would be linearizability hazard).
     assert!(
@@ -8174,12 +8200,14 @@ mod tests {
 
     // Follower calls read_index: should forward ReadIndex to leader 1.
     let ctx = bytes::Bytes::from_static(b"fwd_read");
-    follower.read_index(
-      Instant::ORIGIN,
-      &mut follower_log,
-      &mut follower_stable,
-      ctx.clone(),
-    );
+    follower
+      .read_index(
+        Instant::ORIGIN,
+        &follower_log,
+        &follower_stable,
+        ctx.clone(),
+      )
+      .expect("follower with a known leader must forward the read");
 
     let msg = follower
       .poll_message()
@@ -8223,8 +8251,10 @@ mod tests {
     let ctx_b = bytes::Bytes::from_static(b"read_b");
 
     // Both reads are at commit=1 (nothing new committed between them).
-    ep.read_index(d, &mut log, &mut stable, ctx_a.clone());
-    ep.read_index(d, &mut log, &mut stable, ctx_b.clone());
+    ep.read_index(d, &log, &stable, ctx_a.clone())
+      .expect("first read (ctx_a) must be accepted");
+    ep.read_index(d, &log, &stable, ctx_b.clone())
+      .expect("second read (ctx_b, distinct context) must be accepted");
     while ep.poll_message().is_some() {}
 
     // Peer 2 acks with ctx_b (the last pending context from broadcast_heartbeat).
@@ -8316,7 +8346,8 @@ mod tests {
 
     // read_index called before the no-op is committed → must be DEFERRED.
     let ctx = bytes::Bytes::from_static(b"deferred_read");
-    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("leader must accept the read (deferred until the no-op commits)");
 
     // No heartbeats with ctx should have been sent (deferred).
     let mut ctx_hb = false;
@@ -8583,7 +8614,7 @@ mod tests {
     while ep.poll_event().is_some() {}
 
     // Propose a second entry (index 2) to create lag for peer 2.
-    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"x"))
+    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
       .unwrap();
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
@@ -8650,7 +8681,7 @@ mod tests {
       .propose(
         Instant::ORIGIN,
         &mut log,
-        &mut stable,
+        &stable,
         &bytes::Bytes::from_static(b"x"),
       )
       .unwrap_err();
@@ -8682,7 +8713,7 @@ mod tests {
     let ok = ep.propose(
       deadline,
       &mut log,
-      &mut stable,
+      &stable,
       &bytes::Bytes::from_static(b"after_abort"),
     );
     assert!(
@@ -8728,7 +8759,7 @@ mod tests {
     let ok = ep.propose(
       after_deadline,
       &mut log,
-      &mut stable,
+      &stable,
       &bytes::Bytes::from_static(b"resumed"),
     );
     assert!(ok.is_ok(), "propose must succeed after abort");
@@ -8962,12 +8993,7 @@ mod tests {
 
     // Proposals must be blocked while the transfer is in flight.
     let blocked = ep
-      .propose(
-        d,
-        &mut log,
-        &mut stable,
-        &bytes::Bytes::from_static(b"blocked"),
-      )
+      .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"blocked"))
       .unwrap_err();
     assert!(
       matches!(blocked, ProposeError::LeaderTransferInProgress),
@@ -9012,7 +9038,7 @@ mod tests {
       .propose(
         past_first_deadline,
         &mut log,
-        &mut stable,
+        &stable,
         &bytes::Bytes::from_static(b"blocked2"),
       )
       .unwrap_err();
@@ -9054,7 +9080,7 @@ mod tests {
     let ok = ep.propose(
       past_first_deadline,
       &mut log,
-      &mut stable,
+      &stable,
       &bytes::Bytes::from_static(b"resumed"),
     );
     assert!(

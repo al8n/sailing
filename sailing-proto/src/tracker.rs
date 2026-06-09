@@ -149,11 +149,13 @@ impl<I: NodeId> Tracker<I> {
   }
 
   /// Whether `id` is a learner (not staged — see `is_learner_next`).
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
   pub fn is_learner(&self, id: &I) -> bool {
     self.learners.contains(id)
   }
 
   /// Whether `id` is staged in `learners_next` (will become a learner after `leave_joint`).
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
   pub fn is_learner_next(&self, id: &I) -> bool {
     self.learners_next.contains(id)
   }
@@ -199,6 +201,7 @@ impl<I: NodeId> Tracker<I> {
   }
 
   /// The full progress map (all voters + learners + learners_next).
+  #[allow(dead_code, reason = "exercised by unit tests; progress accessor")]
   pub fn progress_map(&self) -> &BTreeMap<I, Progress> {
     &self.progress
   }
@@ -229,12 +232,20 @@ impl<I: NodeId> Tracker<I> {
   }
 
   /// Insert or replace a progress entry.
+  #[allow(
+    dead_code,
+    reason = "internal progress mutator; retained for completeness"
+  )]
   pub fn insert_progress(&mut self, id: I, p: Progress) {
     self.progress.insert(id, p);
   }
 
   /// Remove a progress entry. Only use this when you have separately ensured the node is
   /// no longer in any membership set; the invariant checker will catch misuse in tests.
+  #[allow(
+    dead_code,
+    reason = "internal progress mutator; retained for completeness"
+  )]
   pub fn remove_progress(&mut self, id: &I) {
     self.progress.remove(id);
   }
@@ -242,16 +253,22 @@ impl<I: NodeId> Tracker<I> {
   // ── Joint-config halves (needed by confchange) ─────────────────────────────
 
   /// The joint voter configuration.
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
   pub fn voters(&self) -> &JointConfig<I> {
     &self.voters
   }
 
   /// The current learner set (not staged).
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
   pub fn learners(&self) -> &BTreeSet<I> {
     &self.learners
   }
 
   /// The staged learner set (waiting for `leave_joint`).
+  #[allow(
+    dead_code,
+    reason = "internal membership accessor; retained for completeness"
+  )]
   pub fn learners_next(&self) -> &BTreeSet<I> {
     &self.learners_next
   }

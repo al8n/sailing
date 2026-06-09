@@ -16,7 +16,7 @@ extern crate std;
 compile_error!("sailing-proto requires the `alloc` feature (it is enabled transitively by `std`)");
 
 mod prng;
-pub use prng::Prng;
+pub(crate) use prng::Prng;
 
 mod num;
 pub use num::{Index, Term};
@@ -28,7 +28,7 @@ mod time;
 pub use time::Instant;
 
 mod data;
-pub use data::{Data, DataRef, DecodeError};
+pub use data::{Data, DecodeError};
 
 mod entry;
 pub use entry::{Entry, EntryKind};
@@ -41,8 +41,8 @@ pub use conf::{
   ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
 };
 
-pub mod quorum;
-pub use quorum::{JointConfig, MajorityConfig, VoteResult};
+mod quorum;
+pub(crate) use quorum::{JointConfig, MajorityConfig, VoteResult};
 
 mod message;
 pub use message::{
@@ -57,19 +57,20 @@ mod storage;
 pub use storage::{LogDone, LogStore, OpId, StableDone, StableStore};
 
 mod error;
-pub use error::{ConfigError, ProposeError, TransferError};
+pub use error::{ConfigError, ProposeError, ReadIndexError, TransferError};
 
 mod inflights;
-pub use inflights::Inflights;
+pub(crate) use inflights::Inflights;
 
 mod progress;
-pub use progress::{Progress, ProgressState};
+pub(crate) use progress::{Progress, ProgressState};
 
 mod config;
 pub use config::{Config, ReadOnlyOption};
 
 mod read_only;
-pub use read_only::{ReadOnly, ReadState};
+pub(crate) use read_only::ReadOnly;
+pub use read_only::ReadState;
 
 mod event;
 pub use event::{Applied, ConfChanged, Event, LeaderChanged};
@@ -77,11 +78,8 @@ pub use event::{Applied, ConfChanged, Event, LeaderChanged};
 mod endpoint;
 pub use endpoint::{Endpoint, PoisonReason, Role, TimerKind};
 
-pub mod tracker;
-pub use tracker::{
-  Tracker,
-  confchange::{Changer as ConfChanger, ConfChangeError},
-};
+mod tracker;
+pub(crate) use tracker::Tracker;
 
 #[cfg(test)]
 pub(crate) mod testkit;

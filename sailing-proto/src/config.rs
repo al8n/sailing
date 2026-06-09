@@ -202,6 +202,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `max_size_per_msg` knob.
+  #[must_use]
   pub fn with_max_size_per_msg(mut self, v: u64) -> Self {
     self.max_size_per_msg = v;
     self
@@ -217,6 +218,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `max_inflight_bytes` knob.
+  #[must_use]
   pub fn with_max_inflight_bytes(mut self, v: u64) -> Self {
     self.max_inflight_bytes = v;
     self
@@ -229,6 +231,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `snapshot_threshold` knob.
+  #[must_use]
   pub fn with_snapshot_threshold(mut self, v: usize) -> Self {
     self.snapshot_threshold = v;
     self
@@ -242,6 +245,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `step_down_on_removal` knob.
+  #[must_use]
   pub fn with_step_down_on_removal(mut self, v: bool) -> Self {
     self.step_down_on_removal = v;
     self
@@ -257,6 +261,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `pre_vote` knob.
+  #[must_use]
   pub fn with_pre_vote(mut self, v: bool) -> Self {
     self.pre_vote = v;
     self
@@ -272,6 +277,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `check_quorum` knob.
+  #[must_use]
   pub fn with_check_quorum(mut self, v: bool) -> Self {
     self.check_quorum = v;
     self
@@ -287,6 +293,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `disable_proposal_forwarding` knob.
+  #[must_use]
   pub fn with_disable_proposal_forwarding(mut self, v: bool) -> Self {
     self.disable_proposal_forwarding = v;
     self
@@ -299,6 +306,7 @@ impl<I: NodeId> Config<I> {
   }
 
   /// Override the `read_only` knob.
+  #[must_use]
   pub fn with_read_only(mut self, v: ReadOnlyOption) -> Self {
     self.read_only = v;
     self

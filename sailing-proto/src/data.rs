@@ -1,6 +1,6 @@
-//! `Data`/`DataRef`: the per-element wire codec for the generic plug-in types. Values are
-//! length-known and self-describing enough to nest inside a buffa `bytes` field. The codec
-//! here is deliberately minimal (fixed/var width primitives); message envelopes use buffa.
+//! `Data`: the per-element wire codec for the generic plug-in types. Values are
+//! length-known and self-describing enough to nest inside a `bytes` field. The codec
+//! here is deliberately minimal (fixed/var width primitives).
 use std::vec::Vec;
 
 /// A value that can be encoded to and decoded from bytes.
@@ -9,13 +9,6 @@ pub trait Data: Sized {
   fn encode(&self, buf: &mut Vec<u8>);
   /// Decode a value from the front of `buf`, returning `(bytes_consumed, value)`.
   fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError>;
-}
-
-/// A zero-copy borrowed view decoded from a wire buffer (the GAT-free M0 form;
-/// promoted to a `Data::Ref<'a>` GAT when zero-copy message views are added).
-pub trait DataRef<'a>: Sized {
-  /// Decode a borrowed view from the front of `buf`.
-  fn decode_ref(buf: &'a [u8]) -> Result<(usize, Self), DecodeError>;
 }
 
 /// Wire-decoding failure.

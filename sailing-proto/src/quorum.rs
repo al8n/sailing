@@ -57,12 +57,14 @@ impl<I: NodeId> MajorityConfig<I> {
 
   /// Number of members.
   #[inline(always)]
+  #[allow(dead_code, reason = "internal accessor; retained for completeness")]
   pub fn len(&self) -> usize {
     self.ids.len()
   }
 
   /// `true` if the config is empty.
   #[inline(always)]
+  #[allow(dead_code, reason = "internal accessor; retained for completeness")]
   pub fn is_empty(&self) -> bool {
     self.ids.is_empty()
   }

@@ -104,6 +104,7 @@ impl<I: NodeId> ReadOnly<I> {
 
   /// The configured read-only option.
   #[inline(always)]
+  #[allow(dead_code, reason = "internal accessor; retained for completeness")]
   pub const fn option(&self) -> ReadOnlyOption {
     self.option
   }
@@ -128,13 +129,18 @@ impl<I: NodeId> ReadOnly<I> {
   ///
   /// Idempotent: if `context` is already pending this call is a no-op (matches
   /// etcd's early-return-if-present behaviour).
-  pub fn add_request(&mut self, index: Index, context: Bytes, from: Option<I>, leader: I) {
+  ///
+  /// Returns `true` if the request was newly recorded, or `false` if a request with this
+  /// exact `context` was already pending (the duplicate-context case the caller surfaces as
+  /// [`crate::ReadIndexError::DuplicateContext`]).
+  pub fn add_request(&mut self, index: Index, context: Bytes, from: Option<I>, leader: I) -> bool {
     if self.pending.contains_key(&context) {
-      return;
+      return false;
     }
     let status = ReadIndexStatus::new(context.clone(), from, index, leader);
     self.pending.insert(context.clone(), status);
     self.queue.push(context);
+    true
   }
 
   /// Record that `from` has acknowledged the heartbeat round whose context is
@@ -191,6 +197,7 @@ impl<I: NodeId> ReadOnly<I> {
 
   /// Whether there are no pending reads.
   #[inline(always)]
+  #[allow(dead_code, reason = "internal accessor; retained for completeness")]
   pub fn is_empty(&self) -> bool {
     self.queue.is_empty()
   }
@@ -273,8 +280,10 @@ mod tests {
   #[test]
   fn add_request_idempotent() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-    ro.add_request(idx(10), ctx(b"ctx_c"), None, 1u64);
-    ro.add_request(idx(99), ctx(b"ctx_c"), Some(2u64), 1u64); // second add: no-op
+    // First add is newly recorded → true.
+    assert!(ro.add_request(idx(10), ctx(b"ctx_c"), None, 1u64));
+    // Second add with the same context is a no-op → false (duplicate context).
+    assert!(!ro.add_request(idx(99), ctx(b"ctx_c"), Some(2u64), 1u64));
     assert_eq!(ro.queue.len(), 1);
     // Index must be from the FIRST add (10), not 99.
     assert_eq!(ro.pending[ctx(b"ctx_c").as_ref()].index, idx(10));

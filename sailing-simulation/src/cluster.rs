@@ -222,8 +222,10 @@ impl Cluster {
   /// Calls `Endpoint::read_index` on the leader.  Returns `true` if there is a leader
   /// (the call was made); `false` if no leader is available.
   ///
-  /// The confirmed `ReadState` will appear in `read_states_of(leader)` once a
-  /// heartbeat-quorum round completes (for `ReadOnlySafe`) or immediately (for
+  /// The leader accepts the read (`read_index` returns `Ok`) for any fresh context; this
+  /// helper asserts that, so a reused/duplicate context surfaces as a panic rather than a
+  /// silently dropped read.  The confirmed `ReadState` will appear in `read_states_of(leader)`
+  /// once a heartbeat-quorum round completes (for `ReadOnlySafe`) or immediately (for
   /// `ReadOnlyLeaseBased`).
   pub fn read_index(&mut self, context: &[u8]) -> bool {
     let leader = match self.leader() {
@@ -231,14 +233,16 @@ impl Cluster {
       None => return false,
     };
     let i = self.node_idx[&leader];
-    let log = &mut self.logs[i];
-    let stable = &mut self.stables[i];
-    self.nodes[i].read_index(
-      self.now,
-      log,
-      stable,
-      bytes::Bytes::copy_from_slice(context),
-    );
+    let log = &self.logs[i];
+    let stable = &self.stables[i];
+    self.nodes[i]
+      .read_index(
+        self.now,
+        log,
+        stable,
+        bytes::Bytes::copy_from_slice(context),
+      )
+      .expect("leader must accept the read_index for a fresh context");
     true
   }
 

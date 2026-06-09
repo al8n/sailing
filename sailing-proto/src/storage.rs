@@ -150,6 +150,11 @@ pub trait LogStore {
 }
 
 /// The durable-metadata store (term/vote/commit + snapshot blobs).
+///
+/// Borrow strength on the command surface follows what each method actually needs:
+/// append-only / read-only methods (e.g. `propose`, `read_index`, `transfer_leader`) take
+/// `&S`; only methods that write durable term/vote/commit (e.g. `handle_timeout`,
+/// `handle_message`, `handle_storage`) take `&mut S`.
 pub trait StableStore {
   /// The node-id type stored in the vote.
   type NodeId: NodeId;
