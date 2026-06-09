@@ -260,11 +260,16 @@ fn reconcile_restart_log(
         }
       }
       Some(Ok(_)) => {
-        // Boundary term MISMATCHES the snapshot. If a committed entry sits above `N`
-        // (`committed_in_log > N`), the committed history would diverge at/below a committed point —
-        // impossible in correct Raft → fatal corruption; poison rather than truncate the committed
-        // tail. Otherwise the divergent entries are uncommitted — re-baseline to the snapshot.
-        if committed_in_log > n {
+        // Boundary term MISMATCHES the snapshot. If a committed entry sits AT OR ABOVE `N`
+        // (`committed_in_log >= N`), then the boundary index `N` itself is already committed (equality)
+        // or a committed entry sits above it — so the disagreeing term means the committed history
+        // diverges at a committed point, impossible in correct Raft → fatal corruption; poison rather
+        // than discard or OVERWRITE the committed boundary with snapshot metadata from a different
+        // history. Only when `committed_in_log < N` are the divergent entries (the boundary included)
+        // uncommitted locally — re-baseline to the snapshot. (R36: equality is a committed boundary too;
+        // `>` would re-baseline a committed `N` onto a different history. `committed_in_log >= n` ⇔
+        // `hs.commit >= n` here, since `last_index >= n` in this branch.)
+        if committed_in_log >= n {
           RestartLogAction::Poison(PoisonReason::OrphanedLog)
         } else {
           RestartLogAction::Restore(n, t)
@@ -9776,8 +9781,16 @@ mod tests {
         i(6),
         i(9),
         Some(Ok(other)),
+        A::Poison(P::OrphanedLog),
+      ), // fi==N+1, boundary MISMATCH, committed AT N (cil==n) → committed-boundary corruption (R36)
+      (
+        Some((n, t)),
+        i(4),
+        i(6),
+        i(9),
+        Some(Ok(other)),
         A::Restore(n, t),
-      ), // fi==N+1, boundary MISMATCH, no committed tail → re-baseline
+      ), // fi==N+1, boundary MISMATCH, boundary uncommitted (cil<n) → re-baseline
       (
         Some((n, t)),
         i(5),
@@ -9792,8 +9805,16 @@ mod tests {
         i(3),
         i(7),
         Some(Ok(other)),
+        A::Poison(P::OrphanedLog),
+      ), // live boundary, MISMATCH, committed AT N (cil==n) → committed-boundary corruption (R36)
+      (
+        Some((n, t)),
+        i(4),
+        i(3),
+        i(7),
+        Some(Ok(other)),
         A::Restore(n, t),
-      ), // mismatch, committed <= N → restore
+      ), // live boundary, MISMATCH, boundary uncommitted (cil<n) → re-baseline
       (
         Some((n, t)),
         i(7),
@@ -9931,6 +9952,96 @@ mod tests {
       log.last_index(),
       Index::new(7),
       "the committed tail must NOT be truncated"
+    );
+  }
+
+  /// Regression (R36 — a boundary-term mismatch AT the committed boundary (`committed_in_log == N`)
+  /// must poison, not re-baseline): the durable snapshot is at 5 (term 2), the log holds 1..=5 with
+  /// `term(5)=3` (DISAGREEING), and `HardState.commit=5`, so index 5 ITSELF is committed (there is no
+  /// committed tail ABOVE the boundary — the earlier `> N` gate missed this). The committed boundary and
+  /// the snapshot are from different histories — restart must poison (`OrphanedLog`), NOT re-baseline
+  /// the committed boundary 5 onto the snapshot's term-2 history.
+  ///
+  /// MUTATION: weaken the `reconcile_restart_log` mismatch gate from `committed_in_log >= n` back to
+  /// `> n` → restart re-baselines (Restore) over the committed boundary instead of poisoning.
+  #[test]
+  fn restart_committed_boundary_equality_mismatch_poisons() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_data = encode_count_snapshot(10);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    // commit == 5 == the snapshot boundary: index 5 ITSELF is committed (no committed tail above it).
+    stable.force_state(Term::new(3), None, Index::new(5));
+
+    // Log 1..=5 with the boundary entry at 5 carrying term 3 — DISAGREEING with the snapshot's term 2.
+    let mut log = crate::testkit::VecLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(2),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(3),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(4),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(5),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+    ]);
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      1, // boot_epoch
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a boundary mismatch AT the committed boundary is corruption — must poison"
+    );
+    assert_eq!(ep.poison_reason().map(|r| r.as_str()), Some("orphaned_log"));
+    assert_eq!(
+      log.last_index(),
+      Index::new(5),
+      "the committed boundary must NOT be re-baselined/truncated"
     );
   }
 
