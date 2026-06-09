@@ -1,5 +1,7 @@
 //! ReadIndex tracking: pending read requests, heartbeat-ack bookkeeping, and confirmed read
-//! states.  Port of the classical etcd `readOnly` structure (context-keyed variant).
+//! states.  Adapted from etcd's `readOnly`, but keyed by an INTERNAL per-round token rather than the
+//! application context (see [`ReadOnly`]) so the quorum proof is sound even when the application
+//! reuses a context across reads.
 use crate::{Index, NodeId, ReadOnlyOption};
 use bytes::Bytes;
 use std::{
@@ -86,17 +88,25 @@ impl<I: NodeId> ReadIndexStatus<I> {
 
 /// Manages in-flight read-index requests for the leader.
 ///
-/// Pending reads are keyed by their opaque `context` bytes (FIFO queue).  When a
-/// heartbeat-response quorum acks a context, all reads up to and including it are
-/// confirmed and returned via [`ReadOnly::advance`].
+/// Pending reads are keyed by an INTERNAL, monotonically-unique **round token** (an 8-byte
+/// counter), NOT by the application's `context`.  This is what makes the heartbeat-quorum proof
+/// sound under message duplication/reordering AND application context reuse: each read's heartbeat
+/// round carries its own token, so a stale/duplicated `HeartbeatResp` echoing an earlier round's
+/// token can never be matched to a later read (even one that reuses the same user `context` after an
+/// earlier read with that context completed).  The user `context` rides along inside the status and
+/// is echoed back on confirmation.  When a heartbeat-response quorum acks a token, all reads up to
+/// and including it are confirmed (FIFO) and returned via [`ReadOnly::advance`].
 #[derive(Debug, Clone)]
 pub struct ReadOnly<I> {
   /// How reads are confirmed.
   option: ReadOnlyOption,
-  /// Pending reads, keyed by context.
+  /// Pending reads, keyed by their internal round token.
   pending: BTreeMap<Bytes, ReadIndexStatus<I>>,
-  /// FIFO queue of context keys (preserves insertion order for batch confirmation).
+  /// FIFO queue of round-token keys (preserves insertion order for batch confirmation).
   queue: Vec<Bytes>,
+  /// Monotonic source of round tokens.  Never reused for the life of the manager, so two reads —
+  /// even with the same user `context` — get distinct tokens and thus independent quorum rounds.
+  next_round: u64,
 }
 
 impl<I: NodeId> ReadOnly<I> {
@@ -106,6 +116,7 @@ impl<I: NodeId> ReadOnly<I> {
       option,
       pending: BTreeMap::new(),
       queue: Vec::new(),
+      next_round: 0,
     }
   }
 
@@ -126,61 +137,71 @@ impl<I: NodeId> ReadOnly<I> {
     self.queue.clear();
   }
 
-  /// Record a new pending read request.
+  /// Record a new pending read request and assign it a fresh, internally-unique **round token**.
   ///
-  /// `index` is the leader's commit index at receipt.  `context` is an opaque
-  /// application token identifying this request.  `from` is `None` for local
-  /// (leader-application) reads and `Some(follower_id)` for forwarded reads.
-  /// `leader` is the current leader's id — it is included in the ack set
-  /// immediately.
+  /// `index` is the leader's commit index at receipt.  `context` is the opaque application token
+  /// echoed back on confirmation.  `from` is `None` for local (leader-application) reads and
+  /// `Some(follower_id)` for forwarded reads.  `leader` is the current leader's id — included in the
+  /// ack set immediately (the leader counts toward its own quorum).
   ///
-  /// Idempotent: if `context` is already pending this call is a no-op (matches
-  /// etcd's early-return-if-present behaviour).
-  ///
-  /// Returns `true` if the request was newly recorded, or `false` if a request with this
-  /// exact `context` was already pending (the duplicate-context case the caller surfaces as
-  /// [`crate::ReadIndexError::DuplicateContext`]).
-  pub fn add_request(&mut self, index: Index, context: Bytes, from: Option<I>, leader: I) -> bool {
-    if self.pending.contains_key(&context) {
-      return false;
-    }
-    let status = ReadIndexStatus::new(context.clone(), from, index, leader);
-    self.pending.insert(context.clone(), status);
-    self.queue.push(context);
-    true
+  /// Returns the round token the caller must seed into the heartbeat round for this read.  The token
+  /// is NEVER reused, so the quorum proof is unambiguous: a stale/duplicated `HeartbeatResp` echoing
+  /// an earlier read's token cannot be credited to this one, even when the user `context` is reused
+  /// after an earlier read with the same context completed.  The caller's own in-flight dedup
+  /// ([`Self::context_in_flight`]) surfaces a concurrent same-`context` reuse as
+  /// [`crate::ReadIndexError::DuplicateContext`] before this is called.
+  pub fn add_request(&mut self, index: Index, context: Bytes, from: Option<I>, leader: I) -> Bytes {
+    let token = Bytes::copy_from_slice(&self.next_round.to_be_bytes());
+    self.next_round += 1;
+    let status = ReadIndexStatus::new(context, from, index, leader);
+    self.pending.insert(token.clone(), status);
+    self.queue.push(token.clone());
+    token
   }
 
-  /// Record that `from` has acknowledged the heartbeat round whose context is
-  /// `context`.
+  /// Whether a LOCAL (leader-originated) pending read carries this user `context` — the in-flight
+  /// dedup the leader's local read-index guard uses.  Reads are keyed by internal round token, so this
+  /// scans the bounded pending set (`<= MAX_LEADER_READS`).  FORWARDED reads (`req_from = Some`) are
+  /// excluded: their stored `context` is the forwarding follower's OWN per-follower token, which
+  /// collides across followers (each starts at 0) and lives in a different namespace from the leader
+  /// application's contexts — the follower owns its own user-context dedup.
+  pub fn context_in_flight(&self, context: &[u8]) -> bool {
+    self
+      .pending
+      .values()
+      .any(|s| s.req_from.is_none() && s.context.as_ref() == context)
+  }
+
+  /// Record that `from` has acknowledged the heartbeat round identified by round `token`.
   ///
   /// Returns the **total number of acks** (including the self-ack seeded at
   /// creation) for the identified pending request.  Returns `0` if no pending
-  /// request with that context exists.
+  /// request with that token exists (e.g. a stale ack echoing an already-confirmed,
+  /// hence removed, round — which is exactly why a reused user context is safe).
   ///
   /// Calling this multiple times with the same `from` is idempotent (`BTreeSet`
   /// deduplicates).
-  pub fn recv_ack(&mut self, from: I, context: &[u8]) -> usize {
-    let Some(status) = self.pending.get_mut(context) else {
+  pub fn recv_ack(&mut self, from: I, token: &[u8]) -> usize {
+    let Some(status) = self.pending.get_mut(token) else {
       return 0;
     };
     status.acks.insert(from);
     status.acks.len()
   }
 
-  /// Confirm all pending reads up to and including the one identified by
-  /// `context`.
+  /// Confirm all pending reads up to and including the one identified by round `token`.
   ///
   /// Pops (in FIFO order) every pending read whose position in the queue is ≤
-  /// the position of `context`, removes them from `pending`, and returns them.
-  /// If `context` is not found in the queue, returns an empty `Vec`.
+  /// the position of `token`, removes them from `pending`, and returns them.
+  /// If `token` is not found in the queue, returns an empty `Vec`.
   ///
   /// The FIFO guarantee: a later read is confirmed no earlier than an earlier
-  /// one — once the heartbeat round for `context` achieves quorum, all preceding
+  /// one — once the heartbeat round for `token` achieves quorum, all preceding
   /// reads have also been confirmed (they were added at an equal or lower commit
   /// index and their heartbeat rounds were sent first).
-  pub fn advance(&mut self, context: &[u8]) -> Vec<ReadIndexStatus<I>> {
-    // Find the position of `context` in the queue.
-    let Some(pos) = self.queue.iter().position(|c| c.as_ref() == context) else {
+  pub fn advance(&mut self, token: &[u8]) -> Vec<ReadIndexStatus<I>> {
+    // Find the position of `token` in the queue.
+    let Some(pos) = self.queue.iter().position(|c| c.as_ref() == token) else {
       return Vec::new();
     };
     // Drain queue[0..=pos] and remove corresponding pending entries.
@@ -194,8 +215,8 @@ impl<I: NodeId> ReadOnly<I> {
     out
   }
 
-  /// The context of the most recently queued read request — used as the heartbeat
-  /// context marker so the leader's next heartbeat round covers all pending reads.
+  /// The round token of the most recently queued read request — seeded as the heartbeat
+  /// context so the leader's next heartbeat round covers all pending reads (FIFO).
   ///
   /// Returns `None` when there are no pending reads.
   pub fn last_pending_request_ctx(&self) -> Option<&Bytes> {
@@ -217,10 +238,10 @@ impl<I: NodeId> ReadOnly<I> {
     self.queue.len()
   }
 
-  /// Return a reference to the ack set for the pending read identified by `context`,
+  /// Return a reference to the ack set for the pending read identified by round `token`,
   /// or `None` if no such request is pending.
-  pub fn acks_for(&self, context: &[u8]) -> Option<&std::collections::BTreeSet<I>> {
-    self.pending.get(context).map(|s| &s.acks)
+  pub fn acks_for(&self, token: &[u8]) -> Option<&std::collections::BTreeSet<I>> {
+    self.pending.get(token).map(|s| &s.acks)
   }
 }
 
@@ -250,30 +271,32 @@ mod tests {
 
   // ── add_request / recv_ack / advance ──────────────────────────────────────
 
-  /// Three voters (1=leader, 2, 3).  Context "a" is added, peers 2 and 3 ack →
+  /// Three voters (1=leader, 2, 3).  A read is added (round token t); peers 2 and 3 ack t →
   /// quorum reached (leader self-ack + peer2 = 2/3, not yet; + peer3 = 3/3).
   #[test]
   fn add_recv_ack_advance_basic() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
 
-    // Leader 1 adds a read at commit index 5.
-    ro.add_request(idx(5), ctx(b"ctx_a"), None, 1u64);
+    // Leader 1 adds a read at commit index 5 → round token t.
+    let t = ro.add_request(idx(5), ctx(b"ctx_a"), None, 1u64);
     assert_eq!(ro.queue.len(), 1);
-    assert!(ro.pending.contains_key(ctx(b"ctx_a").as_ref()));
+    assert!(ro.pending.contains_key(&t));
+    assert!(ro.context_in_flight(b"ctx_a"));
 
-    // Leader self-ack is already in the set; peer 2 acks.
-    let n = ro.recv_ack(2u64, b"ctx_a");
+    // Leader self-ack is already in the set; peer 2 acks the token.
+    let n = ro.recv_ack(2u64, &t);
     assert_eq!(n, 2); // leader 1 + peer 2
 
     // Peer 3 acks → 3 acks now.
-    let n = ro.recv_ack(3u64, b"ctx_a");
+    let n = ro.recv_ack(3u64, &t);
     assert_eq!(n, 3);
 
-    // advance → returns the one status.
-    let confirmed = ro.advance(b"ctx_a");
+    // advance → returns the one status, carrying the user context.
+    let confirmed = ro.advance(&t);
     assert_eq!(confirmed.len(), 1);
     assert_eq!(confirmed[0].index, idx(5));
     assert!(confirmed[0].req_from.is_none());
+    assert_eq!(confirmed[0].context.as_ref(), b"ctx_a");
 
     // queue and pending are now empty.
     assert!(ro.is_empty());
@@ -283,49 +306,54 @@ mod tests {
   #[test]
   fn recv_ack_same_peer_twice_counts_once() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-    ro.add_request(idx(3), ctx(b"ctx_b"), None, 1u64);
+    let t = ro.add_request(idx(3), ctx(b"ctx_b"), None, 1u64);
 
-    ro.recv_ack(2u64, b"ctx_b");
-    let n1 = ro.recv_ack(2u64, b"ctx_b"); // duplicate
+    ro.recv_ack(2u64, &t);
+    let n1 = ro.recv_ack(2u64, &t); // duplicate
     // Still only leader(1) + peer(2) = 2.
     assert_eq!(n1, 2);
   }
 
-  /// Idempotent add: adding the same context twice is a no-op.
+  /// Each `add_request` mints a fresh, distinct round token — even for the SAME user context — so a
+  /// reused context never collides internally (the property the linearizable-read fix relies on).
   #[test]
-  fn add_request_idempotent() {
+  fn add_request_assigns_unique_round_tokens() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-    // First add is newly recorded → true.
-    assert!(ro.add_request(idx(10), ctx(b"ctx_c"), None, 1u64));
-    // Second add with the same context is a no-op → false (duplicate context).
-    assert!(!ro.add_request(idx(99), ctx(b"ctx_c"), Some(2u64), 1u64));
-    assert_eq!(ro.queue.len(), 1);
-    // Index must be from the FIRST add (10), not 99.
-    assert_eq!(ro.pending[ctx(b"ctx_c").as_ref()].index, idx(10));
+    let t1 = ro.add_request(idx(10), ctx(b"ctx_c"), None, 1u64);
+    let t2 = ro.add_request(idx(99), ctx(b"ctx_c"), Some(2u64), 1u64);
+    assert_ne!(
+      t1, t2,
+      "the same user context must still get distinct round tokens"
+    );
+    assert_eq!(ro.queue.len(), 2);
+    // Each token maps to its own status (keyed by token, not context).
+    assert_eq!(ro.pending[&t1].index, idx(10));
+    assert_eq!(ro.pending[&t2].index, idx(99));
+    assert!(ro.context_in_flight(b"ctx_c"));
   }
 
-  /// `advance` on a middle context confirms it AND all earlier ones (FIFO).
+  /// `advance` on a middle token confirms it AND all earlier ones (FIFO).
   #[test]
   fn advance_middle_confirms_all_earlier() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-    ro.add_request(idx(1), ctx(b"r1"), None, 1u64);
-    ro.add_request(idx(2), ctx(b"r2"), None, 1u64);
-    ro.add_request(idx(3), ctx(b"r3"), None, 1u64);
+    let _t1 = ro.add_request(idx(1), ctx(b"r1"), None, 1u64);
+    let t2 = ro.add_request(idx(2), ctx(b"r2"), None, 1u64);
+    let t3 = ro.add_request(idx(3), ctx(b"r3"), None, 1u64);
 
-    // Advance "r2" — must return r1 and r2 (FIFO), not r3.
-    let confirmed = ro.advance(b"r2");
+    // Advance t2 — must return r1 and r2 (FIFO), not r3.
+    let confirmed = ro.advance(&t2);
     assert_eq!(confirmed.len(), 2);
     assert_eq!(confirmed[0].index, idx(1)); // r1
     assert_eq!(confirmed[1].index, idx(2)); // r2
 
-    // r3 is still pending.
+    // r3 (token t3) is still pending.
     assert_eq!(ro.queue.len(), 1);
-    assert_eq!(ro.queue[0], ctx(b"r3"));
+    assert_eq!(ro.queue[0], t3);
   }
 
-  /// `advance` with unknown context returns empty.
+  /// `advance` with an unknown token returns empty.
   #[test]
-  fn advance_unknown_context_is_empty() {
+  fn advance_unknown_token_is_empty() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
     ro.add_request(idx(5), ctx(b"r1"), None, 1u64);
     let confirmed = ro.advance(b"unknown");
@@ -334,17 +362,17 @@ mod tests {
     assert_eq!(ro.queue.len(), 1);
   }
 
-  /// `last_pending_request_ctx` tracks the most-recently added context.
+  /// `last_pending_request_ctx` tracks the most-recently added read's round token.
   #[test]
   fn last_pending_request_ctx() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
     assert!(ro.last_pending_request_ctx().is_none());
 
-    ro.add_request(idx(1), ctx(b"first"), None, 1u64);
-    assert_eq!(ro.last_pending_request_ctx().unwrap().as_ref(), b"first");
+    let t1 = ro.add_request(idx(1), ctx(b"first"), None, 1u64);
+    assert_eq!(ro.last_pending_request_ctx().unwrap(), &t1);
 
-    ro.add_request(idx(2), ctx(b"second"), None, 1u64);
-    assert_eq!(ro.last_pending_request_ctx().unwrap().as_ref(), b"second");
+    let t2 = ro.add_request(idx(2), ctx(b"second"), None, 1u64);
+    assert_eq!(ro.last_pending_request_ctx().unwrap(), &t2);
   }
 
   /// `reset` discards all pending requests.
@@ -362,10 +390,11 @@ mod tests {
   #[test]
   fn forwarded_request_has_req_from() {
     let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
-    ro.add_request(idx(7), ctx(b"fwd"), Some(3u64), 1u64);
-    let s = &ro.pending[ctx(b"fwd").as_ref()];
+    let t = ro.add_request(idx(7), ctx(b"fwd"), Some(3u64), 1u64);
+    let s = &ro.pending[&t];
     assert_eq!(s.req_from, Some(3u64));
     assert_eq!(s.index, idx(7));
+    assert_eq!(s.context.as_ref(), b"fwd");
     // Leader self-ack is in the set.
     assert!(s.acks.contains(&1u64));
     assert!(!s.acks.contains(&3u64));

@@ -591,8 +591,20 @@ impl Cluster {
     self.logs[i].discard_inflight();
     self.stables[i].discard_inflight();
     let cfg = self.configs[i].clone();
+    // Strictly-increasing per-restart boot epoch (the harness's durable boot counter): it namespaces
+    // the restarted node's forwarded-read tokens so a pre-crash ReadIndexResp cannot complete a
+    // post-restart read. `restarts[i]` counts PRIOR restarts, so +1 is unique per incarnation.
+    let boot_epoch = self.restarts[i] + 1;
     let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-    self.nodes[i] = Endpoint::restart(cfg, self.now, 0x5EED ^ id, LogSm::new(), log, stable);
+    self.nodes[i] = Endpoint::restart(
+      cfg,
+      self.now,
+      0x5EED ^ id,
+      LogSm::new(),
+      boot_epoch,
+      log,
+      stable,
+    );
     // Reset the snapshot-install counter for the restarted node.
     self.snapshot_installs[i] = 0;
     self.restarts[i] += 1;

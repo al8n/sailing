@@ -306,21 +306,44 @@ const MAX_FORWARDED_READS: usize = 256;
 /// with `TooManyInFlight` and a forwarded read is dropped (the follower can re-issue).
 const MAX_LEADER_READS: usize = 256;
 
-/// The read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
-/// awaiting a `ReadIndexResp` for — the follower-side mirror of the leader's `read_context_in_flight`
-/// guard. Backed by a `VecDeque` for insertion-order (FIFO) eviction: at [`MAX_FORWARDED_READS`] the
-/// oldest context is dropped so a stream of dropped reads with fresh contexts cannot grow it without
-/// bound. The cap is small, so a linear `contains` is cheaper than the bookkeeping a separate index
-/// would need.
+/// The reads this node (as a FOLLOWER) has forwarded to its current leader and is still awaiting a
+/// `ReadIndexResp` for. Each is keyed by an INTERNAL token (NOT the application context) — the
+/// follower-side mirror of the leader's round-token fix: the token is what travels in the forwarded
+/// `ReadIndex`/`ReadIndexResp`, so a stale or duplicated response echoing an earlier forward's token
+/// can never complete a LATER read that reused the same user context. The user context rides alongside
+/// for the `DuplicateContext` in-flight guard and for the emitted `ReadState`. Backed by a `VecDeque`
+/// (FIFO) and bounded at [`MAX_FORWARDED_READS`] via BACK-PRESSURE (a full set rejects the new read
+/// rather than evicting an accepted one). The cap is small, so linear scans are cheaper than the
+/// bookkeeping a separate index would need.
+///
+/// The token is `boot_epoch (8 bytes) || counter (8 bytes)`. `counter` is unique WITHIN an incarnation;
+/// `boot_epoch` (durable, app-provided via [`Endpoint::restart`], strictly increasing per restart) makes
+/// tokens unique ACROSS restarts. Without it a same-term restart resets `counter` to 0, and a delayed
+/// pre-crash `ReadIndexResp` could complete a post-restart read at a stale index — a linearizability
+/// break under a transport that redelivers pre-crash messages.
 #[derive(Debug, Default)]
 struct ForwardedReads {
-  order: VecDeque<Bytes>,
+  /// `(internal token, user context)` in forward order.
+  order: VecDeque<(Bytes, Bytes)>,
+  /// This incarnation's durable boot epoch — the high 8 bytes of every token (cross-restart uniqueness).
+  boot_epoch: u64,
+  /// Monotonic source of the low 8 bytes — unique WITHIN this incarnation.
+  next_token: u64,
 }
 
 impl ForwardedReads {
-  /// Whether `ctx` is currently in flight.
-  fn contains(&self, ctx: &Bytes) -> bool {
-    self.order.contains(ctx)
+  /// Construct for an incarnation whose durable, app-provided boot epoch is `boot_epoch`.
+  fn new(boot_epoch: u64) -> Self {
+    Self {
+      order: VecDeque::new(),
+      boot_epoch,
+      next_token: 0,
+    }
+  }
+
+  /// Whether the user `context` is currently in flight (the duplicate-context guard).
+  fn contains_context(&self, context: &Bytes) -> bool {
+    self.order.iter().any(|(_, c)| c == context)
   }
 
   /// Whether the in-flight set is at capacity. The follower applies BACK-PRESSURE here rather than
@@ -331,30 +354,34 @@ impl ForwardedReads {
     self.order.len() >= MAX_FORWARDED_READS
   }
 
-  /// Record a NEW in-flight context. The caller has already verified `!contains(ctx)` (dedup) AND
-  /// `!is_full()` (back-pressure), so this never inserts a duplicate and never evicts.
-  fn push(&mut self, ctx: Bytes) {
-    self.order.push_back(ctx);
+  /// Record a NEW forwarded read for user `context` and return its fresh internal token (sent to the
+  /// leader as the `ReadIndex` context and echoed back in the `ReadIndexResp`). The caller has already
+  /// verified `!contains_context(context)` (dedup) AND `!is_full()` (back-pressure).
+  fn push(&mut self, context: Bytes) -> Bytes {
+    let mut buf = [0u8; 16];
+    buf[..8].copy_from_slice(&self.boot_epoch.to_be_bytes());
+    buf[8..].copy_from_slice(&self.next_token.to_be_bytes());
+    self.next_token += 1;
+    let token = Bytes::copy_from_slice(&buf);
+    self.order.push_back((token.clone(), context));
+    token
   }
 
-  /// Remove `ctx`, returning whether it was present (its `ReadIndexResp` arrived, or it was
-  /// already cleared/never forwarded). Doubles as the already-completed guard in `on_read_index_resp`.
-  fn remove(&mut self, ctx: &Bytes) -> bool {
-    if let Some(pos) = self.order.iter().position(|c| c == ctx) {
-      self.order.remove(pos);
-      true
-    } else {
-      false
-    }
+  /// Remove the forwarded read identified by `token` (the echoed correlator), returning its user
+  /// context if present. `None` means unsolicited / stale / already-completed — doubling as the
+  /// already-completed guard in `on_read_index_resp`.
+  fn remove_by_token(&mut self, token: &[u8]) -> Option<Bytes> {
+    let pos = self.order.iter().position(|(t, _)| t.as_ref() == token)?;
+    self.order.remove(pos).map(|(_, ctx)| ctx)
   }
 
-  /// Drop every in-flight context (term change / leader loss): reads forwarded to a now-stale
+  /// Drop every in-flight read (term change / leader loss): reads forwarded to a now-stale
   /// leader must be re-issued to the new one, not block on a confirmation that will never come.
   fn clear(&mut self) {
     self.order.clear();
   }
 
-  /// Current number of in-flight contexts. Test-only (bound assertion).
+  /// Current number of in-flight reads. Test-only (bound assertion).
   #[cfg(test)]
   fn len(&self) -> usize {
     self.order.len()
@@ -536,7 +563,9 @@ where
       pending_conf_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
-      forwarded_reads: ForwardedReads::default(),
+      // Fresh node: boot epoch 0. A later restart provides a strictly-higher epoch, so this
+      // incarnation's forwarded-read tokens can never collide with a post-restart incarnation's.
+      forwarded_reads: ForwardedReads::new(0),
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -1539,11 +1568,21 @@ where
   /// election timer armed.
   ///
   /// A corrupt durable snapshot poisons the node (no partial state is applied).
+  ///
+  /// `boot_epoch` MUST be strictly greater than the `boot_epoch` of every prior incarnation of THIS
+  /// node, and the caller MUST persist it durably (e.g. a monotonic boot counter) BEFORE calling
+  /// `restart`. It namespaces this incarnation's forwarded-read tokens so that a `ReadIndexResp` sent
+  /// to a previous incarnation — and redelivered after the restart by a transport that does not drop
+  /// pre-crash messages — can never complete a post-restart read at a stale index. A fresh node
+  /// ([`Endpoint::new`]) uses epoch 0, so the first `restart` must pass at least 1. Reusing or
+  /// decreasing the epoch reopens the stale-read hole; the leader-side read path needs no epoch
+  /// because re-acquiring leadership requires a strictly-higher term, which fences stale responses.
   pub fn restart<L, S>(
     config: Config<I>,
     now: Instant,
     seed: u64,
     fsm: F,
+    boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
   ) -> Self
@@ -1691,7 +1730,7 @@ where
       events: VecDeque::new(),
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
-      forwarded_reads: ForwardedReads::default(),
+      forwarded_reads: ForwardedReads::new(boot_epoch),
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -3023,14 +3062,16 @@ where
   fn do_safe_read(&mut self, now: Instant, context: Bytes, from: Option<I>) {
     let me = self.config.id();
     let commit = self.commit;
-    self
-      .read_only
-      .add_request(commit, context.clone(), from, me);
+    // Register the read and seed the heartbeat round with its INTERNAL token (not the user
+    // `context`): the token is unique per round, so a stale/duplicated HeartbeatResp echoing an
+    // earlier round's token can never confirm this read — the linearizability hazard when a user
+    // reuses a `context` after an earlier read with it completed.
+    let round = self.read_only.add_request(commit, context, from, me);
     // Single-node cluster fast-path: self-ack is already a quorum.
     let single_node_quorum = {
       let acks = self
         .read_only
-        .acks_for(context.as_ref())
+        .acks_for(round.as_ref())
         .cloned()
         .unwrap_or_default();
       let votes: BTreeMap<I, bool> = self
@@ -3043,7 +3084,7 @@ where
       self.tracker.vote_result(&votes).is_won()
     };
     if single_node_quorum {
-      let confirmed = self.read_only.advance(context.as_ref());
+      let confirmed = self.read_only.advance(round.as_ref());
       let (term, me2) = (self.term, me);
       for st in confirmed {
         let (context, req_from, index) = st.into_parts();
@@ -3060,18 +3101,20 @@ where
         }
       }
     } else {
-      self.broadcast_heartbeat_with_ctx(now, context);
+      self.broadcast_heartbeat_with_ctx(now, round);
     }
   }
 
   /// Initiate a linearizable read.
   ///
-  /// The `context` MUST uniquely identify each in-flight read — it is the **sole** correlator
-  /// between this request and the eventual [`Event::ReadState`](crate::Event::ReadState)
-  /// (locally) or [`ReadIndexResp`](crate::ReadIndexResp) (when forwarded to the leader).
-  /// Reusing a `context` that is already in flight (including the **empty** context for two
-  /// concurrent reads) returns [`crate::ReadIndexError::DuplicateContext`]; the prior read's single
-  /// confirmation would otherwise be the only acknowledgement for both calls.
+  /// The `context` correlates this request with the eventual [`Event::ReadState`](crate::Event::ReadState)
+  /// (locally) or [`ReadIndexResp`](crate::ReadIndexResp) (when forwarded), so it should identify the
+  /// read uniquely AMONG IN-FLIGHT reads: reusing a `context` that is already in flight (including the
+  /// **empty** context for two concurrent reads) returns [`crate::ReadIndexError::DuplicateContext`],
+  /// since the prior read's single confirmation would otherwise be the only acknowledgement for both.
+  /// Reuse AFTER a prior read with the same context has completed is safe: the leader's heartbeat-quorum
+  /// proof keys on an internal, never-reused round token (not the `context`), so a stale or duplicated
+  /// `HeartbeatResp` from the earlier read can never confirm the later one.
   ///
   /// `Ok(())` means the read was accepted onto a confirmation path; the caller should wait for
   /// the matching `ReadState`/`ReadIndexResp`. An `Err` means **no** acknowledgement will ever
@@ -3142,7 +3185,7 @@ where
         // Follower-side duplicate-context guard (mirror of the leader's `read_context_in_flight`):
         // a context already forwarded and awaiting its `ReadIndexResp` owns the completion path;
         // reject the duplicate rather than forward it again (unbounded re-forward / silent coalesce).
-        if self.forwarded_reads.contains(&context) {
+        if self.forwarded_reads.contains_context(&context) {
           return Err(crate::ReadIndexError::DuplicateContext);
         }
         // Back-pressure at capacity: reject the NEW read rather than evict an already-accepted one
@@ -3150,13 +3193,16 @@ where
         if self.forwarded_reads.is_full() {
           return Err(crate::ReadIndexError::TooManyInFlight);
         }
-        // Record before forwarding. `read_index` already returned early if poisoned, so this never
+        // Record before forwarding and forward by the INTERNAL token, NOT the user context: the leader
+        // echoes whatever we send as the `ReadIndexResp` context, so correlating on a unique token
+        // means a stale/duplicated response from an earlier forward (even of the same user context)
+        // cannot complete a later read. `read_index` already returned early if poisoned, so this never
         // desyncs from the suppressed `send` below.
-        self.forwarded_reads.push(context.clone());
+        let token = self.forwarded_reads.push(context);
         let (term, me) = (self.term, self.config.id());
         self.send(
           leader,
-          Message::ReadIndex(crate::ReadIndex::new(term, me, context)),
+          Message::ReadIndex(crate::ReadIndex::new(term, me, token)),
         );
         Ok(())
       }
@@ -3167,13 +3213,19 @@ where
     }
   }
 
-  /// Whether a read with this exact `context` is already in flight on the leader — either
-  /// deferred awaiting the first current-term commit (`pending_reads`) or registered with the
-  /// heartbeat-ack tracker (`read_only`). Used by [`Self::read_index`] to surface
-  /// [`crate::ReadIndexError::DuplicateContext`] before any side effect.
+  /// Whether a LOCAL (leader-application) read with this exact `context` is already in flight on the
+  /// leader — either deferred awaiting the first current-term commit (`pending_reads`) or registered
+  /// with the heartbeat-ack tracker (`read_only`). Used by [`Self::read_index`]'s leader path to
+  /// surface [`crate::ReadIndexError::DuplicateContext`] before any side effect. FORWARDED reads are
+  /// EXCLUDED: their stored `context` is the forwarding follower's per-follower token (a different
+  /// namespace that collides across followers, each starting at 0), and the follower owns its own
+  /// user-context dedup.
   fn read_context_in_flight(&self, context: &Bytes) -> bool {
-    self.pending_reads.iter().any(|(ctx, _)| ctx == context)
-      || self.read_only.acks_for(context.as_ref()).is_some()
+    self
+      .pending_reads
+      .iter()
+      .any(|(ctx, from)| from.is_none() && ctx == context)
+      || self.read_only.context_in_flight(context.as_ref())
   }
 
   /// Whether the leader's combined in-flight read backlog (deferred `pending_reads` + confirming
@@ -3194,16 +3246,16 @@ where
     if !self.role.is_leader() {
       return;
     }
+    // `ri.context()` is the forwarding follower's per-read TOKEN (not a user context); the leader keeps
+    // it opaque and echoes it in the `ReadIndexResp` so the follower can correlate.
     let context = Bytes::copy_from_slice(ri.context());
     let from = ri.from();
-    // Apply the SAME duplicate-context guard as the local read path. Without it a retrying or
-    // malicious follower forwarding the same context repeatedly would either grow `pending_reads`
-    // without bound (before the current-term no-op commits) or be silently dropped by
-    // `ReadOnly::add_request` afterward — leaving the originator waiting forever. The first request
-    // for the context already owns its completion path; drop the duplicate.
-    if self.read_context_in_flight(&context) {
-      return;
-    }
+    // No leader-side duplicate-context guard on the forwarded path: the FORWARDING FOLLOWER owns the
+    // dedup of its own user contexts and sends a unique per-read token, and the leader's read tracker
+    // keys on its OWN round token, so distinct forwards never collide even when followers reuse token
+    // VALUES (each follower's token sequence starts at 0). A network-duplicated `ReadIndex` is harmless:
+    // the leader confirms it again, but the follower's token-keyed `forwarded_reads` drops the redundant
+    // `ReadIndexResp`. Unbounded growth is bounded by the capacity check below, not by a dedup.
     // Leader-side read back-pressure (same bound as the local path): at capacity we decline the
     // forwarded read rather than grow the backlog without limit. We MUST tell the follower so it can
     // clear its `forwarded_reads` entry — a bare drop would strand that entry until an unrelated
@@ -3255,31 +3307,32 @@ where
   /// unsolicited / stale / wrong-leader / already-completed response is rejected without emitting a
   /// `ReadState`. Without the membership check, a spoofed or duplicate resp could complete a read the
   /// node never forwarded (or re-complete one it already did), surfacing a confirmation the
-  /// application would treat as linearizable. The `forwarded_reads.remove` doubles as the
-  /// already-completed guard: it returns `false` once the context has been consumed (or never
-  /// existed), so a delayed duplicate is dropped.
+  /// application would treat as linearizable. The response's correlator is the follower's INTERNAL
+  /// token (echoed by the leader), NOT the user context, so a stale/duplicated response from an
+  /// earlier forward — even of a since-reused user context — finds no matching in-flight read and is
+  /// dropped. `remove_by_token` doubles as the already-completed guard: `None` once consumed.
   fn on_read_index_resp(&mut self, from: I, resp: crate::ReadIndexResp<I>) {
-    let ctx = Bytes::copy_from_slice(resp.context());
-    // Only a follower awaiting THIS forwarded read may complete it, and only from its current leader
-    // as identified by the ENVELOPE sender `from` (the transport peer) — never the self-reported
-    // `resp.from()`, which a wrong peer could forge to the leader's id (R4 finding 3). `remove`
-    // returning false rejects unsolicited / stale / already-completed contexts.
-    //
-    // The `remove` runs for BOTH outcomes: it is the authoritative clear of the in-flight slot. A
-    // rejecting response (leader at read back-pressure capacity) clears the strand exactly like a
-    // confirming one, but must NOT emit a `ReadState` — its `index` is meaningless. Clearing here
-    // lets the originator re-issue the same context (it is no longer a duplicate).
-    if self.role != Role::Follower
-      || self.leader != Some(from)
-      || resp.from() != from
-      || !self.forwarded_reads.remove(&ctx)
-    {
+    let token = resp.context();
+    // Only a follower awaiting a forward from its CURRENT leader may complete it, and the leader is
+    // identified by the ENVELOPE sender `from` (the transport peer) — never the self-reported
+    // `resp.from()`, which a wrong peer could forge to the leader's id (R4 finding 3). Membership is
+    // checked BEFORE consuming the token, so a spoofed / wrong-leader response never clears a real
+    // in-flight slot.
+    if self.role != Role::Follower || self.leader != Some(from) || resp.from() != from {
       return;
     }
+    // `remove_by_token` is the authoritative clear of the in-flight slot AND the already-completed /
+    // stale guard: `None` rejects an unsolicited / stale / already-completed token. It runs for BOTH
+    // outcomes — a rejecting response (leader at read back-pressure capacity) clears the strand exactly
+    // like a confirming one, but must NOT emit a `ReadState` (its `index` is meaningless). Clearing
+    // here lets the originator re-issue the same user context (it is no longer a duplicate).
+    let Some(context) = self.forwarded_reads.remove_by_token(token) else {
+      return;
+    };
     if resp.reject() {
       return;
     }
-    self.emit_read_state(resp.index(), ctx);
+    self.emit_read_state(resp.index(), context);
   }
 
   /// Walk the leader's log downward from `index` until we find an entry whose term is
@@ -4813,6 +4866,7 @@ mod tests {
       Instant::ORIGIN,
       7,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -4879,6 +4933,7 @@ mod tests {
       Instant::ORIGIN,
       7,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -4975,6 +5030,7 @@ mod tests {
       Instant::ORIGIN,
       9,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -7964,6 +8020,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8015,6 +8072,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8094,6 +8152,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8139,6 +8198,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8328,6 +8388,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8384,6 +8445,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8439,6 +8501,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8508,6 +8571,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8608,6 +8672,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8726,6 +8791,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -8937,6 +9003,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -9015,6 +9082,7 @@ mod tests {
       Instant::ORIGIN,
       42,
       crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
       &mut log,
       &mut stable,
     );
@@ -11748,19 +11816,23 @@ mod tests {
     ep.read_index(d, &log, &stable, ctx.clone())
       .expect("leader with a current-term commit must accept the read");
 
-    // The leader should have broadcast heartbeats carrying ctx.
+    // The leader broadcasts read heartbeats carrying the INTERNAL round token (NOT the user ctx).
+    // Capture the token to echo it back in the HeartbeatResp, exactly as a real follower would.
+    let mut round = None;
     let mut ctx_hb_count = 0usize;
     while let Some(out) = ep.poll_message() {
       if let Message::Heartbeat(hb) = out.message() {
-        if hb.context() == ctx.as_ref() {
+        if !hb.context().is_empty() {
+          round = Some(bytes::Bytes::copy_from_slice(hb.context()));
           ctx_hb_count += 1;
         }
       }
     }
     assert_eq!(
       ctx_hb_count, 2,
-      "leader must broadcast 2 heartbeats with ctx (to peers 2 and 3)"
+      "leader must broadcast 2 read heartbeats (to peers 2 and 3)"
     );
+    let round = round.expect("a read heartbeat round token");
 
     // No ReadState yet (need quorum = 2/3 voters, leader already counted itself = 1).
     assert!(
@@ -11768,7 +11840,7 @@ mod tests {
       "ReadState must not be emitted before a quorum of heartbeat acks"
     );
 
-    // One HeartbeatResp with ctx from peer 2 → quorum reached (self + peer2 = 2/3).
+    // One HeartbeatResp echoing the round token from peer 2 → quorum reached (self + peer2 = 2/3).
     ep.handle_message(
       d,
       &mut log,
@@ -11777,7 +11849,7 @@ mod tests {
       Message::HeartbeatResp(crate::HeartbeatResp::new(
         crate::Term::new(1),
         2u64,
-        ctx.clone(),
+        round.clone(),
       )),
     );
     while ep.poll_message().is_some() {}
@@ -11800,6 +11872,112 @@ mod tests {
       crate::Index::new(1),
       "index must be the commit at receipt"
     );
+  }
+
+  /// Regression (R23-F1 — the ReadIndex quorum proof keys on an INTERNAL round token, never the
+  /// reusable user context): after a read with context X completes, the application may reuse X for a
+  /// new read. A stale/duplicated `HeartbeatResp` from the FIRST read's round must NOT confirm the
+  /// SECOND read. Each read's heartbeat round carries a unique internal token, so the stale ack
+  /// (echoing the first token) finds no pending entry for the second read and is ignored; only a fresh
+  /// ack echoing the second round's token confirms it. Without this, a delayed duplicate could confirm
+  /// the reused read with no fresh quorum — a linearizability break if the leader has since lost quorum.
+  ///
+  /// MUTATION: stop incrementing `next_round` in `ReadOnly::add_request` (all reads share token 0) →
+  /// `token1 == token2` and the stale read-#1 ack confirms read #2.
+  #[test]
+  fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
+    let (mut ep, mut log, mut stable, d) = make_leader_with_current_term_commit();
+    let ctx = bytes::Bytes::from_static(b"reused_ctx");
+
+    // Helper: drain the leader's outgoing messages, returning the round token its read heartbeat
+    // carries (the non-empty Heartbeat context).
+    fn read_round(ep: &mut Endpoint<u64, crate::testkit::CountSm>) -> bytes::Bytes {
+      let mut token = None;
+      while let Some(out) = ep.poll_message() {
+        if let Message::Heartbeat(hb) = out.message() {
+          if !hb.context().is_empty() {
+            token = Some(bytes::Bytes::copy_from_slice(hb.context()));
+          }
+        }
+      }
+      token.expect("a read heartbeat round token")
+    }
+    fn read_states(
+      ep: &mut Endpoint<u64, crate::testkit::CountSm>,
+    ) -> std::vec::Vec<crate::ReadState> {
+      core::iter::from_fn(|| ep.poll_event())
+        .filter_map(|e| match e {
+          crate::Event::ReadState(rs) => Some(rs),
+          _ => None,
+        })
+        .collect()
+    }
+
+    // ── Read #1: register, capture its round token, confirm via a quorum ack. ──
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("read #1 accepted");
+    let token1 = read_round(&mut ep);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        token1.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    assert_eq!(read_states(&mut ep).len(), 1, "read #1 must confirm");
+
+    // ── Read #2: REUSE the same context (allowed now that #1 completed). ──
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("read #2 (reused context) accepted after #1 completed");
+    let token2 = read_round(&mut ep);
+    assert_ne!(
+      token1, token2,
+      "the reused context must get a fresh internal round token"
+    );
+
+    // ── The STALE HeartbeatResp from read #1's round arrives (delayed/duplicated). ──
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        token1.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    assert!(
+      read_states(&mut ep).is_empty(),
+      "a stale ack echoing read #1's token must NOT confirm the reused read #2 (no fresh quorum)"
+    );
+
+    // ── A FRESH ack echoing read #2's token confirms it. ──
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        token2.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    let confirmed2 = read_states(&mut ep);
+    assert_eq!(
+      confirmed2.len(),
+      1,
+      "read #2 confirms only after a FRESH quorum ack echoing its own round token"
+    );
+    assert_eq!(confirmed2[0].context().as_ref(), ctx.as_ref());
   }
 
   /// Test 2: Stale leader (partitioned from quorum) cannot confirm a read.
@@ -11882,17 +12060,18 @@ mod tests {
     ep.read_index(d, &log, &stable, ctx.clone())
       .expect("LeaseBased + check_quorum leader must accept the read");
 
-    // No heartbeats should have been sent for the read round.
-    let mut hb_with_ctx = false;
+    // No read heartbeats should have been sent for the read round. A read heartbeat carries a
+    // non-empty context (the internal round token); the immediate LeaseBased path sends none.
+    let mut read_hb_sent = false;
     while let Some(out) = ep.poll_message() {
       if let Message::Heartbeat(hb) = out.message() {
-        if hb.context() == ctx.as_ref() {
-          hb_with_ctx = true;
+        if !hb.context().is_empty() {
+          read_hb_sent = true;
         }
       }
     }
     assert!(
-      !hb_with_ctx,
+      !read_hb_sent,
       "LeaseBased must NOT broadcast read-heartbeats"
     );
 
@@ -11976,21 +12155,20 @@ mod tests {
       "LeaseBased without check_quorum must NOT confirm immediately — no ReadState yet"
     );
 
-    // Must have broadcast a heartbeat with ctx (Safe path).
-    let mut hb_with_ctx = false;
+    // Must have broadcast a read heartbeat (Safe path), carrying the internal round token.
+    let mut round = None;
     while let Some(out) = ep.poll_message() {
       if let Message::Heartbeat(hb) = out.message() {
-        if hb.context() == ctx.as_ref() {
-          hb_with_ctx = true;
+        if !hb.context().is_empty() {
+          round = Some(bytes::Bytes::copy_from_slice(hb.context()));
         }
       }
     }
-    assert!(
-      hb_with_ctx,
-      "LeaseBased without check_quorum must fall back to Safe and broadcast a heartbeat round"
+    let round = round.expect(
+      "LeaseBased without check_quorum must fall back to Safe and broadcast a heartbeat round",
     );
 
-    // After a quorum of HeartbeatResp acks, ReadState is emitted.
+    // After a quorum of HeartbeatResp acks (echoing the round token), ReadState is emitted.
     ep.handle_message(
       d,
       &mut log,
@@ -11999,7 +12177,7 @@ mod tests {
       Message::HeartbeatResp(crate::HeartbeatResp::new(
         crate::Term::new(1),
         2u64,
-        ctx.clone(),
+        round.clone(),
       )),
     );
     while ep.poll_message().is_some() {}
@@ -12088,21 +12266,19 @@ mod tests {
       ep.poll_event().is_none(),
       "expired LeaseBased lease must NOT confirm immediately — no ReadState yet"
     );
-    // Must degrade to Safe: broadcast a heartbeat round carrying the read ctx.
-    let mut hb_with_ctx = false;
+    // Must degrade to Safe: broadcast a read heartbeat round carrying the internal round token.
+    let mut round = None;
     while let Some(out) = ep.poll_message() {
       if let Message::Heartbeat(hb) = out.message() {
-        if hb.context() == ctx.as_ref() {
-          hb_with_ctx = true;
+        if !hb.context().is_empty() {
+          round = Some(bytes::Bytes::copy_from_slice(hb.context()));
         }
       }
     }
-    assert!(
-      hb_with_ctx,
-      "expired LeaseBased lease must fall back to Safe and broadcast a heartbeat round"
-    );
+    let round = round
+      .expect("expired LeaseBased lease must fall back to Safe and broadcast a heartbeat round");
 
-    // A HeartbeatResp quorum then completes the read at the committed index (liveness preserved).
+    // A HeartbeatResp quorum (echoing the round token) then completes the read (liveness preserved).
     ep.handle_message(
       expired,
       &mut log,
@@ -12111,7 +12287,7 @@ mod tests {
       Message::HeartbeatResp(crate::HeartbeatResp::new(
         crate::Term::new(1),
         2u64,
-        ctx.clone(),
+        round.clone(),
       )),
     );
     while ep.poll_message().is_some() {}
@@ -12179,9 +12355,14 @@ mod tests {
       .poll_message()
       .expect("follower must send ReadIndex to leader");
     assert_eq!(msg.to(), 1u64);
-    assert!(msg.message().is_read_index(), "message must be ReadIndex");
+    // The forwarded ReadIndex carries the follower's INTERNAL token, not the user ctx. Capture it to
+    // echo back, exactly as the leader would.
+    let token = match msg.message() {
+      Message::ReadIndex(ri) => bytes::Bytes::copy_from_slice(ri.context()),
+      other => panic!("expected ReadIndex, got {other:?}"),
+    };
 
-    // Now simulate the leader confirming and replying with ReadIndexResp.
+    // Now simulate the leader confirming and replying with ReadIndexResp echoing the token.
     follower.handle_message(
       Instant::ORIGIN,
       &mut follower_log,
@@ -12191,7 +12372,7 @@ mod tests {
         crate::Term::new(1),
         1u64,
         crate::Index::new(5),
-        ctx.clone(),
+        token.clone(),
         false,
       )),
     );
@@ -12204,6 +12385,320 @@ mod tests {
     let rs = ev.unwrap_read_state_ref();
     assert_eq!(rs.index(), crate::Index::new(5));
     assert_eq!(rs.context().as_ref(), ctx.as_ref());
+  }
+
+  /// Regression (R24-F1 — the FOLLOWER-FORWARDED read correlator must be an internal token, not the
+  /// reusable user context): the follower-side mirror of R23. After a forwarded read with context X
+  /// completes, the app may reuse X. A delayed/duplicated `ReadIndexResp` from the FIRST forward must
+  /// NOT complete the SECOND forwarded read. Each forward carries a unique internal token; the stale
+  /// response echoes the first token, which `forwarded_reads.remove_by_token` no longer holds, so it is
+  /// dropped. Only the fresh response for the second forward's token completes it (at the fresh index).
+  ///
+  /// MUTATION: freeze the follower's forward-token counter (`push` reuses token 0) → the stale response
+  /// completes the reused read at the STALE index.
+  #[test]
+  fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Learn leader 1 via a heartbeat.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::Heartbeat(crate::Heartbeat::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::ZERO,
+        bytes::Bytes::new(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    let ctx = bytes::Bytes::from_static(b"reused_fwd");
+
+    // Forward a read for `ctx` and return the internal token it carried over the wire.
+    fn forward(
+      ep: &mut Endpoint<u64, crate::testkit::CountSm>,
+      log: &crate::testkit::VecLog,
+      stable: &crate::testkit::NoopStable,
+      ctx: bytes::Bytes,
+    ) -> bytes::Bytes {
+      ep.read_index(Instant::ORIGIN, log, stable, ctx)
+        .expect("forward accepted");
+      let mut tok = None;
+      while let Some(o) = ep.poll_message() {
+        if let Message::ReadIndex(ri) = o.message() {
+          tok = Some(bytes::Bytes::copy_from_slice(ri.context()));
+        }
+      }
+      tok.expect("a forwarded ReadIndex")
+    }
+    fn read_states(
+      ep: &mut Endpoint<u64, crate::testkit::CountSm>,
+    ) -> std::vec::Vec<crate::ReadState> {
+      core::iter::from_fn(|| ep.poll_event())
+        .filter_map(|e| match e {
+          crate::Event::ReadState(rs) => Some(rs),
+          _ => None,
+        })
+        .collect()
+    }
+
+    // ── Read #1: forward, capture token, complete via the leader's resp. ──
+    let token1 = forward(&mut ep, &log, &stable, ctx.clone());
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(crate::ReadIndexResp::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::new(5),
+        token1.clone(),
+        false,
+      )),
+    );
+    let s1 = read_states(&mut ep);
+    assert_eq!(s1.len(), 1, "read #1 completes");
+    assert_eq!(s1[0].index(), crate::Index::new(5));
+    assert_eq!(s1[0].context().as_ref(), ctx.as_ref());
+
+    // ── Read #2: REUSE the context (allowed now that #1 completed). ──
+    let token2 = forward(&mut ep, &log, &stable, ctx.clone());
+    assert_ne!(
+      token1, token2,
+      "the reused forwarded context must get a fresh internal token"
+    );
+
+    // ── A STALE duplicate ReadIndexResp echoing read #1's token arrives. ──
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(crate::ReadIndexResp::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::new(5),
+        token1.clone(),
+        false,
+      )),
+    );
+    assert!(
+      read_states(&mut ep).is_empty(),
+      "a stale resp echoing read #1's token must NOT complete the reused read #2"
+    );
+
+    // ── The fresh resp for read #2's token completes it at the FRESH index. ──
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(crate::ReadIndexResp::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::new(8),
+        token2.clone(),
+        false,
+      )),
+    );
+    let s2 = read_states(&mut ep);
+    assert_eq!(s2.len(), 1, "read #2 completes only on its own fresh resp");
+    assert_eq!(
+      s2[0].index(),
+      crate::Index::new(8),
+      "at the FRESH index, not the stale 5"
+    );
+    assert_eq!(s2[0].context().as_ref(), ctx.as_ref());
+  }
+
+  /// Regression (R25-F1 — forwarded-read tokens are unique ACROSS restarts via the durable boot epoch):
+  /// a follower forwards a read (boot epoch E), crashes, and restarts with a strictly-higher boot epoch.
+  /// A delayed pre-crash `ReadIndexResp` (carrying the epoch-E token) must NOT complete a post-restart
+  /// forwarded read (whose token carries the higher epoch), even at the same term — otherwise it would
+  /// complete the new read at a stale index (a linearizability break under a transport that redelivers
+  /// pre-crash messages across a restart).
+  ///
+  /// MUTATION: drop the `boot_epoch` prefix from the token (`push` uses only the counter) → both
+  /// incarnations' first tokens are identical and the pre-crash response completes the post-restart read.
+  #[test]
+  fn forwarded_read_token_is_unique_across_restart() {
+    use crate::{Config, Index, Instant, Message, ReadIndexResp, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    stable.force_state(Term::new(1), None, Index::ZERO); // restart at term 1, no leader yet
+
+    // Restart at `boot_epoch`, learn leader 1 (term 1) via a heartbeat, forward `ctx`, return the token.
+    fn restart_and_forward(
+      cfg: Config<u64>,
+      log: &mut crate::testkit::VecLog,
+      stable: &mut crate::testkit::NoopStable,
+      boot_epoch: u64,
+      ctx: bytes::Bytes,
+    ) -> (Endpoint<u64, crate::testkit::CountSm>, bytes::Bytes) {
+      let mut ep = Endpoint::restart(
+        cfg,
+        Instant::ORIGIN,
+        7,
+        crate::testkit::CountSm::default(),
+        boot_epoch,
+        log,
+        stable,
+      );
+      ep.handle_message(
+        Instant::ORIGIN,
+        log,
+        stable,
+        1u64,
+        Message::Heartbeat(crate::Heartbeat::new(
+          Term::new(1),
+          1u64,
+          Index::ZERO,
+          bytes::Bytes::new(),
+        )),
+      );
+      while ep.poll_message().is_some() {}
+      ep.read_index(Instant::ORIGIN, log, stable, ctx)
+        .expect("forward accepted");
+      let mut tok = None;
+      while let Some(o) = ep.poll_message() {
+        if let Message::ReadIndex(ri) = o.message() {
+          tok = Some(bytes::Bytes::copy_from_slice(ri.context()));
+        }
+      }
+      (ep, tok.expect("forwarded a ReadIndex"))
+    }
+    fn read_states(
+      ep: &mut Endpoint<u64, crate::testkit::CountSm>,
+    ) -> std::vec::Vec<crate::ReadState> {
+      core::iter::from_fn(|| ep.poll_event())
+        .filter_map(|e| match e {
+          crate::Event::ReadState(rs) => Some(rs),
+          _ => None,
+        })
+        .collect()
+    }
+
+    let ctx = bytes::Bytes::from_static(b"read_x");
+    // Incarnation A (boot epoch 1): forward, capture the token (the "pre-crash" one).
+    let (_ep_a, token_a) = restart_and_forward(cfg.clone(), &mut log, &mut stable, 1, ctx.clone());
+    // Incarnation B (boot epoch 2): restart from the SAME durable stores, forward, capture the token.
+    let (mut ep_b, token_b) =
+      restart_and_forward(cfg.clone(), &mut log, &mut stable, 2, ctx.clone());
+    assert_ne!(
+      token_a, token_b,
+      "tokens from different boot epochs must differ"
+    );
+
+    // The DELAYED pre-crash ReadIndexResp (epoch-1 token) must NOT complete B's post-restart read.
+    ep_b.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        1u64,
+        Index::new(5),
+        token_a.clone(),
+        false,
+      )),
+    );
+    assert!(
+      read_states(&mut ep_b).is_empty(),
+      "a pre-crash (lower boot-epoch) token must not complete a post-restart read"
+    );
+
+    // The fresh response (B's own epoch-2 token) completes B's read at the fresh index.
+    ep_b.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        1u64,
+        Index::new(8),
+        token_b.clone(),
+        false,
+      )),
+    );
+    let s = read_states(&mut ep_b);
+    assert_eq!(s.len(), 1, "B's read completes on its own fresh token");
+    assert_eq!(s[0].index(), Index::new(8));
+    assert_eq!(s[0].context().as_ref(), ctx.as_ref());
+  }
+
+  /// R25 follow-up — pin the leader-side round-token restart safety Codex flagged for audit. The
+  /// leader's ReadIndex round token also resets on restart, but it is safe BY CONSTRUCTION: a restarted
+  /// node returns as a FOLLOWER, and `on_heartbeat_resp` only confirms reads while leader. To confirm
+  /// reads again it must win a NEW election (strictly higher term), and the term pre-pass drops any
+  /// pre-crash HeartbeatResp (lower term). Here a restarted follower receives a HeartbeatResp at its
+  /// current term and emits NO ReadState (it is not leader), so a reset round token cannot complete a
+  /// read from a stale ack.
+  #[test]
+  fn restarted_follower_ignores_heartbeat_resp_read_acks() {
+    use crate::{Config, HeartbeatResp, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    stable.force_state(Term::new(1), None, Index::ZERO);
+    let mut ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert!(ep.role().is_follower());
+    // A HeartbeatResp (the leader-side read ack) carrying any context must not complete a read on a
+    // follower — `on_heartbeat_resp` early-returns when `!is_leader`.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::HeartbeatResp(HeartbeatResp::new(
+        Term::new(1),
+        1u64,
+        bytes::Bytes::copy_from_slice(&[0u8; 8]),
+      )),
+    );
+    assert!(
+      !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::ReadState(_))),
+      "a restarted follower must not complete a read from a HeartbeatResp"
+    );
   }
 
   /// Test 5: FIFO confirmation + index correctness.
@@ -12222,10 +12717,19 @@ mod tests {
       .expect("first read (ctx_a) must be accepted");
     ep.read_index(d, &log, &stable, ctx_b.clone())
       .expect("second read (ctx_b, distinct context) must be accepted");
-    while ep.poll_message().is_some() {}
+    // Capture the LAST read heartbeat's round token (read_b's) — acking it advances through both
+    // reads (FIFO). With internal round tokens the heartbeat carries the token, not the user ctx.
+    let mut last_round = None;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        if !hb.context().is_empty() {
+          last_round = Some(bytes::Bytes::copy_from_slice(hb.context()));
+        }
+      }
+    }
+    let last_round = last_round.expect("two read heartbeat rounds were broadcast");
 
-    // Peer 2 acks with ctx_b (the last pending context from broadcast_heartbeat).
-    // This should advance through both ctx_a and ctx_b (FIFO).
+    // Peer 2 acks the last round token → advance through both read_a and read_b (FIFO).
     ep.handle_message(
       d,
       &mut log,
@@ -12234,7 +12738,7 @@ mod tests {
       Message::HeartbeatResp(crate::HeartbeatResp::new(
         crate::Term::new(1),
         2u64,
-        ctx_b.clone(),
+        last_round.clone(),
       )),
     );
     while ep.poll_message().is_some() {}
@@ -12317,17 +12821,17 @@ mod tests {
     ep.read_index(d, &log, &stable, ctx.clone())
       .expect("leader must accept the read (deferred until the no-op commits)");
 
-    // No heartbeats with ctx should have been sent (deferred).
-    let mut ctx_hb = false;
+    // No read heartbeats (non-empty context) should have been sent (the read is deferred).
+    let mut read_hb_before = false;
     while let Some(out) = ep.poll_message() {
       if let Message::Heartbeat(hb) = out.message() {
-        if hb.context() == ctx.as_ref() {
-          ctx_hb = true;
+        if !hb.context().is_empty() {
+          read_hb_before = true;
         }
       }
     }
     assert!(
-      !ctx_hb,
+      !read_hb_before,
       "deferred read must NOT broadcast a heartbeat round before no-op commits"
     );
 
@@ -12358,21 +12862,19 @@ mod tests {
     );
     while ep.poll_event().is_some() {} // drain Applied for no-op (it's Empty, so none)
 
-    // The deferred read should now have been flushed → leader broadcasts heartbeat with ctx.
-    let mut ctx_hb_after = false;
+    // The deferred read should now have been flushed → leader broadcasts a read heartbeat carrying
+    // the internal round token. Capture it to echo back.
+    let mut round = None;
     while let Some(out) = ep.poll_message() {
       if let Message::Heartbeat(hb) = out.message() {
-        if hb.context() == ctx.as_ref() {
-          ctx_hb_after = true;
+        if !hb.context().is_empty() {
+          round = Some(bytes::Bytes::copy_from_slice(hb.context()));
         }
       }
     }
-    assert!(
-      ctx_hb_after,
-      "deferred read must broadcast heartbeats after no-op commits"
-    );
+    let round = round.expect("deferred read must broadcast heartbeats after no-op commits");
 
-    // Peer 2 acks the heartbeat → quorum → ReadState emitted.
+    // Peer 2 acks the round token → quorum → ReadState emitted.
     ep.handle_message(
       d,
       &mut log,
@@ -12381,7 +12883,7 @@ mod tests {
       Message::HeartbeatResp(crate::HeartbeatResp::new(
         crate::Term::new(1),
         2u64,
-        ctx.clone(),
+        round.clone(),
       )),
     );
     while ep.poll_message().is_some() {}
@@ -13940,17 +14442,18 @@ mod tests {
 
     let ctx = bytes::Bytes::from_static(b"read-ctx");
 
-    // First read forwards to the leader.
+    // First read forwards to the leader. The forward carries the follower's INTERNAL token (not the
+    // user ctx); capture it to echo back in the ReadIndexResp.
     assert_eq!(
       ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
       Ok(())
     );
-    assert!(
-      matches!(ep.poll_message().map(|o| o.message().clone()), Some(Message::ReadIndex(ri)) if ri.context() == ctx.as_ref()),
-      "first read forwarded as a ReadIndex"
-    );
+    let token = match ep.poll_message().map(|o| o.message().clone()) {
+      Some(Message::ReadIndex(ri)) => bytes::Bytes::copy_from_slice(ri.context()),
+      other => panic!("first read must forward as a ReadIndex, got {other:?}"),
+    };
 
-    // Second read with the SAME context — rejected, no second forward.
+    // Second read with the SAME user context — rejected by the follower's dedup, no second forward.
     assert_eq!(
       ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
       Err(ReadIndexError::DuplicateContext),
@@ -13958,7 +14461,7 @@ mod tests {
     );
     assert!(ep.poll_message().is_none(), "no duplicate forward emitted");
 
-    // The matching ReadIndexResp confirms the read and clears the in-flight context.
+    // The matching ReadIndexResp (echoing the token) confirms the read and clears the in-flight context.
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -13968,7 +14471,7 @@ mod tests {
         Term::new(1),
         1u64,
         Index::ZERO,
-        ctx.clone(),
+        token.clone(),
         false,
       )),
     );
@@ -14173,6 +14676,11 @@ mod tests {
       Ok(()),
       "the read forwards and records a forwarded_reads strand"
     );
+    // Capture the follower's internal token from the forward to echo in the rejecting resp.
+    let strand_token = match follower.poll_message().map(|o| o.message().clone()) {
+      Some(Message::ReadIndex(ri)) => bytes::Bytes::copy_from_slice(ri.context()),
+      other => panic!("the read must forward as a ReadIndex, got {other:?}"),
+    };
     while follower.poll_message().is_some() {}
     // A re-issue right now is a duplicate (strand still held).
     assert_eq!(
@@ -14181,7 +14689,8 @@ mod tests {
       "while the strand is held the context is a duplicate"
     );
 
-    // The rejecting ReadIndexResp from the leader (node 1) clears the strand and emits NO ReadState.
+    // The rejecting ReadIndexResp from the leader (node 1), echoing the token, clears the strand and
+    // emits NO ReadState.
     follower.handle_message(
       Instant::ORIGIN,
       &mut flog,
@@ -14191,7 +14700,7 @@ mod tests {
         Term::new(1),
         1u64,
         Index::ZERO,
-        ctx.clone(),
+        strand_token.clone(),
         true,
       )),
     );
@@ -14556,9 +15065,14 @@ mod tests {
       ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
       Ok(())
     );
+    // The forward carries the follower's INTERNAL token; capture it (the correlator the resp echoes).
+    let token = match ep.poll_message().map(|o| o.message().clone()) {
+      Some(Message::ReadIndex(ri)) => bytes::Bytes::copy_from_slice(ri.context()),
+      other => panic!("the read must forward as a ReadIndex, got {other:?}"),
+    };
     while ep.poll_message().is_some() {}
 
-    // (a) Unsolicited context (never forwarded): no ReadState.
+    // (a) Unsolicited token (never forwarded): no ReadState.
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -14574,11 +15088,11 @@ mod tests {
     );
     assert!(
       !ep.poll_all_events_any_read_state(),
-      "an unsolicited context must not complete a read"
+      "an unsolicited token must not complete a read"
     );
 
-    // (b) Right context but WRONG leader (from node 3, not our leader node 1): no ReadState, and the
-    // in-flight context must remain (so the legitimate resp can still complete it below).
+    // (b) Right token but WRONG leader (from node 3, not our leader node 1): no ReadState, and the
+    // in-flight read must remain (so the legitimate resp can still complete it below).
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -14588,7 +15102,7 @@ mod tests {
         Term::new(1),
         3u64,
         Index::new(5),
-        ctx.clone(),
+        token.clone(),
         false,
       )),
     );
@@ -14597,7 +15111,7 @@ mod tests {
       "a wrong-leader resp must not complete the read"
     );
 
-    // (c) The legitimate resp from the current leader: exactly one ReadState.
+    // (c) The legitimate resp from the current leader (echoing the token): exactly one ReadState.
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -14607,7 +15121,7 @@ mod tests {
         Term::new(1),
         1u64,
         Index::new(7),
-        ctx.clone(),
+        token.clone(),
         false,
       )),
     );
@@ -14627,7 +15141,7 @@ mod tests {
     );
     assert_eq!(read_states[0].index(), Index::new(7));
 
-    // (d) A delayed DUPLICATE of the same context (already completed/cleared): no second ReadState.
+    // (d) A delayed DUPLICATE echoing the same token (already completed/cleared): no second ReadState.
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -14637,7 +15151,7 @@ mod tests {
         Term::new(1),
         1u64,
         Index::new(7),
-        ctx.clone(),
+        token.clone(),
         false,
       )),
     );
@@ -14871,21 +15385,17 @@ mod tests {
       Ok(()),
       "a follower with a known leader forwards the read"
     );
-    // The forward is a ReadIndex to the leader (node 2).
-    assert!(
-      {
-        let mut forwarded = false;
-        while let Some(o) = ep.poll_message() {
-          if let Message::ReadIndex(ri) = o.message() {
-            assert_eq!(o.to(), 2u64, "the read forwards to the leader");
-            assert_eq!(ri.context(), ctx.as_ref());
-            forwarded = true;
-          }
+    // The forward is a ReadIndex to the leader (node 2), carrying the follower's internal token.
+    let token = {
+      let mut tok = None;
+      while let Some(o) = ep.poll_message() {
+        if let Message::ReadIndex(ri) = o.message() {
+          assert_eq!(o.to(), 2u64, "the read forwards to the leader");
+          tok = Some(bytes::Bytes::copy_from_slice(ri.context()));
         }
-        forwarded
-      },
-      "read_index must forward a ReadIndex to the leader"
-    );
+      }
+      tok.expect("read_index must forward a ReadIndex to the leader")
+    };
 
     // (a) SPOOFED: payload `from` claims to be the leader (2), but the ENVELOPE sender is node 3 (the
     // transport peer). Must be REJECTED — no ReadState — because the peer that actually delivered it
@@ -14899,7 +15409,7 @@ mod tests {
         Term::new(1),
         2u64,
         Index::new(9),
-        ctx.clone(),
+        token.clone(),
         false,
       )),
     );
@@ -14910,8 +15420,7 @@ mod tests {
     );
 
     // (b) LEGITIMATE: envelope sender == payload from == leader (2). The read completes: one ReadState
-    // at the confirmed index. (The in-flight context survived step (a), proving (a) did not consume
-    // it.)
+    // at the confirmed index. (The in-flight read survived step (a), proving (a) did not consume it.)
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -14921,7 +15430,7 @@ mod tests {
         Term::new(1),
         2u64,
         Index::new(9),
-        ctx.clone(),
+        token.clone(),
         false,
       )),
     );

@@ -52,6 +52,9 @@ struct Node {
   log: MemLog,
   stable: MemStable<u64>,
   config: Config<u64>,
+  /// Monotonic boot epoch, incremented per crash/restart — the durable boot counter the harness feeds
+  /// to [`Endpoint::restart`] so forwarded-read tokens are unique across restarts.
+  boot_epoch: u64,
 }
 
 /// A parsed directive argument: a key with zero-or-more values. A bare positional argument is
@@ -246,6 +249,7 @@ impl InteractionEnv {
           log,
           stable,
           config: cfg,
+          boot_epoch: 0,
         },
       );
       out.push_str(&std::format!(
@@ -362,6 +366,7 @@ impl InteractionEnv {
           log: MemLog::new(),
           stable: MemStable::new(),
           config: cfg,
+          boot_epoch: 0,
         },
       );
     }
@@ -434,6 +439,7 @@ impl InteractionEnv {
           log: MemLog::new(),
           stable: MemStable::new(),
           config: cfg,
+          boot_epoch: 0,
         }
       });
     }
@@ -493,11 +499,15 @@ impl InteractionEnv {
     if let Some(n) = self.nodes.get_mut(&id) {
       n.log.discard_inflight();
       n.stable.discard_inflight();
+      // Bump the durable boot epoch so this incarnation's forwarded-read tokens are unique vs. any
+      // pre-crash ones (a pre-crash ReadIndexResp cannot complete a post-restart read).
+      n.boot_epoch += 1;
       n.ep = Endpoint::restart(
         n.config.clone(),
         now,
         id,
         LogSm::new(),
+        n.boot_epoch,
         &mut n.log,
         &mut n.stable,
       );
