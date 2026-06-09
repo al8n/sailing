@@ -33,7 +33,18 @@ impl OpId {
 }
 
 /// A completed log write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  derive_more::IsVariant,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum LogDone {
   /// The `submit_append` with this id is durable.
@@ -43,7 +54,18 @@ pub enum LogDone {
 }
 
 /// A completed stable-store write.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
+#[derive(
+  Debug,
+  Clone,
+  Copy,
+  PartialEq,
+  Eq,
+  derive_more::IsVariant,
+  derive_more::Unwrap,
+  derive_more::TryUnwrap,
+)]
+#[unwrap(ref, ref_mut)]
+#[try_unwrap(ref, ref_mut)]
 #[non_exhaustive]
 pub enum StableDone {
   /// The `submit_write` with this id is durable.

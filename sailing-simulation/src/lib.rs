@@ -1,1 +1,12 @@
-//! Deterministic simulation harness for sailing-proto (stub — filled in M0 U6).
+//! Deterministic simulation harness for `sailing-proto`.
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+mod store;
+pub use store::{MemLog, MemStable};
+
+mod sm;
+pub use sm::LogSm;
+
+mod cluster;
+pub use cluster::Cluster;

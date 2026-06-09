@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 default = ["std"]
-std = ["alloc", "bytes/std", "thiserror/std"]
+std = ["alloc", "bytes/std", "thiserror/std", "derive_more/std"]
 alloc = []
 
 [dependencies]

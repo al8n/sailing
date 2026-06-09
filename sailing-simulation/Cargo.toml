@@ -8,7 +8,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-sailing-proto.workspace = true
+sailing-proto = { workspace = true, features = ["std"] }
+bytes.workspace = true
 
 [lints]
 workspace = true

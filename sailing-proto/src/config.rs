@@ -27,7 +27,11 @@ impl<I: Copy> Config<I> {
         heartbeat: heartbeat_interval,
       });
     }
-    Ok(Self { id, election_timeout, heartbeat_interval })
+    Ok(Self {
+      id,
+      election_timeout,
+      heartbeat_interval,
+    })
   }
 
   /// This node's id.
@@ -56,8 +60,12 @@ mod tests {
 
   #[test]
   fn config_validation_and_defaults() {
-    let c =
-      Config::try_new(1u64, Duration::from_millis(1000), Duration::from_millis(100)).unwrap();
+    let c = Config::try_new(
+      1u64,
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
     assert_eq!(c.id(), 1u64);
     assert_eq!(c.heartbeat_interval(), Duration::from_millis(100));
     // election timeout must exceed heartbeat interval

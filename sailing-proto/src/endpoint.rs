@@ -40,7 +40,8 @@ impl Role {
 /// (§8): the struct stores `Event<I, F::Response>`, which cannot be named without it.
 #[derive(Debug)]
 // M0 skeleton: several fields are written in `new` but not yet read — M1 fills them in.
-#[allow(dead_code)]
+// `expect` (not `allow`): once M1 reads these fields it becomes a stale-lint error, forcing removal.
+#[expect(dead_code)]
 pub struct Endpoint<I, F>
 where
   F: StateMachine,
@@ -86,7 +87,7 @@ where
 
   /// This node's id.
   #[inline(always)]
-  pub fn id(&self) -> I {
+  pub const fn id(&self) -> I {
     self.config.id()
   }
 
