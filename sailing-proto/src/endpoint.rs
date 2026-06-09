@@ -560,6 +560,26 @@ where
   /// from response-receipt time. `None` until the first fresh quorum confirmation. (The residual
   /// clock-drift assumption common to all lease reads remains — see `do_leader_read`.)
   lease_valid_until: Option<Instant>,
+  /// R37 post-restart vote-suppression fence (LeaseBased crash-safety). A node that crashed may have
+  /// acked a leader's read-lease just before crashing; on restart that in-memory promise is gone, so
+  /// without a fence it could grant a vote to a new candidate and elect a new leader WHILE the old
+  /// leader is still inside its (unexpired) lease window — letting the old leader serve a stale
+  /// LeaseBased read. While `now < lease_vote_fence_until` a restarted node REFUSES to grant votes
+  /// (real and pre), UNLESS the request is a forced leader-transfer (mirrors the `in_lease` bypass).
+  /// `restart` sets it to `now + election_timeout` ONLY under `ReadOnlyOption::LeaseBased`
+  /// (`restart_now + election_timeout >= the leader's lease expiry`, so it always covers any acked
+  /// lease); `new` and all non-LeaseBased configs leave it `None`. Not persisted — re-armed each restart.
+  lease_vote_fence_until: Option<Instant>,
+  /// R39: whether a forced leader handoff (`TimeoutNow`) was emitted during the CURRENT leader term.
+  /// Sending `TimeoutNow` authorizes the transferee to campaign FORCED (bypassing the follower/restart
+  /// lease fences), and under Raft's unbounded message delay that forced campaign — or its already-sent
+  /// forced `RequestVote`s — can elect a new leader at ANY later point this term, even AFTER the transfer
+  /// aborts (`lead_transferee` is cleared on the deadline). So once set, this leader MUST NOT serve a
+  /// LeaseBased read for the rest of the term (`do_leader_read` Safe-degrades); it regains the lease
+  /// shortcut only on re-election (a fresh term resets this in `become_leader`). Meaningful only while
+  /// leader. (The R38 `lead_transferee` gate covers the lagging-transfer window BEFORE `TimeoutNow` is
+  /// sent; this flag covers everything AFTER it, including post-abort.)
+  forced_handoff_this_term: bool,
   /// Target of an in-progress leader transfer, or `None` if no transfer is active.
   ///
   /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
@@ -638,6 +658,10 @@ where
       lease_round_start: now,
       lease_acks: BTreeSet::new(),
       lease_valid_until: None,
+      // A fresh node never acked any leader's read-lease, so no post-restart vote fence (R37).
+      lease_vote_fence_until: None,
+      // No forced handoff authorized yet (R39).
+      forced_handoff_this_term: false,
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -1497,6 +1521,15 @@ where
     }
   }
 
+  /// R37: whether the post-restart vote-suppression fence currently blocks GRANTING a vote (LeaseBased
+  /// crash-safety). `None`/expired fence ⇒ not fenced. A forced leader-transfer bypasses it: the current
+  /// leader is voluntarily handing off (relinquishing its lease), so granting cannot strand a live lease
+  /// — mirrors the `in_lease` bypass. Only ever armed under `ReadOnlyOption::LeaseBased` (see `restart`).
+  #[inline]
+  fn lease_vote_fenced(&self, now: Instant, force: bool) -> bool {
+    !force && self.lease_vote_fence_until.is_some_and(|d| now < d)
+  }
+
   fn on_request_vote<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Instant,
@@ -1540,7 +1573,11 @@ where
           || self.voted_for.is_none()
           || self.voted_for == Some(rv.candidate()));
       let lease_open = !(self.leader.is_some() && self.election_deadline.is_some_and(|d| d > now));
-      let grant = log_ok && term_ok && lease_open;
+      // (d) R37 post-restart fence: a restarted node under LeaseBased withholds even its PRE-vote during
+      //     the fence window, so a lease it may have acked before crashing cannot be undermined by a
+      //     fresh election (a forced transfer bypasses — see `lease_vote_fenced`).
+      let grant =
+        log_ok && term_ok && lease_open && !self.lease_vote_fenced(now, rv.leader_transfer());
       let me = self.config.id();
       // On grant: reply at the advertised term so the pre-candidate counts it for this
       // round; on reject: reply at self.term so the pre-candidate learns our (possibly
@@ -1555,7 +1592,11 @@ where
 
     // Real vote path.
     let can_vote = self.voted_for.is_none() || self.voted_for == Some(rv.candidate());
-    if can_vote && log_ok {
+    // R37 post-restart fence: a restarted node under LeaseBased withholds its real vote during the fence
+    // window (a forced leader-transfer bypasses — see `lease_vote_fenced`), so a lease it may have acked
+    // before crashing cannot be undermined by electing a new leader inside the old lease window. The
+    // higher term is still ADOPTED in `handle_message` (always safe); only the GRANT is withheld.
+    if can_vote && log_ok && !self.lease_vote_fenced(now, rv.leader_transfer()) {
       self.voted_for = Some(rv.candidate());
       self.arm_election_timer(now);
       // Persist (term, vote); the VoteResp(grant) is owed once the write is DURABLE.
@@ -1966,6 +2007,16 @@ where
     // Never trust commit beyond the durable log; never below the snapshot baseline.
     let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
     let read_only_opt = config.read_only();
+    // R37: under LeaseBased, fence vote-granting for one election_timeout after restart. This node may
+    // have acked a leader's read-lease just before crashing; that promise is in-memory and now lost, so
+    // without the fence it could grant a vote and elect a new leader inside the old leader's still-valid
+    // lease window. `now + election_timeout >= the lease expiry` because the ack happened at or before
+    // `now`, so the fence always covers it. Non-LeaseBased configs don't rely on the lease → no fence.
+    let lease_vote_fence_until = if read_only_opt == crate::ReadOnlyOption::LeaseBased {
+      Some(now + config.election_timeout())
+    } else {
+      None
+    };
     // Misconfiguration is handled by degradation, not rejection (see `Endpoint::new`); restart
     // construction stays infallible and identical across build profiles.
     let mut ep = Self {
@@ -2012,6 +2063,9 @@ where
       lease_round_start: now,
       lease_acks: BTreeSet::new(),
       lease_valid_until: None,
+      lease_vote_fence_until,
+      // A restarted node is not leader (recovers as Follower) and has authorized no handoff (R39).
+      forced_handoff_this_term: false,
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -2866,6 +2920,9 @@ where
     // target (us) has won; the previous leader's transfer state is irrelevant.
     self.lead_transferee = None;
     self.transfer_deadline = None;
+    // R39: a fresh leader term has authorized no forced handoff yet, so the LeaseBased read shortcut is
+    // available again once a fresh quorum lease forms. (A `TimeoutNow` sent later this term re-arms it.)
+    self.forced_handoff_this_term = false;
     // Clear the candidate/follower election_deadline unconditionally; it will be re-armed
     // below only if check_quorum is enabled. Without this clear, a CQ-disabled leader would
     // inherit the stale candidate election_deadline (arm_heartbeat_timer no longer clears it).
@@ -3388,15 +3445,26 @@ where
         //
         // Degrade to the Safe heartbeat round (which re-confirms a quorum before emitting) whenever:
         //   - check_quorum is disabled (the lease invariant is never maintained), or
-        //   - the fresh lease has lapsed or never formed (`lease_valid_until` is `None` or `<= now`).
+        //   - the fresh lease has lapsed or never formed (`lease_valid_until` is `None` or `<= now`), or
+        //   - a leader transfer is in progress (`lead_transferee.is_some()`): the transfer AUTHORIZES a
+        //     new leader (the transferee campaigns forced, bypassing the R37 restart fence), so this
+        //     leader may no longer be the only one — it MUST NOT serve a lease read from its old commit
+        //     (R38). The Safe path re-confirms via a heartbeat quorum, which fails the moment the
+        //     transferee has won (its higher term rejects the heartbeats), so degrading is always safe, or
+        //   - a forced handoff (`TimeoutNow`) was already SENT this term (`forced_handoff_this_term`):
+        //     the authorized forced campaign — or its already-sent forced `RequestVote`s — can elect a
+        //     new leader at ANY later point this term under unbounded message delay, even after the
+        //     transfer aborts and `lead_transferee` clears (R39). Lease reads stay off until re-election.
         // Degrading is silent and always safe.
         //
         // RESIDUAL CAVEAT (irreducible for ALL lease reads, not closed here): bounded clock drift — if
         // this leader's clock runs slow relative to the followers' election timers, a follower could
         // time out and elect a new leader before this lease expires. Use `Safe` if that assumption may
         // not hold.
-        let use_lease =
-          self.config.check_quorum() && self.lease_valid_until.is_some_and(|d| d > now);
+        let use_lease = self.config.check_quorum()
+          && self.lead_transferee.is_none()
+          && !self.forced_handoff_this_term
+          && self.lease_valid_until.is_some_and(|d| d > now);
         if use_lease {
           match from {
             None => {
@@ -3842,6 +3910,9 @@ where
           if peer_match == log.last_index() {
             let (term, me) = (self.term, self.config.id());
             self.send(from, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
+            // R39: a forced campaign is now authorized for this term — disable LeaseBased reads for the
+            // rest of it (the forced campaign can elect a new leader at any later point, even post-abort).
+            self.forced_handoff_this_term = true;
           }
         }
       }
@@ -4138,6 +4209,14 @@ where
     // Arm the transfer: stop accepting proposals, start the deadline window.
     self.lead_transferee = Some(to);
     self.transfer_deadline = Some(now + self.config.election_timeout());
+    // R38: revoke the LeaseBased read authority for the duration of the transfer. Authorizing a transfer
+    // lets the transferee become leader (forced campaign, bypassing the R37 fence), so this leader must
+    // relinquish its lease — otherwise it could keep serving stale LeaseBased reads at its old commit
+    // while the transferee commits ahead. `do_leader_read` also gates the lease on `lead_transferee`, so
+    // a heartbeat that re-renews `lease_valid_until` during the transfer still cannot be used; this clear
+    // is the immediate revocation.
+    self.lease_valid_until = None;
+    self.lease_acks.clear();
 
     // If the target is already caught up, send TimeoutNow immediately.
     let target_match = self
@@ -4148,6 +4227,10 @@ where
     if target_match == log.last_index() {
       let (term, me) = (self.term, self.config.id());
       self.send(to, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
+      // R39: a forced campaign is now authorized for this term — disable LeaseBased reads for the rest
+      // of it (the forced campaign can elect a new leader at any later point, even after this transfer
+      // aborts on the deadline).
+      self.forced_handoff_this_term = true;
     } else {
       // Target is lagging: kick replication so it catches up.
       // TimeoutNow will be sent from on_append_resp once match_index == last_index.
@@ -10042,6 +10125,301 @@ mod tests {
       log.last_index(),
       Index::new(5),
       "the committed boundary must NOT be re-baselined/truncated"
+    );
+  }
+
+  /// R37 (LeaseBased crash-safety — a restarted node withholds its vote during the post-restart fence):
+  /// a node that may have acked a leader's read-lease just before crashing must not, after restart,
+  /// grant a vote that could elect a new leader inside the old lease window (while the old leader still
+  /// serves LeaseBased reads). Under LeaseBased, `restart` arms a one-election-timeout vote fence: WITHIN
+  /// it a non-forced RequestVote is REJECTED (the higher term is still adopted); a FORCED leader-transfer
+  /// bypasses; PAST it, votes are granted normally.
+  ///
+  /// MUTATION: drop the `!self.lease_vote_fenced(...)` guard in `on_request_vote` (or stop arming the
+  /// fence in `restart`) → the restarted node grants the vote within the window.
+  #[test]
+  fn restarted_leasebased_node_fences_votes() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+    let election = Duration::from_millis(1000);
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      election,
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true)
+    .with_read_only(crate::ReadOnlyOption::LeaseBased);
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    // Restart under LeaseBased at ORIGIN → arms the post-restart vote fence for one election_timeout.
+    let mut ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+      1, // boot_epoch
+      &mut log,
+      &mut stable,
+    );
+    assert!(
+      ep.lease_vote_fence_until.is_some(),
+      "a LeaseBased restart arms the post-restart vote fence"
+    );
+
+    // WITHIN the fence: a higher-term, non-forced RequestVote is REJECTED — the node may have acked a
+    // lease before crashing. The higher term is still adopted (term adoption is always safe).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(1),
+        3u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        false,
+      )),
+    );
+    match ep
+      .poll_message()
+      .expect("a reject VoteResp is sent")
+      .message()
+    {
+      Message::VoteResp(v) => assert!(v.reject(), "a fenced node must REJECT the vote"),
+      _ => panic!("expected VoteResp"),
+    }
+    assert_eq!(ep.voted_for, None, "no vote granted within the fence");
+    assert_eq!(ep.term(), Term::new(1), "but the higher term IS adopted");
+
+    // WITHIN the fence: a FORCED leader-transfer RequestVote BYPASSES the fence and is granted (the
+    // current leader is voluntarily handing off, relinquishing its lease).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(2),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        true, // leader_transfer
+      )),
+    );
+    assert_eq!(
+      ep.voted_for,
+      Some(1u64),
+      "a forced leader-transfer vote bypasses the fence"
+    );
+
+    // PAST the fence: a non-forced RequestVote is granted normally.
+    let past = Instant::ORIGIN + election + election;
+    ep.handle_message(
+      past,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(3),
+        3u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        false,
+      )),
+    );
+    assert_eq!(
+      ep.voted_for,
+      Some(3u64),
+      "past the fence, votes are granted normally"
+    );
+  }
+
+  /// R38 (a leader transfer revokes LeaseBased read authority): R37's forced-transfer vote-fence bypass
+  /// is only safe if the transferring leader actually relinquishes its lease. A leader that arms a
+  /// transfer authorizes the transferee to become leader (forced campaign), so it must stop serving
+  /// LeaseBased reads from its old commit — otherwise it could return a stale read while the transferee
+  /// commits ahead. `transfer_leader` clears the lease, and `do_leader_read` additionally gates the
+  /// lease shortcut on `lead_transferee.is_none()` (so a heartbeat re-renewing the lease mid-transfer
+  /// still cannot be used).
+  ///
+  /// MUTATION: drop the `lead_transferee.is_none()` term from `use_lease` in `do_leader_read` (or the
+  /// `lease_valid_until = None` clear in `transfer_leader`) → a read during the transfer serves
+  /// immediately from the lease.
+  #[test]
+  fn leader_transfer_revokes_leasebased_read_authority() {
+    use crate::{Config, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let election = Duration::from_millis(1000);
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      election,
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true)
+    .with_read_only(crate::ReadOnlyOption::LeaseBased);
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+
+    // Become leader at term 1 with a current-term commit (campaign → self-vote durable → peer vote →
+    // commit the no-op), mirroring `make_leader_with_current_term_commit` but under LeaseBased.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // (1) Live lease, no transfer → a LeaseBased read is served IMMEDIATELY (the lease shortcut works).
+    ep.lease_valid_until = Some(d + election);
+    ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r1"))
+      .unwrap();
+    assert!(
+      ep.poll_all_events_any_read_state(),
+      "with a live lease and no transfer, a LeaseBased read emits a ReadState immediately"
+    );
+
+    // (2) Arming a transfer REVOKES the lease read authority (immediate clear).
+    ep.transfer_leader(d, &log, &stable, 2u64).unwrap();
+    assert_eq!(
+      ep.lease_valid_until, None,
+      "arming a transfer must revoke the read lease"
+    );
+
+    // (3) Even if a heartbeat RE-RENEWS the lease during the transfer window, a read must NOT serve from
+    //     it — the transferee may already be leader. Re-arm the lease and confirm the read Safe-degrades
+    //     (no immediate ReadState; it broadcasts a heartbeat to re-confirm a quorum instead).
+    ep.lease_valid_until = Some(d + election);
+    while ep.poll_message().is_some() {}
+    ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r2"))
+      .unwrap();
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "during a transfer, a LeaseBased read must Safe-degrade — no immediate ReadState"
+    );
+  }
+
+  /// R39 (a forced handoff disables LeaseBased reads for the rest of the term, even after the transfer
+  /// aborts): once `TimeoutNow` is sent, the transferee is authorized to campaign FORCED — and under
+  /// unbounded message delay that campaign (or its already-sent forced `RequestVote`s) can elect a new
+  /// leader at ANY later point this term, even after the transfer aborts on the deadline. So the old
+  /// leader must keep LeaseBased reads disabled until re-election, NOT re-enable them when
+  /// `lead_transferee` clears on abort.
+  ///
+  /// MUTATION: drop the `!self.forced_handoff_this_term` term from `use_lease` in `do_leader_read` →
+  /// after the abort the leader serves an immediate LeaseBased read from a re-renewed lease.
+  #[test]
+  fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
+    use crate::{Config, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let election = Duration::from_millis(1000);
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      election,
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true)
+    .with_read_only(crate::ReadOnlyOption::LeaseBased);
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+
+    // Become leader at term 1 with a current-term commit (node 2 acks the no-op → match=1).
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // Transfer to node 2 (caught up at index 1) → TimeoutNow sent immediately → forced-handoff armed.
+    ep.transfer_leader(d, &log, &stable, 2u64).unwrap();
+    assert!(
+      ep.forced_handoff_this_term,
+      "sending TimeoutNow arms the forced-handoff flag"
+    );
+
+    // Abort the transfer on the deadline. Node 2 was recently active (it acked at `d`), so the
+    // CheckQuorum check at `after` keeps this node leader; only the transfer is aborted.
+    let after = d + election + Duration::from_millis(1);
+    ep.handle_timeout(after, &mut log, &mut stable);
+    assert!(
+      ep.role().is_leader(),
+      "leader survives the abort (peer was recently active)"
+    );
+    assert!(
+      ep.lead_transferee.is_none(),
+      "the transfer aborted on the deadline"
+    );
+    assert!(
+      ep.forced_handoff_this_term,
+      "the forced-handoff flag PERSISTS past the abort"
+    );
+
+    // Even with the transfer aborted AND the lease re-renewed, a read must NOT serve from the lease:
+    // the forced campaign authorized earlier can still elect a new leader at any later point this term.
+    ep.lease_valid_until = Some(after + election);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+    ep.read_index(after, &log, &stable, bytes::Bytes::from_static(b"r"))
+      .unwrap();
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "after a TimeoutNow + abort, LeaseBased reads stay disabled for the rest of the term"
     );
   }
 
