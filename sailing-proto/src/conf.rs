@@ -422,6 +422,18 @@ impl<I: NodeId> ConfChangeV2<I> {
   pub fn context(&self) -> &Bytes {
     &self.context
   }
+
+  /// Construct the canonical "leave joint" entry: empty changes, `Auto` transition, empty context.
+  ///
+  /// When decoded at apply time, the empty-changes + Auto combination signals the Changer to
+  /// call `leave_joint`, completing the two-phase membership transition.
+  pub fn leave_joint() -> Self {
+    Self {
+      transition: ConfChangeTransition::Auto,
+      changes: Vec::new(),
+      context: Bytes::new(),
+    }
+  }
 }
 
 impl<I: NodeId + Data> Data for ConfChangeV2<I> {

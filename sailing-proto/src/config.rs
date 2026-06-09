@@ -21,6 +21,11 @@ pub struct Config<I> {
   max_inflight_bytes: u64,
   /// Number of committed entries between automatic snapshots (etcd's SnapshotCount default).
   snapshot_threshold: usize,
+  /// When `true` (default), a leader that is removed or demoted to learner by a committed
+  /// `ConfChange` steps down immediately (role → Follower, timers disarmed). Set to `false`
+  /// only if the operator explicitly wants the removed leader to keep acting until it hears
+  /// from a new leader (unusual; the default is safe).
+  step_down_on_removal: bool,
 }
 
 impl<I: NodeId> Config<I> {
@@ -52,6 +57,7 @@ impl<I: NodeId> Config<I> {
       max_inflight_msgs: 256,
       max_inflight_bytes: 0,
       snapshot_threshold: 10_000, // etcd default SnapshotCount
+      step_down_on_removal: true,
     })
   }
 
@@ -141,6 +147,19 @@ impl<I: NodeId> Config<I> {
     self.snapshot_threshold = v;
     self
   }
+
+  /// Whether a leader that loses its voter status (removed or demoted to learner) should
+  /// step down immediately when the `ConfChange` is applied. Defaults to `true`.
+  #[inline(always)]
+  pub const fn step_down_on_removal(&self) -> bool {
+    self.step_down_on_removal
+  }
+
+  /// Override the `step_down_on_removal` knob.
+  pub fn with_step_down_on_removal(mut self, v: bool) -> Self {
+    self.step_down_on_removal = v;
+    self
+  }
 }
 
 #[cfg(test)]
@@ -193,6 +212,31 @@ mod tests {
       ),
       Err(ConfigError::ElectionNotGreaterThanHeartbeat { .. })
     ));
+  }
+
+  #[test]
+  fn step_down_on_removal_default_and_override() {
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert!(
+      c.step_down_on_removal(),
+      "step_down_on_removal must default to true"
+    );
+    let c2 = c.with_step_down_on_removal(false);
+    assert!(
+      !c2.step_down_on_removal(),
+      "with_step_down_on_removal(false) must persist"
+    );
+    let c3 = c2.with_step_down_on_removal(true);
+    assert!(
+      c3.step_down_on_removal(),
+      "with_step_down_on_removal(true) must persist"
+    );
   }
 
   #[test]

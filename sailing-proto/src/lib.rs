@@ -69,10 +69,16 @@ mod config;
 pub use config::Config;
 
 mod event;
-pub use event::{Applied, Event, LeaderChanged};
+pub use event::{Applied, ConfChanged, Event, LeaderChanged};
 
 mod endpoint;
 pub use endpoint::{Endpoint, Role};
+
+pub mod tracker;
+pub use tracker::{
+  Tracker,
+  confchange::{Changer as ConfChanger, ConfChangeError},
+};
 
 #[cfg(test)]
 pub(crate) mod testkit;

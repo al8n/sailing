@@ -10,6 +10,11 @@ pub enum ProposeError<I> {
     /// The believed current leader, if known.
     leader: Option<I>,
   },
+  /// A previous configuration change is still in flight (not yet applied). Only one
+  /// `ConfChange` entry may be pending at a time — propose another after the first is
+  /// committed and applied.
+  #[error("a conf change is already in flight")]
+  ConfChangeInFlight,
 }
 
 /// Why constructing a [`crate::Config`] failed.

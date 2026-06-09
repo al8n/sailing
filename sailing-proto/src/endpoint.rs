@@ -4,7 +4,7 @@ use crate::{
   Config, Event, Index, Instant, LogStore, Message, NodeId, Outgoing, Prng, StableStore,
   StateMachine, Term,
 };
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
@@ -65,12 +65,17 @@ where
   commit: Index,
   applied: Index,
   prng: Prng,
-  votes_granted: BTreeSet<I>,
+  /// Per-voter ballot: `true` = grant, `false` = reject. Absent IDs have not voted yet.
+  /// Replaces the old `votes_granted: BTreeSet<I>` — the joint quorum needs the full
+  /// ballot (grants *and* rejections), not just the grant set.
+  votes: BTreeMap<I, bool>,
   election_deadline: Option<Instant>,
   heartbeat_deadline: Option<Instant>,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
-  progress: BTreeMap<I, crate::Progress>,
+  /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
+  /// Replaces the old `progress: BTreeMap<I, crate::Progress>` and static-voter quorum.
+  tracker: crate::Tracker<I>,
   /// Monotonically minted id for every storage submission.
   next_op_id: crate::OpId,
   /// Outstanding write → deferred action.
@@ -87,6 +92,14 @@ where
   /// (the node wedges). A store error poisons the node via `handle_storage`, and `restart`
   /// resets this field to `None`.
   pending_compact: Option<(crate::OpId, Index)>,
+  /// Log index of the most recently appended (not-yet-applied) `ConfChange` entry.
+  ///
+  /// Initialized to `Index::ZERO` in both `new` and `restart`. On restart, ZERO is acceptable
+  /// for M6 — a more precise scan of the durable log to find any pending ConfChange entry is a
+  /// future refinement. If a ConfChange entry is in the log but not yet applied after restart,
+  /// the one-in-flight guard will be permissive (ZERO <= applied), but correctness is maintained
+  /// because the entry will still be applied exactly once in `apply_committed`.
+  pending_conf_index: Index,
 }
 
 // ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
@@ -99,6 +112,15 @@ where
   /// Create a fresh node (status Follower, term 0, empty log view).
   /// Arms the election timer immediately.
   pub fn new(config: Config<I>, now: Instant, seed: u64, fsm: F) -> Self {
+    // Bootstrap the Tracker from the static seed voter set. Read the needed config
+    // values BEFORE moving `config` into the struct literal below.
+    let cs = crate::ConfState::from_voters(config.voters().iter().copied());
+    let tracker = crate::Tracker::from_conf_state(
+      &cs,
+      Index::ZERO,
+      config.max_inflight_msgs(),
+      config.max_inflight_bytes(),
+    );
     let mut ep = Self {
       config,
       fsm,
@@ -109,16 +131,17 @@ where
       commit: Index::ZERO,
       applied: Index::ZERO,
       prng: Prng::new(seed),
-      votes_granted: BTreeSet::new(),
+      votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
-      progress: BTreeMap::new(),
+      tracker,
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
       poisoned: false,
       pending_compact: None,
+      pending_conf_index: Index::ZERO,
     };
     ep.arm_election_timer(now);
     ep
@@ -211,14 +234,12 @@ where
     self.outgoing.push_back(Outgoing::new(to, msg));
   }
 
-  fn peers(&self) -> impl Iterator<Item = I> + '_ {
+  fn peers(&self) -> impl Iterator<Item = I> {
     let me = self.config.id();
-    self
-      .config
-      .voters()
-      .iter()
-      .copied()
-      .filter(move |&p| p != me)
+    // Iterate all tracked IDs (voters both halves ∪ learners ∪ learners_next), excluding self.
+    // The leader replicates to learners too; quorum is still computed over voters only
+    // (tracker.quorum_committed / tracker.vote_result read only the voter halves).
+    self.tracker.ids().into_iter().filter(move |&p| p != me)
   }
 
   fn last_log(&self, log: &impl LogStore) -> (Index, Term) {
@@ -227,9 +248,12 @@ where
     (li, lt)
   }
 
-  /// Build the current `ConfState` from the config voter set.
+  /// Build the current `ConfState` from the runtime membership (Tracker).
+  ///
+  /// This reflects the live configuration so snapshots and restarts carry the correct
+  /// membership, not just the static bootstrap seed from `Config.voters`.
   fn conf_state(&self) -> crate::ConfState<I> {
-    crate::ConfState::from_voters(self.config.voters().iter().copied())
+    self.tracker.conf_state()
   }
 
   /// Expose `pending_compact` for testing.
@@ -248,8 +272,8 @@ where
       // uncommitted tail commit+apply a stale entry (the etcd `min(committed, pr.Match)`
       // rule). Default to ZERO if progress is unknown.
       let peer_commit = self
-        .progress
-        .get(&peer)
+        .tracker
+        .progress(&peer)
         .map(|pr| core::cmp::min(self.commit, pr.match_index()))
         .unwrap_or(Index::ZERO);
       self.send(
@@ -277,7 +301,7 @@ where
     log: &L,
     stable: &S,
   ) {
-    let Some(pr) = self.progress.get(&peer).cloned() else {
+    let Some(pr) = self.tracker.progress(&peer).cloned() else {
       return;
     };
     // M4 Task 4: respect the in-flight window — if paused, don't send.
@@ -298,7 +322,7 @@ where
           peer,
           Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, data)),
         );
-        if let Some(p) = self.progress.get_mut(&peer) {
+        if let Some(p) = self.tracker.progress_mut(&peer) {
           p.become_snapshot(pending);
         }
       }
@@ -377,7 +401,7 @@ where
     // max_inflight_msgs heartbeat-resp cycles the window fills and newly proposed entries
     // are silently not delivered. (etcd guards SentEntries on len(entries) > 0.)
     let is_empty = bytes_sent == 0 && entries_len == 0;
-    if let Some(p) = self.progress.get_mut(&peer) {
+    if let Some(p) = self.tracker.progress_mut(&peer) {
       if (!is_empty && p.state().is_replicate()) || sent_partial {
         p.sent_entries(last_sent, bytes_sent);
       }
@@ -385,18 +409,13 @@ where
   }
 
   fn maybe_advance_commit<L: LogStore>(&mut self, log: &L) {
-    let mut matches: std::vec::Vec<Index> = self
-      .progress
-      .values()
-      .map(crate::Progress::match_index)
-      .collect();
-    matches.sort_unstable();
-    // highest index replicated on >= quorum nodes
-    let q = self.config.quorum();
-    if matches.len() < q {
-      return;
-    }
-    let candidate = matches[matches.len() - q];
+    // Delegate to the Tracker's joint-quorum committed index. For a simple (non-joint)
+    // config this is identical to the old sorted-match logic:
+    //   old: matches.sort(); candidate = matches[n - (n/2+1)]
+    //   new: MajorityConfig::committed_index does exactly that sort+pick internally.
+    // A degenerate Tracker with the static seed (voters = config seed, outgoing empty,
+    // no learners) returns the same value — M0–M5 tests are therefore unaffected.
+    let candidate = self.tracker.quorum_committed();
     // §5.4.2: only commit an entry from the CURRENT term by counting replicas.
     let current_term = log.term(candidate).map(|t| t == self.term).unwrap_or(false);
     if candidate > self.commit && current_term {
@@ -453,12 +472,13 @@ where
     if !self.role.is_candidate() || vr.term() != self.term {
       return;
     }
-    if !vr.reject() {
-      self.votes_granted.insert(vr.from());
-      if self.votes_granted.len() >= self.config.quorum() {
-        self.become_leader(now, log, stable);
-      }
+    // Record the ballot: true = grant, false = reject.
+    // `vr.reject()` is false when the vote was granted.
+    self.votes.insert(vr.from(), !vr.reject());
+    if self.tracker.vote_result(&self.votes).is_won() {
+      self.become_leader(now, log, stable);
     }
+    // Lost or Pending: stay candidate; the election timeout retries (preserves M1 liveness).
   }
 }
 
@@ -512,6 +532,19 @@ where
     }
     // After all completions are drained, check whether a new snapshot is warranted.
     self.maybe_snapshot(log, stable);
+
+    // Auto-leave joint consensus: once the joint config is applied and no conf change is in
+    // flight, the leader appends an empty leave-joint entry to transition back to a simple
+    // config. Re-evaluated each call so a freshly-elected leader also finishes the job.
+    // The condition stops once is_joint() is false — no infinite loop risk.
+    if self.role.is_leader()
+      && self.tracker.is_joint()
+      && self.tracker.auto_leave()
+      && self.pending_conf_index <= self.applied
+    {
+      let leave = crate::ConfChangeV2::leave_joint();
+      self.append_conf_change(log, stable, leave);
+    }
   }
 
   /// Trigger a snapshot if `applied - first_index >= snapshot_threshold`.
@@ -587,6 +620,15 @@ where
     let mut fsm = fsm;
     let mut applied = Index::ZERO;
     let mut poisoned = false;
+    // Bootstrap tracker from the static seed first; may be overridden below if a
+    // durable snapshot carries a more recent ConfState.
+    let seed_cs = crate::ConfState::from_voters(config.voters().iter().copied());
+    let mut tracker = crate::Tracker::from_conf_state(
+      &seed_cs,
+      Index::ZERO,
+      config.max_inflight_msgs(),
+      config.max_inflight_bytes(),
+    );
     // Restore from a durable snapshot first: the compacted log no longer holds entries
     // <= meta.last_index, so the SM baseline comes from the snapshot; we then replay only
     // the durable post-snapshot committed tail.
@@ -597,7 +639,15 @@ where
             poisoned = true;
           } else {
             applied = meta.last_index();
-            // M6 installs meta.conf() (dynamic membership); M5 has fixed config voters.
+            // M6: install the durable membership from the snapshot's ConfState.
+            // This supersedes the bootstrap seed from Config.voters.
+            // (Replaying ConfChange log entries to further refine membership is U5's job.)
+            tracker = crate::Tracker::from_conf_state(
+              &meta.conf().clone(),
+              meta.last_index(),
+              config.max_inflight_msgs(),
+              config.max_inflight_bytes(),
+            );
           }
         }
         Err(_) => poisoned = true,
@@ -615,14 +665,16 @@ where
       commit,
       applied,
       prng: Prng::new(seed),
-      votes_granted: BTreeSet::new(),
+      votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
       poisoned,
       pending_compact: None,
-      progress: BTreeMap::new(),
+      // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
+      pending_conf_index: Index::ZERO,
+      tracker,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
     };
@@ -661,7 +713,7 @@ where
       // and commit. `pending` is cleared on every term change, so a stale `LeaderAppend`
       // reaching a non-leader is already unreachable — this makes the safety local.
       Some(Pending::LeaderAppend { upto }) if self.role.is_leader() => {
-        if let Some(p) = self.progress.get_mut(&self.config.id()) {
+        if let Some(p) = self.tracker.progress_mut(&self.config.id()) {
           p.maybe_update(upto);
         }
         self.maybe_advance_commit(log);
@@ -755,10 +807,108 @@ where
       }
       _ => {
         if self.election_deadline.is_some_and(|d| d <= now) {
-          self.become_candidate(now, log, stable);
+          // A learner or removed node must never start an election.
+          // Leaving the timer disarmed for non-voters is intentional: they have no
+          // business holding an election timer (see U6 step-down and become_candidate
+          // defensive guard).
+          if self.tracker.is_voter(&self.config.id()) {
+            self.become_candidate(now, log, stable);
+          }
+          // else: non-voter — timer expires silently; do not re-arm.
         }
       }
     }
+  }
+
+  /// Append a `ConfChangeV2` entry to the log and replicate it to all peers.
+  ///
+  /// Internal helper shared by `propose_conf_change_v2` and the auto-leave path.
+  /// Mirrors `propose`'s deferred-append + `LeaderAppend` + replicate pattern exactly.
+  ///
+  /// Requires `I: crate::Data` because the ConfChangeV2 encodes node ids.
+  fn append_conf_change<L, S>(
+    &mut self,
+    log: &mut L,
+    stable: &S,
+    cc: crate::ConfChangeV2<I>,
+  ) -> Index
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    use crate::Data as _;
+    let mut buf = std::vec::Vec::new();
+    cc.encode(&mut buf);
+    let index = log.last_index().next();
+    let entry = crate::Entry::new(
+      self.term,
+      index,
+      crate::EntryKind::ConfChange,
+      bytes::Bytes::from(buf),
+    );
+    let opid = self.mint_op_id();
+    log.submit_append(opid, core::slice::from_ref(&entry));
+    self
+      .pending
+      .insert(opid, Pending::LeaderAppend { upto: index });
+    self.pending_conf_index = index;
+    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+      self.maybe_send_append(peer, log, stable);
+    }
+    index
+  }
+
+  /// Propose a v1 (single-op) configuration change on the leader.
+  ///
+  /// Normalises the v1 input to a [`ConfChangeV2`] via [`ConfChange::into_v2`] and delegates
+  /// to [`propose_conf_change_v2`][Self::propose_conf_change_v2].
+  ///
+  /// Returns the assigned log index on success, or an error if:
+  /// - this node is not the leader (`NotLeader`), or
+  /// - a previous conf-change entry is still pending (`ConfChangeInFlight`).
+  pub fn propose_conf_change<L, S>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &S,
+    cc: crate::ConfChange<I>,
+  ) -> Result<Index, crate::ProposeError<I>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    self.propose_conf_change_v2(now, log, stable, cc.into_v2())
+  }
+
+  /// Propose a v2 (possibly multi-op / joint-consensus) configuration change on the leader.
+  ///
+  /// **Safety invariants:**
+  /// - Changes apply at commit time, not at append time (Tracker is ONLY updated in
+  ///   `apply_committed`).
+  /// - Only one conf-change entry may be in flight at a time (`pending_conf_index > applied`
+  ///   causes `ConfChangeInFlight`).
+  pub fn propose_conf_change_v2<L, S>(
+    &mut self,
+    _now: Instant,
+    log: &mut L,
+    stable: &S,
+    cc: crate::ConfChangeV2<I>,
+  ) -> Result<Index, crate::ProposeError<I>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.role.is_leader() {
+      return Err(crate::ProposeError::NotLeader {
+        leader: self.leader,
+      });
+    }
+    // One change in flight at a time: refuse if a ConfChange entry is not yet applied.
+    if self.pending_conf_index > self.applied {
+      return Err(crate::ProposeError::ConfChangeInFlight);
+    }
+    let index = self.append_conf_change(log, stable, cc);
+    Ok(index)
   }
 
   /// Propose a command on the leader. Returns the assigned index, or `NotLeader`.
@@ -826,7 +976,72 @@ where
           }
         }
         crate::EntryKind::Empty => {} // no-op: just advance applied
-        crate::EntryKind::ConfChange => {} // M6: membership applied here
+        crate::EntryKind::ConfChange => {
+          // Decode the ConfChangeV2 payload. On failure: sticky fatal (mirror Normal decode).
+          let cc = match <crate::ConfChangeV2<I> as crate::Data>::decode(entry.data()) {
+            Ok((_, c)) => c,
+            Err(_) => break,
+          };
+          // Dispatch to the Changer using the etcd rules:
+          //   empty changes + Auto transition  → leave_joint
+          //   transition != Auto OR >1 change   → enter_joint (auto_leave = transition != Explicit)
+          //   else (1 change, Auto transition)  → simple
+          let changer = crate::tracker::confchange::Changer::new(
+            log.last_index(),
+            self.config.max_inflight_msgs(),
+            self.config.max_inflight_bytes(),
+          );
+          let result = if cc.changes().is_empty()
+            && cc.transition() == crate::ConfChangeTransition::Auto
+          {
+            changer.leave_joint(&self.tracker)
+          } else if cc.transition() != crate::ConfChangeTransition::Auto || cc.changes().len() > 1 {
+            let auto_leave = cc.transition() != crate::ConfChangeTransition::Explicit;
+            changer.enter_joint(&self.tracker, auto_leave, cc.changes())
+          } else {
+            changer.simple(&self.tracker, cc.changes())
+          };
+          match result {
+            Ok(new_tracker) => {
+              self.tracker = new_tracker;
+              let conf = self.tracker.conf_state();
+              self
+                .events
+                .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
+                  idx, conf,
+                )));
+              // U6: a leader that this change removed (or demoted to learner) is no longer a
+              // voter in the new configuration and must stop acting as leader.
+              // `is_voter()` checks BOTH joint halves, so during a joint phase where we are
+              // still in the outgoing config we keep leading (we must shepherd the joint →
+              // simple transition). We only step down once removed from BOTH halves.
+              // The step-down is at the SAME term (no term bump): this is a leader yielding
+              // to its own removal, not losing an election.
+              if self.role.is_leader()
+                && self.config.step_down_on_removal()
+                && !self.tracker.is_voter(&self.config.id())
+              {
+                self.role = Role::Follower;
+                self.leader = None;
+                self.heartbeat_deadline = None;
+                // Do NOT arm the election timer: a non-voter must not campaign (see
+                // handle_timeout / become_candidate guards). Leaving election_deadline
+                // disarmed is the right choice — a removed/demoted node has no business
+                // holding an election timer.
+                self.election_deadline = None;
+              }
+            }
+            // A committed, validly-decoded ConfChange that the Changer rejects is an
+            // unrecoverable logic violation (e.g. an overlapping change that should have
+            // been prevented upstream). Poison so the failure is detectable rather than
+            // a silent apply stall.
+            Err(_) => {
+              self.poison();
+              break;
+            }
+          }
+          // Do NOT call F::apply for ConfChange entries — they advance `applied` only.
+        }
       }
       self.applied = idx;
     }
@@ -838,6 +1053,11 @@ where
     log: &mut L,
     stable: &mut S,
   ) {
+    // Defensive guard: a non-voter (learner or removed node) must never campaign.
+    // The handle_timeout gate is the primary check; this guard closes any other call sites.
+    if !self.tracker.is_voter(&self.config.id()) {
+      return;
+    }
     self.term = self.term.next();
     // All pending work from the previous term is now stale (spec §7). Clear before recording
     // the self-vote below so old completions that arrive later are harmlessly ignored.
@@ -845,8 +1065,9 @@ where
     self.role = Role::Candidate;
     self.leader = None;
     self.voted_for = Some(self.config.id());
-    self.votes_granted.clear();
-    self.votes_granted.insert(self.config.id());
+    // Record self-vote in the ballot map (true = grant).
+    self.votes.clear();
+    self.votes.insert(self.config.id(), true);
     // Persist (term, self-vote). No Pending entry — a candidate doesn't owe an ack.
     let opid = self.mint_op_id();
     let hs = stable
@@ -858,7 +1079,11 @@ where
 
     let (last_index, last_term) = self.last_log(log);
     let (term, me) = (self.term, self.config.id());
-    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+    // Send RequestVote only to VOTER peers (not learners). Learners don't participate in
+    // elections; sending them a RequestVote wastes bandwidth and may confuse their state.
+    // Replication still goes to all peers (learners get AppendEntries from become_leader).
+    let voter_peers: std::vec::Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
+    for peer in voter_peers {
       self.send(
         peer,
         Message::RequestVote(crate::RequestVote::new(
@@ -866,8 +1091,8 @@ where
         )),
       );
     }
-    // single-node cluster: self-vote already a quorum
-    if self.votes_granted.len() >= self.config.quorum() {
+    // single-node cluster fast-path: self-vote already a quorum under joint config.
+    if self.tracker.vote_result(&self.votes).is_won() {
       self.become_leader(now, log, stable);
     }
   }
@@ -882,17 +1107,25 @@ where
     self.leader = Some(self.config.id());
     self.arm_heartbeat_timer(now);
 
-    // Initialize Progress for every voter (self included; self is fully caught up).
+    // Re-initialize Progress for every tracked member via reset_progress, then mark
+    // self as fully caught-up. reset_progress covers voters (both joint halves) ∪
+    // learners ∪ learners_next so no member is missing a Progress — a missing voter
+    // Progress reads match_index = ZERO and would silently block commit advancement.
     let last = log.last_index();
-    self.progress.clear();
-    let max_inflight_msgs = self.config.max_inflight_msgs();
-    let max_inflight_bytes = self.config.max_inflight_bytes();
-    for v in self.config.voters().to_vec() {
-      let mut p = crate::Progress::new(last.next(), max_inflight_msgs, max_inflight_bytes);
-      if v == self.config.id() {
-        p.maybe_update(last);
-      }
-      self.progress.insert(v, p);
+    // A newly-elected leader may have inherited an uncommitted ConfChange in its log tail.
+    // Conservatively block new conf changes until it has committed+applied that whole tail
+    // (etcd becomeLeader: "set pendingConfIndex to the last index in the log"). Without this,
+    // the one-in-flight guard (pending_conf_index > applied) is ZERO on a fresh leader and a
+    // second conf change could stack onto an inherited one, wedging apply on the joint dispatch.
+    self.pending_conf_index = last;
+    self.tracker.reset_progress(
+      last.next(),
+      self.config.max_inflight_msgs(),
+      self.config.max_inflight_bytes(),
+    );
+    // Self is fully caught up: advance own match_index to last.
+    if let Some(p) = self.tracker.progress_mut(&self.config.id()) {
+      p.maybe_update(last);
     }
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
@@ -1084,7 +1317,7 @@ where
     if !self.role.is_leader() {
       return;
     }
-    if let Some(pr) = self.progress.get_mut(&from) {
+    if let Some(pr) = self.tracker.progress_mut(&from) {
       pr.clear_probe_pause();
     }
     self.maybe_send_append(from, log, stable);
@@ -1115,7 +1348,7 @@ where
     if !self.role.is_leader() {
       return;
     }
-    let Some(pr) = self.progress.get_mut(&from) else {
+    let Some(pr) = self.tracker.progress_mut(&from) else {
       return;
     };
     if resp.reject() {
@@ -1126,7 +1359,7 @@ where
       let hint_index = resp.reject_hint_index();
       let hint_term = resp.reject_hint_term();
       let cur_next = pr.next_index();
-      // Compute the conflict index before re-borrowing self.progress mutably.
+      // Compute the conflict index before re-borrowing self.tracker.progress mutably.
       let conflict = self.find_conflict_by_term(log, hint_index, hint_term);
       // next_index must be at least 1 and must not advance past the current next on reject.
       let safe_next = if conflict == Index::ZERO || conflict >= cur_next {
@@ -1135,7 +1368,7 @@ where
         conflict
       };
       // Re-acquire progress to update (prior `pr` reference dropped implicitly by this point).
-      if let Some(p) = self.progress.get_mut(&from) {
+      if let Some(p) = self.tracker.progress_mut(&from) {
         p.become_probe();
         p.set_next_index(safe_next);
       }
@@ -1249,8 +1482,15 @@ where
       .events
       .push_back(crate::Event::SnapshotInstalled(meta.clone()));
 
-    // Step 7: M6 will wire dynamic membership from meta.conf() here. For now (M5, fixed
-    // config), the conf field is informational only — skip it.
+    // Step 7 (M6): install the membership from the snapshot's ConfState. A follower
+    // installing a snapshot jumps directly to the committed membership at that point;
+    // the Tracker is rebuilt from the snapshot's conf, superseding the prior config.
+    self.tracker = crate::Tracker::from_conf_state(
+      meta.conf(),
+      meta.last_index(),
+      self.config.max_inflight_msgs(),
+      self.config.max_inflight_bytes(),
+    );
 
     // Step 8: ack to the leader with match_index = last_index, signalling successful install.
     // The leader's maybe_update(last_index) >= pending_snapshot transitions the peer out of
@@ -1276,7 +1516,7 @@ where
     if !self.role.is_leader() {
       return;
     }
-    let Some(pr) = self.progress.get_mut(&from) else {
+    let Some(pr) = self.tracker.progress_mut(&from) else {
       return;
     };
     if resp.reject() {
@@ -1285,7 +1525,7 @@ where
       // is still below first_index, re-sends the snapshot.
       pr.become_probe();
       // Drop the mutable borrow of `pr` before calling maybe_send_append (which re-borrows
-      // self.progress). The pattern mirrors on_append_resp's reject branch.
+      // self.tracker). The pattern mirrors on_append_resp's reject branch.
       self.maybe_send_append(from, log, stable);
     } else {
       // Success: maybe_update drives the Snapshot → Probe transition regardless of its return
@@ -3183,7 +3423,7 @@ mod tests {
 
     // Set peer 2's progress so next_index = 3 < first_index = 6.
     let far_behind = Index::new(3);
-    if let Some(p) = ep.progress.get_mut(&2u64) {
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
       p.become_probe();
       p.set_next_index(far_behind);
     }
@@ -3215,7 +3455,7 @@ mod tests {
     );
 
     // Peer 2's progress must now be in Snapshot state with pending = offset.
-    let pr = ep.progress.get(&2u64).unwrap();
+    let pr = ep.tracker.progress(&2u64).unwrap();
     assert!(
       pr.state().is_snapshot(),
       "peer 2 must be in Snapshot state after sending InstallSnapshot"
@@ -3238,7 +3478,7 @@ mod tests {
     let (mut ep, log, stable) = make_leader_with_compacted_log(offset, 2);
 
     // Peer 2 is far behind (next_index < first_index).
-    if let Some(p) = ep.progress.get_mut(&2u64) {
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
       p.become_probe();
       p.set_next_index(Index::new(3));
     }
@@ -3268,7 +3508,7 @@ mod tests {
     let (mut ep, log, stable) = make_leader_with_compacted_log(offset, 2);
 
     // Set peer 2 far behind.
-    if let Some(p) = ep.progress.get_mut(&2u64) {
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
       p.become_probe();
       p.set_next_index(Index::new(3));
     }
@@ -3297,7 +3537,7 @@ mod tests {
     let first = log.first_index();
     assert_eq!(first, Index::new(offset + 1));
 
-    if let Some(p) = ep.progress.get_mut(&2u64) {
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
       p.become_probe();
       p.set_next_index(first); // exactly at boundary
     }
@@ -3684,10 +3924,10 @@ mod tests {
     while ep.poll_event().is_some() {}
 
     // Manually put peer 2 into Snapshot(10) state.
-    if let Some(p) = ep.progress.get_mut(&2u64) {
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
       p.become_snapshot(Index::new(10));
     }
-    assert!(ep.progress.get(&2u64).unwrap().state().is_snapshot());
+    assert!(ep.tracker.progress(&2u64).unwrap().state().is_snapshot());
 
     // --- Reject case: become_probe, then maybe_send_append re-enters probe ---
     ep.handle_message(
@@ -3704,12 +3944,12 @@ mod tests {
     );
     // After reject the peer must have transitioned to Probe.
     assert!(
-      ep.progress.get(&2u64).unwrap().state().is_probe(),
+      ep.tracker.progress(&2u64).unwrap().state().is_probe(),
       "reject SnapshotResp must transition peer to Probe"
     );
 
     // --- Success case: peer has been put back in Snapshot(10). ---
-    if let Some(p) = ep.progress.get_mut(&2u64) {
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
       p.become_snapshot(Index::new(10));
     }
     // Drain any messages from the probe that was triggered by the reject.
@@ -3728,7 +3968,7 @@ mod tests {
       )),
     );
     // maybe_update(10) >= pending_snapshot(10) → Probe; match_index == 10.
-    let pr = ep.progress.get(&2u64).unwrap();
+    let pr = ep.tracker.progress(&2u64).unwrap();
     assert!(
       pr.state().is_probe(),
       "success SnapshotResp must transition peer out of Snapshot state"
@@ -4073,6 +4313,874 @@ mod tests {
       ep.state_machine().count(),
       0,
       "SM must be empty after corrupt snapshot (no partial apply)"
+    );
+  }
+
+  // ── M6-U5: propose_conf_change + apply-at-commit tests ────────────────────────────────────────
+
+  /// Helper: build a single-node leader (node 1) with a VecLog + NoopStable, and drain storage
+  /// so the no-op entry at index 1 is committed and applied. Returns (ep, log, stable, d).
+  fn make_single_node_leader() -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::NoopStable,
+    crate::Instant,
+  ) {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // self-elects (quorum=1)
+    assert!(ep.role().is_leader());
+    // Drain so the no-op at index 1 commits and applies.
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+    (ep, log, stable, d)
+  }
+
+  /// Test 1: One-in-flight refusal.
+  /// A second `propose_conf_change` before the first is applied → `ConfChangeInFlight`.
+  /// After apply, a new one is accepted.
+  #[test]
+  fn conf_change_in_flight_refusal() {
+    use crate::{ConfChange, ConfChangeType, ProposeError};
+    let (mut ep, mut log, mut stable, d) = make_single_node_leader();
+
+    // First conf-change: AddNode(2). Should succeed.
+    let cc1 = ConfChange::new(ConfChangeType::AddNode, 2u64, bytes::Bytes::new());
+    let idx1 = ep
+      .propose_conf_change(d, &mut log, &stable, cc1)
+      .expect("first conf change must be accepted");
+    assert!(idx1 > crate::Index::ZERO);
+
+    // Second conf-change before first is applied: must be refused.
+    let cc2 = ConfChange::new(ConfChangeType::AddNode, 3u64, bytes::Bytes::new());
+    let err = ep
+      .propose_conf_change(d, &mut log, &stable, cc2.clone())
+      .expect_err("second conf change must be refused while first is in flight");
+    assert_eq!(
+      err,
+      ProposeError::ConfChangeInFlight,
+      "expected ConfChangeInFlight error"
+    );
+
+    // Drive the first conf-change to committed+applied (single-node cluster: self-quorum).
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // Now a new conf-change is accepted.
+    let cc3 = ConfChange::new(ConfChangeType::AddNode, 3u64, bytes::Bytes::new());
+    let idx3 = ep.propose_conf_change(d, &mut log, &stable, cc3);
+    assert!(idx3.is_ok(), "conf change must be accepted after apply");
+  }
+
+  /// Test 2: Simple AddNode applies at commit time.
+  ///
+  /// Invariants verified:
+  /// - Tracker is updated ONLY at apply time (not at propose time).
+  /// - `Event::ConfChanged` is emitted carrying the new `ConfState`.
+  /// - `F::apply` is NOT called for the ConfChange entry (SM apply-count unchanged).
+  #[test]
+  fn simple_add_node_applies_at_commit() {
+    use crate::{ConfChange, ConfChangeType};
+    let (mut ep, mut log, mut stable, d) = make_single_node_leader();
+
+    let sm_count_before = ep.state_machine().count();
+
+    // Propose AddNode(2) — must NOT immediately change the Tracker.
+    let cc = ConfChange::new(ConfChangeType::AddNode, 2u64, bytes::Bytes::new());
+    let _idx = ep
+      .propose_conf_change(d, &mut log, &stable, cc)
+      .expect("propose AddNode must succeed");
+
+    // Tracker must still only have voter 1 — not yet at commit time.
+    assert!(
+      !ep.tracker.is_voter(&2u64),
+      "AddNode must NOT take effect before commit"
+    );
+
+    // Drive to committed+applied (single-node: self-quorum on storage drain).
+    ep.handle_storage(d, &mut log, &mut stable);
+
+    // Now the Tracker must have node 2 as a voter.
+    assert!(
+      ep.tracker.is_voter(&2u64),
+      "AddNode must take effect after apply"
+    );
+
+    // SM apply-count must NOT have increased (ConfChange does not call F::apply).
+    assert_eq!(
+      ep.state_machine().count(),
+      sm_count_before,
+      "F::apply must NOT be called for a ConfChange entry"
+    );
+
+    // An Event::ConfChanged must have been emitted.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    let conf_changed: std::vec::Vec<_> = events.iter().filter(|e| e.is_conf_changed()).collect();
+    assert!(
+      !conf_changed.is_empty(),
+      "Event::ConfChanged must be emitted when AddNode is applied"
+    );
+    // The ConfState must contain voter 2.
+    if let crate::Event::ConfChanged(cc_ev) = conf_changed[0] {
+      assert!(
+        cc_ev.conf().is_voter(&2u64),
+        "ConfChanged event must carry a ConfState with voter 2"
+      );
+    }
+  }
+
+  /// Test 3: Simple RemoveNode applies at commit time.
+  #[test]
+  fn simple_remove_node_applies_at_commit() {
+    use crate::{ConfChange, ConfChangeType};
+    // Start with a 2-voter cluster (1, 2), single-node leader at id=1.
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // become candidate
+    // Self-vote is enough if quorum=1 among {1,2} with only self-vote — but actually 2-voter
+    // quorum=2. We need to hand-grant ourselves leadership via a VoteResp.
+    use crate::{Message, Term, VoteResp};
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader(), "node 1 must be leader");
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // Also need to advance commit for the no-op entry. The 2-voter quorum requires peer ack.
+    // Simulate peer 2 acking the no-op.
+    use crate::{AppendResp, Index};
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1), // ack no-op at index 1
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // Node 2 must be a voter initially.
+    assert!(
+      ep.tracker.is_voter(&2u64),
+      "node 2 must be a voter before remove"
+    );
+
+    // Propose RemoveNode(2).
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, 2u64, bytes::Bytes::new());
+    let _idx = ep
+      .propose_conf_change(d, &mut log, &stable, cc)
+      .expect("propose RemoveNode must succeed");
+
+    // Not yet applied — node 2 still a voter.
+    assert!(
+      ep.tracker.is_voter(&2u64),
+      "RemoveNode must NOT take effect before commit"
+    );
+
+    // Drive to commit: need quorum. Peer 2 acks the ConfChange entry at index 2.
+    ep.handle_storage(d, &mut log, &mut stable); // leader self-match → 2
+    // Peer 2 acks up to index 2 → quorum of {1,2} → commit.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(2), // ack ConfChange at index 2
+      )),
+    );
+
+    // Node 2 must now be gone from voters.
+    assert!(
+      !ep.tracker.is_voter(&2u64),
+      "RemoveNode must take effect after apply"
+    );
+
+    // ConfChanged event.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    assert!(
+      events.iter().any(|e| e.is_conf_changed()),
+      "Event::ConfChanged must be emitted when RemoveNode is applied"
+    );
+  }
+
+  /// Test 4: Non-leader refused.
+  #[test]
+  fn non_leader_conf_change_is_refused() {
+    use crate::{ConfChange, ConfChangeType, ProposeError};
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let stable = crate::testkit::NoopStable::default();
+
+    assert!(ep.role().is_follower());
+    let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new());
+    let err = ep
+      .propose_conf_change(Instant::ORIGIN, &mut log, &stable, cc)
+      .expect_err("follower must refuse propose_conf_change");
+    assert!(
+      matches!(err, ProposeError::NotLeader { .. }),
+      "expected NotLeader error, got {err:?}"
+    );
+  }
+
+  // ── Review findings C1/I1 regression tests ────────────────────────────────────────────────────
+
+  /// Regression: a freshly-elected leader must not accept a new ConfChange while an inherited
+  /// one is uncommitted (review finding C1).
+  ///
+  /// Scenario: node 2 is a follower that receives a ConfChange entry from leader 1 but the
+  /// entry is NOT committed (leader_commit stays at 0). Node 2 then wins an election and
+  /// becomes leader. Its log contains an uncommitted ConfChange at index 2 (the inherited tail).
+  /// The one-in-flight guard must fire and refuse a second ConfChange proposal.
+  ///
+  /// On the OLD code (before Fix C1): `pending_conf_index` was ZERO on a fresh leader, so
+  /// `ZERO > applied` is false and the second ConfChange was wrongly accepted → Ok(_).
+  /// On the FIXED code: `become_leader` sets `pending_conf_index = last_index` (= 2), so
+  /// `2 > applied(0)` is true → Err(ConfChangeInFlight).
+  #[test]
+  fn inherited_uncommitted_conf_change_blocks_new_proposal() {
+    use crate::{
+      AppendEntries, ConfChange, ConfChangeType, Entry, EntryKind, Index, Message, ProposeError,
+      Term, VoteResp,
+    };
+    use core::time::Duration;
+
+    // Node 2 is a follower in a 3-voter cluster {1, 2, 3}.
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Step 1: Leader 1 (term 1) sends node 2 an AppendEntries carrying:
+    //   - index 1: the leader's no-op (Empty entry)
+    //   - index 2: a ConfChange entry (AddNode 4)
+    // leader_commit = 0 → neither entry is committed on node 2.
+    use crate::Data as _;
+    let cc_payload = {
+      let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()).into_v2();
+      let mut buf = std::vec::Vec::new();
+      cc.encode(&mut buf);
+      bytes::Bytes::from(buf)
+    };
+    let noop = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    );
+    let conf_entry = Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::ConfChange,
+      cc_payload,
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![noop, conf_entry],
+        Index::ZERO, // leader_commit = 0: nothing committed
+      )),
+    );
+    // Drain the deferred append completion so entries are in the log.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Verify: log holds entries at indices 1 and 2; applied and commit are still 0.
+    assert_eq!(
+      log.last_index(),
+      Index::new(2),
+      "follower log must hold both entries"
+    );
+    assert_eq!(ep.applied, Index::ZERO, "nothing applied yet");
+    assert_eq!(ep.commit, Index::ZERO, "nothing committed yet");
+
+    // Step 2: A term advance causes node 2 to become a candidate in term 2 and win.
+    // Simulate: election timeout fires, node 2 becomes candidate (term 2), then receives a
+    // grant from node 3 → quorum (self + 3) → become_leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // become candidate, term 2
+    assert!(ep.role().is_candidate());
+    while ep.poll_message().is_some() {}
+
+    // Node 3 grants the vote → quorum reached → become_leader.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::VoteResp(VoteResp::new(Term::new(2), 3u64, false, false)),
+    );
+    assert!(ep.role().is_leader(), "node 2 must be leader after quorum");
+
+    // Step 3: Now call propose_conf_change(AddNode(5)).
+    // The inherited tail (index 2: uncommitted ConfChange) must block this.
+    // Fix C1 sets pending_conf_index = last (= 2) in become_leader; applied = 0;
+    // so 2 > 0 is true → ConfChangeInFlight.
+    let cc_new = ConfChange::new(ConfChangeType::AddNode, 5u64, bytes::Bytes::new());
+    let result = ep.propose_conf_change(d, &mut log, &stable, cc_new);
+    assert_eq!(
+      result,
+      Err(ProposeError::ConfChangeInFlight),
+      "a freshly-elected leader must refuse a new ConfChange while an inherited one is \
+       uncommitted (review finding C1)"
+    );
+  }
+
+  /// Regression: a committed ConfChange that the Changer rejects must poison the node
+  /// rather than silently stalling apply (review finding I1).
+  ///
+  /// Scenario: node 2 (follower) receives an AppendEntries that carries a leave-joint
+  /// ConfChange entry and commits it (leader_commit covers it). The node is NOT in joint
+  /// config, so Changer::leave_joint returns Err. Fix I1 adds `self.poison()` in that
+  /// branch so the failure is observable rather than a silent apply stall.
+  #[test]
+  fn changer_error_at_apply_poisons_node() {
+    use crate::{AppendEntries, Entry, EntryKind, Index, Message, Term};
+    use core::time::Duration;
+
+    // Node 2 is a follower in a 3-voter cluster {1, 2, 3}.
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Build a leave-joint ConfChange payload. The node is not in joint config, so
+    // when this entry commits the Changer will return Err(NotInJointConfig).
+    use crate::Data as _;
+    let leave_payload = {
+      let cc = crate::ConfChangeV2::<u64>::leave_joint();
+      let mut buf = std::vec::Vec::new();
+      cc.encode(&mut buf);
+      bytes::Bytes::from(buf)
+    };
+
+    // Leader 1 (term 1) sends two entries: a no-op and the bad leave-joint ConfChange.
+    // leader_commit = 2 forces the follower to commit and apply both entries immediately.
+    let noop = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    );
+    let leave_entry = Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::ConfChange,
+      leave_payload,
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![noop, leave_entry],
+        Index::new(2), // leader_commit = 2: both entries committed
+      )),
+    );
+    // Drain the deferred append completion so apply_committed runs with the durable entries.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+    // The Changer must have rejected leave_joint (not in joint) → node poisoned (Fix I1).
+    assert!(
+      ep.is_poisoned(),
+      "node must be poisoned when Changer rejects a committed ConfChange at apply time \
+       (review finding I1)"
+    );
+  }
+
+  // ── M6-U6: leader step-down on self-removal/demotion ─────────────────────────────────────────
+
+  /// Helper: elect node 1 as leader of a 3-voter cluster {1, 2, 3}, drive the no-op to
+  /// committed+applied, then return (ep, log, stable, d).
+  fn make_three_node_leader() -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::NoopStable,
+    crate::Instant,
+  ) {
+    use crate::{Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // candidate
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    // Drain storage: no-op LeaderAppend fires → self match → commit advances.
+    ep.handle_storage(d, &mut log, &mut stable);
+    // Need peer ack to commit the no-op in a 3-voter cluster (quorum=2).
+    use crate::{AppendResp, Index};
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        crate::Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+    (ep, log, stable, d)
+  }
+
+  /// Test U6-1: A leader that removes itself (RemoveNode(self)) steps down immediately when
+  /// the ConfChange is committed+applied.
+  ///
+  /// Invariants:
+  /// - role → Follower (same term, no term bump)
+  /// - leader → None
+  /// - heartbeat_deadline → None (no longer heartbeating)
+  /// - election_deadline → None (non-voter must not campaign)
+  /// - is_voter(self) == false in the new Tracker
+  #[test]
+  fn leader_steps_down_on_self_removal() {
+    use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+
+    let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+    let self_id = ep.id();
+    let term_before = ep.term();
+
+    // Propose RemoveNode(self).
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, self_id, bytes::Bytes::new());
+    let idx = ep
+      .propose_conf_change(d, &mut log, &stable, cc)
+      .expect("RemoveNode(self) must be accepted");
+
+    // Not yet committed: leader must still be leader.
+    assert!(
+      ep.role().is_leader(),
+      "leader must not step down before commit"
+    );
+
+    // Drive to commit: leader self-match via storage drain, then peer 2 acks.
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        idx,
+      )),
+    );
+
+    // After apply: leader must have stepped down.
+    assert!(
+      ep.role().is_follower(),
+      "leader must step down after RemoveNode(self) is applied"
+    );
+    assert_eq!(
+      ep.leader(),
+      None,
+      "leader field must be cleared after step-down"
+    );
+    assert!(
+      ep.heartbeat_deadline.is_none(),
+      "heartbeat_deadline must be None after step-down"
+    );
+    assert!(
+      ep.election_deadline.is_none(),
+      "election_deadline must be None: a non-voter must not campaign"
+    );
+    // Step-down is at the same term (no bump).
+    assert_eq!(ep.term(), term_before, "step-down must not bump the term");
+    // The new Tracker must not have self as a voter.
+    assert!(
+      !ep.tracker.is_voter(&self_id),
+      "self must not be a voter after RemoveNode(self) is applied"
+    );
+  }
+
+  /// Test U6-2: A leader demoted to learner (AddLearnerNode(self)) also steps down.
+  #[test]
+  fn leader_steps_down_on_demotion_to_learner() {
+    use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+
+    let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+    let self_id = ep.id();
+    let term_before = ep.term();
+
+    // Propose AddLearnerNode(self) — demotes the current leader to learner.
+    let cc = ConfChange::new(ConfChangeType::AddLearnerNode, self_id, bytes::Bytes::new());
+    let idx = ep
+      .propose_conf_change(d, &mut log, &stable, cc)
+      .expect("AddLearnerNode(self) must be accepted");
+
+    // Not yet committed: leader must still be leader.
+    assert!(
+      ep.role().is_leader(),
+      "leader must not step down before commit"
+    );
+
+    // Drive to commit.
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        idx,
+      )),
+    );
+
+    // After apply: leader stepped down; self is now a learner (not a voter).
+    assert!(
+      ep.role().is_follower(),
+      "leader must step down after AddLearnerNode(self) is applied"
+    );
+    assert_eq!(ep.leader(), None, "leader field must be cleared");
+    assert!(
+      ep.heartbeat_deadline.is_none(),
+      "heartbeat_deadline must be None"
+    );
+    assert!(
+      ep.election_deadline.is_none(),
+      "election_deadline must be None"
+    );
+    assert_eq!(ep.term(), term_before, "step-down must not bump the term");
+    assert!(
+      !ep.tracker.is_voter(&self_id),
+      "self must not be a voter after demotion to learner"
+    );
+    assert!(
+      ep.tracker.is_learner(&self_id),
+      "self must be a learner after AddLearnerNode(self)"
+    );
+  }
+
+  /// Test U6-3: A non-voter (learner) that has an election timer fire must NOT become a
+  /// candidate. The term must not change and the role must stay Follower.
+  #[test]
+  fn non_voter_does_not_campaign_on_timeout() {
+    use core::time::Duration;
+
+    // Node 4 is a learner in {voters: [1,2,3], learners: [4]}.
+    // We bootstrap as if 4 is a voter (Config requirement) then manually adjust the Tracker.
+    let cfg = crate::Config::try_new(
+      4u64,
+      std::vec![1u64, 2u64, 3u64, 4u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 99, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Demote node 4 to learner in the Tracker by rebuilding it from a ConfState that has
+    // node 4 as a learner, not a voter.
+    let learner_cs = crate::ConfState::new([1u64, 2u64, 3u64], [4u64], [], [], false);
+    ep.tracker = crate::Tracker::from_conf_state(&learner_cs, crate::Index::ZERO, 256, 0);
+
+    // Sanity: node 4 is NOT a voter.
+    assert!(!ep.tracker.is_voter(&4u64), "node 4 must not be a voter");
+    assert!(ep.tracker.is_learner(&4u64), "node 4 must be a learner");
+
+    let term_before = ep.term();
+
+    // Arm the election deadline to now (expired).
+    ep.election_deadline = Some(Instant::ORIGIN);
+
+    // Fire handle_timeout at now (deadline expired).
+    ep.handle_timeout(Instant::ORIGIN, &mut log, &mut stable);
+
+    // Non-voter must NOT have started an election.
+    assert!(
+      ep.role().is_follower(),
+      "non-voter must remain a follower after election timeout"
+    );
+    assert_eq!(
+      ep.term(),
+      term_before,
+      "non-voter must not bump the term on election timeout"
+    );
+    // No RequestVote messages emitted.
+    assert!(
+      ep.poll_message().is_none(),
+      "non-voter must not send RequestVote"
+    );
+  }
+
+  /// Test U6-4: With `step_down_on_removal = false`, a leader that removes itself keeps
+  /// the Leader role (the operator has opted out of the default behavior).
+  #[test]
+  fn step_down_disabled_leader_keeps_role_after_self_removal() {
+    use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+    use core::time::Duration;
+
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_step_down_on_removal(false); // opt out
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // Propose and apply RemoveNode(self).
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, 1u64, bytes::Bytes::new());
+    let idx = ep
+      .propose_conf_change(d, &mut log, &stable, cc)
+      .expect("RemoveNode(self) must be accepted");
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        idx,
+      )),
+    );
+
+    // With step_down_on_removal=false, the leader must keep the Leader role.
+    assert!(
+      ep.role().is_leader(),
+      "leader must keep leadership when step_down_on_removal=false"
+    );
+  }
+
+  /// Test U6-5: Joint phase — a leader still present in the outgoing joint half must NOT
+  /// step down mid-joint (it must shepherd the joint → simple transition).
+  ///
+  /// We use `enter_joint` with `auto_leave=false` (Explicit transition) so the leader stays
+  /// in a joint config where the outgoing half still contains self. `is_voter` checks BOTH
+  /// halves, so the leader remains a voter and must NOT step down.
+  #[test]
+  fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
+    use crate::{AppendResp, ConfChangeType, Index, Message, Term};
+    use core::time::Duration;
+
+    // 3-voter cluster {1, 2, 3}. We propose a joint change that replaces node 3 with node 4
+    // via enter_joint (Explicit transition). Node 1 (leader) is still in both the incoming
+    // AND outgoing half → is_voter(1) == true → must not step down.
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    // Commit the no-op via peer 2.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // Propose an Explicit joint change: add node 4, remove node 3. Node 1 stays in BOTH
+    // incoming and outgoing halves, so is_voter(1) == true throughout.
+    let ccv2 = crate::ConfChangeV2::new(
+      crate::ConfChangeTransition::Explicit,
+      std::vec![
+        crate::ConfChangeSingle::new(ConfChangeType::AddNode, 4u64),
+        crate::ConfChangeSingle::new(ConfChangeType::RemoveNode, 3u64),
+      ],
+      bytes::Bytes::new(),
+    );
+    let idx = ep
+      .propose_conf_change_v2(d, &mut log, &stable, ccv2)
+      .expect("joint conf change must be accepted");
+
+    // Drive to commit: storage drain + peer 2 ack.
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        idx,
+      )),
+    );
+
+    // We are now in joint config. Node 1 is still in both halves → is_voter(1) == true.
+    assert!(
+      ep.tracker.is_joint(),
+      "cluster must be in joint configuration"
+    );
+    assert!(
+      ep.tracker.is_voter(&1u64),
+      "node 1 must still be a voter in the joint config (outgoing half)"
+    );
+    // Leader must NOT have stepped down.
+    assert!(
+      ep.role().is_leader(),
+      "leader must not step down mid-joint when still a voter in the outgoing half"
     );
   }
 }
