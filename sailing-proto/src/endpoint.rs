@@ -496,15 +496,17 @@ where
   /// The `OpId` of the FIRST HardState write that carried `last_submitted_term`. When a `Wrote` completion
   /// with `opid >= term_persist_opid` arrives (stable completions are ordered), that term is durable.
   term_persist_opid: crate::OpId,
-  /// R34: a SUCCESS `AppendResp` deferred until `self.term` is durable, tagged with the term it was
-  /// deferred under. A follower must not RESPOND to an AppendEntries under a term whose HardState write
-  /// is not yet durable (Raft §5.1: persist `currentTerm` before responding to RPCs). Flushed in
-  /// `on_stable_wrote` once the term is durable; the match is re-derived from the live `ack_watermark()`
-  /// then, so it is never stale, and a tag from a superseded term is dropped.
-  term_gated_append_ack: Option<(I, crate::Term)>,
-  /// R34: a SUCCESS `SnapshotResp` deferred until `self.term` is durable — the snapshot analogue of
-  /// `term_gated_append_ack`.
-  term_gated_snapshot_ack: Option<(I, crate::Term)>,
+  /// R34/R35: a SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
+  /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
+  /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
+  /// (Raft §5.1: persist `currentTerm` before responding to RPCs). Flushed in `on_stable_wrote` as
+  /// `proven.min(ack_watermark())` — `proven` caps to what the leader matched (never over-ack a durable-
+  /// but-divergent tail; the R35 hole) and `ack_watermark()` caps to durability. A superseded-term tag
+  /// is dropped; same-`(leader, term)` deferrals keep the MAX proven extent (acks are cumulative).
+  term_gated_append_ack: Option<(I, crate::Term, Index)>,
+  /// R34/R35: a SUCCESS `SnapshotResp` deferred until `self.term` is durable — the snapshot analogue of
+  /// `term_gated_append_ack` (`proven` = the snapshot boundary / committed match).
+  term_gated_snapshot_ack: Option<(I, crate::Term, Index)>,
   /// Log index of the most recently appended (not-yet-applied) `ConfChange` entry.
   ///
   /// Initialized to `Index::ZERO` in both `new` and `restart`. On restart, ZERO is acceptable
@@ -842,6 +844,19 @@ where
       Pending::FollowerAck { match_index, .. } => *match_index <= boundary,
       _ => true,
     });
+    // R34/R35: a DEFERRED success ack also caps its proven match to the new boundary — the discarded
+    // tail can no longer back it. (The flush already clamps by `ack_watermark()`, which regresses here,
+    // so this is defense-in-depth that keeps the stored extent honest.)
+    if let Some((to, term, proven)) = self.term_gated_append_ack {
+      if proven > boundary {
+        self.term_gated_append_ack = Some((to, term, boundary));
+      }
+    }
+    if let Some((to, term, proven)) = self.term_gated_snapshot_ack {
+      if proven > boundary {
+        self.term_gated_snapshot_ack = Some((to, term, boundary));
+      }
+    }
   }
 
   fn submit_write<S: StableStore<NodeId = I>>(
@@ -875,28 +890,31 @@ where
 
   /// Flush any term-gated success ack once `self.term` is durable (called from `on_stable_wrote` after
   /// a `Wrote` completion may have advanced the durability watermark). A tag from a superseded term is
-  /// dropped (the leader/term has since changed); a current-term tag is sent with its match re-derived
-  /// from the LIVE `ack_watermark()`, so deferral never reports a stale or since-truncated index.
+  /// dropped (the leader/term has since changed); a current-term tag is sent with its match clamped to
+  /// `proven.min(ack_watermark())`. `proven` is the highest extent the leader's RPC(s) actually MATCHED
+  /// on this follower (so the flush can never over-ack a durable-but-DIVERGENT tail the current leader
+  /// never replicated — the R35 hole), and `ack_watermark()` is the live durability cap (so it never
+  /// reports a since-truncated index either).
   fn flush_term_gated_acks(&mut self) {
-    if matches!(self.term_gated_snapshot_ack, Some((_, t)) if t != self.term) {
+    if matches!(self.term_gated_snapshot_ack, Some((_, t, _)) if t != self.term) {
       self.term_gated_snapshot_ack = None;
     }
-    if matches!(self.term_gated_append_ack, Some((_, t)) if t != self.term) {
+    if matches!(self.term_gated_append_ack, Some((_, t, _)) if t != self.term) {
       self.term_gated_append_ack = None;
     }
     if !self.term_is_durable() {
       return;
     }
     let (term, me) = (self.term, self.config.id());
-    if let Some((to, _)) = self.term_gated_snapshot_ack.take() {
-      let match_index = self.commit.min(self.ack_watermark());
+    if let Some((to, _, proven)) = self.term_gated_snapshot_ack.take() {
+      let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
         Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
       );
     }
-    if let Some((to, _)) = self.term_gated_append_ack.take() {
-      let match_index = self.ack_watermark();
+    if let Some((to, _, proven)) = self.term_gated_append_ack.take() {
+      let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
         Message::AppendResp(crate::AppendResp::new(
@@ -911,12 +929,17 @@ where
     }
   }
 
-  /// Emit a SUCCESS `AppendResp(match=match_index)` if `self.term` is durable; otherwise DEFER it (R34
-  /// persist-before-respond) until [`flush_term_gated_acks`] releases it. Deferral collapses to the
-  /// latest tag (acks are cumulative) and re-derives the match from the live watermark at flush.
-  fn send_or_gate_append_ack(&mut self, to: I, match_index: Index) {
+  /// Emit a SUCCESS `AppendResp` if `self.term` is durable; otherwise DEFER it (R34 persist-before-
+  /// respond) until [`flush_term_gated_acks`] releases it. `proven` is the extent this AppendEntries
+  /// actually matched on the follower (`last_new` / the deferred-append match) — NOT pre-clamped to
+  /// durability. This fn applies `proven.min(ack_watermark())` both on the immediate send and (via the
+  /// stored `proven`) at flush, so a deferred ack can NEVER over-ack a durable-but-divergent tail the
+  /// leader did not replicate (R35). Deferral keeps the MAX proven extent for this `(leader, term)` —
+  /// acks are cumulative, and the durability clamp is re-applied at flush.
+  fn send_or_gate_append_ack(&mut self, to: I, proven: Index) {
     if self.term_is_durable() {
       let (term, me) = (self.term, self.config.id());
+      let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
         Message::AppendResp(crate::AppendResp::new(
@@ -929,21 +952,35 @@ where
         )),
       );
     } else {
-      self.term_gated_append_ack = Some((to, self.term));
+      let proven = match self.term_gated_append_ack {
+        Some((prev_to, prev_term, prev)) if prev_to == to && prev_term == self.term => {
+          prev.max(proven)
+        }
+        _ => proven,
+      };
+      self.term_gated_append_ack = Some((to, self.term, proven));
     }
   }
 
-  /// Emit a SUCCESS `SnapshotResp(match=match_index)` if `self.term` is durable; otherwise DEFER it
-  /// (R34 persist-before-respond) until [`flush_term_gated_acks`] releases it.
-  fn send_or_gate_snapshot_ack(&mut self, to: I, match_index: Index) {
+  /// Emit a SUCCESS `SnapshotResp` if `self.term` is durable; otherwise DEFER it (R34 persist-before-
+  /// respond). `proven` (the snapshot boundary / committed match) is clamped to `ack_watermark()` on
+  /// send and at flush — the snapshot analogue of [`send_or_gate_append_ack`].
+  fn send_or_gate_snapshot_ack(&mut self, to: I, proven: Index) {
     if self.term_is_durable() {
       let (term, me) = (self.term, self.config.id());
+      let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
         Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
       );
     } else {
-      self.term_gated_snapshot_ack = Some((to, self.term));
+      let proven = match self.term_gated_snapshot_ack {
+        Some((prev_to, prev_term, prev)) if prev_to == to && prev_term == self.term => {
+          prev.max(proven)
+        }
+        _ => proven,
+      };
+      self.term_gated_snapshot_ack = Some((to, self.term, proven));
     }
   }
 
@@ -2012,17 +2049,13 @@ where
     }
     match self.pending.remove(&opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
-        // Persist-before-ack: clamp the deferred ack to `ack_watermark()`. This fires when the append's
-        // bytes are durable, but if a freshly-installed snapshot's blob is still in flight the entry sits
-        // ABOVE the snapshot boundary on a baseline that is NOT yet durable — a crash would orphan it —
-        // so `ack_watermark()` caps at the boundary in that window; once the blob lands the next
-        // AppendEntries/heartbeat re-acks the higher match. In the steady state `match_index <=
-        // durable_index`, so this is a no-op.
-        let ack_index = match_index.min(self.ack_watermark());
-        // R34 persist-before-RESPOND: the entries are durable, but a follower must not ack under a term
-        // whose HardState write is not yet durable. If the term is still in flight, DEFER — the ack is
-        // released by `flush_term_gated_acks` once `on_stable_wrote` sees the term durable.
-        self.send_or_gate_append_ack(to, ack_index);
+        // `match_index` is the extent this append proved (its `last_new`). `send_or_gate_append_ack`
+        // applies the persist-before-ack clamp `proven.min(ack_watermark())` itself — both when sending
+        // now and at flush — so a freshly-installed snapshot's in-flight blob (ack_watermark caps at the
+        // boundary) and a durable-but-divergent tail (proven caps to what the leader matched, R35) are
+        // both respected. R34 persist-before-RESPOND: if the just-adopted term is not yet durable this
+        // DEFERS, released by `flush_term_gated_acks` once `on_stable_wrote` sees the term durable.
+        self.send_or_gate_append_ack(to, match_index);
       }
       // Role-gate (defense-in-depth): only a current leader advances its own match index
       // and commit. `pending` is cleared on every term change, so a stale `LeaderAppend`
@@ -3143,11 +3176,12 @@ where
       // no durable baseline yet. Either over-ack lets the leader count a phantom replica and commit an
       // entry a crash loses. When the tail/blob flushes, the deferred FollowerAck or next heartbeat
       // reports the higher match.
-      let ack_index = last_new.min(self.ack_watermark());
-      // R34 persist-before-RESPOND: defer this success ack if `self.term` (possibly just adopted from a
-      // higher-term heartbeat) is not yet durable; released by `flush_term_gated_acks`.
+      // `last_new` is the extent this (empty/duplicate) RPC proved; `send_or_gate_append_ack` applies the
+      // persist-before-ack clamp `last_new.min(ack_watermark())` itself (so an in-flight tail/blob and a
+      // durable-but-divergent tail are both respected — R35). R34 persist-before-RESPOND: defer if
+      // `self.term` (possibly just adopted from a higher-term heartbeat) is not yet durable.
       let leader = ae.leader();
-      self.send_or_gate_append_ack(leader, ack_index);
+      self.send_or_gate_append_ack(leader, last_new);
     }
   }
 
@@ -3861,12 +3895,13 @@ where
     // watermark, and `ack_watermark() >= meta.last_index()` holds whenever the durable log (or, during a
     // pending install, the snapshot boundary) already covers the already-quorum-committed snapshot index.
     if meta.last_index() <= self.commit {
-      // R34 persist-before-RESPOND: defer if `self.term` (the install message's term) is not yet durable
-      // — on this stale path `ensure_term_durable` does not run (no install), so the term write is the
-      // post-dispatch catch-all in `handle_message`, and `flush_term_gated_acks` releases this ack.
-      let ack = self.commit.min(self.ack_watermark());
+      // `self.commit` is this follower's committed (hence matched) prefix; `send_or_gate_snapshot_ack`
+      // applies the `commit.min(ack_watermark())` persist-before-ack clamp itself. R34 persist-before-
+      // RESPOND: defer if `self.term` (the install message's term) is not yet durable — on this stale
+      // path `ensure_term_durable` does not run (no install), so the term write is the post-dispatch
+      // catch-all in `handle_message`, and `flush_term_gated_acks` releases this ack.
       let leader = is.leader();
-      self.send_or_gate_snapshot_ack(leader, ack);
+      self.send_or_gate_snapshot_ack(leader, self.commit);
       return;
     }
 
@@ -7929,6 +7964,82 @@ mod tests {
       acks.len(),
       1,
       "the success ack is sent exactly once the term is durable"
+    );
+  }
+
+  /// R35 (the deferred ack must not over-ack a durable-but-DIVERGENT tail). A follower holds a durable
+  /// tail through index 10 (from an old leader), but a NEW higher-term leader proves consistency only
+  /// through index 8. The success ack is deferred (term not yet durable); when it flushes it must report
+  /// the leader-proven match (8), NOT the follower's durable_index (10) — otherwise the leader would
+  /// count this follower for entries 9-10 it never replicated and could commit without a real quorum.
+  ///
+  /// MUTATION: flush `self.ack_watermark()` instead of `proven.min(self.ack_watermark())` in
+  /// `flush_term_gated_acks` (i.e. drop the proven cap) → the flushed match is 10.
+  #[test]
+  fn deferred_ack_does_not_over_ack_divergent_tail() {
+    use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};
+    let (mut ep, mut log, mut stable) = make_follower();
+
+    // Durable divergent tail: entries 1..=10 at term 1, durable through 10. (`force_append` writes the
+    // VecLog directly; mirror `durable_index` so the follower's durable state is self-consistent.)
+    let entries: std::vec::Vec<_> = (1u64..=10)
+      .map(|i| {
+        Entry::new(
+          Term::new(1),
+          Index::new(i),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"x"),
+        )
+      })
+      .collect();
+    log.force_append(&entries);
+    ep.durable_index = Index::new(10);
+
+    // A NEW leader at a higher term (5) sends a heartbeat-shaped AppendEntries proving only through 8
+    // (prev=8, term 1 matches; no entries). The follower adopts term 5 (not yet durable) → the success
+    // ack DEFERS with proven match = last_new = 8.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(5),
+        1u64,
+        Index::new(8),
+        Term::new(1),
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    assert!(
+      !ep.term_is_durable(),
+      "term 5 is adopted but not yet durable"
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "the success ack is deferred under the non-durable term"
+    );
+
+    // Complete the term write → flush the deferred ack.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    let acks: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
+      .collect();
+    assert_eq!(
+      acks.len(),
+      1,
+      "the deferred ack is flushed once term 5 is durable"
+    );
+    let m = match acks[0].message() {
+      Message::AppendResp(a) => a.match_index(),
+      _ => unreachable!(),
+    };
+    assert_eq!(
+      m,
+      Index::new(8),
+      "the flushed ack must report only the leader-proven match (8), NOT the durable-but-divergent \
+       tail (10)"
     );
   }
 
