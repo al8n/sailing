@@ -308,6 +308,28 @@ where
     self.leader
   }
 
+  /// The current commit index — the highest log index this node believes is committed
+  /// (durably replicated to a quorum and safe to apply).
+  ///
+  /// Read-only observability accessor: exposes the in-memory `commit` watermark for
+  /// verification harnesses (the simulator's per-tick safety oracles read it to check
+  /// commit monotonicity, quorum-durability, and the recovered-commit/C1 durability
+  /// invariant). The proto never mutates state through this; it is a pure observer.
+  #[inline(always)]
+  pub const fn commit_index(&self) -> Index {
+    self.commit
+  }
+
+  /// The current applied index — the highest log index this node has applied to its
+  /// state machine. Always `applied <= commit_index()`.
+  ///
+  /// Read-only observability accessor (see [`commit_index`](Self::commit_index)). Used by
+  /// verification harnesses to relate the state machine's progress to the commit watermark.
+  #[inline(always)]
+  pub const fn applied_index(&self) -> Index {
+    self.applied
+  }
+
   /// The application state machine (read-only access for agreement checks).
   #[inline]
   pub const fn state_machine(&self) -> &F {

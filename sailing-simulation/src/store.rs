@@ -32,22 +32,24 @@ use sailing_proto::{
 };
 use std::{cell::Cell, collections::VecDeque, vec::Vec};
 
-/// A small deterministic SplitMix64 PRNG, local to the simulator's stores.
+/// A small deterministic SplitMix64 PRNG, local to the simulator.
 ///
 /// `sailing_proto::Prng` is `pub(crate)`, so the sim cannot reuse it; this is the same
-/// SplitMix64 algorithm. Seeded from the cluster seed so storage faults are reproducible:
-/// the same seed yields the same fault schedule. Never reads wall-clock / platform entropy.
+/// SplitMix64 algorithm. Seeded from the cluster seed so faults are reproducible: the same seed
+/// yields the same fault schedule. Never reads wall-clock / platform entropy. Shared by the
+/// storage-fault stores here and the [`crate::network`] fault model (one PRNG kind, distinct
+/// streams seeded from the cluster seed).
 #[derive(Debug, Clone, Copy, Default)]
-struct FaultPrng(u64);
+pub(crate) struct FaultPrng(u64);
 
 impl FaultPrng {
   #[inline(always)]
-  const fn new(seed: u64) -> Self {
+  pub(crate) const fn new(seed: u64) -> Self {
     Self(seed)
   }
 
   #[inline]
-  fn next_u64(&mut self) -> u64 {
+  pub(crate) fn next_u64(&mut self) -> u64 {
     self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = self.0;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -58,7 +60,7 @@ impl FaultPrng {
   /// `true` with probability `per_mille / 1000` (deterministic given the seed/stream).
   /// `per_mille == 0` is always `false`; `>= 1000` is always `true`.
   #[inline]
-  fn chance_per_mille(&mut self, per_mille: u16) -> bool {
+  pub(crate) fn chance_per_mille(&mut self, per_mille: u16) -> bool {
     if per_mille == 0 {
       return false;
     }

@@ -1,6 +1,6 @@
 //! A deterministic, single-threaded cluster of `Endpoint`s over an in-memory typed-message
 //! bus and a virtual clock. M0 wires the loop; M1+ exercises real consensus through it.
-use crate::{LogSm, MemLog, MemStable, StorageFaults};
+use crate::{LogSm, MemLog, MemStable, NetworkFaults, StorageFaults, network::NetPrng};
 use core::time::Duration;
 use sailing_proto::{
   ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, ReadState, Term,
@@ -21,6 +21,11 @@ type SnapCount = u64;
 type ConfChangedCount = u64;
 
 type Node = Endpoint<u64, LogSm>;
+
+/// One node's applied log as `(index, command-bytes)` pairs, copied out for cross-run / cross-node
+/// comparison (see [`Cluster::applied_entries_of`]). A `Vec<AppliedLog>` is the whole cluster's
+/// applied state captured at a point in time.
+pub type AppliedLog = Vec<(u64, Vec<u8>)>;
 
 /// An in-flight typed message: `(deliver_at, from, to, message)`.
 struct InFlight {
@@ -70,6 +75,25 @@ pub struct Cluster {
   /// `crash` that discards in-flight writes loses exactly the un-flushed window. Default false
   /// (synchronous stores, byte-identical to M0–M7).
   async_mode: bool,
+  /// Seeded network fault model applied per message at the bus-push point (latency/jitter/drop/
+  /// duplicate/reorder). Default [`NetworkFaults::none()`] — a faultless, zero-latency, FIFO bus
+  /// byte-identical to M0–M7 + M8-U1. Installed via [`Cluster::set_network_faults`].
+  net_faults: NetworkFaults,
+  /// Seeded network-fault PRNG, on a stream distinct from the per-node store seeds. Drives every
+  /// drop/dup roll and jitter draw, so the same cluster seed yields an identical run. Only consumed
+  /// when `net_faults` is non-`none()` (an all-off config touches the PRNG only for the bounded
+  /// drop/dup checks, which short-circuit on a `0` rate without a draw — see [`NetPrng`]).
+  net_prng: NetPrng,
+  /// Per-`(from,to)` last-scheduled `deliver_at`, used to keep deliveries FIFO when
+  /// `net_faults.reorder == false`: a message's `deliver_at` is clamped to be ≥ the previous one
+  /// for that ordered pair. Empty (and unused) when reorder is on or faults are off.
+  net_last_sched: BTreeMap<(u64, u64), Instant>,
+  /// Count of messages dropped by the seeded network fault model (non-vacuity counter so tests can
+  /// assert the fault model actually fired). Never incremented by partition/isolation drops.
+  net_dropped: u64,
+  /// Count of messages duplicated by the seeded network fault model (each fired duplication counts
+  /// once, i.e. the number of EXTRA copies pushed). Non-vacuity counter.
+  net_duplicated: u64,
 }
 
 impl Cluster {
@@ -160,6 +184,14 @@ impl Cluster {
       conf_changed,
       read_states,
       async_mode,
+      net_faults: NetworkFaults::none(),
+      // Network-fault PRNG seed: derived from the cluster seed on a stream DISTINCT from the
+      // per-node store seeds (which use `seed ^ id` / `seed.rotate_left(32) ^ id`), so the network
+      // schedule is reproducible yet independent of storage faults. `0x4E_4554` spells "NET".
+      net_prng: NetPrng::new(seed.rotate_left(16) ^ 0x004E_4554),
+      net_last_sched: BTreeMap::new(),
+      net_dropped: 0,
+      net_duplicated: 0,
     }
   }
 
@@ -349,6 +381,33 @@ impl Cluster {
     self.nodes[i].state_machine().applied().len()
   }
 
+  /// Node `id`'s applied `(index, command-bytes)` sequence, copied out for cross-run comparison.
+  ///
+  /// Used by the network-fault determinism test to assert two runs of the same seed produce
+  /// byte-identical applied logs. The agreement oracle ([`agreement_holds`](Self::agreement_holds))
+  /// compares these prefixes across nodes; this exposes a single node's sequence.
+  pub fn applied_entries_of(&self, id: u64) -> AppliedLog {
+    let i = self.node_idx[&id];
+    self.nodes[i]
+      .state_machine()
+      .applied()
+      .iter()
+      .map(|(idx, cmd)| (idx.get(), cmd.to_vec()))
+      .collect()
+  }
+
+  /// Number of messages DROPPED by the seeded network fault model since construction (a non-vacuity
+  /// counter so tests can assert the model actually fired). Excludes partition/isolation drops.
+  pub fn net_dropped(&self) -> u64 {
+    self.net_dropped
+  }
+
+  /// Number of message DUPLICATIONS fired by the seeded network fault model since construction
+  /// (counts each fired duplication once, i.e. extra copies pushed). A non-vacuity counter.
+  pub fn net_duplicated(&self) -> u64 {
+    self.net_duplicated
+  }
+
   /// Crash node `id`: lose all in-memory consensus state and any fsync still in-flight,
   /// but keep the durably-written store contents. The node is immediately restarted from
   /// its durable stores.
@@ -363,6 +422,10 @@ impl Cluster {
     self.snapshot_installs[i] = 0;
     // Drain any messages left in the bus to/from this node (stale in-flight traffic).
     self.bus.retain(|m| m.from != id && m.to != id);
+    // Drop the FIFO bookkeeping for any pair touching this node so the restarted node starts
+    // FIFO-fresh (a stale high-water mark would needlessly delay its new traffic). No-op when the
+    // network fault model is off (the map is empty).
+    self.net_last_sched.retain(|&(f, t), _| f != id && t != id);
   }
 
   /// The durable `last_index()` of node `id`'s log. In async mode this reflects only flushed
@@ -388,6 +451,22 @@ impl Cluster {
     let i = self.node_idx[&id];
     self.logs[i].set_faults(faults, seed);
     self.stables[i].set_faults(faults, seed.rotate_left(17));
+  }
+
+  /// Install a seeded [`NetworkFaults`] config on the typed-message bus: per-message
+  /// latency/jitter/drop/duplicate/reorder applied at the bus-push point in [`tick`](Self::tick),
+  /// AFTER the structural oracles run. Faults are deterministic given the cluster seed (the network
+  /// PRNG was seeded from it at construction). Defaults are all-off, so `new`/`new_async` keep a
+  /// faultless, zero-latency, FIFO bus byte-identical to M0–M7 + M8-U1.
+  ///
+  /// Re-seeds the network-fault PRNG from `seed` and clears the FIFO bookkeeping so the schedule is
+  /// reproducible from the call site (pass the cluster seed, or a fresh seed for a distinct stream).
+  /// Isolated/partitioned nodes still drop entirely — that full-partition behavior is independent
+  /// of these per-message faults.
+  pub fn set_network_faults(&mut self, faults: NetworkFaults, seed: u64) {
+    self.net_faults = faults;
+    self.net_prng = NetPrng::new(seed);
+    self.net_last_sched.clear();
   }
 
   /// Whether node `id` is poisoned (a fatal storage/apply error has made it inert). In async mode
@@ -762,7 +841,9 @@ impl Cluster {
       let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
       self.nodes[i].handle_storage(self.now, log, stable);
     }
-    // Collect outgoing messages produced by completion handlers.
+    // Collect outgoing messages produced by completion handlers (e.g. deferred acks once a staged
+    // append flushes). Same path as the `tick` outgoing-drain: the structural oracles + seeded
+    // network faults are applied via `schedule_send`.
     for i in 0..self.nodes.len() {
       let id = self.node_ids[i];
       if self.isolated.contains(&id) {
@@ -771,43 +852,7 @@ impl Cluster {
         while let Some(out) = self.nodes[i].poll_message() {
           any_new = true;
           let (to, message) = Outgoing::into_parts(out);
-          // ── Structural assertion (a): append-before-ack ──────────────────────────
-          // A success AppendResp must not outrun the node's durable log.
-          if let Message::AppendResp(a) = &message {
-            if !a.reject() {
-              assert!(
-                self.logs[i].last_index() >= a.match_index(),
-                "append-before-ack violated: node {id} acked {:?} but durable last_index is {:?}",
-                a.match_index(),
-                self.logs[i].last_index(),
-              );
-            }
-          }
-          // ── Structural assertion (b): one-grant-per-(node,term) ──────────────────
-          // A success VoteResp from `from` in term `T` to candidate `to` must not
-          // appear a second time for a different candidate — that would be a double-vote.
-          if let Message::VoteResp(vr) = &message {
-            if !vr.reject() {
-              let from = id;
-              let term = vr.term();
-              let grantee = to;
-              match self.grants.get(&(from, term)) {
-                Some(&prev) => assert_eq!(
-                  prev, grantee,
-                  "double-vote bug: node {from} granted vote in term {term:?} to both {prev} and {grantee}"
-                ),
-                None => {
-                  self.grants.insert((from, term), grantee);
-                }
-              }
-            }
-          }
-          self.bus.push_back(InFlight {
-            deliver_at: self.now,
-            from: id,
-            to,
-            message,
-          });
+          self.schedule_send(i, to, message);
         }
       }
       while let Some(ev) = self.nodes[i].poll_event() {
@@ -823,6 +868,115 @@ impl Cluster {
       }
     }
     any_new
+  }
+
+  /// Run the structural oracles on a message node `i` is SENDING, then apply the seeded
+  /// [`NetworkFaults`] and push the resulting `InFlight`(s) onto the bus.
+  ///
+  /// **Oracle ordering (critical):** the append-before-ack and one-grant-per-term tripwires run on
+  /// EVERY sent message, BEFORE the drop/duplicate roll — they audit what the node SENDS regardless
+  /// of delivery fate, so a dropped message never bypasses an oracle. (A reorder/dup must likewise
+  /// never produce a double-vote or a premature ack; the proto's idempotency must absorb them.)
+  ///
+  /// **Fault application (seeded, deterministic):**
+  /// - **drop:** with probability `drop_per_mille/1000`, do not push (the message is lost).
+  /// - **duplicate:** with probability `duplicate_per_mille/1000`, push the SAME message TWICE; each
+  ///   copy gets an independent jitter draw, so the copies may arrive at different times.
+  /// - **latency+jitter:** `deliver_at = now + latency + U[0, jitter]` (seeded uniform). With
+  ///   nonzero jitter messages can be delivered out of order; if `reorder == false`, each (from,to)
+  ///   pair's `deliver_at` is clamped to be ≥ the previous one for that pair (FIFO).
+  ///
+  /// When `net_faults.is_none()` this is byte-identical to the original push (no draw, no clamp,
+  /// `deliver_at == now`, exactly one `InFlight`). Returns whether at least one copy was pushed.
+  fn schedule_send(&mut self, i: usize, to: u64, message: Message<u64>) -> bool {
+    let from = self.node_ids[i];
+
+    // ── Structural assertion (a): append-before-ack ──────────────────────────────
+    // A success AppendResp must not outrun the node's durable log.
+    if let Message::AppendResp(a) = &message {
+      if !a.reject() {
+        assert!(
+          self.logs[i].last_index() >= a.match_index(),
+          "append-before-ack violated: node {from} acked {:?} but durable last_index is {:?}",
+          a.match_index(),
+          self.logs[i].last_index(),
+        );
+      }
+    }
+    // ── Structural assertion (b): one-grant-per-(node,term) ──────────────────────
+    // A success VoteResp from `from` in term `T` to candidate `to` must not appear a second time
+    // for a different candidate — that would be a double-vote. Holds under reorder+dup: a duplicate
+    // grant to the SAME candidate is fine; a grant to a DIFFERENT one in the same term is a bug.
+    if let Message::VoteResp(vr) = &message {
+      if !vr.reject() {
+        let term = vr.term();
+        match self.grants.get(&(from, term)) {
+          Some(&prev) => assert_eq!(
+            prev, to,
+            "double-vote bug: node {from} granted vote in term {term:?} to both {prev} and {to}"
+          ),
+          None => {
+            self.grants.insert((from, term), to);
+          }
+        }
+      }
+    }
+
+    // Fast path: faults off ⇒ original behavior (zero-latency, FIFO, single push). Keeps M0–M7 +
+    // M8-U1 byte-identical and never touches the network PRNG or FIFO map.
+    if self.net_faults.is_none() {
+      self.bus.push_back(InFlight {
+        deliver_at: self.now,
+        from,
+        to,
+        message,
+      });
+      return true;
+    }
+
+    // ── Seeded drop ───────────────────────────────────────────────────────────────
+    if self
+      .net_prng
+      .chance_per_mille(self.net_faults.drop_per_mille)
+    {
+      self.net_dropped += 1;
+      return false; // lost in flight
+    }
+
+    // ── Seeded duplicate ──────────────────────────────────────────────────────────
+    let copies = if self
+      .net_prng
+      .chance_per_mille(self.net_faults.duplicate_per_mille)
+    {
+      self.net_duplicated += 1;
+      2
+    } else {
+      1
+    };
+    for _ in 0..copies {
+      // Each copy gets an independent jitter draw (a dup may overtake its twin).
+      let jitter = self.net_prng.jitter_draw(self.net_faults.jitter);
+      let mut deliver_at = self.now + self.net_faults.latency + jitter;
+      // FIFO clamp: when reorder is disabled, never schedule a message before the previous one for
+      // this ordered pair (so jitter delays but never reorders within (from,to)).
+      if !self.net_faults.reorder {
+        let last = self
+          .net_last_sched
+          .entry((from, to))
+          .or_insert(Instant::ORIGIN);
+        if deliver_at < *last {
+          deliver_at = *last;
+        }
+        *last = deliver_at;
+      }
+      self.bus.push_back(InFlight {
+        deliver_at,
+        from,
+        to,
+        message: message.clone(),
+      });
+    }
+    true
   }
 
   /// Deliver all messages on the bus that are due at or before `self.now`.
@@ -899,40 +1053,10 @@ impl Cluster {
             any_new = true;
             progressed = true;
             let (to, message) = Outgoing::into_parts(out);
-            // ── Structural assertion (a): append-before-ack ──────────────────────
-            if let Message::AppendResp(a) = &message {
-              if !a.reject() {
-                assert!(
-                  self.logs[i].last_index() >= a.match_index(),
-                  "append-before-ack violated: node {id} acked {:?} but durable last_index is {:?}",
-                  a.match_index(),
-                  self.logs[i].last_index(),
-                );
-              }
-            }
-            // ── Structural assertion (b): one-grant-per-(node,term) ──────────────
-            if let Message::VoteResp(vr) = &message {
-              if !vr.reject() {
-                let from = id;
-                let term = vr.term();
-                let grantee = to;
-                match self.grants.get(&(from, term)) {
-                  Some(&prev) => assert_eq!(
-                    prev, grantee,
-                    "double-vote bug: node {from} granted vote in term {term:?} to both {prev} and {grantee}"
-                  ),
-                  None => {
-                    self.grants.insert((from, term), grantee);
-                  }
-                }
-              }
-            }
-            self.bus.push_back(InFlight {
-              deliver_at: self.now,
-              from: id,
-              to,
-              message,
-            });
+            // Run the structural oracles and apply the seeded network faults, then push onto the
+            // bus. The oracles run on every SENT message (inside `schedule_send`), BEFORE the
+            // drop/dup roll, so a dropped message never bypasses a tripwire.
+            self.schedule_send(i, to, message);
           }
         }
         while let Some(ev) = self.nodes[i].poll_event() {
@@ -997,5 +1121,71 @@ mod tests {
       }
     }
     assert!(found, "a leader should emerge within 100 ticks");
+  }
+
+  /// Drive a cluster to agreement on a batch and return each node's applied (index, command) log.
+  fn drive_and_capture(c: &mut Cluster, batch: u32) -> Vec<AppliedLog> {
+    assert!(c.run_until(300, |c| c.leader_count() == 1));
+    for i in 0..batch {
+      c.run_until(100, |c| c.leader_count() == 1);
+      c.propose(&i.to_le_bytes());
+      c.run_until(60, |_| false);
+    }
+    assert!(c.run_until(600, |c| c.agreement_holds()
+      && c.min_applied_len() >= batch as usize));
+    (0..c.size() as u64)
+      .map(|n| c.applied_entries_of(n))
+      .collect()
+  }
+
+  #[test]
+  fn faults_off_is_byte_identical_to_baseline() {
+    // A cluster with the network fault model installed as `none()` must produce the EXACT same run
+    // as a plain `Cluster::new` (no `deliver_at` change, no drops, no extra PRNG influence). This
+    // is the M0–M7 / M8-U1 byte-identity invariant, made explicit at the cluster level.
+    let baseline = {
+      let mut c = Cluster::new(3);
+      drive_and_capture(&mut c, 8)
+    };
+    let with_off_faults = {
+      let mut c = Cluster::new(3);
+      c.set_network_faults(NetworkFaults::none(), 0xDEAD_BEEF);
+      drive_and_capture(&mut c, 8)
+    };
+    assert_eq!(
+      baseline, with_off_faults,
+      "an all-off NetworkFaults config must be byte-identical to the faultless bus"
+    );
+    // And no fault counter moved (nothing was dropped or duplicated).
+    let mut c = Cluster::new(3);
+    c.set_network_faults(NetworkFaults::none(), 7);
+    drive_and_capture(&mut c, 8);
+    assert_eq!(c.net_dropped(), 0);
+    assert_eq!(c.net_duplicated(), 0);
+  }
+
+  #[test]
+  fn same_seed_same_run_under_faults() {
+    // Cluster-level determinism: identical seed ⇒ identical applied logs AND identical fault tallies.
+    let run = |seed: u64| -> (Vec<AppliedLog>, u64, u64) {
+      let mut c = Cluster::new(3);
+      c.set_network_faults(
+        NetworkFaults {
+          latency: Duration::from_millis(3),
+          jitter: Duration::from_millis(20),
+          drop_per_mille: 120,
+          duplicate_per_mille: 90,
+          reorder: true,
+        },
+        seed,
+      );
+      let logs = drive_and_capture(&mut c, 8);
+      (logs, c.net_dropped(), c.net_duplicated())
+    };
+    assert_eq!(
+      run(0x1234),
+      run(0x1234),
+      "same seed ⇒ identical run + tallies"
+    );
   }
 }
