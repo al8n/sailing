@@ -468,11 +468,135 @@ impl<I: Copy> SnapshotResp<I> {
   }
 }
 
+/// Leader → follower: "campaign immediately" signal used during leader transfer.
+///
+/// The recipient bypasses PreVote and any lease check (this is an authorized handoff) and
+/// immediately calls for a real election. Carries the sender's term so the recipient can
+/// accept it through the normal term pre-pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TimeoutNow<I> {
+  term: Term,
+  leader: I,
+}
+
+impl<I: Copy> TimeoutNow<I> {
+  /// Construct.
+  pub const fn new(term: Term, leader: I) -> Self {
+    Self { term, leader }
+  }
+
+  /// The sending leader's current term.
+  #[inline(always)]
+  pub const fn term(&self) -> Term {
+    self.term
+  }
+
+  /// The sending leader's node id.
+  #[inline(always)]
+  pub const fn leader(&self) -> I {
+    self.leader
+  }
+}
+
+/// Follower → leader: forward a linearizable read request.
+///
+/// A follower that receives a read request from a client forwards it to the known leader
+/// using this message. The leader processes it (confirming its leadership via a heartbeat
+/// round for `ReadOnlySafe`, or via the lease for `ReadOnlyLeaseBased`) and replies with
+/// a [`ReadIndexResp`].
+///
+/// `term` is set to the sender's current term so the message is not dropped by the leader's
+/// term pre-pass (which drops any message whose term is less than the leader's).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadIndex<I> {
+  term: Term,
+  from: I,
+  context: Bytes,
+}
+
+impl<I: Copy> ReadIndex<I> {
+  /// Construct.
+  pub fn new(term: Term, from: I, context: Bytes) -> Self {
+    Self {
+      term,
+      from,
+      context,
+    }
+  }
+
+  /// The sender's current term.
+  #[inline(always)]
+  pub const fn term(&self) -> Term {
+    self.term
+  }
+
+  /// The sender's node id.
+  #[inline(always)]
+  pub const fn from(&self) -> I {
+    self.from
+  }
+
+  /// Opaque application context identifying this read request.
+  #[inline(always)]
+  pub fn context(&self) -> &[u8] {
+    &self.context
+  }
+}
+
+/// Leader → follower: the confirmed read index for a forwarded read request.
+///
+/// After the leader confirms its leadership (heartbeat round or lease), it replies to the
+/// follower with the current committed index. The follower surfaces a `ReadState` once
+/// its `applied` index reaches `index`.
+///
+/// `term` is set to the sender's (leader's) current term so the message is not dropped by
+/// the follower's term pre-pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadIndexResp<I> {
+  term: Term,
+  from: I,
+  index: Index,
+  context: Bytes,
+}
+
+impl<I: Copy> ReadIndexResp<I> {
+  /// Construct.
+  pub fn new(term: Term, from: I, index: Index, context: Bytes) -> Self {
+    Self {
+      term,
+      from,
+      index,
+      context,
+    }
+  }
+
+  /// The sender's (leader's) current term.
+  #[inline(always)]
+  pub const fn term(&self) -> Term {
+    self.term
+  }
+
+  /// The sender's node id.
+  #[inline(always)]
+  pub const fn from(&self) -> I {
+    self.from
+  }
+
+  /// The confirmed committed index the follower must wait for before serving the read.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// Opaque application context echoed from the original [`ReadIndex`] request.
+  #[inline(always)]
+  pub fn context(&self) -> &[u8] {
+    &self.context
+  }
+}
+
 /// The full Raft message set. `#[non_exhaustive]` for forward-compat; derive variant
 /// predicates + unwrap accessors per §2.
-///
-/// `TimeoutNow`, `ReadIndex`, `ReadIndexResp` are added as new newtype variants in their
-/// milestones (M7); `#[non_exhaustive]` makes that additive.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -496,6 +620,12 @@ pub enum Message<I> {
   InstallSnapshot(InstallSnapshot<I>),
   /// Follower → leader: acknowledgement of an `InstallSnapshot`.
   SnapshotResp(SnapshotResp<I>),
+  /// Leader → transfer target: campaign immediately (leader transfer).
+  TimeoutNow(TimeoutNow<I>),
+  /// Follower → leader: forward a linearizable read request.
+  ReadIndex(ReadIndex<I>),
+  /// Leader → follower: confirmed read index for a forwarded read request.
+  ReadIndexResp(ReadIndexResp<I>),
 }
 
 /// A typed message addressed to a peer. The driver frames + sends it; the sim moves it
@@ -532,7 +662,13 @@ impl<I: Copy> Outgoing<I> {
 }
 
 impl<I: crate::NodeId> Message<I> {
-  /// The term carried by this message (every variant carries one).
+  /// The term carried by this message.
+  ///
+  /// Every variant carries a term field. For [`TimeoutNow`], [`ReadIndex`], and
+  /// [`ReadIndexResp`] the term is the sender's current term — it is included so that the
+  /// receiver's term pre-pass (`msg.term() < self.term → drop`) does not accidentally drop
+  /// these messages. Callers must set the term to the sender's current term when
+  /// constructing these messages.
   pub fn term(&self) -> crate::Term {
     match self {
       Self::AppendEntries(m) => m.term(),
@@ -543,6 +679,9 @@ impl<I: crate::NodeId> Message<I> {
       Self::HeartbeatResp(m) => m.term(),
       Self::InstallSnapshot(m) => m.term(),
       Self::SnapshotResp(m) => m.term(),
+      Self::TimeoutNow(m) => m.term(),
+      Self::ReadIndex(m) => m.term(),
+      Self::ReadIndexResp(m) => m.term(),
     }
   }
 }
@@ -560,6 +699,44 @@ mod term_test {
       bytes::Bytes::new(),
     ));
     assert_eq!(m.term(), crate::Term::new(5));
+  }
+
+  #[test]
+  fn timeout_now_message_term() {
+    let tn = TimeoutNow::new(crate::Term::new(8), 2u64);
+    assert_eq!(tn.term(), crate::Term::new(8));
+    assert_eq!(tn.leader(), 2u64);
+    let m = Message::TimeoutNow(tn);
+    assert_eq!(m.term(), crate::Term::new(8));
+    assert!(m.is_timeout_now());
+  }
+
+  #[test]
+  fn read_index_message_term() {
+    let ri = ReadIndex::new(crate::Term::new(6), 3u64, bytes::Bytes::from_static(b"ctx"));
+    assert_eq!(ri.term(), crate::Term::new(6));
+    assert_eq!(ri.from(), 3u64);
+    assert_eq!(ri.context(), b"ctx");
+    let m = Message::ReadIndex(ri);
+    assert_eq!(m.term(), crate::Term::new(6));
+    assert!(m.is_read_index());
+  }
+
+  #[test]
+  fn read_index_resp_message_term() {
+    let rir = ReadIndexResp::new(
+      crate::Term::new(7),
+      1u64,
+      crate::Index::new(42),
+      bytes::Bytes::from_static(b"ctx"),
+    );
+    assert_eq!(rir.term(), crate::Term::new(7));
+    assert_eq!(rir.from(), 1u64);
+    assert_eq!(rir.index(), crate::Index::new(42));
+    assert_eq!(rir.context(), b"ctx");
+    let m = Message::ReadIndexResp(rir);
+    assert_eq!(m.term(), crate::Term::new(7));
+    assert!(m.is_read_index_resp());
   }
 
   #[test]

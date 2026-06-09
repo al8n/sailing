@@ -4,6 +4,35 @@ use crate::{NodeId, error::ConfigError};
 use core::time::Duration;
 use std::vec::Vec;
 
+/// How linearizable read-only queries are satisfied.
+///
+/// `Safe` (the default) issues a heartbeat round to confirm leadership before serving the
+/// read. `LeaseBased` skips the round-trip by relying on the election-timeout lease — it
+/// requires [`Config::check_quorum`] to be enabled (validated by [`Config::validate`]).
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
+)]
+pub enum ReadOnlyOption {
+  /// Confirm leadership via a heartbeat quorum before serving each read (default, always safe).
+  #[default]
+  Safe,
+  /// Use the election-timeout lease to confirm leadership without a round-trip.
+  ///
+  /// **Requires** [`Config::check_quorum`] = `true`; [`Config::validate`] enforces this.
+  LeaseBased,
+}
+
+impl ReadOnlyOption {
+  /// The stable snake_case name.
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Safe => "safe",
+      Self::LeaseBased => "lease_based",
+    }
+  }
+}
+
 /// Static configuration for an [`crate::Endpoint`]. Holds the initial voter set (dynamic
 /// membership via `ConfChange` is M6). `Clone`, not `Copy` (it owns the voter list).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +55,18 @@ pub struct Config<I> {
   /// only if the operator explicitly wants the removed leader to keep acting until it hears
   /// from a new leader (unusual; the default is safe).
   step_down_on_removal: bool,
+  /// Enable the PreVote extension (§9.6 of the Raft thesis). A node probes for a quorum
+  /// of "would-grant" responses before incrementing its term. Prevents a partitioned node
+  /// from inflating the cluster term when it rejoins. Default: `false` (M1–M6 behavior).
+  pre_vote: bool,
+  /// Enable CheckQuorum. A leader that does not hear from a quorum of peers within an
+  /// election timeout steps down. Pairs with `ReadOnlyOption::LeaseBased`. Default: `false`.
+  check_quorum: bool,
+  /// When `true`, a follower that receives a `Propose` request does not forward it to the
+  /// leader; it returns `NotLeader` immediately. Default: `false`.
+  disable_proposal_forwarding: bool,
+  /// How linearizable read-only queries are satisfied. Default: [`ReadOnlyOption::Safe`].
+  read_only: ReadOnlyOption,
 }
 
 impl<I: NodeId> Config<I> {
@@ -58,6 +99,10 @@ impl<I: NodeId> Config<I> {
       max_inflight_bytes: 0,
       snapshot_threshold: 10_000, // etcd default SnapshotCount
       step_down_on_removal: true,
+      pre_vote: false,
+      check_quorum: false,
+      disable_proposal_forwarding: false,
+      read_only: ReadOnlyOption::Safe,
     })
   }
 
@@ -95,6 +140,10 @@ impl<I: NodeId> Config<I> {
       max_inflight_bytes: 0,
       snapshot_threshold: 10_000, // etcd default SnapshotCount
       step_down_on_removal: true,
+      pre_vote: false,
+      check_quorum: false,
+      disable_proposal_forwarding: false,
+      read_only: ReadOnlyOption::Safe,
     })
   }
 
@@ -196,6 +245,79 @@ impl<I: NodeId> Config<I> {
   pub fn with_step_down_on_removal(mut self, v: bool) -> Self {
     self.step_down_on_removal = v;
     self
+  }
+
+  /// Whether the PreVote extension is enabled.
+  ///
+  /// When `true`, a node probes for a quorum of "would-grant" responses before
+  /// incrementing its term, preventing a partitioned node from inflating the cluster term.
+  #[inline(always)]
+  pub const fn pre_vote(&self) -> bool {
+    self.pre_vote
+  }
+
+  /// Override the `pre_vote` knob.
+  pub fn with_pre_vote(mut self, v: bool) -> Self {
+    self.pre_vote = v;
+    self
+  }
+
+  /// Whether CheckQuorum is enabled.
+  ///
+  /// When `true`, a leader that does not hear from a quorum of peers within an election
+  /// timeout steps down. Required by [`ReadOnlyOption::LeaseBased`].
+  #[inline(always)]
+  pub const fn check_quorum(&self) -> bool {
+    self.check_quorum
+  }
+
+  /// Override the `check_quorum` knob.
+  pub fn with_check_quorum(mut self, v: bool) -> Self {
+    self.check_quorum = v;
+    self
+  }
+
+  /// Whether proposal forwarding from followers to the leader is disabled.
+  ///
+  /// When `true`, a follower that receives a `Propose` returns `NotLeader` immediately
+  /// rather than forwarding to the leader.
+  #[inline(always)]
+  pub const fn disable_proposal_forwarding(&self) -> bool {
+    self.disable_proposal_forwarding
+  }
+
+  /// Override the `disable_proposal_forwarding` knob.
+  pub fn with_disable_proposal_forwarding(mut self, v: bool) -> Self {
+    self.disable_proposal_forwarding = v;
+    self
+  }
+
+  /// How linearizable read-only queries are satisfied.
+  #[inline(always)]
+  pub const fn read_only(&self) -> ReadOnlyOption {
+    self.read_only
+  }
+
+  /// Override the `read_only` knob.
+  pub fn with_read_only(mut self, v: ReadOnlyOption) -> Self {
+    self.read_only = v;
+    self
+  }
+
+  /// Validate cross-field invariants that cannot be checked at construction time.
+  ///
+  /// Currently enforces: `ReadOnlyOption::LeaseBased` requires `check_quorum = true`.
+  /// (Lease-based reads are only safe when CheckQuorum guarantees the election-timeout
+  /// lease is fresh; without it a stale leader could serve a read after losing quorum.)
+  ///
+  /// Call this after building a `Config` via the builder chain; `try_new` and
+  /// `try_new_observer` do **not** call it automatically so that callers have a chance to
+  /// set all knobs first.
+  pub fn validate(&self) -> Result<(), ConfigError> {
+    if self.read_only == ReadOnlyOption::LeaseBased && !self.check_quorum {
+      return Err(ConfigError::LeaseRequiresCheckQuorum);
+    }
+    Ok(())
   }
 }
 
@@ -320,5 +442,116 @@ mod tests {
       c.clone().with_max_inflight_msgs(0),
       Err(ConfigError::ZeroInflight)
     ));
+  }
+
+  #[test]
+  fn pre_vote_default_and_override() {
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert!(!c.pre_vote(), "pre_vote must default to false");
+    let c2 = c.with_pre_vote(true);
+    assert!(c2.pre_vote(), "with_pre_vote(true) must persist");
+    let c3 = c2.with_pre_vote(false);
+    assert!(!c3.pre_vote(), "with_pre_vote(false) must persist");
+  }
+
+  #[test]
+  fn check_quorum_default_and_override() {
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert!(!c.check_quorum(), "check_quorum must default to false");
+    let c2 = c.with_check_quorum(true);
+    assert!(c2.check_quorum(), "with_check_quorum(true) must persist");
+    let c3 = c2.with_check_quorum(false);
+    assert!(!c3.check_quorum(), "with_check_quorum(false) must persist");
+  }
+
+  #[test]
+  fn disable_proposal_forwarding_default_and_override() {
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert!(
+      !c.disable_proposal_forwarding(),
+      "disable_proposal_forwarding must default to false"
+    );
+    let c2 = c.with_disable_proposal_forwarding(true);
+    assert!(
+      c2.disable_proposal_forwarding(),
+      "with_disable_proposal_forwarding(true) must persist"
+    );
+  }
+
+  #[test]
+  fn read_only_option_defaults_and_as_str() {
+    // Default is Safe.
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(c.read_only(), ReadOnlyOption::Safe);
+    assert!(c.read_only().is_safe());
+    assert_eq!(ReadOnlyOption::Safe.as_str(), "safe");
+    assert_eq!(ReadOnlyOption::LeaseBased.as_str(), "lease_based");
+
+    // Builder round-trip.
+    let c2 = c.with_read_only(ReadOnlyOption::LeaseBased);
+    assert_eq!(c2.read_only(), ReadOnlyOption::LeaseBased);
+    assert!(c2.read_only().is_lease_based());
+    let c3 = c2.with_read_only(ReadOnlyOption::Safe);
+    assert_eq!(c3.read_only(), ReadOnlyOption::Safe);
+  }
+
+  #[test]
+  fn validate_lease_requires_check_quorum() {
+    let base = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    // Safe + no check_quorum: always ok.
+    assert!(base.clone().validate().is_ok());
+
+    // Safe + check_quorum: ok.
+    assert!(base.clone().with_check_quorum(true).validate().is_ok());
+
+    // LeaseBased WITHOUT check_quorum: error.
+    assert!(matches!(
+      base
+        .clone()
+        .with_read_only(ReadOnlyOption::LeaseBased)
+        .validate(),
+      Err(ConfigError::LeaseRequiresCheckQuorum)
+    ));
+
+    // LeaseBased WITH check_quorum: ok.
+    assert!(
+      base
+        .clone()
+        .with_read_only(ReadOnlyOption::LeaseBased)
+        .with_check_quorum(true)
+        .validate()
+        .is_ok()
+    );
   }
 }

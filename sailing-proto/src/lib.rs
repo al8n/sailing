@@ -47,7 +47,7 @@ pub use quorum::{JointConfig, MajorityConfig, VoteResult};
 mod message;
 pub use message::{
   AppendEntries, AppendResp, Heartbeat, HeartbeatResp, InstallSnapshot, Message, Outgoing,
-  RequestVote, SnapshotMeta, SnapshotResp, VoteResp,
+  ReadIndex, ReadIndexResp, RequestVote, SnapshotMeta, SnapshotResp, TimeoutNow, VoteResp,
 };
 
 mod state_machine;
@@ -66,7 +66,7 @@ mod progress;
 pub use progress::{Progress, ProgressState};
 
 mod config;
-pub use config::Config;
+pub use config::{Config, ReadOnlyOption};
 
 mod event;
 pub use event::{Applied, ConfChanged, Event, LeaderChanged};

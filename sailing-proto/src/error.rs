@@ -38,4 +38,8 @@ pub enum ConfigError {
   /// `max_inflight_msgs` was zero.
   #[error("max_inflight_msgs must be greater than zero")]
   ZeroInflight,
+  /// `ReadOnlyOption::LeaseBased` requires `check_quorum = true` (the lease safety depends on
+  /// the leader knowing it still holds a quorum; without CheckQuorum that guarantee is absent).
+  #[error("ReadOnlyOption::LeaseBased requires check_quorum to be enabled")]
+  LeaseRequiresCheckQuorum,
 }
