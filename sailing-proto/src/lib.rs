@@ -11,11 +11,15 @@
 extern crate alloc as std;
 #[cfg(feature = "std")]
 extern crate std;
-#[cfg(feature = "std")]
-extern crate alloc;
 
 #[cfg(not(feature = "alloc"))]
 compile_error!("sailing-proto requires the `alloc` feature (it is enabled transitively by `std`)");
 
 mod num;
 pub use num::{Index, Term};
+
+mod id;
+pub use id::NodeId;
+
+mod time;
+pub use time::Instant;
