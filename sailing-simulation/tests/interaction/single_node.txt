@@ -6,7 +6,7 @@ n1: created voters={1} term=0 commit=0 last=0
 
 campaign 1
 ----
-n1 leader term=1
+n1 candidate term=1
 n1 leader-changed term=1 lead=1
 
 stabilize

@@ -213,18 +213,22 @@ impl crate::StateMachine for CountSm {
   }
 }
 
-/// A minimal stable store that persists `HardState<u64>` in memory.
-/// `submit_write` updates state immediately but enqueues NO completion — `poll` always
-/// returns `None`. Use when durability of the hard-state write is irrelevant to the test.
+/// A synchronous in-memory stable store: `submit_write` persists `HardState<u64>` immediately AND
+/// enqueues a `StableDone::Wrote` completion (released on `poll`), modeling a store that is durable
+/// the moment the write returns. The completion is what the proto's persist-before-act paths need —
+/// the candidate `Campaign` (become-leader gated on the self-vote being durable) and the follower
+/// `CastVote` — so a driver must call `handle_storage` to drain it.
 #[derive(Debug)]
 pub(crate) struct NoopStable {
   hard_state: HardState<u64>,
+  completions: VecDeque<StableDone>,
 }
 
 impl Default for NoopStable {
   fn default() -> Self {
     Self {
       hard_state: HardState::initial(),
+      completions: VecDeque::new(),
     }
   }
 }
@@ -247,8 +251,9 @@ impl StableStore for NoopStable {
     self.hard_state
   }
 
-  fn submit_write(&mut self, _id: OpId, hard_state: HardState<u64>) {
+  fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {
     self.hard_state = hard_state;
+    self.completions.push_back(StableDone::Wrote(id));
   }
 
   fn submit_snapshot(&mut self, _id: OpId, _meta: SnapshotMeta<u64>, _data: Bytes) {
@@ -260,7 +265,7 @@ impl StableStore for NoopStable {
   }
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
-    None
+    self.completions.pop_front().map(Ok)
   }
 }
 

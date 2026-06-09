@@ -153,6 +153,13 @@ enum Pending<I> {
   FollowerAck { to: I, match_index: Index },
   /// Advance the leader's own `match_index` to `upto` (and re-check commit) once durable.
   LeaderAppend { upto: Index },
+  /// The candidate's term+self-vote hard-state write is in flight. Until it is durable the self-vote
+  /// must NOT be acted on: `become_leader` (single-node now, or once peer votes arrive) fires from
+  /// `on_stable_wrote`/`on_vote_resp` only after this completes. `term` guards a stale completion that
+  /// arrives after the term advanced. This makes the candidate's self-vote persist-before-act,
+  /// symmetric with the follower's `CastVote` — otherwise a node could lead in a term on an un-durable
+  /// self-vote, crash, restart with no recorded vote, and grant another candidate the same term.
+  Campaign { term: crate::Term },
 }
 
 /// The Sans-I/O Raft state machine for one node.
@@ -539,10 +546,31 @@ where
     self.tracker.ids().into_iter().filter(move |&p| p != me)
   }
 
-  fn last_log(&self, log: &impl LogStore) -> (Index, Term) {
+  /// Our log's `(last_index, last_term)` for the §5.4.1 up-to-date comparison, or `None` on a genuine
+  /// storage error reading the last term of a NON-empty log.
+  ///
+  /// An empty log (`last_index == 0`) legitimately has last term `0`. But collapsing a term-READ
+  /// FAILURE on a non-empty log to `Term::ZERO` would fabricate a stale term and could make us grant
+  /// a vote to a candidate whose log is actually staler than ours (a leader-completeness hazard), so
+  /// the caller must treat `None` as a fatal read error (poison), never as "term zero".
+  fn last_log(&self, log: &impl LogStore) -> Option<(Index, Term)> {
     let li = log.last_index();
-    let lt = log.term(li).unwrap_or(Term::ZERO);
-    (li, lt)
+    if li == Index::ZERO {
+      return Some((Index::ZERO, Term::ZERO));
+    }
+    log.term(li).ok().map(|lt| (li, lt))
+  }
+
+  /// Whether this candidate's self-vote (the term+vote hard-state write from `become_candidate`) is
+  /// already durable — i.e. no `Campaign` completion for the current term is still pending.
+  /// `become_leader` must never fire on a quorum that counts an un-durable self-vote: a crash before
+  /// the write lands would restart with no recorded vote and could grant a different candidate the
+  /// same term.
+  fn self_vote_durable(&self) -> bool {
+    !self
+      .pending
+      .values()
+      .any(|p| matches!(p, Pending::Campaign { term } if *term == self.term))
   }
 
   /// The current committed-configuration membership ([`ConfState`](crate::ConfState)) derived from
@@ -673,23 +701,24 @@ where
       log.term(prev_index).unwrap_or(Term::ZERO)
     };
     let end = log.last_index().next();
-    let all_entries = if next < end {
-      log
-        .entries(next..end, u64::MAX)
-        .map(<[_]>::to_vec)
-        .unwrap_or_default()
+    // Read the BORROWED suffix slice (no allocation) and apply the byte cap on the slice, cloning
+    // ONLY the capped prefix below. A lagging follower must never force the whole suffix to be
+    // cloned: the configured `max_size_per_msg` bounds the per-send allocation. `max_bytes` is also
+    // passed to the store so an implementation that honours it can return a shorter slice.
+    let max_bytes = self.config.max_size_per_msg();
+    let slice: &[crate::Entry] = if next < end {
+      log.entries(next..end, max_bytes).unwrap_or_default()
     } else {
-      std::vec::Vec::new()
+      &[]
     };
 
     // Cap at max_size_per_msg bytes, but always send at least one entry.
-    let max_bytes = self.config.max_size_per_msg();
-    let entries = if all_entries.is_empty() || max_bytes == u64::MAX {
-      all_entries
+    let entries = if slice.is_empty() || max_bytes == u64::MAX {
+      slice.to_vec()
     } else {
       let mut budget = max_bytes;
       let mut count = 0usize;
-      for e in &all_entries {
+      for e in slice {
         let sz = Self::entry_size(e);
         if count == 0 {
           // always include at least one entry regardless of size
@@ -702,7 +731,7 @@ where
           break;
         }
       }
-      all_entries[..count].to_vec()
+      slice[..count].to_vec()
     };
 
     // Compute the last index and total bytes for sent_entries.
@@ -788,7 +817,12 @@ where
     stable: &mut S,
     rv: crate::RequestVote<I>,
   ) {
-    let (my_index, my_term) = self.last_log(log);
+    let Some((my_index, my_term)) = self.last_log(log) else {
+      // Storage error reading our own last-log term: we cannot safely compare freshness, so poison
+      // rather than fabricate `Term::ZERO` and risk granting a vote to a staler candidate.
+      self.poison(PoisonReason::LogTerm);
+      return;
+    };
     let log_ok = (rv.last_log_term(), rv.last_log_index()) >= (my_term, my_index);
 
     // Pre-vote path: a completely separate branch — NO durable state is changed.
@@ -888,7 +922,10 @@ where
     // Record the ballot: true = grant, false = reject.
     // `vr.reject()` is false when the vote was granted.
     self.votes.insert(vr.from(), !vr.reject());
-    if self.tracker.vote_result(&self.votes).is_won() {
+    // Become leader on a quorum ONLY if our own self-vote is already durable; otherwise defer to
+    // on_stable_wrote, which re-checks the quorum once the self-vote write completes. Leading on a
+    // quorum that includes an un-durable self-vote would break election safety under async storage.
+    if self.tracker.vote_result(&self.votes).is_won() && self.self_vote_durable() {
       self.become_leader(now, log, stable);
     }
     // Lost or Pending: stay candidate; the election timeout retries (preserves election liveness).
@@ -928,7 +965,7 @@ where
     }
     while let Some(done) = stable.poll() {
       match done {
-        Ok(crate::StableDone::Wrote(opid)) => self.on_stable_wrote(opid),
+        Ok(crate::StableDone::Wrote(opid)) => self.on_stable_wrote(now, log, stable, opid),
         Ok(crate::StableDone::SnapshotWritten(opid)) => {
           // Deferred compaction: fire only after the snapshot is durable.
           // This mirrors append-before-ack: the log is never compacted before the
@@ -1218,21 +1255,41 @@ where
     }
   }
 
-  fn on_stable_wrote(&mut self, opid: crate::OpId) {
-    if let Some(Pending::CastVote { to, term }) = self.pending.remove(&opid) {
-      // Only emit the grant if the term hasn't changed and we still hold the vote for `to`.
-      // If either condition is false the write was superseded by a term advance; drop silently.
-      if term == self.term && self.voted_for == Some(to) {
-        debug_assert!(
-          self.voted_for == Some(to),
-          "releasing a CastVote we no longer hold"
-        );
-        let me = self.config.id();
-        self.send(
-          to,
-          Message::VoteResp(crate::VoteResp::new(term, me, false, false)),
-        );
+  fn on_stable_wrote<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &mut S,
+    opid: crate::OpId,
+  ) {
+    match self.pending.remove(&opid) {
+      Some(Pending::CastVote { to, term }) => {
+        // Only emit the grant if the term hasn't changed and we still hold the vote for `to`.
+        // If either condition is false the write was superseded by a term advance; drop silently.
+        if term == self.term && self.voted_for == Some(to) {
+          debug_assert!(
+            self.voted_for == Some(to),
+            "releasing a CastVote we no longer hold"
+          );
+          let me = self.config.id();
+          self.send(
+            to,
+            Message::VoteResp(crate::VoteResp::new(term, me, false, false)),
+          );
+        }
       }
+      // The candidate's self-vote is now DURABLE. If we are still a candidate at this term and a
+      // quorum is already met (single-node now, or peer votes that arrived before this completion),
+      // become leader — the self-vote backing the quorum is persisted, so a crash + restart can
+      // never replay it as a vote for a different candidate in the same term.
+      Some(Pending::Campaign { term })
+        if term == self.term
+          && self.role.is_candidate()
+          && self.tracker.vote_result(&self.votes).is_won() =>
+      {
+        self.become_leader(now, log, stable);
+      }
+      _ => {}
     }
   }
 
@@ -1784,9 +1841,18 @@ where
       .with_commit(self.commit);
     stable.submit_write(opid, hs);
     self.committed_persisted = self.commit;
+    // Defer acting on the self-vote until it is DURABLE (persist-before-act, symmetric with the
+    // follower `CastVote` path): `become_leader` fires from `on_stable_wrote` (single-node now, or
+    // once peer votes arrive) only after this write's `StableDone::Wrote`.
+    self
+      .pending
+      .insert(opid, Pending::Campaign { term: self.term });
     self.arm_election_timer(now);
 
-    let (last_index, last_term) = self.last_log(log);
+    let Some((last_index, last_term)) = self.last_log(log) else {
+      self.poison(PoisonReason::LogTerm);
+      return;
+    };
     let (term, me) = (self.term, self.config.id());
     // Send RequestVote only to VOTER peers (not learners). Learners don't participate in
     // elections; sending them a RequestVote wastes bandwidth and may confuse their state.
@@ -1800,10 +1866,8 @@ where
         )),
       );
     }
-    // single-node cluster fast-path: self-vote already a quorum under joint config.
-    if self.tracker.vote_result(&self.votes).is_won() {
-      self.become_leader(now, log, stable);
-    }
+    // Do NOT become leader here even on a single-node self-vote quorum: the self-vote write above is
+    // not yet durable. `on_stable_wrote` fires `become_leader` once `StableDone::Wrote` confirms it.
   }
 
   /// Begin a pre-vote probe: set `role = PreCandidate`, cast a self pre-vote, and broadcast
@@ -1829,7 +1893,10 @@ where
     self.arm_election_timer(now);
 
     let advertised_term = self.term.next(); // proposed, not adopted
-    let (last_index, last_term) = self.last_log(log);
+    let Some((last_index, last_term)) = self.last_log(log) else {
+      self.poison(PoisonReason::LogTerm);
+      return false;
+    };
     let me = self.config.id();
     let voter_peers: std::vec::Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
     for peer in voter_peers {
@@ -2462,6 +2529,14 @@ where
     }
     let context = Bytes::copy_from_slice(ri.context());
     let from = ri.from();
+    // Apply the SAME duplicate-context guard as the local read path. Without it a retrying or
+    // malicious follower forwarding the same context repeatedly would either grow `pending_reads`
+    // without bound (before the current-term no-op commits) or be silently dropped by
+    // `ReadOnly::add_request` afterward — leaving the originator waiting forever. The first request
+    // for the context already owns its completion path; drop the duplicate.
+    if self.read_context_in_flight(&context) {
+      return;
+    }
     // Current-term-commit gate (same as the local path).
     if !self.has_current_term_commit(log) {
       self.pending_reads.push((context, Some(from)));
@@ -3001,6 +3076,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // become candidate, term 1, self-vote
+    ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {} // drain RequestVotes
     assert!(ep.role().is_candidate());
 
@@ -3046,6 +3122,7 @@ mod tests {
     let mut stable = crate::testkit::NoopStable::default();
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // candidate
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -3080,6 +3157,7 @@ mod tests {
     let mut stable = crate::testkit::NoopStable::default();
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -3499,6 +3577,7 @@ mod tests {
     // Self-elect (quorum == 1) and let the no-op LeaderAppend commit.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader(), "lone voter must self-elect");
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
@@ -3580,6 +3659,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // self-elects (quorum=1)
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
 
     // The no-op LeaderAppend is still in pending — commit has NOT advanced yet.
@@ -3658,6 +3738,90 @@ mod tests {
     assert!(
       matches!(ep.poll_message().unwrap().message(), Message::VoteResp(v) if !v.reject()),
       "grant must be emitted after handle_storage"
+    );
+  }
+
+  /// Regression (Codex R1 finding 1 — election safety): a candidate must not become leader, or
+  /// otherwise act on its self-vote, until the term+self-vote hard-state write is DURABLE. The
+  /// cluster is a single node, so the self-vote alone is a quorum — yet with async storage the
+  /// leader transition must wait for `StableDone::Wrote`. Without the gate the node leads term 1 on
+  /// an un-durable self-vote; a crash before that write lands would restart it at term 0 with no
+  /// vote recorded, free to grant a different candidate in term 1 → two leaders in term 1.
+  #[test]
+  fn candidate_does_not_lead_until_self_vote_durable() {
+    use crate::{Config, Instant, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    // Campaign at term 1. The self-vote is a single-node quorum, but the hard-state write is in
+    // flight (AsyncStable holds the `StableDone::Wrote` until `poll`).
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    assert_eq!(ep.term(), Term::new(1));
+    assert!(
+      ep.role().is_candidate() && !ep.role().is_leader(),
+      "must not lead while the self-vote write is un-durable"
+    );
+
+    // The hard-state write completes → the self-vote is durable → only now is it safe to lead.
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(
+      ep.role().is_leader(),
+      "leads once the self-vote write is durable"
+    );
+  }
+
+  /// Regression (Codex R1 finding 1): even when a PEER's grant reaches quorum, the leader transition
+  /// waits until the candidate's own self-vote write is durable (`on_vote_resp` gates on
+  /// `self_vote_durable`). Without the gate the peer grant elects the node on an un-durable self-vote.
+  #[test]
+  fn quorum_from_peer_vote_waits_for_durable_self_vote() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    // Campaign at term 1; self-vote write in flight.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {} // drain RequestVotes
+    assert!(ep.role().is_candidate());
+
+    // Peer 2 grants → 2 of 3 is a quorum. But our own self-vote is not durable yet → must NOT lead.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(
+      ep.role().is_candidate() && !ep.role().is_leader(),
+      "quorum met by a peer grant, but the self-vote is not durable: must wait"
+    );
+
+    // Self-vote write completes → the deferred quorum elects us.
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(
+      ep.role().is_leader(),
+      "leads once the self-vote write is durable"
     );
   }
 
@@ -3836,6 +4000,7 @@ mod tests {
     // Elect node 1 leader (term 1) and let its no-op append become durable (commit→1).
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -3887,6 +4052,7 @@ mod tests {
     // Fire the heartbeat timer → broadcast_heartbeat to peers 2 and 3.
     let hb_deadline = ep.poll_timeout().unwrap();
     ep.handle_timeout(hb_deadline, &mut log, &mut stable);
+    ep.handle_storage(hb_deadline, &mut log, &mut stable);
 
     // Collect the heartbeat advertised to the LAGGING peer 3.
     let mut hb_to_3: Option<Index> = None;
@@ -3933,6 +4099,7 @@ mod tests {
     // Elect node 1 as leader.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -4070,6 +4237,7 @@ mod tests {
     // Elect node 1 as leader.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -4352,6 +4520,7 @@ mod tests {
     // Elect node 1 as leader (term=1, noop at index 1).
     let d = leader.poll_timeout().unwrap();
     leader.handle_timeout(d, &mut leader_log, &mut leader_stable);
+    leader.handle_storage(d, &mut leader_log, &mut leader_stable);
     leader.handle_message(
       d,
       &mut leader_log,
@@ -4560,6 +4729,7 @@ mod tests {
     // Elect node 1 as leader.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -4666,6 +4836,7 @@ mod tests {
     // Elect node 1 as leader.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -4850,6 +5021,7 @@ mod tests {
 
     let d = leader.poll_timeout().unwrap();
     leader.handle_timeout(d, &mut leader_log, &mut leader_stable);
+    leader.handle_storage(d, &mut leader_log, &mut leader_stable);
     leader.handle_message(
       d,
       &mut leader_log,
@@ -4960,7 +5132,9 @@ mod tests {
     let mut stable = crate::testkit::AsyncStable::default();
 
     let d = ep.poll_timeout().unwrap();
-    ep.handle_timeout(d, &mut log, &mut stable); // self-elects
+    ep.handle_timeout(d, &mut log, &mut stable); // campaign
+    // Self-vote must become durable before become_leader fires (persist-before-ACT).
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
     // Drain no-op (LeaderAppend for index 1).
     ep.handle_storage(d, &mut log, &mut stable);
@@ -5085,7 +5259,9 @@ mod tests {
     stable.drop_next_snapshot_completion();
 
     let d = ep.poll_timeout().unwrap();
-    ep.handle_timeout(d, &mut log, &mut stable); // self-elects
+    ep.handle_timeout(d, &mut log, &mut stable); // campaign
+    // Self-vote must become durable before become_leader fires (persist-before-ACT).
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
     ep.handle_storage(d, &mut log, &mut stable); // drain no-op
     while ep.poll_message().is_some() {}
@@ -5218,7 +5394,10 @@ mod tests {
       2u64,
       Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
     );
+    // Self-vote must become durable before become_leader fires (persist-before-ACT).
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
+    // Drain again so the no-op append completion is processed.
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}
@@ -5912,6 +6091,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -6241,6 +6421,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // self-elect (quorum == 1)
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
     ep.handle_storage(d, &mut log, &mut stable); // no-op LeaderAppend at index 1 commits
     while ep.poll_message().is_some() {}
@@ -6356,9 +6537,11 @@ mod tests {
     let mut stable = crate::testkit::NoopStable::default();
 
     let d = ep.poll_timeout().unwrap();
-    ep.handle_timeout(d, &mut log, &mut stable); // self-elects (quorum=1)
+    ep.handle_timeout(d, &mut log, &mut stable); // campaign (quorum=1)
+    // Self-vote must be durable before become_leader fires (persist-before-ACT).
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
-    // Drain so the no-op at index 1 commits and applies.
+    // Drain again so the no-op at index 1 commits and applies.
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_event().is_some() {}
     while ep.poll_message().is_some() {}
@@ -6478,6 +6661,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // become candidate
+    ep.handle_storage(d, &mut log, &mut stable);
     // Self-vote is enough if quorum=1 among {1,2} with only self-vote — but actually 2-voter
     // quorum=2. We need to hand-grant ourselves leadership via a VoteResp.
     use crate::{Message, Term, VoteResp};
@@ -6680,6 +6864,7 @@ mod tests {
     // A majority of three is two, so a single peer grant (self + 3) elects node 2.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // become candidate, term 2
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_candidate());
     while ep.poll_message().is_some() {}
 
@@ -6811,8 +6996,10 @@ mod tests {
       2u64,
       Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
     );
+    // Self-vote must become durable before become_leader fires (persist-before-ACT).
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
-    // Drain storage: no-op LeaderAppend fires → self match → commit advances.
+    // Drain storage again: no-op LeaderAppend fires → self match → commit advances.
     ep.handle_storage(d, &mut log, &mut stable);
     // Need peer ack to commit the no-op in a 3-voter cluster (quorum=2).
     use crate::{AppendResp, Index};
@@ -7151,6 +7338,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -7232,6 +7420,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -7964,6 +8153,7 @@ mod tests {
     // Become leader via the normal election path.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // → Candidate
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -7995,6 +8185,7 @@ mod tests {
     // No messages received from peers → recent_active is false for peers 2 and 3.
     // Fire the CheckQuorum tick.
     ep.handle_timeout(cq_deadline, &mut log, &mut stable);
+    ep.handle_storage(cq_deadline, &mut log, &mut stable);
 
     // CRITICAL: step down at the SAME term (no term bump).
     assert!(
@@ -8032,6 +8223,7 @@ mod tests {
     // Become leader.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -8070,6 +8262,7 @@ mod tests {
 
     // Peer 2 active + self active = 2 of 3 = quorum. Fire CheckQuorum tick.
     ep.handle_timeout(cq_deadline, &mut log, &mut stable);
+    ep.handle_storage(cq_deadline, &mut log, &mut stable);
 
     // Must remain leader.
     assert!(
@@ -8112,6 +8305,7 @@ mod tests {
     // Become leader.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -8293,6 +8487,7 @@ mod tests {
     let mut stable = crate::testkit::NoopStable::default();
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -8400,8 +8595,10 @@ mod tests {
         false,
       )),
     );
+    // Self-vote must become durable before become_leader fires (persist-before-ACT).
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
-    // Drain storage: no-op LeaderAppend fires → self match_index advances.
+    // Drain storage again: no-op LeaderAppend fires → self match_index advances.
     ep.handle_storage(d, &mut log, &mut stable);
     // Peer 2 acks the no-op → quorum (self + peer2) → commit advances to 1.
     ep.handle_message(
@@ -8534,6 +8731,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -8621,6 +8819,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -8870,6 +9069,7 @@ mod tests {
 
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -9021,6 +9221,8 @@ mod tests {
         false,
       )),
     );
+    // Self-vote must become durable before become_leader fires (persist-before-ACT).
+    ep.handle_storage(d, &mut log, &mut stable);
     assert!(ep.role().is_leader());
     // Drain the no-op append from storage so self-match advances.
     ep.handle_storage(d, &mut log, &mut stable);
@@ -9138,6 +9340,7 @@ mod tests {
     // Elect node 1.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -9250,6 +9453,7 @@ mod tests {
     // Advance time past the transfer deadline.
     let deadline = Instant::ORIGIN + Duration::from_millis(1001); // > election_timeout (1000ms)
     ep.handle_timeout(deadline, &mut log, &mut stable);
+    ep.handle_storage(deadline, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
 
     // After abort, propose must succeed again.
@@ -9279,6 +9483,7 @@ mod tests {
     // Fire handle_timeout BEFORE the deadline → still in transfer.
     let before_deadline = Instant::ORIGIN + Duration::from_millis(500);
     ep.handle_timeout(before_deadline, &mut log, &mut stable);
+    ep.handle_storage(before_deadline, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     assert!(
       ep.lead_transferee.is_some(),
@@ -9288,6 +9493,7 @@ mod tests {
     // Fire handle_timeout AFTER the deadline → transfer aborted.
     let after_deadline = Instant::ORIGIN + Duration::from_millis(1001);
     ep.handle_timeout(after_deadline, &mut log, &mut stable);
+    ep.handle_storage(after_deadline, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     assert!(
       ep.lead_transferee.is_none(),
@@ -9454,6 +9660,7 @@ mod tests {
     // Elect node 1 as leader.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
     ep.handle_message(
       d,
       &mut log,
@@ -9552,6 +9759,7 @@ mod tests {
     // Advance time past `d + election_timeout` to trigger the deadline abort.
     let past_first_deadline = d + Duration::from_millis(1001); // > election_timeout (1000ms)
     ep.handle_timeout(past_first_deadline, &mut log, &mut stable);
+    ep.handle_storage(past_first_deadline, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     assert!(
       ep.lead_transferee.is_none(),
@@ -9732,6 +9940,7 @@ mod tests {
     let mut stable_cq = crate::testkit::NoopStable::default();
     let d_cq = ep_cq.poll_timeout().unwrap();
     ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
+    ep_cq.handle_storage(d_cq, &mut log_cq, &mut stable_cq);
     ep_cq.handle_message(
       d_cq,
       &mut log_cq,
@@ -9863,6 +10072,7 @@ mod tests {
     let mut stable_cq = crate::testkit::NoopStable::default();
     let d_cq = ep_cq.poll_timeout().unwrap();
     ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
+    ep_cq.handle_storage(d_cq, &mut log_cq, &mut stable_cq);
     ep_cq.handle_message(
       d_cq,
       &mut log_cq,
@@ -9967,6 +10177,7 @@ mod tests {
     let mut log_f = crate::testkit::NoopLog;
     let mut stable_f = crate::testkit::NoopStable::default();
     ep_f.handle_timeout(now, &mut log_f, &mut stable_f);
+    ep_f.handle_storage(now, &mut log_f, &mut stable_f);
     // After: either poll_timeout is None (single-node immediate leader) or > now.
     if let Some(next_dl) = ep_f.poll_timeout() {
       assert!(
@@ -9988,6 +10199,7 @@ mod tests {
     let mut log_nv = crate::testkit::NoopLog;
     let mut stable_nv = crate::testkit::NoopStable::default();
     ep_nv.handle_timeout(now, &mut log_nv, &mut stable_nv);
+    ep_nv.handle_storage(now, &mut log_nv, &mut stable_nv);
     assert!(
       ep_nv.poll_timeout().is_none(),
       "non-voter: poll_timeout must be None after silent expiry"
@@ -10003,6 +10215,7 @@ mod tests {
     // Force heartbeat deadline to now.
     ep_l.heartbeat_deadline = Some(now);
     ep_l.handle_timeout(now, &mut log_leader, &mut stable_leader);
+    ep_l.handle_storage(now, &mut log_leader, &mut stable_leader);
     while ep_l.poll_message().is_some() {}
     let pt_l = ep_l
       .poll_timeout()
@@ -10031,6 +10244,7 @@ mod tests {
     let mut stable_cq = crate::testkit::NoopStable::default();
     let d_cq = ep_cq.poll_timeout().unwrap();
     ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
+    ep_cq.handle_storage(d_cq, &mut log_cq, &mut stable_cq);
     ep_cq.handle_message(
       d_cq,
       &mut log_cq,
@@ -10048,6 +10262,7 @@ mod tests {
     ep_cq.heartbeat_deadline = Some(now);
     ep_cq.election_deadline = Some(now);
     ep_cq.handle_timeout(now, &mut log_cq, &mut stable_cq);
+    ep_cq.handle_storage(now, &mut log_cq, &mut stable_cq);
     while ep_cq.poll_message().is_some() {}
     // After: either stepped down (quorum inactive) or both timers re-armed to future.
     if let Some(pt_cq) = ep_cq.poll_timeout() {
@@ -10075,6 +10290,7 @@ mod tests {
     ep_tr.transfer_deadline = Some(now);
     ep_tr.heartbeat_deadline = Some(now + Duration::from_millis(100)); // not due
     ep_tr.handle_timeout(now, &mut log_tr, &mut stable_tr);
+    ep_tr.handle_storage(now, &mut log_tr, &mut stable_tr);
     while ep_tr.poll_message().is_some() {}
     assert!(
       ep_tr.lead_transferee.is_none(),
