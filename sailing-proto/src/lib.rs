@@ -34,7 +34,7 @@ mod entry;
 pub use entry::{Entry, EntryKind};
 
 mod hard_state;
-pub use hard_state::HardState;
+pub use hard_state::{HardState, LeaseSupport};
 
 pub mod conf;
 pub use conf::{

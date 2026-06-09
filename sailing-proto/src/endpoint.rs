@@ -145,6 +145,14 @@ pub enum PoisonReason {
   /// corrupt recovered log, so fail-stop. (User proposals get `ProposeError::LogIndexExhausted`
   /// instead; this poison is for the internal append paths that have no error channel.)
   LogExhausted,
+  /// On restart the durable `HardState.lease_support` is [`crate::LeaseSupport::Unrecorded`] (a genuine
+  /// pre-`lease_support`/legacy record) but the caller supplied no `assume_prior_lease_support` bound. The
+  /// prior LeaseBased promise is then UNKNOWN and possibly larger than this run's `election_timeout`, so no
+  /// finite post-restart vote fence is provably safe — fail-stop rather than silently under-fence and grant
+  /// a vote inside an old leader's still-live lease (R44). Recover via `restart_migrating(assume_prior =
+  /// the pre-upgrade election_timeout, or Some(ZERO) if it never enforced)`. Native nodes never hit this
+  /// (genesis is `Recorded`), so it only guards a pre-format upgrade done via plain `restart`.
+  LegacyLeaseUnrecoverable,
 }
 
 impl PoisonReason {
@@ -167,8 +175,73 @@ impl PoisonReason {
       Self::InvalidConfState => "invalid_conf_state",
       Self::OrphanedLog => "orphaned_log",
       Self::LogExhausted => "log_exhausted",
+      Self::LegacyLeaseUnrecoverable => "legacy_lease_unrecoverable",
     }
   }
+}
+
+/// The derived in-memory lease-safety state produced by [`reconcile_durable`] from the durable record + the
+/// post-restart config: the floor to seed and the post-restart vote-fence WINDOW (the caller adds `now`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DerivedLeaseSafety {
+  /// The in-memory `lease_support_floor` to seed (the max lease window this incarnation will back).
+  lease_support_floor: Option<core::time::Duration>,
+  /// The vote-fence WINDOW (`None` = no fence); the caller arms `now + window`.
+  fence_window: Option<core::time::Duration>,
+}
+
+/// The outcome of [`reconcile_durable`]: either a safe derived state, or a fail-stop for a legacy record
+/// whose prior promise cannot be safely bounded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LeaseReconcile {
+  /// Safe to proceed with this derived lease-safety state.
+  Ok(DerivedLeaseSafety),
+  /// A legacy `Unrecorded` record with no operator-supplied `assume_prior` bound — the prior promise is
+  /// unknown/unbounded, so no finite fence is provably safe. Fail-stop ([`PoisonReason::LegacyLeaseUnrecoverable`]).
+  Poison,
+}
+
+/// Decide the post-restart lease-safety state from the DURABLE lease-support record + the post-restart
+/// config, branching on the recovered PROVENANCE ([`crate::LeaseSupport`]). PURE and total — the lease-axis
+/// sibling of [`reconcile_restart_log`], exhaustively case-testable in isolation.
+///
+/// - `Recorded(d)` (a current-format node's authoritative record): trust it. The floor is `d.max(this_run)`
+///   — a recorded promise dominates a config shrink (the R42 config-drift fix), and this run's own future
+///   acks are covered. `assume_prior` is IGNORED: a native record is authoritative, never over-fenced on
+///   operator input. `Recorded(None)` genuinely means "promised nothing" (the persist-before-advertise gate
+///   guarantees a native node never advertised more than its durable floor), so it fences only by `this_run`.
+/// - `Unrecorded` (a genuine pre-format/legacy decode): the prior promise is UNKNOWN and possibly LARGER
+///   than `election_timeout`, so no finite fence is provably safe (R44). With an operator-supplied
+///   `assume_prior` bound (via `restart_migrating`; `Some(ZERO)` asserts "never promised") the floor is
+///   `this_run.max(assume_prior)` — safe. WITHOUT one (plain `restart`), fail-stop with `Poison` rather than
+///   silently under-fence: `this_run` is NOT an upper bound on the unknown old promise, and persisting it
+///   would also erase the `Unrecorded` provenance and defeat a later `restart_migrating`. (Native nodes
+///   never reach this — genesis is `Recorded` — so it only guards a pre-format upgrade done via plain restart.)
+///
+/// A genuine-ZERO floor (`Some(0)`) is filtered out of the fence window (a recorded no-op promise).
+/// `this_run` = the lease window THIS incarnation will advertise = `election_timeout` iff it enforces.
+fn reconcile_durable(
+  recovered: crate::LeaseSupport,
+  enforcing: bool,
+  election_timeout: core::time::Duration,
+  assume_prior: Option<core::time::Duration>,
+) -> LeaseReconcile {
+  let this_run = if enforcing {
+    Some(election_timeout)
+  } else {
+    None
+  };
+  let lease_support_floor = match recovered {
+    crate::LeaseSupport::Recorded(d) => d.max(this_run),
+    // Legacy record with a known operator bound: safe. Without one: unbounded → fail-stop.
+    crate::LeaseSupport::Unrecorded if assume_prior.is_some() => this_run.max(assume_prior),
+    crate::LeaseSupport::Unrecorded => return LeaseReconcile::Poison,
+  };
+  let fence_window = lease_support_floor.filter(|d| !d.is_zero());
+  LeaseReconcile::Ok(DerivedLeaseSafety {
+    lease_support_floor,
+    fence_window,
+  })
 }
 
 /// The action [`Endpoint::restart`] must take to make the durable LOG consistent with the durable
@@ -501,6 +574,25 @@ where
   /// The `OpId` of the FIRST HardState write that carried `last_submitted_term`. When a `Wrote` completion
   /// with `opid >= term_persist_opid` arrives (stable completions are ordered), that term is durable.
   term_persist_opid: crate::OpId,
+  /// R42 (persist-before-ADVERTISE for the lease promise; exact mirror of the R34 term machinery above).
+  /// The in-memory lease-support floor: the max lease window this node will uphold this incarnation =
+  /// `max(recovered durable floor, this run's own election_timeout if it enforces)`. Bumped at most ONCE
+  /// per incarnation (election_timeout is process-constant); persisted to `HardState.lease_support` so the
+  /// restart vote fence honors the PRE-CRASH promise regardless of post-restart config. `None` = no
+  /// enforcing promise (fresh / legacy / never-enforced); `Some(d)` = a real promise of `d`.
+  lease_support_floor: Option<core::time::Duration>,
+  /// The highest lease-support floor ever submitted to the `StableStore` (paired with
+  /// `lease_support_persist_opid`, exactly like `last_submitted_term`/`term_persist_opid`).
+  last_submitted_lease_support: Option<core::time::Duration>,
+  /// The highest lease-support floor whose HardState write has reached stable storage. A follower must NOT
+  /// advertise its real `lease_support` until `durable_lease_support >= Some(this_run)` — otherwise a crash
+  /// in the fsync window erases a promise the leader already counted toward a live lease (persist-before-
+  /// advertise, the lease sibling of R34's term-before-respond). Seeded to the recovered durable floor.
+  durable_lease_support: Option<core::time::Duration>,
+  /// The `OpId` of the FIRST HardState write that carried `last_submitted_lease_support`. When a `Wrote`
+  /// completion with `opid >= lease_support_persist_opid` arrives, that floor is durable (advanced in
+  /// [`on_stable_wrote`], releasing the persist-before-advertise gate in `on_heartbeat`).
+  lease_support_persist_opid: crate::OpId,
   /// R34/R35: a SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
   /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
   /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
@@ -574,9 +666,12 @@ where
   /// leader is still inside its (unexpired) lease window — letting the old leader serve a stale
   /// LeaseBased read. While `now < lease_vote_fence_until` a restarted node REFUSES to grant votes
   /// (real and pre), UNLESS the request is a forced leader-transfer (mirrors the `in_lease` bypass).
-  /// `restart` sets it to `now + election_timeout` ONLY under `ReadOnlyOption::LeaseBased`
-  /// (`restart_now + election_timeout >= the leader's lease expiry`, so it always covers any acked
-  /// lease); `new` and all non-LeaseBased configs leave it `None`. Not persisted — re-armed each restart.
+  /// R42: `restart` sizes it as `now + the DURABLE lease-support floor` (`HardState.lease_support`,
+  /// monotone-max'd with this run's own support), so it honors the PRE-CRASH promise regardless of the
+  /// post-restart config — closing config drift (a restart with a shorter `election_timeout` or
+  /// enforcement disabled) by construction. `None` only when no enforcing promise is on record and this
+  /// run enforces nothing. Safety rests on `now >= the pre-crash ack instants` (follower clock
+  /// monotonicity across restart) — the irreducible clock residual common to all lease reads.
   lease_vote_fence_until: Option<Instant>,
   /// R39: whether a forced leader handoff (`TimeoutNow`) was emitted during the CURRENT leader term.
   /// Sending `TimeoutNow` authorizes the transferee to campaign FORCED (bypassing the follower/restart
@@ -654,6 +749,13 @@ where
       durable_term: Term::ZERO,
       last_submitted_term: Term::ZERO,
       term_persist_opid: crate::OpId::ZERO,
+      // R42: a fresh node has made no lease promise. `new()` has no StableStore, so the floor is recorded
+      // lazily on the first enforcing heartbeat (bumped in `on_heartbeat`, persisted by the post-dispatch
+      // `ensure_term_durable`); until then `durable_lease_support` is None and the advertise gate emits ZERO.
+      lease_support_floor: None,
+      last_submitted_lease_support: None,
+      durable_lease_support: None,
+      lease_support_persist_opid: crate::OpId::ZERO,
       term_gated_append_ack: None,
       term_gated_snapshot_ack: None,
       pending_conf_index: Index::ZERO,
@@ -897,6 +999,19 @@ where
     }
   }
 
+  /// Fold every MONOTONE durable safety floor onto a HardState about to be written — the single extension
+  /// point for the choke-point floor-preservation invariant (R43). `submit_write` calls this so EVERY write
+  /// preserves the floor regardless of which builder produced `hs` or what `stable.hard_state()` returned:
+  /// the `StableStore` trait documents `hard_state()` as LAST-DURABLE, so a conforming store can hand a
+  /// writer (vote grant, commit watermark, campaign) a STALE floor while a raise is still in flight — a
+  /// later write rebuilt from it would then ERASE the durable promise. Folding the IN-MEMORY raised floor
+  /// here (NOT a re-read value) makes the durable floor monotone by construction (`raise` never lowers it,
+  /// and also upgrades a legacy `Unrecorded` record to `Recorded` — the self-heal). A future monotone field
+  /// `F` adds exactly ONE line here: `.with_f(hs.f().max(self.f_floor))`.
+  fn stamp_floors(&self, hs: crate::HardState<I>) -> crate::HardState<I> {
+    hs.with_lease_support(hs.lease_support().raise(self.lease_support_floor))
+  }
+
   fn submit_write<S: StableStore<NodeId = I>>(
     &mut self,
     stable: &mut S,
@@ -906,12 +1021,23 @@ where
     if self.poisoned {
       return;
     }
+    // R43: fold every monotone durable safety floor onto this write at the choke-point (see `stamp_floors`),
+    // so the durable floor is preserved by construction regardless of the builder or what `hard_state()`
+    // returned.
+    let hard_state = self.stamp_floors(hard_state);
     // R34: remember the FIRST write that carries each newly-higher term, so `term_is_durable` can tell
     // when `self.term` has actually reached stable storage. Terms are monotonic and all HardState writes
     // carry the current term, so the first write at a higher term establishes that term's durability.
     if hard_state.term() > self.last_submitted_term {
       self.last_submitted_term = hard_state.term();
       self.term_persist_opid = id;
+    }
+    // R42: the same watermark for the monotone-increasing lease-support floor (MAGNITUDE), so
+    // `on_stable_wrote` can tell when a newly-RAISED floor has reached stable storage and the follower may
+    // begin advertising its real lease support (the persist-before-advertise gate in `on_heartbeat`).
+    if hard_state.lease_support().promised() > self.last_submitted_lease_support {
+      self.last_submitted_lease_support = hard_state.lease_support().promised();
+      self.lease_support_persist_opid = id;
     }
     stable.submit_write(id, hard_state);
   }
@@ -1042,10 +1168,19 @@ where
       return;
     }
     let durable = stable.hard_state();
-    if durable.term() == self.term && durable.vote() == self.voted_for {
+    // R42: also force a write when the in-memory lease-support floor has outrun the durable one — a fresh
+    // node that adopted its term via AppendEntries (no term change here) then bumped the floor on its first
+    // enforcing Heartbeat would otherwise early-return and never persist the promise it is about to advertise.
+    if durable.term() == self.term
+      && durable.vote() == self.voted_for
+      && durable.promised_lease_support() == self.lease_support_floor
+    {
       return;
     }
     let opid = self.mint_op_id();
+    // The lease-support floor is stamped by the `submit_write` choke-point (`raise`), so this builder need
+    // not carry it — and relying on the choke-point also UPGRADES a legacy `Unrecorded` durable record to
+    // `Recorded` on this write (self-heal).
     let hs = durable
       .with_term(self.term)
       .with_vote(self.voted_for)
@@ -1898,6 +2033,65 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
     F::Snapshot: crate::Data,
+    I: crate::Data,
+  {
+    Self::restart_inner(config, now, seed, fsm, boot_epoch, None, log, stable)
+  }
+
+  /// R43 migration entry point: like [`restart`](Self::restart) but for a ONE-TIME upgrade from a binary
+  /// that persisted no `lease_support` floor (pre-R42). `assume_prior_lease_support` is an upper bound on
+  /// the LeaseBased read-lease window this node may have advertised (in memory) before the crash — typically
+  /// the pre-upgrade `election_timeout`. The post-restart vote fence is sized to honor it (so the old
+  /// leader's still-live lease cannot be undermined), and it is persisted as the durable floor so every
+  /// subsequent plain `restart` is fully covered. Pass `None` (or just use `restart`) once any enforcing
+  /// restart has recorded a real floor; a too-small value reopens the config-drift hole for exactly one
+  /// restart, and `None` means "trust only the durable record".
+  // Mirrors `restart`'s wide recovery API plus the one migration parameter; bundling into a struct would
+  // obscure the parallel with `restart`/`new`.
+  #[allow(clippy::too_many_arguments)]
+  pub fn restart_migrating<L, S>(
+    config: Config<I>,
+    now: Instant,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<core::time::Duration>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Self
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
+    I: crate::Data,
+  {
+    Self::restart_inner(
+      config,
+      now,
+      seed,
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      log,
+      stable,
+    )
+  }
+
+  #[allow(clippy::too_many_arguments)]
+  fn restart_inner<L, S>(
+    config: Config<I>,
+    now: Instant,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<core::time::Duration>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Self
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
     I: crate::Data, // decode ConfChangeV2 entries when replaying the log's membership (Raft §4.1)
   {
     let hs = stable.hard_state();
@@ -2025,19 +2219,34 @@ where
     // Never trust commit beyond the durable log; never below the snapshot baseline.
     let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
     let read_only_opt = config.read_only();
-    // R37+R41: fence vote-granting for one election_timeout after restart. This node may have acked SOME
-    // leader's read-lease just before crashing; that promise was in-memory and is now lost, so without
-    // the fence it could grant a vote and elect a new leader inside the old leader's still-valid lease
-    // window. `now + election_timeout >= the lease expiry` because the ack happened at or before `now`,
-    // so the fence always covers it. R41 FIX: arm it on the ENFORCEMENT CAPABILITY (`check_quorum ||
-    // pre_vote` — the exact predicate under which this node advertises `lease_support` and runs
-    // `in_lease`), NOT on this node's OWN `read_only`: a node whose own reads are `Safe` can still have
-    // acked-and-promised to uphold a LeaseBased leader's lease, so keying the fence off its read mode
-    // would miss that and let it elect a new leader post-restart inside the live lease window.
-    let lease_vote_fence_until = if config.check_quorum() || config.pre_vote() {
-      Some(now + config.election_timeout())
-    } else {
-      None
+    // R37+R41+R42+R43/R44: size the post-restart vote fence by the DURABLE PRE-CRASH PROMISE, not the
+    // (possibly weaker) post-restart config, so this node cannot help elect a new leader inside a read-lease
+    // it promised (as a follower) but has since forgotten (the in-memory `in_lease` state is lost on crash).
+    // `reconcile_durable` is the pure, exhaustively case-tested lease-axis sibling of `reconcile_restart_log`:
+    // it branches on the recovered PROVENANCE — a `Recorded` floor is authoritative (config drift cannot
+    // shrink it; `assume_prior` is ignored — never over-fence a native node) while a legacy `Unrecorded`
+    // record's prior promise is UNKNOWN and is fenced conservatively by this run's window + `assume_prior`.
+    // SAFETY rests on `now >= every pre-crash ack instant` (follower local-clock monotonicity across
+    // restart) — the same irreducible clock residual as all lease reads (see `lease_read_available`).
+    let enforcing = config.check_quorum() || config.pre_vote();
+    let recovered_floor = hs.promised_lease_support();
+    let (lease_support_floor, lease_vote_fence_until) = match reconcile_durable(
+      hs.lease_support(),
+      enforcing,
+      config.election_timeout(),
+      assume_prior_lease_support,
+    ) {
+      LeaseReconcile::Ok(d) => (d.lease_support_floor, d.fence_window.map(|w| now + w)),
+      // A legacy `Unrecorded` record with no operator bound: fail-stop (R44) — the prior promise is
+      // unbounded, so no finite fence is safe; recover via `restart_migrating(assume_prior = ..)`. A
+      // poisoned node is inert (it emits nothing and persists nothing), so it can never grant a vote.
+      LeaseReconcile::Poison => {
+        if !poisoned {
+          poisoned = true;
+          poison_reason = Some(PoisonReason::LegacyLeaseUnrecoverable);
+        }
+        (None, None)
+      }
     };
     // Misconfiguration is handled by degradation, not rejection (see `Endpoint::new`); restart
     // construction stays infallible and identical across build profiles.
@@ -2071,6 +2280,14 @@ where
       durable_term: hs.term(),
       last_submitted_term: hs.term(),
       term_persist_opid: crate::OpId::ZERO,
+      // R42: `recovered_floor` (= hs.lease_support()) is what is durable NOW; `lease_support_floor` may be
+      // larger (a config grow this incarnation), in which case the post-construction step below persists it
+      // and the advertise gate holds at ZERO until that write drains. On a same/shrunk-config restart the
+      // floor already equals the recovered value, so the gate is true immediately (no advertise stall).
+      lease_support_floor,
+      last_submitted_lease_support: recovered_floor,
+      durable_lease_support: recovered_floor,
+      lease_support_persist_opid: crate::OpId::ZERO,
       term_gated_append_ack: None,
       term_gated_snapshot_ack: None,
       // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
@@ -2096,6 +2313,18 @@ where
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
     if !ep.poisoned {
       ep.apply_committed(log);
+    }
+    // R42: if this incarnation's enforcement window GREW the durable floor (a config grow, or a legacy
+    // record being recorded for the first time under an enforcing config), persist the raised floor ONCE
+    // here. `submit_write` records the watermark so the advertise gate holds at ZERO until it drains. On a
+    // same/shrunk-config restart the floor already equals the recovered value, so this is a no-op (no
+    // write, no advertise stall). Skipped when poisoned (no side effects from a poisoned restart).
+    if !ep.poisoned && ep.lease_support_floor > ep.durable_lease_support {
+      let opid = ep.mint_op_id();
+      // The `submit_write` choke-point `raise`s `ep.lease_support_floor` onto this write, recording the
+      // floor AND upgrading a legacy `Unrecorded` recovered record to `Recorded` (the self-heal).
+      let hsw = stable.hard_state();
+      ep.submit_write(stable, opid, hsw);
     }
     ep.events.clear();
     ep.arm_election_timer(now);
@@ -2167,6 +2396,14 @@ where
     // are ordered). Advance `durable_term`, which may now release a term-gated success ack below.
     if self.last_submitted_term > self.durable_term && opid >= self.term_persist_opid {
       self.durable_term = self.last_submitted_term;
+    }
+    // R42: the same advance for the lease-support floor — a completion at/past the floor write makes the
+    // raised floor durable, releasing the persist-before-advertise gate so `on_heartbeat` may now advertise
+    // this node's real lease support.
+    if self.last_submitted_lease_support > self.durable_lease_support
+      && opid >= self.lease_support_persist_opid
+    {
+      self.durable_lease_support = self.last_submitted_lease_support;
     }
     match self.pending.remove(&opid) {
       Some(Pending::CastVote { to, term }) => {
@@ -3070,8 +3307,24 @@ where
     // leader does not count it toward the lease quorum (closes R41's heterogeneous-cooperation hole);
     // sending our OWN election_timeout (not the leader's) lets the leader bound the lease by the quorum's
     // real support even under heterogeneous timeouts.
+    // R42 persist-before-ADVERTISE: a lease-support advertisement is a PROMISE to uphold the leader's
+    // lease for one election_timeout that this node must keep even across a crash (the post-restart vote
+    // fence). So we advertise our real `election_timeout` ONLY once that promise is DURABLE — i.e. the
+    // durable lease-support floor covers it. We bump the in-memory floor here (the advertise site); the
+    // post-dispatch `ensure_term_durable` persists it, and `on_stable_wrote` then advances
+    // `durable_lease_support`. Until durable, advertise ZERO: the leader counts ZERO (does not float a
+    // lease on a promise a crash could erase), so the read silently degrades to Safe. This is the lease
+    // sibling of R34's term-before-respond ack gating.
     let lease_support = if self.config.check_quorum() || self.config.pre_vote() {
-      self.config.election_timeout()
+      let this_run = self.config.election_timeout();
+      if self.lease_support_floor < Some(this_run) {
+        self.lease_support_floor = Some(this_run);
+      }
+      if self.durable_lease_support >= Some(this_run) {
+        this_run
+      } else {
+        core::time::Duration::ZERO
+      }
     } else {
       core::time::Duration::ZERO
     };
@@ -3503,9 +3756,11 @@ where
   /// cannot be elected while a lease the followers granted is still live:
   ///   - `in_lease` (in `handle_message`): a follower that has heard from its current leader within the
   ///     election timeout ignores a disruptive higher-term vote request; and
-  ///   - the post-restart vote fence (`lease_vote_fenced`, armed in `restart` — R37): a RESTARTED
-  ///     follower, which may have acked a lease it has since forgotten, refuses to grant votes for one
-  ///     election timeout.
+  ///   - the post-restart vote fence (`lease_vote_fenced`, armed in `restart` — R37/R42): a RESTARTED
+  ///     follower, which may have acked a lease it has since forgotten, refuses to grant votes until the
+  ///     promise expires. R42 sizes the fence by the DURABLE lease-support floor (`HardState.lease_support`,
+  ///     persisted before the advertisement via the `on_heartbeat` gate), so it honors the pre-crash promise
+  ///     even if the node restarts under a weaker config (shorter `election_timeout` / enforcement disabled).
   ///
   /// A FORCED leader-transfer vote bypasses both (the current leader voluntarily relinquished its lease,
   /// clearing it in `transfer_leader` and disabling its own lease reads via conditions 3–4).
@@ -3519,8 +3774,10 @@ where
   /// RESIDUAL CAVEAT (IRREDUCIBLE for ALL lease reads — etcd's included — and PROVEN unremovable by a
   /// multi-expert Raft panel: a lease infers a non-event from elapsed time, which no logical/epoch/HLC
   /// machinery can discharge): bounded clock-RATE drift, plus the non-Byzantine honesty of voters. R41's
-  /// self-validating renewal (condition 2) closed the COOPERATION/heterogeneity vector by construction, so
-  /// these are the ONLY residuals that remain. If this leader's clock runs slow relative to the followers'
+  /// self-validating renewal (condition 2) closed the COOPERATION/heterogeneity vector by construction, and
+  /// R42's durable lease-support floor closed the CONFIG-DRIFT-across-restart vector (a node restarting
+  /// under weaker config granting a vote inside a live lease), so these are the ONLY residuals that remain.
+  /// If this leader's clock runs slow relative to the followers'
   /// election timers, a follower could time out and elect a new leader before this lease expires.
   /// Deployments that cannot bound clock drift MUST use `ReadOnlyOption::Safe` (the default), whose
   /// per-read heartbeat round needs no timing assumption.
@@ -14110,6 +14367,771 @@ mod tests {
     assert!(
       ep.lease_valid_until.is_none(),
       "a committed membership change must revoke the lease (quorum overlap no longer guaranteed)"
+    );
+  }
+
+  // ---- R42: persist the lease-support PROMISE across restart (config-drift safety) ----
+
+  /// Build a fresh enforcing follower (node 2 in {1,2,3}, check_quorum on, LeaseBased) at term 0 on an
+  /// async store. Drive it with `follower_advertised_support` to exercise the persist-before-advertise gate.
+  fn enforcing_follower(
+    et: core::time::Duration,
+  ) -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::AsyncStable,
+  ) {
+    use crate::{Config, Instant};
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      et,
+      core::time::Duration::from_millis(50),
+    )
+    .unwrap()
+    .with_check_quorum(true)
+    .with_read_only(crate::ReadOnlyOption::LeaseBased);
+    (
+      Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default()),
+      crate::testkit::VecLog::default(),
+      crate::testkit::AsyncStable::default(),
+    )
+  }
+
+  /// Deliver one Heartbeat (leader 1, term `t`, lease round `r`) and return the `lease_support` the
+  /// follower advertised in its HeartbeatResp.
+  fn follower_advertised_support(
+    ep: &mut Endpoint<u64, crate::testkit::CountSm>,
+    log: &mut crate::testkit::VecLog,
+    stable: &mut crate::testkit::AsyncStable,
+    now: crate::Instant,
+    t: u64,
+    r: u64,
+  ) -> core::time::Duration {
+    use crate::Message;
+    ep.handle_message(
+      now,
+      log,
+      stable,
+      1u64,
+      Message::Heartbeat(
+        crate::Heartbeat::new(
+          crate::Term::new(t),
+          1u64,
+          crate::Index::ZERO,
+          bytes::Bytes::new(),
+        )
+        .with_lease_round(r),
+      ),
+    );
+    let mut support = None;
+    while let Some(out) = ep.poll_message() {
+      if let Message::HeartbeatResp(hr) = out.message() {
+        support = Some(hr.lease_support());
+      }
+    }
+    support.expect("the follower produced a HeartbeatResp")
+  }
+
+  /// R42: a restart under a config that DISABLES enforcement (neither check_quorum nor pre_vote) must
+  /// still fence for the DURABLE pre-crash promise — the fence is sized by `hs.lease_support()`, not by the
+  /// post-restart config.
+  ///
+  /// MUTATION: size `lease_vote_fence_until` from the config window only (ignore `durable_window`) → the
+  /// fence becomes None under enforcement-off (the original R42 bug).
+  #[test]
+  fn restart_fence_honors_persisted_floor_under_enforcement_disabled() {
+    use crate::{Config, HardState, Instant};
+    use core::time::Duration;
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_hard_state(HardState::initial().with_lease_support(
+      crate::LeaseSupport::Recorded(Some(Duration::from_millis(1000))),
+    ));
+    // Restart with enforcement OFF (check_quorum and pre_vote both default false).
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(100),
+      Duration::from_millis(50),
+    )
+    .unwrap();
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+    let ep = Endpoint::restart(
+      cfg,
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep.lease_vote_fence_until,
+      Some(now + Duration::from_millis(1000)),
+      "the durable pre-crash promise must arm the fence even when the post-restart config enforces nothing"
+    );
+  }
+
+  /// R42: a restart with a SHORTER election_timeout must still fence for the (longer) durable promise.
+  ///
+  /// MUTATION: `lease_vote_fence_until = Some(now + config.election_timeout())` (drop the max with the
+  /// durable floor) → fence becomes now+100ms, shorter than the 1000ms promised.
+  #[test]
+  fn restart_fence_honors_persisted_floor_over_shrunk_election_timeout() {
+    use crate::{Config, HardState, Instant};
+    use core::time::Duration;
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_hard_state(HardState::initial().with_lease_support(
+      crate::LeaseSupport::Recorded(Some(Duration::from_millis(1000))),
+    ));
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(100),
+      Duration::from_millis(50),
+    )
+    .unwrap()
+    .with_check_quorum(true);
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+    let ep = Endpoint::restart(
+      cfg,
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep.lease_vote_fence_until,
+      Some(now + Duration::from_millis(1000)),
+      "the fence must honor the durable 1000ms promise, not the shrunk 100ms election_timeout"
+    );
+  }
+
+  /// R42 (the decisive persist-before-ADVERTISE gate — Hole A): a follower advertises ZERO lease support
+  /// until its floor is DURABLE, then its real election_timeout. So the leader can never float a lease on a
+  /// promise a crash could erase.
+  ///
+  /// MUTATION: drop the `&& self.durable_lease_support >= Some(this_run)` gate in `on_heartbeat` (advertise
+  /// `this_run` unconditionally) → the FIRST response carries 1000ms before the floor is durable.
+  #[test]
+  fn advertise_is_zero_until_lease_support_floor_durable_then_full() {
+    use core::time::Duration;
+    let et = Duration::from_millis(1000);
+    let (mut ep, mut log, mut stable) = enforcing_follower(et);
+    let now = crate::Instant::ORIGIN;
+    let s1 = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
+    assert_eq!(
+      s1,
+      Duration::ZERO,
+      "a follower must advertise ZERO until its lease-support floor is durable"
+    );
+    // Drain the floor write → durable_lease_support advances.
+    ep.handle_storage(now, &mut log, &mut stable);
+    let s2 = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 2);
+    assert_eq!(
+      s2, et,
+      "once the floor is durable the follower advertises its real election_timeout"
+    );
+  }
+
+  /// R42: a crash in the fsync window (the floor write never reaches disk) is HARMLESS because only ZERO
+  /// was ever advertised — so a restart under weaker config with no durable promise (fence None) is safe.
+  ///
+  /// MUTATION: ungate the advertise (as above) → the pre-crash advertisement would be 1000ms, the leader
+  /// would float a lease, and the None post-restart fence would be a stale-read hole.
+  #[test]
+  fn persist_before_advertise_survives_crash_in_fsync_window() {
+    use crate::{Config, Instant};
+    use core::time::Duration;
+    let et = Duration::from_millis(1000);
+    let (mut ep, mut log, mut stable) = enforcing_follower(et);
+    let now = Instant::ORIGIN;
+    let s1 = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
+    assert_eq!(s1, Duration::ZERO, "pre-durable advertise must be ZERO");
+    // CRASH before the floor write drains → the promise was never durable.
+    stable.discard_inflight();
+    assert_eq!(
+      stable.hard_state().promised_lease_support(),
+      None,
+      "the inflight lease-support write was lost on crash"
+    );
+    drop(ep);
+    // Restart under WEAKER config (enforcement disabled). No durable promise → no fence — and none is
+    // needed, since only ZERO was ever advertised (no lease was floated on this node).
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(100),
+      Duration::from_millis(50),
+    )
+    .unwrap();
+    let r_now = now + Duration::from_millis(50);
+    let ep2 = Endpoint::restart(
+      cfg,
+      r_now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep2.lease_vote_fence_until, None,
+      "no durable promise → no fence (safe: only ZERO was ever advertised)"
+    );
+  }
+
+  /// R42: a grow → crash-in-fsync-window → shrink chain must not under-fence. The grown floor that never
+  /// reached disk is lost; the restart must fence for the last DURABLE promise (run A's 1000ms), not the
+  /// lost 2000ms grow nor the 100ms shrink.
+  ///
+  /// MUTATION: drop the monotone-max (`floor = this_run`) → run C fences for 100ms; or fence from
+  /// `this_run` → same. Either under-fences run A's still-possible 1000ms lease.
+  #[test]
+  fn grow_then_crash_then_shrink_does_not_underfence() {
+    use crate::{Config, HardState, Instant};
+    use core::time::Duration;
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    // Run A already persisted+flushed a 1000ms promise.
+    stable.force_hard_state(HardState::initial().with_lease_support(
+      crate::LeaseSupport::Recorded(Some(Duration::from_millis(1000))),
+    ));
+    // Run B: restart GROWN to et=2000 → submits a floor=2000 write (in flight).
+    let cfg_b = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(2000),
+      Duration::from_millis(50),
+    )
+    .unwrap()
+    .with_check_quorum(true);
+    let now_b = Instant::ORIGIN + Duration::from_millis(1000);
+    let _ep_b = Endpoint::restart(
+      cfg_b,
+      now_b,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    // CRASH in the fsync window → the 2000 write never reached disk; durable rolls back to run A's 1000.
+    stable.discard_inflight();
+    assert_eq!(
+      stable.hard_state().promised_lease_support(),
+      Some(Duration::from_millis(1000)),
+      "the grown 2000ms floor was lost; durable stays at run A's 1000ms"
+    );
+    // Run C: restart SHRUNK to et=100. Fence must still cover run A's still-possible 1000ms lease.
+    let cfg_c = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(100),
+      Duration::from_millis(50),
+    )
+    .unwrap()
+    .with_check_quorum(true);
+    let now_c = Instant::ORIGIN + Duration::from_millis(1100);
+    let ep_c = Endpoint::restart(
+      cfg_c,
+      now_c,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep_c.lease_vote_fence_until,
+      Some(now_c + Duration::from_millis(1000)),
+      "fence must honor run A's durable 1000ms, not the lost 2000 grow nor the 100ms shrink"
+    );
+  }
+
+  /// R44 (fail-stop): a legacy (pre-format) `Unrecorded` record has an UNKNOWN, possibly-large prior lease
+  /// promise, so plain `restart` (no operator bound) cannot fence it safely by any finite value and must
+  /// FAIL-STOP (poison `legacy_lease_unrecoverable`) — under BOTH enforcing and non-enforcing config, since
+  /// either way the node could grant a disruptive vote inside an old leader's still-live lease. A poisoned
+  /// node is inert (emits/persists nothing), so it can never grant. `restart_migrating(Some(bound))` is the
+  /// recovery path and is NOT poisoned (the et-shrink case is fenced by the operator's bound, not under-fenced).
+  /// Native nodes never hit this (genesis is `Recorded`).
+  ///
+  /// MUTATION: have the `Unrecorded`-without-bound arm of `reconcile_durable` return a finite fence instead
+  /// of `Poison` → plain restart under-fences a legacy node (R44) → the `is_poisoned` assertion fails.
+  #[test]
+  fn legacy_unrecorded_plain_restart_poisons_migrating_recovers() {
+    use crate::{Config, HardState, Instant, LeaseSupport, PoisonReason};
+    use core::time::Duration;
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+    let legacy = || {
+      let mut s = crate::testkit::AsyncStable::default();
+      s.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Unrecorded));
+      s
+    };
+    let enforcing = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(100), // SHRUNK timeout (the dangerous et-shrink-on-upgrade case)
+      Duration::from_millis(50),
+    )
+    .unwrap()
+    .with_check_quorum(true);
+    let non_enforcing = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(100),
+      Duration::from_millis(50),
+    )
+    .unwrap();
+    // Plain restart of a legacy Unrecorded record FAIL-STOPS — both enforcing and non-enforcing.
+    for cfg in [enforcing.clone(), non_enforcing] {
+      let mut log = crate::testkit::VecLog::default();
+      let mut stable = legacy();
+      let ep = Endpoint::restart(
+        cfg,
+        now,
+        7,
+        crate::testkit::CountSm::default(),
+        1,
+        &mut log,
+        &mut stable,
+      );
+      assert!(
+        ep.is_poisoned(),
+        "plain restart of a legacy Unrecorded record must fail-stop (unbounded prior promise)"
+      );
+      assert_eq!(
+        ep.poison_reason(),
+        Some(PoisonReason::LegacyLeaseUnrecoverable)
+      );
+    }
+    // restart_migrating with the operator's known pre-upgrade window (2000ms) RECOVERS — fence honors the
+    // bound (now+2000), NOT the shrunk 100ms config, and the node is NOT poisoned.
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = legacy();
+    let ep = Endpoint::restart_migrating(
+      enforcing,
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      Some(Duration::from_millis(2000)),
+      &mut log,
+      &mut stable,
+    );
+    assert!(
+      !ep.is_poisoned(),
+      "restart_migrating with a bound must recover, not poison"
+    );
+    assert_eq!(
+      ep.lease_vote_fence_until,
+      Some(now + Duration::from_millis(2000)),
+      "restart_migrating fences by the operator's known prior window, not the shrunk config"
+    );
+  }
+
+  /// R43/R44: `reconcile_durable` is a pure total fn — a table over
+  /// (Recorded(None) / Recorded(Some) / Unrecorded) x (enforcing / not) x (assume_prior present / absent)
+  /// pins every cell. A native `Recorded` is authoritative (assume_prior IGNORED, never poisons); a legacy
+  /// `Unrecorded` is safe ONLY with an operator bound, else fail-stops (unbounded prior promise).
+  ///
+  /// MUTATION: make the `Recorded` arm consult assume_prior (over-fences a native node), make the
+  /// `Unrecorded` arm fence by `this_run` instead of poisoning when assume_prior is None (R44 under-fence),
+  /// or have `Unrecorded` poison even WITH a bound → a cell mismatches.
+  #[test]
+  fn reconcile_durable_is_exhaustive() {
+    use crate::LeaseSupport;
+    use core::time::Duration;
+    let et = Duration::from_millis(1000);
+    let p = Some(Duration::from_millis(900)); // an operator-supplied assume_prior bound
+    let d700 = Some(Duration::from_millis(700));
+    let ok = |floor, window| {
+      LeaseReconcile::Ok(DerivedLeaseSafety {
+        lease_support_floor: floor,
+        fence_window: window,
+      })
+    };
+    // (recovered, enforcing, assume_prior) -> expected LeaseReconcile
+    let cases = [
+      // Native Recorded(Some(700)): authoritative; enforcing maxes with this_run(1000); assume_prior ignored.
+      (
+        LeaseSupport::Recorded(d700),
+        true,
+        p,
+        ok(Some(et), Some(et)),
+      ),
+      (LeaseSupport::Recorded(d700), false, p, ok(d700, d700)),
+      // Native Recorded(None): promised nothing; fence only by this_run; assume_prior ignored; never poisons.
+      (
+        LeaseSupport::Recorded(None),
+        true,
+        p,
+        ok(Some(et), Some(et)),
+      ),
+      (LeaseSupport::Recorded(None), false, p, ok(None, None)),
+      (LeaseSupport::Recorded(None), false, None, ok(None, None)),
+      // Legacy Unrecorded WITH an operator bound: safe (this_run.max(assume_prior)).
+      (LeaseSupport::Unrecorded, true, p, ok(Some(et), Some(et))), // max(1000,900)=1000
+      (LeaseSupport::Unrecorded, false, p, ok(p, p)),
+      // Legacy Unrecorded WITHOUT a bound: fail-stop (the prior promise is unbounded).
+      (LeaseSupport::Unrecorded, true, None, LeaseReconcile::Poison),
+      (
+        LeaseSupport::Unrecorded,
+        false,
+        None,
+        LeaseReconcile::Poison,
+      ),
+    ];
+    for (recovered, enforcing, assume_prior, expected) in cases {
+      assert_eq!(
+        reconcile_durable(recovered, enforcing, et, assume_prior),
+        expected,
+        "reconcile_durable({recovered:?}, enforcing={enforcing}, assume_prior={assume_prior:?})"
+      );
+    }
+  }
+
+  /// R43/R44: a NATIVE `Recorded(None)` (a fresh / non-enforcing current-format node) is NOT over-fenced —
+  /// `reconcile_durable` ignores `assume_prior` for any `Recorded` record (it is authoritative). Only a
+  /// legacy `Unrecorded` record consults the operator's assumed prior. This pins the by-construction
+  /// native/legacy distinction the in-tree by-value store must preserve.
+  ///
+  /// MUTATION: treat `Recorded(None)` as `Unrecorded` (or have the `Recorded` arm consult assume_prior) →
+  /// the native node is fenced by the (huge) assume_prior it should ignore.
+  #[test]
+  fn native_recorded_none_is_not_overfenced() {
+    use crate::{Config, HardState, Instant, LeaseSupport};
+    use core::time::Duration;
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+    let cfg = || {
+      Config::try_new(
+        2u64,
+        std::vec![1u64, 2u64, 3u64],
+        Duration::from_millis(100),
+        Duration::from_millis(50),
+      )
+      .unwrap()
+    };
+    // A NATIVE Recorded(None) under restart_migrating with a HUGE assume_prior: the native record is
+    // authoritative → assume_prior is ignored → non-enforcing config → no fence.
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Recorded(None)));
+    let ep = Endpoint::restart_migrating(
+      cfg(),
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      Some(Duration::from_secs(999)), // huge assume_prior — MUST be ignored for a native record
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep.lease_vote_fence_until, None,
+      "a native Recorded(None) must ignore assume_prior (authoritative no-promise), not over-fence"
+    );
+    // Contrast: the SAME huge assume_prior on a legacy Unrecorded record IS honored.
+    let mut log2 = crate::testkit::VecLog::default();
+    let mut stable2 = crate::testkit::AsyncStable::default();
+    stable2.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Unrecorded));
+    let ep2 = Endpoint::restart_migrating(
+      cfg(),
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      Some(Duration::from_secs(999)),
+      &mut log2,
+      &mut stable2,
+    );
+    assert_eq!(
+      ep2.lease_vote_fence_until,
+      Some(now + Duration::from_secs(999)),
+      "a legacy Unrecorded record DOES honor the operator's assume_prior"
+    );
+  }
+
+  /// R42: a recorded genuine-ZERO floor means "promised nothing" — it must NOT arm a degenerate `now+0`
+  /// fence. (In-tree we never persist ZERO, but an out-of-tree decoder might, so the fence filters it.)
+  ///
+  /// MUTATION: drop the `.filter(|d| !d.is_zero())` on `durable_window` → Some(ZERO) arms a `Some(now)`
+  /// fence instead of None.
+  #[test]
+  fn genuine_zero_floor_does_not_force_fence() {
+    use crate::{Config, HardState, Instant};
+    use core::time::Duration;
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_hard_state(
+      HardState::initial().with_lease_support(crate::LeaseSupport::Recorded(Some(Duration::ZERO))),
+    );
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(50),
+    )
+    .unwrap(); // enforcement off
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+    let ep = Endpoint::restart(
+      cfg,
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep.lease_vote_fence_until, None,
+      "a recorded genuine-ZERO floor promised nothing → no fence (must not arm now+0)"
+    );
+  }
+
+  /// R42 write-amplification invariant (constraint 2): once the floor is durable, steady-state heartbeats
+  /// at a stable term add NO HardState write.
+  ///
+  /// MUTATION: drop the early-return in `ensure_term_durable` (write on every message) → steady-state
+  /// heartbeats each submit a HardState write.
+  #[test]
+  fn steady_state_heartbeats_add_no_hardstate_write() {
+    use core::time::Duration;
+    let et = Duration::from_millis(1000);
+    let (mut ep, mut log, mut stable) = enforcing_follower(et);
+    let now = crate::Instant::ORIGIN;
+    // First heartbeat establishes term 5 + the floor; drain both writes to durability.
+    let _ = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
+    ep.handle_storage(now, &mut log, &mut stable);
+    while stable.pending_writes() > 0 {
+      ep.handle_storage(now, &mut log, &mut stable);
+    }
+    // Steady-state heartbeats at the SAME term: no new HardState writes.
+    for r in 2..8 {
+      let _ = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, r);
+    }
+    assert_eq!(
+      stable.pending_writes(),
+      0,
+      "steady-state heartbeats must add no HardState write (the floor is a process-lifetime constant)"
+    );
+  }
+
+  /// R42: a same-config restart submits NO floor write (the recovered floor already covers this run) and
+  /// the gate is satisfied immediately (no ZERO advertise stall).
+  ///
+  /// MUTATION: always submit the floor write in restart (drop the `if floor > durable` guard) → a write
+  /// appears and the first advertisement stalls at ZERO.
+  #[test]
+  fn restart_same_config_no_floor_write_and_no_advertise_stall() {
+    use crate::{Config, HardState, Instant, Term};
+    use core::time::Duration;
+    let et = Duration::from_millis(1000);
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_hard_state(
+      HardState::initial()
+        .with_term(Term::new(5))
+        .with_lease_support(crate::LeaseSupport::Recorded(Some(et))),
+    );
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      et,
+      Duration::from_millis(50),
+    )
+    .unwrap()
+    .with_check_quorum(true)
+    .with_read_only(crate::ReadOnlyOption::LeaseBased);
+    let now = Instant::ORIGIN;
+    let mut ep = Endpoint::restart(
+      cfg,
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      stable.pending_writes(),
+      0,
+      "a same-config restart must submit no floor write (recovered floor already covers this run)"
+    );
+    // First heartbeat (same term 5) advertises the real support immediately — no ZERO stall.
+    let s1 = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
+    assert_eq!(
+      s1, et,
+      "a same-config restart's first HeartbeatResp must advertise the real support (no stall)"
+    );
+  }
+
+  /// R42 defense-in-depth: the restart fence is computed from the durable floor UNCONDITIONALLY — even a
+  /// restart that POISONS still arms the fence (a poisoned node grants no vote anyway, but the fence must
+  /// not depend on the poison decision).
+  ///
+  /// MUTATION: gate the fence computation behind `if !poisoned { .. } else { None }` → the poisoned
+  /// restart leaves the fence None.
+  #[test]
+  fn poisoned_restart_still_computes_fence_from_floor() {
+    use crate::{Config, HardState, Index, Instant, Term};
+    use core::time::Duration;
+    // An orphaned-log restart (re-baselined log, no durable snapshot) poisons.
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_hard_state(
+      HardState::initial()
+        .with_term(Term::new(2))
+        .with_commit(Index::new(7))
+        .with_lease_support(crate::LeaseSupport::Recorded(Some(Duration::from_millis(
+          1000,
+        )))),
+    );
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(5), Term::new(2));
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(100),
+      Duration::from_millis(50),
+    )
+    .unwrap();
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+    let ep = Endpoint::restart(
+      cfg,
+      now,
+      42,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert!(ep.is_poisoned(), "the orphaned-log restart must poison");
+    assert_eq!(
+      ep.lease_vote_fence_until,
+      Some(now + Duration::from_millis(1000)),
+      "the fence must still be armed from the durable floor on a poisoned restart"
+    );
+  }
+
+  // ---- R43: adversarial-review follow-ups ----
+
+  /// R43 Finding 2 (choke-point floor preservation): under a strict `StableStore` whose `hard_state()`
+  /// returns LAST-DURABLE state, writers that rebuild HardState from it (vote grant, commit, campaign) must
+  /// NOT erase a lease-support floor whose raise is still in flight. `submit_write` stamps the in-memory
+  /// floor on EVERY write, so the durable floor is monotone non-decreasing regardless of the writer.
+  ///
+  /// MUTATION: remove the `with_lease_support(max(floor))` stamp in `submit_write` → the vote-grant write,
+  /// rebuilt from the stale last-durable `hard_state()` (lease None), submits None AFTER the floor's Some →
+  /// the monotonicity assertion fails.
+  #[test]
+  fn lease_floor_never_lowered_by_any_write_under_last_durable_store() {
+    use crate::{Index, Message, Term};
+    use core::time::Duration;
+    let (mut ep, mut log, mut stable) = enforcing_follower(Duration::from_millis(1000));
+    stable.set_last_durable_reads(true);
+    let now = crate::Instant::ORIGIN;
+    // Heartbeat raises the in-memory floor to 1000 and submits the floor write (in flight; durable stays
+    // None under last-durable reads).
+    let _ = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
+    // A higher-term FORCED-TRANSFER RequestVote (transfer bypasses `in_lease`/the fence, so the grant —
+    // and its HardState write — actually fires). `on_request_vote` rebuilds HardState from the last-durable
+    // `hard_state()` (lease None) WITHOUT stamping lease_support — the choke-point must restore the floor.
+    ep.handle_message(
+      now,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::RequestVote(crate::RequestVote::new(
+        Term::new(9),
+        3u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        true,
+      )),
+    );
+    // Every submitted write must be monotone non-decreasing in lease_support (None < Some); a Some->None
+    // (or Some->smaller) regression means a write erased the durable floor.
+    let seq = stable.submitted_lease_supports();
+    assert!(
+      seq.windows(2).all(|w| w[0] <= w[1]),
+      "lease_support floor must never be lowered by any write; got {seq:?}"
+    );
+    assert!(
+      seq.iter().any(|d| *d == Some(Duration::from_millis(1000))),
+      "the floor write should have carried Some(1000); got {seq:?}"
+    );
+  }
+
+  /// R43 Finding 1 (migration boundary): `restart_migrating` folds the operator-supplied
+  /// `assume_prior_lease_support` into the fence, so upgrading from a pre-R42 binary (no durable floor)
+  /// under WEAKER config still honors the in-memory-only promise the old node may have made — and persists
+  /// it so subsequent plain restarts are covered. Plain `restart` (the contrast below) cannot.
+  ///
+  /// MUTATION: drop `.max(assume_prior_lease_support)` in `restart_inner` → the legacy None record under a
+  /// non-enforcing config yields a None floor → no fence → the assertion fails.
+  #[test]
+  fn restart_migrating_honors_assumed_prior_lease_support() {
+    use crate::{Config, HardState, Instant};
+    use core::time::Duration;
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+    let cfg = || {
+      // Upgrade restart under WEAKER config: enforcement OFF (so `this_run` is None) + shorter timeout.
+      Config::try_new(
+        2u64,
+        std::vec![1u64, 2u64, 3u64],
+        Duration::from_millis(100),
+        Duration::from_millis(50),
+      )
+      .unwrap()
+    };
+    // Plain restart of a legacy (Unrecorded) record FAIL-STOPS — the prior promise is unbounded, so no
+    // finite fence is safe (R44); the operator must use restart_migrating.
+    let mut log0 = crate::testkit::VecLog::default();
+    let mut stable0 = crate::testkit::AsyncStable::default();
+    stable0
+      .force_hard_state(HardState::initial().with_lease_support(crate::LeaseSupport::Unrecorded));
+    let ep0 = Endpoint::restart(
+      cfg(),
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log0,
+      &mut stable0,
+    );
+    assert!(
+      ep0.is_poisoned(),
+      "plain restart of a legacy Unrecorded record must fail-stop, not silently proceed"
+    );
+    // restart_migrating with the operator-supplied prior closes it.
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable
+      .force_hard_state(HardState::initial().with_lease_support(crate::LeaseSupport::Unrecorded)); // legacy/pre-format record
+    let ep = Endpoint::restart_migrating(
+      cfg(),
+      now,
+      7,
+      crate::testkit::CountSm::default(),
+      1,
+      Some(Duration::from_millis(1000)), // operator: this node may have promised up to 1000ms pre-crash
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(
+      ep.lease_vote_fence_until,
+      Some(now + Duration::from_millis(1000)),
+      "restart_migrating must honor the assumed prior promise (1000ms), not the weaker post-restart config"
+    );
+    assert!(
+      stable.pending_writes() > 0,
+      "the assumed floor must be persisted on the migration restart so later plain restarts are covered"
     );
   }
 

@@ -178,6 +178,16 @@ pub trait StableStore {
   type Error;
 
   /// The current durable hard state (synchronous read).
+  ///
+  /// NORMATIVE for out-of-tree DISK impls (R42/R43/R44): [`HardState::lease_support`] is the three-valued
+  /// [`crate::LeaseSupport`]. When (de)serializing, preserve the THREE cases distinctly:
+  /// `Recorded(None)` (a current-format node that promised nothing), `Recorded(Some(d))` (a promise of `d`),
+  /// and — CRITICALLY — a genuine PRE-`lease_support` (legacy) blob MUST decode to `Unrecorded`, **never**
+  /// to `Recorded(None)`. `Unrecorded` triggers the conservative restart fence (and `restart_migrating`'s
+  /// operator-supplied prior), so a freshly-upgraded node is never less safe than before; decoding a legacy
+  /// blob as `Recorded(None)` would assert "promised nothing" and reopen the disruptive-vote-inside-a-live-
+  /// lease hole for one post-upgrade restart of a previously-enforcing node. In-tree impls store `HardState`
+  /// by value (no serialization), so they preserve all three cases automatically.
   fn hard_state(&self) -> HardState<Self::NodeId>;
 
   /// Queue a hard-state write. Durable on the matching `poll` (completions are ordered).

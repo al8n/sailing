@@ -348,33 +348,86 @@ impl StableStore for NoopStable {
 /// Use in tests that verify a granted vote is withheld until the write is durable.
 #[derive(Debug)]
 pub(crate) struct AsyncStable {
+  /// The VISIBLE HardState (reflects a `submit_write` immediately, before its completion is polled).
   hard_state: HardState<u64>,
+  /// The DURABLE HardState — the value a crash (`discard_inflight`) rolls back to. Advanced to the visible
+  /// value when a `Wrote` completion is polled (models flush-on-poll). Lets tests model a crash in the
+  /// fsync window: a `submit_write` whose completion is never polled is LOST on `discard_inflight`.
+  durable_hard_state: HardState<u64>,
   completions: VecDeque<StableDone>,
   snapshot: Option<(SnapshotMeta<u64>, Bytes)>,
   /// When set, the NEXT `submit_snapshot` persists the durable snapshot but DROPS its
   /// `SnapshotWritten` completion (models a store that coalesces/loses the completion while
   /// still making the blob durable). Used by the reconciliation test.
   drop_next_snapshot_completion: bool,
+  /// R43: when true, `hard_state()` returns the LAST-DURABLE value (the strict trait contract) rather than
+  /// the submit-visible one. Models a conforming store, exposing writers that rebuild HardState from
+  /// `hard_state()` while a floor write is in flight.
+  last_durable_reads: bool,
+  /// R43: the `lease_support` of every HardState actually handed to `submit_write` (post choke-point
+  /// stamp). Lets a test assert the durable floor is monotone non-decreasing across all writes.
+  submitted_lease: std::vec::Vec<Option<core::time::Duration>>,
 }
 
 impl Default for AsyncStable {
   fn default() -> Self {
     Self {
       hard_state: HardState::initial(),
+      durable_hard_state: HardState::initial(),
       completions: VecDeque::new(),
       snapshot: None,
       drop_next_snapshot_completion: false,
+      last_durable_reads: false,
+      submitted_lease: std::vec::Vec::new(),
     }
   }
 }
 
 impl AsyncStable {
-  /// Seed the stable store with a specific (term, vote, commit). Used in restart tests.
+  /// Seed the stable store with a specific (term, vote, commit) — durable from the start.
   pub(crate) fn force_state(&mut self, term: Term, vote: Option<u64>, commit: Index) {
-    self.hard_state = HardState::initial()
+    let hs = HardState::initial()
       .with_term(term)
       .with_vote(vote)
       .with_commit(commit);
+    self.hard_state = hs;
+    self.durable_hard_state = hs;
+  }
+
+  /// Seed the store with an arbitrary durable `HardState` (e.g. one carrying a `lease_support` floor).
+  /// Used by the R42 lease-promise restart tests.
+  pub(crate) fn force_hard_state(&mut self, hs: HardState<u64>) {
+    self.hard_state = hs;
+    self.durable_hard_state = hs;
+  }
+
+  /// Model a crash: every `submit_write` whose `Wrote` completion has not yet been polled is LOST — the
+  /// visible HardState rolls back to the last durable value and pending completions are discarded.
+  pub(crate) fn discard_inflight(&mut self) {
+    self.hard_state = self.durable_hard_state;
+    self.completions.clear();
+  }
+
+  /// R43: make `hard_state()` return the LAST-DURABLE value (strict `StableStore` contract) instead of the
+  /// submit-visible one, so writers that rebuild from `hard_state()` see a stale floor while a raise is in
+  /// flight — the exact condition Finding 2 needs.
+  pub(crate) fn set_last_durable_reads(&mut self, on: bool) {
+    self.last_durable_reads = on;
+  }
+
+  /// R43: the `lease_support` of every HardState handed to `submit_write`, in order.
+  pub(crate) fn submitted_lease_supports(&self) -> &[Option<core::time::Duration>] {
+    &self.submitted_lease
+  }
+
+  /// Number of HardState writes submitted but not yet polled — used to assert the write-amplification
+  /// invariant (steady-state heartbeats and same-config restarts add no HardState write).
+  pub(crate) fn pending_writes(&self) -> usize {
+    self
+      .completions
+      .iter()
+      .filter(|c| matches!(c, StableDone::Wrote(_)))
+      .count()
   }
 
   /// Arm the store so the next `submit_snapshot` persists the durable snapshot but drops its
@@ -389,10 +442,18 @@ impl StableStore for AsyncStable {
   type Error = core::convert::Infallible;
 
   fn hard_state(&self) -> HardState<u64> {
-    self.hard_state
+    // R43: a strict store returns the LAST-DURABLE state; the default models a submit-visible store.
+    if self.last_durable_reads {
+      self.durable_hard_state
+    } else {
+      self.hard_state
+    }
   }
 
   fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {
+    self
+      .submitted_lease
+      .push(hard_state.promised_lease_support());
     self.hard_state = hard_state;
     self.completions.push_back(StableDone::Wrote(id));
   }
@@ -413,6 +474,12 @@ impl StableStore for AsyncStable {
   }
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
-    self.completions.pop_front().map(Ok)
+    let done = self.completions.pop_front();
+    // A polled `Wrote` completion means that HardState write reached stable storage — fold it into the
+    // durable value so a later `discard_inflight` (crash) no longer rolls it back.
+    if matches!(done, Some(StableDone::Wrote(_))) {
+      self.durable_hard_state = self.hard_state;
+    }
+    done.map(Ok)
   }
 }
