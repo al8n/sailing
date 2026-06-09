@@ -49,3 +49,9 @@ pub use error::ConfigError;
 
 mod config;
 pub use config::Config;
+
+mod event;
+pub use event::{Applied, Event, LeaderChanged};
+
+mod endpoint;
+pub use endpoint::{Endpoint, Role};
