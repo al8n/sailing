@@ -33,6 +33,18 @@ impl Role {
   }
 }
 
+/// What the core owes once a storage write completes.
+#[derive(Debug, Clone, Copy)]
+#[allow(dead_code)] // variants filled in M3-U2
+enum Pending<I> {
+  /// Emit `VoteResp(grant)` to `to` once the term+vote write is durable.
+  CastVote { to: I },
+  /// Emit `AppendResp(success, match_index)` to `to` once the log append is durable.
+  FollowerAck { to: I, match_index: Index },
+  /// Advance the leader's own `match_index` to `upto` (and re-check commit) once durable.
+  LeaderAppend { upto: Index },
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -52,12 +64,21 @@ where
   commit: Index,
   applied: Index,
   prng: Prng,
+  #[allow(dead_code)] // preserved for Endpoint::restart (M3-U3)
+  seed: u64,
   votes_granted: BTreeSet<I>,
   election_deadline: Option<Instant>,
   heartbeat_deadline: Option<Instant>,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
   progress: BTreeMap<I, crate::Progress>,
+  /// Monotonically minted id for every storage submission.
+  #[allow(dead_code)] // read via mint_op_id; non-test callers added in M3-U2
+  next_op_id: crate::OpId,
+  /// Outstanding write → deferred action (filled in M3-U2; empty until then).
+  pending: BTreeMap<crate::OpId, Pending<I>>,
+  /// Sticky fatal error: once set, all `handle_*` are no-ops.
+  poisoned: bool,
 }
 
 // ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
@@ -80,12 +101,16 @@ where
       commit: Index::ZERO,
       applied: Index::ZERO,
       prng: Prng::new(seed),
+      seed,
       votes_granted: BTreeSet::new(),
       election_deadline: None,
       heartbeat_deadline: None,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       progress: BTreeMap::new(),
+      next_op_id: crate::OpId::ZERO,
+      pending: BTreeMap::new(),
+      poisoned: false,
     };
     ep.arm_election_timer(now);
     ep
@@ -142,12 +167,24 @@ where
     }
   }
 
-  /// Drain storage completions. (M3+: append-before-ack / persist-vote.)
-  pub fn handle_storage<L, S>(&mut self, _now: Instant, _log: &mut L, _stable: &mut S)
-  where
-    L: LogStore,
-    S: StableStore<NodeId = I>,
-  {
+  /// Mint a unique, monotonically-increasing operation id for a storage submission.
+  #[allow(dead_code)] // used in M3-U2 when Pending entries are created
+  fn mint_op_id(&mut self) -> crate::OpId {
+    let id = self.next_op_id;
+    self.next_op_id = self.next_op_id.next();
+    id
+  }
+
+  /// Enter the permanent failed state (a fatal storage/apply error). Every subsequent
+  /// `handle_*` becomes a no-op; the driver should surface this and stop.
+  fn poison(&mut self) {
+    self.poisoned = true;
+  }
+
+  /// Whether this node has hit an unrecoverable error.
+  #[inline(always)]
+  pub const fn is_poisoned(&self) -> bool {
+    self.poisoned
   }
 
   // --- PRIVATE HELPERS (no Data bound) ---
@@ -302,6 +339,79 @@ where
   F: StateMachine,
   F::Command: crate::Data,
 {
+  /// Drain storage completions. (M3+: append-before-ack / persist-vote.)
+  pub fn handle_storage<L, S>(&mut self, _now: Instant, log: &mut L, stable: &mut S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if self.poisoned {
+      return;
+    }
+    while let Some(done) = log.poll() {
+      match done {
+        Ok(crate::LogDone::Appended(opid)) => self.on_log_appended(log, opid),
+        Ok(crate::LogDone::Compacted(_)) => {}
+        Err(_) => {
+          self.poison();
+          return;
+        }
+      }
+    }
+    while let Some(done) = stable.poll() {
+      match done {
+        Ok(crate::StableDone::Wrote(opid)) => self.on_stable_wrote(opid),
+        Ok(crate::StableDone::SnapshotWritten(_)) => {}
+        Err(_) => {
+          self.poison();
+          return;
+        }
+      }
+    }
+  }
+
+  #[cfg(test)]
+  pub(crate) fn mint_op_id_for_test(&mut self) -> crate::OpId {
+    self.mint_op_id()
+  }
+
+  fn on_log_appended<L: LogStore>(&mut self, log: &mut L, opid: crate::OpId) {
+    match self.pending.remove(&opid) {
+      Some(Pending::FollowerAck { to, match_index }) => {
+        let (term, me) = (self.term, self.config.id());
+        self.send(
+          to,
+          Message::AppendResp(crate::AppendResp::new(
+            term,
+            me,
+            false,
+            Index::ZERO,
+            Term::ZERO,
+            match_index,
+          )),
+        );
+      }
+      Some(Pending::LeaderAppend { upto }) => {
+        if let Some(p) = self.progress.get_mut(&self.config.id()) {
+          p.maybe_update(upto);
+        }
+        self.maybe_advance_commit(log);
+        self.apply_committed(log);
+      }
+      _ => {} // CastVote completes via stable; unknown/superseded opid → ignore
+    }
+  }
+
+  fn on_stable_wrote(&mut self, opid: crate::OpId) {
+    if let Some(Pending::CastVote { to }) = self.pending.remove(&opid) {
+      let (term, me) = (self.term, self.config.id());
+      self.send(
+        to,
+        Message::VoteResp(crate::VoteResp::new(term, me, false, false)),
+      );
+    }
+  }
+
   /// Feed an inbound message. Runs the universal term pre-pass then dispatches.
   pub fn handle_message<L, S>(
     &mut self,
@@ -314,6 +424,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if self.poisoned {
+      return;
+    }
     // Universal term handling (Raft §5.1): a higher term forces us to a follower.
     if msg.term() > self.term {
       self.term = msg.term();
@@ -342,6 +455,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if self.poisoned {
+      return;
+    }
     match self.role {
       Role::Leader => {
         if self.heartbeat_deadline.is_some_and(|d| d <= now) {
@@ -1118,5 +1234,23 @@ mod tests {
       Index::new(3),
       "stale AppendEntries must not truncate entries 2 and 3"
     );
+  }
+
+  // --- M3 tests ---
+
+  #[test]
+  fn op_ids_are_minted_distinctly() {
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      core::time::Duration::from_millis(1000),
+      core::time::Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let a = ep.mint_op_id_for_test();
+    let b = ep.mint_op_id_for_test();
+    assert_ne!(a, b);
+    assert_eq!(b.get(), a.get() + 1);
   }
 }

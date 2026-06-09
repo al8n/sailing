@@ -159,14 +159,67 @@ impl Cluster {
       .unwrap_or(0)
   }
 
+  /// Drain storage completions for every node and collect any messages they produce.
+  /// Returns `true` if any new messages were enqueued onto the bus.
+  fn drain_storage_all(&mut self) -> bool {
+    let mut any_new = false;
+    for i in 0..self.nodes.len() {
+      let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
+      self.nodes[i].handle_storage(self.now, log, stable);
+    }
+    // Collect outgoing messages produced by completion handlers.
+    for i in 0..self.nodes.len() {
+      if self.isolated.contains(&(i as u64)) {
+        while self.nodes[i].poll_message().is_some() {}
+      } else {
+        while let Some(out) = self.nodes[i].poll_message() {
+          any_new = true;
+          let (to, message) = Outgoing::into_parts(out);
+          self.bus.push_back(InFlight {
+            deliver_at: self.now,
+            from: i as u64,
+            to,
+            message,
+          });
+        }
+      }
+      while self.nodes[i].poll_event().is_some() {}
+    }
+    any_new
+  }
+
+  /// Deliver all messages on the bus that are due at or before `self.now`.
+  /// Returns `true` if any message was delivered.
+  fn deliver_due(&mut self) -> bool {
+    let mut delivered = false;
+    let mut rest: VecDeque<InFlight> = VecDeque::new();
+    while let Some(m) = self.bus.pop_front() {
+      if m.deliver_at <= self.now {
+        if self.isolated.contains(&m.from) || self.isolated.contains(&m.to) {
+          // Drop silently — partition swallows it.
+        } else {
+          delivered = true;
+          let to = m.to as usize;
+          let (log, stable) = (&mut self.logs[to], &mut self.stables[to]);
+          self.nodes[to].handle_message(self.now, log, stable, m.from, m.message);
+        }
+      } else {
+        rest.push_back(m);
+      }
+    }
+    self.bus = rest;
+    delivered
+  }
+
   /// Advance the simulation one step. Returns `true` if any work happened.
   ///
   /// A single step:
   ///   a. Advance virtual time to the earliest pending deadline.
   ///   b. Fire all timers due at that time.
-  ///   c. Flush all outgoing messages to the bus, then deliver all due messages.
-  ///      Repeat (c) until stable at this timestamp (zero-latency bus drains completely
-  ///      before the next timer can fire).
+  ///   c. Flush outgoing → deliver due → drain storage for all nodes → repeat until
+  ///      quiescent at this timestamp (zero-latency bus drains completely before the
+  ///      next timer can fire). Panics if the inner loop exceeds 10_000 iterations
+  ///      (indicates a livelock bug).
   pub fn tick(&mut self) -> bool {
     let mut progressed = false;
 
@@ -183,14 +236,19 @@ impl Cluster {
           progressed = true;
           let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
           self.nodes[i].handle_timeout(self.now, log, stable);
-          let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-          self.nodes[i].handle_storage(self.now, log, stable);
         }
       }
     }
 
-    // Step c: flush outgoing → deliver → repeat until stable at `self.now`.
+    // Step c: flush outgoing → deliver → drain storage → repeat until stable.
+    let mut iters = 0u32;
     loop {
+      iters += 1;
+      assert!(
+        iters <= 10_000,
+        "Cluster::tick inner loop exceeded 10_000 iterations — livelock?"
+      );
+
       // Drain all node outgoing queues onto the bus.
       // Skip isolated nodes: their outgoing messages are dropped (partition).
       let mut any_new = false;
@@ -217,27 +275,19 @@ impl Cluster {
       }
 
       // Deliver all messages due now.
-      // Drop any message whose `from` or `to` is isolated (full two-way partition).
-      let mut delivered = false;
-      let mut rest: VecDeque<InFlight> = VecDeque::new();
-      while let Some(m) = self.bus.pop_front() {
-        if m.deliver_at <= self.now {
-          if self.isolated.contains(&m.from) || self.isolated.contains(&m.to) {
-            // Drop silently — partition swallows it.
-          } else {
-            delivered = true;
-            progressed = true;
-            let to = m.to as usize;
-            let (log, stable) = (&mut self.logs[to], &mut self.stables[to]);
-            self.nodes[to].handle_message(self.now, log, stable, m.from, m.message);
-          }
-        } else {
-          rest.push_back(m);
-        }
+      let delivered = self.deliver_due();
+      if delivered {
+        progressed = true;
       }
-      self.bus = rest;
 
-      if !any_new && !delivered {
+      // Drain storage completions for every node (deferred acks produced here
+      // will be picked up by the outgoing-drain in the next iteration).
+      let storage_produced = self.drain_storage_all();
+      if storage_produced {
+        progressed = true;
+      }
+
+      if !any_new && !delivered && !storage_produced {
         break;
       }
     }
