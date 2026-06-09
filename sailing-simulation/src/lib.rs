@@ -19,3 +19,6 @@ pub use cluster::{AppliedLog, Cluster};
 
 mod vopr;
 pub use vopr::{VoprReport, run_vopr};
+
+mod interaction;
+pub use interaction::{InteractionEnv, run_interaction_file};

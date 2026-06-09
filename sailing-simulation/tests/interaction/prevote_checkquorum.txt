@@ -1,0 +1,174 @@
+# PreVote + CheckQuorum together: an isolated leader steps down (check-quorum); the majority {2,3}
+# elects a new leader at a higher term; and when the old leader recovers it rejoins as a follower the
+# moment it hears the new leader's heartbeat — its stale-term presence cannot disrupt the new term.
+add-nodes 3 voters=(1,2,3) prevote=true checkquorum=true
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 pre-candidate term=0
+RequestVote term=1 last=0/0 prevote=true
+RequestVote term=1 last=0/0 prevote=true
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=true
+> n3 recv RequestVote term=1 last=0/0 prevote=true
+> n2 ready
+  VoteResp term=1 prevote=true reject=false
+> n3 ready
+  VoteResp term=1 prevote=true reject=false
+> n1 recv VoteResp term=1 prevote=true reject=false
+> n1 recv VoteResp term=1 prevote=true reject=false
+> n1 ready
+  RequestVote term=1 last=0/0 prevote=false
+  RequestVote term=1 last=0/0 prevote=false
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResp term=1 prevote=false reject=false
+> n3 ready
+  VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n3 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+
+isolate 1
+----
+n1 isolated
+
+tick-election 1
+----
+ok
+
+tick-election 1
+----
+ok
+
+campaign 2
+----
+n2 pre-candidate term=1
+RequestVote term=2 last=1/1 prevote=true
+
+stabilize
+----
+> n3 recv RequestVote term=2 last=1/1 prevote=true
+> n3 ready
+  VoteResp term=2 prevote=true reject=false
+> n2 recv VoteResp term=2 prevote=true reject=false
+> n2 ready
+  RequestVote term=2 last=1/1 prevote=false
+> n3 recv RequestVote term=2 last=1/1 prevote=false
+> n3 ready
+  VoteResp term=2 prevote=false reject=false
+> n2 recv VoteResp term=2 prevote=false reject=false
+> n2 ready
+  Heartbeat term=2 commit=0
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  n2 leader-changed term=2 lead=2
+> n3 recv Heartbeat term=2 commit=0
+> n3 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n3 ready
+  HeartbeatResp term=2
+  AppendResp term=2 match=2
+  n3 leader-changed term=2 lead=2
+> n2 recv HeartbeatResp term=2
+> n2 recv AppendResp term=2 match=2
+> n2 ready
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n3 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n3 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n3 ready
+  AppendResp term=2 match=2
+  AppendResp term=2 match=2
+> n2 recv AppendResp term=2 match=2
+> n2 recv AppendResp term=2 match=2
+
+recover 1
+----
+n1 recovered
+
+tick-heartbeat 2
+----
+Heartbeat term=2 commit=0
+Heartbeat term=2 commit=2
+
+stabilize
+----
+> n1 recv Heartbeat term=2 commit=0
+> n3 recv Heartbeat term=2 commit=2
+> n1 ready
+  HeartbeatResp term=2
+  n1 leader-changed term=2 lead=2
+> n3 ready
+  HeartbeatResp term=2
+> n2 recv HeartbeatResp term=2
+> n2 recv HeartbeatResp term=2
+> n2 ready
+  AppendEntries term=2 prev=1/1 commit=2 entries=[2/2 empty]
+  AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n1 recv AppendEntries term=2 prev=1/1 commit=2 entries=[2/2 empty]
+> n3 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n1 ready
+  AppendResp term=2 match=2
+> n3 ready
+  AppendResp term=2 match=2
+> n2 recv AppendResp term=2 match=2
+> n2 recv AppendResp term=2 match=2
+> n2 ready
+  AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n1 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n1 ready
+  AppendResp term=2 match=2
+> n2 recv AppendResp term=2 match=2
+
+raft-state
+----
+n1: follower term=2 lead=2
+n2: leader term=2 lead=2
+n3: follower term=2 lead=2
+
