@@ -75,7 +75,7 @@ mod event;
 pub use event::{Applied, ConfChanged, Event, LeaderChanged};
 
 mod endpoint;
-pub use endpoint::{Endpoint, Role, TimerKind};
+pub use endpoint::{Endpoint, PoisonReason, Role, TimerKind};
 
 pub mod tracker;
 pub use tracker::{

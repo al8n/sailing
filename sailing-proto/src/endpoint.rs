@@ -70,6 +70,61 @@ impl TimerKind {
   }
 }
 
+/// The CLASS of unrecoverable failure that poisoned a node.
+///
+/// Once a node is poisoned every `handle_*` is a no-op (see [`Endpoint::is_poisoned`]); this
+/// enum records *why* so a driver can surface a diagnosis instead of a bare "node is dead".
+/// It captures the kind of fault — a corrupt snapshot vs. an FSM bug vs. a storage read error
+/// — not the underlying error value (the variants are unit-only so the type stays `no_std`-
+/// friendly and `Copy`). The first cause wins: a later poison never overwrites the original
+/// (see [`Endpoint::poison_reason`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+#[non_exhaustive]
+pub enum PoisonReason {
+  /// A committed-range log read (`LogStore::entries`) failed during apply.
+  LogRead,
+  /// `LogStore::poll` yielded a storage error.
+  LogPoll,
+  /// `StableStore::poll` yielded a storage error.
+  StablePoll,
+  /// `LogStore::term` failed while preparing a snapshot.
+  LogTerm,
+  /// A committed `Normal` entry's payload failed to decode as `F::Command`.
+  NormalEntryDecode,
+  /// `StateMachine::apply` returned an error for a committed entry.
+  Apply,
+  /// `StateMachine::snapshot` returned an error while capturing state.
+  SnapshotCapture,
+  /// A committed `ConfChange` entry's payload failed to decode as `ConfChangeV2`.
+  ConfChangeDecode,
+  /// The `Changer` rejected a committed, validly-decoded `ConfChange`.
+  ConfChangeApply,
+  /// A snapshot blob failed to decode as `F::Snapshot` (install or restart).
+  SnapshotDecode,
+  /// `StateMachine::restore` failed while installing a snapshot (install or restart).
+  SnapshotRestore,
+}
+
+impl PoisonReason {
+  /// The stable snake_case name.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::LogRead => "log_read",
+      Self::LogPoll => "log_poll",
+      Self::StablePoll => "stable_poll",
+      Self::LogTerm => "log_term",
+      Self::NormalEntryDecode => "normal_entry_decode",
+      Self::Apply => "apply",
+      Self::SnapshotCapture => "snapshot_capture",
+      Self::ConfChangeDecode => "conf_change_decode",
+      Self::ConfChangeApply => "conf_change_apply",
+      Self::SnapshotDecode => "snapshot_decode",
+      Self::SnapshotRestore => "snapshot_restore",
+    }
+  }
+}
+
 /// What the core owes once a storage write completes.
 #[derive(Debug, Clone, Copy)]
 enum Pending<I> {
@@ -101,6 +156,14 @@ where
   leader: Option<I>,
   commit: Index,
   applied: Index,
+  /// The last `commit` value durably written to `HardState`. The commit watermark is
+  /// persisted (batched) by the `handle_storage` choke-point whenever `self.commit` exceeds
+  /// this, and stamped into every term/vote write so a stale read-back can never regress the
+  /// durable commit. Without persisting it, a crash with no snapshot loses the commit
+  /// watermark and `restart` rebuilds an empty/snapshot-only state machine despite a durable
+  /// committed log (review C1). Init `Index::ZERO` in `new`; init to the recovered commit in
+  /// `restart` (so the choke-point doesn't immediately re-persist an unchanged value).
+  committed_persisted: Index,
   prng: Prng,
   /// Per-voter ballot: `true` = grant, `false` = reject. Absent IDs have not voted yet.
   /// Replaces the old `votes_granted: BTreeSet<I>` — the joint quorum needs the full
@@ -117,8 +180,14 @@ where
   next_op_id: crate::OpId,
   /// Outstanding write → deferred action.
   pending: BTreeMap<crate::OpId, Pending<I>>,
-  /// Sticky fatal error: once set, all `handle_*` are no-ops.
+  /// Sticky fatal error: once set, all `handle_*` are no-ops. The fast-path flag checked by
+  /// every `handle_*` guard; the cause is recorded separately in `poison_reason`.
   poisoned: bool,
+  /// The CLASS of the *first* fatal failure that poisoned this node, or `None` if healthy.
+  /// First-cause-wins: a later poison never clobbers the original diagnosis. Surfaced to the
+  /// driver via `poison_reason()` so an operator can distinguish (e.g.) a corrupt snapshot
+  /// from an FSM bug from a disk read error.
+  poison_reason: Option<PoisonReason>,
   /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
   /// is durable (crash-safe: we never compact before the snapshot write completes).
   ///
@@ -185,6 +254,7 @@ where
       leader: None,
       commit: Index::ZERO,
       applied: Index::ZERO,
+      committed_persisted: Index::ZERO,
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -195,6 +265,7 @@ where
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
       poisoned: false,
+      poison_reason: None,
       pending_compact: None,
       pending_conf_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
@@ -274,14 +345,29 @@ where
 
   /// Enter the permanent failed state (a fatal storage/apply error). Every subsequent
   /// `handle_*` becomes a no-op; the driver should surface this and stop.
-  fn poison(&mut self) {
+  ///
+  /// `reason` records the CLASS of failure. First-cause-wins: if the node was already
+  /// poisoned, the original `reason` is preserved so the diagnosis is not clobbered by a
+  /// downstream failure.
+  fn poison(&mut self, reason: PoisonReason) {
     self.poisoned = true;
+    self.poison_reason.get_or_insert(reason);
   }
 
   /// Whether this node has hit an unrecoverable error.
   #[inline(always)]
   pub const fn is_poisoned(&self) -> bool {
     self.poisoned
+  }
+
+  /// The CLASS of the first fatal failure that poisoned this node, or `None` if healthy.
+  ///
+  /// First-cause-wins: this is the *original* diagnosis, never overwritten by a later poison.
+  /// Pairs with [`is_poisoned`](Self::is_poisoned) (the fast boolean check) to let a driver
+  /// surface *why* a node died (a corrupt snapshot vs. an FSM bug vs. a storage read error).
+  #[inline(always)]
+  pub const fn poison_reason(&self) -> Option<PoisonReason> {
+    self.poison_reason
   }
 
   // --- PRIVATE HELPERS (no Data bound) ---
@@ -612,12 +698,18 @@ where
       self.voted_for = Some(rv.candidate());
       self.arm_election_timer(now);
       // Persist (term, vote); the VoteResp(grant) is owed once the write is DURABLE.
+      // Stamp the current commit too: we read-modify `hard_state()` then override fields, so
+      // without this the write would carry a possibly-stale `hard_state().commit` and could
+      // REGRESS the durable commit below a value the handle_storage choke-point already wrote.
+      // `self.commit` is monotonic, so stamping it keeps the durable commit monotonic (C1).
       let opid = self.mint_op_id();
       let hs = stable
         .hard_state()
         .with_term(self.term)
-        .with_vote(self.voted_for);
+        .with_vote(self.voted_for)
+        .with_commit(self.commit);
       stable.submit_write(opid, hs);
+      self.committed_persisted = self.commit;
       self.pending.insert(
         opid,
         Pending::CastVote {
@@ -643,6 +735,9 @@ where
     vr: crate::VoteResp<I>,
   ) where
     F::Command: crate::Data,
+    // `become_candidate`/`become_leader` live in the `apply_committed` impl block, which is
+    // gated on this bound (the fatal apply error must be inspectable, design spec §6.3).
+    F::Error: core::error::Error,
   {
     if vr.pre_vote() {
       // Pre-vote response: only count if we are still a PreCandidate.
@@ -680,6 +775,9 @@ where
   I: NodeId,
   F: StateMachine,
   F::Command: crate::Data,
+  // The fatal apply/snapshot error must be inspectable so a poisoned node's cause can be
+  // surfaced (design spec §6.3). `core::error::Error` is stable in core (no_std-OK).
+  F::Error: core::error::Error,
 {
   /// Drain storage completions. (M3+: append-before-ack / persist-vote.)
   pub fn handle_storage<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
@@ -696,7 +794,7 @@ where
         Ok(crate::LogDone::Appended(opid)) => self.on_log_appended(now, log, stable, opid),
         Ok(crate::LogDone::Compacted(_)) => {}
         Err(_) => {
-          self.poison();
+          self.poison(PoisonReason::LogPoll);
           return;
         }
       }
@@ -716,7 +814,7 @@ where
           }
         }
         Err(_) => {
-          self.poison();
+          self.poison(PoisonReason::StablePoll);
           return;
         }
       }
@@ -735,6 +833,25 @@ where
     {
       let leave = crate::ConfChangeV2::leave_joint();
       self.append_conf_change(log, stable, leave);
+    }
+
+    // Persist the advanced commit watermark so a restart recovers it (without this, restart
+    // rebuilds an empty/snapshot-only state machine despite a durable committed log — review
+    // C1). Batched here (runs every driver iteration) rather than on every advance; a crash
+    // before this persist only loses a bounded commit suffix that is still in the durable LOG
+    // and is re-advanced by the leader on recovery — Leader Completeness guarantees the leader
+    // holds those committed entries, so no committed entry is lost, just a brief re-sync.
+    // No `Pending` entry: a commit-watermark write owes no ack (like the step-down /
+    // become_candidate writes); its completion drains harmlessly through `on_stable_wrote`.
+    if !self.poisoned && self.commit > self.committed_persisted {
+      let opid = self.mint_op_id();
+      let hs = stable
+        .hard_state()
+        .with_term(self.term)
+        .with_vote(self.voted_for)
+        .with_commit(self.commit);
+      stable.submit_write(opid, hs);
+      self.committed_persisted = self.commit;
     }
   }
 
@@ -766,7 +883,7 @@ where
     let snap = match self.fsm.snapshot() {
       Ok(s) => s,
       Err(_) => {
-        self.poison();
+        self.poison(PoisonReason::SnapshotCapture);
         return;
       }
     };
@@ -776,7 +893,7 @@ where
     let last_term = match log.term(self.applied) {
       Ok(t) => t,
       Err(_) => {
-        self.poison();
+        self.poison(PoisonReason::LogTerm);
         return;
       }
     };
@@ -811,6 +928,7 @@ where
     let mut fsm = fsm;
     let mut applied = Index::ZERO;
     let mut poisoned = false;
+    let mut poison_reason: Option<PoisonReason> = None;
     // Bootstrap tracker from the static seed first; may be overridden below if a
     // durable snapshot carries a more recent ConfState.
     let seed_cs = crate::ConfState::from_voters(config.voters().iter().copied());
@@ -828,6 +946,7 @@ where
         Ok((_, snap)) => {
           if fsm.restore(snap).is_err() {
             poisoned = true;
+            poison_reason = Some(PoisonReason::SnapshotRestore);
           } else {
             applied = meta.last_index();
             // M6: install the durable membership from the snapshot's ConfState.
@@ -841,7 +960,10 @@ where
             );
           }
         }
-        Err(_) => poisoned = true,
+        Err(_) => {
+          poisoned = true;
+          poison_reason = Some(PoisonReason::SnapshotDecode);
+        }
       }
     }
     // Never trust commit beyond the durable log; never below the snapshot baseline.
@@ -856,6 +978,9 @@ where
       leader: None,
       commit,
       applied,
+      // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
+      // the handle_storage choke-point doesn't immediately re-persist an unchanged value (C1).
+      committed_persisted: commit,
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -863,6 +988,7 @@ where
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
       poisoned,
+      poison_reason,
       pending_compact: None,
       // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
       pending_conf_index: Index::ZERO,
@@ -1009,9 +1135,16 @@ where
         self.lead_transferee = None;
         self.transfer_deadline = None;
         // Persist the new term and cleared vote. Stepping down owes no ack, so no Pending entry.
+        // Stamp the current commit too (see on_request_vote): a read-modify of `hard_state()`
+        // must not write back a stale `commit` that regresses the durable watermark (C1).
         let opid = self.mint_op_id();
-        let hs = stable.hard_state().with_term(self.term).with_vote(None);
+        let hs = stable
+          .hard_state()
+          .with_term(self.term)
+          .with_vote(None)
+          .with_commit(self.commit);
         stable.submit_write(opid, hs);
+        self.committed_persisted = self.commit;
       }
     }
     // Drop messages from a stale term — with one caveat for pre-vote requests:
@@ -1265,35 +1398,58 @@ where
   }
 
   /// Apply all entries that have been committed but not yet applied.
+  ///
+  /// Every unrecoverable fault here POISONS the node (it does not silently stall): a poisoned
+  /// node is inert (`handle_*` are no-ops) and the driver surfaces `poison_reason()` and stops.
+  /// This matches the policy of `on_install_snapshot` and the ConfChange Changer-reject arm.
+  /// A bare `break` is used ONLY for the benign "committed entry not yet readable" case (the
+  /// log slice is empty), which is transient and retried on the next `handle_*`.
   fn apply_committed<L: LogStore>(&mut self, log: &L) {
     while self.applied < self.commit {
       let idx = self.applied.next();
       let entry = match log.entries(idx..idx.next(), u64::MAX) {
         Ok(s) => match s.first() {
           Some(e) => e.clone(),
+          // Benign: the committed entry is not yet in the read view. Retry next tick.
           None => break,
         },
-        Err(_) => break, // M3: a read error here becomes a sticky fatal error
+        // A committed-range read failed. A healthy LogStore never fails this read, so treat it
+        // as unrecoverable: poison rather than silently stall applied behind commit.
+        Err(_) => {
+          self.poison(PoisonReason::LogRead);
+          break;
+        }
       };
       match entry.kind() {
         crate::EntryKind::Normal => {
           let cmd = match <F::Command as crate::Data>::decode(entry.data()) {
             Ok((_, c)) => c,
-            Err(_) => break, // M3: corrupt-log decode error → sticky fatal
+            // A committed entry whose payload won't decode is corrupt/unrecoverable → poison.
+            Err(_) => {
+              self.poison(PoisonReason::NormalEntryDecode);
+              break;
+            }
           };
           match self.fsm.apply(idx, cmd) {
             Ok(resp) => self
               .events
               .push_back(crate::Event::Applied(crate::Applied::new(idx, resp))),
-            Err(_) => break, // M3: apply error → sticky fatal
+            // An FSM apply error is fatal (the SM diverges from the committed log) → poison.
+            Err(_) => {
+              self.poison(PoisonReason::Apply);
+              break;
+            }
           }
         }
         crate::EntryKind::Empty => {} // no-op: just advance applied
         crate::EntryKind::ConfChange => {
-          // Decode the ConfChangeV2 payload. On failure: sticky fatal (mirror Normal decode).
+          // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
           let cc = match <crate::ConfChangeV2<I> as crate::Data>::decode(entry.data()) {
             Ok((_, c)) => c,
-            Err(_) => break,
+            Err(_) => {
+              self.poison(PoisonReason::ConfChangeDecode);
+              break;
+            }
           };
           // Dispatch to the Changer using the etcd rules:
           //   empty changes + Auto transition  → leave_joint
@@ -1363,7 +1519,7 @@ where
             // been prevented upstream). Poison so the failure is detectable rather than
             // a silent apply stall.
             Err(_) => {
-              self.poison();
+              self.poison(PoisonReason::ConfChangeApply);
               break;
             }
           }
@@ -1403,12 +1559,16 @@ where
     self.votes.clear();
     self.votes.insert(self.config.id(), true);
     // Persist (term, self-vote). No Pending entry — a candidate doesn't owe an ack.
+    // Stamp the current commit too (see on_request_vote): a read-modify of `hard_state()`
+    // must not write back a stale `commit` that regresses the durable watermark (C1).
     let opid = self.mint_op_id();
     let hs = stable
       .hard_state()
       .with_term(self.term)
-      .with_vote(self.voted_for);
+      .with_vote(self.voted_for)
+      .with_commit(self.commit);
     stable.submit_write(opid, hs);
+    self.committed_persisted = self.commit;
     self.arm_election_timer(now);
 
     let (last_index, last_term) = self.last_log(log);
@@ -2134,14 +2294,14 @@ where
     let snap = match <F::Snapshot as crate::Data>::decode(is.data()) {
       Ok((_, s)) => s,
       Err(_) => {
-        self.poison();
+        self.poison(PoisonReason::SnapshotDecode);
         return;
       }
     };
 
     // Step 2: restore the state machine. On failure, poison and return — leave NO partial state.
     if self.fsm.restore(snap).is_err() {
-      self.poison();
+      self.poison(PoisonReason::SnapshotRestore);
       return;
     }
 
@@ -2742,23 +2902,25 @@ mod tests {
     let mut stable = crate::testkit::NoopStable::default();
 
     // Feed 3 entries from leader 1, leader_commit=3 → follower appends and commits all three.
+    // Payloads are Data-encoded (`encode_cmd`) so the committed entries decode as the SM's
+    // `Command` and apply cleanly — an undecodable committed entry now (correctly) poisons.
     let e1 = Entry::new(
       Term::new(1),
       Index::new(1),
       EntryKind::Normal,
-      bytes::Bytes::from_static(b"a"),
+      encode_cmd(b"a"),
     );
     let e2 = Entry::new(
       Term::new(1),
       Index::new(2),
       EntryKind::Normal,
-      bytes::Bytes::from_static(b"b"),
+      encode_cmd(b"b"),
     );
     let e3 = Entry::new(
       Term::new(1),
       Index::new(3),
       EntryKind::Normal,
-      bytes::Bytes::from_static(b"c"),
+      encode_cmd(b"c"),
     );
     ep.handle_message(
       Instant::ORIGIN,
@@ -2791,7 +2953,7 @@ mod tests {
       Term::new(1),
       Index::new(1),
       EntryKind::Normal,
-      bytes::Bytes::from_static(b"a"),
+      encode_cmd(b"a"),
     );
     ep.handle_message(
       Instant::ORIGIN,
@@ -2874,6 +3036,111 @@ mod tests {
     assert!(ep.role().is_follower());
     // election timer must be armed
     assert!(ep.poll_timeout().is_some());
+  }
+
+  /// Review C1 regression: a node that commits+applies entries [1..N] through the REAL path
+  /// (self-elect → propose → handle_storage drains the append, advances commit, applies, AND
+  /// now persists the commit watermark to HardState) must, after a `restart` from the SAME
+  /// stores with NO snapshot, recover `commit == N`, `applied == N`, and a state machine that
+  /// reflects all N applied entries — NOT an empty SM.
+  ///
+  /// FAILS ON OLD CODE: without the handle_storage commit-persist (and the with_commit stamps),
+  /// the durable HardState.commit stays Index::ZERO for the node's life, so restart computes
+  /// `commit = min(0, last_index).max(0) = 0`, the replay loop (0..0] is empty, and the
+  /// restarted node recovers commit=0 with an EMPTY state machine despite the durable log
+  /// holding all N committed entries.
+  #[test]
+  fn restart_recovers_commit_persisted_via_real_path() {
+    use crate::{Config, Index, Instant};
+    use core::time::Duration;
+    // 1-voter cluster: quorum == 1, so a lone node self-elects and commits on storage drain.
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut log = crate::testkit::VecLog::default();
+    // AsyncStable enqueues a Wrote completion for every submit_write, so handle_storage also
+    // drains the commit-watermark completion (verifying it passes harmlessly through
+    // on_stable_wrote with no Pending entry). Both testkit stores persist synchronously, so
+    // the durable HardState reflects each write immediately.
+    let mut stable = crate::testkit::AsyncStable::default();
+    let mut ep = Endpoint::new(
+      cfg.clone(),
+      Instant::ORIGIN,
+      7,
+      crate::testkit::CountSm::default(),
+    );
+
+    // Self-elect (quorum == 1) and let the no-op LeaderAppend commit.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    assert!(ep.role().is_leader(), "lone voter must self-elect");
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Propose N Normal entries through the real path; drain storage after each so it commits
+    // and applies (and, with the fix, persists the advanced commit watermark). The command
+    // bytes are irrelevant to CountSm (it just counts applies); use fixed distinct payloads.
+    let cmds: [&[u8]; 4] = [b"c0", b"c1", b"c2", b"c3"];
+    const N: usize = 4;
+    for cmd in cmds {
+      ep.propose(
+        d,
+        &mut log,
+        &mut stable,
+        &bytes::Bytes::copy_from_slice(cmd),
+      )
+      .unwrap();
+      ep.handle_storage(d, &mut log, &mut stable);
+      while ep.poll_message().is_some() {}
+      while ep.poll_event().is_some() {}
+    }
+    assert!(!ep.is_poisoned(), "node must not be poisoned");
+    // SM reflects N applied Normal entries (the leader's term-start no-op is Empty, not counted).
+    assert_eq!(
+      ep.state_machine().count(),
+      N,
+      "live leader must have applied all N proposed entries"
+    );
+    // The durable HardState.commit must now reflect the advanced watermark (the fix). The log
+    // holds the no-op at index 1 plus N Normal entries, so commit == N + 1.
+    let expected_commit = Index::new(N as u64 + 1);
+    assert_eq!(
+      stable.hard_state().commit(),
+      expected_commit,
+      "handle_storage must persist the advanced commit watermark into HardState (C1)"
+    );
+
+    // Restart from the SAME log + stable with NO snapshot.
+    let restarted = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      9,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+    assert!(
+      !restarted.is_poisoned(),
+      "restarted node must not be poisoned"
+    );
+    assert_eq!(
+      restarted.commit, expected_commit,
+      "restart must recover the durable commit watermark, not collapse to applied/0 (C1)"
+    );
+    assert_eq!(
+      restarted.applied, expected_commit,
+      "restart must replay the committed tail so applied catches up to commit (C1)"
+    );
+    assert_eq!(
+      restarted.state_machine().count(),
+      N,
+      "restarted SM must reflect all N committed entries, not be empty (C1)"
+    );
   }
 
   // --- M3 extra: single-node leader commits after storage drain ---
@@ -4999,9 +5266,14 @@ mod tests {
 
   /// Test 3: no snapshot (regression) — M3 replay-from-1 still works when
   /// stable.snapshot() is None and the log starts at 1.
+  ///
+  /// Updated for review C1 to drive the REAL commit-persist path (a live single-node leader)
+  /// instead of `force_state`-injecting the durable commit. This makes the no-snapshot restart
+  /// suite genuinely exercise the handle_storage commit-watermark write: the live leader's
+  /// `commit` reaches HardState only because of the fix, and the restart reads it back.
   #[test]
   fn restart_no_snapshot_replays_from_one() {
-    use crate::{Config, Entry, EntryKind, Index, Instant, Term};
+    use crate::{Config, Index, Instant};
     use core::time::Duration;
 
     let cfg = Config::try_new(
@@ -5012,33 +5284,44 @@ mod tests {
     )
     .unwrap();
 
-    // No snapshot.
+    // No snapshot. Drive a live single-node leader so commit advances and is persisted to
+    // HardState by the handle_storage choke-point (no force_state injection).
     let mut stable = crate::testkit::AsyncStable::default();
-    stable.force_state(Term::new(1), None, Index::new(3));
-
-    // Durable log: entries 1,2,3 at term 1.
-    // Entry data must be length-prefixed (Bytes::decode requires 8-byte LE length prefix).
     let mut log = crate::testkit::VecLog::default();
-    log.force_append(&[
-      Entry::new(
-        Term::new(1),
-        Index::new(1),
-        EntryKind::Empty,
-        bytes::Bytes::new(),
-      ),
-      Entry::new(
-        Term::new(1),
-        Index::new(2),
-        EntryKind::Normal,
-        encode_cmd(b"a"),
-      ),
-      Entry::new(
-        Term::new(1),
-        Index::new(3),
-        EntryKind::Normal,
-        encode_cmd(b"b"),
-      ),
-    ]);
+    let mut ep = Endpoint::new(
+      cfg.clone(),
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+    );
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // self-elect (quorum == 1)
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable); // no-op LeaderAppend at index 1 commits
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Propose 2 Normal entries (indices 2 and 3); drain storage so each commits and applies.
+    for b in [b"a".as_slice(), b"b".as_slice()] {
+      ep.propose(d, &mut log, &mut stable, &bytes::Bytes::copy_from_slice(b))
+        .unwrap();
+      ep.handle_storage(d, &mut log, &mut stable);
+      while ep.poll_message().is_some() {}
+      while ep.poll_event().is_some() {}
+    }
+    assert_eq!(
+      ep.state_machine().count(),
+      2,
+      "two Normal entries applied pre-restart"
+    );
+    assert_eq!(
+      ep.commit,
+      Index::new(3),
+      "commit must reach 3 (no-op + 2 Normal)"
+    );
+    // The fix: commit watermark is durable, so restart can recover it.
+    assert_eq!(stable.hard_state().commit(), Index::new(3));
 
     let ep = Endpoint::restart(
       cfg,
@@ -8621,5 +8904,232 @@ mod tests {
       !ep_tr.serviceable_now(TimerKind::Transfer),
       "transfer abort: Transfer no longer serviceable"
     );
+  }
+
+  // ── Review C2/I3: fatal apply_committed errors poison (no silent stall) + carry a cause ──────
+
+  /// A state machine whose `apply` returns `Err` for a sentinel command. `Error` is a real
+  /// `core::error::Error` (the §6.3 bound). Used to exercise the `PoisonReason::Apply` path.
+  #[derive(Debug, Default)]
+  struct FailSm;
+
+  /// Apply failure for `FailSm`. Implements `core::error::Error` via `std::error::Error`
+  /// (which IS `core::error::Error` under std) so it satisfies the `apply_committed` bound.
+  #[derive(Debug)]
+  struct FailSmError;
+
+  impl core::fmt::Display for FailSmError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      f.write_str("apply failed")
+    }
+  }
+
+  impl std::error::Error for FailSmError {}
+
+  impl crate::StateMachine for FailSm {
+    type Command = Bytes;
+    type Response = usize;
+    type Snapshot = u64;
+    type Error = FailSmError;
+
+    fn apply(&mut self, _index: Index, cmd: Bytes) -> Result<usize, Self::Error> {
+      // Sentinel: a single 0xFF byte means "fail". Any other payload applies successfully.
+      if cmd.as_ref() == [0xFFu8] {
+        return Err(FailSmError);
+      }
+      Ok(cmd.len())
+    }
+
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(0)
+    }
+
+    fn restore(&mut self, _snapshot: u64) -> Result<(), Self::Error> {
+      Ok(())
+    }
+  }
+
+  /// Encode `payload` as a `Normal` entry's `data` using the `Bytes` codec (length-prefixed),
+  /// so `<F::Command as Data>::decode` reads it back as the SM command.
+  fn normal_entry(term: u64, index: u64, payload: &[u8]) -> crate::Entry {
+    use crate::Data as _;
+    let mut buf = std::vec::Vec::new();
+    bytes::Bytes::copy_from_slice(payload).encode(&mut buf);
+    crate::Entry::new(
+      Term::new(term),
+      Index::new(index),
+      crate::EntryKind::Normal,
+      bytes::Bytes::from(buf),
+    )
+  }
+
+  /// Regression (review C2 + I3): a committed Normal entry whose `StateMachine::apply` returns
+  /// `Err` must POISON the node with `PoisonReason::Apply` — not silently stall apply — and the
+  /// poisoned node must be inert (all `handle_*` are no-ops).
+  ///
+  /// FAILS-ON-OLD: with the bare `break` (no `self.poison()`), `is_poisoned()` stays `false`,
+  /// `applied` stays stuck behind `commit`, and the node keeps serving — so all three asserts
+  /// (poisoned, reason, inertness) fail.
+  #[test]
+  fn failing_fsm_apply_poisons_node() {
+    use crate::{AppendEntries, Index, Message, Term};
+    use core::time::Duration;
+
+    // Node 2 is a follower in a 3-voter cluster {1, 2, 3}.
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, FailSm);
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Leader 1 (term 1) sends one Normal entry carrying the 0xFF sentinel; leader_commit = 1
+    // forces the follower to commit and apply it. FailSm::apply will return Err.
+    let bad = normal_entry(1, 1, &[0xFFu8]);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![bad],
+        Index::new(1), // leader_commit = 1: the entry is committed
+      )),
+    );
+    // Drain the deferred append completion so apply_committed runs with the durable entry.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+    // The FSM apply failed → node poisoned, with the precise cause.
+    assert!(
+      ep.is_poisoned(),
+      "node must be poisoned when StateMachine::apply errors (review C2)"
+    );
+    assert_eq!(
+      ep.poison_reason(),
+      Some(crate::PoisonReason::Apply),
+      "poison_reason must record the apply failure (review I3)"
+    );
+    // applied is stuck at the pre-apply watermark (the failing entry was never applied).
+    assert_eq!(
+      ep.applied,
+      Index::ZERO,
+      "the failing entry must not advance applied"
+    );
+
+    // The poisoned node is inert: subsequent handle_* are no-ops.
+    let outgoing_before = ep.outgoing.len();
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![normal_entry(1, 2, b"ok")],
+        Index::new(2),
+      )),
+    );
+    ep.handle_timeout(
+      Instant::ORIGIN + Duration::from_secs(10),
+      &mut log,
+      &mut stable,
+    );
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    assert_eq!(
+      ep.outgoing.len(),
+      outgoing_before,
+      "a poisoned node must emit nothing on subsequent handle_*"
+    );
+    assert_eq!(
+      ep.poison_reason(),
+      Some(crate::PoisonReason::Apply),
+      "poison_reason is first-cause-wins and must not change"
+    );
+  }
+
+  /// Regression (review C2 + I3): a committed Normal entry whose `data` does NOT decode as the
+  /// SM's `Command` must POISON the node with `PoisonReason::NormalEntryDecode`.
+  ///
+  /// FAILS-ON-OLD: with the bare `break` the decode error silently stalls apply —
+  /// `is_poisoned()` stays `false` and `applied` is stuck behind `commit`.
+  #[test]
+  fn corrupt_normal_entry_poisons_node() {
+    use crate::{AppendEntries, Index, Message, Term};
+    use core::time::Duration;
+
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // A Normal entry whose data is a single byte. `<Bytes as Data>::decode` needs an 8-byte
+    // u64 length prefix, so this decodes as UnexpectedEof → corrupt-log decode error.
+    let corrupt = crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      bytes::Bytes::from_static(&[0x01u8]),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![corrupt],
+        Index::new(1), // leader_commit = 1: the corrupt entry is committed
+      )),
+    );
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+    assert!(
+      ep.is_poisoned(),
+      "node must be poisoned when a committed Normal entry fails to decode (review C2)"
+    );
+    assert_eq!(
+      ep.poison_reason(),
+      Some(crate::PoisonReason::NormalEntryDecode),
+      "poison_reason must record the decode failure (review I3)"
+    );
+    assert_eq!(
+      ep.applied,
+      Index::ZERO,
+      "the undecodable entry must not advance applied"
+    );
+  }
+
+  /// `PoisonReason` follows the unit-enum convention (snake_case `as_str` + Display + predicates).
+  #[test]
+  fn poison_reason_as_str_display_and_predicate() {
+    use crate::PoisonReason;
+    assert_eq!(PoisonReason::Apply.as_str(), "apply");
+    assert_eq!(
+      PoisonReason::NormalEntryDecode.as_str(),
+      "normal_entry_decode"
+    );
+    assert_eq!(PoisonReason::SnapshotRestore.as_str(), "snapshot_restore");
+    assert!(PoisonReason::LogRead.is_log_read());
+    assert!(!PoisonReason::LogRead.is_apply());
   }
 }
