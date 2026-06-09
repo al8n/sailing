@@ -37,3 +37,15 @@ mod message;
 pub use message::{
   AppendEntries, AppendResp, Heartbeat, HeartbeatResp, Message, Outgoing, RequestVote, VoteResp,
 };
+
+mod state_machine;
+pub use state_machine::StateMachine;
+
+mod storage;
+pub use storage::{LogDone, LogStore, OpId, StableDone, StableStore};
+
+mod error;
+pub use error::ConfigError;
+
+mod config;
+pub use config::Config;
