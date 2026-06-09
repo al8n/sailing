@@ -262,6 +262,10 @@ where
   /// committed log. Init `Index::ZERO` in `new`; init to the recovered commit in
   /// `restart` (so the choke-point doesn't immediately re-persist an unchanged value).
   committed_persisted: Index,
+  /// Highest log index durably persisted (an append's LogDone::Appended fired). Every outbound
+  /// AppendResp match is clamped to this so a follower never reports an index only in its
+  /// visible-but-unflushed tail (persist-before-ack on the immediate-ack path too).
+  durable_index: Index,
   prng: Prng,
   /// Per-voter ballot: `true` = grant, `false` = reject. Absent IDs have not voted yet.
   /// Replaces the old `votes_granted: BTreeSet<I>` — the joint quorum needs the full
@@ -369,6 +373,7 @@ where
       commit: Index::ZERO,
       applied: Index::ZERO,
       committed_persisted: Index::ZERO,
+      durable_index: Index::ZERO,
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -1373,6 +1378,7 @@ where
       // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
       // the handle_storage choke-point doesn't immediately re-persist an unchanged value.
       committed_persisted: commit,
+      durable_index: log.last_index(),
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -1417,6 +1423,7 @@ where
   ) {
     match self.pending.remove(&opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
+        self.durable_index = self.durable_index.max(match_index);
         let (term, me) = (self.term, self.config.id());
         self.send(
           to,
@@ -1434,6 +1441,7 @@ where
       // and commit. `pending` is cleared on every term change, so a stale `LeaderAppend`
       // reaching a non-leader is already unreachable — this makes the safety local.
       Some(Pending::LeaderAppend { upto }) if self.role.is_leader() => {
+        self.durable_index = self.durable_index.max(upto);
         if let Some(p) = self.tracker.progress_mut(&self.config.id()) {
           p.maybe_update(upto);
         }
@@ -2371,6 +2379,8 @@ where
           Pending::FollowerAck { match_index, .. } => *match_index < truncate_from,
           _ => true,
         });
+        // The truncated tail is no longer durable; regress the watermark below it (truncate_from >= 1).
+        self.durable_index = self.durable_index.min(Index::new(truncate_from.get() - 1));
         let opid = self.mint_op_id();
         self.submit_append(log, opid, &entries[i..]);
         appended_opid = Some(opid);
@@ -2406,7 +2416,14 @@ where
         },
       );
     } else {
-      // Nothing was appended (heartbeat or pure duplicate) — entries already durable, ack now.
+      // Nothing was appended (heartbeat or pure duplicate) — ack immediately, but clamp the
+      // reported match to `durable_index` (persist-before-ack on the immediate path). In steady
+      // state `last_new <= durable_index`, so the clamp is a no-op for genuine heartbeats and
+      // already-durable duplicates. The hazard it closes: a duplicate AppendEntries for entries
+      // present only in our visible-but-unflushed (in-flight) tail would otherwise ack them as
+      // durable, letting the leader count a phantom replica and commit an entry a crash loses.
+      // When that tail does flush, the deferred FollowerAck reports the higher match.
+      let ack_index = last_new.min(self.durable_index);
       self.send(
         ae.leader(),
         Message::AppendResp(crate::AppendResp::new(
@@ -2415,7 +2432,7 @@ where
           false,
           Index::ZERO,
           Term::ZERO,
-          last_new,
+          ack_index,
         )),
       );
     }
@@ -3090,6 +3107,11 @@ where
     // point. Acking before the blob is durable is safe because meta.last_index <= leader.commit —
     // those entries are already quorum-committed, so this ack cannot advance the cluster commit.
     log.restore(meta.last_index(), meta.last_term());
+    // The re-baselined log is durable up to the snapshot boundary (meta.last_index <= leader.commit,
+    // i.e. quorum-committed), so advance the persist-before-ack watermark to it. Without this, the
+    // next empty AppendEntries(prev=last_index) would hit the immediate-ack clamp and report a stale
+    // pre-snapshot durable_index, contradicting the SnapshotResp(match=last_index) just sent.
+    self.durable_index = self.durable_index.max(meta.last_index());
 
     // Tripwire: the install just advanced commit/applied to `meta.last_index` and the
     // re-baseline must have taken effect, so the log read-view now reflects the snapshot boundary:
@@ -3600,6 +3622,112 @@ mod tests {
     );
     let r = ep.poll_message().unwrap();
     assert!(matches!(r.message(), Message::AppendResp(a) if a.reject()));
+  }
+
+  /// Regression (persist-before-ack on the immediate-ack path): a DUPLICATE `AppendEntries` for
+  /// entries that exist only in the follower's visible-but-unflushed (in-flight) tail must NOT be
+  /// acked as durable. `VecLog::submit_append` makes an entry visible immediately but releases its
+  /// `LogDone::Appended` only on `handle_storage`; if the duplicate's immediate `AppendResp`
+  /// reported the in-flight index, the leader could count a phantom replica and commit an entry a
+  /// crash would lose (a non-quorum-durable commit). The immediate ack is clamped to
+  /// `durable_index`, so the duplicate reports the prior durable watermark (here `0`); the deferred
+  /// `FollowerAck` reports the full match once the append flushes.
+  ///
+  /// MUTATION: revert the edit so the immediate `else` sends `last_new` unclamped → the first
+  /// assertion (duplicate acks `0`) fails because the duplicate over-acks the in-flight index.
+  #[test]
+  fn duplicate_append_does_not_ack_in_flight_tail() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    let e1 = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"a"),
+    );
+
+    // First AppendEntries carries a NEW entry at index 1 → the follower appends it in-flight
+    // (visible in VecLog) and registers a deferred FollowerAck. We deliberately do NOT drain
+    // `handle_storage`, so the append's LogDone::Appended is still pending and `durable_index`
+    // stays at ZERO.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1.clone()],
+        Index::ZERO,
+      )),
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "fresh append: ack deferred until durable (no immediate ack)"
+    );
+    assert_eq!(
+      log.last_index(),
+      Index::new(1),
+      "entry 1 is visible in the log"
+    );
+
+    // DUPLICATE AppendEntries for the SAME entry. Index 1 already matches (same index+term), so
+    // nothing is appended → the immediate-ack `else` branch fires. Persist-before-ack: the match
+    // must be clamped to the durable watermark (0), NOT the in-flight index 1.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1.clone()],
+        Index::ZERO,
+      )),
+    );
+    let dup = ep
+      .poll_message()
+      .expect("duplicate emits an immediate AppendResp");
+    match dup.message() {
+      Message::AppendResp(a) => {
+        assert!(!a.reject(), "duplicate is a success ack, not a reject");
+        assert_eq!(
+          a.match_index(),
+          Index::ZERO,
+          "persist-before-ack: the duplicate must report the durable watermark (0), \
+           not the in-flight index 1"
+        );
+      }
+      other => panic!("expected AppendResp, got {other:?}"),
+    }
+
+    // Now drain storage → the deferred FollowerAck for index 1 fires → the follower reports the
+    // full match (1) once the entry is genuinely durable.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    let acked = ep
+      .poll_message()
+      .expect("the deferred FollowerAck fires after the append flushes");
+    assert!(
+      matches!(acked.message(), Message::AppendResp(a) if !a.reject() && a.match_index() == Index::new(1)),
+      "after flush the FollowerAck reports the full match (1)"
+    );
   }
 
   #[test]

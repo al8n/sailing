@@ -92,38 +92,17 @@ stabilize
 > n4 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n5 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  AppendResp term=1 match=1
+  AppendResp term=1 match=0
 > n3 ready
-  AppendResp term=1 match=1
+  AppendResp term=1 match=0
 > n4 ready
-  AppendResp term=1 match=1
+  AppendResp term=1 match=0
 > n5 ready
-  AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 ready
-  AppendEntries term=1 prev=1/1 commit=0 entries=[]
-  AppendEntries term=1 prev=1/1 commit=0 entries=[]
-  AppendEntries term=1 prev=1/1 commit=1 entries=[]
-  AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n2 recv AppendEntries term=1 prev=1/1 commit=0 entries=[]
-> n3 recv AppendEntries term=1 prev=1/1 commit=0 entries=[]
-> n4 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n5 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n2 ready
-  AppendResp term=1 match=1
-> n3 ready
-  AppendResp term=1 match=1
-> n4 ready
-  AppendResp term=1 match=1
-> n5 ready
-  AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
+  AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
 
 flush 1 2 3 4 5
 ----
@@ -138,6 +117,27 @@ flush 1 2 3 4 5
 
 stabilize
 ----
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=1/1 commit=0 entries=[]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=1/1 commit=0 entries=[]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n4 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n5 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResp term=1 match=1
+> n3 ready
+  AppendResp term=1 match=1
+> n4 ready
+  AppendResp term=1 match=1
+> n5 ready
+  AppendResp term=1 match=1
 > n1 recv AppendResp term=1 match=1
 > n1 recv AppendResp term=1 match=1
 > n1 recv AppendResp term=1 match=1
@@ -222,13 +222,13 @@ stabilize
 > n3 ready
   Heartbeat term=2 commit=0
   Heartbeat term=2 commit=0
-  AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
-  AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
   n3 leader-changed term=2 lead=3
 > n4 recv Heartbeat term=2 commit=0
 > n5 recv Heartbeat term=2 commit=0
-> n4 recv AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
-> n5 recv AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
+> n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n4 ready
   HeartbeatResp term=2
   n4 leader-changed term=2 lead=3
@@ -238,27 +238,27 @@ stabilize
 > n3 recv HeartbeatResp term=2
 > n3 recv HeartbeatResp term=2
 > n3 ready
-  AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
-  AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
-> n4 recv AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
-> n5 recv AppendEntries term=2 prev=1/1 commit=0 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n4 ready
-  AppendResp term=2 match=2
+  AppendResp term=2 match=1
 > n5 ready
-  AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
+  AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
 > n3 ready
-  AppendEntries term=2 prev=2/2 commit=0 entries=[]
-  AppendEntries term=2 prev=2/2 commit=0 entries=[]
-> n4 recv AppendEntries term=2 prev=2/2 commit=0 entries=[]
-> n5 recv AppendEntries term=2 prev=2/2 commit=0 entries=[]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n4 ready
-  AppendResp term=2 match=2
+  AppendResp term=2 match=1
 > n5 ready
-  AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
+  AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
 
 flush 3 4 5
 ----
@@ -269,6 +269,17 @@ flush 3 4 5
 
 stabilize
 ----
+> n3 recv AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
+> n3 ready
+  AppendEntries term=2 prev=2/2 commit=1 entries=[]
+  AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n4 recv AppendEntries term=2 prev=2/2 commit=1 entries=[]
+> n5 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n4 ready
+  AppendResp term=2 match=2
+> n5 ready
+  AppendResp term=2 match=2
 > n3 recv AppendResp term=2 match=2
 > n3 recv AppendResp term=2 match=2
 
@@ -319,24 +330,11 @@ stabilize
 > n4 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
 > n5 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
 > n4 ready
-  AppendResp term=2 match=3
+  AppendResp term=2 match=2
 > n5 ready
-  AppendResp term=2 match=3
-> n3 recv AppendResp term=2 match=3
-> n3 recv AppendResp term=2 match=3
-> n3 ready
-  AppendEntries term=2 prev=2/3 commit=2 entries=[]
-  AppendEntries term=2 prev=2/3 commit=3 entries=[]
-  n3 applied index=3
-> n4 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
-> n5 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
-> n4 ready
-  AppendResp term=2 match=3
-> n5 ready
-  AppendResp term=2 match=3
-  n5 applied index=3
-> n3 recv AppendResp term=2 match=3
-> n3 recv AppendResp term=2 match=3
+  AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
 
 flush 2
 ----
@@ -347,16 +345,15 @@ stabilize
 ----
 > n3 recv AppendResp term=2 match=3
 > n3 ready
-  AppendEntries term=2 prev=2/3 commit=3 entries=[]
-> n2 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
+  AppendEntries term=2 prev=2/3 commit=2 entries=[]
+> n2 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
 > n2 ready
   AppendResp term=2 match=3
-  n2 applied index=3
 > n3 recv AppendResp term=2 match=3
 
 raft-log 2
 ----
-n2: commit=3 applied=3 last=3
+n2: commit=2 applied=2 last=3
   1/1 empty
   2/2 empty
   2/3 normal 0x010000000000000062

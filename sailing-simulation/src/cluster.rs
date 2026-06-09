@@ -283,8 +283,21 @@ impl Cluster {
   /// total order, so the result is a pure function of the cluster state (no map/iteration-order or
   /// wall-clock nondeterminism). Returns an empty set only for an empty/all-removed cluster.
   pub fn committed_voters(&self) -> BTreeSet<u64> {
-    if let Some(leader) = self.leader() {
-      let i = self.node_idx[&leader];
+    // Source the committed config from the HIGHEST-TERM leader. A stale, partitioned ex-leader at a
+    // lower term — or one removed by a committed conf-change it never received, so it never stepped
+    // down — can still report `role = Leader` with an OUTDATED voter set. Picking the first such node
+    // (as `self.leader()` does) would let the safety oracle re-judge entries committed under the
+    // CURRENT config against that stale set, a false positive (e.g. node 1 commits idx 55 under the
+    // committed `{0,1,3}` while a stale node still advertises the pre-removal `{0,1,2,3}`). The
+    // highest-term leader is the authoritative source of the latest committed membership.
+    let authoritative = self
+      .node_ids
+      .iter()
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .filter(|(i, _)| self.nodes[*i].role().is_leader())
+      .max_by_key(|(i, _)| self.nodes[*i].term());
+    if let Some((i, _)) = authoritative {
       return self.nodes[i]
         .conf_state()
         .voters()
@@ -325,8 +338,16 @@ impl Cluster {
   /// learner set of the same plurality committed config `committed_voters` selects, so the two stay
   /// consistent). Used by the VOPR to tell a successfully-committed learner from an orphaned joiner.
   pub fn committed_learners(&self) -> BTreeSet<u64> {
-    if let Some(leader) = self.leader() {
-      let i = self.node_idx[&leader];
+    // Same authoritative-source rule as `committed_voters`: read from the HIGHEST-TERM leader so a
+    // stale lower-term ex-leader cannot report an outdated learner set.
+    let authoritative = self
+      .node_ids
+      .iter()
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .filter(|(i, _)| self.nodes[*i].role().is_leader())
+      .max_by_key(|(i, _)| self.nodes[*i].term());
+    if let Some((i, _)) = authoritative {
       return self.nodes[i]
         .conf_state()
         .learners()

@@ -61,22 +61,11 @@ stabilize
 > n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  AppendResp term=1 match=1
+  AppendResp term=1 match=0
 > n3 ready
-  AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 ready
-  AppendEntries term=1 prev=1/1 commit=0 entries=[]
-  AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n2 recv AppendEntries term=1 prev=1/1 commit=0 entries=[]
-> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n2 ready
-  AppendResp term=1 match=1
-> n3 ready
-  AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
+  AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
 
 raft-state
 ----
