@@ -96,7 +96,7 @@ mod tests {
     let meta = SnapshotMeta::new(
       crate::Index::new(10),
       crate::Term::new(4),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let ev: Event<u64, u32> = Event::SnapshotInstalled(meta.clone());
     assert!(ev.is_snapshot_installed());

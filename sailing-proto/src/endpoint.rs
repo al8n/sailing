@@ -229,7 +229,7 @@ where
 
   /// Build the current `ConfState` from the config voter set.
   fn conf_state(&self) -> crate::ConfState<I> {
-    crate::ConfState::new(self.config.voters().to_vec())
+    crate::ConfState::from_voters(self.config.voters().iter().copied())
   }
 
   /// Expose `pending_compact` for testing.
@@ -3163,7 +3163,7 @@ mod tests {
     let meta = crate::SnapshotMeta::new(
       Index::new(offset),
       Term::new(1),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let data = bytes::Bytes::from_static(b"snap-data");
     stable.submit_snapshot(crate::OpId::new(99), meta, data);
@@ -3384,7 +3384,7 @@ mod tests {
     let meta = crate::SnapshotMeta::new(
       Index::new(10),
       Term::new(4),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta.clone(), snap_data.clone());
 
@@ -3526,7 +3526,7 @@ mod tests {
     let meta = crate::SnapshotMeta::new(
       Index::new(10),
       Term::new(4),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, snap_data);
     ep.handle_message(
@@ -3594,7 +3594,7 @@ mod tests {
     let meta = crate::SnapshotMeta::new(
       Index::new(10),
       Term::new(4),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, bad_data);
     ep.handle_message(
@@ -3628,7 +3628,7 @@ mod tests {
     let meta2 = crate::SnapshotMeta::new(
       Index::new(10),
       Term::new(4),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let is2 = crate::InstallSnapshot::new(Term::new(1), 1u64, meta2, good_data);
     ep.handle_message(
@@ -3862,8 +3862,11 @@ mod tests {
     let mut stable = crate::testkit::AsyncStable::default();
     let snap_count: u64 = 10;
     let snap_data = encode_count_snapshot(snap_count);
-    let meta =
-      crate::SnapshotMeta::new(Index::new(5), Term::new(2), ConfState::new(std::vec![1u64]));
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
     stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
     // Drain the SnapshotWritten completion so stable.snapshot() is readable.
     while stable.poll().is_some() {}
@@ -3932,8 +3935,11 @@ mod tests {
     let mut stable = crate::testkit::AsyncStable::default();
     let snap_count: u64 = 7;
     let snap_data = encode_count_snapshot(snap_count);
-    let meta =
-      crate::SnapshotMeta::new(Index::new(5), Term::new(2), ConfState::new(std::vec![1u64]));
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
     stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
     while stable.poll().is_some() {}
     stable.force_state(Term::new(2), None, Index::new(5));
@@ -4037,8 +4043,11 @@ mod tests {
     let mut stable = crate::testkit::AsyncStable::default();
     // Store garbage — too short to decode a u64 count.
     let bad_data = bytes::Bytes::from_static(b"\x01\x02\x03");
-    let meta =
-      crate::SnapshotMeta::new(Index::new(5), Term::new(2), ConfState::new(std::vec![1u64]));
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
     stable.submit_snapshot(crate::OpId::new(1), meta, bad_data);
     while stable.poll().is_some() {}
     stable.force_state(Term::new(2), None, Index::new(7));

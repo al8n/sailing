@@ -246,7 +246,7 @@ mod tests {
     let meta = SnapshotMeta::new(
       Index::new(10),
       Term::new(3),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let data = Bytes::from_static(b"snapshot-data");
     s.submit_snapshot(OpId::new(42), meta.clone(), data.clone());
@@ -268,7 +268,7 @@ mod tests {
     let meta2 = SnapshotMeta::new(
       Index::new(20),
       Term::new(5),
-      ConfState::new(std::vec![1u64]),
+      ConfState::from_voters(std::vec![1u64]),
     );
     s.submit_snapshot(OpId::new(43), meta2.clone(), Bytes::from_static(b"v2"));
     let _ = s.poll();

@@ -568,7 +568,7 @@ mod term_test {
     let meta = SnapshotMeta::new(
       crate::Index::new(10),
       crate::Term::new(3),
-      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let snap = InstallSnapshot::new(
       crate::Term::new(7),
@@ -622,12 +622,14 @@ mod tests {
   #[test]
   fn snapshot_meta_accessors() {
     use crate::conf::ConfState;
+    use std::collections::BTreeSet;
     let voters = std::vec![1u64, 2u64, 3u64];
-    let conf = ConfState::new(voters.clone());
+    let conf = ConfState::from_voters(voters.clone());
     let meta = SnapshotMeta::new(Index::new(42), Term::new(5), conf);
     assert_eq!(meta.last_index(), Index::new(42));
     assert_eq!(meta.last_term(), Term::new(5));
-    assert_eq!(meta.conf().voters(), voters.as_slice());
+    let expected: BTreeSet<u64> = voters.into_iter().collect();
+    assert_eq!(meta.conf().voters(), &expected);
   }
 
   #[test]
@@ -636,7 +638,7 @@ mod tests {
     let meta = SnapshotMeta::new(
       Index::new(10),
       Term::new(3),
-      ConfState::new(std::vec![1u64]),
+      ConfState::from_voters(std::vec![1u64]),
     );
     let data = bytes::Bytes::from_static(b"payload");
     let snap = InstallSnapshot::new(Term::new(7), 1u64, meta.clone(), data.clone());

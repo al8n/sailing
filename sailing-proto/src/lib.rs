@@ -37,7 +37,12 @@ mod hard_state;
 pub use hard_state::HardState;
 
 pub mod conf;
-pub use conf::ConfState;
+pub use conf::{
+  ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
+};
+
+pub mod quorum;
+pub use quorum::{JointConfig, MajorityConfig, VoteResult};
 
 mod message;
 pub use message::{

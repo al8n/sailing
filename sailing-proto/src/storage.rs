@@ -191,7 +191,7 @@ mod tests {
     let meta = SnapshotMeta::new(
       Index::new(5),
       Term::new(2),
-      ConfState::new(std::vec![1u64, 2u64]),
+      ConfState::from_voters(std::vec![1u64, 2u64]),
     );
     let data = bytes::Bytes::from_static(b"state");
     s.submit_snapshot(OpId::new(1), meta.clone(), data.clone());
