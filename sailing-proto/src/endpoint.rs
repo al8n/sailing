@@ -660,6 +660,30 @@ where
     id
   }
 
+  /// The match-ack ceiling: the highest log index a follower may report as matched. EVERY outbound
+  /// follower success-ack clamps to this single bound (persist-before-ack) — centralizing it is what
+  /// guarantees no ack site can drift, since an over-ack lets the leader count a phantom replica and
+  /// commit an entry a crash would lose.
+  ///
+  /// Normally this is `durable_index` (the durable log tip, backed by a durable baseline). While a
+  /// freshly-installed snapshot's blob is still in flight (`snapshot_durability_pending`), it is capped
+  /// at the snapshot BOUNDARY instead: the re-based log above the boundary has no durable baseline yet,
+  /// so an uncommitted post-snapshot append (whose bytes may already have flushed, advancing
+  /// `durable_index` past the boundary) is NOT ackable — a crash would orphan it. The boundary itself is
+  /// safe to ack because it is already quorum-committed (a leader only snapshots committed state, so
+  /// boundary <= leader.commit): the leader cannot newly-commit an already-committed index, exactly the
+  /// reasoning that lets the fresh-install ack report the boundary. `durable_index >= boundary` holds
+  /// throughout the window, so the `min` resolves to the boundary; once the blob lands the cap lifts and
+  /// the next append/heartbeat re-acks the higher match. NOTE this is distinct from the commit-persist
+  /// cap (`durable_commit`), which uses `committed_persisted` — the boundary is ackable but not yet
+  /// persistable as `HardState.commit`.
+  fn ack_watermark(&self) -> Index {
+    match self.snapshot_durability_pending {
+      Some((_, boundary)) => self.durable_index.min(boundary),
+      None => self.durable_index,
+    }
+  }
+
   /// The commit watermark that is actually backed by the DURABLE log: `min(commit, durable_index)`.
   /// EVERY `HardState.commit` persist stamps THIS, never raw `self.commit`, so a crash can never leave
   /// a durable commit above the durable log — a state restart would otherwise have to silently lower
@@ -671,9 +695,10 @@ where
   /// on §5.3 truncation and snapshot install), so it never regresses the persisted watermark.
   fn durable_commit(&self) -> Index {
     // While a follower snapshot install's blob is not yet durable, `durable_index` has already been
-    // advanced to the (not-yet-durable) snapshot boundary for the ack, so it cannot be trusted for the
-    // commit fence: cap at the last actually-persisted commit (`committed_persisted`), which is
-    // recoverable from the still-durable pre-install log. Cleared the moment the blob is durable.
+    // advanced to the (not-yet-durable) snapshot boundary, so it cannot be trusted for the commit fence:
+    // cap at the last actually-persisted commit (`committed_persisted`), which is recoverable from the
+    // still-durable pre-install log. (Acks may report the boundary — already-committed — but a commit is
+    // not PERSISTABLE there until the blob lands.) Cleared the moment the blob is durable.
     if self.snapshot_durability_pending.is_some() {
       return core::cmp::min(
         self.committed_persisted,
@@ -1710,6 +1735,13 @@ where
     match self.pending.remove(&opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
         let (term, me) = (self.term, self.config.id());
+        // Persist-before-ack: clamp the deferred ack to `ack_watermark()`. This fires when the append's
+        // bytes are durable, but if a freshly-installed snapshot's blob is still in flight the entry sits
+        // ABOVE the snapshot boundary on a baseline that is NOT yet durable — a crash would orphan it —
+        // so `ack_watermark()` caps at the boundary in that window; once the blob lands the next
+        // AppendEntries/heartbeat re-acks the higher match. In the steady state `match_index <=
+        // durable_index`, so this is a no-op.
+        let ack_index = match_index.min(self.ack_watermark());
         self.send(
           to,
           Message::AppendResp(crate::AppendResp::new(
@@ -1718,7 +1750,7 @@ where
             false,
             Index::ZERO,
             Term::ZERO,
-            match_index,
+            ack_index,
           )),
         );
       }
@@ -2747,14 +2779,16 @@ where
         },
       );
     } else {
-      // Nothing was appended (heartbeat or pure duplicate) — ack immediately, but clamp the
-      // reported match to `durable_index` (persist-before-ack on the immediate path). In steady
-      // state `last_new <= durable_index`, so the clamp is a no-op for genuine heartbeats and
-      // already-durable duplicates. The hazard it closes: a duplicate AppendEntries for entries
-      // present only in our visible-but-unflushed (in-flight) tail would otherwise ack them as
-      // durable, letting the leader count a phantom replica and commit an entry a crash loses.
-      // When that tail does flush, the deferred FollowerAck reports the higher match.
-      let ack_index = last_new.min(self.durable_index);
+      // Nothing was appended (heartbeat or pure duplicate) — ack immediately, but clamp the reported
+      // match to `ack_watermark()` (persist-before-ack on the immediate path). In steady state
+      // `last_new <= durable_index`, so the clamp is a no-op for genuine heartbeats and already-durable
+      // duplicates. The hazards it closes: (a) a duplicate AppendEntries for entries present only in our
+      // visible-but-unflushed (in-flight) tail would otherwise ack them as durable; (b) during a pending
+      // snapshot install the watermark caps at the snapshot boundary, since the re-based log above it has
+      // no durable baseline yet. Either over-ack lets the leader count a phantom replica and commit an
+      // entry a crash loses. When the tail/blob flushes, the deferred FollowerAck or next heartbeat
+      // reports the higher match.
+      let ack_index = last_new.min(self.ack_watermark());
       self.send(
         ae.leader(),
         Message::AppendResp(crate::AppendResp::new(
@@ -3422,13 +3456,24 @@ where
 
     // Staleness guard: if last_index <= commit we are already at or ahead of the snapshot.
     // Installing it would REGRESS committed/applied state — absolutely forbidden.
-    // Ack anyway with match_index = self.commit so the leader can transition the peer out
-    // of Snapshot state (maybe_update(commit) >= pending since leader only sends snapshots
-    // whose last_index <= leader.commit, so commit >= pending holds).
+    // Ack anyway so the leader can transition the peer out of Snapshot state, BUT clamp the reported
+    // match to `ack_watermark()` (the shared persist-before-ack ceiling). An async follower can have
+    // `commit > durable_index` (commit advanced over a visible-but-not-yet-durable append), and replying
+    // raw `self.commit` would over-ack a tail this node cannot recover after a crash — the leader would
+    // count a phantom replica toward commit, exactly the persist-before-ack hole the immediate-ack clamp
+    // closes on the AppendEntries path. Transitioning the peer self-heals: when `durable_index` catches
+    // up (the in-flight appends complete), the normal append/heartbeat cycle re-acks the higher
+    // watermark, and `ack_watermark() >= meta.last_index()` holds whenever the durable log (or, during a
+    // pending install, the snapshot boundary) already covers the already-quorum-committed snapshot index.
     if meta.last_index() <= self.commit {
       self.send(
         is.leader(),
-        Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, self.commit)),
+        Message::SnapshotResp(crate::SnapshotResp::new(
+          term,
+          me,
+          false,
+          self.commit.min(self.ack_watermark()),
+        )),
       );
       return;
     }
@@ -3549,6 +3594,15 @@ where
     // Step 8: ack to the leader with match_index = last_index, signalling successful install.
     // The leader's maybe_update(last_index) >= pending_snapshot transitions the peer out of
     // Snapshot state and resumes normal replication.
+    //
+    // This ack reports the snapshot boundary — which is exactly what `ack_watermark()` returns during
+    // the pending-install window (it caps at the boundary), so this is CONSISTENT with the centralized
+    // persist-before-ack clamp, not an exception. The boundary is safe to ack because it is already
+    // quorum-committed (a leader only snapshots committed state, so last_index <= leader.commit): the
+    // leader cannot newly-commit an already-committed index, so the optimistic ack drives no phantom
+    // commit even if this node crashes and re-syncs before the blob lands. Acks ABOVE the boundary (an
+    // uncommitted post-snapshot entry) are what `ack_watermark()` gates on the immediate / deferred
+    // append paths. (etcd likewise acks the boundary immediately, not waiting for snapshot durability.)
     self.send(
       is.leader(),
       Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, meta.last_index())),
@@ -7293,9 +7347,13 @@ mod tests {
       })
       .collect();
     log.force_append(&entries);
-    // Manually advance commit to 15 (the follower has committed up to 15).
+    // Manually advance commit to 15 (the follower has committed up to 15). `force_append` writes the
+    // durable VecLog directly (bypassing submit_append), so also advance `durable_index` to keep the
+    // state self-consistent: a follower whose log is durable to 15 has durable_index == 15. Without
+    // this the stale-snapshot ack would (correctly) clamp to durable_commit() = min(15, 0) = 0.
     ep.commit = Index::new(15);
     ep.applied = Index::new(15);
+    ep.durable_index = Index::new(15);
     // SM count is arbitrary (doesn't matter — must not change).
     let sm_count_before = ep.state_machine().count();
 
@@ -9199,6 +9257,347 @@ mod tests {
       Index::new(10),
       "fence lifts to the snapshot boundary once the blob is durable"
     );
+  }
+
+  /// Regression (R21-F1 — persist-before-ack on the STALE-snapshot reply path): the staleness guard in
+  /// `on_install_snapshot` (last_index <= commit) acks so the leader can transition the peer out of
+  /// Snapshot state, but it must report `durable_commit()` (the recoverable watermark), NOT raw
+  /// `self.commit`. An async follower can have `commit > durable_index` — commit advanced over a
+  /// visible-but-not-yet-durable append — and replying raw commit would over-ack a tail this node
+  /// cannot recover after a crash, letting the leader count a phantom replica (the same persist-before-
+  /// ack hole the immediate `AppendResp` clamp closes on the AppendEntries path).
+  ///
+  /// Setup: durable log [1..=3] (commit/durable 3); a second AppendEntries [4..=5] with leader_commit=5
+  /// advances commit to 5 but `durable_index` stays 3 (the 4/5 `Appended` is NOT drained). A stale
+  /// InstallSnapshot(last_index=5) then hits the guard; the reply must report 3 = min(commit 5,
+  /// durable_index 3), not 5.
+  ///
+  /// MUTATION: revert the stale-guard ack to `self.commit` → the `SnapshotResp` reports 5, over-acking
+  /// the non-durable tail [4..=5].
+  #[test]
+  fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+      SnapshotMeta, Term, conf::ConfState,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    let d = Instant::ORIGIN;
+
+    // Durable log [1..=3], commit=3, durable_index=3.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![
+          Entry::new(
+            Term::new(2),
+            Index::new(1),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(2),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(3),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+        ],
+        Index::new(3),
+      )),
+    );
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert_eq!(ep.durable_index, Index::new(3));
+    assert_eq!(ep.commit, Index::new(3));
+
+    // Second AppendEntries [4..=5] with leader_commit=5: commit jumps to 5, but the 4/5 append is NOT
+    // yet durable (no handle_storage), so durable_index stays 3 → commit > durable_index.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::new(3),
+        Term::new(2),
+        std::vec![
+          Entry::new(
+            Term::new(2),
+            Index::new(4),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(5),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+        ],
+        Index::new(5),
+      )),
+    );
+    assert_eq!(
+      ep.commit,
+      Index::new(5),
+      "commit advanced to the leader_commit"
+    );
+    assert_eq!(
+      ep.durable_index,
+      Index::new(3),
+      "but the 4/5 append is not yet durable"
+    );
+    // Drain the outbox (the immediate AppendResp for the second append) so the next poll is the
+    // SnapshotResp under test.
+    while ep.poll_message().is_some() {}
+
+    // A stale InstallSnapshot at index 5 (== commit) hits the staleness guard.
+    let meta = SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    );
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::InstallSnapshot(InstallSnapshot::new(
+        Term::new(2),
+        2u64,
+        meta,
+        encode_count_snapshot(5),
+      )),
+    );
+
+    let resp = ep
+      .poll_message()
+      .expect("a stale InstallSnapshot emits a SnapshotResp");
+    match resp.message() {
+      Message::SnapshotResp(s) => {
+        assert!(
+          !s.reject(),
+          "the follower is at/ahead → success ack, not a reject"
+        );
+        assert_eq!(
+          s.match_index(),
+          Index::new(3),
+          "persist-before-ack: the stale-snapshot ack must report the durable watermark \
+           min(commit=5, durable_index=3)=3, not the raw in-memory commit 5"
+        );
+      }
+      other => panic!("expected SnapshotResp, got {other:?}"),
+    }
+    // The stale path installs nothing: commit must not regress and no commit-fence is armed.
+    assert_eq!(
+      ep.commit,
+      Index::new(5),
+      "a stale snapshot must not regress commit"
+    );
+    assert!(
+      ep.snapshot_durability_pending.is_none(),
+      "the stale path installs no blob → no fence armed"
+    );
+  }
+
+  /// Regression (R22-F1 — persist-before-ack centralized through `ack_watermark()`, covering the
+  /// POST-snapshot append window): after a fresh InstallSnapshot whose blob is still in flight, the
+  /// re-based log above the boundary has no durable baseline. A leader can append entries beyond the
+  /// snapshot boundary; if such an append's bytes flush BEFORE `SnapshotWritten`, the deferred
+  /// FollowerAck must NOT report the post-snapshot index — a crash would orphan it (no durable baseline),
+  /// yet the leader could have counted it toward committing a current-term entry. `ack_watermark()` caps
+  /// the ack at the snapshot BOUNDARY (10) — already quorum-committed, hence safe to ack — never the
+  /// uncommitted post-snapshot index 11. Once the blob lands the cap lifts and the next append re-acks 11.
+  ///
+  /// `handle_storage` drains LOG completions (firing the deferred ack) BEFORE the stable drain clears
+  /// the fence, so a single drain deterministically exercises the in-window ack.
+  ///
+  /// MUTATION: drop the `snapshot_durability_pending` branch in `ack_watermark()` (return `durable_index`
+  /// unconditionally) → the deferred ack reports the orphan-prone post-snapshot index 11, not 10.
+  #[test]
+  fn post_snapshot_append_ack_is_fenced_until_blob_durable() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+      SnapshotMeta, Term, conf::ConfState,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    let d = Instant::ORIGIN;
+
+    // Durable log [1..=3], commit=3, committed_persisted=3, durable_index=3.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![
+          Entry::new(
+            Term::new(2),
+            Index::new(1),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(2),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(3),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+        ],
+        Index::new(3),
+      )),
+    );
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert_eq!(ep.committed_persisted, Index::new(3));
+
+    // Install a snapshot at index 10 (blob deferred via AsyncStable) → fence armed, committed_persisted
+    // stays 3.
+    let meta = SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    );
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::InstallSnapshot(InstallSnapshot::new(
+        Term::new(2),
+        2u64,
+        meta,
+        encode_count_snapshot(10),
+      )),
+    );
+    assert!(
+      ep.snapshot_durability_pending.is_some(),
+      "blob in flight → fence armed"
+    );
+    assert_eq!(ep.durable_index, Index::new(10));
+    assert_eq!(
+      ep.committed_persisted,
+      Index::new(3),
+      "pre-install durable commit"
+    );
+
+    // The leader appends entry 11 ABOVE the snapshot boundary (prev=10/term2), still uncommitted
+    // (leader_commit=10). The follower appends it → deferred FollowerAck(match=11).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::new(10),
+        Term::new(2),
+        std::vec![Entry::new(
+          Term::new(2),
+          Index::new(11),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        )],
+        Index::new(10),
+      )),
+    );
+    // Drain queued messages (the fresh-install SnapshotResp) so the next poll is the deferred ack.
+    while ep.poll_message().is_some() {}
+
+    // Drain storage: the LOG completion for entry 11 fires the deferred FollowerAck FIRST (the fence is
+    // still armed during the log drain), so the ack clamps to ack_watermark()=10 (the boundary), NOT 11.
+    ep.handle_storage(d, &mut log, &mut stable);
+    let resp = ep
+      .poll_message()
+      .expect("the deferred FollowerAck for entry 11 fires");
+    match resp.message() {
+      Message::AppendResp(a) => {
+        assert!(!a.reject(), "a successful append ack");
+        assert_eq!(
+          a.match_index(),
+          Index::new(10),
+          "persist-before-ack: the post-snapshot append ack must clamp to ack_watermark()=10 (the \
+           already-committed snapshot boundary) while the blob is in flight, not the orphan-prone index 11"
+        );
+      }
+      other => panic!("expected AppendResp, got {other:?}"),
+    }
+
+    // The blob is now durable (SnapshotWritten drained in the same handle_storage), so the fence lifted
+    // and durable_index includes entry 11; a follow-up empty AppendEntries re-acks the higher match.
+    assert!(
+      ep.snapshot_durability_pending.is_none(),
+      "blob durable → fence lifted"
+    );
+    assert_eq!(ep.durable_index, Index::new(11));
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::new(11),
+        Term::new(2),
+        std::vec![],
+        Index::new(10),
+      )),
+    );
+    let resp2 = ep
+      .poll_message()
+      .expect("the empty AppendEntries acks immediately");
+    match resp2.message() {
+      Message::AppendResp(a) => assert_eq!(
+        a.match_index(),
+        Index::new(11),
+        "after the blob is durable the follower re-acks the full recoverable match 11"
+      ),
+      other => panic!("expected AppendResp, got {other:?}"),
+    }
   }
 
   // ── propose_conf_change + apply-at-commit tests ────────────────────────────────────────

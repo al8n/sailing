@@ -2,6 +2,11 @@
 # follower that briefly drops out during a burst of proposals falls behind; the leader snapshots and
 # compacts its log past the follower's position, so when the follower returns it can only be caught up
 # via InstallSnapshot (the compacted entries are gone) — not plain AppendEntries.
+#
+# The leader sends two InstallSnapshots (inflight=2): the first installs and acks match=5; the second
+# hits the staleness guard and also acks the snapshot boundary (5) — already quorum-committed, so safe
+# under the persist-before-ack ceiling (ack_watermark) even while the blob is in flight. n3 converges
+# to commit=5.
 add-nodes 3 voters=(1,2,3) inflight=2 snap=3
 ----
 n1: created voters={1,2,3} term=0 commit=0 last=0
