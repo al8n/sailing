@@ -62,6 +62,15 @@ impl Data for bool {
   }
 }
 
+impl Data for () {
+  #[inline(always)]
+  fn encode(&self, _buf: &mut Vec<u8>) {}
+  #[inline(always)]
+  fn decode(_buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    Ok((0, ()))
+  }
+}
+
 impl Data for bytes::Bytes {
   fn encode(&self, buf: &mut Vec<u8>) {
     (self.len() as u64).encode(buf);
@@ -89,6 +98,11 @@ mod tests {
     let (read, decoded) = T::decode(&buf).expect("decode");
     assert_eq!(read, buf.len());
     assert_eq!(decoded, v);
+  }
+
+  #[test]
+  fn unit_roundtrip() {
+    roundtrip(());
   }
 
   #[test]

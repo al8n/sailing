@@ -1,6 +1,6 @@
 //! Raft RPC messages. Payloads are named structs; `Message<I>` wraps them as newtype
 //! variants (no multi-field enum variants). Types only — behavior lands in M1–M3.
-use crate::{Entry, Index, Term};
+use crate::{Entry, Index, Term, conf::ConfState};
 use bytes::Bytes;
 use std::vec::Vec;
 
@@ -338,12 +338,141 @@ impl<I: Copy> HeartbeatResp<I> {
   }
 }
 
+/// Metadata describing a snapshot (the logical "header" without the raw blob).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotMeta<I> {
+  last_index: Index,
+  last_term: Term,
+  conf: ConfState<I>,
+}
+
+impl<I: crate::NodeId> SnapshotMeta<I> {
+  /// Construct.
+  pub fn new(last_index: Index, last_term: Term, conf: ConfState<I>) -> Self {
+    Self {
+      last_index,
+      last_term,
+      conf,
+    }
+  }
+
+  /// The last log index covered by this snapshot.
+  #[inline(always)]
+  pub const fn last_index(&self) -> Index {
+    self.last_index
+  }
+
+  /// The term of `last_index`.
+  #[inline(always)]
+  pub const fn last_term(&self) -> Term {
+    self.last_term
+  }
+
+  /// The cluster configuration at the snapshot point.
+  #[inline(always)]
+  pub fn conf(&self) -> &ConfState<I> {
+    &self.conf
+  }
+}
+
+/// Leader → follower: install a snapshot (follower is too far behind to catch up via entries).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallSnapshot<I> {
+  term: Term,
+  leader: I,
+  snapshot: SnapshotMeta<I>,
+  data: Bytes,
+}
+
+impl<I: crate::NodeId> InstallSnapshot<I> {
+  /// Construct.
+  pub fn new(term: Term, leader: I, snapshot: SnapshotMeta<I>, data: Bytes) -> Self {
+    Self {
+      term,
+      leader,
+      snapshot,
+      data,
+    }
+  }
+
+  /// The leader's current term.
+  #[inline(always)]
+  pub const fn term(&self) -> Term {
+    self.term
+  }
+
+  /// The leader's node id.
+  #[inline(always)]
+  pub fn leader(&self) -> I
+  where
+    I: Copy,
+  {
+    self.leader
+  }
+
+  /// Snapshot metadata (last covered index/term + conf).
+  #[inline(always)]
+  pub fn snapshot(&self) -> &SnapshotMeta<I> {
+    &self.snapshot
+  }
+
+  /// The raw snapshot blob.
+  #[inline(always)]
+  pub fn data(&self) -> &Bytes {
+    &self.data
+  }
+}
+
+/// Follower → leader: acknowledgement of an `InstallSnapshot`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotResp<I> {
+  term: Term,
+  from: I,
+  reject: bool,
+  match_index: Index,
+}
+
+impl<I: Copy> SnapshotResp<I> {
+  /// Construct.
+  pub const fn new(term: Term, from: I, reject: bool, match_index: Index) -> Self {
+    Self {
+      term,
+      from,
+      reject,
+      match_index,
+    }
+  }
+
+  /// The respondent's current term.
+  #[inline(always)]
+  pub const fn term(&self) -> Term {
+    self.term
+  }
+
+  /// The sender's node id.
+  #[inline(always)]
+  pub const fn from(&self) -> I {
+    self.from
+  }
+
+  /// Whether the snapshot was rejected (stale or follower is already ahead).
+  #[inline(always)]
+  pub const fn reject(&self) -> bool {
+    self.reject
+  }
+
+  /// The follower's match index after applying the snapshot (on success).
+  #[inline(always)]
+  pub const fn match_index(&self) -> Index {
+    self.match_index
+  }
+}
+
 /// The full Raft message set. `#[non_exhaustive]` for forward-compat; derive variant
 /// predicates + unwrap accessors per §2.
 ///
-/// `InstallSnapshot`, `SnapshotResp`, `TimeoutNow`, `ReadIndex`, `ReadIndexResp` are
-/// added as new newtype variants in their milestones (M5/M7); `#[non_exhaustive]` makes
-/// that additive. This is the M1–M3 subset.
+/// `TimeoutNow`, `ReadIndex`, `ReadIndexResp` are added as new newtype variants in their
+/// milestones (M7); `#[non_exhaustive]` makes that additive.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -363,6 +492,10 @@ pub enum Message<I> {
   Heartbeat(Heartbeat<I>),
   /// Heartbeat response.
   HeartbeatResp(HeartbeatResp<I>),
+  /// Leader → follower: install a snapshot (follower is too far behind).
+  InstallSnapshot(InstallSnapshot<I>),
+  /// Follower → leader: acknowledgement of an `InstallSnapshot`.
+  SnapshotResp(SnapshotResp<I>),
 }
 
 /// A typed message addressed to a peer. The driver frames + sends it; the sim moves it
@@ -398,7 +531,7 @@ impl<I: Copy> Outgoing<I> {
   }
 }
 
-impl<I: Copy> Message<I> {
+impl<I: crate::NodeId> Message<I> {
   /// The term carried by this message (every variant carries one).
   pub fn term(&self) -> crate::Term {
     match self {
@@ -408,6 +541,8 @@ impl<I: Copy> Message<I> {
       Self::VoteResp(m) => m.term(),
       Self::Heartbeat(m) => m.term(),
       Self::HeartbeatResp(m) => m.term(),
+      Self::InstallSnapshot(m) => m.term(),
+      Self::SnapshotResp(m) => m.term(),
     }
   }
 }
@@ -425,6 +560,31 @@ mod term_test {
       bytes::Bytes::new(),
     ));
     assert_eq!(m.term(), crate::Term::new(5));
+  }
+
+  #[test]
+  fn install_snapshot_message_term() {
+    use crate::conf::ConfState;
+    let meta = SnapshotMeta::new(
+      crate::Index::new(10),
+      crate::Term::new(3),
+      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+    );
+    let snap = InstallSnapshot::new(
+      crate::Term::new(7),
+      1u64,
+      meta,
+      bytes::Bytes::from_static(b"snap"),
+    );
+    let m = Message::InstallSnapshot(snap);
+    assert_eq!(m.term(), crate::Term::new(7));
+  }
+
+  #[test]
+  fn snapshot_resp_message_term() {
+    let resp = SnapshotResp::new(crate::Term::new(4), 2u64, false, crate::Index::new(10));
+    let m = Message::SnapshotResp(resp);
+    assert_eq!(m.term(), crate::Term::new(4));
   }
 }
 
@@ -457,5 +617,47 @@ mod tests {
     );
     assert_eq!(out.to(), 3u64);
     assert!(out.message().is_heartbeat());
+  }
+
+  #[test]
+  fn snapshot_meta_accessors() {
+    use crate::conf::ConfState;
+    let voters = std::vec![1u64, 2u64, 3u64];
+    let conf = ConfState::new(voters.clone());
+    let meta = SnapshotMeta::new(Index::new(42), Term::new(5), conf);
+    assert_eq!(meta.last_index(), Index::new(42));
+    assert_eq!(meta.last_term(), Term::new(5));
+    assert_eq!(meta.conf().voters(), voters.as_slice());
+  }
+
+  #[test]
+  fn install_snapshot_accessors() {
+    use crate::conf::ConfState;
+    let meta = SnapshotMeta::new(
+      Index::new(10),
+      Term::new(3),
+      ConfState::new(std::vec![1u64]),
+    );
+    let data = bytes::Bytes::from_static(b"payload");
+    let snap = InstallSnapshot::new(Term::new(7), 1u64, meta.clone(), data.clone());
+    assert_eq!(snap.term(), Term::new(7));
+    assert_eq!(snap.leader(), 1u64);
+    assert_eq!(snap.snapshot().last_index(), meta.last_index());
+    assert_eq!(snap.data(), &data);
+
+    let m = Message::InstallSnapshot(snap);
+    assert!(m.is_install_snapshot());
+  }
+
+  #[test]
+  fn snapshot_resp_accessors() {
+    let resp = SnapshotResp::new(Term::new(4), 2u64, false, Index::new(10));
+    assert_eq!(resp.term(), Term::new(4));
+    assert_eq!(resp.from(), 2u64);
+    assert!(!resp.reject());
+    assert_eq!(resp.match_index(), Index::new(10));
+
+    let m = Message::SnapshotResp(resp);
+    assert!(m.is_snapshot_resp());
   }
 }

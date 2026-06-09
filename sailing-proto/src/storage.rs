@@ -1,7 +1,8 @@
 //! Storage seams. The driver owns the impls and passes them by `&mut`. Reads are
 //! synchronous (no durability-ordering constraint); writes are deferred — `submit_*`
 //! queues work, `poll()` drains completions (drained by `Endpoint::handle_storage`).
-use crate::{Entry, HardState, Index, NodeId, Term};
+use crate::{Entry, HardState, Index, NodeId, SnapshotMeta, Term};
+use bytes::Bytes;
 use core::ops::Range;
 
 /// A storage-submission correlation id, echoed back on completion.
@@ -114,6 +115,12 @@ pub trait StableStore {
   /// Queue a hard-state write. Durable on the matching `poll` (completions are ordered).
   fn submit_write(&mut self, id: OpId, hard_state: HardState<Self::NodeId>);
 
+  /// Queue a snapshot write. Completes as `StableDone::SnapshotWritten(id)`.
+  fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<Self::NodeId>, data: Bytes);
+
+  /// Read the latest persisted snapshot (synchronous). Returns `None` if no snapshot exists.
+  fn snapshot(&self) -> Option<(SnapshotMeta<Self::NodeId>, Bytes)>;
+
   /// Drain the next completion, if any.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;
 }
@@ -134,5 +141,40 @@ mod tests {
     next = next.next();
     assert_ne!(a, next);
     assert_eq!(next.get(), 1);
+  }
+
+  #[test]
+  fn stable_store_submit_snapshot_and_read_via_noop_stable() {
+    // NoopStable has no snapshot; snapshot() returns None
+    use crate::testkit::NoopStable;
+    let s = NoopStable::default();
+    assert!(s.snapshot().is_none());
+  }
+
+  #[test]
+  fn stable_store_submit_snapshot_roundtrip_via_async_stable() {
+    use crate::{SnapshotMeta, conf::ConfState, testkit::AsyncStable};
+    let mut s = AsyncStable::default();
+    assert!(s.snapshot().is_none()); // no snapshot yet
+
+    let meta = SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::new(std::vec![1u64, 2u64]),
+    );
+    let data = bytes::Bytes::from_static(b"state");
+    s.submit_snapshot(OpId::new(1), meta.clone(), data.clone());
+
+    // completion is enqueued
+    assert_eq!(
+      s.poll(),
+      Some(Ok(StableDone::SnapshotWritten(OpId::new(1))))
+    );
+
+    // snapshot is now readable
+    let (rmeta, rdata) = s.snapshot().unwrap();
+    assert_eq!(rmeta.last_index(), meta.last_index());
+    assert_eq!(rmeta.last_term(), meta.last_term());
+    assert_eq!(rdata, data);
   }
 }

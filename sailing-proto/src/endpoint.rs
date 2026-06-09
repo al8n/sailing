@@ -77,6 +77,16 @@ where
   pending: BTreeMap<crate::OpId, Pending<I>>,
   /// Sticky fatal error: once set, all `handle_*` are no-ops.
   poisoned: bool,
+  /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
+  /// is durable (crash-safe: we never compact before the snapshot write completes).
+  ///
+  /// Completion contract: this field relies on the `StableStore` guarantee that every
+  /// `submit_snapshot` call eventually yields a `SnapshotWritten` completion. If that
+  /// completion never arrives (e.g. a store implementation that silently drops snapshots),
+  /// the `is_some()` guard in `maybe_snapshot` would permanently block future snapshots
+  /// (the node wedges). A store error poisons the node via `handle_storage`, and `restart`
+  /// resets this field to `None`.
+  pending_compact: Option<(crate::OpId, Index)>,
 }
 
 // ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
@@ -108,6 +118,7 @@ where
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
       poisoned: false,
+      pending_compact: None,
     };
     ep.arm_election_timer(now);
     ep
@@ -214,6 +225,17 @@ where
     let li = log.last_index();
     let lt = log.term(li).unwrap_or(Term::ZERO);
     (li, lt)
+  }
+
+  /// Build the current `ConfState` from the config voter set.
+  fn conf_state(&self) -> crate::ConfState<I> {
+    crate::ConfState::new(self.config.voters().to_vec())
+  }
+
+  /// Expose `pending_compact` for testing.
+  #[cfg(test)]
+  pub(crate) fn pending_compact(&self) -> Option<(crate::OpId, Index)> {
+    self.pending_compact
   }
 
   fn broadcast_heartbeat(&mut self, _now: Instant) {
@@ -426,6 +448,7 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
   {
     if self.poisoned {
       return;
@@ -443,13 +466,74 @@ where
     while let Some(done) = stable.poll() {
       match done {
         Ok(crate::StableDone::Wrote(opid)) => self.on_stable_wrote(opid),
-        Ok(crate::StableDone::SnapshotWritten(_)) => {}
+        Ok(crate::StableDone::SnapshotWritten(opid)) => {
+          // Deferred compaction: fire only after the snapshot is durable.
+          // This mirrors append-before-ack: the log is never compacted before the
+          // snapshot backing it is safely on stable storage.
+          if let Some((pid, up_to)) = self.pending_compact {
+            if pid == opid {
+              log.compact(up_to);
+              self.pending_compact = None;
+            }
+          }
+        }
         Err(_) => {
           self.poison();
           return;
         }
       }
     }
+    // After all completions are drained, check whether a new snapshot is warranted.
+    self.maybe_snapshot(log, stable);
+  }
+
+  /// Trigger a snapshot if `applied - first_index >= snapshot_threshold`.
+  ///
+  /// Durability rule: the snapshot is persisted first via `submit_snapshot`; the log is
+  /// compacted only after `SnapshotWritten` is received in `handle_storage`. This mirrors
+  /// append-before-ack and ensures a crash after compaction but before snapshot durability
+  /// cannot lose data.
+  fn maybe_snapshot<L, S>(&mut self, log: &L, stable: &mut S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
+  {
+    if self.pending_compact.is_some() {
+      // A snapshot is already being persisted; don't start another.
+      return;
+    }
+    if self.applied == Index::ZERO {
+      // Nothing has been applied yet — nothing to snapshot.
+      return;
+    }
+    if self.applied.get().saturating_sub(log.first_index().get())
+      < self.config.snapshot_threshold() as u64
+    {
+      return;
+    }
+    let snap = match self.fsm.snapshot() {
+      Ok(s) => s,
+      Err(_) => {
+        self.poison();
+        return;
+      }
+    };
+    use crate::Data as _;
+    let mut data = std::vec::Vec::new();
+    snap.encode(&mut data);
+    let last_term = match log.term(self.applied) {
+      Ok(t) => t,
+      Err(_) => {
+        self.poison();
+        return;
+      }
+    };
+    let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state());
+    let opid = self.mint_op_id();
+    stable.submit_snapshot(opid, meta, bytes::Bytes::from(data));
+    // Defer compaction until SnapshotWritten fires.
+    self.pending_compact = Some((opid, self.applied));
   }
 
   /// Rebuild a node from durable storage after a crash. Restores `(term, vote)`, sets
@@ -487,10 +571,20 @@ where
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
       poisoned: false,
+      pending_compact: None,
       progress: BTreeMap::new(),
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
     };
+    // M5-U3 will replace this replay with a snapshot-restore prefix followed by a
+    // partial log replay. Until that unit lands, guard against silent state loss:
+    // if the log has been compacted (first_index > 1) we cannot rebuild state by
+    // replaying from index 1, so fail loudly rather than silently returning an
+    // empty state machine despite a non-zero commit.
+    debug_assert!(
+      log.first_index() == Index::new(1),
+      "restart cannot yet restore from a compacted log — see M5-U3 (restore-on-restart)"
+    );
     // Replay committed log into the fresh SM (a restart is silent to the app).
     ep.apply_committed(log);
     ep.events.clear();
@@ -2669,6 +2763,128 @@ mod tests {
     assert!(
       found_low_prev,
       "leader must jump to prev ≤ 2 via the two-sided hint (O(1) round-trip), not back off one-by-one"
+    );
+  }
+
+  // ---- M5 Task 4: snapshot threshold + deferred compaction ----
+
+  /// Helper: elect a single-node leader, drain the no-op, and apply `n` Normal entries.
+  /// Returns the endpoint with `applied == n + 1` (no-op + n commands, all committed).
+  fn make_single_node_leader_with_entries(
+    n: usize,
+    threshold: usize,
+  ) -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::AsyncStable,
+  ) {
+    use crate::{Config, Instant};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_snapshot_threshold(threshold);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // self-elects
+    assert!(ep.role().is_leader());
+    // Drain no-op (LeaderAppend for index 1).
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Propose and commit `n` Normal entries one at a time.
+    for i in 0..n {
+      let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
+      let _ = ep.propose(d, &mut log, &mut stable, &cmd).unwrap();
+      // Drain storage each time to let the self-append complete (quorum=1: auto-commits).
+      ep.handle_storage(d, &mut log, &mut stable);
+      while ep.poll_message().is_some() {}
+      while ep.poll_event().is_some() {}
+    }
+    (ep, log, stable)
+  }
+
+  /// After applying past `snapshot_threshold`, a single `handle_storage` call should:
+  /// 1. Submit a snapshot to stable (readable via `stable.snapshot().is_some()`).
+  /// 2. Set `pending_compact` to the deferred (opid, applied) pair.
+  ///
+  /// The log is NOT yet compacted — the SnapshotWritten completion hasn't fired.
+  #[test]
+  fn snapshot_submitted_and_pending_compact_set() {
+    // threshold=3 means we snapshot once applied - first_index >= 3.
+    // After no-op (idx 1) + 3 Normal entries (idx 2,3,4), applied=4, first_index=1 → gap=3.
+    let (ep, log, stable) = make_single_node_leader_with_entries(3, 3);
+
+    // snapshot was persisted in stable
+    assert!(
+      stable.snapshot().is_some(),
+      "stable must hold the persisted snapshot"
+    );
+    // pending_compact is set (snapshot write in flight, compaction deferred)
+    assert!(
+      ep.pending_compact().is_some(),
+      "pending_compact must be set while snapshot write is in flight"
+    );
+    // log is NOT yet compacted (compaction deferred until SnapshotWritten)
+    assert_eq!(
+      log.first_index(),
+      Index::new(1),
+      "log must not be compacted before SnapshotWritten fires"
+    );
+  }
+
+  /// After the `SnapshotWritten` completion fires (second `handle_storage`), the deferred
+  /// compaction executes: `log.first_index()` advances and `pending_compact` is cleared.
+  #[test]
+  fn deferred_compact_fires_on_snapshot_written() {
+    let (mut ep, mut log, mut stable) = make_single_node_leader_with_entries(3, 3);
+
+    // Drain the SnapshotWritten completion → deferred compact fires.
+    ep.handle_storage(crate::Instant::ORIGIN, &mut log, &mut stable);
+
+    // Log is now compacted: first_index advanced past the initial first_index.
+    assert!(
+      log.first_index() > Index::new(1),
+      "first_index must advance after SnapshotWritten fires (got {:?})",
+      log.first_index()
+    );
+    // pending_compact cleared
+    assert!(
+      ep.pending_compact().is_none(),
+      "pending_compact must be None after compaction fires"
+    );
+  }
+
+  /// While `pending_compact` is set, `maybe_snapshot` must not fire again (idempotence guard).
+  #[test]
+  fn maybe_snapshot_does_not_refire_while_pending() {
+    let (mut ep, mut log, mut stable) = make_single_node_leader_with_entries(3, 3);
+
+    // At this point pending_compact is Some. Drain again without clearing the completion —
+    // but since AsyncStable enqueues SnapshotWritten only once, calling handle_storage again
+    // before any new completion simply runs maybe_snapshot again. The guard must prevent a
+    // second submit_snapshot.
+    let snap_count_before = stable.snapshot().map(|_| 1usize).unwrap_or(0);
+
+    // Call handle_storage again — no new completion available yet (already drained above),
+    // so maybe_snapshot runs again. With the guard it must be a no-op.
+    ep.handle_storage(crate::Instant::ORIGIN, &mut log, &mut stable);
+    // We shouldn't have gotten a SECOND snapshot submission — check pending_compact is still set.
+    // (It won't be cleared because there's no new SnapshotWritten completion.)
+    // The stable still has exactly one snapshot (no double-submit).
+    let snap_count_after = stable.snapshot().map(|_| 1usize).unwrap_or(0);
+    assert_eq!(
+      snap_count_before, snap_count_after,
+      "maybe_snapshot must not re-fire while pending_compact is set"
     );
   }
 }

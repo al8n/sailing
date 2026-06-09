@@ -19,6 +19,8 @@ pub struct Config<I> {
   max_inflight_msgs: usize,
   /// Maximum total in-flight bytes per peer (`0` = uncapped).
   max_inflight_bytes: u64,
+  /// Number of committed entries between automatic snapshots (etcd's SnapshotCount default).
+  snapshot_threshold: usize,
 }
 
 impl<I: NodeId> Config<I> {
@@ -49,6 +51,7 @@ impl<I: NodeId> Config<I> {
       max_size_per_msg: 1024 * 1024, // 1 MiB default
       max_inflight_msgs: 256,
       max_inflight_bytes: 0,
+      snapshot_threshold: 10_000, // etcd default SnapshotCount
     })
   }
 
@@ -126,6 +129,18 @@ impl<I: NodeId> Config<I> {
     self.max_inflight_bytes = v;
     self
   }
+
+  /// Number of committed entries between automatic snapshots.
+  #[inline(always)]
+  pub const fn snapshot_threshold(&self) -> usize {
+    self.snapshot_threshold
+  }
+
+  /// Override the `snapshot_threshold` knob.
+  pub fn with_snapshot_threshold(mut self, v: usize) -> Self {
+    self.snapshot_threshold = v;
+    self
+  }
 }
 
 #[cfg(test)]
@@ -178,6 +193,20 @@ mod tests {
       ),
       Err(ConfigError::ElectionNotGreaterThanHeartbeat { .. })
     ));
+  }
+
+  #[test]
+  fn snapshot_threshold_default_and_override() {
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(c.snapshot_threshold(), 10_000, "default should be 10_000");
+    let c2 = c.with_snapshot_threshold(50);
+    assert_eq!(c2.snapshot_threshold(), 50);
   }
 
   #[test]

@@ -36,9 +36,13 @@ pub use entry::{Entry, EntryKind};
 mod hard_state;
 pub use hard_state::HardState;
 
+pub mod conf;
+pub use conf::ConfState;
+
 mod message;
 pub use message::{
-  AppendEntries, AppendResp, Heartbeat, HeartbeatResp, Message, Outgoing, RequestVote, VoteResp,
+  AppendEntries, AppendResp, Heartbeat, HeartbeatResp, InstallSnapshot, Message, Outgoing,
+  RequestVote, SnapshotMeta, SnapshotResp, VoteResp,
 };
 
 mod state_machine;

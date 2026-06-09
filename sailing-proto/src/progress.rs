@@ -1,8 +1,13 @@
 //! Per-peer replication progress (Raft §replication). M2 uses Probe/Replicate with naive
-//! one-step back-off on reject; M4 adds the `Inflights` window + term-skip reject hints.
+//! one-step back-off on reject; M4 adds the `Inflights` window + term-skip reject hints;
+//! M5 adds `Snapshot` (peer is receiving an InstallSnapshot).
 use crate::{Index, Inflights};
 
 /// How the leader is currently replicating to a peer.
+///
+/// `Snapshot(pending_snapshot)` carries the last log index covered by the snapshot being
+/// sent; the peer stays paused until it acks at or past that index, then transitions back
+/// to `Probe`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 pub enum ProgressState {
@@ -10,6 +15,8 @@ pub enum ProgressState {
   Probe,
   /// Steady-state: optimistically advance `next_index` as acks arrive.
   Replicate,
+  /// An `InstallSnapshot` is in flight; `pending_snapshot` is its `last_index`.
+  Snapshot(Index),
 }
 
 impl ProgressState {
@@ -18,6 +25,7 @@ impl ProgressState {
     match self {
       Self::Probe => "probe",
       Self::Replicate => "replicate",
+      Self::Snapshot(_) => "snapshot",
     }
   }
 }
@@ -68,11 +76,13 @@ impl Progress {
   /// - `Probe`: paused after the first send until the peer acks or a heartbeat response
   ///   clears `msg_app_flow_paused`.
   /// - `Replicate`: paused only when the in-flight window is full.
+  /// - `Snapshot`: always paused (waiting for the snapshot ack).
   #[inline(always)]
   pub fn is_paused(&self) -> bool {
     match self.state {
       ProgressState::Probe => self.msg_app_flow_paused,
       ProgressState::Replicate => self.inflight.full(),
+      ProgressState::Snapshot(_) => true,
     }
   }
 
@@ -87,7 +97,18 @@ impl Progress {
           self.next_index = last.next();
         }
       }
+      ProgressState::Snapshot(_) => {
+        // In Snapshot state no entries are sent; this is a no-op.
+      }
     }
+  }
+
+  /// Enter snapshot-delivery state. The peer stays paused until it acks at or past
+  /// `pending_snapshot`, then `maybe_update` transitions it back to `Probe`.
+  pub fn become_snapshot(&mut self, pending_snapshot: Index) {
+    self.state = ProgressState::Snapshot(pending_snapshot);
+    self.inflight.reset();
+    self.msg_app_flow_paused = false;
   }
 
   /// Enter steady-state replication.
@@ -107,6 +128,8 @@ impl Progress {
 
   /// On a successful ack of index `n`: advance match/next if it moved forward.
   /// Also frees inflights up to `n` and clears the probe pause.
+  ///
+  /// If in `Snapshot` state and `n >= pending_snapshot`, transitions to `Probe`.
   pub fn maybe_update(&mut self, n: Index) -> bool {
     let updated = n > self.match_index;
     if updated {
@@ -117,6 +140,12 @@ impl Progress {
     }
     self.inflight.free_le(n);
     self.msg_app_flow_paused = false;
+    // If we were waiting for a snapshot ack and the peer is now caught up, resume.
+    if let ProgressState::Snapshot(pending) = self.state {
+      if n >= pending {
+        self.become_probe();
+      }
+    }
     updated
   }
 
@@ -174,5 +203,65 @@ mod tests {
     assert!(!p.is_paused()); // replicate: paused only when the window is full
     p.sent_entries(crate::Index::new(3), 10);
     assert!(p.is_paused()); // window (2) now full
+  }
+
+  // --- Task 3: ProgressState::Snapshot ---
+
+  #[test]
+  fn snapshot_state_as_str_and_predicate() {
+    assert_eq!(ProgressState::Snapshot(Index::new(10)).as_str(), "snapshot");
+    assert!(ProgressState::Snapshot(Index::new(10)).is_snapshot());
+    assert!(!ProgressState::Probe.is_snapshot());
+    assert!(!ProgressState::Replicate.is_snapshot());
+  }
+
+  #[test]
+  fn snapshot_state_is_always_paused() {
+    let mut p = Progress::new(Index::new(5), 256, 0);
+    p.become_snapshot(Index::new(10));
+    assert!(p.is_paused());
+    assert!(p.state().is_snapshot());
+  }
+
+  #[test]
+  fn become_snapshot_records_pending_index() {
+    let mut p = Progress::new(Index::new(5), 256, 0);
+    p.become_snapshot(Index::new(20));
+    assert!(p.state().is_snapshot());
+    assert!(p.is_paused());
+    // pending_snapshot index is stored in the variant
+    if let ProgressState::Snapshot(pending) = p.state() {
+      assert_eq!(pending, Index::new(20));
+    } else {
+      panic!("expected Snapshot state");
+    }
+  }
+
+  #[test]
+  fn maybe_update_past_pending_snapshot_becomes_probe() {
+    let mut p = Progress::new(Index::new(5), 256, 0);
+    p.become_snapshot(Index::new(10));
+    // ack at exactly pending_snapshot → transition to Probe
+    p.maybe_update(Index::new(10));
+    assert!(p.state().is_probe());
+    assert!(!p.is_paused());
+  }
+
+  #[test]
+  fn maybe_update_below_pending_snapshot_stays_in_snapshot() {
+    let mut p = Progress::new(Index::new(5), 256, 0);
+    p.become_snapshot(Index::new(10));
+    // ack below pending_snapshot → stays Snapshot
+    p.maybe_update(Index::new(9));
+    assert!(p.state().is_snapshot());
+    assert!(p.is_paused());
+  }
+
+  #[test]
+  fn snapshot_state_display() {
+    assert_eq!(
+      std::format!("{}", ProgressState::Snapshot(Index::new(0))),
+      "snapshot"
+    );
   }
 }
