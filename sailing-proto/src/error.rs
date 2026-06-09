@@ -30,4 +30,7 @@ pub enum ConfigError {
   /// The configured `id` was not present in the voter set.
   #[error("id is not among the configured voters")]
   IdNotAVoter,
+  /// `max_inflight_msgs` was zero.
+  #[error("max_inflight_msgs must be greater than zero")]
+  ZeroInflight,
 }

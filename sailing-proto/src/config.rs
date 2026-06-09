@@ -12,6 +12,13 @@ pub struct Config<I> {
   voters: Vec<I>,
   election_timeout: Duration,
   heartbeat_interval: Duration,
+  /// Maximum byte size of entries in a single `AppendEntries`. `u64::MAX` = unbounded;
+  /// `0` = one entry per message.
+  max_size_per_msg: u64,
+  /// Maximum number of in-flight `AppendEntries` per peer. Must be > 0.
+  max_inflight_msgs: usize,
+  /// Maximum total in-flight bytes per peer (`0` = uncapped).
+  max_inflight_bytes: u64,
 }
 
 impl<I: NodeId> Config<I> {
@@ -39,6 +46,9 @@ impl<I: NodeId> Config<I> {
       voters,
       election_timeout,
       heartbeat_interval,
+      max_size_per_msg: 1024 * 1024, // 1 MiB default
+      max_inflight_msgs: 256,
+      max_inflight_bytes: 0,
     })
   }
 
@@ -76,6 +86,45 @@ impl<I: NodeId> Config<I> {
   #[inline(always)]
   pub const fn heartbeat_interval(&self) -> Duration {
     self.heartbeat_interval
+  }
+
+  /// Maximum byte size of entries packed into a single `AppendEntries` (`u64::MAX` = unbounded).
+  #[inline(always)]
+  pub const fn max_size_per_msg(&self) -> u64 {
+    self.max_size_per_msg
+  }
+
+  /// Maximum number of in-flight (un-acked) `AppendEntries` per peer.
+  #[inline(always)]
+  pub const fn max_inflight_msgs(&self) -> usize {
+    self.max_inflight_msgs
+  }
+
+  /// Maximum total in-flight bytes per peer (`0` = uncapped).
+  #[inline(always)]
+  pub const fn max_inflight_bytes(&self) -> u64 {
+    self.max_inflight_bytes
+  }
+
+  /// Override the `max_size_per_msg` knob.
+  pub fn with_max_size_per_msg(mut self, v: u64) -> Self {
+    self.max_size_per_msg = v;
+    self
+  }
+
+  /// Override the `max_inflight_msgs` knob. Returns `Err(ConfigError::ZeroInflight)` if `v == 0`.
+  pub fn with_max_inflight_msgs(mut self, v: usize) -> Result<Self, ConfigError> {
+    if v == 0 {
+      return Err(ConfigError::ZeroInflight);
+    }
+    self.max_inflight_msgs = v;
+    Ok(self)
+  }
+
+  /// Override the `max_inflight_bytes` knob.
+  pub fn with_max_inflight_bytes(mut self, v: u64) -> Self {
+    self.max_inflight_bytes = v;
+    self
   }
 }
 
@@ -128,6 +177,38 @@ mod tests {
         Duration::from_millis(100)
       ),
       Err(ConfigError::ElectionNotGreaterThanHeartbeat { .. })
+    ));
+  }
+
+  #[test]
+  fn flow_control_defaults_and_validation() {
+    let c = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    // Defaults: 1 MiB per msg, 256 in-flight msgs, 0 (uncapped) bytes.
+    assert_eq!(c.max_size_per_msg(), 1024 * 1024);
+    assert_eq!(c.max_inflight_msgs(), 256);
+    assert_eq!(c.max_inflight_bytes(), 0);
+
+    // with_* builders work.
+    let c2 = c
+      .clone()
+      .with_max_size_per_msg(512)
+      .with_max_inflight_msgs(8)
+      .unwrap()
+      .with_max_inflight_bytes(4096);
+    assert_eq!(c2.max_size_per_msg(), 512);
+    assert_eq!(c2.max_inflight_msgs(), 8);
+    assert_eq!(c2.max_inflight_bytes(), 4096);
+
+    // ZeroInflight: max_inflight_msgs = 0 is rejected.
+    assert!(matches!(
+      c.clone().with_max_inflight_msgs(0),
+      Err(ConfigError::ZeroInflight)
     ));
   }
 }

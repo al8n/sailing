@@ -217,19 +217,46 @@ where
   }
 
   fn broadcast_heartbeat(&mut self, _now: Instant) {
-    let (term, me, commit) = (self.term, self.config.id(), self.commit);
+    let (term, me) = (self.term, self.config.id());
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
+      // Clamp the advertised commit to this peer's known match index. A heartbeat carries
+      // no prev-log check, so the follower can only safely commit up to the prefix it has
+      // proven (via a consistency-checked AppendEntries) matches ours. Telling a peer to
+      // commit past its match index lets a freshly-restarted node with a divergent,
+      // uncommitted tail commit+apply a stale entry (the etcd `min(committed, pr.Match)`
+      // rule). Default to ZERO if progress is unknown.
+      let peer_commit = self
+        .progress
+        .get(&peer)
+        .map(|pr| core::cmp::min(self.commit, pr.match_index()))
+        .unwrap_or(Index::ZERO);
       self.send(
         peer,
-        Message::Heartbeat(crate::Heartbeat::new(term, me, commit, bytes::Bytes::new())),
+        Message::Heartbeat(crate::Heartbeat::new(
+          term,
+          me,
+          peer_commit,
+          bytes::Bytes::new(),
+        )),
       );
     }
   }
 
+  /// Byte size of one entry (data length only — the transport framing adds its own overhead
+  /// but we use data bytes as the cap unit, matching etcd's `limitSize` convention).
+  #[inline(always)]
+  fn entry_size(e: &crate::Entry) -> u64 {
+    e.data().len() as u64
+  }
+
   fn maybe_send_append<L: LogStore>(&mut self, peer: I, log: &L) {
-    let Some(pr) = self.progress.get(&peer).copied() else {
+    let Some(pr) = self.progress.get(&peer).cloned() else {
       return;
     };
+    // M4 Task 4: respect the in-flight window — if paused, don't send.
+    if pr.is_paused() {
+      return;
+    }
     let next = pr.next_index();
     let prev_index = Index::new(next.get().saturating_sub(1));
     let prev_term = if prev_index == Index::ZERO {
@@ -238,7 +265,7 @@ where
       log.term(prev_index).unwrap_or(Term::ZERO)
     };
     let end = log.last_index().next();
-    let entries = if next < end {
+    let all_entries = if next < end {
       log
         .entries(next..end, u64::MAX)
         .map(<[_]>::to_vec)
@@ -246,6 +273,43 @@ where
     } else {
       std::vec::Vec::new()
     };
+
+    // M4 Task 4: cap at max_size_per_msg bytes, but always send at least one entry.
+    let max_bytes = self.config.max_size_per_msg();
+    let entries = if all_entries.is_empty() || max_bytes == u64::MAX {
+      all_entries
+    } else {
+      let mut budget = max_bytes;
+      let mut count = 0usize;
+      for e in &all_entries {
+        let sz = Self::entry_size(e);
+        if count == 0 {
+          // always include at least one entry regardless of size
+          count += 1;
+          budget = budget.saturating_sub(sz);
+        } else if sz <= budget {
+          count += 1;
+          budget -= sz;
+        } else {
+          break;
+        }
+      }
+      all_entries[..count].to_vec()
+    };
+
+    // Compute the last index and total bytes for sent_entries.
+    let last_sent = if entries.is_empty() {
+      prev_index
+    } else {
+      entries.last().unwrap().index()
+    };
+    let bytes_sent: u64 = entries.iter().map(Self::entry_size).sum();
+    // Whether we sent a partial batch (capped below last_index). In Probe mode we only
+    // pause the window when we're holding back entries due to the byte cap — if we sent
+    // everything available there is nothing left to throttle and pausing would block the
+    // next propose from being pipelined.
+    let sent_partial = last_sent < log.last_index();
+
     let (term, me, commit) = (self.term, self.config.id(), self.commit);
     self.send(
       peer,
@@ -253,6 +317,16 @@ where
         term, me, prev_index, prev_term, entries, commit,
       )),
     );
+
+    // M4 Task 4: record the send so the window tracks in-flight messages.
+    // For Probe: only pause when we sent a partial batch (byte-capped); a full send leaves
+    // nothing to throttle and pausing would stall subsequent proposes unnecessarily.
+    // For Replicate: always record (inflights window tracks every sent message).
+    if let Some(p) = self.progress.get_mut(&peer) {
+      if p.state().is_replicate() || sent_partial {
+        p.sent_entries(last_sent, bytes_sent);
+      }
+    }
   }
 
   fn maybe_advance_commit<L: LogStore>(&mut self, log: &L) {
@@ -439,7 +513,10 @@ where
           )),
         );
       }
-      Some(Pending::LeaderAppend { upto }) => {
+      // Role-gate (defense-in-depth): only a current leader advances its own match index
+      // and commit. `pending` is cleared on every term change, so a stale `LeaderAppend`
+      // reaching a non-leader is already unreachable — this makes the safety local.
+      Some(Pending::LeaderAppend { upto }) if self.role.is_leader() => {
         if let Some(p) = self.progress.get_mut(&self.config.id()) {
           p.maybe_update(upto);
         }
@@ -659,8 +736,10 @@ where
     // Initialize Progress for every voter (self included; self is fully caught up).
     let last = log.last_index();
     self.progress.clear();
+    let max_inflight_msgs = self.config.max_inflight_msgs();
+    let max_inflight_bytes = self.config.max_inflight_bytes();
     for v in self.config.voters().to_vec() {
-      let mut p = crate::Progress::new(last.next());
+      let mut p = crate::Progress::new(last.next(), max_inflight_msgs, max_inflight_bytes);
       if v == self.config.id() {
         p.maybe_update(last);
       }
@@ -1650,5 +1729,219 @@ mod tests {
       matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index()==Index::new(1)),
       "AppendResp(success, match=1) must be emitted after handle_storage"
     );
+  }
+
+  /// Regression: a leader's heartbeat must advertise a commit index CLAMPED to each peer's
+  /// match index, never the leader's full `commit`. A bare heartbeat carries no prev-log
+  /// check, so a lagging follower with a divergent, uncommitted tail (e.g. a crashed ex-leader
+  /// whose durable log holds an orphan entry whose index == its last_index) would otherwise
+  /// commit+apply that stale entry on `min(hb.commit, last_index)`. Etcd's `min(committed,
+  /// pr.Match)` rule. Without this clamp the cluster loses a committed entry / applies a
+  /// phantom one (caught by the holistic-review chaos probe as UNSOUND-COMMIT).
+  #[test]
+  fn heartbeat_commit_is_clamped_to_peer_match() {
+    use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 leader (term 1) and let its no-op append become durable (commit→1).
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable); // no-op (index 1) becomes durable
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Propose two Normal entries (indices 2 and 3) and make them durable on the leader.
+    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"x"))
+      .unwrap();
+    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"y"))
+      .unwrap();
+    ep.handle_storage(d, &mut log, &mut stable); // leader self-match → 3
+    while ep.poll_message().is_some() {}
+
+    // Peer 2 acks up to index 3 → quorum (leader match=3 + peer2 match=3) → commit advances to 3.
+    // Peer 3 NEVER acks: its progress match_index stays at the post-election default (0/1).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(3),
+      )),
+    );
+    // Commit must have advanced to 3: the two Normal entries (idx 2, 3) are now applied.
+    let applied: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event())
+      .filter(|e| matches!(e, crate::Event::Applied(_)))
+      .collect();
+    assert_eq!(
+      applied.len(),
+      2,
+      "leader must have committed+applied indices 2 and 3 via the peer-2 quorum"
+    );
+    // Drain any replication traffic produced by the commit advance.
+    while ep.poll_message().is_some() {}
+
+    // Fire the heartbeat timer → broadcast_heartbeat to peers 2 and 3.
+    let hb_deadline = ep.poll_timeout().unwrap();
+    ep.handle_timeout(hb_deadline, &mut log, &mut stable);
+
+    // Collect the heartbeat advertised to the LAGGING peer 3.
+    let mut hb_to_3: Option<Index> = None;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 3u64 {
+        if let Message::Heartbeat(hb) = out.message() {
+          hb_to_3 = Some(hb.commit());
+        }
+      }
+    }
+    let advertised = hb_to_3.expect("a heartbeat must be sent to peer 3");
+    // Peer 3's match index is far below the leader's commit (3). The heartbeat must be clamped.
+    assert!(
+      advertised < Index::new(3),
+      "heartbeat to a lagging peer must be clamped below the leader commit (got {advertised:?})"
+    );
+  }
+
+  // ---- M4 Task 4: leader pacing ----
+
+  /// A leader in Replicate mode with a window of 2 in-flight messages must stop sending
+  /// once both slots are occupied, and resume after an ack frees a slot.
+  #[test]
+  fn leader_paces_by_inflight_window() {
+    use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+
+    // window = 2, no byte cap, unbounded per-msg size
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_max_inflight_msgs(2)
+    .unwrap()
+    .with_max_size_per_msg(u64::MAX);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 as leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    // Drain no-op append messages and storage.
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Transition peer 2 to Replicate by simulating it acking the no-op (index 1).
+    // This calls become_replicate() on the progress, enabling the inflight window.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1), // ack no-op at index 1
+      )),
+    );
+    // Drain any triggered sends (the become_replicate ack may trigger maybe_send_append).
+    while ep.poll_message().is_some() {}
+
+    // Propose 5 entries. With window=2 and Replicate mode, peer 2 should receive at most
+    // 2 AppendEntries before the window fills.
+    for i in 0u8..5 {
+      let _ = ep
+        .propose(d, &mut log, &mut stable, &bytes::Bytes::copy_from_slice(&[i]))
+        .unwrap();
+      ep.handle_storage(d, &mut log, &mut stable);
+    }
+
+    // Collect all non-empty AppendEntries sent to peer 2.
+    let mut appends_to_2: usize = 0;
+    let mut last_sent_index = Index::ZERO;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          if !ae.entries().is_empty() {
+            appends_to_2 += 1;
+            if let Some(last) = ae.entries().last() {
+              last_sent_index = last.index();
+            }
+          }
+        }
+      }
+    }
+    // With window=2 the leader must have stopped pipelining after 2 in-flight messages.
+    assert!(
+      appends_to_2 <= 2,
+      "leader sent {appends_to_2} AppendEntries but window=2"
+    );
+    assert!(appends_to_2 > 0, "leader must send at least one batch");
+
+    // Free the window: peer 2 acks through the last sent index.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        last_sent_index,
+      )),
+    );
+    // After the ack, the leader should pipeline more entries (entries 5 and beyond).
+    let mut resumed = false;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          if !ae.entries().is_empty() {
+            resumed = true;
+          }
+        }
+      }
+    }
+    assert!(resumed, "leader must resume sending after ack frees the window");
   }
 }

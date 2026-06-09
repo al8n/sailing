@@ -50,6 +50,9 @@ pub use storage::{LogDone, LogStore, OpId, StableDone, StableStore};
 mod error;
 pub use error::{ConfigError, ProposeError};
 
+mod inflights;
+pub use inflights::Inflights;
+
 mod progress;
 pub use progress::{Progress, ProgressState};
 
