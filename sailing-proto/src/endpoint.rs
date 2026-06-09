@@ -432,6 +432,36 @@ where
   ) {
     let (my_index, my_term) = self.last_log(log);
     let log_ok = (rv.last_log_term(), rv.last_log_index()) >= (my_term, my_index);
+
+    // Pre-vote path: a completely separate branch — NO durable state is changed.
+    if rv.pre_vote() {
+      // Grant iff ALL of:
+      // (a) candidate's log is up-to-date (same §5.4.1 check)
+      // (b) advertised term >= our term (etcd: stale-term pre-vote is rejected outright;
+      //     the reject reply carries self.term so the pre-candidate learns it is behind).
+      //     When rv.term() == self.term, also require we haven't voted for someone else
+      //     (etcd canVote); when rv.term() > self.term, the above is trivially satisfied.
+      // (c) lease check: we have NOT heard from a current leader within the election timeout
+      //     (election timer healthy and we know a leader → refuse; lease is open otherwise)
+      let term_ok = rv.term() >= self.term
+        && (rv.term() > self.term
+          || self.voted_for.is_none()
+          || self.voted_for == Some(rv.candidate()));
+      let lease_open = !(self.leader.is_some() && self.election_deadline.is_some_and(|d| d > now));
+      let grant = log_ok && term_ok && lease_open;
+      let me = self.config.id();
+      // On grant: reply at the advertised term so the pre-candidate counts it for this
+      // round; on reject: reply at self.term so the pre-candidate learns our (possibly
+      // higher) term. Do NOT touch self.term, self.voted_for, or self.pending.
+      let resp_term = if grant { rv.term() } else { self.term };
+      self.send(
+        rv.candidate(),
+        Message::VoteResp(crate::VoteResp::new(resp_term, me, true, !grant)),
+      );
+      return;
+    }
+
+    // Real vote path (unchanged from M1–M6).
     let can_vote = self.voted_for.is_none() || self.voted_for == Some(rv.candidate());
     if can_vote && log_ok {
       self.voted_for = Some(rv.candidate());
@@ -469,6 +499,22 @@ where
   ) where
     F::Command: crate::Data,
   {
+    if vr.pre_vote() {
+      // Pre-vote response: only count if we are still a PreCandidate.
+      if !self.role.is_pre_candidate() {
+        return; // stale: we already advanced or stepped down
+      }
+      // Record the ballot for the pre-vote round.
+      self.votes.insert(vr.from(), !vr.reject());
+      if self.tracker.vote_result(&self.votes).is_won() {
+        // Pre-vote quorum: NOW start the real campaign (bumps term, persists, broadcasts).
+        self.become_candidate(now, log, stable);
+      }
+      // No quorum yet (or lost): stay PreCandidate; election timeout retries.
+      return;
+    }
+
+    // Real vote path: only count if we are currently a Candidate.
     if !self.role.is_candidate() || vr.term() != self.term {
       return;
     }
@@ -758,22 +804,41 @@ where
       return;
     }
     // Universal term handling (Raft §5.1): a higher term forces us to a follower.
+    // Exception (PreVote anti-disruption): pre-vote traffic carries an *advertised* term
+    // that has not been adopted — do NOT step down or adopt it.
     if msg.term() > self.term {
-      self.term = msg.term();
-      self.role = Role::Follower;
-      self.voted_for = None;
-      self.leader = None;
-      // All pending work from the old term is now stale (spec §7). Drop it before any new
-      // grant is recorded below — a fresh CastVote added by on_request_vote will survive.
-      self.pending.clear();
-      // Persist the new term and cleared vote. Stepping down owes no ack, so no Pending entry.
-      let opid = self.mint_op_id();
-      let hs = stable.hard_state().with_term(self.term).with_vote(None);
-      stable.submit_write(opid, hs);
+      let is_prevote_req = matches!(&msg, Message::RequestVote(rv) if rv.pre_vote());
+      let is_prevote_resp = matches!(&msg, Message::VoteResp(vr) if vr.pre_vote());
+      if is_prevote_req || is_prevote_resp {
+        // A PreVote request/response carries an *advertised* future term — the candidate
+        // has only proposed it, not adopted it. Fall through without adopting the term,
+        // stepping down, or persisting. The anti-disruption guarantee: a partitioned node's
+        // pre-votes can never raise the cluster term.
+      } else {
+        // All other higher-term messages: adopt term, step down to follower.
+        self.term = msg.term();
+        self.role = Role::Follower;
+        self.voted_for = None;
+        self.leader = None;
+        // All pending work from the old term is now stale (spec §7). Drop it before any new
+        // grant is recorded below — a fresh CastVote added by on_request_vote will survive.
+        self.pending.clear();
+        // Persist the new term and cleared vote. Stepping down owes no ack, so no Pending entry.
+        let opid = self.mint_op_id();
+        let hs = stable.hard_state().with_term(self.term).with_vote(None);
+        stable.submit_write(opid, hs);
+      }
     }
-    // Drop messages from a stale term (a CheckQuorum nudge is added in M7).
+    // Drop messages from a stale term — with one caveat for pre-vote requests:
+    // a pre-vote whose advertised term < self.term is routed to on_request_vote, which
+    // rejects it and replies at self.term (etcd: MsgPreVoteResp{Reject:true, Term:r.Term})
+    // so the pre-candidate learns it is behind. Only silently drop non-pre-vote stale messages.
     if msg.term() < self.term {
-      return;
+      let is_prevote_req = matches!(&msg, Message::RequestVote(rv) if rv.pre_vote());
+      if !is_prevote_req {
+        return;
+      }
+      // Fall through: on_request_vote rejects (rv.term() < self.term fails the term_ok check).
     }
     #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for M7 variants
     match msg {
@@ -814,7 +879,15 @@ where
           // `arm_election_timer`).
           self.election_deadline = None;
           if self.tracker.is_voter(&self.config.id()) {
-            self.become_candidate(now, log, stable);
+            if self.config.pre_vote() {
+              let won = self.become_pre_candidate(now, log);
+              if won {
+                // Single-node pre-vote quorum: skip straight to the real campaign.
+                self.become_candidate(now, log, stable);
+              }
+            } else {
+              self.become_candidate(now, log, stable);
+            }
           }
           // else: non-voter — timer expires silently; deadline cleared above.
         }
@@ -1097,6 +1170,50 @@ where
     if self.tracker.vote_result(&self.votes).is_won() {
       self.become_leader(now, log, stable);
     }
+  }
+
+  /// Begin a pre-vote probe: set `role = PreCandidate`, cast a self pre-vote, and broadcast
+  /// `RequestVote{pre_vote:true, term: self.term.next()}` to voter peers WITHOUT bumping
+  /// `self.term`, persisting anything, or clearing `voted_for`.
+  ///
+  /// The advertised term is `self.term.next()` — the term we *would* use in a real campaign.
+  /// It is NOT adopted here; only `become_candidate` (reached on a pre-vote quorum) adopts it.
+  ///
+  /// Returns `true` if the pre-vote quorum is already satisfied (single-node fast path), so
+  /// the caller can immediately proceed to `become_candidate`.
+  fn become_pre_candidate<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
+    // Non-voter guard (mirrors become_candidate for defense-in-depth).
+    if !self.tracker.is_voter(&self.config.id()) {
+      return false;
+    }
+    self.role = Role::PreCandidate;
+    self.leader = None;
+    // Clear the ballot and record self pre-vote.
+    self.votes.clear();
+    self.votes.insert(self.config.id(), true);
+    // Arm the election timer so a failed pre-vote retries on the next timeout.
+    self.arm_election_timer(now);
+
+    let advertised_term = self.term.next(); // proposed, not adopted
+    let (last_index, last_term) = self.last_log(log);
+    let me = self.config.id();
+    let voter_peers: std::vec::Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
+    for peer in voter_peers {
+      self.send(
+        peer,
+        Message::RequestVote(crate::RequestVote::new(
+          advertised_term,
+          me,
+          last_index,
+          last_term,
+          true,  // pre_vote
+          false, // leader_transfer
+        )),
+      );
+    }
+    // Return whether the pre-vote quorum is already won (single-node cluster fast path:
+    // self-vote = quorum). The caller must call become_candidate if this returns true.
+    self.tracker.vote_result(&self.votes).is_won()
   }
 
   fn become_leader<L: LogStore, S: StableStore<NodeId = I>>(
@@ -5189,6 +5306,544 @@ mod tests {
     assert!(
       ep.role().is_leader(),
       "leader must not step down mid-joint when still a voter in the outgoing half"
+    );
+  }
+
+  // ─── M7-U2: PreVote tests ─────────────────────────────────────────────────────────────────────
+
+  /// Test 1: A PreCandidate that loses pre-vote stays at the SAME term.
+  /// A node with pre_vote=true times out → PreCandidate; peers reject (they have a live leader)
+  /// → the node does NOT advance to Candidate, and self.term is UNCHANGED.
+  #[test]
+  fn pre_candidate_loses_stays_at_same_term() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_pre_vote(true);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Trigger the election timer — with pre_vote enabled, node becomes PreCandidate.
+    let deadline = ep.poll_timeout().unwrap();
+    ep.handle_timeout(deadline, &mut log, &mut stable);
+    assert!(ep.role().is_pre_candidate(), "must become PreCandidate");
+    assert_eq!(
+      ep.term(),
+      Term::ZERO,
+      "term must NOT be bumped during pre-vote"
+    );
+
+    // Drain the RequestVote{pre_vote:true, term:1} messages to peers 2 and 3.
+    let mut pre_vote_msgs: std::vec::Vec<u64> = std::vec::Vec::new();
+    while let Some(out) = ep.poll_message() {
+      match out.message() {
+        Message::RequestVote(rv) => {
+          assert!(rv.pre_vote(), "must be a pre-vote request");
+          assert_eq!(
+            rv.term(),
+            Term::new(1),
+            "advertised term must be self.term.next()"
+          );
+          pre_vote_msgs.push(out.to());
+        }
+        other => panic!("unexpected message: {other:?}"),
+      }
+    }
+    pre_vote_msgs.sort();
+    assert_eq!(
+      pre_vote_msgs,
+      std::vec![2u64, 3u64],
+      "must send pre-vote to both peers"
+    );
+
+    // Peers reject: they have a live leader (simulate by sending reject responses at self.term=0).
+    // A pre-vote reject carries the responder's term (self.term = 0 here since this is a fresh
+    // cluster test; the key invariant is the pre-candidate does NOT advance to Candidate).
+    for peer in [2u64, 3u64] {
+      ep.handle_message(
+        deadline,
+        &mut log,
+        &mut stable,
+        peer,
+        Message::VoteResp(VoteResp::new(
+          Term::ZERO,
+          peer,
+          true, /* pre_vote */
+          true, /* reject */
+        )),
+      );
+    }
+
+    // Must still be PreCandidate (or return to Follower), NOT Candidate, and term must be 0.
+    assert!(
+      !ep.role().is_candidate(),
+      "pre-candidate that loses must NOT become a real Candidate"
+    );
+    assert_eq!(
+      ep.term(),
+      Term::ZERO,
+      "term must be unchanged after failed pre-vote"
+    );
+  }
+
+  /// Test 2: A partitioned node's pre-vote requests do NOT cause grantors to adopt the higher
+  /// advertised term. A follower that receives RequestVote{pre_vote:true, term: self.term+5}
+  /// must NOT adopt term+5; its term remains unchanged.
+  #[test]
+  fn pre_vote_request_does_not_raise_granter_term() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+
+    // Follower node 2 with pre_vote=false (it's a stable cluster peer).
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Establish a live leader so the lease check blocks the grant.
+    // Feed a heartbeat from leader 1 in term 3 — this sets leader=Some(1) and re-arms timer.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::Heartbeat(crate::Heartbeat::new(
+        Term::new(3),
+        1u64,
+        crate::Index::ZERO,
+        bytes::Bytes::new(),
+      )),
+    );
+    while ep.poll_message().is_some() {} // drain HeartbeatResp
+    assert_eq!(
+      ep.term(),
+      Term::new(3),
+      "term from heartbeat must be adopted"
+    );
+    assert_eq!(ep.leader(), Some(1u64), "leader must be known");
+
+    // Now a partitioned node 1 (pre-candidate) sends a pre-vote request at term+5 = 8.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64, // from
+      Message::RequestVote(RequestVote::new(
+        Term::new(8), // advertised future term (pre_vote)
+        1u64,         // candidate
+        Index::ZERO,
+        Term::ZERO,
+        true,  // pre_vote
+        false, // leader_transfer
+      )),
+    );
+
+    // The node must NOT have adopted term 8.
+    assert_eq!(
+      ep.term(),
+      Term::new(3),
+      "pre-vote request must NOT cause the receiver to adopt the advertised term"
+    );
+
+    // A response must have been sent (reject, since live leader + healthy election timer).
+    let resp = ep.poll_message().expect("must send a VoteResp");
+    match resp.message() {
+      Message::VoteResp(vr) => {
+        assert!(vr.pre_vote(), "response must be a pre-vote response");
+        assert!(
+          vr.reject(),
+          "must reject (live leader + healthy election timer)"
+        );
+        // Rejection carries self.term (3), not the advertised 8.
+        assert_eq!(
+          vr.term(),
+          Term::new(3),
+          "reject response must carry self.term, not the advertised term"
+        );
+      }
+      other => panic!("expected VoteResp, got {other:?}"),
+    }
+  }
+
+  /// Test 3: A successful pre-vote quorum transitions to a real Candidate with a term bump
+  /// and a real RequestVote{pre_vote:false} broadcast.
+  #[test]
+  fn successful_pre_vote_quorum_starts_real_campaign() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_pre_vote(true);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Fire election → PreCandidate.
+    let deadline = ep.poll_timeout().unwrap();
+    ep.handle_timeout(deadline, &mut log, &mut stable);
+    assert!(ep.role().is_pre_candidate());
+    assert_eq!(ep.term(), Term::ZERO, "term must not bump during pre-vote");
+    while ep.poll_message().is_some() {} // drain pre-vote RequestVote msgs
+
+    // Peer 2 grants the pre-vote. Node has no live leader (election timer expired), log
+    // is at ZERO (same as ours) → grant. The response carries the advertised term (1).
+    ep.handle_message(
+      deadline,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(
+        Term::new(1),
+        2u64,
+        true,  /* pre_vote */
+        false, /* grant */
+      )),
+    );
+
+    // Pre-vote quorum reached (self + peer2 = 2/3 → majority).
+    // Node must now be a real Candidate with term bumped to 1.
+    assert!(
+      ep.role().is_candidate(),
+      "must advance to real Candidate after pre-vote quorum"
+    );
+    assert_eq!(
+      ep.term(),
+      Term::new(1),
+      "term must be bumped on real campaign"
+    );
+
+    // Must broadcast real RequestVote{pre_vote:false} to peers.
+    let mut real_vote_targets: std::vec::Vec<u64> = std::vec::Vec::new();
+    while let Some(out) = ep.poll_message() {
+      if let Message::RequestVote(rv) = out.message() {
+        assert!(!rv.pre_vote(), "real campaign must send pre_vote=false");
+        assert_eq!(
+          rv.term(),
+          Term::new(1),
+          "real RequestVote must carry the new term"
+        );
+        real_vote_targets.push(out.to());
+        // Note: other message types (empty-append from become_candidate) are ignored here.
+      }
+    }
+    real_vote_targets.sort();
+    assert_eq!(
+      real_vote_targets,
+      std::vec![2u64, 3u64],
+      "real campaign must broadcast to both voter peers"
+    );
+  }
+
+  /// Test 4: An up-to-date check still applies to pre-votes. A pre-candidate with a STALE log
+  /// is rejected even if the lease is open (no live leader).
+  #[test]
+  fn pre_vote_rejected_for_stale_log() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+
+    // Follower node 2 with a fresh log (entries up to index 5@term3).
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Seed log with 5 entries in term 3 so our last_log = (5, 3).
+    log.force_append(&[
+      Entry::new(
+        Term::new(3),
+        Index::new(1),
+        EntryKind::Normal,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(2),
+        EntryKind::Normal,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(3),
+        EntryKind::Normal,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(4),
+        EntryKind::Normal,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(5),
+        EntryKind::Normal,
+        bytes::Bytes::new(),
+      ),
+    ]);
+
+    // No leader known — lease is open. Election timer is expired (use Instant::ORIGIN as now).
+    // Pre-vote from node 1 with a STALE log (last_log_index=2, last_log_term=1 < our 5@3).
+    // This violates the up-to-date check → must be rejected.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(4), // advertised term (pre_vote)
+        1u64,
+        Index::new(2), // stale last_log_index
+        Term::new(1),  // stale last_log_term
+        true,          // pre_vote
+        false,
+      )),
+    );
+
+    let resp = ep.poll_message().expect("must reply to pre-vote");
+    match resp.message() {
+      Message::VoteResp(vr) => {
+        assert!(vr.pre_vote(), "must be a pre-vote response");
+        assert!(
+          vr.reject(),
+          "must reject pre-vote from a stale-log candidate"
+        );
+      }
+      other => panic!("expected VoteResp, got {other:?}"),
+    }
+    // The receiver's term must be unchanged (pre-vote never changes term).
+    assert_eq!(
+      ep.term(),
+      Term::ZERO,
+      "pre-vote must not change receiver term"
+    );
+  }
+
+  /// Test 5: Term pre-pass exemption. A follower receiving RequestVote{pre_vote:true, term:T+5}
+  /// does NOT adopt T+5. Its term is unchanged, and it replies (grant or reject) immediately
+  /// without persisting. Specifically: voted_for is not set, and the response is immediate
+  /// (not deferred behind a storage write).
+  #[test]
+  fn term_pre_pass_exemption_for_pre_vote_request() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    // Use AsyncStable to confirm that NO storage write is issued for a pre-vote response.
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    // Node 2 is at term=0, no known leader, election timer just expired (now=ORIGIN).
+    // Receive a pre-vote request at term+5 = 5 from node 1.
+    // Log is empty (NoopLog) → log_ok passes (last_log=(0,0) == candidate's).
+    // Lease check: no leader known → lease open.
+    // term_ok: rv.term()=5 > self.term=0 → passes.
+    // All conditions pass → grant.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(5), // advertised term (T+5)
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        true, // pre_vote
+        false,
+      )),
+    );
+
+    // CRITICAL: term must NOT have been adopted.
+    assert_eq!(
+      ep.term(),
+      Term::ZERO,
+      "pre-vote request must NOT cause receiver to adopt the advertised term T+5"
+    );
+    // CRITICAL: voted_for must NOT have been set.
+    assert!(ep.voted_for.is_none(), "pre-vote must NOT set voted_for");
+
+    // Response must be IMMEDIATE (no persist needed) — it is already in the outgoing queue.
+    let resp = ep
+      .poll_message()
+      .expect("response must be sent immediately, without waiting for storage");
+    match resp.message() {
+      Message::VoteResp(vr) => {
+        assert!(vr.pre_vote(), "must be a pre-vote response");
+        // Grant: log_ok + term_ok + lease_open all pass.
+        assert!(!vr.reject(), "must grant (log ok, term ok, lease open)");
+        // Reply term is the advertised term on grant.
+        assert_eq!(
+          vr.term(),
+          Term::new(5),
+          "grant reply must carry the advertised term rv.term()"
+        );
+      }
+      other => panic!("expected VoteResp, got {other:?}"),
+    }
+
+    // No storage write must have been submitted (pre-vote grants no-persist invariant).
+    // Drain all pending storage → if a write was submitted, AsyncStable would yield it.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    // No additional messages should appear (a CastVote would have produced a VoteResp here).
+    assert!(
+      ep.poll_message().is_none(),
+      "no additional VoteResp after handle_storage — pre-vote must not persist"
+    );
+  }
+
+  // ─── N1: stale-term pre-vote rejection (etcd PreVote fidelity) ───────────────────────────────
+
+  /// Regression N1: a follower at term 5 with no voted_for and no live leader receives a
+  /// pre-vote whose advertised term (3) is BELOW its own term.
+  ///
+  /// Expected (etcd semantics):
+  /// - Reply: VoteResp{ pre_vote: true, reject: true, term: 5 } (granter's term in reject)
+  /// - self.term stays 5
+  /// - voted_for stays None
+  ///
+  /// No durable state is touched (pre-vote path).
+  ///
+  /// Before fix: the `voted_for.is_none()` disjunct in the old `term_ok` incorrectly
+  /// GRANTED this stale pre-vote (reject: false). The fix adds `rv.term() >= self.term` as
+  /// a required conjunct so a stale advertised term is rejected regardless of voted_for.
+  #[test]
+  fn stale_term_pre_vote_is_rejected() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+
+    // Node 2 is a follower at term 5 with no voted_for and no live leader.
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Manually set term to 5 (no voted_for, no leader, election timer expired).
+    ep.term = Term::new(5);
+
+    // Negative case: stale pre-vote (advertised term 3 < our term 5), up-to-date log.
+    // Must be rejected: rv.term() < self.term fails the term_ok >= check.
+    ep.handle_message(
+      Instant::ORIGIN, // election timer at ORIGIN, so deadline <= now → lease open
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(3), // stale advertised term
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        true, // pre_vote
+        false,
+      )),
+    );
+
+    let resp = ep.poll_message().expect("must reply to stale pre-vote");
+    match resp.message() {
+      Message::VoteResp(vr) => {
+        assert!(vr.pre_vote(), "response must be a pre-vote response");
+        assert!(
+          vr.reject(),
+          "stale-term pre-vote (term 3 < our term 5) must be rejected (N1)"
+        );
+        assert_eq!(
+          vr.term(),
+          Term::new(5),
+          "reject reply must carry self.term (5) so the pre-candidate learns it is behind"
+        );
+      }
+      other => panic!("expected VoteResp, got {other:?}"),
+    }
+    // No state mutation: term and voted_for are unchanged.
+    assert_eq!(
+      ep.term(),
+      Term::new(5),
+      "self.term must remain 5 after stale pre-vote"
+    );
+    assert!(ep.voted_for.is_none(), "voted_for must remain None");
+
+    // Positive case: pre-vote with advertised term 6 (> 5), up-to-date log, lease open.
+    // Must be granted.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(6), // rv.term() > self.term → term_ok passes
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        true, // pre_vote
+        false,
+      )),
+    );
+
+    let resp2 = ep.poll_message().expect("must reply to valid pre-vote");
+    match resp2.message() {
+      Message::VoteResp(vr) => {
+        assert!(vr.pre_vote(), "response must be a pre-vote response");
+        assert!(
+          !vr.reject(),
+          "pre-vote at term 6 > 5, up-to-date, lease open → must grant"
+        );
+        assert_eq!(
+          vr.term(),
+          Term::new(6),
+          "grant reply must carry the advertised term (6)"
+        );
+      }
+      other => panic!("expected VoteResp, got {other:?}"),
+    }
+    // Still no state mutation after grant either.
+    assert_eq!(
+      ep.term(),
+      Term::new(5),
+      "self.term must remain 5 after granted pre-vote"
+    );
+    assert!(
+      ep.voted_for.is_none(),
+      "voted_for must remain None after granted pre-vote"
     );
   }
 }
