@@ -35,10 +35,11 @@ impl Role {
 
 /// What the core owes once a storage write completes.
 #[derive(Debug, Clone, Copy)]
-#[allow(dead_code)] // variants filled in M3-U2
 enum Pending<I> {
   /// Emit `VoteResp(grant)` to `to` once the term+vote write is durable.
-  CastVote { to: I },
+  /// `term` records the term at which the vote was cast so stale completions can be
+  /// detected and dropped if the term has since advanced.
+  CastVote { to: I, term: crate::Term },
   /// Emit `AppendResp(success, match_index)` to `to` once the log append is durable.
   FollowerAck { to: I, match_index: Index },
   /// Advance the leader's own `match_index` to `upto` (and re-check commit) once durable.
@@ -64,8 +65,6 @@ where
   commit: Index,
   applied: Index,
   prng: Prng,
-  #[allow(dead_code)] // preserved for Endpoint::restart (M3-U3)
-  seed: u64,
   votes_granted: BTreeSet<I>,
   election_deadline: Option<Instant>,
   heartbeat_deadline: Option<Instant>,
@@ -73,9 +72,8 @@ where
   events: VecDeque<Event<I, F::Response>>,
   progress: BTreeMap<I, crate::Progress>,
   /// Monotonically minted id for every storage submission.
-  #[allow(dead_code)] // read via mint_op_id; non-test callers added in M3-U2
   next_op_id: crate::OpId,
-  /// Outstanding write → deferred action (filled in M3-U2; empty until then).
+  /// Outstanding write → deferred action.
   pending: BTreeMap<crate::OpId, Pending<I>>,
   /// Sticky fatal error: once set, all `handle_*` are no-ops.
   poisoned: bool,
@@ -101,7 +99,6 @@ where
       commit: Index::ZERO,
       applied: Index::ZERO,
       prng: Prng::new(seed),
-      seed,
       votes_granted: BTreeSet::new(),
       election_deadline: None,
       heartbeat_deadline: None,
@@ -168,7 +165,6 @@ where
   }
 
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
-  #[allow(dead_code)] // used in M3-U2 when Pending entries are created
   fn mint_op_id(&mut self) -> crate::OpId {
     let id = self.next_op_id;
     self.next_op_id = self.next_op_id.next();
@@ -218,14 +214,6 @@ where
     let li = log.last_index();
     let lt = log.term(li).unwrap_or(Term::ZERO);
     (li, lt)
-  }
-
-  fn persist_hard_state<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
-    let hs = stable
-      .hard_state()
-      .with_term(self.term)
-      .with_vote(self.voted_for);
-    stable.submit_write(crate::OpId::ZERO, hs);
   }
 
   fn broadcast_heartbeat(&mut self, _now: Instant) {
@@ -297,17 +285,31 @@ where
     let (my_index, my_term) = self.last_log(log);
     let log_ok = (rv.last_log_term(), rv.last_log_index()) >= (my_term, my_index);
     let can_vote = self.voted_for.is_none() || self.voted_for == Some(rv.candidate());
-    let grant = can_vote && log_ok;
-    if grant {
+    if can_vote && log_ok {
       self.voted_for = Some(rv.candidate());
-      self.persist_hard_state(stable);
       self.arm_election_timer(now);
+      // Persist (term, vote); the VoteResp(grant) is owed once the write is DURABLE.
+      let opid = self.mint_op_id();
+      let hs = stable
+        .hard_state()
+        .with_term(self.term)
+        .with_vote(self.voted_for);
+      stable.submit_write(opid, hs);
+      self.pending.insert(
+        opid,
+        Pending::CastVote {
+          to: rv.candidate(),
+          term: self.term,
+        },
+      );
+    } else {
+      // A rejection needs no durability guarantee — send immediately.
+      let (term, me) = (self.term, self.config.id());
+      self.send(
+        rv.candidate(),
+        Message::VoteResp(crate::VoteResp::new(term, me, false, true)),
+      );
     }
-    let (term, me) = (self.term, self.config.id());
-    self.send(
-      rv.candidate(),
-      Message::VoteResp(crate::VoteResp::new(term, me, false, !grant)),
-    );
   }
 
   fn on_vote_resp<L: LogStore, S: StableStore<NodeId = I>>(
@@ -370,6 +372,52 @@ where
     }
   }
 
+  /// Rebuild a node from durable storage after a crash. Restores `(term, vote)`, sets
+  /// `commit` to the durably-committed frontier (capped by the durable log), and replays
+  /// the durable committed log into the (fresh) state machine. Returns in `Follower` with
+  /// the election timer armed.
+  pub fn restart<L, S>(
+    config: Config<I>,
+    now: Instant,
+    seed: u64,
+    fsm: F,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Self
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let hs = stable.hard_state();
+    // Never trust a commit index beyond what is durably in the log (§3.8).
+    let commit = core::cmp::min(hs.commit(), log.last_index());
+    let mut ep = Self {
+      config,
+      fsm,
+      role: Role::Follower,
+      term: hs.term(),
+      voted_for: hs.vote(),
+      leader: None,
+      commit,
+      applied: Index::ZERO,
+      prng: Prng::new(seed),
+      votes_granted: BTreeSet::new(),
+      election_deadline: None,
+      heartbeat_deadline: None,
+      next_op_id: crate::OpId::ZERO,
+      pending: BTreeMap::new(),
+      poisoned: false,
+      progress: BTreeMap::new(),
+      outgoing: VecDeque::new(),
+      events: VecDeque::new(),
+    };
+    // Replay committed log into the fresh SM (a restart is silent to the app).
+    ep.apply_committed(log);
+    ep.events.clear();
+    ep.arm_election_timer(now);
+    ep
+  }
+
   #[cfg(test)]
   pub(crate) fn mint_op_id_for_test(&mut self) -> crate::OpId {
     self.mint_op_id()
@@ -403,12 +451,20 @@ where
   }
 
   fn on_stable_wrote(&mut self, opid: crate::OpId) {
-    if let Some(Pending::CastVote { to }) = self.pending.remove(&opid) {
-      let (term, me) = (self.term, self.config.id());
-      self.send(
-        to,
-        Message::VoteResp(crate::VoteResp::new(term, me, false, false)),
-      );
+    if let Some(Pending::CastVote { to, term }) = self.pending.remove(&opid) {
+      // Only emit the grant if the term hasn't changed and we still hold the vote for `to`.
+      // If either condition is false the write was superseded by a term advance; drop silently.
+      if term == self.term && self.voted_for == Some(to) {
+        debug_assert!(
+          self.voted_for == Some(to),
+          "releasing a CastVote we no longer hold"
+        );
+        let me = self.config.id();
+        self.send(
+          to,
+          Message::VoteResp(crate::VoteResp::new(term, me, false, false)),
+        );
+      }
     }
   }
 
@@ -433,7 +489,13 @@ where
       self.role = Role::Follower;
       self.voted_for = None;
       self.leader = None;
-      self.persist_hard_state(stable);
+      // All pending work from the old term is now stale (spec §7). Drop it before any new
+      // grant is recorded below — a fresh CastVote added by on_request_vote will survive.
+      self.pending.clear();
+      // Persist the new term and cleared vote. Stepping down owes no ack, so no Pending entry.
+      let opid = self.mint_op_id();
+      let hs = stable.hard_state().with_term(self.term).with_vote(None);
+      stable.submit_write(opid, hs);
     }
     // Drop messages from a stale term (a CheckQuorum nudge is added in M7).
     if msg.term() < self.term {
@@ -501,15 +563,15 @@ where
       crate::EntryKind::Normal,
       bytes::Bytes::from(buf),
     );
-    log.submit_append(crate::OpId::ZERO, core::slice::from_ref(&entry));
-    if let Some(p) = self.progress.get_mut(&self.config.id()) {
-      p.maybe_update(index);
-    }
+    // Self-match advance is deferred until the append is durable (on_log_appended).
+    let opid = self.mint_op_id();
+    log.submit_append(opid, core::slice::from_ref(&entry));
+    self
+      .pending
+      .insert(opid, Pending::LeaderAppend { upto: index });
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       self.maybe_send_append(peer, log);
     }
-    self.maybe_advance_commit(log);
-    self.apply_committed(log);
     Ok(index)
   }
 
@@ -551,12 +613,21 @@ where
     stable: &mut S,
   ) {
     self.term = self.term.next();
+    // All pending work from the previous term is now stale (spec §7). Clear before recording
+    // the self-vote below so old completions that arrive later are harmlessly ignored.
+    self.pending.clear();
     self.role = Role::Candidate;
     self.leader = None;
     self.voted_for = Some(self.config.id());
     self.votes_granted.clear();
     self.votes_granted.insert(self.config.id());
-    self.persist_hard_state(stable);
+    // Persist (term, self-vote). No Pending entry — a candidate doesn't owe an ack.
+    let opid = self.mint_op_id();
+    let hs = stable
+      .hard_state()
+      .with_term(self.term)
+      .with_vote(self.voted_for);
+    stable.submit_write(opid, hs);
     self.arm_election_timer(now);
 
     let (last_index, last_term) = self.last_log(log);
@@ -597,6 +668,7 @@ where
     }
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
+    // Self-match advance is deferred until the append is durable (on_log_appended).
     let noop_index = last.next();
     let noop = crate::Entry::new(
       self.term,
@@ -604,10 +676,11 @@ where
       crate::EntryKind::Empty,
       bytes::Bytes::new(),
     );
-    log.submit_append(crate::OpId::ZERO, core::slice::from_ref(&noop));
-    if let Some(p) = self.progress.get_mut(&self.config.id()) {
-      p.maybe_update(noop_index);
-    }
+    let opid = self.mint_op_id();
+    log.submit_append(opid, core::slice::from_ref(&noop));
+    self
+      .pending
+      .insert(opid, Pending::LeaderAppend { upto: noop_index });
 
     self
       .events
@@ -697,6 +770,8 @@ where
     // Entries that already match (same index, same term) are left untouched so that a
     // stale or duplicate AppendEntries never erases already-committed entries.
     let entries = ae.entries();
+    let last_new = Index::new(ae.prev_log_index().get() + entries.len() as u64);
+    let mut appended_opid: Option<crate::OpId> = None;
     if !entries.is_empty() {
       let mut conflict_at: Option<usize> = None;
       for (i, entry) in entries.iter().enumerate() {
@@ -715,29 +790,44 @@ where
           entries[i].index().get() > self.commit.get(),
           "AppendEntries would truncate a committed entry"
         );
-        log.submit_append(crate::OpId::ZERO, &entries[i..]);
+        let opid = self.mint_op_id();
+        log.submit_append(opid, &entries[i..]);
+        appended_opid = Some(opid);
       }
       // else: every entry already present (pure duplicate) — append nothing.
     }
-    let last_new = Index::new(ae.prev_log_index().get() + ae.entries().len() as u64);
 
-    // Advance commit (min with what we actually hold) and apply.
+    // Commit advance and apply proceed independently of the local ack (committed entries
+    // are durable on a quorum elsewhere; on restart the SM is rebuilt from durable log).
     let new_commit = core::cmp::min(ae.leader_commit(), last_new);
     if new_commit > self.commit {
       self.commit = new_commit;
       self.apply_committed(log);
     }
-    self.send(
-      ae.leader(),
-      Message::AppendResp(crate::AppendResp::new(
-        term,
-        me,
-        false,
-        Index::ZERO,
-        Term::ZERO,
-        last_new,
-      )),
-    );
+
+    if let Some(opid) = appended_opid {
+      // A new suffix was submitted — defer the ack until the append is durable.
+      self.pending.insert(
+        opid,
+        Pending::FollowerAck {
+          to: ae.leader(),
+          match_index: last_new,
+        },
+      );
+    } else {
+      // Nothing was appended (heartbeat or pure duplicate) — entries already durable, ack now.
+      self.send(
+        ae.leader(),
+        Message::AppendResp(crate::AppendResp::new(
+          term,
+          me,
+          false,
+          Index::ZERO,
+          Term::ZERO,
+          last_new,
+        )),
+      );
+    }
   }
 
   fn on_append_resp<L: LogStore>(
@@ -865,9 +955,10 @@ mod tests {
     .unwrap();
     let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
     let mut log = crate::testkit::NoopLog;
-    let mut stable = crate::testkit::NoopStable::default();
+    // Use AsyncStable so that the VoteResp(grant) is released on handle_storage.
+    let mut stable = crate::testkit::AsyncStable::default();
 
-    // candidate 1 in term 1, empty log — should be granted
+    // candidate 1 in term 1, empty log — grant is deferred behind durability
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -882,11 +973,15 @@ mod tests {
         false,
       )),
     );
+    // Grant is withheld until the hard-state write is durable.
+    assert!(ep.poll_message().is_none(), "no grant before durability");
+    // Drain storage → hard-state write completes → grant emitted.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
     let vr = ep.poll_message().unwrap();
     assert!(matches!(vr.message(), Message::VoteResp(v) if !v.reject() && v.from()==2));
     assert_eq!(ep.term(), Term::new(1));
 
-    // candidate 3 in the SAME term — already voted for 1, reject
+    // candidate 3 in the SAME term — already voted for 1, reject sent immediately
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -1041,7 +1136,7 @@ mod tests {
     let mut log = crate::testkit::VecLog::default();
     let mut stable = crate::testkit::NoopStable::default();
 
-    // matching append at index 1 (prev=0)
+    // matching append at index 1 (prev=0) — fresh entry, ack deferred until durable
     let e1 = Entry::new(
       Term::new(1),
       Index::new(1),
@@ -1062,13 +1157,20 @@ mod tests {
         Index::ZERO,
       )),
     );
+    // No ack yet — append-before-ack: wait for durability.
+    assert!(
+      ep.poll_message().is_none(),
+      "no ack before append is durable"
+    );
+    // Drain storage (VecLog completes synchronously on poll) → ack emitted.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
     let r = ep.poll_message().unwrap();
     assert!(
       matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index()==Index::new(1))
     );
     assert_eq!(log.last_index(), Index::new(1));
 
-    // gap: prev_log_index=5 we don't have → reject
+    // gap: prev_log_index=5 we don't have → reject immediately (no append, no deferral)
     ep.handle_message(
       Instant::ORIGIN,
       &mut log,
@@ -1110,14 +1212,19 @@ mod tests {
       2u64,
       Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
     );
+    // Drain storage so the no-op LeaderAppend fires (advances self match_index to 1).
+    ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}
+
     let idx = ep
       .propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"x"))
       .unwrap(); // index 2
+    // Drain storage so the LeaderAppend for index 2 fires (advances self match_index to 2).
+    ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
 
-    // peer 2 acks up to idx 2 → quorum (self + peer2) → commit + apply
+    // peer 2 acks up to idx 2 → quorum (self match=2 + peer2 match=2) → commit + apply
     ep.handle_message(
       d,
       &mut log,
@@ -1132,7 +1239,7 @@ mod tests {
         idx,
       )),
     );
-    // Applied event for the Normal entry at idx 2 (the no-op at 1 is skipped)
+    // Applied event for the Normal entry at idx 2 (the no-op at 1 is an Empty entry, not Applied)
     let applied: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
     assert!(
       applied
@@ -1192,6 +1299,9 @@ mod tests {
         Index::new(3),
       )),
     );
+    // Fresh entries → ack deferred until durable; drain storage to release it.
+    assert!(ep.poll_message().is_none(), "no ack before append durable");
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
     // Must reply success with match_index=3.
     let r = ep.poll_message().unwrap();
     assert!(
@@ -1236,6 +1346,101 @@ mod tests {
     );
   }
 
+  // --- M3 Task 5: restart test ---
+
+  /// Encode a Bytes command through the Data codec (as propose does internally).
+  fn encode_cmd(b: &[u8]) -> bytes::Bytes {
+    use crate::Data;
+    let mut buf = std::vec::Vec::new();
+    bytes::Bytes::copy_from_slice(b).encode(&mut buf);
+    bytes::Bytes::from(buf)
+  }
+
+  #[test]
+  fn restart_replays_committed_log() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    // Seed the stores as if a prior incarnation had committed 2 Normal entries.
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Normal,
+        encode_cmd(b"a"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Normal,
+        encode_cmd(b"b"),
+      ),
+    ]);
+    stable.force_state(Term::new(1), Some(1u64), Index::new(2)); // term=1, vote=1, commit=2
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      7,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+    assert_eq!(ep.term(), Term::new(1));
+    assert_eq!(ep.state_machine().count(), 2); // both committed entries replayed
+    assert!(ep.role().is_follower());
+    // election timer must be armed
+    assert!(ep.poll_timeout().is_some());
+  }
+
+  // --- M3 extra: single-node leader commits after storage drain ---
+
+  #[test]
+  fn single_node_leader_commits_after_storage_drain() {
+    use crate::{Config, Instant};
+    use core::time::Duration;
+    // 1-voter cluster: quorum == 1, so a lone node self-elects immediately.
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // self-elects (quorum=1)
+    assert!(ep.role().is_leader());
+
+    // The no-op LeaderAppend is still in pending — commit has NOT advanced yet.
+    // Drain storage: the no-op append completes → self match advances → commit advances.
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Now propose a Normal entry and drain storage so it commits.
+    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"cmd"))
+      .unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+
+    // Applied event for the Normal entry must have been emitted.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    assert!(
+      events.iter().any(|e| matches!(e, crate::Event::Applied(_))),
+      "a single-node leader must commit after handle_storage drains"
+    );
+  }
+
   // --- M3 tests ---
 
   #[test]
@@ -1252,5 +1457,198 @@ mod tests {
     let b = ep.mint_op_id_for_test();
     assert_ne!(a, b);
     assert_eq!(b.get(), a.get() + 1);
+  }
+
+  /// Task 3 (M3): A granted vote must be withheld until the HardState write is durable.
+  /// Uses `AsyncStable` which releases completions only on `poll`.
+  #[test]
+  fn vote_grant_waits_for_durable_hard_state() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        false,
+      )),
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "no grant before the vote is durable"
+    );
+    // Drain storage → HardState write completes → grant emitted.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    assert!(
+      matches!(ep.poll_message().unwrap().message(), Message::VoteResp(v) if !v.reject()),
+      "grant must be emitted after handle_storage"
+    );
+  }
+
+  /// Regression (M3): A vote grant for term N must NOT be emitted when storage drains
+  /// if the node has since advanced to a higher term. Without the fix two grants would be
+  /// emitted — one to candidate 1 (term 5, stale) and one to candidate 3 (term 6) — both
+  /// stamped term 6, giving two leaders.
+  #[test]
+  fn deferred_vote_does_not_leak_across_term_bump() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    // AsyncStable: writes complete only when handle_storage / poll is called.
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    // Step 1: candidate 1 requests a vote in term 5. Follower grants it (deferred).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(5),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        false,
+      )),
+    );
+    // Grant is withheld — storage not yet drained.
+    assert!(
+      ep.poll_message().is_none(),
+      "no grant before durability (term 5)"
+    );
+
+    // Step 2: candidate 3 arrives in term 6. Term pre-pass bumps term, clears pending.
+    // on_request_vote then grants 3 and enqueues a NEW CastVote{to:3, term:6}.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(6),
+        3u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        false,
+      )),
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "no grant before durability (term 6)"
+    );
+
+    // Step 3: drain all storage completions (both op1 from term-5 grant and op2 from
+    // term-6 step-down write, plus op3 from term-6 grant, all complete here).
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+
+    // Step 4: collect all VoteResp messages.
+    let mut grants: std::vec::Vec<(u64, u64)> = std::vec::Vec::new(); // (from, to/candidate)
+    while let Some(out) = ep.poll_message() {
+      if let Message::VoteResp(vr) = out.message() {
+        if !vr.reject() {
+          // out.to() is the candidate we're replying to
+          grants.push((vr.from(), out.to()));
+        }
+      }
+    }
+
+    // There must be AT MOST one grant, and if present it must be to candidate 3 (term 6).
+    assert!(
+      grants.len() <= 1,
+      "double-vote bug: got {} grants (expected at most 1): {:?}",
+      grants.len(),
+      grants
+    );
+    if let Some(&(_from, to)) = grants.first() {
+      assert_eq!(
+        to, 3u64,
+        "grant must be to candidate 3 (term-6 vote), not candidate 1 (stale term-5 vote)"
+      );
+    }
+    // There must be exactly one grant (to candidate 3).
+    assert_eq!(
+      grants.len(),
+      1,
+      "expected exactly one grant (to candidate 3)"
+    );
+  }
+
+  /// Task 4 (M3): A follower must not send AppendResp until the new log entries are durable.
+  /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
+  #[test]
+  fn follower_ack_waits_for_durable_append() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let e1 = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"a"),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1],
+        Index::ZERO,
+      )),
+    );
+    // append-before-ack: no AppendResp yet (the append isn't durable)
+    assert!(
+      ep.poll_message().is_none(),
+      "no ack before append is durable"
+    );
+    // drain storage → the append completes → AppendResp(success) is emitted
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    let r = ep.poll_message().unwrap();
+    assert!(
+      matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index()==Index::new(1)),
+      "AppendResp(success, match=1) must be emitted after handle_storage"
+    );
   }
 }

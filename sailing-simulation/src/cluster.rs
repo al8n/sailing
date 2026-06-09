@@ -2,9 +2,9 @@
 //! bus and a virtual clock. M0 wires the loop; M1+ exercises real consensus through it.
 use crate::{LogSm, MemLog, MemStable};
 use core::time::Duration;
-use sailing_proto::{Config, Endpoint, Instant, Message, Outgoing};
+use sailing_proto::{Config, Endpoint, Instant, LogStore, Message, Outgoing, Term};
 use std::{
-  collections::{BTreeSet, VecDeque},
+  collections::{BTreeMap, BTreeSet, VecDeque},
   vec::Vec,
 };
 
@@ -23,11 +23,16 @@ pub struct Cluster {
   nodes: Vec<Node>,
   logs: Vec<MemLog>,
   stables: Vec<MemStable<u64>>,
+  /// Config for each node, kept so `crash` can rebuild from durable stores.
+  configs: Vec<Config<u64>>,
   bus: VecDeque<InFlight>,
   now: Instant,
   /// Node ids that are fully partitioned: their outgoing messages are dropped and
   /// inbound messages to/from them are dropped. Init empty.
   isolated: BTreeSet<u64>,
+  /// Double-vote tripwire: maps `(granter, term)` → `grantee`.
+  /// A second distinct grantee for the same `(granter, term)` is a fatal bug.
+  grants: BTreeMap<(u64, Term), u64>,
 }
 
 impl Cluster {
@@ -36,6 +41,7 @@ impl Cluster {
     let mut nodes = Vec::with_capacity(n);
     let mut logs = Vec::with_capacity(n);
     let mut stables = Vec::with_capacity(n);
+    let mut configs = Vec::with_capacity(n);
     let voters: Vec<u64> = (0..n as u64).collect();
     for id in 0..n as u64 {
       let cfg = Config::try_new(
@@ -45,7 +51,13 @@ impl Cluster {
         Duration::from_millis(100),
       )
       .expect("valid config");
-      nodes.push(Endpoint::new(cfg, Instant::ORIGIN, id, LogSm::new()));
+      nodes.push(Endpoint::new(
+        cfg.clone(),
+        Instant::ORIGIN,
+        id,
+        LogSm::new(),
+      ));
+      configs.push(cfg);
       logs.push(MemLog::new());
       stables.push(MemStable::new());
     }
@@ -53,9 +65,11 @@ impl Cluster {
       nodes,
       logs,
       stables,
+      configs,
       bus: VecDeque::new(),
       now: Instant::ORIGIN,
       isolated: BTreeSet::new(),
+      grants: BTreeMap::new(),
     }
   }
 
@@ -108,6 +122,20 @@ impl Cluster {
   /// Heal the partition for node `id`: messages to/from it flow again.
   pub fn heal(&mut self, id: u64) {
     self.isolated.remove(&id);
+  }
+
+  /// Crash node `id`: lose all in-memory consensus state and any fsync still in-flight,
+  /// but keep the durably-written store contents. The node is immediately restarted from
+  /// its durable stores.
+  pub fn crash(&mut self, id: u64) {
+    let i = id as usize;
+    self.logs[i].discard_inflight();
+    self.stables[i].discard_inflight();
+    let cfg = self.configs[i].clone();
+    let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
+    self.nodes[i] = Endpoint::restart(cfg, self.now, 0x5EED ^ id, LogSm::new(), log, stable);
+    // Drain any messages left in the bus to/from this node (stale in-flight traffic).
+    self.bus.retain(|m| m.from != id && m.to != id);
   }
 
   /// Propose `data` on the current leader; returns the assigned index (or `None` if no leader).
@@ -175,6 +203,37 @@ impl Cluster {
         while let Some(out) = self.nodes[i].poll_message() {
           any_new = true;
           let (to, message) = Outgoing::into_parts(out);
+          // ── Structural assertion (a): append-before-ack ──────────────────────────
+          // A success AppendResp must not outrun the node's durable log.
+          if let Message::AppendResp(a) = &message {
+            if !a.reject() {
+              assert!(
+                self.logs[i].last_index() >= a.match_index(),
+                "append-before-ack violated: node {i} acked {:?} but durable last_index is {:?}",
+                a.match_index(),
+                self.logs[i].last_index(),
+              );
+            }
+          }
+          // ── Structural assertion (b): one-grant-per-(node,term) ──────────────────
+          // A success VoteResp from `from` in term `T` to candidate `to` must not
+          // appear a second time for a different candidate — that would be a double-vote.
+          if let Message::VoteResp(vr) = &message {
+            if !vr.reject() {
+              let from = i as u64;
+              let term = vr.term();
+              let grantee = to;
+              match self.grants.get(&(from, term)) {
+                Some(&prev) => assert_eq!(
+                  prev, grantee,
+                  "double-vote bug: node {from} granted vote in term {term:?} to both {prev} and {grantee}"
+                ),
+                None => {
+                  self.grants.insert((from, term), grantee);
+                }
+              }
+            }
+          }
           self.bus.push_back(InFlight {
             deliver_at: self.now,
             from: i as u64,
@@ -261,6 +320,34 @@ impl Cluster {
             any_new = true;
             progressed = true;
             let (to, message) = Outgoing::into_parts(out);
+            // ── Structural assertion (a): append-before-ack ──────────────────────
+            if let Message::AppendResp(a) = &message {
+              if !a.reject() {
+                assert!(
+                  self.logs[i].last_index() >= a.match_index(),
+                  "append-before-ack violated: node {i} acked {:?} but durable last_index is {:?}",
+                  a.match_index(),
+                  self.logs[i].last_index(),
+                );
+              }
+            }
+            // ── Structural assertion (b): one-grant-per-(node,term) ──────────────
+            if let Message::VoteResp(vr) = &message {
+              if !vr.reject() {
+                let from = i as u64;
+                let term = vr.term();
+                let grantee = to;
+                match self.grants.get(&(from, term)) {
+                  Some(&prev) => assert_eq!(
+                    prev, grantee,
+                    "double-vote bug: node {from} granted vote in term {term:?} to both {prev} and {grantee}"
+                  ),
+                  None => {
+                    self.grants.insert((from, term), grantee);
+                  }
+                }
+              }
+            }
             self.bus.push_back(InFlight {
               deliver_at: self.now,
               from: i as u64,

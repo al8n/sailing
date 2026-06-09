@@ -18,6 +18,13 @@ impl MemLog {
   pub fn new() -> Self {
     Self::default()
   }
+
+  /// Drop any in-flight (not-yet-durable) work. In synchronous mode this is a no-op
+  /// because `submit_append` commits data immediately; in async mode (M8) this would
+  /// drop the staged bytes and their pending completions, modelling fsync loss.
+  pub fn discard_inflight(&mut self) {
+    // Synchronous mode: nothing is un-flushed; no-op.
+  }
 }
 
 impl LogStore for MemLog {
@@ -86,6 +93,13 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
       hard_state: HardState::initial(),
       completions: VecDeque::new(),
     }
+  }
+
+  /// Drop any in-flight (not-yet-durable) work. In synchronous mode this is a no-op
+  /// because `submit_write` commits state immediately; in async mode (M8) this would
+  /// drop staged writes and their pending completions, modelling fsync loss.
+  pub fn discard_inflight(&mut self) {
+    // Synchronous mode: nothing is un-flushed; no-op.
   }
 }
 

@@ -46,6 +46,17 @@ pub(crate) struct VecLog {
   completions: VecDeque<LogDone>,
 }
 
+impl VecLog {
+  /// Seed the log with already-durable entries (no completion enqueued). Used in restart tests.
+  pub(crate) fn force_append(&mut self, entries: &[Entry]) {
+    for e in entries {
+      let from = (e.index().get() as usize).saturating_sub(1);
+      self.entries.truncate(from);
+      self.entries.push(e.clone());
+    }
+  }
+}
+
 impl LogStore for VecLog {
   type Error = core::convert::Infallible;
 
@@ -131,6 +142,8 @@ impl crate::StateMachine for CountSm {
 }
 
 /// A minimal stable store that persists `HardState<u64>` in memory.
+/// `submit_write` updates state immediately but enqueues NO completion — `poll` always
+/// returns `None`. Use when durability of the hard-state write is irrelevant to the test.
 #[derive(Debug)]
 pub(crate) struct NoopStable {
   hard_state: HardState<u64>,
@@ -141,6 +154,16 @@ impl Default for NoopStable {
     Self {
       hard_state: HardState::initial(),
     }
+  }
+}
+
+impl NoopStable {
+  /// Seed the stable store with a specific (term, vote, commit). Used in restart tests.
+  pub(crate) fn force_state(&mut self, term: Term, vote: Option<u64>, commit: Index) {
+    self.hard_state = HardState::initial()
+      .with_term(term)
+      .with_vote(vote)
+      .with_commit(commit);
   }
 }
 
@@ -158,5 +181,41 @@ impl StableStore for NoopStable {
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
     None
+  }
+}
+
+/// An async-mode stable store: `submit_write` persists the `HardState` AND enqueues a
+/// `StableDone::Wrote(opid)` completion that is released only when `poll` is called.
+/// Use in tests that verify a granted vote is withheld until the write is durable.
+#[derive(Debug)]
+pub(crate) struct AsyncStable {
+  hard_state: HardState<u64>,
+  completions: VecDeque<StableDone>,
+}
+
+impl Default for AsyncStable {
+  fn default() -> Self {
+    Self {
+      hard_state: HardState::initial(),
+      completions: VecDeque::new(),
+    }
+  }
+}
+
+impl StableStore for AsyncStable {
+  type NodeId = u64;
+  type Error = core::convert::Infallible;
+
+  fn hard_state(&self) -> HardState<u64> {
+    self.hard_state
+  }
+
+  fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {
+    self.hard_state = hard_state;
+    self.completions.push_back(StableDone::Wrote(id));
+  }
+
+  fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
+    self.completions.pop_front().map(Ok)
   }
 }
