@@ -326,6 +326,26 @@ impl MemLog {
     !self.staged.is_empty()
   }
 
+  /// The durable entries currently present (those above the compaction `offset`), as a raw
+  /// slice — NEVER subject to the seeded `transient_read` fault that [`LogStore::entries`]
+  /// injects.
+  ///
+  /// This is the observation seam for the per-tick safety oracles ([`crate::checker`]): a
+  /// checker must read a node's durable log WITHOUT perturbing the simulated run (the
+  /// `transient_read` fault advances a PRNG and would poison the node on a `LogStore::entries`
+  /// error), so it reads here instead. Staged (un-flushed) appends are invisible — only durable
+  /// state is returned, mirroring the read view of [`first_index`](LogStore::first_index) /
+  /// [`last_index`](LogStore::last_index).
+  pub fn durable_entries(&self) -> &[Entry] {
+    &self.entries
+  }
+
+  /// The number of durable in-memory entries (above the compaction `offset`). Used by the
+  /// boundedness oracle to assert per-node bookkeeping stays bounded under compaction.
+  pub fn durable_len(&self) -> usize {
+    self.entries.len()
+  }
+
   /// Apply one append to the durable `entries` (truncate-then-extend). Shared by the sync
   /// `submit_append` fast path and the async `flush` path so the two are byte-identical.
   fn apply_append(&mut self, entries: &[Entry]) {

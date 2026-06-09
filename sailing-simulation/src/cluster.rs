@@ -1,9 +1,13 @@
 //! A deterministic, single-threaded cluster of `Endpoint`s over an in-memory typed-message
 //! bus and a virtual clock. M0 wires the loop; M1+ exercises real consensus through it.
-use crate::{LogSm, MemLog, MemStable, NetworkFaults, StorageFaults, network::NetPrng};
+use crate::{
+  Checker, ClusterView, DurableEntry, LogSm, MemLog, MemStable, NetworkFaults, NodeView,
+  StorageFaults, checker, network::NetPrng,
+};
 use core::time::Duration;
 use sailing_proto::{
-  ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, ReadState, Term,
+  ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, ReadState,
+  StableStore, Term,
 };
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -94,6 +98,18 @@ pub struct Cluster {
   /// Count of messages duplicated by the seeded network fault model (each fired duplication counts
   /// once, i.e. the number of EXTRA copies pushed). Non-vacuity counter.
   net_duplicated: u64,
+  /// The per-tick safety-oracle suite (M8-U3). Holds the cross-tick history (commit/term
+  /// monotonicity, the committed-history high-water) and runs the WHOLE oracle suite at the end of
+  /// every [`tick`](Self::tick); a violation panics with the oracle name + seed + tick for exact
+  /// VOPR replay. A pure observer — it never mutates the simulated nodes/stores and never draws a
+  /// PRNG, so the run is byte-identical with or without it. See [`crate::checker`].
+  checker: Checker,
+  /// The cluster construction seed, threaded into the oracle panic for VOPR replay. Captured from
+  /// the seed passed to [`new_async`](Self::new_async); `0` for the (seedless) sync constructors.
+  seed: u64,
+  /// Monotonic count of completed [`tick`](Self::tick)s, threaded into the oracle panic so a
+  /// violation pinpoints the exact step to replay.
+  tick_count: u64,
 }
 
 impl Cluster {
@@ -192,6 +208,9 @@ impl Cluster {
       net_last_sched: BTreeMap::new(),
       net_dropped: 0,
       net_duplicated: 0,
+      checker: Checker::new(),
+      seed,
+      tick_count: 0,
     }
   }
 
@@ -779,6 +798,83 @@ impl Cluster {
     self.read_states.push(Vec::new());
   }
 
+  /// Capture a read-only [`ClusterView`] snapshot for the per-tick safety oracles ([`crate::checker`]).
+  ///
+  /// Every field is read through a PUBLIC accessor (the proto's
+  /// `commit_index()`/`applied_index()`/`term()`/`role()`/`state_machine()`/`is_poisoned()` and the
+  /// sim store's non-faulting durable-read seams [`MemLog::durable_entries`] /
+  /// `MemStable::hard_state` / `MemStable::snapshot`), so building the view never perturbs the run
+  /// (in particular it never triggers the `transient_read` fault on the committed-range
+  /// `LogStore::entries` read). The `seed`/`tick` are threaded through for VOPR replay.
+  pub fn view(&self) -> ClusterView {
+    let nodes = (0..self.nodes.len())
+      .map(|i| {
+        let id = self.node_ids[i];
+        let node = &self.nodes[i];
+        let log = &self.logs[i];
+        let stable = &self.stables[i];
+        let durable_first = log.first_index().get();
+        let durable_last = log.last_index().get();
+        let durable_entries: std::vec::Vec<DurableEntry> = log
+          .durable_entries()
+          .iter()
+          .map(|e| DurableEntry {
+            index: e.index().get(),
+            term: e.term().get(),
+            data: e.data().to_vec(),
+          })
+          .collect();
+        let (snapshot_last_index, snapshot_last_term) = match stable.snapshot() {
+          Some((meta, _)) => (meta.last_index().get(), meta.last_term().get()),
+          None => (0, 0),
+        };
+        let applied_log: std::vec::Vec<(u64, std::vec::Vec<u8>)> = node
+          .state_machine()
+          .applied()
+          .iter()
+          .map(|(idx, cmd)| (idx.get(), cmd.to_vec()))
+          .collect();
+        NodeView {
+          id,
+          removed: self.removed.contains(&id),
+          poisoned: node.is_poisoned(),
+          is_leader: node.role().is_leader(),
+          term: node.term().get(),
+          commit: node.commit_index().get(),
+          applied: node.applied_index().get(),
+          applied_log,
+          durable_first,
+          durable_last,
+          durable_entries,
+          snapshot_last_index,
+          snapshot_last_term,
+          hardstate_commit: stable.hard_state().commit().get(),
+          inflight_staged: usize::from(log.has_inflight()) + usize::from(stable.has_inflight()),
+        }
+      })
+      .collect();
+    ClusterView {
+      seed: self.seed,
+      tick: self.tick_count,
+      nodes,
+    }
+  }
+
+  /// Run the full per-tick safety-oracle suite against the current cluster state, panicking with
+  /// the oracle name + seed + tick on a violation (for exact VOPR replay). Called at the end of
+  /// every [`tick`](Self::tick). Exposed so tests can also invoke it at a chosen point.
+  pub fn run_oracles(&mut self) {
+    let view = self.view();
+    self.checker.check_or_panic(&view);
+  }
+
+  /// Borrow the [`Violation`](crate::Violation)-or-`Ok` result of running the suite WITHOUT
+  /// panicking — for tests that want to assert the suite is green at a point.
+  pub fn check_oracles(&mut self) -> Result<(), checker::Violation> {
+    let view = self.view();
+    self.checker.check(&view)
+  }
+
   /// True if every non-removed node's applied `(index, command)` sequence agrees as a
   /// prefix of the longest — the core safety property.
   ///
@@ -1098,6 +1194,17 @@ impl Cluster {
         break;
       }
     }
+
+    // The cluster is now quiescent at this timestamp (delivery + storage drained) — a consistent
+    // observable state. Advance the tick counter and run the WHOLE per-tick safety-oracle suite
+    // (M8-U3). A violation panics with the oracle name + seed + tick for exact VOPR replay. The
+    // suite is a pure observer: it reads only public accessors / non-faulting durable seams and
+    // never mutates the nodes/stores or draws a PRNG, so the run stays byte-identical and
+    // deterministic. (The send-time append-before-ack / one-grant tripwires in `schedule_send`
+    // remain as earlier-firing immediate checks; this is the consolidated guarantee.)
+    self.tick_count += 1;
+    let view = self.view();
+    self.checker.check_or_panic(&view);
 
     progressed
   }
