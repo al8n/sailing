@@ -19,6 +19,11 @@ pub enum ProposeError<I> {
   /// the transfer completes or times out.
   #[error("a leader transfer is in progress")]
   LeaderTransferInProgress,
+  /// The proposed configuration change is invalid for the current configuration (e.g. leaving a
+  /// joint config while not in one, or an overlapping change). It was rejected at propose time —
+  /// nothing was appended — rather than being committed and then poisoning the node on apply.
+  #[error("the configuration change is invalid for the current configuration")]
+  InvalidConfChange,
   /// The node has entered the permanent poisoned state (a fatal storage/apply error) and accepts no
   /// new work. The proposal was NOT appended or persisted; inspect `poison_reason()`.
   #[error("the node is poisoned and accepts no new proposals")]

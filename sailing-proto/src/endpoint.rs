@@ -282,6 +282,16 @@ where
   next_op_id: crate::OpId,
   /// Outstanding write → deferred action.
   pending: BTreeMap<crate::OpId, Pending<I>>,
+  /// Per-append last-index, keyed by the submission's `OpId`, for EVERY in-flight log append —
+  /// independent of `pending`. `durable_index` must advance on every `LogDone::Appended`, but
+  /// `pending` is cleared on term changes and a same-term step-down routes a `LeaderAppend`
+  /// completion to the `_` arm; in both cases the entry still became durable. Keeping the upto
+  /// here lets `on_log_appended` advance the watermark unconditionally (role/term-independent),
+  /// so a follower never under-acks its durable suffix on a later duplicate/empty AppendEntries.
+  /// Entry is recorded in `submit_append`, removed (consumed into the watermark) in
+  /// `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init empty
+  /// in `new` and `restart`.
+  inflight_append_upto: BTreeMap<crate::OpId, Index>,
   /// Sticky fatal error: once set, all `handle_*` are no-ops. The fast-path flag checked by
   /// every `handle_*` guard; the cause is recorded separately in `poison_reason`.
   poisoned: bool,
@@ -383,6 +393,7 @@ where
       tracker,
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
+      inflight_append_upto: BTreeMap::new(),
       poisoned: false,
       poison_reason: None,
       pending_compact: None,
@@ -529,11 +540,30 @@ where
   /// for any caller — public API, handler, or future code — not just the ones that remember to check.
   /// Together with the egress emit-halt (`poll_*` return `None` when poisoned) this means a poisoned
   /// node can neither persist nor emit, regardless of which entry point is exercised.
-  fn submit_append<L: LogStore>(&self, log: &mut L, id: crate::OpId, entries: &[crate::Entry]) {
+  fn submit_append<L: LogStore>(&mut self, log: &mut L, id: crate::OpId, entries: &[crate::Entry]) {
     if self.poisoned {
       return;
     }
     log.submit_append(id, entries);
+    // Track this append's last index independently of `pending` so `on_log_appended` can advance
+    // `durable_index` unconditionally when the completion fires (see the field comment).
+    if let Some(last) = entries.last() {
+      self.inflight_append_upto.insert(id, last.index());
+    }
+  }
+
+  /// Scrub state that references log entries ABOVE `boundary` — used wherever the log tail is discarded
+  /// (a §5.3 conflict truncation OR a snapshot install). A queued success `AppendResp` or a pending
+  /// `FollowerAck` for an index past `boundary` would otherwise over-ack an entry the node no longer
+  /// stores, letting the leader count a phantom replica toward commit.
+  fn scrub_acks_above(&mut self, boundary: Index) {
+    self.outgoing.retain(|o| {
+      !matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() > boundary)
+    });
+    self.pending.retain(|_, p| match p {
+      Pending::FollowerAck { match_index, .. } => *match_index <= boundary,
+      _ => true,
+    });
   }
 
   fn submit_write<S: StableStore<NodeId = I>>(
@@ -1385,6 +1415,7 @@ where
       heartbeat_deadline: None,
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
+      inflight_append_upto: BTreeMap::new(),
       poisoned,
       poison_reason,
       pending_compact: None,
@@ -1421,9 +1452,17 @@ where
     stable: &S,
     opid: crate::OpId,
   ) {
+    // Advance the persist-before-ack watermark for EVERY completed append, regardless of role,
+    // term, or whether a `pending` action survived. `pending` is cleared on term changes, and a
+    // same-term step-down routes a `LeaderAppend` completion to the `_` arm below — in both cases
+    // the entry still became durable, so the watermark must rise here, once, unconditionally.
+    // Otherwise the follower clamps a later duplicate/empty AppendEntries to a stale-low watermark
+    // and under-acks its durable suffix, wedging replication.
+    if let Some(upto) = self.inflight_append_upto.remove(&opid) {
+      self.durable_index = self.durable_index.max(upto);
+    }
     match self.pending.remove(&opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
-        self.durable_index = self.durable_index.max(match_index);
         let (term, me) = (self.term, self.config.id());
         self.send(
           to,
@@ -1441,7 +1480,6 @@ where
       // and commit. `pending` is cleared on every term change, so a stale `LeaderAppend`
       // reaching a non-leader is already unreachable — this makes the safety local.
       Some(Pending::LeaderAppend { upto }) if self.role.is_leader() => {
-        self.durable_index = self.durable_index.max(upto);
         if let Some(p) = self.tracker.progress_mut(&self.config.id()) {
           p.maybe_update(upto);
         }
@@ -1831,6 +1869,30 @@ where
     // One change in flight at a time: refuse if a ConfChange entry is not yet applied.
     if self.pending_conf_index > self.applied {
       return Err(crate::ProposeError::ConfChangeInFlight);
+    }
+    // Pre-validate against the CURRENT tracker using the SAME Changer dispatch `apply_committed`
+    // uses (apply-time membership, spec §9). An invalid change (e.g. `leave_joint` while not in a
+    // joint config) must be a REJECTED proposal here, not an `Ok` that replicates and then poisons
+    // the node when `apply_committed`'s Changer rejects the committed entry. We DISCARD the
+    // resulting tracker — membership still only changes at apply time; this is validation only.
+    {
+      let changer = crate::tracker::confchange::Changer::new(
+        log.last_index(),
+        self.config.max_inflight_msgs(),
+        self.config.max_inflight_bytes(),
+      );
+      let result =
+        if cc.changes().is_empty() && cc.transition() == crate::ConfChangeTransition::Auto {
+          changer.leave_joint(&self.tracker)
+        } else if cc.transition() != crate::ConfChangeTransition::Auto || cc.changes().len() > 1 {
+          let auto_leave = cc.transition() != crate::ConfChangeTransition::Explicit;
+          changer.enter_joint(&self.tracker, auto_leave, cc.changes())
+        } else {
+          changer.simple(&self.tracker, cc.changes())
+        };
+      if result.is_err() {
+        return Err(crate::ProposeError::InvalidConfChange);
+      }
     }
     let index = self.append_conf_change(log, stable, cc);
     Ok(index)
@@ -2372,15 +2434,17 @@ where
         // suffix and a conflicting AppendEntries (e.g. a reordered/duplicate one) truncates it before
         // the ack leaves the outgoing queue. The new suffix's own ack is registered below.
         let truncate_from = entries[i].index();
-        self.outgoing.retain(|o| {
-          !matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() >= truncate_from)
-        });
-        self.pending.retain(|_, p| match p {
-          Pending::FollowerAck { match_index, .. } => *match_index < truncate_from,
-          _ => true,
-        });
+        // boundary = truncate_from - 1, so `> boundary` is exactly `>= truncate_from`: scrub every
+        // queued success ack / pending FollowerAck whose match index lies in the overwritten range.
+        self.scrub_acks_above(Index::new(truncate_from.get() - 1));
         // The truncated tail is no longer durable; regress the watermark below it (truncate_from >= 1).
         self.durable_index = self.durable_index.min(Index::new(truncate_from.get() - 1));
+        // Drop in-flight append records the truncation supersedes: those entries are overwritten,
+        // so their (possibly still-pending) completions must NOT re-advance `durable_index` into
+        // the truncated range. The new suffix's own record is added by `submit_append` below.
+        self
+          .inflight_append_upto
+          .retain(|_, upto| *upto < truncate_from);
         let opid = self.mint_op_id();
         self.submit_append(log, opid, &entries[i..]);
         appended_opid = Some(opid);
@@ -3107,11 +3171,22 @@ where
     // point. Acking before the blob is durable is safe because meta.last_index <= leader.commit —
     // those entries are already quorum-committed, so this ack cannot advance the cluster commit.
     log.restore(meta.last_index(), meta.last_term());
-    // The re-baselined log is durable up to the snapshot boundary (meta.last_index <= leader.commit,
-    // i.e. quorum-committed), so advance the persist-before-ack watermark to it. Without this, the
-    // next empty AppendEntries(prev=last_index) would hit the immediate-ack clamp and report a stale
-    // pre-snapshot durable_index, contradicting the SnapshotResp(match=last_index) just sent.
-    self.durable_index = self.durable_index.max(meta.last_index());
+    // `restore` DISCARDS the prior log tail, so the durable boundary IS exactly the snapshot's
+    // last index — a hard RESET, not a `max`. A `max` would keep the watermark stale-HIGH if the
+    // follower had a durable divergent tail ABOVE this (shorter) snapshot; a later duplicate
+    // AppendEntries would then ack an entry no longer in the (now-shorter) durable log, reopening
+    // the phantom-replica commit hole. Without setting it at all, the next empty
+    // AppendEntries(prev=last_index) would hit the immediate-ack clamp and report a stale
+    // pre-snapshot watermark, contradicting the SnapshotResp(match=last_index) just sent.
+    self.durable_index = meta.last_index();
+    // The log was replaced wholesale; any in-flight append records refer to discarded entries and
+    // must not re-advance `durable_index` when their completions arrive.
+    self.inflight_append_upto.clear();
+    // The snapshot install discarded the log tail above `meta.last_index()`. Scrub any already-queued
+    // success `AppendResp` (or deferred `FollowerAck`) for an index past the new boundary: reporting
+    // it would over-ack an entry this node no longer stores, letting the leader count a phantom
+    // replica toward commit (symmetric with the §5.3 truncation scrub).
+    self.scrub_acks_above(meta.last_index());
 
     // Tripwire: the install just advanced commit/applied to `meta.last_index` and the
     // re-baseline must have taken effect, so the log read-view now reflects the snapshot boundary:
@@ -3727,6 +3802,356 @@ mod tests {
     assert!(
       matches!(acked.message(), Message::AppendResp(a) if !a.reject() && a.match_index() == Index::new(1)),
       "after flush the FollowerAck reports the full match (1)"
+    );
+  }
+
+  /// Regression (R7-F1, snapshot restore RESETS `durable_index`, never `max`): a follower with a
+  /// DURABLE divergent tail ABOVE a later, SHORTER snapshot must not keep a stale-high watermark.
+  ///
+  /// Setup: the follower flushes a durable-but-uncommitted tail (indices 1..=3, term 1), so
+  /// `durable_index == 3` while `commit == 0`. It then installs a LOWER snapshot (last_index=2,
+  /// term 2). `restore` re-baselines the log to last_index 2 and DISCARDS the tail, so the durable
+  /// boundary is now exactly 2. A new entry (index 3, term 2) is appended in-flight (NOT flushed),
+  /// and a DUPLICATE of it arrives before `handle_storage` drains. The immediate-ack clamp
+  /// (`last_new.min(durable_index)`) must report 2 (the snapshot boundary), not the unflushed 3.
+  ///
+  /// MUTATION: revert FIX 1 to `self.durable_index = self.durable_index.max(meta.last_index())`.
+  /// Then after install `durable_index` stays at the stale-high 3, the duplicate clamps to
+  /// `min(3, 3) = 3`, and the assertion (duplicate acks 2) FAILS — the follower over-acks an
+  /// unflushed entry, reopening the phantom-replica commit hole.
+  #[test]
+  fn snapshot_install_resets_durable_index_below_divergent_tail() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+      SnapshotMeta, Term, conf::ConfState,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    // Durable-but-uncommitted tail: entries 1..=3 at term 1, leader_commit=0.
+    let tail: std::vec::Vec<Entry> = (1u64..=3)
+      .map(|i| {
+        Entry::new(
+          Term::new(1),
+          Index::new(i),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"old"),
+        )
+      })
+      .collect();
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        tail,
+        Index::ZERO,
+      )),
+    );
+    // Flush so the divergent tail becomes durable: durable_index == 3, commit still 0.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert_eq!(ep.durable_index, Index::new(3), "tail flushed → durable=3");
+    assert_eq!(ep.commit, Index::ZERO, "tail is uncommitted");
+
+    // Install a LOWER snapshot (last_index=2 > commit=0 → install proceeds, discards the tail).
+    let meta = SnapshotMeta::new(
+      Index::new(2),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    );
+    let snap_data = encode_snapshot(7u64);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(InstallSnapshot::new(Term::new(1), 1u64, meta, snap_data)),
+    );
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      log.last_index(),
+      Index::new(2),
+      "restore re-baselined the log to the snapshot boundary"
+    );
+    assert_eq!(
+      ep.durable_index,
+      Index::new(2),
+      "RESET: durable boundary IS the snapshot's last index (not the stale-high tail at 3)"
+    );
+
+    // Append ONE genuinely-new entry (index 3, term 2) in-flight — do NOT flush.
+    let e3 = Entry::new(
+      Term::new(2),
+      Index::new(3),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"new"),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        1u64,
+        Index::new(2),
+        Term::new(2),
+        std::vec![e3.clone()],
+        Index::ZERO,
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      log.last_index(),
+      Index::new(3),
+      "new entry 3 is visible in-flight"
+    );
+
+    // DUPLICATE of entry 3 BEFORE draining → immediate-ack path clamps to durable_index.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        1u64,
+        Index::new(2),
+        Term::new(2),
+        std::vec![e3],
+        Index::ZERO,
+      )),
+    );
+    let dup = ep
+      .poll_message()
+      .expect("duplicate emits an immediate AppendResp");
+    match dup.message() {
+      Message::AppendResp(a) => {
+        assert!(!a.reject(), "duplicate is a success ack");
+        assert_eq!(
+          a.match_index(),
+          Index::new(2),
+          "persist-before-ack: the duplicate must report the snapshot boundary (2), \
+           not the unflushed in-flight entry 3"
+        );
+      }
+      other => panic!("expected AppendResp, got {other:?}"),
+    }
+  }
+
+  /// Regression (R7-F2, `durable_index` advances independently of the `pending` ack action): a
+  /// follower's `FollowerAck` is CLEARED by a higher-term message before its append flushes, yet
+  /// the append still became durable — so `durable_index` must rise when the completion arrives.
+  ///
+  /// Setup: the follower appends entry 1 in-flight (FollowerAck pending, durable still 0). A
+  /// higher-term AppendEntries clears `pending` (term change wipes it). `handle_storage` then
+  /// drains the original append's completion — which advances `durable_index` to 1 via the
+  /// unconditional advance, even though no `pending` action survives. A later duplicate's
+  /// immediate ack must report 1, proving the watermark advanced.
+  ///
+  /// MUTATION: revert FIX 2 so the advance lives only inside the `FollowerAck`/`LeaderAppend`
+  /// arms. Then the cleared-pending completion hits the `_` arm, `durable_index` stays at 0, and
+  /// the duplicate clamps to `min(1, 0) = 0` — the assertion (duplicate acks 1) FAILS.
+  #[test]
+  fn durable_index_advances_after_term_cleared_follower_ack() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    let e1 = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"a"),
+    );
+    // Append entry 1 in-flight (FollowerAck pending; durable stays 0 — not drained).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1.clone()],
+        Index::ZERO,
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      ep.durable_index,
+      Index::ZERO,
+      "append in-flight, not yet durable"
+    );
+
+    // Higher-term heartbeat (term 2) from the same leader clears `pending` (term change).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        1u64,
+        Index::new(1),
+        Term::new(1),
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    assert!(
+      ep.pending.is_empty(),
+      "term change must have cleared the pending FollowerAck"
+    );
+
+    // Drain the ORIGINAL append's completion. It became durable, so the watermark must rise to 1
+    // even though no pending action survives.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      ep.durable_index,
+      Index::new(1),
+      "the completed append advanced durable_index independently of the cleared pending"
+    );
+
+    // A duplicate of entry 1 (now at term 2's consistency) immediate-acks the now-durable 1.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1],
+        Index::ZERO,
+      )),
+    );
+    let dup = ep
+      .poll_message()
+      .expect("duplicate emits an immediate AppendResp");
+    match dup.message() {
+      Message::AppendResp(a) => {
+        assert!(!a.reject(), "duplicate is a success ack");
+        assert_eq!(
+          a.match_index(),
+          Index::new(1),
+          "the immediate ack reports the now-durable index 1, not a stale-low 0"
+        );
+      }
+      other => panic!("expected AppendResp, got {other:?}"),
+    }
+  }
+
+  /// Regression (R7-F2, same-term leader step-down before a `LeaderAppend` completes): a leader
+  /// appends entry 1 (LeaderAppend pending), then steps down to follower at the SAME term. When
+  /// the append completes it hits the `_` arm (role no longer leader), but it still became
+  /// durable, so `durable_index` must advance via the unconditional advance.
+  ///
+  /// MUTATION: revert FIX 2 so the advance is only in the arms. Then the post-step-down
+  /// completion hits `_`, `durable_index` stays at the pre-append value, and the assertion FAILS.
+  #[test]
+  fn durable_index_advances_after_same_term_leader_step_down() {
+    use crate::{AppendEntries, Config, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    // Elect node 1 leader at term 1.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    // Self-vote durable → become_leader fires; the no-op append is now in-flight (LeaderAppend).
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(ep.role().is_leader(), "node 1 is leader at term 1");
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+    // The leader's current-term no-op is pending as a LeaderAppend; durable_index has NOT yet
+    // captured it (the completion is still queued in the log).
+    let upto_before = ep.durable_index;
+    assert!(
+      !ep.pending.is_empty(),
+      "the leader's no-op append is pending as a LeaderAppend"
+    );
+    let noop_index = log.last_index();
+    assert!(
+      noop_index > upto_before,
+      "the no-op sits above the durable watermark before it flushes"
+    );
+
+    // Step down to follower at the SAME term (1) via an AppendEntries from a same-term peer.
+    // (prev_log_index = noop_index, prev_log_term = 1 keeps the log consistent so we step down
+    // rather than reject.)
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        2u64,
+        noop_index,
+        Term::new(1),
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    assert!(
+      ep.role().is_follower(),
+      "node 1 stepped down to follower at the same term"
+    );
+    while ep.poll_message().is_some() {}
+
+    // Drain the no-op append's completion: it now hits the `_` arm (no longer leader), but the
+    // append became durable, so the watermark must advance to the no-op index.
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      ep.durable_index, noop_index,
+      "the no-op became durable; durable_index advanced despite the same-term step-down (hit `_`)"
     );
   }
 
@@ -6392,6 +6817,60 @@ mod tests {
     assert!(
       ep.poll_timeout().is_some(),
       "election timer must be re-armed after receiving a snapshot"
+    );
+  }
+
+  /// R8-F1 regression: a snapshot install must scrub stale outgoing success acks.
+  ///
+  /// A follower has a queued success `AppendResp(match_index = 3)` still in `outgoing` (it acked
+  /// index 3, but the ack has not yet been polled). It then installs a snapshot at a LOWER boundary
+  /// (`last_index = 2`). The truncated entry 3 no longer exists, so emitting that ack would over-ack
+  /// an entry the follower no longer stores — letting the leader count a phantom replica toward
+  /// commit. After the install, no success `AppendResp` with `match_index > 2` may be emitted.
+  #[test]
+  fn install_snapshot_scrubs_stale_outgoing_ack() {
+    use crate::{Index, Instant, Message, Outgoing, Term, conf::ConfState};
+
+    let (mut ep, mut log, mut stable) = make_follower();
+
+    // Queue a success AppendResp(match_index = 3) as if the follower had acked index 3 and the ack
+    // is still sitting in `outgoing` (not yet polled). This is the stale ack that must be scrubbed.
+    ep.outgoing.push_back(Outgoing::new(
+      1u64,
+      Message::AppendResp(crate::AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(3),
+      )),
+    ));
+
+    // Install a snapshot at a LOWER boundary (last_index = 2 > commit = 0 → install proceeds).
+    let snap_data = encode_snapshot(7u64);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(2),
+      Term::new(4),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    );
+    let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, snap_data);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(is),
+    );
+
+    // Drain all outgoing messages: NONE may be a success AppendResp with match_index > 2.
+    let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+    let over_ack = msgs.iter().any(|o| {
+      matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() > Index::new(2))
+    });
+    assert!(
+      !over_ack,
+      "the stale success AppendResp(match_index = 3) must be scrubbed by the snapshot install"
     );
   }
 
@@ -9097,6 +9576,35 @@ mod tests {
     while ep.poll_event().is_some() {}
     while ep.poll_message().is_some() {}
     (ep, log, stable, d)
+  }
+
+  /// R8-F2 regression: an invalid ConfChangeV2 is REJECTED at propose time, not committed-then-poisoned.
+  ///
+  /// A leader NOT in a joint config receives `propose_conf_change_v2(leave_joint())`. `leave_joint`
+  /// is only valid from a joint config, so the Changer would reject it on apply and poison the node.
+  /// Pre-validation must turn this into a rejected proposal: `Err(InvalidConfChange)`, nothing
+  /// appended (`log.last_index()` unchanged), and the node NOT poisoned.
+  #[test]
+  fn propose_invalid_conf_change_is_rejected_not_poisoned() {
+    let (mut ep, mut log, stable, d) = make_leader_with_current_term_commit();
+
+    // The leader is in a simple (non-joint) config {1,2,3}; leaving a joint config is invalid here.
+    let last_before = log.last_index();
+    let res = ep.propose_conf_change_v2(d, &mut log, &stable, crate::ConfChangeV2::leave_joint());
+
+    assert!(
+      matches!(res, Err(crate::ProposeError::InvalidConfChange)),
+      "an invalid conf change must be rejected at propose time, got {res:?}"
+    );
+    assert_eq!(
+      log.last_index(),
+      last_before,
+      "a rejected conf-change proposal must append nothing"
+    );
+    assert!(
+      ep.poison_reason().is_none(),
+      "a rejected conf-change proposal must NOT poison the node"
+    );
   }
 
   /// Test 1: Safe read confirmed only after a heartbeat quorum.
