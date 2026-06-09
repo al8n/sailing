@@ -191,17 +191,22 @@ impl ForwardedReads {
     self.order.contains(ctx)
   }
 
-  /// Record a NEW in-flight context, evicting the oldest if at capacity. The caller has already
-  /// verified `!contains(ctx)` (the duplicate-context guard), so this never inserts a duplicate.
+  /// Whether the in-flight set is at capacity. The follower applies BACK-PRESSURE here rather than
+  /// evicting: silently dropping an already-accepted read (one `read_index` returned `Ok` for) would
+  /// strand it forever, and after eviction the reused context could complete the WRONG read with a
+  /// stale index (R4 finding 2). So a full set rejects the NEW read instead of evicting an old one.
+  fn is_full(&self) -> bool {
+    self.order.len() >= MAX_FORWARDED_READS
+  }
+
+  /// Record a NEW in-flight context. The caller has already verified `!contains(ctx)` (dedup) AND
+  /// `!is_full()` (back-pressure), so this never inserts a duplicate and never evicts.
   fn push(&mut self, ctx: Bytes) {
-    if self.order.len() >= MAX_FORWARDED_READS {
-      self.order.pop_front();
-    }
     self.order.push_back(ctx);
   }
 
   /// Remove `ctx`, returning whether it was present (its `ReadIndexResp` arrived, or it was
-  /// already evicted/never forwarded). Doubles as the already-completed guard in `on_read_index_resp`.
+  /// already cleared/never forwarded). Doubles as the already-completed guard in `on_read_index_resp`.
   fn remove(&mut self, ctx: &Bytes) -> bool {
     if let Some(pos) = self.order.iter().position(|c| c == ctx) {
       self.order.remove(pos);
@@ -435,12 +440,24 @@ where
   /// Next outbound message, if any.
   #[inline]
   pub fn poll_message(&mut self) -> Option<Outgoing<I>> {
+    // A poisoned node emits nothing — not even already-queued messages. The emit-halt must live at
+    // the EGRESS (here), not only at `send`'s enqueue: a handler can queue a message (e.g. a leader
+    // broadcasts heartbeats) and then hit a fatal op later in the SAME dispatch, and those queued
+    // messages must never reach the wire from a dead node.
+    if self.poisoned {
+      return None;
+    }
     self.outgoing.pop_front()
   }
 
   /// Next application event, if any.
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event<I, F::Response>> {
+    // Same egress emit-halt as `poll_message`: a poisoned node completes no reads and surfaces no
+    // events (a queued `ReadState` from before a mid-dispatch poison must not leak).
+    if self.poisoned {
+      return None;
+    }
     self.events.pop_front()
   }
 
@@ -465,6 +482,11 @@ where
   /// busy-spins on a stale deadline.
   #[inline]
   pub fn poll_timeout(&self) -> Option<Instant> {
+    // A poisoned node has nothing to service; returning `None` also avoids a busy-loop where a
+    // driver re-feeds a stale deadline that `handle_timeout` no-ops without re-arming.
+    if self.poisoned {
+      return None;
+    }
     TimerKind::ALL
       .iter()
       .filter(|&&k| self.serviceable_now(k))
@@ -1565,7 +1587,7 @@ where
       Message::AppendResp(r) => self.on_append_resp(now, log, stable, from, r),
       Message::HeartbeatResp(hr) => self.on_heartbeat_resp(from, log, stable, hr),
       Message::ReadIndex(ri) => self.on_read_index(now, log, stable, ri),
-      Message::ReadIndexResp(r) => self.on_read_index_resp(r),
+      Message::ReadIndexResp(r) => self.on_read_index_resp(from, r),
       Message::InstallSnapshot(is) => self.on_install_snapshot(now, log, stable, is),
       Message::SnapshotResp(r) => self.on_snapshot_resp(now, log, stable, from, r),
       Message::TimeoutNow(tn) => self.on_timeout_now(now, log, stable, tn),
@@ -2648,8 +2670,13 @@ where
         if self.forwarded_reads.contains(&context) {
           return Err(crate::ReadIndexError::DuplicateContext);
         }
-        // Record before forwarding (FIFO-evicting the oldest at capacity). `read_index` already
-        // returned early if poisoned, so this never desyncs from the suppressed `send` below.
+        // Back-pressure at capacity: reject the NEW read rather than evict an already-accepted one
+        // (eviction would strand the evicted read and let a reused context complete the wrong one).
+        if self.forwarded_reads.is_full() {
+          return Err(crate::ReadIndexError::TooManyInFlight);
+        }
+        // Record before forwarding. `read_index` already returned early if poisoned, so this never
+        // desyncs from the suppressed `send` below.
         self.forwarded_reads.push(context.clone());
         let (term, me) = (self.term, self.config.id());
         self.send(
@@ -2729,10 +2756,15 @@ where
   /// application would treat as linearizable. The `forwarded_reads.remove` doubles as the
   /// already-completed guard: it returns `false` once the context has been consumed (or never
   /// existed), so a delayed duplicate is dropped.
-  fn on_read_index_resp(&mut self, resp: crate::ReadIndexResp<I>) {
+  fn on_read_index_resp(&mut self, from: I, resp: crate::ReadIndexResp<I>) {
     let ctx = Bytes::copy_from_slice(resp.context());
+    // Only a follower awaiting THIS forwarded read may complete it, and only from its current leader
+    // as identified by the ENVELOPE sender `from` (the transport peer) — never the self-reported
+    // `resp.from()`, which a wrong peer could forge to the leader's id (R4 finding 3). `remove`
+    // returning false rejects unsolicited / stale / already-completed contexts.
     if self.role != Role::Follower
-      || self.leader != Some(resp.from())
+      || self.leader != Some(from)
+      || resp.from() != from
       || !self.forwarded_reads.remove(&ctx)
     {
       return;
@@ -11370,16 +11402,27 @@ mod tests {
     );
     while ep.poll_message().is_some() {}
 
-    // Forward far more distinct contexts than the cap; every forward succeeds (distinct context),
-    // none is ever answered. The in-flight set must stay bounded at MAX_FORWARDED_READS.
+    // Forward far more distinct contexts than the cap, never answering any. The first
+    // MAX_FORWARDED_READS are accepted; beyond the cap the follower applies BACK-PRESSURE —
+    // rejecting the new read with `TooManyInFlight` rather than evicting an already-accepted one — so
+    // the in-flight set saturates exactly at the cap, never grows, and never strands a prior read.
     let total = MAX_FORWARDED_READS * 3 + 17;
     for i in 0..total {
       let ctx = bytes::Bytes::copy_from_slice(&(i as u64).to_be_bytes());
-      assert_eq!(
-        ep.read_index(Instant::ORIGIN, &log, &stable, ctx),
-        Ok(()),
-        "each distinct context forwards"
-      );
+      let result = ep.read_index(Instant::ORIGIN, &log, &stable, ctx);
+      if i < MAX_FORWARDED_READS {
+        assert_eq!(
+          result,
+          Ok(()),
+          "below the cap each distinct context forwards"
+        );
+      } else {
+        assert_eq!(
+          result,
+          Err(crate::ReadIndexError::TooManyInFlight),
+          "at capacity the follower back-pressures instead of evicting"
+        );
+      }
       while ep.poll_message().is_some() {}
       assert!(
         ep.forwarded_reads.len() <= MAX_FORWARDED_READS,
@@ -11391,5 +11434,226 @@ mod tests {
       MAX_FORWARDED_READS,
       "the set saturates exactly at the cap"
     );
+  }
+
+  /// A message ENQUEUED in an earlier dispatch must never reach the wire once the node poisons in a
+  /// LATER dispatch. The emit-halt lives at the EGRESS (`poll_message`), not only at `send`'s enqueue:
+  /// a candidate broadcasts `RequestVote`s (queued, not drained), then a follow-up AppendEntries
+  /// triggers a fatal term-read mid-`on_append_entries` and poisons — those already-queued votes must
+  /// be SUPPRESSED at the egress, not leak from a dead node (R4-F1).
+  ///
+  /// FAILS-ON-OLD: with the `if self.poisoned { return None; }` guard removed from `poll_message`, a
+  /// queued `RequestVote` leaks and the `is_none()` assertion below fires.
+  #[test]
+  fn queued_message_is_suppressed_after_later_dispatch_poisons() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+    // pre_vote / check_quorum both default to false, so a fired election timer goes STRAIGHT to
+    // `become_candidate` (bumping the term and broadcasting real RequestVotes) — not through a
+    // pre-vote probe. A fresh node starts at term 0, so the first campaign is term 1; the term-1
+    // AppendEntries below is therefore a SAME-term step-down (the candidate recognizes the leader).
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Two durable entries at indices 1 and 2 (both term 1).
+    let mut log = crate::testkit::FailTermLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+    ]);
+
+    // Arm a FATAL term-read at index 1, but leave term(2) OK. Dispatch 1 (become_candidate) reads
+    // only term(last_index=2) → OK; dispatch 2 (on_append_entries consistency check) reads
+    // term(prev_log_index=1) → Err → poison.
+    log.fail_term_at(Some(Index::new(1)));
+
+    // DISPATCH 1: fire the election timer. become_candidate bumps term 0→1, reads term(2)=OK, and
+    // broadcasts RequestVote{term:1} to voter peers 2 and 3. We do NOT drain `outgoing`, and we do
+    // NOT drain `stable` (so the self-vote write stays pending and become_leader never fires) — the
+    // node sits as a Candidate with two RequestVotes QUEUED.
+    let fire = Instant::ORIGIN + Duration::from_millis(5000);
+    ep.handle_timeout(fire, &mut log, &mut stable);
+    assert!(!ep.is_poisoned(), "candidate is healthy after dispatch 1");
+    assert_eq!(
+      ep.role(),
+      Role::Candidate,
+      "fired timer made us a candidate"
+    );
+    assert_eq!(ep.term(), Term::new(1), "first campaign is term 1");
+    // Sanity (without draining): at least one queued message is a RequestVote at term 1 — proving the
+    // votes really are sitting in the egress BEFORE the poison happens.
+    assert!(
+      ep.outgoing
+        .iter()
+        .any(|o| matches!(o.message(), Message::RequestVote(rv) if rv.term() == Term::new(1))),
+      "become_candidate must have QUEUED a RequestVote(term=1) before any poison"
+    );
+
+    // DISPATCH 2: deliver an AppendEntries at the SAME term (1) with prev at index 1. on_append_entries
+    // sets role=Follower (candidate recognizes the term-1 leader), then the consistency check reads
+    // term(1) → armed Err → poison, and returns before sending anything.
+    ep.handle_message(
+      fire,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        2u64,
+        Index::new(1),
+        Term::new(1),
+        std::vec![],
+        Index::new(1),
+      )),
+    );
+    assert!(
+      ep.is_poisoned(),
+      "the fatal term-read in dispatch 2 must poison the node"
+    );
+
+    // THE PROPERTY: the RequestVotes queued in dispatch 1 must NOT leak from the now-poisoned node —
+    // the egress emit-halt suppresses every queued message, and no ReadState event surfaces either.
+    assert!(
+      ep.poll_message().is_none(),
+      "a message queued BEFORE the poison must be suppressed at the egress"
+    );
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "a poisoned node surfaces no ReadState event"
+    );
+  }
+
+  /// A forwarded read may be completed only by a `ReadIndexResp` whose ENVELOPE sender (the transport
+  /// peer `from` passed to `handle_message`) is the follower's current leader — not merely one whose
+  /// PAYLOAD `from` claims to be the leader. A wrong peer can forge `resp.from()` to the leader's id;
+  /// validating only the payload would let that spoofed response complete a read the application then
+  /// treats as linearizable (R4-F3).
+  ///
+  /// FAILS-ON-OLD: if `on_read_index_resp` checks only `self.leader != Some(resp.from())` (ignoring
+  /// the envelope `from`), the spoofed message at step (a) completes the read and a ReadState leaks.
+  #[test]
+  fn read_index_resp_requires_matching_envelope_sender() {
+    use crate::{AppendEntries, Config, Index, Instant, Message, ReadIndexResp, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Establish leader = node 2 (via an AppendEntries whose envelope sender is 2) and forward a read.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    assert_eq!(ep.leader(), Some(2u64));
+    assert_eq!(ep.role(), Role::Follower);
+    while ep.poll_message().is_some() {}
+
+    let ctx = bytes::Bytes::from_static(b"read-ctx");
+    assert_eq!(
+      ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
+      Ok(()),
+      "a follower with a known leader forwards the read"
+    );
+    // The forward is a ReadIndex to the leader (node 2).
+    assert!(
+      {
+        let mut forwarded = false;
+        while let Some(o) = ep.poll_message() {
+          if let Message::ReadIndex(ri) = o.message() {
+            assert_eq!(o.to(), 2u64, "the read forwards to the leader");
+            assert_eq!(ri.context(), ctx.as_ref());
+            forwarded = true;
+          }
+        }
+        forwarded
+      },
+      "read_index must forward a ReadIndex to the leader"
+    );
+
+    // (a) SPOOFED: payload `from` claims to be the leader (2), but the ENVELOPE sender is node 3 (the
+    // transport peer). Must be REJECTED — no ReadState — because the peer that actually delivered it
+    // is not our leader, even though the payload lies about being from node 2.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        2u64,
+        Index::new(9),
+        ctx.clone(),
+      )),
+    );
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "a resp whose ENVELOPE sender is not the leader must not complete the read, \
+       even if its payload `from` is forged to the leader's id"
+    );
+
+    // (b) LEGITIMATE: envelope sender == payload from == leader (2). The read completes: one ReadState
+    // at the confirmed index. (The in-flight context survived step (a), proving (a) did not consume
+    // it.)
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        2u64,
+        Index::new(9),
+        ctx.clone(),
+      )),
+    );
+    let read_states: std::vec::Vec<_> = {
+      let mut v = std::vec::Vec::new();
+      while let Some(e) = ep.poll_event() {
+        if let crate::Event::ReadState(rs) = e {
+          v.push(rs);
+        }
+      }
+      v
+    };
+    assert_eq!(
+      read_states.len(),
+      1,
+      "the legitimately-addressed resp completes the read exactly once"
+    );
+    assert_eq!(read_states[0].index(), Index::new(9));
   }
 }

@@ -453,14 +453,14 @@ impl<I: NodeId + Data> Data for ConfChangeV2<I> {
 
     // Number of changes (u64 length prefix).
     let rest = buf.get(pos..).ok_or(DecodeError::UnexpectedEof)?;
-    let (n, count_u64) = u64::decode(rest)?;
+    // Length-prefix choke-point: narrows the u64 to usize (rejecting overflow), the same path as
+    // every other length-prefixed decode.
+    let (n, count) = crate::data::decode_len(rest, "conf_change_v2 change count")?;
     pos += n;
-    // Reject a length that overflows `usize` or exceeds the remaining input BEFORE allocating: every
-    // `ConfChangeSingle` encodes to at least one byte, so a count larger than the bytes left cannot be
-    // valid — and trusting it would let a malformed committed payload drive an unbounded `Vec`
-    // preallocation (OOM in the core). This bounds the capacity to the actual input size.
-    let count = usize::try_from(count_u64)
-      .map_err(|_| DecodeError::Invalid("conf_change_v2 change count"))?;
+    // Reject a count that exceeds the remaining input BEFORE allocating: every `ConfChangeSingle`
+    // encodes to at least one byte, so a count larger than the bytes left cannot be valid — and
+    // trusting it would let a malformed committed payload drive an unbounded `Vec` preallocation
+    // (OOM in the core). This bounds the capacity to the actual input size.
     if count > buf.len().saturating_sub(pos) {
       return Err(DecodeError::Invalid(
         "conf_change_v2 change count exceeds input",

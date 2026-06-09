@@ -65,6 +65,12 @@ pub enum ReadIndexError {
   /// in-flight read to confirm, or reissue with a unique context.
   #[error("a read with this context is already in flight")]
   DuplicateContext,
+  /// This follower already has the maximum number of forwarded reads awaiting a `ReadIndexResp`
+  /// (back-pressure). The read was NOT accepted; retry after some in-flight reads confirm, or once a
+  /// leader/term change clears the backlog. Forwarded reads are never silently evicted, so an
+  /// already-accepted read is never stranded.
+  #[error("too many forwarded reads are already in flight")]
+  TooManyInFlight,
 }
 
 /// Why constructing a [`crate::Config`] failed.
