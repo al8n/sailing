@@ -90,6 +90,15 @@ pub struct NodeView {
   /// Whether the node has been removed from the cluster (its applied log legitimately stops
   /// advancing at removal, so the cross-node oracles skip it).
   pub removed: bool,
+  /// Whether the node considers ITSELF a voter in its own committed configuration
+  /// (`Endpoint::conf_state().is_voter(id)`). The quorum-durability oracle's denominator is the
+  /// VOTER set, not all live nodes: only voters can ack an entry toward commit, and a node only
+  /// becomes a voter by APPLYING the `AddNode` that adds it — which requires a durable log up to
+  /// that conf-change's index, hence covering every earlier committed entry. So counting voters is
+  /// both correct and self-consistent (a counted voter provably holds every earlier committed
+  /// entry), which removes the false positive a wired-but-not-yet-voting / learner node would cause
+  /// in the all-live-nodes denominator. A learner or a freshly-wired joiner is `false` here.
+  pub is_voter: bool,
   /// Whether the node is poisoned (a fatal storage/apply error made it inert). A poisoned node's
   /// watermarks are frozen; the monotonicity oracles still treat it as a normal observation (a
   /// frozen value never regresses), but it is excluded from liveness-flavored checks.
@@ -104,11 +113,20 @@ pub struct NodeView {
   pub applied: u64,
   /// The node's applied `(index, command)` sequence (`Endpoint::state_machine().applied()`).
   pub applied_log: Vec<(u64, Vec<u8>)>,
-  /// The node's durable log `first_index()` (advances after compaction).
+  /// The node's DURABLE (fsync'd) log `first_index` (advances after compaction). In async mode this
+  /// is the durable snapshot's first index; a submitted-but-unflushed tail is excluded.
   pub durable_first: u64,
-  /// The node's durable log `last_index()`.
+  /// The node's DURABLE (fsync'd) log `last_index`. In async mode this is the durable snapshot's
+  /// last index — a submitted-but-unflushed append (visible to the proto's reads) is NOT counted
+  /// here, since a crash before flush would lose it.
   pub durable_last: u64,
-  /// The node's durable entries (`first..=last`), read via the non-faulting seam.
+  /// The node's VISIBLE log `last_index` (`Endpoint`-readable state). In async mode this INCLUDES a
+  /// submitted-but-unflushed tail (≥ [`durable_last`](Self::durable_last)); in sync mode the two
+  /// coincide. The proto applies committed entries from this visible view (a node can only apply
+  /// what it can read), so the `applied <= visible_last` sanity bound uses this, while durability
+  /// oracles use `durable_last`.
+  pub visible_last: u64,
+  /// The node's durable entries (`durable_first..=durable_last`), read via the non-faulting seam.
   pub durable_entries: Vec<DurableEntry>,
   /// The `last_index` of the node's durable snapshot (or `0` if none). Entries `<=` this are
   /// covered by the snapshot even though they are compacted out of `durable_entries`.
@@ -164,25 +182,34 @@ pub struct ClusterView {
 }
 
 impl ClusterView {
-  /// Iterate the non-removed nodes (the cross-node oracles operate on these).
+  /// Iterate the non-removed nodes (the cross-node oracles — agreement, no-committed-rewrite — operate
+  /// on these: a learner must also agree on the committed prefix it has applied).
   fn live(&self) -> impl Iterator<Item = &NodeView> {
     self.nodes.iter().filter(|n| !n.removed)
   }
 
-  /// The number of non-removed nodes — the denominator for the durable-quorum threshold.
-  fn live_count(&self) -> usize {
-    self.live().count()
+  /// Iterate the non-removed VOTERS (the quorum-durability denominator population). A node is a voter
+  /// iff it considers itself one in its own committed configuration (`is_voter`); learners and
+  /// freshly-wired joiners that have not yet applied their `AddNode` are excluded.
+  fn voters(&self) -> impl Iterator<Item = &NodeView> {
+    self.nodes.iter().filter(|n| !n.removed && n.is_voter)
   }
 
-  /// The majority threshold over the non-removed nodes: `⌊live/2⌋ + 1`.
+  /// The number of non-removed voters — the denominator for the durable-quorum threshold.
+  fn voter_count(&self) -> usize {
+    self.voters().count()
+  }
+
+  /// The majority threshold over the non-removed VOTERS: `⌊voters/2⌋ + 1`.
   ///
-  /// NOTE: this counts ALL non-removed nodes (voters + learners), not the voter set alone (the
-  /// post-R7 minimized surface does not expose per-node voter membership to the sim). Since a
-  /// learner durably holding a copy only ADDS to the count, this threshold is never *stricter*
-  /// than a pure-voter quorum, so the quorum-durability oracle can never false-positive on a
-  /// legitimate run; in the common all-voter cluster it is exact. See [`commit_is_quorum_durable`].
-  fn quorum(&self) -> usize {
-    self.live_count() / 2 + 1
+  /// Counting the voter set (not all live nodes) is what makes [`commit_is_quorum_durable`] sound
+  /// under reconfiguration: only voters ack toward commit, and a node becomes a voter only by
+  /// applying the `AddNode` that adds it (which requires a durable log covering that conf-change's
+  /// index — and hence every earlier committed entry). So a wired-but-not-yet-voting joiner or a
+  /// learner does not inflate the denominator against an entry it could not have witnessed. (The old
+  /// all-live-nodes denominator false-positived exactly there — surfaced by the VOPR, seed 43.)
+  fn voter_quorum(&self) -> usize {
+    self.voter_count() / 2 + 1
   }
 }
 
@@ -291,29 +318,38 @@ pub fn agreement(view: &ClusterView) -> Result<(), Violation> {
   Ok(())
 }
 
-/// **append-before-ack** (per-tick form): no node has applied/committed beyond its OWN durable log
-/// — a node must never have acknowledged (and thus let the leader count) an entry it has not
-/// durably stored.
+/// **append-before-ack** (per-tick form): no node has applied beyond its VISIBLE (readable) log —
+/// a node can only apply an entry it can read.
 ///
-/// The send-time form of this invariant (a non-reject `AppendResp{match}` implies durable
-/// `last_index >= match` at send time) is kept as an immediate tripwire in
-/// [`Cluster::schedule_send`](crate::Cluster); this per-tick form is the consolidated guarantee:
-/// `applied <= max(durable_last, snapshot_last_index)`. (A snapshot-install follower has its
-/// applied watermark at the snapshot boundary with the entries compacted out of the durable log,
-/// so the snapshot boundary counts.)
+/// **The real durability invariant is the send-time tripwire** in
+/// [`Cluster::schedule_send`](crate::Cluster): a follower sends a non-reject `AppendResp{match}`
+/// only after its append is DURABLE (the proto defers the ack to `on_log_appended`, which fires on
+/// the flush completion), so `durable_last >= match` holds when the ack is sent. That is where
+/// "never ack an entry you have not durably stored" is enforced.
+///
+/// This per-tick form is a weaker companion sanity check: `applied <= max(visible_last,
+/// snapshot_last_index)`. It deliberately uses the VISIBLE last index, NOT the durable one, because
+/// the proto legitimately applies committed entries from its visible log BEFORE its own fsync —
+/// commit advance/apply proceed independently of the local ack since a committed entry is durable
+/// on a QUORUM elsewhere and the local state machine is rebuilt from the durable log on restart
+/// (see `Endpoint::on_append_entries`). Bounding `applied` by `durable_last` would therefore
+/// false-fire on a leader (or any node) that has applied a committed-but-not-yet-locally-flushed
+/// tail. Per-entry quorum durability of every committed index is enforced separately by
+/// [`commit_is_quorum_durable`]. (A snapshot-install follower has its applied watermark at the
+/// snapshot boundary with the entries compacted out of the log, so the snapshot boundary counts.)
 pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
   for n in view.nodes.iter() {
-    let durable_high = n.durable_last.max(n.snapshot_last_index);
-    if n.applied > durable_high {
+    let visible_high = n.visible_last.max(n.snapshot_last_index);
+    if n.applied > visible_high {
       return Err(Violation::new(
         "append_before_ack",
         std::format!(
-          "node {} applied={} exceeds its durable log high-water {} (durable_last={}, \
-           snapshot_last_index={}) — applied/acked beyond durable storage",
+          "node {} applied={} exceeds its visible log high-water {} (visible_last={}, \
+           snapshot_last_index={}) — applied beyond readable storage",
           n.id,
           n.applied,
-          durable_high,
-          n.durable_last,
+          visible_high,
+          n.visible_last,
           n.snapshot_last_index,
         ),
       ));
@@ -322,25 +358,34 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
   Ok(())
 }
 
-/// **commit-is-quorum-durable**: for each non-removed node, the entry at its `commit` index must be
-/// present with the SAME term on a quorum of nodes' DURABLE logs.
+/// **commit-is-quorum-durable**: for each non-removed VOTER, the entry at its `commit` index must be
+/// present with the SAME term on a quorum of the VOTERS' DURABLE logs.
 ///
 /// Catches a node that advanced commit without the entry being durably replicated to a quorum (the
 /// M5/heartbeat class) — one tick BEFORE [`agreement`] would catch the resulting divergence.
 /// Compaction is accounted for: a snapshotted entry counts as durable-present at the snapshot
 /// boundary term (see [`NodeView::durable_covers`] / [`NodeView::durable_term`]).
 ///
-/// The committing node's own durable term at its commit index is the witness term `t`; the oracle
-/// then counts how many nodes durably hold `(commit, t)`. Fewer than [`ClusterView::quorum`] is a
-/// violation. A `commit` of 0 (nothing committed) is vacuously fine.
+/// The committing voter's own durable term at its commit index is the witness term `t`; the oracle
+/// then counts how many VOTERS durably hold `(commit, t)`. Fewer than [`ClusterView::voter_quorum`]
+/// is a violation. A `commit` of 0 (nothing committed) is vacuously fine.
+///
+/// **Voter-set denominator (reconfiguration soundness):** the quorum is taken over the voter set, not
+/// all live nodes. Only voters ack toward commit, and a node becomes a voter only by applying the
+/// `AddNode` that adds it (which requires its durable log to cover that conf-change's index, hence
+/// every earlier committed entry). So a learner or a wired-but-not-yet-voting joiner never inflates
+/// the denominator against an entry it could not have witnessed — which is exactly the false positive
+/// the old all-live-nodes denominator produced (surfaced by the VOPR: seed 43, a 5→6 voter growth).
+/// A learner's own `commit` watermark is not checked here (it makes no quorum claim; the same entry
+/// is checked via the voters), but a learner that holds the entry still does no harm.
 pub fn commit_is_quorum_durable(view: &ClusterView) -> Result<(), Violation> {
-  let quorum = view.quorum();
-  for n in view.live() {
+  let quorum = view.voter_quorum();
+  for n in view.voters() {
     let c = n.commit;
     if c == 0 {
       continue; // nothing committed
     }
-    // The committing node must itself durably cover its commit index (this is the append-before-
+    // The committing voter must itself durably cover its commit index (this is the append-before-
     // ack / C1 ordering; a violation here is also a violation, reported precisely).
     let witness_term = match n.durable_term(c) {
       Some(t) => t,
@@ -360,20 +405,20 @@ pub fn commit_is_quorum_durable(view: &ClusterView) -> Result<(), Violation> {
       }
     };
     let copies = view
-      .live()
+      .voters()
       .filter(|m| m.durable_covers(c) && m.durable_term(c) == Some(witness_term))
       .count();
     if copies < quorum {
       return Err(Violation::new(
         "commit_is_quorum_durable",
         std::format!(
-          "node {} committed index {} (term {}) but only {} of {} durable logs hold it with that \
-           term (quorum needs {})",
+          "node {} committed index {} (term {}) but only {} of {} voter durable logs hold it with \
+           that term (quorum needs {})",
           n.id,
           c,
           witness_term,
           copies,
-          view.live_count(),
+          view.voter_count(),
           quorum,
         ),
       ));
@@ -523,14 +568,20 @@ pub fn no_committed_rewrite(checker: &mut Checker, view: &ClusterView) -> Result
   Ok(())
 }
 
-/// **monotonic-commit-per-node**: a node's `commit` index never decreases across ticks — within an
-/// incarnation AND across a restart.
+/// **monotonic-commit-per-node**: a (healthy) node's `commit` index never decreases across ticks —
+/// within an incarnation AND across a restart.
 ///
 /// Per review **C1** the durable commit watermark is persisted, so a restart recovers it and commit
-/// must NOT regress even across restart. This is asserted strictly: at a tick boundary a node's
-/// in-memory commit is always durably persisted (the `handle_storage` choke-point ran to
-/// quiescence), so the next incarnation recovers `>=` the last observed value. A regression below a
-/// previously-observed commit therefore IS a C1-class durability bug, not a legitimate reset.
+/// must NOT regress even across restart. At a tick boundary a HEALTHY node's in-memory commit is
+/// durably persisted (the `handle_storage` choke-point ran to quiescence), so the next incarnation
+/// recovers `>=` the last observed value; a regression below a previously-observed HEALTHY commit IS
+/// a C1-class durability bug.
+///
+/// **Poisoned exception:** the proto gates commit-persistence on `!poisoned`, so a node that
+/// advanced commit in-memory and THEN poisoned (e.g. a committed-range read fault during apply,
+/// after advancing commit but before persisting it) holds an in-memory commit that was never made
+/// durable. C1 protects only the DURABLE commit, so that un-persisted advance is legitimately lost
+/// on restart and must NOT be used as the regression baseline (see the recording pass).
 pub fn monotonic_commit(checker: &mut Checker, view: &ClusterView) -> Result<(), Violation> {
   for n in view.nodes.iter() {
     let prev = checker.max_commit_seen.get(&n.id).copied().unwrap_or(0);
@@ -548,6 +599,19 @@ pub fn monotonic_commit(checker: &mut Checker, view: &ClusterView) -> Result<(),
     }
   }
   for n in view.nodes.iter() {
+    // Do NOT record a poisoned node's in-memory commit as the monotonic baseline. The proto's
+    // commit-persistence choke-point is gated on `!poisoned`, so a node that advanced commit
+    // in-memory and THEN poisoned (e.g. on a committed-range read fault during apply, before the
+    // persist step) carries an in-memory commit that was never durably persisted. C1 only
+    // guarantees the DURABLE commit is recovered on restart, so that un-persisted advance is
+    // legitimately lost when the node restarts — recording it here would make the next (healthy,
+    // correctly-recovered) incarnation look like a regression. The regression CHECK above still
+    // runs for every node (a poisoned node's commit is frozen and can only sit at/above the
+    // healthy baseline, never below it), so this only suppresses the false positive, never a real
+    // durability regression on a healthy node.
+    if n.poisoned {
+      continue;
+    }
     let e = checker.max_commit_seen.entry(n.id).or_insert(0);
     *e = (*e).max(n.commit);
   }
@@ -601,6 +665,7 @@ mod tests {
     NodeView {
       id,
       removed: false,
+      is_voter: true,
       poisoned: false,
       is_leader: id == 0,
       term: 1,
@@ -609,6 +674,8 @@ mod tests {
       applied_log,
       durable_first: 1,
       durable_last,
+      // A healthy node has no un-flushed tail, so the visible last index equals the durable one.
+      visible_last: durable_last,
       durable_entries,
       snapshot_last_index: 0,
       snapshot_last_term: 0,
@@ -662,8 +729,10 @@ mod tests {
   // ─── append-before-ack teeth ─────────────────────────────────────────────────────────────────
 
   #[test]
-  fn append_before_ack_detects_applied_beyond_durable() {
-    // A node applied index 5 but its durable log only reaches 3 (and no snapshot covers it).
+  fn append_before_ack_detects_applied_beyond_visible() {
+    // A node applied index 5 but its VISIBLE log only reaches 3 (and no snapshot covers it) — it
+    // cannot have applied an entry it cannot even read. (`healthy_node` sets visible_last ==
+    // durable_last == 3.)
     let mut n = healthy_node(0, 3, 3);
     n.applied = 5;
     n.commit = 5;
@@ -674,7 +743,25 @@ mod tests {
     };
     let v = append_before_ack(&view).unwrap_err();
     assert_eq!(v.oracle, "append_before_ack");
-    assert!(v.detail.contains("exceeds its durable log"), "{}", v.detail);
+    assert!(v.detail.contains("exceeds its visible log"), "{}", v.detail);
+  }
+
+  #[test]
+  fn append_before_ack_allows_applied_within_visible_unflushed_tail() {
+    // The proto legitimately applies committed entries from its VISIBLE log before its own fsync:
+    // applied may exceed durable_last as long as it stays within visible_last. This must NOT fire
+    // (durability is guaranteed per-entry by commit_is_quorum_durable, and on a quorum elsewhere).
+    let mut n = healthy_node(0, 5, 3); // durable_last=3, applied=commit=5
+    n.visible_last = 5; // a visible-but-unflushed tail (indices 4,5)
+    let view = ClusterView {
+      seed: 1,
+      tick: 9,
+      nodes: std::vec![n],
+    };
+    assert!(
+      append_before_ack(&view).is_ok(),
+      "applied within the visible (un-flushed) tail is legal"
+    );
   }
 
   // ─── commit-is-quorum-durable teeth ──────────────────────────────────────────────────────────
@@ -696,7 +783,7 @@ mod tests {
     let v = commit_is_quorum_durable(&view).unwrap_err();
     assert_eq!(v.oracle, "commit_is_quorum_durable");
     assert!(
-      v.detail.contains("only 1 of 3 durable logs"),
+      v.detail.contains("only 1 of 3 voter durable logs"),
       "{}",
       v.detail
     );

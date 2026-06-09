@@ -447,11 +447,21 @@ impl Cluster {
     self.net_last_sched.retain(|&(f, t), _| f != id && t != id);
   }
 
-  /// The durable `last_index()` of node `id`'s log. In async mode this reflects only flushed
-  /// (durable) appends — a staged-but-unflushed append is invisible here.
+  /// The VISIBLE `last_index()` of node `id`'s log. In async mode a submitted-but-unflushed append
+  /// IS visible here (the proto's submit-then-read contract); use
+  /// [`durable_last_index_of`](Self::durable_last_index_of) for the fsync'd window.
   pub fn last_index_of(&self, id: u64) -> sailing_proto::Index {
     let i = self.node_idx[&id];
     self.logs[i].last_index()
+  }
+
+  /// The DURABLE (fsync'd) `last_index` of node `id`'s log. In async mode this reflects only
+  /// flushed (durable) appends — a submitted-but-unflushed append is NOT counted here (it is
+  /// visible to [`last_index_of`](Self::last_index_of) but lost on a crash before flush). In sync
+  /// mode it equals the visible `last_index`.
+  pub fn durable_last_index_of(&self, id: u64) -> sailing_proto::Index {
+    let i = self.node_idx[&id];
+    self.logs[i].durable_last_index()
   }
 
   /// Whether node `id` currently has a staged (submitted-but-not-yet-flushed) store write — i.e.
@@ -813,8 +823,17 @@ impl Cluster {
         let node = &self.nodes[i];
         let log = &self.logs[i];
         let stable = &self.stables[i];
-        let durable_first = log.first_index().get();
-        let durable_last = log.last_index().get();
+        // Read the DURABLE (fsync'd) window — in async mode this is the durable snapshot, which
+        // EXCLUDES a submitted-but-unflushed tail (visible to `last_index()` but not yet durable).
+        // `durable_first`/`durable_last`/`durable_entries` must all come from the same durable
+        // snapshot so the boundedness oracle's window stays internally consistent and the
+        // quorum-durability oracle observes only fsync'd state. In sync mode these equal the visible
+        // state.
+        let durable_first = log.durable_first_index().get();
+        let durable_last = log.durable_last_index().get();
+        // The VISIBLE last index (includes a submitted-but-unflushed tail in async mode). The proto
+        // applies committed entries from this visible view, so the apply sanity bound uses it.
+        let visible_last = log.last_index().get();
         let durable_entries: std::vec::Vec<DurableEntry> = log
           .durable_entries()
           .iter()
@@ -837,6 +856,11 @@ impl Cluster {
         NodeView {
           id,
           removed: self.removed.contains(&id),
+          // The node's own view of whether it is a voter in its committed configuration. Derived
+          // from the proto's runtime `conf_state()` (tracks applied ConfChanges), so a learner or a
+          // freshly-wired-but-not-yet-applied joiner reports `false` — the quorum-durability oracle
+          // uses this as its denominator population so growth/learners don't inflate the quorum.
+          is_voter: node.conf_state().is_voter(&id),
           poisoned: node.is_poisoned(),
           is_leader: node.role().is_leader(),
           term: node.term().get(),
@@ -845,6 +869,7 @@ impl Cluster {
           applied_log,
           durable_first,
           durable_last,
+          visible_last,
           durable_entries,
           snapshot_last_index,
           snapshot_last_term,
@@ -988,12 +1013,18 @@ impl Cluster {
     let from = self.node_ids[i];
 
     // ── Structural assertion (a): append-before-ack ──────────────────────────────
-    // A success AppendResp must not outrun the node's durable log.
+    // A success AppendResp must not outrun the node's readable log. (The proto's append-before-ack
+    // ordering — deferring a NEW suffix's ack to its durability via `on_log_appended` — is exercised
+    // by the M8-U1 fsync-window integration test; this send-time tripwire is a coarse outran-the-log
+    // guard. It uses the VISIBLE `last_index()` so it stays byte-identical to M0–M7 in sync mode and
+    // does not flag the legitimate "duplicate AppendEntries, entries already present" ack path that
+    // can fire for a visible-but-in-flight suffix. The per-entry quorum-durability of every COMMITTED
+    // index is enforced separately by the `commit_is_quorum_durable` oracle on the durable snapshot.)
     if let Message::AppendResp(a) = &message {
       if !a.reject() {
         assert!(
           self.logs[i].last_index() >= a.match_index(),
-          "append-before-ack violated: node {from} acked {:?} but durable last_index is {:?}",
+          "append-before-ack violated: node {from} acked {:?} but last_index is {:?}",
           a.match_index(),
           self.logs[i].last_index(),
         );

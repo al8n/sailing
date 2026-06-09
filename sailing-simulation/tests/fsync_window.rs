@@ -48,10 +48,11 @@ fn crash_in_fsync_window_loses_inflight_and_recovers() {
     "the follower must be sitting in the fsync window (staged, un-flushed append) — \
      otherwise the test is vacuous"
   );
-  // The staged append is invisible to the follower's durable read view.
+  // The in-flight append is VISIBLE to the follower (submit-then-read contract) but NOT yet
+  // DURABLE — a crash before flush will lose exactly this un-synced tail.
   assert!(
-    c.last_index_of(follower) < idx,
-    "the staged append must NOT be durable on the follower before the crash"
+    c.durable_last_index_of(follower) < idx,
+    "the in-flight append must NOT be durable on the follower before the crash"
   );
 
   // Crash the follower mid-window: discard the staged (un-flushed) append, then restart from the

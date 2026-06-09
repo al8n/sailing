@@ -16,3 +16,6 @@ pub use checker::{Checker, ClusterView, DurableEntry, NodeView, Violation};
 
 mod cluster;
 pub use cluster::{AppliedLog, Cluster};
+
+mod vopr;
+pub use vopr::{VoprReport, run_vopr};

@@ -6,20 +6,24 @@
 //!   completion immediately (commit-on-submit). `discard_inflight()` is a no-op. This is the
 //!   M0–M7 behavior and is BYTE-IDENTICAL to the original synchronous store, so every existing
 //!   test passes unchanged.
-//! - **Async (opt-in, M8)** — `submit_*` STAGES the write into an in-flight buffer that is NOT
-//!   yet durable and enqueues NO completion. The driver pumps an explicit `flush()` each tick
-//!   (modeling fsync completing between iterations): `flush()` applies every staged write to
-//!   durable state and enqueues its completion in submission order. `discard_inflight()` DROPS
-//!   the staged (un-flushed) writes and their pending completions — modeling a crash that loses
-//!   an in-flight fsync. **Already-durable state survives `discard_inflight`.** Reads
-//!   (`entries`/`last_index`/`term`/`hard_state`/`snapshot`) reflect ONLY durable state — staged
-//!   writes are invisible — so the proto's deferred-completion contract is testable: the core
-//!   acts only on a drained `poll()` completion, never on un-flushed bytes.
+//! - **Async (opt-in, M8) — visible state + durable snapshot.** `submit_*` applies the write to
+//!   the VISIBLE state IMMEDIATELY (so reads see it — this is required: the proto submits an
+//!   append then reads `last_index()`/`entries()` to replicate it in the SAME call), but only
+//!   DEFERS durability — it records the op in an `in_flight` list and enqueues NO completion. The
+//!   driver pumps an explicit `flush()` each tick (modeling fsync completing between iterations):
+//!   `flush()` snapshots the visible state into the durable snapshot and releases each deferred
+//!   completion in submission order. `discard_inflight()` (a crash) ROLLS BACK the visible state
+//!   to the durable snapshot — losing exactly the submitted-but-unflushed tail. This matches a
+//!   real log: an appended entry is visible immediately; a crash before fsync loses only the
+//!   un-synced tail. **Already-durable (fsync'd) state survives `discard_inflight`.** Reads
+//!   (`entries`/`last_index`/`term`/`hard_state`/`snapshot`) reflect the VISIBLE state; the
+//!   per-tick safety oracles read the DURABLE snapshot via the non-faulting
+//!   [`MemLog::durable_entries`] seam, so they observe fsync'd state, never the optimistic tail.
 //!
 //! **Flush model — explicit `flush()`:** we use an explicit `flush()` that `Cluster::tick` calls
 //! each step (before draining completions) rather than auto-releasing on the Nth `poll()`. This
 //! makes the crash window directly controllable: a `crash()` that calls `discard_inflight()`
-//! WITHOUT a preceding `flush()` loses exactly the staged window.
+//! WITHOUT a preceding `flush()` rolls back exactly the un-flushed window.
 //!
 //! **Storage faults** ([`StorageFaults`]) are seeded and surface as VALUES (errors / dropped
 //! writes), NEVER panics, and are OFF by default. See the struct docs for which are implemented
@@ -100,17 +104,18 @@ impl ReadFaultPrng {
 
 /// The write mode of a [`MemLog`] / [`MemStable`].
 ///
-/// `Sync` (default) is commit-on-submit (M0–M7 behavior, byte-identical). `Async` stages writes
-/// into an in-flight buffer released only on `flush()`, re-opening the fsync-loss window that the
-/// proto's durability-ordering rules (append-before-ack, persist-vote-before-grant,
-/// deferred-compact, commit persistence) guard against.
+/// `Sync` (default) is commit-on-submit (M0–M7 behavior, byte-identical). `Async` applies writes
+/// to the VISIBLE state immediately but defers DURABILITY (the completion) until `flush()`,
+/// re-opening the fsync-loss window that the proto's durability-ordering rules (append-before-ack,
+/// persist-vote-before-grant, deferred-compact, commit persistence) guard against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StoreMode {
   /// `submit_*` is durable immediately and enqueues its completion immediately.
   #[default]
   Sync,
-  /// `submit_*` stages into an in-flight buffer; `flush()` makes it durable + enqueues the
-  /// completion; `discard_inflight()` drops the staged window (fsync loss).
+  /// `submit_*` applies to the VISIBLE state immediately (so reads see it) but enqueues no
+  /// completion; `flush()` makes it durable + enqueues the completion; `discard_inflight()` rolls
+  /// the visible state back to the durable snapshot (fsync loss).
   Async,
 }
 
@@ -143,11 +148,13 @@ impl StoreMode {
 ///   Deliberately confined to `entries`: the proto's `term` callers treat a failed/zero `term`
 ///   read as NON-fatal (`.unwrap_or`), so faulting `term` would model a scenario the proto does
 ///   not claim to survive rather than the C2 path (see the `term`/`entries` impls).
-/// - `torn_write_per_mille` — a per-flush probability (async mode only) that a staged write is
-///   silently DROPPED at `flush()` instead of being applied + completed. Distinct from
-///   `discard_inflight`: a torn write models a write the device acknowledged nothing about (no
-///   completion ever fires, the bytes never land), exercising the same recovery path as a crash
-///   in the fsync window but WITHOUT a crash. Off by default.
+/// - `torn_write_per_mille` — a per-flush probability (async mode only) that the in-flight batch's
+///   fsync FAILS at `flush()`: the durable snapshot is NOT advanced and no completion fires, but the
+///   VISIBLE (page-cache) state is left intact and the writes stay in flight (retried on the next
+///   flush). A torn write that is never followed by a successful flush is lost on the next crash —
+///   so it widens the fsync-loss window WITHOUT a crash, while never rolling back state under the
+///   still-running node (which would desync the node's in-memory watermarks from its log). Off by
+///   default.
 ///
 /// Scaffolded (fields reserved; not yet wired — see the per-field TODO):
 /// - `bit_rot_per_mille` — flip durable bytes after the fact so a later read's checksum fails.
@@ -156,7 +163,9 @@ impl StoreMode {
 pub struct StorageFaults {
   /// Probability (per mille) a read returns [`MemStoreError::TransientRead`]. Implemented.
   pub transient_read_per_mille: u16,
-  /// Probability (per mille) a staged write is dropped at `flush` (async mode). Implemented.
+  /// Probability (per mille) the in-flight batch's fsync fails at `flush` (async mode): durability
+  /// is deferred (writes stay in flight, retried next flush; lost on a crash before then), the
+  /// visible state is left intact. Implemented.
   pub torn_write_per_mille: u16,
   /// TODO(M8): bit-rot — corrupt already-durable bytes so a later checksum read fails.
   /// Reserved; not yet wired (the wire `Entry`/`HardState` checksum lands with the VOPR in a
@@ -219,9 +228,18 @@ impl core::error::Error for MemStoreError {}
 /// - `compacted_term`: term at `offset` (the snapshot's last term). Starts at `Term::ZERO`.
 /// - `first_index() == offset + 1`; `last_index() == offset + entries.len()`.
 ///
-/// In [`StoreMode::Async`], `submit_append` stages into `staged` instead of mutating `entries`;
-/// `flush()` applies staged appends to `entries` + enqueues completions; `discard_inflight()`
-/// drops `staged`. Reads only ever see `entries` (durable), never `staged`.
+/// **Async model — visible state + durable snapshot.** In [`StoreMode::Async`], `submit_append`
+/// applies the append to the VISIBLE `entries`/`offset` IMMEDIATELY (so the proto's submit-then-read
+/// contract holds — `propose` submits, then `maybe_send_append` reads `last_index()`/`entries()` and
+/// sees the just-appended entry, exactly as in sync mode), but only records the op id in `in_flight`
+/// WITHOUT enqueuing a completion. `flush()` snapshots the visible state into the durable snapshot
+/// (`durable_entries`/`durable_offset`/`durable_compacted_term`) and releases the deferred
+/// completions. `discard_inflight()` (the crash) ROLLS BACK the visible state to the durable
+/// snapshot, dropping exactly the submitted-but-unflushed tail — the genuine fsync-loss window.
+/// This matches a real log: an appended entry is visible immediately; a crash before fsync loses
+/// only the un-synced tail. The per-tick safety oracles read the DURABLE snapshot via
+/// [`durable_entries`](Self::durable_entries), so they observe durable (fsync'd) state, not the
+/// optimistic visible tail.
 #[derive(Debug, Default)]
 pub struct MemLog {
   entries: Vec<Entry>,
@@ -232,10 +250,19 @@ pub struct MemLog {
   compacted_term: Term,
   /// Write mode. `Sync` (default) is byte-identical to the original store.
   mode: StoreMode,
-  /// Async mode only: appends submitted but not yet flushed to `entries`. Each is
-  /// `(op id, entries)`; `flush()` applies them in order (truncate-then-extend, same as sync) and
-  /// `discard_inflight()` drops them (fsync loss). Empty in sync mode.
-  staged: Vec<(OpId, Vec<Entry>)>,
+  /// Async mode only: the last-flushed durable SNAPSHOT of `entries`. `flush()` copies the visible
+  /// `entries` here; `discard_inflight()`/torn-write roll the visible `entries` back to this. In
+  /// sync mode this mirror is kept consistent but never read (reads use the visible `entries`).
+  durable_entries: Vec<Entry>,
+  /// Async mode only: the durable snapshot's `offset` (paired with `durable_entries`).
+  durable_offset: Index,
+  /// Async mode only: the durable snapshot's `compacted_term` (paired with `durable_entries`).
+  durable_compacted_term: Term,
+  /// Async mode only: op ids submitted (and already applied to the VISIBLE `entries`) but not yet
+  /// flushed. `flush()` enqueues `LogDone::Appended(id)` for each in order and clears this;
+  /// `discard_inflight()` clears it without enqueuing (their completions never fired). Empty in
+  /// sync mode.
+  in_flight: Vec<OpId>,
   /// Seeded fault config (off by default).
   faults: StorageFaults,
   /// Write-side fault PRNG (drives `torn_write` at `flush`). Deterministic given the seed.
@@ -250,8 +277,9 @@ impl MemLog {
     Self::default()
   }
 
-  /// Empty log in [`StoreMode::Async`] (staged writes, fsync-loss window) seeded with `seed`
-  /// for any storage faults.
+  /// Empty log in [`StoreMode::Async`] (visible-state + durable-snapshot, fsync-loss window) seeded
+  /// with `seed` for any storage faults. The durable snapshot starts equal to the empty visible
+  /// state; `in_flight` is empty.
   pub fn new_async(seed: u64) -> Self {
     Self {
       mode: StoreMode::Async,
@@ -261,12 +289,12 @@ impl MemLog {
     }
   }
 
-  /// Set the write mode. Switching to `Sync` requires no staged writes (debug-asserted); we only
+  /// Set the write mode. Switching to `Sync` requires no in-flight writes (debug-asserted); we only
   /// ever switch at construction in practice.
   pub fn set_mode(&mut self, mode: StoreMode) {
     debug_assert!(
-      mode.is_async() || self.staged.is_empty(),
-      "switching MemLog to Sync mode with staged writes still in flight"
+      mode.is_async() || self.in_flight.is_empty(),
+      "switching MemLog to Sync mode with writes still in flight"
     );
     self.mode = mode;
   }
@@ -284,66 +312,112 @@ impl MemLog {
     self.read_prng.reseed(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
   }
 
-  /// Async mode: apply every staged append to the durable log (truncate-then-extend, exactly as
-  /// the sync `submit_append` path) and enqueue each completion in submission order. Models the
-  /// fsync for the in-flight window completing between driver iterations.
+  /// Async mode: make the in-flight (already-visible) appends DURABLE by snapshotting the visible
+  /// state into the durable snapshot and releasing each deferred completion in submission order.
+  /// Models the fsync for the in-flight window completing between driver iterations.
   ///
-  /// A seeded `torn_write` fault (off by default) silently DROPS a staged write here — the bytes
-  /// never land and NO completion fires (distinct from `discard_inflight`, which is crash-driven).
+  /// A seeded `torn_write` fault (off by default), rolled ONCE for the whole batch, models a FAILED
+  /// fsync: the durable snapshot is NOT advanced and NO completion fires this flush, but the VISIBLE
+  /// (page-cache) state is left intact and the in-flight writes STAY in flight — a later `flush()`
+  /// retries the fsync. (Rolling back the visible state here would be wrong: the proc is still
+  /// running and has already read/acted on the visible tail; only a CRASH — `discard_inflight` —
+  /// rolls visible state back. A torn write that is never followed by a successful flush is lost on
+  /// the next crash, exercising the fsync-loss recovery path WITHOUT a crash advancing durability.)
   ///
-  /// No-op in sync mode (writes are already durable; nothing is staged).
+  /// No-op in sync mode (writes are already durable; nothing is in flight).
   pub fn flush(&mut self) {
     if !self.mode.is_async() {
       return;
     }
-    let staged = core::mem::take(&mut self.staged);
-    for (id, entries) in staged {
-      // Seeded torn-write: drop this staged write entirely (no apply, no completion).
-      if self.prng.chance_per_mille(self.faults.torn_write_per_mille) {
-        continue;
-      }
-      self.apply_append(&entries);
+    // Seeded torn-write: roll ONCE for the whole in-flight batch. If it fires, this fsync FAILED —
+    // do not advance the durable snapshot, fire no completions, and leave the writes in flight
+    // (visible state intact; retried on the next flush, lost on a crash before then).
+    if self.prng.chance_per_mille(self.faults.torn_write_per_mille) {
+      return;
+    }
+    // Normal flush: snapshot visible → durable, then release the deferred completions in order.
+    self.durable_entries.clone_from(&self.entries);
+    self.durable_offset = self.offset;
+    self.durable_compacted_term = self.compacted_term;
+    for id in self.in_flight.drain(..) {
       self.completions.push_back(LogDone::Appended(id));
     }
   }
 
   /// Drop any in-flight (not-yet-durable) work, modeling fsync loss on crash.
   ///
-  /// - Sync mode: nothing is un-flushed; no-op (`staged` is always empty).
-  /// - Async mode: clears the staged appends and their pending completions. **Already-durable
-  ///   `entries` and already-flushed `completions` survive** — a crash loses the fsync window,
-  ///   not committed data.
+  /// - Sync mode: nothing is un-flushed; no-op (`in_flight` is always empty).
+  /// - Async mode: ROLL BACK the visible state to the durable snapshot and clear `in_flight`
+  ///   (their completions were never enqueued). **The already-durable snapshot and already-flushed
+  ///   `completions` survive** — a crash loses exactly the submitted-but-unflushed tail, not
+  ///   committed data.
   pub fn discard_inflight(&mut self) {
-    // Staged appends were never durable: drop them. In async mode `completions` only holds
-    // entries whose data is ALREADY durable (flush enqueues data+completion together), so durable
-    // completions are preserved; in sync mode `staged` is always empty, so this is a no-op.
-    self.staged.clear();
+    if !self.mode.is_async() {
+      return;
+    }
+    self.entries.clone_from(&self.durable_entries);
+    self.offset = self.durable_offset;
+    self.compacted_term = self.durable_compacted_term;
+    self.in_flight.clear();
   }
 
-  /// Whether there is a staged (submitted-but-not-yet-flushed) append in the fsync window.
-  /// Always `false` in sync mode. Used by tests to assert a crash genuinely lands mid-window.
+  /// Whether there is a submitted-but-not-yet-flushed append in the fsync window. Always `false`
+  /// in sync mode. Used by tests to assert a crash genuinely lands mid-window.
   pub fn has_inflight(&self) -> bool {
-    !self.staged.is_empty()
+    !self.in_flight.is_empty()
   }
 
-  /// The durable entries currently present (those above the compaction `offset`), as a raw
-  /// slice — NEVER subject to the seeded `transient_read` fault that [`LogStore::entries`]
+  /// The DURABLE (fsync'd) entries currently present (those above the durable compaction offset),
+  /// as a raw slice — NEVER subject to the seeded `transient_read` fault that [`LogStore::entries`]
   /// injects.
   ///
   /// This is the observation seam for the per-tick safety oracles ([`crate::checker`]): a
   /// checker must read a node's durable log WITHOUT perturbing the simulated run (the
   /// `transient_read` fault advances a PRNG and would poison the node on a `LogStore::entries`
-  /// error), so it reads here instead. Staged (un-flushed) appends are invisible — only durable
-  /// state is returned, mirroring the read view of [`first_index`](LogStore::first_index) /
-  /// [`last_index`](LogStore::last_index).
+  /// error), so it reads here instead. In async mode this returns the durable SNAPSHOT, so a
+  /// submitted-but-unflushed append (visible to [`last_index`](LogStore::last_index)) is NOT yet
+  /// observed by the oracles — they see only fsync'd state. In sync mode the durable snapshot is
+  /// unused, so this returns the visible `entries` (which is the durable state in sync mode).
   pub fn durable_entries(&self) -> &[Entry] {
-    &self.entries
+    if self.mode.is_async() {
+      &self.durable_entries
+    } else {
+      &self.entries
+    }
   }
 
-  /// The number of durable in-memory entries (above the compaction `offset`). Used by the
-  /// boundedness oracle to assert per-node bookkeeping stays bounded under compaction.
+  /// The number of durable in-memory entries (above the compaction offset). Used by the
+  /// boundedness oracle to assert per-node bookkeeping stays bounded under compaction. Returns the
+  /// durable-snapshot length in async mode, the visible length in sync mode (they coincide in
+  /// sync).
   pub fn durable_len(&self) -> usize {
-    self.entries.len()
+    if self.mode.is_async() {
+      self.durable_entries.len()
+    } else {
+      self.entries.len()
+    }
+  }
+
+  /// The DURABLE (fsync'd) `first_index` — `durable_offset + 1` in async mode (matching the durable
+  /// snapshot), the visible `first_index` in sync mode. The oracles consume this so their durable
+  /// window `[first..=last]` stays consistent with [`durable_entries`](Self::durable_entries).
+  pub fn durable_first_index(&self) -> Index {
+    if self.mode.is_async() {
+      Index::new(self.durable_offset.get() + 1)
+    } else {
+      self.first_index()
+    }
+  }
+
+  /// The DURABLE (fsync'd) `last_index` — `durable_offset + durable_entries.len()` in async mode
+  /// (excludes a submitted-but-unflushed tail), the visible `last_index` in sync mode. The oracles
+  /// consume this so their durable window stays consistent with the durable snapshot.
+  pub fn durable_last_index(&self) -> Index {
+    if self.mode.is_async() {
+      Index::new(self.durable_offset.get() + self.durable_entries.len() as u64)
+    } else {
+      self.last_index()
+    }
   }
 
   /// Apply one append to the durable `entries` (truncate-then-extend). Shared by the sync
@@ -436,9 +510,13 @@ impl LogStore for MemLog {
 
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
     if self.mode.is_async() {
-      // Async: STAGE — not yet durable, no completion. `flush()` releases it; a crash before the
-      // next `flush()` (via `discard_inflight`) loses exactly this in-flight window.
-      self.staged.push((id, entries.to_vec()));
+      // Async: apply to the VISIBLE state IMMEDIATELY (so the proto's submit-then-read contract
+      // holds — reads see the just-appended entry, exactly as in sync), but DEFER durability: record
+      // the op id in `in_flight` and enqueue NO completion. `flush()` releases the completion and
+      // makes it durable; a crash before the next `flush()` (via `discard_inflight`) rolls the
+      // visible state back to the durable snapshot, losing exactly this in-flight tail.
+      self.apply_append(entries);
+      self.in_flight.push(id);
       return;
     }
     // Sync (byte-identical to the original): durable immediately + completion enqueued.
@@ -452,27 +530,44 @@ impl LogStore for MemLog {
     }
     let last = self.last_index();
     let up_to = if up_to > last { last } else { up_to };
-    // Read the boundary term before draining
+    // Read the boundary term (from the VISIBLE state) before draining.
     let boundary_term = self.term(up_to).unwrap_or(Term::ZERO);
-    // Number of entries to remove: up_to - offset (= index in entries of up_to's position + 1)
+    // Number of VISIBLE entries to remove: up_to - offset (position of up_to in `entries`, +1).
     let drain_count = (up_to.get() - self.offset.get()) as usize;
     let drain_count = drain_count.min(self.entries.len());
     self.entries.drain(0..drain_count);
     self.offset = up_to;
     self.compacted_term = boundary_term;
+    // Async mode: GC the same already-durable prefix from the durable snapshot so it stays
+    // consistent. Compaction only ever removes already-durable entries (the proto compacts at or
+    // below the applied index, which is durable), so the durable snapshot covers `up_to`. Compute
+    // the durable drain relative to `durable_offset` and clamp to its (possibly shorter) length.
+    if self.mode.is_async() && up_to > self.durable_offset {
+      let durable_drain = (up_to.get() - self.durable_offset.get()) as usize;
+      let durable_drain = durable_drain.min(self.durable_entries.len());
+      self.durable_entries.drain(0..durable_drain);
+      self.durable_offset = up_to;
+      self.durable_compacted_term = boundary_term;
+    }
   }
 
   fn restore(&mut self, last_index: Index, last_term: Term) {
     // Discard all entries: the follower's entire log is replaced by the snapshot.
     // Drop any pending completions for discarded appends — they will never fire.
-    // Also drop any staged (un-flushed) appends — a restore supersedes in-flight writes.
+    // Also drop any in-flight (un-flushed) appends — a restore supersedes in-flight writes.
     self.entries.clear();
     self.completions.clear();
-    self.staged.clear();
+    self.in_flight.clear();
     // Re-baseline: offset == last_index so that first_index() == last_index + 1
     // and term(last_index) == last_term (the snapshot boundary term).
     self.offset = last_index;
     self.compacted_term = last_term;
+    // A restore is an IMMEDIATE durable re-baseline: re-baseline the durable snapshot too (async).
+    if self.mode.is_async() {
+      self.durable_entries.clear();
+      self.durable_offset = last_index;
+      self.durable_compacted_term = last_term;
+    }
   }
 
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
@@ -482,10 +577,14 @@ impl LogStore for MemLog {
 
 /// In-memory durable metadata store.
 ///
-/// In [`StoreMode::Async`], `submit_write`/`submit_snapshot` STAGE into `staged` instead of
-/// mutating `hard_state`/`snapshot`; `flush()` applies staged writes + enqueues completions in
-/// submission order; `discard_inflight()` drops the staged window (fsync loss). The `hard_state()`
-/// / `snapshot()` reads only ever see durable state, never staged.
+/// **Async model — visible state + durable snapshot.** In [`StoreMode::Async`],
+/// `submit_write`/`submit_snapshot` set the VISIBLE `hard_state`/`snapshot` IMMEDIATELY (so the
+/// proto's submit-then-read contract holds) but DEFER durability: they record the op id + kind in
+/// `in_flight` and enqueue NO completion. `flush()` snapshots the visible state into the durable
+/// snapshot (`durable_hard_state`/`durable_snapshot`) and releases the deferred completions in
+/// submission order. `discard_inflight()` (the crash) ROLLS BACK the visible state to the durable
+/// snapshot, losing exactly the submitted-but-unflushed window (fsync loss). `hard_state()` /
+/// `snapshot()` read the VISIBLE state.
 #[derive(Debug)]
 pub struct MemStable<I> {
   hard_state: HardState<I>,
@@ -493,21 +592,29 @@ pub struct MemStable<I> {
   snapshot: Option<(SnapshotMeta<I>, Bytes)>,
   /// Write mode. `Sync` (default) is byte-identical to the original store.
   mode: StoreMode,
-  /// Async mode only: writes submitted but not yet flushed. Empty in sync mode.
-  staged: Vec<StagedWrite<I>>,
+  /// Async mode only: the last-flushed durable SNAPSHOT of `hard_state`. `flush()` copies the
+  /// visible `hard_state` here; rollback (`discard_inflight`/torn-write) restores from it.
+  durable_hard_state: HardState<I>,
+  /// Async mode only: the last-flushed durable SNAPSHOT of `snapshot`. Paired with
+  /// `durable_hard_state`.
+  durable_snapshot: Option<(SnapshotMeta<I>, Bytes)>,
+  /// Async mode only: writes submitted (and already applied to the VISIBLE state) but not yet
+  /// flushed, with the kind of completion each owes. `flush()` enqueues the matching completion in
+  /// order and clears this; `discard_inflight()` clears it without enqueuing. Empty in sync mode.
+  in_flight: Vec<(OpId, StableKind)>,
   /// Seeded fault config (off by default).
   faults: StorageFaults,
   /// Write-side fault PRNG (drives `torn_write` at `flush`). Deterministic given the seed.
   prng: FaultPrng,
 }
 
-/// One staged (async, not-yet-durable) stable-store write.
-#[derive(Debug)]
-enum StagedWrite<I> {
-  /// A staged hard-state write awaiting `flush`.
-  Hard(OpId, HardState<I>),
-  /// A staged snapshot write awaiting `flush`.
-  Snapshot(OpId, SnapshotMeta<I>, Bytes),
+/// Which completion an in-flight (async, not-yet-flushed) stable-store write owes at `flush`.
+#[derive(Debug, Clone, Copy)]
+enum StableKind {
+  /// A hard-state write → `StableDone::Wrote`.
+  Wrote,
+  /// A snapshot write → `StableDone::SnapshotWritten`.
+  SnapshotWritten,
 }
 
 impl<I: sailing_proto::NodeId> MemStable<I> {
@@ -518,13 +625,17 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
       completions: VecDeque::new(),
       snapshot: None,
       mode: StoreMode::Sync,
-      staged: Vec::new(),
+      durable_hard_state: HardState::initial(),
+      durable_snapshot: None,
+      in_flight: Vec::new(),
       faults: StorageFaults::none(),
       prng: FaultPrng::default(),
     }
   }
 
-  /// Fresh store in [`StoreMode::Async`] (staged writes, fsync-loss window) seeded with `seed`.
+  /// Fresh store in [`StoreMode::Async`] (visible-state + durable-snapshot, fsync-loss window)
+  /// seeded with `seed`. The durable snapshot starts equal to the initial visible state;
+  /// `in_flight` is empty.
   pub fn new_async(seed: u64) -> Self {
     Self {
       mode: StoreMode::Async,
@@ -533,11 +644,11 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     }
   }
 
-  /// Set the write mode. Switching to `Sync` requires no staged writes (debug-asserted).
+  /// Set the write mode. Switching to `Sync` requires no in-flight writes (debug-asserted).
   pub fn set_mode(&mut self, mode: StoreMode) {
     debug_assert!(
-      mode.is_async() || self.staged.is_empty(),
-      "switching MemStable to Sync mode with staged writes still in flight"
+      mode.is_async() || self.in_flight.is_empty(),
+      "switching MemStable to Sync mode with writes still in flight"
     );
     self.mode = mode;
   }
@@ -553,50 +664,58 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     self.prng = FaultPrng::new(seed);
   }
 
-  /// Async mode: apply every staged write to durable state (hard_state / snapshot) and enqueue
-  /// each completion in submission order. Models the fsync for the in-flight window completing
-  /// between driver iterations.
+  /// Async mode: make the in-flight (already-visible) writes DURABLE by snapshotting the visible
+  /// state into the durable snapshot and releasing each deferred completion in submission order.
+  /// Models the fsync for the in-flight window completing between driver iterations.
   ///
-  /// A seeded `torn_write` fault (off by default) silently DROPS a staged write here.
+  /// A seeded `torn_write` fault (off by default), rolled ONCE for the whole batch, models a FAILED
+  /// fsync: the durable snapshot is NOT advanced and NO completion fires this flush, but the VISIBLE
+  /// state is left intact and the writes STAY in flight (retried on the next flush, lost on a crash
+  /// before then). Rolling back the visible state here would be wrong (the proc is still running and
+  /// has acted on the visible value); only a CRASH (`discard_inflight`) rolls visible state back.
   ///
-  /// No-op in sync mode (writes are already durable; nothing is staged).
+  /// No-op in sync mode (writes are already durable; nothing is in flight).
   pub fn flush(&mut self) {
     if !self.mode.is_async() {
       return;
     }
-    let staged = core::mem::take(&mut self.staged);
-    for w in staged {
-      // Seeded torn-write: drop this staged write entirely (no apply, no completion).
-      if self.prng.chance_per_mille(self.faults.torn_write_per_mille) {
-        continue;
-      }
-      match w {
-        StagedWrite::Hard(id, hs) => {
-          self.hard_state = hs;
-          self.completions.push_back(StableDone::Wrote(id));
-        }
-        StagedWrite::Snapshot(id, meta, data) => {
-          self.snapshot = Some((meta, data));
-          self.completions.push_back(StableDone::SnapshotWritten(id));
-        }
+    // Seeded torn-write: roll ONCE for the whole in-flight batch. If it fires, this fsync FAILED —
+    // do not advance the durable snapshot, fire no completions, and leave the writes in flight
+    // (visible state intact; retried on the next flush, lost on a crash before then).
+    if self.prng.chance_per_mille(self.faults.torn_write_per_mille) {
+      return;
+    }
+    // Normal flush: snapshot visible → durable, then release the deferred completions in order.
+    self.durable_hard_state = self.hard_state;
+    self.durable_snapshot.clone_from(&self.snapshot);
+    for (id, kind) in self.in_flight.drain(..) {
+      match kind {
+        StableKind::Wrote => self.completions.push_back(StableDone::Wrote(id)),
+        StableKind::SnapshotWritten => self.completions.push_back(StableDone::SnapshotWritten(id)),
       }
     }
   }
 
   /// Drop any in-flight (not-yet-durable) work, modeling fsync loss on crash.
   ///
-  /// - Sync mode: nothing is un-flushed; no-op (`staged` is always empty).
-  /// - Async mode: clears the staged writes and their pending completions. **Already-durable
-  ///   `hard_state` / `snapshot` and already-flushed `completions` survive** — a crash loses the
-  ///   fsync window, not committed metadata.
+  /// - Sync mode: nothing is un-flushed; no-op (`in_flight` is always empty).
+  /// - Async mode: ROLL BACK the visible `hard_state`/`snapshot` to the durable snapshot and clear
+  ///   `in_flight` (their completions were never enqueued). **The already-durable snapshot and
+  ///   already-flushed `completions` survive** — a crash loses the fsync window, not committed
+  ///   metadata.
   pub fn discard_inflight(&mut self) {
-    self.staged.clear();
+    if !self.mode.is_async() {
+      return;
+    }
+    self.hard_state = self.durable_hard_state;
+    self.snapshot.clone_from(&self.durable_snapshot);
+    self.in_flight.clear();
   }
 
-  /// Whether there is a staged (submitted-but-not-yet-flushed) write in the fsync window.
-  /// Always `false` in sync mode.
+  /// Whether there is a submitted-but-not-yet-flushed write in the fsync window. Always `false` in
+  /// sync mode.
   pub fn has_inflight(&self) -> bool {
-    !self.staged.is_empty()
+    !self.in_flight.is_empty()
   }
 }
 
@@ -620,7 +739,9 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
 
   fn submit_write(&mut self, id: OpId, hard_state: HardState<I>) {
     if self.mode.is_async() {
-      self.staged.push(StagedWrite::Hard(id, hard_state));
+      // Async: set the VISIBLE hard_state IMMEDIATELY (submit-then-read), DEFER durability.
+      self.hard_state = hard_state;
+      self.in_flight.push((id, StableKind::Wrote));
       return;
     }
     // Sync (byte-identical to the original): durable immediately + completion enqueued.
@@ -630,7 +751,9 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
 
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<I>, data: Bytes) {
     if self.mode.is_async() {
-      self.staged.push(StagedWrite::Snapshot(id, meta, data));
+      // Async: set the VISIBLE snapshot IMMEDIATELY (submit-then-read), DEFER durability.
+      self.snapshot = Some((meta, data));
+      self.in_flight.push((id, StableKind::SnapshotWritten));
       return;
     }
     // Sync (byte-identical to the original): durable immediately + completion enqueued.
@@ -814,50 +937,62 @@ mod tests {
 
   #[test]
   fn async_log_submit_then_discard_loses_inflight_append() {
-    // Async mode: submit_append STAGES. A crash (discard_inflight) BEFORE flush loses it:
-    // last_index unchanged, no completion ever fires.
+    // Async mode (visible-state + durable-snapshot): submit_append is VISIBLE to reads immediately
+    // but its durability is deferred (no completion). A crash (discard_inflight) BEFORE flush rolls
+    // the visible state back to the durable snapshot: last_index returns to its durable value and
+    // no completion ever fires.
     let mut log = MemLog::new_async(7);
     assert!(log.mode().is_async());
     assert_eq!(log.last_index(), Index::ZERO);
 
     let e = make_entry(1, 1);
     log.submit_append(OpId::new(1), core::slice::from_ref(&e));
-    // Staged: NOT durable, NOT visible to reads, NO completion.
+    // Visible to reads immediately (the proto relies on this), but NOT yet durable and NO
+    // completion enqueued.
     assert_eq!(
       log.last_index(),
-      Index::ZERO,
-      "staged append must be invisible to reads"
+      Index::new(1),
+      "submitted append must be VISIBLE to reads (deferred durability, not deferred visibility)"
+    );
+    assert!(log.has_inflight(), "the append is in the fsync window");
+    assert_eq!(
+      log.durable_len(),
+      0,
+      "durable snapshot still empty (append not yet fsync'd)"
     );
     assert_eq!(
       log.poll(),
       None,
-      "staged append must not enqueue a completion"
+      "in-flight append must not enqueue a completion before flush"
     );
 
-    // Crash in the fsync window.
+    // Crash in the fsync window: roll back to the (empty) durable snapshot.
     log.discard_inflight();
     assert_eq!(
       log.last_index(),
       Index::ZERO,
-      "discarded in-flight append must be gone"
+      "discarded in-flight append must be rolled back"
     );
+    assert!(!log.has_inflight(), "fsync window empty after crash");
     assert_eq!(log.poll(), None, "no completion after discard");
   }
 
   #[test]
   fn async_log_submit_then_flush_is_durable() {
-    // Async mode: submit_append then flush → durable: last_index advances, poll yields the
-    // completion (preserving the ordered-completion contract).
+    // Async mode: submit_append is visible immediately; flush makes it DURABLE and releases the
+    // deferred completion (preserving the ordered-completion contract).
     let mut log = MemLog::new_async(7);
     let e = make_entry(1, 1);
     log.submit_append(OpId::new(1), core::slice::from_ref(&e));
-    // Before flush: invisible.
-    assert_eq!(log.last_index(), Index::ZERO);
+    // Before flush: visible to reads, but not yet durable and no completion.
+    assert_eq!(log.last_index(), Index::new(1), "visible immediately");
+    assert_eq!(log.durable_len(), 0, "not yet durable");
     assert_eq!(log.poll(), None);
 
     log.flush();
-    // After flush: durable + completion.
+    // After flush: durable + completion; survives a subsequent crash.
     assert_eq!(log.last_index(), Index::new(1), "flushed append is durable");
+    assert_eq!(log.durable_len(), 1, "durable snapshot now covers it");
     assert_eq!(log.term(Index::new(1)).unwrap(), Term::new(1));
     assert_eq!(log.poll(), Some(Ok(LogDone::Appended(OpId::new(1)))));
     assert_eq!(log.poll(), None);
@@ -873,14 +1008,19 @@ mod tests {
     let _ = log.poll();
     assert_eq!(log.last_index(), Index::new(1));
 
-    // Stage a second append, then crash before flushing it.
+    // Submit a second append (visible immediately), then crash before flushing it.
     log.submit_append(OpId::new(2), core::slice::from_ref(&make_entry(1, 2)));
+    assert_eq!(
+      log.last_index(),
+      Index::new(2),
+      "second append visible before the crash"
+    );
     log.discard_inflight();
 
     assert_eq!(
       log.last_index(),
       Index::new(1),
-      "durable prefix survives crash"
+      "durable prefix survives crash; un-flushed tail rolled back"
     );
     assert_eq!(log.poll(), None, "no completion for the discarded tail");
     // The durable entry is still readable.
@@ -925,20 +1065,23 @@ mod tests {
     assert!(s.mode().is_async());
     let hs = s.hard_state().with_term(Term::new(9));
     s.submit_write(OpId::new(1), hs);
-    // Staged: invisible, no completion.
+    // Visible immediately, but not yet durable and no completion.
     assert_eq!(
       s.hard_state().term(),
-      Term::ZERO,
-      "staged hard-state write is invisible"
+      Term::new(9),
+      "submitted hard-state write is VISIBLE immediately (deferred durability)"
     );
+    assert!(s.has_inflight());
     assert_eq!(s.poll(), None);
 
+    // Crash before flush: roll back to the durable (initial) snapshot.
     s.discard_inflight();
     assert_eq!(
       s.hard_state().term(),
       Term::ZERO,
-      "discarded in-flight write is gone"
+      "discarded in-flight write is rolled back to the durable snapshot"
     );
+    assert!(!s.has_inflight());
     assert_eq!(s.poll(), None);
   }
 
@@ -948,7 +1091,7 @@ mod tests {
     let mut s = MemStable::<u64>::new_async(3);
     let hs = s.hard_state().with_term(Term::new(9));
     s.submit_write(OpId::new(1), hs);
-    assert_eq!(s.hard_state().term(), Term::ZERO);
+    assert_eq!(s.hard_state().term(), Term::new(9), "visible immediately");
 
     s.flush();
     assert_eq!(
@@ -958,10 +1101,17 @@ mod tests {
     );
     assert_eq!(s.poll(), Some(Ok(StableDone::Wrote(OpId::new(1)))));
     assert_eq!(s.poll(), None);
+    // Durable: a subsequent crash preserves it.
+    s.discard_inflight();
+    assert_eq!(
+      s.hard_state().term(),
+      Term::new(9),
+      "flushed write survives a later crash"
+    );
   }
 
   #[test]
-  fn async_stable_snapshot_stages_and_flushes() {
+  fn async_stable_snapshot_is_visible_then_flushes() {
     use sailing_proto::StableDone;
     let mut s = MemStable::<u64>::new_async(5);
     let meta = SnapshotMeta::new(
@@ -970,8 +1120,11 @@ mod tests {
       ConfState::from_voters(std::vec![1u64]),
     );
     s.submit_snapshot(OpId::new(7), meta, Bytes::from_static(b"snap"));
-    // Staged: snapshot not yet readable.
-    assert!(s.snapshot().is_none(), "staged snapshot is invisible");
+    // Visible immediately, but no completion before flush.
+    assert!(
+      s.snapshot().is_some(),
+      "submitted snapshot is visible immediately"
+    );
     assert_eq!(s.poll(), None);
 
     s.flush();
@@ -1050,9 +1203,11 @@ mod tests {
   }
 
   #[test]
-  fn torn_write_fault_drops_staged_write_on_flush() {
-    // A torn write at 100% drops every staged append on flush: nothing durable, no completion —
-    // distinct from discard_inflight (no crash), and never a panic.
+  fn torn_write_fault_keeps_visible_undurable_then_retries() {
+    // A torn write fails the fsync on flush: nothing becomes durable and no completion fires, but
+    // the VISIBLE append survives (page cache intact) and stays in-flight. A LATER successful flush
+    // retries the fsync and makes it durable; never a panic, never a visible rollback under the
+    // running proc.
     let mut log = MemLog::new_async(0);
     log.set_faults(
       StorageFaults {
@@ -1062,12 +1217,95 @@ mod tests {
       11,
     );
     log.submit_append(OpId::new(1), core::slice::from_ref(&make_entry(1, 1)));
-    log.flush();
+    assert_eq!(log.last_index(), Index::new(1), "append visible on submit");
+    log.flush(); // torn: fsync fails
     assert_eq!(
       log.last_index(),
-      Index::ZERO,
-      "torn write never landed durably"
+      Index::new(1),
+      "torn write does NOT roll back the visible (page-cache) tail"
+    );
+    assert_eq!(log.durable_len(), 0, "but nothing landed durably");
+    assert!(
+      log.has_inflight(),
+      "the write stays in flight (will be retried)"
     );
     assert_eq!(log.poll(), None, "torn write enqueues no completion");
+
+    // Clear the fault and flush again: the retried fsync now lands.
+    log.set_faults(StorageFaults::none(), 0);
+    log.flush();
+    assert_eq!(log.durable_len(), 1, "retried fsync made it durable");
+    assert_eq!(log.poll(), Some(Ok(LogDone::Appended(OpId::new(1)))));
+
+    // A crash BEFORE a successful retry would instead lose the torn tail: re-run that path.
+    let mut log2 = MemLog::new_async(0);
+    log2.set_faults(
+      StorageFaults {
+        torn_write_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      11,
+    );
+    log2.submit_append(OpId::new(2), core::slice::from_ref(&make_entry(1, 1)));
+    log2.flush(); // torn
+    log2.discard_inflight(); // crash before a successful retry
+    assert_eq!(
+      log2.last_index(),
+      Index::ZERO,
+      "a crash before a successful retry loses the torn tail"
+    );
+    assert_eq!(log2.poll(), None);
+  }
+
+  #[test]
+  fn async_compact_keeps_durable_snapshot_consistent() {
+    // Compaction GCs already-durable entries from BOTH the visible state and the durable snapshot.
+    let mut log = MemLog::new_async(0);
+    let entries: Vec<Entry> = (1..=5).map(|i| make_entry(1, i)).collect();
+    log.submit_append(OpId::new(1), &entries);
+    log.flush(); // entries 1..=5 now durable
+    let _ = log.poll();
+    assert_eq!(log.durable_len(), 5);
+
+    log.compact(Index::new(3)); // retain 4,5 in both visible and durable
+    assert_eq!(
+      log.first_index(),
+      Index::new(4),
+      "visible first_index advanced"
+    );
+    assert_eq!(log.last_index(), Index::new(5));
+    assert_eq!(log.durable_len(), 2, "durable snapshot GC'd in lockstep");
+    assert_eq!(log.durable_entries().len(), 2);
+    assert_eq!(log.durable_entries()[0].index(), Index::new(4));
+
+    // A crash now rolls back to the (compacted) durable snapshot — still consistent.
+    log.discard_inflight();
+    assert_eq!(log.first_index(), Index::new(4));
+    assert_eq!(log.last_index(), Index::new(5));
+  }
+
+  #[test]
+  fn async_restore_rebaselines_visible_and_durable() {
+    // restore() is an immediate durable re-baseline of BOTH visible and durable snapshot.
+    let mut log = MemLog::new_async(0);
+    log.submit_append(OpId::new(1), core::slice::from_ref(&make_entry(1, 1)));
+    log.flush();
+    let _ = log.poll();
+
+    log.restore(Index::new(10), Term::new(3));
+    assert_eq!(log.first_index(), Index::new(11));
+    assert_eq!(log.last_index(), Index::new(10));
+    assert_eq!(log.term(Index::new(10)).unwrap(), Term::new(3));
+    assert_eq!(
+      log.durable_len(),
+      0,
+      "durable re-baselined to the snapshot point"
+    );
+    assert!(!log.has_inflight());
+
+    // A crash after restore stays at the re-baselined point (durable == visible).
+    log.discard_inflight();
+    assert_eq!(log.last_index(), Index::new(10));
+    assert_eq!(log.term(Index::new(10)).unwrap(), Term::new(3));
   }
 }

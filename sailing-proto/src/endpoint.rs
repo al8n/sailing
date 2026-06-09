@@ -486,11 +486,15 @@ where
     (li, lt)
   }
 
-  /// Build the current `ConfState` from the runtime membership (Tracker).
+  /// The current committed-configuration membership ([`ConfState`](crate::ConfState)) derived from
+  /// the runtime [`Tracker`](crate::tracker::Tracker).
   ///
-  /// This reflects the live configuration so snapshots and restarts carry the correct
-  /// membership, not just the static bootstrap seed from `Config.voters`.
-  fn conf_state(&self) -> crate::ConfState<I> {
+  /// This reflects the LIVE configuration (it tracks every applied `ConfChange`), not just the static
+  /// bootstrap seed from `Config.voters`, so snapshots and restarts carry the correct membership.
+  /// Exposed (read-only) so a verification harness can derive the true VOTER set — the correct quorum
+  /// denominator for a durable-quorum oracle under reconfiguration (a learner / not-yet-applied
+  /// joiner is not a voter and must not inflate the quorum). A pure read of internal state.
+  pub fn conf_state(&self) -> crate::ConfState<I> {
     self.tracker.conf_state()
   }
 
@@ -1817,6 +1821,14 @@ where
     let new_commit = core::cmp::min(hb.commit(), log.last_index());
     if new_commit > self.commit {
       self.commit = new_commit;
+    }
+    // Always attempt to apply: a follower's `applied` can lag `commit` even when commit does NOT
+    // advance this round — e.g. a previously-committed entry was not yet in the durable read view
+    // (the benign empty-read break in `apply_committed`) when commit last advanced. If we only
+    // applied on a commit advance, an idle (commit-stable) follower would stay wedged with
+    // `applied < commit` forever. Applying whenever `applied < commit` is idempotent (a no-op when
+    // already caught up) and closes that wedge. (Surfaced by the VOPR: seed 42, tick 6783.)
+    if self.applied < self.commit {
       self.apply_committed(log);
     }
     let (term, me) = (self.term, self.config.id());
@@ -1920,6 +1932,12 @@ where
     let new_commit = core::cmp::min(ae.leader_commit(), last_new);
     if new_commit > self.commit {
       self.commit = new_commit;
+    }
+    // Always attempt to apply when `applied < commit` (not only on a commit advance): apply can lag
+    // commit via the benign empty-read break in `apply_committed` (the committed entry was not yet
+    // in the durable read view when commit advanced), and an idle follower would otherwise stay
+    // wedged. Idempotent when already caught up. (Surfaced by the VOPR: seed 42, tick 6783.)
+    if self.applied < self.commit {
       self.apply_committed(log);
     }
 
