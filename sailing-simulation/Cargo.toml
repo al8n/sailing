@@ -10,6 +10,7 @@ repository.workspace = true
 [dependencies]
 sailing-proto = { workspace = true, features = ["std"] }
 bytes.workspace = true
+derive_more.workspace = true
 
 [lints]
 workspace = true

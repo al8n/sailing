@@ -1,6 +1,6 @@
 //! A deterministic, single-threaded cluster of `Endpoint`s over an in-memory typed-message
 //! bus and a virtual clock. M0 wires the loop; M1+ exercises real consensus through it.
-use crate::{LogSm, MemLog, MemStable};
+use crate::{LogSm, MemLog, MemStable, StorageFaults};
 use core::time::Duration;
 use sailing_proto::{
   ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, ReadState, Term,
@@ -65,6 +65,11 @@ pub struct Cluster {
   /// Per-node list of `ReadState`s confirmed via `Event::ReadState` during `tick`.
   /// Appended monotonically; never cleared. Index into the outer Vec by node position.
   read_states: Vec<Vec<ReadState>>,
+  /// When true, the stores run in [`crate::StoreMode::Async`] (staged writes / fsync-loss window):
+  /// `tick` flushes every node's staged writes each step (before draining completions), and a
+  /// `crash` that discards in-flight writes loses exactly the un-flushed window. Default false
+  /// (synchronous stores, byte-identical to M0–M7).
+  async_mode: bool,
 }
 
 impl Cluster {
@@ -77,6 +82,30 @@ impl Cluster {
   /// construction. Use this to override flow-control knobs (e.g. `max_inflight_msgs`)
   /// for targeted tests while keeping `new` unchanged.
   pub fn new_with(n: usize, configure: impl Fn(Config<u64>) -> Config<u64>) -> Self {
+    Self::new_inner(n, configure, false, 0)
+  }
+
+  /// Build an `n`-node cluster whose stores run in [`crate::StoreMode::Async`] (staged writes /
+  /// fsync-loss window), seeded with `seed`.
+  ///
+  /// In async mode `submit_*` stages a write that is made durable only when `tick` flushes it
+  /// the next step; a `crash` between submit and the next flush loses that in-flight write (and
+  /// the node recovers via re-replication / commit persistence). This is what makes the proto's
+  /// durability-ordering rules (append-before-ack, persist-vote-before-grant, deferred-compact,
+  /// commit persistence) MEANINGFUL under crash. Storage faults stay off unless installed.
+  pub fn new_async(n: usize, seed: u64) -> Self {
+    Self::new_inner(n, |cfg| cfg, true, seed)
+  }
+
+  /// Shared constructor body. `async_mode` selects [`crate::StoreMode::Async`] stores (seeded with
+  /// `seed` for any storage faults); `false` keeps the default synchronous stores so `new` /
+  /// `new_with` are byte-identical to M0–M7.
+  fn new_inner(
+    n: usize,
+    configure: impl Fn(Config<u64>) -> Config<u64>,
+    async_mode: bool,
+    seed: u64,
+  ) -> Self {
     let mut nodes = Vec::with_capacity(n);
     let mut logs = Vec::with_capacity(n);
     let mut stables = Vec::with_capacity(n);
@@ -100,8 +129,15 @@ impl Cluster {
         LogSm::new(),
       ));
       configs.push(cfg);
-      logs.push(MemLog::new());
-      stables.push(MemStable::new());
+      // Per-node store seeds derived from the cluster seed + id so each node's fault schedule is
+      // distinct yet reproducible from `seed`.
+      if async_mode {
+        logs.push(MemLog::new_async(seed ^ id));
+        stables.push(MemStable::new_async(seed.rotate_left(32) ^ id));
+      } else {
+        logs.push(MemLog::new());
+        stables.push(MemStable::new());
+      }
       node_idx.insert(id, id as usize);
       node_ids.push(id);
     }
@@ -123,6 +159,7 @@ impl Cluster {
       snapshot_installs,
       conf_changed,
       read_states,
+      async_mode,
     }
   }
 
@@ -328,6 +365,165 @@ impl Cluster {
     self.bus.retain(|m| m.from != id && m.to != id);
   }
 
+  /// The durable `last_index()` of node `id`'s log. In async mode this reflects only flushed
+  /// (durable) appends — a staged-but-unflushed append is invisible here.
+  pub fn last_index_of(&self, id: u64) -> sailing_proto::Index {
+    let i = self.node_idx[&id];
+    self.logs[i].last_index()
+  }
+
+  /// Whether node `id` currently has a staged (submitted-but-not-yet-flushed) store write — i.e.
+  /// it is sitting inside the fsync-loss window. Always `false` in sync mode. Used by crash-window
+  /// tests to assert the crash genuinely lands mid-window (non-vacuity).
+  pub fn node_has_inflight(&self, id: u64) -> bool {
+    let i = self.node_idx[&id];
+    self.logs[i].has_inflight() || self.stables[i].has_inflight()
+  }
+
+  /// Install a seeded [`StorageFaults`] config on node `id`'s stores (both log and stable),
+  /// re-seeding their fault PRNGs from `seed` so the schedule is reproducible. Faults surface as
+  /// VALUES (a read returns the store error → the proto poisons; a torn write drops a staged
+  /// append) and NEVER panic. Defaults are all-off, so unfaulted nodes are unaffected.
+  pub fn set_node_faults(&mut self, id: u64, faults: StorageFaults, seed: u64) {
+    let i = self.node_idx[&id];
+    self.logs[i].set_faults(faults, seed);
+    self.stables[i].set_faults(faults, seed.rotate_left(17));
+  }
+
+  /// Whether node `id` is poisoned (a fatal storage/apply error has made it inert). In async mode
+  /// a `transient_read` fault that fires on a committed-range read poisons the node via the
+  /// proto's review-C2 path.
+  pub fn is_poisoned(&self, id: u64) -> bool {
+    let i = self.node_idx[&id];
+    self.nodes[i].is_poisoned()
+  }
+
+  /// The [`sailing_proto::PoisonReason`] of node `id`, or `None` if healthy.
+  pub fn poison_reason_of(&self, id: u64) -> Option<sailing_proto::PoisonReason> {
+    let i = self.node_idx[&id];
+    self.nodes[i].poison_reason()
+  }
+
+  /// Deterministically drive the cluster until node `keep` is sitting inside the fsync window
+  /// (has a staged-but-unflushed append), WITHOUT ever flushing `keep`. Returns `true` once the
+  /// window is open, or `false` if it did not open within `max_iters`.
+  ///
+  /// Each outer iteration mirrors a `tick`: advance virtual time to the next deadline and fire
+  /// due timers (so the leader's heartbeat re-replicates a freshly-durable entry), then pump
+  /// drain-outgoing → deliver → flush+drain-storage for every node EXCEPT `keep`. `keep` receives
+  /// messages (and so STAGES the resulting append) but is never flushed, so its in-flight window
+  /// stays open. Pairing this with [`crash`](Self::crash) drops exactly that window (a crash
+  /// mid-fsync). The double-vote / append-before-ack tripwires are not evaluated here (this is a
+  /// pre-crash setup pump); they run on every real `tick`.
+  pub fn open_fsync_window(&mut self, keep: u64, max_iters: usize) -> bool {
+    for _ in 0..max_iters {
+      if self.node_has_inflight(keep) {
+        return true;
+      }
+      // Advance time to the next deadline and fire due timers (leader heartbeat replicates the
+      // durable entry; followers' timers keep their state fresh). `keep`'s timers fire too — a
+      // heartbeat will reset its election timer on delivery.
+      let next_timer = self.nodes.iter().filter_map(Endpoint::poll_timeout).min();
+      let next_msg = self.bus.iter().map(|m| m.deliver_at).min();
+      if let Some(target) = [next_timer, next_msg].into_iter().flatten().min() {
+        if target > self.now {
+          self.now = target;
+        }
+        for i in 0..self.nodes.len() {
+          if self.nodes[i].poll_timeout().is_some_and(|d| d <= self.now) {
+            let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
+            self.nodes[i].handle_timeout(self.now, log, stable);
+          }
+        }
+      }
+      // Pump: drain outgoing → deliver → flush+drain every node EXCEPT `keep`, until quiescent at
+      // this timestamp or the window opens. Mirrors the `tick` inner loop.
+      let mut inner = 0u32;
+      loop {
+        inner += 1;
+        assert!(inner <= 10_000, "open_fsync_window inner loop livelock");
+
+        // Drain every non-isolated node's outgoing onto the bus (and discard events — this is a
+        // test-only setup pump; the real counters advance in `tick`).
+        let mut any_new = false;
+        for i in 0..self.nodes.len() {
+          let from = self.node_ids[i];
+          if self.isolated.contains(&from) {
+            while self.nodes[i].poll_message().is_some() {}
+          } else {
+            while let Some(out) = self.nodes[i].poll_message() {
+              any_new = true;
+              let (to, message) = Outgoing::into_parts(out);
+              self.bus.push_back(InFlight {
+                deliver_at: self.now,
+                from,
+                to,
+                message,
+              });
+            }
+          }
+          while self.nodes[i].poll_event().is_some() {}
+        }
+
+        let delivered = self.deliver_due();
+        if self.node_has_inflight(keep) {
+          return true;
+        }
+
+        // Flush + drain storage for every node EXCEPT `keep`, collecting any messages they produce
+        // straight onto the bus (so the loop can detect progress without a deferred iteration).
+        let storage_produced = self.flush_drain_collect_except(keep);
+        if self.node_has_inflight(keep) {
+          return true;
+        }
+
+        if !any_new && !delivered && !storage_produced {
+          break;
+        }
+      }
+    }
+    self.node_has_inflight(keep)
+  }
+
+  /// Flush + drain storage for every node whose id is not `keep`, pushing any messages the
+  /// completion handlers produce onto the bus. Returns whether any message was produced. Used by
+  /// [`open_fsync_window`](Self::open_fsync_window) so it can mirror `tick`'s storage step while
+  /// holding one node out of the flush. Isolated nodes' messages are discarded (as in `tick`).
+  fn flush_drain_collect_except(&mut self, keep: u64) -> bool {
+    for i in 0..self.nodes.len() {
+      if self.node_ids[i] == keep {
+        continue;
+      }
+      self.logs[i].flush();
+      self.stables[i].flush();
+      let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
+      self.nodes[i].handle_storage(self.now, log, stable);
+    }
+    let mut produced = false;
+    for i in 0..self.nodes.len() {
+      let from = self.node_ids[i];
+      if from == keep {
+        continue;
+      }
+      if self.isolated.contains(&from) {
+        while self.nodes[i].poll_message().is_some() {}
+      } else {
+        while let Some(out) = self.nodes[i].poll_message() {
+          produced = true;
+          let (to, message) = Outgoing::into_parts(out);
+          self.bus.push_back(InFlight {
+            deliver_at: self.now,
+            from,
+            to,
+            message,
+          });
+        }
+      }
+      while self.nodes[i].poll_event().is_some() {}
+    }
+    produced
+  }
+
   /// Propose `data` on the current leader; returns the assigned index (or `None` if no leader).
   pub fn propose(&mut self, data: &[u8]) -> Option<sailing_proto::Index> {
     let leader = self.leader()?;
@@ -487,8 +683,17 @@ impl Cluster {
 
     let ep = Endpoint::new(base.clone(), self.now, 0x5EED ^ id, LogSm::new());
     self.nodes.push(ep);
-    self.logs.push(MemLog::new());
-    self.stables.push(MemStable::new());
+    // Honor the cluster's store mode so a node added mid-run matches the rest (async clusters
+    // must not silently gain a synchronous store).
+    if self.async_mode {
+      self.logs.push(MemLog::new_async(0x5EED ^ id));
+      self
+        .stables
+        .push(MemStable::new_async(0x5EED_0000_0000 ^ id));
+    } else {
+      self.logs.push(MemLog::new());
+      self.stables.push(MemStable::new());
+    }
     self.configs.push(base);
     self.snapshot_installs.push(0);
     self.conf_changed.push(0);
@@ -537,6 +742,16 @@ impl Cluster {
       .map(|(i, _)| self.nodes[i].state_machine().applied().len())
       .min()
       .unwrap_or(0)
+  }
+
+  /// Async mode: flush every node's staged (in-flight) writes to durable state, modeling the
+  /// fsync for the in-flight window completing between driver iterations. No-op for sync stores
+  /// (their `flush` is a no-op) but only ever called when `async_mode` is set.
+  fn flush_all(&mut self) {
+    for i in 0..self.nodes.len() {
+      self.logs[i].flush();
+      self.stables[i].flush();
+    }
   }
 
   /// Drain storage completions for every node and collect any messages they produce.
@@ -738,6 +953,14 @@ impl Cluster {
       let delivered = self.deliver_due();
       if delivered {
         progressed = true;
+      }
+
+      // Async mode: flush each node's staged (in-flight) writes to durable state BEFORE
+      // draining completions — modeling the fsync for the in-flight window completing between
+      // driver iterations. A `crash()` that runs `discard_inflight()` WITHOUT a preceding
+      // `flush()` therefore loses exactly the staged window. No-op in sync mode.
+      if self.async_mode {
+        self.flush_all();
       }
 
       // Drain storage completions for every node (deferred acks produced here

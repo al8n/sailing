@@ -3,7 +3,7 @@
 #![deny(missing_docs)]
 
 mod store;
-pub use store::{MemLog, MemStable};
+pub use store::{MemLog, MemStable, MemStoreError, StorageFaults, StoreMode};
 
 mod sm;
 pub use sm::LogSm;
