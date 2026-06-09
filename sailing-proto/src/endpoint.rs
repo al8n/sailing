@@ -191,12 +191,14 @@ where
   /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
   /// is durable (crash-safe: we never compact before the snapshot write completes).
   ///
-  /// Completion contract: this field relies on the `StableStore` guarantee that every
-  /// `submit_snapshot` call eventually yields a `SnapshotWritten` completion. If that
-  /// completion never arrives (e.g. a store implementation that silently drops snapshots),
-  /// the `is_some()` guard in `maybe_snapshot` would permanently block future snapshots
-  /// (the node wedges). A store error poisons the node via `handle_storage`, and `restart`
-  /// resets this field to `None`.
+  /// Completion contract: the normal path clears this field when the matching `SnapshotWritten`
+  /// completion drains through `handle_storage`'s poll loop. If that completion is dropped or
+  /// coalesced by a store (so it never arrives), `handle_storage` instead RECONCILES this field
+  /// against the durable snapshot (review I9): once `StableStore::snapshot()` reports a persisted
+  /// snapshot whose `last_index >= up_to`, the blob is durable, the deferred compaction is
+  /// performed, and this field is cleared — so a missed completion can no longer wedge future
+  /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
+  /// this field to `None`.
   pending_compact: Option<(crate::OpId, Index)>,
   /// Log index of the most recently appended (not-yet-applied) `ConfChange` entry.
   ///
@@ -639,6 +641,30 @@ where
     }
   }
 
+  /// Liveness fix (review I1): re-send the persisted snapshot to a peer that is stuck in
+  /// `Snapshot` state.
+  ///
+  /// A peer in `Snapshot` state is unconditionally paused, so `maybe_send_append`
+  /// early-returns for it. It only leaves Snapshot state via `maybe_update(n >= pending)`,
+  /// which requires the snapshot to have been DELIVERED (a `SnapshotResp`/`AppendResp`). If
+  /// the single `InstallSnapshot` emitted by `maybe_send_append`'s compacted-hole branch is
+  /// lost, the leader would never retry and the follower would wedge forever. `on_heartbeat_resp`
+  /// calls this each heartbeat round for a peer still behind its pending snapshot index.
+  ///
+  /// Unlike the `maybe_send_append` branch this does NOT touch progress: the peer is already
+  /// `Snapshot(pending)` with the correct pending index, and re-sending the same blob is
+  /// idempotent for the follower's install (`on_install_snapshot` is staleness-guarded). If no
+  /// snapshot is persisted yet (shouldn't happen once compaction ran) this is a no-op.
+  fn resend_snapshot<S: StableStore<NodeId = I>>(&mut self, peer: I, stable: &S) {
+    if let Some((meta, data)) = stable.snapshot() {
+      let (term, me) = (self.term, self.config.id());
+      self.send(
+        peer,
+        Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, data)),
+      );
+    }
+  }
+
   fn maybe_advance_commit<L: LogStore>(&mut self, log: &L) {
     // Delegate to the Tracker's joint-quorum committed index. For a simple (non-joint)
     // config this is identical to the old sorted-match logic:
@@ -819,6 +845,28 @@ where
         }
       }
     }
+
+    // Reconcile a deferred compaction whose `SnapshotWritten` completion was missed or coalesced
+    // by the store (review I9): if the durable snapshot already covers `up_to`, the blob IS safely
+    // persisted, so the deferred compaction is safe even though we never observed the specific
+    // completion. Without this, a single dropped completion would wedge `pending_compact`, and the
+    // `is_some()` guard in `maybe_snapshot` would stop ALL future snapshots and compaction, growing
+    // the log unbounded.
+    //
+    // This is a NO-OP on the happy path: the poll-drain loop above clears `pending_compact` when the
+    // completion arrives, so the `if let` does not match. It can only fire when a completion was
+    // genuinely missed AND the durable snapshot already covers `up_to` — so it can never compact
+    // ahead of a durable snapshot (safety preserved). It runs before `maybe_snapshot` so a node that
+    // was wedged can snapshot again in this same call.
+    if let Some((_pid, up_to)) = self.pending_compact {
+      if let Some((meta, _data)) = stable.snapshot() {
+        if meta.last_index() >= up_to {
+          log.compact(up_to);
+          self.pending_compact = None;
+        }
+      }
+    }
+
     // After all completions are drained, check whether a new snapshot is warranted.
     self.maybe_snapshot(log, stable);
 
@@ -1893,6 +1941,26 @@ where
     }
     self.maybe_send_append(from, log, stable);
 
+    // Liveness fix (review I1): if this peer is still in Snapshot state and has NOT yet
+    // caught up to its pending snapshot index, RE-SEND the snapshot. The single
+    // `InstallSnapshot` emitted by maybe_send_append's compacted-hole branch may have been
+    // dropped; a Snapshot-state peer is unconditionally paused so maybe_send_append above
+    // sends it nothing, and it only leaves Snapshot state once the snapshot is delivered and
+    // acked (maybe_update). Without this resend a dropped InstallSnapshot wedges the follower
+    // forever. Re-send each heartbeat round until it acks past `pending` and `maybe_update`
+    // transitions it to Probe. (Read state/pending/match via an immutable borrow into locals,
+    // drop the borrow, then call resend_snapshot — mirrors on_append_resp's re-borrow.)
+    let resend = match self.tracker.progress(&from) {
+      Some(pr) => match pr.state() {
+        crate::ProgressState::Snapshot(pending) => pr.match_index() < pending,
+        _ => false,
+      },
+      None => false,
+    };
+    if resend {
+      self.resend_snapshot(from, stable);
+    }
+
     // ReadIndex Safe path: if the resp carries a context, record the ack and check quorum.
     let ctx = resp.context();
     if ctx.is_empty() {
@@ -2225,22 +2293,44 @@ where
         p.set_next_index(safe_next);
       }
       self.maybe_send_append(from, log, stable);
-    } else if pr.maybe_update(resp.match_index()) {
-      pr.become_replicate();
-      self.maybe_advance_commit(log);
-      self.apply_committed(log);
-      self.maybe_flush_deferred_reads(now, log, stable);
-      self.maybe_send_append(from, log, stable); // keep the pipeline moving if still behind
-      // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
-      if self.lead_transferee == Some(from) {
-        let peer_match = self
-          .tracker
-          .progress(&from)
-          .map(|p| p.match_index())
-          .unwrap_or(crate::Index::ZERO);
-        if peer_match == log.last_index() {
-          let (term, me) = (self.term, self.config.id());
-          self.send(from, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
+    } else {
+      // Capture the state BEFORE maybe_update so we can guard the Probe -> Replicate
+      // transition (review I5). etcd's MsgAppResp handler only switches Probe -> Replicate
+      // on the first successful ack.
+      let state_before = pr.state();
+      if pr.maybe_update(resp.match_index()) {
+        // etcd 3-way switch: only transition Probe -> Replicate here. For a peer ALREADY in
+        // Replicate, maybe_update already advanced match/next and freed the acked inflight
+        // slot via free_le; calling become_replicate() again would rewind next_index to
+        // match.next() and reset the whole inflight window, defeating the flow control and
+        // re-sending the in-flight tail on every ack. For Snapshot, maybe_update already
+        // performed the Snapshot -> Probe transition when the peer caught up past pending, so
+        // there is nothing to do here either.
+        match state_before {
+          crate::ProgressState::Probe => {
+            // Re-acquire progress (prior `pr` borrow ended at maybe_update above), mirroring
+            // the reject-branch re-borrow idiom.
+            if let Some(p) = self.tracker.progress_mut(&from) {
+              p.become_replicate();
+            }
+          }
+          crate::ProgressState::Replicate | crate::ProgressState::Snapshot(_) => {}
+        }
+        self.maybe_advance_commit(log);
+        self.apply_committed(log);
+        self.maybe_flush_deferred_reads(now, log, stable);
+        self.maybe_send_append(from, log, stable); // keep the pipeline moving if still behind
+        // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
+        if self.lead_transferee == Some(from) {
+          let peer_match = self
+            .tracker
+            .progress(&from)
+            .map(|p| p.match_index())
+            .unwrap_or(crate::Index::ZERO);
+          if peer_match == log.last_index() {
+            let (term, me) = (self.term, self.config.id());
+            self.send(from, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
+          }
         }
       }
     }
@@ -2329,14 +2419,28 @@ where
     // term(last_index) == last_term — the NEXT AppendEntries(prev=last_index) passes the
     // consistency check without a reject-loop.
     //
-    // The install updates in-memory state and the log read-view immediately (so commit/applied
-    // and the log stay mutually consistent for apply_committed). The snapshot blob is persisted
-    // via submit_snapshot (deferred completion). Local crash recovery does NOT rely on intra-call
+    // `restore` re-baselines the read-view IMMEDIATELY (synchronous), keeping the log mutually
+    // consistent with the commit/applied we just advanced (apply_committed reads it synchronously).
+    // The snapshot blob is persisted separately via submit_snapshot (deferred completion). The
+    // restore-vs-blob durability window is governed by the NORMATIVE durability-ordering contract on
+    // `LogStore::restore` (review I8): a disk-backed log must not make the re-baseline durable ahead
+    // of the blob, and otherwise must rely on restart re-sync. We do NOT rely on intra-call
     // ordering: if the process crashes before the blob is durable, restart-from-snapshot (M5-U3)
-    // finds no durable snapshot and the node re-syncs from the leader. Acking before the blob is
-    // durable is safe because meta.last_index <= leader.commit — those entries are already
-    // quorum-committed, so this ack cannot advance the cluster commit.
+    // finds no durable snapshot and re-syncs from the leader — and with commit persistence (review
+    // C1) the restart recovers the real commit watermark, so the re-sync resumes from the right
+    // point. Acking before the blob is durable is safe because meta.last_index <= leader.commit —
+    // those entries are already quorum-committed, so this ack cannot advance the cluster commit.
     log.restore(meta.last_index(), meta.last_term());
+
+    // Tripwire (review I8): the install just advanced commit/applied to `meta.last_index` and the
+    // re-baseline must have taken effect, so the log read-view now reflects the snapshot boundary:
+    // first_index == last_index + 1. This documents and cheaply checks the synchronous-read-view
+    // invariant that the deferred-blob durability contract depends on.
+    debug_assert_eq!(
+      log.first_index().get(),
+      meta.last_index().get() + 1,
+      "restore must re-baseline first_index to last_index + 1 (read-view consistent with commit/applied)"
+    );
 
     // Step 5: persist the snapshot for restart recovery (deferred; see comment above).
     let opid = self.mint_op_id();
@@ -3616,6 +3720,198 @@ mod tests {
     );
   }
 
+  /// Review I5 regression: a SINGLE-entry ack from a peer already in Replicate must NOT
+  /// rewind `next_index` or reset the in-flight window. The old code called
+  /// `become_replicate()` unconditionally on every successful ack, which rewound
+  /// `next_index` to `match.next()` and reset the whole `Inflights` window — so the next
+  /// `maybe_send_append` re-sent the already-in-flight tail and the window cap never tripped.
+  ///
+  /// Setup (window = 2, one entry per message so each send is observable):
+  ///   peer 2 in Replicate at match=1, next=2; propose 4 entries (indexes 2..=5).
+  ///   The window fills after entries 2 and 3 are pipelined (inflight = {2, 3}, next = 4);
+  ///   entries 4 and 5 are held back (paused). Now ack ONLY index 2.
+  ///
+  /// Expected (NEW): match advances to 2, slot for 2 frees, the peer STAYS in Replicate,
+  ///   next stays 4 (never rewinds), and exactly ONE *new* entry (index 4) is pipelined —
+  ///   the still-in-flight entry 3 is NOT re-sent. Final next = 5.
+  /// Old behaviour (BUG): become_replicate rewinds next to match.next() = 3 and clears the
+  ///   window, so the post-ack send re-transmits index 3 (already in flight) and next ends
+  ///   at 4 — strictly less than the NEW path's 5, and a wasted re-send of an in-flight entry.
+  #[test]
+  fn single_ack_does_not_rewind_replicate_window() {
+    use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+
+    // window = 2, exactly one entry per AppendEntries (max_size_per_msg = 1 byte; each
+    // command below is 1 byte) so every send carries a single, identifiable entry.
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_max_inflight_msgs(2)
+    .unwrap()
+    .with_max_size_per_msg(1);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 as leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Move peer 2 into Replicate by acking the no-op (index 1). This is the legitimate
+    // Probe -> Replicate transition (must still happen — preserved by the fix).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    assert!(
+      ep.tracker.progress(&2u64).unwrap().state().is_replicate(),
+      "peer 2 must be in Replicate after acking the no-op (Probe -> Replicate preserved)"
+    );
+
+    // Propose 4 entries (indexes 2..=5). With window = 2 the leader pipelines exactly two
+    // (indexes 2 and 3) and then pauses; indexes 4 and 5 are held back.
+    for i in 0u8..4 {
+      let _ = ep
+        .propose(
+          d,
+          &mut log,
+          &mut stable,
+          &bytes::Bytes::copy_from_slice(&[i]),
+        )
+        .unwrap();
+      ep.handle_storage(d, &mut log, &mut stable);
+    }
+    while ep.poll_message().is_some() {}
+
+    // Snapshot the pipeline position: window is full at {2, 3}, next sits at 4.
+    let next_before = ep.tracker.progress(&2u64).unwrap().next_index();
+    assert_eq!(
+      next_before,
+      Index::new(4),
+      "peer 2 should be pipelined to next=4 (entries 2,3 in flight) before the ack"
+    );
+
+    // Deliver a SINGLE-entry ack of just index 2 (the first in-flight index). This frees
+    // exactly one slot; entry 3 is STILL in flight.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(2), // ack ONLY index 2
+      )),
+    );
+
+    // Collect the AppendEntries (and their entry indexes) the leader emits after the ack.
+    let mut appends_after: usize = 0;
+    let mut min_sent_index = Index::new(u64::MAX);
+    let mut max_sent_index = Index::ZERO;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          if !ae.entries().is_empty() {
+            appends_after += 1;
+            for e in ae.entries() {
+              if e.index() < min_sent_index {
+                min_sent_index = e.index();
+              }
+              if e.index() > max_sent_index {
+                max_sent_index = e.index();
+              }
+            }
+          }
+        }
+      }
+    }
+
+    let next_after = ep.tracker.progress(&2u64).unwrap().next_index();
+    let match_after = ep.tracker.progress(&2u64).unwrap().match_index();
+
+    // (1) The peer stayed in Replicate (no spurious become_replicate / state churn).
+    assert!(
+      ep.tracker.progress(&2u64).unwrap().state().is_replicate(),
+      "peer 2 must remain in Replicate after a single-entry ack"
+    );
+
+    // (2) match_index advanced monotonically to the acked index.
+    assert_eq!(
+      match_after,
+      Index::new(2),
+      "match must advance to the acked index 2"
+    );
+
+    // (3) next_index is monotonic non-decreasing — it must NOT rewind below its pre-ack
+    //     value. The old unconditional become_replicate() rewound it to match.next() = 3.
+    assert!(
+      next_after >= next_before,
+      "next_index rewound: was {} now {} (the bug rewinds to match.next())",
+      next_before.get(),
+      next_after.get()
+    );
+
+    // (4) The window cap is respected: freeing one slot lets the leader send at most ONE
+    //     new entry. It must be a *fresh* entry (index 4), NOT a re-send of the entry that
+    //     is still in flight (index 3). The old code re-sent index 3 because the window was
+    //     reset and next rewound to 3.
+    assert!(
+      appends_after <= 1,
+      "expected at most one new AppendEntries after freeing one slot, got {appends_after}"
+    );
+    if appends_after > 0 {
+      assert!(
+        min_sent_index > Index::new(3),
+        "leader re-sent in-flight entry {} (still in flight) instead of a fresh entry; \
+         min_sent={} max_sent={}",
+        min_sent_index.get(),
+        min_sent_index.get(),
+        max_sent_index.get()
+      );
+    }
+
+    // (5) Net effect: the freed slot advanced the pipeline by exactly one fresh entry
+    //     (index 4), so next reaches 5. The bug leaves next stuck at 4 (re-sent 3 -> next 4).
+    assert_eq!(
+      next_after,
+      Index::new(5),
+      "after freeing one slot the leader should pipeline exactly one fresh entry (index 4), \
+       leaving next=5; the bug re-sends in-flight index 3 and leaves next=4"
+    );
+  }
+
   // ---- M4 Task 5: term-skip reject hint ----
 
   /// A divergent follower's reject carries a term hint that lets the leader skip a whole
@@ -4389,6 +4685,126 @@ mod tests {
     );
   }
 
+  /// Like `make_single_node_leader_with_entries`, but the stable store is armed to DROP the
+  /// `SnapshotWritten` completion of the threshold-crossing snapshot while still making the blob
+  /// durable. Models a store that coalesces/loses the completion (review I9). After this returns,
+  /// `pending_compact` is `Some`, the durable snapshot is readable, but no completion is queued.
+  fn make_single_node_leader_dropping_snapshot_completion(
+    n: usize,
+    threshold: usize,
+  ) -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::AsyncStable,
+  ) {
+    use crate::{Config, Instant};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_snapshot_threshold(threshold);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    // The threshold is crossed exactly once during the drive, so the only `submit_snapshot` is
+    // the one whose completion we want dropped — arming at the start is sufficient and precise.
+    stable.drop_next_snapshot_completion();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // self-elects
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable); // drain no-op
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    for i in 0..n {
+      let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
+      let _ = ep.propose(d, &mut log, &mut stable, &cmd).unwrap();
+      ep.handle_storage(d, &mut log, &mut stable);
+      while ep.poll_message().is_some() {}
+      while ep.poll_event().is_some() {}
+    }
+    (ep, log, stable)
+  }
+
+  /// Review I9: a dropped `SnapshotWritten` completion must NOT permanently wedge `pending_compact`
+  /// (and thus all future snapshots/compaction). `handle_storage` reconciles `pending_compact`
+  /// against the durable snapshot: once the persisted snapshot covers `up_to`, the deferred
+  /// compaction is performed and the field cleared, even though the completion was never seen.
+  ///
+  /// FAILS ON OLD CODE (no reconciliation): `pending_compact` stays `Some`, `first_index` never
+  /// advances, and the `is_some()` guard in `maybe_snapshot` wedges every future snapshot.
+  #[test]
+  fn dropped_snapshot_completion_reconciled_against_durable_snapshot() {
+    // threshold=3: after no-op (idx 1) + 3 entries (idx 2,3,4), applied=4, first_index=1 → gap=3,
+    // so a snapshot is submitted — but its completion is dropped by the armed store.
+    let (mut ep, mut log, mut stable) = make_single_node_leader_dropping_snapshot_completion(3, 3);
+
+    // Precondition: the snapshot blob IS durable, but pending_compact is stuck (no completion),
+    // and the log was NOT compacted (the deferred compact never ran).
+    assert!(
+      stable.snapshot().is_some(),
+      "the durable snapshot blob must be persisted even though the completion was dropped"
+    );
+    assert!(
+      ep.pending_compact().is_some(),
+      "pending_compact must still be set (the SnapshotWritten completion was dropped)"
+    );
+    assert_eq!(
+      log.first_index(),
+      Index::new(1),
+      "log must not be compacted yet (no completion drained the deferred compact)"
+    );
+
+    // Drive handle_storage again. There is NO SnapshotWritten completion to drain, so on OLD code
+    // this would be a no-op and the node would stay wedged. The I9 reconciliation must instead
+    // notice the durable snapshot covers `up_to`, perform the compaction, and clear pending_compact.
+    ep.handle_storage(crate::Instant::ORIGIN, &mut log, &mut stable);
+
+    assert!(
+      ep.pending_compact().is_none(),
+      "I9: pending_compact must be reconciled to None against the durable snapshot"
+    );
+    assert!(
+      log.first_index() > Index::new(1),
+      "I9: the deferred compaction must run via reconciliation (first_index advanced, got {:?})",
+      log.first_index()
+    );
+
+    // The node is no longer wedged: keep applying until the gap past the (new) first_index reaches
+    // the threshold again, and a NEW snapshot must fire (pending_compact set for the fresh point).
+    // After reconciliation first_index == 5 (compacted up_to=4); applied must reach 8 for gap >= 3.
+    let first_index_after_reconcile = log.first_index();
+    let d = crate::Instant::ORIGIN;
+    for i in 0..4usize {
+      let cmd = bytes::Bytes::copy_from_slice(&[100 + i as u8]);
+      let _ = ep.propose(d, &mut log, &mut stable, &cmd).unwrap();
+      ep.handle_storage(d, &mut log, &mut stable);
+      while ep.poll_message().is_some() {}
+      while ep.poll_event().is_some() {}
+    }
+    assert!(
+      ep.pending_compact().is_some(),
+      "I9: after reconciliation the node can snapshot again (not wedged)"
+    );
+    // And draining the (this time delivered) completion compacts further, proving end-to-end health.
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(
+      ep.pending_compact().is_none(),
+      "the follow-up snapshot's completion clears pending_compact normally"
+    );
+    assert!(
+      log.first_index() > first_index_after_reconcile,
+      "the follow-up compaction advances first_index further (got {:?})",
+      log.first_index()
+    );
+  }
+
   // ---- M5 Task 5: send InstallSnapshot to lagging follower ----
 
   /// Helper: build a 3-voter leader (node 1) with a compacted log.
@@ -4635,6 +5051,165 @@ mod tests {
         }
       }
     }
+  }
+
+  // ---- Review I1: heartbeat-driven snapshot resend (no wedge on dropped InstallSnapshot) ----
+
+  /// Helper: drive `make_leader_with_compacted_log` peer 2 into Snapshot state and DROP the
+  /// resulting InstallSnapshot (clear the outgoing queue), simulating the §11 message loss.
+  /// Returns the leader, log, stable, and the snapshot's pending index (= offset).
+  fn wedged_snapshot_follower(
+    offset: u64,
+    n_tail: usize,
+  ) -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::AsyncStable,
+    crate::Index,
+  ) {
+    use crate::Index;
+
+    let (mut ep, log, stable) = make_leader_with_compacted_log(offset, n_tail);
+
+    // Peer 2 far behind: next_index < first_index = offset + 1.
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
+      p.become_probe();
+      p.set_next_index(Index::new(2));
+    }
+
+    // First send: emits the InstallSnapshot and moves peer 2 into Snapshot(offset).
+    ep.maybe_send_append(2u64, &log, &stable);
+    assert!(
+      ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+      "peer 2 must be in Snapshot state after the first send"
+    );
+
+    // DROP the InstallSnapshot — simulate the loss by clearing the outgoing queue.
+    while ep.poll_message().is_some() {}
+
+    (ep, log, stable, Index::new(offset))
+  }
+
+  /// Review I1 regression: a HeartbeatResp from a peer still stuck in Snapshot state (its
+  /// InstallSnapshot was dropped) must RE-SEND the InstallSnapshot, carrying the same meta.
+  ///
+  /// FAILS-ON-OLD: without the resend hook the HeartbeatResp produces NO InstallSnapshot
+  /// (maybe_send_append early-returns on the paused Snapshot peer), so the follower wedges.
+  #[test]
+  fn heartbeat_resend_snapshot_to_wedged_follower() {
+    use crate::{Index, Instant, Message, Term};
+
+    let offset = 5u64;
+    let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
+    assert_eq!(pending, Index::new(offset));
+
+    // Peer 2 is still in Snapshot(offset) with match_index = 0 < pending: it has NOT received
+    // the snapshot. Deliver a HeartbeatResp (empty context — no ReadIndex involvement).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
+    );
+
+    // A NEW InstallSnapshot to peer 2 must be emitted (the resend), carrying the same meta.
+    let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+    let snap_msgs: std::vec::Vec<_> = msgs
+      .iter()
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+      .collect();
+    assert_eq!(
+      snap_msgs.len(),
+      1,
+      "a HeartbeatResp from a wedged Snapshot-state follower must RE-SEND exactly one InstallSnapshot"
+    );
+    let resent = match snap_msgs[0].message() {
+      Message::InstallSnapshot(s) => s,
+      _ => unreachable!(),
+    };
+    assert_eq!(
+      resent.snapshot().last_index(),
+      pending,
+      "the resent InstallSnapshot must carry the same snapshot meta (last_index = pending)"
+    );
+
+    // Peer 2 remains in Snapshot(pending) — the resend does not change progress state.
+    let pr = ep.tracker.progress(&2u64).unwrap();
+    assert!(pr.state().is_snapshot(), "peer 2 stays in Snapshot state");
+    if let crate::ProgressState::Snapshot(p) = pr.state() {
+      assert_eq!(
+        p, pending,
+        "pending snapshot index is unchanged by the resend"
+      );
+    }
+  }
+
+  /// Review I1: the resend STOPS once the follower acks past its pending snapshot index.
+  /// After a SnapshotResp (match >= pending) the peer leaves Snapshot state (→ Probe), so a
+  /// subsequent HeartbeatResp must NOT emit another InstallSnapshot (no infinite resend / spam).
+  #[test]
+  fn no_snapshot_resend_after_follower_catches_up() {
+    use crate::{Instant, Message, Term};
+
+    let offset = 5u64;
+    let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
+
+    // First heartbeat round while wedged: resend fires (sanity — same as the test above).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
+    );
+    let resent = core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+      .count();
+    assert_eq!(resent, 1, "resend fires while the follower is still wedged");
+
+    // The follower finally receives a snapshot and acks at pending (SnapshotResp success).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::SnapshotResp(crate::SnapshotResp::new(Term::new(1), 2u64, false, pending)),
+    );
+    // It must have left Snapshot state (maybe_update(pending) → Probe).
+    assert!(
+      !ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+      "after acking at pending the follower must leave Snapshot state"
+    );
+    while ep.poll_message().is_some() {} // drain anything the catch-up emitted
+
+    // A subsequent HeartbeatResp must NOT emit another InstallSnapshot (resend has stopped).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
+    );
+    let after = core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+      .count();
+    assert_eq!(
+      after, 0,
+      "once the follower has caught up, no further InstallSnapshot may be re-sent (no spam)"
+    );
   }
 
   // ---- M5-U2c: InstallSnapshot receive + SnapshotResp ----
@@ -8913,8 +9488,9 @@ mod tests {
   #[derive(Debug, Default)]
   struct FailSm;
 
-  /// Apply failure for `FailSm`. Implements `core::error::Error` via `std::error::Error`
-  /// (which IS `core::error::Error` under std) so it satisfies the `apply_committed` bound.
+  /// Apply failure for `FailSm`. Implements `core::error::Error` (available under both std and
+  /// no_std) so it satisfies the `apply_committed` bound without pulling in `std` — keeps the
+  /// test module compiling under `--no-default-features --features alloc`.
   #[derive(Debug)]
   struct FailSmError;
 
@@ -8924,7 +9500,7 @@ mod tests {
     }
   }
 
-  impl std::error::Error for FailSmError {}
+  impl core::error::Error for FailSmError {}
 
   impl crate::StateMachine for FailSm {
     type Command = Bytes;

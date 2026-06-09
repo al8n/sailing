@@ -96,6 +96,15 @@ pub trait LogStore {
   fn submit_append(&mut self, id: OpId, entries: &[Entry]);
 
   /// Drop entries at and below `up_to` (post-snapshot GC).
+  ///
+  /// **Durability ordering (NORMATIVE):** `compact` discards committed log entries, so an
+  /// implementation MUST NOT make the compaction durable before the snapshot blob covering
+  /// `up_to` (persisted via `StableStore::submit_snapshot`) is itself durable — otherwise a crash
+  /// in between loses entries that no durable snapshot replaces. The core already enforces this
+  /// ordering by deferring the `compact` call until the matching `SnapshotWritten` completion (or,
+  /// if that completion is missed, until `StableStore::snapshot()` reports a durable snapshot whose
+  /// `last_index >= up_to` — review I9); a disk-backed implementation must not weaken it by
+  /// flushing the compaction ahead of the blob.
   fn compact(&mut self, up_to: Index);
 
   /// Discard the entire log and re-baseline it on an installed snapshot.
@@ -120,13 +129,20 @@ pub trait LogStore {
   /// core to emit a spurious `AppendResp`, potentially advancing the leader's commit past
   /// what the follower has actually stored.
   ///
-  /// **Durability note (disk-backed implementations):** `restore` re-baselines the
-  /// in-memory read-view immediately. A persistent implementation that also updates
-  /// on-disk state must coordinate that durability with the snapshot blob written via
-  /// `StableStore::submit_snapshot` to avoid a crash window where the log is re-baselined
-  /// but no snapshot blob backs it. The safe alternative — relied upon by M5-U3 — is to
-  /// let restart re-sync from the leader if the snapshot blob was not yet durable at
-  /// crash time (the log's pre-restore image is gone, so the node re-requests a snapshot).
+  /// **Durability ordering (NORMATIVE — disk-backed implementations):** `restore` re-baselines
+  /// the log read-view IMMEDIATELY (synchronous, in-memory). A durable (disk-backed)
+  /// implementation **MUST NOT** make the re-baseline durable before the corresponding snapshot
+  /// blob (persisted separately via `StableStore::submit_snapshot`) is itself durable — otherwise
+  /// a crash in the window between the two leaves the log discarded with no snapshot to recover
+  /// from, and the node has neither its old entries nor a usable snapshot.
+  ///
+  /// An implementation that cannot guarantee this ordering MUST instead rely on **restart
+  /// re-sync**: on restart, if no durable snapshot is found, the node re-syncs the discarded
+  /// entries from the leader. This is safe because every discarded entry was below the leader's
+  /// commit (i.e. quorum-committed) at the time of the `restore`, so Leader Completeness
+  /// guarantees the leader still holds them and will re-replicate. (This is the path relied upon
+  /// by M5-U3.) Combined with commit persistence (review C1), a restart recovers the real commit
+  /// watermark and re-syncs correctly even when the blob was not yet durable at crash time.
   fn restore(&mut self, last_index: Index, last_term: Term);
 
   /// Drain the next completion, if any.

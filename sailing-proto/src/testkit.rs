@@ -272,6 +272,10 @@ pub(crate) struct AsyncStable {
   hard_state: HardState<u64>,
   completions: VecDeque<StableDone>,
   snapshot: Option<(SnapshotMeta<u64>, Bytes)>,
+  /// When set, the NEXT `submit_snapshot` persists the durable snapshot but DROPS its
+  /// `SnapshotWritten` completion (models a store that coalesces/loses the completion while
+  /// still making the blob durable). Used by the review-I9 reconciliation test.
+  drop_next_snapshot_completion: bool,
 }
 
 impl Default for AsyncStable {
@@ -280,6 +284,7 @@ impl Default for AsyncStable {
       hard_state: HardState::initial(),
       completions: VecDeque::new(),
       snapshot: None,
+      drop_next_snapshot_completion: false,
     }
   }
 }
@@ -291,6 +296,12 @@ impl AsyncStable {
       .with_term(term)
       .with_vote(vote)
       .with_commit(commit);
+  }
+
+  /// Arm the store so the next `submit_snapshot` persists the durable snapshot but drops its
+  /// `SnapshotWritten` completion (review I9). The blob remains readable via `snapshot()`.
+  pub(crate) fn drop_next_snapshot_completion(&mut self) {
+    self.drop_next_snapshot_completion = true;
   }
 }
 
@@ -308,8 +319,14 @@ impl StableStore for AsyncStable {
   }
 
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<u64>, data: Bytes) {
+    // The blob is always made durable (readable via `snapshot()`).
     self.snapshot = Some((meta, data));
-    self.completions.push_back(StableDone::SnapshotWritten(id));
+    // The completion is enqueued unless this submit is armed to drop it (review I9).
+    if self.drop_next_snapshot_completion {
+      self.drop_next_snapshot_completion = false;
+    } else {
+      self.completions.push_back(StableDone::SnapshotWritten(id));
+    }
   }
 
   fn snapshot(&self) -> Option<(SnapshotMeta<u64>, Bytes)> {
