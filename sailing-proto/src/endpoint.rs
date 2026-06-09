@@ -207,6 +207,15 @@ fn reconcile_restart_log(
   last_index: Index,
   boundary_term: Option<Result<Term, ()>>,
 ) -> RestartLogAction {
+  // Log-validity precondition (snapshot-independent): a valid log is contiguous, so
+  // `first_index <= last_index + 1` (equal when empty/baselined). A larger gap — e.g. a
+  // partially-persisted re-baseline that advanced `first_index` to `N + 1` while `last_index` stayed
+  // below `N` — is a structurally-impossible shape (store corruption); fail-stop. This also makes the
+  // `first_index == N + 1` branch below total: a valid log with `first_index == N + 1` necessarily
+  // has `last_index >= N`, so reaching that branch can never mean "behind the snapshot".
+  if first_index > last_index.next() {
+    return RestartLogAction::Poison(PoisonReason::OrphanedLog);
+  }
   let Some((n, t)) = snap else {
     // No durable snapshot: every committed entry must come from the log, so nothing may be compacted
     // away. A compacted log (`first_index > 1`) with no snapshot has lost its committed prefix.
@@ -219,26 +228,34 @@ fn reconcile_restart_log(
   if first_index > n.next() {
     // Compacted PAST the snapshot: `[N+1 .. first_index-1]` has no baseline — committed prefix gone.
     RestartLogAction::Poison(PoisonReason::OrphanedLog)
-  } else if first_index == n.next() {
-    // Already compacted exactly to the boundary; the log continues from the snapshot. Consistent.
-    RestartLogAction::None
   } else if last_index < n {
     // Log entirely below `N` (interrupted install re-baseline): it holds no entry above the snapshot,
     // so `committed_in_log <= last_index < N` — nothing committed is lost. Re-baseline.
     RestartLogAction::Restore(n, t)
   } else {
-    // `first_index <= N <= last_index`: the boundary entry is present; its term decides.
+    // The snapshot boundary `N` is materialized in the log — either as a live entry
+    // (`first_index <= N <= last_index`) or as the compacted baseline (`first_index == N + 1`, so
+    // `N == first_index - 1`). Both expose a readable boundary term, which we VALIDATE against the
+    // snapshot before trusting the log to continue from it: a disagreeing boundary means the log and
+    // snapshot are from different histories (corruption / stale snapshot). (The already-compacted
+    // `first_index == N + 1` case previously trusted this blindly — R19-F1.)
     match boundary_term {
       Some(Ok(bt)) if bt == t => {
-        // Boundary matches — the log is the node's OWN committed log (local-compaction window).
-        // Compact to drop the snapshotted prefix while PRESERVING the committed tail above `N`.
-        RestartLogAction::Compact(n)
+        // Boundary matches — the log is a valid continuation of the snapshot. If it is already
+        // compacted exactly to the boundary (`first_index == N + 1`) it is consistent (no mutation);
+        // otherwise compact to drop the snapshotted prefix while PRESERVING the committed tail above
+        // `N`.
+        if first_index == n.next() {
+          RestartLogAction::None
+        } else {
+          RestartLogAction::Compact(n)
+        }
       }
       Some(Ok(_)) => {
         // Boundary term MISMATCHES the snapshot. If a committed entry sits above `N`
         // (`committed_in_log > N`), the committed history would diverge at/below a committed point —
         // impossible in correct Raft → fatal corruption; poison rather than truncate the committed
-        // tail. Otherwise the divergent entries are uncommitted (interrupted install) — re-baseline.
+        // tail. Otherwise the divergent entries are uncommitted — re-baseline to the snapshot.
         if committed_in_log > n {
           RestartLogAction::Poison(PoisonReason::OrphanedLog)
         } else {
@@ -247,7 +264,7 @@ fn reconcile_restart_log(
       }
       _ => {
         // `Err` (fatal boundary term-read fault — never an excuse to truncate) or `None` (caller
-        // contract violation: `N` is provably in `[first_index, last_index]` here). Poison.
+        // contract violation: the boundary `N` is provably materialized in the log here). Poison.
         RestartLogAction::Poison(PoisonReason::LogTerm)
       }
     }
@@ -374,6 +391,16 @@ where
   /// AppendResp match is clamped to this so a follower never reports an index only in its
   /// visible-but-unflushed tail (persist-before-ack on the immediate-ack path too).
   durable_index: Index,
+  /// `Some((blob_opid, snapshot_index))` while a FOLLOWER snapshot install's blob is still in flight
+  /// (submitted, no `SnapshotWritten` yet). `on_install_snapshot` sets `durable_index` to the snapshot
+  /// boundary IMMEDIATELY (for the post-install ack — safe, since that boundary is already
+  /// quorum-committed), but the blob is NOT yet durable. So `durable_commit()` (the HardState-commit
+  /// fence) must NOT trust that boundary during this window — else a crash could leave
+  /// `HardState.commit` above durable storage, the exact state the fence excludes. Cleared on the
+  /// matching `SnapshotWritten`, or when `stable.snapshot()` evidence covers the index (a missed
+  /// completion must not wedge the fence). Only the follower-install path advances commit ahead of
+  /// durability, so only it arms this; the leader's own commit is always already durable.
+  snapshot_durability_pending: Option<(crate::OpId, Index)>,
   prng: Prng,
   /// Per-voter ballot: `true` = grant, `false` = reject. Absent IDs have not voted yet.
   /// Replaces the old `votes_granted: BTreeSet<I>` — the joint quorum needs the full
@@ -492,6 +519,7 @@ where
       applied: Index::ZERO,
       committed_persisted: Index::ZERO,
       durable_index: Index::ZERO,
+      snapshot_durability_pending: None,
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -630,6 +658,29 @@ where
     let id = self.next_op_id;
     self.next_op_id = self.next_op_id.next();
     id
+  }
+
+  /// The commit watermark that is actually backed by the DURABLE log: `min(commit, durable_index)`.
+  /// EVERY `HardState.commit` persist stamps THIS, never raw `self.commit`, so a crash can never leave
+  /// a durable commit above the durable log — a state restart would otherwise have to silently lower
+  /// (discarding the persisted commitment, hiding a durability-ordering bug). The leader's `commit` is
+  /// already durable (it counts only durable matches), so this fences only the follower window where
+  /// `commit` advances over a visible-but-not-yet-durable tail; that suffix is re-synced after a crash
+  /// (Leader Completeness), so persisting only the durable prefix loses no committed entry. Monotonic
+  /// non-decreasing (`commit` is monotonic; `durable_index` only ever resets upward-relative-to-commit
+  /// on §5.3 truncation and snapshot install), so it never regresses the persisted watermark.
+  fn durable_commit(&self) -> Index {
+    // While a follower snapshot install's blob is not yet durable, `durable_index` has already been
+    // advanced to the (not-yet-durable) snapshot boundary for the ack, so it cannot be trusted for the
+    // commit fence: cap at the last actually-persisted commit (`committed_persisted`), which is
+    // recoverable from the still-durable pre-install log. Cleared the moment the blob is durable.
+    if self.snapshot_durability_pending.is_some() {
+      return core::cmp::min(
+        self.committed_persisted,
+        core::cmp::min(self.commit, self.durable_index),
+      );
+    }
+    core::cmp::min(self.commit, self.durable_index)
   }
 
   /// Enter the permanent failed state (a fatal storage/apply error). Every subsequent
@@ -1219,9 +1270,9 @@ where
         .hard_state()
         .with_term(self.term)
         .with_vote(self.voted_for)
-        .with_commit(self.commit);
+        .with_commit(self.durable_commit());
       self.submit_write(stable, opid, hs);
-      self.committed_persisted = self.commit;
+      self.committed_persisted = self.durable_commit();
       self.pending.insert(
         opid,
         Pending::CastVote {
@@ -1327,6 +1378,10 @@ where
               self.pending_compact = None;
             }
           }
+          // A follower install's blob is now durable — un-fence the commit watermark.
+          if matches!(self.snapshot_durability_pending, Some((pid, _)) if pid == opid) {
+            self.snapshot_durability_pending = None;
+          }
         }
         Err(_) => {
           self.poison(PoisonReason::StablePoll);
@@ -1355,6 +1410,17 @@ where
         }
       }
     }
+    // Same fallback for the commit-fence: if a follower install's `SnapshotWritten` was missed but the
+    // durable snapshot already covers the pending boundary, the blob IS durable — un-fence so the
+    // commit watermark does not stay frozen at `committed_persisted` forever (which would force a
+    // re-sync of the post-snapshot committed tail after every crash).
+    if let Some((_pid, idx)) = self.snapshot_durability_pending {
+      if let Some((meta, _data)) = stable.snapshot() {
+        if meta.last_index() >= idx {
+          self.snapshot_durability_pending = None;
+        }
+      }
+    }
 
     // After all completions are drained, check whether a new snapshot is warranted.
     self.maybe_snapshot(log, stable);
@@ -1380,15 +1446,15 @@ where
     // holds those committed entries, so no committed entry is lost, just a brief re-sync.
     // No `Pending` entry: a commit-watermark write owes no ack (like the step-down /
     // become_candidate writes); its completion drains harmlessly through `on_stable_wrote`.
-    if !self.poisoned && self.commit > self.committed_persisted {
+    if !self.poisoned && self.durable_commit() > self.committed_persisted {
       let opid = self.mint_op_id();
       let hs = stable
         .hard_state()
         .with_term(self.term)
         .with_vote(self.voted_for)
-        .with_commit(self.commit);
+        .with_commit(self.durable_commit());
       self.submit_write(stable, opid, hs);
-      self.committed_persisted = self.commit;
+      self.committed_persisted = self.durable_commit();
     }
 
     // Invariant restore: a learner promoted to voter by an applied conf-change above may have been
@@ -1528,10 +1594,13 @@ where
       // The highest committed index actually present in the log — the watermark that gates whether a
       // discard would lose committed data.
       let committed_in_log = core::cmp::min(hs.commit(), log.last_index());
-      // Read the boundary term ONLY when the snapshot index is inside the log; otherwise its absence
-      // is decided structurally from first_index/last_index.
+      // Read the boundary term whenever the snapshot index `N` is MATERIALIZED in the log — either as
+      // a live entry (`first_index <= N <= last_index`) or as the compacted baseline
+      // (`first_index == N + 1`, i.e. `N == first_index - 1`, whose retained boundary term the log
+      // exposes for AppendEntries consistency). Otherwise `N` is not in the log and its absence is
+      // decided structurally. (`first_index <= N + 1` ⇔ `first_index <= n.next()`.)
       let boundary_term = snap_nt.and_then(|(n, _)| {
-        if log.first_index() <= n && n <= log.last_index() {
+        if log.first_index() <= n.next() && n <= log.last_index() {
           Some(log.term(n).map_err(|_| ()))
         } else {
           None
@@ -1579,6 +1648,7 @@ where
       // the handle_storage choke-point doesn't immediately re-persist an unchanged value.
       committed_persisted: commit,
       durable_index: log.last_index(),
+      snapshot_durability_pending: None,
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -1792,9 +1862,9 @@ where
           .hard_state()
           .with_term(self.term)
           .with_vote(None)
-          .with_commit(self.commit);
+          .with_commit(self.durable_commit());
         self.submit_write(stable, opid, hs);
-        self.committed_persisted = self.commit;
+        self.committed_persisted = self.durable_commit();
         // NOTE: a voter that steps down here on a higher-term RESPONSE (whose handler does not
         // re-arm) would be left without an election timer — `reconcile_election_timer`, run at the
         // end of this entry point, restores the invariant. We deliberately do NOT arm inline (that
@@ -2295,9 +2365,9 @@ where
       .hard_state()
       .with_term(self.term)
       .with_vote(self.voted_for)
-      .with_commit(self.commit);
+      .with_commit(self.durable_commit());
     self.submit_write(stable, opid, hs);
-    self.committed_persisted = self.commit;
+    self.committed_persisted = self.durable_commit();
     // Defer acting on the self-vote until it is DURABLE (persist-before-act, symmetric with the
     // follower `CastVote` path): `become_leader` fires from `on_stable_wrote` (single-node now, or
     // once peer votes arrive) only after this write's `StableDone::Wrote`.
@@ -3456,6 +3526,10 @@ where
     // Step 5: persist the snapshot for restart recovery (deferred; see comment above).
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta.clone(), is.data().clone());
+    // Fence the commit watermark until this blob is durable: `durable_index` was just advanced to the
+    // boundary (for the ack), but that boundary is not yet recoverable, so `durable_commit()` must not
+    // persist `HardState.commit` above it until `SnapshotWritten` (or `stable.snapshot()` evidence).
+    self.snapshot_durability_pending = Some((opid, meta.last_index()));
 
     // Step 6: emit the application event.
     self
@@ -8646,9 +8720,34 @@ mod tests {
         None,
         A::Poison(P::OrphanedLog),
       ), // first_index > N+1 → past
-      (Some((n, t)), i(5), i(6), i(9), None, A::None), // first_index == N+1 → consistent
+      (Some((n, t)), i(5), i(6), i(9), Some(Ok(t)), A::None), // first_index == N+1, boundary matches → consistent
       (Some((n, t)), i(3), i(1), i(3), None, A::Restore(n, t)), // last_index < N → behind (install)
-      (Some((n, t)), i(5), i(3), i(7), Some(Ok(t)), A::Compact(n)), // boundary matches → compaction
+      (Some((n, t)), i(5), i(3), i(7), Some(Ok(t)), A::Compact(n)), // boundary matches (fi<=N) → compaction
+      // R19-F1: first_index == N+1 must ALSO validate the retained baseline term.
+      (
+        Some((n, t)),
+        i(9),
+        i(6),
+        i(9),
+        Some(Ok(other)),
+        A::Poison(P::OrphanedLog),
+      ), // fi==N+1, boundary MISMATCH, committed tail above N → corruption
+      (
+        Some((n, t)),
+        i(5),
+        i(6),
+        i(9),
+        Some(Ok(other)),
+        A::Restore(n, t),
+      ), // fi==N+1, boundary MISMATCH, no committed tail → re-baseline
+      (
+        Some((n, t)),
+        i(5),
+        i(6),
+        i(9),
+        Some(Err(())),
+        A::Poison(P::LogTerm),
+      ), // fi==N+1, fatal boundary term-read
       (
         Some((n, t)),
         i(5),
@@ -8673,6 +8772,18 @@ mod tests {
         Some(Err(())),
         A::Poison(P::LogTerm),
       ), // fatal boundary term-read
+      // ── Log-validity precondition (structural gaps) ──
+      (
+        Some((n, t)),
+        i(0),
+        i(6),
+        i(4),
+        None,
+        A::Poison(P::OrphanedLog),
+      ), // first_index=N+1 but last_index<N → gap
+      (None, i(0), i(6), i(4), None, A::Poison(P::OrphanedLog)), // gap with no snapshot
+      // ── Empty log baselined exactly at N (first==last+1, NOT a gap) ──
+      (Some((n, t)), i(5), i(6), i(5), Some(Ok(t)), A::None), // snapshot at N, empty log above it, boundary matches
     ];
 
     for (idx, (snap, cil, fi, li, bt, expected)) in cases.iter().enumerate() {
@@ -8781,6 +8892,312 @@ mod tests {
       log.last_index(),
       Index::new(7),
       "the committed tail must NOT be truncated"
+    );
+  }
+
+  /// Regression (R19-F1 — the `first_index == N+1` compacted-baseline case must ALSO validate the
+  /// retained boundary term): a durable snapshot at `(5, 2)` with a log compacted exactly to baseline
+  /// 5 BUT whose retained `term(5)` is 3 (disagreeing with the snapshot) and a committed tail 6,7.
+  /// The pre-R19 code returned healthy (`None`) for `first_index == N+1` without reading `term(5)`,
+  /// so it would have replayed 6,7 on the WRONG snapshot history. Restart must read the baseline term,
+  /// see the mismatch over a committed tail, and poison.
+  ///
+  /// MUTATION: revert `reconcile_restart_log` to map `first_index == N+1` straight to `None` (without
+  /// the boundary-term match) → the node comes up healthy on a divergent baseline instead of poisoning.
+  #[test]
+  fn restart_compacted_baseline_boundary_mismatch_poisons() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_data = encode_count_snapshot(10);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(3), None, Index::new(7));
+
+    // Log compacted EXACTLY to baseline 5 (first_index == 6 == N+1) but with a retained boundary term
+    // of 3 — disagreeing with the snapshot's term 2 — plus a committed tail 6,7.
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(5), Term::new(3));
+    log.force_append(&[
+      Entry::new(
+        Term::new(3),
+        Index::new(6),
+        EntryKind::Normal,
+        encode_cmd(b"cmd6"),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(7),
+        EntryKind::Normal,
+        encode_cmd(b"cmd7"),
+      ),
+    ]);
+    assert_eq!(log.first_index(), Index::new(6), "compacted to N+1");
+    assert_eq!(
+      log.term(Index::new(5)).unwrap(),
+      Term::new(3),
+      "baseline term mismatches snapshot"
+    );
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "fi==N+1 with a mismatched baseline term over a committed tail must poison"
+    );
+    assert_eq!(ep.poison_reason().map(|r| r.as_str()), Some("orphaned_log"));
+    assert_eq!(
+      log.last_index(),
+      Index::new(7),
+      "committed tail not truncated"
+    );
+  }
+
+  /// Regression (R19-F2 — `HardState.commit` is fenced by the durable log): a follower commits over a
+  /// visible-but-not-yet-durable tail (`commit=7`, `durable_index=5`), then a higher-term message
+  /// steps it down and persists hard state. The persisted commit MUST be fenced to the durable log
+  /// (`durable_commit() = min(commit, durable_index) = 5`), never raw `self.commit=7` — otherwise a
+  /// crash leaves `HardState.commit > durable log`, which restart would have to silently lower
+  /// (discarding the persisted commitment).
+  ///
+  /// MUTATION: revert any commit-stamp site to `.with_commit(self.commit)` / `committed_persisted =
+  /// self.commit` → the persisted commit jumps to 7, above the durable log at 5.
+  #[test]
+  fn commit_persist_is_fenced_by_durable_index() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, RequestVote, Term,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = Instant::ORIGIN;
+
+    // Become a follower at term 2 with a durable log [1..=5], commit=5.
+    let mut e = std::vec::Vec::new();
+    for i in 1u64..=5 {
+      e.push(Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ));
+    }
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        e,
+        Index::new(5),
+      )),
+    );
+    ep.handle_storage(d, &mut log, &mut stable); // make [1..=5] durable → durable_index=5, committed_persisted=5
+    assert_eq!(ep.commit, Index::new(5));
+    assert_eq!(ep.durable_index, Index::new(5));
+
+    // Append [6,7] and commit to 7, but DO NOT run handle_storage — the tail stays visible-but-not-
+    // durable, so durable_index stays at 5 while commit advances to 7.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::new(5),
+        Term::new(2),
+        std::vec![
+          Entry::new(
+            Term::new(2),
+            Index::new(6),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(7),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+        ],
+        Index::new(7),
+      )),
+    );
+    assert_eq!(
+      ep.commit,
+      Index::new(7),
+      "commit advanced over the visible tail"
+    );
+    assert_eq!(ep.durable_index, Index::new(5), "tail not yet durable");
+    assert_eq!(
+      ep.durable_commit(),
+      Index::new(5),
+      "durable_commit fences to the durable log"
+    );
+
+    // A higher-term message steps the node down and persists hard state — the commit it persists must
+    // be the FENCED value (5), not raw self.commit (7).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(3),
+        3u64,
+        Index::new(7),
+        Term::new(2),
+        false,
+        false,
+      )),
+    );
+    assert_eq!(
+      ep.committed_persisted,
+      Index::new(5),
+      "persisted commit must be fenced to the durable log (5), not the over-committed 7"
+    );
+  }
+
+  /// Regression (R20-F1 — the commit fence must hold across snapshot install too): `on_install_snapshot`
+  /// advances `durable_index` to the snapshot boundary IMMEDIATELY (for the ack), but the blob is not
+  /// yet durable. The R19 fence trusts `durable_index`, so without `snapshot_durability_pending` it
+  /// would persist `HardState.commit = snapshot index` above durable storage — the exact F2 failure.
+  /// Here a follower at committed_persisted=3 installs a snapshot at index 10 (blob deferred); the
+  /// commit fence must stay at 3 until the blob is durable, then lift to 10.
+  ///
+  /// MUTATION: drop the `snapshot_durability_pending` cap in `durable_commit()` → the fence reports 10
+  /// while the blob is still in flight.
+  #[test]
+  fn install_snapshot_fences_commit_until_blob_durable() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+      SnapshotMeta, Term, conf::ConfState,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    let d = Instant::ORIGIN;
+
+    // Follower at term 2 with a durable log [1..=3], commit=3, committed_persisted=3.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![
+          Entry::new(
+            Term::new(2),
+            Index::new(1),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(2),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(3),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+        ],
+        Index::new(3),
+      )),
+    );
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert_eq!(ep.committed_persisted, Index::new(3));
+
+    // Install a snapshot at index 10 — commit/durable_index jump to 10, but the blob is DEFERRED
+    // (AsyncStable), so SnapshotWritten has not fired yet.
+    let meta = SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    );
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::InstallSnapshot(InstallSnapshot::new(
+        Term::new(2),
+        2u64,
+        meta,
+        encode_count_snapshot(10),
+      )),
+    );
+    assert_eq!(ep.commit, Index::new(10));
+    assert_eq!(ep.durable_index, Index::new(10));
+    assert!(
+      ep.snapshot_durability_pending.is_some(),
+      "blob in flight → fence armed"
+    );
+    assert_eq!(
+      ep.durable_commit(),
+      Index::new(3),
+      "commit fence stays at the pre-install durable commit while the blob is in flight"
+    );
+
+    // Make the blob durable (SnapshotWritten fires) → the fence lifts to the snapshot boundary.
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(
+      ep.snapshot_durability_pending.is_none(),
+      "blob durable → fence disarmed"
+    );
+    assert_eq!(
+      ep.durable_commit(),
+      Index::new(10),
+      "fence lifts to the snapshot boundary once the blob is durable"
     );
   }
 
