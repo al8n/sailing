@@ -5,7 +5,7 @@ use crate::{
   StateMachine, Term,
 };
 use bytes::Bytes;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
@@ -499,6 +499,29 @@ where
   /// grow it without bound), and cleared wholesale on any term change or leader change (a read
   /// forwarded to a now-stale leader must not block re-issuing it to the new one).
   forwarded_reads: ForwardedReads,
+  /// The leader's CURRENT CheckQuorum lease round (bumped on every heartbeat broadcast). Carried in
+  /// each `Heartbeat` and echoed in `HeartbeatResp`, it is what makes the LeaseBased read lease
+  /// FRESH: only a `HeartbeatResp` echoing this exact round counts toward renewing the lease, so a
+  /// stale or duplicated earlier-round response cannot keep an isolated leader's lease alive
+  /// (R26). Meaningful only while leader.
+  lease_round: u64,
+  /// The instant the CURRENT `lease_round`'s heartbeat was SENT (set in `broadcast_heartbeat` when the
+  /// round is bumped). The lease is renewed to `lease_round_start + election_timeout`, NOT
+  /// `response_receipt + election_timeout`: followers reset their election timers when they RECEIVED
+  /// this round (≈ its send time), so the lease must expire by then — measuring from a (possibly
+  /// delayed) response would over-extend the lease past the quorum's election window (R27).
+  lease_round_start: Instant,
+  /// Voters that have acked the CURRENT `lease_round` (the leader counts itself implicitly). Cleared
+  /// on every heartbeat broadcast (each round must be freshly re-confirmed). When this set plus self
+  /// forms a voter quorum, the read lease (`lease_valid_until`) is renewed.
+  lease_acks: BTreeSet<I>,
+  /// The read lease deadline for `ReadOnlyOption::LeaseBased`: the leader may serve a read from its
+  /// local commit WITHOUT a per-read round-trip while `now < lease_valid_until`. Renewed to
+  /// `lease_round_start + election_timeout` only when a quorum FRESHLY acks the current `lease_round` —
+  /// NOT from the (spoofable) `recent_active`/`election_deadline` CheckQuorum step-down signal, and NOT
+  /// from response-receipt time. `None` until the first fresh quorum confirmation. (The residual
+  /// clock-drift assumption common to all lease reads remains — see `do_leader_read`.)
+  lease_valid_until: Option<Instant>,
   /// Target of an in-progress leader transfer, or `None` if no transfer is active.
   ///
   /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
@@ -566,6 +589,10 @@ where
       // Fresh node: boot epoch 0. A later restart provides a strictly-higher epoch, so this
       // incarnation's forwarded-read tokens can never collide with a post-restart incarnation's.
       forwarded_reads: ForwardedReads::new(0),
+      lease_round: 0,
+      lease_round_start: now,
+      lease_acks: BTreeSet::new(),
+      lease_valid_until: None,
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -1032,8 +1059,16 @@ where
     self.pending_compact
   }
 
-  fn broadcast_heartbeat(&mut self, _now: Instant) {
-    let (term, me) = (self.term, self.config.id());
+  fn broadcast_heartbeat(&mut self, now: Instant) {
+    // Start a FRESH CheckQuorum lease round: bump the round, record its SEND instant, and clear the
+    // per-round ack set, so the read lease (`lease_valid_until`) is renewed only by HeartbeatResp
+    // echoing THIS round and is bounded by this round's send time (R26 + R27). A stale/duplicated
+    // earlier-round response then cannot keep an isolated leader's lease alive, and a delayed
+    // current-round response cannot extend it past the quorum's election window.
+    self.lease_round += 1;
+    self.lease_round_start = now;
+    self.lease_acks.clear();
+    let (term, me, lease_round) = (self.term, self.config.id(), self.lease_round);
     // Carry the last-pending-read context so followers can echo it back, giving the
     // leader the acks it needs to confirm outstanding safe reads.  An empty context
     // means there are no pending reads (the echo is harmless either way).
@@ -1056,7 +1091,9 @@ where
         .unwrap_or(Index::ZERO);
       self.send(
         peer,
-        Message::Heartbeat(crate::Heartbeat::new(term, me, peer_commit, ctx.clone())),
+        Message::Heartbeat(
+          crate::Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
+        ),
       );
     }
   }
@@ -1066,7 +1103,9 @@ where
   /// Used by the ReadIndex Safe path to kick off a dedicated heartbeat round that
   /// proves the leader is still reachable by a quorum.
   fn broadcast_heartbeat_with_ctx(&mut self, _now: Instant, ctx: Bytes) {
-    let (term, me) = (self.term, self.config.id());
+    // Carry the CURRENT lease round (do NOT bump — only the periodic `broadcast_heartbeat` opens a new
+    // round) so responses to this read-path heartbeat also count toward the lease.
+    let (term, me, lease_round) = (self.term, self.config.id(), self.lease_round);
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       let peer_commit = self
         .tracker
@@ -1075,7 +1114,9 @@ where
         .unwrap_or(Index::ZERO);
       self.send(
         peer,
-        Message::Heartbeat(crate::Heartbeat::new(term, me, peer_commit, ctx.clone())),
+        Message::Heartbeat(
+          crate::Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
+        ),
       );
     }
   }
@@ -1731,6 +1772,10 @@ where
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
       forwarded_reads: ForwardedReads::new(boot_epoch),
+      lease_round: 0,
+      lease_round_start: now,
+      lease_acks: BTreeSet::new(),
+      lease_valid_until: None,
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -2530,6 +2575,12 @@ where
     // be confirmed against the new term's commit index).
     self.read_only.reset(self.config.read_only());
     self.pending_reads.clear();
+    // R26: a fresh leader holds NO read lease until a quorum freshly acks its first CheckQuorum
+    // round. Reset the lease round/ack set and clear the deadline, so no LeaseBased read can be
+    // served until `on_heartbeat_resp` confirms a fresh current-round quorum.
+    self.lease_round = 0;
+    self.lease_acks.clear();
+    self.lease_valid_until = None;
     // Clear any in-progress leader transfer — becoming the leader means the transfer
     // target (us) has won; the previous leader's transfer state is irrelevant.
     self.lead_transferee = None;
@@ -2631,13 +2682,15 @@ where
       self.apply_committed(log);
     }
     let (term, me) = (self.term, self.config.id());
-    // Echo the heartbeat's context back to the leader.  This lets the leader count
-    // this follower's ack toward the quorum needed to confirm a pending safe read.
-    // An empty context is a normal heartbeat; the echo is harmless.
+    // Echo the heartbeat's context back to the leader (lets the leader count this follower's ack
+    // toward a pending safe read; empty context is a normal heartbeat) AND echo the lease round so the
+    // leader can confirm this is a FRESH response to its current CheckQuorum round (R26).
     let ctx = Bytes::copy_from_slice(hb.context());
     self.send(
       hb.leader(),
-      Message::HeartbeatResp(crate::HeartbeatResp::new(term, me, ctx)),
+      Message::HeartbeatResp(
+        crate::HeartbeatResp::new(term, me, ctx).with_lease_round(hb.lease_round()),
+      ),
     );
   }
 
@@ -2860,6 +2913,31 @@ where
     if !self.role.is_leader() {
       return;
     }
+    // R26: renew the LeaseBased read lease ONLY from a FRESH response to the CURRENT CheckQuorum round.
+    // A HeartbeatResp echoing `self.lease_round` proves `from` was reachable for THIS round — not via a
+    // stale or duplicated earlier-round message (which carries a different round and is ignored here).
+    // R27: bound the renewed lease by the round's SEND instant (`lease_round_start`), NOT this
+    // response's receipt time: followers reset their election timers when they RECEIVED this round
+    // (≈ its send instant), so the lease must expire by `lease_round_start + election_timeout`.
+    // Measuring from a (possibly delayed) response would extend the lease past the quorum's election
+    // window, letting an isolated leader serve a stale read. Computing from `lease_round_start` is
+    // idempotent per round, so a duplicate current-round response cannot extend the same round's
+    // deadline. The separate `recent_active`/`election_deadline` CheckQuorum step-down signal is
+    // unchanged.
+    if resp.lease_round() == self.lease_round {
+      self.lease_acks.insert(from);
+      let me = self.config.id();
+      let fresh: BTreeMap<I, bool> = self
+        .tracker
+        .ids()
+        .into_iter()
+        .filter(|id| self.tracker.is_voter(id))
+        .map(|id| (id, id == me || self.lease_acks.contains(&id)))
+        .collect();
+      if self.tracker.vote_result(&fresh).is_won() {
+        self.lease_valid_until = Some(self.lease_round_start + self.config.election_timeout());
+      }
+    }
     if let Some(pr) = self.tracker.progress_mut(&from) {
       pr.clear_probe_pause();
       // etcd FreeFirstOne: free one inflight slot so a Replicate peer whose in-flight window
@@ -3005,26 +3083,25 @@ where
         self.do_safe_read(now, context, from);
       }
       crate::ReadOnlyOption::LeaseBased => {
-        // LeaseBased is sound only when CheckQuorum is also enabled AND the current quorum-lease
-        // window is still open. CheckQuorum repurposes the leader's `election_deadline` as the lease
-        // timer: each window it runs a quorum heartbeat round and re-arms the deadline, so
-        // `election_deadline > now` is the proof that the leader still holds a fresh quorum lease —
-        // the precondition for skipping the per-read heartbeat. (Same `election_deadline > now`
-        // lease-live test used by the vote-lease guards.)
+        // LeaseBased serves a read from the local commit WITHOUT a per-read heartbeat round, but ONLY
+        // while the leader holds a FRESH quorum lease. The lease (`lease_valid_until`) is renewed in
+        // `on_heartbeat_resp` solely by responses echoing the CURRENT `lease_round` (R26): a stale or
+        // duplicated earlier-round response cannot renew it, so an isolated old leader's lease lapses
+        // and this path degrades instead of serving a stale read. (`election_deadline`/`recent_active`,
+        // the CheckQuorum STEP-DOWN signal, is deliberately NOT reused here — it is set by ANY inbound
+        // current-term message and is thus spoofable by stale/duplicated traffic.)
         //
-        // Two ways the lease can fail to hold, both of which MUST degrade to the Safe heartbeat
-        // round rather than confirm immediately:
-        //   - check_quorum disabled: the lease invariant is never maintained (a partitioned leader
-        //     would serve stale reads).
-        //   - lease window lapsed (`election_deadline <= now`): the deadline is due but
-        //     `handle_timeout` has not yet run for this `now`, so the lease is unproven. Confirming
-        //     here — before the CheckQuorum tick re-confirms quorum or steps the stale leader down —
-        //     could serve a read a majority has already moved past. The driver may call `read_index`
-        //     before `handle_timeout` for the same instant, so this path cannot assume the timer
-        //     fired; it must check the lease itself.
-        // Degrading is silent and always safe: the Safe path re-confirms quorum before emitting.
+        // Degrade to the Safe heartbeat round (which re-confirms a quorum before emitting) whenever:
+        //   - check_quorum is disabled (the lease invariant is never maintained), or
+        //   - the fresh lease has lapsed or never formed (`lease_valid_until` is `None` or `<= now`).
+        // Degrading is silent and always safe.
+        //
+        // RESIDUAL CAVEAT (irreducible for ALL lease reads, not closed here): bounded clock drift — if
+        // this leader's clock runs slow relative to the followers' election timers, a follower could
+        // time out and elect a new leader before this lease expires. Use `Safe` if that assumption may
+        // not hold.
         let use_lease =
-          self.config.check_quorum() && self.election_deadline.is_some_and(|d| d > now);
+          self.config.check_quorum() && self.lease_valid_until.is_some_and(|d| d > now);
         if use_lease {
           match from {
             None => {
@@ -12056,8 +12133,35 @@ mod tests {
     while ep.poll_event().is_some() {}
     while ep.poll_message().is_some() {}
 
+    // Establish a FRESH lease (R26): tick a heartbeat round (bumps the lease round), then a quorum
+    // HeartbeatResp echoing the CURRENT lease round renews `lease_valid_until`. The lease is no longer
+    // the spoofable `election_deadline`, so an immediate LeaseBased read requires this fresh confirmation.
+    let lease_at = ep.poll_timeout().expect("heartbeat timer armed");
+    ep.handle_timeout(lease_at, &mut log, &mut stable);
+    let lease_round = {
+      let mut lr = None;
+      while let Some(out) = ep.poll_message() {
+        if let Message::Heartbeat(hb) = out.message() {
+          lr = Some(hb.lease_round());
+        }
+      }
+      lr.expect("leader broadcast a heartbeat carrying a lease round")
+    };
+    ep.handle_message(
+      lease_at,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(
+        crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+          .with_lease_round(lease_round),
+      ),
+    );
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
     let ctx = bytes::Bytes::from_static(b"lease_read");
-    ep.read_index(d, &log, &stable, ctx.clone())
+    ep.read_index(lease_at, &log, &stable, ctx.clone())
       .expect("LeaseBased + check_quorum leader must accept the read");
 
     // No read heartbeats should have been sent for the read round. A read heartbeat carries a
@@ -12083,6 +12187,191 @@ mod tests {
     let rs = ev.unwrap_read_state_ref();
     assert_eq!(rs.index(), crate::Index::new(1));
     assert_eq!(rs.context().as_ref(), ctx.as_ref());
+  }
+
+  /// Regression (R26-F1 — the LeaseBased read lease is renewed ONLY by FRESH current-round responses):
+  /// a stale or duplicated `HeartbeatResp` echoing an EARLIER CheckQuorum round must NOT renew the
+  /// lease. Otherwise an isolated old leader could keep serving stale lease reads on delayed/duplicated
+  /// pre-partition traffic (unbounded under duplication), while a new leader commits newer state.
+  ///
+  /// MUTATION: drop the `resp.lease_round() == self.lease_round` guard in `on_heartbeat_resp` → the
+  /// stale earlier-round response renews the lease (`lease_acks` gains the peer, `lease_valid_until`
+  /// extends).
+  #[test]
+  fn stale_round_heartbeat_resp_does_not_renew_lease() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseBased)
+    .with_check_quorum(true);
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    // Elect node 1 leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Tick a heartbeat round and return (time, lease round token).
+    fn tick_round(
+      ep: &mut Endpoint<u64, crate::testkit::CountSm>,
+      log: &mut crate::testkit::VecLog,
+      stable: &mut crate::testkit::NoopStable,
+    ) -> (crate::Instant, u64) {
+      let at = ep.poll_timeout().expect("heartbeat timer armed");
+      ep.handle_timeout(at, log, stable);
+      let mut lr = None;
+      while let Some(out) = ep.poll_message() {
+        if let Message::Heartbeat(hb) = out.message() {
+          lr = Some(hb.lease_round());
+        }
+      }
+      (at, lr.expect("heartbeat carried a lease round"))
+    }
+    fn hb_resp(round: u64) -> Message<u64> {
+      Message::HeartbeatResp(
+        crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+          .with_lease_round(round),
+      )
+    }
+
+    // Round R1: a fresh quorum ack establishes the lease.
+    let (t1, r1) = tick_round(&mut ep, &mut log, &mut stable);
+    ep.handle_message(t1, &mut log, &mut stable, 2u64, hb_resp(r1));
+    assert!(
+      ep.lease_valid_until.is_some(),
+      "a fresh current-round quorum ack establishes the lease"
+    );
+
+    // Round R2: a new round opens — lease_acks is cleared and R1 is now STALE.
+    let (t2, r2) = tick_round(&mut ep, &mut log, &mut stable);
+    assert_ne!(r1, r2, "a new heartbeat round bumps the lease round");
+    assert!(ep.lease_acks.is_empty(), "a new round clears the ack set");
+    let lease_before = ep.lease_valid_until;
+
+    // A STALE HeartbeatResp echoing the OLD round R1 must be IGNORED for the lease.
+    ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp(r1));
+    assert!(
+      !ep.lease_acks.contains(&2u64),
+      "a stale (old-round) ack must not count toward the lease"
+    );
+    assert_eq!(
+      ep.lease_valid_until, lease_before,
+      "a stale ack must not renew the lease"
+    );
+
+    // A FRESH HeartbeatResp echoing the CURRENT round R2 renews the lease.
+    ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp(r2));
+    assert!(
+      ep.lease_acks.contains(&2u64),
+      "a fresh current-round ack counts toward the lease"
+    );
+    assert!(
+      ep.lease_valid_until.is_some_and(|d| d >= t2),
+      "a fresh quorum ack renews the lease"
+    );
+  }
+
+  /// Regression (R27-F1 — the lease deadline is bounded by the round's SEND instant, not the response
+  /// receipt time): a DELAYED current-round HeartbeatResp must renew the lease to
+  /// `lease_round_start + election_timeout`, NOT `response_receipt + election_timeout`. Followers reset
+  /// their election timers when they RECEIVED the round (≈ its send instant), so measuring from a
+  /// delayed response would extend the lease past the quorum's election window and let an isolated
+  /// leader serve a stale read.
+  ///
+  /// MUTATION: renew from `now` (response receipt) instead of `lease_round_start` → the lease extends
+  /// by the response delay.
+  #[test]
+  fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseBased)
+    .with_check_quorum(true);
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Tick a heartbeat round; capture its SEND instant and lease round token.
+    let t_send = ep.poll_timeout().expect("heartbeat timer armed");
+    ep.handle_timeout(t_send, &mut log, &mut stable);
+    let round = {
+      let mut lr = None;
+      while let Some(out) = ep.poll_message() {
+        if let Message::Heartbeat(hb) = out.message() {
+          lr = Some(hb.lease_round());
+        }
+      }
+      lr.expect("heartbeat carried a lease round")
+    };
+
+    // The quorum's HeartbeatResp echoing this round arrives MUCH later (delayed in transit).
+    let t_late = t_send + Duration::from_millis(500);
+    ep.handle_message(
+      t_late,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(
+        crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+          .with_lease_round(round),
+      ),
+    );
+
+    // The lease must be bounded by the SEND instant, NOT the (delayed) receipt instant.
+    assert_eq!(
+      ep.lease_valid_until,
+      Some(t_send + Duration::from_millis(1000)),
+      "lease must expire at round_start + election_timeout, not response_receipt + election_timeout"
+    );
+    assert_ne!(
+      ep.lease_valid_until,
+      Some(t_late + Duration::from_millis(1000)),
+      "a delayed response must not extend the lease by the response delay"
+    );
   }
 
   /// Test: LeaseBased without check_quorum degrades to Safe (all build profiles).

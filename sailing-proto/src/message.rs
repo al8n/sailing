@@ -256,24 +256,34 @@ impl<I: Copy> VoteResp<I> {
   }
 }
 
-/// Heartbeat (carries `context` for the ReadIndex round).
+/// Heartbeat (carries `context` for the ReadIndex round and `lease_round` for the CheckQuorum lease).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Heartbeat<I> {
   term: Term,
   leader: I,
   commit: Index,
   context: Bytes,
+  lease_round: u64,
 }
 
 impl<I: Copy> Heartbeat<I> {
-  /// Construct.
+  /// Construct. `lease_round` defaults to 0; the leader sets it via [`Self::with_lease_round`].
   pub fn new(term: Term, leader: I, commit: Index, context: Bytes) -> Self {
     Self {
       term,
       leader,
       commit,
       context,
+      lease_round: 0,
     }
+  }
+
+  /// Set the per-round CheckQuorum lease token (builder). The follower echoes it in
+  /// [`HeartbeatResp`] so the leader confirms a quorum responded to THIS round, not a stale one.
+  #[inline(always)]
+  pub fn with_lease_round(mut self, lease_round: u64) -> Self {
+    self.lease_round = lease_round;
+    self
   }
 
   /// The leader's term.
@@ -299,6 +309,12 @@ impl<I: Copy> Heartbeat<I> {
   pub fn context(&self) -> &[u8] {
     &self.context
   }
+
+  /// The per-round CheckQuorum lease token (0 when the lease is not in use).
+  #[inline(always)]
+  pub const fn lease_round(&self) -> u64 {
+    self.lease_round
+  }
 }
 
 /// Response to Heartbeat.
@@ -307,16 +323,26 @@ pub struct HeartbeatResp<I> {
   term: Term,
   from: I,
   context: Bytes,
+  lease_round: u64,
 }
 
 impl<I: Copy> HeartbeatResp<I> {
-  /// Construct.
+  /// Construct. `lease_round` defaults to 0; the follower echoes the heartbeat's round via
+  /// [`Self::with_lease_round`].
   pub fn new(term: Term, from: I, context: Bytes) -> Self {
     Self {
       term,
       from,
       context,
+      lease_round: 0,
     }
+  }
+
+  /// Echo the heartbeat's per-round CheckQuorum lease token (builder).
+  #[inline(always)]
+  pub fn with_lease_round(mut self, lease_round: u64) -> Self {
+    self.lease_round = lease_round;
+    self
   }
 
   /// The respondent's current term.
@@ -335,6 +361,12 @@ impl<I: Copy> HeartbeatResp<I> {
   #[inline(always)]
   pub fn context(&self) -> &[u8] {
     &self.context
+  }
+
+  /// The per-round CheckQuorum lease token echoed from the heartbeat (0 when not in use).
+  #[inline(always)]
+  pub const fn lease_round(&self) -> u64 {
+    self.lease_round
   }
 }
 
