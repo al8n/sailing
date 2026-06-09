@@ -92,7 +92,21 @@ pub trait LogStore {
   /// Entries in `range`, capped at roughly `max_bytes` (always at least one if non-empty).
   fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<&[Entry], Self::Error>;
 
-  /// Queue an append (truncating any conflicting suffix first). Durable on the matching `poll`.
+  /// Queue an append (truncating any conflicting suffix first). Durable on the matching `poll`
+  /// (a [`LogDone::Appended`] for this `id`).
+  ///
+  /// **Durability is prefix-ordered (NORMATIVE):** a Raft log is a sequential record, so making the
+  /// entry at index `N` durable implies every entry in `first_index()..=N` is also durable. A
+  /// [`LogDone::Appended`] completion for an append whose highest index is `N` therefore guarantees
+  /// the WHOLE durable prefix through `N` — not merely the entries this one `submit_append` carried.
+  /// The core relies on this for persist-before-ack: it tracks a watermark = the highest index any
+  /// `Appended` has reported, and a follower acks its match only up to that watermark. An
+  /// implementation that reported `Appended` for index `N` while some earlier index `< N` were still
+  /// crash-losable would let the leader count a phantom durable replica and commit an entry a crash
+  /// could lose (a non-quorum-durable commit). Completions MAY arrive in any order, but each one's
+  /// index MUST already be backed by a durable prefix. Disk-backed logs satisfy this automatically by
+  /// appending and flushing in index order; an implementation that flushes out of order MUST hold a
+  /// completion back until its prefix is durable.
   fn submit_append(&mut self, id: OpId, entries: &[Entry]);
 
   /// Drop entries at and below `up_to` (post-snapshot GC).

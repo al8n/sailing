@@ -128,6 +128,10 @@ pub enum PoisonReason {
   /// (a gap, a duplicate, or an out-of-range embedded index) — a correct leader always sends a
   /// contiguous suffix, so this is fatal corruption (malformed or version-skewed input).
   NonContiguousAppend,
+  /// A snapshot (install or restart) carried a `ConfState` that violates the core membership
+  /// invariants (empty voters, learner/voter overlap, bad `learners_next`, non-joint `auto_leave`).
+  /// Installing it verbatim would corrupt the membership tracker; a correct leader never sends one.
+  InvalidConfState,
 }
 
 impl PoisonReason {
@@ -147,6 +151,7 @@ impl PoisonReason {
       Self::SnapshotRestore => "snapshot_restore",
       Self::CommittedTruncation => "committed_truncation",
       Self::NonContiguousAppend => "non_contiguous_append",
+      Self::InvalidConfState => "invalid_conf_state",
     }
   }
 }
@@ -1052,6 +1057,19 @@ where
     stable: &mut S,
     rv: crate::RequestVote<I>,
   ) {
+    // INTENTIONAL (do NOT add a `tracker.is_voter(rv.candidate())` gate here): vote granting is
+    // membership-AGNOSTIC, matching etcd's `Step`. Election safety comes from one-vote-per-term
+    // (`voted_for`) + log-up-to-date (`log_ok`) + quorum overlap across configurations — a
+    // candidate's membership is not part of that proof. A removed node that has not yet applied its
+    // own removal can briefly campaign, but if it wins it necessarily holds every committed entry
+    // (it won on log freshness), cannot share a term with another leader (one-vote-per-term), and
+    // steps down the instant it applies its removal — no committed entry is lost. That disruption is
+    // already bounded by PreVote + the lease check (`in_lease`) + the promotable-campaign guard
+    // (`become_candidate`/`become_pre_candidate` require `is_voter(self)`), the same mitigations
+    // etcd uses. Gating on `tracker.is_voter` would instead couple vote-granting to APPLY-TIME
+    // membership (which lags): a freshly-added voter, in the window after its addition commits but
+    // before a peer applies it, would be wrongly rejected — breaking legitimate config-change
+    // elections. Membership-agnostic is the correct, golden choice.
     let Some((my_index, my_term)) = self.last_log(log) else {
       // Storage error reading our own last-log term: we cannot safely compare freshness, so poison
       // rather than fabricate `Term::ZERO` and risk granting a vote to a staler candidate.
@@ -1364,27 +1382,36 @@ where
     // <= meta.last_index, so the SM baseline comes from the snapshot; we then replay only
     // the durable post-snapshot committed tail.
     if let Some((meta, data)) = stable.snapshot() {
-      match <F::Snapshot as crate::Data>::decode(&data) {
-        Ok((_, snap)) => {
-          if fsm.restore(snap).is_err() {
-            poisoned = true;
-            poison_reason = Some(PoisonReason::SnapshotRestore);
-          } else {
-            applied = meta.last_index();
-            // Install the durable membership from the snapshot's ConfState.
-            // This supersedes the bootstrap seed from Config.voters.
-            // (Replaying ConfChange log entries to further refine membership is handled separately.)
-            tracker = crate::Tracker::from_conf_state(
-              &meta.conf().clone(),
-              meta.last_index(),
-              config.max_inflight_msgs(),
-              config.max_inflight_bytes(),
-            );
+      // Validate the durable snapshot's membership BEFORE decoding/restoring the SM or installing the
+      // tracker (which copies the ConfState verbatim). A corrupt-on-disk or version-skewed snapshot
+      // with an impossible membership poisons rather than recovering into an invalid configuration.
+      // Mirrors the `on_install_snapshot` Step-0 gate (validate conf before any other snapshot step).
+      if !meta.conf().is_valid() {
+        poisoned = true;
+        poison_reason = Some(PoisonReason::InvalidConfState);
+      } else {
+        match <F::Snapshot as crate::Data>::decode(&data) {
+          Ok((_, snap)) => {
+            if fsm.restore(snap).is_err() {
+              poisoned = true;
+              poison_reason = Some(PoisonReason::SnapshotRestore);
+            } else {
+              applied = meta.last_index();
+              // Install the durable membership from the snapshot's ConfState.
+              // This supersedes the bootstrap seed from Config.voters.
+              // (Replaying ConfChange log entries to further refine membership is handled separately.)
+              tracker = crate::Tracker::from_conf_state(
+                &meta.conf().clone(),
+                meta.last_index(),
+                config.max_inflight_msgs(),
+                config.max_inflight_bytes(),
+              );
+            }
           }
-        }
-        Err(_) => {
-          poisoned = true;
-          poison_reason = Some(PoisonReason::SnapshotDecode);
+          Err(_) => {
+            poisoned = true;
+            poison_reason = Some(PoisonReason::SnapshotDecode);
+          }
         }
       }
     }
@@ -1463,6 +1490,12 @@ where
     // the entry still became durable, so the watermark must rise here, once, unconditionally.
     // Otherwise the follower clamps a later duplicate/empty AppendEntries to a stale-low watermark
     // and under-acks its durable suffix, wedging replication.
+    //
+    // Taking the MAX of completed `upto`s is correct because `LogStore::submit_append` guarantees
+    // prefix-ordered durability (NORMATIVE): an `Appended` for index `upto` means the entire prefix
+    // through `upto` is durable, so this watermark is a true durable-PREFIX bound no matter what
+    // order completions arrive in — a later append cannot complete ahead of an earlier index that is
+    // still crash-losable.
     if let Some(upto) = self.inflight_append_upto.remove(&opid) {
       self.durable_index = self.durable_index.max(upto);
     }
@@ -3193,6 +3226,16 @@ where
     }
 
     // meta.last_index() > self.commit: proceed with installation.
+
+    // Step 0: validate the snapshot's membership BEFORE mutating any state. `Tracker::from_conf_state`
+    // (Step 7) copies the ConfState sets verbatim, so a malformed `meta.conf()` — empty voters,
+    // learner/voter overlap, bad `learners_next`, non-joint `auto_leave` — would install an impossible
+    // configuration (no quorum, vacuous votes). A correct leader never sends one; treat it as fatal
+    // corruption and poison BEFORE the SM restore / commit advance, leaving no partial install.
+    if !meta.conf().is_valid() {
+      self.poison(PoisonReason::InvalidConfState);
+      return;
+    }
 
     // Step 1: decode the SM snapshot. On failure, poison and return — leave NO partial state.
     let snap = match <F::Snapshot as crate::Data>::decode(is.data()) {
@@ -7839,6 +7882,198 @@ mod tests {
       ep.state_machine().count(),
       0,
       "SM must be empty after corrupt snapshot (no partial apply)"
+    );
+  }
+
+  /// Regression (R11-F1 — `on_install_snapshot` validates the snapshot `ConfState`): a
+  /// sender-authentic but malformed snapshot whose membership violates the core invariants (here a
+  /// learner that is also a voter) must poison the follower BEFORE any state mutation, not install an
+  /// impossible configuration into the tracker. `Tracker::from_conf_state` copies the sets verbatim,
+  /// so the boundary check is the only thing standing between malformed input and a corrupt
+  /// membership (no quorum, vacuous votes).
+  ///
+  /// MUTATION: drop the Step-0 `meta.conf().is_valid()` gate in `on_install_snapshot` → the follower
+  /// installs the impossible config and is not poisoned.
+  #[test]
+  fn install_snapshot_with_invalid_conf_state_poisons() {
+    use crate::{Config, Index, Instant, Message, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Malformed membership: node 1 is BOTH a voter and a learner. last_index=5 > commit=0 passes the
+    // staleness guard and reaches the Step-0 membership validation.
+    let bad_meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::new(
+        std::vec![1u64, 2u64],
+        std::vec![1u64],
+        std::vec![],
+        std::vec![],
+        false,
+      ),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(2),
+        2u64,
+        bad_meta,
+        bytes::Bytes::from_static(b"anything"),
+      )),
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "an invalid snapshot ConfState must poison the follower"
+    );
+    assert_eq!(
+      ep.poison_reason().map(|r| r.as_str()),
+      Some("invalid_conf_state")
+    );
+    // No partial install: neither commit nor the state machine advanced.
+    assert_eq!(
+      ep.commit_index(),
+      Index::ZERO,
+      "commit must not advance on a rejected snapshot"
+    );
+    assert_eq!(
+      ep.state_machine().count(),
+      0,
+      "no SM restore on a rejected snapshot"
+    );
+  }
+
+  /// Regression (R12-F2 — `ConfState::is_valid` rejects a `learners_next` ∩ incoming-voter overlap):
+  /// a malformed JOINT snapshot where a node is BOTH an incoming voter and staged for demotion
+  /// (`learners_next`) is impossible from a correct `Changer` (which removes a node from the incoming
+  /// half before staging it). Installed verbatim, `leave_joint` would later make that node a
+  /// simultaneous voter+learner and poison `ConfChangeApply` AFTER the snapshot was already restored.
+  /// The install gate must reject it up front via the tightened validator.
+  ///
+  /// MUTATION: drop the `|| self.voters.contains(id)` clause added to `ConfState::is_valid`'s
+  /// `learners_next` loop → the overlap is accepted and the follower installs it instead of poisoning.
+  #[test]
+  fn install_snapshot_with_learners_next_voter_overlap_poisons() {
+    use crate::{Config, Index, Instant, Message, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Joint config where node 3 is in the incoming voters AND staged in learners_next — impossible.
+    let bad_meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::new(
+        std::vec![1u64, 2u64, 3u64],
+        std::vec![],
+        std::vec![1u64, 2u64, 3u64],
+        std::vec![3u64],
+        true,
+      ),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(2),
+        2u64,
+        bad_meta,
+        bytes::Bytes::from_static(b"anything"),
+      )),
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a learners_next/incoming-voter overlap must poison the follower"
+    );
+    assert_eq!(
+      ep.poison_reason().map(|r| r.as_str()),
+      Some("invalid_conf_state")
+    );
+    assert_eq!(ep.commit_index(), Index::ZERO, "no commit advance");
+  }
+
+  /// Regression (R11-F1 — `restart` validates the durable snapshot `ConfState`): recovering from a
+  /// corrupt-on-disk or version-skewed snapshot whose membership is impossible (here empty voters)
+  /// must poison rather than recover into an unquorable configuration. The ConfState is checked
+  /// before the SM is even decoded, so the data itself is irrelevant.
+  ///
+  /// MUTATION: drop the `meta.conf().is_valid()` gate in `restart` → the node recovers with an empty
+  /// voter set and is not poisoned.
+  #[test]
+  fn restart_with_invalid_snapshot_conf_state_poisons() {
+    use crate::{Config, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    // Durable snapshot with an INVALID ConfState (empty voters); the data is never reached.
+    let bad_meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::<u64>::from_voters(std::vec![]),
+    );
+    stable.submit_snapshot(
+      crate::OpId::new(1),
+      bad_meta,
+      bytes::Bytes::from_static(b"anything"),
+    );
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(7));
+
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(5), Term::new(2));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "restart from an invalid snapshot ConfState must poison"
+    );
+    assert_eq!(
+      ep.poison_reason().map(|r| r.as_str()),
+      Some("invalid_conf_state")
+    );
+    assert_eq!(
+      ep.state_machine().count(),
+      0,
+      "no SM restore on an invalid-ConfState snapshot"
     );
   }
 

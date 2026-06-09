@@ -147,6 +147,49 @@ impl<I: NodeId> ConfState<I> {
   pub fn is_empty(&self) -> bool {
     self.voters.is_empty()
   }
+
+  /// Whether this is a valid, installable *live* configuration — the invariant a
+  /// snapshot-delivered or disk-recovered membership MUST satisfy before it is fed into the tracker
+  /// (which copies the sets verbatim, performing no checks of its own). These mirror the post-change
+  /// invariants the `Changer` enforces internally, applied here at the untrusted-input boundary so a
+  /// malformed snapshot cannot install an impossible membership (no quorum, vacuous votes, a broken
+  /// joint-leave):
+  ///
+  /// - at least one incoming voter (a live cluster must be able to form a quorum);
+  /// - learners disjoint from BOTH voter halves;
+  /// - every `learners_next` member is an outgoing voter and NOT an incoming voter (an
+  ///   outgoing-only staged demotion: it is demoted to learner on `leave_joint`);
+  /// - non-joint (`voters_outgoing` empty) ⇒ no `learners_next` and `auto_leave == false`.
+  ///
+  /// NOTE: the empty [`Default`](Self::default) (no voters) is a pre-bootstrap placeholder and is
+  /// intentionally NOT valid here — a snapshot of a live cluster always carries at least one voter.
+  pub fn is_valid(&self) -> bool {
+    if self.voters.is_empty() {
+      return false;
+    }
+    // Learners must not overlap either voter half.
+    for id in &self.learners {
+      if self.voters.contains(id) || self.voters_outgoing.contains(id) {
+        return false;
+      }
+    }
+    // `learners_next` are OUTGOING-ONLY staged demotions: a member leaves on `leave_joint` and
+    // becomes a learner, so it must be an outgoing voter AND must NOT also be an incoming voter — it
+    // cannot both remain a voter and be demoted. (The local `Changer` removes a node from the
+    // incoming half before staging it, so this overlap is impossible from a correct change; reject it
+    // here so a malformed snapshot can't smuggle a node that `leave_joint` would turn into a
+    // simultaneous voter+learner, poisoning `ConfChangeApply` after the snapshot is already installed.)
+    for id in &self.learners_next {
+      if !self.voters_outgoing.contains(id) || self.voters.contains(id) {
+        return false;
+      }
+    }
+    // Non-joint cleanliness: with no outgoing half there can be no staged demotions or auto-leave.
+    if !self.is_joint() && (!self.learners_next.is_empty() || self.auto_leave) {
+      return false;
+    }
+    true
+  }
 }
 
 // ─── ConfChangeType ───────────────────────────────────────────────────────────
@@ -516,6 +559,75 @@ mod tests {
   fn conf_state_empty() {
     let c = ConfState::<u64>::from_voters(vec![]);
     assert!(c.is_empty());
+  }
+
+  #[test]
+  fn conf_state_is_valid_accepts_legitimate_configs() {
+    // Simple (non-joint) config.
+    assert!(ConfState::from_voters(vec![1u64, 2u64, 3u64]).is_valid());
+    // Simple config with a learner disjoint from the voters.
+    assert!(ConfState::new(vec![1u64, 2u64], vec![3u64], vec![], vec![], false).is_valid());
+    // Joint config mid-change (incoming {1,2,3}, outgoing {1,2}), no staged demotions.
+    assert!(
+      ConfState::new(
+        vec![1u64, 2u64, 3u64],
+        vec![],
+        vec![1u64, 2u64],
+        vec![],
+        false
+      )
+      .is_valid()
+    );
+    // Joint config demoting an outgoing voter to a learner on leave (3 in outgoing + learners_next).
+    assert!(
+      ConfState::new(
+        vec![1u64, 2u64],
+        vec![],
+        vec![1u64, 2u64, 3u64],
+        vec![3u64],
+        true
+      )
+      .is_valid()
+    );
+  }
+
+  #[test]
+  fn conf_state_is_valid_rejects_malformed_configs() {
+    // Empty incoming voters — a live cluster cannot form a quorum.
+    assert!(!ConfState::<u64>::from_voters(vec![]).is_valid());
+    assert!(!ConfState::<u64>::default().is_valid());
+    // Learner overlaps an incoming voter.
+    assert!(!ConfState::new(vec![1u64, 2u64], vec![1u64], vec![], vec![], false).is_valid());
+    // Learner overlaps an outgoing voter.
+    assert!(
+      !ConfState::new(
+        vec![1u64, 2u64],
+        vec![3u64],
+        vec![3u64, 1u64],
+        vec![],
+        false
+      )
+      .is_valid()
+    );
+    // learners_next member is not an outgoing voter.
+    assert!(
+      !ConfState::new(vec![1u64, 2u64], vec![], vec![1u64, 2u64], vec![9u64], true).is_valid()
+    );
+    // Non-joint (no outgoing) but auto_leave set.
+    assert!(!ConfState::new(vec![1u64, 2u64], vec![], vec![], vec![], true).is_valid());
+    // Non-joint (no outgoing) but learners_next non-empty.
+    assert!(!ConfState::new(vec![1u64, 2u64], vec![], vec![], vec![3u64], false).is_valid());
+    // learners_next member is ALSO an incoming voter (cannot both stay a voter and be demoted).
+    assert!(
+      !ConfState::new(
+        vec![1u64, 2u64, 3u64],
+        vec![],
+        vec![1u64, 2u64, 3u64],
+        vec![3u64],
+        true
+      )
+      .is_valid()
+    );
   }
 
   #[test]
