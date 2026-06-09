@@ -32,3 +32,8 @@ pub use entry::{Entry, EntryKind};
 
 mod hard_state;
 pub use hard_state::HardState;
+
+mod message;
+pub use message::{
+  AppendEntries, AppendResp, Heartbeat, HeartbeatResp, Message, Outgoing, RequestVote, VoteResp,
+};
