@@ -114,6 +114,33 @@ impl<I: NodeId> Tracker<I> {
     self.voters.vote_result(|id| votes.get(&id).copied())
   }
 
+  /// Whether a voter quorum is currently active (i.e. `recent_active` is true for a quorum
+  /// of voters in each joint-config half).
+  ///
+  /// Uses the same `JointConfig::vote_result` machinery as `vote_result`: a voter not in
+  /// `progress` contributes `false`; the JOINT rule applies (both halves must have an active
+  /// majority). Returns `true` iff the result is `VoteResult::Won`.
+  pub fn quorum_active(&self) -> bool {
+    self
+      .voters
+      .vote_result(|id| Some(self.progress.get(&id).is_some_and(|p| p.recent_active())))
+      .is_won()
+  }
+
+  /// Reset every tracked member's `recent_active` to `false`, then set `leader_id`'s back to
+  /// `true` (the leader is always active to itself).
+  ///
+  /// Called at the start of each CheckQuorum window so that only peers heard from *in this
+  /// window* count toward the next `quorum_active` check.
+  pub fn reset_recent_active(&mut self, leader_id: I) {
+    for pr in self.progress.values_mut() {
+      pr.set_recent_active(false);
+    }
+    if let Some(pr) = self.progress.get_mut(&leader_id) {
+      pr.set_recent_active(true);
+    }
+  }
+
   // ── Membership predicates ──────────────────────────────────────────────────
 
   /// Whether `id` is a voter in either the incoming or outgoing joint-config half.

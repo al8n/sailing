@@ -38,6 +38,10 @@ pub struct Progress {
   state: ProgressState,
   inflight: Inflights,
   msg_app_flow_paused: bool,
+  /// Set when the leader hears from this peer in the current election window; reset each
+  /// CheckQuorum tick. Used by [`crate::Tracker::quorum_active`] to determine whether a
+  /// quorum of voters has been recently reachable.
+  recent_active: bool,
 }
 
 impl Progress {
@@ -50,6 +54,7 @@ impl Progress {
       state: ProgressState::Probe,
       inflight: Inflights::new(max_inflight_msgs, max_inflight_bytes),
       msg_app_flow_paused: false,
+      recent_active: false,
     }
   }
 
@@ -153,6 +158,19 @@ impl Progress {
   /// stalled Probe peer resumes on the next heartbeat round (M4 Task 6).
   pub fn clear_probe_pause(&mut self) {
     self.msg_app_flow_paused = false;
+  }
+
+  /// Whether this peer has been heard from in the current election window.
+  #[inline(always)]
+  pub const fn recent_active(&self) -> bool {
+    self.recent_active
+  }
+
+  /// Set or clear the `recent_active` flag (called on inbound messages from this peer while
+  /// we are the leader, and cleared by `Tracker::reset_recent_active` each CheckQuorum tick).
+  #[inline(always)]
+  pub fn set_recent_active(&mut self, v: bool) {
+    self.recent_active = v;
   }
 
   /// etcd `FreeFirstOne`: if this peer is in `Replicate` state with a full in-flight window

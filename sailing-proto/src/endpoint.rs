@@ -225,9 +225,27 @@ where
     self.heartbeat_deadline = None;
   }
 
+  /// Step down to Follower at the SAME term (no term bump): used by CheckQuorum when the
+  /// leader can no longer reach a quorum. (The U6 self-removal step-down is separate and
+  /// inlined in `apply_committed` — it disarms the election timer because a removed
+  /// non-voter must never campaign, the opposite of this helper.)
+  ///
+  /// Sets `role = Follower`, clears `leader` and `heartbeat_deadline`, and arms the election
+  /// timer so the node will eventually campaign again (with PreVote, non-disruptively).
+  fn step_down_to_follower(&mut self, now: Instant) {
+    self.role = Role::Follower;
+    self.leader = None;
+    self.heartbeat_deadline = None;
+    // The partitioned former leader arms the election timer; once it heals and
+    // pre-vote/real vote succeeds it can campaign again without disrupting the cluster.
+    self.arm_election_timer(now);
+  }
+
   fn arm_heartbeat_timer(&mut self, now: Instant) {
     self.heartbeat_deadline = Some(now + self.config.heartbeat_interval());
-    self.election_deadline = None;
+    // Callers that need to clear election_deadline (e.g. become_leader when check_quorum is
+    // false) do so explicitly; we do NOT touch election_deadline here so the CQ timer
+    // (set by become_leader when check_quorum is true) is not clobbered on each heartbeat.
   }
 
   fn send(&mut self, to: I, msg: Message<I>) {
@@ -815,6 +833,29 @@ where
         // stepping down, or persisting. The anti-disruption guarantee: a partitioned node's
         // pre-votes can never raise the cluster term.
       } else {
+        // CheckQuorum / PreVote follower lease: a follower that has heard from its current
+        // leader within the election timeout ignores a disruptive higher-term REAL vote
+        // request unless the campaign is a forced leader-transfer. (A higher-term PRE-vote
+        // already took the exemption branch above and is lease-checked separately inside
+        // `on_request_vote`.) This prevents a partitioned node that has been campaigning
+        // from raising the cluster term when it rejoins and followers still have a live
+        // leader (etcd inLease).
+        //
+        // The check: (check_quorum OR pre_vote) AND we know a leader AND our election timer
+        // is still healthy (i.e. we heard from the leader within the election timeout window).
+        // A leader_transfer campaign ALWAYS bypasses the lease (it's an authorized handoff).
+        if let Message::RequestVote(rv) = &msg {
+          let force = rv.leader_transfer();
+          let in_lease = (self.config.check_quorum() || self.config.pre_vote())
+            && self.leader.is_some()
+            && self.election_deadline.is_some_and(|d| d > now);
+          if !force && in_lease {
+            // We've heard from our leader recently; ignore this challenger.
+            // Do NOT adopt the term, do NOT grant, do NOT reply.
+            return;
+          }
+        }
+
         // All other higher-term messages: adopt term, step down to follower.
         self.term = msg.term();
         self.role = Role::Follower;
@@ -840,6 +881,17 @@ where
       }
       // Fall through: on_request_vote rejects (rv.term() < self.term fails the term_ok check).
     }
+
+    // CheckQuorum: while the leader, any inbound message from a known peer proves that peer
+    // is reachable. Mark it active so it counts toward the next quorum_active check.
+    // We do this AFTER the term pre-pass (so a higher-term message that steps us down doesn't
+    // mark a peer active on the stale term's leader) and only if we're still the leader.
+    if self.role.is_leader() {
+      if let Some(pr) = self.tracker.progress_mut(&from) {
+        pr.set_recent_active(true);
+      }
+    }
+
     #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for M7 variants
     match msg {
       Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
@@ -868,6 +920,21 @@ where
         if self.heartbeat_deadline.is_some_and(|d| d <= now) {
           self.broadcast_heartbeat(now);
           self.arm_heartbeat_timer(now);
+        }
+        // CheckQuorum: the leader uses the otherwise-idle election_deadline to run a
+        // periodic quorum-activity check every election_timeout. If fewer than a quorum of
+        // voters have been recently active (no message from them this window), the leader is
+        // likely partitioned from the majority — step down so we stop serving stale reads
+        // and allow a reachable node to be elected.
+        if self.config.check_quorum() && self.election_deadline.is_some_and(|d| d <= now) {
+          if !self.tracker.quorum_active() {
+            self.step_down_to_follower(now);
+          } else {
+            // Quorum still reachable: reset the activity window and re-arm for the next check.
+            let me = self.config.id();
+            self.tracker.reset_recent_active(me);
+            self.election_deadline = Some(now + self.config.election_timeout());
+          }
         }
       }
       _ => {
@@ -1224,6 +1291,10 @@ where
   ) {
     self.role = Role::Leader;
     self.leader = Some(self.config.id());
+    // Clear the candidate/follower election_deadline unconditionally; it will be re-armed
+    // below only if check_quorum is enabled. Without this clear, a CQ-disabled leader would
+    // inherit the stale candidate election_deadline (arm_heartbeat_timer no longer clears it).
+    self.election_deadline = None;
     self.arm_heartbeat_timer(now);
 
     // Re-initialize Progress for every tracked member via reset_progress, then mark
@@ -1245,6 +1316,17 @@ where
     // Self is fully caught up: advance own match_index to last.
     if let Some(p) = self.tracker.progress_mut(&self.config.id()) {
       p.maybe_update(last);
+    }
+
+    // CheckQuorum: mark the leader's own Progress as active (it is always reachable to
+    // itself) and arm the election_deadline for the first CheckQuorum window.
+    if self.config.check_quorum() {
+      if let Some(p) = self.tracker.progress_mut(&self.config.id()) {
+        p.set_recent_active(true);
+      }
+      // Use the base election_timeout (not randomized) for the CheckQuorum interval, matching
+      // etcd's behavior (checkQuorumActive is checked every electionTimeout ticks).
+      self.election_deadline = Some(now + self.config.election_timeout());
     }
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
@@ -5844,6 +5926,437 @@ mod tests {
     assert!(
       ep.voted_for.is_none(),
       "voted_for must remain None after granted pre-vote"
+    );
+  }
+
+  // ─── CheckQuorum (M7-U3) tests ────────────────────────────────────────────────────────────────
+
+  /// Helper: build a Config with check_quorum=true for a cluster of `voters` with 1s/100ms.
+  fn cq_config(id: u64, voters: std::vec::Vec<u64>) -> crate::Config<u64> {
+    crate::Config::try_new(
+      id,
+      voters,
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true)
+  }
+
+  /// Test CQ-1: A leader isolated from a quorum steps down when the CheckQuorum deadline fires.
+  ///
+  /// Setup: leader of a 3-node cluster. No `recent_active` peers (neither peer 2 nor peer 3
+  /// has sent any messages). At the CheckQuorum deadline, `quorum_active` is false → step down
+  /// to Follower (same term, leader=None).
+  ///
+  /// Conversely: with a quorum active (peer 2 marked), the leader stays and resets the window.
+  #[test]
+  fn check_quorum_isolated_leader_steps_down() {
+    let cfg = cq_config(1, std::vec![1u64, 2, 3]);
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Become leader via the normal election path.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // → Candidate
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(
+      ep.role().is_leader(),
+      "should be leader after winning election"
+    );
+    let leader_term = ep.term();
+
+    // Drain all outbound messages (heartbeats, AppendEntries).
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // The CheckQuorum election_deadline was armed in become_leader.
+    // It should be Some (check_quorum is true).
+    let cq_deadline = ep
+      .election_deadline
+      .expect("CQ election_deadline must be armed");
+
+    // No messages received from peers → recent_active is false for peers 2 and 3.
+    // Fire the CheckQuorum tick.
+    ep.handle_timeout(cq_deadline, &mut log, &mut stable);
+
+    // CRITICAL: step down at the SAME term (no term bump).
+    assert!(
+      ep.role().is_follower(),
+      "isolated leader must step down to Follower"
+    );
+    assert_eq!(
+      ep.term(),
+      leader_term,
+      "step-down must be same-term (no bump)"
+    );
+    assert!(
+      ep.leader().is_none(),
+      "leader field must be None after step-down"
+    );
+    // heartbeat_deadline must be cleared; election timer must be armed (for eventual re-campaign).
+    assert!(
+      ep.heartbeat_deadline.is_none(),
+      "heartbeat_deadline must be cleared after step-down"
+    );
+    assert!(
+      ep.election_deadline.is_some(),
+      "election timer must be armed after step-down"
+    );
+  }
+
+  /// Test CQ-2: With a quorum active, the leader stays and resets the window.
+  #[test]
+  fn check_quorum_active_quorum_stays_leader() {
+    let cfg = cq_config(1, std::vec![1u64, 2, 3]);
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Become leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    let cq_deadline = ep
+      .election_deadline
+      .expect("CQ election_deadline must be armed");
+
+    // Simulate a HeartbeatResp from peer 2 (marks peer 2 active). Use a time before the
+    // CheckQuorum deadline (base + election_timeout / 2 is safely before cq_deadline).
+    let before_cq = Instant::ORIGIN + Duration::from_millis(1);
+    ep.handle_message(
+      before_cq,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+
+    // Peer 2 active + self active = 2 of 3 = quorum. Fire CheckQuorum tick.
+    ep.handle_timeout(cq_deadline, &mut log, &mut stable);
+
+    // Must remain leader.
+    assert!(
+      ep.role().is_leader(),
+      "leader with active quorum must remain leader"
+    );
+    // The CheckQuorum window must have been reset (election_deadline re-armed for next window).
+    let new_cq_deadline = ep.election_deadline.expect("CQ deadline must be re-armed");
+    assert!(
+      new_cq_deadline > cq_deadline,
+      "re-armed CQ deadline must be in the future"
+    );
+    // After the reset, peers should be inactive again (except self).
+    assert!(
+      ep.tracker
+        .progress(&2u64)
+        .map(|p| !p.recent_active())
+        .unwrap_or(false),
+      "peer 2 recent_active must be reset to false"
+    );
+    assert!(
+      ep.tracker
+        .progress(&1u64)
+        .map(|p| p.recent_active())
+        .unwrap_or(false),
+      "self recent_active must remain true"
+    );
+  }
+
+  /// Test CQ-3: `recent_active` is set when the leader receives a message from a peer.
+  ///
+  /// A leader receiving an AppendResp/HeartbeatResp from a peer marks that peer active.
+  #[test]
+  fn check_quorum_recent_active_set_on_inbound_message() {
+    let cfg = cq_config(1, std::vec![1u64, 2, 3]);
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Become leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    // Drain storage (noop write for leader).
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Initially peer 2 is NOT active.
+    assert!(
+      !ep
+        .tracker
+        .progress(&2u64)
+        .map(|p| p.recent_active())
+        .unwrap_or(true),
+      "peer 2 must start inactive"
+    );
+
+    // Receive a HeartbeatResp from peer 2.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
+    );
+
+    // Peer 2 must now be active.
+    assert!(
+      ep.tracker
+        .progress(&2u64)
+        .map(|p| p.recent_active())
+        .unwrap_or(false),
+      "peer 2 must be marked active after HeartbeatResp"
+    );
+  }
+
+  /// Test CQ-4: Follower lease ignores a disruptive vote request.
+  ///
+  /// A follower with check_quorum=true, a live leader, and a healthy election timer (deadline
+  /// in the future) receives `RequestVote{term: self.term+2, leader_transfer: false}` → it
+  /// does NOT adopt the term, does NOT grant, term unchanged.
+  ///
+  /// With `leader_transfer=true` (forced) → it IS NOT ignored (proceeds normally: adopts
+  /// the higher term and steps down, would eventually vote or reject based on log).
+  #[test]
+  fn check_quorum_follower_lease_blocks_disruptive_vote() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true);
+
+    // "now" is well within the election timer window so deadline > now.
+    let base = Instant::ORIGIN;
+    let mut ep = Endpoint::new(cfg, base, 7, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // The follower must believe it has a live leader. Receive a Heartbeat from leader 1
+    // to set leader=Some(1) and arm the election timer.
+    ep.handle_message(
+      base,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::Heartbeat(crate::Heartbeat::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        bytes::Bytes::new(),
+      )),
+    );
+    // Drain the HeartbeatResp.
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    assert_eq!(ep.term(), Term::new(1));
+    assert_eq!(ep.leader(), Some(1u64));
+    // election_deadline must be in the future (healthy lease).
+    let deadline = ep.election_deadline.expect("election timer must be armed");
+    assert!(deadline > base, "election deadline must be in the future");
+
+    // --- Case A: non-forced RequestVote at higher term while lease is active ---
+    // Simulate a small time advance that is still within the lease window.
+    let now_in_lease = base + Duration::from_millis(50); // well before deadline
+    ep.handle_message(
+      now_in_lease,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(3), // term+2
+        3u64,
+        Index::ZERO,
+        Term::ZERO,
+        false, // real vote, NOT pre_vote
+        false, // NOT leader_transfer
+      )),
+    );
+
+    // CRITICAL: term must NOT be adopted (lease blocked the message before the step-down).
+    assert_eq!(
+      ep.term(),
+      Term::new(1),
+      "follower lease must block term adoption from disruptive vote"
+    );
+    // No response sent (we returned early).
+    assert!(
+      ep.poll_message().is_none(),
+      "no reply must be sent while lease blocks disruptive vote"
+    );
+
+    // --- Case B: forced (leader_transfer) RequestVote at higher term ---
+    // leader_transfer bypasses the lease; this IS processed normally.
+    ep.handle_message(
+      now_in_lease,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(5), // higher term
+        3u64,
+        Index::ZERO,
+        Term::ZERO,
+        false, // real vote
+        true,  // leader_transfer → bypass lease
+      )),
+    );
+
+    // The forced campaign bypasses the lease: the term IS adopted.
+    assert_eq!(
+      ep.term(),
+      Term::new(5),
+      "forced leader_transfer vote must bypass lease and adopt the higher term"
+    );
+  }
+
+  /// Test CQ-5: `check_quorum=false` default → no CheckQuorum tick, no lease ignore.
+  ///
+  /// With the default config (check_quorum=false):
+  /// - A leader's election_deadline is NOT armed (no CheckQuorum window).
+  /// - A follower does NOT block a higher-term vote request (no lease protection).
+  #[test]
+  fn check_quorum_disabled_preserves_m1_m6_behavior() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+
+    // --- Part 1: Leader has no CQ election_deadline when check_quorum=false ---
+    let cfg_leader = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    // check_quorum defaults to false
+    let mut ep = Endpoint::new(cfg_leader, Instant::ORIGIN, 1, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader(), "should be leader");
+    // With check_quorum=false, election_deadline must NOT be armed (arm_heartbeat_timer clears it).
+    assert!(
+      ep.election_deadline.is_none(),
+      "check_quorum=false: election_deadline must not be armed for leader"
+    );
+
+    // --- Part 2: Follower with no check_quorum does NOT block higher-term vote ---
+    let cfg_follower = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    // check_quorum=false AND pre_vote=false
+    let base = Instant::ORIGIN;
+    let mut ep2 = Endpoint::new(cfg_follower, base, 7, Noop);
+    let mut log2 = crate::testkit::NoopLog;
+    let mut stable2 = crate::testkit::NoopStable::default();
+
+    // Give the follower a live leader via Heartbeat.
+    ep2.handle_message(
+      base,
+      &mut log2,
+      &mut stable2,
+      1u64,
+      Message::Heartbeat(crate::Heartbeat::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        bytes::Bytes::new(),
+      )),
+    );
+    while ep2.poll_message().is_some() {}
+    while ep2.poll_event().is_some() {}
+    assert_eq!(ep2.term(), Term::new(1));
+    assert_eq!(ep2.leader(), Some(1u64));
+
+    // A higher-term real vote (non-forced) arrives while the lease *would* apply — but
+    // check_quorum=false AND pre_vote=false → lease is NOT active → term IS adopted.
+    let now_in_lease = base + Duration::from_millis(50);
+    ep2.handle_message(
+      now_in_lease,
+      &mut log2,
+      &mut stable2,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(3),
+        3u64,
+        Index::ZERO,
+        Term::ZERO,
+        false, // real vote
+        false, // not forced
+      )),
+    );
+    // Without check_quorum or pre_vote, the lease block is inactive → term IS adopted.
+    assert_eq!(
+      ep2.term(),
+      Term::new(3),
+      "check_quorum=false: higher-term vote must be processed normally (no lease block)"
     );
   }
 }
