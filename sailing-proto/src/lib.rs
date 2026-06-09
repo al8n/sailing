@@ -1,0 +1,21 @@
+//! Sans-I/O Raft consensus core. See `docs/superpowers/specs/2026-06-02-sailing-design.md`.
+//!
+//! `alloc` is the mandatory floor (Case A); `std` layers OS facilities on top. There is
+//! no no-alloc tier in v1, which is why `std = ["alloc", …]` rather than independent.
+#![cfg_attr(not(feature = "std"), no_std)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
+#![forbid(unsafe_code)]
+#![deny(missing_docs)]
+
+#[cfg(all(not(feature = "std"), feature = "alloc"))]
+extern crate alloc as std;
+#[cfg(feature = "std")]
+extern crate std;
+#[cfg(feature = "std")]
+extern crate alloc;
+
+#[cfg(not(feature = "alloc"))]
+compile_error!("sailing-proto requires the `alloc` feature (it is enabled transitively by `std`)");
+
+mod num;
+pub use num::{Index, Term};
