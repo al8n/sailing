@@ -3,7 +3,7 @@
 use crate::{LogSm, MemLog, MemStable};
 use core::time::Duration;
 use sailing_proto::{
-  ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, Term,
+  ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, ReadState, Term,
 };
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -62,6 +62,9 @@ pub struct Cluster {
   /// Per-node count of `Event::ConfChanged` events drained during `tick`.
   /// Monotonically incremented; never reset.
   conf_changed: Vec<ConfChangedCount>,
+  /// Per-node list of `ReadState`s confirmed via `Event::ReadState` during `tick`.
+  /// Appended monotonically; never cleared. Index into the outer Vec by node position.
+  read_states: Vec<Vec<ReadState>>,
 }
 
 impl Cluster {
@@ -104,6 +107,7 @@ impl Cluster {
     }
     let snapshot_installs = vec![0u64; n];
     let conf_changed = vec![0u64; n];
+    let read_states = vec![Vec::new(); n];
     Self {
       node_ids,
       node_idx,
@@ -118,6 +122,7 @@ impl Cluster {
       grants: BTreeMap::new(),
       snapshot_installs,
       conf_changed,
+      read_states,
     }
   }
 
@@ -173,6 +178,82 @@ impl Cluster {
   pub fn term_of(&self, id: u64) -> sailing_proto::Term {
     let i = self.node_idx[&id];
     self.nodes[i].term()
+  }
+
+  /// The maximum term across all live (non-removed) nodes.
+  ///
+  /// Used by PreVote tests to assert that an isolated node's campaigns did NOT inflate
+  /// the cluster term (with PreVote, the isolated node stays in PreCandidate without bumping
+  /// its real term).
+  pub fn max_term(&self) -> sailing_proto::Term {
+    self
+      .node_ids
+      .iter()
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .map(|(i, _)| self.nodes[i].term())
+      .max()
+      .unwrap_or(sailing_proto::Term::ZERO)
+  }
+
+  /// The id of the current leader — same as `leader()`, a convenience alias so tests
+  /// can write `cluster.leader_id()` alongside `term_of`, `max_term`, etc.
+  pub fn leader_id(&self) -> Option<u64> {
+    self.leader()
+  }
+
+  /// The role of node `id`.
+  pub fn role_of(&self, id: u64) -> sailing_proto::Role {
+    let i = self.node_idx[&id];
+    self.nodes[i].role()
+  }
+
+  /// All `ReadState`s confirmed for node `id` (ever), in confirmation order.
+  ///
+  /// Populated by the `tick` inner loop from `Event::ReadState` events drained off the
+  /// node's event queue. This list grows monotonically and is never cleared.
+  pub fn read_states_of(&self, id: u64) -> &[ReadState] {
+    let i = self.node_idx[&id];
+    &self.read_states[i]
+  }
+
+  /// Initiate a linearizable read on the current leader with the given context bytes.
+  ///
+  /// Calls `Endpoint::read_index` on the leader.  Returns `true` if there is a leader
+  /// (the call was made); `false` if no leader is available.
+  ///
+  /// The confirmed `ReadState` will appear in `read_states_of(leader)` once a
+  /// heartbeat-quorum round completes (for `ReadOnlySafe`) or immediately (for
+  /// `ReadOnlyLeaseBased`).
+  pub fn read_index(&mut self, context: &[u8]) -> bool {
+    let leader = match self.leader() {
+      Some(l) => l,
+      None => return false,
+    };
+    let i = self.node_idx[&leader];
+    let log = &mut self.logs[i];
+    let stable = &mut self.stables[i];
+    self.nodes[i].read_index(
+      self.now,
+      log,
+      stable,
+      bytes::Bytes::copy_from_slice(context),
+    );
+    true
+  }
+
+  /// Initiate a leader transfer: ask the current leader to transfer to `to`.
+  ///
+  /// Returns `Ok(())` if the leader accepted the transfer, or an error if there is no
+  /// leader / the transfer was refused (e.g. `to` is not a voter).
+  pub fn transfer_leader(&mut self, to: u64) -> Result<(), sailing_proto::TransferError<u64>> {
+    let leader = self
+      .leader()
+      .ok_or(sailing_proto::TransferError::NotLeader { leader: None })?;
+    let i = self.node_idx[&leader];
+    let log = &mut self.logs[i];
+    let stable = &mut self.stables[i];
+    self.nodes[i].transfer_leader(self.now, log, stable, to)
   }
 
   /// Isolate node `id`: drop all messages to and from it (a full two-way partition).
@@ -407,6 +488,7 @@ impl Cluster {
     self.configs.push(base);
     self.snapshot_installs.push(0);
     self.conf_changed.push(0);
+    self.read_states.push(Vec::new());
   }
 
   /// True if every non-removed node's applied `(index, command)` sequence agrees as a
@@ -515,6 +597,9 @@ impl Cluster {
         }
         if ev.is_conf_changed() {
           self.conf_changed[i] += 1;
+        }
+        if let sailing_proto::Event::ReadState(rs) = ev {
+          self.read_states[i].push(rs);
         }
       }
     }
@@ -638,6 +723,9 @@ impl Cluster {
           }
           if ev.is_conf_changed() {
             self.conf_changed[i] += 1;
+          }
+          if let sailing_proto::Event::ReadState(rs) = ev {
+            self.read_states[i].push(rs);
           }
         }
       }
