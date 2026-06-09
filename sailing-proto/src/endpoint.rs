@@ -5,7 +5,7 @@ use crate::{
   StateMachine, Term,
 };
 use bytes::Bytes;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, VecDeque};
 
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
@@ -166,6 +166,64 @@ enum Pending<I> {
   Campaign { term: crate::Term },
 }
 
+/// Cap on the number of distinct read contexts a follower may hold in-flight to its leader at once
+/// (the [`ForwardedReads`] set). A follower inserts a context before forwarding and removes it only
+/// on the matching `ReadIndexResp`; if the request or its response is dropped while the leader stays
+/// stable, distinct retry contexts would otherwise accumulate without bound. At the cap the oldest
+/// in-flight context is evicted FIFO. Kept independent of `max_inflight_msgs` (the leader's per-peer
+/// replication window) because the two limits are unrelated; 256 is the same generous default.
+const MAX_FORWARDED_READS: usize = 256;
+
+/// The read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
+/// awaiting a `ReadIndexResp` for — the follower-side mirror of the leader's `read_context_in_flight`
+/// guard. Backed by a `VecDeque` for insertion-order (FIFO) eviction: at [`MAX_FORWARDED_READS`] the
+/// oldest context is dropped so a stream of dropped reads with fresh contexts cannot grow it without
+/// bound. The cap is small, so a linear `contains` is cheaper than the bookkeeping a separate index
+/// would need.
+#[derive(Debug, Default)]
+struct ForwardedReads {
+  order: VecDeque<Bytes>,
+}
+
+impl ForwardedReads {
+  /// Whether `ctx` is currently in flight.
+  fn contains(&self, ctx: &Bytes) -> bool {
+    self.order.contains(ctx)
+  }
+
+  /// Record a NEW in-flight context, evicting the oldest if at capacity. The caller has already
+  /// verified `!contains(ctx)` (the duplicate-context guard), so this never inserts a duplicate.
+  fn push(&mut self, ctx: Bytes) {
+    if self.order.len() >= MAX_FORWARDED_READS {
+      self.order.pop_front();
+    }
+    self.order.push_back(ctx);
+  }
+
+  /// Remove `ctx`, returning whether it was present (its `ReadIndexResp` arrived, or it was
+  /// already evicted/never forwarded). Doubles as the already-completed guard in `on_read_index_resp`.
+  fn remove(&mut self, ctx: &Bytes) -> bool {
+    if let Some(pos) = self.order.iter().position(|c| c == ctx) {
+      self.order.remove(pos);
+      true
+    } else {
+      false
+    }
+  }
+
+  /// Drop every in-flight context (term change / leader loss): reads forwarded to a now-stale
+  /// leader must be re-issued to the new one, not block on a confirmation that will never come.
+  fn clear(&mut self) {
+    self.order.clear();
+  }
+
+  /// Current number of in-flight contexts. Test-only (bound assertion).
+  #[cfg(test)]
+  fn len(&self) -> usize {
+    self.order.len()
+  }
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -248,10 +306,11 @@ where
   /// awaiting a `ReadIndexResp` for. The follower-side mirror of the leader's
   /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
   /// `DuplicateContext` instead of being silently coalesced (or unboundedly re-forwarded), so the
-  /// originator is never left waiting on a confirmation the first forward already owns. Cleared on
-  /// the matching `ReadIndexResp`, and wholesale on any term change or leader change (a read
+  /// originator is never left waiting on a confirmation the first forward already owns. Removed on
+  /// the matching `ReadIndexResp`, FIFO-evicted at [`MAX_FORWARDED_READS`] (so dropped reads cannot
+  /// grow it without bound), and cleared wholesale on any term change or leader change (a read
   /// forwarded to a now-stale leader must not block re-issuing it to the new one).
-  forwarded_reads: BTreeSet<Bytes>,
+  forwarded_reads: ForwardedReads,
   /// Target of an in-progress leader transfer, or `None` if no transfer is active.
   ///
   /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
@@ -313,7 +372,7 @@ where
       pending_conf_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
-      forwarded_reads: BTreeSet::new(),
+      forwarded_reads: ForwardedReads::default(),
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -383,6 +442,17 @@ where
   #[inline]
   pub fn poll_event(&mut self) -> Option<Event<I, F::Response>> {
     self.events.pop_front()
+  }
+
+  /// Test-only: drain all pending events, returning whether ANY was an `Event::ReadState`.
+  /// Used by the poison / read-validation regressions to assert a read did (not) complete.
+  #[cfg(test)]
+  fn poll_all_events_any_read_state(&mut self) -> bool {
+    let mut any = false;
+    while let Some(e) = self.poll_event() {
+      any |= e.is_read_state();
+    }
+    any
   }
 
   /// The earliest deadline the current `(role, state)` will ACTUALLY service in
@@ -550,7 +620,18 @@ where
     }
   }
 
+  /// The single outbound choke-point. A poisoned node emits NOTHING: a fatal fault can strike
+  /// mid-handler (e.g. `apply_committed` poisons inside `on_heartbeat`/`on_append_entries`, after
+  /// which the handler would otherwise still queue a `HeartbeatResp`/`AppendResp`), and a poisoned
+  /// node that keeps replying to peers — acking entries it can no longer guarantee, granting reads it
+  /// cannot confirm — is a safety hazard, not merely a dead node. Suppressing centrally here covers
+  /// every message kind (HeartbeatResp/AppendResp/AppendEntries/VoteResp/ReadIndex(Resp)/…) without a
+  /// per-handler guard. `poison()` only sets a flag and emits no event, so this drops the message
+  /// silently; the driver surfaces the fault via `poison_reason()`.
   fn send(&mut self, to: I, msg: Message<I>) {
+    if self.poisoned {
+      return;
+    }
     self.outgoing.push_back(Outgoing::new(to, msg));
   }
 
@@ -1242,7 +1323,7 @@ where
       events: VecDeque::new(),
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
-      forwarded_reads: BTreeSet::new(),
+      forwarded_reads: ForwardedReads::default(),
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -2141,7 +2222,12 @@ where
       // falling back to a one-step decrement. (etcd's uniform findConflictByTerm path.)
       let last_index = log.last_index();
       let hint_index_raw = core::cmp::min(ae.prev_log_index(), last_index);
-      let hint_index = self.find_conflict_by_term(log, hint_index_raw, ae.prev_log_term());
+      // A fatal term-read inside the conflict walk poisons; short-circuit before sending — a
+      // poisoned node must not emit a reject hint computed from a fabricated index.
+      let Some(hint_index) = self.find_conflict_by_term(log, hint_index_raw, ae.prev_log_term())
+      else {
+        return;
+      };
       let hint_term = match self.log_term(log, hint_index) {
         Some(t) => t,
         None => return,
@@ -2337,11 +2423,7 @@ where
         match req_from {
           None => {
             // Local leader read — emit ReadState event.
-            self
-              .events
-              .push_back(crate::Event::ReadState(crate::ReadState::new(
-                index, context,
-              )));
+            self.emit_read_state(index, context);
           }
           Some(follower) => {
             // Forwarded read — reply ReadIndexResp to the originating follower.
@@ -2446,11 +2528,7 @@ where
             let (context, req_from, index) = st.into_parts();
             match req_from {
               None => {
-                self
-                  .events
-                  .push_back(crate::Event::ReadState(crate::ReadState::new(
-                    index, context,
-                  )));
+                self.emit_read_state(index, context);
               }
               Some(follower) => {
                 self.send(
@@ -2478,11 +2556,7 @@ where
         if use_lease {
           match from {
             None => {
-              self
-                .events
-                .push_back(crate::Event::ReadState(crate::ReadState::new(
-                  commit, context,
-                )));
+              self.emit_read_state(commit, context);
             }
             Some(follower) => {
               let (term, me2) = (self.term, me);
@@ -2574,7 +2648,9 @@ where
         if self.forwarded_reads.contains(&context) {
           return Err(crate::ReadIndexError::DuplicateContext);
         }
-        self.forwarded_reads.insert(context.clone());
+        // Record before forwarding (FIFO-evicting the oldest at capacity). `read_index` already
+        // returned early if poisoned, so this never desyncs from the suppressed `send` below.
+        self.forwarded_reads.push(context.clone());
         let (term, me) = (self.term, self.config.id());
         self.send(
           leader,
@@ -2627,35 +2703,66 @@ where
     self.do_leader_read(now, log, context, Some(from));
   }
 
-  /// Follower receives a `ReadIndexResp` from the leader.
-  fn on_read_index_resp(&mut self, resp: crate::ReadIndexResp<I>) {
-    let ctx = Bytes::copy_from_slice(resp.context());
-    // The forwarded read for this context is now confirmed; drop it from the in-flight set so the
-    // same context can be re-issued later.
-    self.forwarded_reads.remove(&ctx);
+  /// The single `ReadState`-emission choke-point. A poisoned node must NOT complete a read: its
+  /// commit/applied view is no longer trustworthy, so confirming a linearizable read against it
+  /// would hand the application a stale-or-wrong index. Every `Event::ReadState` push — the local
+  /// leader read (Safe single-node and quorum-confirmed paths, LeaseBased) and the follower's
+  /// validated `ReadIndexResp` completion — routes through here so the poison check lives in one
+  /// place. Mirrors `send`'s central emit-halt for the event channel.
+  fn emit_read_state(&mut self, index: Index, context: Bytes) {
+    if self.poisoned {
+      return;
+    }
     self
       .events
       .push_back(crate::Event::ReadState(crate::ReadState::new(
-        resp.index(),
-        ctx,
+        index, context,
       )));
+  }
+
+  /// Follower receives a `ReadIndexResp` from the leader.
+  ///
+  /// Only a FOLLOWER awaiting THIS forwarded read, from its CURRENT leader, may complete it: an
+  /// unsolicited / stale / wrong-leader / already-completed response is rejected without emitting a
+  /// `ReadState`. Without the membership check, a spoofed or duplicate resp could complete a read the
+  /// node never forwarded (or re-complete one it already did), surfacing a confirmation the
+  /// application would treat as linearizable. The `forwarded_reads.remove` doubles as the
+  /// already-completed guard: it returns `false` once the context has been consumed (or never
+  /// existed), so a delayed duplicate is dropped.
+  fn on_read_index_resp(&mut self, resp: crate::ReadIndexResp<I>) {
+    let ctx = Bytes::copy_from_slice(resp.context());
+    if self.role != Role::Follower
+      || self.leader != Some(resp.from())
+      || !self.forwarded_reads.remove(&ctx)
+    {
+      return;
+    }
+    self.emit_read_state(resp.index(), ctx);
   }
 
   /// Walk the leader's log downward from `index` until we find an entry whose term is
   /// `<= term` (or we hit the beginning). This mirrors etcd's `findConflictByTerm` and
   /// lets the leader skip a whole divergent term in one round-trip on reject.
-  fn find_conflict_by_term<L: LogStore>(&mut self, log: &L, mut index: Index, term: Term) -> Index {
+  ///
+  /// Returns `None` if a fatal term-read poisoned the node mid-walk: the hint index it would
+  /// otherwise return is fabricated (the search never completed), so callers must short-circuit
+  /// rather than mutate peer progress or send on it. A normal exit returns `Some(index)`.
+  fn find_conflict_by_term<L: LogStore>(
+    &mut self,
+    log: &L,
+    mut index: Index,
+    term: Term,
+  ) -> Option<Index> {
     while index > Index::ZERO {
-      // On a fatal term-read the node is poisoned; the hint is moot, so return the current index.
-      let Some(t) = self.log_term(log, index) else {
-        return index;
-      };
+      // A fatal term-read poisoned the node (inside `log_term`): propagate `None` so the caller
+      // short-circuits rather than acting on a fabricated index the incomplete search would return.
+      let t = self.log_term(log, index)?;
       if t <= term {
         break;
       }
       index = Index::new(index.get() - 1);
     }
-    index
+    Some(index)
   }
 
   fn on_append_resp<L: LogStore, S: StableStore<NodeId = I>>(
@@ -2680,8 +2787,12 @@ where
       let hint_index = resp.reject_hint_index();
       let hint_term = resp.reject_hint_term();
       let cur_next = pr.next_index();
-      // Compute the conflict index before re-borrowing self.tracker.progress mutably.
-      let conflict = self.find_conflict_by_term(log, hint_index, hint_term);
+      // Compute the conflict index before re-borrowing self.tracker.progress mutably. A fatal
+      // term-read mid-walk poisons and returns `None`; short-circuit before mutating peer progress
+      // or sending — a poisoned node must neither advance `next_index` nor emit an AppendEntries.
+      let Some(conflict) = self.find_conflict_by_term(log, hint_index, hint_term) else {
+        return;
+      };
       // etcd `Progress.MaybeDecrTo`: jump next_index to `min(rejected_prev, conflict+1)`, floored at
       // 1 — NOT a one-index decrement. The jump makes catch-up of a deeply-divergent follower O(terms)
       // round-trips instead of O(entries): a `(0,0)` hint (the follower's WHOLE log conflicts, so
@@ -10807,6 +10918,478 @@ mod tests {
       ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
       Ok(()),
       "context is re-issuable after its ReadIndexResp"
+    );
+  }
+
+  /// R3-F2: a node that POISONS mid-handler must emit NOTHING for the rest of that handler — no
+  /// `HeartbeatResp` (the central `send` halt) and no `ReadState`. Here a `Heartbeat` advances commit
+  /// over a durable-but-undecodable `Normal` entry; `apply_committed` poisons (`NormalEntryDecode`)
+  /// and the handler would otherwise still queue a `HeartbeatResp` to the leader.
+  ///
+  /// FAILS-ON-OLD: without the `send` guard the poisoned follower still replies a `HeartbeatResp`,
+  /// acking a heartbeat it can no longer honor.
+  #[test]
+  fn poison_after_apply_emits_nothing() {
+    use crate::{Entry, EntryKind, Heartbeat, Index, Message, PoisonReason, Term};
+    use core::time::Duration;
+
+    let cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // A durable Normal entry at index 1 whose data is a single byte: `<Bytes as Data>::decode`
+    // needs an 8-byte length prefix, so applying it fails → poison. Seed it directly (already
+    // durable) so the heartbeat only has to advance commit over it.
+    log.force_append(&[Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(&[0x01u8]),
+    )]);
+
+    // A heartbeat from leader 1 with commit=1 makes the follower advance commit to 1 and apply —
+    // the apply poisons. The handler then reaches its tail `send(HeartbeatResp)`, which must be
+    // suppressed by the central `send` poison-guard.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::Heartbeat(Heartbeat::new(
+        Term::new(1),
+        1u64,
+        Index::new(1),
+        bytes::Bytes::new(),
+      )),
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "follower must be poisoned by the undecodable committed entry"
+    );
+    assert_eq!(ep.poison_reason(), Some(PoisonReason::NormalEntryDecode));
+    // No HeartbeatResp (nor any other message) may leak out of a poisoned node.
+    assert!(
+      ep.poll_message().is_none(),
+      "a poisoned node must emit no message (no HeartbeatResp ack)"
+    );
+    // And no ReadState event slipped out either.
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "a poisoned node must complete no read (no ReadState event)"
+    );
+  }
+
+  /// R3-F1 (follower side): a fatal term-read inside `find_conflict_by_term` during an AppendEntries
+  /// reject walk must short-circuit — the node poisons and sends NO reject `AppendResp`.
+  ///
+  /// On the follower path the no-send guarantee is enforced jointly by FIX 1 (propagate `None`) and
+  /// the pre-existing `hint_term` guard (the index `find_conflict_by_term` fails on is the same index
+  /// the follower would re-read for `hint_term`, which fails again). This test locks in the
+  /// end-to-end behavior; the leader-side sibling test is the one that isolates FIX 1's
+  /// progress-mutation short-circuit.
+  #[test]
+  fn find_conflict_by_term_poison_propagation_follower() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Three durable (uncommitted) entries at term 5 (indices 1..=3).
+    let mut log = crate::testkit::FailTermLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(5),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(5),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(5),
+        Index::new(3),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+    ]);
+
+    // Send an INCONSISTENT AppendEntries that reaches the reject path WITHOUT poisoning in the
+    // consistency check: prev_log_index=3 reads term(3)=5 (NOT armed) which != prev_log_term=2 →
+    // inconsistent, no poison. The reject walk then starts at min(3, last=3)=3: term(3)=5 > 2 →
+    // step to index 2 → term(2) is ARMED → Err → poison → `find_conflict_by_term` returns None →
+    // the handler short-circuits before computing a hint term or sending a reject.
+    log.fail_term_at(Some(Index::new(2)));
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(5),
+        1u64,
+        Index::new(3),
+        Term::new(2),
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "fatal term-read in the reject walk must poison"
+    );
+    assert_eq!(ep.poison_reason(), Some(crate::PoisonReason::LogTerm));
+    assert!(
+      ep.poll_message().is_none(),
+      "no reject AppendResp may be sent on a fabricated conflict index"
+    );
+  }
+
+  /// R3-F1 (leader side): a fatal term-read inside `find_conflict_by_term` while handling a follower
+  /// reject must short-circuit — the leader must NOT mutate the peer's progress (no `next_index`
+  /// rewind, no Replicate→Probe flip) and must NOT send a follow-on AppendEntries.
+  ///
+  /// FAILS-ON-OLD: the old `-> Index` return handed back a fabricated conflict index, so the leader
+  /// computed `safe_next` (= `min(rejected_prev, conflict+1)`), called `become_probe()` +
+  /// `set_next_index()`, and `maybe_send_append` on a poisoned node. The peer here is driven to
+  /// Replicate at next_index=4 first, with the failure armed at the walk's FIRST probe (index 4): the
+  /// old path would rewind next to 3 and flip the state to Probe — both OBSERVABLE — whereas the fix
+  /// leaves the full `PeerProgress` untouched.
+  #[test]
+  fn find_conflict_by_term_poison_propagation_leader() {
+    use crate::{
+      AppendResp, Config, Entry, EntryKind, Index, Instant, Message, ProgressState, Term, VoteResp,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut leader = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::FailTermLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 (term 1, no-op at index 1).
+    let d = leader.poll_timeout().unwrap();
+    leader.handle_timeout(d, &mut log, &mut stable);
+    leader.handle_storage(d, &mut log, &mut stable);
+    leader.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(leader.role().is_leader());
+    leader.handle_storage(d, &mut log, &mut stable);
+
+    // Seed durable term-1 entries so the leader log is [1@1(noop), 2@1, 3@1, 4@1, 5@1].
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(4),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(5),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+    ]);
+
+    // Drive peer 2 to Replicate with match=3, next=4 via a SUCCESS ack at match_index=3.
+    leader.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(3),
+      )),
+    );
+    while leader.poll_message().is_some() {}
+    while leader.poll_event().is_some() {}
+    // The Replicate transition optimistically jumped next to last_index+1 = 6.
+    let before = leader.peer_progress(&2u64).expect("peer 2 tracked");
+    assert_eq!(
+      before.next_index,
+      Index::new(6),
+      "peer 2 at next_index=6 pre-reject"
+    );
+    assert!(
+      matches!(before.state, ProgressState::Replicate),
+      "peer 2 in Replicate pre-reject"
+    );
+
+    // Arm a fatal term-read at index 4 (the reject walk's FIRST probe: min(hint_index=4, last=5)=4),
+    // then deliver a reject hint (index=4, term=1). `find_conflict_by_term(log, 4, 1)` reads term(4)
+    // → Err → poison → `None` → the handler returns before mutating progress or sending. (OLD code
+    // would have set next_index = min(rejected_prev=5, conflict+1=5) = 5 and flipped to Probe.)
+    log.fail_term_at(Some(Index::new(4)));
+    leader.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        true,
+        Index::new(4),
+        Term::new(1),
+        Index::ZERO,
+      )),
+    );
+
+    assert!(
+      leader.is_poisoned(),
+      "fatal term-read in the leader reject walk must poison"
+    );
+    assert_eq!(leader.poison_reason(), Some(crate::PoisonReason::LogTerm));
+    let after = leader.peer_progress(&2u64).expect("peer 2 tracked");
+    assert_eq!(
+      after.next_index, before.next_index,
+      "peer next_index must not be rewound on a poisoned conflict walk"
+    );
+    assert!(
+      matches!(after.state, ProgressState::Replicate),
+      "peer state must not flip Replicate→Probe on a poisoned conflict walk"
+    );
+    assert!(
+      leader.poll_message().is_none(),
+      "no follow-on AppendEntries may be sent after a poisoned conflict walk"
+    );
+  }
+
+  /// R3-F3: a follower completes a forwarded read ONLY for a `ReadIndexResp` it actually awaits, from
+  /// its CURRENT leader. An unsolicited / wrong-leader resp emits NO `ReadState`; the legitimate resp
+  /// emits exactly one; a delayed duplicate (after the context cleared) emits nothing.
+  ///
+  /// FAILS-ON-OLD: `on_read_index_resp` removed-and-emitted unconditionally, so a spoofed or
+  /// duplicate resp would surface a `ReadState` the application would treat as linearizable.
+  #[test]
+  fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
+    use crate::{AppendEntries, Config, Index, Instant, Message, ReadIndexResp, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Establish leader = node 1 and forward a read with context "ctx".
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    assert_eq!(ep.leader(), Some(1u64));
+    while ep.poll_message().is_some() {}
+    let ctx = bytes::Bytes::from_static(b"ctx");
+    assert_eq!(
+      ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
+      Ok(())
+    );
+    while ep.poll_message().is_some() {}
+
+    // (a) Unsolicited context (never forwarded): no ReadState.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        1u64,
+        Index::new(5),
+        bytes::Bytes::from_static(b"never-forwarded"),
+      )),
+    );
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "an unsolicited context must not complete a read"
+    );
+
+    // (b) Right context but WRONG leader (from node 3, not our leader node 1): no ReadState, and the
+    // in-flight context must remain (so the legitimate resp can still complete it below).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        3u64,
+        Index::new(5),
+        ctx.clone(),
+      )),
+    );
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "a wrong-leader resp must not complete the read"
+    );
+
+    // (c) The legitimate resp from the current leader: exactly one ReadState.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        1u64,
+        Index::new(7),
+        ctx.clone(),
+      )),
+    );
+    let read_states: std::vec::Vec<_> = {
+      let mut v = std::vec::Vec::new();
+      while let Some(e) = ep.poll_event() {
+        if let crate::Event::ReadState(rs) = e {
+          v.push(rs);
+        }
+      }
+      v
+    };
+    assert_eq!(
+      read_states.len(),
+      1,
+      "the legitimate resp completes the read exactly once"
+    );
+    assert_eq!(read_states[0].index(), Index::new(7));
+
+    // (d) A delayed DUPLICATE of the same context (already completed/cleared): no second ReadState.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        1u64,
+        Index::new(7),
+        ctx.clone(),
+      )),
+    );
+    assert!(
+      !ep.poll_all_events_any_read_state(),
+      "a delayed duplicate resp must not re-complete the read"
+    );
+  }
+
+  /// R3-F4: a follower whose forwarded reads are never answered (request/response dropped) while the
+  /// leader stays stable must NOT grow `forwarded_reads` without bound: each new distinct context is
+  /// FIFO-bounded at `MAX_FORWARDED_READS`.
+  ///
+  /// FAILS-ON-OLD: the unbounded `BTreeSet` grew one entry per dropped read.
+  #[test]
+  fn forwarded_reads_is_bounded() {
+    use crate::{AppendEntries, Config, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Establish a stable leader (node 1) so every read FORWARDS (and is then "dropped" — we never
+    // deliver a ReadIndexResp).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    while ep.poll_message().is_some() {}
+
+    // Forward far more distinct contexts than the cap; every forward succeeds (distinct context),
+    // none is ever answered. The in-flight set must stay bounded at MAX_FORWARDED_READS.
+    let total = MAX_FORWARDED_READS * 3 + 17;
+    for i in 0..total {
+      let ctx = bytes::Bytes::copy_from_slice(&(i as u64).to_be_bytes());
+      assert_eq!(
+        ep.read_index(Instant::ORIGIN, &log, &stable, ctx),
+        Ok(()),
+        "each distinct context forwards"
+      );
+      while ep.poll_message().is_some() {}
+      assert!(
+        ep.forwarded_reads.len() <= MAX_FORWARDED_READS,
+        "forwarded_reads must never exceed the cap"
+      );
+    }
+    assert_eq!(
+      ep.forwarded_reads.len(),
+      MAX_FORWARDED_READS,
+      "the set saturates exactly at the cap"
     );
   }
 }
