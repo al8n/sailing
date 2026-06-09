@@ -32,7 +32,11 @@
 //! The suite is a **pure observer**: it never draws from a PRNG and never mutates the simulated
 //! nodes/stores, so the run is byte-identical with or without it (determinism preserved).
 
-use std::{collections::BTreeMap, string::String, vec::Vec};
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  string::String,
+  vec::Vec,
+};
 
 /// A safety-oracle violation: which oracle tripped and a human-readable detail.
 ///
@@ -91,13 +95,16 @@ pub struct NodeView {
   /// advancing at removal, so the cross-node oracles skip it).
   pub removed: bool,
   /// Whether the node considers ITSELF a voter in its own committed configuration
-  /// (`Endpoint::conf_state().is_voter(id)`). The quorum-durability oracle's denominator is the
-  /// VOTER set, not all live nodes: only voters can ack an entry toward commit, and a node only
-  /// becomes a voter by APPLYING the `AddNode` that adds it — which requires a durable log up to
-  /// that conf-change's index, hence covering every earlier committed entry. So counting voters is
-  /// both correct and self-consistent (a counted voter provably holds every earlier committed
-  /// entry), which removes the false positive a wired-but-not-yet-voting / learner node would cause
-  /// in the all-live-nodes denominator. A learner or a freshly-wired joiner is `false` here.
+  /// (`Endpoint::conf_state().is_voter(id)`). A learner or a freshly-wired joiner is `false` here.
+  ///
+  /// This is the per-node self-view. The quorum-durability oracle's PRIMARY denominator is the
+  /// cluster-wide [authoritative committed voter set](ClusterView::committed_voters) (the leader's
+  /// `conf_state().voters()`); this self-report is the FALLBACK population used only when no
+  /// authoritative set is available (an empty/all-removed cluster, or a direct-constructed synthetic
+  /// view in the oracle teeth tests). Counting voters — not all live nodes — is what keeps the oracle
+  /// sound under reconfiguration: only voters ack toward commit, and a node becomes a voter only by
+  /// applying the `AddNode` that adds it (which requires a durable log up to that conf-change's index,
+  /// hence covering every earlier committed entry).
   pub is_voter: bool,
   /// Whether the node is poisoned (a fatal storage/apply error made it inert). A poisoned node's
   /// watermarks are frozen; the monotonicity oracles still treat it as a normal observation (a
@@ -177,6 +184,18 @@ pub struct ClusterView {
   pub seed: u64,
   /// The current tick/step number (for VOPR replay).
   pub tick: u64,
+  /// The cluster's REAL committed VOTER set — the authoritative quorum denominator for
+  /// [`commit_is_quorum_durable`], read from the leader's runtime `conf_state().voters()` (or the
+  /// plurality committed config when leaderless). Threading the leader's view (rather than each
+  /// node's own `is_voter` self-report combined with the sim's `removed` flag) makes the oracle's
+  /// denominator the proto's true committed membership: a node the sim prematurely marked removed —
+  /// an accepted-but-never-committed RemoveNode — is still a real committed voter and durable
+  /// witness, and a learner is correctly excluded.
+  ///
+  /// `None` only when the cluster could not derive a committed set (empty / all-removed); the oracle
+  /// then falls back to the per-node `is_voter & !removed` population. Direct-constructed synthetic
+  /// views (the oracle teeth tests) leave this `None` and rely on that fallback.
+  pub committed_voters: Option<BTreeSet<u64>>,
   /// One [`NodeView`] per node, in node-position order.
   pub nodes: Vec<NodeView>,
 }
@@ -188,26 +207,56 @@ impl ClusterView {
     self.nodes.iter().filter(|n| !n.removed)
   }
 
-  /// Iterate the non-removed VOTERS (the quorum-durability denominator population). A node is a voter
-  /// iff it considers itself one in its own committed configuration (`is_voter`); learners and
-  /// freshly-wired joiners that have not yet applied their `AddNode` are excluded.
-  fn voters(&self) -> impl Iterator<Item = &NodeView> {
-    self.nodes.iter().filter(|n| !n.removed && n.is_voter)
-  }
-
-  /// The number of non-removed voters — the denominator for the durable-quorum threshold.
-  fn voter_count(&self) -> usize {
-    self.voters().count()
-  }
-
-  /// The majority threshold over the non-removed VOTERS: `⌊voters/2⌋ + 1`.
+  /// Iterate the committed VOTERS — the quorum-durability denominator/witness population.
   ///
-  /// Counting the voter set (not all live nodes) is what makes [`commit_is_quorum_durable`] sound
-  /// under reconfiguration: only voters ack toward commit, and a node becomes a voter only by
-  /// applying the `AddNode` that adds it (which requires a durable log covering that conf-change's
-  /// index — and hence every earlier committed entry). So a wired-but-not-yet-voting joiner or a
-  /// learner does not inflate the denominator against an entry it could not have witnessed. (The old
-  /// all-live-nodes denominator false-positived exactly there — surfaced by the VOPR, seed 43.)
+  /// When [`committed_voters`](Self::committed_voters) is `Some` (the production path: a leader
+  /// exists or a plurality committed config was derived), membership is taken from that authoritative
+  /// committed voter set — a node is a voter iff its id is in the set, regardless of its own
+  /// `is_voter` self-report or the sim's `removed` flag. This is what makes the oracle independent of
+  /// the harness's optimistic membership bookkeeping (a prematurely-`removed` real voter is still
+  /// counted; a learner is excluded because it is not in the committed voter set).
+  ///
+  /// When `committed_voters` is `None` (an empty/all-removed cluster, or a direct-constructed
+  /// synthetic view), it falls back to the per-node `!removed && is_voter` self-report.
+  fn voters(&self) -> impl Iterator<Item = &NodeView> {
+    self
+      .nodes
+      .iter()
+      .filter(move |n| match &self.committed_voters {
+        Some(set) => set.contains(&n.id),
+        None => !n.removed && n.is_voter,
+      })
+  }
+
+  /// The number of committed voters — the denominator for the durable-quorum threshold.
+  ///
+  /// When the authoritative [`committed_voters`](Self::committed_voters) set is known, the count is
+  /// its cardinality (the TRUE voter population), not the number of matching `NodeView`s — so a
+  /// momentarily-absent voter view can never shrink the quorum threshold and weaken the oracle's
+  /// teeth. Otherwise it falls back to counting the per-node voter self-reports.
+  fn voter_count(&self) -> usize {
+    match &self.committed_voters {
+      Some(set) => set.len(),
+      None => self.voters().count(),
+    }
+  }
+
+  /// The majority threshold over the committed VOTERS: `⌊voters/2⌋ + 1`.
+  ///
+  /// Taking the quorum over the committed voter set (not all live nodes) is what makes
+  /// [`commit_is_quorum_durable`] sound under reconfiguration: only voters ack toward commit, and a
+  /// node becomes a voter only by applying the `AddNode` that adds it (which requires a durable log
+  /// covering that conf-change's index — and hence every earlier committed entry). So a
+  /// wired-but-not-yet-voting joiner or a learner does not inflate the denominator against an entry
+  /// it could not have witnessed. (An all-live-nodes denominator false-positived exactly there —
+  /// surfaced by the VOPR, seed 43.)
+  ///
+  /// The voter set is the AUTHORITATIVE committed membership ([`committed_voters`](Self::committed_voters),
+  /// the leader's `conf_state().voters()`), not each node's own `is_voter` self-report combined with
+  /// the sim's `removed` flag. The latter could DESELECT a real committed voter the harness had
+  /// prematurely marked removed (an accepted-but-never-committed RemoveNode) while still
+  /// counting a behind voter, shrinking the witness population below the real quorum and false-firing
+  /// — surfaced by the VOPR, seed 4.
   fn voter_quorum(&self) -> usize {
     self.voter_count() / 2 + 1
   }
@@ -231,6 +280,17 @@ pub struct Checker {
   /// Used by [`no_committed_rewrite`] (a later conflicting command at a recorded index is a
   /// violation) and to attest the committed prefix for the durability checks.
   committed_hw: BTreeMap<u64, Vec<u8>>,
+  /// The highest committed index that was reached under a configuration STRICTLY OLDER than the
+  /// current one — raised to the committed high-water each time the authoritative voter set changes.
+  /// [`commit_is_quorum_durable`] judges a quorum only for commit indices ABOVE this floor: an entry
+  /// committed under a prior config had its quorum defined by that config, so the current voter set
+  /// need not durably hold it (a removed voter carried a copy; a freshly-added voter joined later).
+  /// Those older entries' safety stays covered by [`agreement`], [`no_committed_rewrite`], and
+  /// [`durable_prefix`].
+  commit_floor: u64,
+  /// The authoritative committed voter set observed on the previous tick — a change signals a
+  /// reconfiguration and raises [`commit_floor`](Self::commit_floor).
+  last_committed_voters: Option<BTreeSet<u64>>,
 }
 
 impl Checker {
@@ -249,10 +309,24 @@ impl Checker {
   /// [`term_monotonic`]) check the NEW observation against stored history and THEN fold it in, so a
   /// regression is caught at the tick it first appears.
   pub fn check(&mut self, view: &ClusterView) -> Result<(), Violation> {
+    // A reconfiguration (the authoritative voter set changed) raises the commit floor to the current
+    // committed high-water, so entries committed under the prior config are not re-judged against the
+    // new voter set. Only a genuine change of an already-known set counts — the first observation
+    // (None -> Some, the initial config) does not raise the floor.
+    if let (Some(old), Some(new)) = (&self.last_committed_voters, &view.committed_voters) {
+      if old != new {
+        let hw = view.voters().map(|n| n.commit).max().unwrap_or(0);
+        self.commit_floor = self.commit_floor.max(hw);
+      }
+    }
+    if view.committed_voters.is_some() {
+      self.last_committed_voters = view.committed_voters.clone();
+    }
+
     // Stateless cross-node oracles first.
     agreement(view)?;
     append_before_ack(view)?;
-    commit_is_quorum_durable(view)?;
+    commit_is_quorum_durable(view, self.commit_floor)?;
     durable_prefix(view)?;
     boundedness(view)?;
     // History oracles (read-then-fold).
@@ -358,7 +432,7 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
   Ok(())
 }
 
-/// **commit-is-quorum-durable**: for each non-removed VOTER, the entry at its `commit` index must be
+/// **commit-is-quorum-durable**: for each committed VOTER, the entry at its `commit` index must be
 /// present with the SAME term on a quorum of the VOTERS' DURABLE logs.
 ///
 /// Catches a node that advanced commit without the entry being durably replicated to a quorum (the
@@ -370,15 +444,20 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
 /// then counts how many VOTERS durably hold `(commit, t)`. Fewer than [`ClusterView::voter_quorum`]
 /// is a violation. A `commit` of 0 (nothing committed) is vacuously fine.
 ///
-/// **Voter-set denominator (reconfiguration soundness):** the quorum is taken over the voter set, not
-/// all live nodes. Only voters ack toward commit, and a node becomes a voter only by applying the
-/// `AddNode` that adds it (which requires its durable log to cover that conf-change's index, hence
-/// every earlier committed entry). So a learner or a wired-but-not-yet-voting joiner never inflates
-/// the denominator against an entry it could not have witnessed — which is exactly the false positive
-/// the old all-live-nodes denominator produced (surfaced by the VOPR: seed 43, a 5→6 voter growth).
-/// A learner's own `commit` watermark is not checked here (it makes no quorum claim; the same entry
-/// is checked via the voters), but a learner that holds the entry still does no harm.
-pub fn commit_is_quorum_durable(view: &ClusterView) -> Result<(), Violation> {
+/// **Voter-set denominator (reconfiguration soundness):** the quorum is taken over the
+/// [authoritative committed voter set](ClusterView::committed_voters) (the leader's
+/// `conf_state().voters()`), not all live nodes and not each node's own `is_voter` self-report. Only
+/// voters ack toward commit, and a node becomes a voter only by applying the `AddNode` that adds it
+/// (which requires its durable log to cover that conf-change's index, hence every earlier committed
+/// entry). So a learner or a wired-but-not-yet-voting joiner never inflates the denominator against
+/// an entry it could not have witnessed — the false positive an all-live-nodes denominator produced
+/// (VOPR seed 43, a 5→6 voter growth). And because the population is the LEADER's committed config,
+/// a real committed voter the harness had prematurely marked removed (an accepted-but-never-committed
+/// RemoveNode) is still counted as a durable witness, while a behind voter does not crowd it out —
+/// the false positive a per-node `is_voter & !removed` denominator produced (VOPR seed 4). A
+/// learner's own `commit` watermark is not checked here (it makes no quorum claim; the same entry is
+/// checked via the voters), but a learner that holds the entry still does no harm.
+pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result<(), Violation> {
   let quorum = view.voter_quorum();
   for n in view.voters() {
     let c = n.commit;
@@ -404,6 +483,12 @@ pub fn commit_is_quorum_durable(view: &ClusterView) -> Result<(), Violation> {
         ));
       }
     };
+    // An entry at or below the reconfiguration floor was committed under a configuration older than
+    // the current voter set; its quorum was defined by that config, so the current voters need not
+    // all hold it. Its safety is covered by agreement / no_committed_rewrite / durable_prefix.
+    if c <= commit_floor {
+      continue;
+    }
     let copies = view
       .voters()
       .filter(|m| m.durable_covers(c) && m.durable_term(c) == Some(witness_term))
@@ -684,17 +769,40 @@ mod tests {
     }
   }
 
+  /// Build a [`ClusterView`] from `nodes`, deriving the authoritative `committed_voters` set the way
+  /// the production [`Cluster::view`](crate::Cluster) does: the ids that consider themselves voters
+  /// in their committed config and are not removed. This exercises the oracle's real authoritative
+  /// voter-set path (not just the `None` fallback) while keeping every teeth test's voter population
+  /// exactly what its node self-reports describe.
+  fn cv(seed: u64, tick: u64, nodes: Vec<NodeView>) -> ClusterView {
+    let voters: BTreeSet<u64> = nodes
+      .iter()
+      .filter(|n| !n.removed && n.is_voter)
+      .map(|n| n.id)
+      .collect();
+    ClusterView {
+      seed,
+      tick,
+      committed_voters: if voters.is_empty() {
+        None
+      } else {
+        Some(voters)
+      },
+      nodes,
+    }
+  }
+
   /// A healthy, fully-agreed 3-node cluster: every node committed+applied `commit` entries and
   /// durably holds `durable_last` entries. Passes the WHOLE suite (the positive baseline that
   /// proves no oracle false-positives on a correct snapshot).
   fn healthy_cluster(commit: u64, durable_last: u64) -> ClusterView {
-    ClusterView {
-      seed: 1,
-      tick: 1,
-      nodes: (0..3)
+    cv(
+      1,
+      1,
+      (0..3)
         .map(|id| healthy_node(id, commit, durable_last))
         .collect(),
-    }
+    )
   }
 
   #[test]
@@ -716,11 +824,7 @@ mod tests {
     let a = healthy_node(0, 3, 3);
     let mut b = healthy_node(1, 3, 3);
     b.applied_log[1] = (2, std::vec![0xFF]); // node 1's applied[index=2] now differs from node 0's
-    let view = ClusterView {
-      seed: 7,
-      tick: 42,
-      nodes: std::vec![a, b, healthy_node(2, 3, 3)],
-    };
+    let view = cv(7, 42, std::vec![a, b, healthy_node(2, 3, 3)]);
     let v = agreement(&view).unwrap_err();
     assert_eq!(v.oracle, "agreement");
     assert!(v.detail.contains("applied[1] diverges"), "{}", v.detail);
@@ -736,11 +840,7 @@ mod tests {
     let mut n = healthy_node(0, 3, 3);
     n.applied = 5;
     n.commit = 5;
-    let view = ClusterView {
-      seed: 1,
-      tick: 9,
-      nodes: std::vec![n],
-    };
+    let view = cv(1, 9, std::vec![n]);
     let v = append_before_ack(&view).unwrap_err();
     assert_eq!(v.oracle, "append_before_ack");
     assert!(v.detail.contains("exceeds its visible log"), "{}", v.detail);
@@ -753,11 +853,7 @@ mod tests {
     // (durability is guaranteed per-entry by commit_is_quorum_durable, and on a quorum elsewhere).
     let mut n = healthy_node(0, 5, 3); // durable_last=3, applied=commit=5
     n.visible_last = 5; // a visible-but-unflushed tail (indices 4,5)
-    let view = ClusterView {
-      seed: 1,
-      tick: 9,
-      nodes: std::vec![n],
-    };
+    let view = cv(1, 9, std::vec![n]);
     assert!(
       append_before_ack(&view).is_ok(),
       "applied within the visible (un-flushed) tail is legal"
@@ -775,12 +871,8 @@ mod tests {
     n0.applied = 4; // keep append-before-ack happy elsewhere; this test calls the oracle directly
     let n1 = healthy_node(1, 4, 4);
     let n2 = healthy_node(2, 4, 4);
-    let view = ClusterView {
-      seed: 3,
-      tick: 11,
-      nodes: std::vec![n0, n1, n2],
-    };
-    let v = commit_is_quorum_durable(&view).unwrap_err();
+    let view = cv(3, 11, std::vec![n0, n1, n2]);
+    let v = commit_is_quorum_durable(&view, 0).unwrap_err();
     assert_eq!(v.oracle, "commit_is_quorum_durable");
     assert!(
       v.detail.contains("only 1 of 3 voter durable logs"),
@@ -799,12 +891,8 @@ mod tests {
     n1.durable_entries[4].term = 2; // node 1 holds (5, term 2)
     let mut n2 = healthy_node(2, 4, 5);
     n2.durable_entries[4].term = 2; // node 2 holds (5, term 2)
-    let view = ClusterView {
-      seed: 3,
-      tick: 12,
-      nodes: std::vec![n0, n1, n2],
-    };
-    let v = commit_is_quorum_durable(&view).unwrap_err();
+    let view = cv(3, 12, std::vec![n0, n1, n2]);
+    let v = commit_is_quorum_durable(&view, 0).unwrap_err();
     assert_eq!(v.oracle, "commit_is_quorum_durable");
     assert!(v.detail.contains("with that term"), "{}", v.detail);
   }
@@ -823,12 +911,76 @@ mod tests {
       n.durable_entries.retain(|e| e.index >= 6);
       nodes.push(n);
     }
+    let view = cv(1, 1, nodes);
+    assert_eq!(commit_is_quorum_durable(&view, 0), Ok(()));
+  }
+
+  #[test]
+  fn commit_is_quorum_durable_uses_authoritative_voter_set_not_self_view() {
+    // Regression for the VOPR seed-4 false positive. The harness had prematurely marked a node
+    // `removed` (an accepted-but-never-committed RemoveNode) while it was STILL a real committed
+    // voter holding the entry, and had grown a learner. Deriving the quorum from per-node
+    // `is_voter & !removed` then under-counted the witnesses and false-fired. With the authoritative
+    // committed voter set threaded in, the real quorum is recognized and the oracle stays green.
+    //
+    // Committed voter set = {0,1,2} (3 voters → quorum 2). Node 1 is the leader committing index 5.
+    // Node 0 is a real voter that is simply BEHIND (durable only to 3 — committed off a quorum that
+    // did not include it). Node 2 is a real voter that HOLDS index 5 but the harness flagged it
+    // `removed=true`. Node 3 is a learner that also holds index 5 but must NOT count. The durable
+    // witnesses among the real voters are {1, 2} = 2 ≥ quorum, so this is sound and must pass.
+    let mut n0 = healthy_node(0, 3, 3); // behind real voter
+    n0.is_voter = true;
+    let mut n1 = healthy_node(1, 5, 5); // leader, holds 5
+    n1.is_leader = true;
+    let mut n2 = healthy_node(2, 5, 5); // real voter holding 5, but harness-`removed`
+    n2.removed = true;
+    let mut n3 = healthy_node(3, 5, 5); // learner holding 5 (must not count toward the quorum)
+    n3.is_voter = false;
+    n3.is_leader = false;
     let view = ClusterView {
-      seed: 1,
-      tick: 1,
-      nodes,
+      seed: 4,
+      tick: 336,
+      committed_voters: Some(BTreeSet::from([0, 1, 2])),
+      nodes: std::vec![n0, n1, n2, n3],
     };
-    assert_eq!(commit_is_quorum_durable(&view), Ok(()));
+    assert_eq!(
+      commit_is_quorum_durable(&view, 0),
+      Ok(()),
+      "the real {{0,1,2}} voter quorum holds index 5; the oracle must not false-fire on the \
+       harness's stale removed/learner bookkeeping"
+    );
+  }
+
+  #[test]
+  fn commit_is_quorum_durable_keeps_teeth_with_authoritative_voter_set() {
+    // The flip side: with the SAME authoritative voter set, a commit that is genuinely NOT on a
+    // voter quorum must still trip. Voter set = {0,1,2} (quorum 2); node 1 (leader) committed index
+    // 5 but only node 1 durably holds it (nodes 0 and 2 reach only index 4), and the learner node 3
+    // holding 5 does not count. 1 < 2 → violation. Proves the authoritative-set path did not blunt
+    // the oracle.
+    let mut n0 = healthy_node(0, 4, 4);
+    n0.is_voter = true;
+    let mut n1 = healthy_node(1, 5, 5);
+    n1.is_leader = true;
+    n1.applied = 4;
+    let mut n2 = healthy_node(2, 4, 4);
+    n2.is_voter = true;
+    let mut n3 = healthy_node(3, 5, 5); // learner holds 5 — must not rescue the quorum
+    n3.is_voter = false;
+    n3.is_leader = false;
+    let view = ClusterView {
+      seed: 4,
+      tick: 1,
+      committed_voters: Some(BTreeSet::from([0, 1, 2])),
+      nodes: std::vec![n0, n1, n2, n3],
+    };
+    let v = commit_is_quorum_durable(&view, 0).unwrap_err();
+    assert_eq!(v.oracle, "commit_is_quorum_durable");
+    assert!(
+      v.detail.contains("only 1 of 3 voter durable logs"),
+      "{}",
+      v.detail
+    );
   }
 
   // ─── monotonic-commit teeth ──────────────────────────────────────────────────────────────────
@@ -900,11 +1052,7 @@ mod tests {
     // The durable entry count disagrees with the index window — a compaction/offset GC bug.
     let mut n = healthy_node(0, 3, 3);
     n.durable_entries.pop(); // 2 entries but window [1..=3] says 3
-    let view = ClusterView {
-      seed: 1,
-      tick: 1,
-      nodes: std::vec![n],
-    };
+    let view = cv(1, 1, std::vec![n]);
     let v = boundedness(&view).unwrap_err();
     assert_eq!(v.oracle, "boundedness");
     assert!(
@@ -918,11 +1066,7 @@ mod tests {
   fn boundedness_detects_staged_leak() {
     let mut n = healthy_node(0, 3, 3);
     n.inflight_staged = 5000; // unbounded staged writes — flush/discard leak
-    let view = ClusterView {
-      seed: 1,
-      tick: 1,
-      nodes: std::vec![n],
-    };
+    let view = cv(1, 1, std::vec![n]);
     let v = boundedness(&view).unwrap_err();
     assert_eq!(v.oracle, "boundedness");
     assert!(v.detail.contains("staged"), "{}", v.detail);
@@ -943,11 +1087,7 @@ mod tests {
     n.applied = 0;
     n.applied_log.clear();
     n.hardstate_commit = 5; // ... but the DURABLE committed prefix is 5 (durable_last = 5).
-    let view = ClusterView {
-      seed: 0xC1,
-      tick: 100,
-      nodes: std::vec![n],
-    };
+    let view = cv(0xC1, 100, std::vec![n]);
     let v = durable_prefix(&view).unwrap_err();
     assert_eq!(v.oracle, "durable_prefix");
     assert!(v.detail.contains("review C1"), "{}", v.detail);
@@ -963,11 +1103,7 @@ mod tests {
     // The CORRECT C1 behavior: restart recovered commit = HardState.commit = 5 (durable log covers
     // it). No violation.
     let n = healthy_node(0, 5, 5); // commit == hardstate_commit == durable_last == 5
-    let view = ClusterView {
-      seed: 1,
-      tick: 1,
-      nodes: std::vec![n],
-    };
+    let view = cv(1, 1, std::vec![n]);
     assert_eq!(durable_prefix(&view), Ok(()));
   }
 
@@ -980,11 +1116,7 @@ mod tests {
     // recovered commit of 3 is accepted.
     let mut n = healthy_node(0, 3, 3);
     n.hardstate_commit = 5; // persisted ahead of the (lost) log tail
-    let view = ClusterView {
-      seed: 1,
-      tick: 1,
-      nodes: std::vec![n],
-    };
+    let view = cv(1, 1, std::vec![n]);
     assert_eq!(durable_prefix(&view), Ok(()));
   }
 

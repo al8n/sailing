@@ -240,6 +240,93 @@ impl Cluster {
       .map(|(_, &id)| id)
   }
 
+  /// The cluster's REAL committed VOTER set — the authoritative committed membership, read from the
+  /// proto's runtime `conf_state()` (which tracks every APPLIED `ConfChange`), NOT from any
+  /// optimistic propose-time bookkeeping.
+  ///
+  /// **Source of truth: the current leader's `conf_state().voters()`.** A node's `conf_state()`
+  /// reflects only the ConfChanges IT has applied; the committed configuration is the one a quorum
+  /// agrees on. The leader has applied every committed entry up to its commit index (it is the most
+  /// up-to-date node by construction), so its `conf_state().voters()` IS the committed voter set —
+  /// the safe authoritative read whenever a leader exists.
+  ///
+  /// **No-leader fallback (deterministic):** during an election there is no single authority, so we
+  /// return the MOST COMMON `conf_state().voters()` across the live (non-removed) nodes — the
+  /// committed config a plurality has applied. Ties break by the smallest voter set under `BTreeSet`'s
+  /// total order, so the result is a pure function of the cluster state (no map/iteration-order or
+  /// wall-clock nondeterminism). Returns an empty set only for an empty/all-removed cluster.
+  pub fn committed_voters(&self) -> BTreeSet<u64> {
+    if let Some(leader) = self.leader() {
+      let i = self.node_idx[&leader];
+      return self.nodes[i]
+        .conf_state()
+        .voters()
+        .iter()
+        .copied()
+        .collect();
+    }
+    // No single leader: tally each live node's committed voter set and pick the most common one.
+    // `BTreeMap` keyed by the (sorted) voter set keeps the tally deterministic; the fold picks the
+    // highest count, breaking ties by the set that is smaller under the map's key ordering.
+    let mut tally: BTreeMap<BTreeSet<u64>, usize> = BTreeMap::new();
+    for (i, id) in self.node_ids.iter().enumerate() {
+      if self.removed.contains(id) {
+        continue;
+      }
+      let voters: BTreeSet<u64> = self.nodes[i]
+        .conf_state()
+        .voters()
+        .iter()
+        .copied()
+        .collect();
+      *tally.entry(voters).or_insert(0) += 1;
+    }
+    tally
+      .into_iter()
+      .max_by(|(a_set, a_n), (b_set, b_n)| {
+        // Higher count wins; on a tie prefer the set that sorts FIRST (smaller under BTreeSet order)
+        // so the choice is deterministic. `max_by` keeps the last maximum, so invert the set
+        // comparison to make the first-sorting set the chosen maximum.
+        a_n.cmp(b_n).then_with(|| b_set.cmp(a_set))
+      })
+      .map(|(set, _)| set)
+      .unwrap_or_default()
+  }
+
+  /// The cluster's REAL committed LEARNER set — the companion to [`committed_voters`](Self::committed_voters),
+  /// read from the current leader's runtime `conf_state().learners()` (or, when leaderless, the
+  /// learner set of the same plurality committed config `committed_voters` selects, so the two stay
+  /// consistent). Used by the VOPR to tell a successfully-committed learner from an orphaned joiner.
+  pub fn committed_learners(&self) -> BTreeSet<u64> {
+    if let Some(leader) = self.leader() {
+      let i = self.node_idx[&leader];
+      return self.nodes[i]
+        .conf_state()
+        .learners()
+        .iter()
+        .copied()
+        .collect();
+    }
+    // Leaderless: pick the learner set of the plurality committed config (same selection rule as
+    // `committed_voters`, keyed on the voter set so both accessors agree on the chosen config).
+    let mut tally: BTreeMap<BTreeSet<u64>, (usize, BTreeSet<u64>)> = BTreeMap::new();
+    for (i, id) in self.node_ids.iter().enumerate() {
+      if self.removed.contains(id) {
+        continue;
+      }
+      let cs = self.nodes[i].conf_state();
+      let voters: BTreeSet<u64> = cs.voters().iter().copied().collect();
+      let learners: BTreeSet<u64> = cs.learners().iter().copied().collect();
+      let e = tally.entry(voters).or_insert((0, learners));
+      e.0 += 1;
+    }
+    tally
+      .into_iter()
+      .max_by(|(a_v, (a_n, _)), (b_v, (b_n, _))| a_n.cmp(b_n).then_with(|| b_v.cmp(a_v)))
+      .map(|(_, (_, learners))| learners)
+      .unwrap_or_default()
+  }
+
   /// Tick until `predicate(self)` holds or `max_steps` elapse; returns whether it held.
   pub fn run_until(&mut self, max_steps: usize, mut predicate: impl FnMut(&Self) -> bool) -> bool {
     for _ in 0..max_steps {
@@ -881,6 +968,17 @@ impl Cluster {
     ClusterView {
       seed: self.seed,
       tick: self.tick_count,
+      // The authoritative committed VOTER set (leader's `conf_state().voters()`, or the plurality
+      // committed config when leaderless) — the quorum-durability oracle's denominator/witness
+      // population. Threading the leader's view (not each node's self-`is_voter`) makes the oracle
+      // independent of the sim's optimistic membership bookkeeping: a node the sim prematurely
+      // marked removed (an accepted-but-never-committed RemoveNode) is still a real committed voter
+      // and durable witness here, and a learner is correctly excluded. `None` only for an
+      // empty/all-removed cluster, where the oracle falls back to per-node `is_voter`.
+      committed_voters: {
+        let v = self.committed_voters();
+        if v.is_empty() { None } else { Some(v) }
+      },
       nodes,
     }
   }

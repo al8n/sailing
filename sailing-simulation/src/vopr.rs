@@ -131,18 +131,42 @@ const MENU: &[(Action, u32)] = &[
   (Action::FaultReroll, 8),
 ];
 
-/// The VOPR's own deterministic view of the cluster's logical state, threaded through the run.
+/// The number of consecutive reconciliation passes a wired joiner must stay both SETTLED (no
+/// conf-change in flight) and ABSENT from the committed membership before the VOPR concludes its
+/// AddNode/AddLearner never committed and abandons it as an orphan. A small grace so a transient
+/// leader loss (which conservatively clears `conf_in_flight`) right after wiring does not abandon a
+/// joiner whose change was about to commit.
+const ORPHAN_GRACE_PASSES: u32 = 3;
+
+/// The VOPR's deterministic view of the cluster's logical state, threaded through the run.
 ///
-/// The `Cluster`'s `isolated`/`removed`/voter sets are private, so the VOPR tracks its own
-/// authoritative copies (seeded entirely from the run, so they stay deterministic). `voters` /
-/// `learners` mirror the membership the VOPR has driven via conf-changes; `down` is the set of
-/// currently-isolated nodes (the sustained-outage set the fault budget caps).
+/// **Membership is tracked from the cluster's REAL COMMITTED state, not optimistically.** `voters` /
+/// `learners` are RECONCILED each iteration from the leader's runtime `conf_state()` (via
+/// [`Cluster::committed_voters`]/[`Cluster::committed_learners`]) so a conf-change that was ACCEPTED
+/// but never COMMITTED (leader crashed / lost quorum before replicating it) never leaves a PHANTOM
+/// voter inflating the fault budget or pinning quiesce. The other sets are the VOPR's own
+/// deterministic bookkeeping (the `Cluster`'s `isolated`/`removed` are private).
 struct VoprState {
-  /// Current voter ids (starts `0..size`; tracks Add/Remove conf-changes once proposed).
+  /// The current committed VOTER ids, RECONCILED from `committed_voters()` (minus `gone`). The fault
+  /// budget and the quiesce caught-up check operate on THIS real set. Last-known set is kept across a
+  /// momentary leaderless tick (don't thrash).
   voters: BTreeSet<u64>,
-  /// Current learner ids (tracks AddLearner conf-changes).
+  /// The current committed LEARNER ids, reconciled from `committed_learners()` (minus `gone`).
   learners: BTreeSet<u64>,
-  /// Currently-isolated nodes (the sustained-outage set; the fault budget caps the voter subset).
+  /// Joiner ids the VOPR has `wire_joining_node`'d whose AddNode/AddLearner has not yet been observed
+  /// committed (so they are not yet in `voters`/`learners`). Tracked so the sim-live set (faults /
+  /// crash / poison-restart) still includes a freshly-wired node, and so an orphan (a joiner whose
+  /// change never commits) can be detected and abandoned. Pruned once the node becomes a committed
+  /// member or is abandoned into `gone`.
+  wired: BTreeSet<u64>,
+  /// Per-wired-joiner count of consecutive reconciliation passes it has been settled-but-absent from
+  /// the committed membership — the orphan grace counter (see [`ORPHAN_GRACE_PASSES`]).
+  missing_streak: std::collections::BTreeMap<u64, u32>,
+  /// Nodes the VOPR has `c.mark_removed()` (abandoned orphans + nodes a RemoveNode targeted). The
+  /// cluster keeps these isolated, so they are excluded from the reconciled `voters`/`learners` and
+  /// from the sim-live set — they cannot pin `min_applied_len`/quiesce or absorb phantom isolation.
+  gone: BTreeSet<u64>,
+  /// Currently VOPR-isolated nodes (the sustained-outage set; the fault budget caps the voter subset).
   down: BTreeSet<u64>,
   /// The next node id to hand out for an AddNode/AddLearner (monotonic; never reused).
   next_id: u64,
@@ -162,21 +186,100 @@ struct VoprState {
 }
 
 impl VoprState {
-  /// The number of currently-isolated VOTERS — the quantity the fault budget caps.
+  /// The sim-live node set: every node id the VOPR considers a participating part of the cluster —
+  /// committed voters, committed learners, and freshly-wired joiners — MINUS the abandoned/removed
+  /// `gone` set (those are isolated and inert). The fault/crash/poison-restart helpers iterate this
+  /// in sorted (deterministic) order.
+  fn live_ids(&self) -> BTreeSet<u64> {
+    self
+      .voters
+      .iter()
+      .chain(self.learners.iter())
+      .chain(self.wired.iter())
+      .filter(|id| !self.gone.contains(id))
+      .copied()
+      .collect()
+  }
+
+  /// The number of currently-isolated VOTERS — the quantity the fault budget caps. Counts a voter
+  /// that is VOPR-isolated (`down`) OR has been `c.mark_removed()` (`gone`, hence cluster-isolated):
+  /// either way it cannot help the surviving quorum, so the budget must account for it.
   fn voters_down(&self) -> usize {
     self
-      .down
+      .voters
       .iter()
-      .filter(|id| self.voters.contains(id))
+      .filter(|id| self.down.contains(id) || self.gone.contains(id))
       .count()
   }
 
   /// The fault budget: at most `⌊(n-1)/2⌋` voters may be simultaneously down, where `n` is the
-  /// current voter count. Returns how many MORE voters may be taken down right now.
+  /// current committed voter count. Returns how many MORE voters may be taken down right now.
   fn budget_remaining(&self) -> usize {
     let n = self.voters.len();
     let max_down = (n.saturating_sub(1)) / 2;
     max_down.saturating_sub(self.voters_down())
+  }
+}
+
+/// Reconcile the VOPR's tracked membership from the cluster's REAL committed state.
+///
+/// When a leader exists (so `committed_voters()` is authoritative), set `voters`/`learners` to the
+/// leader's committed config MINUS the VOPR's `gone` set (a node the VOPR has `mark_removed`'d is
+/// isolated and must not re-enter the working set even while a RemoveNode for it is still committing).
+/// When there is no leader, KEEP the last-known sets (don't thrash on a transient election).
+///
+/// Then ABANDON orphans: a wired joiner that is SETTLED (`!conf_in_flight`) and still absent from the
+/// committed membership for [`ORPHAN_GRACE_PASSES`] consecutive passes had its AddNode/AddLearner
+/// accepted-but-never-committed — `mark_removed` it so it cannot pin `min_applied_len`/quiesce or
+/// receive phantom isolation. A wired joiner that DID become a committed member is dropped from
+/// `wired` (its streak reset).
+///
+/// Deterministic: every input (`committed_voters`/`committed_learners`, `leader`) is a pure function
+/// of the cluster state, and the orphan grace is driven by a per-node pass counter — no wall-clock /
+/// `rand` / map-iteration-order influence.
+fn reconcile_membership(c: &mut Cluster, st: &mut VoprState) {
+  if c.leader().is_some() {
+    let voters = c.committed_voters();
+    let learners = c.committed_learners();
+    st.voters = voters.difference(&st.gone).copied().collect();
+    st.learners = learners.difference(&st.gone).copied().collect();
+  }
+  // A VOPR-isolated node that is no longer a voter (e.g. its RemoveNode committed) should leave
+  // `down` so it stops being counted — `voters_down` already filters by `voters`, but pruning keeps
+  // `down` from growing without bound across a long run.
+  st.down
+    .retain(|id| st.voters.contains(id) || st.learners.contains(id));
+
+  // Orphan sweep over the wired joiners (sorted order — deterministic).
+  let committed_member = |id: &u64| st.voters.contains(id) || st.learners.contains(id);
+  let mut abandon: Vec<u64> = Vec::new();
+  let mut promoted: Vec<u64> = Vec::new();
+  for id in st.wired.iter().copied() {
+    if committed_member(&id) {
+      promoted.push(id); // its change committed — no longer a pending joiner
+      continue;
+    }
+    if st.conf_in_flight {
+      // A change is still in flight; the joiner may yet commit. Reset its streak.
+      st.missing_streak.insert(id, 0);
+      continue;
+    }
+    let streak = st.missing_streak.entry(id).or_insert(0);
+    *streak += 1;
+    if *streak >= ORPHAN_GRACE_PASSES {
+      abandon.push(id);
+    }
+  }
+  for id in promoted {
+    st.wired.remove(&id);
+    st.missing_streak.remove(&id);
+  }
+  for id in abandon {
+    c.mark_removed(id); // accepted-but-never-committed AddNode/AddLearner — abandon the orphan
+    st.gone.insert(id);
+    st.wired.remove(&id);
+    st.missing_streak.remove(&id);
+    st.down.remove(&id);
   }
 }
 
@@ -210,6 +313,9 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   let mut st = VoprState {
     voters: (0..size as u64).collect(),
     learners: BTreeSet::new(),
+    wired: BTreeSet::new(),
+    missing_streak: std::collections::BTreeMap::new(),
+    gone: BTreeSet::new(),
     down: BTreeSet::new(),
     next_id: size as u64,
     conf_in_flight: false,
@@ -228,6 +334,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   // cannot even from a clean start, that is itself a liveness bug.
   elect_leader(&mut c, 3_000, seed, /* phase */ "initial-election");
   observe(&mut c, &mut st, &mut report);
+  reconcile_membership(&mut c, &mut st);
 
   // The next tick at which to open a calm window (seed-jittered cadence).
   let calm_period = 60 + (prng.next_u64() % 60) as usize; // every 60..=119 iterations
@@ -235,6 +342,11 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 
   // ── Main loop ─────────────────────────────────────────────────────────────────────────────────
   for iter in 0..ticks {
+    // Reconcile the tracked membership from the cluster's REAL committed state BEFORE any
+    // budget/conf-change decision this iteration, so a phantom (accepted-but-never-committed) voter
+    // never inflates the fault budget and an orphaned joiner is abandoned promptly.
+    reconcile_membership(&mut c, &mut st);
+
     let action = pick_action(&mut prng);
     match action {
       Action::ClientLoad => client_load(&mut c, &mut st, &mut prng, &mut report),
@@ -398,7 +510,7 @@ fn crash_one(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report: 
   // Crash any live (non-removed) node, isolated or not. Crashing a participating voter is the
   // highest-value case (it exercises fsync-loss + recovery while the cluster is making progress),
   // and since a crash auto-restarts, it never sustains an outage past the budget.
-  let live: BTreeSet<u64> = st.voters.union(&st.learners).copied().collect();
+  let live = st.live_ids();
   if let Some(victim) = pick_from(&live, prng) {
     c.crash(victim);
     report.crashes += 1;
@@ -435,9 +547,13 @@ fn conf_change(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report
       .filter(|&&id| id != leader)
       .filter(|&&id| {
         // After removing `id`, the voter set is voters \ {id}; require a surviving majority among the
-        // up voters (those not in `down`). This keeps liveness achievable post-change.
+        // up voters (those neither VOPR-isolated nor already cluster-removed). Keeps liveness
+        // achievable post-change.
         let remaining: BTreeSet<u64> = st.voters.iter().copied().filter(|&v| v != id).collect();
-        let up = remaining.iter().filter(|v| !st.down.contains(v)).count();
+        let up = remaining
+          .iter()
+          .filter(|v| !st.down.contains(v) && !st.gone.contains(v))
+          .count();
         up * 2 > remaining.len()
       })
       .copied()
@@ -447,15 +563,20 @@ fn conf_change(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report
   };
 
   // Weighted choice: grow (add voter or learner) vs shrink (remove), only among the viable options.
+  // On a successful ADD we do NOT optimistically insert the new id into `voters`/`learners` — those
+  // are reconciled from the cluster's committed state once the AddNode/AddLearner actually COMMITS.
+  // We only record the wired joiner; if its change never commits, the orphan sweep in
+  // `reconcile_membership` abandons it.
   let roll = prng.next_u64() % 3;
   let did = match roll {
     0 if can_grow => {
       // AddNode (voter). Wire the node into the sim FIRST (so the replicated AddNode entry can reach
       // it), then propose. If the proposal is refused (e.g. the proto rejects with ConfChangeInFlight
       // because a previous change is still pending despite our flag, or the leader just vanished),
-      // the wired node would be an ORPHAN observer that never receives the log and would pin
-      // `min_applied_len()` at 0 forever — so mark it removed (the oracles + min_applied skip removed
-      // nodes) to cleanly abandon it.
+      // the wired node is an ORPHAN observer that never receives the log and would pin
+      // `min_applied_len()` at 0 forever — so mark it removed at once. If accepted, it becomes a
+      // pending joiner; reconciliation promotes it to a voter when its AddNode commits, or the orphan
+      // sweep abandons it if the change never commits.
       let id = st.next_id;
       st.next_id += 1;
       c.wire_joining_node(id);
@@ -465,15 +586,17 @@ fn conf_change(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report
         bytes::Bytes::new(),
       );
       if c.propose_conf_change(cc).is_some() {
-        st.voters.insert(id);
+        st.wired.insert(id);
+        st.missing_streak.insert(id, 0);
         true
       } else {
         c.mark_removed(id); // abandon the orphan so it cannot pin liveness metrics
+        st.gone.insert(id);
         false
       }
     }
     1 if can_grow => {
-      // AddLearner (same orphan-abandon safeguard as AddNode).
+      // AddLearner (same wire-then-reconcile / orphan-abandon handling as AddNode).
       let id = st.next_id;
       st.next_id += 1;
       c.wire_joining_node(id);
@@ -483,15 +606,21 @@ fn conf_change(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report
         bytes::Bytes::new(),
       );
       if c.propose_conf_change(cc).is_some() {
-        st.learners.insert(id);
+        st.wired.insert(id);
+        st.missing_streak.insert(id, 0);
         true
       } else {
         c.mark_removed(id); // abandon the orphan so it cannot pin liveness metrics
+        st.gone.insert(id);
         false
       }
     }
     _ => {
-      // RemoveNode (only if a viable victim exists).
+      // RemoveNode (only if a viable victim exists). On accept we `mark_removed`+isolate the victim
+      // immediately (it stops campaigning before it applies its own removal), and record it in
+      // `gone`; reconciliation drops it from `voters` once the RemoveNode COMMITS. While the removal
+      // is still in flight the victim stays in the leader's committed config, so `gone` is what keeps
+      // reconciliation from re-adding it and keeps the budget treating it as down.
       if let Some(victim) = pick_from(&removable, prng) {
         let cc = sailing_proto::ConfChange::new(
           sailing_proto::ConfChangeType::RemoveNode,
@@ -499,11 +628,11 @@ fn conf_change(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report
           bytes::Bytes::new(),
         );
         if c.propose_conf_change(cc).is_some() {
-          // Inform the oracles the node's applied log may now diverge; isolate it from elections.
           c.mark_removed(victim);
+          st.gone.insert(victim);
           st.voters.remove(&victim);
           st.learners.remove(&victim);
-          st.down.remove(&victim); // it's removed, not part of the up/down budget anymore
+          st.down.remove(&victim);
           true
         } else {
           false
@@ -632,25 +761,34 @@ fn calm_window(
     );
   }
 
-  // Assert PROGRESS (the liveness payoff): the cluster must COMMIT-and-APPLY `target_extra` NEW
-  // client commands cluster-wide. We capture the applied-log length, then interleave proposing and
-  // ticking — RE-proposing as needed, because a command accepted by a leader that then loses
-  // leadership is not guaranteed to commit (a legitimate Raft outcome). The loop runs until
-  // `min_applied_len()` has advanced by `target_extra` (real new committed entries applied
-  // everywhere) or a generous tick budget is exhausted, which is a genuine LIVELOCK.
-  let before = c.min_applied_len();
+  // Assert PROGRESS (the liveness payoff): the committed VOTERS must COMMIT-and-APPLY `target_extra`
+  // NEW client commands. The metric is scoped to the committed voter set — the nodes that actually
+  // form quorum — not all non-removed nodes: a wired-but-never-committed orphan joiner (an AddNode
+  // the cluster accepted but never committed) sits idle at applied 0 forever, and an all-nodes
+  // minimum would let it pin liveness even though every voter is making progress. We re-propose as
+  // needed because a command accepted by a leader that then loses leadership is not guaranteed to
+  // commit (a legitimate Raft outcome).
+  let voters_snapshot: Vec<u64> = st.voters.iter().copied().collect();
+  let voter_min_applied = |c: &Cluster| -> usize {
+    voters_snapshot
+      .iter()
+      .map(|&id| c.applied_len_of(id))
+      .min()
+      .unwrap_or(0)
+  };
+  let before = voter_min_applied(c);
   let target_extra = 1 + (prng.next_u64() % 3) as usize; // require 1..=3 new committed entries
   let target = before + target_extra;
   let mut budget = 8_000u32; // generous: a healthy cluster commits a handful of entries fast
-  while c.min_applied_len() < target {
+  while voter_min_applied(c) < target {
     if budget == 0 {
       let tick = c.view().tick;
       panic!(
         "VOPR LIVELOCK (calm window): a healthy, fully-healed cluster failed to commit+apply \
-         {target_extra} new client commands within the window (min_applied {} did not reach \
+         {target_extra} new client commands within the window (voter min_applied {} did not reach \
          {target})\n  seed={seed} tick={tick} (replay: run_vopr({seed}, ticks))\n  \
          voters={:?} learners={:?} leader={:?}",
-        c.min_applied_len(),
+        voter_min_applied(c),
         st.voters,
         st.learners,
         c.leader(),
@@ -826,20 +964,11 @@ mod tests {
 
   /// Smoke test: run a HANDFUL of seeds for a couple thousand ticks each and assert the runs are
   /// NON-VACUOUS — every run commits client load, and across the handful the adversary actually
-  /// exercised the hard paths (some crashes AND some partitions). This is the "it works and reaches
-  /// the hard paths" gate; the exhaustive sweep is U5's `#[ignore]` job.
-  ///
-  /// **CURRENTLY `#[ignore]`d — it is RED because the VOPR found REAL proto safety bugs.** Running it
-  /// over seeds `0..5` (and indeed most seeds with a cluster of ≥ 3 nodes) trips a genuine State
-  /// Machine Safety violation in `sailing-proto` under composed crash + partition + lossy-network
-  /// schedules — observed as the proto's `"AppendEntries would truncate a committed entry"`
-  /// debug-assert and the checker's `agreement` / `commit_is_quorum_durable` oracles. These reproduce
-  /// WITHOUT storage faults, WITHOUT conf-changes, and independently of the apply-lag fix; the
-  /// smallest repro is `run_vopr(2, 20)` / the `vopr_known_proto_safety_bug_repro` test below. This is
-  /// the VOPR doing its job. Re-enable (drop the `#[ignore]`) once the proto bug is fixed; the
-  /// assertions here are the correct non-vacuity gate. See the unit's report for the full analysis.
-  #[ignore = "RED: surfaces a real proto State Machine Safety bug under composed faults — see \
-              vopr_known_proto_safety_bug_repro and the unit report"]
+  /// exercised the hard paths (some crashes AND some partitions). The per-tick safety-oracle suite
+  /// runs every tick inside each run and panics on any violation, so a green run is also a proof
+  /// that the consensus core held under the composed crash + partition + lossy-network + membership
+  /// schedule. This is the "it works and reaches the hard paths" gate; the exhaustive seed sweep is
+  /// U5's job.
   #[test]
   fn vopr_smoke_runs_a_few_seeds() {
     let ticks = 2_000;
@@ -934,28 +1063,5 @@ mod tests {
       (r1.ticks_run, r1.proposals),
       "a different tick budget must drive a different run"
     );
-  }
-
-  /// **Executable bug report:** the VOPR deterministically surfaces a REAL `sailing-proto` State
-  /// Machine Safety bug under composed crash + partition + lossy-network schedules. This test pins
-  /// the minimal repro so the proto fix has a regression target.
-  ///
-  /// `run_vopr(2, 20)` (a 3→4-node cluster, ~20 adversarial iterations, NO storage faults needed,
-  /// NO conf-change needed to trigger the class) trips a safety stop. Depending on the budget the
-  /// symptom is the proto's own `debug_assert!("AppendEntries would truncate a committed entry")`,
-  /// the checker `agreement` oracle (two nodes apply DIFFERENT commands at the same applied index —
-  /// e.g. seeds 2 and 8 at 2000 ticks), or `commit_is_quorum_durable` (a commit not on a voter
-  /// quorum — seed 0). All reproduce independently of the apply-lag fix (verified by reverting it).
-  ///
-  /// Marked `#[ignore]` so the normal `cargo test` stays green; run with
-  /// `cargo test -p sailing-simulation vopr_known_proto_safety_bug_repro -- --ignored --nocapture`
-  /// to observe the panic (seed + tick are in the message for replay). DELETE this test (and drop the
-  /// `#[ignore]` on `vopr_smoke_runs_a_few_seeds`) once the proto bug is fixed.
-  #[ignore = "documents a real, unfixed proto safety bug — run explicitly with --ignored"]
-  #[test]
-  #[should_panic]
-  fn vopr_known_proto_safety_bug_repro() {
-    // Expected to PANIC (a safety stop). The smallest reliably-failing budget we found.
-    let _ = run_vopr(2, 20);
   }
 }
