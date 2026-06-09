@@ -1,9 +1,10 @@
 //! The Sans-I/O Raft core. M0 is a no-op skeleton: it owns state and exposes the
 //! `handle_*`/`poll_*` surface. M1 fills in leader election. M2 adds log replication.
 use crate::{
-  Config, Event, Index, Instant, LogStore, Message, NodeId, Outgoing, Prng, StableStore,
+  Config, Event, Index, Instant, LogStore, Message, NodeId, Outgoing, Prng, ReadOnly, StableStore,
   StateMachine, Term,
 };
+use bytes::Bytes;
 use std::collections::{BTreeMap, VecDeque};
 
 /// The role of a node in its current term.
@@ -100,6 +101,14 @@ where
   /// the one-in-flight guard will be permissive (ZERO <= applied), but correctness is maintained
   /// because the entry will still be applied exactly once in `apply_committed`.
   pending_conf_index: Index,
+  /// ReadIndex tracking (pending reads, heartbeat-ack sets, confirmed read states).
+  read_only: ReadOnly<I>,
+  /// Deferred read requests that arrived before the leader has committed an entry in its
+  /// current term.  Flushed once `maybe_advance_commit` advances `self.commit` to a
+  /// current-term entry.
+  ///
+  /// Each element is `(context, from)` matching `add_request`'s signature.
+  pending_reads: std::vec::Vec<(Bytes, Option<I>)>,
 }
 
 // ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
@@ -121,6 +130,7 @@ where
       config.max_inflight_msgs(),
       config.max_inflight_bytes(),
     );
+    let read_only_opt = config.read_only();
     let mut ep = Self {
       config,
       fsm,
@@ -142,6 +152,8 @@ where
       poisoned: false,
       pending_compact: None,
       pending_conf_index: Index::ZERO,
+      read_only: ReadOnly::new(read_only_opt),
+      pending_reads: std::vec::Vec::new(),
     };
     ep.arm_election_timer(now);
     ep
@@ -236,6 +248,10 @@ where
     self.role = Role::Follower;
     self.leader = None;
     self.heartbeat_deadline = None;
+    // Drop all pending reads — a stepped-down node is no longer the leader and
+    // cannot confirm any outstanding read requests.
+    self.read_only.reset(self.config.read_only());
+    self.pending_reads.clear();
     // The partitioned former leader arms the election timer; once it heals and
     // pre-vote/real vote succeeds it can campaign again without disrupting the cluster.
     self.arm_election_timer(now);
@@ -282,6 +298,14 @@ where
 
   fn broadcast_heartbeat(&mut self, _now: Instant) {
     let (term, me) = (self.term, self.config.id());
+    // Carry the last-pending-read context so followers can echo it back, giving the
+    // leader the acks it needs to confirm outstanding safe reads.  An empty context
+    // means there are no pending reads (the echo is harmless either way).
+    let ctx = self
+      .read_only
+      .last_pending_request_ctx()
+      .cloned()
+      .unwrap_or_default();
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       // Clamp the advertised commit to this peer's known match index. A heartbeat carries
       // no prev-log check, so the follower can only safely commit up to the prefix it has
@@ -296,12 +320,26 @@ where
         .unwrap_or(Index::ZERO);
       self.send(
         peer,
-        Message::Heartbeat(crate::Heartbeat::new(
-          term,
-          me,
-          peer_commit,
-          bytes::Bytes::new(),
-        )),
+        Message::Heartbeat(crate::Heartbeat::new(term, me, peer_commit, ctx.clone())),
+      );
+    }
+  }
+
+  /// Broadcast a heartbeat to all peers carrying a specific `context`.
+  ///
+  /// Used by the ReadIndex Safe path to kick off a dedicated heartbeat round that
+  /// proves the leader is still reachable by a quorum.
+  fn broadcast_heartbeat_with_ctx(&mut self, _now: Instant, ctx: Bytes) {
+    let (term, me) = (self.term, self.config.id());
+    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+      let peer_commit = self
+        .tracker
+        .progress(&peer)
+        .map(|pr| core::cmp::min(self.commit, pr.match_index()))
+        .unwrap_or(Index::ZERO);
+      self.send(
+        peer,
+        Message::Heartbeat(crate::Heartbeat::new(term, me, peer_commit, ctx.clone())),
       );
     }
   }
@@ -555,7 +593,7 @@ where
   F::Command: crate::Data,
 {
   /// Drain storage completions. (M3+: append-before-ack / persist-vote.)
-  pub fn handle_storage<L, S>(&mut self, _now: Instant, log: &mut L, stable: &mut S)
+  pub fn handle_storage<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
@@ -566,7 +604,7 @@ where
     }
     while let Some(done) = log.poll() {
       match done {
-        Ok(crate::LogDone::Appended(opid)) => self.on_log_appended(log, opid),
+        Ok(crate::LogDone::Appended(opid)) => self.on_log_appended(now, log, stable, opid),
         Ok(crate::LogDone::Compacted(_)) => {}
         Err(_) => {
           self.poison();
@@ -719,6 +757,7 @@ where
     }
     // Never trust commit beyond the durable log; never below the snapshot baseline.
     let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
+    let read_only_opt = config.read_only();
     let mut ep = Self {
       config,
       fsm,
@@ -741,6 +780,8 @@ where
       tracker,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
+      read_only: ReadOnly::new(read_only_opt),
+      pending_reads: std::vec::Vec::new(),
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
@@ -757,7 +798,13 @@ where
     self.mint_op_id()
   }
 
-  fn on_log_appended<L: LogStore>(&mut self, log: &mut L, opid: crate::OpId) {
+  fn on_log_appended<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &S,
+    opid: crate::OpId,
+  ) {
     match self.pending.remove(&opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
         let (term, me) = (self.term, self.config.id());
@@ -782,6 +829,9 @@ where
         }
         self.maybe_advance_commit(log);
         self.apply_committed(log);
+        // ReadIndex deferred-flush: if this commit advanced to the first current-term
+        // entry, flush any reads that were deferred waiting for it.
+        self.maybe_flush_deferred_reads(now, log, stable);
       }
       _ => {} // CastVote completes via stable; unknown/superseded opid → ignore
     }
@@ -899,7 +949,9 @@ where
       Message::Heartbeat(hb) => self.on_heartbeat(now, log, hb),
       Message::AppendEntries(ae) => self.on_append_entries(now, log, ae),
       Message::AppendResp(r) => self.on_append_resp(now, log, stable, from, r),
-      Message::HeartbeatResp(_) => self.on_heartbeat_resp(from, log, stable),
+      Message::HeartbeatResp(hr) => self.on_heartbeat_resp(from, log, stable, hr),
+      Message::ReadIndex(ri) => self.on_read_index(now, log, stable, ri),
+      Message::ReadIndexResp(r) => self.on_read_index_resp(r),
       Message::InstallSnapshot(is) => self.on_install_snapshot(now, log, stable, is),
       Message::SnapshotResp(r) => self.on_snapshot_resp(now, log, stable, from, r),
       _ => {}
@@ -1291,6 +1343,10 @@ where
   ) {
     self.role = Role::Leader;
     self.leader = Some(self.config.id());
+    // Reset read-index state from the previous term (stale pending reads must not
+    // be confirmed against the new term's commit index).
+    self.read_only.reset(self.config.read_only());
+    self.pending_reads.clear();
     // Clear the candidate/follower election_deadline unconditionally; it will be re-armed
     // below only if check_quorum is enabled. Without this clear, a CQ-disabled leader would
     // inherit the stale candidate election_deadline (arm_heartbeat_timer no longer clears it).
@@ -1378,9 +1434,13 @@ where
       self.apply_committed(log);
     }
     let (term, me) = (self.term, self.config.id());
+    // Echo the heartbeat's context back to the leader.  This lets the leader count
+    // this follower's ack toward the quorum needed to confirm a pending safe read.
+    // An empty context is a normal heartbeat; the echo is harmless.
+    let ctx = Bytes::copy_from_slice(hb.context());
     self.send(
       hb.leader(),
-      Message::HeartbeatResp(crate::HeartbeatResp::new(term, me, bytes::Bytes::new())),
+      Message::HeartbeatResp(crate::HeartbeatResp::new(term, me, ctx)),
     );
   }
 
@@ -1502,20 +1562,20 @@ where
     }
   }
 
-  /// M4 Task 6 + liveness fix: a HeartbeatResp from a peer clears its probe pause and
-  /// kicks off a new send. This allows a stalled `Probe` peer (whose partial-batch send was
-  /// never acked) to resume replication on the next heartbeat round rather than waiting
-  /// indefinitely.
+  /// M4 Task 6 + liveness fix + M7-U4 ReadIndex acks.
   ///
-  /// Liveness fix (etcd `FreeFirstOne`): if the peer is in `Replicate` state with a full
-  /// in-flight window (all acks were lost during a partition), we free the oldest in-flight
-  /// slot. This lets the leader send one `AppendEntries` per heartbeat round so a healed
-  /// follower resumes on its own without requiring an unrelated client proposal.
+  /// A HeartbeatResp from a peer:
+  /// 1. Clears the peer's probe pause (so stalled replication resumes).
+  /// 2. Frees one in-flight slot on a full Replicate window (etcd FreeFirstOne).
+  /// 3. If the response carries a non-empty context, records the ack for the
+  ///    corresponding pending read-index request and confirms any reads that have
+  ///    reached a voter quorum.
   fn on_heartbeat_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     from: I,
     log: &L,
     stable: &S,
+    resp: crate::HeartbeatResp<I>,
   ) {
     if !self.role.is_leader() {
       return;
@@ -1528,6 +1588,287 @@ where
       pr.free_inflight_on_heartbeat();
     }
     self.maybe_send_append(from, log, stable);
+
+    // ReadIndex Safe path: if the resp carries a context, record the ack and check quorum.
+    let ctx = resp.context();
+    if ctx.is_empty() {
+      return;
+    }
+    let ctx_bytes = Bytes::copy_from_slice(ctx);
+    self.read_only.recv_ack(from, ctx);
+    // Quorum check: the ack set (including the self-ack seeded at add_request) must
+    // form a voter quorum across the joint config.  Reuse vote_result machinery:
+    // treat each voter as "granted" iff its id is in the ack set.
+    let quorum_reached = {
+      let acks = self
+        .read_only
+        .acks_for(ctx_bytes.as_ref())
+        .cloned()
+        .unwrap_or_default();
+      // vote_result(|id| Some(acks.contains(id))).is_won() covers both joint halves.
+      let votes: BTreeMap<I, bool> = self
+        .tracker
+        .ids()
+        .into_iter()
+        .filter(|id| self.tracker.is_voter(id))
+        .map(|id| (id, acks.contains(&id)))
+        .collect();
+      self.tracker.vote_result(&votes).is_won()
+    };
+    if quorum_reached {
+      let confirmed = self.read_only.advance(ctx_bytes.as_ref());
+      let (term, me) = (self.term, self.config.id());
+      for st in confirmed {
+        match st.req_from {
+          None => {
+            // Local leader read — emit ReadState event.
+            self
+              .events
+              .push_back(crate::Event::ReadState(crate::ReadState::new(
+                st.index, st.context,
+              )));
+          }
+          Some(follower) => {
+            // Forwarded read — reply ReadIndexResp to the originating follower.
+            self.send(
+              follower,
+              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, st.index, st.context)),
+            );
+          }
+        }
+      }
+    }
+  }
+
+  // ─── ReadIndex helpers ────────────────────────────────────────────────────────
+
+  /// Whether the leader has committed an entry in its current term.
+  ///
+  /// A newly-elected leader cannot confirm reads against a commit index whose entry is from
+  /// a prior term (§5.4.2).  It must wait until its no-op append is committed before
+  /// confirming any reads.
+  fn has_current_term_commit<L: LogStore>(&self, log: &L) -> bool {
+    log
+      .term(self.commit)
+      .map(|t| t == self.term)
+      .unwrap_or(false)
+  }
+
+  /// Confirm all pending reads in `pending_reads` by registering them with `read_only` and
+  /// broadcasting the heartbeat round (Safe) or confirming immediately (LeaseBased).
+  ///
+  /// Called once the leader first commits an entry in its current term.
+  fn flush_deferred_reads<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Instant,
+    log: &L,
+    _stable: &S,
+  ) {
+    if self.pending_reads.is_empty() {
+      return;
+    }
+    let deferred = core::mem::take(&mut self.pending_reads);
+    for (ctx, from) in deferred {
+      self.do_leader_read(now, log, ctx, from);
+    }
+  }
+
+  /// Called after `maybe_advance_commit` to flush any deferred read requests once the
+  /// leader has committed its first current-term entry.
+  fn maybe_flush_deferred_reads<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Instant,
+    log: &L,
+    stable: &S,
+  ) {
+    if self.pending_reads.is_empty() {
+      return;
+    }
+    if !self.role.is_leader() {
+      return;
+    }
+    if !self.has_current_term_commit(log) {
+      return;
+    }
+    self.flush_deferred_reads(now, log, stable);
+  }
+
+  /// Core leader read logic: register the read and broadcast / confirm.
+  fn do_leader_read<L: LogStore>(
+    &mut self,
+    now: Instant,
+    _log: &L,
+    context: Bytes,
+    from: Option<I>,
+  ) {
+    let me = self.config.id();
+    let commit = self.commit;
+    match self.config.read_only() {
+      crate::ReadOnlyOption::Safe => {
+        self
+          .read_only
+          .add_request(commit, context.clone(), from, me);
+        // Single-node cluster fast-path: self-ack is already a quorum.
+        let single_node_quorum = {
+          let acks = self
+            .read_only
+            .acks_for(context.as_ref())
+            .cloned()
+            .unwrap_or_default();
+          let votes: BTreeMap<I, bool> = self
+            .tracker
+            .ids()
+            .into_iter()
+            .filter(|id| self.tracker.is_voter(id))
+            .map(|id| (id, acks.contains(&id)))
+            .collect();
+          self.tracker.vote_result(&votes).is_won()
+        };
+        if single_node_quorum {
+          let confirmed = self.read_only.advance(context.as_ref());
+          let (term, me2) = (self.term, me);
+          for st in confirmed {
+            match st.req_from {
+              None => {
+                self
+                  .events
+                  .push_back(crate::Event::ReadState(crate::ReadState::new(
+                    st.index, st.context,
+                  )));
+              }
+              Some(follower) => {
+                self.send(
+                  follower,
+                  Message::ReadIndexResp(crate::ReadIndexResp::new(
+                    term, me2, st.index, st.context,
+                  )),
+                );
+              }
+            }
+          }
+        } else {
+          self.broadcast_heartbeat_with_ctx(now, context);
+        }
+      }
+      crate::ReadOnlyOption::LeaseBased => {
+        // LeaseBased is sound only when CheckQuorum is also enabled: CheckQuorum's
+        // periodic heartbeat round proves the leader still holds a quorum lease,
+        // which is the precondition for skipping the per-read heartbeat.
+        //
+        // If check_quorum is disabled the lease invariant is not maintained, so
+        // confirming immediately would be a linearizability hazard (a partitioned
+        // leader could serve stale reads). Degrade silently to the Safe path
+        // (heartbeat-quorum round) so any misconfiguration is safe rather than
+        // silently incorrect.
+        let use_lease = self.config.check_quorum();
+        if use_lease {
+          match from {
+            None => {
+              self
+                .events
+                .push_back(crate::Event::ReadState(crate::ReadState::new(
+                  commit, context,
+                )));
+            }
+            Some(follower) => {
+              let (term, me2) = (self.term, me);
+              self.send(
+                follower,
+                Message::ReadIndexResp(crate::ReadIndexResp::new(term, me2, commit, context)),
+              );
+            }
+          }
+        } else {
+          // Degrade to Safe: record the request and broadcast a heartbeat round.
+          self
+            .read_only
+            .add_request(commit, context.clone(), from, me);
+          self.broadcast_heartbeat_with_ctx(now, context);
+        }
+      }
+    }
+  }
+
+  /// Initiate a linearizable read.
+  ///
+  /// - **Leader, `ReadOnlySafe`:** records the read at the current commit index and
+  ///   broadcasts a heartbeat round.  Once a voter quorum acks the round, emits
+  ///   `Event::ReadState`.  If no current-term commit exists yet, defers until it does.
+  /// - **Leader, `ReadOnlyLeaseBased`:** confirms immediately from `commit` when
+  ///   `check_quorum` is also enabled (relies on the CheckQuorum lease).  If
+  ///   `check_quorum` is disabled the request degrades to the Safe path so the
+  ///   misconfiguration is safe rather than silently non-linearizable.
+  /// - **Follower:** forwards a `ReadIndex` message to the known leader.  Dropped
+  ///   if no leader is known or `disable_proposal_forwarding` is set.
+  /// - **Candidate / PreCandidate:** dropped (no leader to confirm).
+  pub fn read_index<L, S>(&mut self, now: Instant, log: &mut L, _stable: &mut S, context: Bytes)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if self.poisoned {
+      return;
+    }
+    match self.role {
+      Role::Leader => {
+        // Current-term-commit gate.
+        if !self.has_current_term_commit(log) {
+          // Defer until the no-op commits.
+          self.pending_reads.push((context, None));
+          return;
+        }
+        self.do_leader_read(now, log, context, None);
+      }
+      Role::Follower => {
+        // Forward to the leader if known and forwarding is not disabled.
+        if self.config.disable_proposal_forwarding() {
+          return;
+        }
+        let Some(leader) = self.leader else {
+          return;
+        };
+        let (term, me) = (self.term, self.config.id());
+        self.send(
+          leader,
+          Message::ReadIndex(crate::ReadIndex::new(term, me, context)),
+        );
+      }
+      Role::Candidate | Role::PreCandidate => {
+        // No leader to confirm reads; drop.
+      }
+    }
+  }
+
+  /// Leader receives a forwarded `ReadIndex` from a follower.
+  fn on_read_index<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    _stable: &mut S,
+    ri: crate::ReadIndex<I>,
+  ) {
+    if !self.role.is_leader() {
+      return;
+    }
+    let context = Bytes::copy_from_slice(ri.context());
+    let from = ri.from();
+    // Current-term-commit gate (same as the local path).
+    if !self.has_current_term_commit(log) {
+      self.pending_reads.push((context, Some(from)));
+      return;
+    }
+    self.do_leader_read(now, log, context, Some(from));
+  }
+
+  /// Follower receives a `ReadIndexResp` from the leader.
+  fn on_read_index_resp(&mut self, resp: crate::ReadIndexResp<I>) {
+    let ctx = Bytes::copy_from_slice(resp.context());
+    self
+      .events
+      .push_back(crate::Event::ReadState(crate::ReadState::new(
+        resp.index(),
+        ctx,
+      )));
   }
 
   /// Walk the leader's log downward from `index` until we find an entry whose term is
@@ -1546,7 +1887,7 @@ where
 
   fn on_append_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    _now: Instant,
+    now: Instant,
     log: &mut L,
     stable: &S,
     from: I,
@@ -1584,6 +1925,7 @@ where
       pr.become_replicate();
       self.maybe_advance_commit(log);
       self.apply_committed(log);
+      self.maybe_flush_deferred_reads(now, log, stable);
       self.maybe_send_append(from, log, stable); // keep the pipeline moving if still behind
     }
   }
@@ -1711,7 +2053,7 @@ where
   /// M5-U2c: receive a `SnapshotResp` from a follower (leader path).
   fn on_snapshot_resp<L, S>(
     &mut self,
-    _now: Instant,
+    now: Instant,
     log: &mut L,
     stable: &S,
     from: I,
@@ -1742,6 +2084,7 @@ where
       // Re-borrow self for the resume sequence (pr is dropped above).
       self.maybe_advance_commit(log);
       self.apply_committed(log);
+      self.maybe_flush_deferred_reads(now, log, stable);
       self.maybe_send_append(from, log, stable);
     }
   }
@@ -6358,5 +6701,615 @@ mod tests {
       Term::new(3),
       "check_quorum=false: higher-term vote must be processed normally (no lease block)"
     );
+  }
+
+  // ── M7-U4: ReadIndex tests ─────────────────────────────────────────────────────────────────────
+
+  /// Helper: elect node 1 leader in a 3-voter cluster, drain the no-op so the leader has
+  /// a committed current-term entry.  Returns (ep, log, stable, now).
+  fn make_leader_with_current_term_commit() -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::NoopStable,
+    crate::Instant,
+  ) {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // candidate
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    // Drain storage: no-op LeaderAppend fires → self match_index advances.
+    ep.handle_storage(d, &mut log, &mut stable);
+    // Peer 2 acks the no-op → quorum (self + peer2) → commit advances to 1.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+    (ep, log, stable, d)
+  }
+
+  /// Test 1: Safe read confirmed only after a heartbeat quorum.
+  ///
+  /// A 3-node leader (with a current-term commit) calls `read_index(ctx)` →
+  /// broadcasts heartbeats with ctx; NO `ReadState` until a quorum of `HeartbeatResp`
+  /// arrive; after the quorum, exactly one `Event::ReadState` is emitted.
+  #[test]
+  fn safe_read_confirmed_after_heartbeat_quorum() {
+    let (mut ep, mut log, mut stable, d) = make_leader_with_current_term_commit();
+    let ctx = bytes::Bytes::from_static(b"read_1");
+
+    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+
+    // The leader should have broadcast heartbeats carrying ctx.
+    let mut ctx_hb_count = 0usize;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        if hb.context() == ctx.as_ref() {
+          ctx_hb_count += 1;
+        }
+      }
+    }
+    assert_eq!(
+      ctx_hb_count, 2,
+      "leader must broadcast 2 heartbeats with ctx (to peers 2 and 3)"
+    );
+
+    // No ReadState yet (need quorum = 2/3 voters, leader already counted itself = 1).
+    assert!(
+      ep.poll_event().is_none(),
+      "ReadState must not be emitted before a quorum of heartbeat acks"
+    );
+
+    // One HeartbeatResp with ctx from peer 2 → quorum reached (self + peer2 = 2/3).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        ctx.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+
+    // ReadState must be emitted now.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    assert_eq!(
+      events.len(),
+      1,
+      "exactly one ReadState must be emitted after quorum; got: {:?}",
+      events
+    );
+    let rs = match &events[0] {
+      crate::Event::ReadState(rs) => rs.clone(),
+      other => panic!("expected ReadState, got {:?}", other),
+    };
+    assert_eq!(rs.context().as_ref(), ctx.as_ref(), "context must match");
+    assert_eq!(
+      rs.index(),
+      crate::Index::new(1),
+      "index must be the commit at receipt"
+    );
+  }
+
+  /// Test 2: Stale leader (partitioned from quorum) cannot confirm a read.
+  ///
+  /// The leader calls `read_index` but only gets heartbeat acks from itself (no quorum)
+  /// → no `ReadState` is emitted.
+  #[test]
+  fn stale_leader_cannot_confirm_read() {
+    let (mut ep, mut log, mut stable, d) = make_leader_with_current_term_commit();
+    let ctx = bytes::Bytes::from_static(b"stale_read");
+
+    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+    while ep.poll_message().is_some() {}
+    // No heartbeat acks arrive (partitioned).
+    // No ReadState must be emitted.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    assert!(
+      events.is_empty(),
+      "stale/partitioned leader must not emit ReadState without a heartbeat quorum"
+    );
+  }
+
+  /// Test 3: LeaseBased confirms immediately.
+  ///
+  /// With `read_only=LeaseBased` + `check_quorum=true`, `read_index` emits ReadState
+  /// from `commit` without waiting for heartbeats.
+  #[test]
+  fn lease_based_confirms_immediately() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseBased)
+    .with_check_quorum(true);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    let ctx = bytes::Bytes::from_static(b"lease_read");
+    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+
+    // No heartbeats should have been sent for the read round.
+    let mut hb_with_ctx = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        if hb.context() == ctx.as_ref() {
+          hb_with_ctx = true;
+        }
+      }
+    }
+    assert!(
+      !hb_with_ctx,
+      "LeaseBased must NOT broadcast read-heartbeats"
+    );
+
+    // ReadState must be emitted immediately.
+    let ev = ep
+      .poll_event()
+      .expect("LeaseBased must emit ReadState immediately");
+    assert!(ev.is_read_state(), "expected ReadState event");
+    let rs = ev.unwrap_read_state_ref();
+    assert_eq!(rs.index(), crate::Index::new(1));
+    assert_eq!(rs.context().as_ref(), ctx.as_ref());
+  }
+
+  /// Test: LeaseBased without check_quorum degrades to Safe.
+  ///
+  /// A leader configured `read_only=LeaseBased` but `check_quorum=false` must
+  /// NOT confirm the read immediately.  It must behave like Safe: broadcast a
+  /// heartbeat round and wait for a quorum of acks before emitting ReadState.
+  #[test]
+  fn lease_based_without_check_quorum_degrades_to_safe() {
+    use core::time::Duration;
+
+    // Build a leader with LeaseBased but check_quorum=false (the unsafe combination).
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseBased)
+    .with_check_quorum(false);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    let ctx = bytes::Bytes::from_static(b"degraded_lease_read");
+    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+
+    // Must NOT emit ReadState immediately (would be linearizability hazard).
+    assert!(
+      ep.poll_event().is_none(),
+      "LeaseBased without check_quorum must NOT confirm immediately — no ReadState yet"
+    );
+
+    // Must have broadcast a heartbeat with ctx (Safe path).
+    let mut hb_with_ctx = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        if hb.context() == ctx.as_ref() {
+          hb_with_ctx = true;
+        }
+      }
+    }
+    assert!(
+      hb_with_ctx,
+      "LeaseBased without check_quorum must fall back to Safe and broadcast a heartbeat round"
+    );
+
+    // After a quorum of HeartbeatResp acks, ReadState is emitted.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        ctx.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+
+    let ev = ep
+      .poll_event()
+      .expect("ReadState must be emitted once heartbeat quorum acks");
+    assert!(ev.is_read_state(), "expected ReadState");
+    let rs = ev.unwrap_read_state_ref();
+    assert_eq!(rs.index(), crate::Index::new(1));
+    assert_eq!(rs.context().as_ref(), ctx.as_ref());
+  }
+
+  /// Test 4: Follower-forwarded read.
+  ///
+  /// A follower calls `read_index(ctx)` → sends `ReadIndex` to the leader.
+  /// The leader confirms (heartbeat quorum) and replies `ReadIndexResp`.
+  /// The follower emits `Event::ReadState`.
+  #[test]
+  fn follower_forwarded_read() {
+    use core::time::Duration;
+
+    // Set up a follower (node 2) pointing to leader 1.
+    let follower_cfg = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut follower = Endpoint::new(
+      follower_cfg,
+      Instant::ORIGIN,
+      7,
+      crate::testkit::CountSm::default(),
+    );
+    let mut follower_log = crate::testkit::VecLog::default();
+    let mut follower_stable = crate::testkit::NoopStable::default();
+
+    // Give the follower a heartbeat so it knows about leader 1.
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut follower_log,
+      &mut follower_stable,
+      1u64,
+      Message::Heartbeat(crate::Heartbeat::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::ZERO,
+        bytes::Bytes::new(),
+      )),
+    );
+    while follower.poll_message().is_some() {}
+    while follower.poll_event().is_some() {}
+
+    // Follower calls read_index: should forward ReadIndex to leader 1.
+    let ctx = bytes::Bytes::from_static(b"fwd_read");
+    follower.read_index(
+      Instant::ORIGIN,
+      &mut follower_log,
+      &mut follower_stable,
+      ctx.clone(),
+    );
+
+    let msg = follower
+      .poll_message()
+      .expect("follower must send ReadIndex to leader");
+    assert_eq!(msg.to(), 1u64);
+    assert!(msg.message().is_read_index(), "message must be ReadIndex");
+
+    // Now simulate the leader confirming and replying with ReadIndexResp.
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut follower_log,
+      &mut follower_stable,
+      1u64,
+      Message::ReadIndexResp(crate::ReadIndexResp::new(
+        crate::Term::new(1),
+        1u64,
+        crate::Index::new(5),
+        ctx.clone(),
+      )),
+    );
+
+    // Follower must emit ReadState.
+    let ev = follower
+      .poll_event()
+      .expect("follower must emit ReadState on ReadIndexResp");
+    assert!(ev.is_read_state());
+    let rs = ev.unwrap_read_state_ref();
+    assert_eq!(rs.index(), crate::Index::new(5));
+    assert_eq!(rs.context().as_ref(), ctx.as_ref());
+  }
+
+  /// Test 5: FIFO confirmation + index correctness.
+  ///
+  /// Two reads in order confirm in order; each ReadState.index is the commit recorded
+  /// at that read's receipt (never less than a prior read's index).
+  #[test]
+  fn fifo_confirmation_and_index_correctness() {
+    let (mut ep, mut log, mut stable, d) = make_leader_with_current_term_commit();
+
+    let ctx_a = bytes::Bytes::from_static(b"read_a");
+    let ctx_b = bytes::Bytes::from_static(b"read_b");
+
+    // Both reads are at commit=1 (nothing new committed between them).
+    ep.read_index(d, &mut log, &mut stable, ctx_a.clone());
+    ep.read_index(d, &mut log, &mut stable, ctx_b.clone());
+    while ep.poll_message().is_some() {}
+
+    // Peer 2 acks with ctx_b (the last pending context from broadcast_heartbeat).
+    // This should advance through both ctx_a and ctx_b (FIFO).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        ctx_b.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+
+    // Both reads should now be confirmed.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    let read_states: std::vec::Vec<_> = events
+      .iter()
+      .filter_map(|e| {
+        if let crate::Event::ReadState(rs) = e {
+          Some(rs.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+
+    assert_eq!(
+      read_states.len(),
+      2,
+      "both reads must be confirmed; got {} ReadStates",
+      read_states.len()
+    );
+    // FIFO: ctx_a before ctx_b.
+    assert_eq!(
+      read_states[0].context().as_ref(),
+      ctx_a.as_ref(),
+      "first confirmed must be ctx_a"
+    );
+    assert_eq!(
+      read_states[1].context().as_ref(),
+      ctx_b.as_ref(),
+      "second confirmed must be ctx_b"
+    );
+    // Index correctness: both are at commit=1.
+    assert_eq!(read_states[0].index(), crate::Index::new(1));
+    assert_eq!(read_states[1].index(), crate::Index::new(1));
+  }
+
+  /// Test 6: No-current-term-commit defers.
+  ///
+  /// A freshly-elected leader whose no-op hasn't committed yet defers a read until
+  /// the no-op commits, then confirms it.
+  #[test]
+  fn no_current_term_commit_defers_read() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    // Do NOT drain storage or advance commit yet.
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // read_index called before the no-op is committed → must be DEFERRED.
+    let ctx = bytes::Bytes::from_static(b"deferred_read");
+    ep.read_index(d, &mut log, &mut stable, ctx.clone());
+
+    // No heartbeats with ctx should have been sent (deferred).
+    let mut ctx_hb = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        if hb.context() == ctx.as_ref() {
+          ctx_hb = true;
+        }
+      }
+    }
+    assert!(
+      !ctx_hb,
+      "deferred read must NOT broadcast a heartbeat round before no-op commits"
+    );
+
+    // No ReadState yet.
+    assert!(
+      ep.poll_event().is_none(),
+      "deferred read must NOT emit ReadState before no-op commits"
+    );
+
+    // Now drain storage → no-op LeaderAppend fires → self match advances.
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_event().is_some() {} // drain LeaderChanged etc.
+
+    // Peer 2 acks the no-op → commit=1 in current term → deferred read gets flushed.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {} // drain Applied for no-op (it's Empty, so none)
+
+    // The deferred read should now have been flushed → leader broadcasts heartbeat with ctx.
+    let mut ctx_hb_after = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        if hb.context() == ctx.as_ref() {
+          ctx_hb_after = true;
+        }
+      }
+    }
+    assert!(
+      ctx_hb_after,
+      "deferred read must broadcast heartbeats after no-op commits"
+    );
+
+    // Peer 2 acks the heartbeat → quorum → ReadState emitted.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        ctx.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    let read_states: std::vec::Vec<_> = events
+      .iter()
+      .filter_map(|e| {
+        if let crate::Event::ReadState(rs) = e {
+          Some(rs.clone())
+        } else {
+          None
+        }
+      })
+      .collect();
+    assert_eq!(
+      read_states.len(),
+      1,
+      "exactly one ReadState must be emitted after deferred read is confirmed"
+    );
+    assert_eq!(
+      read_states[0].index(),
+      crate::Index::new(1),
+      "index must be commit at receipt"
+    );
+    assert_eq!(read_states[0].context().as_ref(), ctx.as_ref());
   }
 }

@@ -68,6 +68,9 @@ pub use progress::{Progress, ProgressState};
 mod config;
 pub use config::{Config, ReadOnlyOption};
 
+mod read_only;
+pub use read_only::{ReadOnly, ReadState};
+
 mod event;
 pub use event::{Applied, ConfChanged, Event, LeaderChanged};
 

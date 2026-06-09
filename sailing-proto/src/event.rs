@@ -1,5 +1,5 @@
 //! Application-facing outputs drained via `Endpoint::poll_event`.
-use crate::{ConfState, Index, SnapshotMeta, Term};
+use crate::{ConfState, Index, ReadState, SnapshotMeta, Term};
 
 /// A committed `Normal` entry was applied; `response` is the `StateMachine::Response`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,8 +87,7 @@ impl<I: Clone> ConfChanged<I> {
   }
 }
 
-/// Outputs the application observes. `#[non_exhaustive]` — `ReadState`
-/// is added additively in later milestones.
+/// Outputs the application observes.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -105,6 +104,9 @@ pub enum Event<I, R> {
   SnapshotInstalled(SnapshotMeta<I>),
   /// A `ConfChange` entry was committed and applied; the cluster membership changed.
   ConfChanged(ConfChanged<I>),
+  /// A linearizable read index has been confirmed.  The application may serve the
+  /// associated read once `applied >= ReadState.index`.
+  ReadState(ReadState),
 }
 
 #[cfg(test)]
@@ -118,6 +120,20 @@ mod tests {
     let lc: Event<u64, u32> =
       Event::LeaderChanged(LeaderChanged::new(crate::Term::new(2), Some(1u64)));
     assert!(lc.is_leader_changed());
+  }
+
+  #[test]
+  fn read_state_event_construct_and_classify() {
+    use crate::ReadState;
+    let rs = ReadState::new(crate::Index::new(7), bytes::Bytes::from_static(b"ctx"));
+    let ev: Event<u64, u32> = Event::ReadState(rs.clone());
+    assert!(ev.is_read_state());
+    assert!(!ev.is_applied());
+    assert!(!ev.is_leader_changed());
+    // Unwrap gives back the ReadState.
+    let rs2 = ev.unwrap_read_state_ref();
+    assert_eq!(rs2.index(), crate::Index::new(7));
+    assert_eq!(rs2.context().as_ref(), b"ctx");
   }
 
   #[test]
