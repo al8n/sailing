@@ -684,6 +684,27 @@ impl<I: crate::NodeId> Message<I> {
       Self::ReadIndexResp(m) => m.term(),
     }
   }
+
+  /// The sender id carried by this message. Every variant records the node that sent it, so the
+  /// receiver can reject any message whose self-reported sender disagrees with the transport peer
+  /// it actually arrived from — closing payload-sender spoofing for every message type at once.
+  pub fn from(&self) -> I {
+    match self {
+      // Leader/candidate-originated messages name their sender as `leader`/`candidate`.
+      Self::AppendEntries(m) => m.leader(),
+      Self::RequestVote(m) => m.candidate(),
+      Self::Heartbeat(m) => m.leader(),
+      Self::InstallSnapshot(m) => m.leader(),
+      Self::TimeoutNow(m) => m.leader(),
+      // Responses and forwarded reads carry an explicit `from`.
+      Self::AppendResp(m) => m.from(),
+      Self::VoteResp(m) => m.from(),
+      Self::HeartbeatResp(m) => m.from(),
+      Self::SnapshotResp(m) => m.from(),
+      Self::ReadIndex(m) => m.from(),
+      Self::ReadIndexResp(m) => m.from(),
+    }
+  }
 }
 
 #[cfg(test)]

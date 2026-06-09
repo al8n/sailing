@@ -209,6 +209,14 @@ impl<I: NodeId> ReadOnly<I> {
     self.queue.is_empty()
   }
 
+  /// The number of pending reads awaiting heartbeat-quorum confirmation. Bounds the leader's
+  /// in-flight read backlog (together with `pending_reads`) so a partitioned leader — one that
+  /// never gathers an ack quorum — cannot accumulate contexts without limit.
+  #[inline(always)]
+  pub fn len(&self) -> usize {
+    self.queue.len()
+  }
+
   /// Return a reference to the ack set for the pending read identified by `context`,
   /// or `None` if no such request is pending.
   pub fn acks_for(&self, context: &[u8]) -> Option<&std::collections::BTreeSet<I>> {

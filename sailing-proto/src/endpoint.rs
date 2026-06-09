@@ -174,6 +174,13 @@ enum Pending<I> {
 /// replication window) because the two limits are unrelated; 256 is the same generous default.
 const MAX_FORWARDED_READS: usize = 256;
 
+/// Upper bound on a LEADER's combined in-flight read backlog — deferred reads awaiting the
+/// current-term no-op (`pending_reads`) plus reads awaiting heartbeat-quorum confirmation
+/// (`read_only`). A partitioned leader never drains this backlog, so without the cap a spammy or
+/// looping client could drive unbounded `Bytes` retention. Beyond the cap a local read is rejected
+/// with `TooManyInFlight` and a forwarded read is dropped (the follower can re-issue).
+const MAX_LEADER_READS: usize = 256;
+
 /// The read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
 /// awaiting a `ReadIndexResp` for — the follower-side mirror of the leader's `read_context_in_flight`
 /// guard. Backed by a `VecDeque` for insertion-order (FIFO) eviction: at [`MAX_FORWARDED_READS`] the
@@ -510,6 +517,43 @@ where
   fn poison(&mut self, reason: PoisonReason) {
     self.poisoned = true;
     self.poison_reason.get_or_insert(reason);
+  }
+
+  /// Storage-submission choke-point: a poisoned node must never persist new work. Routing every
+  /// `submit_*` through these wrappers makes "poisoned ⇒ no durable write" hold BY CONSTRUCTION,
+  /// for any caller — public API, handler, or future code — not just the ones that remember to check.
+  /// Together with the egress emit-halt (`poll_*` return `None` when poisoned) this means a poisoned
+  /// node can neither persist nor emit, regardless of which entry point is exercised.
+  fn submit_append<L: LogStore>(&self, log: &mut L, id: crate::OpId, entries: &[crate::Entry]) {
+    if self.poisoned {
+      return;
+    }
+    log.submit_append(id, entries);
+  }
+
+  fn submit_write<S: StableStore<NodeId = I>>(
+    &self,
+    stable: &mut S,
+    id: crate::OpId,
+    hard_state: crate::HardState<I>,
+  ) {
+    if self.poisoned {
+      return;
+    }
+    stable.submit_write(id, hard_state);
+  }
+
+  fn submit_snapshot<S: StableStore<NodeId = I>>(
+    &self,
+    stable: &mut S,
+    id: crate::OpId,
+    meta: crate::SnapshotMeta<I>,
+    data: Bytes,
+  ) {
+    if self.poisoned {
+      return;
+    }
+    stable.submit_snapshot(id, meta, data);
   }
 
   /// Whether this node has hit an unrecoverable error.
@@ -1020,7 +1064,7 @@ where
         .with_term(self.term)
         .with_vote(self.voted_for)
         .with_commit(self.commit);
-      stable.submit_write(opid, hs);
+      self.submit_write(stable, opid, hs);
       self.committed_persisted = self.commit;
       self.pending.insert(
         opid,
@@ -1187,7 +1231,7 @@ where
         .with_term(self.term)
         .with_vote(self.voted_for)
         .with_commit(self.commit);
-      stable.submit_write(opid, hs);
+      self.submit_write(stable, opid, hs);
       self.committed_persisted = self.commit;
     }
 
@@ -1236,7 +1280,7 @@ where
     };
     let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state());
     let opid = self.mint_op_id();
-    stable.submit_snapshot(opid, meta, bytes::Bytes::from(data));
+    self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
     self.pending_compact = Some((opid, self.applied));
   }
@@ -1457,6 +1501,13 @@ where
     if self.poisoned {
       return;
     }
+    // Sender-authenticity choke-point: reject any message whose self-reported sender disagrees with
+    // the transport peer it actually arrived from. This single check closes payload-sender spoofing
+    // for EVERY message type — past this point vote tallies, append acks, and read confirmations may
+    // all trust `*.from()` because it provably equals the transport sender.
+    if msg.from() != from {
+      return;
+    }
     // Universal term handling (Raft §5.1): a higher term forces us to a follower.
     // Exception (PreVote anti-disruption): pre-vote traffic carries an *advertised* term
     // that has not been adopted — do NOT step down or adopt it.
@@ -1520,7 +1571,7 @@ where
           .with_term(self.term)
           .with_vote(None)
           .with_commit(self.commit);
-        stable.submit_write(opid, hs);
+        self.submit_write(stable, opid, hs);
         self.committed_persisted = self.commit;
         // NOTE: a voter that steps down here on a higher-term RESPONSE (whose handler does not
         // re-arm) would be left without an election timer — `reconcile_election_timer`, run at the
@@ -1702,7 +1753,7 @@ where
       bytes::Bytes::from(buf),
     );
     let opid = self.mint_op_id();
-    log.submit_append(opid, core::slice::from_ref(&entry));
+    self.submit_append(log, opid, core::slice::from_ref(&entry));
     self
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
@@ -1757,6 +1808,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if self.poisoned {
+      return Err(crate::ProposeError::Poisoned);
+    }
     if !self.role.is_leader() {
       return Err(crate::ProposeError::NotLeader {
         leader: self.leader,
@@ -1787,6 +1841,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if self.poisoned {
+      return Err(crate::ProposeError::Poisoned);
+    }
     if !self.role.is_leader() {
       return Err(crate::ProposeError::NotLeader {
         leader: self.leader,
@@ -1809,7 +1866,7 @@ where
     );
     // Self-match advance is deferred until the append is durable (on_log_appended).
     let opid = self.mint_op_id();
-    log.submit_append(opid, core::slice::from_ref(&entry));
+    self.submit_append(log, opid, core::slice::from_ref(&entry));
     self
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
@@ -1993,7 +2050,7 @@ where
       .with_term(self.term)
       .with_vote(self.voted_for)
       .with_commit(self.commit);
-    stable.submit_write(opid, hs);
+    self.submit_write(stable, opid, hs);
     self.committed_persisted = self.commit;
     // Defer acting on the self-vote until it is DURABLE (persist-before-act, symmetric with the
     // follower `CastVote` path): `become_leader` fires from `on_stable_wrote` (single-node now, or
@@ -2138,7 +2195,7 @@ where
       bytes::Bytes::new(),
     );
     let opid = self.mint_op_id();
-    log.submit_append(opid, core::slice::from_ref(&noop));
+    self.submit_append(log, opid, core::slice::from_ref(&noop));
     self
       .pending
       .insert(opid, Pending::LeaderAppend { upto: noop_index });
@@ -2315,7 +2372,7 @@ where
           _ => true,
         });
         let opid = self.mint_op_id();
-        log.submit_append(opid, &entries[i..]);
+        self.submit_append(log, opid, &entries[i..]);
         appended_opid = Some(opid);
         // Apply-time membership (etcd, spec §9): a follower does NOT fold appended ConfChanges into
         // its tracker. The configuration changes only when those entries commit-and-apply
@@ -2647,6 +2704,12 @@ where
         if self.read_context_in_flight(&context) {
           return Err(crate::ReadIndexError::DuplicateContext);
         }
+        // Leader-side read back-pressure: a partitioned leader (no current-term commit, or no
+        // heartbeat-ack quorum) must not accumulate reads without bound. Cap the combined in-flight
+        // backlog — deferred (`pending_reads`) plus confirming (`read_only`) — and reject beyond it.
+        if self.leader_reads_at_capacity() {
+          return Err(crate::ReadIndexError::TooManyInFlight);
+        }
         // Current-term-commit gate.
         if !self.has_current_term_commit(log) {
           // Defer until the no-op commits.
@@ -2701,6 +2764,13 @@ where
       || self.read_only.acks_for(context.as_ref()).is_some()
   }
 
+  /// Whether the leader's combined in-flight read backlog (deferred `pending_reads` + confirming
+  /// `read_only`) has reached [`MAX_LEADER_READS`]. A read is in one or the other, never both, so
+  /// their sum is the live count.
+  fn leader_reads_at_capacity(&self) -> bool {
+    self.pending_reads.len() + self.read_only.len() >= MAX_LEADER_READS
+  }
+
   /// Leader receives a forwarded `ReadIndex` from a follower.
   fn on_read_index<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
@@ -2720,6 +2790,12 @@ where
     // `ReadOnly::add_request` afterward — leaving the originator waiting forever. The first request
     // for the context already owns its completion path; drop the duplicate.
     if self.read_context_in_flight(&context) {
+      return;
+    }
+    // Leader-side read back-pressure (same bound as the local path): drop a forwarded read at
+    // capacity rather than grow the backlog without limit. The follower's `forwarded_reads` entry
+    // clears on its own term/leader change, so it can re-issue once the leader drains.
+    if self.leader_reads_at_capacity() {
       return;
     }
     // Current-term-commit gate (same as the local path).
@@ -2997,7 +3073,7 @@ where
 
     // Step 5: persist the snapshot for restart recovery (deferred; see comment above).
     let opid = self.mint_op_id();
-    stable.submit_snapshot(opid, meta.clone(), is.data().clone());
+    self.submit_snapshot(stable, opid, meta.clone(), is.data().clone());
 
     // Step 6: emit the application event.
     self
@@ -3085,6 +3161,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if self.poisoned {
+      return Err(crate::TransferError::Poisoned);
+    }
     if !self.role.is_leader() {
       return Err(crate::TransferError::NotLeader {
         leader: self.leader,
@@ -11655,5 +11734,291 @@ mod tests {
       "the legitimately-addressed resp completes the read exactly once"
     );
     assert_eq!(read_states[0].index(), Index::new(9));
+  }
+
+  /// Class B regression — sender-authenticity choke-point.
+  ///
+  /// `handle_message` rejects any message whose self-reported sender (`Message::from()`)
+  /// disagrees with the transport peer it arrived from. A granting `VoteResp` whose PAYLOAD
+  /// claims `from = 2` but which actually arrives over the transport from peer `3` must be
+  /// dropped — so a single hostile peer cannot forge a second node's grant to push a candidate
+  /// over quorum. The legitimate grant (payload from = 2, transport from = 2) then elects it.
+  ///
+  /// FAILS-ON-OLD: with the `if msg.from() != from { return; }` choke-point removed, the spoofed
+  /// grant from peer 3 is tallied as node 2's vote, reaching quorum and electing the candidate
+  /// before the legitimate grant ever arrives.
+  #[test]
+  fn spoofed_sender_vote_resp_is_rejected() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Node 1 campaigns: become candidate (term 1, self-vote), then make the self-vote durable so
+    // the `Campaign` completes (persist-before-act). Mirrors the election-mechanics of
+    // `quorum_makes_a_leader_and_heartbeats_follow`.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {} // drain RequestVotes
+    assert!(
+      ep.role().is_candidate(),
+      "node 1 must be a candidate after campaigning"
+    );
+
+    // Spoofed grant: PAYLOAD says from = 2 (a peer whose vote WOULD complete quorum), but it
+    // arrives over the transport from peer 3. The choke-point must reject it before the tally.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(
+      ep.role().is_candidate(),
+      "a grant whose payload sender (2) disagrees with the transport peer (3) must NOT be \
+       counted — the node stays a candidate"
+    );
+    assert!(
+      !ep.role().is_leader(),
+      "the spoofed grant must not elect the candidate"
+    );
+
+    // Legitimate grant: payload from = 2, transport from = 2 → now quorum (self + 2) → leader.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(
+      ep.role().is_leader(),
+      "the legitimate grant from peer 2 must reach quorum and elect the candidate"
+    );
+  }
+
+  /// Class A regression — poison effect-boundary on the work-accepting APIs.
+  ///
+  /// A poisoned node's commit/applied view is no longer trustworthy. `propose`,
+  /// `propose_conf_change_v2`, and `transfer_leader` must therefore reject with `Poisoned`
+  /// (not silently `Ok` or `NotLeader`), and — because every durability submit routes through the
+  /// `submit_*` no-op-when-poisoned wrappers — none of them may advance the durable log.
+  ///
+  /// FAILS-ON-OLD: with the `if self.poisoned { return Err(ProposeError::Poisoned); }` guard
+  /// removed from `propose`, a poisoned leader's `propose` returns `Ok`/`NotLeader` instead.
+  #[test]
+  fn poisoned_node_rejects_work_and_persists_nothing() {
+    use crate::{
+      AppendEntries, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, Config,
+      Entry, EntryKind, Index, Instant, Message, PoisonReason, Term,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Poison via the same FATAL term-read path as
+    // `term_read_failure_at_committed_index_poisons_no_truncation`: two durable committed entries,
+    // then a conflicting AppendEntries whose conflict scan reads an armed-to-fail term(2) → poison.
+    let mut log = crate::testkit::FailTermLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+    ]);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::new(2),
+        Term::new(1),
+        std::vec![],
+        Index::new(2),
+      )),
+    );
+    assert!(!ep.is_poisoned(), "healthy after the setup append");
+    while ep.poll_message().is_some() {}
+
+    log.fail_term_at(Some(Index::new(2)));
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        1u64,
+        Index::new(1),
+        Term::new(1),
+        std::vec![Entry::new(
+          Term::new(2),
+          Index::new(2),
+          EntryKind::Empty,
+          bytes::Bytes::new(),
+        )],
+        Index::new(1),
+      )),
+    );
+    log.fail_term_at(None);
+    assert!(ep.is_poisoned(), "fatal term-read must poison the node");
+    assert_eq!(ep.poison_reason(), Some(PoisonReason::LogTerm));
+
+    // Snapshot the durable tail BEFORE the work-accepting calls. None of them may advance it.
+    let last_before = log.last_index();
+    assert_eq!(last_before, Index::new(2));
+
+    // propose → Poisoned.
+    let cmd = bytes::Bytes::from_static(b"x");
+    assert_eq!(
+      ep.propose(Instant::ORIGIN, &mut log, &stable, &cmd),
+      Err(crate::ProposeError::Poisoned),
+      "a poisoned node must reject propose with Poisoned"
+    );
+    // propose_conf_change_v2 → Poisoned.
+    let cc = ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      std::vec![ConfChangeSingle::new(ConfChangeType::AddNode, 4u64)],
+      bytes::Bytes::new(),
+    );
+    assert_eq!(
+      ep.propose_conf_change_v2(Instant::ORIGIN, &mut log, &stable, cc),
+      Err(crate::ProposeError::Poisoned),
+      "a poisoned node must reject propose_conf_change_v2 with Poisoned"
+    );
+    // transfer_leader → Poisoned.
+    assert_eq!(
+      ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64),
+      Err(crate::TransferError::Poisoned),
+      "a poisoned node must reject transfer_leader with Poisoned"
+    );
+
+    // No durable work was produced by any of those calls.
+    assert_eq!(
+      log.last_index(),
+      last_before,
+      "a poisoned node must persist nothing: last_index must not advance across the rejected calls"
+    );
+
+    // White-box backstop: even a DIRECT call to the private submit wrapper no-ops when poisoned.
+    // (The public-API guards above are the first line of defense; `submit_append` is the
+    // structural one that holds for any caller.) `tests` is an inner module of `endpoint`, so the
+    // private method is in scope.
+    let opid = ep.mint_op_id_for_test();
+    let entry = Entry::new(
+      Term::new(2),
+      log.last_index().next(),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    );
+    ep.submit_append(&mut log, opid, core::slice::from_ref(&entry));
+    assert_eq!(
+      log.last_index(),
+      last_before,
+      "submit_append must no-op when poisoned: the durable tail must not advance"
+    );
+  }
+
+  /// Class C regression — leader read backlog is bounded.
+  ///
+  /// A freshly-elected multi-node leader whose current-term no-op has NOT yet committed defers
+  /// each read into `pending_reads` (no heartbeat round). That backlog must be capped at
+  /// `MAX_LEADER_READS`: the first `MAX_LEADER_READS` distinct-context reads are accepted, and the
+  /// next one is rejected with `TooManyInFlight`. The backlog never exceeds the cap.
+  ///
+  /// FAILS-ON-OLD: with the `if self.leader_reads_at_capacity() { return Err(..TooManyInFlight) }`
+  /// check removed from the `read_index` leader branch, the cap+1 read returns `Ok` and
+  /// `pending_reads` grows past `MAX_LEADER_READS`.
+  #[test]
+  fn leader_read_backlog_is_bounded() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 leader, but do NOT drain storage / advance commit, so `has_current_term_commit`
+    // is false and reads defer into `pending_reads`. Mirrors `no_current_term_commit_defers_read`.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // First read: deferred (no current-term commit) but accepted.
+    ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"read-0"))
+      .expect("a leader with no current-term commit must accept (defer) the first read");
+
+    // Fill the rest of the cap with distinct contexts: indices 1..MAX_LEADER_READS are all Ok.
+    for i in 1..MAX_LEADER_READS {
+      let ctx = bytes::Bytes::from(std::format!("read-{i}"));
+      ep.read_index(d, &log, &stable, ctx)
+        .expect("reads up to the cap must be accepted");
+      assert!(
+        ep.pending_reads.len() <= MAX_LEADER_READS,
+        "the deferred backlog must never exceed MAX_LEADER_READS"
+      );
+    }
+    assert_eq!(
+      ep.pending_reads.len(),
+      MAX_LEADER_READS,
+      "exactly MAX_LEADER_READS reads are now in the deferred backlog"
+    );
+
+    // One more distinct read: the cap is reached → TooManyInFlight, and the backlog does not grow.
+    let overflow = bytes::Bytes::from_static(b"read-overflow");
+    assert_eq!(
+      ep.read_index(d, &log, &stable, overflow),
+      Err(crate::ReadIndexError::TooManyInFlight),
+      "the read past the cap must be rejected with TooManyInFlight"
+    );
+    assert_eq!(
+      ep.pending_reads.len(),
+      MAX_LEADER_READS,
+      "the rejected read must not be added: the backlog stays at the cap"
+    );
   }
 }

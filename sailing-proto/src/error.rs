@@ -19,6 +19,10 @@ pub enum ProposeError<I> {
   /// the transfer completes or times out.
   #[error("a leader transfer is in progress")]
   LeaderTransferInProgress,
+  /// The node has entered the permanent poisoned state (a fatal storage/apply error) and accepts no
+  /// new work. The proposal was NOT appended or persisted; inspect `poison_reason()`.
+  #[error("the node is poisoned and accepts no new proposals")]
+  Poisoned,
 }
 
 /// Why a leader-transfer request was rejected.
@@ -38,6 +42,10 @@ pub enum TransferError<I> {
   /// The target node is the current leader — no transfer needed.
   #[error("transfer target is already the leader")]
   AlreadyLeader,
+  /// The node has entered the permanent poisoned state and accepts no new work. The transfer was
+  /// NOT initiated; inspect `poison_reason()`.
+  #[error("the node is poisoned and cannot initiate a transfer")]
+  Poisoned,
 }
 
 /// Why a [`read_index`](crate::Endpoint::read_index) request could not be issued.
