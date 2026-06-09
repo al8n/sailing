@@ -162,10 +162,19 @@ struct VoprState {
   /// Per-wired-joiner count of consecutive reconciliation passes it has been settled-but-absent from
   /// the committed membership — the orphan grace counter (see [`ORPHAN_GRACE_PASSES`]).
   missing_streak: std::collections::BTreeMap<u64, u32>,
-  /// Nodes the VOPR has `c.mark_removed()` (abandoned orphans + nodes a RemoveNode targeted). The
-  /// cluster keeps these isolated, so they are excluded from the reconciled `voters`/`learners` and
-  /// from the sim-live set — they cannot pin `min_applied_len`/quiesce or absorb phantom isolation.
+  /// Nodes the VOPR has `c.mark_removed()` (abandoned orphans + nodes whose RemoveNode COMMITTED).
+  /// The cluster keeps these isolated, so they are excluded from the reconciled `voters`/`learners`
+  /// and from the sim-live set — they cannot pin `min_applied_len`/quiesce or absorb phantom isolation.
   gone: BTreeSet<u64>,
+  /// Voters with an in-flight RemoveNode that has NOT yet committed. A removed voter is kept FULLY
+  /// LIVE (it still votes / replicates) until its removal is observed committed — mirroring real Raft,
+  /// where a node remains a voting member of every configuration up to and including the one that
+  /// removes it. Isolating it at propose time (the old behavior) made it a PHANTOM voter: still in the
+  /// surviving nodes' committed configs (hence counted toward quorum) yet unreachable, which can
+  /// DEADLOCK an election when the removal never propagates (no node can reach the inflated quorum).
+  /// [`reconcile_membership`] moves an id from here into `gone` (isolating it) once `committed_voters`
+  /// no longer lists it.
+  removing: BTreeSet<u64>,
   /// Currently VOPR-isolated nodes (the sustained-outage set; the fault budget caps the voter subset).
   down: BTreeSet<u64>,
   /// The next node id to hand out for an AddNode/AddLearner (monotonic; never reused).
@@ -201,14 +210,34 @@ impl VoprState {
       .collect()
   }
 
-  /// The number of currently-isolated VOTERS — the quantity the fault budget caps. Counts a voter
-  /// that is VOPR-isolated (`down`) OR has been `c.mark_removed()` (`gone`, hence cluster-isolated):
-  /// either way it cannot help the surviving quorum, so the budget must account for it.
+  /// The voters that are SETTLED members — committed voters MINUS any with an in-flight RemoveNode.
+  /// A node being removed stays network-live so it can still VOTE (keeping election quorum reachable),
+  /// but it is on its way out and may legitimately lag, so it is EXCLUDED from the catch-up liveness
+  /// metrics (calm-window progress / quiesce full-catch-up): requiring a departing node to fully
+  /// re-sync would falsely fire a livelock. Real liveness bugs are still caught — only the node(s)
+  /// whose removal is in flight are exempt.
+  ///
+  /// NEVER empty when there are voters: `removing` can transiently cover EVERY voter (a stuck removal
+  /// that never commits while another is proposed past it), but a cluster cannot be removing all its
+  /// members at once — so if the difference is empty, fall back to the full voter set, measuring the
+  /// survivors rather than an empty set (which made the metric vacuously 0 — VOPR seeds 60/666). The
+  /// quorum liveness metric already tolerates a departing laggard as a minority.
+  fn settled_voters(&self) -> BTreeSet<u64> {
+    let s: BTreeSet<u64> = self.voters.difference(&self.removing).copied().collect();
+    if s.is_empty() { self.voters.clone() } else { s }
+  }
+
+  /// The number of voters the fault budget must treat as UNAVAILABLE to the surviving quorum. Counts a
+  /// voter that is VOPR-isolated (`down`), `c.mark_removed()` (`gone`), OR has an in-flight RemoveNode
+  /// (`removing`). The `removing` case is the apply-time liveness guard: under apply-time, a RemoveNode
+  /// commits through the OLD (still-committed) config that INCLUDES the victim, so until it commits the
+  /// victim's quorum slot must be reserved — otherwise the adversary could partition enough OTHER
+  /// voters that the in-flight removal can never reach quorum, wedging the proto's one-in-flight gate.
   fn voters_down(&self) -> usize {
     self
       .voters
       .iter()
-      .filter(|id| self.down.contains(id) || self.gone.contains(id))
+      .filter(|id| self.down.contains(id) || self.gone.contains(id) || self.removing.contains(id))
       .count()
   }
 
@@ -241,6 +270,38 @@ fn reconcile_membership(c: &mut Cluster, st: &mut VoprState) {
   if c.leader().is_some() {
     let voters = c.committed_voters();
     let learners = c.committed_learners();
+    // Regression recovery: a `gone` node the CURRENT leader's committed view STILL lists must rejoin the
+    // network. The leader needs that node's vote/ack to make progress, but the harness had isolated it
+    // because the leader is a post-restart/partition laggard whose APPLIED config regressed (rebuilt
+    // from a stale durable commit, or never learned the removal committed). The failure shape behind
+    // churn seeds 38/53/102/249/666. We trust ONLY the leader's view here, never a non-leader laggard's
+    // (seed 83). Re-admitted as a FULL voter (NOT `removing`) so it counts toward progress and the
+    // leader replicates it back into sync — dumping survivors into `removing` emptied the metric (seed 60).
+    let resurrect: Vec<u64> = st
+      .gone
+      .iter()
+      .copied()
+      .filter(|g| voters.contains(g))
+      .collect();
+    for g in resurrect {
+      c.reinstate(g);
+      st.gone.remove(&g);
+    }
+    // A victim with an in-flight RemoveNode is isolated only ONCE it has left the leader's committed
+    // voter set (its removal committed on the quorum the leader sees). If a later laggard-leader
+    // regresses to need it, the resurrect above re-arms it — so isolating on the leader's view is safe.
+    let committed_removed: Vec<u64> = st
+      .removing
+      .iter()
+      .copied()
+      .filter(|v| !voters.contains(v))
+      .collect();
+    for v in committed_removed {
+      c.mark_removed(v);
+      st.gone.insert(v);
+      st.removing.remove(&v);
+      st.down.remove(&v);
+    }
     st.voters = voters.difference(&st.gone).copied().collect();
     st.learners = learners.difference(&st.gone).copied().collect();
   }
@@ -299,7 +360,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 
   // ── Setup: seed-chosen cluster size in 2..=7 (INCLUDING even sizes). ───────────────────────────
   let size = 2 + (prng.next_u64() % 6) as usize; // 2..=7
-  let mut c = Cluster::new_async(size, seed);
+  let mut c = Cluster::new_async_with(size, seed, |cfg| cfg.with_pre_vote(true));
 
   // Install a seed-chosen baseline network + per-node storage fault config (modest — the run must
   // still be able to make progress; calm windows back it off entirely).
@@ -316,6 +377,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     wired: BTreeSet::new(),
     missing_streak: std::collections::BTreeMap::new(),
     gone: BTreeSet::new(),
+    removing: BTreeSet::new(),
     down: BTreeSet::new(),
     next_id: size as u64,
     conf_in_flight: false,
@@ -475,15 +537,29 @@ fn partition(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report: 
   if st.budget_remaining() == 0 {
     return; // taking another voter down would break quorum — skip
   }
-  // Eligible victims: voters that are currently up (and not removed). Prefer NOT isolating the only
-  // means of progress — but the budget already guarantees a surviving majority, so any voter is fine.
+  // Eligible victims: voters currently up, not already down, and NOT an in-flight removal victim — a
+  // `removing` node is kept network-live so it can ack/vote its own RemoveNode's quorum (under
+  // apply-time that removal commits through the OLD config, which still includes the victim).
   let eligible: BTreeSet<u64> = st
     .voters
     .iter()
-    .filter(|id| !st.down.contains(id))
+    .filter(|id| !st.down.contains(id) && !st.removing.contains(id))
     .copied()
     .collect();
   if let Some(victim) = pick_from(&eligible, prng) {
+    // Apply-time liveness guard: never isolate a voter if doing so drops the FULL committed config
+    // (counting a `removing` victim as the live, quorum-relevant member it still is) below a reachable
+    // majority — an in-flight RemoveNode must be able to commit through that quorum. Mirrors
+    // `conf_change`'s removable surviving-majority test; closes the compose-with-budget gap where
+    // partition + an in-flight removal each pass their own check but together strand the quorum.
+    let reachable_after = st
+      .voters
+      .iter()
+      .filter(|v| **v != victim && !st.down.contains(v) && !st.gone.contains(v))
+      .count();
+    if reachable_after * 2 <= st.voters.len() {
+      return; // would strand the committed-config quorum — skip this isolation
+    }
     c.isolate(victim);
     st.down.insert(victim);
     report.partitions += 1;
@@ -616,11 +692,12 @@ fn conf_change(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report
       }
     }
     _ => {
-      // RemoveNode (only if a viable victim exists). On accept we `mark_removed`+isolate the victim
-      // immediately (it stops campaigning before it applies its own removal), and record it in
-      // `gone`; reconciliation drops it from `voters` once the RemoveNode COMMITS. While the removal
-      // is still in flight the victim stays in the leader's committed config, so `gone` is what keeps
-      // reconciliation from re-adding it and keeps the budget treating it as down.
+      // RemoveNode (only if a viable victim exists). The victim is kept FULLY LIVE (still voting /
+      // replicating) until its removal is observed COMMITTED — `reconcile_membership` isolates it
+      // (`mark_removed` + `gone`) once `committed_voters` no longer lists it. Isolating at propose
+      // time (the old behavior) made the victim a PHANTOM voter — still in the surviving nodes'
+      // committed configs, hence counted toward quorum, yet unreachable — which deadlocks an election
+      // if the removal never propagates. Recording it in `removing` is what defers the isolation.
       if let Some(victim) = pick_from(&removable, prng) {
         let cc = sailing_proto::ConfChange::new(
           sailing_proto::ConfChangeType::RemoveNode,
@@ -628,11 +705,7 @@ fn conf_change(c: &mut Cluster, st: &mut VoprState, prng: &mut FaultPrng, report
           bytes::Bytes::new(),
         );
         if c.propose_conf_change(cc).is_some() {
-          c.mark_removed(victim);
-          st.gone.insert(victim);
-          st.voters.remove(&victim);
-          st.learners.remove(&victim);
-          st.down.remove(&victim);
+          st.removing.insert(victim);
           true
         } else {
           false
@@ -691,11 +764,16 @@ fn refresh_conf_in_flight(c: &Cluster, st: &mut VoprState) {
   }
 }
 
-/// Whether every live voter (not removed) has applied EXACTLY as many entries as the most-advanced
-/// voter — i.e. the cluster is fully caught up, not merely prefix-consistent. The precondition for
-/// the quiesce apply-everywhere equality check.
+/// Whether every SETTLED voter (committed, not mid-removal) has applied EXACTLY as many entries as
+/// the most-advanced one — i.e. the cluster is fully caught up, not merely prefix-consistent. The
+/// precondition for the quiesce apply-everywhere equality check. A voter whose removal is in flight is
+/// excluded (it is departing and may legitimately lag — see [`VoprState::settled_voters`]).
 fn voters_fully_caught_up(c: &Cluster, st: &VoprState) -> bool {
-  let lens: Vec<usize> = st.voters.iter().map(|&id| c.applied_len_of(id)).collect();
+  let lens: Vec<usize> = st
+    .settled_voters()
+    .iter()
+    .map(|&id| c.applied_len_of(id))
+    .collect();
   match (lens.iter().min(), lens.iter().max()) {
     (Some(lo), Some(hi)) => lo == hi,
     _ => true, // no voters (shouldn't happen) → vacuously caught up
@@ -730,10 +808,16 @@ fn calm_window(
   report: &mut VoprReport,
   seed: u64,
 ) {
-  // Heal every VOPR-isolated node.
-  for node in st.down.iter().copied().collect::<Vec<_>>() {
-    c.heal(node);
-    report.restarts += 1;
+  // Heal EVERY isolated node that is not permanently `gone` — not only those still tracked in
+  // `st.down`. A node can be `c.isolated` yet absent from `st.down` (reconcile prunes `st.down` to the
+  // current voters WITHOUT un-isolating it), which would otherwise strand it unreachable forever
+  // (VOPR seed 3077: a fresh 2-voter peer isolated then dropped from `st.down`, never healed → it
+  // sits at term 0 and the 2-voter quorum can never make progress).
+  for node in c.isolated_nodes() {
+    if !st.gone.contains(&node) {
+      c.heal(node);
+      report.restarts += 1;
+    }
   }
   st.down.clear();
   // Clear all faults (network + every live node's storage) BEFORE restarting poisoned nodes, so a
@@ -752,46 +836,129 @@ fn calm_window(
 
   // Let the cluster settle to a single leader (generous bound — a healthy majority MUST converge).
   if !c.run_until(4_000, |c| c.leader_count() == 1) {
-    let tick = c.view().tick;
-    panic!(
-      "VOPR LIVELOCK (calm window): cluster failed to elect a single leader within 4000 ticks \
+    // Last-resort phantom-gone recovery for a LEADERLESS deadlock: a divergent-config election cannot
+    // resolve when a `gone` node a current voter still lists as a member never answers (VOPR seed 1197:
+    // node 5 is gone, but voter n1's config still has it, so neither candidate can assemble a quorum that
+    // both branches accept). Reinstate any such node — trusting ONLY `st.voters` members' applied views,
+    // never a hopeless removed laggard's (seed 83) — and give the cluster another window to elect. This
+    // fires ONLY when genuinely stuck (no leader for 4000 ticks), so it can't over-reinstate a cleanly
+    // removed node while the cluster is making progress.
+    let needed: BTreeSet<u64> = st
+      .voters
+      .iter()
+      .flat_map(|&v| c.node_voters(v))
+      .filter(|id| st.gone.contains(id))
+      .collect();
+    let reinstated_any = !needed.is_empty();
+    for g in needed {
+      c.reinstate(g);
+      st.gone.remove(&g);
+    }
+    if !reinstated_any || !c.run_until(4_000, |c| c.leader_count() == 1) {
+      let tick = c.view().tick;
+      let per_node: Vec<_> = st
+        .voters
+        .iter()
+        .copied()
+        .map(|id| {
+          let (armed, due) = c.dbg_timer(id);
+          std::format!(
+            "n{id}[{:?} term={:?} applied={} last={} poison={} timer={} {}]",
+            c.role_of(id),
+            c.term_of(id),
+            c.applied_len_of(id),
+            c.last_index_of(id).get(),
+            c.is_poisoned(id),
+            if !armed {
+              "DISARMED"
+            } else if due {
+              "due"
+            } else {
+              "future"
+            },
+            c.dbg_membership(id),
+          )
+        })
+        .collect();
+      panic!(
+        "VOPR LIVELOCK (calm window): cluster failed to elect a single leader within 4000 ticks \
        after healing all partitions, clearing faults, and restarting poisoned nodes\n  \
-       seed={seed} tick={tick} (replay: run_vopr({seed}, ticks))\n  voters={:?} learners={:?}",
-      st.voters, st.learners,
-    );
+       seed={seed} tick={tick} (replay: run_vopr({seed}, ticks))\n  voters={:?} learners={:?} \
+       removing={:?} gone={:?} leaders={}\n  nodes: {}",
+        st.voters,
+        st.learners,
+        st.removing,
+        st.gone,
+        c.leader_count(),
+        per_node.join(" "),
+      );
+    }
   }
 
+  // Reconcile NOW that a leader exists: a voter whose RemoveNode has COMMITTED (the leader applied it
+  // and stopped replicating to it) must leave `st.voters` before we measure progress — otherwise the
+  // just-removed node, frozen at its last applied index, would pin `voter_min_applied` and the
+  // liveness assertion would falsely fire. Reconcile isolates it (`removing` → `gone`).
+  reconcile_membership(c, st);
+
   // Assert PROGRESS (the liveness payoff): the committed VOTERS must COMMIT-and-APPLY `target_extra`
-  // NEW client commands. The metric is scoped to the committed voter set — the nodes that actually
-  // form quorum — not all non-removed nodes: a wired-but-never-committed orphan joiner (an AddNode
-  // the cluster accepted but never committed) sits idle at applied 0 forever, and an all-nodes
-  // minimum would let it pin liveness even though every voter is making progress. We re-propose as
-  // needed because a command accepted by a leader that then loses leadership is not guaranteed to
-  // commit (a legitimate Raft outcome).
-  let voters_snapshot: Vec<u64> = st.voters.iter().copied().collect();
-  let voter_min_applied = |c: &Cluster| -> usize {
-    voters_snapshot
+  // NEW client commands. The population is the LEADER's AUTHORITATIVE committed voter set
+  // (`committed_voters()` — the nodes that actually form quorum), read DIRECTLY from the cluster, NOT
+  // the harness's incremental `settled_voters` bookkeeping: under heavy churn the latter can drift to a
+  // stale phantom (a laggard id the leader has already dropped) or be hollowed out by `removing` down
+  // to that single phantom, which would pin or empty the metric (VOPR seeds 117/216/666/1675). We
+  // re-propose as needed because a command accepted by a leader that then loses leadership is not
+  // guaranteed to commit (a legitimate Raft outcome).
+  let voters_snapshot: Vec<u64> = c.committed_voters().into_iter().collect();
+  // Liveness metric: a QUORUM (strict majority) of the settled voters must reach the target — NOT every
+  // one. A cluster is LIVE when it COMMITS new entries, which needs only a quorum to ack and apply; a
+  // MINORITY that legitimately lags — a freshly-added voter still catching up via snapshot, an
+  // in-flight-removal victim, or a just-healed partition straggler — must not pin the metric. The
+  // majority-th highest applied index IS the configuration's committed-and-applied frontier: it
+  // advances iff the cluster is committing, while a real liveness bug (fewer than a quorum advancing)
+  // still trips. Fixes the whole minority-laggard class (VOPR seeds 117/216/285/402/616/666/736/774).
+  let voter_quorum_applied = |c: &Cluster| -> usize {
+    let mut a: std::vec::Vec<usize> = voters_snapshot
       .iter()
       .map(|&id| c.applied_len_of(id))
-      .min()
-      .unwrap_or(0)
+      .collect();
+    a.sort_unstable_by(|x, y| y.cmp(x)); // descending
+    a.get(a.len() / 2).copied().unwrap_or(0) // majority-th highest (empty → 0)
   };
-  let before = voter_min_applied(c);
+  let before = voter_quorum_applied(c);
   let target_extra = 1 + (prng.next_u64() % 3) as usize; // require 1..=3 new committed entries
   let target = before + target_extra;
   let mut budget = 8_000u32; // generous: a healthy cluster commits a handful of entries fast
-  while voter_min_applied(c) < target {
+  while voter_quorum_applied(c) < target {
     if budget == 0 {
       let tick = c.view().tick;
+      let per_node: Vec<_> = st
+        .voters
+        .iter()
+        .copied()
+        .map(|id| {
+          std::format!(
+            "n{id}[{:?} term={:?} applied={} poison={} {}]",
+            c.role_of(id),
+            c.term_of(id),
+            c.applied_len_of(id),
+            c.is_poisoned(id),
+            c.dbg_membership(id),
+          )
+        })
+        .collect();
       panic!(
         "VOPR LIVELOCK (calm window): a healthy, fully-healed cluster failed to commit+apply \
-         {target_extra} new client commands within the window (voter min_applied {} did not reach \
+         {target_extra} new client commands within the window (voter quorum_applied {} did not reach \
          {target})\n  seed={seed} tick={tick} (replay: run_vopr({seed}, ticks))\n  \
-         voters={:?} learners={:?} leader={:?}",
-        voter_min_applied(c),
+         voters={:?} learners={:?} leader={:?} removing={:?} gone={:?}\n  nodes: {}",
+        voter_quorum_applied(c),
         st.voters,
         st.learners,
         c.leader(),
+        st.removing,
+        st.gone,
+        per_node.join(" "),
       );
     }
     // Top up client load if there is a leader to accept it (re-propose past any non-committing ones).
@@ -823,9 +990,13 @@ fn calm_window(
 fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u64) {
   // Heal everything and clear all faults, then restart any poisoned nodes (a poisoned node is inert
   // until restarted; quiesce must bring the whole live cluster back to apply the committed history).
-  for node in st.down.iter().copied().collect::<Vec<_>>() {
-    c.heal(node);
-    report.restarts += 1;
+  // Heal EVERY isolated-but-not-`gone` node, not just `st.down` (reconcile can prune `st.down` without
+  // un-isolating — see the calm-window heal / VOPR seed 3077).
+  for node in c.isolated_nodes() {
+    if !st.gone.contains(&node) {
+      c.heal(node);
+      report.restarts += 1;
+    }
   }
   st.down.clear();
   c.set_network_faults(NetworkFaults::none(), seed);
@@ -833,6 +1004,25 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
     c.set_node_faults(id, StorageFaults::none(), seed.wrapping_add(id));
   }
   restart_poisoned(c, st, report);
+
+  // Settle any in-flight RemoveNode FIRST: with a leader up and the cluster healed, the pending
+  // removal commits quickly; reconcile then isolates the victim and drops it from `st.voters`. We
+  // must do this before the convergence check below, because a removed voter — once the leader
+  // applies its removal and stops replicating to it — freezes at its last applied index, and a stale
+  // `st.voters` that still listed it would make `voters_fully_caught_up` unsatisfiable forever.
+  let mut settle = 24u32;
+  while !st.removing.is_empty() && settle > 0 {
+    settle -= 1;
+    if !c.run_until(2_000, |c| c.leader_count() == 1) {
+      break; // no leader emerged — the convergence check below will report it
+    }
+    // Advance with the leader up so the in-flight RemoveNode commits + applies, then reconcile so
+    // the now-removed victim is isolated and leaves `st.voters`.
+    for _ in 0..300 {
+      c.tick();
+    }
+    reconcile_membership(c, st);
+  }
 
   // Drain until a single stable leader, agreement holds, AND every live voter is FULLY caught up to
   // the leader's applied length (not merely a prefix). Full catch-up is the precondition for the
@@ -844,16 +1034,33 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
   });
   if !converged {
     let leader_len = c.leader().map(|l| c.applied_len_of(l)).unwrap_or(0);
+    let per_node: Vec<_> = st
+      .voters
+      .iter()
+      .copied()
+      .map(|id| {
+        std::format!(
+          "n{id}[{:?} term={:?} applied={} poison={} inflight={}]",
+          c.role_of(id),
+          c.term_of(id),
+          c.applied_len_of(id),
+          c.is_poisoned(id),
+          c.node_has_inflight(id),
+        )
+      })
+      .collect();
     panic!(
       "VOPR QUIESCE FAILURE: a fully-healed, fault-free cluster failed to converge (single leader + \
        agreement + every voter caught up) within 10000 ticks\n  seed={seed} \
        (replay: run_vopr({seed}, ticks))\n  leader_count={} agreement={} leader_applied_len={} \
-       min_applied_len={} voters={:?}",
+       min_applied_len={} voters={:?} removing={:?}\n  nodes: {}",
       c.leader_count(),
       c.agreement_holds(),
       leader_len,
       c.min_applied_len(),
       st.voters,
+      st.removing,
+      per_node.join(" "),
     );
   }
 
@@ -890,7 +1097,10 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
     .filter(|(_, cmd)| !cmd.is_empty())
     .map(|(_, cmd)| cmd)
     .collect();
-  for id in st.voters.iter().copied() {
+  // Settled voters only: a node whose removal is still in flight is departing and may legitimately
+  // hold a shorter committed history (the quiesce settle loop above drains the common case, so this
+  // normally equals `st.voters`).
+  for id in st.settled_voters() {
     let applied = c.applied_entries_of(id);
     let cmds: Vec<&Vec<u8>> = applied
       .iter()

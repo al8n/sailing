@@ -68,6 +68,11 @@ pub struct Cluster {
   /// Per-node count of `Event::SnapshotInstalled` events drained during `tick`.
   /// Monotonically incremented; reset to zero on `crash`+restart.
   snapshot_installs: Vec<SnapCount>,
+  /// Per-node restart counter (incarnation), bumped each time `crash` rebuilds the node from
+  /// durable storage. The checker resets a node's commit/term monotonicity baseline when its
+  /// incarnation changes: the batched commit/term persist can drop an in-memory advance still in
+  /// the fsync window on crash, and the restarted node re-derives it.
+  restarts: Vec<u64>,
   /// Per-node count of `Event::ConfChanged` events drained during `tick`.
   /// Monotonically incremented; never reset.
   conf_changed: Vec<ConfChangedCount>,
@@ -110,6 +115,11 @@ pub struct Cluster {
   /// Monotonic count of completed [`tick`](Self::tick)s, threaded into the oracle panic so a
   /// violation pinpoints the exact step to replay.
   tick_count: u64,
+  /// The per-node `Config` transform, applied to the bootstrap config of EVERY node — the initial
+  /// members and any joiner wired in mid-run — so a dynamically-added node gets the same knobs
+  /// (e.g. `pre_vote`/`check_quorum`) as the founders. Without this a freshly-added voter would run
+  /// the default config and, sitting far behind, could disrupt elections.
+  node_configure: std::boxed::Box<dyn Fn(Config<u64>) -> Config<u64>>,
 }
 
 impl Cluster {
@@ -121,7 +131,7 @@ impl Cluster {
   /// Build an `n`-node cluster and apply `configure` to each node's `Config` after
   /// construction. Use this to override flow-control knobs (e.g. `max_inflight_msgs`)
   /// for targeted tests while keeping `new` unchanged.
-  pub fn new_with(n: usize, configure: impl Fn(Config<u64>) -> Config<u64>) -> Self {
+  pub fn new_with(n: usize, configure: impl Fn(Config<u64>) -> Config<u64> + 'static) -> Self {
     Self::new_inner(n, configure, false, 0)
   }
 
@@ -137,12 +147,24 @@ impl Cluster {
     Self::new_inner(n, |cfg| cfg, true, seed)
   }
 
+  /// Build an async-mode cluster ([`new_async`](Self::new_async)) that also applies `configure` to
+  /// every node's bootstrap config — the founders AND any joiner wired in mid-run. Use it to run the
+  /// fuzzer under a realistic config (e.g. `pre_vote` + `check_quorum`, which keep a far-behind
+  /// freshly-added voter from disrupting a stable leader before it catches up).
+  pub fn new_async_with(
+    n: usize,
+    seed: u64,
+    configure: impl Fn(Config<u64>) -> Config<u64> + 'static,
+  ) -> Self {
+    Self::new_inner(n, configure, true, seed)
+  }
+
   /// Shared constructor body. `async_mode` selects [`crate::StoreMode::Async`] stores (seeded with
   /// `seed` for any storage faults); `false` keeps the default synchronous stores so `new` /
   /// `new_with` are byte-identical to M0–M7.
   fn new_inner(
     n: usize,
-    configure: impl Fn(Config<u64>) -> Config<u64>,
+    configure: impl Fn(Config<u64>) -> Config<u64> + 'static,
     async_mode: bool,
     seed: u64,
   ) -> Self {
@@ -152,6 +174,8 @@ impl Cluster {
     let mut configs = Vec::with_capacity(n);
     let mut node_ids = Vec::with_capacity(n);
     let mut node_idx = BTreeMap::new();
+    let node_configure: std::boxed::Box<dyn Fn(Config<u64>) -> Config<u64>> =
+      std::boxed::Box::new(configure);
     let voters: Vec<u64> = (0..n as u64).collect();
     for id in 0..n as u64 {
       let base = Config::try_new(
@@ -161,7 +185,7 @@ impl Cluster {
         Duration::from_millis(100),
       )
       .expect("valid config");
-      let cfg = configure(base);
+      let cfg = node_configure(base);
       nodes.push(Endpoint::new(
         cfg.clone(),
         Instant::ORIGIN,
@@ -182,6 +206,7 @@ impl Cluster {
       node_ids.push(id);
     }
     let snapshot_installs = vec![0u64; n];
+    let restarts = vec![0u64; n];
     let conf_changed = vec![0u64; n];
     let read_states = vec![Vec::new(); n];
     Self {
@@ -197,6 +222,8 @@ impl Cluster {
       removed: BTreeSet::new(),
       grants: BTreeMap::new(),
       snapshot_installs,
+      restarts,
+      node_configure,
       conf_changed,
       read_states,
       async_mode,
@@ -445,6 +472,17 @@ impl Cluster {
     self.isolated.remove(&id);
   }
 
+  /// Reverse a [`mark_removed`](Self::mark_removed): make node `id` a reachable participant again and
+  /// stop the oracles from skipping it. Used by the harness when a `gone` node turns out to still be
+  /// needed — a laggard's APPLIED config (post-restart or post-partition) regressed to list it as a
+  /// voter, so it must rejoin the network until its removal is re-applied cluster-wide, or the laggard
+  /// (once elected) deadlocks demanding the vote of a node the harness had isolated. `mark_removed`
+  /// never destroyed the node's log/endpoint, so reinstating simply un-isolates and un-skips it.
+  pub fn reinstate(&mut self, id: u64) {
+    self.removed.remove(&id);
+    self.isolated.remove(&id);
+  }
+
   /// The `first_index()` of node `id`'s durable log (advances after compaction).
   pub fn first_index_of(&self, id: u64) -> sailing_proto::Index {
     let i = self.node_idx[&id];
@@ -487,6 +525,16 @@ impl Cluster {
     self.nodes[i].state_machine().applied().len()
   }
 
+  /// Debug: `(armed, due_now)` for node `id`'s next serviceable timer — `armed=false` means the node
+  /// has no timer at all (`poll_timeout()` is None) and so the event-driven clock never wakes it.
+  pub fn dbg_timer(&self, id: u64) -> (bool, bool) {
+    let i = self.node_idx[&id];
+    match self.nodes[i].poll_timeout() {
+      Some(d) => (true, d <= self.now),
+      None => (false, false),
+    }
+  }
+
   /// Node `id`'s applied `(index, command-bytes)` sequence, copied out for cross-run comparison.
   ///
   /// Used by the network-fault determinism test to assert two runs of the same seed produce
@@ -526,6 +574,7 @@ impl Cluster {
     self.nodes[i] = Endpoint::restart(cfg, self.now, 0x5EED ^ id, LogSm::new(), log, stable);
     // Reset the snapshot-install counter for the restarted node.
     self.snapshot_installs[i] = 0;
+    self.restarts[i] += 1;
     // Drain any messages left in the bus to/from this node (stale in-flight traffic).
     self.bus.retain(|m| m.from != id && m.to != id);
     // Drop the FIFO bookkeeping for any pair touching this node so the restarted node starts
@@ -540,6 +589,45 @@ impl Cluster {
   pub fn last_index_of(&self, id: u64) -> sailing_proto::Index {
     let i = self.node_idx[&id];
     self.logs[i].last_index()
+  }
+
+  /// Debug: node `id`'s proto-internal membership view — its tracker's incoming/outgoing voters and
+  /// learners, plus its visible last log index. Used by VOPR panic diagnostics to spot a config
+  /// divergence that stalls commit (e.g. a leader whose tracker still lists a removed node, so the
+  /// quorum waits forever on a match that never advances).
+  pub fn dbg_membership(&self, id: u64) -> String {
+    let i = self.node_idx[&id];
+    let cs = self.nodes[i].conf_state();
+    std::format!(
+      "voters={:?} out={:?} learners={:?} last={}",
+      cs.voters(),
+      cs.voters_outgoing(),
+      cs.learners(),
+      self.logs[i].last_index().get(),
+    )
+  }
+
+  /// Node `id`'s proto-internal VOTER set (both joint halves) from its applied `conf_state`. Used by
+  /// the harness to detect a node a current voter still considers a member but the harness has already
+  /// isolated (`gone`) — that node must be reinstated, or a divergent-config election / stale-leader
+  /// commit deadlocks on it.
+  pub fn node_voters(&self, id: u64) -> BTreeSet<u64> {
+    let i = self.node_idx[&id];
+    let cs = self.nodes[i].conf_state();
+    cs.voters()
+      .iter()
+      .chain(cs.voters_outgoing().iter())
+      .copied()
+      .collect()
+  }
+
+  /// The set of currently network-isolated node ids (VOPR-partitioned `down` ∪ `mark_removed` `gone`).
+  /// The calm-window heal uses this to un-isolate EVERY reachable-but-isolated node, not just the ones
+  /// the harness still tracks in `st.down` — a node can be `c.isolated` yet absent from `st.down`
+  /// (reconcile prunes `st.down` to current voters without un-isolating), which would otherwise leave
+  /// it stranded unreachable forever.
+  pub fn isolated_nodes(&self) -> BTreeSet<u64> {
+    self.isolated.clone()
   }
 
   /// The DURABLE (fsync'd) `last_index` of node `id`'s log. In async mode this reflects only
@@ -871,6 +959,7 @@ impl Cluster {
       Duration::from_millis(100),
     )
     .expect("valid observer config");
+    let base = (self.node_configure)(base);
 
     let pos = self.nodes.len();
     self.node_idx.insert(id, pos);
@@ -891,6 +980,7 @@ impl Cluster {
     }
     self.configs.push(base);
     self.snapshot_installs.push(0);
+    self.restarts.push(0);
     self.conf_changed.push(0);
     self.read_states.push(Vec::new());
   }
@@ -962,6 +1052,7 @@ impl Cluster {
           snapshot_last_term,
           hardstate_commit: stable.hard_state().commit().get(),
           inflight_staged: usize::from(log.has_inflight()) + usize::from(stable.has_inflight()),
+          incarnation: self.restarts[i],
         }
       })
       .collect();
@@ -1122,9 +1213,13 @@ impl Cluster {
       if !a.reject() {
         assert!(
           self.logs[i].last_index() >= a.match_index(),
-          "append-before-ack violated: node {from} acked {:?} but last_index is {:?}",
+          "append-before-ack violated: node {from} acked {:?} but last_index is {:?} \
+           (durable_last={:?} inflight={} restarts={})",
           a.match_index(),
           self.logs[i].last_index(),
+          self.logs[i].durable_last_index(),
+          self.logs[i].has_inflight(),
+          self.restarts[i],
         );
       }
     }
@@ -1133,7 +1228,10 @@ impl Cluster {
     // for a different candidate — that would be a double-vote. Holds under reorder+dup: a duplicate
     // grant to the SAME candidate is fine; a grant to a DIFFERENT one in the same term is a bug.
     if let Message::VoteResp(vr) = &message {
-      if !vr.reject() {
+      // Only a REAL-vote grant binds (it persists `voted_for` for the term). A PRE-vote grant is
+      // non-binding — "would I vote for you" — so a node may grant pre-votes to several candidates
+      // in the same term without it being a double-vote; exclude them from the tripwire.
+      if !vr.reject() && !vr.pre_vote() {
         let term = vr.term();
         match self.grants.get(&(from, term)) {
           Some(&prev) => assert_eq!(

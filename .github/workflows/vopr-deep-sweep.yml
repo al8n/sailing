@@ -1,0 +1,89 @@
+name: VOPR Deep Sweep
+
+# Exhaustive, fault-injecting fuzz of the consensus core (`sailing_simulation::run_vopr`) across a
+# WIDE band of deterministic seeds at a DEEP tick budget — composed crash + partition + lossy-network
+# + membership schedules, with the per-tick safety-oracle suite asserting on EVERY tick. This is far
+# too slow for the per-commit gate (that lives in `ci.yml`, which runs the fast `0..24 @200` band and
+# the proto unit tests); the deep sweep runs on a schedule + on demand, SHARDED across runners so the
+# wall-clock stays reasonable.
+#
+# Determinism: every `run_vopr(seed, ticks)` is a pure function of `(seed, ticks)` with no wall-clock,
+# no RNG, and no hash-iteration-order dependence — so it is reproducible across platforms and opt
+# levels. A failure prints `seed=<S>` (and the tick budget); reproduce it ANYWHERE with
+# `run_vopr(<S>, <ticks>)`, which is exactly what a developer runs locally to debug.
+
+on:
+  workflow_dispatch:
+    inputs:
+      total_seeds:
+        description: "Sweep seeds 0..total_seeds, split across 16 shards (try 1024 or 2048)"
+        default: "1024"
+        required: false
+      ticks:
+        description: "Ticks per run (depth — deeper finds longer-horizon churn bugs)"
+        default: "2000"
+        required: false
+  schedule:
+    # Weekly: Monday 04:17 UTC (offset from the top of the hour to dodge the scheduler stampede).
+    - cron: "17 4 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  sweep:
+    name: shard ${{ matrix.shard }}/16
+    timeout-minutes: 120
+    strategy:
+      # Never cancel sibling shards on a failure — we want the FULL landscape of failing seeds in one
+      # run, not just the first.
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-vopr-sweep-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-vopr-sweep-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Compute this shard's seed slice and run the sweep
+        env:
+          TOTAL: ${{ github.event.inputs.total_seeds || '1024' }}
+          TICKS: ${{ github.event.inputs.ticks || '2000' }}
+          SHARDS: "16"
+          SHARD: ${{ matrix.shard }}
+        run: |
+          set -euo pipefail
+          # Ceil division so 16 shards always cover [0, TOTAL); the tail shard takes the remainder.
+          PER=$(( (TOTAL + SHARDS - 1) / SHARDS ))
+          START=$(( SHARD * PER ))
+          END=$(( START + PER ))
+          [ "$END" -gt "$TOTAL" ] && END=$TOTAL || true
+          if [ "$START" -ge "$END" ]; then
+            echo "::notice title=shard ${SHARD}::empty slice (START=${START} >= TOTAL=${TOTAL}) — skipping"
+            exit 0
+          fi
+          echo "::notice title=shard ${SHARD}::sweeping seeds [${START}, ${END}) @ ${TICKS} ticks"
+          # Release build: the sweep is compute-bound; release is ~5-10x faster and finds the SAME
+          # bugs (the proto logic is opt-level independent). Each shard is one disjoint seed slice.
+          VOPR_SEED_START="$START" VOPR_SEED_END="$END" VOPR_TICKS="$TICKS" \
+            cargo test -p sailing-simulation --release --test vopr vopr_long_sweep -- --ignored --nocapture
+
+  # Single aggregate status: green iff EVERY shard passed (a failed shard leaves `sweep` failed, so
+  # this job is skipped and the workflow reports failure). Gives one check to gate on / watch.
+  sweep-result:
+    name: deep-sweep result
+    needs: sweep
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All VOPR deep-sweep shards passed."

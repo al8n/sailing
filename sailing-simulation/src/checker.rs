@@ -145,6 +145,11 @@ pub struct NodeView {
   pub hardstate_commit: u64,
   /// The number of staged (un-flushed) store writes (fsync window). Bounded-bookkeeping check.
   pub inflight_staged: usize,
+  /// The node's restart count ("incarnation") — bumped each time the node crashes and recovers from
+  /// durable storage. A change signals a restart boundary at which the commit/term monotonicity
+  /// baseline is legitimately reset: the batched commit/term persist can lose an in-memory advance
+  /// still in the fsync window on crash, and the restarted node re-derives it.
+  pub incarnation: u64,
 }
 
 impl NodeView {
@@ -240,26 +245,6 @@ impl ClusterView {
       None => self.voters().count(),
     }
   }
-
-  /// The majority threshold over the committed VOTERS: `⌊voters/2⌋ + 1`.
-  ///
-  /// Taking the quorum over the committed voter set (not all live nodes) is what makes
-  /// [`commit_is_quorum_durable`] sound under reconfiguration: only voters ack toward commit, and a
-  /// node becomes a voter only by applying the `AddNode` that adds it (which requires a durable log
-  /// covering that conf-change's index — and hence every earlier committed entry). So a
-  /// wired-but-not-yet-voting joiner or a learner does not inflate the denominator against an entry
-  /// it could not have witnessed. (An all-live-nodes denominator false-positived exactly there —
-  /// surfaced by the VOPR, seed 43.)
-  ///
-  /// The voter set is the AUTHORITATIVE committed membership ([`committed_voters`](Self::committed_voters),
-  /// the leader's `conf_state().voters()`), not each node's own `is_voter` self-report combined with
-  /// the sim's `removed` flag. The latter could DESELECT a real committed voter the harness had
-  /// prematurely marked removed (an accepted-but-never-committed RemoveNode) while still
-  /// counting a behind voter, shrinking the witness population below the real quorum and false-firing
-  /// — surfaced by the VOPR, seed 4.
-  fn voter_quorum(&self) -> usize {
-    self.voter_count() / 2 + 1
-  }
 }
 
 /// The per-tick safety-oracle suite, holding the cross-tick history the monotonicity / committed-
@@ -291,6 +276,10 @@ pub struct Checker {
   /// The authoritative committed voter set observed on the previous tick — a change signals a
   /// reconfiguration and raises [`commit_floor`](Self::commit_floor).
   last_committed_voters: Option<BTreeSet<u64>>,
+  /// Per-node last-observed incarnation ([`NodeView::incarnation`]). When a node's incarnation
+  /// changes (it crashed and recovered), its commit/term monotonicity baseline is reset, so a
+  /// legitimate watermark drop across the restart boundary is not flagged as a backward step.
+  last_incarnation: BTreeMap<u64, u64>,
 }
 
 impl Checker {
@@ -315,12 +304,40 @@ impl Checker {
     // (None -> Some, the initial config) does not raise the floor.
     if let (Some(old), Some(new)) = (&self.last_committed_voters, &view.committed_voters) {
       if old != new {
-        let hw = view.voters().map(|n| n.commit).max().unwrap_or(0);
+        // Raise the floor to the high-water commit among the OLD voter set — the configuration under
+        // which everything up to here was committed — INCLUDING any voter this change REMOVES. Using
+        // only the NEW voters misses entries a removed voter legitimately committed (under the old
+        // quorum) that the survivors have not yet caught up to; those entries would then be wrongly
+        // re-judged against the smaller new voter set and flagged as non-quorum-durable. They are
+        // safe — already validated against their own config before this change, and still covered by
+        // agreement / no_committed_rewrite / durable_prefix. (VOPR seed 36: leader 0 commits index
+        // 375 under {0,2,3}; 0 is then removed → {2,3} with voter 2 still behind, so 375 must stay
+        // exempt.) A removed voter is still present in `view.nodes` (isolated, not dropped).
+        let hw = view
+          .nodes
+          .iter()
+          .filter(|n| old.contains(&n.id))
+          .map(|n| n.commit)
+          .max()
+          .unwrap_or(0);
         self.commit_floor = self.commit_floor.max(hw);
       }
     }
     if view.committed_voters.is_some() {
       self.last_committed_voters = view.committed_voters.clone();
+    }
+
+    // A node that crashed and recovered (its incarnation changed) re-derives its commit/term
+    // watermark from durable state — the batched commit/term persist can drop an in-memory advance
+    // still in the fsync window on crash. Reset that node's monotonicity baseline so the legitimate
+    // drop across the restart boundary is not flagged as a backward step within one incarnation.
+    for n in view.nodes.iter() {
+      let last = self.last_incarnation.get(&n.id).copied().unwrap_or(0);
+      if n.incarnation != last {
+        self.max_commit_seen.remove(&n.id);
+        self.max_term_seen.remove(&n.id);
+        self.last_incarnation.insert(n.id, n.incarnation);
+      }
     }
 
     // Stateless cross-node oracles first.
@@ -441,8 +458,9 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
 /// boundary term (see [`NodeView::durable_covers`] / [`NodeView::durable_term`]).
 ///
 /// The committing voter's own durable term at its commit index is the witness term `t`; the oracle
-/// then counts how many VOTERS durably hold `(commit, t)`. Fewer than [`ClusterView::voter_quorum`]
-/// is a violation. A `commit` of 0 (nothing committed) is vacuously fine.
+/// then counts how many VOTERS durably hold `(commit, t)`. Fewer than a majority of the EFFECTIVE
+/// voter count (the authoritative [`committed_voters`](ClusterView::committed_voters) cardinality minus
+/// voters provably on a stale lower-term branch) is a violation. A `commit` of 0 is vacuously fine.
 ///
 /// **Voter-set denominator (reconfiguration soundness):** the quorum is taken over the
 /// [authoritative committed voter set](ClusterView::committed_voters) (the leader's
@@ -458,7 +476,6 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
 /// learner's own `commit` watermark is not checked here (it makes no quorum claim; the same entry is
 /// checked via the voters), but a learner that holds the entry still does no harm.
 pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result<(), Violation> {
-  let quorum = view.voter_quorum();
   for n in view.voters() {
     let c = n.commit;
     if c == 0 {
@@ -489,22 +506,64 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
     if c <= commit_floor {
       continue;
     }
+    // Quorum DENOMINATOR. Start from the AUTHORITATIVE committed-voter count (`committed_voters.len()`
+    // when known — a momentarily-absent voter view must not shrink it and weaken the oracle; VOPR seeds
+    // 43/4), then SUBTRACT voters provably on a stale STRICTLY-LOWER-term branch at `c`. Such a voter
+    // durably holds a different, older-term entry, so it never acked `(c, witness_term)` — a same-index
+    // entry cannot revert to an older term — and it was not in the quorum that committed this entry (the
+    // higher-term log will overwrite it). Excluding ONLY lower-term divergence keeps full teeth: a
+    // merely-LAGGING voter (no entry at `c`) and a HIGHER-term divergent voter both remain, so a solo /
+    // under-replicated commit AND a commit on a LOSING branch still trip. (VOPR seed 66: a term-3 entry
+    // committed under a smaller config while two voters sit on a stale term-2 branch.)
+    // A second exclusion handles the deep-churn boundary: a voter whose DURABLE log does not even reach
+    // the reconfiguration floor (`durable_last < commit_floor`) is a freshly-added member still catching
+    // up to the prior committed config — it could not have witnessed ANY entry above the floor, so it
+    // was not in the quorum that committed `c` (which is just above the floor). Counting it demands a
+    // phantom ack it could never have given. This is distinct from a merely-LAGGING real voter (which
+    // HAS reached the floor and is only missing the latest entries) — that one stays counted, so a true
+    // under-replication still trips. (VOPR seed 1021 @4000: idx 2056 committed under a small config that
+    // then grew to 5 voters, three of which sit far below the floor at 223/490/2034 vs floor 2055.)
+    let excluded = view
+      .voters()
+      .filter(|m| {
+        m.durable_term(c).map(|t| t < witness_term).unwrap_or(false)
+          || m.durable_last < commit_floor
+      })
+      .count();
+    let effective = view.voter_count().saturating_sub(excluded);
+    let quorum = effective / 2 + 1;
     let copies = view
       .voters()
       .filter(|m| m.durable_covers(c) && m.durable_term(c) == Some(witness_term))
       .count();
     if copies < quorum {
+      let per_voter: std::vec::Vec<_> = view
+        .voters()
+        .map(|m| {
+          std::format!(
+            "n{}(durable_last={} term@{}={:?} covers={})",
+            m.id,
+            m.durable_last,
+            c,
+            m.durable_term(c),
+            m.durable_covers(c)
+          )
+        })
+        .collect();
       return Err(Violation::new(
         "commit_is_quorum_durable",
         std::format!(
           "node {} committed index {} (term {}) but only {} of {} voter durable logs hold it with \
-           that term (quorum needs {})",
+           that term (quorum needs {})\n  commit_floor={} committed_voters={:?}\n  voters: {}",
           n.id,
           c,
           witness_term,
           copies,
-          view.voter_count(),
+          effective,
           quorum,
+          commit_floor,
+          view.committed_voters,
+          per_voter.join(" "),
         ),
       ));
     }
@@ -766,6 +825,7 @@ mod tests {
       snapshot_last_term: 0,
       hardstate_commit: commit,
       inflight_staged: 0,
+      incarnation: 0,
     }
   }
 

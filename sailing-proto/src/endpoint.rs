@@ -407,6 +407,39 @@ where
     self.heartbeat_deadline = None;
   }
 
+  /// Re-establish the election-timer INVARIANT, by construction, at every public-entry boundary:
+  ///
+  /// > a node that is a VOTER and is NOT the leader must hold an armed `election_deadline`.
+  ///
+  /// Otherwise it can never campaign, and a cluster whose voters are ALL in that state wedges
+  /// leaderless forever. The hazard arises because the Sans-I/O design DISARMS a non-voter's
+  /// deadline (so the event-driven sim clock can advance past a node that must not campaign) — and
+  /// several transitions can leave a node a voter without a timer: adopting a higher term and
+  /// stepping down on a RESPONSE message (no handler re-arm), and a learner→voter promotion applied
+  /// with no current leader to heartbeat it. Rather than remember to arm at each such site (a
+  /// fragility that already caused two distinct livelock bugs — VOPR seeds 0/88), we enforce the
+  /// invariant centrally here, after the entry point has finished mutating role/term/membership.
+  ///
+  /// This is a SAFETY NET, not a reset: it arms ONLY when the deadline is currently absent, so it
+  /// never postpones an already-running timer (resetting a live timer on every higher-term adoption
+  /// regressed VOPR seed 61). The legitimate resets — leader contact (heartbeat/append/snapshot),
+  /// granting a vote, starting a campaign, a CheckQuorum step-down — remain explicit at their own
+  /// sites and set a fresh deadline; this no-ops for them. Leaders are skipped (a leader owns its
+  /// heartbeat timer, and with CheckQuorum it repurposes `election_deadline` for the quorum check);
+  /// non-voters are skipped (they must not campaign).
+  ///
+  /// Mirrors the guarantee etcd gets for free from its always-incrementing `electionElapsed` counter
+  /// (every node ticks, so a voter always eventually campaigns); we reconstruct it for the
+  /// deadline-based model without giving up the event-driven clock skip for non-voters.
+  fn reconcile_election_timer(&mut self, now: Instant) {
+    if !self.role.is_leader()
+      && self.election_deadline.is_none()
+      && self.tracker.is_voter(&self.config.id())
+    {
+      self.arm_election_timer(now);
+    }
+  }
+
   /// Step down to Follower at the SAME term (no term bump): used by CheckQuorum when the
   /// leader can no longer reach a quorum. (The U6 self-removal step-down is separate and
   /// inlined in `apply_committed` — it disarms the election timer because a removed
@@ -449,12 +482,21 @@ where
   /// Whether the current `(role, state)` will service `kind` in `handle_timeout`.
   ///
   /// This is the exact mirror of `handle_timeout`'s dispatch conditions:
+  /// - A POISONED node services NOTHING — `handle_timeout` (like every `handle_*`) early-returns on
+  ///   poison. Surfacing a deadline a poisoned node will never act on wedges the event-driven driver:
+  ///   it advances `now` to that deadline, the timeout fires as a no-op, the deadline stays due, and
+  ///   the clock can never advance past it — freezing the WHOLE cluster (no other node's timer can
+  ///   fire). A poisoned node is revived only by an external `restart`, not by a timer. (Surfaced by
+  ///   the VOPR: a poisoned, already-removed voter froze `now` and starved every election — seed 88.)
   /// - `Heartbeat`: the leader always services its heartbeat deadline.
   /// - `Election`: the leader services it only when `check_quorum` is enabled (CheckQuorum
   ///   tick); a follower/candidate services it only when it is a voter (non-voters never
   ///   campaign, so their election timer firing is a silent no-op — we should not surface it).
   /// - `Transfer`: the leader services it only when a leader transfer is in progress.
   fn serviceable_now(&self, kind: TimerKind) -> bool {
+    if self.poisoned {
+      return false;
+    }
     match kind {
       TimerKind::Heartbeat => self.role.is_leader(),
       TimerKind::Election => {
@@ -932,6 +974,10 @@ where
       stable.submit_write(opid, hs);
       self.committed_persisted = self.commit;
     }
+
+    // Invariant restore: a learner promoted to voter by an applied conf-change above may have been
+    // left without an election timer; ensure a voter non-leader can always campaign.
+    self.reconcile_election_timer(now);
   }
 
   /// Trigger a snapshot if `applied - first_index >= snapshot_threshold`.
@@ -1002,6 +1048,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
     F::Snapshot: crate::Data,
+    I: crate::Data, // decode ConfChangeV2 entries when replaying the log's membership (Raft §4.1)
   {
     let hs = stable.hard_state();
     let mut fsm = fsm;
@@ -1045,6 +1092,14 @@ where
         }
       }
     }
+    // Apply-time membership (etcd, spec §9): the recovered tracker is the snapshot's ConfState
+    // baseline (set above). The COMMITTED tail beyond the snapshot is re-folded by the `apply_committed`
+    // call at the end of `restart`, which replays `applied+1..=commit` and folds each committed
+    // ConfChange exactly once. The UNCOMMITTED log tail (`commit+1..=last`) is NOT folded — the
+    // configuration never reflects an uncommitted entry, so `conf_state()` always means the committed
+    // voter set. A churn survivor whose removals are not yet committed campaigns on its committed
+    // config and gets the removed-but-not-yet-committed peers' votes (the driver keeps them reachable
+    // until their RemoveNode commits — see the membership driver contract in spec §9).
     // Never trust commit beyond the durable log; never below the snapshot baseline.
     let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
     let read_only_opt = config.read_only();
@@ -1231,18 +1286,50 @@ where
           .with_commit(self.commit);
         stable.submit_write(opid, hs);
         self.committed_persisted = self.commit;
+        // NOTE: a voter that steps down here on a higher-term RESPONSE (whose handler does not
+        // re-arm) would be left without an election timer — `reconcile_election_timer`, run at the
+        // end of this entry point, restores the invariant. We deliberately do NOT arm inline (that
+        // would reset an already-running Follower timer on every higher-term adoption — regressed
+        // VOPR seed 61).
       }
     }
-    // Drop messages from a stale term — with one caveat for pre-vote requests:
-    // a pre-vote whose advertised term < self.term is routed to on_request_vote, which
-    // rejects it and replies at self.term (etcd: MsgPreVoteResp{Reject:true, Term:r.Term})
-    // so the pre-candidate learns it is behind. Only silently drop non-pre-vote stale messages.
+    // Drop messages from a stale term — with two caveats.
     if msg.term() < self.term {
       let is_prevote_req = matches!(&msg, Message::RequestVote(rv) if rv.pre_vote());
       if !is_prevote_req {
+        // CheckQuorum / PreVote step-down nudge (etcd): a stale-term Heartbeat or AppendEntries
+        // means the sender BELIEVES it is the leader but is behind our term — we advanced (e.g.
+        // campaigned) during a partition, then rejoined. It can never replicate to us (we reject
+        // its lower-term entries), and we may be too far behind to win an election ourselves, so a
+        // silent drop wedges us BOTH forever. Reply with an AppendResp at OUR (higher) term: the
+        // stale leader sees the higher term and steps down, and the ensuing election lifts the
+        // cluster to our term so the winner can finally replicate to us. Only when CheckQuorum or
+        // PreVote is enabled (it is the mechanism those modes rely on; plain Raft has the disruptive
+        // higher-term campaign instead). Mirrors etcd's `case m.Term < r.Term` MsgAppResp branch.
+        let nudge_step_down = (self.config.check_quorum() || self.config.pre_vote())
+          && matches!(&msg, Message::Heartbeat(_) | Message::AppendEntries(_));
+        if nudge_step_down {
+          // Only `term` (ours, strictly higher) is meaningful — the stale leader adopts it and
+          // steps down in its own term pre-pass BEFORE the response body is ever inspected, so the
+          // reject hints / match_index are immaterial (sent zeroed).
+          let me = self.config.id();
+          self.send(
+            from,
+            Message::AppendResp(crate::AppendResp::new(
+              self.term,
+              me,
+              true,
+              Index::ZERO,
+              Term::ZERO,
+              Index::ZERO,
+            )),
+          );
+        }
         return;
       }
-      // Fall through: on_request_vote rejects (rv.term() < self.term fails the term_ok check).
+      // Pre-vote request: fall through to on_request_vote, which rejects it (rv.term() < self.term
+      // fails the term_ok check) and replies at self.term (etcd: MsgPreVoteResp{Reject:true,
+      // Term:r.Term}) so the pre-candidate learns it is behind.
     }
 
     // CheckQuorum: while the leader, any inbound message from a known peer proves that peer
@@ -1270,6 +1357,12 @@ where
       Message::TimeoutNow(tn) => self.on_timeout_now(now, log, stable, tn),
       _ => {}
     }
+
+    // Invariant restore: a higher-term step-down on a RESPONSE message (handled above) or a
+    // conf-change applied by this message may have left a voter without an election timer. The
+    // early `return`s above (stale-term drop, in-lease ignore) change neither role nor membership,
+    // so they cannot break the invariant and need no reconcile.
+    self.reconcile_election_timer(now);
   }
 
   /// Fire due timers (election for followers/candidates, heartbeat for leaders).
@@ -1332,6 +1425,9 @@ where
         }
       }
     }
+    // Invariant restore (defense-in-depth; the campaign branch above already arms a voter whose
+    // timer fired). Arms to a FUTURE deadline, so it never trips the wedge tripwire below.
+    self.reconcile_election_timer(now);
     // Wedge tripwire: after all dispatch, no serviceable timer must still be armed-and-due.
     // If this fires, `serviceable_now` has diverged from the actual dispatch (a branch acted
     // on a timer but forgot to re-arm it to a future instant or clear it).
@@ -1375,6 +1471,10 @@ where
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
     self.pending_conf_index = index;
+    // Apply-time membership (etcd, spec §9): the leader does NOT fold the conf-change into its tracker
+    // here. The configuration changes only when the entry is committed-and-applied (apply_committed) —
+    // so `conf_state()`/`quorum_committed()` always reflect the COMMITTED voter set, never an
+    // uncommitted log tail. At append the leader records only `pending_conf_index` (one in flight).
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       self.maybe_send_append(peer, log, stable);
     }
@@ -1537,7 +1637,9 @@ where
               break;
             }
           };
-          // Dispatch to the Changer using the etcd rules:
+          // Dispatch to the Changer using the etcd rules (apply-time, spec §9): a committed ConfChange
+          // takes effect on the tracker HERE — `apply_committed` is the SOLE fold site, so each change
+          // (including a joint enter/leave) is folded exactly once by construction.
           //   empty changes + Auto transition  → leave_joint
           //   transition != Auto OR >1 change   → enter_joint (auto_leave = transition != Explicit)
           //   else (1 change, Auto transition)  → simple
@@ -1559,56 +1661,55 @@ where
           match result {
             Ok(new_tracker) => {
               self.tracker = new_tracker;
-              let conf = self.tracker.conf_state();
-              self
-                .events
-                .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
-                  idx, conf,
-                )));
-              // U6: a leader that this change removed (or demoted to learner) is no longer a
-              // voter in the new configuration and must stop acting as leader.
-              // `is_voter()` checks BOTH joint halves, so during a joint phase where we are
-              // still in the outgoing config we keep leading (we must shepherd the joint →
-              // simple transition). We only step down once removed from BOTH halves.
-              // The step-down is at the SAME term (no term bump): this is a leader yielding
-              // to its own removal, not losing an election.
-              if self.role.is_leader()
-                && self.config.step_down_on_removal()
-                && !self.tracker.is_voter(&self.config.id())
-              {
-                self.role = Role::Follower;
-                self.leader = None;
-                self.heartbeat_deadline = None;
-                // Do NOT arm the election timer: a non-voter must not campaign (see
-                // handle_timeout / become_candidate guards). Leaving election_deadline
-                // disarmed is the right choice — a removed/demoted node has no business
-                // holding an election timer.
-                self.election_deadline = None;
-                // Abort any in-progress leader transfer — the leader is being removed.
-                self.lead_transferee = None;
-                self.transfer_deadline = None;
-              }
-              // If an in-flight leader transfer's target was removed or demoted by this conf
-              // change, abort it (the target can no longer be elected, and proposals must not
-              // stay blocked until the transfer deadline). Mirrors etcd's abortLeaderTransfer
-              // on conf-change apply.
-              if self
-                .lead_transferee
-                .is_some_and(|t| !self.tracker.is_voter(&t))
-              {
-                self.lead_transferee = None;
-                self.transfer_deadline = None;
-              }
             }
-            // A committed, validly-decoded ConfChange that the Changer rejects is an
-            // unrecoverable logic violation (e.g. an overlapping change that should have
-            // been prevented upstream). Poison so the failure is detectable rather than
-            // a silent apply stall.
+            // A committed, validly-decoded ConfChange that the Changer rejects is an unrecoverable
+            // logic violation (e.g. an overlapping change that should have been prevented upstream).
+            // Poison so the failure is detectable rather than a silent apply stall.
             Err(_) => {
               self.poison(PoisonReason::ConfChangeApply);
               break;
             }
           }
+          let conf = self.tracker.conf_state();
+          self
+            .events
+            .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
+              idx, conf,
+            )));
+          // U6: a leader that this change removed (or demoted to learner) is no longer a voter in the
+          // new configuration and must stop acting as leader. `is_voter()` checks BOTH joint halves,
+          // so during a joint phase where we are still in the outgoing config we keep leading (we must
+          // shepherd the joint → simple transition). We only step down once removed from BOTH halves.
+          // The step-down is at the SAME term (no term bump): a leader yielding to its own removal,
+          // not losing an election.
+          if self.role.is_leader()
+            && self.config.step_down_on_removal()
+            && !self.tracker.is_voter(&self.config.id())
+          {
+            self.role = Role::Follower;
+            self.leader = None;
+            self.heartbeat_deadline = None;
+            // Do NOT arm the election timer: a non-voter must not campaign (see handle_timeout /
+            // become_candidate guards). Leaving election_deadline disarmed is the right choice — a
+            // removed/demoted node has no business holding an election timer.
+            self.election_deadline = None;
+            // Abort any in-progress leader transfer — the leader is being removed.
+            self.lead_transferee = None;
+            self.transfer_deadline = None;
+          }
+          // If an in-flight leader transfer's target was removed or demoted by this conf change,
+          // abort it (the target can no longer be elected, and proposals must not stay blocked until
+          // the transfer deadline). Mirrors etcd's abortLeaderTransfer on conf-change apply.
+          if self
+            .lead_transferee
+            .is_some_and(|t| !self.tracker.is_voter(&t))
+          {
+            self.lead_transferee = None;
+            self.transfer_deadline = None;
+          }
+          // NOTE: a learner promoted to voter by this change may be left without an election timer (a
+          // non-voter disarms it and never re-arms). `reconcile_election_timer`, run at the end of the
+          // public entry point that drove this apply, restores the invariant — no per-site arm needed.
           // Do NOT call F::apply for ConfChange entries — they advance `applied` only.
         }
       }
@@ -1920,9 +2021,29 @@ where
           entries[i].index().get() > self.commit.get(),
           "AppendEntries would truncate a committed entry"
         );
+        // §5.3 truncation invalidates any success-ack — already QUEUED in `outgoing` (the immediate
+        // pure-duplicate ack) or still PENDING as a deferred FollowerAck — whose match index lies in
+        // the range being overwritten. Those entries are gone, so reporting them is an OVER-ACK: it
+        // advances the leader's match for this peer past what the peer durably holds and can drive a
+        // commit the peer cannot back. This arises in the async fsync window when a follower acks a
+        // suffix and a conflicting AppendEntries (e.g. a reordered/duplicate one) truncates it before
+        // the ack leaves the outgoing queue — VOPR seed 3395 @4000, where node 5 acked 2181 after
+        // truncating to 2032. The new suffix's own ack is registered below.
+        let truncate_from = entries[i].index();
+        self.outgoing.retain(|o| {
+          !matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() >= truncate_from)
+        });
+        self.pending.retain(|_, p| match p {
+          Pending::FollowerAck { match_index, .. } => *match_index < truncate_from,
+          _ => true,
+        });
         let opid = self.mint_op_id();
         log.submit_append(opid, &entries[i..]);
         appended_opid = Some(opid);
+        // Apply-time membership (etcd, spec §9): a follower does NOT fold appended ConfChanges into
+        // its tracker. The configuration changes only when those entries commit-and-apply
+        // (apply_committed), so the tracker is never ahead of the committed log — no truncation
+        // revert is needed, and `conf_state()` always means the committed voter set.
       }
       // else: every entry already present (pure duplicate) — append nothing.
     }
@@ -2371,12 +2492,19 @@ where
       let cur_next = pr.next_index();
       // Compute the conflict index before re-borrowing self.tracker.progress mutably.
       let conflict = self.find_conflict_by_term(log, hint_index, hint_term);
-      // next_index must be at least 1 and must not advance past the current next on reject.
-      let safe_next = if conflict == Index::ZERO || conflict >= cur_next {
-        Index::new(cur_next.get().saturating_sub(1).max(1))
-      } else {
-        conflict
-      };
+      // etcd `Progress.MaybeDecrTo`: jump next_index to `min(rejected_prev, conflict+1)`, floored at
+      // 1 — NOT a one-index decrement. The jump makes catch-up of a deeply-divergent follower O(terms)
+      // round-trips instead of O(entries): a `(0,0)` hint (the follower's WHOLE log conflicts, so
+      // `find_conflict_by_term` bottomed out at 0) jumps straight to index 1 in a single step rather
+      // than walking down one index per reject. The one-index decrement is recovered automatically
+      // for a stale/unhelpful hint (`conflict >= cur_next` ⇒ `conflict+1 > rejected_prev` ⇒ the `min`
+      // picks `rejected_prev = cur_next-1`). (VOPR seed 7 was pathologically slow on the O(entries)
+      // walk — thousands of reject round-trips compressed into each instant-delivery tick.)
+      let rejected_prev = cur_next.get().saturating_sub(1);
+      let safe_next = Index::new(core::cmp::max(
+        core::cmp::min(rejected_prev, conflict.get() + 1),
+        1,
+      ));
       // Re-acquire progress to update (prior `pr` reference dropped implicitly by this point).
       if let Some(p) = self.tracker.progress_mut(&from) {
         p.become_probe();
@@ -3230,6 +3358,79 @@ mod tests {
     assert!(ep.role().is_follower());
     // election timer must be armed
     assert!(ep.poll_timeout().is_some());
+  }
+
+  /// Apply-time membership regression (etcd, spec §9): on restart the configuration is reconstructed
+  /// from the COMMITTED log prefix only — `apply_committed` re-folds the committed ConfChanges — and an
+  /// UNCOMMITTED ConfChange in the log tail does NOT take effect. So `conf_state()` after restart is
+  /// exactly the committed voter set, never an uncommitted one (the golden invariant the membership
+  /// audit settled on: the configuration follows the APPLIED prefix, not the raw log).
+  ///
+  /// Scenario: genesis is the 5-voter cluster {1,2,3,4,5}. The durable log holds two RemoveNode
+  /// conf-changes — drop 4 at index 1 (COMMITTED, commit=1) and drop 5 at index 2 (UNCOMMITTED). The
+  /// reconstructed config must be {1,2,3,5}: drop-4 applied, drop-5 ignored.
+  #[test]
+  fn restart_reconstructs_committed_config_ignoring_uncommitted_tail() {
+    use crate::{
+      ConfChange, ConfChangeType, Config, Data as _, Entry, EntryKind, Index, Instant, Term,
+    };
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3, 4, 5],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let remove = |node: u64| -> bytes::Bytes {
+      let cc = ConfChange::new(ConfChangeType::RemoveNode, node, bytes::Bytes::new()).into_v2();
+      let mut buf = std::vec::Vec::new();
+      cc.encode(&mut buf);
+      bytes::Bytes::from(buf)
+    };
+
+    // Durable log: drop 4 (index 1, committed) then drop 5 (index 2, uncommitted).
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::ConfChange,
+        remove(4),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::ConfChange,
+        remove(5),
+      ),
+    ]);
+    // commit = 1: drop-4 is committed; drop-5 is an uncommitted tail entry.
+    stable.force_state(Term::new(1), None, Index::new(1));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      7,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    // Reconstructed config is {1,2,3,5}: the COMMITTED drop-4 took effect (apply_committed re-folded
+    // it); the UNCOMMITTED drop-5 did NOT — apply-time never folds an uncommitted entry.
+    assert!(ep.tracker.is_voter(&1u64) && ep.tracker.is_voter(&2u64) && ep.tracker.is_voter(&3u64));
+    assert!(
+      !ep.tracker.is_voter(&4u64),
+      "committed RemoveNode(4) must be reconstructed on restart"
+    );
+    assert!(
+      ep.tracker.is_voter(&5u64),
+      "uncommitted RemoveNode(5) must NOT take effect (apply-time: config == committed prefix)"
+    );
   }
 
   /// Review C1 regression: a node that commits+applies entries [1..N] through the REAL path
@@ -4187,10 +4388,10 @@ mod tests {
 
     // Now simulate receiving the two-sided reject hint from peer 2:
     //   reject=true, reject_hint_index=2, reject_hint_term=1
-    // find_conflict_by_term(leader_log, 2, ceiling=1): term(2)=1 ≤ 1 → stop at 2
-    // safe_next = 2, prev_log_index = 1.
-    // With the OLD code (naive decrement from cur_next): next would step back only one slot.
-    // With the NEW code (two-sided hint): next_index jumps to 2 in one round-trip.
+    // find_conflict_by_term(leader_log, 2, ceiling=1): term(2)=1 ≤ 1 → conflict = 2.
+    // etcd MaybeDecrTo: next = min(rejected_prev, conflict+1) = min(5, 3) = 3, prev_log_index = 2.
+    // (The leader's index 2 is term 1 — exactly the follower's hint term — so probing prev=2 lands in
+    // ONE round-trip; the old naive decrement would step back one slot per reject.)
     leader.handle_message(
       d,
       &mut leader_log,
@@ -4206,13 +4407,14 @@ mod tests {
       )),
     );
 
-    // The leader should now send AppendEntries with prev_log_index = 1 (next_index = 2).
-    // If the old naive decrement were used, it would send with a much higher prev_log_index.
+    // The leader should now send AppendEntries with prev_log_index = 2 (next_index = 3) — the
+    // etcd `min(rejected, conflict+1)` jump. If the old naive decrement were used, prev would step
+    // back only one slot per reject (a much higher prev_log_index here).
     let mut found_correct_prev = false;
     while let Some(out) = leader.poll_message() {
       if out.to() == 2u64 {
         if let Message::AppendEntries(ae) = out.message() {
-          if ae.prev_log_index() == Index::new(1) {
+          if ae.prev_log_index() == Index::new(2) {
             found_correct_prev = true;
           }
         }
@@ -4220,7 +4422,87 @@ mod tests {
     }
     assert!(
       found_correct_prev,
-      "leader must jump next_index to 2 (prev=1) via two-sided term-skip hint, not step back one-by-one"
+      "leader must jump next_index to 3 (prev=2) via two-sided term-skip hint, not step back one-by-one"
+    );
+  }
+
+  /// A deeply-divergent follower — its WHOLE log conflicts, so its reject hint bottoms out at the
+  /// `(0,0)` form — must be re-synced in ONE round-trip: the leader jumps `next_index` straight to 1
+  /// (etcd `Progress.MaybeDecrTo`'s `min(rejected, hint+1)`), NOT decrement one index per reject. The
+  /// naive one-at-a-time walk is O(entries) round-trips; under the simulator's instant delivery that
+  /// is thousands of reject cycles compressed into a single tick, making a run pathologically slow.
+  /// (VOPR seed 7 @2000 was the symptom — a >350s run that the jump cuts to ~20s.)
+  ///
+  /// Before fix: a `(0,0)` hint took the `conflict == 0` branch and stepped `next_index` back by one.
+  #[test]
+  fn deeply_divergent_follower_jumps_to_one_not_decrement() {
+    use crate::{AppendResp, Entry, EntryKind, Index, Message, Term};
+
+    let (mut leader, mut log, mut stable, d) = make_three_node_leader();
+    // Give the leader a 5-entry log [1@1 .. 5@1] (index 1 is the elected no-op).
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"b"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"c"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(4),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"d"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(5),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"e"),
+      ),
+    ]);
+    // Peer 2 had been replicating, so its next_index is high (here 6). A deep-divergence reject
+    // arrives: with a one-index decrement the leader would step to next=5 (prev=4).
+    leader
+      .tracker
+      .progress_mut(&2u64)
+      .unwrap()
+      .set_next_index(Index::new(6));
+    while leader.poll_message().is_some() {}
+
+    leader.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        true,        // reject
+        Index::ZERO, // reject_hint_index = 0  ┐ the follower's whole log conflicts:
+        Term::ZERO,  // reject_hint_term  = 0  ┘ the `(0,0)` bottomed-out hint
+        Index::ZERO,
+      )),
+    );
+
+    // The leader must probe at prev_log_index = 0 (next_index jumped straight to 1) in ONE step.
+    let mut prev = None;
+    while let Some(out) = leader.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          prev = Some(ae.prev_log_index());
+        }
+      }
+    }
+    assert_eq!(
+      prev,
+      Some(Index::ZERO),
+      "a (0,0) deep-divergence reject must jump next_index to 1 (prev=0) in one step, not decrement"
     );
   }
 
@@ -6366,14 +6648,15 @@ mod tests {
     assert_eq!(ep.commit, Index::ZERO, "nothing committed yet");
 
     // Step 2: A term advance causes node 2 to become a candidate in term 2 and win.
-    // Simulate: election timeout fires, node 2 becomes candidate (term 2), then receives a
-    // grant from node 3 → quorum (self + 3) → become_leader.
+    // Under APPLY-TIME membership (etcd, spec §9), the inherited AddNode(4) at index 2 is UNCOMMITTED,
+    // so node 2's config is still {1,2,3} — the change does not take effect until it commits-and-applies.
+    // A majority of three is two, so a single peer grant (self + 3) elects node 2.
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable); // become candidate, term 2
     assert!(ep.role().is_candidate());
     while ep.poll_message().is_some() {}
 
-    // Node 3 grants the vote → quorum reached → become_leader.
+    // Node 3 grants the vote → self + 3 = two of {1,2,3} → quorum → become_leader.
     ep.handle_message(
       d,
       &mut log,
@@ -6712,6 +6995,112 @@ mod tests {
     assert!(
       ep.poll_message().is_none(),
       "non-voter must not send RequestVote"
+    );
+  }
+
+  /// A learner PROMOTED to voter must get its election timer ARMED so it can campaign. A non-voter
+  /// disarms its `election_deadline` when the timer fires (so the event-driven sim clock can advance
+  /// past it) and never re-arms; without re-arming on promotion the new voter would sit forever with
+  /// `election_deadline = None` and never start an election — a cluster whose voters were ALL
+  /// promoted learners would wedge leaderless. (Surfaced by the VOPR: seed 88, tick 7347.)
+  ///
+  /// Before fix: `apply_committed` updated the tracker on promotion but never armed the timer, so
+  /// `election_deadline` stayed `None` and `is_some()` below was false.
+  #[test]
+  fn promoted_learner_arms_election_timer() {
+    use crate::{ConfChange, ConfChangeType, Data as _, Entry, EntryKind, Instant, Term};
+    use core::time::Duration;
+
+    // Node 4 starts as a LEARNER in {voters:[1,2,3], learners:[4]}.
+    let cfg = crate::Config::try_new(
+      4u64,
+      std::vec![1u64, 2u64, 3u64, 4u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 99, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let learner_cs = crate::ConfState::new([1u64, 2u64, 3u64], [4u64], [], [], false);
+    ep.tracker = crate::Tracker::from_conf_state(&learner_cs, crate::Index::ZERO, 256, 0);
+    assert!(ep.tracker.is_learner(&4u64), "node 4 must start a learner");
+
+    // The non-voter state: the election timer fired once and was cleared to None (never re-armed).
+    ep.election_deadline = None;
+
+    // Append a committed AddNode(4) conf-change entry — it promotes node 4 from learner to voter.
+    let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()).into_v2();
+    let mut buf = std::vec::Vec::new();
+    cc.encode(&mut buf);
+    let idx = log.last_index().next();
+    log.force_append(&[Entry::new(
+      Term::new(1),
+      idx,
+      EntryKind::ConfChange,
+      bytes::Bytes::from(buf),
+    )]);
+    ep.commit = idx;
+
+    ep.apply_committed(&log);
+    // The promotion itself does not arm (no per-site patch); the invariant is restored centrally by
+    // `reconcile_election_timer`, which every public entry point (handle_message / handle_timeout /
+    // handle_storage) runs after applying committed entries. Invoke it directly here to test that
+    // central guarantee in isolation.
+    assert!(
+      ep.tracker.is_voter(&4u64),
+      "node 4 must be a voter after AddNode(4) applies"
+    );
+    assert!(
+      ep.election_deadline.is_none(),
+      "promotion alone must NOT arm — arming is the reconcile's job, by construction"
+    );
+    ep.reconcile_election_timer(Instant::ORIGIN);
+
+    // Node 4 is now a voter AND the reconcile armed its election timer so it can campaign.
+    assert!(
+      ep.election_deadline.is_some(),
+      "reconcile_election_timer must arm a promoted voter so it can campaign"
+    );
+  }
+
+  /// Stepping down to Follower on a higher-term message must ARM a voter's election timer (mirrors
+  /// etcd's `becomeFollower`). A leader with check_quorum disabled holds `election_deadline = None`; a
+  /// higher-term RESPONSE (VoteResp / AppendResp — whose handler returns early without arming) would
+  /// otherwise leave it a voter Follower that can NEVER campaign, wedging the cluster leaderless.
+  /// (Surfaced by the VOPR: seed 0 at 2000 ticks, tick 6839.)
+  ///
+  /// Before fix: the term pre-pass step-down never armed the timer, so a leader stepping down on a
+  /// higher-term VoteResp kept `election_deadline = None`.
+  #[test]
+  fn step_down_on_higher_term_arms_voter_election_timer() {
+    use crate::{Message, Term, VoteResp};
+
+    let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+    assert!(ep.role().is_leader(), "precondition: node is the leader");
+    // check_quorum is off by default, so a leader holds NO election deadline.
+    assert!(
+      ep.election_deadline.is_none(),
+      "precondition: a leader without check_quorum has no election timer"
+    );
+
+    // A higher-term VoteResp — a response whose handler returns early (we are no longer a candidate)
+    // without arming — forces the step-down through the term pre-pass.
+    let higher = Term::new(ep.term().get() + 5);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(higher, 2u64, false, true)),
+    );
+
+    assert!(
+      ep.role().is_follower(),
+      "must step down to Follower on the higher term"
+    );
+    assert!(
+      ep.election_deadline.is_some(),
+      "a voter that stepped down must have an ARMED election timer so it can campaign"
     );
   }
 
@@ -7427,6 +7816,96 @@ mod tests {
     assert!(
       ep.voted_for.is_none(),
       "voted_for must remain None after granted pre-vote"
+    );
+  }
+
+  /// CheckQuorum/PreVote step-down nudge: a node that ADVANCED its term during a partition (here to
+  /// term 8) and then receives a STALE-term Heartbeat from a node still claiming leadership at a
+  /// lower term (3) must reply with an AppendResp at ITS OWN higher term — the stale leader adopts
+  /// it and steps down, breaking the wedge where it can neither replicate to us (our term is higher)
+  /// nor be unseated by us (we are too far behind to win an election). Mirrors etcd's `m.Term <
+  /// r.Term` MsgAppResp branch; only fires when CheckQuorum or PreVote is enabled (plain Raft relies
+  /// on the disruptive higher-term campaign instead).
+  ///
+  /// Before fix: the stale-term branch silently `return`ed for every non-pre-vote message, so NO
+  /// response was sent and the lower-term leader never learned it was stale — a permanent livelock
+  /// (surfaced by the VOPR at seed 22, tick 11794).
+  #[test]
+  fn stale_term_heartbeat_forces_leader_step_down() {
+    use crate::{Config, Index, Instant, Message, Term};
+    use core::time::Duration;
+
+    let make = |pre_vote: bool| {
+      let mut cfg = Config::try_new(
+        2u64,
+        std::vec![1u64, 2u64, 3u64],
+        Duration::from_millis(1000),
+        Duration::from_millis(100),
+      )
+      .unwrap();
+      if pre_vote {
+        cfg = cfg.with_pre_vote(true);
+      }
+      // Node 2 manually advanced to term 8 (as if it campaigned during a partition and is now far
+      // behind a leader that stayed at the lower term 3).
+      let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
+      ep.term = Term::new(8);
+      ep
+    };
+    let stale_heartbeat = || {
+      Message::Heartbeat(crate::Heartbeat::new(
+        Term::new(3), // stale: 3 < our 8
+        1u64,         // a node still claiming leadership at the stale term
+        Index::ZERO,
+        bytes::Bytes::new(),
+      ))
+    };
+
+    // pre_vote ON: the stale heartbeat must provoke an AppendResp at OUR term (8).
+    let mut ep = make(true);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      stale_heartbeat(),
+    );
+    let resp = ep
+      .poll_message()
+      .expect("pre_vote on: must reply to a stale-term heartbeat to force the stale leader down");
+    assert_eq!(
+      resp.to(),
+      1u64,
+      "the nudge must go back to the stale leader"
+    );
+    match resp.message() {
+      Message::AppendResp(ar) => assert_eq!(
+        ar.term(),
+        Term::new(8),
+        "the nudge must carry OUR higher term so the stale leader adopts it and steps down"
+      ),
+      other => panic!("expected AppendResp (step-down nudge), got {other:?}"),
+    }
+    assert_eq!(
+      ep.term(),
+      Term::new(8),
+      "must NOT adopt the stale lower term"
+    );
+
+    // Neither mode: the same stale heartbeat is silently dropped (plain-Raft behavior preserved).
+    let mut ep2 = make(false);
+    ep2.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      stale_heartbeat(),
+    );
+    assert!(
+      ep2.poll_message().is_none(),
+      "without check_quorum/pre_vote a stale heartbeat is silently dropped (no nudge)"
     );
   }
 
@@ -9398,6 +9877,46 @@ mod tests {
       "CQ+transfer leader poll_timeout must be min(hb, el, tr)"
     );
     let _ = ep_l;
+  }
+
+  /// A POISONED node must surface NO serviceable timer (`poll_timeout` returns None), even with an
+  /// armed election deadline as a voter. `handle_timeout` (like every `handle_*`) early-returns on
+  /// poison, so surfacing a deadline wedges the event-driven driver: it advances `now` to that
+  /// deadline, the timeout fires as a no-op, the deadline stays due, and the clock can NEVER advance
+  /// past it — freezing the whole cluster (no other node's timer can fire). A poisoned node is
+  /// revived only by an external `restart`, never by a timer. (Surfaced by the VOPR: a poisoned,
+  /// already-removed voter froze the simulated clock and starved every election — seeds 0/3/88.)
+  ///
+  /// Before fix: `serviceable_now` ignored `poisoned`, so a poisoned voter's election timer was
+  /// surfaced and `poll_timeout` returned `Some`.
+  #[test]
+  fn poisoned_node_surfaces_no_timer() {
+    use core::time::Duration;
+
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
+    // A healthy voter follower surfaces its (armed) election timer.
+    assert!(
+      ep.poll_timeout().is_some(),
+      "precondition: a healthy voter surfaces its election timer"
+    );
+
+    // An unrecoverable storage/apply error poisons the node — every handle_* is now a no-op.
+    ep.poison(PoisonReason::LogRead);
+    assert!(ep.is_poisoned());
+
+    // It must surface NO timer: it services nothing until an external restart, so the driver must
+    // not advance the clock to (and then no-op on) any deadline it holds.
+    assert!(
+      ep.poll_timeout().is_none(),
+      "a poisoned node must surface no serviceable timer (else it freezes the driver clock)"
+    );
   }
 
   /// U6-T3: `handle_timeout` → `poll_timeout` makes progress (no busy-wakeup wedge).
