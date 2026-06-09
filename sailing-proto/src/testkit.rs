@@ -178,6 +178,80 @@ impl LogStore for VecLog {
   }
 }
 
+/// A `VecLog` whose [`LogStore::term`] returns `Err(())` for one configurable index, modelling a
+/// FATAL storage read failure (not "absent"). Used to prove the core poisons rather than
+/// fabricating a default term. Its `Error` is `()` (a distinct, non-`Infallible` error type) so the
+/// `Err` arm is actually reachable.
+#[derive(Debug, Default)]
+pub(crate) struct FailTermLog {
+  inner: VecLog,
+  /// When `Some(i)`, `term(i)` returns `Err(())`; every other index delegates to `inner`.
+  fail_index: Option<Index>,
+}
+
+impl FailTermLog {
+  /// Seed durable entries (delegates to [`VecLog::force_append`]).
+  pub(crate) fn force_append(&mut self, entries: &[Entry]) {
+    self.inner.force_append(entries);
+  }
+
+  /// Arm the fatal term-read failure at `index` (cleared with `None`).
+  pub(crate) fn fail_term_at(&mut self, index: Option<Index>) {
+    self.fail_index = index;
+  }
+}
+
+impl LogStore for FailTermLog {
+  type Error = ();
+
+  fn first_index(&self) -> Index {
+    self.inner.first_index()
+  }
+
+  fn last_index(&self) -> Index {
+    self.inner.last_index()
+  }
+
+  fn term(&self, index: Index) -> Result<Term, Self::Error> {
+    if self.fail_index == Some(index) {
+      return Err(());
+    }
+    Ok(self.inner.term(index).expect("VecLog::term is Infallible"))
+  }
+
+  fn entries(
+    &self,
+    range: core::ops::Range<Index>,
+    max_bytes: u64,
+  ) -> Result<&[Entry], Self::Error> {
+    Ok(
+      self
+        .inner
+        .entries(range, max_bytes)
+        .expect("VecLog::entries is Infallible"),
+    )
+  }
+
+  fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
+    self.inner.submit_append(id, entries);
+  }
+
+  fn compact(&mut self, up_to: Index) {
+    self.inner.compact(up_to);
+  }
+
+  fn restore(&mut self, last_index: Index, last_term: Term) {
+    self.inner.restore(last_index, last_term);
+  }
+
+  fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
+    self
+      .inner
+      .poll()
+      .map(|r| Ok(r.expect("VecLog::poll is Infallible")))
+  }
+}
+
 /// A counting state machine: `Command = Bytes`, `Response = usize`. Counts applied commands.
 #[derive(Debug, Default)]
 pub(crate) struct CountSm {

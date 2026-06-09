@@ -5,7 +5,7 @@ use crate::{
   StateMachine, Term,
 };
 use bytes::Bytes;
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
@@ -121,6 +121,9 @@ pub enum PoisonReason {
   SnapshotDecode,
   /// `StateMachine::restore` failed while installing a snapshot (install or restart).
   SnapshotRestore,
+  /// An AppendEntries conflict at or below the commit index would rewrite committed/applied log
+  /// state — impossible in correct Raft; treated as fatal corruption.
+  CommittedTruncation,
 }
 
 impl PoisonReason {
@@ -138,6 +141,7 @@ impl PoisonReason {
       Self::ConfChangeApply => "conf_change_apply",
       Self::SnapshotDecode => "snapshot_decode",
       Self::SnapshotRestore => "snapshot_restore",
+      Self::CommittedTruncation => "committed_truncation",
     }
   }
 }
@@ -240,6 +244,14 @@ where
   ///
   /// Each element is `(context, from)` matching `add_request`'s signature.
   pending_reads: std::vec::Vec<(Bytes, Option<I>)>,
+  /// Read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
+  /// awaiting a `ReadIndexResp` for. The follower-side mirror of the leader's
+  /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
+  /// `DuplicateContext` instead of being silently coalesced (or unboundedly re-forwarded), so the
+  /// originator is never left waiting on a confirmation the first forward already owns. Cleared on
+  /// the matching `ReadIndexResp`, and wholesale on any term change or leader change (a read
+  /// forwarded to a now-stale leader must not block re-issuing it to the new one).
+  forwarded_reads: BTreeSet<Bytes>,
   /// Target of an in-progress leader transfer, or `None` if no transfer is active.
   ///
   /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
@@ -301,6 +313,7 @@ where
       pending_conf_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
+      forwarded_reads: BTreeSet::new(),
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -479,6 +492,9 @@ where
     // cannot confirm any outstanding read requests.
     self.read_only.reset(self.config.read_only());
     self.pending_reads.clear();
+    // Leadership is gone: any reads we forwarded to the old leader are moot — clear so they can be
+    // re-issued once we learn a new leader.
+    self.forwarded_reads.clear();
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
     self.lead_transferee = None;
     self.transfer_deadline = None;
@@ -546,19 +562,37 @@ where
     self.tracker.ids().into_iter().filter(move |&p| p != me)
   }
 
+  /// The single term-read choke-point. `LogStore::term` returning `Err` is a FATAL storage failure
+  /// (per the trait contract) — never "absent" — so every term read in the core funnels through here:
+  /// on `Err` the node poisons (`PoisonReason::LogTerm`) and returns `None`, and the caller
+  /// short-circuits. This replaces the scattered `log.term(idx).unwrap_or(<default>)` reads, each of
+  /// which silently swallowed a fatal error into a fabricated default — the defect class behind R1
+  /// finding 2 (`last_log`) and R2 finding 1 (`on_append_entries`). An index that legitimately has no
+  /// entry (index 0, out of range, compacted) is the store's job to answer with `Ok`; `Err` is
+  /// reserved for I/O failure, and there is exactly one correct response to that: poison.
+  fn log_term<L: LogStore>(&mut self, log: &L, idx: Index) -> Option<Term> {
+    match log.term(idx) {
+      Ok(t) => Some(t),
+      Err(_) => {
+        self.poison(PoisonReason::LogTerm);
+        None
+      }
+    }
+  }
+
   /// Our log's `(last_index, last_term)` for the §5.4.1 up-to-date comparison, or `None` on a genuine
-  /// storage error reading the last term of a NON-empty log.
+  /// storage error reading the last term of a NON-empty log (the node is poisoned via
+  /// [`Self::log_term`]).
   ///
-  /// An empty log (`last_index == 0`) legitimately has last term `0`. But collapsing a term-READ
-  /// FAILURE on a non-empty log to `Term::ZERO` would fabricate a stale term and could make us grant
-  /// a vote to a candidate whose log is actually staler than ours (a leader-completeness hazard), so
-  /// the caller must treat `None` as a fatal read error (poison), never as "term zero".
-  fn last_log(&self, log: &impl LogStore) -> Option<(Index, Term)> {
+  /// An empty log (`last_index == 0`) legitimately has last term `0`. A term-READ FAILURE on a
+  /// non-empty log poisons rather than fabricating a stale `Term::ZERO` (which could make us grant a
+  /// vote to a candidate whose log is actually staler than ours — a leader-completeness hazard).
+  fn last_log(&mut self, log: &impl LogStore) -> Option<(Index, Term)> {
     let li = log.last_index();
     if li == Index::ZERO {
       return Some((Index::ZERO, Term::ZERO));
     }
-    log.term(li).ok().map(|lt| (li, lt))
+    self.log_term(log, li).map(|lt| (li, lt))
   }
 
   /// Whether this candidate's self-vote (the term+vote hard-state write from `become_candidate`) is
@@ -698,7 +732,10 @@ where
     let prev_term = if prev_index == Index::ZERO {
       Term::ZERO
     } else {
-      log.term(prev_index).unwrap_or(Term::ZERO)
+      match self.log_term(log, prev_index) {
+        Some(t) => t,
+        None => return,
+      }
     };
     let end = log.last_index().next();
     // Read the BORROWED suffix slice (no allocation) and apply the byte cap on the slice, cloning
@@ -707,7 +744,15 @@ where
     // passed to the store so an implementation that honours it can return a shorter slice.
     let max_bytes = self.config.max_size_per_msg();
     let slice: &[crate::Entry] = if next < end {
-      log.entries(next..end, max_bytes).unwrap_or_default()
+      // A replicable-range read failure is fatal, same policy as `apply_committed`'s LogRead: poison
+      // rather than silently shipping an empty AppendEntries that stalls the follower forever.
+      match log.entries(next..end, max_bytes) {
+        Ok(s) => s,
+        Err(_) => {
+          self.poison(PoisonReason::LogRead);
+          return;
+        }
+      }
     } else {
       &[]
     };
@@ -804,7 +849,10 @@ where
     // no learners) returns the same value.
     let candidate = self.tracker.quorum_committed();
     // §5.4.2: only commit an entry from the CURRENT term by counting replicas.
-    let current_term = log.term(candidate).map(|t| t == self.term).unwrap_or(false);
+    let current_term = self
+      .log_term(log, candidate)
+      .map(|t| t == self.term)
+      .unwrap_or(false);
     if candidate > self.commit && current_term {
       self.commit = candidate;
     }
@@ -1080,12 +1128,8 @@ where
     use crate::Data as _;
     let mut data = std::vec::Vec::new();
     snap.encode(&mut data);
-    let last_term = match log.term(self.applied) {
-      Ok(t) => t,
-      Err(_) => {
-        self.poison(PoisonReason::LogTerm);
-        return;
-      }
+    let Some(last_term) = self.log_term(log, self.applied) else {
+      return;
     };
     let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state());
     let opid = self.mint_op_id();
@@ -1198,6 +1242,7 @@ where
       events: VecDeque::new(),
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
+      forwarded_reads: BTreeSet::new(),
       lead_transferee: None,
       transfer_deadline: None,
     };
@@ -1357,6 +1402,9 @@ where
         // leader-gated, so this is robustness, not a behavior change).
         self.read_only.reset(self.config.read_only());
         self.pending_reads.clear();
+        // A read forwarded under the old term/leader is stale across this term change — clear so a
+        // re-issue to the new leader is not blocked.
+        self.forwarded_reads.clear();
         // Abort any in-progress leader transfer — leadership is changing.
         self.lead_transferee = None;
         self.transfer_deadline = None;
@@ -1826,6 +1874,9 @@ where
     self.pending.clear();
     self.role = Role::Candidate;
     self.leader = None;
+    // Campaigning: no leader to forward reads to, and the term is advancing — drop any forwarded
+    // reads so they can be re-issued to whoever wins.
+    self.forwarded_reads.clear();
     self.voted_for = Some(self.config.id());
     // Record self-vote in the ballot map (true = grant).
     self.votes.clear();
@@ -1886,6 +1937,9 @@ where
     }
     self.role = Role::PreCandidate;
     self.leader = None;
+    // No leader to forward reads to while probing — drop any forwarded reads (a pre-vote that fails
+    // returns to Follower; a successful one bumps the term via become_candidate).
+    self.forwarded_reads.clear();
     // Clear the ballot and record self pre-vote.
     self.votes.clear();
     self.votes.insert(self.config.id(), true);
@@ -2006,6 +2060,8 @@ where
     self.leader = Some(hb.leader());
     self.arm_election_timer(now);
     if changed {
+      // New leader: drop reads forwarded to the previous one (see on_append_entries).
+      self.forwarded_reads.clear();
       self
         .events
         .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
@@ -2049,6 +2105,9 @@ where
     self.leader = Some(ae.leader());
     self.arm_election_timer(now);
     if changed {
+      // New leader: reads forwarded to the previous leader are moot — clear so they can be
+      // re-issued to this one.
+      self.forwarded_reads.clear();
       self
         .events
         .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
@@ -2057,13 +2116,19 @@ where
         )));
     }
 
-    // Log-consistency check at prev_log_index/term.
+    // Log-consistency check at prev_log_index/term. A fatal term-read poisons via `log_term` and
+    // produces `None` → not consistent → reject path; the poisoned node's later dispatch no-ops.
     let consistent = ae.prev_log_index() == Index::ZERO
       || (ae.prev_log_index() <= log.last_index()
-        && log
-          .term(ae.prev_log_index())
+        && self
+          .log_term(log, ae.prev_log_index())
           .map(|t| t == ae.prev_log_term())
           .unwrap_or(false));
+    // A fatal term-read inside the consistency check poisoned us; stop before emitting any reply —
+    // a poisoned node must not send (the later dispatch no-ops, but this in-flight handler must too).
+    if self.poisoned {
+      return;
+    }
 
     let (term, me) = (self.term, self.config.id());
     if !consistent {
@@ -2077,7 +2142,10 @@ where
       let last_index = log.last_index();
       let hint_index_raw = core::cmp::min(ae.prev_log_index(), last_index);
       let hint_index = self.find_conflict_by_term(log, hint_index_raw, ae.prev_log_term());
-      let hint_term = log.term(hint_index).unwrap_or(Term::ZERO);
+      let hint_term = match self.log_term(log, hint_index) {
+        Some(t) => t,
+        None => return,
+      };
       self.send(
         ae.leader(),
         Message::AppendResp(crate::AppendResp::new(
@@ -2102,20 +2170,27 @@ where
       let mut conflict_at: Option<usize> = None;
       for (i, entry) in entries.iter().enumerate() {
         let idx = entry.index();
-        let matches_existing =
-          idx <= log.last_index() && log.term(idx).map(|t| t == entry.term()).unwrap_or(false);
+        let matches_existing = if idx <= log.last_index() {
+          match self.log_term(log, idx) {
+            Some(t) => t == entry.term(),
+            // Fatal term-read: poisoned; abort rather than mis-classify as a conflict (R2-F1).
+            None => return,
+          }
+        } else {
+          false
+        };
         if !matches_existing {
           conflict_at = Some(i);
           break;
         }
       }
       if let Some(i) = conflict_at {
-        // Safety tripwire: a conflict at/below our commit means a committed entry would be
-        // rewritten — that must be impossible in correct Raft.
-        debug_assert!(
-          entries[i].index().get() > self.commit.get(),
-          "AppendEntries would truncate a committed entry"
-        );
+        // A conflict at or below our commit would rewrite a committed entry — impossible in correct
+        // Raft. Treat it as fatal corruption: poison and abort rather than truncate durable state.
+        if entries[i].index() <= self.commit {
+          self.poison(PoisonReason::CommittedTruncation);
+          return;
+        }
         // §5.3 truncation invalidates any success-ack — already QUEUED in `outgoing` (the immediate
         // pure-duplicate ack) or still PENDING as a deferred FollowerAck — whose match index lies in
         // the range being overwritten. Those entries are gone, so reporting them is an OVER-ACK: it
@@ -2287,9 +2362,9 @@ where
   /// A newly-elected leader cannot confirm reads against a commit index whose entry is from
   /// a prior term (§5.4.2).  It must wait until its no-op append is committed before
   /// confirming any reads.
-  fn has_current_term_commit<L: LogStore>(&self, log: &L) -> bool {
-    log
-      .term(self.commit)
+  fn has_current_term_commit<L: LogStore>(&mut self, log: &L) -> bool {
+    self
+      .log_term(log, self.commit)
       .map(|t| t == self.term)
       .unwrap_or(false)
   }
@@ -2493,6 +2568,13 @@ where
         let Some(leader) = self.leader else {
           return Err(crate::ReadIndexError::NoLeader);
         };
+        // Follower-side duplicate-context guard (mirror of the leader's `read_context_in_flight`):
+        // a context already forwarded and awaiting its `ReadIndexResp` owns the completion path;
+        // reject the duplicate rather than forward it again (unbounded re-forward / silent coalesce).
+        if self.forwarded_reads.contains(&context) {
+          return Err(crate::ReadIndexError::DuplicateContext);
+        }
+        self.forwarded_reads.insert(context.clone());
         let (term, me) = (self.term, self.config.id());
         self.send(
           leader,
@@ -2548,6 +2630,9 @@ where
   /// Follower receives a `ReadIndexResp` from the leader.
   fn on_read_index_resp(&mut self, resp: crate::ReadIndexResp<I>) {
     let ctx = Bytes::copy_from_slice(resp.context());
+    // The forwarded read for this context is now confirmed; drop it from the in-flight set so the
+    // same context can be re-issued later.
+    self.forwarded_reads.remove(&ctx);
     self
       .events
       .push_back(crate::Event::ReadState(crate::ReadState::new(
@@ -2559,9 +2644,12 @@ where
   /// Walk the leader's log downward from `index` until we find an entry whose term is
   /// `<= term` (or we hit the beginning). This mirrors etcd's `findConflictByTerm` and
   /// lets the leader skip a whole divergent term in one round-trip on reject.
-  fn find_conflict_by_term<L: LogStore>(&self, log: &L, mut index: Index, term: Term) -> Index {
+  fn find_conflict_by_term<L: LogStore>(&mut self, log: &L, mut index: Index, term: Term) -> Index {
     while index > Index::ZERO {
-      let t = log.term(index).unwrap_or(Term::ZERO);
+      // On a fatal term-read the node is poisoned; the hint is moot, so return the current index.
+      let Some(t) = self.log_term(log, index) else {
+        return index;
+      };
       if t <= term {
         break;
       }
@@ -2674,6 +2762,8 @@ where
     self.leader = Some(is.leader());
     self.arm_election_timer(now);
     if changed {
+      // New leader: drop reads forwarded to the previous one (see on_append_entries).
+      self.forwarded_reads.clear();
       self
         .events
         .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
@@ -10530,7 +10620,193 @@ mod tests {
       "normal_entry_decode"
     );
     assert_eq!(PoisonReason::SnapshotRestore.as_str(), "snapshot_restore");
+    assert_eq!(
+      PoisonReason::CommittedTruncation.as_str(),
+      "committed_truncation"
+    );
     assert!(PoisonReason::LogRead.is_log_read());
     assert!(!PoisonReason::LogRead.is_apply());
+    assert!(PoisonReason::CommittedTruncation.is_committed_truncation());
+  }
+
+  /// A fatal `LogStore::term` failure at a COMMITTED index during an AppendEntries conflict scan
+  /// must POISON the node (`PoisonReason::LogTerm`) — never silently fabricate a default term and
+  /// truncate committed state. Regression for the swallowed-`term`-error defect class (R2-F1).
+  #[test]
+  fn term_read_failure_at_committed_index_poisons_no_truncation() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, PoisonReason, Term,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Follower holds two durable, COMMITTED entries at indices 1 and 2 (both term 1). Use Empty
+    // entries so commit-and-apply needs no payload decode — this test isolates the term-read path.
+    let mut log = crate::testkit::FailTermLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+    ]);
+
+    // Drive commit up to index 2 with a benign heartbeat-shaped AppendEntries (prev at the
+    // matching tail, no new entries): the consistency check reads term(2)=ok and commit advances.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::new(2),
+        Term::new(1),
+        std::vec![],
+        Index::new(2),
+      )),
+    );
+    assert_eq!(ep.commit_index(), Index::new(2), "commit advanced to 2");
+    assert!(!ep.is_poisoned(), "healthy after the setup append");
+    while ep.poll_message().is_some() {}
+
+    // Now arm a FATAL term-read failure at the committed index 2, and send a conflicting
+    // AppendEntries whose suffix overlaps index 2 with a DIFFERENT term. prev_log_index=1 passes
+    // the consistency check (term(1) ok); the conflict scan then reads term(2) → Err → poison.
+    log.fail_term_at(Some(Index::new(2)));
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        1u64,
+        Index::new(1),
+        Term::new(1),
+        std::vec![Entry::new(
+          Term::new(2),
+          Index::new(2),
+          EntryKind::Empty,
+          bytes::Bytes::new(),
+        )],
+        Index::new(1),
+      )),
+    );
+
+    assert!(ep.is_poisoned(), "fatal term-read must poison the node");
+    assert_eq!(
+      ep.poison_reason(),
+      Some(PoisonReason::LogTerm),
+      "the swallowed term error must surface as LogTerm, not a fabricated default"
+    );
+    // NO truncation/append happened: the durable tail is still indices 1..=2 with the ORIGINAL
+    // terms (the conflicting suffix at index 2 was never submitted).
+    log.fail_term_at(None);
+    assert_eq!(log.last_index(), Index::new(2), "no truncation occurred");
+    assert_eq!(
+      log.term(Index::new(2)),
+      Ok(Term::new(1)),
+      "the committed entry's term is untouched (no overwrite to term 2)"
+    );
+  }
+
+  /// A FOLLOWER forwarding a `ReadIndex` to its leader applies the same duplicate-context guard as
+  /// the leader: a second `read_index` with an in-flight context returns `DuplicateContext`, and the
+  /// matching `ReadIndexResp` clears it so the context can be re-issued. Regression (Class 2).
+  #[test]
+  fn duplicate_follower_read_index_is_rejected_then_clears() {
+    use crate::{
+      AppendEntries, Config, Index, Instant, Message, ReadIndexError, ReadIndexResp, Term,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Establish a known leader (node 1) via a heartbeat-shaped AppendEntries.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    assert_eq!(ep.role(), Role::Follower);
+    assert_eq!(ep.leader(), Some(1u64));
+    while ep.poll_message().is_some() {}
+
+    let ctx = bytes::Bytes::from_static(b"read-ctx");
+
+    // First read forwards to the leader.
+    assert_eq!(
+      ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
+      Ok(())
+    );
+    assert!(
+      matches!(ep.poll_message().map(|o| o.message().clone()), Some(Message::ReadIndex(ri)) if ri.context() == ctx.as_ref()),
+      "first read forwarded as a ReadIndex"
+    );
+
+    // Second read with the SAME context — rejected, no second forward.
+    assert_eq!(
+      ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
+      Err(ReadIndexError::DuplicateContext),
+      "duplicate forwarded context is rejected"
+    );
+    assert!(ep.poll_message().is_none(), "no duplicate forward emitted");
+
+    // The matching ReadIndexResp confirms the read and clears the in-flight context.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::ReadIndexResp(ReadIndexResp::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        ctx.clone(),
+      )),
+    );
+    // Drain the ReadState event.
+    while ep.poll_event().is_some() {}
+
+    // Re-issuing the same context now succeeds (the guard cleared).
+    assert_eq!(
+      ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
+      Ok(()),
+      "context is re-issuable after its ReadIndexResp"
+    );
   }
 }
