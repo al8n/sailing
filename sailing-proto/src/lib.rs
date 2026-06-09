@@ -57,7 +57,7 @@ mod storage;
 pub use storage::{LogDone, LogStore, OpId, StableDone, StableStore};
 
 mod error;
-pub use error::{ConfigError, ProposeError};
+pub use error::{ConfigError, ProposeError, TransferError};
 
 mod inflights;
 pub use inflights::Inflights;
@@ -75,7 +75,7 @@ mod event;
 pub use event::{Applied, ConfChanged, Event, LeaderChanged};
 
 mod endpoint;
-pub use endpoint::{Endpoint, Role};
+pub use endpoint::{Endpoint, Role, TimerKind};
 
 pub mod tracker;
 pub use tracker::{

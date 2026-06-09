@@ -15,6 +15,29 @@ pub enum ProposeError<I> {
   /// committed and applied.
   #[error("a conf change is already in flight")]
   ConfChangeInFlight,
+  /// A leader transfer is in progress; the leader is not accepting new proposals until
+  /// the transfer completes or times out.
+  #[error("a leader transfer is in progress")]
+  LeaderTransferInProgress,
+}
+
+/// Why a leader-transfer request was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum TransferError<I> {
+  /// This node is not the leader; a transfer can only be initiated by the current leader.
+  #[error("not the leader")]
+  NotLeader {
+    /// The believed current leader, if known.
+    leader: Option<I>,
+  },
+  /// The target node is not a voter in the current configuration and therefore cannot be
+  /// elected leader.
+  #[error("transfer target is not a voter")]
+  NotAVoter,
+  /// The target node is the current leader — no transfer needed.
+  #[error("transfer target is already the leader")]
+  AlreadyLeader,
 }
 
 /// Why constructing a [`crate::Config`] failed.

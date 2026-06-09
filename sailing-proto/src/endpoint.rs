@@ -34,6 +34,42 @@ impl Role {
   }
 }
 
+/// The independent timers an `Endpoint` arms.
+///
+/// `poll_timeout` filters to the ones the current `(role, state)` will actually service in
+/// `handle_timeout` — the §8 timer-wedge defense. Returning a deadline the current state
+/// will not service would leave the driver sleeping to a deadline that `handle_timeout`
+/// ignores, re-arms nothing, and triggers a busy-wakeup loop / wedge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
+#[display("{}", self.as_str())]
+pub enum TimerKind {
+  /// Follower/candidate election timeout; also the CheckQuorum interval on a leader with
+  /// `check_quorum` enabled.
+  Election,
+  /// Leader heartbeat interval.
+  Heartbeat,
+  /// Leader transfer abort window (one election timeout after transfer start).
+  Transfer,
+}
+
+impl TimerKind {
+  /// All timer kinds in a fixed order.
+  pub const ALL: [TimerKind; 3] = [
+    TimerKind::Election,
+    TimerKind::Heartbeat,
+    TimerKind::Transfer,
+  ];
+
+  /// The stable snake_case name.
+  pub const fn as_str(&self) -> &'static str {
+    match self {
+      Self::Election => "election",
+      Self::Heartbeat => "heartbeat",
+      Self::Transfer => "transfer",
+    }
+  }
+}
+
 /// What the core owes once a storage write completes.
 #[derive(Debug, Clone, Copy)]
 enum Pending<I> {
@@ -109,6 +145,15 @@ where
   ///
   /// Each element is `(context, from)` matching `add_request`'s signature.
   pending_reads: std::vec::Vec<(Bytes, Option<I>)>,
+  /// Target of an in-progress leader transfer, or `None` if no transfer is active.
+  ///
+  /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
+  /// `step_down_to_follower`, `become_leader`) and on `transfer_deadline` expiry.
+  lead_transferee: Option<I>,
+  /// When to abort a stalled leader transfer (abort window = one election timeout).
+  ///
+  /// Armed when `lead_transferee` is set; cleared together with `lead_transferee`.
+  transfer_deadline: Option<Instant>,
 }
 
 // ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
@@ -154,6 +199,8 @@ where
       pending_conf_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
+      lead_transferee: None,
+      transfer_deadline: None,
     };
     ep.arm_election_timer(now);
     ep
@@ -201,13 +248,21 @@ where
     self.events.pop_front()
   }
 
-  /// The earliest armed deadline (election for followers/candidates, heartbeat for leaders).
+  /// The earliest deadline the current `(role, state)` will ACTUALLY service in
+  /// `handle_timeout` (the §8 timer-wedge defense).
+  ///
+  /// Only deadlines that `serviceable_now` considers active for the current role+state are
+  /// candidates; the minimum of those is returned.  A driver that feeds `poll_timeout` back
+  /// into `handle_timeout` is guaranteed to make progress: every returned deadline will be
+  /// re-armed to a strictly-future instant (or cleared) by the dispatch, so the loop never
+  /// busy-spins on a stale deadline.
   #[inline]
   pub fn poll_timeout(&self) -> Option<Instant> {
-    match self.role {
-      Role::Leader => self.heartbeat_deadline,
-      _ => self.election_deadline,
-    }
+    TimerKind::ALL
+      .iter()
+      .filter(|&&k| self.serviceable_now(k))
+      .filter_map(|&k| self.deadline_of(k))
+      .min()
   }
 
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
@@ -252,6 +307,9 @@ where
     // cannot confirm any outstanding read requests.
     self.read_only.reset(self.config.read_only());
     self.pending_reads.clear();
+    // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
+    self.lead_transferee = None;
+    self.transfer_deadline = None;
     // The partitioned former leader arms the election timer; once it heals and
     // pre-vote/real vote succeeds it can campaign again without disrupting the cluster.
     self.arm_election_timer(now);
@@ -262,6 +320,37 @@ where
     // Callers that need to clear election_deadline (e.g. become_leader when check_quorum is
     // false) do so explicitly; we do NOT touch election_deadline here so the CQ timer
     // (set by become_leader when check_quorum is true) is not clobbered on each heartbeat.
+  }
+
+  /// The armed deadline for the given timer kind, regardless of whether it is serviceable now.
+  fn deadline_of(&self, kind: TimerKind) -> Option<Instant> {
+    match kind {
+      TimerKind::Election => self.election_deadline,
+      TimerKind::Heartbeat => self.heartbeat_deadline,
+      TimerKind::Transfer => self.transfer_deadline,
+    }
+  }
+
+  /// Whether the current `(role, state)` will service `kind` in `handle_timeout`.
+  ///
+  /// This is the exact mirror of `handle_timeout`'s dispatch conditions:
+  /// - `Heartbeat`: the leader always services its heartbeat deadline.
+  /// - `Election`: the leader services it only when `check_quorum` is enabled (CheckQuorum
+  ///   tick); a follower/candidate services it only when it is a voter (non-voters never
+  ///   campaign, so their election timer firing is a silent no-op — we should not surface it).
+  /// - `Transfer`: the leader services it only when a leader transfer is in progress.
+  fn serviceable_now(&self, kind: TimerKind) -> bool {
+    match kind {
+      TimerKind::Heartbeat => self.role.is_leader(),
+      TimerKind::Election => {
+        if self.role.is_leader() {
+          self.config.check_quorum()
+        } else {
+          self.tracker.is_voter(&self.config.id())
+        }
+      }
+      TimerKind::Transfer => self.role.is_leader() && self.lead_transferee.is_some(),
+    }
   }
 
   fn send(&mut self, to: I, msg: Message<I>) {
@@ -564,7 +653,7 @@ where
       self.votes.insert(vr.from(), !vr.reject());
       if self.tracker.vote_result(&self.votes).is_won() {
         // Pre-vote quorum: NOW start the real campaign (bumps term, persists, broadcasts).
-        self.become_candidate(now, log, stable);
+        self.become_candidate(now, log, stable, false);
       }
       // No quorum yet (or lost): stay PreCandidate; election timeout retries.
       return;
@@ -782,6 +871,8 @@ where
       events: VecDeque::new(),
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
+      lead_transferee: None,
+      transfer_deadline: None,
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
@@ -914,6 +1005,9 @@ where
         // All pending work from the old term is now stale (spec §7). Drop it before any new
         // grant is recorded below — a fresh CastVote added by on_request_vote will survive.
         self.pending.clear();
+        // Abort any in-progress leader transfer — leadership is changing.
+        self.lead_transferee = None;
+        self.transfer_deadline = None;
         // Persist the new term and cleared vote. Stepping down owes no ack, so no Pending entry.
         let opid = self.mint_op_id();
         let hs = stable.hard_state().with_term(self.term).with_vote(None);
@@ -942,7 +1036,7 @@ where
       }
     }
 
-    #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for M7 variants
+    #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for future variants
     match msg {
       Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
       Message::VoteResp(vr) => self.on_vote_resp(now, log, stable, vr),
@@ -954,6 +1048,7 @@ where
       Message::ReadIndexResp(r) => self.on_read_index_resp(r),
       Message::InstallSnapshot(is) => self.on_install_snapshot(now, log, stable, is),
       Message::SnapshotResp(r) => self.on_snapshot_resp(now, log, stable, from, r),
+      Message::TimeoutNow(tn) => self.on_timeout_now(now, log, stable, tn),
       _ => {}
     }
   }
@@ -972,6 +1067,12 @@ where
         if self.heartbeat_deadline.is_some_and(|d| d <= now) {
           self.broadcast_heartbeat(now);
           self.arm_heartbeat_timer(now);
+        }
+        // Leader transfer abort: if the transfer deadline has passed without the target
+        // taking over, abort the transfer and resume accepting proposals.
+        if self.lead_transferee.is_some() && self.transfer_deadline.is_some_and(|d| d <= now) {
+          self.lead_transferee = None;
+          self.transfer_deadline = None;
         }
         // CheckQuorum: the leader uses the otherwise-idle election_deadline to run a
         // periodic quorum-activity check every election_timeout. If fewer than a quorum of
@@ -1002,16 +1103,25 @@ where
               let won = self.become_pre_candidate(now, log);
               if won {
                 // Single-node pre-vote quorum: skip straight to the real campaign.
-                self.become_candidate(now, log, stable);
+                self.become_candidate(now, log, stable, false);
               }
             } else {
-              self.become_candidate(now, log, stable);
+              self.become_candidate(now, log, stable, false);
             }
           }
           // else: non-voter — timer expires silently; deadline cleared above.
         }
       }
     }
+    // Wedge tripwire: after all dispatch, no serviceable timer must still be armed-and-due.
+    // If this fires, `serviceable_now` has diverged from the actual dispatch (a branch acted
+    // on a timer but forgot to re-arm it to a future instant or clear it).
+    debug_assert!(
+      TimerKind::ALL
+        .iter()
+        .all(|&k| { !(self.serviceable_now(k) && self.deadline_of(k).is_some_and(|d| d <= now)) }),
+      "handle_timeout left a serviceable timer armed-and-due (serviceable_now diverged from dispatch)"
+    );
   }
 
   /// Append a `ConfChangeV2` entry to the log and replicate it to all peers.
@@ -1097,6 +1207,10 @@ where
         leader: self.leader,
       });
     }
+    // A leader transfer is in progress: no membership changes mid-transfer either.
+    if self.lead_transferee.is_some() {
+      return Err(crate::ProposeError::LeaderTransferInProgress);
+    }
     // One change in flight at a time: refuse if a ConfChange entry is not yet applied.
     if self.pending_conf_index > self.applied {
       return Err(crate::ProposeError::ConfChangeInFlight);
@@ -1122,6 +1236,11 @@ where
       return Err(crate::ProposeError::NotLeader {
         leader: self.leader,
       });
+    }
+    // A leader transfer is in progress: stop accepting new entries so the target can
+    // catch up to a fixed last_index and receive TimeoutNow.
+    if self.lead_transferee.is_some() {
+      return Err(crate::ProposeError::LeaderTransferInProgress);
     }
     use crate::Data as _;
     let mut buf = std::vec::Vec::new();
@@ -1223,6 +1342,20 @@ where
                 // disarmed is the right choice — a removed/demoted node has no business
                 // holding an election timer.
                 self.election_deadline = None;
+                // Abort any in-progress leader transfer — the leader is being removed.
+                self.lead_transferee = None;
+                self.transfer_deadline = None;
+              }
+              // If an in-flight leader transfer's target was removed or demoted by this conf
+              // change, abort it (the target can no longer be elected, and proposals must not
+              // stay blocked until the transfer deadline). Mirrors etcd's abortLeaderTransfer
+              // on conf-change apply.
+              if self
+                .lead_transferee
+                .is_some_and(|t| !self.tracker.is_voter(&t))
+              {
+                self.lead_transferee = None;
+                self.transfer_deadline = None;
               }
             }
             // A committed, validly-decoded ConfChange that the Changer rejects is an
@@ -1241,11 +1374,18 @@ where
     }
   }
 
+  /// Start a real election campaign.
+  ///
+  /// `transfer` must be `true` when called from `on_timeout_now` (leader-transfer path):
+  /// it sets `leader_transfer: true` on the broadcast `RequestVote` so that granters bypass
+  /// their CheckQuorum/PreVote lease check (U3's `!force` guard).  For normal elections
+  /// (election-timeout path, pre-vote quorum reached) pass `transfer = false`.
   fn become_candidate<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Instant,
     log: &mut L,
     stable: &mut S,
+    transfer: bool,
   ) {
     // Defensive guard: a non-voter (learner or removed node) must never campaign.
     // The handle_timeout gate is the primary check; this guard closes any other call sites.
@@ -1281,7 +1421,7 @@ where
       self.send(
         peer,
         Message::RequestVote(crate::RequestVote::new(
-          term, me, last_index, last_term, false, false,
+          term, me, last_index, last_term, false, transfer,
         )),
       );
     }
@@ -1347,6 +1487,10 @@ where
     // be confirmed against the new term's commit index).
     self.read_only.reset(self.config.read_only());
     self.pending_reads.clear();
+    // Clear any in-progress leader transfer — becoming the leader means the transfer
+    // target (us) has won; the previous leader's transfer state is irrelevant.
+    self.lead_transferee = None;
+    self.transfer_deadline = None;
     // Clear the candidate/follower election_deadline unconditionally; it will be re-armed
     // below only if check_quorum is enabled. Without this clear, a CQ-disabled leader would
     // inherit the stale candidate election_deadline (arm_heartbeat_timer no longer clears it).
@@ -1927,6 +2071,18 @@ where
       self.apply_committed(log);
       self.maybe_flush_deferred_reads(now, log, stable);
       self.maybe_send_append(from, log, stable); // keep the pipeline moving if still behind
+      // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
+      if self.lead_transferee == Some(from) {
+        let peer_match = self
+          .tracker
+          .progress(&from)
+          .map(|p| p.match_index())
+          .unwrap_or(crate::Index::ZERO);
+        if peer_match == log.last_index() {
+          let (term, me) = (self.term, self.config.id());
+          self.send(from, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
+        }
+      }
     }
   }
 
@@ -2087,6 +2243,90 @@ where
       self.maybe_flush_deferred_reads(now, log, stable);
       self.maybe_send_append(from, log, stable);
     }
+  }
+
+  // ─── Leader transfer ──────────────────────────────────────────────────────────
+
+  /// Initiate a graceful leader transfer to `to`.
+  ///
+  /// The leader stops accepting proposals, catches `to` up to its log, then sends it a
+  /// `TimeoutNow` so it campaigns immediately (bypassing PreVote and the lease).  The
+  /// cluster experiences at most one election timeout of unavailability.
+  ///
+  /// Returns `Ok(())` on success (transfer initiated or already targeting `to`).
+  /// Returns `Err(TransferError::NotLeader)` if this node is not the current leader.
+  /// Returns `Err(TransferError::NotAVoter)` if `to` is not a voter.
+  /// Returns `Err(TransferError::AlreadyLeader)` if `to == self.id()`.
+  pub fn transfer_leader<L, S>(
+    &mut self,
+    now: Instant,
+    log: &L,
+    stable: &S,
+    to: I,
+  ) -> Result<(), crate::TransferError<I>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.role.is_leader() {
+      return Err(crate::TransferError::NotLeader {
+        leader: self.leader,
+      });
+    }
+    if to == self.config.id() {
+      return Err(crate::TransferError::AlreadyLeader);
+    }
+    if !self.tracker.is_voter(&to) {
+      return Err(crate::TransferError::NotAVoter);
+    }
+    // Already targeting this node — idempotent, just return Ok.
+    if self.lead_transferee == Some(to) {
+      return Ok(());
+    }
+    // Arm the transfer: stop accepting proposals, start the deadline window.
+    self.lead_transferee = Some(to);
+    self.transfer_deadline = Some(now + self.config.election_timeout());
+
+    // If the target is already caught up, send TimeoutNow immediately.
+    let target_match = self
+      .tracker
+      .progress(&to)
+      .map(|p| p.match_index())
+      .unwrap_or(crate::Index::ZERO);
+    if target_match == log.last_index() {
+      let (term, me) = (self.term, self.config.id());
+      self.send(to, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
+    } else {
+      // Target is lagging: kick replication so it catches up.
+      // TimeoutNow will be sent from on_append_resp once match_index == last_index.
+      self.maybe_send_append(to, log, stable);
+    }
+    Ok(())
+  }
+
+  /// Receive a `TimeoutNow` from the current leader (transfer target path).
+  ///
+  /// The target campaigns immediately as a REAL candidate (bypassing PreVote and the lease),
+  /// with `leader_transfer: true` on its `RequestVote` broadcast.  If this node is not a
+  /// voter it ignores the message (etcd: removed/learner nodes silently drop TimeoutNow).
+  fn on_timeout_now<L, S>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &mut S,
+    _tn: crate::TimeoutNow<I>,
+  ) where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    // A non-voter cannot be elected; ignore.
+    if !self.tracker.is_voter(&self.config.id()) {
+      return;
+    }
+    // Campaign immediately as a REAL candidate (transfer=true):
+    // - Does NOT do a PreVote phase even if config.pre_vote() is on.
+    // - Sets leader_transfer=true on every RequestVote so granters bypass their lease.
+    self.become_candidate(now, log, stable, true);
   }
 }
 
@@ -7311,5 +7551,1075 @@ mod tests {
       "index must be commit at receipt"
     );
     assert_eq!(read_states[0].context().as_ref(), ctx.as_ref());
+  }
+
+  // ─── M7-U5: leader transfer tests ────────────────────────────────────────────
+
+  /// Elect node 1 as leader and return (ep, log, stable) ready for transfer tests.
+  /// The log has the no-op at index 1 committed; peer 2's match_index is caught up.
+  fn setup_leader_with_peer2_caught_up() -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::NoopStable,
+  ) {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    // Drain the no-op append from storage so self-match advances.
+    ep.handle_storage(d, &mut log, &mut stable);
+    // Peer 2 acks the no-op (index 1) → match_index=1.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(1),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+    (ep, log, stable)
+  }
+
+  /// Test 1: transfer_leader to a caught-up follower sends TimeoutNow immediately.
+  /// When peer 2 receives TimeoutNow it becomes a real Candidate (even with pre_vote=true)
+  /// and broadcasts RequestVote{leader_transfer:true, pre_vote:false}.
+  #[test]
+  fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
+    use core::time::Duration;
+    let (mut leader, log, stable) = setup_leader_with_peer2_caught_up();
+    // Peer 2 is caught up (match=1, last_index=1): transfer_leader should send TimeoutNow now.
+    leader
+      .transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
+      .expect("transfer should succeed");
+
+    // Exactly one TimeoutNow to peer 2 must be in the outgoing queue.
+    let mut tn_count = 0;
+    while let Some(out) = leader.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::TimeoutNow(_) = out.message() {
+          tn_count += 1;
+        }
+      }
+    }
+    assert_eq!(tn_count, 1, "exactly one TimeoutNow must be sent to peer 2");
+
+    // Now simulate peer 2 receiving TimeoutNow (with pre_vote=true config, should still
+    // do a REAL campaign bypassing PreVote).
+    let cfg2 = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_pre_vote(true);
+    let mut follower = Endpoint::new(cfg2, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut flog = crate::testkit::VecLog::default();
+    let mut fstable = crate::testkit::NoopStable::default();
+
+    // Deliver the TimeoutNow (term=1, from leader=1).
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut flog,
+      &mut fstable,
+      1u64,
+      Message::TimeoutNow(crate::TimeoutNow::new(crate::Term::new(1), 1u64)),
+    );
+
+    // Peer 2 must be a REAL Candidate (not PreCandidate) at term 2.
+    assert!(
+      follower.role().is_candidate(),
+      "TimeoutNow must produce a real Candidate even when pre_vote=true"
+    );
+    assert_eq!(
+      follower.term(),
+      crate::Term::new(2),
+      "candidate term must be bumped to 2"
+    );
+
+    // The RequestVote broadcasts must have pre_vote=false and leader_transfer=true.
+    let mut rv_count = 0;
+    while let Some(out) = follower.poll_message() {
+      if let Message::RequestVote(rv) = out.message() {
+        assert!(
+          !rv.pre_vote(),
+          "TimeoutNow-triggered campaign must be a REAL vote (pre_vote=false)"
+        );
+        assert!(
+          rv.leader_transfer(),
+          "TimeoutNow-triggered campaign must set leader_transfer=true"
+        );
+        rv_count += 1;
+      }
+    }
+    assert!(rv_count > 0, "peer 2 must broadcast RequestVote messages");
+  }
+
+  /// Test 2: transfer_leader to a LAGGING follower does NOT send TimeoutNow yet.
+  /// TimeoutNow is sent only when on_append_resp brings the target to last_index.
+  #[test]
+  fn transfer_to_lagging_follower_waits_for_catch_up() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    // Drain storage (no-op append).
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Propose a second entry (index 2) to create lag for peer 2.
+    ep.propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"x"))
+      .unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    // log.last_index() == 2, but peer 2 match_index == 0 (has NOT acked yet).
+
+    // Initiate transfer to peer 2 (it is lagging).
+    ep.transfer_leader(d, &log, &stable, 2u64)
+      .expect("transfer should succeed");
+
+    // Must NOT have sent a TimeoutNow yet.
+    let mut tn_sent = false;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::TimeoutNow(_) = out.message() {
+          tn_sent = true;
+        }
+      }
+    }
+    assert!(!tn_sent, "TimeoutNow must NOT be sent to a lagging peer");
+
+    // Now simulate peer 2 catching up: ack at match_index=2 (last_index).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(2), // caught up to last_index=2
+      )),
+    );
+
+    // Now TimeoutNow MUST have been sent.
+    let mut tn_after = false;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::TimeoutNow(_) = out.message() {
+          tn_after = true;
+        }
+      }
+    }
+    assert!(
+      tn_after,
+      "TimeoutNow must be sent to peer 2 after it catches up"
+    );
+  }
+
+  /// Test 3: proposals are refused during transfer and accepted again after abort.
+  #[test]
+  fn proposals_refused_during_transfer_allowed_after_abort() {
+    use core::time::Duration;
+    let (mut ep, mut log, mut stable) = setup_leader_with_peer2_caught_up();
+
+    // Initiate transfer.
+    ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
+      .unwrap();
+
+    // Normal propose must be refused.
+    let err = ep
+      .propose(
+        Instant::ORIGIN,
+        &mut log,
+        &mut stable,
+        &bytes::Bytes::from_static(b"x"),
+      )
+      .unwrap_err();
+    assert!(
+      matches!(err, crate::ProposeError::LeaderTransferInProgress),
+      "propose must fail with LeaderTransferInProgress during transfer"
+    );
+
+    // Conf-change propose must also be refused.
+    let cc_err = ep
+      .propose_conf_change(
+        Instant::ORIGIN,
+        &mut log,
+        &stable,
+        crate::ConfChange::new(crate::ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new()),
+      )
+      .unwrap_err();
+    assert!(
+      matches!(cc_err, crate::ProposeError::LeaderTransferInProgress),
+      "propose_conf_change must fail with LeaderTransferInProgress during transfer"
+    );
+
+    // Advance time past the transfer deadline.
+    let deadline = Instant::ORIGIN + Duration::from_millis(1001); // > election_timeout (1000ms)
+    ep.handle_timeout(deadline, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // After abort, propose must succeed again.
+    let ok = ep.propose(
+      deadline,
+      &mut log,
+      &mut stable,
+      &bytes::Bytes::from_static(b"after_abort"),
+    );
+    assert!(
+      ok.is_ok(),
+      "propose must succeed after transfer abort; got {ok:?}"
+    );
+  }
+
+  /// Test 4: transfer aborts after election timeout with no completion.
+  #[test]
+  fn transfer_aborts_on_deadline() {
+    use core::time::Duration;
+    let (mut ep, mut log, mut stable) = setup_leader_with_peer2_caught_up();
+
+    ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
+      .unwrap();
+    // lead_transferee must be set.
+    assert!(ep.lead_transferee.is_some());
+
+    // Fire handle_timeout BEFORE the deadline → still in transfer.
+    let before_deadline = Instant::ORIGIN + Duration::from_millis(500);
+    ep.handle_timeout(before_deadline, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert!(
+      ep.lead_transferee.is_some(),
+      "transfer must still be active before deadline"
+    );
+
+    // Fire handle_timeout AFTER the deadline → transfer aborted.
+    let after_deadline = Instant::ORIGIN + Duration::from_millis(1001);
+    ep.handle_timeout(after_deadline, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert!(
+      ep.lead_transferee.is_none(),
+      "transfer must be aborted after deadline"
+    );
+    assert!(
+      ep.transfer_deadline.is_none(),
+      "transfer_deadline must be cleared after abort"
+    );
+
+    // Proposals must be accepted again.
+    let ok = ep.propose(
+      after_deadline,
+      &mut log,
+      &mut stable,
+      &bytes::Bytes::from_static(b"resumed"),
+    );
+    assert!(ok.is_ok(), "propose must succeed after abort");
+  }
+
+  /// Test 5: TimeoutNow bypasses PreVote + lease (check_quorum=true, pre_vote=true).
+  /// The recipient becomes a REAL Candidate (not PreCandidate), bumps its term, and sends
+  /// RequestVote{leader_transfer:true}. A follower receiving that RequestVote grants it
+  /// even though the election timer is still healthy (lease bypassed by leader_transfer flag).
+  #[test]
+  fn timeout_now_bypasses_prevote_and_lease() {
+    use core::time::Duration;
+
+    // Node 2 is the transfer target: pre_vote=true, check_quorum=true.
+    let cfg2 = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_pre_vote(true)
+    .with_check_quorum(true);
+    let mut target = Endpoint::new(cfg2, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let mut tlog = crate::testkit::VecLog::default();
+    let mut tstable = crate::testkit::NoopStable::default();
+
+    // Arm a healthy election timer (simulating a live leader heartbeat was recently received).
+    target.arm_election_timer(Instant::ORIGIN);
+
+    // Set leader so lease check would normally block a vote.
+    target.leader = Some(1u64);
+
+    // Deliver TimeoutNow.
+    target.handle_message(
+      Instant::ORIGIN,
+      &mut tlog,
+      &mut tstable,
+      1u64,
+      Message::TimeoutNow(crate::TimeoutNow::new(crate::Term::new(1), 1u64)),
+    );
+
+    // Must be a REAL Candidate (not PreCandidate) despite pre_vote=true.
+    assert!(
+      target.role().is_candidate(),
+      "TimeoutNow must produce Candidate, not PreCandidate"
+    );
+    assert_eq!(
+      target.term(),
+      crate::Term::new(2),
+      "term must be bumped to 2"
+    );
+
+    // All RequestVote messages must have leader_transfer=true and pre_vote=false.
+    let mut rv_count = 0;
+    while let Some(out) = target.poll_message() {
+      if let Message::RequestVote(rv) = out.message() {
+        assert!(
+          rv.leader_transfer(),
+          "RequestVote from TimeoutNow must have leader_transfer=true"
+        );
+        assert!(
+          !rv.pre_vote(),
+          "RequestVote from TimeoutNow must have pre_vote=false"
+        );
+        rv_count += 1;
+      }
+    }
+    assert!(rv_count > 0, "target must broadcast RequestVote messages");
+
+    // Node 3 (a follower with a live leader and healthy election timer) receives the
+    // RequestVote{leader_transfer:true}: the lease must NOT block it — it should grant.
+    let cfg3 = crate::Config::try_new(
+      3u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_pre_vote(true)
+    .with_check_quorum(true);
+    let mut follower3 = Endpoint::new(
+      cfg3,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+    );
+    let mut fl3 = crate::testkit::VecLog::default();
+    let mut fs3 = crate::testkit::AsyncStable::default();
+
+    // Give follower3 a live leader + healthy election timer (same-term as the RequestVote).
+    // A real vote from term 2 would normally be blocked by the lease in on_handle_message
+    // (RequestVote with term=2 > self.term=1 → term pre-pass would first update term to 2
+    // and step down, then on_request_vote grants since voted_for is now None).
+    // The CRITICAL test: leader_transfer=true in the higher-term path means the lease guard
+    // in the term pre-pass is bypassed, so the request reaches on_request_vote normally.
+    follower3.leader = Some(1u64);
+    // Make the election timer healthy so the in-lease condition fires if we didn't force it.
+    follower3.election_deadline = Some(Instant::ORIGIN + Duration::from_millis(500));
+
+    follower3.handle_message(
+      Instant::ORIGIN,
+      &mut fl3,
+      &mut fs3,
+      2u64,
+      Message::RequestVote(crate::RequestVote::new(
+        crate::Term::new(2), // higher term
+        2u64,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        false, // real vote
+        true,  // leader_transfer — must bypass lease
+      )),
+    );
+    // Drain storage (AsyncStable releases CastVote completion on handle_storage).
+    follower3.handle_storage(Instant::ORIGIN, &mut fl3, &mut fs3);
+
+    // follower3 must have granted the vote (not rejected it due to the lease).
+    let mut granted = false;
+    while let Some(out) = follower3.poll_message() {
+      if let Message::VoteResp(vr) = out.message() {
+        if !vr.reject() {
+          granted = true;
+        }
+      }
+    }
+    assert!(
+      granted,
+      "follower3 must grant the leader-transfer RequestVote despite live leader + healthy timer"
+    );
+  }
+
+  /// Test 6: transfer_leader to a learner/non-voter is rejected with NotAVoter.
+  #[test]
+  fn transfer_to_learner_rejected() {
+    use core::time::Duration;
+    // Create a cluster where node 4 is a learner (not a voter).
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 as leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+
+    // Node 4 is not in the voter set — transfer must fail with NotAVoter.
+    let err = ep.transfer_leader(d, &log, &stable, 4u64).unwrap_err();
+    assert!(
+      matches!(err, crate::TransferError::NotAVoter),
+      "transfer to non-voter must fail with NotAVoter; got {err:?}"
+    );
+
+    // Transferring to self must fail with AlreadyLeader.
+    let err2 = ep.transfer_leader(d, &log, &stable, 1u64).unwrap_err();
+    assert!(
+      matches!(err2, crate::TransferError::AlreadyLeader),
+      "transfer to self must fail with AlreadyLeader; got {err2:?}"
+    );
+
+    // Non-leader can't initiate transfer at all.
+    let cfg_follower = crate::Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut follower = Endpoint::new(
+      cfg_follower,
+      Instant::ORIGIN,
+      5,
+      crate::testkit::CountSm::default(),
+    );
+    let err3 = follower
+      .transfer_leader(d, &log, &stable, 3u64)
+      .unwrap_err();
+    assert!(
+      matches!(err3, crate::TransferError::NotLeader { .. }),
+      "non-leader transfer_leader must fail with NotLeader; got {err3:?}"
+    );
+  }
+
+  /// Test 7 (review I-1): Removing the transfer target via a conf change aborts the in-flight
+  /// transfer immediately — proposals must resume without waiting for the deadline.
+  ///
+  /// Scenario: node 1 is leader of {1, 2, 3}; transfer to node 2 is in flight; then
+  /// RemoveNode(2) is committed+applied. After apply:
+  ///   - `lead_transferee` must be `None`
+  ///   - `transfer_deadline` must be `None`
+  ///   - a subsequent `propose` must SUCCEED (not `LeaderTransferInProgress`)
+  #[test]
+  fn transfer_aborted_when_transferee_removed_by_conf_change() {
+    use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, ProposeError, Term};
+    use core::time::Duration;
+
+    let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+    // `d` is the Instant at which the election fired (the value returned by poll_timeout
+    // before the election).  All time offsets are anchored to `d` so that the
+    // transfer_deadline arithmetic (deadline = now + election_timeout = d + 1000ms) is
+    // consistent regardless of what randomised value poll_timeout produced.
+
+    // Start leader transfer to node 2 (caught-up: match=1, last=1 → TimeoutNow sent now).
+    ep.transfer_leader(d, &log, &stable, 2u64)
+      .expect("transfer_leader must succeed");
+    assert!(
+      ep.lead_transferee == Some(2u64),
+      "lead_transferee must be Some(2) after transfer_leader"
+    );
+    // Drain the outgoing TimeoutNow.
+    while ep.poll_message().is_some() {}
+
+    // Proposals must be blocked while the transfer is in flight.
+    let blocked = ep
+      .propose(
+        d,
+        &mut log,
+        &mut stable,
+        &bytes::Bytes::from_static(b"blocked"),
+      )
+      .unwrap_err();
+    assert!(
+      matches!(blocked, ProposeError::LeaderTransferInProgress),
+      "propose must fail with LeaderTransferInProgress during transfer; got {blocked:?}"
+    );
+
+    // Strategy: abort the in-flight transfer via its deadline (so we can re-issue
+    // propose_conf_change without the LeaderTransferInProgress guard firing), propose
+    // RemoveNode(2), then re-start the transfer to node 2 (still a voter at that point),
+    // and finally commit+apply the RemoveNode.  The fix must abort the re-started transfer
+    // when the conf-change is applied, well before its own deadline.
+
+    // Advance time past `d + election_timeout` to trigger the deadline abort.
+    let past_first_deadline = d + Duration::from_millis(1001); // > election_timeout (1000ms)
+    ep.handle_timeout(past_first_deadline, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert!(
+      ep.lead_transferee.is_none(),
+      "deadline abort must clear lead_transferee"
+    );
+
+    // Propose RemoveNode(2) (no transfer in flight — allowed).
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, 2u64, bytes::Bytes::new());
+    let cc_idx = ep
+      .propose_conf_change(past_first_deadline, &mut log, &stable, cc)
+      .expect("propose_conf_change(RemoveNode(2)) must succeed");
+    // Drain self-match (leader writes the ConfChange entry).
+    ep.handle_storage(past_first_deadline, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Re-start a transfer to node 2 (still a voter until the conf change is applied).
+    ep.transfer_leader(past_first_deadline, &log, &stable, 2u64)
+      .expect("transfer_leader to node 2 (still a voter) must succeed");
+    assert!(
+      ep.lead_transferee == Some(2u64),
+      "lead_transferee must be node 2 for the re-started transfer"
+    );
+    while ep.poll_message().is_some() {}
+
+    // Proposals must be blocked again (new transfer in flight).
+    let blocked2 = ep
+      .propose(
+        past_first_deadline,
+        &mut log,
+        &mut stable,
+        &bytes::Bytes::from_static(b"blocked2"),
+      )
+      .unwrap_err();
+    assert!(
+      matches!(blocked2, ProposeError::LeaderTransferInProgress),
+      "propose must be blocked by re-started transfer; got {blocked2:?}"
+    );
+
+    // Commit the RemoveNode(2): peer 3 acks up to cc_idx (quorum = leader + peer 3 = 2/3).
+    // Leader self-match already happened via handle_storage above.
+    ep.handle_message(
+      past_first_deadline,
+      &mut log,
+      &mut stable,
+      3u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        3u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        cc_idx,
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // After the conf change applies: the transfer must have been aborted immediately.
+    assert!(
+      ep.lead_transferee.is_none(),
+      "lead_transferee must be None after the transferee is removed by conf change (review I-1)"
+    );
+    assert!(
+      ep.transfer_deadline.is_none(),
+      "transfer_deadline must be None after transfer aborted on conf-change apply"
+    );
+
+    // Proposals must resume immediately — no need to wait for the transfer deadline.
+    let ok = ep.propose(
+      past_first_deadline,
+      &mut log,
+      &mut stable,
+      &bytes::Bytes::from_static(b"resumed"),
+    );
+    assert!(
+      ok.is_ok(),
+      "propose must succeed immediately after transferee is removed; got {ok:?}"
+    );
+  }
+
+  // ──────────────────────────────────────────────────────────────────────────────────────────
+  // M7-U6: serviceable-timer filter (timer-wedge defense)
+  // ──────────────────────────────────────────────────────────────────────────────────────────
+
+  /// U6-T1: `serviceable_now` mirrors the `handle_timeout` dispatch exactly.
+  ///
+  /// - Follower: Heartbeat not serviceable; Election serviceable iff voter.
+  /// - Leader (no CQ, no transfer): only Heartbeat serviceable.
+  /// - Leader (CQ, no transfer): Heartbeat + Election serviceable.
+  /// - Leader (CQ + transfer): Heartbeat + Election + Transfer serviceable.
+  #[test]
+  fn serviceable_now_mirrors_dispatch() {
+    use core::time::Duration;
+
+    // --- Follower (voter) ---
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
+    assert!(ep.role().is_follower());
+    assert!(
+      !ep.serviceable_now(TimerKind::Heartbeat),
+      "follower: Heartbeat not serviceable"
+    );
+    assert!(
+      ep.serviceable_now(TimerKind::Election),
+      "follower voter: Election serviceable"
+    );
+    assert!(
+      !ep.serviceable_now(TimerKind::Transfer),
+      "follower: Transfer not serviceable"
+    );
+
+    // --- Follower (non-voter / observer) ---
+    // Use try_new_observer: node 99 joins an existing cluster {1,2,3} as an observer.
+    // Its id is not in the voter seed so is_voter(99) = false in its Tracker.
+    let cfg_nv = crate::Config::try_new_observer(
+      99u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let ep_nv = Endpoint::new(cfg_nv, Instant::ORIGIN, 13, Noop);
+    // Node 99 is not in the voter set {1,2,3} so is_voter(99) = false.
+    assert!(ep_nv.role().is_follower());
+    assert!(
+      !ep_nv.serviceable_now(TimerKind::Election),
+      "non-voter: Election NOT serviceable"
+    );
+    assert!(
+      !ep_nv.serviceable_now(TimerKind::Heartbeat),
+      "non-voter: Heartbeat not serviceable"
+    );
+    assert!(
+      !ep_nv.serviceable_now(TimerKind::Transfer),
+      "non-voter: Transfer not serviceable"
+    );
+
+    // --- Leader (no check_quorum, no transfer) ---
+    let (ep_l, log_leader, stable_leader, _) = make_three_node_leader();
+    assert!(ep_l.role().is_leader());
+    assert!(!ep_l.config.check_quorum());
+    assert!(ep_l.lead_transferee.is_none());
+    assert!(
+      ep_l.serviceable_now(TimerKind::Heartbeat),
+      "leader: Heartbeat serviceable"
+    );
+    assert!(
+      !ep_l.serviceable_now(TimerKind::Election),
+      "leader (no CQ): Election NOT serviceable"
+    );
+    assert!(
+      !ep_l.serviceable_now(TimerKind::Transfer),
+      "leader (no transfer): Transfer not serviceable"
+    );
+
+    // --- Leader (check_quorum=true, no transfer) ---
+    let cfg_cq = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true);
+    let mut ep_cq = Endpoint::new(
+      cfg_cq,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+    );
+    let mut log_cq = crate::testkit::VecLog::default();
+    let mut stable_cq = crate::testkit::NoopStable::default();
+    let d_cq = ep_cq.poll_timeout().unwrap();
+    ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
+    ep_cq.handle_message(
+      d_cq,
+      &mut log_cq,
+      &mut stable_cq,
+      2u64,
+      crate::Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep_cq.role().is_leader());
+    assert!(ep_cq.config.check_quorum());
+    assert!(
+      ep_cq.serviceable_now(TimerKind::Heartbeat),
+      "leader CQ: Heartbeat serviceable"
+    );
+    assert!(
+      ep_cq.serviceable_now(TimerKind::Election),
+      "leader CQ: Election serviceable (CheckQuorum tick)"
+    );
+    assert!(
+      !ep_cq.serviceable_now(TimerKind::Transfer),
+      "leader CQ (no transfer): Transfer not serviceable"
+    );
+
+    // --- Leader (check_quorum=true, transfer in progress) ---
+    let ep_cq_log_ref = &log_cq;
+    let ep_cq_stable_ref = &stable_cq;
+    ep_cq
+      .transfer_leader(d_cq, ep_cq_log_ref, ep_cq_stable_ref, 2u64)
+      .expect("transfer_leader must succeed");
+    assert!(ep_cq.lead_transferee.is_some());
+    assert!(
+      ep_cq.serviceable_now(TimerKind::Transfer),
+      "leader CQ + transfer: Transfer serviceable"
+    );
+    let _ = (ep_l, log_leader, stable_leader);
+  }
+
+  /// U6-T2: `poll_timeout` never surfaces a non-serviceable deadline.
+  ///
+  /// - A Follower with a stale heartbeat_deadline set returns its election_deadline only.
+  /// - A non-voter follower returns `None` even if election_deadline is armed.
+  /// - A Leader without check_quorum returns only heartbeat (not election).
+  /// - A Leader with check_quorum returns min(heartbeat, election).
+  /// - A Leader with transfer returns min(heartbeat, election[if CQ], transfer).
+  #[test]
+  fn poll_timeout_only_surfaces_serviceable_deadlines() {
+    use core::time::Duration;
+
+    let election_timeout = Duration::from_millis(1000);
+    let heartbeat_interval = Duration::from_millis(100);
+
+    // --- Follower: stale heartbeat_deadline set, should NOT appear in poll_timeout ---
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      election_timeout,
+      heartbeat_interval,
+    )
+    .unwrap();
+    let mut ep_f = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
+    // Defensively set a stale heartbeat_deadline (should not be serviceable for a follower).
+    let stale_hb = Instant::ORIGIN + Duration::from_millis(50);
+    ep_f.heartbeat_deadline = Some(stale_hb);
+    let election_dl = ep_f.election_deadline.expect("election timer armed");
+    let pt = ep_f
+      .poll_timeout()
+      .expect("poll_timeout must be Some for voter follower");
+    assert_eq!(
+      pt, election_dl,
+      "follower poll_timeout must return election_deadline only"
+    );
+    assert_ne!(
+      pt, stale_hb,
+      "follower poll_timeout must NOT return heartbeat_deadline"
+    );
+
+    // --- Non-voter: election_deadline armed but not serviceable → poll_timeout returns None ---
+    let cfg_nv = crate::Config::try_new_observer(
+      99u64,
+      std::vec![1u64, 2u64, 3u64], // 99 is not in the voter set
+      election_timeout,
+      heartbeat_interval,
+    )
+    .unwrap();
+    let ep_nv = Endpoint::new(cfg_nv, Instant::ORIGIN, 7, Noop);
+    assert!(
+      ep_nv.election_deadline.is_some(),
+      "election_deadline is armed on construction"
+    );
+    assert!(
+      ep_nv.poll_timeout().is_none(),
+      "non-voter poll_timeout must be None even with election_deadline armed"
+    );
+
+    // --- Leader (no CQ): poll_timeout returns heartbeat, NOT election ---
+    let (ep_l, _log_l, _stable_l, _d_l) = make_three_node_leader();
+    assert!(!ep_l.config.check_quorum());
+    // The leader has no election_deadline (cleared on become_leader when CQ=false).
+    assert!(ep_l.election_deadline.is_none());
+    let hb_dl = ep_l.heartbeat_deadline.expect("heartbeat_deadline armed");
+    let pt_l = ep_l
+      .poll_timeout()
+      .expect("leader poll_timeout must be Some");
+    assert_eq!(
+      pt_l, hb_dl,
+      "leader (no CQ) poll_timeout must return heartbeat_deadline"
+    );
+
+    // --- Leader (CQ): poll_timeout returns min(heartbeat, election) ---
+    let cfg_cq = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      election_timeout,
+      heartbeat_interval,
+    )
+    .unwrap()
+    .with_check_quorum(true);
+    let mut ep_cq = Endpoint::new(
+      cfg_cq,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+    );
+    let mut log_cq = crate::testkit::VecLog::default();
+    let mut stable_cq = crate::testkit::NoopStable::default();
+    let d_cq = ep_cq.poll_timeout().unwrap();
+    ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
+    ep_cq.handle_message(
+      d_cq,
+      &mut log_cq,
+      &mut stable_cq,
+      2u64,
+      crate::Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep_cq.role().is_leader());
+    let hb = ep_cq.heartbeat_deadline.expect("heartbeat armed");
+    let el = ep_cq.election_deadline.expect("election (CQ) armed");
+    let pt_cq = ep_cq
+      .poll_timeout()
+      .expect("CQ leader poll_timeout must be Some");
+    assert_eq!(
+      pt_cq,
+      hb.min(el),
+      "CQ leader poll_timeout must be min(hb, el)"
+    );
+
+    // --- Leader (CQ + transfer): poll_timeout includes transfer ---
+    ep_cq
+      .transfer_leader(d_cq, &log_cq, &stable_cq, 2u64)
+      .expect("transfer_leader must succeed");
+    let tr = ep_cq.transfer_deadline.expect("transfer_deadline armed");
+    let pt_cq_tr = ep_cq
+      .poll_timeout()
+      .expect("CQ+transfer leader poll_timeout must be Some");
+    assert_eq!(
+      pt_cq_tr,
+      hb.min(el).min(tr),
+      "CQ+transfer leader poll_timeout must be min(hb, el, tr)"
+    );
+    let _ = ep_l;
+  }
+
+  /// U6-T3: `handle_timeout` → `poll_timeout` makes progress (no busy-wakeup wedge).
+  ///
+  /// For each role/state, arm the relevant deadline(s) to `now` (or just past it), call
+  /// `handle_timeout(now)`, and assert that `poll_timeout` afterwards is either `None` or
+  /// strictly `> now` — the serviced timer was re-armed to a future instant or cleared.
+  #[test]
+  fn handle_timeout_makes_progress_no_wedge() {
+    use core::time::Duration;
+    let now = Instant::ORIGIN + Duration::from_millis(5000);
+
+    // --- Follower voter: election timer fires → campaign → election re-armed to future ---
+    let cfg_f = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep_f = Endpoint::new(cfg_f, now, 42, Noop);
+    // Force the election deadline to exactly `now` (due).
+    ep_f.election_deadline = Some(now);
+    let mut log_f = crate::testkit::NoopLog;
+    let mut stable_f = crate::testkit::NoopStable::default();
+    ep_f.handle_timeout(now, &mut log_f, &mut stable_f);
+    // After: either poll_timeout is None (single-node immediate leader) or > now.
+    if let Some(next_dl) = ep_f.poll_timeout() {
+      assert!(
+        next_dl > now,
+        "follower: poll_timeout after timeout must be > now, got {next_dl:?}"
+      );
+    }
+
+    // --- Non-voter follower: election timer fires silently → poll_timeout becomes None ---
+    let cfg_nv = crate::Config::try_new_observer(
+      99u64,
+      std::vec![1u64, 2u64, 3u64], // 99 is not in the voter set
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep_nv = Endpoint::new(cfg_nv, now, 7, Noop);
+    ep_nv.election_deadline = Some(now);
+    let mut log_nv = crate::testkit::NoopLog;
+    let mut stable_nv = crate::testkit::NoopStable::default();
+    ep_nv.handle_timeout(now, &mut log_nv, &mut stable_nv);
+    assert!(
+      ep_nv.poll_timeout().is_none(),
+      "non-voter: poll_timeout must be None after silent expiry"
+    );
+    assert!(
+      ep_nv.election_deadline.is_none(),
+      "non-voter: election_deadline must be cleared after handle_timeout"
+    );
+
+    // --- Leader (no CQ): heartbeat fires → re-armed to future ---
+    let (mut ep_l, mut log_leader, mut stable_leader, _) = make_three_node_leader();
+    assert!(!ep_l.config.check_quorum());
+    // Force heartbeat deadline to now.
+    ep_l.heartbeat_deadline = Some(now);
+    ep_l.handle_timeout(now, &mut log_leader, &mut stable_leader);
+    while ep_l.poll_message().is_some() {}
+    let pt_l = ep_l
+      .poll_timeout()
+      .expect("leader: poll_timeout must be Some after heartbeat fires");
+    assert!(
+      pt_l > now,
+      "leader: poll_timeout after heartbeat must be > now, got {pt_l:?}"
+    );
+
+    // --- Leader (CQ): both heartbeat and election fire, both re-armed ---
+    let cfg_cq = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true);
+    let mut ep_cq = Endpoint::new(
+      cfg_cq,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+    );
+    let mut log_cq = crate::testkit::VecLog::default();
+    let mut stable_cq = crate::testkit::NoopStable::default();
+    let d_cq = ep_cq.poll_timeout().unwrap();
+    ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
+    ep_cq.handle_message(
+      d_cq,
+      &mut log_cq,
+      &mut stable_cq,
+      2u64,
+      crate::Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep_cq.role().is_leader());
+    // Force both timers to now.
+    ep_cq.heartbeat_deadline = Some(now);
+    ep_cq.election_deadline = Some(now);
+    ep_cq.handle_timeout(now, &mut log_cq, &mut stable_cq);
+    while ep_cq.poll_message().is_some() {}
+    // After: either stepped down (quorum inactive) or both timers re-armed to future.
+    if let Some(pt_cq) = ep_cq.poll_timeout() {
+      assert!(
+        pt_cq > now,
+        "CQ leader: poll_timeout after timeout must be > now, got {pt_cq:?}"
+      );
+    }
+    // No serviceable-and-due timer must remain (the debug_assert also guards this).
+    for &k in &TimerKind::ALL {
+      let still_due = ep_cq.serviceable_now(k) && ep_cq.deadline_of(k).is_some_and(|d| d <= now);
+      assert!(
+        !still_due,
+        "CQ leader: timer {k} is still serviceable-and-due after handle_timeout"
+      );
+    }
+
+    // --- Leader (transfer): transfer deadline fires → cleared ---
+    let (mut ep_tr, mut log_tr, mut stable_tr, d_tr) = make_three_node_leader();
+    ep_tr
+      .transfer_leader(d_tr, &log_tr, &stable_tr, 2u64)
+      .expect("transfer_leader must succeed");
+    while ep_tr.poll_message().is_some() {}
+    // Force transfer deadline to now.
+    ep_tr.transfer_deadline = Some(now);
+    ep_tr.heartbeat_deadline = Some(now + Duration::from_millis(100)); // not due
+    ep_tr.handle_timeout(now, &mut log_tr, &mut stable_tr);
+    while ep_tr.poll_message().is_some() {}
+    assert!(
+      ep_tr.lead_transferee.is_none(),
+      "transfer abort: lead_transferee must be cleared"
+    );
+    assert!(
+      ep_tr.transfer_deadline.is_none(),
+      "transfer abort: transfer_deadline must be cleared"
+    );
+    assert!(
+      !ep_tr.serviceable_now(TimerKind::Transfer),
+      "transfer abort: Transfer no longer serviceable"
+    );
   }
 }
