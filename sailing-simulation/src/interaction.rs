@@ -45,11 +45,13 @@ const ELECTION_TIMEOUT: Duration = Duration::from_millis(1000);
 /// The fixed heartbeat interval every harness node is configured with.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
 
-/// One node under the harness: its proto [`Endpoint`] plus the two stores it writes through.
+/// One node under the harness: its proto [`Endpoint`] plus the two stores it writes through. The
+/// `config` is retained so the node can be rebuilt by [`Endpoint::restart`] on `crash`.
 struct Node {
   ep: Endpoint<u64, LogSm>,
   log: MemLog,
   stable: MemStable<u64>,
+  config: Config<u64>,
 }
 
 /// A parsed directive argument: a key with zero-or-more values. A bare positional argument is
@@ -192,10 +194,12 @@ impl InteractionEnv {
       "isolate" => self.isolate(d),
       "recover" => self.recover(d),
       "flush" => self.flush(d),
+      "crash" => self.crash(d),
       "read-index" => self.read_index(d),
       "raft-state" => self.raft_state(),
       "raft-log" => self.raft_log(d),
       "conf-state" => self.conf_state_cmd(d),
+      "status" => self.status(d),
       other => std::format!("unknown command: {other}\n"),
     }
   }
@@ -215,14 +219,19 @@ impl InteractionEnv {
     let pre_vote = d.flag("prevote");
     let check_quorum = d.flag("checkquorum");
     let async_store = d.flag("async");
+    let inflight: usize = d.value("inflight").unwrap_or(256);
+    let snap: usize = d.value("snap").unwrap_or(10_000);
 
     let mut out = String::new();
     for &id in &voters {
       let cfg = Config::try_new(id, voters.clone(), ELECTION_TIMEOUT, HEARTBEAT_INTERVAL)
         .expect("valid harness config")
         .with_pre_vote(pre_vote)
-        .with_check_quorum(check_quorum);
-      let ep = Endpoint::new(cfg, Instant::ORIGIN, id, LogSm::new());
+        .with_check_quorum(check_quorum)
+        .with_max_inflight_msgs(inflight)
+        .expect("valid inflight window")
+        .with_snapshot_threshold(snap);
+      let ep = Endpoint::new(cfg.clone(), Instant::ORIGIN, id, LogSm::new());
       // Async stores re-open the fsync-in-flight window: a submitted write is visible but not durable
       // until an explicit `flush`, so acks/votes stay deferred until then (persist-before-send).
       let (log, stable) = if async_store {
@@ -230,7 +239,15 @@ impl InteractionEnv {
       } else {
         (MemLog::new(), MemStable::new())
       };
-      self.nodes.insert(id, Node { ep, log, stable });
+      self.nodes.insert(
+        id,
+        Node {
+          ep,
+          log,
+          stable,
+          config: cfg,
+        },
+      );
       out.push_str(&std::format!(
         "n{id}: created voters={} term={} commit={} last={}\n",
         fmt_set(&voters),
@@ -337,13 +354,14 @@ impl InteractionEnv {
       let cfg =
         Config::try_new_observer(node, current_voters, ELECTION_TIMEOUT, HEARTBEAT_INTERVAL)
           .expect("valid observer config");
-      let ep = Endpoint::new(cfg, Instant::ORIGIN, node, LogSm::new());
+      let ep = Endpoint::new(cfg.clone(), Instant::ORIGIN, node, LogSm::new());
       self.nodes.insert(
         node,
         Node {
           ep,
           log: MemLog::new(),
           stable: MemStable::new(),
+          config: cfg,
         },
       );
     }
@@ -412,9 +430,10 @@ impl InteractionEnv {
         )
         .expect("valid observer config");
         Node {
-          ep: Endpoint::new(cfg, Instant::ORIGIN, node, LogSm::new()),
+          ep: Endpoint::new(cfg.clone(), Instant::ORIGIN, node, LogSm::new()),
           log: MemLog::new(),
           stable: MemStable::new(),
+          config: cfg,
         }
       });
     }
@@ -458,6 +477,37 @@ impl InteractionEnv {
       self.partitioned.insert(id);
       out.push_str(&std::format!("n{id} isolated\n"));
     }
+    out
+  }
+
+  /// `crash <id>` — model a crash + restart of node `id`: discard its in-flight (submitted-but-not-
+  /// yet-durable) store writes, rebuild the `Endpoint` from durable state via [`Endpoint::restart`],
+  /// and drop every in-flight message to or from it. The node rejoins from exactly its durable log +
+  /// hard state (persistence recovery — M3).
+  fn crash(&mut self, d: &Directive) -> String {
+    let id: u64 = match d.positional(0).and_then(|s| s.parse().ok()) {
+      Some(v) => v,
+      None => return "crash: missing node id\n".to_string(),
+    };
+    let now = self.now;
+    if let Some(n) = self.nodes.get_mut(&id) {
+      n.log.discard_inflight();
+      n.stable.discard_inflight();
+      n.ep = Endpoint::restart(
+        n.config.clone(),
+        now,
+        id,
+        LogSm::new(),
+        &mut n.log,
+        &mut n.stable,
+      );
+    } else {
+      return std::format!("n{id}: no such node\n");
+    }
+    // A crash loses every message in flight to or from the node.
+    self.bus.retain(|(from, to, _)| *from != id && *to != id);
+    let mut out = std::format!("n{id} crashed and restarted\n");
+    self.drain_node(id, &mut out);
     out
   }
 
@@ -526,6 +576,46 @@ impl InteractionEnv {
     self.drain_node(id, &mut out);
     if out.is_empty() {
       out.push_str("ok\n");
+    }
+    out
+  }
+
+  /// `status <id>` — node `id`'s view of its replication progress to each peer (match / next index,
+  /// flow-control state probe|replicate|snapshot, and whether paused). Meaningful while `id` leads.
+  fn status(&mut self, d: &Directive) -> String {
+    let id: u64 = match d.positional(0).and_then(|s| s.parse().ok()) {
+      Some(v) => v,
+      None => return "status: missing node id\n".to_string(),
+    };
+    let n = match self.nodes.get(&id) {
+      Some(n) => n,
+      None => return std::format!("n{id}: no such node\n"),
+    };
+    let cs = n.ep.conf_state();
+    let mut peers: Vec<u64> = cs
+      .voters()
+      .iter()
+      .chain(cs.learners().iter())
+      .copied()
+      .filter(|&p| p != id)
+      .collect();
+    peers.sort_unstable();
+    peers.dedup();
+    let mut out = String::new();
+    for p in peers {
+      match n.ep.peer_progress(&p) {
+        Some(pr) => out.push_str(&std::format!(
+          "n{p}: match={} next={} {}{}\n",
+          pr.match_index.get(),
+          pr.next_index.get(),
+          pr.state.as_str(),
+          if pr.paused { " paused" } else { "" },
+        )),
+        None => out.push_str(&std::format!("n{p}: (no progress)\n")),
+      }
+    }
+    if out.is_empty() {
+      out.push_str(&std::format!("n{id}: no peers\n"));
     }
     out
   }
@@ -737,6 +827,14 @@ impl InteractionEnv {
     use sailing_proto::LogStore;
     let first = n.log.first_index();
     let last = Index::new(n.log_last());
+    // Surface compaction: a `first_index` past 1 means everything up to `first-1` is in the snapshot
+    // (and gone from the entry list). Only shown when compacted, so uncompacted goldens are unchanged.
+    if first.get() > 1 {
+      out.push_str(&std::format!(
+        "  (snapshot covers <= index {})\n",
+        first.get() - 1
+      ));
+    }
     if last >= first {
       if let Ok(entries) = n.log.entries(first..Index::new(last.get() + 1), u64::MAX) {
         for e in entries {

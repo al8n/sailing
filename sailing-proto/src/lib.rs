@@ -63,7 +63,8 @@ mod inflights;
 pub(crate) use inflights::Inflights;
 
 mod progress;
-pub(crate) use progress::{Progress, ProgressState};
+pub(crate) use progress::Progress;
+pub use progress::ProgressState;
 
 mod config;
 pub use config::{Config, ReadOnlyOption};
@@ -76,7 +77,7 @@ mod event;
 pub use event::{Applied, ConfChanged, Event, LeaderChanged};
 
 mod endpoint;
-pub use endpoint::{Endpoint, PoisonReason, Role, TimerKind};
+pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 
 mod tracker;
 pub(crate) use tracker::Tracker;

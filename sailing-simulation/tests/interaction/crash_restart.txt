@@ -1,0 +1,155 @@
+# Crash recovery (persistence, M3): a node rebuilds from exactly its durable log + hard state. Elect
+# node 1 and replicate a command so node 2 has it committed + durable; then crash node 2 — it drops
+# any in-flight messages and volatile role state and restarts via Endpoint::restart from durable
+# storage (its committed log survives). A heartbeat re-syncs it and it resumes as a follower with the
+# entry intact.
+add-nodes 3 voters=(1,2,3)
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResp term=1 prevote=false reject=false
+> n3 ready
+  VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n3 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+
+propose 1 x
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+> n2 ready
+  AppendResp term=1 match=2
+> n3 ready
+  AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=2
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  n1 applied index=2
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResp term=1 match=2
+  n2 applied index=2
+> n3 ready
+  AppendResp term=1 match=2
+  n3 applied index=2
+> n1 recv AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=2
+
+raft-log 2
+----
+n2: commit=2 applied=2 last=2
+  1/1 empty
+  1/2 normal 0x010000000000000078
+
+crash 2
+----
+n2 crashed and restarted
+
+raft-log 2
+----
+n2: commit=2 applied=2 last=2
+  1/1 empty
+  1/2 normal 0x010000000000000078
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=2
+Heartbeat term=1 commit=2
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=2
+> n3 recv Heartbeat term=1 commit=2
+> n2 ready
+  HeartbeatResp term=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResp term=1
+> n1 recv HeartbeatResp term=1
+> n1 recv HeartbeatResp term=1
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResp term=1 match=2
+> n3 ready
+  AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=2
+
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: follower term=1 lead=1
+
+raft-log 2
+----
+n2: commit=2 applied=2 last=2
+  1/1 empty
+  1/2 normal 0x010000000000000078
+

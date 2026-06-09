@@ -34,6 +34,23 @@ impl Role {
   }
 }
 
+/// A read-only snapshot of the leader's replication progress for one peer — the observable subset of
+/// the internal per-peer `Progress`. Returned by [`Endpoint::peer_progress`] for status /
+/// observability (mirrors the per-peer `Progress` of etcd's `RawNode.Status`); meaningful only while
+/// this node is the leader.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerProgress {
+  /// Highest log index known to be replicated on the peer.
+  pub match_index: Index,
+  /// Next log index the leader will send to the peer.
+  pub next_index: Index,
+  /// The peer's flow-control state (probe / replicate / snapshot).
+  pub state: crate::ProgressState,
+  /// Whether sending to the peer is currently paused (a probe is outstanding, the inflight window is
+  /// full, or an `InstallSnapshot` is in flight).
+  pub paused: bool,
+}
+
 /// The independent timers an `Endpoint` arms.
 ///
 /// `poll_timeout` filters to the ones the current `(role, state)` will actually service in
@@ -538,6 +555,18 @@ where
   /// joiner is not a voter and must not inflate the quorum). A pure read of internal state.
   pub fn conf_state(&self) -> crate::ConfState<I> {
     self.tracker.conf_state()
+  }
+
+  /// The leader's replication [`PeerProgress`] for `peer` (its match/next index, flow-control state,
+  /// and whether it is paused), or `None` if `peer` is not a tracked member. A pure read of internal
+  /// state for status / observability; only meaningful while this node is the leader.
+  pub fn peer_progress(&self, peer: &I) -> Option<PeerProgress> {
+    self.tracker.progress(peer).map(|p| PeerProgress {
+      match_index: p.match_index(),
+      next_index: p.next_index(),
+      state: p.state(),
+      paused: p.is_paused(),
+    })
   }
 
   /// Expose `pending_compact` for testing.
