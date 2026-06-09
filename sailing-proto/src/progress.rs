@@ -120,12 +120,23 @@ impl Progress {
     updated
   }
 
+  /// Clear the Probe pause flag without changing state — used by HeartbeatResp so a
+  /// stalled Probe peer resumes on the next heartbeat round (M4 Task 6).
+  pub fn clear_probe_pause(&mut self) {
+    self.msg_app_flow_paused = false;
+  }
+
   /// On a reject: back `next_index` off by one (floored at 1) and re-probe.
   pub fn decrement(&mut self) {
     self.next_index = Index::new(self.next_index.get().saturating_sub(1).max(1));
     self.state = ProgressState::Probe;
     self.inflight.reset();
     self.msg_app_flow_paused = false;
+  }
+
+  /// Directly set `next_index` (used by the term-skip reject handler after `become_probe`).
+  pub fn set_next_index(&mut self, n: Index) {
+    self.next_index = n;
   }
 }
 

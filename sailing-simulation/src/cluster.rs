@@ -38,19 +38,27 @@ pub struct Cluster {
 impl Cluster {
   /// Build an `n`-node cluster (ids `0..n`), each a fresh Follower.
   pub fn new(n: usize) -> Self {
+    Self::new_with(n, |cfg| cfg)
+  }
+
+  /// Build an `n`-node cluster and apply `configure` to each node's `Config` after
+  /// construction. Use this to override flow-control knobs (e.g. `max_inflight_msgs`)
+  /// for targeted tests while keeping `new` unchanged.
+  pub fn new_with(n: usize, configure: impl Fn(Config<u64>) -> Config<u64>) -> Self {
     let mut nodes = Vec::with_capacity(n);
     let mut logs = Vec::with_capacity(n);
     let mut stables = Vec::with_capacity(n);
     let mut configs = Vec::with_capacity(n);
     let voters: Vec<u64> = (0..n as u64).collect();
     for id in 0..n as u64 {
-      let cfg = Config::try_new(
+      let base = Config::try_new(
         id,
         voters.clone(),
         Duration::from_millis(1000),
         Duration::from_millis(100),
       )
       .expect("valid config");
+      let cfg = configure(base);
       nodes.push(Endpoint::new(
         cfg.clone(),
         Instant::ORIGIN,

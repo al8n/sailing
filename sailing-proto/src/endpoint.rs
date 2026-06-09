@@ -304,6 +304,7 @@ where
       entries.last().unwrap().index()
     };
     let bytes_sent: u64 = entries.iter().map(Self::entry_size).sum();
+    let entries_len = entries.len();
     // Whether we sent a partial batch (capped below last_index). In Probe mode we only
     // pause the window when we're holding back entries due to the byte cap — if we sent
     // everything available there is nothing left to throttle and pausing would block the
@@ -321,9 +322,14 @@ where
     // M4 Task 4: record the send so the window tracks in-flight messages.
     // For Probe: only pause when we sent a partial batch (byte-capped); a full send leaves
     // nothing to throttle and pausing would stall subsequent proposes unnecessarily.
-    // For Replicate: always record (inflights window tracks every sent message).
+    // For Replicate: only record non-empty sends — an empty AppendEntries (heartbeat probe
+    // for a caught-up peer) must NOT consume an inflight slot. Empty sends carry no entries
+    // so there is nothing for the peer to ack; the slot would never be freed, and after
+    // max_inflight_msgs heartbeat-resp cycles the window fills and newly proposed entries
+    // are silently not delivered. (etcd guards SentEntries on len(entries) > 0.)
+    let is_empty = bytes_sent == 0 && entries_len == 0;
     if let Some(p) = self.progress.get_mut(&peer) {
-      if p.state().is_replicate() || sent_partial {
+      if (!is_empty && p.state().is_replicate()) || sent_partial {
         p.sent_entries(last_sent, bytes_sent);
       }
     }
@@ -578,12 +584,14 @@ where
     if msg.term() < self.term {
       return;
     }
+    #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for M5/M7 variants
     match msg {
       Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
       Message::VoteResp(vr) => self.on_vote_resp(now, log, stable, vr),
       Message::Heartbeat(hb) => self.on_heartbeat(now, log, hb),
       Message::AppendEntries(ae) => self.on_append_entries(now, log, ae),
       Message::AppendResp(r) => self.on_append_resp(now, log, from, r),
+      Message::HeartbeatResp(_) => self.on_heartbeat_resp(from, log),
       _ => {}
     }
   }
@@ -830,15 +838,25 @@ where
 
     let (term, me) = (self.term, self.config.id());
     if !consistent {
-      // M2: simple hint = our last_index (M4 adds term-skip). Leader will back off.
+      // M4 Task 5 (updated): etcd's two-sided reject hint — uniform for both the
+      // term-mismatch and the simply-behind case. This makes the hint O(terms) rather
+      // than O(entries): start from min(prev_log_index, last_index) on the FOLLOWER's log
+      // and walk down while the term exceeds the leader's prev_log_term. The resulting
+      // hint_term is meaningful even when the follower is merely behind, so the leader's
+      // find_conflict_by_term lands in one round-trip instead of walking to index 0 and
+      // falling back to a one-step decrement. (etcd's uniform findConflictByTerm path.)
+      let last_index = log.last_index();
+      let hint_index_raw = core::cmp::min(ae.prev_log_index(), last_index);
+      let hint_index = self.find_conflict_by_term(log, hint_index_raw, ae.prev_log_term());
+      let hint_term = log.term(hint_index).unwrap_or(Term::ZERO);
       self.send(
         ae.leader(),
         Message::AppendResp(crate::AppendResp::new(
           term,
           me,
           true,
-          log.last_index(),
-          Term::ZERO,
+          hint_index,
+          hint_term,
           Index::ZERO,
         )),
       );
@@ -909,6 +927,37 @@ where
     }
   }
 
+  /// M4 Task 6: a HeartbeatResp from a peer clears its probe pause and kicks off a new
+  /// send. This allows a stalled `Probe` peer (whose partial-batch send was never acked)
+  /// to resume replication on the next heartbeat round rather than waiting indefinitely.
+  ///
+  /// LIVENESS (deferred to a later milestone): a Replicate peer whose entire in-flight window
+  /// is dropped with no further acks won't be re-probed by heartbeats — etcd sends an empty
+  /// MsgApp when Replicate && Inflights.full(). Revisit with snapshots.
+  fn on_heartbeat_resp<L: LogStore>(&mut self, from: I, log: &L) {
+    if !self.role.is_leader() {
+      return;
+    }
+    if let Some(pr) = self.progress.get_mut(&from) {
+      pr.clear_probe_pause();
+    }
+    self.maybe_send_append(from, log);
+  }
+
+  /// Walk the leader's log downward from `index` until we find an entry whose term is
+  /// `<= term` (or we hit the beginning). This mirrors etcd's `findConflictByTerm` and
+  /// lets the leader skip a whole divergent term in one round-trip on reject.
+  fn find_conflict_by_term<L: LogStore>(&self, log: &L, mut index: Index, term: Term) -> Index {
+    while index > Index::ZERO {
+      let t = log.term(index).unwrap_or(Term::ZERO);
+      if t <= term {
+        break;
+      }
+      index = Index::new(index.get() - 1);
+    }
+    index
+  }
+
   fn on_append_resp<L: LogStore>(
     &mut self,
     _now: Instant,
@@ -923,7 +972,26 @@ where
       return;
     };
     if resp.reject() {
-      pr.decrement(); // M4: use the term-skip hint instead
+      // M4 Task 5: use the term-skip hint to jump next_index forward in one step.
+      // find_conflict_by_term walks the leader's log from reject_hint_index downward
+      // until we find an entry whose term ≤ reject_hint_term (the follower's conflicting
+      // term). This lets the leader skip a whole conflicting term in O(terms) round-trips.
+      let hint_index = resp.reject_hint_index();
+      let hint_term = resp.reject_hint_term();
+      let cur_next = pr.next_index();
+      // Compute the conflict index before re-borrowing self.progress mutably.
+      let conflict = self.find_conflict_by_term(log, hint_index, hint_term);
+      // next_index must be at least 1 and must not advance past the current next on reject.
+      let safe_next = if conflict == Index::ZERO || conflict >= cur_next {
+        Index::new(cur_next.get().saturating_sub(1).max(1))
+      } else {
+        conflict
+      };
+      // Re-acquire progress to update (prior `pr` reference dropped implicitly by this point).
+      if let Some(p) = self.progress.get_mut(&from) {
+        p.become_probe();
+        p.set_next_index(safe_next);
+      }
       self.maybe_send_append(from, log);
     } else if pr.maybe_update(resp.match_index()) {
       pr.become_replicate();
@@ -1889,7 +1957,12 @@ mod tests {
     // 2 AppendEntries before the window fills.
     for i in 0u8..5 {
       let _ = ep
-        .propose(d, &mut log, &mut stable, &bytes::Bytes::copy_from_slice(&[i]))
+        .propose(
+          d,
+          &mut log,
+          &mut stable,
+          &bytes::Bytes::copy_from_slice(&[i]),
+        )
         .unwrap();
       ep.handle_storage(d, &mut log, &mut stable);
     }
@@ -1942,6 +2015,660 @@ mod tests {
         }
       }
     }
-    assert!(resumed, "leader must resume sending after ack frees the window");
+    assert!(
+      resumed,
+      "leader must resume sending after ack frees the window"
+    );
+  }
+
+  // ---- M4 Task 5: term-skip reject hint ----
+
+  /// A divergent follower's reject carries a term hint that lets the leader skip a whole
+  /// conflicting term instead of backing off one entry at a time.
+  ///
+  /// Scenario:
+  ///   Leader log:   1@1 2@1 3@2 4@2 5@3
+  ///   Follower log: 1@1 2@1 3@3 4@3   (diverges at index 3: has term-3 entries)
+  ///
+  /// The leader (optimistically in Replicate, next=6) sends AppendEntries(prev=5@3, entries=[]).
+  /// The follower rejects: prev=5, but follower only has 4 entries; last_index=4, so hint is:
+  ///   reject_hint_term = term(4) = 3 (on follower log)
+  ///   reject_hint_index = first index where term==3 on follower = 3
+  ///
+  /// Leader's find_conflict_by_term(index=3, term=3):
+  ///   leader log term(3) = 2 < 3 → stop immediately at 3
+  ///   → next_index = 3 (skip the whole stale term-3 region in one step)
+  #[test]
+  fn divergent_follower_resyncs_fast_via_term_skip() {
+    use crate::{
+      AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    };
+    use core::time::Duration;
+
+    // === Follower side: test the reject-hint computation ===
+    // Node 2 is the follower with log [1@1, 2@1, 3@3, 4@3].
+    let follower_cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut follower = Endpoint::new(
+      follower_cfg,
+      Instant::ORIGIN,
+      7,
+      crate::testkit::CountSm::default(),
+    );
+    let mut follower_log = crate::testkit::VecLog::default();
+    let mut follower_stable = crate::testkit::NoopStable::default();
+
+    // Seed follower log with [1@1, 2@1, 3@3, 4@3].
+    follower_log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"a"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"b"),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(3),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"c"),
+      ),
+      Entry::new(
+        Term::new(3),
+        Index::new(4),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"d"),
+      ),
+    ]);
+
+    // Leader sends AppendEntries(prev_index=4, prev_term=2) — inconsistency at prev.
+    // Follower has term(4)=3 ≠ 2 → reject.
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut follower_log,
+      &mut follower_stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(3),
+        1u64,
+        Index::new(4), // prev_log_index
+        Term::new(2),  // prev_log_term (leader has 4@2, follower has 4@3)
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+
+    // The follower must reject with the etcd two-sided term-skip hint.
+    // hint_index_raw = min(prev_log_index=4, last_index=4) = 4
+    // find_conflict_by_term(follower_log, 4, ceiling=prev_log_term=2):
+    //   term(4)=3 > 2 → 3; term(3)=3 > 2 → 2; term(2)=1 ≤ 2 → stop at 2
+    // hint_index=2, hint_term=term(2)=1
+    let resp = follower
+      .poll_message()
+      .expect("follower must send AppendResp(reject)");
+    let ar = match resp.message() {
+      Message::AppendResp(r) => *r,
+      other => panic!("expected AppendResp, got {other:?}"),
+    };
+    assert!(ar.reject(), "follower must reject the inconsistent append");
+    // Etcd two-sided hint: walk from min(prev=4, last=4)=4 down while term > prev_log_term=2.
+    // Stops at index 2 (term=1 ≤ 2).
+    assert_eq!(
+      ar.reject_hint_index(),
+      Index::new(2),
+      "hint index must be 2 (find_conflict_by_term walks below all term-3 entries)"
+    );
+    assert_eq!(
+      ar.reject_hint_term(),
+      Term::new(1),
+      "hint term must be 1 (term at index 2 on follower)"
+    );
+
+    // === Leader side: test that find_conflict_by_term jumps next_index in one step ===
+    // Node 1 is the leader with log [1@1, 2@1, 3@1, 4@1, 5@1] in term 1.
+    // (We keep term=1 throughout so the leader doesn't step down.)
+    // The reject hint (from follower's two-sided form) is (index=2, term=1).
+    // Leader find_conflict_by_term(2, ceiling=1): term(2)=1 ≤ 1 → stop at 2 → next=2 → prev=1.
+    let leader_cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut leader = Endpoint::new(
+      leader_cfg,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+    );
+    let mut leader_log = crate::testkit::VecLog::default();
+    let mut leader_stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 as leader (term=1, noop at index 1).
+    let d = leader.poll_timeout().unwrap();
+    leader.handle_timeout(d, &mut leader_log, &mut leader_stable);
+    leader.handle_message(
+      d,
+      &mut leader_log,
+      &mut leader_stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(leader.role().is_leader());
+    leader.handle_storage(d, &mut leader_log, &mut leader_stable);
+    while leader.poll_message().is_some() {}
+    while leader.poll_event().is_some() {}
+
+    // Force-seed the leader log with 4 more entries so total = [1@1, 2@1, 3@1, 4@1, 5@1].
+    // All term-1 entries. The follower will hint term=3 (its divergent term), which is
+    // higher than any term on the leader's log. find_conflict_by_term(index=3, term=3)
+    // will walk back: leader term(3)=1 ≤ 3 → stop at 3 → next_index = 3.
+    leader_log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"b"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"c"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(4),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"d"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(5),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"e"),
+      ),
+    ]);
+
+    // Simulate peer 2 acking index 1 (noop) → transitions to Replicate.
+    leader.handle_message(
+      d,
+      &mut leader_log,
+      &mut leader_stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    // Drain any pipelined sends triggered by the ack.
+    while leader.poll_message().is_some() {}
+
+    // Now simulate receiving the two-sided reject hint from peer 2:
+    //   reject=true, reject_hint_index=2, reject_hint_term=1
+    // find_conflict_by_term(leader_log, 2, ceiling=1): term(2)=1 ≤ 1 → stop at 2
+    // safe_next = 2, prev_log_index = 1.
+    // With the OLD code (naive decrement from cur_next): next would step back only one slot.
+    // With the NEW code (two-sided hint): next_index jumps to 2 in one round-trip.
+    leader.handle_message(
+      d,
+      &mut leader_log,
+      &mut leader_stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        true,          // reject
+        Index::new(2), // reject_hint_index (etcd two-sided form)
+        Term::new(1),  // reject_hint_term
+        Index::ZERO,
+      )),
+    );
+
+    // The leader should now send AppendEntries with prev_log_index = 1 (next_index = 2).
+    // If the old naive decrement were used, it would send with a much higher prev_log_index.
+    let mut found_correct_prev = false;
+    while let Some(out) = leader.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          if ae.prev_log_index() == Index::new(1) {
+            found_correct_prev = true;
+          }
+        }
+      }
+    }
+    assert!(
+      found_correct_prev,
+      "leader must jump next_index to 2 (prev=1) via two-sided term-skip hint, not step back one-by-one"
+    );
+  }
+
+  // ---- M4 Task 6: heartbeat response resumes a stalled probe ----
+
+  /// A peer in Probe mode that has stalled (msg_app_flow_paused set because only a partial
+  /// batch was sent due to the byte cap) must resume replication when a HeartbeatResp arrives.
+  #[test]
+  fn heartbeat_resp_resumes_stalled_probe() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+
+    // max_size_per_msg=0 means exactly 1 entry per AppendEntries.
+    // With multiple entries in the log, each send is a partial batch → probe pauses.
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_max_size_per_msg(0); // 0 = one entry per message
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 as leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Propose TWO more entries so the log has [noop@1, cmd1@2, cmd2@3].
+    // With max_size_per_msg=0 (1 entry/msg), the probe from become_leader already sent
+    // noop@1 alone. Since log.last_index()=1 and we sent to index 1 → not partial → no pause.
+    // Now we add cmd1@2. After propose, maybe_send_append sends from next=1 (Probe unchanged):
+    //   entries=[noop@1, cmd1@2], capped to 1 → sends [noop@1], last_sent=1, last_index=2 → partial → PAUSED.
+    let _ = ep
+      .propose(
+        d,
+        &mut log,
+        &mut stable,
+        &bytes::Bytes::from_static(b"cmd1"),
+      )
+      .unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+    let _ = ep
+      .propose(
+        d,
+        &mut log,
+        &mut stable,
+        &bytes::Bytes::from_static(b"cmd2"),
+      )
+      .unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+    // Drain all messages from the propose phase (probe fires on first propose, then pauses).
+    while ep.poll_message().is_some() {}
+
+    // Probe is now paused (partial batch was sent: noop@1 sent, but cmd1@2/cmd2@3 remain).
+    // A new propose would call maybe_send_append → paused → no send.
+    let _ = ep
+      .propose(
+        d,
+        &mut log,
+        &mut stable,
+        &bytes::Bytes::from_static(b"cmd3"),
+      )
+      .unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+    let mut probe_blocked = true;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(_) = out.message() {
+          probe_blocked = false;
+        }
+      }
+    }
+    assert!(
+      probe_blocked,
+      "while probe is paused, a new propose must NOT trigger an AppendEntries to peer 2"
+    );
+
+    // Task 6: a HeartbeatResp from peer 2 must clear msg_app_flow_paused and call
+    // maybe_send_append so the stalled probe resumes immediately.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
+    );
+    let mut resumed = false;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(_) = out.message() {
+          resumed = true;
+        }
+      }
+    }
+    assert!(
+      resumed,
+      "HeartbeatResp must clear the probe pause and trigger an AppendEntries to peer 2"
+    );
+  }
+
+  // ---- Fix 1 regression: empty appends must NOT consume the inflight window ----
+
+  /// A caught-up Replicate peer triggers an empty AppendEntries on every HeartbeatResp.
+  /// Before the fix, each call to `sent_entries` added a zero-byte inflight slot that was
+  /// never freed (no ack for empty sends), so after `max_inflight_msgs` heartbeat-resps
+  /// the window filled and newly proposed entries were silently not delivered.
+  ///
+  /// This test uses a small window (4 slots), delivers many HeartbeatResps (more than 4),
+  /// then proposes a new entry and asserts that an AppendEntries carrying it IS emitted.
+  #[test]
+  fn empty_appends_do_not_wedge_inflight_window() {
+    use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_max_inflight_msgs(4)
+    .unwrap()
+    .with_max_size_per_msg(u64::MAX);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 as leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Transition peer 2 to Replicate by acking the no-op (index 1).
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+
+    // Deliver 10 HeartbeatResps from peer 2 (each triggers an empty AppendEntries for a
+    // caught-up peer). With window=4 and the bug, only 4 resps suffice to wedge the window.
+    for _ in 0..10 {
+      ep.handle_message(
+        d,
+        &mut log,
+        &mut stable,
+        2u64,
+        Message::HeartbeatResp(crate::HeartbeatResp::new(
+          Term::new(1),
+          2u64,
+          bytes::Bytes::new(),
+        )),
+      );
+      while ep.poll_message().is_some() {}
+    }
+
+    // Now propose a new entry. The leader must emit an AppendEntries carrying it to peer 2.
+    let _idx = ep
+      .propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"new"))
+      .unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+
+    let mut delivered = false;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          if !ae.entries().is_empty() {
+            delivered = true;
+          }
+        }
+      }
+    }
+    assert!(
+      delivered,
+      "after 10 heartbeat-resps the inflight window must not be wedged; proposed entry must be delivered to peer 2"
+    );
+  }
+
+  // ---- Fix 2 regression: lagging-follower hint is O(terms) not O(entries) ----
+
+  /// A follower that is simply behind (prev_log_index > last_index) must emit a reject hint
+  /// whose term is meaningful so the leader can jump in one step.
+  ///
+  /// Scenario: follower log [1..=2]@term1, leader sends AppendEntries(prev=20@term1).
+  /// - Old hint: (last_index.next()=3, Term::ZERO) → leader walks to index 0, falls back
+  ///   to one-step decrement → O(entries) round-trips to converge.
+  /// - New hint (etcd two-sided): hint_index_raw=min(20,2)=2,
+  ///   find_conflict_by_term(log, 2, ceiling=term1): term(2)=1 ≤ 1 → stop at 2
+  ///   → hint=(2, term1). Leader's find_conflict_by_term(2, term1)=2 → next=2 → converges
+  ///   on the very next send.
+  ///
+  /// Verification: check the follower's hint_term is non-zero (meaningful), and that a
+  /// leader receiving it jumps to next=3 (prev=2) in one step — not to index 0.
+  #[test]
+  fn lagging_follower_hint_is_two_sided() {
+    use crate::{
+      AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    };
+    use core::time::Duration;
+
+    // --- Follower side: verify the hint ----------------------------------------
+    // Follower has [1@1, 2@1]; receives AppendEntries(prev=20, prev_term=1).
+    let follower_cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut follower = Endpoint::new(
+      follower_cfg,
+      Instant::ORIGIN,
+      7,
+      crate::testkit::CountSm::default(),
+    );
+    let mut follower_log = crate::testkit::VecLog::default();
+    let mut follower_stable = crate::testkit::NoopStable::default();
+    follower_log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"a"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"b"),
+      ),
+    ]);
+
+    follower.handle_message(
+      Instant::ORIGIN,
+      &mut follower_log,
+      &mut follower_stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::new(20), // prev_log_index far past follower's last (2)
+        Term::new(1),   // prev_log_term
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+
+    let resp = follower.poll_message().expect("follower must reject");
+    let ar = match resp.message() {
+      Message::AppendResp(r) => *r,
+      other => panic!("expected AppendResp, got {other:?}"),
+    };
+    assert!(ar.reject(), "follower must reject (prev=20 > last=2)");
+    // Two-sided hint: hint_index_raw=min(20,2)=2; find_conflict_by_term(log, 2, ceiling=1):
+    // term(2)=1 ≤ 1 → stop → hint_index=2, hint_term=1 (NOT Term::ZERO as in the old code).
+    assert_eq!(
+      ar.reject_hint_index(),
+      Index::new(2),
+      "hint index must be 2 (follower's last index, walk stops immediately at ceiling)"
+    );
+    assert_ne!(
+      ar.reject_hint_term(),
+      Term::ZERO,
+      "hint term must NOT be ZERO for a simply-lagging follower (old bug: always emitted ZERO)"
+    );
+    assert_eq!(
+      ar.reject_hint_term(),
+      Term::new(1),
+      "hint term must be 1 (the term at the follower's last index)"
+    );
+
+    // --- Leader side: verify the one-step jump ----------------------------------
+    // Leader has [1..20]@term1. Receives reject hint (2, term1).
+    // find_conflict_by_term(leader_log, 2, ceiling=1): term(2)=1 ≤ 1 → stop at 2 → next=2.
+    // This gives prev=1 on the follow-up send — O(1) not O(entries).
+    let leader_cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_max_size_per_msg(u64::MAX);
+    let mut leader = Endpoint::new(
+      leader_cfg,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+    );
+    let mut leader_log = crate::testkit::VecLog::default();
+    let mut leader_stable = crate::testkit::NoopStable::default();
+
+    let d = leader.poll_timeout().unwrap();
+    leader.handle_timeout(d, &mut leader_log, &mut leader_stable);
+    leader.handle_message(
+      d,
+      &mut leader_log,
+      &mut leader_stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(leader.role().is_leader());
+    leader.handle_storage(d, &mut leader_log, &mut leader_stable);
+    while leader.poll_message().is_some() {}
+    while leader.poll_event().is_some() {}
+
+    // Force-seed indices 2..=20 so leader has [1..20]@term1.
+    let extra: std::vec::Vec<_> = (2u64..=20)
+      .map(|i| {
+        Entry::new(
+          Term::new(1),
+          Index::new(i),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"x"),
+        )
+      })
+      .collect();
+    leader_log.force_append(&extra);
+
+    // Peer 2 acks noop (index 1) → Replicate, next=2.
+    leader.handle_message(
+      d,
+      &mut leader_log,
+      &mut leader_stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1),
+      )),
+    );
+    // Drain the pipelined sends after the ack (sends indices 2..=20 in one batch, then
+    // records 1 inflight slot in Replicate).
+    while leader.poll_message().is_some() {}
+
+    // Inject the two-sided reject hint (2, term1) from the follower.
+    // With the old hint (3, ZERO), the leader walks to index 0 and falls back to cur_next-1.
+    // With the new hint (2, 1), find_conflict_by_term(leader_log, 2, 1)=2 → next=2, prev=1.
+    leader.handle_message(
+      d,
+      &mut leader_log,
+      &mut leader_stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        true,          // reject
+        Index::new(2), // hint_index from two-sided follower
+        Term::new(1),  // hint_term: NON-ZERO so leader can land in one step
+        Index::ZERO,
+      )),
+    );
+
+    // The leader must send AppendEntries with prev_log_index ≤ 2 (next_index ≤ 3).
+    // If the old code were used with hint=(2, 0), it would fall back to cur_next-1 = 20
+    // (because find_conflict_by_term walks to 0 with ceiling=0 → safe_next = cur_next-1).
+    let mut found_low_prev = false;
+    while let Some(out) = leader.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          // With two-sided hint the leader jumps to next=2 → prev=1.
+          if ae.prev_log_index() <= Index::new(2) {
+            found_low_prev = true;
+          }
+        }
+      }
+    }
+    assert!(
+      found_low_prev,
+      "leader must jump to prev ≤ 2 via the two-sided hint (O(1) round-trip), not back off one-by-one"
+    );
   }
 }
