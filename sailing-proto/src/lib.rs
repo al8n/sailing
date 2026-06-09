@@ -48,7 +48,10 @@ mod storage;
 pub use storage::{LogDone, LogStore, OpId, StableDone, StableStore};
 
 mod error;
-pub use error::ConfigError;
+pub use error::{ConfigError, ProposeError};
+
+mod progress;
+pub use progress::{Progress, ProgressState};
 
 mod config;
 pub use config::Config;

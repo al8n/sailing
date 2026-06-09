@@ -62,6 +62,22 @@ impl Data for bool {
   }
 }
 
+impl Data for bytes::Bytes {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    (self.len() as u64).encode(buf);
+    buf.extend_from_slice(self);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let (n, len) = u64::decode(buf)?;
+    let end = n
+      .checked_add(len as usize)
+      .ok_or(DecodeError::UnexpectedEof)?;
+    let slice = buf.get(n..end).ok_or(DecodeError::UnexpectedEof)?;
+    Ok((end, bytes::Bytes::copy_from_slice(slice)))
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -81,5 +97,15 @@ mod tests {
     roundtrip(u64::MAX);
     roundtrip(true);
     roundtrip(false);
+  }
+
+  #[test]
+  fn bytes_roundtrips() {
+    let mut buf = std::vec::Vec::new();
+    let b = bytes::Bytes::from_static(b"hello");
+    b.encode(&mut buf);
+    let (n, back) = bytes::Bytes::decode(&buf).unwrap();
+    assert_eq!(n, buf.len());
+    assert_eq!(back, b);
   }
 }

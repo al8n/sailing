@@ -1,10 +1,10 @@
 //! The Sans-I/O Raft core. M0 is a no-op skeleton: it owns state and exposes the
-//! `handle_*`/`poll_*` surface. M1 fills in leader election.
+//! `handle_*`/`poll_*` surface. M1 fills in leader election. M2 adds log replication.
 use crate::{
   Config, Event, Index, Instant, LogStore, Message, NodeId, Outgoing, Prng, StableStore,
   StateMachine, Term,
 };
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
@@ -39,9 +39,6 @@ impl Role {
 /// need it. `F: StateMachine` is the documented "bounds that gate storage shape" exception
 /// (§8): the struct stores `Event<I, F::Response>`, which cannot be named without it.
 #[derive(Debug)]
-// M0 skeleton: some fields are written in `new` but not yet read — M2 fills them in.
-// `expect` (not `allow`): once M2 reads these fields it becomes a stale-lint error, forcing removal.
-#[expect(dead_code)]
 pub struct Endpoint<I, F>
 where
   F: StateMachine,
@@ -60,7 +57,10 @@ where
   heartbeat_deadline: Option<Instant>,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
+  progress: BTreeMap<I, crate::Progress>,
 }
+
+// ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
 
 impl<I, F> Endpoint<I, F>
 where
@@ -85,6 +85,7 @@ where
       heartbeat_deadline: None,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
+      progress: BTreeMap::new(),
     };
     ep.arm_election_timer(now);
     ep
@@ -114,71 +115,11 @@ where
     self.leader
   }
 
-  // --- INPUTS ---
-
-  /// Feed an inbound message. Runs the universal term pre-pass then dispatches.
-  pub fn handle_message<L, S>(
-    &mut self,
-    now: Instant,
-    log: &mut L,
-    stable: &mut S,
-    _from: I,
-    msg: Message<I>,
-  ) where
-    L: LogStore,
-    S: StableStore<NodeId = I>,
-  {
-    // Universal term handling (Raft §5.1): a higher term forces us to a follower.
-    if msg.term() > self.term {
-      self.term = msg.term();
-      self.role = Role::Follower;
-      self.voted_for = None;
-      self.leader = None;
-      self.persist_hard_state(stable);
-    }
-    // Drop messages from a stale term (a CheckQuorum nudge is added in M7).
-    if msg.term() < self.term {
-      return;
-    }
-    match msg {
-      Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
-      Message::VoteResp(vr) => self.on_vote_resp(now, log, stable, vr),
-      Message::Heartbeat(hb) => self.on_heartbeat(now, hb),
-      // AppendEntries/AppendResp/HeartbeatResp: M2 fills these; ignore in M1.
-      _ => {}
-    }
+  /// The application state machine (read-only access for agreement checks).
+  #[inline]
+  pub const fn state_machine(&self) -> &F {
+    &self.fsm
   }
-
-  /// Fire due timers (election for followers/candidates, heartbeat for leaders).
-  pub fn handle_timeout<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
-  where
-    L: LogStore,
-    S: StableStore<NodeId = I>,
-  {
-    match self.role {
-      Role::Leader => {
-        if self.heartbeat_deadline.is_some_and(|d| d <= now) {
-          self.broadcast_heartbeat(now);
-          self.arm_heartbeat_timer(now);
-        }
-      }
-      _ => {
-        if self.election_deadline.is_some_and(|d| d <= now) {
-          self.become_candidate(now, log, stable);
-        }
-      }
-    }
-  }
-
-  /// Drain storage completions. (M3+: append-before-ack / persist-vote.)
-  pub fn handle_storage<L, S>(&mut self, _now: Instant, _log: &mut L, _stable: &mut S)
-  where
-    L: LogStore,
-    S: StableStore<NodeId = I>,
-  {
-  }
-
-  // --- OUTPUTS ---
 
   /// Next outbound message, if any.
   #[inline]
@@ -201,7 +142,15 @@ where
     }
   }
 
-  // --- PRIVATE HELPERS ---
+  /// Drain storage completions. (M3+: append-before-ack / persist-vote.)
+  pub fn handle_storage<L, S>(&mut self, _now: Instant, _log: &mut L, _stable: &mut S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+  }
+
+  // --- PRIVATE HELPERS (no Data bound) ---
 
   fn arm_election_timer(&mut self, now: Instant) {
     let t = self.prng.election_timeout(self.config.election_timeout());
@@ -235,12 +184,248 @@ where
   }
 
   fn persist_hard_state<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
-    // M1: write synchronously; M3 introduces OpId/pending + deferral.
     let hs = stable
       .hard_state()
       .with_term(self.term)
       .with_vote(self.voted_for);
     stable.submit_write(crate::OpId::ZERO, hs);
+  }
+
+  fn broadcast_heartbeat(&mut self, _now: Instant) {
+    let (term, me, commit) = (self.term, self.config.id(), self.commit);
+    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+      self.send(
+        peer,
+        Message::Heartbeat(crate::Heartbeat::new(term, me, commit, bytes::Bytes::new())),
+      );
+    }
+  }
+
+  fn maybe_send_append<L: LogStore>(&mut self, peer: I, log: &L) {
+    let Some(pr) = self.progress.get(&peer).copied() else {
+      return;
+    };
+    let next = pr.next_index();
+    let prev_index = Index::new(next.get().saturating_sub(1));
+    let prev_term = if prev_index == Index::ZERO {
+      Term::ZERO
+    } else {
+      log.term(prev_index).unwrap_or(Term::ZERO)
+    };
+    let end = log.last_index().next();
+    let entries = if next < end {
+      log
+        .entries(next..end, u64::MAX)
+        .map(<[_]>::to_vec)
+        .unwrap_or_default()
+    } else {
+      std::vec::Vec::new()
+    };
+    let (term, me, commit) = (self.term, self.config.id(), self.commit);
+    self.send(
+      peer,
+      Message::AppendEntries(crate::AppendEntries::new(
+        term, me, prev_index, prev_term, entries, commit,
+      )),
+    );
+  }
+
+  fn maybe_advance_commit<L: LogStore>(&mut self, log: &L) {
+    let mut matches: std::vec::Vec<Index> = self
+      .progress
+      .values()
+      .map(crate::Progress::match_index)
+      .collect();
+    matches.sort_unstable();
+    // highest index replicated on >= quorum nodes
+    let q = self.config.quorum();
+    if matches.len() < q {
+      return;
+    }
+    let candidate = matches[matches.len() - q];
+    // §5.4.2: only commit an entry from the CURRENT term by counting replicas.
+    let current_term = log.term(candidate).map(|t| t == self.term).unwrap_or(false);
+    if candidate > self.commit && current_term {
+      self.commit = candidate;
+    }
+  }
+
+  fn on_request_vote<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &mut S,
+    rv: crate::RequestVote<I>,
+  ) {
+    let (my_index, my_term) = self.last_log(log);
+    let log_ok = (rv.last_log_term(), rv.last_log_index()) >= (my_term, my_index);
+    let can_vote = self.voted_for.is_none() || self.voted_for == Some(rv.candidate());
+    let grant = can_vote && log_ok;
+    if grant {
+      self.voted_for = Some(rv.candidate());
+      self.persist_hard_state(stable);
+      self.arm_election_timer(now);
+    }
+    let (term, me) = (self.term, self.config.id());
+    self.send(
+      rv.candidate(),
+      Message::VoteResp(crate::VoteResp::new(term, me, false, !grant)),
+    );
+  }
+
+  fn on_vote_resp<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &mut S,
+    vr: crate::VoteResp<I>,
+  ) where
+    F::Command: crate::Data,
+  {
+    if !self.role.is_candidate() || vr.term() != self.term {
+      return;
+    }
+    if !vr.reject() {
+      self.votes_granted.insert(vr.from());
+      if self.votes_granted.len() >= self.config.quorum() {
+        self.become_leader(now, log, stable);
+      }
+    }
+  }
+}
+
+// ─── Full replication impl (F::Command: Data required for apply_committed) ──────────────────────
+
+impl<I, F> Endpoint<I, F>
+where
+  I: NodeId,
+  F: StateMachine,
+  F::Command: crate::Data,
+{
+  /// Feed an inbound message. Runs the universal term pre-pass then dispatches.
+  pub fn handle_message<L, S>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &mut S,
+    from: I,
+    msg: Message<I>,
+  ) where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    // Universal term handling (Raft §5.1): a higher term forces us to a follower.
+    if msg.term() > self.term {
+      self.term = msg.term();
+      self.role = Role::Follower;
+      self.voted_for = None;
+      self.leader = None;
+      self.persist_hard_state(stable);
+    }
+    // Drop messages from a stale term (a CheckQuorum nudge is added in M7).
+    if msg.term() < self.term {
+      return;
+    }
+    match msg {
+      Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
+      Message::VoteResp(vr) => self.on_vote_resp(now, log, stable, vr),
+      Message::Heartbeat(hb) => self.on_heartbeat(now, log, hb),
+      Message::AppendEntries(ae) => self.on_append_entries(now, log, ae),
+      Message::AppendResp(r) => self.on_append_resp(now, log, from, r),
+      _ => {}
+    }
+  }
+
+  /// Fire due timers (election for followers/candidates, heartbeat for leaders).
+  pub fn handle_timeout<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    match self.role {
+      Role::Leader => {
+        if self.heartbeat_deadline.is_some_and(|d| d <= now) {
+          self.broadcast_heartbeat(now);
+          self.arm_heartbeat_timer(now);
+        }
+      }
+      _ => {
+        if self.election_deadline.is_some_and(|d| d <= now) {
+          self.become_candidate(now, log, stable);
+        }
+      }
+    }
+  }
+
+  /// Propose a command on the leader. Returns the assigned index, or `NotLeader`.
+  /// Takes `cmd` by reference (encoding only borrows; the caller keeps it to retry).
+  pub fn propose<L, S>(
+    &mut self,
+    _now: Instant,
+    log: &mut L,
+    _stable: &mut S,
+    cmd: &F::Command,
+  ) -> Result<Index, crate::ProposeError<I>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.role.is_leader() {
+      return Err(crate::ProposeError::NotLeader {
+        leader: self.leader,
+      });
+    }
+    use crate::Data as _;
+    let mut buf = std::vec::Vec::new();
+    cmd.encode(&mut buf);
+    let index = log.last_index().next();
+    let entry = crate::Entry::new(
+      self.term,
+      index,
+      crate::EntryKind::Normal,
+      bytes::Bytes::from(buf),
+    );
+    log.submit_append(crate::OpId::ZERO, core::slice::from_ref(&entry));
+    if let Some(p) = self.progress.get_mut(&self.config.id()) {
+      p.maybe_update(index);
+    }
+    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+      self.maybe_send_append(peer, log);
+    }
+    self.maybe_advance_commit(log);
+    self.apply_committed(log);
+    Ok(index)
+  }
+
+  /// Apply all entries that have been committed but not yet applied.
+  fn apply_committed<L: LogStore>(&mut self, log: &L) {
+    while self.applied < self.commit {
+      let idx = self.applied.next();
+      let entry = match log.entries(idx..idx.next(), u64::MAX) {
+        Ok(s) => match s.first() {
+          Some(e) => e.clone(),
+          None => break,
+        },
+        Err(_) => break, // M3: a read error here becomes a sticky fatal error
+      };
+      match entry.kind() {
+        crate::EntryKind::Normal => {
+          let cmd = match <F::Command as crate::Data>::decode(entry.data()) {
+            Ok((_, c)) => c,
+            Err(_) => break, // M3: corrupt-log decode error → sticky fatal
+          };
+          match self.fsm.apply(idx, cmd) {
+            Ok(resp) => self
+              .events
+              .push_back(crate::Event::Applied(crate::Applied::new(idx, resp))),
+            Err(_) => break, // M3: apply error → sticky fatal
+          }
+        }
+        crate::EntryKind::Empty => {} // no-op: just advance applied
+        crate::EntryKind::ConfChange => {} // M6: membership applied here
+      }
+      self.applied = idx;
+    }
   }
 
   fn become_candidate<L: LogStore, S: StableStore<NodeId = I>>(
@@ -277,75 +462,52 @@ where
   fn become_leader<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Instant,
-    _log: &mut L,
+    log: &mut L,
     _stable: &mut S,
   ) {
     self.role = Role::Leader;
     self.leader = Some(self.config.id());
     self.arm_heartbeat_timer(now);
-    self.broadcast_heartbeat(now);
+
+    // Initialize Progress for every voter (self included; self is fully caught up).
+    let last = log.last_index();
+    self.progress.clear();
+    for v in self.config.voters().to_vec() {
+      let mut p = crate::Progress::new(last.next());
+      if v == self.config.id() {
+        p.maybe_update(last);
+      }
+      self.progress.insert(v, p);
+    }
+
+    // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
+    let noop_index = last.next();
+    let noop = crate::Entry::new(
+      self.term,
+      noop_index,
+      crate::EntryKind::Empty,
+      bytes::Bytes::new(),
+    );
+    log.submit_append(crate::OpId::ZERO, core::slice::from_ref(&noop));
+    if let Some(p) = self.progress.get_mut(&self.config.id()) {
+      p.maybe_update(noop_index);
+    }
+
     self
       .events
       .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
         self.term,
         Some(self.config.id()),
       )));
-    // M2: append an Empty no-op entry here and initialize the Progress map.
-  }
 
-  fn broadcast_heartbeat(&mut self, _now: Instant) {
-    let (term, me, commit) = (self.term, self.config.id(), self.commit);
+    // Broadcast heartbeats (M1 contract) and kick off replication to peers.
+    self.broadcast_heartbeat(now);
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
-      self.send(
-        peer,
-        Message::Heartbeat(crate::Heartbeat::new(term, me, commit, bytes::Bytes::new())),
-      );
+      self.maybe_send_append(peer, log);
     }
   }
 
-  fn on_request_vote<L: LogStore, S: StableStore<NodeId = I>>(
-    &mut self,
-    now: Instant,
-    log: &mut L,
-    stable: &mut S,
-    rv: crate::RequestVote<I>,
-  ) {
-    let (my_index, my_term) = self.last_log(log);
-    let log_ok = (rv.last_log_term(), rv.last_log_index()) >= (my_term, my_index);
-    let can_vote = self.voted_for.is_none() || self.voted_for == Some(rv.candidate());
-    let grant = can_vote && log_ok;
-    if grant {
-      self.voted_for = Some(rv.candidate());
-      self.persist_hard_state(stable);
-      self.arm_election_timer(now); // granting resets our election timer
-    }
-    let (term, me) = (self.term, self.config.id());
-    self.send(
-      rv.candidate(),
-      Message::VoteResp(crate::VoteResp::new(term, me, false, !grant)),
-    );
-  }
-
-  fn on_vote_resp<L: LogStore, S: StableStore<NodeId = I>>(
-    &mut self,
-    now: Instant,
-    log: &mut L,
-    stable: &mut S,
-    vr: crate::VoteResp<I>,
-  ) {
-    if !self.role.is_candidate() || vr.term() != self.term {
-      return;
-    }
-    if !vr.reject() {
-      self.votes_granted.insert(vr.from());
-      if self.votes_granted.len() >= self.config.quorum() {
-        self.become_leader(now, log, stable);
-      }
-    }
-  }
-
-  fn on_heartbeat(&mut self, now: Instant, hb: crate::Heartbeat<I>) {
-    // term == self.term here (pre-pass handled >, and < returned early)
+  fn on_heartbeat<L: LogStore>(&mut self, now: Instant, log: &mut L, hb: crate::Heartbeat<I>) {
     let changed = self.leader != Some(hb.leader());
     self.role = Role::Follower;
     self.leader = Some(hb.leader());
@@ -358,11 +520,132 @@ where
           Some(hb.leader()),
         )));
     }
+    // Advance commit from heartbeat and apply any newly committed entries.
+    let new_commit = core::cmp::min(hb.commit(), log.last_index());
+    if new_commit > self.commit {
+      self.commit = new_commit;
+      self.apply_committed(log);
+    }
     let (term, me) = (self.term, self.config.id());
     self.send(
       hb.leader(),
       Message::HeartbeatResp(crate::HeartbeatResp::new(term, me, bytes::Bytes::new())),
     );
+  }
+
+  fn on_append_entries<L: LogStore>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    ae: crate::AppendEntries<I>,
+  ) {
+    let changed = self.leader != Some(ae.leader());
+    self.role = Role::Follower;
+    self.leader = Some(ae.leader());
+    self.arm_election_timer(now);
+    if changed {
+      self
+        .events
+        .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
+          self.term,
+          Some(ae.leader()),
+        )));
+    }
+
+    // Log-consistency check at prev_log_index/term.
+    let consistent = ae.prev_log_index() == Index::ZERO
+      || (ae.prev_log_index() <= log.last_index()
+        && log
+          .term(ae.prev_log_index())
+          .map(|t| t == ae.prev_log_term())
+          .unwrap_or(false));
+
+    let (term, me) = (self.term, self.config.id());
+    if !consistent {
+      // M2: simple hint = our last_index (M4 adds term-skip). Leader will back off.
+      self.send(
+        ae.leader(),
+        Message::AppendResp(crate::AppendResp::new(
+          term,
+          me,
+          true,
+          log.last_index(),
+          Term::ZERO,
+          Index::ZERO,
+        )),
+      );
+      return;
+    }
+
+    // Raft §5.3: only delete-and-re-append from the first *conflicting* entry.
+    // Entries that already match (same index, same term) are left untouched so that a
+    // stale or duplicate AppendEntries never erases already-committed entries.
+    let entries = ae.entries();
+    if !entries.is_empty() {
+      let mut conflict_at: Option<usize> = None;
+      for (i, entry) in entries.iter().enumerate() {
+        let idx = entry.index();
+        let matches_existing =
+          idx <= log.last_index() && log.term(idx).map(|t| t == entry.term()).unwrap_or(false);
+        if !matches_existing {
+          conflict_at = Some(i);
+          break;
+        }
+      }
+      if let Some(i) = conflict_at {
+        // Safety tripwire: a conflict at/below our commit means a committed entry would be
+        // rewritten — that must be impossible in correct Raft.
+        debug_assert!(
+          entries[i].index().get() > self.commit.get(),
+          "AppendEntries would truncate a committed entry"
+        );
+        log.submit_append(crate::OpId::ZERO, &entries[i..]);
+      }
+      // else: every entry already present (pure duplicate) — append nothing.
+    }
+    let last_new = Index::new(ae.prev_log_index().get() + ae.entries().len() as u64);
+
+    // Advance commit (min with what we actually hold) and apply.
+    let new_commit = core::cmp::min(ae.leader_commit(), last_new);
+    if new_commit > self.commit {
+      self.commit = new_commit;
+      self.apply_committed(log);
+    }
+    self.send(
+      ae.leader(),
+      Message::AppendResp(crate::AppendResp::new(
+        term,
+        me,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        last_new,
+      )),
+    );
+  }
+
+  fn on_append_resp<L: LogStore>(
+    &mut self,
+    _now: Instant,
+    log: &mut L,
+    from: I,
+    resp: crate::AppendResp<I>,
+  ) {
+    if !self.role.is_leader() {
+      return;
+    }
+    let Some(pr) = self.progress.get_mut(&from) else {
+      return;
+    };
+    if resp.reject() {
+      pr.decrement(); // M4: use the term-skip hint instead
+      self.maybe_send_append(from, log);
+    } else if pr.maybe_update(resp.match_index()) {
+      pr.become_replicate();
+      self.maybe_advance_commit(log);
+      self.apply_committed(log);
+      self.maybe_send_append(from, log); // keep the pipeline moving if still behind
+    }
   }
 }
 
@@ -375,12 +658,12 @@ mod tests {
   struct Noop;
 
   impl crate::StateMachine for Noop {
-    type Command = ();
+    type Command = bytes::Bytes;
     type Response = ();
     type Snapshot = ();
     type Error = core::convert::Infallible;
 
-    fn apply(&mut self, _: crate::Index, _: ()) -> Result<(), Self::Error> {
+    fn apply(&mut self, _: crate::Index, _: bytes::Bytes) -> Result<(), Self::Error> {
       Ok(())
     }
 
@@ -548,5 +831,292 @@ mod tests {
       ep.poll_event(),
       Some(crate::Event::LeaderChanged(_))
     ));
+  }
+
+  // --- M2 tests ---
+
+  #[test]
+  fn become_leader_appends_noop_and_inits_progress() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable); // candidate
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    assert_eq!(log.last_index(), crate::Index::new(1)); // no-op at index 1
+    assert!(
+      log
+        .entries(crate::Index::new(1)..crate::Index::new(2), u64::MAX)
+        .unwrap()[0]
+        .kind()
+        .is_empty()
+    );
+  }
+
+  #[test]
+  fn propose_appends_and_replicates() {
+    use crate::{Config, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    while ep.poll_message().is_some() {} // drain no-op AppendEntries
+    while ep.poll_event().is_some() {} // drain LeaderChanged
+
+    let idx = ep
+      .propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"cmd"))
+      .unwrap();
+    assert_eq!(idx, crate::Index::new(2)); // after the no-op at 1
+    let mut appends = 0;
+    while let Some(o) = ep.poll_message() {
+      if let Message::AppendEntries(ae) = o.message() {
+        if !ae.entries().is_empty() {
+          appends += 1;
+        }
+      }
+    }
+    assert_eq!(appends, 2); // to peers 2 and 3
+  }
+
+  #[test]
+  fn follower_appends_and_rejects_gap() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // matching append at index 1 (prev=0)
+    let e1 = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"a"),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1],
+        Index::ZERO,
+      )),
+    );
+    let r = ep.poll_message().unwrap();
+    assert!(
+      matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index()==Index::new(1))
+    );
+    assert_eq!(log.last_index(), Index::new(1));
+
+    // gap: prev_log_index=5 we don't have → reject
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::new(5),
+        Term::new(1),
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    let r = ep.poll_message().unwrap();
+    assert!(matches!(r.message(), Message::AppendResp(a) if a.reject()));
+  }
+
+  #[test]
+  fn quorum_ack_commits_and_applies() {
+    use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+    let idx = ep
+      .propose(d, &mut log, &mut stable, &bytes::Bytes::from_static(b"x"))
+      .unwrap(); // index 2
+    while ep.poll_message().is_some() {}
+
+    // peer 2 acks up to idx 2 → quorum (self + peer2) → commit + apply
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        idx,
+      )),
+    );
+    // Applied event for the Normal entry at idx 2 (the no-op at 1 is skipped)
+    let applied: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    assert!(
+      applied
+        .iter()
+        .any(|e| matches!(e, crate::Event::Applied(a) if a.index()==idx))
+    );
+  }
+
+  /// Regression: a stale/duplicate AppendEntries must NOT truncate already-committed entries.
+  /// Raft §5.3: only delete-and-append from the first *conflicting* entry.
+  #[test]
+  fn stale_append_entries_does_not_erase_committed_entries() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Feed 3 entries from leader 1, leader_commit=3 → follower appends and commits all three.
+    let e1 = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"a"),
+    );
+    let e2 = Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"b"),
+    );
+    let e3 = Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"c"),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1, e2, e3],
+        Index::new(3),
+      )),
+    );
+    // Must reply success with match_index=3.
+    let r = ep.poll_message().unwrap();
+    assert!(
+      matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index() == Index::new(3)),
+      "expected success match_index=3 after full append"
+    );
+    assert_eq!(log.last_index(), Index::new(3), "log must hold 3 entries");
+
+    // Now feed a stale/duplicate AppendEntries carrying only entry 1 (a short prefix already
+    // present). Under the old code this would have truncated entries 2 and 3.
+    let e1_dup = Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"a"),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![e1_dup],
+        Index::new(3),
+      )),
+    );
+    // Must still reply success (last_new = prev(0) + len(1) = 1).
+    let r2 = ep.poll_message().unwrap();
+    assert!(
+      matches!(r2.message(), Message::AppendResp(a) if !a.reject()),
+      "stale duplicate must still be accepted"
+    );
+    // Entries 2 and 3 must still be in the log — the stale message must not have erased them.
+    assert_eq!(
+      log.last_index(),
+      Index::new(3),
+      "stale AppendEntries must not truncate entries 2 and 3"
+    );
   }
 }

@@ -110,6 +110,55 @@ impl Cluster {
     self.isolated.remove(&id);
   }
 
+  /// Propose `data` on the current leader; returns the assigned index (or `None` if no leader).
+  pub fn propose(&mut self, data: &[u8]) -> Option<sailing_proto::Index> {
+    let leader = self.leader()? as usize;
+    // Split into disjoint borrows: nodes[leader], logs[leader], stables[leader] are each in a
+    // separate Vec, so borrowing them simultaneously is safe.
+    let log = &mut self.logs[leader];
+    let stable = &mut self.stables[leader];
+    self.nodes[leader]
+      .propose(self.now, log, stable, &bytes::Bytes::copy_from_slice(data))
+      .ok()
+  }
+
+  /// True if every node's applied `(index, command)` sequence agrees as a prefix of the
+  /// longest — the core safety property.
+  pub fn agreement_holds(&self) -> bool {
+    let logs: std::vec::Vec<&[(sailing_proto::Index, bytes::Bytes)]> = self
+      .nodes
+      .iter()
+      .map(|n| n.state_machine().applied())
+      .collect();
+    let longest = logs.iter().map(|l| l.len()).max().unwrap_or(0);
+    for k in 0..longest {
+      let mut seen: Option<&(sailing_proto::Index, bytes::Bytes)> = None;
+      for l in &logs {
+        if let Some(cell) = l.get(k) {
+          match seen {
+            None => seen = Some(cell),
+            Some(s) => {
+              if s != cell {
+                return false;
+              }
+            }
+          }
+        }
+      }
+    }
+    true
+  }
+
+  /// Shortest applied-log length across all nodes.
+  pub fn min_applied_len(&self) -> usize {
+    self
+      .nodes
+      .iter()
+      .map(|n| n.state_machine().applied().len())
+      .min()
+      .unwrap_or(0)
+  }
+
   /// Advance the simulation one step. Returns `true` if any work happened.
   ///
   /// A single step:

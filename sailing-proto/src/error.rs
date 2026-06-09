@@ -1,5 +1,17 @@
 //! Public error types for the core.
 
+/// Why a proposal was rejected.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum ProposeError<I> {
+  /// This node is not the leader; redirect to `leader` if known.
+  #[error("not the leader")]
+  NotLeader {
+    /// The believed current leader, if known.
+    leader: Option<I>,
+  },
+}
+
 /// Why constructing a [`crate::Config`] failed.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
