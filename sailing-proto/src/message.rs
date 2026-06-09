@@ -351,7 +351,7 @@ impl<I: Copy> HeartbeatResp<I> {
   /// Advertise how long this follower will UPHOLD the leader's read-lease window (builder) — i.e. how
   /// long it will refuse to help elect a new leader after receiving this round's heartbeat. A follower
   /// that does not enforce the lease (neither `check_quorum` nor `pre_vote`) advertises `ZERO`, so the
-  /// leader does not count it toward the lease quorum (R41 self-validating lease). A non-zero value is
+  /// leader does not count it toward the lease quorum (the self-validating lease). A non-zero value is
   /// the follower's own `election_timeout`, letting the leader bound the lease by the quorum's actual
   /// support even under heterogeneous `election_timeout`.
   #[inline(always)]

@@ -128,8 +128,8 @@ mod tests {
 
   /// A length prefix larger than the buffer can possibly satisfy must DECODE TO AN ERROR — never a
   /// truncated/empty `Bytes`. A `u64::MAX` prefix followed by only a few payload bytes must be
-  /// rejected, not silently yield some shorter value (R4-F4: the security property is "oversized →
-  /// error, never wrong data").
+  /// rejected, not silently yield some shorter value — the security property is "oversized →
+  /// error, never wrong data".
   ///
   /// NOTE: the `usize::try_from` rejection inside [`decode_len`] is only *reachable* on a sub-64-bit
   /// target. On this 64-bit host `usize::MAX == u64::MAX`, so `try_from` succeeds and the oversized

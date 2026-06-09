@@ -160,20 +160,14 @@ stabilize
   AppendResp term=1 match=5
 > n3 ready
   SnapshotResp term=1 reject=false match=5
-  SnapshotResp term=1 reject=false match=5
   n3 snapshot-installed snap=1/5
 > n1 recv AppendResp term=1 match=5
 > n1 recv SnapshotResp term=1 reject=false match=5
-> n1 recv SnapshotResp term=1 reject=false match=5
 > n1 ready
   AppendEntries term=1 prev=1/5 commit=5 entries=[]
-  AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n3 ready
   AppendResp term=1 match=5
-  AppendResp term=1 match=5
-> n1 recv AppendResp term=1 match=5
 > n1 recv AppendResp term=1 match=5
 
 raft-log 3

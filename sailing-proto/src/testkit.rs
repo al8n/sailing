@@ -61,6 +61,11 @@ pub(crate) struct VecLog {
   offset: Index,
   /// Term at offset (boundary term kept after compaction).
   compacted_term: Term,
+  /// When set, `submit_append` makes entries VISIBLE immediately but HOLDS the `Appended` completion
+  /// (models an async log whose fsync is deferred); `flush_held_appends()` releases them. Lets a test
+  /// create `commit > durable_index` — a visible-but-unflushed tail.
+  hold_appends: bool,
+  held: VecDeque<OpId>,
 }
 
 impl VecLog {
@@ -76,6 +81,20 @@ impl VecLog {
       };
       self.entries.truncate(from);
       self.entries.push(e.clone());
+    }
+  }
+
+  /// Hold `Appended` completions on subsequent `submit_append`s (model a deferred fsync) until
+  /// `flush_held_appends()`. The appended entries are still VISIBLE immediately, so `commit` can advance
+  /// over them while `durable_index` stays behind.
+  pub(crate) fn hold_appends(&mut self, on: bool) {
+    self.hold_appends = on;
+  }
+
+  /// Release all held `Appended` completions (the deferred fsync lands).
+  pub(crate) fn flush_held_appends(&mut self) {
+    while let Some(id) = self.held.pop_front() {
+      self.completions.push_back(LogDone::Appended(id));
     }
   }
 }
@@ -146,7 +165,12 @@ impl LogStore for VecLog {
       self.entries.truncate(from);
     }
     self.entries.extend_from_slice(entries);
-    self.completions.push_back(LogDone::Appended(id));
+    if self.hold_appends {
+      // Visible now, but the `Appended` completion is HELD (deferred fsync) — see `flush_held_appends`.
+      self.held.push_back(id);
+    } else {
+      self.completions.push_back(LogDone::Appended(id));
+    }
   }
 
   fn compact(&mut self, up_to: Index) {
@@ -167,6 +191,7 @@ impl LogStore for VecLog {
     // Any pending completions for those appends are also dropped — they will never fire.
     self.entries.clear();
     self.completions.clear();
+    self.held.clear();
     // Re-baseline: offset == last_index so that first_index() == last_index + 1
     // and term(last_index) == last_term (the snapshot boundary term).
     self.offset = last_index;
@@ -338,6 +363,10 @@ impl StableStore for NoopStable {
     None
   }
 
+  fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
+    None
+  }
+
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
   }
@@ -355,16 +384,25 @@ pub(crate) struct AsyncStable {
   /// fsync window: a `submit_write` whose completion is never polled is LOST on `discard_inflight`.
   durable_hard_state: HardState<u64>,
   completions: VecDeque<StableDone>,
+  /// The VISIBLE snapshot slot — `submit_snapshot` sets it immediately (readable via `snapshot()`).
   snapshot: Option<(SnapshotMeta<u64>, Bytes)>,
-  /// When set, the NEXT `submit_snapshot` persists the durable snapshot but DROPS its
-  /// `SnapshotWritten` completion (models a store that coalesces/loses the completion while
-  /// still making the blob durable). Used by the reconciliation test.
+  /// The DURABLE snapshot slot — what a crash (`discard_inflight`) rolls the visible slot back to.
+  /// Advanced to the visible value when a `SnapshotWritten` completion is polled (models flush-on-poll),
+  /// so a `submit_snapshot` whose completion is never polled is LOST on a crash (the snapshot-install window).
+  durable_snapshot: Option<(SnapshotMeta<u64>, Bytes)>,
+  /// When set, the NEXT `submit_snapshot` makes the blob DURABLE but DROPS its `SnapshotWritten`
+  /// completion (models a store that coalesces/loses the completion while still fsync'ing the blob) —
+  /// so the durable slot advances at submit time but no completion fires. Used by the reconciliation test.
   drop_next_snapshot_completion: bool,
-  /// R43: when true, `hard_state()` returns the LAST-DURABLE value (the strict trait contract) rather than
+  /// When set, the NEXT `submit_snapshot` makes the blob VISIBLE but NOT durable and enqueues NO
+  /// completion (models a torn/failed fsync). `durable_snapshot()` stays `None`, so a missed-completion
+  /// fallback keyed on durable evidence must NOT fire the install — the fallback-safety test.
+  fail_next_snapshot_durability: bool,
+  /// When true, `hard_state()` returns the LAST-DURABLE value (the strict trait contract) rather than
   /// the submit-visible one. Models a conforming store, exposing writers that rebuild HardState from
   /// `hard_state()` while a floor write is in flight.
   last_durable_reads: bool,
-  /// R43: the `lease_support` of every HardState actually handed to `submit_write` (post choke-point
+  /// The `lease_support` of every HardState actually handed to `submit_write` (post choke-point
   /// stamp). Lets a test assert the durable floor is monotone non-decreasing across all writes.
   submitted_lease: std::vec::Vec<Option<core::time::Duration>>,
 }
@@ -376,7 +414,9 @@ impl Default for AsyncStable {
       durable_hard_state: HardState::initial(),
       completions: VecDeque::new(),
       snapshot: None,
+      durable_snapshot: None,
       drop_next_snapshot_completion: false,
+      fail_next_snapshot_durability: false,
       last_durable_reads: false,
       submitted_lease: std::vec::Vec::new(),
     }
@@ -395,27 +435,30 @@ impl AsyncStable {
   }
 
   /// Seed the store with an arbitrary durable `HardState` (e.g. one carrying a `lease_support` floor).
-  /// Used by the R42 lease-promise restart tests.
+  /// Used by the lease-promise restart tests.
   pub(crate) fn force_hard_state(&mut self, hs: HardState<u64>) {
     self.hard_state = hs;
     self.durable_hard_state = hs;
   }
 
-  /// Model a crash: every `submit_write` whose `Wrote` completion has not yet been polled is LOST — the
-  /// visible HardState rolls back to the last durable value and pending completions are discarded.
+  /// Model a crash: every `submit_write`/`submit_snapshot` whose completion has not yet been polled is
+  /// LOST — the visible HardState AND the visible snapshot roll back to their last durable values and
+  /// pending completions are discarded. A snapshot submitted but not yet flushed (its `SnapshotWritten`
+  /// unpolled) therefore vanishes, modelling the snapshot-install fsync window.
   pub(crate) fn discard_inflight(&mut self) {
     self.hard_state = self.durable_hard_state;
+    self.snapshot.clone_from(&self.durable_snapshot);
     self.completions.clear();
   }
 
-  /// R43: make `hard_state()` return the LAST-DURABLE value (strict `StableStore` contract) instead of the
+  /// Make `hard_state()` return the LAST-DURABLE value (strict `StableStore` contract) instead of the
   /// submit-visible one, so writers that rebuild from `hard_state()` see a stale floor while a raise is in
   /// flight — the exact condition Finding 2 needs.
   pub(crate) fn set_last_durable_reads(&mut self, on: bool) {
     self.last_durable_reads = on;
   }
 
-  /// R43: the `lease_support` of every HardState handed to `submit_write`, in order.
+  /// The `lease_support` of every HardState handed to `submit_write`, in order.
   pub(crate) fn submitted_lease_supports(&self) -> &[Option<core::time::Duration>] {
     &self.submitted_lease
   }
@@ -435,6 +478,14 @@ impl AsyncStable {
   pub(crate) fn drop_next_snapshot_completion(&mut self) {
     self.drop_next_snapshot_completion = true;
   }
+
+  /// Arm the store so the next `submit_snapshot` makes the blob VISIBLE but NOT durable and enqueues no
+  /// completion (a torn/failed fsync). `durable_snapshot()` stays `None`; a `discard_inflight` then
+  /// rolls the visible blob away. Used to prove the deferred-install fallback fires only on DURABLE
+  /// evidence, never the visible slot.
+  pub(crate) fn fail_next_snapshot_durability(&mut self) {
+    self.fail_next_snapshot_durability = true;
+  }
 }
 
 impl StableStore for AsyncStable {
@@ -442,7 +493,7 @@ impl StableStore for AsyncStable {
   type Error = core::convert::Infallible;
 
   fn hard_state(&self) -> HardState<u64> {
-    // R43: a strict store returns the LAST-DURABLE state; the default models a submit-visible store.
+    // A strict store returns the LAST-DURABLE state; the default models a submit-visible store.
     if self.last_durable_reads {
       self.durable_hard_state
     } else {
@@ -459,12 +510,18 @@ impl StableStore for AsyncStable {
   }
 
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<u64>, data: Bytes) {
-    // The blob is always made durable (readable via `snapshot()`).
+    // The blob is VISIBLE immediately (readable via `snapshot()`), but NOT yet durable.
     self.snapshot = Some((meta, data));
-    // The completion is enqueued unless this submit is armed to drop it.
-    if self.drop_next_snapshot_completion {
+    if self.fail_next_snapshot_durability {
+      // Torn/failed fsync: visible but NOT durable, NO completion. `durable_snapshot()` stays None.
+      self.fail_next_snapshot_durability = false;
+    } else if self.drop_next_snapshot_completion {
+      // Models a store that fsync'd the blob (durable) but coalesced/lost the completion: advance the
+      // durable slot NOW but enqueue NO `SnapshotWritten`, so only `durable_snapshot()` reveals it.
       self.drop_next_snapshot_completion = false;
+      self.durable_snapshot.clone_from(&self.snapshot);
     } else {
+      // Durability is DEFERRED: the durable slot advances when the completion is polled (flush-on-poll).
       self.completions.push_back(StableDone::SnapshotWritten(id));
     }
   }
@@ -473,12 +530,18 @@ impl StableStore for AsyncStable {
     self.snapshot.clone()
   }
 
+  fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
+    self.durable_snapshot.as_ref().map(|(m, _)| m.clone())
+  }
+
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
     let done = self.completions.pop_front();
-    // A polled `Wrote` completion means that HardState write reached stable storage — fold it into the
-    // durable value so a later `discard_inflight` (crash) no longer rolls it back.
-    if matches!(done, Some(StableDone::Wrote(_))) {
-      self.durable_hard_state = self.hard_state;
+    // A polled completion means that write reached stable storage — fold it into the durable value so a
+    // later `discard_inflight` (crash) no longer rolls it back.
+    match done {
+      Some(StableDone::Wrote(_)) => self.durable_hard_state = self.hard_state,
+      Some(StableDone::SnapshotWritten(_)) => self.durable_snapshot.clone_from(&self.snapshot),
+      _ => {}
     }
     done.map(Ok)
   }

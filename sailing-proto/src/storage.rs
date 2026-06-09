@@ -7,7 +7,7 @@ use core::ops::Range;
 
 /// A storage-submission correlation id, echoed back on completion.
 ///
-/// R45: an `OpId` carries the node's BOOT EPOCH (the strictly-increasing per-restart counter the driver
+/// An `OpId` carries the node's BOOT EPOCH (the strictly-increasing per-restart counter the driver
 /// supplies to [`Endpoint::restart`](crate::Endpoint::restart)) as its HIGH-ORDER component, with a
 /// per-incarnation `seq` as the low-order. This makes a completion enqueued by a PRIOR incarnation — one
 /// that survives into a new incarnation because the store did not clear its completion queue on crash —
@@ -214,7 +214,7 @@ pub trait StableStore {
 
   /// The current durable hard state (synchronous read).
   ///
-  /// NORMATIVE for out-of-tree DISK impls (R42/R43/R44): [`HardState::lease_support`] is the three-valued
+  /// NORMATIVE for out-of-tree DISK impls: [`HardState::lease_support`] is the three-valued
   /// [`crate::LeaseSupport`]. When (de)serializing, preserve the THREE cases distinctly:
   /// `Recorded(None)` (a current-format node that promised nothing), `Recorded(Some(d))` (a promise of `d`),
   /// and — CRITICALLY — a genuine PRE-`lease_support` (legacy) blob MUST decode to `Unrecorded`, **never**
@@ -231,8 +231,30 @@ pub trait StableStore {
   /// Queue a snapshot write. Completes as `StableDone::SnapshotWritten(id)`.
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<Self::NodeId>, data: Bytes);
 
-  /// Read the latest persisted snapshot (synchronous). Returns `None` if no snapshot exists.
+  /// Read the latest SUBMITTED snapshot (synchronous). Returns `None` if no snapshot exists.
+  ///
+  /// This is the VISIBLE/optimistic slot: `submit_snapshot` makes its blob readable here IMMEDIATELY,
+  /// before the write is durable. Use it for serving/streaming, NOT for durability decisions —
+  /// see [`durable_snapshot`](Self::durable_snapshot).
   fn snapshot(&self) -> Option<(SnapshotMeta<Self::NodeId>, Bytes)>;
+
+  /// Metadata of the last DURABLE (fsync'd) snapshot — `None` until a submitted snapshot is actually
+  /// durable (synchronous read).
+  ///
+  /// CONTRACT (NORMATIVE): this MUST reflect only blobs that have reached stable storage — it advances
+  /// at the same point the matching `StableDone::SnapshotWritten` becomes true, NEVER at `submit_snapshot`
+  /// time. It is therefore distinct from [`snapshot`](Self::snapshot) (the submit-visible slot): a store
+  /// that has made a blob visible-but-not-durable returns `Some` from `snapshot()` and `None` (or the
+  /// PRIOR durable meta) from `durable_snapshot()`. A sync store (every write immediately durable) returns
+  /// the same meta from both.
+  ///
+  /// The core relies on this — NEVER on `snapshot()` — to confirm a snapshot blob is durable before it
+  /// runs the destructive log re-baseline of a deferred install (it defers the whole install until the
+  /// `SnapshotWritten` completion, or, if that completion is missed/coalesced, until THIS reports the
+  /// boundary durable). Returning the visible (pre-fsync) blob here would let a crash orphan the log — the
+  /// exact ordering hole this method closes. Returns owned metadata (no `Bytes` — the install needs only
+  /// the boundary, and the blob was already handed to the SM at `submit_snapshot`).
+  fn durable_snapshot(&self) -> Option<SnapshotMeta<Self::NodeId>>;
 
   /// Drain the next completion, if any.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;

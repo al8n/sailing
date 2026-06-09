@@ -1,13 +1,13 @@
 //! The durable Raft metadata: `(term, vote, commit, lease_support)`, persisted before acting.
 use crate::{Index, Term};
 
-/// The durable provenance + magnitude of this node's LeaseBased read-lease promise (R43/R44).
+/// The durable provenance + magnitude of this node's LeaseBased read-lease promise.
 ///
 /// The post-restart vote fence must size itself by the largest lease window this node may have advertised
 /// before the crash. The subtlety the bare `Option<Duration>` could not express: the ABSENCE of a value is
 /// ambiguous — it could mean "a current-format node recorded that it promised nothing" OR "a pre-format
 /// (legacy) record that never had this field, whose prior promise is UNKNOWN". Conflating them lets a
-/// legacy upgrade under weaker config under-fence (the R44 hole). The three-valued type makes the
+/// legacy upgrade under weaker config under-fence. The three-valued type makes the
 /// distinction durable and impossible to lose: an in-tree by-value store holds the variant exactly, and
 /// (the library being genesis-at-this-format) only a genuine pre-format disk decode can ever be
 /// [`Unrecorded`](Self::Unrecorded).
@@ -65,7 +65,7 @@ impl LeaseSupport {
 /// `lease_support` is the durable shadow of `HeartbeatResp.lease_support` — the lease window this node has
 /// advertised it will uphold — persisted so a restarted node keeps the promise its prior incarnation made
 /// to the network, sizing the post-restart vote fence by the PROMISE rather than by the (possibly weaker)
-/// post-restart config (R42), with the provenance needed to handle a legacy upgrade safely (R43/R44). It is
+/// post-restart config, with the provenance needed to handle a legacy upgrade safely. It is
 /// the lease analogue of persisting `vote` (persist-before-advertise, the sibling of persist-before-ack).
 /// An out-of-tree disk decoder MUST map a genuine pre-`lease_support` blob to [`LeaseSupport::Unrecorded`]
 /// (never `Recorded(None)`): `Unrecorded` triggers the conservative restart fence, so a freshly-upgraded

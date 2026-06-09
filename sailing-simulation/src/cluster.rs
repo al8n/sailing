@@ -1053,8 +1053,12 @@ impl Cluster {
             data: e.data().to_vec(),
           })
           .collect();
-        let (snapshot_last_index, snapshot_last_term) = match stable.snapshot() {
-          Some((meta, _)) => (meta.last_index().get(), meta.last_term().get()),
+        // Read the DURABLE (fsync'd) snapshot, NEVER the submit-visible `stable.snapshot()` slot —
+        // crediting a visible-but-unflushed blob is exactly the oracle blindness that hid the
+        // snapshot-install orphan window. Pairing this with `durable_first/last` above keeps the
+        // quorum-durability/boundedness oracles observing a single, internally-consistent fsync'd view.
+        let (snapshot_last_index, snapshot_last_term) = match stable.durable_snapshot() {
+          Some(meta) => (meta.last_index().get(), meta.last_term().get()),
           None => (0, 0),
         };
         let applied_log: std::vec::Vec<(u64, std::vec::Vec<u8>)> = node

@@ -765,6 +765,17 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
     self.snapshot.clone()
   }
 
+  fn durable_snapshot(&self) -> Option<SnapshotMeta<I>> {
+    // Async: the durable slot, advanced only by `flush()` (after a successful fsync) — `None` while a
+    // submitted blob is visible-but-not-yet-flushed, and rolled back by `discard_inflight()`. Sync: every
+    // submit is immediately durable, so the visible slot IS the durable one.
+    if self.mode.is_async() {
+      self.durable_snapshot.as_ref().map(|(m, _)| m.clone())
+    } else {
+      self.snapshot.as_ref().map(|(m, _)| m.clone())
+    }
+  }
+
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
   }
