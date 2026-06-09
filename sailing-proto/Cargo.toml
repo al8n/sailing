@@ -9,7 +9,10 @@ repository.workspace = true
 
 [features]
 default = ["std"]
-std = ["alloc", "bytes/std", "thiserror/std", "derive_more/std"]
+# `std` and `alloc` are INDEPENDENT (never `std = ["alloc"]`): `std` layers each dependency's std
+# feature; `alloc` is the no_std heap tier (the deps use `alloc` automatically under
+# `default-features = false`, so there is nothing to layer). The crate requires at least one.
+std = ["bytes/std", "thiserror/std", "derive_more/std"]
 alloc = []
 
 [dependencies]

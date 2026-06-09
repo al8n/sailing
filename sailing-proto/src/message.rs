@@ -1,5 +1,5 @@
 //! Raft RPC messages. Payloads are named structs; `Message<I>` wraps them as newtype
-//! variants (no multi-field enum variants). Types only — behavior lands in M1–M3.
+//! variants (no multi-field enum variants). Types only — behavior lives elsewhere.
 use crate::{Entry, Index, Term, conf::ConfState};
 use bytes::Bytes;
 use std::vec::Vec;

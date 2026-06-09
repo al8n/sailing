@@ -1,5 +1,5 @@
-//! Cluster configuration state and membership-change types (M5 minimal form; M6 full
-//! joint-consensus extension).
+//! Cluster configuration state and membership-change types, including the full
+//! joint-consensus extension.
 //!
 //! This module is the authoritative home for:
 //! - [`ConfState`] — the configuration state embedded in snapshots and checkpoints.
@@ -74,9 +74,6 @@ impl<I: NodeId> ConfState<I> {
 
   /// Convenience constructor for the common single-config (non-joint) case: only the voter
   /// set is populated; all other fields take their default (empty / `false`).
-  ///
-  /// This is the successor to the M5 `ConfState::new(Vec<I>)` call. All M5 call sites
-  /// now use this method.
   pub fn from_voters(voters: impl IntoIterator<Item = I>) -> Self {
     Self {
       voters: voters.into_iter().collect(),

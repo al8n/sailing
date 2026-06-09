@@ -7,17 +7,17 @@
 //! `seed`. There is **NO** wall-clock, **NO** `rand`, and **NO** `HashMap`-iteration-order
 //! dependence anywhere in the driver.
 //!
-//! # What the VOPR composes (M8 units U1–U3)
+//! # What the VOPR composes
 //!
-//! - **U1** async stores + seeded [`StorageFaults`](crate::StorageFaults) (the real fsync-loss
+//! - async stores + seeded [`StorageFaults`](crate::StorageFaults) (the real fsync-loss
 //!   window under crash).
-//! - **U2** the seeded [`NetworkFaults`](crate::NetworkFaults) bus (latency/jitter/drop/dup/reorder).
-//! - **U3** the per-tick safety-oracle suite in [`checker`](crate::checker), which
+//! - the seeded [`NetworkFaults`](crate::NetworkFaults) bus (latency/jitter/drop/dup/reorder).
+//! - the per-tick safety-oracle suite in [`checker`](crate::checker), which
 //!   [`Cluster::tick`](crate::Cluster::tick) runs at the end of EVERY tick and which **panics with
 //!   `seed`+`tick`** on a safety violation. The VOPR relies on that for SAFETY; it does not
 //!   re-implement it.
 //!
-//! # What the VOPR adds on top of U3
+//! # What the VOPR adds on top of the safety oracles
 //!
 //! - **Liveness (calm windows):** periodically the adversary backs off — heal every partition,
 //!   restart anything crashed, clear the faults — and the cluster is given a generous bounded number
@@ -28,7 +28,7 @@
 //!   apply the ENTIRE committed history that the VOPR successfully proposed. If it cannot, the VOPR
 //!   panics with `seed`+`tick`.
 //! - **Non-vacuity ([`VoprReport`]):** counters of what the run actually exercised (crashes,
-//!   partitions, conf-changes, committed entries, max term, faults fired, …) so the U5 sweep can
+//!   partitions, conf-changes, committed entries, max term, faults fired, …) so the seed sweep can
 //!   assert the runs were not vacuous (a VOPR that never crashed a node or never committed anything
 //!   is useless).
 //!
@@ -41,7 +41,7 @@
 //! against the sustained budget. Conf-changes keep the cluster viable — the voter set never drops
 //! below [`MIN_VOTERS`], and a remove is skipped if it would break the surviving quorum.
 //!
-//! If `run_vopr` ever surfaces a REAL proto bug (a U3 checker panic, a calm-window livelock, or a
+//! If `run_vopr` ever surfaces a REAL proto bug (a safety-oracle panic, a calm-window livelock, or a
 //! quiesce failure) on some seed, that seed+tick IS the bug report — do not tune the VOPR to dodge
 //! it.
 
@@ -60,7 +60,7 @@ const MAX_NODES: usize = 9;
 
 /// Non-vacuity counters: a tally of what a single [`run_vopr`] actually EXERCISED.
 ///
-/// The U5 seed sweep aggregates these across many seeds and asserts real coverage (e.g. some
+/// The seed sweep aggregates these across many seeds and asserts real coverage (e.g. some
 /// `crashes`, some `partitions`, `committed > 0`) — a run that never crashed a node or never
 /// committed anything is *vacuous* and would pass every assertion while proving nothing.
 ///
@@ -220,7 +220,7 @@ impl VoprState {
   /// NEVER empty when there are voters: `removing` can transiently cover EVERY voter (a stuck removal
   /// that never commits while another is proposed past it), but a cluster cannot be removing all its
   /// members at once — so if the difference is empty, fall back to the full voter set, measuring the
-  /// survivors rather than an empty set (which made the metric vacuously 0 — VOPR seeds 60/666). The
+  /// survivors rather than an empty set (which made the metric vacuously 0). The
   /// quorum liveness metric already tolerates a departing laggard as a minority.
   fn settled_voters(&self) -> BTreeSet<u64> {
     let s: BTreeSet<u64> = self.voters.difference(&self.removing).copied().collect();
@@ -273,10 +273,10 @@ fn reconcile_membership(c: &mut Cluster, st: &mut VoprState) {
     // Regression recovery: a `gone` node the CURRENT leader's committed view STILL lists must rejoin the
     // network. The leader needs that node's vote/ack to make progress, but the harness had isolated it
     // because the leader is a post-restart/partition laggard whose APPLIED config regressed (rebuilt
-    // from a stale durable commit, or never learned the removal committed). The failure shape behind
-    // churn seeds 38/53/102/249/666. We trust ONLY the leader's view here, never a non-leader laggard's
-    // (seed 83). Re-admitted as a FULL voter (NOT `removing`) so it counts toward progress and the
-    // leader replicates it back into sync — dumping survivors into `removing` emptied the metric (seed 60).
+    // from a stale durable commit, or never learned the removal committed). We trust ONLY the leader's
+    // view here, never a non-leader laggard's. Re-admitted as a FULL voter (NOT `removing`) so it
+    // counts toward progress and the leader replicates it back into sync — dumping survivors into
+    // `removing` emptied the metric.
     let resurrect: Vec<u64> = st
       .gone
       .iter()
@@ -350,7 +350,7 @@ fn reconcile_membership(c: &mut Cluster, st: &mut VoprState) {
 /// the number of main-loop iterations. Returns a [`VoprReport`] of what the run exercised. The same
 /// `(seed, ticks)` always produces an identical run and an identical report.
 ///
-/// **Panics** (each a real bug, carrying `seed`+`tick` for replay) on: a U3 safety-oracle violation
+/// **Panics** (each a real bug, carrying `seed`+`tick` for replay) on: a safety-oracle violation
 /// (from inside [`Cluster::tick`]), a calm-window livelock (a healthy majority failed to make
 /// progress within a generous bound), or a quiesce failure (a fully-healed cluster failed to
 /// converge / apply the committed history).
@@ -419,7 +419,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
       Action::FaultReroll => fault_reroll(&mut c, &st, &mut prng, seed),
     }
 
-    // Let messages flow a seed-chosen small number of ticks (1..=4). The U3 checker runs every tick
+    // Let messages flow a seed-chosen small number of ticks (1..=4). The safety-oracle checker runs every tick
     // and panics on a safety violation with seed+tick.
     let steps = 1 + (prng.next_u64() % 4) as usize;
     for _ in 0..steps {
@@ -502,7 +502,7 @@ fn roll_network_faults(prng: &mut FaultPrng, calm: bool) -> NetworkFaults {
 /// poison/recovery paths are reachable without permanently disabling a quorum. Bounded at a few
 /// per-mille: a high transient-read rate would poison nodes faster than they recover.
 fn roll_storage_faults(prng: &mut FaultPrng) -> StorageFaults {
-  // 0..=6 per-mille transient read (the C2 poison path), 0..=10 per-mille torn write (re-sync path).
+  // 0..=6 per-mille transient read (the poison path), 0..=10 per-mille torn write (re-sync path).
   let transient_read_per_mille = (prng.next_u64() % 7) as u16;
   let torn_write_per_mille = (prng.next_u64() % 11) as u16;
   StorageFaults {
@@ -781,7 +781,7 @@ fn voters_fully_caught_up(c: &Cluster, st: &VoprState) -> bool {
 }
 
 /// Restart (crash → recover-from-durable) every currently-POISONED live node. A poisoned node is
-/// inert forever (its `handle_*` are no-ops) — the proto's deliberate C2 response to an unrecoverable
+/// inert forever (its `handle_*` are no-ops) — the proto's deliberate response to an unrecoverable
 /// storage read error. Since the VOPR injects `transient_read` faults that trigger exactly that, a
 /// poisoned voter is effectively "down" and must be brought back before any liveness assertion. A
 /// `crash` resets the poison flag and rebuilds the node from its durable log (the lost apply tail is
@@ -811,7 +811,7 @@ fn calm_window(
   // Heal EVERY isolated node that is not permanently `gone` — not only those still tracked in
   // `st.down`. A node can be `c.isolated` yet absent from `st.down` (reconcile prunes `st.down` to the
   // current voters WITHOUT un-isolating it), which would otherwise strand it unreachable forever
-  // (VOPR seed 3077: a fresh 2-voter peer isolated then dropped from `st.down`, never healed → it
+  // (the case where a fresh 2-voter peer is isolated then dropped from `st.down`, never healed → it
   // sits at term 0 and the 2-voter quorum can never make progress).
   for node in c.isolated_nodes() {
     if !st.gone.contains(&node) {
@@ -826,7 +826,7 @@ fn calm_window(
   for id in st.voters.iter().chain(st.learners.iter()).copied() {
     c.set_node_faults(id, StorageFaults::none(), seed.wrapping_add(id));
   }
-  // Restart any POISONED nodes. A `transient_read` storage fault poisons a node (the proto's C2
+  // Restart any POISONED nodes. A `transient_read` storage fault poisons a node (the proto's poison
   // path) and a poisoned node is inert FOREVER unless restarted — so a poisoned voter counts as
   // "down". The calm window's whole premise is that a healthy quorum can make progress, which
   // requires bringing poisoned voters back. `crash` resets poison and recovers from the durable log
@@ -837,10 +837,10 @@ fn calm_window(
   // Let the cluster settle to a single leader (generous bound — a healthy majority MUST converge).
   if !c.run_until(4_000, |c| c.leader_count() == 1) {
     // Last-resort phantom-gone recovery for a LEADERLESS deadlock: a divergent-config election cannot
-    // resolve when a `gone` node a current voter still lists as a member never answers (VOPR seed 1197:
-    // node 5 is gone, but voter n1's config still has it, so neither candidate can assemble a quorum that
+    // resolve when a `gone` node a current voter still lists as a member never answers (e.g. a gone
+    // node is still in voter n1's config, so neither candidate can assemble a quorum that
     // both branches accept). Reinstate any such node — trusting ONLY `st.voters` members' applied views,
-    // never a hopeless removed laggard's (seed 83) — and give the cluster another window to elect. This
+    // never a hopeless removed laggard's — and give the cluster another window to elect. This
     // fires ONLY when genuinely stuck (no leader for 4000 ticks), so it can't over-reinstate a cleanly
     // removed node while the cluster is making progress.
     let needed: BTreeSet<u64> = st
@@ -906,7 +906,7 @@ fn calm_window(
   // (`committed_voters()` — the nodes that actually form quorum), read DIRECTLY from the cluster, NOT
   // the harness's incremental `settled_voters` bookkeeping: under heavy churn the latter can drift to a
   // stale phantom (a laggard id the leader has already dropped) or be hollowed out by `removing` down
-  // to that single phantom, which would pin or empty the metric (VOPR seeds 117/216/666/1675). We
+  // to that single phantom, which would pin or empty the metric. We
   // re-propose as needed because a command accepted by a leader that then loses leadership is not
   // guaranteed to commit (a legitimate Raft outcome).
   let voters_snapshot: Vec<u64> = c.committed_voters().into_iter().collect();
@@ -916,7 +916,7 @@ fn calm_window(
   // in-flight-removal victim, or a just-healed partition straggler — must not pin the metric. The
   // majority-th highest applied index IS the configuration's committed-and-applied frontier: it
   // advances iff the cluster is committing, while a real liveness bug (fewer than a quorum advancing)
-  // still trips. Fixes the whole minority-laggard class (VOPR seeds 117/216/285/402/616/666/736/774).
+  // still trips. Fixes the whole minority-laggard class.
   let voter_quorum_applied = |c: &Cluster| -> usize {
     let mut a: std::vec::Vec<usize> = voters_snapshot
       .iter()
@@ -991,7 +991,7 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
   // Heal everything and clear all faults, then restart any poisoned nodes (a poisoned node is inert
   // until restarted; quiesce must bring the whole live cluster back to apply the committed history).
   // Heal EVERY isolated-but-not-`gone` node, not just `st.down` (reconcile can prune `st.down` without
-  // un-isolating — see the calm-window heal / VOPR seed 3077).
+  // un-isolating — see the calm-window heal).
   for node in c.isolated_nodes() {
     if !st.gone.contains(&node) {
       c.heal(node);
@@ -1177,8 +1177,8 @@ mod tests {
   /// exercised the hard paths (some crashes AND some partitions). The per-tick safety-oracle suite
   /// runs every tick inside each run and panics on any violation, so a green run is also a proof
   /// that the consensus core held under the composed crash + partition + lossy-network + membership
-  /// schedule. This is the "it works and reaches the hard paths" gate; the exhaustive seed sweep is
-  /// U5's job.
+  /// schedule. This is the "it works and reaches the hard paths" gate; the exhaustive seed sweep
+  /// runs separately.
   #[test]
   fn vopr_smoke_runs_a_few_seeds() {
     let ticks = 2_000;

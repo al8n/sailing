@@ -2,7 +2,7 @@
 //!
 //! [`NetworkFaults`] describes a per-message adversarial delivery schedule — base latency, random
 //! jitter, loss, duplication, and (jitter-induced) reordering — and is **all-off by default** so
-//! M0–M7 + M8-U1 are byte-identical. Faults are applied at the bus-push point in `Cluster::tick`
+//! the faultless bus is byte-identical to the original. Faults are applied at the bus-push point in `Cluster::tick`
 //! (AFTER the structural oracles, which audit what a node SENDS regardless of delivery fate).
 //!
 //! Determinism: every random draw comes from a sim-local SplitMix64 ([`crate::store::FaultPrng`])
@@ -13,7 +13,7 @@ use crate::store::FaultPrng;
 use core::time::Duration;
 
 /// Seeded, faults-as-data injection config for the typed-message bus. **All off by default** (a
-/// faultless, zero-latency, FIFO bus — byte-identical to M0–M7 + M8-U1). Faults are deterministic
+/// faultless, zero-latency, FIFO bus — byte-identical to the original). Faults are deterministic
 /// given the cluster seed and apply per message at the bus-push point.
 ///
 /// Probabilities are expressed in *per mille* (×1000): `drop_per_mille = 150` is a 15% loss. A
@@ -21,7 +21,7 @@ use core::time::Duration;
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NetworkFaults {
   /// Base one-way delivery delay added to every message's `deliver_at`. Default [`Duration::ZERO`]
-  /// (immediate — the zero-latency bus M0–M7 relied on). A nonzero latency alone does NOT reorder
+  /// (immediate — the original zero-latency bus). A nonzero latency alone does NOT reorder
   /// (it shifts every message by the same constant).
   pub latency: Duration,
   /// Maximum EXTRA random delay added per message, drawn seeded-uniform in `[0, jitter]`. Default
@@ -47,7 +47,7 @@ pub struct NetworkFaults {
 
 impl NetworkFaults {
   /// All faults off (the default): zero latency, zero jitter, no loss, no duplication, FIFO. A bus
-  /// configured with `none()` is byte-identical to the M0–M7 + M8-U1 bus.
+  /// configured with `none()` is byte-identical to the original bus.
   pub const fn none() -> Self {
     Self {
       latency: Duration::ZERO,

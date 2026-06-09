@@ -34,7 +34,7 @@ impl ReadOnlyOption {
 }
 
 /// Static configuration for an [`crate::Endpoint`]. Holds the initial voter set (dynamic
-/// membership via `ConfChange` is M6). `Clone`, not `Copy` (it owns the voter list).
+/// membership is via `ConfChange`). `Clone`, not `Copy` (it owns the voter list).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Config<I> {
   id: I,
@@ -57,7 +57,7 @@ pub struct Config<I> {
   step_down_on_removal: bool,
   /// Enable the PreVote extension (§9.6 of the Raft thesis). A node probes for a quorum
   /// of "would-grant" responses before incrementing its term. Prevents a partitioned node
-  /// from inflating the cluster term when it rejoins. Default: `false` (M1–M6 behavior).
+  /// from inflating the cluster term when it rejoins. Default: `false`.
   pre_vote: bool,
   /// Enable CheckQuorum. A leader that does not hear from a quorum of peers within an
   /// election timeout steps down. Pairs with `ReadOnlyOption::LeaseBased`. Default: `false`.
@@ -112,7 +112,7 @@ impl<I: NodeId> Config<I> {
   /// id. This makes `is_voter(new_id) = false` in the new node's initial Tracker, so it
   /// cannot campaign and cannot disrupt an existing election.
   ///
-  /// Differs from [`try_new`] only by skipping the `id ∈ voters` validation.
+  /// Differs from [`Self::try_new`] only by skipping the `id ∈ voters` validation.
   pub fn try_new_observer(
     id: I,
     current_voters: Vec<I>,

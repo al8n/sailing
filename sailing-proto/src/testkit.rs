@@ -274,7 +274,7 @@ pub(crate) struct AsyncStable {
   snapshot: Option<(SnapshotMeta<u64>, Bytes)>,
   /// When set, the NEXT `submit_snapshot` persists the durable snapshot but DROPS its
   /// `SnapshotWritten` completion (models a store that coalesces/loses the completion while
-  /// still making the blob durable). Used by the review-I9 reconciliation test.
+  /// still making the blob durable). Used by the reconciliation test.
   drop_next_snapshot_completion: bool,
 }
 
@@ -299,7 +299,7 @@ impl AsyncStable {
   }
 
   /// Arm the store so the next `submit_snapshot` persists the durable snapshot but drops its
-  /// `SnapshotWritten` completion (review I9). The blob remains readable via `snapshot()`.
+  /// `SnapshotWritten` completion. The blob remains readable via `snapshot()`.
   pub(crate) fn drop_next_snapshot_completion(&mut self) {
     self.drop_next_snapshot_completion = true;
   }
@@ -321,7 +321,7 @@ impl StableStore for AsyncStable {
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<u64>, data: Bytes) {
     // The blob is always made durable (readable via `snapshot()`).
     self.snapshot = Some((meta, data));
-    // The completion is enqueued unless this submit is armed to drop it (review I9).
+    // The completion is enqueued unless this submit is armed to drop it.
     if self.drop_next_snapshot_completion {
       self.drop_next_snapshot_completion = false;
     } else {

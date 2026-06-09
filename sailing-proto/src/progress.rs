@@ -1,6 +1,6 @@
-//! Per-peer replication progress (Raft §replication). M2 uses Probe/Replicate with naive
-//! one-step back-off on reject; M4 adds the `Inflights` window + term-skip reject hints;
-//! M5 adds `Snapshot` (peer is receiving an InstallSnapshot).
+//! Per-peer replication progress (Raft §replication). Probe/Replicate drive normal
+//! replication (one-step back-off on reject) with an `Inflights` window + term-skip reject
+//! hints; `Snapshot` covers a peer that is receiving an InstallSnapshot.
 use crate::{Index, Inflights};
 
 /// How the leader is currently replicating to a peer.
@@ -155,7 +155,7 @@ impl Progress {
   }
 
   /// Clear the Probe pause flag without changing state — used by HeartbeatResp so a
-  /// stalled Probe peer resumes on the next heartbeat round (M4 Task 6).
+  /// stalled Probe peer resumes on the next heartbeat round.
   pub fn clear_probe_pause(&mut self) {
     self.msg_app_flow_paused = false;
   }
@@ -169,8 +169,9 @@ impl Progress {
   /// Set or clear the `recent_active` flag (called on inbound messages from this peer while
   /// we are the leader, and cleared by `Tracker::reset_recent_active` each CheckQuorum tick).
   #[inline(always)]
-  pub fn set_recent_active(&mut self, v: bool) {
+  pub fn set_recent_active(&mut self, v: bool) -> &mut Self {
     self.recent_active = v;
+    self
   }
 
   /// etcd `FreeFirstOne`: if this peer is in `Replicate` state with a full in-flight window
@@ -202,8 +203,9 @@ impl Progress {
   }
 
   /// Directly set `next_index` (used by the term-skip reject handler after `become_probe`).
-  pub fn set_next_index(&mut self, n: Index) {
+  pub fn set_next_index(&mut self, n: Index) -> &mut Self {
     self.next_index = n;
+    self
   }
 }
 
@@ -243,7 +245,7 @@ mod tests {
     assert!(p.is_paused()); // window (2) now full
   }
 
-  // --- Task 3: ProgressState::Snapshot ---
+  // --- ProgressState::Snapshot ---
 
   #[test]
   fn snapshot_state_as_str_and_predicate() {

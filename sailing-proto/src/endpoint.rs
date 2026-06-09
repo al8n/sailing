@@ -1,5 +1,5 @@
-//! The Sans-I/O Raft core. M0 is a no-op skeleton: it owns state and exposes the
-//! `handle_*`/`poll_*` surface. M1 fills in leader election. M2 adds log replication.
+//! The Sans-I/O Raft core. It owns the consensus state and exposes the
+//! `handle_*`/`poll_*` surface; leader election and log replication run through it.
 use crate::{
   Config, Event, Index, Instant, LogStore, Message, NodeId, Outgoing, Prng, ReadOnly, StableStore,
   StateMachine, Term,
@@ -178,7 +178,7 @@ where
   /// this, and stamped into every term/vote write so a stale read-back can never regress the
   /// durable commit. Without persisting it, a crash with no snapshot loses the commit
   /// watermark and `restart` rebuilds an empty/snapshot-only state machine despite a durable
-  /// committed log (review C1). Init `Index::ZERO` in `new`; init to the recovered commit in
+  /// committed log. Init `Index::ZERO` in `new`; init to the recovered commit in
   /// `restart` (so the choke-point doesn't immediately re-persist an unchanged value).
   committed_persisted: Index,
   prng: Prng,
@@ -211,7 +211,7 @@ where
   /// Completion contract: the normal path clears this field when the matching `SnapshotWritten`
   /// completion drains through `handle_storage`'s poll loop. If that completion is dropped or
   /// coalesced by a store (so it never arrives), `handle_storage` instead RECONCILES this field
-  /// against the durable snapshot (review I9): once `StableStore::snapshot()` reports a persisted
+  /// against the durable snapshot: once `StableStore::snapshot()` reports a persisted
   /// snapshot whose `last_index >= up_to`, the blob is durable, the deferred compaction is
   /// performed, and this field is cleared — so a missed completion can no longer wedge future
   /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
@@ -220,7 +220,7 @@ where
   /// Log index of the most recently appended (not-yet-applied) `ConfChange` entry.
   ///
   /// Initialized to `Index::ZERO` in both `new` and `restart`. On restart, ZERO is acceptable
-  /// for M6 — a more precise scan of the durable log to find any pending ConfChange entry is a
+  /// — a more precise scan of the durable log to find any pending ConfChange entry is a
   /// future refinement. If a ConfChange entry is in the log but not yet applied after restart,
   /// the one-in-flight guard will be permissive (ZERO <= applied), but correctness is maintained
   /// because the entry will still be applied exactly once in `apply_committed`.
@@ -330,7 +330,7 @@ where
   ///
   /// Read-only observability accessor: exposes the in-memory `commit` watermark for
   /// verification harnesses (the simulator's per-tick safety oracles read it to check
-  /// commit monotonicity, quorum-durability, and the recovered-commit/C1 durability
+  /// commit monotonicity, quorum-durability, and the recovered-commit durability
   /// invariant). The proto never mutates state through this; it is a pure observer.
   #[inline(always)]
   pub const fn commit_index(&self) -> Index {
@@ -434,12 +434,12 @@ where
   /// several transitions can leave a node a voter without a timer: adopting a higher term and
   /// stepping down on a RESPONSE message (no handler re-arm), and a learner→voter promotion applied
   /// with no current leader to heartbeat it. Rather than remember to arm at each such site (a
-  /// fragility that already caused two distinct livelock bugs — VOPR seeds 0/88), we enforce the
+  /// fragility that already caused two distinct livelock bugs), we enforce the
   /// invariant centrally here, after the entry point has finished mutating role/term/membership.
   ///
   /// This is a SAFETY NET, not a reset: it arms ONLY when the deadline is currently absent, so it
   /// never postpones an already-running timer (resetting a live timer on every higher-term adoption
-  /// regressed VOPR seed 61). The legitimate resets — leader contact (heartbeat/append/snapshot),
+  /// regressed liveness under an adversarial schedule). The legitimate resets — leader contact (heartbeat/append/snapshot),
   /// granting a vote, starting a campaign, a CheckQuorum step-down — remain explicit at their own
   /// sites and set a fresh deadline; this no-ops for them. Leaders are skipped (a leader owns its
   /// heartbeat timer, and with CheckQuorum it repurposes `election_deadline` for the quorum check);
@@ -458,7 +458,7 @@ where
   }
 
   /// Step down to Follower at the SAME term (no term bump): used by CheckQuorum when the
-  /// leader can no longer reach a quorum. (The U6 self-removal step-down is separate and
+  /// leader can no longer reach a quorum. (The self-removal step-down is separate and
   /// inlined in `apply_committed` — it disarms the election timer because a removed
   /// non-voter must never campaign, the opposite of this helper.)
   ///
@@ -503,8 +503,8 @@ where
   ///   poison. Surfacing a deadline a poisoned node will never act on wedges the event-driven driver:
   ///   it advances `now` to that deadline, the timeout fires as a no-op, the deadline stays due, and
   ///   the clock can never advance past it — freezing the WHOLE cluster (no other node's timer can
-  ///   fire). A poisoned node is revived only by an external `restart`, not by a timer. (Surfaced by
-  ///   the VOPR: a poisoned, already-removed voter froze `now` and starved every election — seed 88.)
+  ///   fire). A poisoned node is revived only by an external `restart`, not by a timer (a poisoned,
+  ///   already-removed voter that froze `now` would starve every election).
   /// - `Heartbeat`: the leader always services its heartbeat deadline.
   /// - `Election`: the leader services it only when `check_quorum` is enabled (CheckQuorum
   ///   tick); a follower/candidate services it only when it is a voter (non-voters never
@@ -546,7 +546,7 @@ where
   }
 
   /// The current committed-configuration membership ([`ConfState`](crate::ConfState)) derived from
-  /// the runtime [`Tracker`](crate::tracker::Tracker).
+  /// the runtime `Tracker`.
   ///
   /// This reflects the LIVE configuration (it tracks every applied `ConfChange`), not just the static
   /// bootstrap seed from `Config.voters`, so snapshots and restarts carry the correct membership.
@@ -639,12 +639,12 @@ where
     let Some(pr) = self.tracker.progress(&peer).cloned() else {
       return;
     };
-    // M4 Task 4: respect the in-flight window — if paused, don't send.
+    // Respect the in-flight window — if paused, don't send.
     if pr.is_paused() {
       return;
     }
 
-    // M5 Task 5: if the entries this peer needs have been compacted into a snapshot
+    // If the entries this peer needs have been compacted into a snapshot
     // (next_index strictly below first_index), an AppendEntries cannot carry a valid
     // prev_log_term across the compaction boundary — send the snapshot instead.
     // At next_index == first_index the normal path still works: prev_index == offset
@@ -682,7 +682,7 @@ where
       std::vec::Vec::new()
     };
 
-    // M4 Task 4: cap at max_size_per_msg bytes, but always send at least one entry.
+    // Cap at max_size_per_msg bytes, but always send at least one entry.
     let max_bytes = self.config.max_size_per_msg();
     let entries = if all_entries.is_empty() || max_bytes == u64::MAX {
       all_entries
@@ -727,7 +727,7 @@ where
       )),
     );
 
-    // M4 Task 4: record the send so the window tracks in-flight messages.
+    // Record the send so the window tracks in-flight messages.
     // For Probe: only pause when we sent a partial batch (byte-capped); a full send leaves
     // nothing to throttle and pausing would stall subsequent proposes unnecessarily.
     // For Replicate: only record non-empty sends — an empty AppendEntries (heartbeat probe
@@ -743,8 +743,7 @@ where
     }
   }
 
-  /// Liveness fix (review I1): re-send the persisted snapshot to a peer that is stuck in
-  /// `Snapshot` state.
+  /// Re-send the persisted snapshot to a peer that is stuck in `Snapshot` state.
   ///
   /// A peer in `Snapshot` state is unconditionally paused, so `maybe_send_append`
   /// early-returns for it. It only leaves Snapshot state via `maybe_update(n >= pending)`,
@@ -773,7 +772,7 @@ where
     //   old: matches.sort(); candidate = matches[n - (n/2+1)]
     //   new: MajorityConfig::committed_index does exactly that sort+pick internally.
     // A degenerate Tracker with the static seed (voters = config seed, outgoing empty,
-    // no learners) returns the same value — M0–M5 tests are therefore unaffected.
+    // no learners) returns the same value.
     let candidate = self.tracker.quorum_committed();
     // §5.4.2: only commit an entry from the CURRENT term by counting replicas.
     let current_term = log.term(candidate).map(|t| t == self.term).unwrap_or(false);
@@ -820,7 +819,7 @@ where
       return;
     }
 
-    // Real vote path (unchanged from M1–M6).
+    // Real vote path.
     let can_vote = self.voted_for.is_none() || self.voted_for == Some(rv.candidate());
     if can_vote && log_ok {
       self.voted_for = Some(rv.candidate());
@@ -829,7 +828,7 @@ where
       // Stamp the current commit too: we read-modify `hard_state()` then override fields, so
       // without this the write would carry a possibly-stale `hard_state().commit` and could
       // REGRESS the durable commit below a value the handle_storage choke-point already wrote.
-      // `self.commit` is monotonic, so stamping it keeps the durable commit monotonic (C1).
+      // `self.commit` is monotonic, so stamping it keeps the durable commit monotonic.
       let opid = self.mint_op_id();
       let hs = stable
         .hard_state()
@@ -892,7 +891,7 @@ where
     if self.tracker.vote_result(&self.votes).is_won() {
       self.become_leader(now, log, stable);
     }
-    // Lost or Pending: stay candidate; the election timeout retries (preserves M1 liveness).
+    // Lost or Pending: stay candidate; the election timeout retries (preserves election liveness).
   }
 }
 
@@ -907,7 +906,7 @@ where
   // surfaced (design spec §6.3). `core::error::Error` is stable in core (no_std-OK).
   F::Error: core::error::Error,
 {
-  /// Drain storage completions. (M3+: append-before-ack / persist-vote.)
+  /// Drain storage completions (append-before-ack / persist-vote).
   pub fn handle_storage<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
   where
     L: LogStore,
@@ -949,7 +948,7 @@ where
     }
 
     // Reconcile a deferred compaction whose `SnapshotWritten` completion was missed or coalesced
-    // by the store (review I9): if the durable snapshot already covers `up_to`, the blob IS safely
+    // by the store: if the durable snapshot already covers `up_to`, the blob IS safely
     // persisted, so the deferred compaction is safe even though we never observed the specific
     // completion. Without this, a single dropped completion would wedge `pending_compact`, and the
     // `is_some()` guard in `maybe_snapshot` would stop ALL future snapshots and compaction, growing
@@ -986,8 +985,8 @@ where
     }
 
     // Persist the advanced commit watermark so a restart recovers it (without this, restart
-    // rebuilds an empty/snapshot-only state machine despite a durable committed log — review
-    // C1). Batched here (runs every driver iteration) rather than on every advance; a crash
+    // rebuilds an empty/snapshot-only state machine despite a durable committed log).
+    // Batched here (runs every driver iteration) rather than on every advance; a crash
     // before this persist only loses a bounded commit suffix that is still in the durable LOG
     // and is re-advanced by the leader on recovery — Leader Completeness guarantees the leader
     // holds those committed entries, so no committed entry is lost, just a brief re-sync.
@@ -1061,7 +1060,7 @@ where
   /// Rebuild a node from durable storage after a crash. If a durable snapshot exists,
   /// restores the state machine from it first, then replays only the post-snapshot
   /// committed tail `(snapshot.last_index .. commit]`. Without a snapshot, replays the
-  /// full committed log from index 1 (the M3 behavior). Returns in `Follower` with the
+  /// full committed log from index 1. Returns in `Follower` with the
   /// election timer armed.
   ///
   /// A corrupt durable snapshot poisons the node (no partial state is applied).
@@ -1104,9 +1103,9 @@ where
             poison_reason = Some(PoisonReason::SnapshotRestore);
           } else {
             applied = meta.last_index();
-            // M6: install the durable membership from the snapshot's ConfState.
+            // Install the durable membership from the snapshot's ConfState.
             // This supersedes the bootstrap seed from Config.voters.
-            // (Replaying ConfChange log entries to further refine membership is U5's job.)
+            // (Replaying ConfChange log entries to further refine membership is handled separately.)
             tracker = crate::Tracker::from_conf_state(
               &meta.conf().clone(),
               meta.last_index(),
@@ -1144,7 +1143,7 @@ where
       commit,
       applied,
       // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
-      // the handle_storage choke-point doesn't immediately re-persist an unchanged value (C1).
+      // the handle_storage choke-point doesn't immediately re-persist an unchanged value.
       committed_persisted: commit,
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
@@ -1306,7 +1305,7 @@ where
         self.transfer_deadline = None;
         // Persist the new term and cleared vote. Stepping down owes no ack, so no Pending entry.
         // Stamp the current commit too (see on_request_vote): a read-modify of `hard_state()`
-        // must not write back a stale `commit` that regresses the durable watermark (C1).
+        // must not write back a stale `commit` that regresses the durable watermark.
         let opid = self.mint_op_id();
         let hs = stable
           .hard_state()
@@ -1319,7 +1318,7 @@ where
         // re-arm) would be left without an election timer — `reconcile_election_timer`, run at the
         // end of this entry point, restores the invariant. We deliberately do NOT arm inline (that
         // would reset an already-running Follower timer on every higher-term adoption — regressed
-        // VOPR seed 61).
+        // liveness under an adversarial schedule).
       }
     }
     // Drop messages from a stale term — with two caveats.
@@ -1512,7 +1511,7 @@ where
 
   /// Propose a v1 (single-op) configuration change on the leader.
   ///
-  /// Normalises the v1 input to a [`ConfChangeV2`] via [`ConfChange::into_v2`] and delegates
+  /// Normalises the v1 input to a [`crate::ConfChangeV2`] via [`crate::ConfChange::into_v2`] and delegates
   /// to [`propose_conf_change_v2`][Self::propose_conf_change_v2].
   ///
   /// Returns the assigned log index on success, or an error if:
@@ -1705,7 +1704,7 @@ where
             .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
               idx, conf,
             )));
-          // U6: a leader that this change removed (or demoted to learner) is no longer a voter in the
+          // A leader that this change removed (or demoted to learner) is no longer a voter in the
           // new configuration and must stop acting as leader. `is_voter()` checks BOTH joint halves,
           // so during a joint phase where we are still in the outgoing config we keep leading (we must
           // shepherd the joint → simple transition). We only step down once removed from BOTH halves.
@@ -1750,7 +1749,7 @@ where
   ///
   /// `transfer` must be `true` when called from `on_timeout_now` (leader-transfer path):
   /// it sets `leader_transfer: true` on the broadcast `RequestVote` so that granters bypass
-  /// their CheckQuorum/PreVote lease check (U3's `!force` guard).  For normal elections
+  /// their CheckQuorum/PreVote lease check (the `!force` guard).  For normal elections
   /// (election-timeout path, pre-vote quorum reached) pass `transfer = false`.
   fn become_candidate<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
@@ -1776,7 +1775,7 @@ where
     self.votes.insert(self.config.id(), true);
     // Persist (term, self-vote). No Pending entry — a candidate doesn't owe an ack.
     // Stamp the current commit too (see on_request_vote): a read-modify of `hard_state()`
-    // must not write back a stale `commit` that regresses the durable watermark (C1).
+    // must not write back a stale `commit` that regresses the durable watermark.
     let opid = self.mint_op_id();
     let hs = stable
       .hard_state()
@@ -1927,7 +1926,7 @@ where
         Some(self.config.id()),
       )));
 
-    // Broadcast heartbeats (M1 contract) and kick off replication to peers.
+    // Broadcast heartbeats and kick off replication to peers.
     self.broadcast_heartbeat(now);
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       self.maybe_send_append(peer, log, stable);
@@ -1957,7 +1956,7 @@ where
     // (the benign empty-read break in `apply_committed`) when commit last advanced. If we only
     // applied on a commit advance, an idle (commit-stable) follower would stay wedged with
     // `applied < commit` forever. Applying whenever `applied < commit` is idempotent (a no-op when
-    // already caught up) and closes that wedge. (Surfaced by the VOPR: seed 42, tick 6783.)
+    // already caught up) and closes that wedge.
     if self.applied < self.commit {
       self.apply_committed(log);
     }
@@ -2001,7 +2000,7 @@ where
 
     let (term, me) = (self.term, self.config.id());
     if !consistent {
-      // M4 Task 5 (updated): etcd's two-sided reject hint — uniform for both the
+      // etcd's two-sided reject hint — uniform for both the
       // term-mismatch and the simply-behind case. This makes the hint O(terms) rather
       // than O(entries): start from min(prev_log_index, last_index) on the FOLLOWER's log
       // and walk down while the term exceeds the leader's prev_log_term. The resulting
@@ -2056,8 +2055,7 @@ where
         // advances the leader's match for this peer past what the peer durably holds and can drive a
         // commit the peer cannot back. This arises in the async fsync window when a follower acks a
         // suffix and a conflicting AppendEntries (e.g. a reordered/duplicate one) truncates it before
-        // the ack leaves the outgoing queue — VOPR seed 3395 @4000, where node 5 acked 2181 after
-        // truncating to 2032. The new suffix's own ack is registered below.
+        // the ack leaves the outgoing queue. The new suffix's own ack is registered below.
         let truncate_from = entries[i].index();
         self.outgoing.retain(|o| {
           !matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() >= truncate_from)
@@ -2086,7 +2084,7 @@ where
     // Always attempt to apply when `applied < commit` (not only on a commit advance): apply can lag
     // commit via the benign empty-read break in `apply_committed` (the committed entry was not yet
     // in the durable read view when commit advanced), and an idle follower would otherwise stay
-    // wedged. Idempotent when already caught up. (Surfaced by the VOPR: seed 42, tick 6783.)
+    // wedged. Idempotent when already caught up.
     if self.applied < self.commit {
       self.apply_committed(log);
     }
@@ -2116,7 +2114,7 @@ where
     }
   }
 
-  /// M4 Task 6 + liveness fix + M7-U4 ReadIndex acks.
+  /// Handle a `HeartbeatResp` from a peer.
   ///
   /// A HeartbeatResp from a peer:
   /// 1. Clears the peer's probe pause (so stalled replication resumes).
@@ -2143,7 +2141,7 @@ where
     }
     self.maybe_send_append(from, log, stable);
 
-    // Liveness fix (review I1): if this peer is still in Snapshot state and has NOT yet
+    // Liveness fix: if this peer is still in Snapshot state and has NOT yet
     // caught up to its pending snapshot index, RE-SEND the snapshot. The single
     // `InstallSnapshot` emitted by maybe_send_append's compacted-hole branch may have been
     // dropped; a Snapshot-state peer is unconditionally paused so maybe_send_append above
@@ -2193,20 +2191,21 @@ where
       let confirmed = self.read_only.advance(ctx_bytes.as_ref());
       let (term, me) = (self.term, self.config.id());
       for st in confirmed {
-        match st.req_from {
+        let (context, req_from, index) = st.into_parts();
+        match req_from {
           None => {
             // Local leader read — emit ReadState event.
             self
               .events
               .push_back(crate::Event::ReadState(crate::ReadState::new(
-                st.index, st.context,
+                index, context,
               )));
           }
           Some(follower) => {
             // Forwarded read — reply ReadIndexResp to the originating follower.
             self.send(
               follower,
-              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, st.index, st.context)),
+              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, index, context)),
             );
           }
         }
@@ -2302,20 +2301,19 @@ where
           let confirmed = self.read_only.advance(context.as_ref());
           let (term, me2) = (self.term, me);
           for st in confirmed {
-            match st.req_from {
+            let (context, req_from, index) = st.into_parts();
+            match req_from {
               None => {
                 self
                   .events
                   .push_back(crate::Event::ReadState(crate::ReadState::new(
-                    st.index, st.context,
+                    index, context,
                   )));
               }
               Some(follower) => {
                 self.send(
                   follower,
-                  Message::ReadIndexResp(crate::ReadIndexResp::new(
-                    term, me2, st.index, st.context,
-                  )),
+                  Message::ReadIndexResp(crate::ReadIndexResp::new(term, me2, index, context)),
                 );
               }
             }
@@ -2369,7 +2367,7 @@ where
   /// between this request and the eventual [`Event::ReadState`](crate::Event::ReadState)
   /// (locally) or [`ReadIndexResp`](crate::ReadIndexResp) (when forwarded to the leader).
   /// Reusing a `context` that is already in flight (including the **empty** context for two
-  /// concurrent reads) returns [`ReadIndexError::DuplicateContext`]; the prior read's single
+  /// concurrent reads) returns [`crate::ReadIndexError::DuplicateContext`]; the prior read's single
   /// confirmation would otherwise be the only acknowledgement for both calls.
   ///
   /// `Ok(())` means the read was accepted onto a confirmation path; the caller should wait for
@@ -2384,9 +2382,9 @@ where
   ///   `check_quorum` is disabled the request degrades to the Safe path so the
   ///   misconfiguration is safe rather than silently non-linearizable.
   /// - **Follower:** forwards a `ReadIndex` message to the known leader.  Returns
-  ///   [`ReadIndexError::NoLeader`] if no leader is known, or
-  ///   [`ReadIndexError::ForwardingDisabled`] if `disable_proposal_forwarding` is set.
-  /// - **Candidate / PreCandidate:** returns [`ReadIndexError::NoLeader`] (no leader to confirm).
+  ///   [`crate::ReadIndexError::NoLeader`] if no leader is known, or
+  ///   [`crate::ReadIndexError::ForwardingDisabled`] if `disable_proposal_forwarding` is set.
+  /// - **Candidate / PreCandidate:** returns [`crate::ReadIndexError::NoLeader`] (no leader to confirm).
   ///
   /// A poisoned node returns `Ok(())` without effect (it is inert; the driver should already be
   /// stopping on `poison_reason()`).
@@ -2512,7 +2510,7 @@ where
       return;
     };
     if resp.reject() {
-      // M4 Task 5: use the term-skip hint to jump next_index forward in one step.
+      // Use the term-skip hint to jump next_index forward in one step.
       // find_conflict_by_term walks the leader's log from reject_hint_index downward
       // until we find an entry whose term ≤ reject_hint_term (the follower's conflicting
       // term). This lets the leader skip a whole conflicting term in O(terms) round-trips.
@@ -2527,8 +2525,8 @@ where
       // `find_conflict_by_term` bottomed out at 0) jumps straight to index 1 in a single step rather
       // than walking down one index per reject. The one-index decrement is recovered automatically
       // for a stale/unhelpful hint (`conflict >= cur_next` ⇒ `conflict+1 > rejected_prev` ⇒ the `min`
-      // picks `rejected_prev = cur_next-1`). (VOPR seed 7 was pathologically slow on the O(entries)
-      // walk — thousands of reject round-trips compressed into each instant-delivery tick.)
+      // picks `rejected_prev = cur_next-1`). (The O(entries) walk was pathologically slow —
+      // thousands of reject round-trips compressed into each instant-delivery tick.)
       let rejected_prev = cur_next.get().saturating_sub(1);
       let safe_next = Index::new(core::cmp::max(
         core::cmp::min(rejected_prev, conflict.get() + 1),
@@ -2542,7 +2540,7 @@ where
       self.maybe_send_append(from, log, stable);
     } else {
       // Capture the state BEFORE maybe_update so we can guard the Probe -> Replicate
-      // transition (review I5). etcd's MsgAppResp handler only switches Probe -> Replicate
+      // transition. etcd's MsgAppResp handler only switches Probe -> Replicate
       // on the first successful ack.
       let state_before = pr.state();
       if pr.maybe_update(resp.match_index()) {
@@ -2583,7 +2581,7 @@ where
     }
   }
 
-  /// M5-U2c: receive an `InstallSnapshot` from the current leader (follower path).
+  /// Receive an `InstallSnapshot` from the current leader (follower path).
   fn on_install_snapshot<L, S>(
     &mut self,
     now: Instant,
@@ -2670,16 +2668,16 @@ where
     // consistent with the commit/applied we just advanced (apply_committed reads it synchronously).
     // The snapshot blob is persisted separately via submit_snapshot (deferred completion). The
     // restore-vs-blob durability window is governed by the NORMATIVE durability-ordering contract on
-    // `LogStore::restore` (review I8): a disk-backed log must not make the re-baseline durable ahead
+    // `LogStore::restore`: a disk-backed log must not make the re-baseline durable ahead
     // of the blob, and otherwise must rely on restart re-sync. We do NOT rely on intra-call
-    // ordering: if the process crashes before the blob is durable, restart-from-snapshot (M5-U3)
-    // finds no durable snapshot and re-syncs from the leader — and with commit persistence (review
-    // C1) the restart recovers the real commit watermark, so the re-sync resumes from the right
+    // ordering: if the process crashes before the blob is durable, restart-from-snapshot
+    // finds no durable snapshot and re-syncs from the leader — and with commit persistence
+    // the restart recovers the real commit watermark, so the re-sync resumes from the right
     // point. Acking before the blob is durable is safe because meta.last_index <= leader.commit —
     // those entries are already quorum-committed, so this ack cannot advance the cluster commit.
     log.restore(meta.last_index(), meta.last_term());
 
-    // Tripwire (review I8): the install just advanced commit/applied to `meta.last_index` and the
+    // Tripwire: the install just advanced commit/applied to `meta.last_index` and the
     // re-baseline must have taken effect, so the log read-view now reflects the snapshot boundary:
     // first_index == last_index + 1. This documents and cheaply checks the synchronous-read-view
     // invariant that the deferred-blob durability contract depends on.
@@ -2698,7 +2696,7 @@ where
       .events
       .push_back(crate::Event::SnapshotInstalled(meta.clone()));
 
-    // Step 7 (M6): install the membership from the snapshot's ConfState. A follower
+    // Step 7: install the membership from the snapshot's ConfState. A follower
     // installing a snapshot jumps directly to the committed membership at that point;
     // the Tracker is rebuilt from the snapshot's conf, superseding the prior config.
     self.tracker = crate::Tracker::from_conf_state(
@@ -2717,7 +2715,7 @@ where
     );
   }
 
-  /// M5-U2c: receive a `SnapshotResp` from a follower (leader path).
+  /// Receive a `SnapshotResp` from a follower (leader path).
   fn on_snapshot_resp<L, S>(
     &mut self,
     now: Instant,
@@ -2881,7 +2879,7 @@ mod tests {
     assert_eq!(ep.id(), 1u64);
     assert!(ep.poll_message().is_none());
     assert!(ep.poll_event().is_none());
-    // M1: election timer is armed immediately on construction
+    // election timer is armed immediately on construction
     assert!(ep.poll_timeout().is_some());
   }
 
@@ -3030,7 +3028,7 @@ mod tests {
     ));
   }
 
-  // --- M2 tests ---
+  // --- log-replication tests ---
 
   #[test]
   fn become_leader_appends_noop_and_inits_progress() {
@@ -3334,7 +3332,7 @@ mod tests {
     );
   }
 
-  // --- M3 Task 5: restart test ---
+  // --- restart test ---
 
   /// Encode a Bytes command through the Data codec (as propose does internally).
   fn encode_cmd(b: &[u8]) -> bytes::Bytes {
@@ -3392,8 +3390,8 @@ mod tests {
   /// Apply-time membership regression (etcd, spec §9): on restart the configuration is reconstructed
   /// from the COMMITTED log prefix only — `apply_committed` re-folds the committed ConfChanges — and an
   /// UNCOMMITTED ConfChange in the log tail does NOT take effect. So `conf_state()` after restart is
-  /// exactly the committed voter set, never an uncommitted one (the golden invariant the membership
-  /// audit settled on: the configuration follows the APPLIED prefix, not the raw log).
+  /// exactly the committed voter set, never an uncommitted one (the configuration follows the
+  /// APPLIED prefix, not the raw log).
   ///
   /// Scenario: genesis is the 5-voter cluster {1,2,3,4,5}. The durable log holds two RemoveNode
   /// conf-changes — drop 4 at index 1 (COMMITTED, commit=1) and drop 5 at index 2 (UNCOMMITTED). The
@@ -3462,7 +3460,7 @@ mod tests {
     );
   }
 
-  /// Review C1 regression: a node that commits+applies entries [1..N] through the REAL path
+  /// A node that commits+applies entries [1..N] through the REAL path
   /// (self-elect → propose → handle_storage drains the append, advances commit, applies, AND
   /// now persists the commit watermark to HardState) must, after a `restart` from the SAME
   /// stores with NO snapshot, recover `commit == N`, `applied == N`, and a state machine that
@@ -3531,7 +3529,7 @@ mod tests {
     assert_eq!(
       stable.hard_state().commit(),
       expected_commit,
-      "handle_storage must persist the advanced commit watermark into HardState (C1)"
+      "handle_storage must persist the advanced commit watermark into HardState"
     );
 
     // Restart from the SAME log + stable with NO snapshot.
@@ -3549,20 +3547,20 @@ mod tests {
     );
     assert_eq!(
       restarted.commit, expected_commit,
-      "restart must recover the durable commit watermark, not collapse to applied/0 (C1)"
+      "restart must recover the durable commit watermark, not collapse to applied/0"
     );
     assert_eq!(
       restarted.applied, expected_commit,
-      "restart must replay the committed tail so applied catches up to commit (C1)"
+      "restart must replay the committed tail so applied catches up to commit"
     );
     assert_eq!(
       restarted.state_machine().count(),
       N,
-      "restarted SM must reflect all N committed entries, not be empty (C1)"
+      "restarted SM must reflect all N committed entries, not be empty"
     );
   }
 
-  // --- M3 extra: single-node leader commits after storage drain ---
+  // --- single-node leader commits after storage drain ---
 
   #[test]
   fn single_node_leader_commits_after_storage_drain() {
@@ -3602,7 +3600,7 @@ mod tests {
     );
   }
 
-  // --- M3 tests ---
+  // --- persistence tests ---
 
   #[test]
   fn op_ids_are_minted_distinctly() {
@@ -3620,7 +3618,7 @@ mod tests {
     assert_eq!(b.get(), a.get() + 1);
   }
 
-  /// Task 3 (M3): A granted vote must be withheld until the HardState write is durable.
+  /// A granted vote must be withheld until the HardState write is durable.
   /// Uses `AsyncStable` which releases completions only on `poll`.
   #[test]
   fn vote_grant_waits_for_durable_hard_state() {
@@ -3663,7 +3661,7 @@ mod tests {
     );
   }
 
-  /// Regression (M3): A vote grant for term N must NOT be emitted when storage drains
+  /// Regression: A vote grant for term N must NOT be emitted when storage drains
   /// if the node has since advanced to a higher term. Without the fix two grants would be
   /// emitted — one to candidate 1 (term 5, stale) and one to candidate 3 (term 6) — both
   /// stamped term 6, giving two leaders.
@@ -3762,7 +3760,7 @@ mod tests {
     );
   }
 
-  /// Task 4 (M3): A follower must not send AppendResp until the new log entries are durable.
+  /// A follower must not send AppendResp until the new log entries are durable.
   /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
   #[test]
   fn follower_ack_waits_for_durable_append() {
@@ -3819,7 +3817,7 @@ mod tests {
   /// whose durable log holds an orphan entry whose index == its last_index) would otherwise
   /// commit+apply that stale entry on `min(hb.commit, last_index)`. Etcd's `min(committed,
   /// pr.Match)` rule. Without this clamp the cluster loses a committed entry / applies a
-  /// phantom one (caught by the holistic-review chaos probe as UNSOUND-COMMIT).
+  /// phantom one.
   #[test]
   fn heartbeat_commit_is_clamped_to_peer_match() {
     use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
@@ -3907,7 +3905,7 @@ mod tests {
     );
   }
 
-  // ---- M4 Task 4: leader pacing ----
+  // ---- leader pacing ----
 
   /// A leader in Replicate mode with a window of 2 in-flight messages must stop sending
   /// once both slots are occupied, and resume after an ack frees a slot.
@@ -4030,7 +4028,7 @@ mod tests {
     );
   }
 
-  /// Review I5 regression: a SINGLE-entry ack from a peer already in Replicate must NOT
+  /// A SINGLE-entry ack from a peer already in Replicate must NOT
   /// rewind `next_index` or reset the in-flight window. The old code called
   /// `become_replicate()` unconditionally on every successful ack, which rewound
   /// `next_index` to `match.next()` and reset the whole `Inflights` window — so the next
@@ -4217,7 +4215,7 @@ mod tests {
     );
   }
 
-  // ---- M4 Task 5: term-skip reject hint ----
+  // ---- term-skip reject hint ----
 
   /// A divergent follower's reject carries a term hint that lets the leader skip a whole
   /// conflicting term instead of backing off one entry at a time.
@@ -4460,7 +4458,7 @@ mod tests {
   /// (etcd `Progress.MaybeDecrTo`'s `min(rejected, hint+1)`), NOT decrement one index per reject. The
   /// naive one-at-a-time walk is O(entries) round-trips; under the simulator's instant delivery that
   /// is thousands of reject cycles compressed into a single tick, making a run pathologically slow.
-  /// (VOPR seed 7 @2000 was the symptom — a >350s run that the jump cuts to ~20s.)
+  /// (The symptom was a >350s run that the jump cuts to ~20s.)
   ///
   /// Before fix: a `(0,0)` hint took the `conflict == 0` branch and stepped `next_index` back by one.
   #[test]
@@ -4535,7 +4533,7 @@ mod tests {
     );
   }
 
-  // ---- M4 Task 6: heartbeat response resumes a stalled probe ----
+  // ---- heartbeat response resumes a stalled probe ----
 
   /// A peer in Probe mode that has stalled (msg_app_flow_paused set because only a partial
   /// batch was sent due to the byte cap) must resume replication when a HeartbeatResp arrives.
@@ -4609,7 +4607,7 @@ mod tests {
       "while probe is paused, a new propose must NOT trigger an AppendEntries to peer 2"
     );
 
-    // Task 6: a HeartbeatResp from peer 2 must clear msg_app_flow_paused and call
+    // A HeartbeatResp from peer 2 must clear msg_app_flow_paused and call
     // maybe_send_append so the stalled probe resumes immediately.
     ep.handle_message(
       d,
@@ -4934,7 +4932,7 @@ mod tests {
     );
   }
 
-  // ---- M5 Task 4: snapshot threshold + deferred compaction ----
+  // ---- snapshot threshold + deferred compaction ----
 
   /// Helper: elect a single-node leader, drain the no-op, and apply `n` Normal entries.
   /// Returns the endpoint with `applied == n + 1` (no-op + n commands, all committed).
@@ -5058,7 +5056,7 @@ mod tests {
 
   /// Like `make_single_node_leader_with_entries`, but the stable store is armed to DROP the
   /// `SnapshotWritten` completion of the threshold-crossing snapshot while still making the blob
-  /// durable. Models a store that coalesces/loses the completion (review I9). After this returns,
+  /// durable. Models a store that coalesces/loses the completion. After this returns,
   /// `pending_compact` is `Some`, the durable snapshot is readable, but no completion is queued.
   fn make_single_node_leader_dropping_snapshot_completion(
     n: usize,
@@ -5103,7 +5101,7 @@ mod tests {
     (ep, log, stable)
   }
 
-  /// Review I9: a dropped `SnapshotWritten` completion must NOT permanently wedge `pending_compact`
+  /// A dropped `SnapshotWritten` completion must NOT permanently wedge `pending_compact`
   /// (and thus all future snapshots/compaction). `handle_storage` reconciles `pending_compact`
   /// against the durable snapshot: once the persisted snapshot covers `up_to`, the deferred
   /// compaction is performed and the field cleared, even though the completion was never seen.
@@ -5133,17 +5131,17 @@ mod tests {
     );
 
     // Drive handle_storage again. There is NO SnapshotWritten completion to drain, so on OLD code
-    // this would be a no-op and the node would stay wedged. The I9 reconciliation must instead
+    // this would be a no-op and the node would stay wedged. The reconciliation must instead
     // notice the durable snapshot covers `up_to`, perform the compaction, and clear pending_compact.
     ep.handle_storage(crate::Instant::ORIGIN, &mut log, &mut stable);
 
     assert!(
       ep.pending_compact().is_none(),
-      "I9: pending_compact must be reconciled to None against the durable snapshot"
+      "pending_compact must be reconciled to None against the durable snapshot"
     );
     assert!(
       log.first_index() > Index::new(1),
-      "I9: the deferred compaction must run via reconciliation (first_index advanced, got {:?})",
+      "the deferred compaction must run via reconciliation (first_index advanced, got {:?})",
       log.first_index()
     );
 
@@ -5161,7 +5159,7 @@ mod tests {
     }
     assert!(
       ep.pending_compact().is_some(),
-      "I9: after reconciliation the node can snapshot again (not wedged)"
+      "after reconciliation the node can snapshot again (not wedged)"
     );
     // And draining the (this time delivered) completion compacts further, proving end-to-end health.
     ep.handle_storage(d, &mut log, &mut stable);
@@ -5176,7 +5174,7 @@ mod tests {
     );
   }
 
-  // ---- M5 Task 5: send InstallSnapshot to lagging follower ----
+  // ---- send InstallSnapshot to lagging follower ----
 
   /// Helper: build a 3-voter leader (node 1) with a compacted log.
   /// Returns the endpoint, a VecLog compacted up to `offset` with the snapshot persisted
@@ -5424,7 +5422,7 @@ mod tests {
     }
   }
 
-  // ---- Review I1: heartbeat-driven snapshot resend (no wedge on dropped InstallSnapshot) ----
+  // ---- heartbeat-driven snapshot resend (no wedge on dropped InstallSnapshot) ----
 
   /// Helper: drive `make_leader_with_compacted_log` peer 2 into Snapshot state and DROP the
   /// resulting InstallSnapshot (clear the outgoing queue), simulating the §11 message loss.
@@ -5461,7 +5459,7 @@ mod tests {
     (ep, log, stable, Index::new(offset))
   }
 
-  /// Review I1 regression: a HeartbeatResp from a peer still stuck in Snapshot state (its
+  /// A HeartbeatResp from a peer still stuck in Snapshot state (its
   /// InstallSnapshot was dropped) must RE-SEND the InstallSnapshot, carrying the same meta.
   ///
   /// FAILS-ON-OLD: without the resend hook the HeartbeatResp produces NO InstallSnapshot
@@ -5520,7 +5518,7 @@ mod tests {
     }
   }
 
-  /// Review I1: the resend STOPS once the follower acks past its pending snapshot index.
+  /// The resend STOPS once the follower acks past its pending snapshot index.
   /// After a SnapshotResp (match >= pending) the peer leaves Snapshot state (→ Probe), so a
   /// subsequent HeartbeatResp must NOT emit another InstallSnapshot (no infinite resend / spam).
   #[test]
@@ -5583,7 +5581,7 @@ mod tests {
     );
   }
 
-  // ---- M5-U2c: InstallSnapshot receive + SnapshotResp ----
+  // ---- InstallSnapshot receive + SnapshotResp ----
 
   /// Encode a `u64` snapshot value into a `Bytes` blob (the wire format used by CountSm).
   fn encode_snapshot(v: u64) -> bytes::Bytes {
@@ -5983,7 +5981,7 @@ mod tests {
     );
   }
 
-  // ---- M5-U2c: LogStore::restore unit tests ----
+  // ---- LogStore::restore unit tests ----
 
   /// After `restore(10, 4)` on a VecLog with arbitrary prior content, the log has the
   /// expected re-baseline invariants.
@@ -6075,7 +6073,7 @@ mod tests {
     );
   }
 
-  // ---- M5-U3: restore-from-snapshot on restart ----
+  // ---- restore-from-snapshot on restart ----
 
   /// Build a `CountSm` snapshot blob for the given count value.
   fn encode_count_snapshot(count: u64) -> bytes::Bytes {
@@ -6210,11 +6208,11 @@ mod tests {
     assert!(!ep.is_poisoned(), "node must not be poisoned");
   }
 
-  /// Test 3: no snapshot (regression) — M3 replay-from-1 still works when
+  /// Test 3: no snapshot (regression) — replay-from-1 still works when
   /// stable.snapshot() is None and the log starts at 1.
   ///
-  /// Updated for review C1 to drive the REAL commit-persist path (a live single-node leader)
-  /// instead of `force_state`-injecting the durable commit. This makes the no-snapshot restart
+  /// Drives the REAL commit-persist path (a live single-node leader) instead of
+  /// `force_state`-injecting the durable commit. This makes the no-snapshot restart
   /// suite genuinely exercise the handle_storage commit-watermark write: the live leader's
   /// `commit` reaches HardState only because of the fix, and the restart reads it back.
   #[test]
@@ -6335,7 +6333,7 @@ mod tests {
     );
   }
 
-  // ── M6-U5: propose_conf_change + apply-at-commit tests ────────────────────────────────────────
+  // ── propose_conf_change + apply-at-commit tests ────────────────────────────────────────
 
   /// Helper: build a single-node leader (node 1) with a VecLog + NoopStable, and drain storage
   /// so the no-op entry at index 1 is committed and applied. Returns (ep, log, stable, d).
@@ -6592,17 +6590,17 @@ mod tests {
     );
   }
 
-  // ── Review findings C1/I1 regression tests ────────────────────────────────────────────────────
+  // ── conf-change regression tests ────────────────────────────────────────────────────
 
   /// Regression: a freshly-elected leader must not accept a new ConfChange while an inherited
-  /// one is uncommitted (review finding C1).
+  /// one is uncommitted.
   ///
   /// Scenario: node 2 is a follower that receives a ConfChange entry from leader 1 but the
   /// entry is NOT committed (leader_commit stays at 0). Node 2 then wins an election and
   /// becomes leader. Its log contains an uncommitted ConfChange at index 2 (the inherited tail).
   /// The one-in-flight guard must fire and refuse a second ConfChange proposal.
   ///
-  /// On the OLD code (before Fix C1): `pending_conf_index` was ZERO on a fresh leader, so
+  /// On the OLD code (before the fix): `pending_conf_index` was ZERO on a fresh leader, so
   /// `ZERO > applied` is false and the second ConfChange was wrongly accepted → Ok(_).
   /// On the FIXED code: `become_leader` sets `pending_conf_index = last_index` (= 2), so
   /// `2 > applied(0)` is true → Err(ConfChangeInFlight).
@@ -6697,7 +6695,7 @@ mod tests {
 
     // Step 3: Now call propose_conf_change(AddNode(5)).
     // The inherited tail (index 2: uncommitted ConfChange) must block this.
-    // Fix C1 sets pending_conf_index = last (= 2) in become_leader; applied = 0;
+    // The fix sets pending_conf_index = last (= 2) in become_leader; applied = 0;
     // so 2 > 0 is true → ConfChangeInFlight.
     let cc_new = ConfChange::new(ConfChangeType::AddNode, 5u64, bytes::Bytes::new());
     let result = ep.propose_conf_change(d, &mut log, &stable, cc_new);
@@ -6705,16 +6703,16 @@ mod tests {
       result,
       Err(ProposeError::ConfChangeInFlight),
       "a freshly-elected leader must refuse a new ConfChange while an inherited one is \
-       uncommitted (review finding C1)"
+       uncommitted"
     );
   }
 
   /// Regression: a committed ConfChange that the Changer rejects must poison the node
-  /// rather than silently stalling apply (review finding I1).
+  /// rather than silently stalling apply.
   ///
   /// Scenario: node 2 (follower) receives an AppendEntries that carries a leave-joint
   /// ConfChange entry and commits it (leader_commit covers it). The node is NOT in joint
-  /// config, so Changer::leave_joint returns Err. Fix I1 adds `self.poison()` in that
+  /// config, so Changer::leave_joint returns Err. The fix adds `self.poison()` in that
   /// branch so the failure is observable rather than a silent apply stall.
   #[test]
   fn changer_error_at_apply_poisons_node() {
@@ -6774,15 +6772,14 @@ mod tests {
     // Drain the deferred append completion so apply_committed runs with the durable entries.
     ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
 
-    // The Changer must have rejected leave_joint (not in joint) → node poisoned (Fix I1).
+    // The Changer must have rejected leave_joint (not in joint) → node poisoned.
     assert!(
       ep.is_poisoned(),
-      "node must be poisoned when Changer rejects a committed ConfChange at apply time \
-       (review finding I1)"
+      "node must be poisoned when Changer rejects a committed ConfChange at apply time"
     );
   }
 
-  // ── M6-U6: leader step-down on self-removal/demotion ─────────────────────────────────────────
+  // ── leader step-down on self-removal/demotion ─────────────────────────────────────────
 
   /// Helper: elect node 1 as leader of a 3-voter cluster {1, 2, 3}, drive the no-op to
   /// committed+applied, then return (ep, log, stable, d).
@@ -6838,7 +6835,7 @@ mod tests {
     (ep, log, stable, d)
   }
 
-  /// Test U6-1: A leader that removes itself (RemoveNode(self)) steps down immediately when
+  /// Test 1: A leader that removes itself (RemoveNode(self)) steps down immediately when
   /// the ConfChange is committed+applied.
   ///
   /// Invariants:
@@ -6911,7 +6908,7 @@ mod tests {
     );
   }
 
-  /// Test U6-2: A leader demoted to learner (AddLearnerNode(self)) also steps down.
+  /// Test 2: A leader demoted to learner (AddLearnerNode(self)) also steps down.
   #[test]
   fn leader_steps_down_on_demotion_to_learner() {
     use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
@@ -6974,7 +6971,7 @@ mod tests {
     );
   }
 
-  /// Test U6-3: A non-voter (learner) that has an election timer fire must NOT become a
+  /// Test 3: A non-voter (learner) that has an election timer fire must NOT become a
   /// candidate. The term must not change and the role must stay Follower.
   #[test]
   fn non_voter_does_not_campaign_on_timeout() {
@@ -7031,7 +7028,7 @@ mod tests {
   /// disarms its `election_deadline` when the timer fires (so the event-driven sim clock can advance
   /// past it) and never re-arms; without re-arming on promotion the new voter would sit forever with
   /// `election_deadline = None` and never start an election — a cluster whose voters were ALL
-  /// promoted learners would wedge leaderless. (Surfaced by the VOPR: seed 88, tick 7347.)
+  /// promoted learners would wedge leaderless.
   ///
   /// Before fix: `apply_committed` updated the tracker on promotion but never armed the timer, so
   /// `election_deadline` stayed `None` and `is_some()` below was false.
@@ -7096,7 +7093,6 @@ mod tests {
   /// etcd's `becomeFollower`). A leader with check_quorum disabled holds `election_deadline = None`; a
   /// higher-term RESPONSE (VoteResp / AppendResp — whose handler returns early without arming) would
   /// otherwise leave it a voter Follower that can NEVER campaign, wedging the cluster leaderless.
-  /// (Surfaced by the VOPR: seed 0 at 2000 ticks, tick 6839.)
   ///
   /// Before fix: the term pre-pass step-down never armed the timer, so a leader stepping down on a
   /// higher-term VoteResp kept `election_deadline = None`.
@@ -7133,7 +7129,7 @@ mod tests {
     );
   }
 
-  /// Test U6-4: With `step_down_on_removal = false`, a leader that removes itself keeps
+  /// Test 4: With `step_down_on_removal = false`, a leader that removes itself keeps
   /// the Leader role (the operator has opted out of the default behavior).
   #[test]
   fn step_down_disabled_leader_keeps_role_after_self_removal() {
@@ -7209,7 +7205,7 @@ mod tests {
     );
   }
 
-  /// Test U6-5: Joint phase — a leader still present in the outgoing joint half must NOT
+  /// Test 5: Joint phase — a leader still present in the outgoing joint half must NOT
   /// step down mid-joint (it must shepherd the joint → simple transition).
   ///
   /// We use `enter_joint` with `auto_leave=false` (Explicit transition) so the leader stays
@@ -7310,7 +7306,7 @@ mod tests {
     );
   }
 
-  // ─── M7-U2: PreVote tests ─────────────────────────────────────────────────────────────────────
+  // ─── PreVote tests ─────────────────────────────────────────────────────────────────────
 
   /// Test 1: A PreCandidate that loses pre-vote stays at the SAME term.
   /// A node with pre_vote=true times out → PreCandidate; peers reject (they have a live leader)
@@ -7857,8 +7853,7 @@ mod tests {
   /// on the disruptive higher-term campaign instead).
   ///
   /// Before fix: the stale-term branch silently `return`ed for every non-pre-vote message, so NO
-  /// response was sent and the lower-term leader never learned it was stale — a permanent livelock
-  /// (surfaced by the VOPR at seed 22, tick 11794).
+  /// response was sent and the lower-term leader never learned it was stale — a permanent livelock.
   #[test]
   fn stale_term_heartbeat_forces_leader_step_down() {
     use crate::{Config, Index, Instant, Message, Term};
@@ -7938,7 +7933,7 @@ mod tests {
     );
   }
 
-  // ─── CheckQuorum (M7-U3) tests ────────────────────────────────────────────────────────────────
+  // ─── CheckQuorum tests ────────────────────────────────────────────────────────────────
 
   /// Helper: build a Config with check_quorum=true for a cluster of `voters` with 1s/100ms.
   fn cq_config(id: u64, voters: std::vec::Vec<u64>) -> crate::Config<u64> {
@@ -8369,7 +8364,7 @@ mod tests {
     );
   }
 
-  // ── M7-U4: ReadIndex tests ─────────────────────────────────────────────────────────────────────
+  // ── ReadIndex tests ─────────────────────────────────────────────────────────────────────
 
   /// Helper: elect node 1 leader in a 3-voter cluster, drain the no-op so the leader has
   /// a committed current-term entry.  Returns (ep, log, stable, now).
@@ -8990,7 +8985,7 @@ mod tests {
     assert_eq!(read_states[0].context().as_ref(), ctx.as_ref());
   }
 
-  // ─── M7-U5: leader transfer tests ────────────────────────────────────────────
+  // ─── leader transfer tests ────────────────────────────────────────────
 
   /// Elect node 1 as leader and return (ep, log, stable) ready for transfer tests.
   /// The log has the no-op at index 1 committed; peer 2's match_index is caught up.
@@ -9510,7 +9505,7 @@ mod tests {
     );
   }
 
-  /// Test 7 (review I-1): Removing the transfer target via a conf change aborts the in-flight
+  /// Test 7: Removing the transfer target via a conf change aborts the in-flight
   /// transfer immediately — proposals must resume without waiting for the deadline.
   ///
   /// Scenario: node 1 is leader of {1, 2, 3}; transfer to node 2 is in flight; then
@@ -9617,7 +9612,7 @@ mod tests {
     // After the conf change applies: the transfer must have been aborted immediately.
     assert!(
       ep.lead_transferee.is_none(),
-      "lead_transferee must be None after the transferee is removed by conf change (review I-1)"
+      "lead_transferee must be None after the transferee is removed by conf change"
     );
     assert!(
       ep.transfer_deadline.is_none(),
@@ -9638,10 +9633,10 @@ mod tests {
   }
 
   // ──────────────────────────────────────────────────────────────────────────────────────────
-  // M7-U6: serviceable-timer filter (timer-wedge defense)
+  // serviceable-timer filter (timer-wedge defense)
   // ──────────────────────────────────────────────────────────────────────────────────────────
 
-  /// U6-T1: `serviceable_now` mirrors the `handle_timeout` dispatch exactly.
+  /// `serviceable_now` mirrors the `handle_timeout` dispatch exactly.
   ///
   /// - Follower: Heartbeat not serviceable; Election serviceable iff voter.
   /// - Leader (no CQ, no transfer): only Heartbeat serviceable.
@@ -9778,7 +9773,7 @@ mod tests {
     let _ = (ep_l, log_leader, stable_leader);
   }
 
-  /// U6-T2: `poll_timeout` never surfaces a non-serviceable deadline.
+  /// `poll_timeout` never surfaces a non-serviceable deadline.
   ///
   /// - A Follower with a stale heartbeat_deadline set returns its election_deadline only.
   /// - A non-voter follower returns `None` even if election_deadline is armed.
@@ -9913,8 +9908,8 @@ mod tests {
   /// poison, so surfacing a deadline wedges the event-driven driver: it advances `now` to that
   /// deadline, the timeout fires as a no-op, the deadline stays due, and the clock can NEVER advance
   /// past it — freezing the whole cluster (no other node's timer can fire). A poisoned node is
-  /// revived only by an external `restart`, never by a timer. (Surfaced by the VOPR: a poisoned,
-  /// already-removed voter froze the simulated clock and starved every election — seeds 0/3/88.)
+  /// revived only by an external `restart`, never by a timer (a poisoned, already-removed voter that
+  /// froze the simulated clock would starve every election).
   ///
   /// Before fix: `serviceable_now` ignored `poisoned`, so a poisoned voter's election timer was
   /// surfaced and `poll_timeout` returned `Some`.
@@ -9948,7 +9943,7 @@ mod tests {
     );
   }
 
-  /// U6-T3: `handle_timeout` → `poll_timeout` makes progress (no busy-wakeup wedge).
+  /// `handle_timeout` → `poll_timeout` makes progress (no busy-wakeup wedge).
   ///
   /// For each role/state, arm the relevant deadline(s) to `now` (or just past it), call
   /// `handle_timeout(now)`, and assert that `poll_timeout` afterwards is either `None` or
@@ -10095,7 +10090,7 @@ mod tests {
     );
   }
 
-  // ── Review C2/I3: fatal apply_committed errors poison (no silent stall) + carry a cause ──────
+  // ── fatal apply_committed errors poison (no silent stall) + carry a cause ──────
 
   /// A state machine whose `apply` returns `Err` for a sentinel command. `Error` is a real
   /// `core::error::Error` (the §6.3 bound). Used to exercise the `PoisonReason::Apply` path.
@@ -10153,7 +10148,7 @@ mod tests {
     )
   }
 
-  /// Regression (review C2 + I3): a committed Normal entry whose `StateMachine::apply` returns
+  /// Regression: a committed Normal entry whose `StateMachine::apply` returns
   /// `Err` must POISON the node with `PoisonReason::Apply` — not silently stall apply — and the
   /// poisoned node must be inert (all `handle_*` are no-ops).
   ///
@@ -10200,12 +10195,12 @@ mod tests {
     // The FSM apply failed → node poisoned, with the precise cause.
     assert!(
       ep.is_poisoned(),
-      "node must be poisoned when StateMachine::apply errors (review C2)"
+      "node must be poisoned when StateMachine::apply errors"
     );
     assert_eq!(
       ep.poison_reason(),
       Some(crate::PoisonReason::Apply),
-      "poison_reason must record the apply failure (review I3)"
+      "poison_reason must record the apply failure"
     );
     // applied is stuck at the pre-apply watermark (the failing entry was never applied).
     assert_eq!(
@@ -10248,7 +10243,7 @@ mod tests {
     );
   }
 
-  /// Regression (review C2 + I3): a committed Normal entry whose `data` does NOT decode as the
+  /// Regression: a committed Normal entry whose `data` does NOT decode as the
   /// SM's `Command` must POISON the node with `PoisonReason::NormalEntryDecode`.
   ///
   /// FAILS-ON-OLD: with the bare `break` the decode error silently stalls apply —
@@ -10295,12 +10290,12 @@ mod tests {
 
     assert!(
       ep.is_poisoned(),
-      "node must be poisoned when a committed Normal entry fails to decode (review C2)"
+      "node must be poisoned when a committed Normal entry fails to decode"
     );
     assert_eq!(
       ep.poison_reason(),
       Some(crate::PoisonReason::NormalEntryDecode),
-      "poison_reason must record the decode failure (review I3)"
+      "poison_reason must record the decode failure"
     );
     assert_eq!(
       ep.applied,

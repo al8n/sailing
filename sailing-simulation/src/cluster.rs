@@ -1,5 +1,5 @@
 //! A deterministic, single-threaded cluster of `Endpoint`s over an in-memory typed-message
-//! bus and a virtual clock. M0 wires the loop; M1+ exercises real consensus through it.
+//! bus and a virtual clock. It wires the run loop that drives real consensus.
 use crate::{
   Checker, ClusterView, DurableEntry, LogSm, MemLog, MemStable, NetworkFaults, NodeView,
   StorageFaults, checker, network::NetPrng,
@@ -82,11 +82,11 @@ pub struct Cluster {
   /// When true, the stores run in [`crate::StoreMode::Async`] (staged writes / fsync-loss window):
   /// `tick` flushes every node's staged writes each step (before draining completions), and a
   /// `crash` that discards in-flight writes loses exactly the un-flushed window. Default false
-  /// (synchronous stores, byte-identical to M0–M7).
+  /// (synchronous stores, byte-identical to the original).
   async_mode: bool,
   /// Seeded network fault model applied per message at the bus-push point (latency/jitter/drop/
   /// duplicate/reorder). Default [`NetworkFaults::none()`] — a faultless, zero-latency, FIFO bus
-  /// byte-identical to M0–M7 + M8-U1. Installed via [`Cluster::set_network_faults`].
+  /// byte-identical to the original bus. Installed via [`Cluster::set_network_faults`].
   net_faults: NetworkFaults,
   /// Seeded network-fault PRNG, on a stream distinct from the per-node store seeds. Drives every
   /// drop/dup roll and jitter draw, so the same cluster seed yields an identical run. Only consumed
@@ -103,7 +103,7 @@ pub struct Cluster {
   /// Count of messages duplicated by the seeded network fault model (each fired duplication counts
   /// once, i.e. the number of EXTRA copies pushed). Non-vacuity counter.
   net_duplicated: u64,
-  /// The per-tick safety-oracle suite (M8-U3). Holds the cross-tick history (commit/term
+  /// The per-tick safety-oracle suite. Holds the cross-tick history (commit/term
   /// monotonicity, the committed-history high-water) and runs the WHOLE oracle suite at the end of
   /// every [`tick`](Self::tick); a violation panics with the oracle name + seed + tick for exact
   /// VOPR replay. A pure observer — it never mutates the simulated nodes/stores and never draws a
@@ -161,7 +161,7 @@ impl Cluster {
 
   /// Shared constructor body. `async_mode` selects [`crate::StoreMode::Async`] stores (seeded with
   /// `seed` for any storage faults); `false` keeps the default synchronous stores so `new` /
-  /// `new_with` are byte-identical to M0–M7.
+  /// `new_with` are byte-identical to the original synchronous behavior.
   fn new_inner(
     n: usize,
     configure: impl Fn(Config<u64>) -> Config<u64> + 'static,
@@ -661,7 +661,7 @@ impl Cluster {
   /// latency/jitter/drop/duplicate/reorder applied at the bus-push point in [`tick`](Self::tick),
   /// AFTER the structural oracles run. Faults are deterministic given the cluster seed (the network
   /// PRNG was seeded from it at construction). Defaults are all-off, so `new`/`new_async` keep a
-  /// faultless, zero-latency, FIFO bus byte-identical to M0–M7 + M8-U1.
+  /// faultless, zero-latency, FIFO bus byte-identical to the original.
   ///
   /// Re-seeds the network-fault PRNG from `seed` and clears the FIFO bookkeeping so the schedule is
   /// reproducible from the call site (pass the cluster seed, or a fresh seed for a distinct stream).
@@ -675,7 +675,7 @@ impl Cluster {
 
   /// Whether node `id` is poisoned (a fatal storage/apply error has made it inert). In async mode
   /// a `transient_read` fault that fires on a committed-range read poisons the node via the
-  /// proto's review-C2 path.
+  /// proto's poison-on-fatal-read path.
   pub fn is_poisoned(&self, id: u64) -> bool {
     let i = self.node_idx[&id];
     self.nodes[i].is_poisoned()
@@ -870,7 +870,7 @@ impl Cluster {
 
   /// Add a new **learner** node with `id` mid-run.
   ///
-  /// Same bootstrap rule as [`add_node`]: the new node starts as a non-voter observer.
+  /// Same bootstrap rule as [`Self::add_node`]: the new node starts as a non-voter observer.
   /// After wiring it into the sim structures, proposes `AddLearnerNode(id)` on the leader.
   ///
   /// Panics if no leader is available.
@@ -890,7 +890,7 @@ impl Cluster {
   ///
   /// Proposes `RemoveNode(id)` on the current leader. The change commits and is applied
   /// by the majority under the current quorum; the node being removed receives the commit
-  /// and applies its own removal (gaining the U6 step-down: role → Follower, election timer
+  /// and applies its own removal (gaining the step-down: role → Follower, election timer
   /// disarmed). Once applied, the node is no longer a voter in any tracker.
   ///
   /// **Agreement oracle handling:** the removed node is tracked in `self.removed` so that the
@@ -910,10 +910,10 @@ impl Cluster {
       .expect("remove_node: a leader must be available to propose RemoveNode");
     // Mark the node as removed so the agreement oracle and min_applied_len skip it.
     // Also isolate it so it does not send spurious RequestVotes after being removed but
-    // before applying the conf change in its own view (the U6 step-down fires when the
+    // before applying the conf change in its own view (the step-down fires when the
     // ConfChange is applied; until then, the node is technically still a voter in its own
     // view and its election timer is still armed). Isolation is a simulation convenience
-    // — a real cluster would rely on U6 to stop the removed node from campaigning.
+    // — a real cluster would rely on the step-down to stop the removed node from campaigning.
     self.removed.insert(id);
     self.isolated.insert(id);
   }
@@ -985,7 +985,7 @@ impl Cluster {
     self.read_states.push(Vec::new());
   }
 
-  /// Capture a read-only [`ClusterView`] snapshot for the per-tick safety oracles ([`crate::checker`]).
+  /// Capture a read-only [`ClusterView`] snapshot for the per-tick safety oracles (the `checker` module).
   ///
   /// Every field is read through a PUBLIC accessor (the proto's
   /// `commit_index()`/`applied_index()`/`term()`/`role()`/`state_machine()`/`is_poisoned()` and the
@@ -1204,8 +1204,8 @@ impl Cluster {
     // ── Structural assertion (a): append-before-ack ──────────────────────────────
     // A success AppendResp must not outrun the node's readable log. (The proto's append-before-ack
     // ordering — deferring a NEW suffix's ack to its durability via `on_log_appended` — is exercised
-    // by the M8-U1 fsync-window integration test; this send-time tripwire is a coarse outran-the-log
-    // guard. It uses the VISIBLE `last_index()` so it stays byte-identical to M0–M7 in sync mode and
+    // by the fsync-window integration test; this send-time tripwire is a coarse outran-the-log
+    // guard. It uses the VISIBLE `last_index()` so it stays byte-identical to the original in sync mode and
     // does not flag the legitimate "duplicate AppendEntries, entries already present" ack path that
     // can fire for a visible-but-in-flight suffix. The per-entry quorum-durability of every COMMITTED
     // index is enforced separately by the `commit_is_quorum_durable` oracle on the durable snapshot.)
@@ -1245,8 +1245,8 @@ impl Cluster {
       }
     }
 
-    // Fast path: faults off ⇒ original behavior (zero-latency, FIFO, single push). Keeps M0–M7 +
-    // M8-U1 byte-identical and never touches the network PRNG or FIFO map.
+    // Fast path: faults off ⇒ original behavior (zero-latency, FIFO, single push). Keeps the
+    // sync path byte-identical to the original and never touches the network PRNG or FIFO map.
     if self.net_faults.is_none() {
       self.bus.push_back(InFlight {
         deliver_at: self.now,
@@ -1423,8 +1423,8 @@ impl Cluster {
     }
 
     // The cluster is now quiescent at this timestamp (delivery + storage drained) — a consistent
-    // observable state. Advance the tick counter and run the WHOLE per-tick safety-oracle suite
-    // (M8-U3). A violation panics with the oracle name + seed + tick for exact VOPR replay. The
+    // observable state. Advance the tick counter and run the WHOLE per-tick safety-oracle suite.
+    // A violation panics with the oracle name + seed + tick for exact VOPR replay. The
     // suite is a pure observer: it reads only public accessors / non-faulting durable seams and
     // never mutates the nodes/stores or draws a PRNG, so the run stays byte-identical and
     // deterministic. (The send-time append-before-ack / one-grant tripwires in `schedule_send`
@@ -1445,7 +1445,7 @@ mod tests {
   fn three_node_cluster_ticks_and_eventually_elects() {
     let mut c = Cluster::new(3);
     assert_eq!(c.size(), 3);
-    // M1: endpoints arm election timers immediately; the cluster should elect a leader.
+    // endpoints arm election timers immediately; the cluster should elect a leader.
     let mut found = false;
     for _ in 0..100 {
       c.tick();
@@ -1476,7 +1476,7 @@ mod tests {
   fn faults_off_is_byte_identical_to_baseline() {
     // A cluster with the network fault model installed as `none()` must produce the EXACT same run
     // as a plain `Cluster::new` (no `deliver_at` change, no drops, no extra PRNG influence). This
-    // is the M0–M7 / M8-U1 byte-identity invariant, made explicit at the cluster level.
+    // is the byte-identity invariant, made explicit at the cluster level.
     let baseline = {
       let mut c = Cluster::new(3);
       drive_and_capture(&mut c, 8)

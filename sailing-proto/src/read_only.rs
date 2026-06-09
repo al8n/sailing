@@ -48,16 +48,16 @@ impl ReadState {
 pub struct ReadIndexStatus<I> {
   /// The opaque application context that identifies this read request (echoed back in
   /// `ReadState` / `ReadIndexResp`).
-  pub context: Bytes,
+  context: Bytes,
   /// The originator: `None` = local leader request, `Some(follower)` = forwarded.
-  pub req_from: Option<I>,
+  req_from: Option<I>,
   /// The leader's commit index at the time the read was received.
-  pub index: Index,
+  index: Index,
   /// Voters that have acknowledged the heartbeat round carrying this read's context.
   ///
   /// The leader's own ack is included immediately on creation (the leader always
   /// counts toward its own quorum).
-  pub acks: BTreeSet<I>,
+  acks: BTreeSet<I>,
 }
 
 impl<I: NodeId> ReadIndexStatus<I> {
@@ -72,6 +72,13 @@ impl<I: NodeId> ReadIndexStatus<I> {
       index,
       acks,
     }
+  }
+
+  /// Consume the confirmed read into the `(context, originator, index)` the leader needs to emit the
+  /// `ReadState` (local read) or `ReadIndexResp` (forwarded read). `originator` is `None` for a local
+  /// leader read and `Some(follower)` for a forwarded one.
+  pub fn into_parts(self) -> (Bytes, Option<I>, Index) {
+    (self.context, self.req_from, self.index)
   }
 }
 

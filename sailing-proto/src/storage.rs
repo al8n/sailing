@@ -103,7 +103,7 @@ pub trait LogStore {
   /// in between loses entries that no durable snapshot replaces. The core already enforces this
   /// ordering by deferring the `compact` call until the matching `SnapshotWritten` completion (or,
   /// if that completion is missed, until `StableStore::snapshot()` reports a durable snapshot whose
-  /// `last_index >= up_to` — review I9); a disk-backed implementation must not weaken it by
+  /// `last_index >= up_to`); a disk-backed implementation must not weaken it by
   /// flushing the compaction ahead of the blob.
   fn compact(&mut self, up_to: Index);
 
@@ -140,9 +140,9 @@ pub trait LogStore {
   /// re-sync**: on restart, if no durable snapshot is found, the node re-syncs the discarded
   /// entries from the leader. This is safe because every discarded entry was below the leader's
   /// commit (i.e. quorum-committed) at the time of the `restore`, so Leader Completeness
-  /// guarantees the leader still holds them and will re-replicate. (This is the path relied upon
-  /// by M5-U3.) Combined with commit persistence (review C1), a restart recovers the real commit
-  /// watermark and re-syncs correctly even when the blob was not yet durable at crash time.
+  /// guarantees the leader still holds them and will re-replicate. Combined with commit
+  /// persistence, a restart recovers the real commit watermark and re-syncs correctly even
+  /// when the blob was not yet durable at crash time.
   fn restore(&mut self, last_index: Index, last_term: Term);
 
   /// Drain the next completion, if any.

@@ -3,10 +3,10 @@
 //! Two write modes ([`StoreMode`]):
 //!
 //! - **Sync (default)** — `submit_*` applies the write to durable state AND enqueues the
-//!   completion immediately (commit-on-submit). `discard_inflight()` is a no-op. This is the
-//!   M0–M7 behavior and is BYTE-IDENTICAL to the original synchronous store, so every existing
+//!   completion immediately (commit-on-submit). `discard_inflight()` is a no-op. This is
+//!   BYTE-IDENTICAL to the original synchronous store, so every existing
 //!   test passes unchanged.
-//! - **Async (opt-in, M8) — visible state + durable snapshot.** `submit_*` applies the write to
+//! - **Async (opt-in) — visible state + durable snapshot.** `submit_*` applies the write to
 //!   the VISIBLE state IMMEDIATELY (so reads see it — this is required: the proto submits an
 //!   append then reads `last_index()`/`entries()` to replicate it in the SAME call), but only
 //!   DEFERS durability — it records the op in an `in_flight` list and enqueues NO completion. The
@@ -104,7 +104,7 @@ impl ReadFaultPrng {
 
 /// The write mode of a [`MemLog`] / [`MemStable`].
 ///
-/// `Sync` (default) is commit-on-submit (M0–M7 behavior, byte-identical). `Async` applies writes
+/// `Sync` (default) is commit-on-submit (byte-identical to the original). `Async` applies writes
 /// to the VISIBLE state immediately but defers DURABILITY (the completion) until `flush()`,
 /// re-opening the fsync-loss window that the proto's durability-ordering rules (append-before-ack,
 /// persist-vote-before-grant, deferred-compact, commit persistence) guard against.
@@ -135,19 +135,19 @@ impl StoreMode {
 }
 
 /// Seeded, faults-as-data injection config for the in-memory stores. **All off by default** so
-/// M0–M7 tests are unaffected. Faults are deterministic given the seed (driven by a sim-local
+/// existing tests are unaffected. Faults are deterministic given the seed (driven by a sim-local
 /// SplitMix64 PRNG) and surface as VALUES through the existing error/completion channels — they
 /// NEVER panic.
 ///
-/// Implemented for M8-U1:
+/// Implemented:
 /// - `transient_read_per_mille` — a per-read probability that the committed-range
 ///   `LogStore::entries` read returns [`MemStoreError::TransientRead`]. The proto's
 ///   `apply_committed` treats an `entries` error as unrecoverable and POISONS the node
-///   (`PoisonReason::LogRead`; review C2), so this makes that poison path reachable in the sim.
+///   (`PoisonReason::LogRead`), so this makes that poison path reachable in the sim.
 ///   Each roll is independent and self-clearing (the next read may succeed) — "transient".
 ///   Deliberately confined to `entries`: the proto's `term` callers treat a failed/zero `term`
 ///   read as NON-fatal (`.unwrap_or`), so faulting `term` would model a scenario the proto does
-///   not claim to survive rather than the C2 path (see the `term`/`entries` impls).
+///   not claim to survive rather than the poison path (see the `term`/`entries` impls).
 /// - `torn_write_per_mille` — a per-flush probability (async mode only) that the in-flight batch's
 ///   fsync FAILS at `flush()`: the durable snapshot is NOT advanced and no completion fires, but the
 ///   VISIBLE (page-cache) state is left intact and the writes stay in flight (retried on the next
@@ -156,7 +156,7 @@ impl StoreMode {
 ///   still-running node (which would desync the node's in-memory watermarks from its log). Off by
 ///   default.
 ///
-/// Scaffolded (fields reserved; not yet wired — see the per-field TODO):
+/// Scaffolded (fields reserved; not yet wired — see the per-field docs):
 /// - `bit_rot_per_mille` — flip durable bytes after the fact so a later read's checksum fails.
 /// - `misdirected_read_per_mille` — return the wrong slot's bytes on a read.
 #[derive(Debug, Clone, Copy, Default)]
@@ -167,11 +167,11 @@ pub struct StorageFaults {
   /// is deferred (writes stay in flight, retried next flush; lost on a crash before then), the
   /// visible state is left intact. Implemented.
   pub torn_write_per_mille: u16,
-  /// TODO(M8): bit-rot — corrupt already-durable bytes so a later checksum read fails.
+  /// Bit-rot — corrupt already-durable bytes so a later checksum read fails.
   /// Reserved; not yet wired (the wire `Entry`/`HardState` checksum lands with the VOPR in a
-  /// later M8 unit).
+  /// later unit).
   pub bit_rot_per_mille: u16,
-  /// TODO(M8): misdirected read — return another slot's bytes. Reserved; not yet wired.
+  /// Misdirected read — return another slot's bytes. Reserved; not yet wired.
   pub misdirected_read_per_mille: u16,
 }
 
@@ -199,7 +199,7 @@ impl StorageFaults {
 ///
 /// Was `core::convert::Infallible`; promoted to a real error enum so seeded [`StorageFaults`]
 /// can surface as VALUES through `LogStore::Error` / `StableStore::Error`. The proto treats any
-/// store error as fatal (poison; review C2), so a `TransientRead` returned from a read makes the
+/// store error as fatal (poison), so a `TransientRead` returned from a read makes the
 /// poison-on-read-error path reachable in the simulator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
@@ -371,7 +371,7 @@ impl MemLog {
   /// as a raw slice — NEVER subject to the seeded `transient_read` fault that [`LogStore::entries`]
   /// injects.
   ///
-  /// This is the observation seam for the per-tick safety oracles ([`crate::checker`]): a
+  /// This is the observation seam for the per-tick safety oracles (the `checker` module): a
   /// checker must read a node's durable log WITHOUT perturbing the simulated run (the
   /// `transient_read` fault advances a PRNG and would poison the node on a `LogStore::entries`
   /// error), so it reads here instead. In async mode this returns the durable SNAPSHOT, so a
@@ -458,7 +458,7 @@ impl LogStore for MemLog {
     // (e.g. the `on_append_entries` matching probe, `maybe_send_append`) deliberately treat a
     // failed/zero `term` read as NON-fatal (`.unwrap_or(...)`), so a hard error here would make a
     // present entry look conflicting and trip a debug-only committed-entry tripwire — modeling a
-    // scenario the proto does not claim to survive, not the C2 poison path. The fault is confined
+    // scenario the proto does not claim to survive, not the poison path. The fault is confined
     // to the committed-range `entries` read, which the proto declares fatal (PoisonReason::LogRead).
     if index == self.offset {
       return Ok(self.compacted_term);
@@ -483,7 +483,7 @@ impl LogStore for MemLog {
   ) -> Result<&[Entry], Self::Error> {
     // Seeded transient-read fault on the committed-range read: surface as a fatal read error. The
     // proto's `apply_committed` treats an `entries` error as unrecoverable and POISONS the node
-    // (PoisonReason::LogRead; review C2), so this makes that poison path reachable in the sim.
+    // (PoisonReason::LogRead), so this makes that poison path reachable in the sim.
     if self.read_prng.fires(self.faults.transient_read_per_mille) {
       return Err(MemStoreError::TransientRead);
     }
@@ -732,7 +732,7 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
   fn hard_state(&self) -> HardState<I> {
     // NOTE: `hard_state` has no `Result` return, so a transient read fault cannot be surfaced here
     // as a value without changing the trait. `transient_read` is confined to the committed-range
-    // `LogStore::entries` read (the proto's C2 poison path); `hard_state` always returns durable
+    // `LogStore::entries` read (the proto's poison path); `hard_state` always returns durable
     // state.
     self.hard_state
   }
@@ -933,7 +933,7 @@ mod tests {
     assert_eq!(log.last_index(), Index::ZERO);
   }
 
-  // ─── M8-U1: async-write mode (fsync-loss window) ──────────────────────────────
+  // ─── async-write mode (fsync-loss window) ──────────────────────────────
 
   #[test]
   fn async_log_submit_then_discard_loses_inflight_append() {
@@ -1135,12 +1135,12 @@ mod tests {
     );
   }
 
-  // ─── M8-U1: seeded storage faults (faults-as-data, never panics) ──────────────
+  // ─── seeded storage faults (faults-as-data, never panics) ──────────────
 
   #[test]
   fn transient_read_fault_surfaces_as_error_not_panic() {
     // With transient_read at 100% the committed-range `entries` read returns the store error (a
-    // VALUE), which the proto treats as fatal (poison; review C2). Never a panic. `term` is
+    // VALUE), which the proto treats as fatal (poison). Never a panic. `term` is
     // deliberately NOT faulted (its proto callers swallow errors), so it keeps succeeding.
     let mut log = MemLog::new_async(7);
     log.submit_append(OpId::new(1), core::slice::from_ref(&make_entry(1, 1)));

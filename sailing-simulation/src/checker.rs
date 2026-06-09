@@ -1,9 +1,9 @@
 //! The per-tick safety-oracle suite — the heart of the VOPR's verification power.
 //!
-//! A multi-expert architecture review (finding **C3**) found the simulator's old oracle was
-//! "structurally blind" to the durability bugs it should have caught (it missed the **C1**
-//! commit-persistence bug entirely). This module fixes that: it consolidates the existing oracles
-//! and adds the review-recommended ones — especially the durability/commit class — into a suite of
+//! An oracle that only checks applied-log agreement is "structurally blind" to durability bugs:
+//! it can miss a commit-persistence bug — a node that advances commit without the entry on a
+//! quorum of durable logs — entirely. This module fixes that: it consolidates the existing oracles
+//! and adds the durability/commit class into a suite of
 //! **pure functions** that run on EVERY tick.
 //!
 //! # Design
@@ -22,11 +22,11 @@
 //! |---|---|
 //! | [`agreement`] | divergent applied logs across nodes (State Machine Safety, prefix form) |
 //! | [`append_before_ack`] | a node acking an entry it has not durably stored |
-//! | [`commit_is_quorum_durable`] | a node advancing commit without the entry on a quorum of durable logs (the M5/heartbeat class) |
-//! | [`monotonic_commit`] | a node's commit going backward across ticks (incl. across restart — C1) |
+//! | [`commit_is_quorum_durable`] | a node advancing commit without the entry on a quorum of durable logs (the heartbeat class) |
+//! | [`monotonic_commit`] | a node's commit going backward across ticks (incl. across restart) |
 //! | [`no_committed_rewrite`] | a previously-committed `(index→command)` being overwritten (the strongest State Machine Safety check) |
 //! | [`term_monotonic`] | a node's term going backward across ticks |
-//! | [`durable_prefix`] | a restarted node silently forgetting the committed prefix it durably stored (the **C1** headline) |
+//! | [`durable_prefix`] | a restarted node silently forgetting the committed prefix it durably stored (the headline durability bug) |
 //! | [`boundedness`] | per-node bookkeeping growing unboundedly under compaction (a GC/compaction failure) |
 //!
 //! The suite is a **pure observer**: it never draws from a PRNG and never mutates the simulated
@@ -84,7 +84,7 @@ pub struct DurableEntry {
 
 /// A read-only snapshot of one node's observable state at a tick boundary.
 ///
-/// Every field is copied out via a PUBLIC accessor (post-R7 minimized surface): the proto's
+/// Every field is copied out via a PUBLIC accessor (minimized surface): the proto's
 /// `commit_index()`/`applied_index()`/`term()`/`role()`/`state_machine()`/`is_poisoned()`, and the
 /// sim store's non-faulting durable-read seams. Nothing here reaches into proto internals.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,7 +140,7 @@ pub struct NodeView {
   pub snapshot_last_index: u64,
   /// The boundary term of the node's durable snapshot (or `0` if none).
   pub snapshot_last_term: u64,
-  /// The node's durable `HardState.commit` — the durably-persisted commit watermark. The C1
+  /// The node's durable `HardState.commit` — the durably-persisted commit watermark. The
   /// durability invariant relates the recovered in-memory `commit` to this.
   pub hardstate_commit: u64,
   /// The number of staged (un-flushed) store writes (fsync window). Bounded-bookkeeping check.
@@ -190,7 +190,7 @@ pub struct ClusterView {
   /// The current tick/step number (for VOPR replay).
   pub tick: u64,
   /// The cluster's REAL committed VOTER set — the authoritative quorum denominator for
-  /// [`commit_is_quorum_durable`], read from the leader's runtime `conf_state().voters()` (or the
+  /// `commit_is_quorum_durable`, read from the leader's runtime `conf_state().voters()` (or the
   /// plurality committed config when leaderless). Threading the leader's view (rather than each
   /// node's own `is_voter` self-report combined with the sim's `removed` flag) makes the oracle's
   /// denominator the proto's true committed membership: a node the sim prematurely marked removed —
@@ -294,8 +294,8 @@ impl Checker {
   /// their state before returning, so a non-fatal observation is still recorded). On `Ok(())` the
   /// cluster satisfied every safety property at this tick.
   ///
-  /// Ordering note: the history oracles ([`no_committed_rewrite`], [`monotonic_commit`],
-  /// [`term_monotonic`]) check the NEW observation against stored history and THEN fold it in, so a
+  /// Ordering note: the history oracles (`no_committed_rewrite`, `monotonic_commit`,
+  /// `term_monotonic`) check the NEW observation against stored history and THEN fold it in, so a
   /// regression is caught at the tick it first appears.
   pub fn check(&mut self, view: &ClusterView) -> Result<(), Violation> {
     // A reconfiguration (the authoritative voter set changed) raises the commit floor to the current
@@ -310,7 +310,7 @@ impl Checker {
         // quorum) that the survivors have not yet caught up to; those entries would then be wrongly
         // re-judged against the smaller new voter set and flagged as non-quorum-durable. They are
         // safe — already validated against their own config before this change, and still covered by
-        // agreement / no_committed_rewrite / durable_prefix. (VOPR seed 36: leader 0 commits index
+        // agreement / no_committed_rewrite / durable_prefix. (e.g. leader 0 commits index
         // 375 under {0,2,3}; 0 is then removed → {2,3} with voter 2 still behind, so 375 must stay
         // exempt.) A removed voter is still present in `view.nodes` (isolated, not dropped).
         let hw = view
@@ -453,7 +453,7 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
 /// present with the SAME term on a quorum of the VOTERS' DURABLE logs.
 ///
 /// Catches a node that advanced commit without the entry being durably replicated to a quorum (the
-/// M5/heartbeat class) — one tick BEFORE [`agreement`] would catch the resulting divergence.
+/// heartbeat class) — one tick BEFORE [`agreement`] would catch the resulting divergence.
 /// Compaction is accounted for: a snapshotted entry counts as durable-present at the snapshot
 /// boundary term (see [`NodeView::durable_covers`] / [`NodeView::durable_term`]).
 ///
@@ -469,10 +469,10 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
 /// (which requires its durable log to cover that conf-change's index, hence every earlier committed
 /// entry). So a learner or a wired-but-not-yet-voting joiner never inflates the denominator against
 /// an entry it could not have witnessed — the false positive an all-live-nodes denominator produced
-/// (VOPR seed 43, a 5→6 voter growth). And because the population is the LEADER's committed config,
+/// (a 5→6 voter growth). And because the population is the LEADER's committed config,
 /// a real committed voter the harness had prematurely marked removed (an accepted-but-never-committed
 /// RemoveNode) is still counted as a durable witness, while a behind voter does not crowd it out —
-/// the false positive a per-node `is_voter & !removed` denominator produced (VOPR seed 4). A
+/// the false positive a per-node `is_voter & !removed` denominator produced. A
 /// learner's own `commit` watermark is not checked here (it makes no quorum claim; the same entry is
 /// checked via the voters), but a learner that holds the entry still does no harm.
 pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result<(), Violation> {
@@ -482,7 +482,7 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
       continue; // nothing committed
     }
     // The committing voter must itself durably cover its commit index (this is the append-before-
-    // ack / C1 ordering; a violation here is also a violation, reported precisely).
+    // ack ordering; a violation here is also a violation, reported precisely).
     let witness_term = match n.durable_term(c) {
       Some(t) => t,
       None => {
@@ -507,13 +507,13 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
       continue;
     }
     // Quorum DENOMINATOR. Start from the AUTHORITATIVE committed-voter count (`committed_voters.len()`
-    // when known — a momentarily-absent voter view must not shrink it and weaken the oracle; VOPR seeds
-    // 43/4), then SUBTRACT voters provably on a stale STRICTLY-LOWER-term branch at `c`. Such a voter
+    // when known — a momentarily-absent voter view must not shrink it and weaken the oracle),
+    // then SUBTRACT voters provably on a stale STRICTLY-LOWER-term branch at `c`. Such a voter
     // durably holds a different, older-term entry, so it never acked `(c, witness_term)` — a same-index
     // entry cannot revert to an older term — and it was not in the quorum that committed this entry (the
     // higher-term log will overwrite it). Excluding ONLY lower-term divergence keeps full teeth: a
     // merely-LAGGING voter (no entry at `c`) and a HIGHER-term divergent voter both remain, so a solo /
-    // under-replicated commit AND a commit on a LOSING branch still trip. (VOPR seed 66: a term-3 entry
+    // under-replicated commit AND a commit on a LOSING branch still trip. (e.g. a term-3 entry
     // committed under a smaller config while two voters sit on a stale term-2 branch.)
     // A second exclusion handles the deep-churn boundary: a voter whose DURABLE log does not even reach
     // the reconfiguration floor (`durable_last < commit_floor`) is a freshly-added member still catching
@@ -521,7 +521,7 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
     // was not in the quorum that committed `c` (which is just above the floor). Counting it demands a
     // phantom ack it could never have given. This is distinct from a merely-LAGGING real voter (which
     // HAS reached the floor and is only missing the latest entries) — that one stays counted, so a true
-    // under-replication still trips. (VOPR seed 1021 @4000: idx 2056 committed under a small config that
+    // under-replication still trips. (e.g. idx 2056 committed under a small config that
     // then grew to 5 voters, three of which sit far below the floor at 223/490/2034 vs floor 2055.)
     let excluded = view
       .voters()
@@ -571,14 +571,14 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
   Ok(())
 }
 
-/// **durable-prefix-after-restart** (the C3 headline, for crash recovery), expressed as a per-tick
+/// **durable-prefix-after-restart** (the headline crash-recovery oracle), expressed as a per-tick
 /// invariant: a node's in-memory `commit` must be `>=` the committed prefix it durably persisted —
 /// concretely, `commit >= min(durable HardState.commit, durable last_index)`.
 ///
-/// # Why this is the C1-catching oracle
+/// # Why this catches the commit-persistence bug
 ///
 /// The durable `HardState.commit` is precisely the committed-prefix length the node had
-/// **acknowledged and persisted** before any crash. The **C1** bug was that `restart` rebuilt an
+/// **acknowledged and persisted** before any crash. The bug was that `restart` rebuilt an
 /// empty / snapshot-only state machine — recovering `commit = 0` — *despite* a durable
 /// `HardState.commit > 0` and a durable log covering it. That trips this oracle the instant the
 /// restarted node is observed: `commit (=0) < min(hs.commit, durable_last) (= hs.commit > 0)`.
@@ -602,7 +602,7 @@ pub fn durable_prefix(view: &ClusterView) -> Result<(), Violation> {
         std::format!(
           "node {} recovered/holds commit={} but its durable committed prefix is {} \
            (HardState.commit={}, durable_last={}) — a restart must not silently forget the \
-           committed state it durably stored (review C1)",
+           committed state it durably stored",
           n.id,
           n.commit,
           durable_committed_prefix,
@@ -617,7 +617,7 @@ pub fn durable_prefix(view: &ClusterView) -> Result<(), Violation> {
 
 /// **boundedness**: per-node bookkeeping stays bounded under compaction.
 ///
-/// A soft structural check (relates to review I9) that catches a compaction/GC failure: a node's
+/// A soft structural check that catches a compaction/GC failure: a node's
 /// in-memory durable log must not grow unboundedly while snapshots are taken. The window of
 /// in-memory entries is `durable_last - durable_first + 1`; under healthy compaction this stays
 /// near `commit - first_index`. We assert the in-memory entry COUNT matches the index window (an
@@ -715,17 +715,18 @@ pub fn no_committed_rewrite(checker: &mut Checker, view: &ClusterView) -> Result
 /// **monotonic-commit-per-node**: a (healthy) node's `commit` index never decreases across ticks —
 /// within an incarnation AND across a restart.
 ///
-/// Per review **C1** the durable commit watermark is persisted, so a restart recovers it and commit
+/// The durable commit watermark is persisted, so a restart recovers it and commit
 /// must NOT regress even across restart. At a tick boundary a HEALTHY node's in-memory commit is
 /// durably persisted (the `handle_storage` choke-point ran to quiescence), so the next incarnation
 /// recovers `>=` the last observed value; a regression below a previously-observed HEALTHY commit IS
-/// a C1-class durability bug.
+/// a durability bug.
 ///
 /// **Poisoned exception:** the proto gates commit-persistence on `!poisoned`, so a node that
 /// advanced commit in-memory and THEN poisoned (e.g. a committed-range read fault during apply,
 /// after advancing commit but before persisting it) holds an in-memory commit that was never made
-/// durable. C1 protects only the DURABLE commit, so that un-persisted advance is legitimately lost
-/// on restart and must NOT be used as the regression baseline (see the recording pass).
+/// durable. Commit-persistence protects only the DURABLE commit, so that un-persisted advance is
+/// legitimately lost on restart and must NOT be used as the regression baseline (see the recording
+/// pass).
 pub fn monotonic_commit(checker: &mut Checker, view: &ClusterView) -> Result<(), Violation> {
   for n in view.nodes.iter() {
     let prev = checker.max_commit_seen.get(&n.id).copied().unwrap_or(0);
@@ -734,7 +735,7 @@ pub fn monotonic_commit(checker: &mut Checker, view: &ClusterView) -> Result<(),
         "monotonic_commit",
         std::format!(
           "node {} commit regressed from {} to {} across ticks — the durable commit watermark is \
-           persisted (review C1), so commit must never go backward (even across restart)",
+           persisted, so commit must never go backward (even across restart)",
           n.id,
           prev,
           n.commit,
@@ -746,8 +747,8 @@ pub fn monotonic_commit(checker: &mut Checker, view: &ClusterView) -> Result<(),
     // Do NOT record a poisoned node's in-memory commit as the monotonic baseline. The proto's
     // commit-persistence choke-point is gated on `!poisoned`, so a node that advanced commit
     // in-memory and THEN poisoned (e.g. on a committed-range read fault during apply, before the
-    // persist step) carries an in-memory commit that was never durably persisted. C1 only
-    // guarantees the DURABLE commit is recovered on restart, so that un-persisted advance is
+    // persist step) carries an in-memory commit that was never durably persisted. Commit-persistence
+    // only guarantees the DURABLE commit is recovered on restart, so that un-persisted advance is
     // legitimately lost when the node restarts — recording it here would make the next (healthy,
     // correctly-recovered) incarnation look like a regression. The regression CHECK above still
     // runs for every node (a poisoned node's commit is frozen and can only sit at/above the
@@ -925,7 +926,7 @@ mod tests {
   #[test]
   fn commit_is_quorum_durable_detects_solo_commit() {
     // Node 0 has commit=5 and durably holds entry 5, but the other two nodes' durable logs only
-    // reach 4 — only 1 of 3 durable logs has entry 5, below the quorum of 2. (The M5/heartbeat
+    // reach 4 — only 1 of 3 durable logs has entry 5, below the quorum of 2. (The heartbeat
     // class: a node advanced commit without quorum-durable replication.)
     let mut n0 = healthy_node(0, 5, 5);
     n0.applied = 4; // keep append-before-ack happy elsewhere; this test calls the oracle directly
@@ -977,7 +978,7 @@ mod tests {
 
   #[test]
   fn commit_is_quorum_durable_uses_authoritative_voter_set_not_self_view() {
-    // Regression for the VOPR seed-4 false positive. The harness had prematurely marked a node
+    // Regression for a false positive. The harness had prematurely marked a node
     // `removed` (an accepted-but-never-committed RemoveNode) while it was STILL a real committed
     // voter holding the entry, and had grown a learner. Deriving the quorum from per-node
     // `is_voter & !removed` then under-counted the witnesses and false-fired. With the authoritative
@@ -1050,7 +1051,7 @@ mod tests {
     let mut ck = Checker::new();
     let up = healthy_cluster(5, 5);
     assert_eq!(monotonic_commit(&mut ck, &up), Ok(()));
-    // Now node 0's commit drops 5 -> 3 (e.g. a restart that forgot the durable commit — C1).
+    // Now node 0's commit drops 5 -> 3 (e.g. a restart that forgot the durable commit).
     let mut down = healthy_cluster(5, 5);
     down.nodes[0].commit = 3;
     let v = monotonic_commit(&mut ck, &down).unwrap_err();
@@ -1132,14 +1133,12 @@ mod tests {
     assert!(v.detail.contains("staged"), "{}", v.detail);
   }
 
-  // ─── durable-prefix-after-restart teeth (the C1-catching test) ───────────────────────────────
+  // ─── durable-prefix-after-restart teeth (the lost-commit-on-restart test) ───────────────────────────────
 
   #[test]
   fn durable_prefix_detects_c1_lost_commit_on_restart() {
-    // ── This is the explicit review-C1 teeth test. ──
-    //
     // Scenario: a node had durably committed a prefix of length 5 — its durable HardState.commit is
-    // 5 and its durable log holds entries 1..=5. It then crashed and RESTARTED. The C1 bug is that
+    // 5 and its durable log holds entries 1..=5. It then crashed and RESTARTED. The bug is that
     // `restart` rebuilt an empty / snapshot-only state machine, recovering commit = 0 DESPITE the
     // durable HardState.commit = 5 and the durable log covering it. The durable-prefix oracle must
     // detect that the recovered commit silently forgot the durably-committed prefix.
@@ -1150,7 +1149,11 @@ mod tests {
     let view = cv(0xC1, 100, std::vec![n]);
     let v = durable_prefix(&view).unwrap_err();
     assert_eq!(v.oracle, "durable_prefix");
-    assert!(v.detail.contains("review C1"), "{}", v.detail);
+    assert!(
+      v.detail.contains("must not silently forget"),
+      "{}",
+      v.detail
+    );
     assert!(
       v.detail.contains("commit=0") && v.detail.contains("durable committed prefix is 5"),
       "{}",
@@ -1160,7 +1163,7 @@ mod tests {
 
   #[test]
   fn durable_prefix_accepts_correct_recovery() {
-    // The CORRECT C1 behavior: restart recovered commit = HardState.commit = 5 (durable log covers
+    // The CORRECT behavior: restart recovered commit = HardState.commit = 5 (durable log covers
     // it). No violation.
     let n = healthy_node(0, 5, 5); // commit == hardstate_commit == durable_last == 5
     let view = cv(1, 1, std::vec![n]);

@@ -1,4 +1,4 @@
-//! The data-driven interaction harness (M8-U6) — sailing's port of etcd's `rafttest`
+//! The data-driven interaction harness — sailing's port of etcd's `rafttest`
 //! `datadriven` testing approach.
 //!
 //! # What this is
@@ -20,7 +20,7 @@
 //!
 //! # The model
 //!
-//! The harness owns one [`Node`] per id (an [`Endpoint`] + its [`MemLog`] + [`MemStable`]) and an
+//! The harness owns one `Node` per id (an [`Endpoint`] + its [`MemLog`] + [`MemStable`]) and an
 //! explicit in-flight message bus, plus a shared virtual clock. Unlike [`Cluster`](crate::Cluster)
 //! (which drives a whole cluster forward one global tick at a time and runs the VOPR oracles), this
 //! harness gives **per-node, per-message** control: campaign exactly one node, deliver exactly the
@@ -483,7 +483,7 @@ impl InteractionEnv {
   /// `crash <id>` — model a crash + restart of node `id`: discard its in-flight (submitted-but-not-
   /// yet-durable) store writes, rebuild the `Endpoint` from durable state via [`Endpoint::restart`],
   /// and drop every in-flight message to or from it. The node rejoins from exactly its durable log +
-  /// hard state (persistence recovery — M3).
+  /// hard state (persistence recovery).
   fn crash(&mut self, d: &Directive) -> String {
     let id: u64 = match d.positional(0).and_then(|s| s.parse().ok()) {
       Some(v) => v,
@@ -908,7 +908,7 @@ impl Default for InteractionEnv {
   }
 }
 
-/// The harness environment: one [`Node`] per id, an explicit in-flight message bus, and a shared
+/// The harness environment: one `Node` per id, an explicit in-flight message bus, and a shared
 /// virtual clock. See the module docs.
 pub struct InteractionEnv {
   nodes: BTreeMap<u64, Node>,
