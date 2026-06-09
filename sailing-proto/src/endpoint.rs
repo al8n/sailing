@@ -124,6 +124,10 @@ pub enum PoisonReason {
   /// An AppendEntries conflict at or below the commit index would rewrite committed/applied log
   /// state — impossible in correct Raft; treated as fatal corruption.
   CommittedTruncation,
+  /// An AppendEntries carried entries that are not positionally contiguous from `prev_log_index`
+  /// (a gap, a duplicate, or an out-of-range embedded index) — a correct leader always sends a
+  /// contiguous suffix, so this is fatal corruption (malformed or version-skewed input).
+  NonContiguousAppend,
 }
 
 impl PoisonReason {
@@ -142,6 +146,7 @@ impl PoisonReason {
       Self::SnapshotDecode => "snapshot_decode",
       Self::SnapshotRestore => "snapshot_restore",
       Self::CommittedTruncation => "committed_truncation",
+      Self::NonContiguousAppend => "non_contiguous_append",
     }
   }
 }
@@ -2399,7 +2404,28 @@ where
     // Entries that already match (same index, same term) are left untouched so that a
     // stale or duplicate AppendEntries never erases already-committed entries.
     let entries = ae.entries();
-    let last_new = Index::new(ae.prev_log_index().get() + entries.len() as u64);
+    // Validate the suffix is positionally contiguous from `prev_log_index` BEFORE trusting any
+    // embedded `entry.index()`. A correct leader always sends a contiguous run starting at
+    // `prev_log_index + 1`; conflict detection, the §5.3 truncation boundary, and the store append
+    // all key off the embedded index, while `last_new` (the commit ceiling and the ack match) is the
+    // positional last. If the two disagree — a malformed or version-skewed message with a gap, a
+    // duplicate, or an out-of-range index — the follower could commit/ack an index its store never
+    // holds at that position. Deriving `last_new` from the validated running index (checked, so a
+    // near-`u64::MAX` prev cannot wrap) makes positional == embedded BY CONSTRUCTION; on any
+    // mismatch a correct peer could never produce, poison and abort rather than desync the log from
+    // the acked match (the same fatal-corruption class as `CommittedTruncation`).
+    let mut last_new = ae.prev_log_index();
+    for entry in entries {
+      let Some(expected) = last_new.get().checked_add(1).map(Index::new) else {
+        self.poison(PoisonReason::NonContiguousAppend);
+        return;
+      };
+      if entry.index() != expected {
+        self.poison(PoisonReason::NonContiguousAppend);
+        return;
+      }
+      last_new = expected;
+    }
     let mut appended_opid: Option<crate::OpId> = None;
     if !entries.is_empty() {
       let mut conflict_at: Option<usize> = None;
@@ -2705,16 +2731,26 @@ where
         }
       }
       crate::ReadOnlyOption::LeaseBased => {
-        // LeaseBased is sound only when CheckQuorum is also enabled: CheckQuorum's
-        // periodic heartbeat round proves the leader still holds a quorum lease,
-        // which is the precondition for skipping the per-read heartbeat.
+        // LeaseBased is sound only when CheckQuorum is also enabled AND the current quorum-lease
+        // window is still open. CheckQuorum repurposes the leader's `election_deadline` as the lease
+        // timer: each window it runs a quorum heartbeat round and re-arms the deadline, so
+        // `election_deadline > now` is the proof that the leader still holds a fresh quorum lease —
+        // the precondition for skipping the per-read heartbeat. (Same `election_deadline > now`
+        // lease-live test used by the vote-lease guards.)
         //
-        // If check_quorum is disabled the lease invariant is not maintained, so
-        // confirming immediately would be a linearizability hazard (a partitioned
-        // leader could serve stale reads). Degrade silently to the Safe path
-        // (heartbeat-quorum round) so any misconfiguration is safe rather than
-        // silently incorrect.
-        let use_lease = self.config.check_quorum();
+        // Two ways the lease can fail to hold, both of which MUST degrade to the Safe heartbeat
+        // round rather than confirm immediately:
+        //   - check_quorum disabled: the lease invariant is never maintained (a partitioned leader
+        //     would serve stale reads).
+        //   - lease window lapsed (`election_deadline <= now`): the deadline is due but
+        //     `handle_timeout` has not yet run for this `now`, so the lease is unproven. Confirming
+        //     here — before the CheckQuorum tick re-confirms quorum or steps the stale leader down —
+        //     could serve a read a majority has already moved past. The driver may call `read_index`
+        //     before `handle_timeout` for the same instant, so this path cannot assume the timer
+        //     fired; it must check the lease itself.
+        // Degrading is silent and always safe: the Safe path re-confirms quorum before emitting.
+        let use_lease =
+          self.config.check_quorum() && self.election_deadline.is_some_and(|d| d > now);
         if use_lease {
           match from {
             None => {
@@ -3697,6 +3733,70 @@ mod tests {
     );
     let r = ep.poll_message().unwrap();
     assert!(matches!(r.message(), Message::AppendResp(a) if a.reject()));
+  }
+
+  /// Regression (R9-F2 — AppendEntries entry contiguity): a follower MUST reject an AppendEntries
+  /// whose entries are not positionally contiguous from `prev_log_index`. The handler computes
+  /// `last_new` (the commit ceiling and the ack match) positionally but keys conflict detection,
+  /// the truncation boundary, and the store append off each entry's embedded `index()`. A malformed
+  /// or version-skewed message — here `prev_log_index=0` with a single entry whose embedded index is
+  /// `2` (a gap at index 1) and `leader_commit=1` — would otherwise advance commit to 1 and ack
+  /// index 1 while the store holds the entry at index 2, desyncing the log from the acked match. A
+  /// correct leader never sends this, so it is fatal corruption: the node poisons
+  /// (`NonContiguousAppend`) and, via the egress halt, emits nothing.
+  ///
+  /// MUTATION: revert the contiguity loop (restore the positional `last_new` and drop the per-entry
+  /// index check) → the follower trusts the gap, so `is_poisoned()` is false and it appends/acks.
+  #[test]
+  fn non_contiguous_append_poisons() {
+    use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // prev_log_index=0 is consistent against the empty log, but the single entry's embedded index
+    // is 2 — a gap at index 1. Positional `last_new` would be 1; the embedded index is 2.
+    let gap = Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"x"),
+    );
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![gap],
+        Index::new(1),
+      )),
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "non-contiguous entries must poison the follower"
+    );
+    assert_eq!(
+      ep.poison_reason().map(|r| r.as_str()),
+      Some("non_contiguous_append"),
+    );
+    // Nothing appended, commit not advanced, and the egress halt suppresses any ack.
+    assert_eq!(log.last_index(), Index::ZERO, "no entry appended");
+    assert_eq!(ep.commit_index(), Index::ZERO, "commit not advanced");
+    assert!(ep.poll_message().is_none(), "poisoned node emits no ack");
   }
 
   /// Regression (persist-before-ack on the immediate-ack path): a DUPLICATE `AppendEntries` for
@@ -9883,6 +9983,115 @@ mod tests {
     let rs = ev.unwrap_read_state_ref();
     assert_eq!(rs.index(), crate::Index::new(1));
     assert_eq!(rs.context().as_ref(), ctx.as_ref());
+  }
+
+  /// Regression (R9-F1 — LeaseBased read requires a LIVE lease): with `LeaseBased` + `check_quorum`,
+  /// the leader may confirm a read immediately ONLY while its quorum-lease window is open. CheckQuorum
+  /// repurposes `election_deadline` as the lease timer; if the window has lapsed
+  /// (`election_deadline <= now`) but `handle_timeout` has not yet run for this `now`, the lease is
+  /// unproven and confirming could serve a read a majority has moved past. Here the leader arms its
+  /// lease at `d`, then `read_index` is called at `d + 2s` (past the `d + 1s` deadline) BEFORE any
+  /// timeout — it must degrade to the Safe heartbeat round, not confirm immediately. A subsequent
+  /// HeartbeatResp quorum then completes the read (liveness preserved).
+  ///
+  /// MUTATION: drop the `election_deadline > now` conjunct so `use_lease` is `check_quorum()` alone →
+  /// the leader confirms immediately and the "no immediate ReadState" assertion fails.
+  #[test]
+  fn lease_based_expired_lease_degrades_to_safe() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseBased)
+    .with_check_quorum(true);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    // The leader armed its quorum lease at `d`: election_deadline = d + election_timeout (1s).
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+
+    // Read at an instant PAST the lease deadline, WITHOUT first calling handle_timeout (so the
+    // CheckQuorum tick has not re-confirmed quorum or stepped the leader down).
+    let expired = d + Duration::from_millis(2000);
+    let ctx = bytes::Bytes::from_static(b"expired_lease_read");
+    ep.read_index(expired, &log, &stable, ctx.clone())
+      .expect("leader must accept the read (degraded LeaseBased → Safe)");
+
+    // Must NOT confirm immediately — the lease is unproven at this instant.
+    assert!(
+      ep.poll_event().is_none(),
+      "expired LeaseBased lease must NOT confirm immediately — no ReadState yet"
+    );
+    // Must degrade to Safe: broadcast a heartbeat round carrying the read ctx.
+    let mut hb_with_ctx = false;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        if hb.context() == ctx.as_ref() {
+          hb_with_ctx = true;
+        }
+      }
+    }
+    assert!(
+      hb_with_ctx,
+      "expired LeaseBased lease must fall back to Safe and broadcast a heartbeat round"
+    );
+
+    // A HeartbeatResp quorum then completes the read at the committed index (liveness preserved).
+    ep.handle_message(
+      expired,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        crate::Term::new(1),
+        2u64,
+        ctx.clone(),
+      )),
+    );
+    while ep.poll_message().is_some() {}
+    let ev = ep
+      .poll_event()
+      .expect("ReadState must be emitted once the Safe heartbeat quorum acks");
+    assert!(ev.is_read_state(), "expected ReadState");
+    assert_eq!(ev.unwrap_read_state_ref().index(), crate::Index::new(1));
   }
 
   /// Test 4: Follower-forwarded read.
