@@ -482,6 +482,29 @@ where
   /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
   /// this field to `None`.
   pending_compact: Option<(crate::OpId, Index)>,
+  /// R34 (term-before-respond durability). The highest `Term` whose HardState write has reached stable
+  /// storage — `term_is_durable()` is simply `durable_term >= self.term`. Seeded to the initial/recovered
+  /// term (trivially durable: it came from durable HardState or is the bootstrap term), then advanced in
+  /// [`on_stable_wrote`] when an adopted term's write completes. The core observes the stable seam's
+  /// completions, so it enforces currentTerm-before-respond itself rather than delegating the ordering to
+  /// the storage layer.
+  durable_term: crate::Term,
+  /// The highest `Term` ever submitted to the `StableStore` (via `submit_write`). Paired with
+  /// `term_persist_opid` so [`on_stable_wrote`] can recognise when the current term's write completes and
+  /// advance `durable_term` (a freshly-adopted term is set in memory before its write is even submitted).
+  last_submitted_term: crate::Term,
+  /// The `OpId` of the FIRST HardState write that carried `last_submitted_term`. When a `Wrote` completion
+  /// with `opid >= term_persist_opid` arrives (stable completions are ordered), that term is durable.
+  term_persist_opid: crate::OpId,
+  /// R34: a SUCCESS `AppendResp` deferred until `self.term` is durable, tagged with the term it was
+  /// deferred under. A follower must not RESPOND to an AppendEntries under a term whose HardState write
+  /// is not yet durable (Raft §5.1: persist `currentTerm` before responding to RPCs). Flushed in
+  /// `on_stable_wrote` once the term is durable; the match is re-derived from the live `ack_watermark()`
+  /// then, so it is never stale, and a tag from a superseded term is dropped.
+  term_gated_append_ack: Option<(I, crate::Term)>,
+  /// R34: a SUCCESS `SnapshotResp` deferred until `self.term` is durable — the snapshot analogue of
+  /// `term_gated_append_ack`.
+  term_gated_snapshot_ack: Option<(I, crate::Term)>,
   /// Log index of the most recently appended (not-yet-applied) `ConfChange` entry.
   ///
   /// Initialized to `Index::ZERO` in both `new` and `restart`. On restart, ZERO is acceptable
@@ -591,6 +614,13 @@ where
       poisoned: false,
       poison_reason: None,
       pending_compact: None,
+      // R34: fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
+      // `term_is_durable()` is true and acks are never spuriously deferred at startup.
+      durable_term: Term::ZERO,
+      last_submitted_term: Term::ZERO,
+      term_persist_opid: crate::OpId::ZERO,
+      term_gated_append_ack: None,
+      term_gated_snapshot_ack: None,
       pending_conf_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
@@ -815,7 +845,7 @@ where
   }
 
   fn submit_write<S: StableStore<NodeId = I>>(
-    &self,
+    &mut self,
     stable: &mut S,
     id: crate::OpId,
     hard_state: crate::HardState<I>,
@@ -823,7 +853,130 @@ where
     if self.poisoned {
       return;
     }
+    // R34: remember the FIRST write that carries each newly-higher term, so `term_is_durable` can tell
+    // when `self.term` has actually reached stable storage. Terms are monotonic and all HardState writes
+    // carry the current term, so the first write at a higher term establishes that term's durability.
+    if hard_state.term() > self.last_submitted_term {
+      self.last_submitted_term = hard_state.term();
+      self.term_persist_opid = id;
+    }
     stable.submit_write(id, hard_state);
+  }
+
+  /// Whether `self.term`'s HardState write has reached stable storage. A follower must not RESPOND to an
+  /// RPC under a term that is not yet durable (Raft §5.1), so the success-ack paths gate on this and
+  /// defer (via `term_gated_*_ack`) until [`on_stable_wrote`] flushes them. True trivially for the
+  /// initial/recovered term (whose watermarks are seeded so the comparison holds) — only a freshly
+  /// ADOPTED term (in memory, write still in flight) reads false.
+  #[inline]
+  fn term_is_durable(&self) -> bool {
+    self.durable_term >= self.term
+  }
+
+  /// Flush any term-gated success ack once `self.term` is durable (called from `on_stable_wrote` after
+  /// a `Wrote` completion may have advanced the durability watermark). A tag from a superseded term is
+  /// dropped (the leader/term has since changed); a current-term tag is sent with its match re-derived
+  /// from the LIVE `ack_watermark()`, so deferral never reports a stale or since-truncated index.
+  fn flush_term_gated_acks(&mut self) {
+    if matches!(self.term_gated_snapshot_ack, Some((_, t)) if t != self.term) {
+      self.term_gated_snapshot_ack = None;
+    }
+    if matches!(self.term_gated_append_ack, Some((_, t)) if t != self.term) {
+      self.term_gated_append_ack = None;
+    }
+    if !self.term_is_durable() {
+      return;
+    }
+    let (term, me) = (self.term, self.config.id());
+    if let Some((to, _)) = self.term_gated_snapshot_ack.take() {
+      let match_index = self.commit.min(self.ack_watermark());
+      self.send(
+        to,
+        Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
+      );
+    }
+    if let Some((to, _)) = self.term_gated_append_ack.take() {
+      let match_index = self.ack_watermark();
+      self.send(
+        to,
+        Message::AppendResp(crate::AppendResp::new(
+          term,
+          me,
+          false,
+          Index::ZERO,
+          Term::ZERO,
+          match_index,
+        )),
+      );
+    }
+  }
+
+  /// Emit a SUCCESS `AppendResp(match=match_index)` if `self.term` is durable; otherwise DEFER it (R34
+  /// persist-before-respond) until [`flush_term_gated_acks`] releases it. Deferral collapses to the
+  /// latest tag (acks are cumulative) and re-derives the match from the live watermark at flush.
+  fn send_or_gate_append_ack(&mut self, to: I, match_index: Index) {
+    if self.term_is_durable() {
+      let (term, me) = (self.term, self.config.id());
+      self.send(
+        to,
+        Message::AppendResp(crate::AppendResp::new(
+          term,
+          me,
+          false,
+          Index::ZERO,
+          Term::ZERO,
+          match_index,
+        )),
+      );
+    } else {
+      self.term_gated_append_ack = Some((to, self.term));
+    }
+  }
+
+  /// Emit a SUCCESS `SnapshotResp(match=match_index)` if `self.term` is durable; otherwise DEFER it
+  /// (R34 persist-before-respond) until [`flush_term_gated_acks`] releases it.
+  fn send_or_gate_snapshot_ack(&mut self, to: I, match_index: Index) {
+    if self.term_is_durable() {
+      let (term, me) = (self.term, self.config.id());
+      self.send(
+        to,
+        Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
+      );
+    } else {
+      self.term_gated_snapshot_ack = Some((to, self.term));
+    }
+  }
+
+  /// Persist the adopted `(term, vote)` if it is not already durable — the lazy term step-down write.
+  ///
+  /// Replaces the eager pre-dispatch term persist (R33). A higher-term step-down is made durable only
+  /// AFTER the message-specific READ-ONLY validation has passed — so a fail-stop during that validation
+  /// (a corrupt `RequestVote`/`AppendEntries`/`InstallSnapshot`) leaves NO premature term/vote write,
+  /// i.e. the fail-stop is side-effect-free — and BEFORE any log entry or snapshot from that term
+  /// reaches its store. The order matters for safety (Raft §5.1): `currentTerm` MUST be durable before
+  /// its own log entries, else a crash that loses the term could let this node vote again in a term it
+  /// has already participated in (it holds an entry/snapshot from that term) → two leaders. The
+  /// entry/snapshot handlers therefore call this just before their durable write (term-before-entries /
+  /// term-before-snapshot), preserving the exact submission order the old eager write had; everything
+  /// else is covered by the post-dispatch catch-all in `handle_message`.
+  ///
+  /// Idempotent via the durable `HardState` read: a same-term message, a pre-vote (which never adopts a
+  /// term), or a handler that already persisted the step-down (a vote grant) does NOT double-write.
+  fn ensure_term_durable<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
+    if self.poisoned {
+      return;
+    }
+    let durable = stable.hard_state();
+    if durable.term() == self.term && durable.vote() == self.voted_for {
+      return;
+    }
+    let opid = self.mint_op_id();
+    let hs = durable
+      .with_term(self.term)
+      .with_vote(self.voted_for)
+      .with_commit(self.durable_commit());
+    self.submit_write(stable, opid, hs);
+    self.committed_persisted = self.durable_commit();
   }
 
   fn submit_snapshot<S: StableStore<NodeId = I>>(
@@ -1797,6 +1950,14 @@ where
       poisoned,
       poison_reason,
       pending_compact: None,
+      // R34: the recovered `hs.term()` came from durable HardState, so it IS durable. Seed both
+      // `durable_term` and `last_submitted_term` to it so `term_is_durable()` is true immediately after
+      // restart and follower acks are not spuriously deferred.
+      durable_term: hs.term(),
+      last_submitted_term: hs.term(),
+      term_persist_opid: crate::OpId::ZERO,
+      term_gated_append_ack: None,
+      term_gated_snapshot_ack: None,
       // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
       pending_conf_index: Index::ZERO,
       tracker,
@@ -1851,7 +2012,6 @@ where
     }
     match self.pending.remove(&opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
-        let (term, me) = (self.term, self.config.id());
         // Persist-before-ack: clamp the deferred ack to `ack_watermark()`. This fires when the append's
         // bytes are durable, but if a freshly-installed snapshot's blob is still in flight the entry sits
         // ABOVE the snapshot boundary on a baseline that is NOT yet durable — a crash would orphan it —
@@ -1859,17 +2019,10 @@ where
         // AppendEntries/heartbeat re-acks the higher match. In the steady state `match_index <=
         // durable_index`, so this is a no-op.
         let ack_index = match_index.min(self.ack_watermark());
-        self.send(
-          to,
-          Message::AppendResp(crate::AppendResp::new(
-            term,
-            me,
-            false,
-            Index::ZERO,
-            Term::ZERO,
-            ack_index,
-          )),
-        );
+        // R34 persist-before-RESPOND: the entries are durable, but a follower must not ack under a term
+        // whose HardState write is not yet durable. If the term is still in flight, DEFER — the ack is
+        // released by `flush_term_gated_acks` once `on_stable_wrote` sees the term durable.
+        self.send_or_gate_append_ack(to, ack_index);
       }
       // Role-gate (defense-in-depth): only a current leader advances its own match index
       // and commit. `pending` is cleared on every term change, so a stale `LeaderAppend`
@@ -1895,6 +2048,11 @@ where
     stable: &mut S,
     opid: crate::OpId,
   ) {
+    // R34: a completion at or past the current term's write makes that term durable (stable completions
+    // are ordered). Advance `durable_term`, which may now release a term-gated success ack below.
+    if self.last_submitted_term > self.durable_term && opid >= self.term_persist_opid {
+      self.durable_term = self.last_submitted_term;
+    }
     match self.pending.remove(&opid) {
       Some(Pending::CastVote { to, term }) => {
         // Only emit the grant if the term hasn't changed and we still hold the vote for `to`.
@@ -1924,6 +2082,9 @@ where
       }
       _ => {}
     }
+    // R34: release any success ack that was deferred because `self.term` was not yet durable. The term
+    // may have just become durable via this completion.
+    self.flush_term_gated_acks();
   }
 
   /// Feed an inbound message. Runs the universal term pre-pass then dispatches.
@@ -2003,17 +2164,13 @@ where
         // Abort any in-progress leader transfer — leadership is changing.
         self.lead_transferee = None;
         self.transfer_deadline = None;
-        // Persist the new term and cleared vote. Stepping down owes no ack, so no Pending entry.
-        // Stamp the current commit too (see on_request_vote): a read-modify of `hard_state()`
-        // must not write back a stale `commit` that regresses the durable watermark.
-        let opid = self.mint_op_id();
-        let hs = stable
-          .hard_state()
-          .with_term(self.term)
-          .with_vote(None)
-          .with_commit(self.durable_commit());
-        self.submit_write(stable, opid, hs);
-        self.committed_persisted = self.durable_commit();
+        // The term step-down is NOT persisted here (R33). Persisting before dispatch would put the
+        // term/vote write AHEAD of the message handler's read-only fatal validation, so a fail-stop in
+        // that handler (a corrupt RequestVote/AppendEntries/InstallSnapshot) would leave a premature
+        // durable term write. Instead `ensure_term_durable` makes the step-down durable AFTER the
+        // handler validates and BEFORE any entry/snapshot from this term — called by the entry/snapshot
+        // handlers themselves (term-before-entries) and, as the catch-all for the rest, after the
+        // dispatch below. Stepping down owes no ack, so there is still no Pending entry.
         // NOTE: a voter that steps down here on a higher-term RESPONSE (whose handler does not
         // re-arm) would be left without an election timer — `reconcile_election_timer`, run at the
         // end of this entry point, restores the invariant. We deliberately do NOT arm inline (that
@@ -2075,7 +2232,7 @@ where
       Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
       Message::VoteResp(vr) => self.on_vote_resp(now, log, stable, vr),
       Message::Heartbeat(hb) => self.on_heartbeat(now, log, hb),
-      Message::AppendEntries(ae) => self.on_append_entries(now, log, ae),
+      Message::AppendEntries(ae) => self.on_append_entries(now, log, stable, ae),
       Message::AppendResp(r) => self.on_append_resp(now, log, stable, from, r),
       Message::HeartbeatResp(hr) => self.on_heartbeat_resp(from, log, stable, hr),
       Message::ReadIndex(ri) => self.on_read_index(now, log, stable, ri),
@@ -2085,6 +2242,13 @@ where
       Message::TimeoutNow(tn) => self.on_timeout_now(now, log, stable, tn),
       _ => {}
     }
+
+    // Catch-all term-step-down persist (R33): make a just-adopted higher term durable for the handlers
+    // that did NOT persist it themselves — a heartbeat, a response, a non-granting RequestVote, a
+    // stale-snapshot ack. Runs AFTER the handler's read-only validation, so a fail-stop above persisted
+    // nothing (side-effect-free). Idempotent: a no-op for same-term/pre-vote messages and for a grant /
+    // entry-append / snapshot-install handler that already persisted the step-down (no double-write).
+    self.ensure_term_durable(stable);
 
     // Invariant restore: a higher-term step-down on a RESPONSE message (handled above) or a
     // conf-change applied by this message may have left a voter without an election timer. The
@@ -2529,6 +2693,14 @@ where
     if next_term == self.term {
       return;
     }
+    // Read the last-log coordinate FIRST (read-only): the vote request needs it, and a fatal term-read
+    // must fail-stop BEFORE any term/vote mutation or the durable self-vote write — so the campaign
+    // fail-stop is side-effect-free (no durable self-vote left in a term we never actually campaigned
+    // in). Mirrors `on_request_vote`, which reads `last_log` before it grants/persists. (R33-F2.)
+    let Some((last_index, last_term)) = self.last_log(log) else {
+      self.poison(PoisonReason::LogTerm);
+      return;
+    };
     self.term = next_term;
     // All pending work from the previous term is now stale (spec §7). Clear before recording
     // the self-vote below so old completions that arrive later are harmlessly ignored.
@@ -2561,10 +2733,6 @@ where
       .insert(opid, Pending::Campaign { term: self.term });
     self.arm_election_timer(now);
 
-    let Some((last_index, last_term)) = self.last_log(log) else {
-      self.poison(PoisonReason::LogTerm);
-      return;
-    };
     let (term, me) = (self.term, self.config.id());
     // Send RequestVote only to VOTER peers (not learners). Learners don't participate in
     // elections; sending them a RequestVote wastes bandwidth and may confuse their state.
@@ -2777,10 +2945,11 @@ where
     );
   }
 
-  fn on_append_entries<L: LogStore>(
+  fn on_append_entries<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Instant,
     log: &mut L,
+    stable: &mut S,
     ae: crate::AppendEntries<I>,
   ) {
     let changed = self.leader != Some(ae.leader());
@@ -2905,6 +3074,12 @@ where
           self.poison(PoisonReason::CommittedTruncation);
           return;
         }
+        // All read-only consistency/contiguity/truncation checks have passed; the durable phase begins
+        // here. Persist the (possibly just-adopted) term BEFORE appending its entries — term-before-
+        // entries (see `ensure_term_durable`), preserving the submission order the old eager step-down
+        // write had. Placed AFTER validation, so a malformed append fail-stops with no term write.
+        // Idempotent for a same-term append (the term is already durable).
+        self.ensure_term_durable(stable);
         // §5.3 truncation invalidates any success-ack — already QUEUED in `outgoing` (the immediate
         // pure-duplicate ack) or still PENDING as a deferred FollowerAck — whose match index lies in
         // the range being overwritten. Those entries are gone, so reporting them is an OVER-ACK: it
@@ -2969,17 +3144,10 @@ where
       // entry a crash loses. When the tail/blob flushes, the deferred FollowerAck or next heartbeat
       // reports the higher match.
       let ack_index = last_new.min(self.ack_watermark());
-      self.send(
-        ae.leader(),
-        Message::AppendResp(crate::AppendResp::new(
-          term,
-          me,
-          false,
-          Index::ZERO,
-          Term::ZERO,
-          ack_index,
-        )),
-      );
+      // R34 persist-before-RESPOND: defer this success ack if `self.term` (possibly just adopted from a
+      // higher-term heartbeat) is not yet durable; released by `flush_term_gated_acks`.
+      let leader = ae.leader();
+      self.send_or_gate_append_ack(leader, ack_index);
     }
   }
 
@@ -3670,7 +3838,6 @@ where
     }
 
     let meta = is.snapshot();
-    let (term, me) = (self.term, self.config.id());
 
     // Reserved-sentinel guard (R31): a snapshot whose boundary index is the reserved sentinel u64::MAX
     // is malformed — a correct leader never commits/snapshots the sentinel (R30), and installing it
@@ -3694,15 +3861,12 @@ where
     // watermark, and `ack_watermark() >= meta.last_index()` holds whenever the durable log (or, during a
     // pending install, the snapshot boundary) already covers the already-quorum-committed snapshot index.
     if meta.last_index() <= self.commit {
-      self.send(
-        is.leader(),
-        Message::SnapshotResp(crate::SnapshotResp::new(
-          term,
-          me,
-          false,
-          self.commit.min(self.ack_watermark()),
-        )),
-      );
+      // R34 persist-before-RESPOND: defer if `self.term` (the install message's term) is not yet durable
+      // — on this stale path `ensure_term_durable` does not run (no install), so the term write is the
+      // post-dispatch catch-all in `handle_message`, and `flush_term_gated_acks` releases this ack.
+      let ack = self.commit.min(self.ack_watermark());
+      let leader = is.leader();
+      self.send_or_gate_snapshot_ack(leader, ack);
       return;
     }
 
@@ -3734,6 +3898,13 @@ where
     }
 
     // From here on the SM is in the snapshot state; all mutations below are safe.
+
+    // Persist the (possibly just-adopted) term now — AFTER the read-only validation (sentinel, conf,
+    // decode) and the SM restore have all succeeded, and BEFORE the durable snapshot install / log
+    // re-baseline below: term-before-snapshot, the snapshot analogue of term-before-entries (see
+    // `ensure_term_durable`), preserving the old eager step-down write's submission order. A fail-stop
+    // in any check above persisted no term write. Idempotent (a same-term install skips).
+    self.ensure_term_durable(stable);
 
     // A snapshot install discards the log tail; drop any pending log-append acks that
     // referred to now-discarded entries (a disk LogStore may have enqueued their
@@ -3831,10 +4002,10 @@ where
     // commit even if this node crashes and re-syncs before the blob lands. Acks ABOVE the boundary (an
     // uncommitted post-snapshot entry) are what `ack_watermark()` gates on the immediate / deferred
     // append paths. (etcd likewise acks the boundary immediately, not waiting for snapshot durability.)
-    self.send(
-      is.leader(),
-      Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, meta.last_index())),
-    );
+    // R34 persist-before-RESPOND: `ensure_term_durable` (above, after restore) submitted the term write,
+    // but if it is not yet durable this success ack must wait — released by `flush_term_gated_acks`.
+    let leader = is.leader();
+    self.send_or_gate_snapshot_ack(leader, meta.last_index());
   }
 
   /// Receive a `SnapshotResp` from a follower (leader path).
@@ -4675,6 +4846,31 @@ mod tests {
       bytes::Bytes::from_static(b"a"),
     );
 
+    // Establish term 1 as a DURABLE term first (R34: a follower must not ack under a non-durable term).
+    // A term-1 heartbeat (no entries) adopts the term; draining storage makes the term write durable
+    // WITHOUT flushing a log tail, leaving `durable_index` at 0 for the persist-before-ack check below.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      ep.durable_index,
+      Index::ZERO,
+      "the term-1 heartbeat made the term durable without flushing a tail"
+    );
+
     // First AppendEntries carries a NEW entry at index 1 → the follower appends it in-flight
     // (visible in VecLog) and registers a deferred FollowerAck. We deliberately do NOT drain
     // `handle_storage`, so the append's LogDone::Appended is still pending and `durable_index`
@@ -4835,6 +5031,32 @@ mod tests {
       ep.durable_index,
       Index::new(2),
       "RESET: durable boundary IS the snapshot's last index (not the stale-high tail at 3)"
+    );
+
+    // Establish term 2 as a DURABLE term first (R34: a follower must not ack under a non-durable term).
+    // A higher-term heartbeat (no entries) adopts term 2; draining storage makes that term write durable
+    // WITHOUT flushing any log tail — modelling a follower already at a durable term 2 before the
+    // in-flight entry arrives. (The divergent tail at 3 was already discarded by the install above.)
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(2),
+        1u64,
+        Index::new(2),
+        Term::new(2),
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      ep.durable_index,
+      Index::new(2),
+      "the term-2 heartbeat made the term durable without flushing a tail"
     );
 
     // Append ONE genuinely-new entry (index 3, term 2) in-flight — do NOT flush.
@@ -7641,6 +7863,75 @@ mod tests {
     (ep, log, stable)
   }
 
+  /// R34 (persist-before-RESPOND, core-enforced): a follower must not send a SUCCESS `AppendResp` under
+  /// a term whose HardState write is not yet durable (Raft §5.1: persist `currentTerm` before responding
+  /// to RPCs). A higher-term heartbeat (no entries) adopts the term in memory and submits the term write,
+  /// but the success ack is DEFERRED until that write is durable — then released by `handle_storage`.
+  /// This isolates the TERM gate from the entry-durability gate (a heartbeat appends nothing), proving
+  /// the core enforces the ordering itself rather than delegating it to the storage layer.
+  ///
+  /// MUTATION: drop the `term_is_durable()` check in `send_or_gate_append_ack` (send unconditionally) →
+  /// the ack is emitted before the term write completes (the deferral and the empty-early-batch fail).
+  #[test]
+  fn follower_defers_success_ack_until_term_durable() {
+    use crate::{AppendEntries, Index, Instant, Message, Term};
+    let (mut ep, mut log, mut stable) = make_follower();
+
+    // Higher-term (5) heartbeat-shaped AppendEntries (no entries): adopts term 5; the term write is
+    // submitted (in flight) by the post-dispatch `ensure_term_durable`.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(5),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![],
+        Index::ZERO,
+      )),
+    );
+
+    // Term 5 is adopted in memory but NOT durable, so the success ack must be withheld.
+    assert!(
+      !ep.term_is_durable(),
+      "a freshly-adopted term is not durable until its write completes"
+    );
+    assert!(
+      ep.term_gated_append_ack.is_some(),
+      "the success ack must be deferred while the term is not durable"
+    );
+    let early: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
+      .collect();
+    assert!(
+      early.is_empty(),
+      "no success ack may be sent under a non-durable term"
+    );
+
+    // The driver drains storage every iteration: completing the term write makes term 5 durable and
+    // releases the deferred ack.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    assert!(
+      ep.term_is_durable(),
+      "term 5 is durable once its HardState write completes"
+    );
+    assert!(
+      ep.term_gated_append_ack.is_none(),
+      "the deferred ack was released"
+    );
+    let acks: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
+      .collect();
+    assert_eq!(
+      acks.len(),
+      1,
+      "the success ack is sent exactly once the term is durable"
+    );
+  }
+
   /// Test 1: a behind follower installs the snapshot and acks correctly.
   #[test]
   fn install_snapshot_on_behind_follower() {
@@ -7666,6 +7957,10 @@ mod tests {
       1u64,
       Message::InstallSnapshot(is),
     );
+    // R34: the install adopts term 1 (follower started at term 0), so the post-install SnapshotResp is
+    // deferred until that term write is durable. Drain storage (as the driver does each iteration) to
+    // complete the term write and release the ack.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
 
     // SM must be restored to the snapshot state.
     assert_eq!(
@@ -7864,6 +8159,10 @@ mod tests {
       1u64,
       Message::InstallSnapshot(is),
     );
+    // R34: the install adopts term 1 (the follower starts at term 0), so the stale-snapshot success ack
+    // is deferred until that term write is durable. Drain storage (the driver does this every iteration)
+    // to complete the term write and release the deferred SnapshotResp.
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
 
     // SM must NOT have been restored.
     assert_eq!(
@@ -15114,6 +15413,193 @@ mod tests {
       log.term(Index::new(2)),
       Ok(Term::new(1)),
       "the committed entry's term is untouched (no overwrite to term 2)"
+    );
+  }
+
+  /// R33-F1 (side-effect-free fail-stop on a higher-term malformed AppendEntries). Adopting a higher
+  /// term no longer persists the step-down BEFORE the handler validates: a higher-term AppendEntries
+  /// with a non-contiguous suffix poisons (`NonContiguousAppend`) WITHOUT first writing the adopted
+  /// term to stable, so a restart cannot recover into a term the node never validly entered.
+  ///
+  /// MUTATION: restore the eager `submit_write` in `handle_message`'s higher-term branch (or drop the
+  /// `ensure_term_durable` deferral) → the durable term becomes the malformed message's term (5).
+  #[test]
+  fn higher_term_malformed_append_poisons_without_persisting_term() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, PoisonReason, Term,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut stable = crate::testkit::NoopStable::default();
+    let mut log = crate::testkit::VecLog::default();
+    assert_eq!(
+      stable.hard_state().term(),
+      Term::ZERO,
+      "baseline durable term is 0"
+    );
+
+    // Higher-term (5) AppendEntries: prev_log_index=0 passes the consistency check on the empty log,
+    // but the suffix is non-contiguous (first entry at index 2, not the expected 1).
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(5),
+        1u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![Entry::new(
+          Term::new(5),
+          Index::new(2),
+          EntryKind::Empty,
+          bytes::Bytes::new(),
+        )],
+        Index::ZERO,
+      )),
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a non-contiguous higher-term append must poison"
+    );
+    assert_eq!(ep.poison_reason(), Some(PoisonReason::NonContiguousAppend));
+    assert_eq!(
+      stable.hard_state().term(),
+      Term::ZERO,
+      "the adopted term must NOT be persisted before the fail-stop (side-effect-free)"
+    );
+  }
+
+  /// R33-F1 (side-effect-free fail-stop on a higher-term `RequestVote` whose `last_log` read fails).
+  /// The higher term is adopted in memory and dispatched to `on_request_vote`, which reads `last_log`
+  /// FIRST; a fatal term-read poisons (`LogTerm`) with NO durable term/vote write — the adopted term
+  /// is not left on disk by the fail-stop.
+  ///
+  /// MUTATION: restore the eager `submit_write` in `handle_message`'s higher-term branch → the durable
+  /// term becomes the vote request's term (5).
+  #[test]
+  fn higher_term_request_vote_last_log_failure_poisons_without_persisting_term() {
+    use crate::{
+      Config, Entry, EntryKind, Index, Instant, Message, PoisonReason, RequestVote, Term,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut stable = crate::testkit::NoopStable::default();
+    // One entry at index 1; arm a fatal term-read at the last index so `last_log` fails.
+    let mut log = crate::testkit::FailTermLog::default();
+    log.force_append(&[Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    )]);
+    log.fail_term_at(Some(Index::new(1)));
+    assert_eq!(
+      stable.hard_state().term(),
+      Term::ZERO,
+      "baseline durable term is 0"
+    );
+
+    // Higher-term (5) real (non-pre-vote) RequestVote from candidate 1. No known leader → not in
+    // lease → the term is adopted and dispatched; `on_request_vote`'s `last_log` read then fails.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(5),
+        1u64,
+        Index::new(1),
+        Term::new(1),
+        false, // pre_vote
+        false, // leader_transfer
+      )),
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a fatal last-log read while granting must poison"
+    );
+    assert_eq!(ep.poison_reason(), Some(PoisonReason::LogTerm));
+    assert_eq!(
+      stable.hard_state().term(),
+      Term::ZERO,
+      "the adopted term must NOT be persisted before the fail-stop (side-effect-free)"
+    );
+  }
+
+  /// R33-F2 (side-effect-free fail-stop at election time). `become_candidate` now reads `last_log`
+  /// BEFORE advancing the term, recording the self-vote, or persisting. A fatal term-read at election
+  /// time poisons (`LogTerm`) with the durable HardState UNCHANGED — no durable self-vote is left in a
+  /// term the node never actually campaigned in.
+  ///
+  /// MUTATION: move the `last_log` read back below the term/self-vote `submit_write` in
+  /// `become_candidate` → the durable HardState gains (term+1, self) before the poison.
+  #[test]
+  fn election_time_last_log_failure_poisons_without_self_vote() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, PoisonReason, Term};
+    use core::time::Duration;
+    // Single-node voter cluster + pre_vote default(false) → the election timeout drives straight into
+    // become_candidate (no pre-vote round).
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut stable = crate::testkit::NoopStable::default();
+    // One entry at index 1; arm a fatal term-read at the last index so `last_log` fails.
+    let mut log = crate::testkit::FailTermLog::default();
+    log.force_append(&[Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    )]);
+    log.fail_term_at(Some(Index::new(1)));
+    assert_eq!(stable.hard_state().term(), Term::ZERO);
+    assert_eq!(stable.hard_state().vote(), None);
+
+    // Fire the election timeout well past the randomized election timer.
+    ep.handle_timeout(
+      Instant::ORIGIN + Duration::from_secs(10),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "a fatal last-log read at election time must poison"
+    );
+    assert_eq!(ep.poison_reason(), Some(PoisonReason::LogTerm));
+    assert_eq!(
+      stable.hard_state().term(),
+      Term::ZERO,
+      "no term advance persisted before the fail-stop"
+    );
+    assert_eq!(
+      stable.hard_state().vote(),
+      None,
+      "no durable self-vote left in a term we never campaigned in"
     );
   }
 
