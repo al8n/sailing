@@ -23,3 +23,12 @@ pub use id::NodeId;
 
 mod time;
 pub use time::Instant;
+
+mod data;
+pub use data::{Data, DataRef, DecodeError};
+
+mod entry;
+pub use entry::{Entry, EntryKind};
+
+mod hard_state;
+pub use hard_state::HardState;

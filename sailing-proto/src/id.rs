@@ -1,15 +1,14 @@
 //! Node identity. A blanket-impl marker so users never implement it by hand.
+use crate::Data;
 use core::{
   fmt::{Debug, Display},
   hash::Hash,
 };
 
 /// Marker for a Raft node identifier. Blanket-implemented for any type meeting the bounds.
-///
-/// `Data` (the wire-codec bound) is added as a supertrait in the `data` module's task.
-pub trait NodeId: Copy + Ord + Hash + Debug + Display + 'static {}
+pub trait NodeId: Data + Copy + Ord + Hash + Debug + Display + 'static {}
 
-impl<T> NodeId for T where T: Copy + Ord + Hash + Debug + Display + 'static {}
+impl<T> NodeId for T where T: Data + Copy + Ord + Hash + Debug + Display + 'static {}
 
 #[cfg(test)]
 mod tests {
