@@ -271,7 +271,12 @@ where
     e.data().len() as u64
   }
 
-  fn maybe_send_append<L: LogStore>(&mut self, peer: I, log: &L) {
+  fn maybe_send_append<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    peer: I,
+    log: &L,
+    stable: &S,
+  ) {
     let Some(pr) = self.progress.get(&peer).cloned() else {
       return;
     };
@@ -279,6 +284,28 @@ where
     if pr.is_paused() {
       return;
     }
+
+    // M5 Task 5: if the entries this peer needs have been compacted into a snapshot
+    // (next_index strictly below first_index), an AppendEntries cannot carry a valid
+    // prev_log_term across the compaction boundary — send the snapshot instead.
+    // At next_index == first_index the normal path still works: prev_index == offset
+    // whose boundary term is retained.
+    if pr.next_index().get() < log.first_index().get() {
+      if let Some((meta, data)) = stable.snapshot() {
+        let (term, me) = (self.term, self.config.id());
+        let pending = meta.last_index();
+        self.send(
+          peer,
+          Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, data)),
+        );
+        if let Some(p) = self.progress.get_mut(&peer) {
+          p.become_snapshot(pending);
+        }
+      }
+      // No snapshot persisted yet → nothing to send; retry later.
+      return;
+    }
+
     let next = pr.next_index();
     let prev_index = Index::new(next.get().saturating_sub(1));
     let prev_term = if prev_index == Index::ZERO {
@@ -536,10 +563,13 @@ where
     self.pending_compact = Some((opid, self.applied));
   }
 
-  /// Rebuild a node from durable storage after a crash. Restores `(term, vote)`, sets
-  /// `commit` to the durably-committed frontier (capped by the durable log), and replays
-  /// the durable committed log into the (fresh) state machine. Returns in `Follower` with
-  /// the election timer armed.
+  /// Rebuild a node from durable storage after a crash. If a durable snapshot exists,
+  /// restores the state machine from it first, then replays only the post-snapshot
+  /// committed tail `(snapshot.last_index .. commit]`. Without a snapshot, replays the
+  /// full committed log from index 1 (the M3 behavior). Returns in `Follower` with the
+  /// election timer armed.
+  ///
+  /// A corrupt durable snapshot poisons the node (no partial state is applied).
   pub fn restart<L, S>(
     config: Config<I>,
     now: Instant,
@@ -551,10 +581,30 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
   {
     let hs = stable.hard_state();
-    // Never trust a commit index beyond what is durably in the log (§3.8).
-    let commit = core::cmp::min(hs.commit(), log.last_index());
+    let mut fsm = fsm;
+    let mut applied = Index::ZERO;
+    let mut poisoned = false;
+    // Restore from a durable snapshot first: the compacted log no longer holds entries
+    // <= meta.last_index, so the SM baseline comes from the snapshot; we then replay only
+    // the durable post-snapshot committed tail.
+    if let Some((meta, data)) = stable.snapshot() {
+      match <F::Snapshot as crate::Data>::decode(&data) {
+        Ok((_, snap)) => {
+          if fsm.restore(snap).is_err() {
+            poisoned = true;
+          } else {
+            applied = meta.last_index();
+            // M6 installs meta.conf() (dynamic membership); M5 has fixed config voters.
+          }
+        }
+        Err(_) => poisoned = true,
+      }
+    }
+    // Never trust commit beyond the durable log; never below the snapshot baseline.
+    let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
     let mut ep = Self {
       config,
       fsm,
@@ -563,30 +613,24 @@ where
       voted_for: hs.vote(),
       leader: None,
       commit,
-      applied: Index::ZERO,
+      applied,
       prng: Prng::new(seed),
       votes_granted: BTreeSet::new(),
       election_deadline: None,
       heartbeat_deadline: None,
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
-      poisoned: false,
+      poisoned,
       pending_compact: None,
       progress: BTreeMap::new(),
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
     };
-    // M5-U3 will replace this replay with a snapshot-restore prefix followed by a
-    // partial log replay. Until that unit lands, guard against silent state loss:
-    // if the log has been compacted (first_index > 1) we cannot rebuild state by
-    // replaying from index 1, so fail loudly rather than silently returning an
-    // empty state machine despite a non-zero commit.
-    debug_assert!(
-      log.first_index() == Index::new(1),
-      "restart cannot yet restore from a compacted log — see M5-U3 (restore-on-restart)"
-    );
-    // Replay committed log into the fresh SM (a restart is silent to the app).
-    ep.apply_committed(log);
+    // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
+    // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
+    if !ep.poisoned {
+      ep.apply_committed(log);
+    }
     ep.events.clear();
     ep.arm_election_timer(now);
     ep
@@ -656,6 +700,7 @@ where
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
   {
     if self.poisoned {
       return;
@@ -678,14 +723,16 @@ where
     if msg.term() < self.term {
       return;
     }
-    #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for M5/M7 variants
+    #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for M7 variants
     match msg {
       Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
       Message::VoteResp(vr) => self.on_vote_resp(now, log, stable, vr),
       Message::Heartbeat(hb) => self.on_heartbeat(now, log, hb),
       Message::AppendEntries(ae) => self.on_append_entries(now, log, ae),
-      Message::AppendResp(r) => self.on_append_resp(now, log, from, r),
-      Message::HeartbeatResp(_) => self.on_heartbeat_resp(from, log),
+      Message::AppendResp(r) => self.on_append_resp(now, log, stable, from, r),
+      Message::HeartbeatResp(_) => self.on_heartbeat_resp(from, log, stable),
+      Message::InstallSnapshot(is) => self.on_install_snapshot(now, log, stable, is),
+      Message::SnapshotResp(r) => self.on_snapshot_resp(now, log, stable, from, r),
       _ => {}
     }
   }
@@ -720,7 +767,7 @@ where
     &mut self,
     _now: Instant,
     log: &mut L,
-    _stable: &mut S,
+    stable: &mut S,
     cmd: &F::Command,
   ) -> Result<Index, crate::ProposeError<I>>
   where
@@ -749,7 +796,7 @@ where
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
-      self.maybe_send_append(peer, log);
+      self.maybe_send_append(peer, log, stable);
     }
     Ok(index)
   }
@@ -829,7 +876,7 @@ where
     &mut self,
     now: Instant,
     log: &mut L,
-    _stable: &mut S,
+    stable: &mut S,
   ) {
     self.role = Role::Leader;
     self.leader = Some(self.config.id());
@@ -873,7 +920,7 @@ where
     // Broadcast heartbeats (M1 contract) and kick off replication to peers.
     self.broadcast_heartbeat(now);
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
-      self.maybe_send_append(peer, log);
+      self.maybe_send_append(peer, log, stable);
     }
   }
 
@@ -1028,14 +1075,19 @@ where
   /// LIVENESS (deferred to a later milestone): a Replicate peer whose entire in-flight window
   /// is dropped with no further acks won't be re-probed by heartbeats — etcd sends an empty
   /// MsgApp when Replicate && Inflights.full(). Revisit with snapshots.
-  fn on_heartbeat_resp<L: LogStore>(&mut self, from: I, log: &L) {
+  fn on_heartbeat_resp<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    from: I,
+    log: &L,
+    stable: &S,
+  ) {
     if !self.role.is_leader() {
       return;
     }
     if let Some(pr) = self.progress.get_mut(&from) {
       pr.clear_probe_pause();
     }
-    self.maybe_send_append(from, log);
+    self.maybe_send_append(from, log, stable);
   }
 
   /// Walk the leader's log downward from `index` until we find an entry whose term is
@@ -1052,10 +1104,11 @@ where
     index
   }
 
-  fn on_append_resp<L: LogStore>(
+  fn on_append_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     _now: Instant,
     log: &mut L,
+    stable: &S,
     from: I,
     resp: crate::AppendResp<I>,
   ) {
@@ -1086,12 +1139,163 @@ where
         p.become_probe();
         p.set_next_index(safe_next);
       }
-      self.maybe_send_append(from, log);
+      self.maybe_send_append(from, log, stable);
     } else if pr.maybe_update(resp.match_index()) {
       pr.become_replicate();
       self.maybe_advance_commit(log);
       self.apply_committed(log);
-      self.maybe_send_append(from, log); // keep the pipeline moving if still behind
+      self.maybe_send_append(from, log, stable); // keep the pipeline moving if still behind
+    }
+  }
+
+  /// M5-U2c: receive an `InstallSnapshot` from the current leader (follower path).
+  fn on_install_snapshot<L, S>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    stable: &mut S,
+    is: crate::InstallSnapshot<I>,
+  ) where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
+  {
+    // Preamble: mirror on_append_entries — reset to Follower, track leader, re-arm election timer.
+    let changed = self.leader != Some(is.leader());
+    self.role = Role::Follower;
+    self.leader = Some(is.leader());
+    self.arm_election_timer(now);
+    if changed {
+      self
+        .events
+        .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
+          self.term,
+          Some(is.leader()),
+        )));
+    }
+
+    let meta = is.snapshot();
+    let (term, me) = (self.term, self.config.id());
+
+    // Staleness guard: if last_index <= commit we are already at or ahead of the snapshot.
+    // Installing it would REGRESS committed/applied state — absolutely forbidden.
+    // Ack anyway with match_index = self.commit so the leader can transition the peer out
+    // of Snapshot state (maybe_update(commit) >= pending since leader only sends snapshots
+    // whose last_index <= leader.commit, so commit >= pending holds).
+    if meta.last_index() <= self.commit {
+      self.send(
+        is.leader(),
+        Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, self.commit)),
+      );
+      return;
+    }
+
+    // meta.last_index() > self.commit: proceed with installation.
+
+    // Step 1: decode the SM snapshot. On failure, poison and return — leave NO partial state.
+    let snap = match <F::Snapshot as crate::Data>::decode(is.data()) {
+      Ok((_, s)) => s,
+      Err(_) => {
+        self.poison();
+        return;
+      }
+    };
+
+    // Step 2: restore the state machine. On failure, poison and return — leave NO partial state.
+    if self.fsm.restore(snap).is_err() {
+      self.poison();
+      return;
+    }
+
+    // From here on the SM is in the snapshot state; all mutations below are safe.
+
+    // A snapshot install discards the log tail; drop any pending log-append acks that
+    // referred to now-discarded entries (a disk LogStore may have enqueued their
+    // completions). Vote-persistence pendings are unrelated to the log and must survive.
+    self
+      .pending
+      .retain(|_, p| matches!(p, Pending::CastVote { .. }));
+
+    // A node installing a snapshot as a follower abandons any leader-side compaction it
+    // had in flight (the deferred compact would target a now-superseded index); the old
+    // SnapshotWritten completion will harmlessly find None.
+    self.pending_compact = None;
+
+    // Step 3: advance commit + applied to the snapshot boundary.
+    self.commit = meta.last_index();
+    self.applied = meta.last_index();
+
+    // Step 4: re-baseline the log. Discards the follower's stale/short log (entries beyond
+    // last_index were uncommitted since commit < last_index before this install — the leader
+    // will re-replicate them if needed). After this call: first_index == last_index + 1,
+    // term(last_index) == last_term — the NEXT AppendEntries(prev=last_index) passes the
+    // consistency check without a reject-loop.
+    //
+    // The install updates in-memory state and the log read-view immediately (so commit/applied
+    // and the log stay mutually consistent for apply_committed). The snapshot blob is persisted
+    // via submit_snapshot (deferred completion). Local crash recovery does NOT rely on intra-call
+    // ordering: if the process crashes before the blob is durable, restart-from-snapshot (M5-U3)
+    // finds no durable snapshot and the node re-syncs from the leader. Acking before the blob is
+    // durable is safe because meta.last_index <= leader.commit — those entries are already
+    // quorum-committed, so this ack cannot advance the cluster commit.
+    log.restore(meta.last_index(), meta.last_term());
+
+    // Step 5: persist the snapshot for restart recovery (deferred; see comment above).
+    let opid = self.mint_op_id();
+    stable.submit_snapshot(opid, meta.clone(), is.data().clone());
+
+    // Step 6: emit the application event.
+    self
+      .events
+      .push_back(crate::Event::SnapshotInstalled(meta.clone()));
+
+    // Step 7: M6 will wire dynamic membership from meta.conf() here. For now (M5, fixed
+    // config), the conf field is informational only — skip it.
+
+    // Step 8: ack to the leader with match_index = last_index, signalling successful install.
+    // The leader's maybe_update(last_index) >= pending_snapshot transitions the peer out of
+    // Snapshot state and resumes normal replication.
+    self.send(
+      is.leader(),
+      Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, meta.last_index())),
+    );
+  }
+
+  /// M5-U2c: receive a `SnapshotResp` from a follower (leader path).
+  fn on_snapshot_resp<L, S>(
+    &mut self,
+    _now: Instant,
+    log: &mut L,
+    stable: &S,
+    from: I,
+    resp: crate::SnapshotResp<I>,
+  ) where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.role.is_leader() {
+      return;
+    }
+    let Some(pr) = self.progress.get_mut(&from) else {
+      return;
+    };
+    if resp.reject() {
+      // The snapshot was refused (shouldn't happen in the current protocol, but handle
+      // defensively): revert to Probe so maybe_send_append re-probes and, if the follower
+      // is still below first_index, re-sends the snapshot.
+      pr.become_probe();
+      // Drop the mutable borrow of `pr` before calling maybe_send_append (which re-borrows
+      // self.progress). The pattern mirrors on_append_resp's reject branch.
+      self.maybe_send_append(from, log, stable);
+    } else {
+      // Success: maybe_update drives the Snapshot → Probe transition regardless of its return
+      // value ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never
+      // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_resp).
+      pr.maybe_update(resp.match_index());
+      // Re-borrow self for the resume sequence (pr is dropped above).
+      self.maybe_advance_commit(log);
+      self.apply_committed(log);
+      self.maybe_send_append(from, log, stable);
     }
   }
 }
@@ -2885,6 +3089,981 @@ mod tests {
     assert_eq!(
       snap_count_before, snap_count_after,
       "maybe_snapshot must not re-fire while pending_compact is set"
+    );
+  }
+
+  // ---- M5 Task 5: send InstallSnapshot to lagging follower ----
+
+  /// Helper: build a 3-voter leader (node 1) with a compacted log.
+  /// Returns the endpoint, a VecLog compacted up to `offset` with the snapshot persisted
+  /// in an AsyncStable, and the stable store.
+  ///
+  /// Log after setup: entries [offset+1 ..= offset+n_tail], first_index = offset + 1.
+  /// Stable holds a snapshot with last_index = offset.
+  fn make_leader_with_compacted_log(
+    offset: u64,
+    n_tail: usize,
+  ) -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::AsyncStable,
+  ) {
+    use crate::{
+      Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, conf::ConfState,
+    };
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_max_size_per_msg(u64::MAX);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    // Elect node 1 as leader.
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Compact the log up to `offset`: seed boundary entries then compact.
+    if offset > 0 {
+      // Force the log to have entries 1..=offset+n_tail to give compact() something to drop.
+      let all: std::vec::Vec<Entry> = (1u64..=offset + n_tail as u64)
+        .map(|i| {
+          Entry::new(
+            Term::new(1),
+            Index::new(i),
+            EntryKind::Normal,
+            bytes::Bytes::from_static(b"x"),
+          )
+        })
+        .collect();
+      log.force_append(&all);
+      // Compact up to offset, retaining entries [offset+1 ..= offset+n_tail].
+      log.compact(Index::new(offset));
+    }
+
+    // Persist a snapshot with last_index = offset in stable.
+    let meta = crate::SnapshotMeta::new(
+      Index::new(offset),
+      Term::new(1),
+      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+    );
+    let data = bytes::Bytes::from_static(b"snap-data");
+    stable.submit_snapshot(crate::OpId::new(99), meta, data);
+    // Drain the SnapshotWritten completion so stable.snapshot() is readable.
+    while stable.poll().is_some() {}
+
+    (ep, log, stable)
+  }
+
+  /// Test 1: sends InstallSnapshot when next_index < first_index.
+  #[test]
+  fn sends_install_snapshot_on_compacted_hole() {
+    use crate::{Index, Message};
+
+    let offset = 5u64;
+    let (mut ep, log, stable) = make_leader_with_compacted_log(offset, 2);
+
+    // Set peer 2's progress so next_index = 3 < first_index = 6.
+    let far_behind = Index::new(3);
+    if let Some(p) = ep.progress.get_mut(&2u64) {
+      p.become_probe();
+      p.set_next_index(far_behind);
+    }
+
+    // Call maybe_send_append; it should detect next_index < first_index and send snapshot.
+    ep.maybe_send_append(2u64, &log, &stable);
+
+    // Exactly one outgoing message to peer 2 must be InstallSnapshot.
+    let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+    let snap_msgs: std::vec::Vec<_> = msgs
+      .iter()
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+      .collect();
+    assert_eq!(
+      snap_msgs.len(),
+      1,
+      "exactly one InstallSnapshot must be sent to peer 2"
+    );
+
+    let snap_msg = match snap_msgs[0].message() {
+      Message::InstallSnapshot(s) => s,
+      _ => unreachable!(),
+    };
+    // The snapshot must match what stable holds (last_index = offset).
+    assert_eq!(
+      snap_msg.snapshot().last_index(),
+      Index::new(offset),
+      "InstallSnapshot must carry the persisted snapshot's last_index"
+    );
+
+    // Peer 2's progress must now be in Snapshot state with pending = offset.
+    let pr = ep.progress.get(&2u64).unwrap();
+    assert!(
+      pr.state().is_snapshot(),
+      "peer 2 must be in Snapshot state after sending InstallSnapshot"
+    );
+    if let crate::ProgressState::Snapshot(pending) = pr.state() {
+      assert_eq!(
+        pending,
+        Index::new(offset),
+        "Snapshot pending index must equal the snapshot's last_index"
+      );
+    }
+  }
+
+  /// Test 2: no broken AppendEntries (prev_log_term == ZERO) for compacted peer.
+  #[test]
+  fn no_broken_append_entries_for_compacted_peer() {
+    use crate::{Index, Message, Term};
+
+    let offset = 5u64;
+    let (mut ep, log, stable) = make_leader_with_compacted_log(offset, 2);
+
+    // Peer 2 is far behind (next_index < first_index).
+    if let Some(p) = ep.progress.get_mut(&2u64) {
+      p.become_probe();
+      p.set_next_index(Index::new(3));
+    }
+
+    ep.maybe_send_append(2u64, &log, &stable);
+
+    // Must NOT see any AppendEntries with prev_log_term == ZERO for this peer.
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          assert_ne!(
+            ae.prev_log_term(),
+            Term::ZERO,
+            "a broken AppendEntries with prev_log_term=ZERO must not be sent to a compacted peer"
+          );
+        }
+      }
+    }
+  }
+
+  /// Test 3: after becoming Snapshot-state, peer is paused (no spam).
+  #[test]
+  fn snapshot_state_peer_is_paused_no_second_send() {
+    use crate::Index;
+
+    let offset = 5u64;
+    let (mut ep, log, stable) = make_leader_with_compacted_log(offset, 2);
+
+    // Set peer 2 far behind.
+    if let Some(p) = ep.progress.get_mut(&2u64) {
+      p.become_probe();
+      p.set_next_index(Index::new(3));
+    }
+
+    // First call: sends the snapshot and transitions peer to Snapshot state.
+    ep.maybe_send_append(2u64, &log, &stable);
+    while ep.poll_message().is_some() {} // drain
+
+    // Second call: peer is now paused (Snapshot state), must send nothing.
+    ep.maybe_send_append(2u64, &log, &stable);
+    let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+    assert!(
+      msgs.is_empty(),
+      "a second maybe_send_append to a Snapshot-state peer must emit nothing (paused)"
+    );
+  }
+
+  /// Test 4: a peer at next_index == first_index gets a normal AppendEntries (not a snapshot).
+  #[test]
+  fn normal_append_at_boundary_not_snapshot() {
+    use crate::{Index, Message};
+
+    let offset = 5u64;
+    let (mut ep, log, stable) = make_leader_with_compacted_log(offset, 2);
+    // first_index = offset + 1 = 6; set next_index = 6 (the boundary).
+    let first = log.first_index();
+    assert_eq!(first, Index::new(offset + 1));
+
+    if let Some(p) = ep.progress.get_mut(&2u64) {
+      p.become_probe();
+      p.set_next_index(first); // exactly at boundary
+    }
+
+    ep.maybe_send_append(2u64, &log, &stable);
+
+    let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+
+    // Must NOT send an InstallSnapshot.
+    let snap_count = msgs
+      .iter()
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+      .count();
+    assert_eq!(
+      snap_count, 0,
+      "must NOT send InstallSnapshot when next_index == first_index"
+    );
+
+    // Must send an AppendEntries (normal path — prev_index = offset, boundary term retained).
+    let ae_count = msgs
+      .iter()
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::AppendEntries(_)))
+      .count();
+    assert_eq!(
+      ae_count, 1,
+      "must send a normal AppendEntries when next_index == first_index"
+    );
+
+    // And the prev_log_term must be the boundary term (Term::new(1)), NOT ZERO.
+    for out in &msgs {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          assert_ne!(
+            ae.prev_log_term(),
+            crate::Term::ZERO,
+            "AppendEntries at the compaction boundary must carry the boundary term, not ZERO"
+          );
+        }
+      }
+    }
+  }
+
+  // ---- M5-U2c: InstallSnapshot receive + SnapshotResp ----
+
+  /// Encode a `u64` snapshot value into a `Bytes` blob (the wire format used by CountSm).
+  fn encode_snapshot(v: u64) -> bytes::Bytes {
+    use crate::Data as _;
+    let mut buf = std::vec::Vec::new();
+    v.encode(&mut buf);
+    bytes::Bytes::from(buf)
+  }
+
+  /// Build a follower endpoint (node 2 in a 3-voter cluster, term 1) with an empty log.
+  fn make_follower() -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::AsyncStable,
+  ) {
+    use crate::{Config, Instant};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
+    let log = crate::testkit::VecLog::default();
+    let stable = crate::testkit::AsyncStable::default();
+    (ep, log, stable)
+  }
+
+  /// Test 1: a behind follower installs the snapshot and acks correctly.
+  #[test]
+  fn install_snapshot_on_behind_follower() {
+    use crate::{Index, Instant, Message, Term, conf::ConfState};
+
+    let (mut ep, mut log, mut stable) = make_follower();
+
+    // Build a snapshot: SM state = 42 (CountSm::count = 42), last_index=10, last_term=4.
+    let snap_value: u64 = 42;
+    let snap_data = encode_snapshot(snap_value);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(10),
+      Term::new(4),
+      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+    );
+    let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta.clone(), snap_data.clone());
+
+    // Follower commit starts at 0 (< 10) → install path.
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(is),
+    );
+
+    // SM must be restored to the snapshot state.
+    assert_eq!(
+      ep.state_machine().count() as u64,
+      snap_value,
+      "state machine must be restored to the snapshot value"
+    );
+
+    // commit and applied must both equal last_index.
+    assert_eq!(
+      ep.commit,
+      Index::new(10),
+      "commit must equal meta.last_index()"
+    );
+    assert_eq!(
+      ep.applied,
+      Index::new(10),
+      "applied must equal meta.last_index()"
+    );
+
+    // Log must be re-baselined: first_index == 11, term(10) == 4.
+    assert_eq!(
+      log.first_index(),
+      Index::new(11),
+      "first_index must be last_index + 1"
+    );
+    assert_eq!(
+      log.last_index(),
+      Index::new(10),
+      "last_index must equal meta.last_index()"
+    );
+    assert_eq!(
+      log.term(Index::new(10)).unwrap(),
+      Term::new(4),
+      "term(last_index) must equal last_term after restore"
+    );
+    // No entries exist above last_index.
+    assert!(
+      log
+        .entries(Index::new(11)..Index::new(11), u64::MAX)
+        .unwrap()
+        .is_empty(),
+      "entries(11..11) must be empty after restore"
+    );
+
+    // Exactly one SnapshotInstalled event must be emitted.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+    let installed: std::vec::Vec<_> = events
+      .iter()
+      .filter(|e| e.is_snapshot_installed())
+      .collect();
+    assert_eq!(
+      installed.len(),
+      1,
+      "exactly one SnapshotInstalled event must be emitted"
+    );
+    assert_eq!(
+      installed[0].unwrap_snapshot_installed_ref().last_index(),
+      Index::new(10)
+    );
+
+    // Exactly one SnapshotResp must be sent to the leader (node 1) with reject=false,
+    // match_index=10.
+    let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+    let snap_resps: std::vec::Vec<_> = msgs
+      .iter()
+      .filter(|o| o.to() == 1u64 && matches!(o.message(), Message::SnapshotResp(_)))
+      .collect();
+    assert_eq!(
+      snap_resps.len(),
+      1,
+      "exactly one SnapshotResp must be sent to the leader"
+    );
+    let sr = match snap_resps[0].message() {
+      Message::SnapshotResp(r) => r,
+      _ => unreachable!(),
+    };
+    assert!(
+      !sr.reject(),
+      "SnapshotResp must not be a rejection on successful install"
+    );
+    assert_eq!(
+      sr.match_index(),
+      Index::new(10),
+      "match_index must equal meta.last_index()"
+    );
+
+    // stable must have a snapshot persisted (submit_snapshot was called).
+    assert!(
+      stable.snapshot().is_some(),
+      "stable store must hold the persisted snapshot after install"
+    );
+
+    // Election timer must be re-armed (poll_timeout is Some).
+    assert!(
+      ep.poll_timeout().is_some(),
+      "election timer must be re-armed after receiving a snapshot"
+    );
+  }
+
+  /// Test 2: a stale snapshot (last_index <= commit) is a no-op ack, SM not touched.
+  #[test]
+  fn stale_snapshot_does_not_install() {
+    use crate::{Entry, EntryKind, Index, Instant, Message, Term, conf::ConfState};
+
+    let (mut ep, mut log, mut stable) = make_follower();
+
+    // Seed the follower log with 15 entries so commit can be set to 15.
+    let entries: std::vec::Vec<_> = (1u64..=15)
+      .map(|i| {
+        Entry::new(
+          Term::new(1),
+          Index::new(i),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"x"),
+        )
+      })
+      .collect();
+    log.force_append(&entries);
+    // Manually advance commit to 15 (the follower has committed up to 15).
+    ep.commit = Index::new(15);
+    ep.applied = Index::new(15);
+    // SM count is arbitrary (doesn't matter — must not change).
+    let sm_count_before = ep.state_machine().count();
+
+    // Try to install a snapshot with last_index=10 (< commit=15): stale.
+    let snap_data = encode_snapshot(7u64);
+    let meta = crate::SnapshotMeta::new(
+      Index::new(10),
+      Term::new(4),
+      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+    );
+    let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, snap_data);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(is),
+    );
+
+    // SM must NOT have been restored.
+    assert_eq!(
+      ep.state_machine().count(),
+      sm_count_before,
+      "SM must not be restored for a stale snapshot"
+    );
+    // commit must be unchanged.
+    assert_eq!(
+      ep.commit,
+      Index::new(15),
+      "commit must not regress for a stale snapshot"
+    );
+
+    // No SnapshotInstalled event.
+    let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event())
+      .filter(|e| e.is_snapshot_installed())
+      .collect();
+    assert!(
+      events.is_empty(),
+      "no SnapshotInstalled event for a stale snapshot"
+    );
+
+    // Must still send a SnapshotResp with reject=false and match_index = self.commit.
+    let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+    let snap_resps: std::vec::Vec<_> = msgs
+      .iter()
+      .filter(|o| o.to() == 1u64 && matches!(o.message(), Message::SnapshotResp(_)))
+      .collect();
+    assert_eq!(
+      snap_resps.len(),
+      1,
+      "stale snapshot must still send a SnapshotResp"
+    );
+    let sr = match snap_resps[0].message() {
+      Message::SnapshotResp(r) => r,
+      _ => unreachable!(),
+    };
+    assert!(!sr.reject(), "stale snapshot ack must have reject=false");
+    assert_eq!(
+      sr.match_index(),
+      Index::new(15),
+      "match_index must be self.commit (so leader leaves Snapshot state)"
+    );
+  }
+
+  /// Test 3: malformed snapshot data poisons the node; no partial state is applied.
+  #[test]
+  fn malformed_snapshot_data_poisons_node() {
+    use crate::{Index, Instant, Message, Term, conf::ConfState};
+
+    let (mut ep, mut log, mut stable) = make_follower();
+
+    // Bad data: too short to decode a u64 (only 3 bytes).
+    let bad_data = bytes::Bytes::from_static(b"bad");
+    let meta = crate::SnapshotMeta::new(
+      Index::new(10),
+      Term::new(4),
+      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+    );
+    let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, bad_data);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(is),
+    );
+
+    // Node must be poisoned.
+    assert!(
+      ep.is_poisoned(),
+      "node must be poisoned after a malformed snapshot"
+    );
+
+    // commit and applied must NOT have been touched (no partial state).
+    assert_eq!(
+      ep.commit,
+      Index::ZERO,
+      "commit must not be modified on decode failure"
+    );
+    assert_eq!(
+      ep.applied,
+      Index::ZERO,
+      "applied must not be modified on decode failure"
+    );
+
+    // All subsequent handle_message calls are no-ops.
+    let good_data = encode_snapshot(1u64);
+    let meta2 = crate::SnapshotMeta::new(
+      Index::new(10),
+      Term::new(4),
+      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+    );
+    let is2 = crate::InstallSnapshot::new(Term::new(1), 1u64, meta2, good_data);
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(is2),
+    );
+    // commit still zero — poisoned node ignores everything.
+    assert_eq!(
+      ep.commit,
+      Index::ZERO,
+      "poisoned node must ignore subsequent messages"
+    );
+    // No messages or events emitted.
+    assert!(
+      ep.poll_message().is_none(),
+      "poisoned node must not emit messages"
+    );
+  }
+
+  /// Test 4: leader processes a successful SnapshotResp — peer leaves Snapshot state.
+  #[test]
+  fn leader_processes_snapshot_resp_success_and_reject() {
+    use crate::{Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+
+    // Build a 3-voter leader (node 1).
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Manually put peer 2 into Snapshot(10) state.
+    if let Some(p) = ep.progress.get_mut(&2u64) {
+      p.become_snapshot(Index::new(10));
+    }
+    assert!(ep.progress.get(&2u64).unwrap().state().is_snapshot());
+
+    // --- Reject case: become_probe, then maybe_send_append re-enters probe ---
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::SnapshotResp(crate::SnapshotResp::new(
+        Term::new(1),
+        2u64,
+        true, // reject
+        Index::new(10),
+      )),
+    );
+    // After reject the peer must have transitioned to Probe.
+    assert!(
+      ep.progress.get(&2u64).unwrap().state().is_probe(),
+      "reject SnapshotResp must transition peer to Probe"
+    );
+
+    // --- Success case: peer has been put back in Snapshot(10). ---
+    if let Some(p) = ep.progress.get_mut(&2u64) {
+      p.become_snapshot(Index::new(10));
+    }
+    // Drain any messages from the probe that was triggered by the reject.
+    while ep.poll_message().is_some() {}
+
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::SnapshotResp(crate::SnapshotResp::new(
+        Term::new(1),
+        2u64,
+        false, // success
+        Index::new(10),
+      )),
+    );
+    // maybe_update(10) >= pending_snapshot(10) → Probe; match_index == 10.
+    let pr = ep.progress.get(&2u64).unwrap();
+    assert!(
+      pr.state().is_probe(),
+      "success SnapshotResp must transition peer out of Snapshot state"
+    );
+    assert_eq!(
+      pr.match_index(),
+      Index::new(10),
+      "match_index must be 10 after successful SnapshotResp"
+    );
+  }
+
+  // ---- M5-U2c: LogStore::restore unit tests ----
+
+  /// After `restore(10, 4)` on a VecLog with arbitrary prior content, the log has the
+  /// expected re-baseline invariants.
+  #[test]
+  fn veclog_restore_rebaselines_correctly() {
+    use crate::{Entry, EntryKind, Index, Term};
+
+    let mut log = crate::testkit::VecLog::default();
+
+    // Seed with entries 1..=5 at term 1.
+    let entries: std::vec::Vec<_> = (1u64..=5)
+      .map(|i| {
+        Entry::new(
+          Term::new(1),
+          Index::new(i),
+          EntryKind::Normal,
+          bytes::Bytes::new(),
+        )
+      })
+      .collect();
+    log.submit_append(crate::OpId::new(1), &entries);
+    let _ = log.poll(); // drain completion
+
+    // Restore to last_index=10, last_term=4 (simulating a received snapshot).
+    log.restore(Index::new(10), Term::new(4));
+
+    assert_eq!(
+      log.first_index(),
+      Index::new(11),
+      "first_index must be last_index + 1"
+    );
+    assert_eq!(
+      log.last_index(),
+      Index::new(10),
+      "last_index must equal the snapshot boundary"
+    );
+    assert_eq!(
+      log.term(Index::new(10)).unwrap(),
+      Term::new(4),
+      "term(last_index) must equal last_term"
+    );
+    // No entries above last_index.
+    assert!(
+      log
+        .entries(Index::new(11)..Index::new(11), u64::MAX)
+        .unwrap()
+        .is_empty(),
+      "entries(11..11) must be empty after restore"
+    );
+    // No stale completions should leak out.
+    assert!(log.poll().is_none(), "no pending completions after restore");
+  }
+
+  /// After `restore` a subsequent `submit_append` of index 11 works correctly.
+  #[test]
+  fn veclog_submit_append_after_restore() {
+    use crate::{Entry, EntryKind, Index, Term};
+
+    let mut log = crate::testkit::VecLog::default();
+
+    // Seed and restore to last_index=10, last_term=4.
+    log.restore(Index::new(10), Term::new(4));
+
+    // Append index 11 at term 5.
+    let e = Entry::new(
+      Term::new(5),
+      Index::new(11),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"next"),
+    );
+    log.submit_append(crate::OpId::new(1), core::slice::from_ref(&e));
+    let _ = log.poll(); // drain
+
+    assert_eq!(
+      log.last_index(),
+      Index::new(11),
+      "last_index must be 11 after appending entry 11"
+    );
+    assert_eq!(
+      log.term(Index::new(11)).unwrap(),
+      Term::new(5),
+      "term(11) must be 5"
+    );
+    // Boundary term still accessible.
+    assert_eq!(
+      log.term(Index::new(10)).unwrap(),
+      Term::new(4),
+      "boundary term must be retained"
+    );
+  }
+
+  // ---- M5-U3: restore-from-snapshot on restart ----
+
+  /// Build a `CountSm` snapshot blob for the given count value.
+  fn encode_count_snapshot(count: u64) -> bytes::Bytes {
+    use crate::Data as _;
+    let mut buf = std::vec::Vec::new();
+    count.encode(&mut buf);
+    bytes::Bytes::from(buf)
+  }
+
+  /// Test 1: restart with a durable snapshot + post-snapshot committed tail.
+  /// SM must reflect snapshot-baseline PLUS replayed entries 6 and 7.
+  /// applied==7, commit==7, not poisoned.
+  #[test]
+  fn restart_restores_snapshot_then_replays_tail() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    // Build a durable stable: snapshot at last_index=5, last_term=2, SM count=10.
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_count: u64 = 10;
+    let snap_data = encode_count_snapshot(snap_count);
+    let meta =
+      crate::SnapshotMeta::new(Index::new(5), Term::new(2), ConfState::new(std::vec![1u64]));
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    // Drain the SnapshotWritten completion so stable.snapshot() is readable.
+    while stable.poll().is_some() {}
+
+    // Set HardState: term=2, commit=7 (two entries past the snapshot).
+    stable.force_state(Term::new(2), None, Index::new(7));
+
+    // Build a durable log: compacted to baseline 5, entries 6 and 7 present.
+    let mut log = crate::testkit::VecLog::default();
+    // Restore the log to the snapshot baseline (offset=5, compacted_term=2).
+    log.restore(Index::new(5), Term::new(2));
+    // Force-append entries 6 and 7 (post-snapshot tail).
+    // Entry data must be length-prefixed (the CountSm uses Bytes::decode, which requires
+    // an 8-byte LE length prefix followed by the raw payload).
+    log.force_append(&[
+      Entry::new(
+        Term::new(2),
+        Index::new(6),
+        EntryKind::Normal,
+        encode_cmd(b"cmd6"),
+      ),
+      Entry::new(
+        Term::new(2),
+        Index::new(7),
+        EntryKind::Normal,
+        encode_cmd(b"cmd7"),
+      ),
+    ]);
+
+    // Restart the node.
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    // SM must be the snapshot baseline (10) + 2 replayed entries = 12.
+    assert_eq!(
+      ep.state_machine().count() as u64,
+      snap_count + 2,
+      "SM must equal snapshot baseline + 2 replayed tail entries"
+    );
+    assert_eq!(ep.applied, Index::new(7), "applied must be 7");
+    assert_eq!(ep.commit, Index::new(7), "commit must be 7");
+    assert!(!ep.is_poisoned(), "node must not be poisoned");
+  }
+
+  /// Test 2: restart with snapshot only, no post-snapshot tail.
+  /// SM == snapshot state, applied==commit==5.
+  #[test]
+  fn restart_restores_snapshot_no_tail() {
+    use crate::{Config, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    let snap_count: u64 = 7;
+    let snap_data = encode_count_snapshot(snap_count);
+    let meta =
+      crate::SnapshotMeta::new(Index::new(5), Term::new(2), ConfState::new(std::vec![1u64]));
+    stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(5));
+
+    // Log baseline = 5, no entries above it.
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(5), Term::new(2));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert_eq!(
+      ep.state_machine().count() as u64,
+      snap_count,
+      "SM must equal the snapshot state"
+    );
+    assert_eq!(ep.applied, Index::new(5), "applied must be 5");
+    assert_eq!(ep.commit, Index::new(5), "commit must be 5");
+    assert!(!ep.is_poisoned(), "node must not be poisoned");
+  }
+
+  /// Test 3: no snapshot (regression) — M3 replay-from-1 still works when
+  /// stable.snapshot() is None and the log starts at 1.
+  #[test]
+  fn restart_no_snapshot_replays_from_one() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Term};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    // No snapshot.
+    let mut stable = crate::testkit::AsyncStable::default();
+    stable.force_state(Term::new(1), None, Index::new(3));
+
+    // Durable log: entries 1,2,3 at term 1.
+    // Entry data must be length-prefixed (Bytes::decode requires 8-byte LE length prefix).
+    let mut log = crate::testkit::VecLog::default();
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Normal,
+        encode_cmd(b"a"),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::Normal,
+        encode_cmd(b"b"),
+      ),
+    ]);
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    // 2 Normal entries applied (entry 1 is Empty/noop).
+    assert_eq!(ep.state_machine().count(), 2, "two Normal entries applied");
+    assert_eq!(ep.applied, Index::new(3), "applied must be 3");
+    assert_eq!(ep.commit, Index::new(3), "commit must be 3");
+    assert!(!ep.is_poisoned(), "node must not be poisoned");
+  }
+
+  /// Test 4: corrupt durable snapshot data poisons the node; no partial apply.
+  #[test]
+  fn restart_corrupt_snapshot_poisons_node() {
+    use crate::{Config, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    // Store garbage — too short to decode a u64 count.
+    let bad_data = bytes::Bytes::from_static(b"\x01\x02\x03");
+    let meta =
+      crate::SnapshotMeta::new(Index::new(5), Term::new(2), ConfState::new(std::vec![1u64]));
+    stable.submit_snapshot(crate::OpId::new(1), meta, bad_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(7));
+
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(5), Term::new(2));
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "node must be poisoned after corrupt snapshot"
+    );
+    // Applied must not have advanced past the snapshot boundary (no partial apply).
+    assert_eq!(
+      ep.state_machine().count(),
+      0,
+      "SM must be empty after corrupt snapshot (no partial apply)"
     );
   }
 }

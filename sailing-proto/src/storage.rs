@@ -98,6 +98,37 @@ pub trait LogStore {
   /// Drop entries at and below `up_to` (post-snapshot GC).
   fn compact(&mut self, up_to: Index);
 
+  /// Discard the entire log and re-baseline it on an installed snapshot.
+  ///
+  /// After this call:
+  /// - `first_index() == last_index + 1`
+  /// - `last_index()  == last_index`
+  /// - `term(last_index)` returns `last_term` (the snapshot boundary term)
+  ///
+  /// This is the receiving-side counterpart to `compact`: whereas `compact` assumes the
+  /// entry at `up_to` is present in the log (it reads its term), `restore` accepts an
+  /// explicit `last_term` so it works even when the follower never had the entry.
+  ///
+  /// **Re-baseline is immediate (synchronous):** the updated read-view (`first_index`,
+  /// `last_index`, `term`) takes effect before this call returns. This keeps the log
+  /// mutually consistent with the caller's already-advanced `commit`/`applied` watermarks,
+  /// which `apply_committed` reads synchronously.
+  ///
+  /// **Completion discipline:** any in-flight `submit_append` completions for indices that
+  /// are now below the new `first_index` MUST be dropped (not returned by future `poll`
+  /// calls). Returning a stale `Appended` completion for a discarded index would cause the
+  /// core to emit a spurious `AppendResp`, potentially advancing the leader's commit past
+  /// what the follower has actually stored.
+  ///
+  /// **Durability note (disk-backed implementations):** `restore` re-baselines the
+  /// in-memory read-view immediately. A persistent implementation that also updates
+  /// on-disk state must coordinate that durability with the snapshot blob written via
+  /// `StableStore::submit_snapshot` to avoid a crash window where the log is re-baselined
+  /// but no snapshot blob backs it. The safe alternative — relied upon by M5-U3 — is to
+  /// let restart re-sync from the leader if the snapshot blob was not yet durable at
+  /// crash time (the log's pre-restore image is gone, so the node re-requests a snapshot).
+  fn restore(&mut self, last_index: Index, last_term: Term);
+
   /// Drain the next completion, if any.
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>>;
 }

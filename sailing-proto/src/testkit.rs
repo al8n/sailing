@@ -6,6 +6,10 @@ use bytes::Bytes;
 use std::collections::VecDeque;
 
 /// A no-op log that is always empty — last_index=0, term(any)=Term::ZERO.
+///
+/// `restore` is a degenerate no-op: the NoopLog carries no real state, so there is nothing
+/// to discard.  `first_index`/`last_index`/`term` stay at their fixed degenerate values.
+/// Tests that exercise restore behaviour must use `VecLog`.
 #[derive(Debug)]
 pub(crate) struct NoopLog;
 
@@ -35,6 +39,10 @@ impl LogStore for NoopLog {
   fn submit_append(&mut self, _id: OpId, _entries: &[crate::Entry]) {}
 
   fn compact(&mut self, _up_to: Index) {}
+
+  fn restore(&mut self, _last_index: Index, _last_term: Term) {
+    // NoopLog carries no real state; the degenerate fixed values remain consistent.
+  }
 
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
     None
@@ -154,6 +162,17 @@ impl LogStore for VecLog {
     self.compacted_term = boundary_term;
   }
 
+  fn restore(&mut self, last_index: Index, last_term: Term) {
+    // Discard all entries: the follower's entire log is replaced by the snapshot.
+    // Any pending completions for those appends are also dropped — they will never fire.
+    self.entries.clear();
+    self.completions.clear();
+    // Re-baseline: offset == last_index so that first_index() == last_index + 1
+    // and term(last_index) == last_term (the snapshot boundary term).
+    self.offset = last_index;
+    self.compacted_term = last_term;
+  }
+
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
   }
@@ -262,6 +281,16 @@ impl Default for AsyncStable {
       completions: VecDeque::new(),
       snapshot: None,
     }
+  }
+}
+
+impl AsyncStable {
+  /// Seed the stable store with a specific (term, vote, commit). Used in restart tests.
+  pub(crate) fn force_state(&mut self, term: Term, vote: Option<u64>, commit: Index) {
+    self.hard_state = HardState::initial()
+      .with_term(term)
+      .with_vote(vote)
+      .with_commit(commit);
   }
 }
 

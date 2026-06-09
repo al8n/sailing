@@ -8,6 +8,11 @@ use std::{
   vec::Vec,
 };
 
+/// Per-node snapshot-install tally: incremented each time an `Event::SnapshotInstalled`
+/// is drained from that node's event queue during `tick`. Used by snapshot tests to
+/// assert that `InstallSnapshot` was genuinely exercised.
+type SnapCount = u64;
+
 type Node = Endpoint<u64, LogSm>;
 
 /// An in-flight typed message: `(deliver_at, from, to, message)`.
@@ -33,6 +38,9 @@ pub struct Cluster {
   /// Double-vote tripwire: maps `(granter, term)` → `grantee`.
   /// A second distinct grantee for the same `(granter, term)` is a fatal bug.
   grants: BTreeMap<(u64, Term), u64>,
+  /// Per-node count of `Event::SnapshotInstalled` events drained during `tick`.
+  /// Monotonically incremented; reset to zero on `crash`+restart.
+  snapshot_installs: Vec<SnapCount>,
 }
 
 impl Cluster {
@@ -69,6 +77,7 @@ impl Cluster {
       logs.push(MemLog::new());
       stables.push(MemStable::new());
     }
+    let snapshot_installs = vec![0u64; n];
     Self {
       nodes,
       logs,
@@ -78,6 +87,7 @@ impl Cluster {
       now: Instant::ORIGIN,
       isolated: BTreeSet::new(),
       grants: BTreeMap::new(),
+      snapshot_installs,
     }
   }
 
@@ -132,6 +142,22 @@ impl Cluster {
     self.isolated.remove(&id);
   }
 
+  /// The `first_index()` of node `id`'s durable log (advances after compaction).
+  pub fn first_index_of(&self, id: u64) -> sailing_proto::Index {
+    self.logs[id as usize].first_index()
+  }
+
+  /// Total number of `Event::SnapshotInstalled` events observed for node `id` since
+  /// cluster construction (or the last `crash`).
+  pub fn snapshot_install_count(&self, id: u64) -> u64 {
+    self.snapshot_installs[id as usize]
+  }
+
+  /// Total `Event::SnapshotInstalled` events across ALL nodes.
+  pub fn total_snapshot_installs(&self) -> u64 {
+    self.snapshot_installs.iter().sum()
+  }
+
   /// Crash node `id`: lose all in-memory consensus state and any fsync still in-flight,
   /// but keep the durably-written store contents. The node is immediately restarted from
   /// its durable stores.
@@ -142,6 +168,8 @@ impl Cluster {
     let cfg = self.configs[i].clone();
     let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
     self.nodes[i] = Endpoint::restart(cfg, self.now, 0x5EED ^ id, LogSm::new(), log, stable);
+    // Reset the snapshot-install counter for the restarted node.
+    self.snapshot_installs[i] = 0;
     // Drain any messages left in the bus to/from this node (stale in-flight traffic).
     self.bus.retain(|m| m.from != id && m.to != id);
   }
@@ -250,7 +278,11 @@ impl Cluster {
           });
         }
       }
-      while self.nodes[i].poll_event().is_some() {}
+      while let Some(ev) = self.nodes[i].poll_event() {
+        if ev.is_snapshot_installed() {
+          self.snapshot_installs[i] += 1;
+        }
+      }
     }
     any_new
   }
@@ -364,8 +396,11 @@ impl Cluster {
             });
           }
         }
-        while self.nodes[i].poll_event().is_some() {
+        while let Some(ev) = self.nodes[i].poll_event() {
           progressed = true;
+          if ev.is_snapshot_installed() {
+            self.snapshot_installs[i] += 1;
+          }
         }
       }
 

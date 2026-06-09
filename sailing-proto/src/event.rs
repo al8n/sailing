@@ -1,5 +1,5 @@
 //! Application-facing outputs drained via `Endpoint::poll_event`.
-use crate::{Index, Term};
+use crate::{Index, SnapshotMeta, Term};
 
 /// A committed `Normal` entry was applied; `response` is the `StateMachine::Response`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -59,8 +59,8 @@ impl<I: Copy> LeaderChanged<I> {
   }
 }
 
-/// Outputs the application observes. `#[non_exhaustive]` — `ConfChanged`, `ReadState`,
-/// `SnapshotInstalled` (design §6.3) are added additively in later milestones.
+/// Outputs the application observes. `#[non_exhaustive]` — `ConfChanged`, `ReadState`
+/// are added additively in later milestones.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
 )]
@@ -72,6 +72,9 @@ pub enum Event<I, R> {
   Applied(Applied<R>),
   /// The leader changed.
   LeaderChanged(LeaderChanged<I>),
+  /// A snapshot was successfully installed on this node (follower receive path).
+  /// The payload is the metadata of the installed snapshot.
+  SnapshotInstalled(SnapshotMeta<I>),
 }
 
 #[cfg(test)]
@@ -85,5 +88,28 @@ mod tests {
     let lc: Event<u64, u32> =
       Event::LeaderChanged(LeaderChanged::new(crate::Term::new(2), Some(1u64)));
     assert!(lc.is_leader_changed());
+  }
+
+  #[test]
+  fn snapshot_installed_event_construct_and_classify() {
+    use crate::{SnapshotMeta, conf::ConfState};
+    let meta = SnapshotMeta::new(
+      crate::Index::new(10),
+      crate::Term::new(4),
+      ConfState::new(std::vec![1u64, 2u64, 3u64]),
+    );
+    let ev: Event<u64, u32> = Event::SnapshotInstalled(meta.clone());
+    assert!(ev.is_snapshot_installed());
+    assert!(!ev.is_applied());
+    assert!(!ev.is_leader_changed());
+    // Unwrap gives back the meta
+    assert_eq!(
+      ev.unwrap_snapshot_installed_ref().last_index(),
+      meta.last_index()
+    );
+    assert_eq!(
+      ev.unwrap_snapshot_installed_ref().last_term(),
+      meta.last_term()
+    );
   }
 }

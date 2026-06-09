@@ -128,6 +128,17 @@ impl LogStore for MemLog {
     self.compacted_term = boundary_term;
   }
 
+  fn restore(&mut self, last_index: Index, last_term: Term) {
+    // Discard all entries: the follower's entire log is replaced by the snapshot.
+    // Drop any pending completions for discarded appends — they will never fire.
+    self.entries.clear();
+    self.completions.clear();
+    // Re-baseline: offset == last_index so that first_index() == last_index + 1
+    // and term(last_index) == last_term (the snapshot boundary term).
+    self.offset = last_index;
+    self.compacted_term = last_term;
+  }
+
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
   }
