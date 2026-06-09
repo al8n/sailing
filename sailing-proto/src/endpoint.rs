@@ -2688,47 +2688,7 @@ where
     let commit = self.commit;
     match self.config.read_only() {
       crate::ReadOnlyOption::Safe => {
-        self
-          .read_only
-          .add_request(commit, context.clone(), from, me);
-        // Single-node cluster fast-path: self-ack is already a quorum.
-        let single_node_quorum = {
-          let acks = self
-            .read_only
-            .acks_for(context.as_ref())
-            .cloned()
-            .unwrap_or_default();
-          let votes: BTreeMap<I, bool> = self
-            .tracker
-            .ids()
-            .into_iter()
-            .filter(|id| self.tracker.is_voter(id))
-            .map(|id| (id, acks.contains(&id)))
-            .collect();
-          self.tracker.vote_result(&votes).is_won()
-        };
-        if single_node_quorum {
-          let confirmed = self.read_only.advance(context.as_ref());
-          let (term, me2) = (self.term, me);
-          for st in confirmed {
-            let (context, req_from, index) = st.into_parts();
-            match req_from {
-              None => {
-                self.emit_read_state(index, context);
-              }
-              Some(follower) => {
-                self.send(
-                  follower,
-                  Message::ReadIndexResp(crate::ReadIndexResp::new(
-                    term, me2, index, context, false,
-                  )),
-                );
-              }
-            }
-          }
-        } else {
-          self.broadcast_heartbeat_with_ctx(now, context);
-        }
+        self.do_safe_read(now, context, from);
       }
       crate::ReadOnlyOption::LeaseBased => {
         // LeaseBased is sound only when CheckQuorum is also enabled AND the current quorum-lease
@@ -2767,13 +2727,65 @@ where
             }
           }
         } else {
-          // Degrade to Safe: record the request and broadcast a heartbeat round.
-          self
-            .read_only
-            .add_request(commit, context.clone(), from, me);
-          self.broadcast_heartbeat_with_ctx(now, context);
+          // Degrade to the FULL Safe read path — including the single-node self-quorum fast-path —
+          // so a one-voter leader still completes the read immediately instead of waiting forever for
+          // a peer that does not exist. Sharing `do_safe_read` keeps the degradation behaviourally
+          // identical to the Safe config (R10-F2: the old partial copy only `add_request`'d and
+          // broadcast, stranding single-node degraded reads until a term/leadership reset).
+          self.do_safe_read(now, context, from);
         }
       }
+    }
+  }
+
+  /// The Safe linearizable-read confirmation path: register the read against the heartbeat-ack
+  /// tracker, then either confirm immediately when the leader's own self-ack already wins quorum (a
+  /// single-voter cluster has no peers to answer) or broadcast a heartbeat round to gather acks.
+  ///
+  /// Shared by the `Safe` read-only config AND the `LeaseBased` degradation fallback so single-node
+  /// completion holds for both: the lease-unavailable fallback MUST run the self-quorum fast-path,
+  /// not merely register-and-broadcast, or a one-voter leader's read would never emit `ReadState`.
+  fn do_safe_read(&mut self, now: Instant, context: Bytes, from: Option<I>) {
+    let me = self.config.id();
+    let commit = self.commit;
+    self
+      .read_only
+      .add_request(commit, context.clone(), from, me);
+    // Single-node cluster fast-path: self-ack is already a quorum.
+    let single_node_quorum = {
+      let acks = self
+        .read_only
+        .acks_for(context.as_ref())
+        .cloned()
+        .unwrap_or_default();
+      let votes: BTreeMap<I, bool> = self
+        .tracker
+        .ids()
+        .into_iter()
+        .filter(|id| self.tracker.is_voter(id))
+        .map(|id| (id, acks.contains(&id)))
+        .collect();
+      self.tracker.vote_result(&votes).is_won()
+    };
+    if single_node_quorum {
+      let confirmed = self.read_only.advance(context.as_ref());
+      let (term, me2) = (self.term, me);
+      for st in confirmed {
+        let (context, req_from, index) = st.into_parts();
+        match req_from {
+          None => {
+            self.emit_read_state(index, context);
+          }
+          Some(follower) => {
+            self.send(
+              follower,
+              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me2, index, context, false)),
+            );
+          }
+        }
+      }
+    } else {
+      self.broadcast_heartbeat_with_ctx(now, context);
     }
   }
 
@@ -3020,6 +3032,19 @@ where
     Some(index)
   }
 
+  /// The boundary check on a peer's reported `match_index` from a SUCCESSFUL response: it must not
+  /// exceed the leader's own `log.last_index()`. The leader only ever sent entries it holds, so no
+  /// honest peer can durably hold more; a higher value is malformed or version-skewed input. Both
+  /// `on_append_resp` and `on_snapshot_resp` gate their success path on this so the invariant lives
+  /// in ONE place. Accepting an over-run would (a) corrupt the peer's `Progress` (`maybe_update`
+  /// trusts the value verbatim, never lowering it again) and (b) let `maybe_advance_commit`'s quorum
+  /// candidate run past the log, where `log_term` reads an out-of-range index and POISONS the leader
+  /// on impossible input — turning one malformed follower ack into a leader-wide halt. An associated
+  /// fn (no `self`) so callers can check it while a `Progress` borrow is live.
+  fn match_within_log(match_index: Index, log: &impl LogStore) -> bool {
+    match_index <= log.last_index()
+  }
+
   fn on_append_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Instant,
@@ -3039,7 +3064,13 @@ where
       // find_conflict_by_term walks the leader's log from reject_hint_index downward
       // until we find an entry whose term ≤ reject_hint_term (the follower's conflicting
       // term). This lets the leader skip a whole conflicting term in O(terms) round-trips.
-      let hint_index = resp.reject_hint_index();
+      // Clamp the PEER-SUPPLIED hint to the leader's own log before the term-skip walk. An honest
+      // follower's hint is meaningful only within the leader's log; an out-of-range value (malformed,
+      // version-skewed, or a follower whose divergent tail is longer than ours) would otherwise make
+      // `find_conflict_by_term` read a non-existent index — poisoning the leader via `log_term` — or,
+      // at `u64::MAX`, overflow the `conflict + 1` jump below. Mirrors the follower-side hint clamp in
+      // `on_append_entries` (`min(prev_log_index, last_index)`).
+      let hint_index = core::cmp::min(resp.reject_hint_index(), log.last_index());
       let hint_term = resp.reject_hint_term();
       let cur_next = pr.next_index();
       // Compute the conflict index before re-borrowing self.tracker.progress mutably. A fatal
@@ -3058,7 +3089,7 @@ where
       // thousands of reject round-trips compressed into each instant-delivery tick.)
       let rejected_prev = cur_next.get().saturating_sub(1);
       let safe_next = Index::new(core::cmp::max(
-        core::cmp::min(rejected_prev, conflict.get() + 1),
+        core::cmp::min(rejected_prev, conflict.get().saturating_add(1)),
         1,
       ));
       // Re-acquire progress to update (prior `pr` reference dropped implicitly by this point).
@@ -3068,6 +3099,13 @@ where
       }
       self.maybe_send_append(from, log, stable);
     } else {
+      // Boundary check (shared with `on_snapshot_resp` via `match_within_log`): a successful ack must
+      // not report a match above the leader's own log. An over-run is malformed/version-skewed input —
+      // ignore the whole ack rather than corrupt this peer's `Progress` or let the commit candidate
+      // run off the log and poison the leader.
+      if !Self::match_within_log(resp.match_index(), log) {
+        return;
+      }
       // Capture the state BEFORE maybe_update so we can guard the Probe -> Replicate
       // transition. etcd's MsgAppResp handler only switches Probe -> Replicate
       // on the first successful ack.
@@ -3289,6 +3327,13 @@ where
       // self.tracker). The pattern mirrors on_append_resp's reject branch.
       self.maybe_send_append(from, log, stable);
     } else {
+      // Boundary check (shared with `on_append_resp` via `match_within_log`): a successful snapshot
+      // ack must not report a match above the leader's own log, for the same reason — an over-run
+      // would corrupt `Progress` and could push the commit candidate off the log and poison the
+      // leader. Ignore the malformed ack; the peer stays in Snapshot and is re-probed normally.
+      if !Self::match_within_log(resp.match_index(), log) {
+        return;
+      }
       // Success: maybe_update drives the Snapshot → Probe transition regardless of its return
       // value ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never
       // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_resp).
@@ -7158,7 +7203,15 @@ mod tests {
       Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
     );
     assert!(ep.role().is_leader());
+    // Extend the leader's log to index 10 (no-op at 1 + 9 proposals) so a peer's snapshot ack at 10
+    // is consistent with the leader's own last_index — a leader never snapshots beyond its log, so
+    // the success-ack boundary check (`match_within_log`) requires last_index >= the acked index.
+    for _ in 0..9 {
+      ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+        .unwrap();
+    }
     ep.handle_storage(d, &mut log, &mut stable);
+    assert_eq!(log.last_index(), Index::new(10));
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}
 
@@ -7217,6 +7270,223 @@ mod tests {
       Index::new(10),
       "match_index must be 10 after successful SnapshotResp"
     );
+  }
+
+  /// Regression (R10-F1 — AppendResp success match is bounded by the leader's log): a sender-authentic
+  /// but malformed/version-skewed voter that reports a `match_index` ABOVE the leader's own
+  /// `log.last_index()` must be ignored. Accepting it would corrupt the peer's `Progress`
+  /// (`maybe_update` never lowers a match again) and push `maybe_advance_commit`'s quorum candidate
+  /// past the log — a FALSE commit of an entry only the leader holds. Here the leader's log reaches
+  /// index 1; peer 2 reports match 1000. The over-ack is dropped: peer 2's match stays 0, commit stays
+  /// 0, and the leader is not poisoned.
+  ///
+  /// MUTATION: delete the `match_within_log` guard in `on_append_resp`'s success branch → peer 2's
+  /// match jumps to 1000 and commit advances to 1 (a non-quorum-durable false commit).
+  #[test]
+  fn append_resp_over_ack_above_log_is_ignored() {
+    use crate::{Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable); // flush the no-op (index 1) durably
+    while ep.poll_message().is_some() {}
+    assert_eq!(log.last_index(), Index::new(1));
+
+    // Peer 2 reports an impossible match far above the leader's log.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(1000),
+      )),
+    );
+
+    assert!(!ep.is_poisoned(), "over-ack must not poison the leader");
+    assert_eq!(
+      ep.tracker.progress(&2u64).unwrap().match_index(),
+      Index::ZERO,
+      "over-ack must be ignored — peer match must not be corrupted past the leader's log"
+    );
+    assert_eq!(
+      ep.commit_index(),
+      Index::ZERO,
+      "no false commit from a single peer's over-ack"
+    );
+  }
+
+  /// Regression (R10-F1 — AppendResp reject hint is clamped to the leader's log): a peer-supplied
+  /// `reject_hint_index` is clamped to `log.last_index()` before the term-skip walk, so the walk only
+  /// ever reads indexes the leader actually holds. The `FailTermLog` is armed to fail `term()` ONLY
+  /// at the out-of-range hint (`u64::MAX`); with the clamp the walk starts at `min(hint, last=5)=5`
+  /// and never touches that index, so the leader is not poisoned. Without the clamp the walk reads
+  /// `term(u64::MAX)` → `Err` → poison: a single malformed reject would halt the whole leader.
+  /// (`LogStore::term` is allowed to error on an out-of-range index — `VecLog` happens to be total,
+  /// which is why this needs a strict store to exercise.)
+  ///
+  /// MUTATION: drop the `min(_, log.last_index())` clamp → the walk reads `term(u64::MAX)`, the armed
+  /// failure fires, and the leader poisons.
+  #[test]
+  fn append_resp_reject_hint_beyond_log_does_not_poison() {
+    use crate::{AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut leader = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::FailTermLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    let d = leader.poll_timeout().unwrap();
+    leader.handle_timeout(d, &mut log, &mut stable);
+    leader.handle_storage(d, &mut log, &mut stable);
+    leader.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(leader.role().is_leader());
+    leader.handle_storage(d, &mut log, &mut stable);
+    // Seed durable term-1 entries so last_index = 5.
+    log.force_append(&[
+      Entry::new(
+        Term::new(1),
+        Index::new(2),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(3),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(4),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+      Entry::new(
+        Term::new(1),
+        Index::new(5),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      ),
+    ]);
+    while leader.poll_message().is_some() {}
+
+    // Fail term() ONLY at the out-of-range hint index; in-range terms (1..=5) stay readable.
+    log.fail_term_at(Some(Index::new(u64::MAX)));
+    leader.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(AppendResp::new(
+        Term::new(1),
+        2u64,
+        true,
+        Index::new(u64::MAX),
+        Term::new(1),
+        Index::ZERO,
+      )),
+    );
+
+    assert!(
+      !leader.is_poisoned(),
+      "an out-of-range reject hint must be clamped to the leader's log, not poison it"
+    );
+    // The peer was re-probed within the leader's log.
+    let pr = leader.peer_progress(&2u64).expect("peer 2 tracked");
+    assert!(
+      pr.next_index <= Index::new(6),
+      "next_index stays within the leader's log"
+    );
+  }
+
+  /// Regression (R10-F2 — LeaseBased degradation shares the FULL Safe read path): when a LeaseBased
+  /// read cannot use the lease (here `check_quorum=false`), the fallback must run the Safe single-node
+  /// self-quorum fast-path, not merely register-and-broadcast. On a ONE-VOTER leader there are no
+  /// peers to answer, so without the fast-path the read would never emit `ReadState`. Sharing
+  /// `do_safe_read` makes the degraded read complete immediately.
+  ///
+  /// MUTATION: revert the degrade arm to `add_request` + `broadcast_heartbeat_with_ctx` (the old
+  /// partial copy) → no `ReadState` is ever emitted for the single-voter degraded read.
+  #[test]
+  fn single_voter_leasebased_degraded_read_completes() {
+    use core::time::Duration;
+    let cfg = crate::Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseBased)
+    .with_check_quorum(false);
+
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Single-node self-election: campaign, flush the self-vote (→ leader + no-op), flush the no-op
+    // (→ commit the current-term no-op so the read is admissible).
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(ep.role().is_leader(), "single voter must self-elect");
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+    assert_eq!(
+      ep.commit_index(),
+      crate::Index::new(1),
+      "single-node no-op must commit before the read"
+    );
+
+    let ctx = bytes::Bytes::from_static(b"single_lease_read");
+    ep.read_index(d, &log, &stable, ctx.clone())
+      .expect("single-voter leader must accept the read");
+
+    // The degraded LeaseBased read must complete immediately via the self-quorum fast-path.
+    let ev = ep
+      .poll_event()
+      .expect("single-voter degraded LeaseBased read must emit ReadState immediately");
+    assert!(ev.is_read_state(), "expected ReadState");
+    assert_eq!(ev.unwrap_read_state_ref().context().as_ref(), ctx.as_ref());
   }
 
   // ---- LogStore::restore unit tests ----
