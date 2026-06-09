@@ -549,10 +549,18 @@ where
   /// this round (≈ its send time), so the lease must expire by then — measuring from a (possibly
   /// delayed) response would over-extend the lease past the quorum's election window (R27).
   lease_round_start: Instant,
-  /// Voters that have acked the CURRENT `lease_round` (the leader counts itself implicitly). Cleared
-  /// on every heartbeat broadcast (each round must be freshly re-confirmed). When this set plus self
-  /// forms a voter quorum, the read lease (`lease_valid_until`) is renewed.
+  /// Voters that ENFORCE the lease and have acked the CURRENT `lease_round` (the leader counts itself
+  /// implicitly). Cleared on every heartbeat broadcast (each round must be freshly re-confirmed). When
+  /// this set plus self forms a voter quorum, the read lease (`lease_valid_until`) is renewed. R41: a
+  /// non-enforcing follower (HeartbeatResp `lease_support == 0`) is NOT inserted here, so it cannot keep
+  /// the lease alive.
   lease_acks: BTreeSet<I>,
+  /// R41: the MINIMUM lease-support duration advertised across the contributing quorum this round
+  /// (reset to the leader's OWN `election_timeout` when the round is bumped in `broadcast_heartbeat`,
+  /// then min'd with each enforcing ack's `lease_support`). The lease is renewed to `lease_round_start +
+  /// lease_min_support`, so a voter with a SHORTER `election_timeout` (heterogeneous config) caps the
+  /// lease at its actual support — the leader never out-lives the quorum's real election window.
+  lease_min_support: core::time::Duration,
   /// The read lease deadline for `ReadOnlyOption::LeaseBased`: the leader may serve a read from its
   /// local commit WITHOUT a per-read round-trip while `now < lease_valid_until`. Renewed to
   /// `lease_round_start + election_timeout` only when a quorum FRESHLY acks the current `lease_round` —
@@ -657,6 +665,7 @@ where
       lease_round: 0,
       lease_round_start: now,
       lease_acks: BTreeSet::new(),
+      lease_min_support: core::time::Duration::ZERO,
       lease_valid_until: None,
       // A fresh node never acked any leader's read-lease, so no post-restart vote fence (R37).
       lease_vote_fence_until: None,
@@ -1295,6 +1304,9 @@ where
     self.lease_round += 1;
     self.lease_round_start = now;
     self.lease_acks.clear();
+    // R41: the contributing quorum's min support resets to the leader's OWN election_timeout (its self
+    // support); each enforcing ack this round mins it down so a shorter-timeout voter caps the lease.
+    self.lease_min_support = self.config.election_timeout();
     let (term, me, lease_round) = (self.term, self.config.id(), self.lease_round);
     // Carry the last-pending-read context so followers can echo it back, giving the
     // leader the acks it needs to confirm outstanding safe reads.  An empty context
@@ -1348,11 +1360,17 @@ where
     }
   }
 
-  /// Byte size of one entry (data length only — the transport framing adds its own overhead
-  /// but we use data bytes as the cap unit, matching etcd's `limitSize` convention).
+  /// The cap-unit "size" of one entry: a FIXED per-entry overhead (Term 8 + Index 8 + EntryKind 1)
+  /// PLUS the payload bytes. Charging a NONZERO per-entry cost — not just `data().len()` — is what makes
+  /// `max_size_per_msg` actually bound the per-send entry COUNT (and thus the cloned `Vec<Entry>`):
+  /// otherwise a long run of zero-byte entries (no-ops, or commands whose encoding is empty) would each
+  /// cost 0, the budget would never decrease, and the packing loop would clone+send the WHOLE suffix in
+  /// one message regardless of the cap — a flow-control bypass / OOM risk (R40). Mirrors etcd's
+  /// `limitSize`, which charges each entry's full encoded `Size()` (never zero).
   #[inline(always)]
   fn entry_size(e: &crate::Entry) -> u64 {
-    e.data().len() as u64
+    const ENTRY_METADATA_SIZE: u64 = 17;
+    ENTRY_METADATA_SIZE + e.data().len() as u64
   }
 
   fn maybe_send_append<L: LogStore, S: StableStore<NodeId = I>>(
@@ -2007,12 +2025,16 @@ where
     // Never trust commit beyond the durable log; never below the snapshot baseline.
     let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
     let read_only_opt = config.read_only();
-    // R37: under LeaseBased, fence vote-granting for one election_timeout after restart. This node may
-    // have acked a leader's read-lease just before crashing; that promise is in-memory and now lost, so
-    // without the fence it could grant a vote and elect a new leader inside the old leader's still-valid
-    // lease window. `now + election_timeout >= the lease expiry` because the ack happened at or before
-    // `now`, so the fence always covers it. Non-LeaseBased configs don't rely on the lease → no fence.
-    let lease_vote_fence_until = if read_only_opt == crate::ReadOnlyOption::LeaseBased {
+    // R37+R41: fence vote-granting for one election_timeout after restart. This node may have acked SOME
+    // leader's read-lease just before crashing; that promise was in-memory and is now lost, so without
+    // the fence it could grant a vote and elect a new leader inside the old leader's still-valid lease
+    // window. `now + election_timeout >= the lease expiry` because the ack happened at or before `now`,
+    // so the fence always covers it. R41 FIX: arm it on the ENFORCEMENT CAPABILITY (`check_quorum ||
+    // pre_vote` — the exact predicate under which this node advertises `lease_support` and runs
+    // `in_lease`), NOT on this node's OWN `read_only`: a node whose own reads are `Safe` can still have
+    // acked-and-promised to uphold a LeaseBased leader's lease, so keying the fence off its read mode
+    // would miss that and let it elect a new leader post-restart inside the live lease window.
+    let lease_vote_fence_until = if config.check_quorum() || config.pre_vote() {
       Some(now + config.election_timeout())
     } else {
       None
@@ -2062,6 +2084,7 @@ where
       lease_round: 0,
       lease_round_start: now,
       lease_acks: BTreeSet::new(),
+      lease_min_support: core::time::Duration::ZERO,
       lease_valid_until: None,
       lease_vote_fence_until,
       // A restarted node is not leader (recovers as Follower) and has authorized no handoff (R39).
@@ -2699,6 +2722,14 @@ where
           match result {
             Ok(new_tracker) => {
               self.tracker = new_tracker;
+              // R41 (membership-change lease revocation): the LeaseBased read lease is safe only because
+              // the lease quorum OVERLAPS any new-leader quorum (one shared voter's `in_lease` blocks the
+              // disruptive vote) — and that overlap is guaranteed ONLY within a SINGLE configuration. A
+              // committed membership change can produce a new config whose quorum is DISJOINT from the
+              // quorum that granted the live lease, so the lease no longer proves "no other leader". Revoke
+              // it; `do_leader_read` degrades to Safe until a fresh quorum re-confirms under the new config.
+              self.lease_valid_until = None;
+              self.lease_acks.clear();
             }
             // A committed, validly-decoded ConfChange that the Changer rejects is an unrecoverable
             // logic violation (e.g. an overlapping change that should have been prevented upstream).
@@ -3032,10 +3063,24 @@ where
     // toward a pending safe read; empty context is a normal heartbeat) AND echo the lease round so the
     // leader can confirm this is a FRESH response to its current CheckQuorum round (R26).
     let ctx = Bytes::copy_from_slice(hb.context());
+    // R41 self-validating lease: advertise how long THIS follower will uphold the leader's read-lease
+    // window. We will refuse to help elect a new leader for one election_timeout (we just re-armed our
+    // election timer above, and we enforce `in_lease` + the post-restart vote fence) IFF we actually run
+    // that enforcement — i.e. `check_quorum || pre_vote`. A non-enforcing follower advertises ZERO so the
+    // leader does not count it toward the lease quorum (closes R41's heterogeneous-cooperation hole);
+    // sending our OWN election_timeout (not the leader's) lets the leader bound the lease by the quorum's
+    // real support even under heterogeneous timeouts.
+    let lease_support = if self.config.check_quorum() || self.config.pre_vote() {
+      self.config.election_timeout()
+    } else {
+      core::time::Duration::ZERO
+    };
     self.send(
       hb.leader(),
       Message::HeartbeatResp(
-        crate::HeartbeatResp::new(term, me, ctx).with_lease_round(hb.lease_round()),
+        crate::HeartbeatResp::new(term, me, ctx)
+          .with_lease_round(hb.lease_round())
+          .with_lease_support(lease_support),
       ),
     );
   }
@@ -3276,8 +3321,16 @@ where
     // idempotent per round, so a duplicate current-round response cannot extend the same round's
     // deadline. The separate `recent_active`/`election_deadline` CheckQuorum step-down signal is
     // unchanged.
-    if resp.lease_round() == self.lease_round {
+    // R41 self-validating lease: count this ack toward the lease quorum ONLY if the follower advertises
+    // that it ENFORCES the lease window (`lease_support > 0` — it runs `in_lease` + the post-restart vote
+    // fence). A non-enforcing voter cannot keep the lease alive, so a heterogeneous/misconfigured cluster
+    // simply fails to form a lease and `do_leader_read` degrades to Safe (closes R41's cooperation hole).
+    // The lease deadline is bounded by the MIN support across the contributing quorum (`lease_min_support`,
+    // min'd here, seeded to the leader's own election_timeout each round), so a voter with a SHORTER
+    // election_timeout caps the lease at its real election window — the leader never out-lives a supporter.
+    if resp.lease_round() == self.lease_round && resp.lease_support() > core::time::Duration::ZERO {
       self.lease_acks.insert(from);
+      self.lease_min_support = self.lease_min_support.min(resp.lease_support());
       let me = self.config.id();
       let fresh: BTreeMap<I, bool> = self
         .tracker
@@ -3287,7 +3340,9 @@ where
         .map(|id| (id, id == me || self.lease_acks.contains(&id)))
         .collect();
       if self.tracker.vote_result(&fresh).is_won() {
-        self.lease_valid_until = Some(self.lease_round_start + self.config.election_timeout());
+        // Re-set every contributing ack: `lease_min_support` only shrinks within a round, so this never
+        // EXTENDS the lease past a supporter's window (a later, shorter-support ack lowers it).
+        self.lease_valid_until = Some(self.lease_round_start + self.lease_min_support);
       }
     }
     if let Some(pr) = self.tracker.progress_mut(&from) {
@@ -3420,6 +3475,63 @@ where
     self.flush_deferred_reads(now, log, stable);
   }
 
+  /// THE single source of truth for LeaseBased read safety (R26/R27/R37/R38/R39 consolidated). A leader
+  /// may serve a `LeaseBased` read from its local commit WITHOUT a per-read heartbeat round ONLY when no
+  /// other node can be (or become) leader before this lease expires. That holds iff ALL of:
+  ///
+  ///   1. `check_quorum` is enabled — the lease invariant is only maintained under CheckQuorum (a leader
+  ///      that loses quorum contact steps down within an election timeout).
+  ///   2. a FRESH quorum lease is live (`lease_valid_until > now`). The lease is renewed in
+  ///      `on_heartbeat_resp` ONLY by a HeartbeatResp echoing the CURRENT `lease_round` (R26) and is
+  ///      bounded by the round's SEND time, not response receipt (R27) — so a stale/duplicated/delayed
+  ///      response can neither keep an isolated leader's lease alive nor over-extend it. SELF-VALIDATING
+  ///      (R41): a contributing ack must ALSO advertise that it enforces the lease window
+  ///      (`lease_support > 0`), and the deadline is bounded by the quorum's MIN advertised support — so a
+  ///      voter that does not run `in_lease`+the vote fence, or that runs a SHORTER `election_timeout`,
+  ///      cannot prop up the lease; the read silently degrades to Safe instead of trusting an unenforced
+  ///      or over-long window. (The CheckQuorum `recent_active`/`election_deadline` step-down signal is
+  ///      deliberately NOT reused here — it is set by ANY inbound current-term message and is thus
+  ///      spoofable by stale/duplicated traffic.)
+  ///   3. no leader transfer is in progress (`lead_transferee.is_none()` — R38): an active transfer
+  ///      authorizes the transferee to campaign FORCED, so this leader may not be the only one.
+  ///   4. no forced handoff was authorized this term (`!forced_handoff_this_term` — R39): once a
+  ///      `TimeoutNow` is sent, the authorized forced campaign (or its already-sent forced `RequestVote`s)
+  ///      can elect a new leader at ANY later point this term under unbounded message delay — even after
+  ///      the transfer aborts and `lead_transferee` clears. Lease reads stay off until re-election.
+  ///
+  /// The LEASE WINDOW is upheld on the FOLLOWER side by two complementary mechanisms, so a new leader
+  /// cannot be elected while a lease the followers granted is still live:
+  ///   - `in_lease` (in `handle_message`): a follower that has heard from its current leader within the
+  ///     election timeout ignores a disruptive higher-term vote request; and
+  ///   - the post-restart vote fence (`lease_vote_fenced`, armed in `restart` — R37): a RESTARTED
+  ///     follower, which may have acked a lease it has since forgotten, refuses to grant votes for one
+  ///     election timeout.
+  ///
+  /// A FORCED leader-transfer vote bypasses both (the current leader voluntarily relinquished its lease,
+  /// clearing it in `transfer_leader` and disabling its own lease reads via conditions 3–4).
+  ///
+  /// A committed MEMBERSHIP CHANGE also revokes the lease (R41): the lease's safety rests on the granting
+  /// quorum OVERLAPPING any new-leader quorum (a shared voter's `in_lease`/vote-fence blocks the
+  /// disruptive vote), which holds only WITHIN a single configuration. `apply_committed` clears
+  /// `lease_valid_until` on a ConfChange so reads degrade to Safe until a fresh quorum re-confirms the
+  /// lease under the new config — a config whose quorum is disjoint from the old one cannot inherit it.
+  ///
+  /// RESIDUAL CAVEAT (IRREDUCIBLE for ALL lease reads — etcd's included — and PROVEN unremovable by a
+  /// multi-expert Raft panel: a lease infers a non-event from elapsed time, which no logical/epoch/HLC
+  /// machinery can discharge): bounded clock-RATE drift, plus the non-Byzantine honesty of voters. R41's
+  /// self-validating renewal (condition 2) closed the COOPERATION/heterogeneity vector by construction, so
+  /// these are the ONLY residuals that remain. If this leader's clock runs slow relative to the followers'
+  /// election timers, a follower could time out and elect a new leader before this lease expires.
+  /// Deployments that cannot bound clock drift MUST use `ReadOnlyOption::Safe` (the default), whose
+  /// per-read heartbeat round needs no timing assumption.
+  #[inline]
+  fn lease_read_available(&self, now: Instant) -> bool {
+    self.config.check_quorum()
+      && self.lead_transferee.is_none()
+      && !self.forced_handoff_this_term
+      && self.lease_valid_until.is_some_and(|d| d > now)
+  }
+
   /// Core leader read logic: register the read and broadcast / confirm.
   fn do_leader_read<L: LogStore>(
     &mut self,
@@ -3435,36 +3547,11 @@ where
         self.do_safe_read(now, context, from);
       }
       crate::ReadOnlyOption::LeaseBased => {
-        // LeaseBased serves a read from the local commit WITHOUT a per-read heartbeat round, but ONLY
-        // while the leader holds a FRESH quorum lease. The lease (`lease_valid_until`) is renewed in
-        // `on_heartbeat_resp` solely by responses echoing the CURRENT `lease_round` (R26): a stale or
-        // duplicated earlier-round response cannot renew it, so an isolated old leader's lease lapses
-        // and this path degrades instead of serving a stale read. (`election_deadline`/`recent_active`,
-        // the CheckQuorum STEP-DOWN signal, is deliberately NOT reused here — it is set by ANY inbound
-        // current-term message and is thus spoofable by stale/duplicated traffic.)
-        //
-        // Degrade to the Safe heartbeat round (which re-confirms a quorum before emitting) whenever:
-        //   - check_quorum is disabled (the lease invariant is never maintained), or
-        //   - the fresh lease has lapsed or never formed (`lease_valid_until` is `None` or `<= now`), or
-        //   - a leader transfer is in progress (`lead_transferee.is_some()`): the transfer AUTHORIZES a
-        //     new leader (the transferee campaigns forced, bypassing the R37 restart fence), so this
-        //     leader may no longer be the only one — it MUST NOT serve a lease read from its old commit
-        //     (R38). The Safe path re-confirms via a heartbeat quorum, which fails the moment the
-        //     transferee has won (its higher term rejects the heartbeats), so degrading is always safe, or
-        //   - a forced handoff (`TimeoutNow`) was already SENT this term (`forced_handoff_this_term`):
-        //     the authorized forced campaign — or its already-sent forced `RequestVote`s — can elect a
-        //     new leader at ANY later point this term under unbounded message delay, even after the
-        //     transfer aborts and `lead_transferee` clears (R39). Lease reads stay off until re-election.
-        // Degrading is silent and always safe.
-        //
-        // RESIDUAL CAVEAT (irreducible for ALL lease reads, not closed here): bounded clock drift — if
-        // this leader's clock runs slow relative to the followers' election timers, a follower could
-        // time out and elect a new leader before this lease expires. Use `Safe` if that assumption may
-        // not hold.
-        let use_lease = self.config.check_quorum()
-          && self.lead_transferee.is_none()
-          && !self.forced_handoff_this_term
-          && self.lease_valid_until.is_some_and(|d| d > now);
+        // Serve from the local commit WITHOUT a round-trip iff the full lease-read invariant holds (see
+        // `lease_read_available` — the single source of truth for LeaseBased safety). Otherwise degrade
+        // to the Safe heartbeat round, which re-confirms a quorum before emitting; degrading is silent
+        // and always safe.
+        let use_lease = self.lease_read_available(now);
         if use_lease {
           match from {
             None => {
@@ -6996,6 +7083,87 @@ mod tests {
     assert!(
       resumed,
       "HeartbeatResp must clear the probe pause and trigger an AppendEntries to peer 2"
+    );
+  }
+
+  /// R40 (the per-message size cap must bound ZERO-BYTE entries): a long run of empty/no-op entries
+  /// (each `data().len() == 0`) must NOT bypass `max_size_per_msg`. With the old `entry_size`
+  /// (data-bytes only), a zero-byte entry cost 0, the packing budget never decreased, and a lagging peer
+  /// behind such a run would make the leader clone+send the WHOLE suffix in one AppendEntries — a
+  /// flow-control bypass / OOM risk. With the per-entry overhead, `max_size_per_msg = 0` packs exactly
+  /// one entry per message even for zero-byte entries.
+  ///
+  /// MUTATION: revert `entry_size` to `e.data().len()` → the single send carries the whole zero-byte run.
+  #[test]
+  fn append_cap_bounds_zero_byte_entry_suffix() {
+    use crate::{Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_max_size_per_msg(0); // 0 = at most one entry per AppendEntries
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Elect node 1 leader (no-op@1).
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+
+    // Append a long run of ZERO-BYTE (Empty / no-op) entries: indices 2..=51, term 1.
+    let zero: std::vec::Vec<_> = (2u64..=51)
+      .map(|i| {
+        Entry::new(
+          Term::new(1),
+          Index::new(i),
+          EntryKind::Empty,
+          bytes::Bytes::new(),
+        )
+      })
+      .collect();
+    log.force_append(&zero);
+
+    // A HeartbeatResp from the lagging peer 2 resumes replication → maybe_send_append packs from peer
+    // 2's next index. The cap must bound the send to ONE zero-byte entry, not the whole 50-entry run.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(crate::HeartbeatResp::new(
+        Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
+    );
+    let mut sent = None;
+    while let Some(out) = ep.poll_message() {
+      if out.to() == 2u64 {
+        if let Message::AppendEntries(ae) = out.message() {
+          sent = Some(ae.entries().len());
+        }
+      }
+    }
+    let n = sent.expect("an AppendEntries was sent to peer 2");
+    assert_eq!(
+      n, 1,
+      "max_size_per_msg=0 must cap the zero-byte suffix at ONE entry, not the whole run"
     );
   }
 
@@ -13480,7 +13648,9 @@ mod tests {
       2u64,
       Message::HeartbeatResp(
         crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
-          .with_lease_round(lease_round),
+          .with_lease_round(lease_round)
+          // R41: advertise enforcement (the follower's own election_timeout) so the leader counts it.
+          .with_lease_support(Duration::from_millis(1000)),
       ),
     );
     while ep.poll_message().is_some() {}
@@ -13577,7 +13747,9 @@ mod tests {
     fn hb_resp(round: u64) -> Message<u64> {
       Message::HeartbeatResp(
         crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
-          .with_lease_round(round),
+          .with_lease_round(round)
+          // R41: advertise enforcement (the follower's own election_timeout) so the leader counts it.
+          .with_lease_support(Duration::from_millis(1000)),
       )
     }
 
@@ -13683,7 +13855,9 @@ mod tests {
       2u64,
       Message::HeartbeatResp(
         crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
-          .with_lease_round(round),
+          .with_lease_round(round)
+          // R41: advertise enforcement (the follower's own election_timeout) so the leader counts it.
+          .with_lease_support(Duration::from_millis(1000)),
       ),
     );
 
@@ -13697,6 +13871,245 @@ mod tests {
       ep.lease_valid_until,
       Some(t_late + Duration::from_millis(1000)),
       "a delayed response must not extend the lease by the response delay"
+    );
+  }
+
+  // ---- R41 self-validating lease regressions ----
+
+  /// Build a `LeaseBased + check_quorum` leader at term 1 with a current-term commit (no lease yet).
+  fn leasebased_leader() -> (
+    Endpoint<u64, crate::testkit::CountSm>,
+    crate::testkit::VecLog,
+    crate::testkit::NoopStable,
+  ) {
+    use crate::{Config, Instant, Message, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_check_quorum(true)
+    .with_read_only(crate::ReadOnlyOption::LeaseBased);
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        crate::Index::ZERO,
+        crate::Term::ZERO,
+        crate::Index::new(1),
+      )),
+    );
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+    (ep, log, stable)
+  }
+
+  /// Fire one CheckQuorum heartbeat round; return (now, the round's lease token).
+  fn tick_lease_round(
+    ep: &mut Endpoint<u64, crate::testkit::CountSm>,
+    log: &mut crate::testkit::VecLog,
+    stable: &mut crate::testkit::NoopStable,
+  ) -> (crate::Instant, u64) {
+    let at = ep.poll_timeout().expect("a timer is armed");
+    ep.handle_timeout(at, log, stable);
+    let mut lr = None;
+    while let Some(out) = ep.poll_message() {
+      if let crate::Message::Heartbeat(hb) = out.message() {
+        lr = Some(hb.lease_round());
+      }
+    }
+    (at, lr.expect("the heartbeat carried a lease round"))
+  }
+
+  /// R41 self-validating lease: a voter that does NOT enforce the lease window (HeartbeatResp
+  /// `lease_support == 0`) must NOT renew the lease — even if it freshly acks the current round. This
+  /// closes the heterogeneous/misconfigured-cluster cooperation hole: a Safe/CQ-disabled voter cannot
+  /// keep a LeaseBased leader's lease alive.
+  ///
+  /// MUTATION: drop the `resp.lease_support() > 0` gate in `on_heartbeat_resp` → the non-enforcing ack
+  /// renews the lease.
+  #[test]
+  fn lease_not_renewed_by_non_enforcing_voter() {
+    use crate::Message;
+    let (mut ep, mut log, mut stable) = leasebased_leader();
+    let (at, round) = tick_lease_round(&mut ep, &mut log, &mut stable);
+    // Peer 2 acks the CURRENT round but advertises NO enforcement (default lease_support == ZERO).
+    ep.handle_message(
+      at,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(
+        crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+          .with_lease_round(round),
+      ),
+    );
+    assert!(
+      ep.lease_valid_until.is_none(),
+      "a non-enforcing voter must NOT renew the lease (self-validating)"
+    );
+  }
+
+  /// R41: the lease deadline is bounded by the quorum's MIN advertised support, so a voter with a
+  /// SHORTER election_timeout (heterogeneous config) caps the lease at its real election window — the
+  /// leader cannot out-live the supporter that would time out first.
+  ///
+  /// MUTATION: renew with `self.config.election_timeout()` instead of `self.lease_min_support` → the
+  /// lease extends to the leader's 1000ms even though peer 2 only supports 300ms.
+  #[test]
+  fn lease_bounded_by_min_support() {
+    use crate::Message;
+    use core::time::Duration;
+    let (mut ep, mut log, mut stable) = leasebased_leader();
+    let (at, round) = tick_lease_round(&mut ep, &mut log, &mut stable);
+    let lease_start = ep.lease_round_start;
+    // Peer 2 enforces but with a SHORTER election_timeout (300ms < the leader's 1000ms).
+    ep.handle_message(
+      at,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(
+        crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+          .with_lease_round(round)
+          .with_lease_support(Duration::from_millis(300)),
+      ),
+    );
+    assert_eq!(
+      ep.lease_valid_until,
+      Some(lease_start + Duration::from_millis(300)),
+      "the lease must be bounded by the quorum's MIN support (300ms), not the leader's 1000ms"
+    );
+  }
+
+  /// R41: the post-restart vote fence is armed on the ENFORCEMENT CAPABILITY (`check_quorum||pre_vote`),
+  /// NOT on the node's own `read_only`. A node whose own reads are Safe but that runs CheckQuorum still
+  /// upholds a LeaseBased leader's lease (advertises `lease_support`, runs `in_lease`), so it MUST fence
+  /// post-restart; a node that enforces nothing must not.
+  ///
+  /// MUTATION: key the fence on `read_only == LeaseBased` → the Safe+CheckQuorum node fails to fence.
+  #[test]
+  fn restart_arms_vote_fence_on_enforcement_capability_not_read_mode() {
+    use crate::{Config, Instant};
+    use core::time::Duration;
+    let et = Duration::from_millis(1000);
+    let hb = Duration::from_millis(100);
+    // Safe reads BUT check_quorum on → enforces a leader's lease → must fence post-restart.
+    let cfg = Config::try_new(2u64, std::vec![1u64, 2u64, 3u64], et, hb)
+      .unwrap()
+      .with_check_quorum(true); // read_only defaults to Safe
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::AsyncStable::default();
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    assert!(
+      ep.lease_vote_fence_until.is_some(),
+      "a Safe-reads BUT check_quorum node must fence post-restart (it can uphold a leader's lease)"
+    );
+    // Neither check_quorum nor pre_vote → enforces nothing → no fence needed.
+    let cfg2 = Config::try_new(2u64, std::vec![1u64, 2u64, 3u64], et, hb).unwrap();
+    let mut log2 = crate::testkit::VecLog::default();
+    let mut stable2 = crate::testkit::AsyncStable::default();
+    let ep2 = Endpoint::restart(
+      cfg2,
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log2,
+      &mut stable2,
+    );
+    assert!(
+      ep2.lease_vote_fence_until.is_none(),
+      "a node that enforces neither check_quorum nor pre_vote needs no post-restart fence"
+    );
+  }
+
+  /// R41 (the 5th vector, found by the adversarial pass): a committed MEMBERSHIP change must revoke the
+  /// lease. The lease's safety rests on quorum OVERLAP, guaranteed only within a single configuration; a
+  /// new config can have a quorum disjoint from the lease's quorum, so the lease no longer proves "no
+  /// other leader". Applying a ConfChange revokes the lease → `do_leader_read` degrades to Safe.
+  ///
+  /// MUTATION: drop the `lease_valid_until = None` on the ConfChange-apply path → the lease survives the
+  /// membership change.
+  #[test]
+  fn membership_change_revokes_lease() {
+    use crate::{ConfChange, ConfChangeType, Index, Message, Term};
+    use core::time::Duration;
+    let (mut ep, mut log, mut stable) = leasebased_leader();
+    // Establish a live lease.
+    let (at, round) = tick_lease_round(&mut ep, &mut log, &mut stable);
+    ep.handle_message(
+      at,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::HeartbeatResp(
+        crate::HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
+          .with_lease_round(round)
+          .with_lease_support(Duration::from_millis(1000)),
+      ),
+    );
+    assert!(ep.lease_valid_until.is_some(), "lease established");
+
+    // Propose + commit + apply a ConfChange (add a learner) → membership changes → lease revoked.
+    ep.propose_conf_change(
+      at,
+      &mut log,
+      &stable,
+      ConfChange::new(ConfChangeType::AddLearnerNode, 4u64, bytes::Bytes::new()),
+    )
+    .expect("AddLearnerNode(4) must be accepted");
+    ep.handle_storage(at, &mut log, &mut stable); // self append durable
+    // Peer 2 acks the ConfChange entry (index 2) → commit=2 → apply_committed folds it → tracker change.
+    ep.handle_message(
+      at,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendResp(crate::AppendResp::new(
+        Term::new(1),
+        2u64,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(2),
+      )),
+    );
+    ep.handle_storage(at, &mut log, &mut stable);
+    assert!(
+      ep.lease_valid_until.is_none(),
+      "a committed membership change must revoke the lease (quorum overlap no longer guaranteed)"
     );
   }
 

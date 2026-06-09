@@ -324,17 +324,20 @@ pub struct HeartbeatResp<I> {
   from: I,
   context: Bytes,
   lease_round: u64,
+  lease_support: core::time::Duration,
 }
 
 impl<I: Copy> HeartbeatResp<I> {
-  /// Construct. `lease_round` defaults to 0; the follower echoes the heartbeat's round via
-  /// [`Self::with_lease_round`].
+  /// Construct. `lease_round` defaults to 0 and `lease_support` to ZERO; the follower echoes the
+  /// heartbeat's round via [`Self::with_lease_round`] and advertises its lease support via
+  /// [`Self::with_lease_support`].
   pub fn new(term: Term, from: I, context: Bytes) -> Self {
     Self {
       term,
       from,
       context,
       lease_round: 0,
+      lease_support: core::time::Duration::ZERO,
     }
   }
 
@@ -342,6 +345,18 @@ impl<I: Copy> HeartbeatResp<I> {
   #[inline(always)]
   pub fn with_lease_round(mut self, lease_round: u64) -> Self {
     self.lease_round = lease_round;
+    self
+  }
+
+  /// Advertise how long this follower will UPHOLD the leader's read-lease window (builder) — i.e. how
+  /// long it will refuse to help elect a new leader after receiving this round's heartbeat. A follower
+  /// that does not enforce the lease (neither `check_quorum` nor `pre_vote`) advertises `ZERO`, so the
+  /// leader does not count it toward the lease quorum (R41 self-validating lease). A non-zero value is
+  /// the follower's own `election_timeout`, letting the leader bound the lease by the quorum's actual
+  /// support even under heterogeneous `election_timeout`.
+  #[inline(always)]
+  pub fn with_lease_support(mut self, lease_support: core::time::Duration) -> Self {
+    self.lease_support = lease_support;
     self
   }
 
@@ -367,6 +382,13 @@ impl<I: Copy> HeartbeatResp<I> {
   #[inline(always)]
   pub const fn lease_round(&self) -> u64 {
     self.lease_round
+  }
+
+  /// How long this follower will uphold the leader's read-lease window (ZERO if it does not enforce the
+  /// lease, so the leader must NOT count it toward the lease quorum). See [`Self::with_lease_support`].
+  #[inline(always)]
+  pub const fn lease_support(&self) -> core::time::Duration {
+    self.lease_support
   }
 }
 
