@@ -28,6 +28,11 @@ pub enum ProposeError<I> {
   /// new work. The proposal was NOT appended or persisted; inspect `poison_reason()`.
   #[error("the node is poisoned and accepts no new proposals")]
   Poisoned,
+  /// The log index space is exhausted (`last_index == u64::MAX`): no new entry can be allocated a
+  /// strictly-greater index without aliasing the existing one. Unreachable by legitimate appends
+  /// (2^64 entries); reachable only from a crafted or corrupt recovered log. Nothing was appended.
+  #[error("the log index space is exhausted")]
+  LogIndexExhausted,
 }
 
 /// Why a leader-transfer request was rejected.

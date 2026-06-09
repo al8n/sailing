@@ -138,6 +138,13 @@ pub enum PoisonReason {
   /// snapshot blob, so this is a durability-contract violation or disk corruption; fail-stop rather
   /// than bootstrap from the static config and serve a log whose committed prefix is gone.
   OrphanedLog,
+  /// The log index space is exhausted: `last_index == u64::MAX`, so no new entry (leader no-op,
+  /// auto-leave-joint) can be allocated a strictly-greater index. Appending at the saturated index
+  /// would truncate-and-replace the existing (possibly committed) entry there — a log-matching/apply
+  /// safety break. Unreachable by legitimate appends (2^64 entries); reachable only from a crafted or
+  /// corrupt recovered log, so fail-stop. (User proposals get `ProposeError::LogIndexExhausted`
+  /// instead; this poison is for the internal append paths that have no error channel.)
+  LogExhausted,
 }
 
 impl PoisonReason {
@@ -159,6 +166,7 @@ impl PoisonReason {
       Self::NonContiguousAppend => "non_contiguous_append",
       Self::InvalidConfState => "invalid_conf_state",
       Self::OrphanedLog => "orphaned_log",
+      Self::LogExhausted => "log_exhausted",
     }
   }
 }
@@ -1530,7 +1538,12 @@ where
       && self.pending_conf_index <= self.applied
     {
       let leave = crate::ConfChangeV2::leave_joint();
-      self.append_conf_change(log, stable, leave);
+      if self.append_conf_change(log, stable, leave).is_none() {
+        // Log index space exhausted: the leader cannot append the leave-joint entry and so cannot
+        // exit joint consensus. This internal path has no user error channel, and a node whose log is
+        // at u64::MAX is in a corrupt/terminal state — fail-stop (R29).
+        self.poison(PoisonReason::LogExhausted);
+      }
     }
 
     // Persist the advanced commit watermark so a restart recovers it (without this, restart
@@ -1657,11 +1670,21 @@ where
       .as_ref()
       .map(|(meta, _)| (meta.last_index(), meta.last_term()));
     if let Some((meta, data)) = snapshot {
-      // Validate the durable snapshot's membership BEFORE decoding/restoring the SM or installing the
-      // tracker (which copies the ConfState verbatim). A corrupt-on-disk or version-skewed snapshot
-      // with an impossible membership poisons rather than recovering into an invalid configuration.
-      // Mirrors the `on_install_snapshot` Step-0 gate (validate conf before any other snapshot step).
-      if !meta.conf().is_valid() {
+      // Validate the durable snapshot's BOUNDARY before decoding/restoring the SM or installing the
+      // tracker (which copies the ConfState verbatim) — a corrupt-on-disk or version-skewed snapshot
+      // must fail-stop WITHOUT mutating the state machine, so every rejection sits ahead of
+      // `decode`/`restore`. Mirrors the `on_install_snapshot` Step-0 gates (validate before any other
+      // snapshot step). Two boundary faults are rejected here, each with its specific poison reason:
+      //   1. Reserved-sentinel index (R31/R32): a snapshot whose `last_index` is the reserved
+      //      sentinel u64::MAX is corrupt — a correct leader reserves it (R30) and never snapshots at
+      //      it, and followers reject installing it. The boundary is unreadable by the half-open log
+      //      ranges, so recovering into it would strand replay. Checked here, BEFORE `restore`, so the
+      //      fail-stop is side-effect-free (the log-boundary sentinel is still checked below).
+      //   2. Impossible membership: a ConfState that cannot represent a valid configuration.
+      if meta.last_index().get() == u64::MAX {
+        poisoned = true;
+        poison_reason = Some(PoisonReason::LogExhausted);
+      } else if !meta.conf().is_valid() {
         poisoned = true;
         poison_reason = Some(PoisonReason::InvalidConfState);
       } else {
@@ -1689,6 +1712,16 @@ where
           }
         }
       }
+    }
+    // Reserved-sentinel guard (R31): a recovered durable LOG whose highest index is the reserved
+    // sentinel u64::MAX is corrupt or version-skewed — a correct node never stores it (the leader
+    // reserves it (R30) and followers reject importing it (the AppendEntries/InstallSnapshot guards)).
+    // An entry at u64::MAX is unreadable by the half-open log ranges (apply/replication), so replay
+    // would stall. Fail-stop rather than recover into it. (The SNAPSHOT-boundary sentinel is rejected
+    // above, BEFORE `restore`, so its fail-stop never mutates the state machine — R32.)
+    if !poisoned && log.last_index().get() == u64::MAX {
+      poisoned = true;
+      poison_reason = Some(PoisonReason::LogExhausted);
     }
     // Reconcile the durable LOG boundary against the durable SNAPSHOT — for BOTH the snapshot-present
     // and snapshot-absent cases — enforcing ONE safety invariant: NEVER discard a committed entry
@@ -2134,10 +2167,26 @@ where
     );
   }
 
+  /// The next FRESH log index to allocate after `last`, or `None` if the index space is exhausted.
+  ///
+  /// The SINGLE choke-point for allocating a new log slot (leader no-op, `propose`, conf-change). It
+  /// reserves `u64::MAX` as a non-allocatable sentinel: every committed entry must be readable via the
+  /// half-open ranges `[i, i.next())` (apply) and `[.., last.next())` (replication), which require
+  /// `i.next() > i`, i.e. `i < u64::MAX`. Allocating `u64::MAX` would make those ranges empty, so the
+  /// entry could be committed yet never applied or replicated — a wedge (R30). `Index::next()` also
+  /// saturates at the ceiling, which would alias `last_index` and truncate-replace the existing entry
+  /// (R29). So the usable index space is `[1, u64::MAX - 1]`; allocation fails once `last >= MAX - 1`.
+  fn next_log_index(last: Index) -> Option<Index> {
+    last.checked_next().filter(|i| i.get() != u64::MAX)
+  }
+
   /// Append a `ConfChangeV2` entry to the log and replicate it to all peers.
   ///
   /// Internal helper shared by `propose_conf_change_v2` and the auto-leave path.
   /// Mirrors `propose`'s deferred-append + `LeaderAppend` + replicate pattern exactly.
+  ///
+  /// Returns `None` if the log index space is exhausted (`last_index == u64::MAX`) — no entry was
+  /// appended (the caller must surface `LogIndexExhausted` or fail-stop). `Some(index)` otherwise.
   ///
   /// Requires `I: crate::Data` because the ConfChangeV2 encodes node ids.
   fn append_conf_change<L, S>(
@@ -2145,15 +2194,17 @@ where
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
-  ) -> Index
+  ) -> Option<Index>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    // Allocate a fresh, usable index (see `next_log_index`): refuse at the ceiling rather than
+    // alias-and-truncate (R29) or allocate the unreadable sentinel `u64::MAX` (R30).
+    let index = Self::next_log_index(log.last_index())?;
     use crate::Data as _;
     let mut buf = std::vec::Vec::new();
     cc.encode(&mut buf);
-    let index = log.last_index().next();
     let entry = crate::Entry::new(
       self.term,
       index,
@@ -2173,7 +2224,7 @@ where
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       self.maybe_send_append(peer, log, stable);
     }
-    index
+    Some(index)
   }
 
   /// Propose a v1 (single-op) configuration change on the leader.
@@ -2256,8 +2307,10 @@ where
         return Err(crate::ProposeError::InvalidConfChange);
       }
     }
-    let index = self.append_conf_change(log, stable, cc);
-    Ok(index)
+    match self.append_conf_change(log, stable, cc) {
+      Some(index) => Ok(index),
+      None => Err(crate::ProposeError::LogIndexExhausted),
+    }
   }
 
   /// Propose a command on the leader. Returns the assigned index, or `NotLeader`.
@@ -2286,10 +2339,14 @@ where
     if self.lead_transferee.is_some() {
       return Err(crate::ProposeError::LeaderTransferInProgress);
     }
+    // Allocate a fresh, usable log index (see `next_log_index`): refuse rather than alias-and-truncate
+    // at the saturated ceiling (R29) or allocate the unreadable sentinel `u64::MAX` (R30).
+    let Some(index) = Self::next_log_index(log.last_index()) else {
+      return Err(crate::ProposeError::LogIndexExhausted);
+    };
     use crate::Data as _;
     let mut buf = std::vec::Vec::new();
     cmd.encode(&mut buf);
-    let index = log.last_index().next();
     let entry = crate::Entry::new(
       self.term,
       index,
@@ -2460,7 +2517,19 @@ where
     if !self.tracker.is_voter(&self.config.id()) {
       return;
     }
-    self.term = self.term.next();
+    // Election safety at term exhaustion: `Term::next()` SATURATES at u64::MAX, so a node already at the
+    // maximum term cannot advance. Campaigning anyway would clear `voted_for` and record a self-vote in
+    // the SAME term — a SECOND vote in a term we may already have voted in — breaking one-vote-per-term
+    // (two leaders possible at u64::MAX). A max term is unreachable by legitimate increments (2^64
+    // elections) but reachable from a crafted/corrupt max-term message or recovered hard state, so we
+    // must not assume `next()` strictly advances. Refuse to campaign rather than violate safety: the
+    // node stays a follower at u64::MAX with its existing ballot intact (it can still vote-follow); it
+    // simply cannot initiate an election. `voted_for`/`pending` are cleared ONLY after a strict advance.
+    let next_term = self.term.next();
+    if next_term == self.term {
+      return;
+    }
+    self.term = next_term;
     // All pending work from the previous term is now stale (spec §7). Clear before recording
     // the self-vote below so old completions that arrive later are harmlessly ignored.
     self.pending.clear();
@@ -2525,6 +2594,12 @@ where
   fn become_pre_candidate<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
     // Non-voter guard (mirrors become_candidate for defense-in-depth).
     if !self.tracker.is_voter(&self.config.id()) {
+      return false;
+    }
+    // Term exhaustion (mirrors become_candidate): a pre-vote advertises `self.term.next()`, which
+    // SATURATES at u64::MAX. At the max term a successful pre-vote could not lead to a real campaign
+    // (`become_candidate` refuses to advance there), so don't probe at all — stay put.
+    if self.term.next() == self.term {
       return false;
     }
     self.role = Role::PreCandidate;
@@ -2625,7 +2700,15 @@ where
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
     // Self-match advance is deferred until the append is durable (on_log_appended).
-    let noop_index = last.next();
+    // Allocate a fresh, usable index for the no-op (see `next_log_index`). If the log is at the ceiling
+    // the leader cannot append its no-op (and so could never commit a current-term entry); allocating
+    // the aliased/sentinel index would truncate-replace the existing entry (R29) or commit an entry that
+    // can never be applied/replicated (R30). A node whose log is at the ceiling is corrupt/terminal —
+    // fail-stop.
+    let Some(noop_index) = Self::next_log_index(last) else {
+      self.poison(PoisonReason::LogExhausted);
+      return;
+    };
     let noop = crate::Entry::new(
       self.term,
       noop_index,
@@ -2781,7 +2864,12 @@ where
     // the acked match (the same fatal-corruption class as `CommittedTruncation`).
     let mut last_new = ae.prev_log_index();
     for entry in entries {
-      let Some(expected) = last_new.get().checked_add(1).map(Index::new) else {
+      // Derive the next position via the SAME allocation choke-point the leader uses, so the follower
+      // REJECTS an imported entry at the reserved sentinel index u64::MAX (or a near-MAX wrap): a
+      // correct leader never allocates it (R30), and an entry committed there would be unreadable by
+      // the half-open apply/replication ranges — committed but never applied (R31). Same
+      // fatal-corruption class as a gap, a duplicate, or an out-of-range index.
+      let Some(expected) = Self::next_log_index(last_new) else {
         self.poison(PoisonReason::NonContiguousAppend);
         return;
       };
@@ -3584,6 +3672,16 @@ where
     let meta = is.snapshot();
     let (term, me) = (self.term, self.config.id());
 
+    // Reserved-sentinel guard (R31): a snapshot whose boundary index is the reserved sentinel u64::MAX
+    // is malformed — a correct leader never commits/snapshots the sentinel (R30), and installing it
+    // would set commit/applied to an index the half-open log ranges cannot represent (and re-baseline
+    // `first_index` past the ceiling). Fail-stop on the malformed/version-skewed message before any
+    // state mutation. (last_index == MAX - 1 is fine: a snapshot at the ceiling, no entry beyond it.)
+    if meta.last_index().get() == u64::MAX {
+      self.poison(PoisonReason::LogExhausted);
+      return;
+    }
+
     // Staleness guard: if last_index <= commit we are already at or ahead of the snapshot.
     // Installing it would REGRESS committed/applied state — absolutely forbidden.
     // Ack anyway so the leader can transition the peer out of Snapshot state, BUT clamp the reported
@@ -3967,6 +4065,267 @@ mod tests {
     }
     targets.sort();
     assert_eq!(targets, std::vec![2u64, 3u64]);
+  }
+
+  /// Regression (R28-F1 — election safety at term exhaustion): `Term::next()` saturates at u64::MAX, so
+  /// a node already at the max term must NOT campaign — that would clear `voted_for` and self-vote in
+  /// the SAME term (a second vote in a term it may already have voted in → two leaders possible at
+  /// u64::MAX). A crafted max-term RequestVote pushes the node to term MAX and it grants the vote; a
+  /// later election timeout must NOT overwrite that vote or make it a candidate.
+  ///
+  /// MUTATION: drop the `next_term == self.term` guard in `become_candidate` → the timeout overwrites
+  /// `voted_for` with a self-vote and the node becomes a Candidate in term MAX.
+  #[test]
+  fn max_term_node_does_not_campaign_or_double_vote() {
+    use crate::{Config, Index, Instant, Message, RequestVote, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+    let mut log = crate::testkit::NoopLog;
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = Instant::ORIGIN;
+
+    // A crafted max-term RequestVote pushes this node to term u64::MAX; it grants the vote to node 2.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(u64::MAX),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        false,
+        false,
+      )),
+    );
+    ep.handle_storage(d, &mut log, &mut stable);
+    assert_eq!(ep.term(), Term::new(u64::MAX), "node adopts the max term");
+    assert_eq!(
+      ep.voted_for,
+      Some(2u64),
+      "node granted its term-MAX vote to node 2"
+    );
+    assert!(ep.role().is_follower());
+    while ep.poll_message().is_some() {}
+
+    // An election timeout must NOT let a max-term node campaign (it cannot strictly advance the term).
+    let t = ep.poll_timeout().expect("election timer armed");
+    ep.handle_timeout(t, &mut log, &mut stable);
+
+    assert!(
+      ep.role().is_follower(),
+      "a max-term node must not become a candidate"
+    );
+    assert_eq!(
+      ep.term(),
+      Term::new(u64::MAX),
+      "term must not change (already saturated)"
+    );
+    assert_eq!(
+      ep.voted_for,
+      Some(2u64),
+      "the term-MAX vote must NOT be overwritten by a self-vote"
+    );
+    let campaigned = core::iter::from_fn(|| ep.poll_message())
+      .any(|o| matches!(o.message(), Message::RequestVote(_)));
+    assert!(
+      !campaigned,
+      "a max-term node must not broadcast RequestVote"
+    );
+  }
+
+  /// Regression (R29-F1 — no log append at index saturation): `Index::next()` saturates at u64::MAX, so
+  /// a leader whose `last_index == u64::MAX` (a crafted/recovered log) must NOT allocate a new entry
+  /// there — `submit_append` is truncate-and-append, so it would replace the existing (possibly
+  /// committed) entry, breaking log matching. propose / conf-change refuse with `LogIndexExhausted`.
+  ///
+  /// MUTATION: revert `propose`'s `checked_next()` to `next()` → propose appends at the saturated index
+  /// (aliasing the entry there) instead of returning `LogIndexExhausted`.
+  #[test]
+  fn propose_at_max_index_is_refused_not_truncating() {
+    use crate::{Config, Index, Instant, LogStore as _, Message, ProposeError, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    // Elect node 1 leader (small log).
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Simulate a crafted/recovered log at the index ceiling: re-baseline so last_index == u64::MAX.
+    log.restore(Index::new(u64::MAX), Term::new(1));
+    assert_eq!(log.last_index(), Index::new(u64::MAX));
+
+    // A normal proposal must be REFUSED, not appended at the saturated (aliased) index.
+    let r = ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"));
+    assert_eq!(
+      r,
+      Err(ProposeError::LogIndexExhausted),
+      "propose at the max index must be refused"
+    );
+    assert_eq!(
+      log.last_index(),
+      Index::new(u64::MAX),
+      "nothing appended — the entry at the ceiling is untouched"
+    );
+    assert!(
+      ep.poison_reason().is_none(),
+      "a refused proposal must not poison the node"
+    );
+  }
+
+  /// Regression (R30-F1 — reserve u64::MAX as a non-allocatable sentinel index): even ONE BELOW the
+  /// ceiling, `last_index == u64::MAX - 1`, must NOT allocate `u64::MAX`. An entry there could be
+  /// committed but never applied or replicated: the half-open log ranges `[i, i.next())` (apply) and
+  /// `[.., last.next())` (replication) saturate to an EMPTY range at the ceiling. So the usable index
+  /// space ends at `u64::MAX - 1`; allocation is refused once `last == u64::MAX - 1`.
+  ///
+  /// MUTATION: drop the `!= u64::MAX` filter in `next_log_index` (bare `checked_next`) → propose at
+  /// `last == u64::MAX - 1` returns `Ok(u64::MAX)`, allocating the unreadable sentinel.
+  #[test]
+  fn propose_reserves_sentinel_max_index() {
+    use crate::{Config, Index, Instant, LogStore as _, Message, ProposeError, Term};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(d, &mut log, &mut stable);
+    ep.handle_storage(d, &mut log, &mut stable);
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    // Re-baseline one BELOW the ceiling: last_index == u64::MAX - 1.
+    log.restore(Index::new(u64::MAX - 1), Term::new(1));
+    assert_eq!(log.last_index(), Index::new(u64::MAX - 1));
+
+    // Allocating the next index (u64::MAX) is refused — it is the reserved sentinel (unreadable by the
+    // half-open apply/replication ranges).
+    let r = ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"));
+    assert_eq!(
+      r,
+      Err(ProposeError::LogIndexExhausted),
+      "u64::MAX must be reserved (a committed entry there could never be applied/replicated)"
+    );
+    assert_eq!(
+      log.last_index(),
+      Index::new(u64::MAX - 1),
+      "nothing appended at the sentinel index"
+    );
+    assert!(ep.poison_reason().is_none());
+  }
+
+  /// Regression (R31-F1 — the follower must also reject IMPORTING the reserved sentinel index): the
+  /// leader reserves u64::MAX (R30), but a malformed/version-skewed AppendEntries with prev_log_index
+  /// == u64::MAX - 1 carrying an entry at u64::MAX must be REJECTED, not imported — an entry committed
+  /// there is unreadable by the half-open apply/replication ranges (committed but never applied). The
+  /// contiguity validation derives the expected position via the same `next_log_index` choke-point, so
+  /// it poisons instead of appending.
+  ///
+  /// MUTATION: revert the contiguity loop to bare `checked_add(1)` → the follower imports the entry at
+  /// the sentinel u64::MAX.
+  #[test]
+  fn append_entries_at_sentinel_index_poisons_not_imports() {
+    use crate::{
+      AppendEntries, Config, Entry, EntryKind, Index, Instant, LogStore as _, Message, Term,
+    };
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      2u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+    let d = Instant::ORIGIN;
+    // Follower's log re-baselined to the ceiling: last_index == u64::MAX - 1, boundary term 1.
+    log.restore(Index::new(u64::MAX - 1), Term::new(1));
+    assert_eq!(log.last_index(), Index::new(u64::MAX - 1));
+
+    // A leader (node 1, term 1) sends an entry at the reserved sentinel index u64::MAX. prev_log_index
+    // == u64::MAX - 1 matches the follower's boundary, so the consistency check passes and the
+    // contiguity validation is reached.
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(1),
+        1u64,
+        Index::new(u64::MAX - 1),
+        Term::new(1),
+        std::vec![Entry::new(
+          Term::new(1),
+          Index::new(u64::MAX),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        )],
+        Index::ZERO,
+      )),
+    );
+
+    assert!(
+      matches!(
+        ep.poison_reason(),
+        Some(crate::PoisonReason::NonContiguousAppend)
+      ),
+      "an entry at the reserved sentinel index must poison, not be imported; got {:?}",
+      ep.poison_reason()
+    );
+    assert_eq!(
+      log.last_index(),
+      Index::new(u64::MAX - 1),
+      "nothing appended at the sentinel index"
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "a poisoned node sends no AppendResp"
+    );
   }
 
   #[test]
@@ -8482,6 +8841,74 @@ mod tests {
       ep.state_machine().count(),
       0,
       "no SM restore on an invalid-ConfState snapshot"
+    );
+  }
+
+  /// Regression (R32 — `restart` fail-stops on a reserved-sentinel snapshot WITHOUT mutating the SM):
+  /// a durable snapshot whose `last_index` is the reserved sentinel `u64::MAX` is corrupt/version-
+  /// skewed (a correct leader reserves the sentinel (R30) and never snapshots at it; followers reject
+  /// installing it). R31 already poisoned on such a snapshot — but did so in the post-restore
+  /// reconciliation guard, AFTER `F::Snapshot::decode` + `fsm.restore` had already mutated the state
+  /// machine. The fail-stop MUST be side-effect-free: the sentinel boundary is now rejected ahead of
+  /// decode/restore (beside the conf-validity gate), so `restore` never runs. Asserts the node poisons
+  /// (`log_exhausted`) AND the SM is untouched — `CountSm.count` stays 0; a restore from the blob
+  /// would have set it to 99.
+  ///
+  /// MUTATION: move the `meta.last_index().get() == u64::MAX` check back below the decode/restore
+  /// branch (the R31 placement) → the node still poisons, but `count() == 99` (restore ran first).
+  #[test]
+  fn restart_sentinel_snapshot_poisons_without_restoring_sm() {
+    use crate::{Config, Index, Instant, Term, conf::ConfState};
+    use core::time::Duration;
+    let cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+
+    let mut stable = crate::testkit::AsyncStable::default();
+    // Durable snapshot at the RESERVED SENTINEL boundary (last_index == u64::MAX) with a VALID
+    // ConfState (so the sentinel gate — not the conf gate — is what poisons) and a blob that decodes
+    // to count=99 (so a restore, if it wrongly ran, is observable as count==99).
+    let snap_data = encode_count_snapshot(99);
+    let bad_meta = crate::SnapshotMeta::new(
+      Index::new(u64::MAX),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(crate::OpId::new(1), bad_meta, snap_data);
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(0));
+
+    // Empty durable log: the snapshot boundary is rejected before reconciliation, so the log is never
+    // consulted here — this isolates the SNAPSHOT-boundary sentinel (the log-boundary sentinel has its
+    // own regression).
+    let mut log = crate::testkit::VecLog::default();
+
+    let ep = Endpoint::restart(
+      cfg,
+      Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      1, // boot_epoch (this incarnation > the prior one)
+      &mut log,
+      &mut stable,
+    );
+
+    assert!(
+      ep.is_poisoned(),
+      "restart from a reserved-sentinel snapshot boundary must poison"
+    );
+    assert_eq!(
+      ep.poison_reason().map(|r| r.as_str()),
+      Some("log_exhausted")
+    );
+    assert_eq!(
+      ep.state_machine().count(),
+      0,
+      "fail-stop must be side-effect-free: the SM must NOT be restored from a sentinel snapshot"
     );
   }
 

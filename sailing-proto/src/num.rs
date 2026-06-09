@@ -20,6 +20,19 @@ macro_rules! counter {
             #[doc = "The next value (saturating at `u64::MAX`)."]
             #[inline(always)]
             pub const fn next(self) -> Self { Self(self.0.saturating_add(1)) }
+            #[doc = "The next value, or `None` at `u64::MAX` (the counter is exhausted)."]
+            #[doc = ""]
+            #[doc = "Use this — never `next()` — wherever the result is treated as a STRICTLY-new"]
+            #[doc = "slot/term (e.g. allocating a fresh log index or advancing the election term):"]
+            #[doc = "`next()` saturates, so at `u64::MAX` it would silently reuse the current value,"]
+            #[doc = "letting a crafted/recovered max-value state alias an existing index/term."]
+            #[inline(always)]
+            pub const fn checked_next(self) -> Option<Self> {
+                match self.0.checked_add(1) {
+                    Some(v) => Some(Self(v)),
+                    None => None,
+                }
+            }
         }
 
         impl core::fmt::Display for $name {
@@ -51,6 +64,10 @@ mod tests {
     assert_eq!(Term::new(5).next(), Term::new(6));
     assert!(Index::new(1) < Index::new(2));
     assert_eq!(Index::new(u64::MAX).next(), Index::new(u64::MAX)); // saturating
+    // checked_next: strict advance, None at the ceiling.
+    assert_eq!(Index::new(5).checked_next(), Some(Index::new(6)));
+    assert_eq!(Index::new(u64::MAX).checked_next(), None);
+    assert_eq!(Term::new(u64::MAX).checked_next(), None);
     assert_eq!(std::format!("{}", Term::new(7)), "7");
   }
 }
