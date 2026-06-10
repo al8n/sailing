@@ -26,6 +26,34 @@ type ConfChangedCount = u64;
 
 type Node = Endpoint<u64, LogSm>;
 
+/// Round-trip a consensus message through the real `Message<I>` wire codec at the delivery seam.
+///
+/// With the `wire` feature OFF (default) this is the identity — the message moves as a value, as it
+/// always has. With `wire` ON, every message the VOPR delivers is `encode`d to bytes and `decode`d
+/// back, so the entire fuzzer (crashes, partitions, membership churn) exercises the codec; a codec
+/// defect on ANY message panics with the failing seed/tick. The round-trip is a verified identity
+/// (`decode(encode(m)) == m`), so it does not change behavior or determinism.
+#[cfg(feature = "wire")]
+fn wire_roundtrip(message: Message<u64>) -> Message<u64> {
+  use sailing_proto::Data;
+  let mut buf = Vec::new();
+  message.encode(&mut buf);
+  let (n, decoded) = Message::<u64>::decode(&buf)
+    .expect("a consensus message must round-trip through the wire codec");
+  assert_eq!(
+    n,
+    buf.len(),
+    "the wire codec must consume exactly the encoded bytes"
+  );
+  decoded
+}
+
+#[cfg(not(feature = "wire"))]
+#[inline(always)]
+fn wire_roundtrip(message: Message<u64>) -> Message<u64> {
+  message
+}
+
 /// One node's applied log as `(index, command-bytes)` pairs, copied out for cross-run / cross-node
 /// comparison (see [`Cluster::applied_entries_of`]). A `Vec<AppliedLog>` is the whole cluster's
 /// applied state captured at a point in time.
@@ -304,7 +332,8 @@ impl Cluster {
         } else if let Some(&to_idx) = self.node_idx.get(&m.to) {
           delivered = true;
           let (log, stable) = (&mut self.logs[to_idx], &mut self.stables[to_idx]);
-          self.nodes[to_idx].handle_message(self.now, log, stable, m.from, m.message);
+          let message = wire_roundtrip(m.message);
+          self.nodes[to_idx].handle_message(self.now, log, stable, m.from, message);
         }
         // else: message to an unknown id (shouldn't happen, but drop safely)
       } else {

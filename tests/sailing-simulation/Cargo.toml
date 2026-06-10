@@ -7,6 +7,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# When enabled, every consensus message is round-tripped through the real `Message<I>` wire codec
+# (encode -> decode) at the delivery seam — so the whole VOPR fuzzer exercises the codec under
+# crashes, partitions, and membership churn. Off by default (the codec round-trip is a verified
+# identity, so it does not change behavior, but it adds per-message overhead).
+wire = []
+
 [dependencies]
 sailing-proto = { workspace = true, features = ["std"] }
 bytes.workspace = true
