@@ -1,0 +1,160 @@
+//! `Conn<I, R>`: a per-connection lifecycle state machine over a record layer `R`.
+//!
+//! It feeds inbound wire bytes to the record layer, binds the peer once the handshake (record-layer
+//! and label) settles (`Handshaking` → `Validated`), and only then decodes application frames into
+//! `Message<I>`s. Any transport-layer fault closes the connection (`Closed`) without ever touching
+//! the consensus `Endpoint`.
+use super::{
+  TransportError,
+  frame::{FrameDecoder, encode_frame},
+  stream::{Intake, RecordIo},
+};
+use crate::{Data, Instant, Message, NodeId};
+use std::vec::Vec;
+
+enum ConnState<I> {
+  Handshaking,
+  Validated { peer: I },
+  Closed,
+}
+
+/// A single transport connection: a record layer + a frame decoder + a lifecycle state.
+pub struct Conn<I, R> {
+  record: R,
+  decoder: FrameDecoder,
+  state: ConnState<I>,
+}
+
+impl<I: NodeId, R: RecordIo> Conn<I, R> {
+  /// A new connection in the `Handshaking` state.
+  pub fn new(record: R) -> Self {
+    Self {
+      record,
+      decoder: FrameDecoder::new(),
+      state: ConnState::Handshaking,
+    }
+  }
+
+  /// Feed inbound wire bytes (with `eof` set when the peer half-closed). Advances the handshake,
+  /// buffers decoded application frames, and binds the peer on validation. Closes the connection on
+  /// a record-layer failure or an undecodable peer id.
+  pub fn handle_data(
+    &mut self,
+    bytes: &[u8],
+    eof: bool,
+    now: Instant,
+  ) -> Result<(), TransportError> {
+    if matches!(self.state, ConnState::Closed) {
+      return Ok(());
+    }
+    let mut input = bytes;
+    loop {
+      match self.record.handle_transport_data(input, now) {
+        Intake::Failed => {
+          self.state = ConnState::Closed;
+          return Err(TransportError::Record);
+        }
+        Intake::Done => input = &[],
+        Intake::Pending(consumed) => {
+          if consumed == 0 {
+            break; // no progress this pass — avoid spinning
+          }
+          input = &input[consumed..];
+        }
+      }
+      // Surface application plaintext (post-handshake/label) into the frame decoder.
+      let mut plain = Vec::new();
+      self.record.read_plaintext(&mut plain);
+      if !plain.is_empty() {
+        self.decoder.push(&plain);
+      }
+      self.try_validate()?;
+      if input.is_empty() {
+        break;
+      }
+    }
+    if eof {
+      self.state = ConnState::Closed;
+    }
+    Ok(())
+  }
+
+  /// Bind the peer once the record layer reports the handshake complete and an identity is available.
+  fn try_validate(&mut self) -> Result<(), TransportError> {
+    if !matches!(self.state, ConnState::Handshaking) || self.record.is_handshaking() {
+      return Ok(());
+    }
+    let peer_bytes = self.record.peer_identity().map(|b| b.to_vec());
+    if let Some(bytes) = peer_bytes {
+      match I::decode(&bytes) {
+        Ok((_, peer)) => self.state = ConnState::Validated { peer },
+        Err(_) => {
+          self.state = ConnState::Closed;
+          return Err(TransportError::Decode);
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// Decode any complete application frames into `out`. Yields nothing until the connection is
+  /// `Validated`; a frame that is not exactly one `Message` closes the connection.
+  pub fn poll_decoded(&mut self, out: &mut Vec<Message<I>>) -> Result<(), TransportError> {
+    if !matches!(self.state, ConnState::Validated { .. }) {
+      return Ok(());
+    }
+    let mut frame = Vec::new();
+    while self.decoder.poll(&mut frame)? {
+      match Message::<I>::decode(&frame) {
+        Ok((n, msg)) if n == frame.len() => out.push(msg),
+        _ => {
+          self.state = ConnState::Closed;
+          return Err(TransportError::Decode);
+        }
+      }
+    }
+    Ok(())
+  }
+
+  /// Encode + frame `msg` and queue it for transmission through the record layer.
+  pub fn send_message(&mut self, msg: &Message<I>) {
+    let mut payload = Vec::new();
+    msg.encode(&mut payload);
+    let mut framed = Vec::new();
+    encode_frame(&payload, &mut framed);
+    self.record.write_plaintext(&framed);
+  }
+
+  /// Drain queued outbound wire bytes into `out`, returning the number written.
+  pub fn poll_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    self.record.poll_transport_transmit(out)
+  }
+
+  /// The bound peer, once `Validated`.
+  pub fn peer(&self) -> Option<I> {
+    match self.state {
+      ConnState::Validated { peer } => Some(peer),
+      _ => None,
+    }
+  }
+
+  /// Whether the connection is terminally closed.
+  pub fn is_closed(&self) -> bool {
+    matches!(self.state, ConnState::Closed)
+  }
+
+  /// Whether the connection is still handshaking (not yet validated, not closed).
+  pub fn is_handshaking(&self) -> bool {
+    matches!(self.state, ConnState::Handshaking)
+  }
+
+  /// Test-only: inject raw plaintext bytes into the record layer, bypassing `send_message`'s
+  /// encoding — used to feed a peer a deliberately malformed frame.
+  #[cfg(test)]
+  pub(crate) fn record_write_for_test(&mut self, bytes: &[u8]) {
+    self.record.write_plaintext(bytes);
+  }
+}
+
+#[cfg(test)]
+mod tests;
