@@ -1,6 +1,6 @@
 //! Raft RPC messages. Payloads are named structs; `Message<I>` wraps them as newtype
 //! variants (no multi-field enum variants). Types only — behavior lives elsewhere.
-use crate::{Entry, Index, Term, conf::ConfState};
+use crate::{Data, DecodeError, Entry, Index, NodeId, Term, conf::ConfState};
 use bytes::Bytes;
 use std::vec::Vec;
 
@@ -773,6 +773,385 @@ impl<I: crate::NodeId> Message<I> {
       Self::ReadIndex(m) => m.from(),
       Self::ReadIndexResp(m) => m.from(),
     }
+  }
+}
+
+// ─── Wire codec (`Data`) ──────────────────────────────────────────────────────
+// A leading tag byte selects the variant; each field encodes via its own `Data` impl.
+// Variable-length fields (`Bytes`, `Vec<Entry>`, the `ConfState` sets) route through
+// the bounds-checked `decode_len`, so no length prefix can drive an oversized allocation.
+
+impl<I: NodeId> Data for SnapshotMeta<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.last_index.encode(buf);
+    self.last_term.encode(buf);
+    self.conf.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let last_index = d.read::<Index>()?;
+    let last_term = d.read::<Term>()?;
+    let conf = d.read::<ConfState<I>>()?;
+    Ok((d.pos(), Self::new(last_index, last_term, conf)))
+  }
+}
+
+impl<I: NodeId> Data for AppendEntries<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.leader.encode(buf);
+    self.prev_log_index.encode(buf);
+    self.prev_log_term.encode(buf);
+    self.entries.encode(buf);
+    self.leader_commit.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let leader = d.read::<I>()?;
+    let prev_log_index = d.read::<Index>()?;
+    let prev_log_term = d.read::<Term>()?;
+    let entries = d.read::<Vec<Entry>>()?;
+    let leader_commit = d.read::<Index>()?;
+    Ok((
+      d.pos(),
+      Self::new(
+        term,
+        leader,
+        prev_log_index,
+        prev_log_term,
+        entries,
+        leader_commit,
+      ),
+    ))
+  }
+}
+
+impl<I: NodeId> Data for AppendResp<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.from.encode(buf);
+    self.reject.encode(buf);
+    self.reject_hint_index.encode(buf);
+    self.reject_hint_term.encode(buf);
+    self.match_index.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let from = d.read::<I>()?;
+    let reject = d.read::<bool>()?;
+    let reject_hint_index = d.read::<Index>()?;
+    let reject_hint_term = d.read::<Term>()?;
+    let match_index = d.read::<Index>()?;
+    Ok((
+      d.pos(),
+      Self::new(
+        term,
+        from,
+        reject,
+        reject_hint_index,
+        reject_hint_term,
+        match_index,
+      ),
+    ))
+  }
+}
+
+impl<I: NodeId> Data for RequestVote<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.candidate.encode(buf);
+    self.last_log_index.encode(buf);
+    self.last_log_term.encode(buf);
+    self.pre_vote.encode(buf);
+    self.leader_transfer.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let candidate = d.read::<I>()?;
+    let last_log_index = d.read::<Index>()?;
+    let last_log_term = d.read::<Term>()?;
+    let pre_vote = d.read::<bool>()?;
+    let leader_transfer = d.read::<bool>()?;
+    Ok((
+      d.pos(),
+      Self::new(
+        term,
+        candidate,
+        last_log_index,
+        last_log_term,
+        pre_vote,
+        leader_transfer,
+      ),
+    ))
+  }
+}
+
+impl<I: NodeId> Data for VoteResp<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.from.encode(buf);
+    self.pre_vote.encode(buf);
+    self.reject.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let from = d.read::<I>()?;
+    let pre_vote = d.read::<bool>()?;
+    let reject = d.read::<bool>()?;
+    Ok((d.pos(), Self::new(term, from, pre_vote, reject)))
+  }
+}
+
+impl<I: NodeId> Data for Heartbeat<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.leader.encode(buf);
+    self.commit.encode(buf);
+    self.context.encode(buf);
+    self.lease_round.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let leader = d.read::<I>()?;
+    let commit = d.read::<Index>()?;
+    let context = d.read::<Bytes>()?;
+    let lease_round = d.read::<u64>()?;
+    Ok((
+      d.pos(),
+      Self::new(term, leader, commit, context).with_lease_round(lease_round),
+    ))
+  }
+}
+
+impl<I: NodeId> Data for HeartbeatResp<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.from.encode(buf);
+    self.context.encode(buf);
+    self.lease_round.encode(buf);
+    self.lease_support.as_secs().encode(buf);
+    (self.lease_support.subsec_nanos() as u64).encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let from = d.read::<I>()?;
+    let context = d.read::<Bytes>()?;
+    let lease_round = d.read::<u64>()?;
+    let secs = d.read::<u64>()?;
+    let nanos = d.read::<u64>()?;
+    if nanos >= 1_000_000_000 {
+      return Err(DecodeError::Invalid("duration nanos"));
+    }
+    let lease_support = core::time::Duration::new(secs, nanos as u32);
+    Ok((
+      d.pos(),
+      Self::new(term, from, context)
+        .with_lease_round(lease_round)
+        .with_lease_support(lease_support),
+    ))
+  }
+}
+
+impl<I: NodeId> Data for InstallSnapshot<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.leader.encode(buf);
+    self.snapshot.encode(buf);
+    self.data.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let leader = d.read::<I>()?;
+    let snapshot = d.read::<SnapshotMeta<I>>()?;
+    let data = d.read::<Bytes>()?;
+    Ok((d.pos(), Self::new(term, leader, snapshot, data)))
+  }
+}
+
+impl<I: NodeId> Data for SnapshotResp<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.from.encode(buf);
+    self.reject.encode(buf);
+    self.match_index.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let from = d.read::<I>()?;
+    let reject = d.read::<bool>()?;
+    let match_index = d.read::<Index>()?;
+    Ok((d.pos(), Self::new(term, from, reject, match_index)))
+  }
+}
+
+impl<I: NodeId> Data for TimeoutNow<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.leader.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let leader = d.read::<I>()?;
+    Ok((d.pos(), Self::new(term, leader)))
+  }
+}
+
+impl<I: NodeId> Data for ReadIndex<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.from.encode(buf);
+    self.context.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let from = d.read::<I>()?;
+    let context = d.read::<Bytes>()?;
+    Ok((d.pos(), Self::new(term, from, context)))
+  }
+}
+
+impl<I: NodeId> Data for ReadIndexResp<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.term.encode(buf);
+    self.from.encode(buf);
+    self.index.encode(buf);
+    self.context.encode(buf);
+    self.reject.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let from = d.read::<I>()?;
+    let index = d.read::<Index>()?;
+    let context = d.read::<Bytes>()?;
+    let reject = d.read::<bool>()?;
+    Ok((d.pos(), Self::new(term, from, index, context, reject)))
+  }
+}
+
+impl<I: NodeId> Data for Message<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    match self {
+      Self::AppendEntries(m) => {
+        buf.push(0);
+        m.encode(buf);
+      }
+      Self::AppendResp(m) => {
+        buf.push(1);
+        m.encode(buf);
+      }
+      Self::RequestVote(m) => {
+        buf.push(2);
+        m.encode(buf);
+      }
+      Self::VoteResp(m) => {
+        buf.push(3);
+        m.encode(buf);
+      }
+      Self::Heartbeat(m) => {
+        buf.push(4);
+        m.encode(buf);
+      }
+      Self::HeartbeatResp(m) => {
+        buf.push(5);
+        m.encode(buf);
+      }
+      Self::InstallSnapshot(m) => {
+        buf.push(6);
+        m.encode(buf);
+      }
+      Self::SnapshotResp(m) => {
+        buf.push(7);
+        m.encode(buf);
+      }
+      Self::TimeoutNow(m) => {
+        buf.push(8);
+        m.encode(buf);
+      }
+      Self::ReadIndex(m) => {
+        buf.push(9);
+        m.encode(buf);
+      }
+      Self::ReadIndexResp(m) => {
+        buf.push(10);
+        m.encode(buf);
+      }
+    }
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let tag = *buf.first().ok_or(DecodeError::UnexpectedEof)?;
+    let rest = buf.get(1..).ok_or(DecodeError::UnexpectedEof)?;
+    let (n, msg) = match tag {
+      0 => {
+        let (n, m) = AppendEntries::<I>::decode(rest)?;
+        (n, Self::AppendEntries(m))
+      }
+      1 => {
+        let (n, m) = AppendResp::<I>::decode(rest)?;
+        (n, Self::AppendResp(m))
+      }
+      2 => {
+        let (n, m) = RequestVote::<I>::decode(rest)?;
+        (n, Self::RequestVote(m))
+      }
+      3 => {
+        let (n, m) = VoteResp::<I>::decode(rest)?;
+        (n, Self::VoteResp(m))
+      }
+      4 => {
+        let (n, m) = Heartbeat::<I>::decode(rest)?;
+        (n, Self::Heartbeat(m))
+      }
+      5 => {
+        let (n, m) = HeartbeatResp::<I>::decode(rest)?;
+        (n, Self::HeartbeatResp(m))
+      }
+      6 => {
+        let (n, m) = InstallSnapshot::<I>::decode(rest)?;
+        (n, Self::InstallSnapshot(m))
+      }
+      7 => {
+        let (n, m) = SnapshotResp::<I>::decode(rest)?;
+        (n, Self::SnapshotResp(m))
+      }
+      8 => {
+        let (n, m) = TimeoutNow::<I>::decode(rest)?;
+        (n, Self::TimeoutNow(m))
+      }
+      9 => {
+        let (n, m) = ReadIndex::<I>::decode(rest)?;
+        (n, Self::ReadIndex(m))
+      }
+      10 => {
+        let (n, m) = ReadIndexResp::<I>::decode(rest)?;
+        (n, Self::ReadIndexResp(m))
+      }
+      _ => return Err(DecodeError::Invalid("Message tag")),
+    };
+    Ok((1 + n, msg))
   }
 }
 

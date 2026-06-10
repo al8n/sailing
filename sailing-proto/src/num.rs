@@ -41,6 +41,18 @@ macro_rules! counter {
                 core::fmt::Display::fmt(&self.0, f)
             }
         }
+
+        impl crate::Data for $name {
+            #[inline]
+            fn encode(&self, buf: &mut std::vec::Vec<u8>) {
+                crate::Data::encode(&self.0, buf);
+            }
+            #[inline]
+            fn decode(buf: &[u8]) -> Result<(usize, Self), crate::DecodeError> {
+                let (n, raw) = <u64 as crate::Data>::decode(buf)?;
+                Ok((n, Self(raw)))
+            }
+        }
     };
 }
 
