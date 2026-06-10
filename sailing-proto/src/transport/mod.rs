@@ -1,5 +1,11 @@
 //! Sans-I/O transport: framed, reliable streams that drive `Endpoint`.
 //! Feature-gated; the consensus core stays no_std + dependency-free by default.
+// The transport is built bottom-up: each lower layer (framing, the record layers, `Conn`) lands
+// before the consumer that uses it (the coordinators). This module-scoped allow keeps those
+// intermediate states warning-clean; it is removed once the coordinators wire everything together.
+#![allow(dead_code)]
+
+mod frame;
 
 /// A 16-byte cluster identity; peers reject handshakes from other clusters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
