@@ -1,0 +1,214 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README'
+      - 'COPYRIGHT'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+  pull_request:
+    paths-ignore:
+      - 'README'
+      - 'COPYRIGHT'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+  workflow_dispatch:
+  schedule:
+    - cron: "0 1 1 * *"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Check formatting (platform-independent, one OS is enough).
+  # Nightly toolchain: rustfmt.toml sets `imports_granularity = "Crate"`, an unstable
+  # rustfmt option only the nightly formatter understands.
+  rustfmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install nightly Rust
+      run: rustup toolchain install nightly --component rustfmt
+    - name: Check formatting
+      run: cargo +nightly fmt --all -- --check
+
+  # Apply clippy lints across the feature sweep
+  clippy:
+    name: clippy
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust
+      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
+      run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+    - name: Apply clippy lints
+      run: cargo hack clippy --each-feature --exclude-no-default-features
+
+  # Run tests on some extra platforms
+  cross:
+    name: cross
+    strategy:
+      # One target failing should not cancel the others — we want the full portability picture.
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-gnu
+          - aarch64-linux-android
+          - aarch64-unknown-linux-musl
+          - i686-linux-android
+          - x86_64-linux-android
+          - i686-pc-windows-gnu
+          - x86_64-pc-windows-gnu
+          - i686-unknown-linux-gnu
+          - powerpc64-unknown-linux-gnu
+          - riscv64gc-unknown-linux-gnu
+          - wasm32-unknown-unknown
+          - wasm32-unknown-emscripten
+          - wasm32-wasip1
+          - wasm32-wasip1-threads
+          - wasm32-wasip2
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cross-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cross-
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: cargo build --target ${{ matrix.target }}
+        run: |
+          rustup target add ${{ matrix.target }}
+          cargo build --target ${{ matrix.target }}
+
+  # Prove the no_std core (sailing-proto) links on a real bare-metal target with only `alloc` and
+  # no `std`. Any accidental std dependency fails to build here.
+  no-std:
+    name: no-std (bare-metal + alloc)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install Rust
+      run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
+    - name: Add bare-metal no_std target
+      run: rustup target add thumbv7em-none-eabi
+    - name: Build sailing-proto (no_std + alloc) on bare metal
+      run: cargo build -p sailing-proto --no-default-features --features alloc --target thumbv7em-none-eabi
+    - name: Clippy sailing-proto (no_std + alloc)
+      run: cargo clippy -p sailing-proto --no-default-features --features alloc -- -D warnings
+
+  build:
+    name: build
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+    - name: Cache cargo build and registry
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-build-${{ hashFiles('**/Cargo.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-build-
+    - name: Install Rust
+      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+    - name: Run build
+      run: cargo hack build --feature-powerset --exclude-no-default-features
+
+  test:
+    name: test
+    strategy:
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+    - uses: actions/checkout@v6
+    - name: Cache cargo build and registry
+      uses: actions/cache@v5
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-test-${{ hashFiles('**/Cargo.toml') }}
+        restore-keys: |
+          ${{ runner.os }}-test-
+    - name: Install Rust
+      # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
+      run: rustup update stable --no-self-update && rustup default stable
+    - name: Install cargo-hack
+      run: cargo install cargo-hack
+    - name: Run test
+      run: cargo hack test --feature-powerset --exclude-no-default-features
+
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    needs:
+      - rustfmt
+      - clippy
+      - build
+      - cross
+      - test
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install Rust
+        run: rustup update nightly && rustup default nightly
+      - name: Install cargo-tarpaulin
+        run: cargo install cargo-tarpaulin
+      - name: Cache cargo build and registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-coverage-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-coverage-
+      - name: Run tarpaulin
+        env:
+          RUSTFLAGS: "--cfg tarpaulin"
+        run: cargo tarpaulin --engine llvm --all-features --run-types lib --run-types tests --run-types doctests --workspace --out xml
+      - name: Upload to codecov.io
+        uses: codecov/codecov-action@v7
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          slug: ${{ github.repository }}
+          fail_ci_if_error: false

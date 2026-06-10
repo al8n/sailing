@@ -1,0 +1,19 @@
+[workspace]
+resolver = "3"
+members = ["sailing-proto", "tests/sailing-simulation"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/al8n/sailing"
+
+[workspace.dependencies]
+sailing-proto = { path = "sailing-proto" }
+bytes = { version = "1", default-features = false }
+thiserror = { version = "2", default-features = false }
+derive_more = { version = "2", default-features = false, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
+
+[workspace.lints.rust]
+missing_docs = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }

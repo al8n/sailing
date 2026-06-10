@@ -1,0 +1,231 @@
+use super::*;
+use core::time::Duration;
+
+#[test]
+fn quorum_and_voters() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert_eq!(c.quorum(), 2);
+  assert_eq!(c.voters(), &[1, 2, 3]);
+  assert!(c.is_voter(2u64));
+  // id must be among voters
+  assert!(
+    Config::try_new(
+      9u64,
+      std::vec![1u64, 2],
+      Duration::from_millis(1000),
+      Duration::from_millis(100)
+    )
+    .is_err()
+  );
+}
+
+#[test]
+fn config_validation_and_defaults() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert_eq!(c.id(), 1u64);
+  assert_eq!(c.heartbeat_interval(), Duration::from_millis(100));
+  // election timeout must exceed heartbeat interval
+  assert!(matches!(
+    Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(50),
+      Duration::from_millis(100)
+    ),
+    Err(ConfigError::ElectionNotGreaterThanHeartbeat { .. })
+  ));
+}
+
+#[test]
+fn step_down_on_removal_default_and_override() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert!(
+    c.step_down_on_removal(),
+    "step_down_on_removal must default to true"
+  );
+  let c2 = c.with_step_down_on_removal(false);
+  assert!(
+    !c2.step_down_on_removal(),
+    "with_step_down_on_removal(false) must persist"
+  );
+  let c3 = c2.with_step_down_on_removal(true);
+  assert!(
+    c3.step_down_on_removal(),
+    "with_step_down_on_removal(true) must persist"
+  );
+}
+
+#[test]
+fn snapshot_threshold_default_and_override() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert_eq!(c.snapshot_threshold(), 10_000, "default should be 10_000");
+  let c2 = c.with_snapshot_threshold(50);
+  assert_eq!(c2.snapshot_threshold(), 50);
+}
+
+#[test]
+fn flow_control_defaults_and_validation() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  // Defaults: 1 MiB per msg, 256 in-flight msgs, 0 (uncapped) bytes.
+  assert_eq!(c.max_size_per_msg(), 1024 * 1024);
+  assert_eq!(c.max_inflight_msgs(), 256);
+  assert_eq!(c.max_inflight_bytes(), 0);
+
+  // with_* builders work.
+  let c2 = c
+    .clone()
+    .with_max_size_per_msg(512)
+    .with_max_inflight_msgs(8)
+    .unwrap()
+    .with_max_inflight_bytes(4096);
+  assert_eq!(c2.max_size_per_msg(), 512);
+  assert_eq!(c2.max_inflight_msgs(), 8);
+  assert_eq!(c2.max_inflight_bytes(), 4096);
+
+  // ZeroInflight: max_inflight_msgs = 0 is rejected.
+  assert!(matches!(
+    c.clone().with_max_inflight_msgs(0),
+    Err(ConfigError::ZeroInflight)
+  ));
+}
+
+#[test]
+fn pre_vote_default_and_override() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert!(!c.pre_vote(), "pre_vote must default to false");
+  let c2 = c.with_pre_vote(true);
+  assert!(c2.pre_vote(), "with_pre_vote(true) must persist");
+  let c3 = c2.with_pre_vote(false);
+  assert!(!c3.pre_vote(), "with_pre_vote(false) must persist");
+}
+
+#[test]
+fn check_quorum_default_and_override() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert!(!c.check_quorum(), "check_quorum must default to false");
+  let c2 = c.with_check_quorum(true);
+  assert!(c2.check_quorum(), "with_check_quorum(true) must persist");
+  let c3 = c2.with_check_quorum(false);
+  assert!(!c3.check_quorum(), "with_check_quorum(false) must persist");
+}
+
+#[test]
+fn disable_proposal_forwarding_default_and_override() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert!(
+    !c.disable_proposal_forwarding(),
+    "disable_proposal_forwarding must default to false"
+  );
+  let c2 = c.with_disable_proposal_forwarding(true);
+  assert!(
+    c2.disable_proposal_forwarding(),
+    "with_disable_proposal_forwarding(true) must persist"
+  );
+}
+
+#[test]
+fn read_only_option_defaults_and_as_str() {
+  // Default is Safe.
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert_eq!(c.read_only(), ReadOnlyOption::Safe);
+  assert!(c.read_only().is_safe());
+  assert_eq!(ReadOnlyOption::Safe.as_str(), "safe");
+  assert_eq!(ReadOnlyOption::LeaseBased.as_str(), "lease_based");
+
+  // Builder round-trip.
+  let c2 = c.with_read_only(ReadOnlyOption::LeaseBased);
+  assert_eq!(c2.read_only(), ReadOnlyOption::LeaseBased);
+  assert!(c2.read_only().is_lease_based());
+  let c3 = c2.with_read_only(ReadOnlyOption::Safe);
+  assert_eq!(c3.read_only(), ReadOnlyOption::Safe);
+}
+
+#[test]
+fn validate_lease_requires_check_quorum() {
+  let base = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+
+  // Safe + no check_quorum: always ok.
+  assert!(base.clone().validate().is_ok());
+
+  // Safe + check_quorum: ok.
+  assert!(base.clone().with_check_quorum(true).validate().is_ok());
+
+  // LeaseBased WITHOUT check_quorum: error.
+  assert!(matches!(
+    base
+      .clone()
+      .with_read_only(ReadOnlyOption::LeaseBased)
+      .validate(),
+    Err(ConfigError::LeaseRequiresCheckQuorum)
+  ));
+
+  // LeaseBased WITH check_quorum: ok.
+  assert!(
+    base
+      .clone()
+      .with_read_only(ReadOnlyOption::LeaseBased)
+      .with_check_quorum(true)
+      .validate()
+      .is_ok()
+  );
+}

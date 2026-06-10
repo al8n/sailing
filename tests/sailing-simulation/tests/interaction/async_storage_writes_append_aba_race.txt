@@ -1,0 +1,360 @@
+# async_storage_writes_append_aba_race: the §5.3 truncation/async-durability ABA. A follower stages
+# an entry (async, not yet durable) from an old leader; a NEW leader at a higher term, whose electing
+# quorum never saw that entry, overwrites the same index; the follower truncates the stale staged
+# entry and accepts the higher-term one. When the follower finally flushes, the durable log must carry
+# the NEW entry — the stale async append must not resurrect (the seed-3395 class). Needs 5 voters so a
+# quorum {3,4,5} that never saw the entry can elect the new leader.
+add-nodes 5 voters=(1,2,3,4,5) async=true
+----
+n1: created voters={1,2,3,4,5} term=0 commit=0 last=0
+n2: created voters={1,2,3,4,5} term=0 commit=0 last=0
+n3: created voters={1,2,3,4,5} term=0 commit=0 last=0
+n4: created voters={1,2,3,4,5} term=0 commit=0 last=0
+n5: created voters={1,2,3,4,5} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+flush 1
+----
+ok
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n4 recv RequestVote term=1 last=0/0 prevote=false
+> n5 recv RequestVote term=1 last=0/0 prevote=false
+
+flush 1 2 3 4 5
+----
+> n2 ready
+  VoteResp term=1 prevote=false reject=false
+> n3 ready
+  VoteResp term=1 prevote=false reject=false
+> n4 ready
+  VoteResp term=1 prevote=false reject=false
+> n5 ready
+  VoteResp term=1 prevote=false reject=false
+
+stabilize
+----
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n4 recv Heartbeat term=1 commit=0
+> n5 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n4 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n5 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResp term=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResp term=1
+  n3 leader-changed term=1 lead=1
+> n4 ready
+  HeartbeatResp term=1
+  n4 leader-changed term=1 lead=1
+> n5 ready
+  HeartbeatResp term=1
+  n5 leader-changed term=1 lead=1
+> n1 recv HeartbeatResp term=1
+> n1 recv HeartbeatResp term=1
+> n1 recv HeartbeatResp term=1
+> n1 recv HeartbeatResp term=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n4 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n5 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  AppendResp term=1 match=0
+> n3 ready
+  AppendResp term=1 match=0
+> n4 ready
+  AppendResp term=1 match=0
+> n5 ready
+  AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+> n1 recv AppendResp term=1 match=0
+
+flush 1 2 3 4 5
+----
+> n2 ready
+  AppendResp term=1 match=1
+> n3 ready
+  AppendResp term=1 match=1
+> n4 ready
+  AppendResp term=1 match=1
+> n5 ready
+  AppendResp term=1 match=1
+
+stabilize
+----
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=1/1 commit=0 entries=[]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=1/1 commit=0 entries=[]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n4 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n5 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResp term=1 match=1
+> n3 ready
+  AppendResp term=1 match=1
+> n4 ready
+  AppendResp term=1 match=1
+> n5 ready
+  AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+
+isolate 3
+----
+n3 isolated
+
+isolate 4
+----
+n4 isolated
+
+isolate 5
+----
+n5 isolated
+
+propose 1 a
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+flush 1
+----
+ok
+
+deliver-msgs to=2
+----
+n1->n2 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+raft-log 2
+----
+n2: commit=1 applied=1 last=2
+  1/1 empty
+  1/2 normal 0x010000000000000061
+
+isolate 1
+----
+n1 isolated
+
+isolate 2
+----
+n2 isolated
+
+recover 3
+----
+n3 recovered
+
+recover 4
+----
+n4 recovered
+
+recover 5
+----
+n5 recovered
+
+campaign 3
+----
+n3 candidate term=2
+RequestVote term=2 last=1/1 prevote=false
+RequestVote term=2 last=1/1 prevote=false
+
+flush 3
+----
+ok
+
+stabilize
+----
+> n4 recv RequestVote term=2 last=1/1 prevote=false
+> n5 recv RequestVote term=2 last=1/1 prevote=false
+
+flush 3 4 5
+----
+> n4 ready
+  VoteResp term=2 prevote=false reject=false
+> n5 ready
+  VoteResp term=2 prevote=false reject=false
+
+stabilize
+----
+> n3 recv VoteResp term=2 prevote=false reject=false
+> n3 recv VoteResp term=2 prevote=false reject=false
+> n3 ready
+  Heartbeat term=2 commit=0
+  Heartbeat term=2 commit=0
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  n3 leader-changed term=2 lead=3
+> n4 recv Heartbeat term=2 commit=0
+> n5 recv Heartbeat term=2 commit=0
+> n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 ready
+  HeartbeatResp term=2
+  n4 leader-changed term=2 lead=3
+> n5 ready
+  HeartbeatResp term=2
+  n5 leader-changed term=2 lead=3
+> n3 recv HeartbeatResp term=2
+> n3 recv HeartbeatResp term=2
+> n3 ready
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 ready
+  AppendResp term=2 match=1
+> n5 ready
+  AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
+> n3 ready
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 ready
+  AppendResp term=2 match=1
+> n5 ready
+  AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
+
+flush 3 4 5
+----
+> n4 ready
+  AppendResp term=2 match=2
+> n5 ready
+  AppendResp term=2 match=2
+
+stabilize
+----
+> n3 recv AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
+> n3 ready
+  AppendEntries term=2 prev=2/2 commit=1 entries=[]
+  AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n4 recv AppendEntries term=2 prev=2/2 commit=1 entries=[]
+> n5 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n4 ready
+  AppendResp term=2 match=2
+> n5 ready
+  AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
+
+propose 3 b
+----
+AppendEntries term=2 prev=2/2 commit=2 entries=[2/3 normal 0x010000000000000062]
+AppendEntries term=2 prev=2/2 commit=2 entries=[2/3 normal 0x010000000000000062]
+
+flush 3
+----
+ok
+
+stabilize
+----
+> n4 recv AppendEntries term=2 prev=2/2 commit=2 entries=[2/3 normal 0x010000000000000062]
+> n5 recv AppendEntries term=2 prev=2/2 commit=2 entries=[2/3 normal 0x010000000000000062]
+
+recover 2
+----
+n2 recovered
+
+tick-heartbeat 3
+----
+Heartbeat term=2 commit=0
+Heartbeat term=2 commit=2
+Heartbeat term=2 commit=2
+
+stabilize
+----
+> n2 recv Heartbeat term=2 commit=0
+> n4 recv Heartbeat term=2 commit=2
+> n5 recv Heartbeat term=2 commit=2
+> n2 ready
+  HeartbeatResp term=2
+  n2 leader-changed term=2 lead=3
+> n4 ready
+  HeartbeatResp term=2
+> n5 ready
+  HeartbeatResp term=2
+> n3 recv HeartbeatResp term=2
+> n3 recv HeartbeatResp term=2
+> n3 recv HeartbeatResp term=2
+> n3 ready
+  AppendEntries term=2 prev=1/1 commit=2 entries=[2/2 empty, 2/3 normal 0x010000000000000062]
+  AppendEntries term=2 prev=2/3 commit=2 entries=[]
+  AppendEntries term=2 prev=2/3 commit=2 entries=[]
+> n2 recv AppendEntries term=2 prev=1/1 commit=2 entries=[2/2 empty, 2/3 normal 0x010000000000000062]
+> n4 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
+> n5 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
+> n4 ready
+  AppendResp term=2 match=2
+> n5 ready
+  AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
+> n3 recv AppendResp term=2 match=2
+
+flush 2
+----
+> n2 ready
+  AppendResp term=2 match=3
+
+stabilize
+----
+> n3 recv AppendResp term=2 match=3
+> n3 ready
+  AppendEntries term=2 prev=2/3 commit=2 entries=[]
+> n2 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
+> n2 ready
+  AppendResp term=2 match=3
+> n3 recv AppendResp term=2 match=3
+
+raft-log 2
+----
+n2: commit=2 applied=2 last=3
+  1/1 empty
+  2/2 empty
+  2/3 normal 0x010000000000000062
+

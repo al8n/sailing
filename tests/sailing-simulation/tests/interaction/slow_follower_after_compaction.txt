@@ -1,0 +1,177 @@
+# slow_follower_after_compaction (etcd raft#31 regression): with a LIMITED in-flight capacity, a
+# follower that briefly drops out during a burst of proposals falls behind; the leader snapshots and
+# compacts its log past the follower's position, so when the follower returns it can only be caught up
+# via InstallSnapshot (the compacted entries are gone) — not plain AppendEntries.
+#
+# The leader sends two InstallSnapshots (inflight=2): the first installs and acks match=5; the second
+# hits the staleness guard and also acks the snapshot boundary (5) — already quorum-committed, so safe
+# under the persist-before-ack ceiling (ack_watermark) even while the blob is in flight. n3 converges
+# to commit=5.
+add-nodes 3 voters=(1,2,3) inflight=2 snap=3
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResp term=1 prevote=false reject=false
+> n3 ready
+  VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n3 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+
+isolate 3
+----
+n3 isolated
+
+propose 1 a
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+propose 1 b
+----
+AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+
+propose 1 c
+----
+ok
+
+propose 1 d
+----
+ok
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+> n2 recv AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+> n2 ready
+  AppendResp term=1 match=2
+  AppendResp term=1 match=3
+> n1 recv AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=3
+> n1 ready
+  AppendEntries term=1 prev=1/3 commit=2 entries=[1/4 normal 0x010000000000000063, 1/5 normal 0x010000000000000064]
+  AppendEntries term=1 prev=1/5 commit=3 entries=[]
+  n1 applied index=2
+  n1 applied index=3
+> n2 recv AppendEntries term=1 prev=1/3 commit=2 entries=[1/4 normal 0x010000000000000063, 1/5 normal 0x010000000000000064]
+> n2 recv AppendEntries term=1 prev=1/5 commit=3 entries=[]
+> n2 ready
+  AppendResp term=1 match=3
+  AppendResp term=1 match=5
+  n2 applied index=2
+  n2 applied index=3
+> n1 recv AppendResp term=1 match=3
+> n1 recv AppendResp term=1 match=5
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  n1 applied index=4
+  n1 applied index=5
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 ready
+  AppendResp term=1 match=5
+  n2 applied index=4
+  n2 applied index=5
+> n1 recv AppendResp term=1 match=5
+
+raft-log 1
+----
+n1: commit=5 applied=5 last=5
+  (snapshot covers <= index 5)
+
+recover 3
+----
+n3 recovered
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=5
+> n3 recv Heartbeat term=1 commit=1
+> n2 ready
+  HeartbeatResp term=1
+> n3 ready
+  HeartbeatResp term=1
+> n1 recv HeartbeatResp term=1
+> n1 recv HeartbeatResp term=1
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  InstallSnapshot term=1 snap=1/5
+  InstallSnapshot term=1 snap=1/5
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n3 recv InstallSnapshot term=1 snap=1/5
+> n3 recv InstallSnapshot term=1 snap=1/5
+> n2 ready
+  AppendResp term=1 match=5
+> n3 ready
+  SnapshotResp term=1 reject=false match=5
+  n3 snapshot-installed snap=1/5
+> n1 recv AppendResp term=1 match=5
+> n1 recv SnapshotResp term=1 reject=false match=5
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n3 ready
+  AppendResp term=1 match=5
+> n1 recv AppendResp term=1 match=5
+
+raft-log 3
+----
+n3: commit=5 applied=5 last=5
+  (snapshot covers <= index 5)
+

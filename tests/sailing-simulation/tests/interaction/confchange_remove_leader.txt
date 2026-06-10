@@ -1,0 +1,132 @@
+# Remove the leader itself (node 1). RemoveNode(1) commits under the old quorum {1,2,3}; on applying
+# it, node 1 steps down to follower (step_down_on_removal) and the surviving config {2,3} re-elects.
+add-nodes 3 voters=(1,2,3)
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResp term=1 prevote=false reject=false
+> n3 ready
+  VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResp term=1
+  AppendResp term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv HeartbeatResp term=1
+> n1 recv AppendResp term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n3 ready
+  AppendResp term=1 match=1
+  AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResp term=1 match=1
+
+propose-conf-change 1 remove 1
+----
+n1 proposed conf-change remove n1 at index 2
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000101000000000000000000000000000000]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000101000000000000000000000000000000]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000101000000000000000000000000000000]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000101000000000000000000000000000000]
+> n2 ready
+  AppendResp term=1 match=2
+> n3 ready
+  AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=2
+> n1 recv AppendResp term=1 match=2
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  n1 conf-changed index=2 voters={2,3}
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResp term=1 match=2
+  n2 conf-changed index=2 voters={2,3}
+> n1 recv AppendResp term=1 match=2
+
+campaign 2
+----
+n2 candidate term=2
+RequestVote term=2 last=1/2 prevote=false
+
+stabilize
+----
+> n3 recv RequestVote term=2 last=1/2 prevote=false
+> n3 ready
+  VoteResp term=2 prevote=false reject=false
+> n2 recv VoteResp term=2 prevote=false reject=false
+> n2 ready
+  Heartbeat term=2 commit=0
+  AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+  n2 leader-changed term=2 lead=2
+> n3 recv Heartbeat term=2 commit=0
+> n3 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+> n3 ready
+  HeartbeatResp term=2
+  AppendResp term=2 match=3
+  n3 leader-changed term=2 lead=2
+  n3 conf-changed index=2 voters={2,3}
+> n2 recv HeartbeatResp term=2
+> n2 recv AppendResp term=2 match=3
+> n2 ready
+  AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+  AppendEntries term=2 prev=2/3 commit=3 entries=[]
+> n3 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+> n3 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
+> n3 ready
+  AppendResp term=2 match=3
+  AppendResp term=2 match=3
+> n2 recv AppendResp term=2 match=3
+> n2 recv AppendResp term=2 match=3
+
+raft-state
+----
+n1: follower term=1 lead=none
+n2: leader term=2 lead=2
+n3: follower term=2 lead=2
+
