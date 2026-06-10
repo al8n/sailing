@@ -1,0 +1,131 @@
+use super::*;
+use crate::{
+  Data, Index, Term,
+  transport::{
+    ClusterId,
+    labeled::{LabelOptions, Labeled},
+    passthrough::Passthrough,
+  },
+};
+use std::vec::Vec;
+
+type R = PeerRouter<u64, Labeled<Passthrough>>;
+
+fn opts(id: u64) -> LabelOptions {
+  let mut local_id = Vec::new();
+  id.encode(&mut local_id);
+  LabelOptions {
+    cluster: ClusterId([1; 16]),
+    local_id,
+  }
+}
+
+fn dialer(id: u64) -> Labeled<Passthrough> {
+  Labeled::dialer(Passthrough::new(), &opts(id))
+}
+
+fn acceptor(id: u64) -> Labeled<Passthrough> {
+  Labeled::acceptor(Passthrough::new(), &opts(id))
+}
+
+fn hb(from: u64) -> Message<u64> {
+  Message::Heartbeat(crate::message::Heartbeat::new(
+    Term::new(1),
+    from,
+    Index::new(0),
+    bytes::Bytes::new(),
+  ))
+}
+
+/// Shuttle bytes between a router's connection `id` and a standalone peer Conn until quiescent.
+fn pump(
+  router: &mut R,
+  id: ConnId,
+  peer: &mut crate::transport::conn::Conn<u64, Labeled<Passthrough>>,
+) {
+  for _ in 0..8 {
+    let moved = router.poll_transmit();
+    let mut any = false;
+    for (cid, bytes) in moved {
+      if cid == id && !bytes.is_empty() {
+        peer.handle_data(&bytes, false, Instant::ORIGIN).unwrap();
+        any = true;
+      }
+    }
+    let mut back = Vec::new();
+    peer.poll_transmit(&mut back);
+    if !back.is_empty() {
+      let mut out = Vec::new();
+      router
+        .handle_conn_data(id, &back, false, Instant::ORIGIN, &mut out)
+        .unwrap();
+      any = true;
+    }
+    if !any {
+      break;
+    }
+  }
+}
+
+#[test]
+fn binds_peer_on_validation_and_routes() {
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register(id, acceptor(10)); // local node 10 accepts
+  let mut peer = crate::transport::conn::Conn::new(dialer(7)); // remote node 7 dials
+  pump(&mut router, id, &mut peer);
+  assert_eq!(router.conn_of(&7), Some(id), "peer 7 is bound to its conn");
+
+  // Routing a message to peer 7 reaches that connection.
+  assert!(router.route(7, &hb(10)));
+  pump(&mut router, id, &mut peer);
+  let mut got = Vec::new();
+  peer.poll_decoded(&mut got).unwrap();
+  assert_eq!(got, std::vec![hb(10)]);
+}
+
+#[test]
+fn decodes_inbound_messages_with_their_peer() {
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register(id, acceptor(10));
+  let mut peer = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id, &mut peer);
+
+  peer.send_message(&hb(7));
+  let mut delivered = Vec::new();
+  for _ in 0..8 {
+    let mut back = Vec::new();
+    peer.poll_transmit(&mut back);
+    if back.is_empty() {
+      break;
+    }
+    router
+      .handle_conn_data(id, &back, false, Instant::ORIGIN, &mut delivered)
+      .unwrap();
+  }
+  assert_eq!(delivered, std::vec![(7, hb(7))]);
+}
+
+#[test]
+fn route_to_unknown_peer_is_dropped() {
+  let mut router = R::new();
+  assert!(!router.route(99, &hb(1)), "no conn to peer 99");
+}
+
+#[test]
+fn newer_connection_wins_duplicate_peer() {
+  let mut router = R::new();
+  // Two connections both validate as peer 7; the second registered wins.
+  let (id1, id2) = (ConnId(1), ConnId(2));
+  router.register(id1, acceptor(10));
+  let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id1, &mut peer1);
+  assert_eq!(router.conn_of(&7), Some(id1));
+
+  router.register(id2, acceptor(10));
+  let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id2, &mut peer2);
+  assert_eq!(router.conn_of(&7), Some(id2), "newer conn wins");
+  assert!(router.route(7, &hb(10)));
+}
