@@ -82,5 +82,10 @@ pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 mod tracker;
 pub(crate) use tracker::Tracker;
 
+#[cfg(any(feature = "tcp", feature = "quic"))]
+mod transport;
+#[cfg(any(feature = "tcp", feature = "quic"))]
+pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
+
 #[cfg(test)]
 pub(crate) mod testkit;
