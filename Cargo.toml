@@ -13,6 +13,8 @@ sailing-proto = { path = "sailing-proto" }
 bytes = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
 derive_more = { version = "2", default-features = false, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
+rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
+quinn-proto = { version = "0.11", default-features = false, features = ["rustls"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"
