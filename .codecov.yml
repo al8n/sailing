@@ -5,6 +5,7 @@ ignore:
   - "**/benches/**"
   - "**/examples/**"
   - "**/tests/**"
+  - tests/
 
 coverage:
   status:
