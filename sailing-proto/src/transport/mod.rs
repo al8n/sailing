@@ -6,6 +6,8 @@
 #![allow(dead_code)]
 
 mod frame;
+mod passthrough;
+mod stream;
 
 /// A 16-byte cluster identity; peers reject handshakes from other clusters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
