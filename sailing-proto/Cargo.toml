@@ -27,6 +27,10 @@ derive_more.workspace = true
 rustls = { workspace = true, optional = true }
 quinn-proto = { workspace = true, optional = true }
 
+[dev-dependencies]
+# Test-only: generates the self-signed certs the `tls` record-layer tests handshake with.
+rcgen = { workspace = true }
+
 [lints]
 workspace = true
 
