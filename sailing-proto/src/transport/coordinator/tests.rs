@@ -1,0 +1,189 @@
+use super::*;
+use crate::{
+  Data,
+  testkit::{CountSm, NoopStable, VecLog},
+  transport::{
+    ClusterId,
+    labeled::{LabelOptions, Labeled},
+    passthrough::Passthrough,
+  },
+};
+use core::time::Duration;
+use std::vec::Vec;
+
+type Rec = Labeled<Passthrough>;
+type Coord = StreamCoordinator<u64, CountSm, Rec>;
+
+const ELECTION: Duration = Duration::from_millis(100);
+const HEARTBEAT: Duration = Duration::from_millis(30);
+
+fn label(id: u64, role_dialer: bool) -> Rec {
+  let mut local_id = Vec::new();
+  id.encode(&mut local_id);
+  let opts = LabelOptions {
+    cluster: ClusterId([1; 16]),
+    local_id,
+  };
+  if role_dialer {
+    Labeled::dialer(Passthrough::new(), &opts)
+  } else {
+    Labeled::acceptor(Passthrough::new(), &opts)
+  }
+}
+
+fn coord(id: u64) -> Coord {
+  let cfg = crate::Config::try_new(id, std::vec![1, 2], ELECTION, HEARTBEAT).unwrap();
+  StreamCoordinator::new(cfg, Instant::ORIGIN, id, CountSm::default())
+}
+
+/// A two-node world: one connection pair (conn id 1 on both sides), driven by a manual clock.
+struct World {
+  a: Coord,
+  b: Coord,
+  la: VecLog,
+  sa: NoopStable,
+  lb: VecLog,
+  sb: NoopStable,
+  now: Instant,
+}
+
+impl World {
+  fn new() -> Self {
+    let mut a = coord(1);
+    let mut b = coord(2);
+    // Node 1 dials node 2; node 2 accepts. Same ConnId(1) on each side's own table.
+    a.on_conn_open(ConnId(1), label(1, true));
+    b.on_conn_open(ConnId(1), label(2, false));
+    World {
+      a,
+      b,
+      la: VecLog::default(),
+      sa: NoopStable::default(),
+      lb: VecLog::default(),
+      sb: NoopStable::default(),
+      now: Instant::ORIGIN,
+    }
+  }
+
+  /// Move all queued bytes across the wire, draining storage on both sides, until quiescent.
+  fn settle(&mut self) {
+    for _ in 0..200 {
+      self.a.handle_storage(self.now, &mut self.la, &mut self.sa);
+      self.b.handle_storage(self.now, &mut self.lb, &mut self.sb);
+      let from_a = self.a.poll_transmit();
+      let from_b = self.b.poll_transmit();
+      let mut moved = false;
+      for (_, bytes) in &from_a {
+        if !bytes.is_empty() {
+          self.b.handle_conn_data(
+            ConnId(1),
+            bytes,
+            false,
+            self.now,
+            &mut self.lb,
+            &mut self.sb,
+          );
+          moved = true;
+        }
+      }
+      for (_, bytes) in &from_b {
+        if !bytes.is_empty() {
+          self.a.handle_conn_data(
+            ConnId(1),
+            bytes,
+            false,
+            self.now,
+            &mut self.la,
+            &mut self.sa,
+          );
+          moved = true;
+        }
+      }
+      if !moved {
+        break;
+      }
+    }
+  }
+
+  /// Advance to the earliest pending deadline across both nodes and fire only the node(s) actually
+  /// due, then settle. Firing each node on its OWN (randomized) deadline — rather than both at once
+  /// — breaks election symmetry, exactly as a real timer-driven cluster does.
+  fn step(&mut self) {
+    let da = self.a.poll_timeout();
+    let db = self.b.poll_timeout();
+    let next = match (da, db) {
+      (Some(x), Some(y)) => x.min(y),
+      (Some(x), None) => x,
+      (None, Some(y)) => y,
+      (None, None) => self.now + HEARTBEAT,
+    };
+    self.now = next;
+    if da.is_some_and(|d| d <= self.now) {
+      self.a.handle_timeout(self.now, &mut self.la, &mut self.sa);
+    }
+    if db.is_some_and(|d| d <= self.now) {
+      self.b.handle_timeout(self.now, &mut self.lb, &mut self.sb);
+    }
+    self.settle();
+  }
+
+  fn a_is_leader(&self) -> bool {
+    self.a.role().is_leader()
+  }
+}
+
+#[test]
+fn two_node_cluster_elects_a_leader_over_the_transport() {
+  let mut w = World::new();
+  w.settle(); // complete the label handshake first
+  assert_eq!(w.a.conn_of(&2), Some(ConnId(1)), "node 1 bound peer 2");
+  assert_eq!(w.b.conn_of(&1), Some(ConnId(1)), "node 2 bound peer 1");
+
+  // Drive timers until a leader emerges.
+  for _ in 0..40 {
+    w.step();
+    if w.a_is_leader() || w.b.role().is_leader() {
+      break;
+    }
+  }
+  assert!(
+    w.a_is_leader() || w.b.role().is_leader(),
+    "a leader emerged through the wire"
+  );
+}
+
+#[test]
+fn leader_replicates_a_proposal_over_the_transport() {
+  let mut w = World::new();
+  w.settle();
+  for _ in 0..40 {
+    w.step();
+    if w.a_is_leader() || w.b.role().is_leader() {
+      break;
+    }
+  }
+  assert!(w.a_is_leader() || w.b.role().is_leader());
+
+  // Propose on whichever node is leader; it must commit + apply on BOTH nodes.
+  let cmd = bytes::Bytes::from_static(b"x");
+  if w.a_is_leader() {
+    w.a
+      .submit_propose(w.now, &mut w.la, &w.sa, &cmd)
+      .expect("propose");
+  } else {
+    w.b
+      .submit_propose(w.now, &mut w.lb, &w.sb, &cmd)
+      .expect("propose");
+  }
+  // Drive heartbeats/commit through to both state machines.
+  for _ in 0..40 {
+    w.step();
+  }
+
+  // Both state machines applied the one committed Normal entry (CountSm counts applies).
+  assert!(w.a.state_machine().count() >= 1, "leader applied the entry");
+  assert!(
+    w.b.state_machine().count() >= 1,
+    "follower applied the entry"
+  );
+}
