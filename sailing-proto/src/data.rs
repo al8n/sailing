@@ -1,7 +1,7 @@
 //! `Data`: the per-element wire codec for the generic plug-in types. Values are
 //! length-known and self-describing enough to nest inside a `bytes` field. The codec
 //! here is deliberately minimal (fixed/var width primitives).
-use std::vec::Vec;
+use std::{collections::BTreeSet, vec::Vec};
 
 /// A value that can be encoded to and decoded from bytes.
 pub trait Data: Sized {
@@ -87,6 +87,80 @@ impl Data for bytes::Bytes {
     let end = n.checked_add(len).ok_or(DecodeError::UnexpectedEof)?;
     let slice = buf.get(n..end).ok_or(DecodeError::UnexpectedEof)?;
     Ok((end, bytes::Bytes::copy_from_slice(slice)))
+  }
+}
+
+/// A forward cursor for decoding a sequence of `Data` fields from one buffer.
+///
+/// Each [`read`](Self::read) bounds-checks against the remaining input and advances by exactly the
+/// bytes the field consumed, so a struct decoder cannot read past its input or miscount offsets.
+pub(crate) struct Decoder<'a> {
+  buf: &'a [u8],
+  pos: usize,
+}
+
+impl<'a> Decoder<'a> {
+  /// Start decoding at the front of `buf`.
+  #[inline]
+  pub(crate) fn new(buf: &'a [u8]) -> Self {
+    Self { buf, pos: 0 }
+  }
+
+  /// Decode the next `T`, advancing past it. Errors if the input is exhausted.
+  #[inline]
+  pub(crate) fn read<T: Data>(&mut self) -> Result<T, DecodeError> {
+    let rest = self.buf.get(self.pos..).ok_or(DecodeError::UnexpectedEof)?;
+    let (n, value) = T::decode(rest)?;
+    self.pos += n;
+    Ok(value)
+  }
+
+  /// Total bytes consumed so far — the decoded length of the value.
+  #[inline]
+  pub(crate) fn pos(&self) -> usize {
+    self.pos
+  }
+}
+
+impl<T: Data> Data for Vec<T> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    (self.len() as u64).encode(buf);
+    for item in self {
+      item.encode(buf);
+    }
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let (prefix, len) = decode_len(buf, "vec length")?;
+    let rest = buf.get(prefix..).ok_or(DecodeError::UnexpectedEof)?;
+    let mut d = Decoder::new(rest);
+    // Do NOT pre-allocate `len` (untrusted): push only what decodes, so an oversized
+    // count fails on the first missing element instead of reserving huge memory.
+    let mut items = Vec::new();
+    for _ in 0..len {
+      items.push(d.read::<T>()?);
+    }
+    Ok((prefix + d.pos(), items))
+  }
+}
+
+impl<T: Data + Ord> Data for BTreeSet<T> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    (self.len() as u64).encode(buf);
+    for item in self {
+      item.encode(buf);
+    }
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let (prefix, len) = decode_len(buf, "set length")?;
+    let rest = buf.get(prefix..).ok_or(DecodeError::UnexpectedEof)?;
+    let mut d = Decoder::new(rest);
+    let mut set = BTreeSet::new();
+    for _ in 0..len {
+      set.insert(d.read::<T>()?);
+    }
+    Ok((prefix + d.pos(), set))
   }
 }
 
