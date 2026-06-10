@@ -9,6 +9,8 @@ mod frame;
 mod labeled;
 mod passthrough;
 mod stream;
+#[cfg(feature = "tls")]
+mod tls;
 
 /// A 16-byte cluster identity; peers reject handshakes from other clusters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
