@@ -192,6 +192,29 @@ impl<I: NodeId> ConfState<I> {
   }
 }
 
+impl<I: NodeId> Data for ConfState<I> {
+  fn encode(&self, buf: &mut Vec<u8>) {
+    self.voters.encode(buf);
+    self.learners.encode(buf);
+    self.voters_outgoing.encode(buf);
+    self.learners_next.encode(buf);
+    self.auto_leave.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let voters = d.read::<BTreeSet<I>>()?;
+    let learners = d.read::<BTreeSet<I>>()?;
+    let voters_outgoing = d.read::<BTreeSet<I>>()?;
+    let learners_next = d.read::<BTreeSet<I>>()?;
+    let auto_leave = d.read::<bool>()?;
+    Ok((
+      d.pos(),
+      Self::new(voters, learners, voters_outgoing, learners_next, auto_leave),
+    ))
+  }
+}
+
 // ─── ConfChangeType ───────────────────────────────────────────────────────────
 
 /// The operation a [`ConfChangeSingle`] or [`ConfChange`] performs on the cluster.

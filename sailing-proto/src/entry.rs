@@ -1,5 +1,5 @@
 //! A replicated-log entry and its kind.
-use crate::{Index, Term};
+use crate::{Data, Index, Term};
 use bytes::Bytes;
 
 /// What a log entry carries. Only `Normal` entries reach `StateMachine::apply`.
@@ -74,6 +74,44 @@ impl Entry {
   #[inline(always)]
   pub fn data_bytes(&self) -> Bytes {
     self.data.clone()
+  }
+}
+
+impl Data for EntryKind {
+  fn encode(&self, buf: &mut std::vec::Vec<u8>) {
+    buf.push(match self {
+      Self::Normal => 0,
+      Self::ConfChange => 1,
+      Self::Empty => 2,
+    });
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), crate::DecodeError> {
+    match buf.first() {
+      Some(0) => Ok((1, Self::Normal)),
+      Some(1) => Ok((1, Self::ConfChange)),
+      Some(2) => Ok((1, Self::Empty)),
+      Some(_) => Err(crate::DecodeError::Invalid("EntryKind")),
+      None => Err(crate::DecodeError::UnexpectedEof),
+    }
+  }
+}
+
+impl Data for Entry {
+  fn encode(&self, buf: &mut std::vec::Vec<u8>) {
+    self.term.encode(buf);
+    self.index.encode(buf);
+    self.kind.encode(buf);
+    self.data.encode(buf);
+  }
+
+  fn decode(buf: &[u8]) -> Result<(usize, Self), crate::DecodeError> {
+    let mut d = crate::data::Decoder::new(buf);
+    let term = d.read::<Term>()?;
+    let index = d.read::<Index>()?;
+    let kind = d.read::<EntryKind>()?;
+    let data = d.read::<Bytes>()?;
+    Ok((d.pos(), Self::new(term, index, kind, data)))
   }
 }
 
