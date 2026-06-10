@@ -27,16 +27,18 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Check formatting (platform-independent, one OS is enough)
+  # Check formatting (platform-independent, one OS is enough).
+  # Nightly toolchain: rustfmt.toml sets `imports_granularity = "Crate"`, an unstable
+  # rustfmt option only the nightly formatter understands.
   rustfmt:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
-    - name: Install Rust
-      run: rustup update stable && rustup default stable && rustup component add rustfmt
+    - name: Install nightly Rust
+      run: rustup toolchain install nightly --component rustfmt
     - name: Check formatting
-      run: cargo fmt --all -- --check
+      run: cargo +nightly fmt --all -- --check
 
   # Apply clippy lints across the feature sweep
   clippy:
