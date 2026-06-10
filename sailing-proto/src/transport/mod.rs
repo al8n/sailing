@@ -5,6 +5,7 @@
 // intermediate states warning-clean; it is removed once the coordinators wire everything together.
 #![allow(dead_code)]
 
+mod conn;
 mod frame;
 mod labeled;
 mod passthrough;
