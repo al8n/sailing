@@ -14,11 +14,18 @@ default = ["std"]
 # `default-features = false`, so there is nothing to layer). The crate requires at least one.
 std = ["bytes/std", "thiserror/std", "derive_more/std"]
 alloc = []
+tcp = []                                   # no_std + alloc OK (no crypto)
+tls = ["tcp", "std", "dep:rustls", "tls-ring"]
+tls-ring = ["rustls?/ring"]
+tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
+quic = ["std", "dep:quinn-proto", "tls-ring"]
 
 [dependencies]
 bytes.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
+rustls = { workspace = true, optional = true }
+quinn-proto = { workspace = true, optional = true }
 
 [lints]
 workspace = true
