@@ -9,6 +9,7 @@ mod conn;
 mod frame;
 mod labeled;
 mod passthrough;
+mod router;
 mod stream;
 #[cfg(feature = "tls")]
 mod tls;
