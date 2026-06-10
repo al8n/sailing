@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 mod conn;
+mod coordinator;
 mod frame;
 mod labeled;
 mod passthrough;
