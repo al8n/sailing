@@ -1,0 +1,16 @@
+[package]
+name = "sailing-simulation"
+description = "Deterministic simulation harness for sailing-proto"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sailing-proto = { workspace = true, features = ["std"] }
+bytes.workspace = true
+derive_more.workspace = true
+
+[lints]
+workspace = true
