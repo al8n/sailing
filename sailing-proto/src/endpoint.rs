@@ -1892,7 +1892,8 @@ where
           // durable log; running it here makes the re-baseline strictly AFTER the blob is durable,
           // closing the orphan window by construction.
           if matches!(&self.pending_install, Some((pid, ..)) if *pid == opid) {
-            let (_pid, meta, snap, leader) = self.pending_install.take().expect("checked Some above");
+            let (_pid, meta, snap, leader) =
+              self.pending_install.take().expect("checked Some above");
             self.install_snapshot_now(log, meta, snap, leader);
           }
         }
@@ -4298,12 +4299,8 @@ where
   /// Receive an `InstallSnapshot` from the current leader (follower path). This only VALIDATES,
   /// persists the term, and submits the blob — it DEFERS the destructive install body (which touches the
   /// log) to `install_snapshot_now` once the blob is durable, so it needs no `LogStore`.
-  fn on_install_snapshot<S>(
-    &mut self,
-    now: Instant,
-    stable: &mut S,
-    is: crate::InstallSnapshot<I>,
-  ) where
+  fn on_install_snapshot<S>(&mut self, now: Instant, stable: &mut S, is: crate::InstallSnapshot<I>)
+  where
     S: StableStore<NodeId = I>,
     F::Snapshot: crate::Data,
   {
@@ -4371,7 +4368,8 @@ where
     // first in-flight blob); the in-flight install will complete and ack. A strictly-NEWER snapshot
     // falls through and REPLACES it below (the stale opid's `SnapshotWritten` then finds no match — a
     // harmless no-op).
-    if matches!(&self.pending_install, Some((_, pmeta, ..)) if pmeta.last_index() >= meta.last_index()) {
+    if matches!(&self.pending_install, Some((_, pmeta, ..)) if pmeta.last_index() >= meta.last_index())
+    {
       return;
     }
 
@@ -11422,7 +11420,12 @@ mod tests {
       Duration::from_millis(100),
     )
     .unwrap();
-    let mut ep = Endpoint::new(cfg.clone(), Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut ep = Endpoint::new(
+      cfg.clone(),
+      Instant::ORIGIN,
+      1,
+      crate::testkit::CountSm::default(),
+    );
     let mut log = crate::testkit::VecLog::default();
     let mut stable = crate::testkit::AsyncStable::default();
     let d = Instant::ORIGIN;
@@ -11437,9 +11440,24 @@ mod tests {
         Index::ZERO,
         Term::ZERO,
         std::vec![
-          Entry::new(Term::new(2), Index::new(1), EntryKind::Empty, bytes::Bytes::new()),
-          Entry::new(Term::new(2), Index::new(2), EntryKind::Empty, bytes::Bytes::new()),
-          Entry::new(Term::new(2), Index::new(3), EntryKind::Empty, bytes::Bytes::new()),
+          Entry::new(
+            Term::new(2),
+            Index::new(1),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(2),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(3),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
         ],
         Index::new(3),
       )),
@@ -11482,7 +11500,10 @@ mod tests {
     // Receive InstallSnapshot at boundary 10 — DEFERRED: blob submitted (visible, not yet durable). Do
     // NOT drive `handle_storage`, so `install_snapshot_now` never runs and `log.restore` is not called.
     ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
-    assert!(ep.pending_install.is_some(), "install deferred → pending_install armed");
+    assert!(
+      ep.pending_install.is_some(),
+      "install deferred → pending_install armed"
+    );
     assert_eq!(
       log.last_index(),
       Index::new(3),
@@ -11633,10 +11654,11 @@ mod tests {
         false,
       )),
     );
-    let granted_reject = core::iter::from_fn(|| ep.poll_message()).find_map(|o| match o.message() {
-      Message::VoteResp(v) => Some(v.reject()),
-      _ => None,
-    });
+    let granted_reject =
+      core::iter::from_fn(|| ep.poll_message()).find_map(|o| match o.message() {
+        Message::VoteResp(v) => Some(v.reject()),
+        _ => None,
+      });
     assert_eq!(
       granted_reject,
       Some(true),
@@ -11699,8 +11721,18 @@ mod tests {
         Index::new(3),
         Term::new(2),
         std::vec![
-          Entry::new(Term::new(2), Index::new(4), EntryKind::Empty, bytes::Bytes::new()),
-          Entry::new(Term::new(2), Index::new(5), EntryKind::Empty, bytes::Bytes::new()),
+          Entry::new(
+            Term::new(2),
+            Index::new(4),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(5),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
         ],
         Index::new(5),
       )),
@@ -11713,7 +11745,11 @@ mod tests {
       ep.pending_install.is_none(),
       "the superseded install is dropped at completion"
     );
-    assert_eq!(ep.commit, Index::new(5), "commit must NOT regress to the boundary");
+    assert_eq!(
+      ep.commit,
+      Index::new(5),
+      "commit must NOT regress to the boundary"
+    );
     assert_eq!(
       log.last_index(),
       Index::new(5),
@@ -11753,10 +11789,30 @@ mod tests {
         Index::new(3),
         Term::new(2),
         std::vec![
-          Entry::new(Term::new(2), Index::new(4), EntryKind::Empty, bytes::Bytes::new()),
-          Entry::new(Term::new(2), Index::new(5), EntryKind::Empty, bytes::Bytes::new()),
-          Entry::new(Term::new(2), Index::new(6), EntryKind::Empty, bytes::Bytes::new()),
-          Entry::new(Term::new(2), Index::new(7), EntryKind::Empty, bytes::Bytes::new()),
+          Entry::new(
+            Term::new(2),
+            Index::new(4),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(5),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(6),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
+          Entry::new(
+            Term::new(2),
+            Index::new(7),
+            EntryKind::Empty,
+            bytes::Bytes::new()
+          ),
         ],
         Index::new(7),
       )),
@@ -11814,7 +11870,14 @@ mod tests {
     // durable_index stays 3 and ack_watermark == 3.
     log.hold_appends(true);
     let tail: std::vec::Vec<Entry> = (4u64..=12)
-      .map(|i| Entry::new(Term::new(2), Index::new(i), EntryKind::Empty, bytes::Bytes::new()))
+      .map(|i| {
+        Entry::new(
+          Term::new(2),
+          Index::new(i),
+          EntryKind::Empty,
+          bytes::Bytes::new(),
+        )
+      })
       .collect();
     ep.handle_message(
       d,
