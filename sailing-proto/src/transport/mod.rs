@@ -6,6 +6,7 @@
 #![allow(dead_code)]
 
 mod frame;
+mod labeled;
 mod passthrough;
 mod stream;
 
