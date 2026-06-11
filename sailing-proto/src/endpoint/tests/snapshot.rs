@@ -550,6 +550,30 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
       "pending snapshot index is unchanged by the resend"
     );
   }
+
+  // BACKOFF: a deferred install legitimately spans many heartbeat intervals, so an immediate
+  // second HeartbeatResp must NOT trigger another full-blob resend — the per-peer countdown
+  // spaces resends roughly one election timeout apart.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResp(crate::HeartbeatResp::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
+  );
+  let again: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  let resends: usize = again
+    .iter()
+    .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+    .count();
+  assert_eq!(
+    resends, 0,
+    "an immediate second HeartbeatResp must not re-send the blob (resend backoff)"
+  );
 }
 
 /// The resend STOPS once the follower acks past its pending snapshot index.

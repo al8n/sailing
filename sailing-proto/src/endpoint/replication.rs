@@ -90,6 +90,43 @@ where
     ENTRY_METADATA_SIZE + e.data().len() as u64
   }
 
+  /// Fill `peer`'s in-flight window: send byte-capped append batches back-to-back until the window
+  /// pauses, the peer catches up, or the state forbids sending (etcd's
+  /// `for r.maybeSendAppend(...) {}` loop). A single [`Self::maybe_send_append`] sends ONE batch;
+  /// without the pump, catch-up replication would move one batch per ack round-trip while the
+  /// configured in-flight window (256 messages by default) sat idle — a throughput ceiling of
+  /// `max_size_per_msg`/RTT on high-latency links.
+  ///
+  /// Terminates by construction: each sent batch optimistically advances `next_index`
+  /// (`sent_entries`), so every iteration either advances `next_index` or exits. The FIRST
+  /// iteration always delegates (no pre-guard): when the peer is "caught up" by `next_index` but
+  /// its `match` is stale (acks lost in transit), `maybe_send_append` sends the EMPTY append whose
+  /// success ack refreshes `match` and unclamps the heartbeat commit — suppressing that send wedges
+  /// a healed follower's commit forever (caught by the VOPR quiesce oracle, seed 3).
+  pub(crate) fn pump_appends<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    peer: I,
+    log: &L,
+    stable: &S,
+  ) {
+    loop {
+      let Some(pr) = self.tracker.progress(&peer) else {
+        return;
+      };
+      if pr.is_paused() {
+        return;
+      }
+      let before = pr.next_index();
+      self.maybe_send_append(peer, log, stable);
+      let Some(pr) = self.tracker.progress(&peer) else {
+        return;
+      };
+      if pr.next_index() == before {
+        return; // empty append sent / snapshot hand-off / halt — one message, stop
+      }
+    }
+  }
+
   pub(crate) fn maybe_send_append<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     peer: I,
@@ -636,17 +673,22 @@ where
       // round instead of wedging until an unrelated proposal triggers a send.
       pr.free_inflight_on_heartbeat();
     }
-    self.maybe_send_append(from, log, stable);
+    self.pump_appends(from, log, stable);
 
     // Liveness fix: if this peer is still in Snapshot state and has NOT yet
     // caught up to its pending snapshot index, RE-SEND the snapshot. The single
     // `InstallSnapshot` emitted by maybe_send_append's compacted-hole branch may have been
-    // dropped; a Snapshot-state peer is unconditionally paused so maybe_send_append above
-    // sends it nothing, and it only leaves Snapshot state once the snapshot is delivered and
-    // acked (maybe_update). Without this resend a dropped InstallSnapshot wedges the follower
-    // forever. Re-send each heartbeat round until it acks past `pending` and `maybe_update`
-    // transitions it to Probe. (Read state/pending/match via an immutable borrow into locals,
-    // drop the borrow, then call resend_snapshot — mirrors on_append_resp's re-borrow.)
+    // dropped; a Snapshot-state peer is unconditionally paused so the pump above sends it
+    // nothing, and it only leaves Snapshot state once the snapshot is delivered and acked
+    // (maybe_update). Without this resend a dropped InstallSnapshot wedges the follower forever.
+    //
+    // BACKOFF: a deferred install legitimately spans many heartbeat intervals (the follower
+    // fsyncs the blob before acking), and ReadIndex Safe rounds elicit extra responses — so an
+    // unconditional per-response resend would re-transmit the full blob dozens of times per
+    // install. The per-peer countdown spaces resends roughly one election timeout apart: a
+    // genuinely dropped blob is still retried within one election timeout (liveness preserved),
+    // without the per-round egress amplification. (Read state/pending/match via an immutable
+    // borrow into locals, drop the borrow, then act — mirrors on_append_resp's re-borrow.)
     let resend = match self.tracker.progress(&from) {
       Some(pr) => match pr.state() {
         crate::ProgressState::Snapshot(pending) => pr.match_index() < pending,
@@ -655,7 +697,25 @@ where
       None => false,
     };
     if resend {
-      self.resend_snapshot(from, stable);
+      let due = match self.snapshot_resend_backoff.get_mut(&from) {
+        Some(rounds) if *rounds > 0 => {
+          *rounds -= 1;
+          false
+        }
+        _ => true,
+      };
+      if due {
+        // Heartbeat-response rounds are the clock here: one election timeout's worth of them.
+        let rounds_per_election = (self.config.election_timeout().as_micros()
+          / self.config.heartbeat_interval().as_micros().max(1))
+        .max(1) as u32;
+        self
+          .snapshot_resend_backoff
+          .insert(from, rounds_per_election);
+        self.resend_snapshot(from, stable);
+      }
+    } else {
+      self.snapshot_resend_backoff.remove(&from);
     }
 
     // ReadIndex Safe path: if the resp carries a context, record the ack and check quorum.
@@ -830,7 +890,7 @@ where
         self.maybe_advance_commit(log);
         self.apply_committed(log);
         self.maybe_flush_deferred_reads(now, log, stable);
-        self.maybe_send_append(from, log, stable); // keep the pipeline moving if still behind
+        self.pump_appends(from, log, stable); // fill the peer's inflight window if still behind
         // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
         if self.lead_transferee == Some(from) {
           let peer_match = self

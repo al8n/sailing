@@ -2577,3 +2577,114 @@ fn higher_term_malformed_append_poisons_without_persisting_term() {
     "the adopted term must NOT be persisted before the fail-stop (side-effect-free)"
   );
 }
+
+/// Catch-up replication PIPELINES: a single success ack from a lagging follower must trigger a
+/// window-fill of follow-up batches (the pump), not one byte-capped batch per ack round-trip.
+/// Without the pump a follower catching up over a 3 MiB backlog moves at max_size_per_msg
+/// (1 MiB) per RTT while the 256-slot inflight window sits idle.
+#[test]
+fn ack_pumps_multiple_batches_to_a_lagging_follower() {
+  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+
+  // A ~3 MiB backlog: 30 proposals of 100 KiB (max_size_per_msg is the 1 MiB default, so the
+  // backlog spans ~3 byte-capped batches).
+  let payload = bytes::Bytes::from(std::vec![0u8; 100 * 1024]);
+  for _ in 0..30 {
+    ep.propose(d, &mut log, &stable, &payload).unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {} // discard the optimistic per-propose sends
+
+  // Rewind the peer to index 1 via a reject (hint 0): Probe state, whole backlog unsent.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      true,
+      Index::ZERO,
+      Term::ZERO,
+      Index::ZERO,
+    )),
+  );
+  // The probe sends exactly ONE byte-capped batch; note where it ends.
+  let probe: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  let probe_batches: std::vec::Vec<_> = probe
+    .iter()
+    .filter_map(|o| match o.message() {
+      Message::AppendEntries(ae) if o.to() == 2u64 => Some(ae),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(probe_batches.len(), 1, "Probe sends a single batch");
+  let probe_end = probe_batches[0].entries().last().unwrap().index();
+
+  // ONE success ack of the probe batch: Probe -> Replicate, and the pump must fill the window
+  // with the REST of the backlog (>= 2 further byte-capped batches), not a single batch.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      probe_end,
+    )),
+  );
+  let pumped: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  let batches: std::vec::Vec<_> = pumped
+    .iter()
+    .filter_map(|o| match o.message() {
+      Message::AppendEntries(ae) if o.to() == 2u64 => Some(ae),
+      _ => None,
+    })
+    .collect();
+  assert!(
+    batches.len() >= 2,
+    "one ack must pump multiple follow-up batches (got {})",
+    batches.len()
+  );
+  // And the pump must cover the whole backlog up to the leader's last index.
+  let last_sent = batches
+    .iter()
+    .filter_map(|ae| ae.entries().last())
+    .map(|e| e.index())
+    .max()
+    .unwrap();
+  assert_eq!(
+    last_sent,
+    log.last_index(),
+    "the pump fills the window to the end of the backlog"
+  );
+}
