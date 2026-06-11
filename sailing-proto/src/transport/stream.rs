@@ -21,7 +21,7 @@ pub(crate) mod sealed {
 
 /// The outcome of feeding inbound transport bytes to a record layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Intake {
+pub enum Intake {
   /// All input was consumed.
   Done,
   /// `n` bytes were consumed; the caller must drain decoded plaintext and re-feed the remaining
@@ -34,8 +34,9 @@ pub(crate) enum Intake {
 /// A Sans-I/O record layer. It accepts inbound wire bytes, surfaces decoded plaintext, accepts
 /// outbound plaintext, and emits wire bytes — with an optional handshake that authenticates a peer.
 ///
-/// Crate-internal and sealed; the concrete layers are `Passthrough`, `TlsRecords`, and `Labeled`.
-pub(crate) trait RecordIo: sealed::Sealed {
+/// Sealed: the concrete layers are `Passthrough`, `TlsRecords`, and `Labeled` — downstream crates
+/// can name and drive the trait but cannot implement it.
+pub trait RecordIo: sealed::Sealed {
   /// Feed inbound wire bytes: advance any handshake and buffer decoded plaintext.
   fn handle_transport_data(&mut self, input: &[u8], now: Instant) -> Intake;
   /// Drain queued outbound wire bytes into `out`, returning the number written.
@@ -60,6 +61,6 @@ pub(crate) trait RecordIo: sealed::Sealed {
 /// A sealed marker naming any record layer, so `Conn` and the coordinators can bound on it without
 /// referring to the crate-internal [`RecordIo`]. Implemented automatically for every record layer;
 /// cannot be implemented downstream.
-pub(crate) trait StreamTransport: sealed::Sealed {}
+pub trait StreamTransport: sealed::Sealed {}
 
 impl<T: RecordIo> StreamTransport for T {}

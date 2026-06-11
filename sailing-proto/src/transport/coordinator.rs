@@ -95,7 +95,7 @@ where
     r
   }
 
-  /// Initiate a linearizable read; the resulting `ReadState` surfaces via [`poll_event`].
+  /// Initiate a linearizable read; the resulting `ReadState` surfaces via [`Self::poll_event`].
   pub fn read_index<L, S>(
     &mut self,
     now: Instant,

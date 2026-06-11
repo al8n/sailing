@@ -20,6 +20,7 @@ struct Throttle {
   inbound: Vec<u8>,
   outbound: Vec<u8>,
   ident: Option<Vec<u8>>,
+  peer_closed: bool,
 }
 
 impl Throttle {
@@ -29,7 +30,14 @@ impl Throttle {
       inbound: Vec::new(),
       outbound: Vec::new(),
       ident,
+      peer_closed: false,
     }
+  }
+
+  /// Simulate an in-band peer close (a TLS close_notify) surfacing from the record layer.
+  fn with_peer_closed(mut self) -> Self {
+    self.peer_closed = true;
+    self
   }
 }
 
@@ -64,7 +72,7 @@ impl RecordIo for Throttle {
     self.ident.as_deref()
   }
   fn peer_has_closed(&self) -> bool {
-    false
+    self.peer_closed
   }
   fn is_secure() -> bool {
     false
@@ -200,6 +208,31 @@ fn backpressured_write_never_truncates_a_frame() {
   let mut msgs = Vec::new();
   receiver.poll_decoded(&mut msgs).unwrap();
   assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
+}
+
+#[test]
+fn outbound_cap_exceeded_closes_the_conn() {
+  // A record layer that accepts NOTHING (cap 0): out_plain retains every framed byte. Once the cap
+  // trips, the connection closes instead of growing without bound.
+  let mut conn: Conn<u64, Throttle> = Conn::new(Throttle::new(0, Some(enc_id(7))));
+  conn.set_max_out_for_test(16);
+  conn.send_message(&sample_msg()); // a heartbeat frame is well over 16 bytes
+  assert!(
+    conn.is_closed(),
+    "exceeding the outbound cap closes the connection"
+  );
+}
+
+#[test]
+fn in_band_peer_close_closes_the_conn() {
+  // The record layer reports peer_has_closed (a TLS close_notify) without any socket EOF.
+  let mut conn: Conn<u64, Throttle> =
+    Conn::new(Throttle::new(usize::MAX, Some(enc_id(7))).with_peer_closed());
+  conn.handle_data(b"", false, Instant::ORIGIN).unwrap();
+  assert!(
+    conn.is_closed(),
+    "an in-band close ends the connection like an EOF"
+  );
 }
 
 #[test]

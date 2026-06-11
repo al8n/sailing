@@ -15,6 +15,13 @@ mod stream;
 #[cfg(feature = "tls")]
 mod tls;
 
+pub use coordinator::StreamCoordinator;
+pub use labeled::{LabelOptions, Labeled};
+pub use passthrough::Passthrough;
+pub use stream::{Intake, RecordIo, StreamTransport};
+#[cfg(feature = "tls")]
+pub use tls::TlsRecords;
+
 /// A 16-byte cluster identity; peers reject handshakes from other clusters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClusterId(
@@ -29,10 +36,14 @@ pub struct Peer<I> {
   pub id: I,
 }
 
-/// Opaque per-connection handle assigned by the driver.
+/// Per-connection handle assigned by the driver.
+///
+/// CONTRACT: the driver must assign ids in monotonically increasing order (a simple counter).
+/// The router's duplicate-peer tie-break relies on it — when two connections authenticate as the
+/// same peer, the HIGHER id (the newer dial) wins and the older is dropped.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct ConnId(
-  /// The driver-assigned connection number.
+  /// The driver-assigned connection number (monotonically increasing).
   pub u64,
 );
 
