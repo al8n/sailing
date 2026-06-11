@@ -280,3 +280,96 @@ fn codec_rejects_out_of_range_duration_nanos() {
     "nanos >= 1e9 must be rejected (canonical duration encoding)"
   );
 }
+
+/// One representative value of EVERY Message variant (shared by the round-trip and the
+/// truncation sweep, so a new variant must be added here to be covered by both).
+fn all_variants() -> std::vec::Vec<Message<u64>> {
+  use crate::{Entry, EntryKind, conf::ConfState};
+  use bytes::Bytes;
+  let entries = std::vec![
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      Bytes::from_static(b"a")
+    ),
+    Entry::new(Term::new(1), Index::new(2), EntryKind::Empty, Bytes::new()),
+  ];
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(3),
+    ConfState::from_voters(std::vec![1u64, 2u64]),
+  );
+  std::vec![
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(3),
+      1,
+      Index::new(2),
+      Term::new(2),
+      entries,
+      Index::new(1),
+    )),
+    Message::AppendResp(AppendResp::new(
+      Term::new(3),
+      2,
+      true,
+      Index::new(4),
+      Term::new(2),
+      Index::new(0),
+    )),
+    Message::RequestVote(RequestVote::new(
+      Term::new(3),
+      1,
+      Index::new(5),
+      Term::new(2),
+      true,
+      false,
+    )),
+    Message::VoteResp(VoteResp::new(Term::new(3), 2, true, false)),
+    Message::Heartbeat(
+      Heartbeat::new(Term::new(3), 1, Index::new(4), Bytes::from_static(b"ctx"))
+        .with_lease_round(9),
+    ),
+    Message::HeartbeatResp(
+      HeartbeatResp::new(Term::new(3), 2, Bytes::from_static(b"ctx"))
+        .with_lease_round(9)
+        .with_lease_support(core::time::Duration::from_millis(150)),
+    ),
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(3),
+      1,
+      meta,
+      Bytes::from_static(b"blob"),
+    )),
+    Message::SnapshotResp(SnapshotResp::new(Term::new(3), 2, false, Index::new(10))),
+    Message::TimeoutNow(TimeoutNow::new(Term::new(3), 1)),
+    Message::ReadIndex(ReadIndex::new(Term::new(3), 2, Bytes::from_static(b"r"))),
+    Message::ReadIndexResp(ReadIndexResp::new(
+      Term::new(3),
+      1,
+      Index::new(7),
+      Bytes::from_static(b"r"),
+      false,
+    )),
+  ]
+}
+
+/// EXHAUSTIVE truncation sweep across EVERY variant: each strict prefix of each encoding must
+/// error cleanly — never panic, never decode as a different value.
+#[test]
+fn codec_truncation_sweep_covers_every_variant() {
+  use crate::Data;
+  for m in all_variants() {
+    let mut buf = std::vec::Vec::new();
+    m.encode(&mut buf);
+    for cut in 0..buf.len() {
+      assert!(
+        Message::<u64>::decode(&buf[..cut]).is_err(),
+        "{m:?}: prefix of len {cut} must fail"
+      );
+    }
+    let (n, back) = Message::<u64>::decode(&buf).expect("full decode");
+    assert_eq!(n, buf.len());
+    assert_eq!(back, m);
+  }
+}
