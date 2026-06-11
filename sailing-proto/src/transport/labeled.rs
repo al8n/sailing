@@ -172,6 +172,10 @@ impl<R: RecordIo> RecordIo for Labeled<R> {
     self.inner.write_plaintext(plaintext)
   }
 
+  fn buffered_outbound(&self) -> usize {
+    self.hello_out.len() + self.inner.buffered_outbound()
+  }
+
   fn is_handshaking(&self) -> bool {
     self.inner.is_handshaking() || self.validated.is_none()
   }

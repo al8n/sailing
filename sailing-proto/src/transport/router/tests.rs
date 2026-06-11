@@ -71,7 +71,7 @@ fn pump(
 fn binds_peer_on_validation_and_routes() {
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10)); // local node 10 accepts
+  router.register(id, acceptor(10), Instant::ORIGIN); // local node 10 accepts
   let mut peer = crate::transport::conn::Conn::new(dialer(7)); // remote node 7 dials
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id), "peer 7 is bound to its conn");
@@ -88,7 +88,7 @@ fn binds_peer_on_validation_and_routes() {
 fn decodes_inbound_messages_with_their_peer() {
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10));
+  router.register(id, acceptor(10), Instant::ORIGIN);
   let mut peer = crate::transport::conn::Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
 
@@ -117,7 +117,7 @@ fn route_to_unknown_peer_is_dropped() {
 fn eof_clears_the_peer_route() {
   let mut router = R::new();
   let id = ConnId(1);
-  router.register(id, acceptor(10));
+  router.register(id, acceptor(10), Instant::ORIGIN);
   let mut peer = crate::transport::conn::Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id));
@@ -139,12 +139,12 @@ fn newer_connection_wins_duplicate_peer() {
   let mut router = R::new();
   // Two connections both validate as peer 7; the second registered wins.
   let (id1, id2) = (ConnId(1), ConnId(2));
-  router.register(id1, acceptor(10));
+  router.register(id1, acceptor(10), Instant::ORIGIN);
   let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
   pump(&mut router, id1, &mut peer1);
   assert_eq!(router.conn_of(&7), Some(id1));
 
-  router.register(id2, acceptor(10));
+  router.register(id2, acceptor(10), Instant::ORIGIN);
   let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
   assert_eq!(router.conn_of(&7), Some(id2), "newer conn wins");
@@ -156,8 +156,8 @@ fn older_connection_validating_late_does_not_evict_newer() {
   let mut router = R::new();
   let (id1, id2) = (ConnId(1), ConnId(2));
   // Both registered up front; the NEWER one (id2) completes its handshake first and binds.
-  router.register(id1, acceptor(10));
-  router.register(id2, acceptor(10));
+  router.register(id1, acceptor(10), Instant::ORIGIN);
+  router.register(id2, acceptor(10), Instant::ORIGIN);
   let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
   let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
@@ -171,4 +171,56 @@ fn older_connection_validating_late_does_not_evict_newer() {
     "a stale older duplicate cannot evict the healthy newer binding"
   );
   assert!(router.route(7, &hb(10)), "the newer route still works");
+}
+
+#[test]
+fn internal_removals_surface_via_poll_conn_closed() {
+  use crate::transport::TransportError;
+  // A faulted connection (garbage hello) is removed AND reported with its fault.
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register(id, acceptor(10), Instant::ORIGIN);
+  let mut out = Vec::new();
+  let _ = router.handle_conn_data(id, &[0xFF; 32], false, Instant::ORIGIN, &mut out);
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, Some(TransportError::Record))),
+    "a transport fault is reported to the driver with its reason"
+  );
+  assert_eq!(router.poll_conn_closed(), None);
+}
+
+#[test]
+fn duplicate_eviction_surfaces_via_poll_conn_closed() {
+  let mut router = R::new();
+  let (id1, id2) = (ConnId(1), ConnId(2));
+  router.register(id1, acceptor(10), Instant::ORIGIN);
+  let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id1, &mut peer1);
+  assert_eq!(router.conn_of(&7), Some(id1));
+
+  router.register(id2, acceptor(10), Instant::ORIGIN);
+  let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id2, &mut peer2);
+  assert_eq!(router.conn_of(&7), Some(id2));
+  // The evicted older connection is reported (clean — no fault) so the driver can close its socket.
+  assert_eq!(router.poll_conn_closed(), Some((id1, None)));
+}
+
+#[test]
+fn unvalidated_conns_are_reaped_after_the_handshake_deadline() {
+  use crate::transport::TransportError;
+  use core::time::Duration;
+  let mut router = R::new();
+  router.register(ConnId(1), acceptor(10), Instant::ORIGIN);
+  // Before the deadline: nothing reaped.
+  router.reap_handshakes(Instant::ORIGIN + Duration::from_secs(9));
+  assert_eq!(router.poll_conn_closed(), None);
+  // Past the deadline: the never-validating connection is reaped and reported.
+  router.reap_handshakes(Instant::ORIGIN + Duration::from_secs(11));
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((ConnId(1), Some(TransportError::NotValidated))),
+    "a connection that never validates is reaped so the driver releases the socket"
+  );
 }

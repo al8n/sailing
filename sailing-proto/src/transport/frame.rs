@@ -26,8 +26,13 @@ pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
 /// buffered are dropped, which is equivalent to in-flight loss and safe for the retry-driven
 /// consensus layer above).
 pub(crate) struct FrameDecoder {
-  /// Complete frames awaiting [`poll`](Self::poll), then the bytes of the trailing partial frame.
+  /// Consumed prefix (before `start`), then complete frames awaiting [`poll`](Self::poll), then the
+  /// bytes of the trailing partial frame.
   buf: Vec<u8>,
+  /// Read cursor: bytes before it were already yielded by `poll`. Popping a frame advances the
+  /// cursor instead of `Vec::drain` (which would memmove the whole remaining buffer per frame —
+  /// O(buffered²) across a burst); the consumed prefix is reclaimed wholesale, amortized O(1)/byte.
+  start: usize,
   /// Bytes of the trailing partial frame present at the tail of `buf` (header + payload so far).
   fill: usize,
   /// Total size (4 + declared payload length) of the trailing partial frame, once its header has
@@ -37,11 +42,15 @@ pub(crate) struct FrameDecoder {
   failed: bool,
 }
 
+/// Reclaim the consumed prefix once it crosses this size (amortizes the memmove across many pops).
+const COMPACT_THRESHOLD: usize = 64 * 1024;
+
 impl FrameDecoder {
   /// A decoder with an empty buffer.
   pub(crate) fn new() -> Self {
     Self {
       buf: Vec::new(),
+      start: 0,
       fill: 0,
       expect: None,
       failed: false,
@@ -72,6 +81,7 @@ impl FrameDecoder {
           if len > MAX_FRAME_LEN {
             self.failed = true;
             self.buf = Vec::new();
+            self.start = 0;
             self.fill = 0;
             self.expect = None;
             return;
@@ -109,21 +119,43 @@ impl FrameDecoder {
     if self.failed {
       return Err(TransportError::FrameTooLarge);
     }
-    // Only complete frames precede the trailing partial one (`fill` bytes at the tail).
-    let complete = self.buf.len() - self.fill;
+    // Complete frames live between the cursor and the trailing partial one (`fill` tail bytes).
+    let complete = self.buf.len() - self.start - self.fill;
     if complete < 4 {
+      self.maybe_compact();
       return Ok(false);
     }
-    let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+    let h = &self.buf[self.start..self.start + 4];
+    let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
     debug_assert!(len <= MAX_FRAME_LEN, "headers are validated at push time");
-    let end = 4 + len;
-    if complete < end {
+    if complete < 4 + len {
+      self.maybe_compact();
       return Ok(false);
     }
     out.clear();
-    out.extend_from_slice(&self.buf[4..end]);
-    self.buf.drain(..end);
+    out.extend_from_slice(&self.buf[self.start + 4..self.start + 4 + len]);
+    self.start += 4 + len;
+    self.maybe_compact();
     Ok(true)
+  }
+
+  /// Reclaim the consumed prefix: free when everything is consumed, else memmove it away once it
+  /// crosses the amortization threshold AND is at least as large as the bytes it would move.
+  /// The proportionality condition is what makes the amortization real: compacting on the absolute
+  /// threshold alone would memmove the WHOLE remaining backlog after every ≥64 KiB frame popped —
+  /// quadratic in the per-read backlog. Requiring consumed ≥ remaining bounds total moved bytes at
+  /// ~2× the bytes ever buffered (each byte is moved at most once per halving), i.e. O(1)/byte.
+  fn maybe_compact(&mut self) {
+    if self.start == 0 {
+      return;
+    }
+    if self.start == self.buf.len() {
+      self.buf.clear();
+      self.start = 0;
+    } else if self.start >= COMPACT_THRESHOLD && self.start >= self.buf.len() - self.start {
+      self.buf.drain(..self.start);
+      self.start = 0;
+    }
   }
 
   /// Test-only: whether the decoder has latched the terminal oversized-frame failure.
@@ -136,7 +168,7 @@ impl FrameDecoder {
   /// retained).
   #[cfg(test)]
   pub(crate) fn buffered_for_test(&self) -> usize {
-    self.buf.len()
+    self.buf.len() - self.start
   }
 }
 

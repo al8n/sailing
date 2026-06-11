@@ -52,8 +52,8 @@ impl World {
     let mut a = coord(1);
     let mut b = coord(2);
     // Node 1 dials node 2; node 2 accepts. Same ConnId(1) on each side's own table.
-    a.on_conn_open(ConnId(1), label(1, true));
-    b.on_conn_open(ConnId(1), label(2, false));
+    a.on_conn_open(ConnId(1), label(1, true), Instant::ORIGIN);
+    b.on_conn_open(ConnId(1), label(2, false), Instant::ORIGIN);
     World {
       a,
       b,
