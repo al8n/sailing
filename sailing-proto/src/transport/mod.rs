@@ -96,4 +96,8 @@ pub enum TransportError {
   /// An application frame arrived before the connection was validated.
   #[error("connection not yet validated")]
   NotValidated,
+  /// A connection was registered under a `ConnId` that is still live (a driver contract
+  /// violation — ids are unique and monotonic). The rejected registration's socket must be closed.
+  #[error("connection id is already registered")]
+  DuplicateConnId,
 }

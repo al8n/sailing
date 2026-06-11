@@ -47,15 +47,17 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   }
 
   /// Register a freshly opened connection (still handshaking) under `id`, starting its handshake
-  /// deadline. Re-registering a live id is a driver contract violation (ids are monotonic); the
-  /// previous connection is dropped and reported closed rather than silently merged.
+  /// deadline. Re-registering a LIVE id is a driver contract violation (ids are unique and
+  /// monotonic): the registration is REJECTED — the existing connection stays untouched and the
+  /// rejected attempt is reported via [`poll_conn_closed`](Self::poll_conn_closed) so the driver
+  /// tears down whatever socket it tried to register. (Accepting the replacement would be
+  /// ambiguous: a later close notification for the id could not say WHICH socket to release.)
   pub fn register(&mut self, id: ConnId, record: R, now: Instant) {
     if self.conns.contains_key(&id) {
-      debug_assert!(
-        false,
-        "ConnId re-registered: driver ids must be unique/monotonic"
-      );
-      self.remove_internal(id, None);
+      self
+        .closed
+        .push_back((id, Some(TransportError::DuplicateConnId)));
+      return;
     }
     self.conns.insert(id, Conn::new(record));
     self.handshake_deadline.insert(id, now + HANDSHAKE_TIMEOUT);

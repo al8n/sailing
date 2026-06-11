@@ -133,14 +133,28 @@ impl RecordIo for TlsRecords {
     if self.aborted {
       return 0; // failure inertness: plaintext from a fatally-errored session is untrustworthy
     }
+    // Read decrypted plaintext DIRECTLY into `out`'s tail (resize, read into the spare slice,
+    // truncate to what arrived) — one copy out of rustls instead of two via a stack hop. The
+    // 16 KiB step matches rustls's received-plaintext cap, so one iteration usually drains it.
+    const STEP: usize = 16 * 1024;
     let before = out.len();
-    let mut buf = [0u8; 4096];
     loop {
-      match self.conn.reader().read(&mut buf) {
-        Ok(0) => break,
-        Ok(n) => out.extend_from_slice(&buf[..n]),
-        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-        Err(_) => break,
+      let len = out.len();
+      out.resize(len + STEP, 0);
+      match self.conn.reader().read(&mut out[len..]) {
+        Ok(0) => {
+          out.truncate(len);
+          break;
+        }
+        Ok(n) => out.truncate(len + n),
+        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+          out.truncate(len);
+          break;
+        }
+        Err(_) => {
+          out.truncate(len);
+          break;
+        }
       }
     }
     out.len() - before
