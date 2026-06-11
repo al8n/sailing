@@ -517,30 +517,14 @@ impl<I: NodeId + Data> Data for ConfChangeV2<I> {
     let (n, transition) = ConfChangeTransition::decode(buf)?;
     pos += n;
 
-    // Number of changes (u64 length prefix).
+    // Changes: route through the generic `Vec<T>` decoder — the length-prefixed-collection
+    // choke-point. It performs NO count-based preallocation (a wire count bounds only the element
+    // COUNT, not the slot bytes — `with_capacity(count)` would let a 64 MiB frame force a ~20×
+    // larger reservation) and requires per-element input progress, so a hostile count fails on the
+    // first missing element.
     let rest = buf.get(pos..).ok_or(DecodeError::UnexpectedEof)?;
-    // Length-prefix choke-point: narrows the u64 to usize (rejecting overflow), the same path as
-    // every other length-prefixed decode.
-    let (n, count) = crate::data::decode_len(rest, "conf_change_v2 change count")?;
+    let (n, changes) = Vec::<ConfChangeSingle<I>>::decode(rest)?;
     pos += n;
-    // Reject a count that exceeds the remaining input BEFORE allocating: every `ConfChangeSingle`
-    // encodes to at least one byte, so a count larger than the bytes left cannot be valid — and
-    // trusting it would let a malformed committed payload drive an unbounded `Vec` preallocation
-    // (OOM in the core). This bounds the capacity to the actual input size.
-    if count > buf.len().saturating_sub(pos) {
-      return Err(DecodeError::Invalid(
-        "conf_change_v2 change count exceeds input",
-      ));
-    }
-
-    // Decode each change.
-    let mut changes = Vec::with_capacity(count);
-    for _ in 0..count {
-      let rest = buf.get(pos..).ok_or(DecodeError::UnexpectedEof)?;
-      let (n, change) = ConfChangeSingle::<I>::decode(rest)?;
-      pos += n;
-      changes.push(change);
-    }
 
     // Context (length-prefixed bytes).
     let rest = buf.get(pos..).ok_or(DecodeError::UnexpectedEof)?;
