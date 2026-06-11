@@ -498,7 +498,7 @@ where
     // Broadcast heartbeats and kick off replication to peers.
     self.broadcast_heartbeat(now);
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
-      self.maybe_send_append(peer, log, stable);
+      self.maybe_send_append(now, peer, log, stable);
     }
   }
 }

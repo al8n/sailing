@@ -76,7 +76,7 @@ where
     } else {
       // Target is lagging: kick replication so it catches up.
       // TimeoutNow will be sent from on_append_resp once match_index == last_index.
-      self.maybe_send_append(to, log, stable);
+      self.maybe_send_append(now, to, log, stable);
     }
     Ok(())
   }
