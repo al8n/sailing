@@ -1,23 +1,32 @@
 //! Sans-I/O transport: framed, reliable streams that drive `Endpoint`.
 //! Feature-gated; the consensus core stays no_std + dependency-free by default.
-// The transport is built bottom-up: each lower layer (framing, the record layers, `Conn`) lands
-// before the consumer that uses it (the coordinators). This module-scoped allow keeps those
-// intermediate states warning-clean; it is removed once the coordinators wire everything together.
-#![allow(dead_code)]
 
+// The framed-stream stack belongs to `tcp` (and `tls`, which implies it); a bare `quic` build gets
+// only the shared types below until the QUIC coordinator lands.
+#[cfg(feature = "tcp")]
 mod conn;
+#[cfg(feature = "tcp")]
 mod coordinator;
+#[cfg(feature = "tcp")]
 mod frame;
+#[cfg(feature = "tcp")]
 mod labeled;
+#[cfg(feature = "tcp")]
 mod passthrough;
+#[cfg(feature = "tcp")]
 mod router;
+#[cfg(feature = "tcp")]
 mod stream;
 #[cfg(feature = "tls")]
 mod tls;
 
+#[cfg(feature = "tcp")]
 pub use coordinator::StreamCoordinator;
+#[cfg(feature = "tcp")]
 pub use labeled::{LabelOptions, Labeled};
+#[cfg(feature = "tcp")]
 pub use passthrough::Passthrough;
+#[cfg(feature = "tcp")]
 pub use stream::{Intake, RecordIo, StreamTransport};
 #[cfg(feature = "tls")]
 pub use tls::TlsRecords;
