@@ -574,6 +574,30 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
     resends, 0,
     "an immediate second HeartbeatResp must not re-send the blob (resend backoff)"
   );
+
+  // TIME-based pacing: once a full election timeout has elapsed, the next response re-sends —
+  // regardless of how many (or few) responses arrived in between.
+  let later = Instant::ORIGIN + ep.config.election_timeout();
+  ep.handle_message(
+    later,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResp(crate::HeartbeatResp::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
+  );
+  let after: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  let resends_after: usize = after
+    .iter()
+    .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+    .count();
+  assert_eq!(
+    resends_after, 1,
+    "a response after the election-timeout deadline re-sends the blob (liveness)"
+  );
 }
 
 /// The resend STOPS once the follower acks past its pending snapshot index.

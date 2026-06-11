@@ -417,9 +417,9 @@ where
     self.lease_round = 0;
     self.lease_acks.clear();
     self.lease_valid_until = None;
-    // Fresh leadership starts fresh snapshot-resend pacing (the per-peer countdowns belong to the
+    // Fresh leadership starts fresh snapshot-resend pacing (the per-peer deadlines belong to the
     // previous leadership's transfer windows).
-    self.snapshot_resend_backoff.clear();
+    self.snapshot_resend_after.clear();
     // Clear any in-progress leader transfer — becoming the leader means the transfer
     // target (us) has won; the previous leader's transfer state is irrelevant.
     self.lead_transferee = None;
