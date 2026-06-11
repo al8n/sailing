@@ -111,3 +111,58 @@ fn completes_handshake_and_carries_plaintext() {
   s.read_plaintext(&mut got);
   assert_eq!(got, b"secret");
 }
+
+/// A fatal record fault (garbage ciphertext) latches the session: Failed is sticky and every
+/// other method becomes inert (no plaintext out, no writes accepted, nothing transmitted).
+#[test]
+fn fatal_record_fault_is_terminal_and_inert() {
+  let (client_cfg, server_cfg) = test_configs();
+  let mut c = TlsRecords::client(client_cfg, "localhost".try_into().unwrap()).unwrap();
+  let mut s = TlsRecords::server(server_cfg).unwrap();
+  pump(&mut c, &mut s);
+  assert!(!s.is_handshaking());
+
+  // Garbage that cannot be a TLS record stream.
+  assert_eq!(
+    s.handle_transport_data(&[0u8; 64], Instant::ORIGIN),
+    Intake::Failed
+  );
+  // Sticky + inert.
+  assert_eq!(
+    s.handle_transport_data(b"more", Instant::ORIGIN),
+    Intake::Failed
+  );
+  assert_eq!(s.write_plaintext(b"app"), 0, "writes refused after abort");
+  let mut out = Vec::new();
+  assert_eq!(
+    s.poll_transport_transmit(&mut out),
+    0,
+    "nothing transmitted after abort"
+  );
+  assert_eq!(
+    s.read_plaintext(&mut out),
+    0,
+    "no plaintext surfaced after abort"
+  );
+}
+
+/// A peer's close_notify surfaces via peer_has_closed (the in-band clean close signal).
+#[test]
+fn close_notify_surfaces_as_peer_has_closed() {
+  let (client_cfg, server_cfg) = test_configs();
+  let mut c = TlsRecords::client(client_cfg, "localhost".try_into().unwrap()).unwrap();
+  let mut s = TlsRecords::server(server_cfg).unwrap();
+  pump(&mut c, &mut s);
+
+  c.send_close_notify_for_test();
+  let mut wire = Vec::new();
+  c.poll_transport_transmit(&mut wire);
+  assert_ne!(
+    s.handle_transport_data(&wire, Instant::ORIGIN),
+    Intake::Failed
+  );
+  assert!(
+    s.peer_has_closed(),
+    "close_notify latches the in-band close"
+  );
+}
