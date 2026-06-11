@@ -9,6 +9,20 @@ pub trait Data: Sized {
   fn encode(&self, buf: &mut Vec<u8>);
   /// Decode a value from the front of `buf`, returning `(bytes_consumed, value)`.
   fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError>;
+
+  /// Decode a value that must occupy the WHOLE buffer — trailing bytes are an error.
+  ///
+  /// The prefix decoder above is right for cursoring through a struct's fields; this is the form
+  /// for a self-contained payload (an entry's command, a snapshot blob, a conf-change record),
+  /// where trailing garbage means the payload is malformed — accepting it would let two distinct
+  /// byte strings decode to the same value (non-canonical input).
+  fn decode_exact(buf: &[u8]) -> Result<Self, DecodeError> {
+    let (n, value) = Self::decode(buf)?;
+    if n != buf.len() {
+      return Err(DecodeError::Invalid("trailing bytes after value"));
+    }
+    Ok(value)
+  }
 }
 
 /// Wire-decoding failure.
