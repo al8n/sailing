@@ -584,14 +584,15 @@ where
   /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
   /// this field to `None`.
   pending_compact: Option<(crate::OpId, Index)>,
-  /// Per-peer countdown (in heartbeat-response rounds) until the next `InstallSnapshot` resend to a
+  /// Per-peer deadline before which the full `InstallSnapshot` blob is NOT re-sent to a
   /// `Snapshot`-state peer. A deferred install legitimately takes many heartbeat intervals (blob
-  /// fsync + apply), so resending the full blob on EVERY response would re-transmit a large
-  /// snapshot tens of times per install; the countdown spaces resends roughly one election timeout
-  /// apart — a genuinely DROPPED blob is still retried within one election timeout (liveness), at
-  /// ~1/heartbeat of the egress cost. Entries clear when the peer leaves `Snapshot` state and on
-  /// leadership change.
-  snapshot_resend_backoff: BTreeMap<I, u32>,
+  /// fsync + apply), so resending on EVERY response would re-transmit a large snapshot tens of
+  /// times per install — and response COUNT is the wrong clock entirely (ReadIndex Safe rounds
+  /// elicit extra responses, accelerating a count-based pacer arbitrarily). The deadline is
+  /// time-based: at most one resend per election timeout, regardless of response rate; a genuinely
+  /// dropped blob is still retried within one election timeout of the next response (liveness).
+  /// Entries clear when the peer leaves `Snapshot` state and on leadership change.
+  snapshot_resend_after: BTreeMap<I, Instant>,
   /// Term-before-respond durability. The highest `Term` whose HardState write has reached stable
   /// storage — `term_is_durable()` is simply `durable_term >= self.term`. Seeded to the initial/recovered
   /// term (trivially durable: it came from durable HardState or is the bootstrap term), then advanced in
@@ -777,7 +778,7 @@ where
       poisoned: false,
       poison_reason: None,
       pending_compact: None,
-      snapshot_resend_backoff: BTreeMap::new(),
+      snapshot_resend_after: BTreeMap::new(),
       // fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
       // `term_is_durable()` is true and acks are never spuriously deferred at startup.
       durable_term: Term::ZERO,
@@ -1232,7 +1233,7 @@ where
       Message::Heartbeat(hb) => self.on_heartbeat(now, log, hb),
       Message::AppendEntries(ae) => self.on_append_entries(now, log, stable, ae),
       Message::AppendResp(r) => self.on_append_resp(now, log, stable, from, r),
-      Message::HeartbeatResp(hr) => self.on_heartbeat_resp(from, log, stable, hr),
+      Message::HeartbeatResp(hr) => self.on_heartbeat_resp(now, from, log, stable, hr),
       Message::ReadIndex(ri) => self.on_read_index(now, log, stable, ri),
       Message::ReadIndexResp(r) => self.on_read_index_resp(from, r),
       Message::InstallSnapshot(is) => self.on_install_snapshot(now, stable, is),

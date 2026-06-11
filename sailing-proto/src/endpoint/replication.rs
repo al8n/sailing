@@ -623,6 +623,7 @@ where
   ///    reached a voter quorum.
   pub(crate) fn on_heartbeat_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
+    now: Instant,
     from: I,
     log: &L,
     stable: &S,
@@ -697,25 +698,23 @@ where
       None => false,
     };
     if resend {
-      let due = match self.snapshot_resend_backoff.get_mut(&from) {
-        Some(rounds) if *rounds > 0 => {
-          *rounds -= 1;
-          false
-        }
-        _ => true,
-      };
+      // TIME-based pacing (response COUNT is the wrong clock: ReadIndex Safe rounds elicit extra
+      // responses, which would accelerate a count-based pacer arbitrarily): resend at most once
+      // per election timeout. The first qualifying response at/after the deadline (or with no
+      // deadline yet) re-sends and re-arms; a genuinely dropped blob is therefore retried within
+      // one election timeout of the next response (liveness preserved).
+      let due = self
+        .snapshot_resend_after
+        .get(&from)
+        .is_none_or(|&after| now >= after);
       if due {
-        // Heartbeat-response rounds are the clock here: one election timeout's worth of them.
-        let rounds_per_election = (self.config.election_timeout().as_micros()
-          / self.config.heartbeat_interval().as_micros().max(1))
-        .max(1) as u32;
         self
-          .snapshot_resend_backoff
-          .insert(from, rounds_per_election);
+          .snapshot_resend_after
+          .insert(from, now + self.config.election_timeout());
         self.resend_snapshot(from, stable);
       }
     } else {
-      self.snapshot_resend_backoff.remove(&from);
+      self.snapshot_resend_after.remove(&from);
     }
 
     // ReadIndex Safe path: if the resp carries a context, record the ack and check quorum.
