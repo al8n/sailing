@@ -18,7 +18,7 @@ tcp = []                                   # no_std + alloc OK (no crypto)
 tls = ["tcp", "std", "dep:rustls", "tls-ring"]
 tls-ring = ["rustls?/ring"]
 tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
-quic = ["std", "dep:quinn-proto", "tls-ring"]
+quic = ["tcp", "std", "dep:rustls", "dep:quinn-proto", "tls-ring"]
 
 [dependencies]
 bytes.workspace = true

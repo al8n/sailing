@@ -86,6 +86,8 @@ pub(crate) use tracker::Tracker;
 mod transport;
 #[cfg(feature = "tls")]
 pub use transport::TlsRecords;
+#[cfg(feature = "quic")]
+pub use transport::quic;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
 #[cfg(feature = "tcp")]
