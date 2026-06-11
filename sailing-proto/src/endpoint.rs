@@ -1351,6 +1351,12 @@ where
   /// log slice is empty), which is transient and retried on the next `handle_*`.
   fn apply_committed<L: LogStore>(&mut self, log: &L) {
     while self.applied < self.commit {
+      // Halt the drain the moment the node poisons (including a poison set EARLIER in the same
+      // dispatch, e.g. by a storage completion processed just before this call): once fail-stopped,
+      // the user FSM must not be re-invoked with further applies.
+      if self.poisoned {
+        return;
+      }
       let idx = self.applied.next();
       let entry = match log.entries(idx..idx.next(), u64::MAX) {
         Ok(s) => match s.first() {
@@ -1367,8 +1373,8 @@ where
       };
       match entry.kind() {
         crate::EntryKind::Normal => {
-          let cmd = match <F::Command as crate::Data>::decode(entry.data()) {
-            Ok((_, c)) => c,
+          let cmd = match <F::Command as crate::Data>::decode_exact(entry.data()) {
+            Ok(c) => c,
             // A committed entry whose payload won't decode is corrupt/unrecoverable → poison.
             Err(_) => {
               self.poison(PoisonReason::NormalEntryDecode);
@@ -1389,8 +1395,8 @@ where
         crate::EntryKind::Empty => {} // no-op: just advance applied
         crate::EntryKind::ConfChange => {
           // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
-          let cc = match <crate::ConfChangeV2<I> as crate::Data>::decode(entry.data()) {
-            Ok((_, c)) => c,
+          let cc = match <crate::ConfChangeV2<I> as crate::Data>::decode_exact(entry.data()) {
+            Ok(c) => c,
             Err(_) => {
               self.poison(PoisonReason::ConfChangeDecode);
               break;

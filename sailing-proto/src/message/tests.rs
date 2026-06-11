@@ -205,3 +205,78 @@ fn codec_rejects_oversized_collection_length() {
   u64::MAX.encode(&mut buf); // entries count = u64::MAX, with nothing following
   assert!(Message::<u64>::decode(&buf).is_err());
 }
+
+/// GOLDEN WIRE VECTORS: pin the exact byte encoding of representative messages, so any
+/// wire-format drift (field reorder, width change, tag renumber) fails HERE — visibly — instead
+/// of silently breaking cross-version clusters. If this test fails because the format was changed
+/// ON PURPOSE, bump the transport hello version (`LABEL_VERSION` in transport/labeled.rs) and
+/// regenerate the vectors in the same commit.
+#[test]
+fn codec_golden_byte_vectors() {
+  use crate::Data;
+
+  // VoteResp { term: 3, from: 2, pre_vote: true, reject: false } — tag 3, LE u64s, bool bytes.
+  let mut buf = std::vec::Vec::new();
+  Message::<u64>::VoteResp(VoteResp::new(Term::new(3), 2, true, false)).encode(&mut buf);
+  assert_eq!(
+    buf,
+    [
+      3, // tag: VoteResp
+      3, 0, 0, 0, 0, 0, 0, 0, // term = 3 (LE u64)
+      2, 0, 0, 0, 0, 0, 0, 0, // from = 2 (LE u64)
+      1, // pre_vote = true
+      0, // reject = false
+    ]
+  );
+
+  // Heartbeat { term: 1, leader: 9, commit: 4, context: "ab", lease_round: 7 } — tag 4;
+  // Bytes carry a LE u64 length prefix.
+  let mut buf = std::vec::Vec::new();
+  Message::<u64>::Heartbeat(
+    Heartbeat::new(
+      Term::new(1),
+      9,
+      Index::new(4),
+      bytes::Bytes::from_static(b"ab"),
+    )
+    .with_lease_round(7),
+  )
+  .encode(&mut buf);
+  assert_eq!(
+    buf,
+    [
+      4, // tag: Heartbeat
+      1, 0, 0, 0, 0, 0, 0, 0, // term = 1
+      9, 0, 0, 0, 0, 0, 0, 0, // leader = 9
+      4, 0, 0, 0, 0, 0, 0, 0, // commit = 4
+      2, 0, 0, 0, 0, 0, 0, 0, // context length = 2
+      b'a', b'b', // context bytes
+      7, 0, 0, 0, 0, 0, 0, 0, // lease_round = 7
+    ]
+  );
+
+  // TimeoutNow { term: 2, leader: 5 } — tag 8, the smallest message.
+  let mut buf = std::vec::Vec::new();
+  Message::<u64>::TimeoutNow(TimeoutNow::new(Term::new(2), 5)).encode(&mut buf);
+  assert_eq!(buf, [8, 2, 0, 0, 0, 0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0, 0,]);
+}
+
+/// The HeartbeatResp duration decoder rejects an out-of-domain nanos field (>= 1e9): two distinct
+/// encodings must never decode to the same Duration.
+#[test]
+fn codec_rejects_out_of_range_duration_nanos() {
+  use crate::Data;
+  let mut buf = std::vec::Vec::new();
+  Message::<u64>::HeartbeatResp(
+    HeartbeatResp::new(Term::new(1), 2, bytes::Bytes::new())
+      .with_lease_support(core::time::Duration::from_millis(5)),
+  )
+  .encode(&mut buf);
+  // Locate the nanos field: it is the LAST 8 bytes of the encoding (secs precedes it).
+  let n = buf.len();
+  buf[n - 8..].copy_from_slice(&1_000_000_000u64.to_le_bytes()); // nanos = 1e9: out of domain
+  assert!(
+    Message::<u64>::decode(&buf).is_err(),
+    "nanos >= 1e9 must be rejected (canonical duration encoding)"
+  );
+}
