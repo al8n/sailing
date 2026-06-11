@@ -1436,6 +1436,16 @@ where
               // it; `do_leader_read` degrades to Safe until a fresh quorum re-confirms under the new config.
               self.lease_valid_until = None;
               self.lease_acks.clear();
+              // Prune resend-pacing deadlines to the new membership. A peer this change REMOVED
+              // while still in Snapshot state can never be observed leaving it (its Progress is
+              // gone, and a dead peer sends no further responses), so its entry would linger for
+              // the rest of the term — and add/remove churn of lagging peers would grow the map
+              // past the live peer set. This is the sole fold site for configuration changes, so
+              // pruning here bounds the map by the tracked peers by construction.
+              let tracker = &self.tracker;
+              self
+                .snapshot_resend_after
+                .retain(|id, _| tracker.progress(id).is_some());
             }
             // A committed, validly-decoded ConfChange that the Changer rejects is an unrecoverable
             // logic violation (e.g. an overlapping change that should have been prevented upstream).
