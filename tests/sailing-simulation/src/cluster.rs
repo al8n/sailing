@@ -38,15 +38,11 @@ fn wire_roundtrip(message: Message<u64>) -> Message<u64> {
   use sailing_proto::Data;
   let mut buf = Vec::new();
   message.encode(&mut buf);
-  let (n, decoded) = Message::<u64>::decode(&buf)
+  // `decode_exact` enforces whole-buffer consumption (the framing invariant).
+  let decoded = Message::<u64>::decode_exact(bytes::Bytes::from(buf))
     .expect("a consensus message must round-trip through the wire codec");
-  assert_eq!(
-    n,
-    buf.len(),
-    "the wire codec must consume exactly the encoded bytes"
-  );
-  // Assert VALUE identity, not just length — a field swap that still consumes the frame would
-  // otherwise silently alter the delivered message and change fuzzer behavior.
+  // Assert VALUE identity, not just consumption — a field swap that still consumes the frame
+  // would otherwise silently alter the delivered message and change fuzzer behavior.
   assert_eq!(
     decoded, message,
     "the wire codec must round-trip to an identical message"

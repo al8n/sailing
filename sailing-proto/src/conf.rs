@@ -201,16 +201,18 @@ impl<I: NodeId> Data for ConfState<I> {
     self.auto_leave.encode(buf);
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let mut d = crate::data::Decoder::new(buf);
-    let voters = d.read::<BTreeSet<I>>()?;
-    let learners = d.read::<BTreeSet<I>>()?;
-    let voters_outgoing = d.read::<BTreeSet<I>>()?;
-    let learners_next = d.read::<BTreeSet<I>>()?;
-    let auto_leave = d.read::<bool>()?;
-    Ok((
-      d.pos(),
-      Self::new(voters, learners, voters_outgoing, learners_next, auto_leave),
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
+    let voters = BTreeSet::<I>::decode(cur)?;
+    let learners = BTreeSet::<I>::decode(cur)?;
+    let voters_outgoing = BTreeSet::<I>::decode(cur)?;
+    let learners_next = BTreeSet::<I>::decode(cur)?;
+    let auto_leave = bool::decode(cur)?;
+    Ok(Self::new(
+      voters,
+      learners,
+      voters_outgoing,
+      learners_next,
+      auto_leave,
     ))
   }
 }
@@ -253,13 +255,12 @@ impl Data for ConfChangeType {
     });
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    match buf.first() {
-      Some(0) => Ok((1, Self::AddNode)),
-      Some(1) => Ok((1, Self::RemoveNode)),
-      Some(2) => Ok((1, Self::AddLearnerNode)),
-      Some(_) => Err(DecodeError::Invalid("ConfChangeType")),
-      None => Err(DecodeError::UnexpectedEof),
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
+    match cur.take_u8()? {
+      0 => Ok(Self::AddNode),
+      1 => Ok(Self::RemoveNode),
+      2 => Ok(Self::AddLearnerNode),
+      _ => Err(DecodeError::Invalid("ConfChangeType")),
     }
   }
 }
@@ -311,13 +312,12 @@ impl Data for ConfChangeTransition {
     });
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    match buf.first() {
-      Some(0) => Ok((1, Self::Auto)),
-      Some(1) => Ok((1, Self::Implicit)),
-      Some(2) => Ok((1, Self::Explicit)),
-      Some(_) => Err(DecodeError::Invalid("ConfChangeTransition")),
-      None => Err(DecodeError::UnexpectedEof),
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
+    match cur.take_u8()? {
+      0 => Ok(Self::Auto),
+      1 => Ok(Self::Implicit),
+      2 => Ok(Self::Explicit),
+      _ => Err(DecodeError::Invalid("ConfChangeTransition")),
     }
   }
 }
@@ -360,11 +360,10 @@ impl<I: NodeId + Data> Data for ConfChangeSingle<I> {
     self.node.encode(buf);
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let (n1, ty) = ConfChangeType::decode(buf)?;
-    let rest = buf.get(n1..).ok_or(DecodeError::UnexpectedEof)?;
-    let (n2, node) = I::decode(rest)?;
-    Ok((n1 + n2, Self { ty, node }))
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
+    let ty = ConfChangeType::decode(cur)?;
+    let node = I::decode(cur)?;
+    Ok(Self { ty, node })
   }
 }
 
@@ -429,13 +428,11 @@ impl<I: NodeId + Data> Data for ConfChange<I> {
     self.context.encode(buf);
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let (n1, ty) = ConfChangeType::decode(buf)?;
-    let rest = buf.get(n1..).ok_or(DecodeError::UnexpectedEof)?;
-    let (n2, node) = I::decode(rest)?;
-    let rest2 = buf.get(n1 + n2..).ok_or(DecodeError::UnexpectedEof)?;
-    let (n3, context) = Bytes::decode(rest2)?;
-    Ok((n1 + n2 + n3, Self { ty, node, context }))
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
+    let ty = ConfChangeType::decode(cur)?;
+    let node = I::decode(cur)?;
+    let context = Bytes::decode(cur)?;
+    Ok(Self { ty, node, context })
   }
 }
 
@@ -510,35 +507,18 @@ impl<I: NodeId + Data> Data for ConfChangeV2<I> {
     self.context.encode(buf);
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let mut pos = 0usize;
-
-    // Transition byte.
-    let (n, transition) = ConfChangeTransition::decode(buf)?;
-    pos += n;
-
-    // Changes: route through the generic `Vec<T>` decoder — the length-prefixed-collection
-    // choke-point. It performs NO count-based preallocation (a wire count bounds only the element
-    // COUNT, not the slot bytes — `with_capacity(count)` would let a 64 MiB frame force a ~20×
-    // larger reservation) and requires per-element input progress, so a hostile count fails on the
-    // first missing element.
-    let rest = buf.get(pos..).ok_or(DecodeError::UnexpectedEof)?;
-    let (n, changes) = Vec::<ConfChangeSingle<I>>::decode(rest)?;
-    pos += n;
-
-    // Context (length-prefixed bytes).
-    let rest = buf.get(pos..).ok_or(DecodeError::UnexpectedEof)?;
-    let (n, context) = Bytes::decode(rest)?;
-    pos += n;
-
-    Ok((
-      pos,
-      Self {
-        transition,
-        changes,
-        context,
-      },
-    ))
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
+    let transition = ConfChangeTransition::decode(cur)?;
+    // Changes: the generic `Vec<T>` decoder is the length-prefixed-collection choke-point — no
+    // count-based preallocation, per-element input progress required, so a hostile count fails on
+    // the first missing element.
+    let changes = Vec::<ConfChangeSingle<I>>::decode(cur)?;
+    let context = Bytes::decode(cur)?;
+    Ok(Self {
+      transition,
+      changes,
+      context,
+    })
   }
 }
 

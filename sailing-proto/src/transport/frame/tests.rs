@@ -7,10 +7,8 @@ fn encodes_and_decodes_one_frame() {
   encode_frame(b"hello", &mut wire);
   let mut dec = FrameDecoder::new();
   dec.push(&wire);
-  let mut out = Vec::new();
-  assert!(dec.poll(&mut out).unwrap());
-  assert_eq!(out, b"hello");
-  assert!(!dec.poll(&mut out).unwrap(), "nothing more buffered");
+  assert_eq!(dec.poll().unwrap().as_deref(), Some(&b"hello"[..]));
+  assert!(dec.poll().unwrap().is_none(), "nothing more buffered");
 }
 
 #[test]
@@ -18,16 +16,14 @@ fn reassembles_across_partial_pushes() {
   let mut wire = Vec::new();
   encode_frame(b"abcd", &mut wire);
   let mut dec = FrameDecoder::new();
-  let mut out = Vec::new();
   for byte in &wire {
     assert!(
-      !dec.poll(&mut out).unwrap(),
+      dec.poll().unwrap().is_none(),
       "no frame until every byte has arrived"
     );
     dec.push(&[*byte]);
   }
-  assert!(dec.poll(&mut out).unwrap());
-  assert_eq!(out, b"abcd");
+  assert_eq!(dec.poll().unwrap().as_deref(), Some(&b"abcd"[..]));
 }
 
 #[test]
@@ -37,12 +33,9 @@ fn decodes_two_concatenated_frames() {
   encode_frame(b"two", &mut wire);
   let mut dec = FrameDecoder::new();
   dec.push(&wire);
-  let mut out = Vec::new();
-  assert!(dec.poll(&mut out).unwrap());
-  assert_eq!(out, b"one");
-  assert!(dec.poll(&mut out).unwrap());
-  assert_eq!(out, b"two");
-  assert!(!dec.poll(&mut out).unwrap());
+  assert_eq!(dec.poll().unwrap().as_deref(), Some(&b"one"[..]));
+  assert_eq!(dec.poll().unwrap().as_deref(), Some(&b"two"[..]));
+  assert!(dec.poll().unwrap().is_none());
 }
 
 #[test]
@@ -52,17 +45,15 @@ fn empty_payload_round_trips() {
   assert_eq!(wire.len(), 4, "just the length prefix");
   let mut dec = FrameDecoder::new();
   dec.push(&wire);
-  let mut out = Vec::new();
-  assert!(dec.poll(&mut out).unwrap());
-  assert!(out.is_empty());
+  let frame = dec.poll().unwrap().expect("zero-length frame surfaces");
+  assert!(frame.is_empty());
 }
 
 #[test]
 fn rejects_oversize_length() {
   let mut dec = FrameDecoder::new();
   dec.push(&u32::MAX.to_be_bytes()); // claims a ~4 GiB frame
-  let mut out = Vec::new();
-  assert_eq!(dec.poll(&mut out), Err(TransportError::FrameTooLarge));
+  assert!(matches!(dec.poll(), Err(TransportError::FrameTooLarge)));
 }
 
 #[test]
@@ -82,8 +73,7 @@ fn oversize_length_latches_failed_at_push_and_frees_buffer() {
   // A subsequent push is ignored, and poll keeps reporting the terminal error.
   dec.push(b"more bytes that must be ignored");
   assert_eq!(dec.buffered_for_test(), 0);
-  let mut out = Vec::new();
-  assert_eq!(dec.poll(&mut out), Err(TransportError::FrameTooLarge));
+  assert!(matches!(dec.poll(), Err(TransportError::FrameTooLarge)));
 }
 
 #[test]
@@ -102,8 +92,7 @@ fn oversize_payload_is_never_buffered_even_mid_stream() {
     0,
     "the latch releases everything; the hostile payload was never accumulated"
   );
-  let mut out = Vec::new();
-  assert_eq!(dec.poll(&mut out), Err(TransportError::FrameTooLarge));
+  assert!(matches!(dec.poll(), Err(TransportError::FrameTooLarge)));
 }
 
 #[test]
@@ -123,29 +112,27 @@ fn split_header_still_validates_before_payload() {
   assert_eq!(dec.buffered_for_test(), 0);
 }
 
-/// Drive the cursor across the compaction threshold with interleaved push/poll: every frame must
-/// come back exactly, and the consumed prefix must be reclaimed (buffered never exceeds what a
-/// partial tail plus unpopped frames justify).
+/// Frames are ZERO-COPY slices of the accumulation buffer; popping a burst of frames must yield
+/// each payload exactly, with the consumed prefix reclaimed O(1) (split_to, no memmove).
 #[test]
-fn compaction_preserves_frames_across_interleaved_push_poll() {
+fn burst_of_frames_pops_zero_copy_and_drains() {
   let mut dec = FrameDecoder::new();
-  let payload = std::vec![0xAB_u8; 48 * 1024]; // 48 KiB — two pops cross the 64 KiB threshold
+  let payload = std::vec![0xAB_u8; 48 * 1024];
   let mut wire = Vec::new();
   encode_frame(&payload, &mut wire);
 
-  let mut out = Vec::new();
   for round in 0..8 {
     // Push one frame split in two arbitrary chunks, then pop it.
     let cut = 5 + round * 1000;
     dec.push(&wire[..cut]);
     assert!(
-      !dec.poll(&mut out).unwrap(),
+      dec.poll().unwrap().is_none(),
       "incomplete frame yields nothing"
     );
     dec.push(&wire[cut..]);
-    assert!(dec.poll(&mut out).unwrap());
-    assert_eq!(out, payload, "frame {round} intact across compaction");
-    assert!(!dec.poll(&mut out).unwrap());
+    let frame = dec.poll().unwrap().expect("frame");
+    assert_eq!(&frame[..], &payload[..], "frame {round} intact");
+    assert!(dec.poll().unwrap().is_none());
     assert_eq!(
       dec.buffered_for_test(),
       0,
@@ -154,7 +141,7 @@ fn compaction_preserves_frames_across_interleaved_push_poll() {
   }
 }
 
-/// EXHAUSTIVE split matrix: a three-frame stream (empty / small / threshold-ish payloads) split
+/// EXHAUSTIVE split matrix: a three-frame stream (empty / small / 300-byte payloads) split
 /// into two pushes at EVERY byte boundary must yield exactly the three payloads, regardless of
 /// where the cut lands (header straddles, payload straddles, frame joins).
 #[test]
@@ -168,15 +155,14 @@ fn every_two_chunk_split_reassembles_three_frames() {
     let mut dec = FrameDecoder::new();
     dec.push(&wire[..cut]);
     dec.push(&wire[cut..]);
-    let mut out = Vec::new();
     for (i, expected) in payloads.iter().enumerate() {
-      assert!(
-        dec.poll(&mut out).unwrap(),
-        "cut {cut}: frame {i} must be produced"
-      );
-      assert_eq!(&out[..], *expected, "cut {cut}: frame {i} intact");
+      let frame = dec
+        .poll()
+        .unwrap()
+        .unwrap_or_else(|| panic!("cut {cut}: frame {i} must be produced"));
+      assert_eq!(&frame[..], *expected, "cut {cut}: frame {i} intact");
     }
-    assert!(!dec.poll(&mut out).unwrap(), "cut {cut}: nothing extra");
+    assert!(dec.poll().unwrap().is_none(), "cut {cut}: nothing extra");
     assert_eq!(dec.buffered_for_test(), 0, "cut {cut}: fully drained");
   }
 }

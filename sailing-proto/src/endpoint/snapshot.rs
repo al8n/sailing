@@ -194,7 +194,7 @@ where
     // Step 1: decode the SM snapshot (fail-fast; leave NO partial state). The decoded snapshot is HELD
     // in `pending_install` and applied to the SM only once the blob is durable (`install_snapshot_now`)
     // — NOT here, so a crash before the blob lands leaves the SM and log untouched and recoverable.
-    let snap = match <F::Snapshot as crate::Data>::decode_exact(is.data()) {
+    let snap = match <F::Snapshot as crate::Data>::decode_exact(is.data().clone()) {
       Ok(s) => s,
       Err(_) => {
         self.poison(PoisonReason::SnapshotDecode);
