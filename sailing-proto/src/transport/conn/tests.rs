@@ -5,11 +5,77 @@ use crate::{
     ClusterId,
     labeled::{LabelOptions, Labeled},
     passthrough::Passthrough,
+    stream::{Intake, RecordIo, sealed},
   },
 };
 use std::vec::Vec;
 
 type C = Conn<u64, Labeled<Passthrough>>;
+
+/// A test record layer that accepts at most `cap` plaintext bytes per `write_plaintext` call (to
+/// force the backpressure / partial-accept path), pipes plaintext through, and reports a fixed
+/// peer identity (so a `Conn` validates immediately and we can feed it a crafted id).
+struct Throttle {
+  cap: usize,
+  inbound: Vec<u8>,
+  outbound: Vec<u8>,
+  ident: Option<Vec<u8>>,
+}
+
+impl Throttle {
+  fn new(cap: usize, ident: Option<Vec<u8>>) -> Self {
+    Self {
+      cap,
+      inbound: Vec::new(),
+      outbound: Vec::new(),
+      ident,
+    }
+  }
+}
+
+impl sealed::Sealed for Throttle {}
+
+impl RecordIo for Throttle {
+  fn handle_transport_data(&mut self, input: &[u8], _now: Instant) -> Intake {
+    self.inbound.extend_from_slice(input);
+    Intake::Done
+  }
+  fn poll_transport_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    let n = self.outbound.len();
+    out.extend_from_slice(&self.outbound);
+    self.outbound.clear();
+    n
+  }
+  fn read_plaintext(&mut self, out: &mut Vec<u8>) -> usize {
+    let n = self.inbound.len();
+    out.extend_from_slice(&self.inbound);
+    self.inbound.clear();
+    n
+  }
+  fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    let take = plaintext.len().min(self.cap);
+    self.outbound.extend_from_slice(&plaintext[..take]);
+    take
+  }
+  fn is_handshaking(&self) -> bool {
+    self.ident.is_none()
+  }
+  fn peer_identity(&self) -> Option<&[u8]> {
+    self.ident.as_deref()
+  }
+  fn peer_has_closed(&self) -> bool {
+    false
+  }
+  fn is_secure() -> bool {
+    false
+  }
+}
+
+fn enc_id(id: u64) -> Vec<u8> {
+  let mut v = Vec::new();
+  id.encode(&mut v);
+  v
+}
 
 fn opts(id: u64) -> LabelOptions {
   let mut local_id = Vec::new();
@@ -107,4 +173,46 @@ fn eof_closes_the_conn() {
   let mut a = acceptor(9);
   a.handle_data(&[], true, Instant::ORIGIN).unwrap();
   assert!(a.is_closed());
+}
+
+#[test]
+fn backpressured_write_never_truncates_a_frame() {
+  // A record layer that accepts only 3 plaintext bytes per write — a hostile backpressure pattern.
+  // The full framed message must still reach the wire intact across repeated drains, never a prefix
+  // that a later frame could complete into a corrupted-but-valid message.
+  let mut sender: Conn<u64, Throttle> = Conn::new(Throttle::new(3, Some(enc_id(7))));
+  sender.send_message(&sample_msg());
+  sender.send_message(&sample_msg());
+
+  // Drain the wire in many small pulls, exactly as the throttle allows.
+  let mut wire = Vec::new();
+  for _ in 0..500 {
+    let mut chunk = Vec::new();
+    if sender.poll_transmit(&mut chunk) == 0 {
+      break;
+    }
+    wire.extend_from_slice(&chunk);
+  }
+
+  // Feed the collected wire into a fresh receiver and confirm BOTH messages decode intact.
+  let mut receiver: Conn<u64, Throttle> = Conn::new(Throttle::new(usize::MAX, Some(enc_id(7))));
+  receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
+  let mut msgs = Vec::new();
+  receiver.poll_decoded(&mut msgs).unwrap();
+  assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
+}
+
+#[test]
+fn peer_id_with_trailing_bytes_is_rejected() {
+  // A valid u64 NodeId encoding followed by a trailing byte is a malformed identity, not a peer.
+  let mut ident = enc_id(7);
+  ident.push(0xAB);
+  let mut conn: Conn<u64, Throttle> = Conn::new(Throttle::new(usize::MAX, Some(ident)));
+  let err = conn.handle_data(b"anything", false, Instant::ORIGIN);
+  assert!(
+    err.is_err(),
+    "trailing bytes after the id must fail validation"
+  );
+  assert!(conn.is_closed());
+  assert_eq!(conn.peer(), None);
 }

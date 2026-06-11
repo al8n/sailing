@@ -64,3 +64,18 @@ fn rejects_oversize_length() {
   let mut out = Vec::new();
   assert_eq!(dec.poll(&mut out), Err(TransportError::FrameTooLarge));
 }
+
+#[test]
+fn oversize_length_latches_failed_at_push_and_frees_buffer() {
+  let mut dec = FrameDecoder::new();
+  // A hostile read: an oversized length prefix followed by some payload bytes.
+  let mut hostile = (MAX_FRAME_LEN as u32 + 1).to_be_bytes().to_vec();
+  hostile.extend_from_slice(&[0u8; 1024]);
+  dec.push(&hostile);
+  // The decoder latched failed at push time and dropped the buffered bytes (no retention).
+  assert!(dec.is_failed_for_test());
+  // A subsequent push is ignored, and poll keeps reporting the terminal error.
+  dec.push(b"more bytes that must be ignored");
+  let mut out = Vec::new();
+  assert_eq!(dec.poll(&mut out), Err(TransportError::FrameTooLarge));
+}
