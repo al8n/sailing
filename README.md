@@ -23,9 +23,9 @@ deterministic simulator.
 
 ## Status
 
-**Pre-release.** The consensus core and the TCP/TLS stream transport are implemented and heavily
-tested (see *Correctness* below); the QUIC transport and a reference async driver are in progress.
-The wire format and public API may still change until 0.1.
+**Pre-release.** The consensus core and the TCP/TLS/QUIC transports are implemented and heavily
+tested (see *Correctness* below); a reference async driver is in progress. The wire format and
+public API may still change until 0.1.
 
 ## Features
 
@@ -89,7 +89,7 @@ connection routing — the driver only moves bytes between sockets and the coord
 | `alloc` | the `no_std` heap tier | no_std |
 | `tcp` | the framed stream transport (no crypto) | **no_std + alloc OK** |
 | `tls` | `tcp` + rustls record layer (+ `tls-ring` / `tls-aws-lc-rs` providers) | std |
-| `quic` | reserved — the QUIC coordinator (quinn-proto) is not yet implemented | std |
+| `quic` | the QUIC coordinator: quinn-proto datagrams, mandatory cluster mTLS, one consensus stream per peer | std (implies `tcp`) |
 
 The byte-level wire format is pinned in
 [`sailing-proto/WIRE.md`](sailing-proto/WIRE.md) (normative, with golden vectors in the tests).
