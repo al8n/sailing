@@ -584,6 +584,14 @@ where
   /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
   /// this field to `None`.
   pending_compact: Option<(crate::OpId, Index)>,
+  /// Per-peer countdown (in heartbeat-response rounds) until the next `InstallSnapshot` resend to a
+  /// `Snapshot`-state peer. A deferred install legitimately takes many heartbeat intervals (blob
+  /// fsync + apply), so resending the full blob on EVERY response would re-transmit a large
+  /// snapshot tens of times per install; the countdown spaces resends roughly one election timeout
+  /// apart — a genuinely DROPPED blob is still retried within one election timeout (liveness), at
+  /// ~1/heartbeat of the egress cost. Entries clear when the peer leaves `Snapshot` state and on
+  /// leadership change.
+  snapshot_resend_backoff: BTreeMap<I, u32>,
   /// Term-before-respond durability. The highest `Term` whose HardState write has reached stable
   /// storage — `term_is_durable()` is simply `durable_term >= self.term`. Seeded to the initial/recovered
   /// term (trivially durable: it came from durable HardState or is the bootstrap term), then advanced in
@@ -769,6 +777,7 @@ where
       poisoned: false,
       poison_reason: None,
       pending_compact: None,
+      snapshot_resend_backoff: BTreeMap::new(),
       // fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
       // `term_is_durable()` is true and acks are never spuriously deferred at startup.
       durable_term: Term::ZERO,
