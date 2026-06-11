@@ -13,6 +13,8 @@ mod frame;
 mod labeled;
 #[cfg(feature = "tcp")]
 mod passthrough;
+#[cfg(feature = "quic")]
+pub mod quic;
 #[cfg(feature = "tcp")]
 mod router;
 #[cfg(feature = "tcp")]
