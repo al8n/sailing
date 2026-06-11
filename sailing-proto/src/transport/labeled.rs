@@ -16,11 +16,11 @@ const LABEL_MAGIC: u8 = 0xCA;
 /// reject each other at the handshake instead of mis-decoding consensus traffic.
 const LABEL_VERSION: u8 = 1;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
-const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
+pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 /// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes
 /// (a u64 is 8); the u16 length field would otherwise admit ~64 KiB of pre-authentication
 /// buffering chosen by an unauthenticated peer.
-const MAX_PEER_ID_LEN: usize = 1024;
+pub(super) const MAX_PEER_ID_LEN: usize = 1024;
 
 /// Construction parameters for a [`Labeled`] layer.
 pub struct LabelOptions {
@@ -30,7 +30,7 @@ pub struct LabelOptions {
   pub local_id: Vec<u8>,
 }
 
-fn build_hello(cluster: &ClusterId, local_id: &[u8]) -> Vec<u8> {
+pub(super) fn build_hello(cluster: &ClusterId, local_id: &[u8]) -> Vec<u8> {
   let mut h = Vec::with_capacity(HELLO_HEADER + local_id.len());
   h.push(LABEL_MAGIC);
   h.push(LABEL_VERSION);
@@ -38,6 +38,35 @@ fn build_hello(cluster: &ClusterId, local_id: &[u8]) -> Vec<u8> {
   h.extend_from_slice(&(local_id.len() as u16).to_be_bytes());
   h.extend_from_slice(local_id);
   h
+}
+
+/// TOTAL parse of one COMPLETE hello against `our` cluster, returning the peer-id bytes.
+///
+/// The QUIC transport's control preface is exactly one hello delivered as one complete frame, so —
+/// unlike [`Labeled`]'s incremental byte-stream parse, where a short prefix legitimately waits for
+/// more bytes — every violation here is terminal: a magic/version/cluster mismatch, an id length
+/// outside `1..=MAX_PEER_ID_LEN`, a frame shorter than the advertised id, or TRAILING bytes after it
+/// (the id must consume the frame exactly; a "valid hello plus junk" is a framing violation, not a
+/// hello). Returns `None` for all of them.
+#[cfg(feature = "quic")]
+pub(super) fn parse_hello_frame<'a>(frame: &'a [u8], our: &ClusterId) -> Option<&'a [u8]> {
+  if frame.len() < HELLO_HEADER {
+    return None;
+  }
+  if frame[0] != LABEL_MAGIC || frame[1] != LABEL_VERSION {
+    return None;
+  }
+  if frame[2..18] != our.0 {
+    return None;
+  }
+  let peer_id_len = u16::from_be_bytes([frame[18], frame[19]]) as usize;
+  if peer_id_len == 0 || peer_id_len > MAX_PEER_ID_LEN {
+    return None;
+  }
+  if frame.len() != HELLO_HEADER + peer_id_len {
+    return None;
+  }
+  Some(&frame[HELLO_HEADER..])
 }
 
 /// Wraps any record layer with the cluster + peer-id hello. The dialer sends its hello eagerly; the
