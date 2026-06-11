@@ -1,6 +1,11 @@
 use super::*;
 use std::vec;
 
+/// Test helper: exact decode from a plain slice (copies into `Bytes` for the cursor API).
+fn dx<T: crate::Data>(buf: &[u8]) -> Result<T, crate::DecodeError> {
+  T::decode_exact(bytes::Bytes::copy_from_slice(buf))
+}
+
 // ── ConfState ──────────────────────────────────────────────────────────────
 
 #[test]
@@ -126,21 +131,20 @@ fn conf_change_type_roundtrip() {
     let mut buf = std::vec::Vec::new();
     ty.encode(&mut buf);
     assert_eq!(buf.len(), 1);
-    let (n, decoded) = ConfChangeType::decode(&buf).unwrap();
-    assert_eq!(n, 1);
+    let decoded = dx::<ConfChangeType>(&buf).unwrap();
     assert_eq!(decoded, ty);
   }
 }
 
 #[test]
 fn conf_change_type_bad_discriminant() {
-  assert!(ConfChangeType::decode(&[99u8]).is_err());
+  assert!(dx::<ConfChangeType>(&[99u8]).is_err());
 }
 
 #[test]
 fn conf_change_type_empty_buf() {
   assert!(matches!(
-    ConfChangeType::decode(&[]),
+    dx::<ConfChangeType>(&[]),
     Err(DecodeError::UnexpectedEof)
   ));
 }
@@ -176,8 +180,7 @@ fn conf_change_transition_roundtrip() {
     let mut buf = std::vec::Vec::new();
     tr.encode(&mut buf);
     assert_eq!(buf.len(), 1);
-    let (n, decoded) = ConfChangeTransition::decode(&buf).unwrap();
-    assert_eq!(n, 1);
+    let decoded = dx::<ConfChangeTransition>(&buf).unwrap();
     assert_eq!(decoded, tr);
   }
 }
@@ -189,13 +192,13 @@ fn conf_change_transition_default_is_auto() {
 
 #[test]
 fn conf_change_transition_bad_discriminant() {
-  assert!(ConfChangeTransition::decode(&[99u8]).is_err());
+  assert!(dx::<ConfChangeTransition>(&[99u8]).is_err());
 }
 
 #[test]
 fn conf_change_transition_empty_buf() {
   assert!(matches!(
-    ConfChangeTransition::decode(&[]),
+    dx::<ConfChangeTransition>(&[]),
     Err(DecodeError::UnexpectedEof)
   ));
 }
@@ -217,20 +220,19 @@ fn conf_change_single_roundtrip() {
   let c = ConfChangeSingle::new(ConfChangeType::AddNode, 42u64);
   let mut buf = std::vec::Vec::new();
   c.encode(&mut buf);
-  let (n, decoded) = ConfChangeSingle::<u64>::decode(&buf).unwrap();
-  assert_eq!(n, buf.len());
+  let decoded = dx::<ConfChangeSingle<u64>>(&buf).unwrap();
   assert_eq!(decoded, c);
 }
 
 #[test]
 fn conf_change_single_truncated() {
   // One byte (type only, missing node).
-  assert!(ConfChangeSingle::<u64>::decode(&[0u8]).is_err());
+  assert!(dx::<ConfChangeSingle::<u64>>(&[0u8]).is_err());
 }
 
 #[test]
 fn conf_change_single_empty_buf() {
-  assert!(ConfChangeSingle::<u64>::decode(&[]).is_err());
+  assert!(dx::<ConfChangeSingle::<u64>>(&[]).is_err());
 }
 
 // ── ConfChange ─────────────────────────────────────────────────────────────
@@ -240,8 +242,7 @@ fn conf_change_roundtrip_with_context() {
   let c = ConfChange::new(ConfChangeType::AddNode, 7u64, Bytes::from_static(b"ctx"));
   let mut buf = std::vec::Vec::new();
   c.encode(&mut buf);
-  let (n, decoded) = ConfChange::<u64>::decode(&buf).unwrap();
-  assert_eq!(n, buf.len());
+  let decoded = dx::<ConfChange<u64>>(&buf).unwrap();
   assert_eq!(decoded, c);
 }
 
@@ -250,15 +251,14 @@ fn conf_change_roundtrip_empty_context() {
   let c = ConfChange::new(ConfChangeType::RemoveNode, 3u64, Bytes::new());
   let mut buf = std::vec::Vec::new();
   c.encode(&mut buf);
-  let (n, decoded) = ConfChange::<u64>::decode(&buf).unwrap();
-  assert_eq!(n, buf.len());
+  let decoded = dx::<ConfChange<u64>>(&buf).unwrap();
   assert_eq!(decoded, c);
 }
 
 #[test]
 fn conf_change_truncated() {
   // Truncated after type byte.
-  assert!(ConfChange::<u64>::decode(&[0u8]).is_err());
+  assert!(dx::<ConfChange::<u64>>(&[0u8]).is_err());
 }
 
 #[test]
@@ -283,8 +283,7 @@ fn conf_change_v2_roundtrip_empty_changes() {
   );
   let mut buf = std::vec::Vec::new();
   v2.encode(&mut buf);
-  let (n, decoded) = ConfChangeV2::<u64>::decode(&buf).unwrap();
-  assert_eq!(n, buf.len());
+  let decoded = dx::<ConfChangeV2<u64>>(&buf).unwrap();
   assert_eq!(decoded, v2);
 }
 
@@ -301,15 +300,14 @@ fn conf_change_v2_roundtrip_multi_change() {
   );
   let mut buf = std::vec::Vec::new();
   v2.encode(&mut buf);
-  let (n, decoded) = ConfChangeV2::<u64>::decode(&buf).unwrap();
-  assert_eq!(n, buf.len());
+  let decoded = dx::<ConfChangeV2<u64>>(&buf).unwrap();
   assert_eq!(decoded, v2);
 }
 
 #[test]
 fn conf_change_v2_truncated_after_transition() {
   // Only the transition byte, nothing else.
-  assert!(ConfChangeV2::<u64>::decode(&[0u8]).is_err());
+  assert!(dx::<ConfChangeV2::<u64>>(&[0u8]).is_err());
 }
 
 #[test]
@@ -320,15 +318,15 @@ fn conf_change_v2_truncated_mid_changes() {
   (2u64).encode(&mut buf); // 8 bytes (len = 2 changes)
   ConfChangeSingle::new(ConfChangeType::AddNode, 1u64).encode(&mut buf); // 1+8 = 9 bytes
   // missing 2nd change → decode must fail, not panic
-  assert!(ConfChangeV2::<u64>::decode(&buf).is_err());
+  assert!(dx::<ConfChangeV2::<u64>>(&buf).is_err());
 }
 
 #[test]
 fn conf_change_v2_empty_buf() {
-  assert!(ConfChangeV2::<u64>::decode(&[]).is_err());
+  assert!(dx::<ConfChangeV2::<u64>>(&[]).is_err());
 }
 
 #[test]
 fn conf_change_v2_bad_transition_discriminant() {
-  assert!(ConfChangeV2::<u64>::decode(&[99u8]).is_err());
+  assert!(dx::<ConfChangeV2::<u64>>(&[99u8]).is_err());
 }

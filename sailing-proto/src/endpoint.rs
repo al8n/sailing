@@ -1374,7 +1374,8 @@ where
       };
       match entry.kind() {
         crate::EntryKind::Normal => {
-          let cmd = match <F::Command as crate::Data>::decode_exact(entry.data()) {
+          // Zero-copy: the command decodes from a shared slice of the entry's payload.
+          let cmd = match <F::Command as crate::Data>::decode_exact(entry.data_bytes()) {
             Ok(c) => c,
             // A committed entry whose payload won't decode is corrupt/unrecoverable → poison.
             Err(_) => {
@@ -1396,7 +1397,7 @@ where
         crate::EntryKind::Empty => {} // no-op: just advance applied
         crate::EntryKind::ConfChange => {
           // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
-          let cc = match <crate::ConfChangeV2<I> as crate::Data>::decode_exact(entry.data()) {
+          let cc = match <crate::ConfChangeV2<I> as crate::Data>::decode_exact(entry.data_bytes()) {
             Ok(c) => c,
             Err(_) => {
               self.poison(PoisonReason::ConfChangeDecode);

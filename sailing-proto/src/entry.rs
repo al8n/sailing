@@ -86,13 +86,12 @@ impl Data for EntryKind {
     });
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), crate::DecodeError> {
-    match buf.first() {
-      Some(0) => Ok((1, Self::Normal)),
-      Some(1) => Ok((1, Self::ConfChange)),
-      Some(2) => Ok((1, Self::Empty)),
-      Some(_) => Err(crate::DecodeError::Invalid("EntryKind")),
-      None => Err(crate::DecodeError::UnexpectedEof),
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, crate::DecodeError> {
+    match cur.take_u8()? {
+      0 => Ok(Self::Normal),
+      1 => Ok(Self::ConfChange),
+      2 => Ok(Self::Empty),
+      _ => Err(crate::DecodeError::Invalid("EntryKind")),
     }
   }
 }
@@ -105,13 +104,13 @@ impl Data for Entry {
     self.data.encode(buf);
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), crate::DecodeError> {
-    let mut d = crate::data::Decoder::new(buf);
-    let term = d.read::<Term>()?;
-    let index = d.read::<Index>()?;
-    let kind = d.read::<EntryKind>()?;
-    let data = d.read::<Bytes>()?;
-    Ok((d.pos(), Self::new(term, index, kind, data)))
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, crate::DecodeError> {
+    let term = Term::decode(cur)?;
+    let index = Index::decode(cur)?;
+    let kind = EntryKind::decode(cur)?;
+    // Zero-copy: the payload is an O(1) shared slice of the frame's allocation.
+    let data = Bytes::decode(cur)?;
+    Ok(Self::new(term, index, kind, data))
   }
 }
 

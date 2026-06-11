@@ -1,5 +1,6 @@
 //! Length-prefixed framing: `[u32 big-endian length][payload]`, with a bounded decoder.
 use super::TransportError;
+use bytes::{Bytes, BytesMut};
 use std::vec::Vec;
 
 /// The largest single frame payload accepted (64 MiB). A length prefix above this is rejected
@@ -25,14 +26,16 @@ pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
 /// [`poll`](Self::poll) reports `FrameTooLarge`; the caller closes the connection — frames already
 /// buffered are dropped, which is equivalent to in-flight loss and safe for the retry-driven
 /// consensus layer above).
+///
+/// [`poll`](Self::poll) yields each frame's payload as a ZERO-COPY shared [`Bytes`] slice of the
+/// accumulation buffer (`BytesMut::split_to` + freeze — O(1), no memmove), so a decoded `Message`'s
+/// `Bytes` fields (entry payloads, snapshot blobs, contexts) share the buffer end-to-end. The
+/// deliberate flip side: a long-retained slice (an entry payload living in the log) keeps its
+/// buffer GENERATION alive — `BytesMut` starts a fresh allocation when it must grow while old
+/// slices still exist, so a generation's footprint is one burst, not the connection's lifetime.
 pub(crate) struct FrameDecoder {
-  /// Consumed prefix (before `start`), then complete frames awaiting [`poll`](Self::poll), then the
-  /// bytes of the trailing partial frame.
-  buf: Vec<u8>,
-  /// Read cursor: bytes before it were already yielded by `poll`. Popping a frame advances the
-  /// cursor instead of `Vec::drain` (which would memmove the whole remaining buffer per frame —
-  /// O(buffered²) across a burst); the consumed prefix is reclaimed wholesale, amortized O(1)/byte.
-  start: usize,
+  /// Complete frames awaiting [`poll`](Self::poll), then the bytes of the trailing partial frame.
+  buf: BytesMut,
   /// Bytes of the trailing partial frame present at the tail of `buf` (header + payload so far).
   fill: usize,
   /// Total size (4 + declared payload length) of the trailing partial frame, once its header has
@@ -42,15 +45,11 @@ pub(crate) struct FrameDecoder {
   failed: bool,
 }
 
-/// Reclaim the consumed prefix once it crosses this size (amortizes the memmove across many pops).
-const COMPACT_THRESHOLD: usize = 64 * 1024;
-
 impl FrameDecoder {
   /// A decoder with an empty buffer.
   pub(crate) fn new() -> Self {
     Self {
-      buf: Vec::new(),
-      start: 0,
+      buf: BytesMut::new(),
       fill: 0,
       expect: None,
       failed: false,
@@ -80,8 +79,7 @@ impl FrameDecoder {
           let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
           if len > MAX_FRAME_LEN {
             self.failed = true;
-            self.buf = Vec::new();
-            self.start = 0;
+            self.buf = BytesMut::new();
             self.fill = 0;
             self.expect = None;
             return;
@@ -111,52 +109,28 @@ impl FrameDecoder {
     }
   }
 
-  /// Pop the next complete frame's payload into `out` (which is cleared first).
+  /// Pop the next complete frame's payload as a zero-copy shared [`Bytes`] slice.
   ///
-  /// Returns `Ok(true)` if a frame was produced, `Ok(false)` if more bytes are needed, and
+  /// Returns `Ok(Some(payload))` if a frame was produced, `Ok(None)` if more bytes are needed, and
   /// `Err(FrameTooLarge)` once the decoder has latched the terminal oversized-frame failure.
-  pub(crate) fn poll(&mut self, out: &mut Vec<u8>) -> Result<bool, TransportError> {
+  pub(crate) fn poll(&mut self) -> Result<Option<Bytes>, TransportError> {
     if self.failed {
       return Err(TransportError::FrameTooLarge);
     }
-    // Complete frames live between the cursor and the trailing partial one (`fill` tail bytes).
-    let complete = self.buf.len() - self.start - self.fill;
+    // Complete frames precede the trailing partial one (`fill` bytes at the tail).
+    let complete = self.buf.len() - self.fill;
     if complete < 4 {
-      self.maybe_compact();
-      return Ok(false);
+      return Ok(None);
     }
-    let h = &self.buf[self.start..self.start + 4];
-    let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+    let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
     debug_assert!(len <= MAX_FRAME_LEN, "headers are validated at push time");
-    if complete < 4 + len {
-      self.maybe_compact();
-      return Ok(false);
+    let end = 4 + len;
+    if complete < end {
+      return Ok(None);
     }
-    out.clear();
-    out.extend_from_slice(&self.buf[self.start + 4..self.start + 4 + len]);
-    self.start += 4 + len;
-    self.maybe_compact();
-    Ok(true)
-  }
-
-  /// Reclaim the consumed prefix: free when everything is consumed, else memmove it away once it
-  /// crosses the amortization threshold AND is at least as large as the bytes it would move.
-  /// The proportionality condition is what makes the amortization real: compacting on the absolute
-  /// threshold alone would memmove the WHOLE remaining backlog after every ≥64 KiB frame popped —
-  /// quadratic in the per-read backlog. Requiring consumed ≥ remaining bounds total moved bytes at
-  /// ~2× the bytes ever buffered (each byte is moved at most once per halving), i.e. O(1)/byte.
-  fn maybe_compact(&mut self) {
-    if self.start == 0 {
-      return;
-    }
-    if self.start == self.buf.len() {
-      self.buf.clear();
-      self.start = 0;
-      super::shrink_excess(&mut self.buf);
-    } else if self.start >= COMPACT_THRESHOLD && self.start >= self.buf.len() - self.start {
-      self.buf.drain(..self.start);
-      self.start = 0;
-    }
+    // O(1): split the frame off the front (pointer arithmetic, no memmove) and drop the header.
+    let frame = self.buf.split_to(end).freeze();
+    Ok(Some(frame.slice(4..)))
   }
 
   /// Test-only: whether the decoder has latched the terminal oversized-frame failure.
@@ -169,7 +143,7 @@ impl FrameDecoder {
   /// retained).
   #[cfg(test)]
   pub(crate) fn buffered_for_test(&self) -> usize {
-    self.buf.len() - self.start
+    self.buf.len()
   }
 }
 

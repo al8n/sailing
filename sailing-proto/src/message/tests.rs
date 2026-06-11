@@ -1,5 +1,10 @@
 use super::*;
 
+/// Test helper: exact decode from a plain slice (copies into `Bytes` for the cursor API).
+fn dx<T: crate::Data>(buf: &[u8]) -> Result<T, crate::DecodeError> {
+  T::decode_exact(bytes::Bytes::copy_from_slice(buf))
+}
+
 #[test]
 fn message_construct_and_classify() {
   let rv = RequestVote::new(
@@ -79,8 +84,7 @@ fn codec_round_trips_every_variant() {
   fn rt(m: Message<u64>) {
     let mut buf = std::vec::Vec::new();
     m.encode(&mut buf);
-    let (n, back) = Message::<u64>::decode(&buf).expect("decode");
-    assert_eq!(n, buf.len(), "consumes exactly all bytes: {m:?}");
+    let back = dx::<Message<u64>>(&buf).expect("decode");
     assert_eq!(back, m, "round-trips: {m:?}");
   }
 
@@ -178,18 +182,17 @@ fn codec_rejects_truncated_input_without_panic() {
   for cut in 0..buf.len() {
     // Every strict prefix must error — never panic, never decode as a different value.
     assert!(
-      Message::<u64>::decode(&buf[..cut]).is_err(),
+      dx::<Message::<u64>>(&buf[..cut]).is_err(),
       "prefix len {cut} must fail"
     );
   }
-  assert!(Message::<u64>::decode(&buf).is_ok());
+  assert!(dx::<Message::<u64>>(&buf).is_ok());
 }
 
 #[test]
 fn codec_rejects_unknown_tag_and_empty() {
-  use crate::Data;
-  assert!(Message::<u64>::decode(&[0xFF]).is_err());
-  assert!(Message::<u64>::decode(&[]).is_err());
+  assert!(dx::<Message<u64>>(&[0xFF]).is_err());
+  assert!(dx::<Message<u64>>(&[]).is_err());
 }
 
 #[test]
@@ -203,7 +206,7 @@ fn codec_rejects_oversized_collection_length() {
   Index::new(0).encode(&mut buf);
   Term::new(0).encode(&mut buf);
   u64::MAX.encode(&mut buf); // entries count = u64::MAX, with nothing following
-  assert!(Message::<u64>::decode(&buf).is_err());
+  assert!(dx::<Message::<u64>>(&buf).is_err());
 }
 
 /// GOLDEN WIRE VECTORS: pin the exact byte encoding of representative messages, so any
@@ -276,7 +279,7 @@ fn codec_rejects_out_of_range_duration_nanos() {
   let n = buf.len();
   buf[n - 8..].copy_from_slice(&1_000_000_000u64.to_le_bytes()); // nanos = 1e9: out of domain
   assert!(
-    Message::<u64>::decode(&buf).is_err(),
+    dx::<Message::<u64>>(&buf).is_err(),
     "nanos >= 1e9 must be rejected (canonical duration encoding)"
   );
 }
@@ -364,12 +367,11 @@ fn codec_truncation_sweep_covers_every_variant() {
     m.encode(&mut buf);
     for cut in 0..buf.len() {
       assert!(
-        Message::<u64>::decode(&buf[..cut]).is_err(),
+        dx::<Message::<u64>>(&buf[..cut]).is_err(),
         "{m:?}: prefix of len {cut} must fail"
       );
     }
-    let (n, back) = Message::<u64>::decode(&buf).expect("full decode");
-    assert_eq!(n, buf.len());
+    let back = dx::<Message<u64>>(&buf).expect("full decode");
     assert_eq!(back, m);
   }
 }

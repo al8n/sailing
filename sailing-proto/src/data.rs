@@ -1,24 +1,99 @@
 //! `Data`: the per-element wire codec for the generic plug-in types. Values are
 //! length-known and self-describing enough to nest inside a `bytes` field. The codec
 //! here is deliberately minimal (fixed/var width primitives).
+//!
+//! Decoding is ZERO-COPY for `Bytes` fields: [`Data::decode`] reads from a [`ByteCursor`] over a
+//! shared [`bytes::Bytes`], so a `Bytes` field decodes as an O(1) refcount slice of the input
+//! buffer rather than a fresh allocation + memcpy. Entry payloads, snapshot blobs, and read
+//! contexts therefore share the frame's allocation end-to-end. The flip side (deliberate, the
+//! standard `bytes` trade-off): a decoded slice keeps the WHOLE backing buffer alive — callers
+//! that retain a tiny slice of a large frame for a long time pin the frame's allocation.
+use bytes::Bytes;
 use std::{collections::BTreeSet, vec::Vec};
+
+/// A read cursor over a shared [`Bytes`] buffer.
+///
+/// Each read bounds-checks against the remaining input and advances past exactly the bytes
+/// consumed; [`take_bytes`](Self::take_bytes) hands out an O(1) shared slice (no copy). Decoders
+/// cannot read past their input or miscount offsets — the cursor owns the position.
+pub struct ByteCursor {
+  buf: Bytes,
+  pos: usize,
+}
+
+impl ByteCursor {
+  /// Start decoding at the front of `buf`.
+  #[inline]
+  pub fn new(buf: Bytes) -> Self {
+    Self { buf, pos: 0 }
+  }
+
+  /// Bytes not yet consumed.
+  #[inline]
+  pub fn remaining(&self) -> usize {
+    self.buf.len() - self.pos
+  }
+
+  /// Whether the input is fully consumed.
+  #[inline]
+  pub fn is_empty(&self) -> bool {
+    self.remaining() == 0
+  }
+
+  /// Consume exactly `N` bytes as a fixed-size array (the primitive-width read).
+  #[inline]
+  pub(crate) fn take_array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+    let end = self.pos.checked_add(N).ok_or(DecodeError::UnexpectedEof)?;
+    let slice = self
+      .buf
+      .get(self.pos..end)
+      .ok_or(DecodeError::UnexpectedEof)?;
+    let arr: [u8; N] = slice.try_into().map_err(|_| DecodeError::UnexpectedEof)?;
+    self.pos = end;
+    Ok(arr)
+  }
+
+  /// Consume one byte.
+  #[inline]
+  pub(crate) fn take_u8(&mut self) -> Result<u8, DecodeError> {
+    let b = *self.buf.get(self.pos).ok_or(DecodeError::UnexpectedEof)?;
+    self.pos += 1;
+    Ok(b)
+  }
+
+  /// Consume exactly `len` bytes as a shared, zero-copy slice of the underlying buffer.
+  #[inline]
+  pub fn take_bytes(&mut self, len: usize) -> Result<Bytes, DecodeError> {
+    let end = self
+      .pos
+      .checked_add(len)
+      .ok_or(DecodeError::UnexpectedEof)?;
+    if end > self.buf.len() {
+      return Err(DecodeError::UnexpectedEof);
+    }
+    let out = self.buf.slice(self.pos..end);
+    self.pos = end;
+    Ok(out)
+  }
+}
 
 /// A value that can be encoded to and decoded from bytes.
 pub trait Data: Sized {
   /// Append the encoding of `self` to `buf`.
   fn encode(&self, buf: &mut Vec<u8>);
-  /// Decode a value from the front of `buf`, returning `(bytes_consumed, value)`.
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError>;
+  /// Decode a value from the cursor, advancing it past exactly the bytes consumed.
+  fn decode(cur: &mut ByteCursor) -> Result<Self, DecodeError>;
 
   /// Decode a value that must occupy the WHOLE buffer — trailing bytes are an error.
   ///
-  /// The prefix decoder above is right for cursoring through a struct's fields; this is the form
+  /// The cursor decoder above is right for reading through a struct's fields; this is the form
   /// for a self-contained payload (an entry's command, a snapshot blob, a conf-change record),
   /// where trailing garbage means the payload is malformed — accepting it would let two distinct
   /// byte strings decode to the same value (non-canonical input).
-  fn decode_exact(buf: &[u8]) -> Result<Self, DecodeError> {
-    let (n, value) = Self::decode(buf)?;
-    if n != buf.len() {
+  fn decode_exact(buf: Bytes) -> Result<Self, DecodeError> {
+    let mut cur = ByteCursor::new(buf);
+    let value = Self::decode(&mut cur)?;
+    if !cur.is_empty() {
       return Err(DecodeError::Invalid("trailing bytes after value"));
     }
     Ok(value)
@@ -38,15 +113,14 @@ pub enum DecodeError {
 }
 
 /// Decode a `u64` length/count prefix and narrow it to `usize` — the single safe conversion point for
-/// every length-prefixed decode. Returns `(bytes_consumed, len)`. A length that exceeds `usize::MAX`
-/// (only reachable on a sub-64-bit target) is rejected as `Invalid(what)` rather than silently
-/// truncated by `as usize`: truncation (e.g. `2^32` → `0` on a 32-bit target) would let an oversized
-/// prefix decode as a *different, shorter* value instead of failing. All collection/bytes decoders
-/// MUST route their length through here so the bound cannot regress per-site.
-pub(crate) fn decode_len(buf: &[u8], what: &'static str) -> Result<(usize, usize), DecodeError> {
-  let (n, raw) = u64::decode(buf)?;
-  let len = usize::try_from(raw).map_err(|_| DecodeError::Invalid(what))?;
-  Ok((n, len))
+/// every length-prefixed decode. A length that exceeds `usize::MAX` (only reachable on a sub-64-bit
+/// target) is rejected as `Invalid(what)` rather than silently truncated by `as usize`: truncation
+/// (e.g. `2^32` → `0` on a 32-bit target) would let an oversized prefix decode as a *different,
+/// shorter* value instead of failing. All collection/bytes decoders MUST route their length through
+/// here so the bound cannot regress per-site.
+pub(crate) fn decode_len(cur: &mut ByteCursor, what: &'static str) -> Result<usize, DecodeError> {
+  let raw = u64::decode(cur)?;
+  usize::try_from(raw).map_err(|_| DecodeError::Invalid(what))
 }
 
 impl Data for u64 {
@@ -55,13 +129,8 @@ impl Data for u64 {
     buf.extend_from_slice(&self.to_le_bytes());
   }
   #[inline]
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let bytes: [u8; 8] = buf
-      .get(..8)
-      .ok_or(DecodeError::UnexpectedEof)?
-      .try_into()
-      .map_err(|_| DecodeError::UnexpectedEof)?;
-    Ok((8, u64::from_le_bytes(bytes)))
+  fn decode(cur: &mut ByteCursor) -> Result<Self, DecodeError> {
+    Ok(u64::from_le_bytes(cur.take_array::<8>()?))
   }
 }
 
@@ -71,12 +140,11 @@ impl Data for bool {
     buf.push(*self as u8);
   }
   #[inline]
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    match buf.first() {
-      Some(0) => Ok((1, false)),
-      Some(1) => Ok((1, true)),
-      Some(_) => Err(DecodeError::Invalid("bool")),
-      None => Err(DecodeError::UnexpectedEof),
+  fn decode(cur: &mut ByteCursor) -> Result<Self, DecodeError> {
+    match cur.take_u8()? {
+      0 => Ok(false),
+      1 => Ok(true),
+      _ => Err(DecodeError::Invalid("bool")),
     }
   }
 }
@@ -85,54 +153,21 @@ impl Data for () {
   #[inline(always)]
   fn encode(&self, _buf: &mut Vec<u8>) {}
   #[inline(always)]
-  fn decode(_buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    Ok((0, ()))
+  fn decode(_cur: &mut ByteCursor) -> Result<Self, DecodeError> {
+    Ok(())
   }
 }
 
-impl Data for bytes::Bytes {
+impl Data for Bytes {
   fn encode(&self, buf: &mut Vec<u8>) {
     (self.len() as u64).encode(buf);
     buf.extend_from_slice(self);
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let (n, len) = decode_len(buf, "bytes length")?;
-    let end = n.checked_add(len).ok_or(DecodeError::UnexpectedEof)?;
-    let slice = buf.get(n..end).ok_or(DecodeError::UnexpectedEof)?;
-    Ok((end, bytes::Bytes::copy_from_slice(slice)))
-  }
-}
-
-/// A forward cursor for decoding a sequence of `Data` fields from one buffer.
-///
-/// Each [`read`](Self::read) bounds-checks against the remaining input and advances by exactly the
-/// bytes the field consumed, so a struct decoder cannot read past its input or miscount offsets.
-pub(crate) struct Decoder<'a> {
-  buf: &'a [u8],
-  pos: usize,
-}
-
-impl<'a> Decoder<'a> {
-  /// Start decoding at the front of `buf`.
-  #[inline]
-  pub(crate) fn new(buf: &'a [u8]) -> Self {
-    Self { buf, pos: 0 }
-  }
-
-  /// Decode the next `T`, advancing past it. Errors if the input is exhausted.
-  #[inline]
-  pub(crate) fn read<T: Data>(&mut self) -> Result<T, DecodeError> {
-    let rest = self.buf.get(self.pos..).ok_or(DecodeError::UnexpectedEof)?;
-    let (n, value) = T::decode(rest)?;
-    self.pos += n;
-    Ok(value)
-  }
-
-  /// Total bytes consumed so far — the decoded length of the value.
-  #[inline]
-  pub(crate) fn pos(&self) -> usize {
-    self.pos
+  fn decode(cur: &mut ByteCursor) -> Result<Self, DecodeError> {
+    let len = decode_len(cur, "bytes length")?;
+    // Zero-copy: an O(1) shared slice of the input buffer (bounds-checked by the cursor).
+    cur.take_bytes(len)
   }
 }
 
@@ -144,24 +179,22 @@ impl<T: Data> Data for Vec<T> {
     }
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let (prefix, len) = decode_len(buf, "vec length")?;
-    let rest = buf.get(prefix..).ok_or(DecodeError::UnexpectedEof)?;
-    let mut d = Decoder::new(rest);
+  fn decode(cur: &mut ByteCursor) -> Result<Self, DecodeError> {
+    let len = decode_len(cur, "vec length")?;
     // Do NOT pre-allocate `len` (untrusted): push only what decodes, so an oversized
     // count fails on the first missing element instead of reserving huge memory.
     let mut items = Vec::new();
     for _ in 0..len {
-      let before = d.pos();
-      let item = d.read::<T>()?;
+      let before = cur.remaining();
+      let item = T::decode(cur)?;
       // Every wire element must consume input — else a huge count of a zero-width element type would
       // spin `len` times (attacker-controlled work) from only the count prefix.
-      if d.pos() == before {
+      if cur.remaining() == before {
         return Err(DecodeError::Invalid("zero-width vec element"));
       }
       items.push(item);
     }
-    Ok((prefix + d.pos(), items))
+    Ok(items)
   }
 }
 
@@ -173,15 +206,13 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     }
   }
 
-  fn decode(buf: &[u8]) -> Result<(usize, Self), DecodeError> {
-    let (prefix, len) = decode_len(buf, "set length")?;
-    let rest = buf.get(prefix..).ok_or(DecodeError::UnexpectedEof)?;
-    let mut d = Decoder::new(rest);
+  fn decode(cur: &mut ByteCursor) -> Result<Self, DecodeError> {
+    let len = decode_len(cur, "set length")?;
     let mut set = BTreeSet::new();
     for _ in 0..len {
-      let before = d.pos();
-      let elem = d.read::<T>()?;
-      if d.pos() == before {
+      let before = cur.remaining();
+      let elem = T::decode(cur)?;
+      if cur.remaining() == before {
         return Err(DecodeError::Invalid("zero-width set element"));
       }
       // Require strictly ascending elements — the unique, canonical wire form of a set. This rejects
@@ -194,7 +225,7 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
       }
       set.insert(elem);
     }
-    Ok((prefix + d.pos(), set))
+    Ok(set)
   }
 }
 
@@ -206,8 +237,7 @@ mod tests {
   fn roundtrip<T: Data + PartialEq + core::fmt::Debug>(v: T) {
     let mut buf = Vec::new();
     v.encode(&mut buf);
-    let (read, decoded) = T::decode(&buf).expect("decode");
-    assert_eq!(read, buf.len());
+    let decoded = T::decode_exact(Bytes::from(buf)).expect("decode");
     assert_eq!(decoded, v);
   }
 
@@ -225,32 +255,34 @@ mod tests {
   }
 
   #[test]
-  fn bytes_roundtrips() {
+  fn bytes_roundtrips_zero_copy() {
     let mut buf = std::vec::Vec::new();
-    let b = bytes::Bytes::from_static(b"hello");
+    let b = Bytes::from_static(b"hello");
     b.encode(&mut buf);
-    let (n, back) = bytes::Bytes::decode(&buf).unwrap();
-    assert_eq!(n, buf.len());
+    let input = Bytes::from(buf);
+    let mut cur = ByteCursor::new(input.clone());
+    let back = Bytes::decode(&mut cur).unwrap();
+    assert!(cur.is_empty());
     assert_eq!(back, b);
+    // ZERO-COPY: the decoded Bytes is a slice of the INPUT allocation, not a fresh copy.
+    assert_eq!(
+      back.as_ptr(),
+      input[8..].as_ptr(),
+      "the decoded payload must share the input buffer"
+    );
   }
 
   /// A length prefix larger than the buffer can possibly satisfy must DECODE TO AN ERROR — never a
   /// truncated/empty `Bytes`. A `u64::MAX` prefix followed by only a few payload bytes must be
   /// rejected, not silently yield some shorter value — the security property is "oversized →
   /// error, never wrong data".
-  ///
-  /// NOTE: the `usize::try_from` rejection inside [`decode_len`] is only *reachable* on a sub-64-bit
-  /// target. On this 64-bit host `usize::MAX == u64::MAX`, so `try_from` succeeds and the oversized
-  /// length is instead caught by the subsequent `checked_add` / slice-bound (`buf.get`) check in
-  /// `<Bytes as Data>::decode`. Either way the contract holds: an oversized prefix can never decode
-  /// as a different, shorter value — it always fails.
   #[test]
   fn bytes_decode_rejects_oversized_length() {
     // u64::MAX length prefix (little-endian), then only 3 payload bytes — nowhere near enough.
     let mut buf = Vec::new();
     u64::MAX.encode(&mut buf);
     buf.extend_from_slice(b"abc");
-    let res = <bytes::Bytes as Data>::decode(&buf);
+    let res = Bytes::decode_exact(Bytes::from(buf));
     assert!(
       res.is_err(),
       "an oversized length prefix must error, not truncate: got {res:?}"
@@ -262,32 +294,32 @@ mod tests {
     1_000_000u64.encode(&mut buf2);
     buf2.extend_from_slice(b"only-a-few");
     assert!(
-      <bytes::Bytes as Data>::decode(&buf2).is_err(),
+      Bytes::decode_exact(Bytes::from(buf2)).is_err(),
       "a length exceeding the buffer must error, never return a short/empty Bytes"
     );
   }
 
-  /// [`decode_len`] is the single safe conversion point both `Bytes::decode` and `ConfChangeV2::decode`
-  /// route their u64 length through. A normal length round-trips (consuming the 8-byte prefix and
-  /// narrowing to `usize`); this also pins that the helper is in fact what the `Bytes` decoder uses —
-  /// the `(n, len)` it reports for a real encoding matches the prefix the encoder wrote.
+  /// [`decode_len`] is the single safe conversion point every length-prefixed decode routes its
+  /// u64 length through: a normal length round-trips (consuming the 8-byte prefix and narrowing
+  /// to `usize`), matching what the `Bytes` encoder wrote.
   #[test]
   fn decode_len_roundtrips_and_is_used_by_bytes_decoder() {
-    // Direct: a normal length narrows cleanly and reports the 8 prefix bytes consumed.
     let mut buf = Vec::new();
     1234u64.encode(&mut buf);
-    let (n, len) = decode_len(&buf, "test length").expect("normal length narrows");
-    assert_eq!(n, 8, "the u64 length prefix is 8 bytes");
+    let mut cur = ByteCursor::new(Bytes::from(buf));
+    let len = decode_len(&mut cur, "test length").expect("normal length narrows");
+    assert!(cur.is_empty(), "the u64 length prefix is 8 bytes");
     assert_eq!(len, 1234usize);
 
     // Cross-check the helper IS the one the Bytes decoder uses: encode a real Bytes, then the prefix
-    // `decode_len` reads off the front must equal that payload's length and the same 8-byte consume.
-    let payload = bytes::Bytes::from_static(b"hello, world");
+    // `decode_len` reads off the front must equal that payload's length.
+    let payload = Bytes::from_static(b"hello, world");
     let mut encoded = Vec::new();
     payload.encode(&mut encoded);
-    let (pn, plen) = decode_len(&encoded, "bytes length").expect("bytes prefix narrows");
-    assert_eq!(pn, 8);
+    let mut cur = ByteCursor::new(Bytes::from(encoded));
+    let plen = decode_len(&mut cur, "bytes length").expect("bytes prefix narrows");
     assert_eq!(plen, payload.len());
+    assert_eq!(cur.remaining(), payload.len());
   }
 
   /// A `Vec<T>` of a zero-width element type must not spin `len` times from only the count prefix —
@@ -297,13 +329,16 @@ mod tests {
     let mut buf = Vec::new();
     1_000_000u64.encode(&mut buf); // claim a million () elements, with no following bytes
     assert!(
-      <Vec<()> as Data>::decode(&buf).is_err(),
+      <Vec<()>>::decode_exact(Bytes::from(buf)).is_err(),
       "a zero-width element type must not be decodable in bulk from just the count"
     );
     // An empty Vec<()> (count 0) is still fine.
     let mut empty = Vec::new();
     0u64.encode(&mut empty);
-    assert_eq!(<Vec<()> as Data>::decode(&empty).unwrap().1, std::vec![]);
+    assert_eq!(
+      <Vec<()>>::decode_exact(Bytes::from(empty)).unwrap(),
+      std::vec![]
+    );
   }
 
   /// A `BTreeSet` decode is canonical: it rejects duplicate and non-ascending elements, so distinct
@@ -316,7 +351,7 @@ mod tests {
     7u64.encode(&mut dup);
     7u64.encode(&mut dup);
     assert!(
-      <BTreeSet<u64> as Data>::decode(&dup).is_err(),
+      <BTreeSet<u64>>::decode_exact(Bytes::from(dup)).is_err(),
       "a duplicate set element must be rejected, not silently collapsed"
     );
     // count = 2 in descending order.
@@ -325,7 +360,7 @@ mod tests {
     9u64.encode(&mut desc);
     3u64.encode(&mut desc);
     assert!(
-      <BTreeSet<u64> as Data>::decode(&desc).is_err(),
+      <BTreeSet<u64>>::decode_exact(Bytes::from(desc)).is_err(),
       "non-ascending set elements must be rejected"
     );
     // A canonical ascending set round-trips.
@@ -334,8 +369,7 @@ mod tests {
     1u64.encode(&mut ok);
     5u64.encode(&mut ok);
     9u64.encode(&mut ok);
-    let (n, set) = <BTreeSet<u64> as Data>::decode(&ok).expect("ascending set decodes");
-    assert_eq!(n, ok.len());
+    let set = <BTreeSet<u64>>::decode_exact(Bytes::from(ok)).expect("ascending set decodes");
     assert_eq!(set, BTreeSet::from([1, 5, 9]));
   }
 }
