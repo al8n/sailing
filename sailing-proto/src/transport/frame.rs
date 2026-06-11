@@ -152,6 +152,7 @@ impl FrameDecoder {
     if self.start == self.buf.len() {
       self.buf.clear();
       self.start = 0;
+      super::shrink_excess(&mut self.buf);
     } else if self.start >= COMPACT_THRESHOLD && self.start >= self.buf.len() - self.start {
       self.buf.drain(..self.start);
       self.start = 0;

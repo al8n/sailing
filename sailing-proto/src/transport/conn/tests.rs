@@ -273,3 +273,116 @@ fn frames_in_the_final_read_before_eof_still_deliver() {
     "final-read frames deliver on a clean close"
   );
 }
+
+/// A record layer with a tiny receive buffer (forces `Intake::Pending` on intake): `handle_data`'s
+/// re-feed loop must drain plaintext between rounds and deliver the full frame stream; and a
+/// WEDGED layer (no consumption, no plaintext) must close the connection rather than silently
+/// dropping the tail.
+struct TinyRecv {
+  cap: usize,
+  inbound: Vec<u8>,
+  outbound: Vec<u8>,
+  ident: Option<Vec<u8>>,
+  wedged: bool,
+}
+
+impl TinyRecv {
+  fn new(cap: usize, ident: Option<Vec<u8>>) -> Self {
+    Self {
+      cap,
+      inbound: Vec::new(),
+      outbound: Vec::new(),
+      ident,
+      wedged: false,
+    }
+  }
+}
+
+impl sealed::Sealed for TinyRecv {}
+
+impl RecordIo for TinyRecv {
+  fn handle_transport_data(&mut self, input: &[u8], _now: Instant) -> Intake {
+    if self.wedged {
+      return Intake::Pending(0); // consumes nothing, surfaces nothing — a wedge
+    }
+    let room = self.cap.saturating_sub(self.inbound.len());
+    if input.len() <= room {
+      self.inbound.extend_from_slice(input);
+      Intake::Done
+    } else {
+      self.inbound.extend_from_slice(&input[..room]);
+      Intake::Pending(room)
+    }
+  }
+  fn poll_transport_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    let n = self.outbound.len();
+    out.extend_from_slice(&self.outbound);
+    self.outbound.clear();
+    n
+  }
+  fn read_plaintext(&mut self, out: &mut Vec<u8>) -> usize {
+    let n = self.inbound.len();
+    out.extend_from_slice(&self.inbound);
+    self.inbound.clear();
+    n
+  }
+  fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    self.outbound.extend_from_slice(plaintext);
+    plaintext.len()
+  }
+  fn buffered_outbound(&self) -> usize {
+    self.outbound.len()
+  }
+  fn is_handshaking(&self) -> bool {
+    self.ident.is_none()
+  }
+  fn peer_identity(&self) -> Option<&[u8]> {
+    self.ident.as_deref()
+  }
+  fn peer_has_closed(&self) -> bool {
+    false
+  }
+  fn is_secure() -> bool {
+    false
+  }
+}
+
+impl<I: NodeId> Conn<I, TinyRecv> {
+  fn record_wedge_for_test(&mut self) {
+    self.record.wedged = true;
+  }
+}
+
+#[test]
+fn pending_refeed_reassembles_across_a_tiny_receive_buffer() {
+  // 8-byte receive cap: a multi-hundred-byte read is consumed in many Pending rounds, with
+  // plaintext drained between each. Both messages must reassemble exactly.
+  let mut sender: Conn<u64, TinyRecv> = Conn::new(TinyRecv::new(usize::MAX, Some(enc_id(7))));
+  sender.send_message(&sample_msg());
+  sender.send_message(&sample_msg());
+  let mut wire = Vec::new();
+  sender.poll_transmit(&mut wire);
+  assert!(
+    wire.len() > 64,
+    "two framed heartbeats are well over the cap"
+  );
+
+  let mut receiver: Conn<u64, TinyRecv> = Conn::new(TinyRecv::new(8, Some(enc_id(7))));
+  receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
+  let mut msgs = Vec::new();
+  receiver.poll_decoded(&mut msgs).unwrap();
+  assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
+}
+
+#[test]
+fn wedged_record_layer_closes_instead_of_dropping_the_tail() {
+  let mut conn: Conn<u64, TinyRecv> = Conn::new(TinyRecv::new(8, Some(enc_id(7))));
+  conn.record_wedge_for_test();
+  let res = conn.handle_data(
+    b"some bytes that cannot make progress",
+    false,
+    Instant::ORIGIN,
+  );
+  assert!(res.is_err(), "a wedged record layer is a transport fault");
+  assert!(conn.is_closed());
+}

@@ -21,7 +21,12 @@ pub struct TlsRecords {
   aborted: bool,
   /// Conservative count of accepted plaintext not yet drained as ciphertext: incremented by
   /// `write_plaintext`'s accepted count, reset when a transmit poll leaves rustls with nothing
-  /// further to write. An upper bound, not byte-exact (rustls exposes no buffered-byte getter).
+  /// further to write. An upper bound, not byte-exact (rustls exposes no buffered-byte getter) —
+  /// with one HANDSHAKE-WINDOW exception: plaintext written before the handshake completes (the
+  /// `Labeled` hello) sits in rustls's send buffer awaiting traffic keys while each handshake
+  /// flight's drain resets this counter, so it can UNDER-count by up to the hello size until the
+  /// handshake finishes. Bounded (≤ the hello, ≤64 KiB) and harmless: application sends cannot
+  /// start pre-validation, so the occupancy gate is not consulted while the gap exists.
   queued_plain: usize,
 }
 
@@ -51,6 +56,14 @@ impl TlsRecords {
       aborted: false,
       queued_plain: 0,
     })
+  }
+}
+
+impl TlsRecords {
+  /// Test-only: queue a TLS `close_notify` so tests can exercise the in-band close path.
+  #[cfg(test)]
+  pub(crate) fn send_close_notify_for_test(&mut self) {
+    self.conn.send_close_notify();
   }
 }
 
@@ -100,6 +113,9 @@ impl RecordIo for TlsRecords {
   }
 
   fn poll_transport_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    if self.aborted {
+      return 0; // failure inertness: a fatally-errored session emits nothing further
+    }
     let before = out.len();
     while self.conn.wants_write() {
       if self.conn.write_tls(out).is_err() {
@@ -114,6 +130,9 @@ impl RecordIo for TlsRecords {
   }
 
   fn read_plaintext(&mut self, out: &mut Vec<u8>) -> usize {
+    if self.aborted {
+      return 0; // failure inertness: plaintext from a fatally-errored session is untrustworthy
+    }
     let before = out.len();
     let mut buf = [0u8; 4096];
     loop {
@@ -128,6 +147,9 @@ impl RecordIo for TlsRecords {
   }
 
   fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    if self.aborted {
+      return 0; // failure inertness
+    }
     // With the buffer limit set, rustls accepts only what fits — a genuine partial accept the
     // caller's pending buffer absorbs.
     let n = self.conn.writer().write(plaintext).unwrap_or(0);
