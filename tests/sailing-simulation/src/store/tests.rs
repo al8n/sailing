@@ -291,11 +291,12 @@ fn async_stable_submit_then_discard_loses_inflight_write() {
   assert!(s.mode().is_async());
   let hs = s.hard_state().with_term(Term::new(9));
   s.submit_write(OpId::new(1), hs);
-  // Visible immediately, but not yet durable and no completion.
+  // The trait contract: `hard_state()` is LAST-DURABLE. A submitted-but-unflushed write must NOT
+  // read back yet (a real disk store would return the previously-fsynced record here).
   assert_eq!(
     s.hard_state().term(),
-    Term::new(9),
-    "submitted hard-state write is VISIBLE immediately (deferred durability)"
+    Term::ZERO,
+    "an in-flight hard-state write is not durable, so hard_state() must not return it"
   );
   assert!(s.has_inflight());
   assert_eq!(s.poll(), None);
@@ -317,7 +318,11 @@ fn async_stable_submit_then_flush_is_durable() {
   let mut s = MemStable::<u64>::new_async(3);
   let hs = s.hard_state().with_term(Term::new(9));
   s.submit_write(OpId::new(1), hs);
-  assert_eq!(s.hard_state().term(), Term::new(9), "visible immediately");
+  assert_eq!(
+    s.hard_state().term(),
+    Term::ZERO,
+    "not durable until flushed (hard_state() reads the durable record)"
+  );
 
   s.flush();
   assert_eq!(
