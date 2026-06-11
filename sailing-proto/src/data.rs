@@ -138,7 +138,14 @@ impl<T: Data> Data for Vec<T> {
     // count fails on the first missing element instead of reserving huge memory.
     let mut items = Vec::new();
     for _ in 0..len {
-      items.push(d.read::<T>()?);
+      let before = d.pos();
+      let item = d.read::<T>()?;
+      // Every wire element must consume input — else a huge count of a zero-width element type would
+      // spin `len` times (attacker-controlled work) from only the count prefix.
+      if d.pos() == before {
+        return Err(DecodeError::Invalid("zero-width vec element"));
+      }
+      items.push(item);
     }
     Ok((prefix + d.pos(), items))
   }
@@ -158,7 +165,20 @@ impl<T: Data + Ord> Data for BTreeSet<T> {
     let mut d = Decoder::new(rest);
     let mut set = BTreeSet::new();
     for _ in 0..len {
-      set.insert(d.read::<T>()?);
+      let before = d.pos();
+      let elem = d.read::<T>()?;
+      if d.pos() == before {
+        return Err(DecodeError::Invalid("zero-width set element"));
+      }
+      // Require strictly ascending elements — the unique, canonical wire form of a set. This rejects
+      // duplicates and re-orderings, so distinct hostile byte strings cannot decode to the same set
+      // (the encode/decode round-trip stays canonical, which `ConfState` snapshot metadata relies on).
+      if set.last().is_some_and(|max| elem <= *max) {
+        return Err(DecodeError::Invalid(
+          "set elements must be strictly ascending",
+        ));
+      }
+      set.insert(elem);
     }
     Ok((prefix + d.pos(), set))
   }
@@ -254,5 +274,54 @@ mod tests {
     let (pn, plen) = decode_len(&encoded, "bytes length").expect("bytes prefix narrows");
     assert_eq!(pn, 8);
     assert_eq!(plen, payload.len());
+  }
+
+  /// A `Vec<T>` of a zero-width element type must not spin `len` times from only the count prefix —
+  /// each element is required to consume input.
+  #[test]
+  fn vec_decode_rejects_zero_width_element_spin() {
+    let mut buf = Vec::new();
+    1_000_000u64.encode(&mut buf); // claim a million () elements, with no following bytes
+    assert!(
+      <Vec<()> as Data>::decode(&buf).is_err(),
+      "a zero-width element type must not be decodable in bulk from just the count"
+    );
+    // An empty Vec<()> (count 0) is still fine.
+    let mut empty = Vec::new();
+    0u64.encode(&mut empty);
+    assert_eq!(<Vec<()> as Data>::decode(&empty).unwrap().1, std::vec![]);
+  }
+
+  /// A `BTreeSet` decode is canonical: it rejects duplicate and non-ascending elements, so distinct
+  /// hostile byte strings cannot decode to the same set.
+  #[test]
+  fn btreeset_decode_requires_strictly_ascending() {
+    // count = 2 with a duplicate element.
+    let mut dup = Vec::new();
+    2u64.encode(&mut dup);
+    7u64.encode(&mut dup);
+    7u64.encode(&mut dup);
+    assert!(
+      <BTreeSet<u64> as Data>::decode(&dup).is_err(),
+      "a duplicate set element must be rejected, not silently collapsed"
+    );
+    // count = 2 in descending order.
+    let mut desc = Vec::new();
+    2u64.encode(&mut desc);
+    9u64.encode(&mut desc);
+    3u64.encode(&mut desc);
+    assert!(
+      <BTreeSet<u64> as Data>::decode(&desc).is_err(),
+      "non-ascending set elements must be rejected"
+    );
+    // A canonical ascending set round-trips.
+    let mut ok = Vec::new();
+    3u64.encode(&mut ok);
+    1u64.encode(&mut ok);
+    5u64.encode(&mut ok);
+    9u64.encode(&mut ok);
+    let (n, set) = <BTreeSet<u64> as Data>::decode(&ok).expect("ascending set decodes");
+    assert_eq!(n, ok.len());
+    assert_eq!(set, BTreeSet::from([1, 5, 9]));
   }
 }

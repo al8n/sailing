@@ -45,6 +45,12 @@ fn wire_roundtrip(message: Message<u64>) -> Message<u64> {
     buf.len(),
     "the wire codec must consume exactly the encoded bytes"
   );
+  // Assert VALUE identity, not just length — a field swap that still consumes the frame would
+  // otherwise silently alter the delivered message and change fuzzer behavior.
+  assert_eq!(
+    decoded, message,
+    "the wire codec must round-trip to an identical message"
+  );
   decoded
 }
 
