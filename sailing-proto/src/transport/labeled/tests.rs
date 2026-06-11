@@ -173,3 +173,69 @@ fn gates_plaintext_until_validated_then_strips_the_hello() {
     "the hello is stripped; only app bytes surface"
   );
 }
+
+#[test]
+fn hello_delivered_byte_at_a_time_still_validates() {
+  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7));
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut wire = Vec::new();
+  a.poll_transport_transmit(&mut wire);
+  for byte in &wire {
+    assert!(b.peer_identity().is_none() || *byte == wire[wire.len() - 1]);
+    assert_ne!(
+      b.handle_transport_data(&[*byte], Instant::ORIGIN),
+      Intake::Failed,
+      "a split hello must never be rejected mid-delivery"
+    );
+  }
+  assert_eq!(b.peer_identity(), Some(enc(7).as_slice()));
+}
+
+#[test]
+fn magic_and_version_mismatches_are_rejected() {
+  // Wrong magic.
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut hello = Vec::new();
+  Labeled::dialer(Passthrough::new(), &opts(1, 7)).poll_transport_transmit(&mut hello);
+  let mut bad_magic = hello.clone();
+  bad_magic[0] ^= 0xFF;
+  assert_eq!(
+    b.handle_transport_data(&bad_magic, Instant::ORIGIN),
+    Intake::Failed
+  );
+
+  // Wrong version (a future wire format must be rejected at the handshake).
+  let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut bad_ver = hello.clone();
+  bad_ver[1] ^= 0xFF;
+  assert_eq!(
+    b2.handle_transport_data(&bad_ver, Instant::ORIGIN),
+    Intake::Failed
+  );
+}
+
+#[test]
+fn zero_length_and_oversized_peer_ids_are_rejected() {
+  // Hand-craft a hello with peer_id_len == 0.
+  let mut zero = std::vec![0xCA_u8, 1];
+  zero.extend_from_slice(&[1u8; 16]); // cluster
+  zero.extend_from_slice(&0u16.to_be_bytes());
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  assert_eq!(
+    b.handle_transport_data(&zero, Instant::ORIGIN),
+    Intake::Failed,
+    "an empty peer id is no identity"
+  );
+
+  // And one claiming a 64 KiB id (over MAX_PEER_ID_LEN) — rejected at the header, before any
+  // id byte is buffered.
+  let mut huge = std::vec![0xCA_u8, 1];
+  huge.extend_from_slice(&[1u8; 16]);
+  huge.extend_from_slice(&u16::MAX.to_be_bytes());
+  let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  assert_eq!(
+    b2.handle_transport_data(&huge, Instant::ORIGIN),
+    Intake::Failed,
+    "an oversized peer id is unauthenticated buffer growth"
+  );
+}

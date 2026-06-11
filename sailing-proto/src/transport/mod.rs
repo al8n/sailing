@@ -31,6 +31,21 @@ pub use stream::{Intake, RecordIo, StreamTransport};
 #[cfg(feature = "tls")]
 pub use tls::TlsRecords;
 
+/// Release excess capacity from a FULLY-DRAINED buffer that once absorbed a large burst.
+///
+/// Every transport buffer is bounded by its layer's cap, but `clear()`/`drain()` retain peak
+/// capacity — one 64 MiB burst would otherwise pin that much heap per connection for its
+/// lifetime. Shrinking only when empty AND well past the retention size avoids regrow thrash in
+/// steady state (ordinary traffic never trips the 4× threshold).
+#[cfg(feature = "tcp")]
+pub(crate) fn shrink_excess(buf: &mut std::vec::Vec<u8>) {
+  /// Capacity worth keeping around for steady-state traffic.
+  const RETAIN: usize = 64 * 1024;
+  if buf.is_empty() && buf.capacity() > 4 * RETAIN {
+    buf.shrink_to(RETAIN);
+  }
+}
+
 /// A 16-byte cluster identity; peers reject handshakes from other clusters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ClusterId(

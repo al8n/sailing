@@ -50,6 +50,7 @@ impl RecordIo for Passthrough {
     let n = self.outbound.len();
     out.extend_from_slice(&self.outbound);
     self.outbound.clear();
+    super::shrink_excess(&mut self.outbound);
     n
   }
 
@@ -57,6 +58,7 @@ impl RecordIo for Passthrough {
     let n = self.inbound.len();
     out.extend_from_slice(&self.inbound);
     self.inbound.clear();
+    super::shrink_excess(&mut self.inbound);
     n
   }
 

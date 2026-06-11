@@ -54,6 +54,10 @@ pub struct Conn<I, R> {
   out_pos: usize,
   /// The outbound-occupancy bound (the [`MAX_CONN_OUT_BUF`] constant; overridable in tests).
   max_out: usize,
+  /// Reusable intake scratch: plaintext drained from the record layer on its way into the frame
+  /// decoder. A field (cleared per pass) rather than a per-iteration `Vec::new()` — `handle_data`
+  /// runs once per socket read, so the allocation churn would be steady per-chunk overhead.
+  scratch: Vec<u8>,
 }
 
 impl<I: NodeId, R: RecordIo> Conn<I, R> {
@@ -66,6 +70,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       out_plain: Vec::new(),
       out_pos: 0,
       max_out: MAX_CONN_OUT_BUF,
+      scratch: Vec::new(),
     }
   }
 
@@ -98,11 +103,12 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
           consumed > 0
         }
       };
-      // Surface decoded plaintext (post-handshake/label) into the frame decoder.
-      let mut plain = Vec::new();
-      let drained = self.record.read_plaintext(&mut plain);
-      if !plain.is_empty() {
-        self.decoder.push(&plain);
+      // Surface decoded plaintext (post-handshake/label) into the frame decoder via the reusable
+      // scratch buffer.
+      self.scratch.clear();
+      let drained = self.record.read_plaintext(&mut self.scratch);
+      if !self.scratch.is_empty() {
+        self.decoder.push(&self.scratch);
       }
       self.try_validate()?;
       if input.is_empty() {
@@ -210,15 +216,18 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       }
       self.out_pos += n;
     }
-    // Fully drained: reset the buffer (keeping its capacity for the next burst).
+    // Fully drained: reset the buffer (excess burst capacity is released; the steady-state
+    // retention stays so ordinary traffic never reallocates).
     self.out_plain.clear();
     self.out_pos = 0;
+    super::shrink_excess(&mut self.out_plain);
   }
 
-  /// Release the outbound buffer on close (nothing further will be transmitted).
+  /// Release the outbound and scratch buffers on close (nothing further will be transmitted).
   fn release_out(&mut self) {
     self.out_plain = Vec::new();
     self.out_pos = 0;
+    self.scratch = Vec::new();
   }
 
   /// Drain queued outbound wire bytes into `out`, returning the number written.

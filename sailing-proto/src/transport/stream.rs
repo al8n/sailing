@@ -11,9 +11,10 @@ use std::vec::Vec;
 
 use crate::Instant;
 
-/// Seals [`RecordIo`]/[`StreamTransport`] so only the in-crate record layers implement them.
-/// The module is crate-visible (so the layer modules can implement `Sealed`) but unreachable
-/// externally because the whole `transport` module is private.
+/// Seals [`RecordIo`]/[`StreamTransport`] so only the in-crate record layers implement them. The
+/// trait itself is re-exported at the crate root (so a driver can NAME record layers in bounds and
+/// construct them), but no downstream type can implement it — the contract below binds only the
+/// in-crate layers and their sole intended driver, `Conn`.
 pub(crate) mod sealed {
   /// The sealing supertrait.
   pub trait Sealed {}
@@ -24,10 +25,15 @@ pub(crate) mod sealed {
 pub enum Intake {
   /// All input was consumed.
   Done,
-  /// `n` bytes were consumed; the caller must drain decoded plaintext and re-feed the remaining
-  /// `input[n..]` — the record layer's receive buffer is full (backpressure).
+  /// `n` bytes were consumed (`n <= input.len()`; `n == 0` is legal); the caller must drain
+  /// decoded plaintext via [`RecordIo::read_plaintext`] and re-feed the remaining `input[n..]`
+  /// VERBATIM — the record layer's receive side is full (backpressure). If an iteration consumes
+  /// nothing AND drains no plaintext, the layer is wedged: the caller closes the connection
+  /// rather than silently dropping the tail (which would desync framing).
   Pending(usize),
-  /// The stream is terminally broken (handshake failure, cluster mismatch). Close the connection.
+  /// The stream is terminally broken (handshake failure, cluster mismatch). The latch is sticky:
+  /// every subsequent call reports `Failed` and the other methods become inert no-ops. Close the
+  /// connection.
   Failed,
 }
 
@@ -35,15 +41,29 @@ pub enum Intake {
 /// outbound plaintext, and emits wire bytes — with an optional handshake that authenticates a peer.
 ///
 /// Sealed: the concrete layers are `Passthrough`, `TlsRecords`, and `Labeled` — downstream crates
-/// can name and drive the trait but cannot implement it.
+/// can name and construct them but cannot implement the trait. `Conn` is the sole intended driver;
+/// the contract notes below are what it relies on.
+///
+/// # Contract (binding on every implementation)
+///
+/// - **Append semantics:** [`read_plaintext`](Self::read_plaintext) and
+///   [`poll_transport_transmit`](Self::poll_transport_transmit) APPEND to `out` (they never clear
+///   it) and return the number of bytes appended.
+/// - **Prefix accepts:** [`write_plaintext`](Self::write_plaintext) may accept any prefix
+///   (including 0 bytes) under backpressure; the caller retains the unaccepted tail and re-offers
+///   it verbatim later. An implementation must never reorder or interleave accepted bytes.
+/// - **Intake:** see [`Intake`] — `Pending(n)` requires `n <= input.len()`; `Failed` is sticky.
+/// - **Failure inertness:** after `Failed` (or an internal abort), `write_plaintext` accepts 0,
+///   the drains produce nothing, and `handle_transport_data` keeps returning `Failed`.
 pub trait RecordIo: sealed::Sealed {
   /// Feed inbound wire bytes: advance any handshake and buffer decoded plaintext.
   fn handle_transport_data(&mut self, input: &[u8], now: Instant) -> Intake;
-  /// Drain queued outbound wire bytes into `out`, returning the number written.
+  /// Append queued outbound wire bytes onto `out`, returning the number appended.
   fn poll_transport_transmit(&mut self, out: &mut Vec<u8>) -> usize;
-  /// Drain decoded inbound plaintext into `out`, returning the number written.
+  /// Append decoded inbound plaintext onto `out`, returning the number appended.
   fn read_plaintext(&mut self, out: &mut Vec<u8>) -> usize;
-  /// Queue outbound plaintext for encoding; returns the number of bytes accepted.
+  /// Queue outbound plaintext for encoding; returns the number of bytes accepted (a prefix —
+  /// possibly 0 under backpressure; the caller re-offers the tail verbatim).
   fn write_plaintext(&mut self, plaintext: &[u8]) -> usize;
   /// Bytes currently queued inside this layer awaiting transmission (its own buffering plus any
   /// inner layer's). The occupancy projection lets the connection enforce ONE outbound bound that

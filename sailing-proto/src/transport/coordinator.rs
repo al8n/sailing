@@ -145,6 +145,12 @@ where
   }
 
   /// Propose a client command on this node (must be the leader).
+  ///
+  /// SIZE BOUND: a command whose encoded entry exceeds the transport's maximum frame size
+  /// (64 MiB) produces a log entry that can never replicate over this transport — the egress
+  /// guard closes any connection that tries to carry it. Applications must bound their command
+  /// encodings well below the frame limit (enforcement at this boundary awaits the codec's
+  /// `encoded_len`, tracked for the zero-copy round).
   pub fn submit_propose<L, S>(
     &mut self,
     now: Instant,

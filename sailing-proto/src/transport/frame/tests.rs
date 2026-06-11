@@ -122,3 +122,34 @@ fn split_header_still_validates_before_payload() {
   );
   assert_eq!(dec.buffered_for_test(), 0);
 }
+
+/// Drive the cursor across the compaction threshold with interleaved push/poll: every frame must
+/// come back exactly, and the consumed prefix must be reclaimed (buffered never exceeds what a
+/// partial tail plus unpopped frames justify).
+#[test]
+fn compaction_preserves_frames_across_interleaved_push_poll() {
+  let mut dec = FrameDecoder::new();
+  let payload = std::vec![0xAB_u8; 48 * 1024]; // 48 KiB — two pops cross the 64 KiB threshold
+  let mut wire = Vec::new();
+  encode_frame(&payload, &mut wire);
+
+  let mut out = Vec::new();
+  for round in 0..8 {
+    // Push one frame split in two arbitrary chunks, then pop it.
+    let cut = 5 + round * 1000;
+    dec.push(&wire[..cut]);
+    assert!(
+      !dec.poll(&mut out).unwrap(),
+      "incomplete frame yields nothing"
+    );
+    dec.push(&wire[cut..]);
+    assert!(dec.poll(&mut out).unwrap());
+    assert_eq!(out, payload, "frame {round} intact across compaction");
+    assert!(!dec.poll(&mut out).unwrap());
+    assert_eq!(
+      dec.buffered_for_test(),
+      0,
+      "fully drained after round {round}"
+    );
+  }
+}

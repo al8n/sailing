@@ -11,9 +11,16 @@ use crate::Instant;
 use std::vec::Vec;
 
 const LABEL_MAGIC: u8 = 0xCA;
+/// The hello wire version. CONTRACT: any change to the transport wire format — the hello layout,
+/// the frame format, or the `Message` codec itself — MUST bump this byte, so mixed-version nodes
+/// reject each other at the handshake instead of mis-decoding consensus traffic.
 const LABEL_VERSION: u8 = 1;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
+/// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes
+/// (a u64 is 8); the u16 length field would otherwise admit ~64 KiB of pre-authentication
+/// buffering chosen by an unauthenticated peer.
+const MAX_PEER_ID_LEN: usize = 1024;
 
 /// Construction parameters for a [`Labeled`] layer.
 pub struct LabelOptions {
@@ -111,6 +118,12 @@ impl<R: RecordIo> Labeled<R> {
       return Intake::Failed;
     }
     let peer_id_len = u16::from_be_bytes([self.pending[18], self.pending[19]]) as usize;
+    // An empty id is no identity at all, and an oversized one is unauthenticated buffer growth —
+    // both are malformed hellos, rejected before any id byte is retained.
+    if peer_id_len == 0 || peer_id_len > MAX_PEER_ID_LEN {
+      self.failed = true;
+      return Intake::Failed;
+    }
     let hello_end = HELLO_HEADER + peer_id_len;
     if self.pending.len() < hello_end {
       return Intake::Done; // need the rest of the peer id
@@ -147,21 +160,28 @@ impl<R: RecordIo> RecordIo for Labeled<R> {
   }
 
   fn poll_transport_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    if self.failed {
+      return 0; // failure inertness: never emit (not even our hello) on a rejected stream
+    }
     self.flush_hello();
     self.inner.poll_transport_transmit(out)
   }
 
   fn read_plaintext(&mut self, out: &mut Vec<u8>) -> usize {
-    if self.validated.is_none() {
-      return 0; // no application plaintext until the peer is bound
+    if self.failed || self.validated.is_none() {
+      return 0; // no application plaintext until the peer is bound (and none after a failure)
     }
     let n = self.pending.len();
     out.extend_from_slice(&self.pending);
     self.pending.clear();
+    super::shrink_excess(&mut self.pending);
     n
   }
 
   fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    if self.failed {
+      return 0; // failure inertness
+    }
     // The hello must FULLY precede any application plaintext: while a hello tail is pending, accept
     // nothing (the caller's own pending buffer holds the app bytes), else app bytes could splice
     // into the middle of the hello on the wire.
