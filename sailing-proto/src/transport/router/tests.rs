@@ -224,3 +224,28 @@ fn unvalidated_conns_are_reaped_after_the_handshake_deadline() {
     "a connection that never validates is reaped so the driver releases the socket"
   );
 }
+
+#[test]
+fn duplicate_conn_id_registration_is_rejected_not_replaced() {
+  use crate::transport::TransportError;
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register(id, acceptor(10), Instant::ORIGIN);
+  let mut peer = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id, &mut peer);
+  assert_eq!(router.conn_of(&7), Some(id), "original conn validated");
+
+  // A second registration under the SAME id: rejected + reported; the original is untouched.
+  router.register(id, acceptor(10), Instant::ORIGIN);
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, Some(TransportError::DuplicateConnId))),
+    "the rejected registration is reported so the driver closes that socket"
+  );
+  assert_eq!(
+    router.conn_of(&7),
+    Some(id),
+    "the original binding is untouched"
+  );
+  assert!(router.route(7, &hb(10)), "the original conn still routes");
+}
