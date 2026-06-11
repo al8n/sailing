@@ -285,7 +285,7 @@ where
       poisoned,
       poison_reason,
       pending_compact: None,
-      snapshot_resend_backoff: BTreeMap::new(),
+      snapshot_resend_after: BTreeMap::new(),
       // the recovered `hs.term()` came from durable HardState, so it IS durable. Seed both
       // `durable_term` and `last_submitted_term` to it so `term_is_durable()` is true immediately after
       // restart and follower acks are not spuriously deferred.
