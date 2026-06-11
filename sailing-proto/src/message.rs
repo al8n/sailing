@@ -780,6 +780,10 @@ impl<I: crate::NodeId> Message<I> {
 // A leading tag byte selects the variant; each field encodes via its own `Data` impl.
 // Variable-length fields (`Bytes`, `Vec<Entry>`, the `ConfState` sets) route through
 // the bounds-checked `decode_len`, so no length prefix can drive an oversized allocation.
+//
+// The NORMATIVE byte-level format (tag table, field orders, canonicality rules, the frame and
+// hello layouts) is pinned in `sailing-proto/WIRE.md`; any change here updates that document, the
+// golden vectors in `message/tests.rs`, and the transport hello version in the same commit.
 
 impl<I: NodeId> Data for SnapshotMeta<I> {
   fn encode(&self, buf: &mut Vec<u8>) {
