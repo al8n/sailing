@@ -28,7 +28,7 @@ mod time;
 pub use time::Instant;
 
 mod data;
-pub use data::{Data, DecodeError};
+pub use data::{ByteCursor, Data, DecodeError};
 
 mod entry;
 pub use entry::{Entry, EntryKind};

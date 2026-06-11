@@ -48,9 +48,8 @@ macro_rules! counter {
                 crate::Data::encode(&self.0, buf);
             }
             #[inline]
-            fn decode(buf: &[u8]) -> Result<(usize, Self), crate::DecodeError> {
-                let (n, raw) = <u64 as crate::Data>::decode(buf)?;
-                Ok((n, Self(raw)))
+            fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, crate::DecodeError> {
+                Ok(Self(<u64 as crate::Data>::decode(cur)?))
             }
         }
     };

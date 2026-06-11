@@ -62,29 +62,20 @@ impl StateMachine for LogSm {
   }
 
   fn restore(&mut self, snapshot: Bytes) -> Result<(), Self::Error> {
-    let buf = &snapshot[..];
-    let mut pos = 0usize;
+    // Cursor-based decode over the shared snapshot buffer: payload slices are zero-copy.
+    let mut cur = sailing_proto::ByteCursor::new(snapshot);
 
-    // decode count — requires ≥ 8 bytes
-    let (n, count) = u64::decode(&buf[pos..]).map_err(|_| SmDecodeError)?;
-    pos += n;
-
-    let mut entries: Vec<(Index, Bytes)> = Vec::with_capacity(count as usize);
+    let count = u64::decode(&mut cur).map_err(|_| SmDecodeError)?;
+    let mut entries: Vec<(Index, Bytes)> = Vec::new();
     for _ in 0..count {
-      // decode index — requires ≥ 8 bytes
-      let (n2, raw_idx) = u64::decode(&buf[pos..]).map_err(|_| SmDecodeError)?;
-      pos += n2;
-      // decode payload length — requires ≥ 8 bytes
-      let (n3, len) = u64::decode(&buf[pos..]).map_err(|_| SmDecodeError)?;
-      pos += n3;
-      // guard against overflow and truncation
-      let end = pos.checked_add(len as usize).ok_or(SmDecodeError)?;
-      if end > buf.len() {
-        return Err(SmDecodeError);
-      }
-      let payload = Bytes::copy_from_slice(&buf[pos..end]);
-      pos = end;
+      let raw_idx = u64::decode(&mut cur).map_err(|_| SmDecodeError)?;
+      let len = u64::decode(&mut cur).map_err(|_| SmDecodeError)?;
+      let len = usize::try_from(len).map_err(|_| SmDecodeError)?;
+      let payload = cur.take_bytes(len).map_err(|_| SmDecodeError)?;
       entries.push((Index::new(raw_idx), payload));
+    }
+    if !cur.is_empty() {
+      return Err(SmDecodeError); // trailing bytes: a malformed snapshot
     }
     self.applied = entries;
     Ok(())
