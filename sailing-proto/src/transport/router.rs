@@ -46,6 +46,23 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     now: Instant,
     out: &mut Vec<(I, Message<I>)>,
   ) -> Result<(), TransportError> {
+    let result = self.handle_conn_data_inner(id, bytes, eof, now, out);
+    // A connection that errored OR reached EOF/Closed must drop its peer binding — otherwise the
+    // next `route` to that peer would send into a dead connection and silently drop the message.
+    if result.is_err() || self.conns.get(&id).is_some_and(|c| c.is_closed()) {
+      self.remove(id);
+    }
+    result
+  }
+
+  fn handle_conn_data_inner(
+    &mut self,
+    id: ConnId,
+    bytes: &[u8],
+    eof: bool,
+    now: Instant,
+    out: &mut Vec<(I, Message<I>)>,
+  ) -> Result<(), TransportError> {
     let conn = match self.conns.get_mut(&id) {
       Some(c) => c,
       None => return Ok(()),

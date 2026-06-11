@@ -114,6 +114,27 @@ fn route_to_unknown_peer_is_dropped() {
 }
 
 #[test]
+fn eof_clears_the_peer_route() {
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register(id, acceptor(10));
+  let mut peer = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id, &mut peer);
+  assert_eq!(router.conn_of(&7), Some(id));
+
+  // The peer half-closes: an inbound read with eof must drop the binding, not leave a dead route.
+  let mut out = Vec::new();
+  router
+    .handle_conn_data(id, &[], true, Instant::ORIGIN, &mut out)
+    .unwrap();
+  assert_eq!(router.conn_of(&7), None, "EOF clears the peer binding");
+  assert!(
+    !router.route(7, &hb(10)),
+    "no route into a closed connection"
+  );
+}
+
+#[test]
 fn newer_connection_wins_duplicate_peer() {
   let mut router = R::new();
   // Two connections both validate as peer 7; the second registered wins.

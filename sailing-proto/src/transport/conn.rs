@@ -23,6 +23,11 @@ pub struct Conn<I, R> {
   record: R,
   decoder: FrameDecoder,
   state: ConnState<I>,
+  /// Framed outbound bytes not yet accepted by the record layer. `write_plaintext` may accept only
+  /// a prefix under backpressure, so the unwritten tail is retained here and re-offered on the next
+  /// drain — a frame is never truncated on the wire (which could otherwise let a later frame's bytes
+  /// complete a short one and decode as a corrupted-but-valid message).
+  out_plain: Vec<u8>,
 }
 
 impl<I: NodeId, R: RecordIo> Conn<I, R> {
@@ -32,6 +37,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       record,
       decoder: FrameDecoder::new(),
       state: ConnState::Handshaking,
+      out_plain: Vec::new(),
     }
   }
 
@@ -86,9 +92,11 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     }
     let peer_bytes = self.record.peer_identity().map(|b| b.to_vec());
     if let Some(bytes) = peer_bytes {
+      // Require the id to consume the WHOLE identity field — a prefix decode that leaves trailing
+      // bytes is a malformed hello, not a valid peer.
       match I::decode(&bytes) {
-        Ok((_, peer)) => self.state = ConnState::Validated { peer },
-        Err(_) => {
+        Ok((n, peer)) if n == bytes.len() => self.state = ConnState::Validated { peer },
+        _ => {
           self.state = ConnState::Closed;
           return Err(TransportError::Decode);
         }
@@ -116,17 +124,33 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     Ok(())
   }
 
-  /// Encode + frame `msg` and queue it for transmission through the record layer.
+  /// Encode + frame `msg` and queue it for transmission. A closed connection drops the message (it
+  /// has no route); the router clears the peer binding so the consensus layer re-routes/retries.
   pub fn send_message(&mut self, msg: &Message<I>) {
+    if matches!(self.state, ConnState::Closed) {
+      return;
+    }
     let mut payload = Vec::new();
     msg.encode(&mut payload);
-    let mut framed = Vec::new();
-    encode_frame(&payload, &mut framed);
-    self.record.write_plaintext(&framed);
+    encode_frame(&payload, &mut self.out_plain);
+    self.drain_out();
+  }
+
+  /// Feed pending framed bytes into the record layer, advancing by exactly the count it accepts. A
+  /// short accept (backpressure) leaves the remainder buffered for the next drain.
+  fn drain_out(&mut self) {
+    while !self.out_plain.is_empty() {
+      let n = self.record.write_plaintext(&self.out_plain);
+      if n == 0 {
+        break;
+      }
+      self.out_plain.drain(..n);
+    }
   }
 
   /// Drain queued outbound wire bytes into `out`, returning the number written.
   pub fn poll_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    self.drain_out();
     self.record.poll_transport_transmit(out)
   }
 
