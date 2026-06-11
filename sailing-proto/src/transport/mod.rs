@@ -100,4 +100,10 @@ pub enum TransportError {
   /// violation — ids are unique and monotonic). The rejected registration's socket must be closed.
   #[error("connection id is already registered")]
   DuplicateConnId,
+  /// The locally configured node-id encoding is outside the hello's bounds (`1..=1024` bytes) —
+  /// a configuration error, rejected at construction before any hello byte reaches the wire
+  /// (an out-of-range length would otherwise wrap through the hello's `u16` length field and
+  /// desynchronize the peer's hello parse).
+  #[error("local node id encoding is out of bounds for the hello")]
+  InvalidLocalId,
 }

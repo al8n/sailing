@@ -94,7 +94,9 @@ validating the dialer's):
 ```
 
 - The peer id is the `NodeId`'s `Data` encoding; it must be 1..=1024 bytes and must decode
-  consuming exactly its length.
+  consuming exactly its length. The bound is enforced on BOTH sides: a received id outside it
+  terminally rejects the stream, and a local id outside it is refused at construction (it could
+  not be represented faithfully through the u16 length field).
 - A magic, version, or cluster mismatch — or a malformed id — terminally rejects the stream.
 - Over `Labeled<TlsRecords>` the hello is ordinary plaintext, i.e. encrypted inside the TLS
   session.
