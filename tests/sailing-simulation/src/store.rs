@@ -454,12 +454,12 @@ impl LogStore for MemLog {
   }
 
   fn term(&self, index: Index) -> Result<Term, Self::Error> {
-    // NOTE: `transient_read` is intentionally NOT injected on `term`. The proto's `term` callers
-    // (e.g. the `on_append_entries` matching probe, `maybe_send_append`) deliberately treat a
-    // failed/zero `term` read as NON-fatal (`.unwrap_or(...)`), so a hard error here would make a
-    // present entry look conflicting and trip a debug-only committed-entry tripwire — modeling a
-    // scenario the proto does not claim to survive, not the poison path. The fault is confined
-    // to the committed-range `entries` read, which the proto declares fatal (PoisonReason::LogRead).
+    // NOTE: `transient_read` is intentionally NOT injected on `term`. Per the trait's domain
+    // contract a `term` Err means a GENUINE storage fault and is poison-fatal (the proto's
+    // `log_term` choke point poisons on Err) — `term` is read on virtually every inbound message,
+    // so injecting transient faults here would poison nodes constantly and the run would measure
+    // the restart path, not consensus. The fatal-read poison path is exercised through the
+    // committed-range `entries` read instead.
     if index == self.offset {
       return Ok(self.compacted_term);
     }
@@ -479,7 +479,7 @@ impl LogStore for MemLog {
   fn entries(
     &self,
     range: core::ops::Range<Index>,
-    _max_bytes: u64,
+    max_bytes: u64,
   ) -> Result<&[Entry], Self::Error> {
     // Seeded transient-read fault on the committed-range read: surface as a fatal read error. The
     // proto's `apply_committed` treats an `entries` error as unrecoverable and POISONS the node
@@ -498,11 +498,27 @@ impl LogStore for MemLog {
     } else {
       (start - offset - 1) as usize
     };
-    let hi = if end <= offset {
+    let mut hi = if end <= offset {
       0usize
     } else {
       ((end - offset - 1).min(len)) as usize
     };
+    // Respect the byte cap (trait contract: roughly `max_bytes`, always at least one entry if the
+    // range is non-empty) — a real store caps here, and the proto's send path relies on the cap to
+    // bound per-message work. Charging only payload bytes is the "roughly".
+    if hi > lo {
+      let mut budget = max_bytes;
+      let mut capped = lo;
+      for e in &self.entries[lo..hi] {
+        let cost = e.data().len() as u64;
+        if capped > lo && cost > budget {
+          break;
+        }
+        budget = budget.saturating_sub(cost);
+        capped += 1;
+      }
+      hi = capped;
+    }
     let lo = lo.min(self.entries.len());
     let hi = hi.max(lo).min(self.entries.len());
     Ok(&self.entries[lo..hi])
@@ -732,9 +748,18 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
   fn hard_state(&self) -> HardState<I> {
     // NOTE: `hard_state` has no `Result` return, so a transient read fault cannot be surfaced here
     // as a value without changing the trait. `transient_read` is confined to the committed-range
-    // `LogStore::entries` read (the proto's poison path); `hard_state` always returns durable
-    // state.
-    self.hard_state
+    // `LogStore::entries` read (the proto's poison path).
+    //
+    // CONTRACT FIDELITY: the trait documents `hard_state()` as LAST-DURABLE. In async mode the
+    // visible state runs ahead of durability (submit-then-flush), so returning it would make the
+    // sim LAXER than the contract — a real store returning genuinely-durable state could then be
+    // conformant-but-broken in ways the sim never exercises. Return the durable snapshot, exactly
+    // what a disk store would read back.
+    if self.mode.is_async() {
+      self.durable_hard_state
+    } else {
+      self.hard_state
+    }
   }
 
   fn submit_write(&mut self, id: OpId, hard_state: HardState<I>) {
