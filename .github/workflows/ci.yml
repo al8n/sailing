@@ -114,10 +114,11 @@ jobs:
     - uses: actions/checkout@v6
     - name: Install MSRV toolchain
       run: rustup toolchain install 1.85 --no-self-update && rustup default 1.85
-    - name: Check sailing-proto on the MSRV (default + tls)
+    - name: Check sailing-proto on the MSRV (default + tls + quic)
       run: |
         cargo check -p sailing-proto
         cargo check -p sailing-proto --features tls
+        cargo check -p sailing-proto --features quic
 
   # Prove the no_std core (sailing-proto) links on a real bare-metal target with only `alloc` and
   # no `std`. Any accidental std dependency fails to build here.
