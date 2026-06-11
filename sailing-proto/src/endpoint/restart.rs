@@ -139,8 +139,8 @@ where
         poisoned = true;
         poison_reason = Some(PoisonReason::InvalidConfState);
       } else {
-        match <F::Snapshot as crate::Data>::decode(&data) {
-          Ok((_, snap)) => {
+        match <F::Snapshot as crate::Data>::decode_exact(&data) {
+          Ok(snap) => {
             if fsm.restore(snap).is_err() {
               poisoned = true;
               poison_reason = Some(PoisonReason::SnapshotRestore);
