@@ -153,3 +153,30 @@ fn compaction_preserves_frames_across_interleaved_push_poll() {
     );
   }
 }
+
+/// EXHAUSTIVE split matrix: a three-frame stream (empty / small / threshold-ish payloads) split
+/// into two pushes at EVERY byte boundary must yield exactly the three payloads, regardless of
+/// where the cut lands (header straddles, payload straddles, frame joins).
+#[test]
+fn every_two_chunk_split_reassembles_three_frames() {
+  let payloads: [&[u8]; 3] = [b"", b"hello", &[0x5A; 300]];
+  let mut wire = Vec::new();
+  for p in payloads {
+    encode_frame(p, &mut wire);
+  }
+  for cut in 0..=wire.len() {
+    let mut dec = FrameDecoder::new();
+    dec.push(&wire[..cut]);
+    dec.push(&wire[cut..]);
+    let mut out = Vec::new();
+    for (i, expected) in payloads.iter().enumerate() {
+      assert!(
+        dec.poll(&mut out).unwrap(),
+        "cut {cut}: frame {i} must be produced"
+      );
+      assert_eq!(&out[..], *expected, "cut {cut}: frame {i} intact");
+    }
+    assert!(!dec.poll(&mut out).unwrap(), "cut {cut}: nothing extra");
+    assert_eq!(dec.buffered_for_test(), 0, "cut {cut}: fully drained");
+  }
+}

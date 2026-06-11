@@ -51,9 +51,11 @@ impl World {
   fn new() -> Self {
     let mut a = coord(1);
     let mut b = coord(2);
-    // Node 1 dials node 2; node 2 accepts. Same ConnId(1) on each side's own table.
-    a.on_conn_open(ConnId(1), label(1, true), Instant::ORIGIN);
-    b.on_conn_open(ConnId(1), label(2, false), Instant::ORIGIN);
+    // Node 1 dials node 2; node 2 accepts. Each coordinator assigns its own ConnId; with a single
+    // connection both counters yield the same first id.
+    let ca = a.on_conn_open(label(1, true), Instant::ORIGIN);
+    let cb = b.on_conn_open(label(2, false), Instant::ORIGIN);
+    assert_eq!(ca, cb, "first allocation on both sides");
     World {
       a,
       b,

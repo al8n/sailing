@@ -58,6 +58,9 @@ pub struct Conn<I, R> {
   /// decoder. A field (cleared per pass) rather than a per-iteration `Vec::new()` — `handle_data`
   /// runs once per socket read, so the allocation churn would be steady per-chunk overhead.
   scratch: Vec<u8>,
+  /// Reusable frame scratch for `poll_decoded` (the popped frame's payload before `Message`
+  /// decode) — same per-call-allocation argument as `scratch`.
+  frame_scratch: Vec<u8>,
 }
 
 impl<I: NodeId, R: RecordIo> Conn<I, R> {
@@ -71,6 +74,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       out_pos: 0,
       max_out: MAX_CONN_OUT_BUF,
       scratch: Vec::new(),
+      frame_scratch: Vec::new(),
     }
   }
 
@@ -162,9 +166,19 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     if self.peer().is_none() {
       return Ok(());
     }
-    let mut frame = Vec::new();
-    while self.decoder.poll(&mut frame)? {
-      match Message::<I>::decode(&frame) {
+    let mut frame = core::mem::take(&mut self.frame_scratch);
+    let result = self.poll_decoded_inner(&mut frame, out);
+    self.frame_scratch = frame;
+    result
+  }
+
+  fn poll_decoded_inner(
+    &mut self,
+    frame: &mut Vec<u8>,
+    out: &mut Vec<Message<I>>,
+  ) -> Result<(), TransportError> {
+    while self.decoder.poll(frame)? {
+      match Message::<I>::decode(frame) {
         Ok((n, msg)) if n == frame.len() => out.push(msg),
         _ => {
           self.close_suspect();
@@ -228,6 +242,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     self.out_plain = Vec::new();
     self.out_pos = 0;
     self.scratch = Vec::new();
+    self.frame_scratch = Vec::new();
   }
 
   /// Drain queued outbound wire bytes into `out`, returning the number written.

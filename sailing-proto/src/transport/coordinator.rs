@@ -20,6 +20,10 @@ where
 {
   endpoint: Endpoint<I, F>,
   router: PeerRouter<I, R>,
+  /// The next connection id to assign. Coordinator-allocated (a simple counter), so the
+  /// uniqueness/monotonicity the router's duplicate-peer tie-break relies on holds BY
+  /// CONSTRUCTION rather than as a driver contract.
+  next_conn_id: u64,
 }
 
 impl<I, F, R> StreamCoordinator<I, F, R>
@@ -94,13 +98,20 @@ where
     Self {
       endpoint,
       router: PeerRouter::new(),
+      next_conn_id: 1,
     }
   }
 
-  /// Register a freshly opened connection (the driver dialed or accepted a socket). `now` starts
-  /// the handshake deadline — a connection that never validates is reaped and reported closed.
-  pub fn on_conn_open(&mut self, conn: ConnId, record: R, now: Instant) {
-    self.router.register(conn, record, now);
+  /// Register a freshly opened connection (the driver dialed or accepted a socket), returning the
+  /// coordinator-assigned [`ConnId`] the driver must key its socket by. Ids are allocated by an
+  /// internal counter, making the uniqueness/monotonicity the duplicate-peer tie-break relies on
+  /// hold by construction. `now` starts the handshake deadline — a connection that never validates
+  /// is reaped and reported closed.
+  pub fn on_conn_open(&mut self, record: R, now: Instant) -> ConnId {
+    let id = ConnId(self.next_conn_id);
+    self.next_conn_id += 1;
+    self.router.register(id, record, now);
+    id
   }
 
   /// Tear down a connection the DRIVER closed (not echoed back via

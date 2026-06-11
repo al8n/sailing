@@ -239,3 +239,29 @@ fn zero_length_and_oversized_peer_ids_are_rejected() {
     "an oversized peer id is unauthenticated buffer growth"
   );
 }
+
+/// EXHAUSTIVE split matrix: the inbound hello split into two chunks at every byte boundary must
+/// validate identically (the two wait-states of the hello parser are re-entrant at any cut).
+#[test]
+fn every_two_chunk_hello_split_validates() {
+  let mut hello = Vec::new();
+  Labeled::dialer(Passthrough::new(), &opts(1, 7)).poll_transport_transmit(&mut hello);
+  for cut in 0..=hello.len() {
+    let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+    assert_ne!(
+      b.handle_transport_data(&hello[..cut], Instant::ORIGIN),
+      Intake::Failed,
+      "cut {cut}: prefix must never reject"
+    );
+    assert_ne!(
+      b.handle_transport_data(&hello[cut..], Instant::ORIGIN),
+      Intake::Failed,
+      "cut {cut}: remainder must validate"
+    );
+    assert_eq!(
+      b.peer_identity(),
+      Some(enc(7).as_slice()),
+      "cut {cut}: peer bound"
+    );
+  }
+}
