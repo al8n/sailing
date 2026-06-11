@@ -68,11 +68,19 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
       None => return Ok(()),
     };
     conn.handle_data(bytes, eof, now)?;
-    // Bind (or rebind) the peer the moment this connection validates.
+    // Bind (or rebind) the peer the moment this connection validates. `ConnId`s are
+    // driver-assigned and monotonically increasing, so "newer connection wins" is exactly
+    // "higher id wins": a NEWER duplicate (a redial) evicts the older binding, while an OLDER
+    // duplicate that validates late is itself dropped — it must never evict the healthy
+    // replacement.
     if let Some(peer) = conn.peer() {
       if let Some(&prev) = self.peer_of.get(&peer) {
+        if prev > id {
+          self.conns.remove(&id); // stale older duplicate: drop it, keep the newer binding
+          return Ok(());
+        }
         if prev != id {
-          self.conns.remove(&prev); // newer connection wins the tie-break
+          self.conns.remove(&prev); // newer connection wins
         }
       }
       self.peer_of.insert(peer, id);
@@ -91,17 +99,21 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
 
   /// Encode `msg` once and queue it to `to`'s connection. Returns `false` if no validated connection
   /// to `to` exists (the message is dropped; the consensus layer will retry on its own cadence).
+  /// A send that closes the connection (the outbound cap tripped — the peer stopped draining) drops
+  /// the route immediately, so no later message is silently queued into a dead connection.
   pub fn route(&mut self, to: I, msg: &Message<I>) -> bool {
-    match self.peer_of.get(&to) {
-      Some(&id) => match self.conns.get_mut(&id) {
-        Some(conn) => {
-          conn.send_message(msg);
-          true
-        }
-        None => false,
-      },
-      None => false,
+    let Some(&id) = self.peer_of.get(&to) else {
+      return false;
+    };
+    let Some(conn) = self.conns.get_mut(&id) else {
+      return false;
+    };
+    conn.send_message(msg);
+    if conn.is_closed() {
+      self.remove(id);
+      return false;
     }
+    true
   }
 
   /// Drain queued outbound wire bytes for every connection, as `(conn, bytes)` pairs.
