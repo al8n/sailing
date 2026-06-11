@@ -105,6 +105,7 @@ where
   /// a healed follower's commit forever (caught by the VOPR quiesce oracle, seed 3).
   pub(crate) fn pump_appends<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
+    now: Instant,
     peer: I,
     log: &L,
     stable: &S,
@@ -117,7 +118,7 @@ where
         return;
       }
       let before = pr.next_index();
-      self.maybe_send_append(peer, log, stable);
+      self.maybe_send_append(now, peer, log, stable);
       let Some(pr) = self.tracker.progress(&peer) else {
         return;
       };
@@ -129,6 +130,7 @@ where
 
   pub(crate) fn maybe_send_append<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
+    now: Instant,
     peer: I,
     log: &L,
     stable: &S,
@@ -157,6 +159,15 @@ where
         if let Some(p) = self.tracker.progress_mut(&peer) {
           p.become_snapshot(pending);
         }
+        // Arm the resend-pacing deadline AT the send: the map entry means "an InstallSnapshot for
+        // this peer's current install window went out at deadline − election_timeout". This (a)
+        // stops `on_heartbeat_resp` from re-sending the very blob this call just emitted (the
+        // heartbeat pump can be what triggers the initial install, in the SAME response handling),
+        // and (b) overwrites any stale deadline left over from a previous install window (the peer
+        // may have exited Snapshot via `maybe_update` without a heartbeat observation to clean up).
+        self
+          .snapshot_resend_after
+          .insert(peer, now + self.config.election_timeout());
       }
       // No snapshot persisted yet → nothing to send; retry later.
       return;
@@ -281,7 +292,7 @@ where
   /// Takes `cmd` by reference (encoding only borrows; the caller keeps it to retry).
   pub fn propose<L, S>(
     &mut self,
-    _now: Instant,
+    now: Instant,
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
@@ -324,7 +335,7 @@ where
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
-      self.maybe_send_append(peer, log, stable);
+      self.maybe_send_append(now, peer, log, stable);
     }
     Ok(index)
   }
@@ -674,7 +685,7 @@ where
       // round instead of wedging until an unrelated proposal triggers a send.
       pr.free_inflight_on_heartbeat();
     }
-    self.pump_appends(from, log, stable);
+    self.pump_appends(now, from, log, stable);
 
     // Liveness fix: if this peer is still in Snapshot state and has NOT yet
     // caught up to its pending snapshot index, RE-SEND the snapshot. The single
@@ -699,10 +710,14 @@ where
     };
     if resend {
       // TIME-based pacing (response COUNT is the wrong clock: ReadIndex Safe rounds elicit extra
-      // responses, which would accelerate a count-based pacer arbitrarily): resend at most once
-      // per election timeout. The first qualifying response at/after the deadline (or with no
-      // deadline yet) re-sends and re-arms; a genuinely dropped blob is therefore retried within
-      // one election timeout of the next response (liveness preserved).
+      // responses, which would accelerate a count-based pacer arbitrarily): at most one blob per
+      // election timeout. The deadline is armed at every InstallSnapshot SEND — by
+      // `maybe_send_append`'s compacted-hole branch when the install window opens (possibly via
+      // the pump a few lines up, in THIS response handling) and re-armed here on each resend — so
+      // "due" always means "a full election timeout has passed since the blob last went out".
+      // A genuinely dropped blob is therefore retried within one election timeout of its send
+      // (liveness preserved). The `is_none_or` arm is a backstop for a Snapshot-state peer with no
+      // armed deadline, which no current path produces.
       let due = self
         .snapshot_resend_after
         .get(&from)
@@ -714,6 +729,9 @@ where
         self.resend_snapshot(from, stable);
       }
     } else {
+      // Observed out of Snapshot state: drop the pacing entry. (A peer that exits via
+      // `maybe_update` keeps its entry until this observation — harmless, since the resend is
+      // gated on Snapshot state above, and a NEW install window re-arms the deadline at send.)
       self.snapshot_resend_after.remove(&from);
     }
 
@@ -855,7 +873,7 @@ where
         p.become_probe();
         p.set_next_index(safe_next);
       }
-      self.maybe_send_append(from, log, stable);
+      self.maybe_send_append(now, from, log, stable);
     } else {
       // Boundary check (shared with `on_snapshot_resp` via `match_within_log`): a successful ack must
       // not report a match above the leader's own log. An over-run is malformed/version-skewed input —
@@ -889,7 +907,7 @@ where
         self.maybe_advance_commit(log);
         self.apply_committed(log);
         self.maybe_flush_deferred_reads(now, log, stable);
-        self.pump_appends(from, log, stable); // fill the peer's inflight window if still behind
+        self.pump_appends(now, from, log, stable); // fill the peer's inflight window if still behind
         // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
         if self.lead_transferee == Some(from) {
           let peer_match = self

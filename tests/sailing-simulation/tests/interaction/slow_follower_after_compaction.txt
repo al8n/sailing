@@ -152,9 +152,7 @@ stabilize
 > n1 ready
   AppendEntries term=1 prev=1/5 commit=5 entries=[]
   InstallSnapshot term=1 snap=1/5
-  InstallSnapshot term=1 snap=1/5
 > n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n3 recv InstallSnapshot term=1 snap=1/5
 > n3 recv InstallSnapshot term=1 snap=1/5
 > n2 ready
   AppendResp term=1 match=5
