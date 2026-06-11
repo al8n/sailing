@@ -122,9 +122,30 @@ pub trait LogStore {
   fn last_index(&self) -> Index;
 
   /// The term of the entry at `index`.
+  ///
+  /// **Domain contract (NORMATIVE):** the core routinely probes indices OUTSIDE the retained
+  /// entries with PEER-CONTROLLED or pre-quorum values — a stale leader's `prev_log_index` below
+  /// the compaction point after a snapshot install, commit-candidate index `0` on a fresh leader
+  /// before any ack, a reject hint beyond the log. The full domain an implementation MUST answer
+  /// with `Ok` is:
+  ///
+  /// - `index == first_index() - 1` (the compaction/snapshot boundary): return the boundary term
+  ///   retained from the covering snapshot (`Term::ZERO` for the empty-log origin, index 0);
+  /// - `first_index() <= index <= last_index()`: the entry's term;
+  /// - any OTHER index (compacted below the boundary, or above `last_index()`): return
+  ///   `Ok(Term::ZERO)` — **never** `Err`. `Term::ZERO` is unambiguous here: no real entry
+  ///   carries it, and the core's consistency checks treat it as "unknown/absent".
+  ///
+  /// `Err` is reserved for genuine storage faults (I/O error, corruption) and is FATAL: the core
+  /// poisons the node (fail-stop) on any term-read error. A store that returns `Err` for routine
+  /// out-of-domain probes will be permanently poisoned by ordinary protocol traffic.
   fn term(&self, index: Index) -> Result<Term, Self::Error>;
 
   /// Entries in `range`, capped at roughly `max_bytes` (always at least one if non-empty).
+  ///
+  /// **Domain contract:** the core only requests ranges within the retained log
+  /// (`first_index() <= range.start` and `range.end <= last_index() + 1`); as with
+  /// [`term`](Self::term), `Err` is reserved for genuine storage faults and poisons the node.
   fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<&[Entry], Self::Error>;
 
   /// Queue an append (truncating any conflicting suffix first). Durable on the matching `poll`

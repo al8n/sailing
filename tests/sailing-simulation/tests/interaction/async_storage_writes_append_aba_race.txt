@@ -250,13 +250,21 @@ stabilize
 > n3 recv AppendResp term=2 match=1
 > n3 ready
   AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=2/2 commit=1 entries=[]
   AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=2/2 commit=1 entries=[]
 > n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n4 recv AppendEntries term=2 prev=2/2 commit=1 entries=[]
 > n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n5 recv AppendEntries term=2 prev=2/2 commit=1 entries=[]
 > n4 ready
+  AppendResp term=2 match=1
   AppendResp term=2 match=1
 > n5 ready
   AppendResp term=2 match=1
+  AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
+> n3 recv AppendResp term=2 match=1
 > n3 recv AppendResp term=2 match=1
 > n3 recv AppendResp term=2 match=1
 
