@@ -35,6 +35,7 @@ where
   /// Requires `I: crate::Data` because the ConfChangeV2 encodes node ids.
   pub(crate) fn append_conf_change<L, S>(
     &mut self,
+    now: Instant,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
@@ -66,7 +67,7 @@ where
     // so `conf_state()`/`quorum_committed()` always reflect the COMMITTED voter set, never an
     // uncommitted log tail. At append the leader records only `pending_conf_index` (one in flight).
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
-      self.maybe_send_append(peer, log, stable);
+      self.maybe_send_append(now, peer, log, stable);
     }
     Some(index)
   }
@@ -102,7 +103,7 @@ where
   ///   causes `ConfChangeInFlight`).
   pub fn propose_conf_change_v2<L, S>(
     &mut self,
-    _now: Instant,
+    now: Instant,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
@@ -151,7 +152,7 @@ where
         return Err(crate::ProposeError::InvalidConfChange);
       }
     }
-    match self.append_conf_change(log, stable, cc) {
+    match self.append_conf_change(now, log, stable, cc) {
       Some(index) => Ok(index),
       None => Err(crate::ProposeError::LogIndexExhausted),
     }

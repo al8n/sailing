@@ -382,7 +382,7 @@ where
       && self.pending_conf_index <= self.applied
     {
       let leave = crate::ConfChangeV2::leave_joint();
-      if self.append_conf_change(log, stable, leave).is_none() {
+      if self.append_conf_change(now, log, stable, leave).is_none() {
         // Log index space exhausted: the leader cannot append the leave-joint entry and so cannot
         // exit joint consensus. This internal path has no user error channel, and a node whose log is
         // at u64::MAX is in a corrupt/terminal state — fail-stop.

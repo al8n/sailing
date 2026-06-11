@@ -238,7 +238,7 @@ fn wedged_snapshot_follower(
   }
 
   // First send: emits the InstallSnapshot and moves peer 2 into Snapshot(offset).
-  ep.maybe_send_append(2u64, &log, &stable);
+  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
   assert!(
     ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
     "peer 2 must be in Snapshot state after the first send"

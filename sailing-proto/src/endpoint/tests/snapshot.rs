@@ -342,7 +342,7 @@ fn sends_install_snapshot_on_compacted_hole() {
   }
 
   // Call maybe_send_append; it should detect next_index < first_index and send snapshot.
-  ep.maybe_send_append(2u64, &log, &stable);
+  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
 
   // Exactly one outgoing message to peer 2 must be InstallSnapshot.
   let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
@@ -396,7 +396,7 @@ fn no_broken_append_entries_for_compacted_peer() {
     p.set_next_index(Index::new(3));
   }
 
-  ep.maybe_send_append(2u64, &log, &stable);
+  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
 
   // Must NOT see any AppendEntries with prev_log_term == ZERO for this peer.
   while let Some(out) = ep.poll_message() {
@@ -427,11 +427,11 @@ fn snapshot_state_peer_is_paused_no_second_send() {
   }
 
   // First call: sends the snapshot and transitions peer to Snapshot state.
-  ep.maybe_send_append(2u64, &log, &stable);
+  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
   while ep.poll_message().is_some() {} // drain
 
   // Second call: peer is now paused (Snapshot state), must send nothing.
-  ep.maybe_send_append(2u64, &log, &stable);
+  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
   let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
   assert!(
     msgs.is_empty(),
@@ -455,7 +455,7 @@ fn normal_append_at_boundary_not_snapshot() {
     p.set_next_index(first); // exactly at boundary
   }
 
-  ep.maybe_send_append(2u64, &log, &stable);
+  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
 
   let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
 
@@ -498,6 +498,10 @@ fn normal_append_at_boundary_not_snapshot() {
 ///
 /// FAILS-ON-OLD: without the resend hook the HeartbeatResp produces NO InstallSnapshot
 /// (maybe_send_append early-returns on the paused Snapshot peer), so the follower wedges.
+///
+/// PACING (deadline armed AT each send): the initial install (sent at ORIGIN by the helper) arms
+/// the deadline, so responses within one election timeout of the SEND must not re-transmit the
+/// blob; the first response at/after the deadline re-sends and re-arms.
 #[test]
 fn heartbeat_resend_snapshot_to_wedged_follower() {
   use crate::{Index, Instant, Message, Term};
@@ -505,22 +509,34 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   let offset = 5u64;
   let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
   assert_eq!(pending, Index::new(offset));
-
-  // Peer 2 is still in Snapshot(offset) with match_index = 0 < pending: it has NOT received
-  // the snapshot. Deliver a HeartbeatResp (empty context — no ReadIndex involvement).
-  ep.handle_message(
-    Instant::ORIGIN,
-    &mut log,
-    &mut stable,
-    2u64,
+  let hb_resp = || {
     Message::HeartbeatResp(crate::HeartbeatResp::new(
       Term::new(1),
       2u64,
       bytes::Bytes::new(),
-    )),
+    ))
+  };
+  let count_installs = |ep: &mut Endpoint<u64, crate::testkit::CountSm>| {
+    core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+      .count()
+  };
+
+  // Peer 2 is still in Snapshot(offset) with match_index = 0 < pending: it has NOT received the
+  // snapshot. A response WITHIN one election timeout of the initial send (the helper sent it at
+  // ORIGIN) must NOT re-send: the blob just went out, and the deadline armed at that send covers
+  // it. (An immediate resend here is exactly the double-blob amplification the pacing prevents.)
+  ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, hb_resp());
+  assert_eq!(
+    count_installs(&mut ep),
+    0,
+    "a response within one election timeout of the install send must not re-send the blob"
   );
 
-  // A NEW InstallSnapshot to peer 2 must be emitted (the resend), carrying the same meta.
+  // The first response at/after the deadline (one election timeout past the SEND) re-sends,
+  // carrying the same meta.
+  let later = Instant::ORIGIN + ep.config.election_timeout();
+  ep.handle_message(later, &mut log, &mut stable, 2u64, hb_resp());
   let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
   let snap_msgs: std::vec::Vec<_> = msgs
     .iter()
@@ -529,7 +545,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   assert_eq!(
     snap_msgs.len(),
     1,
-    "a HeartbeatResp from a wedged Snapshot-state follower must RE-SEND exactly one InstallSnapshot"
+    "the first HeartbeatResp at/after the deadline must RE-SEND exactly one InstallSnapshot"
   );
   let resent = match snap_msgs[0].message() {
     Message::InstallSnapshot(s) => s,
@@ -551,9 +567,44 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
     );
   }
 
-  // BACKOFF: a deferred install legitimately spans many heartbeat intervals, so an immediate
-  // second HeartbeatResp must NOT trigger another full-blob resend — the per-peer countdown
-  // spaces resends roughly one election timeout apart.
+  // BACKOFF: the resend re-armed the deadline, so another response at the SAME instant must not
+  // re-send again — regardless of how many responses arrive (ReadIndex Safe rounds elicit extras).
+  ep.handle_message(later, &mut log, &mut stable, 2u64, hb_resp());
+  assert_eq!(
+    count_installs(&mut ep),
+    0,
+    "a response within one election timeout of the RESEND must not re-send again (backoff)"
+  );
+
+  // TIME-based pacing repeats: one more election timeout later, the next response re-sends.
+  let even_later = later + ep.config.election_timeout();
+  ep.handle_message(even_later, &mut log, &mut stable, 2u64, hb_resp());
+  assert_eq!(
+    count_installs(&mut ep),
+    1,
+    "a response after the re-armed deadline re-sends the blob (liveness repeats)"
+  );
+}
+
+/// FAILS-ON-OLD (Codex R5): when the heartbeat-response PUMP is what opens the install window
+/// (a compacted Probe peer resumes on a heartbeat ack), the same response handling must not send
+/// the blob TWICE — once from the pump's compacted-hole branch and once from the resend hook,
+/// which previously saw "Snapshot state + no deadline" and fired immediately.
+#[test]
+fn heartbeat_pump_initial_install_is_not_double_sent() {
+  use crate::{Index, Instant, Message, Term};
+
+  let offset = 5u64;
+  let (mut ep, mut log, mut stable) = make_leader_with_compacted_log(offset, 2);
+
+  // Peer 2 far behind (next_index < first_index) and still in Probe: the install window is NOT
+  // yet open — the heartbeat response below is what opens it.
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_probe();
+    p.set_next_index(Index::new(2));
+  }
+  while ep.poll_message().is_some() {} // drop anything emitted during setup
+
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -565,38 +616,84 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
       bytes::Bytes::new(),
     )),
   );
-  let again: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
-  let resends: usize = again
-    .iter()
+  let installs = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
     .count();
   assert_eq!(
-    resends, 0,
-    "an immediate second HeartbeatResp must not re-send the blob (resend backoff)"
+    installs, 1,
+    "one response handling = one InstallSnapshot: the pump's initial install must arm the \
+     pacing deadline so the resend hook does not duplicate it"
   );
+  assert!(
+    ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+    "the pump moved peer 2 into Snapshot state"
+  );
+}
 
-  // TIME-based pacing: once a full election timeout has elapsed, the next response re-sends —
-  // regardless of how many (or few) responses arrived in between.
-  let later = Instant::ORIGIN + ep.config.election_timeout();
-  ep.handle_message(
-    later,
-    &mut log,
-    &mut stable,
-    2u64,
+/// FAILS-ON-OLD (Codex R5): a pacing deadline left over from a PREVIOUS install window must not
+/// leak into a new one. The peer exits Snapshot via `maybe_update` (no heartbeat observation to
+/// clean the map), falls behind a fresh compaction, and re-enters Snapshot — the NEW install send
+/// must overwrite the stale (long-expired) deadline, so a response right after the new install
+/// does NOT immediately re-send the blob.
+#[test]
+fn stale_resend_deadline_does_not_leak_across_install_windows() {
+  use crate::{Index, Instant, Message, Term};
+
+  let offset = 5u64;
+  let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
+  let hb_resp = || {
     Message::HeartbeatResp(crate::HeartbeatResp::new(
       Term::new(1),
       2u64,
       bytes::Bytes::new(),
-    )),
+    ))
+  };
+
+  // Window 1: a resend fires at the deadline, re-arming it (deadline now ORIGIN + 2·ET).
+  let t1 = Instant::ORIGIN + ep.config.election_timeout();
+  ep.handle_message(t1, &mut log, &mut stable, 2u64, hb_resp());
+  while ep.poll_message().is_some() {}
+
+  // The follower acks at pending: it exits Snapshot via maybe_update (SnapshotResp path) —
+  // NO heartbeat-response observation cleans the pacing map here.
+  ep.handle_message(
+    t1,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResp(crate::SnapshotResp::new(Term::new(1), 2u64, false, pending)),
   );
-  let after: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
-  let resends_after: usize = after
-    .iter()
+  assert!(
+    !ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+    "after acking at pending the follower leaves Snapshot state"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Window 2 opens MUCH later (the stale window-1 deadline is long expired): the peer falls
+  // behind the compaction boundary again and a heartbeat response re-opens the install.
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_probe();
+    p.set_next_index(Index::new(2));
+  }
+  let t2 = Instant::ORIGIN + ep.config.election_timeout() * 10;
+  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp());
+  let installs = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
     .count();
   assert_eq!(
-    resends_after, 1,
-    "a response after the election-timeout deadline re-sends the blob (liveness)"
+    installs, 1,
+    "the new window's install must overwrite the stale deadline — exactly one blob, not an \
+     install plus an immediate stale-deadline resend"
+  );
+
+  // And the very next response inside the new window's deadline stays quiet.
+  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp());
+  let extra = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+    .count();
+  assert_eq!(
+    extra, 0,
+    "window 2 paces from ITS send, not window 1's deadline"
   );
 }
 
@@ -610,9 +707,10 @@ fn no_snapshot_resend_after_follower_catches_up() {
   let offset = 5u64;
   let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
 
-  // First heartbeat round while wedged: resend fires (sanity — same as the test above).
+  // First heartbeat round at the deadline while wedged: resend fires (sanity — same as above).
+  let t1 = Instant::ORIGIN + ep.config.election_timeout();
   ep.handle_message(
-    Instant::ORIGIN,
+    t1,
     &mut log,
     &mut stable,
     2u64,
@@ -629,7 +727,7 @@ fn no_snapshot_resend_after_follower_catches_up() {
 
   // The follower finally receives a snapshot and acks at pending (SnapshotResp success).
   ep.handle_message(
-    Instant::ORIGIN,
+    t1,
     &mut log,
     &mut stable,
     2u64,
@@ -642,9 +740,10 @@ fn no_snapshot_resend_after_follower_catches_up() {
   );
   while ep.poll_message().is_some() {} // drain anything the catch-up emitted
 
-  // A subsequent HeartbeatResp must NOT emit another InstallSnapshot (resend has stopped).
+  // A subsequent HeartbeatResp — even WAY past every armed deadline — must NOT emit another
+  // InstallSnapshot (the resend is gated on Snapshot state, which the peer has left).
   ep.handle_message(
-    Instant::ORIGIN,
+    Instant::ORIGIN + ep.config.election_timeout() * 10,
     &mut log,
     &mut stable,
     2u64,

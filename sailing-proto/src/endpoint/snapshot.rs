@@ -353,7 +353,7 @@ where
       pr.become_probe();
       // Drop the mutable borrow of `pr` before calling maybe_send_append (which re-borrows
       // self.tracker). The pattern mirrors on_append_resp's reject branch.
-      self.maybe_send_append(from, log, stable);
+      self.maybe_send_append(now, from, log, stable);
     } else {
       // Boundary check (shared with `on_append_resp` via `match_within_log`): a successful snapshot
       // ack must not report a match above the leader's own log, for the same reason — an over-run
@@ -370,7 +370,7 @@ where
       self.maybe_advance_commit(log);
       self.apply_committed(log);
       self.maybe_flush_deferred_reads(now, log, stable);
-      self.maybe_send_append(from, log, stable);
+      self.maybe_send_append(now, from, log, stable);
     }
   }
 }
