@@ -76,8 +76,10 @@ jobs:
           echo "::notice title=shard ${SHARD}::sweeping seeds [${START}, ${END}) @ ${TICKS} ticks"
           # Release build: the sweep is compute-bound; release is ~5-10x faster and finds the SAME
           # bugs (the proto logic is opt-level independent). Each shard is one disjoint seed slice.
+          # `--features wire` routes EVERY delivered message through the real wire codec
+          # (encode -> decode at the delivery seam), so the deep sweep fuzzes the codec too.
           VOPR_SEED_START="$START" VOPR_SEED_END="$END" VOPR_TICKS="$TICKS" \
-            cargo test -p sailing-simulation --release --test vopr vopr_long_sweep -- --ignored --nocapture
+            cargo test -p sailing-simulation --features wire --release --test vopr vopr_long_sweep -- --ignored --nocapture
 
   # Single aggregate status: green iff EVERY shard passed (a failed shard leaves `sweep` failed, so
   # this job is skipped and the workflow reports failure). Gives one check to gate on / watch.
