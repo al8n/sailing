@@ -586,7 +586,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   );
 }
 
-/// FAILS-ON-OLD (Codex R5): when the heartbeat-response PUMP is what opens the install window
+/// FAILS-ON-OLD: when the heartbeat-response PUMP is what opens the install window
 /// (a compacted Probe peer resumes on a heartbeat ack), the same response handling must not send
 /// the blob TWICE — once from the pump's compacted-hole branch and once from the resend hook,
 /// which previously saw "Snapshot state + no deadline" and fired immediately.
@@ -630,7 +630,7 @@ fn heartbeat_pump_initial_install_is_not_double_sent() {
   );
 }
 
-/// FAILS-ON-OLD (Codex R5): a pacing deadline left over from a PREVIOUS install window must not
+/// FAILS-ON-OLD: a pacing deadline left over from a PREVIOUS install window must not
 /// leak into a new one. The peer exits Snapshot via `maybe_update` (no heartbeat observation to
 /// clean the map), falls behind a fresh compaction, and re-enters Snapshot — the NEW install send
 /// must overwrite the stale (long-expired) deadline, so a response right after the new install
@@ -2070,5 +2070,59 @@ fn receipt_stale_above_watermark_records_durable_snapshot() {
     ep.ack_watermark(),
     Index::new(10),
     "the durable snapshot boundary is now ackable → the leader is un-pinned from Snapshot"
+  );
+}
+
+/// FAILS-ON-OLD: a peer REMOVED by a committed conf change while still in Snapshot
+/// state can never be observed leaving it (its Progress is gone, and a dead peer sends no further
+/// responses), so its resend-pacing deadline would linger for the rest of the term — and
+/// add/remove churn of lagging peers would grow the map past the live peer set. The apply-time
+/// membership fold must prune the map to the new membership.
+#[test]
+fn conf_change_removal_prunes_snapshot_resend_deadline() {
+  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Instant, Message, Term};
+
+  let offset = 5u64;
+  let (mut ep, mut log, mut stable, _pending) = wedged_snapshot_follower(offset, 2);
+  assert!(
+    ep.snapshot_resend_after.contains_key(&2u64),
+    "the install send armed peer 2's pacing deadline"
+  );
+  while ep.poll_message().is_some() {}
+  // The helper force-compacted the log without advancing commit/applied (its pacing tests never
+  // apply anything). Make the apply cursor coherent with the compacted log — everything up to the
+  // seeded tail is "already applied" — so the conf-change entry below is the next apply.
+  let tail = log.last_index();
+  ep.commit = tail;
+  ep.applied = tail;
+
+  // Remove the wedged peer 2. Quorum for the conf-change entry under the OLD config {1,2,3}
+  // is leader self-match + peer 3's ack.
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 2u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(Instant::ORIGIN, &mut log, &stable, cc)
+    .expect("propose RemoveNode(2)");
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable); // leader self-match
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx, // peer 3 acks the ConfChange entry → quorum → commit + apply
+    )),
+  );
+  assert!(
+    !ep.tracker.is_voter(&2u64),
+    "RemoveNode(2) must have applied"
+  );
+  assert!(
+    !ep.snapshot_resend_after.contains_key(&2u64),
+    "applying the removal must prune peer 2's resend-pacing deadline (no leak across membership)"
   );
 }
