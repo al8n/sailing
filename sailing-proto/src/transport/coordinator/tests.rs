@@ -25,9 +25,9 @@ fn label(id: u64, role_dialer: bool) -> Rec {
     local_id,
   };
   if role_dialer {
-    Labeled::dialer(Passthrough::new(), &opts)
+    Labeled::dialer(Passthrough::new(), &opts).unwrap()
   } else {
-    Labeled::acceptor(Passthrough::new(), &opts)
+    Labeled::acceptor(Passthrough::new(), &opts).unwrap()
   }
 }
 
@@ -188,4 +188,16 @@ fn leader_replicates_a_proposal_over_the_transport() {
     w.b.state_machine().count() >= 1,
     "follower applied the entry"
   );
+}
+
+/// The coordinator-assigned id counter must never silently wrap into reuse: u64
+/// exhaustion is unreachable in practice, but a release-mode wrap would hand a LIVE id to a new
+/// connection and break the tie-break's uniqueness assumption — so it is a checked panic.
+#[test]
+#[should_panic(expected = "connection id space exhausted")]
+fn conn_id_exhaustion_panics_instead_of_wrapping() {
+  let mut c = coord(1);
+  c.next_conn_id = u64::MAX;
+  // This open hands out ConnId(u64::MAX) and must refuse to wrap the successor.
+  let _ = c.on_conn_open(label(1, true), Instant::ORIGIN);
 }

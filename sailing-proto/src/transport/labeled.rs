@@ -4,7 +4,7 @@
 //! binds the peer id before any application frame flows. The hello rides as plaintext through the
 //! inner layer, so over `Labeled<TlsRecords>` it is encrypted inside the TLS session.
 use super::{
-  ClusterId, ConnRole,
+  ClusterId, ConnRole, TransportError,
   stream::{Intake, RecordIo, sealed},
 };
 use crate::Instant;
@@ -61,7 +61,13 @@ pub struct Labeled<R> {
 
 impl<R: RecordIo> Labeled<R> {
   /// The dialer side: queues its hello eagerly into the inner layer.
-  pub fn dialer(inner: R, opts: &LabelOptions) -> Self {
+  ///
+  /// Errors with [`TransportError::InvalidLocalId`] if the local id encoding is outside
+  /// `1..=MAX_PEER_ID_LEN` bytes — the same bound the inbound side enforces. An oversized id
+  /// would otherwise wrap through the hello's `u16` length field, so the peer would parse a
+  /// truncated id and treat the remaining id bytes as application plaintext.
+  pub fn dialer(inner: R, opts: &LabelOptions) -> Result<Self, TransportError> {
+    Self::check_local_id(&opts.local_id)?;
     let local_hello = build_hello(&opts.cluster, &opts.local_id);
     let mut this = Self {
       inner,
@@ -74,13 +80,17 @@ impl<R: RecordIo> Labeled<R> {
       failed: false,
     };
     this.flush_hello();
-    this
+    Ok(this)
   }
 
   /// The acceptor side: holds its hello until the inbound hello validates.
-  pub fn acceptor(inner: R, opts: &LabelOptions) -> Self {
+  ///
+  /// Errors with [`TransportError::InvalidLocalId`] under the same local-id bound as
+  /// [`Self::dialer`].
+  pub fn acceptor(inner: R, opts: &LabelOptions) -> Result<Self, TransportError> {
+    Self::check_local_id(&opts.local_id)?;
     let local_hello = build_hello(&opts.cluster, &opts.local_id);
-    Self {
+    Ok(Self {
       inner,
       cluster: opts.cluster,
       local_hello,
@@ -89,7 +99,16 @@ impl<R: RecordIo> Labeled<R> {
       hello_out: Vec::new(),
       validated: None,
       failed: false,
+    })
+  }
+
+  /// The OUTBOUND mirror of `advance_handshake`'s peer-id bound: a hello we would reject on
+  /// receipt must never be constructed, let alone sent.
+  fn check_local_id(local_id: &[u8]) -> Result<(), TransportError> {
+    if local_id.is_empty() || local_id.len() > MAX_PEER_ID_LEN {
+      return Err(TransportError::InvalidLocalId);
     }
+    Ok(())
   }
 
   /// Offer pending hello bytes to the inner layer, advancing by exactly the count it accepts.

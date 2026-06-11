@@ -36,8 +36,8 @@ fn pump(a: &mut Labeled<Passthrough>, b: &mut Labeled<Passthrough>) {
 
 #[test]
 fn validates_matching_cluster_and_binds_peer() {
-  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7));
-  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7)).unwrap();
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   assert!(a.is_handshaking() && b.is_handshaking());
   pump(&mut a, &mut b);
   assert_eq!(a.peer_identity(), Some(enc(9).as_slice()));
@@ -48,8 +48,8 @@ fn validates_matching_cluster_and_binds_peer() {
 
 #[test]
 fn rejects_cluster_mismatch() {
-  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7));
-  let mut b = Labeled::acceptor(Passthrough::new(), &opts(2, 9));
+  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7)).unwrap();
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(2, 9)).unwrap();
   let mut wire = Vec::new();
   a.poll_transport_transmit(&mut wire);
   assert_eq!(
@@ -124,7 +124,7 @@ impl RecordIo for ThrottledInner {
 fn hello_survives_partial_accepts_and_gates_app_writes() {
   // The inner layer holds at most ONE byte: the dialer's hello drains a byte at a time, and must
   // still reach the wire complete and uncorrupted; app writes are refused (0) until it has.
-  let mut a = Labeled::dialer(ThrottledInner::new(1), &opts(1, 7));
+  let mut a = Labeled::dialer(ThrottledInner::new(1), &opts(1, 7)).unwrap();
   assert_eq!(
     a.write_plaintext(b"app"),
     0,
@@ -143,7 +143,7 @@ fn hello_survives_partial_accepts_and_gates_app_writes() {
   }
 
   // A fresh acceptor must validate the dialer from that wire — i.e. the hello arrived intact.
-  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   assert_ne!(
     b.handle_transport_data(&wire, Instant::ORIGIN),
     Intake::Failed
@@ -156,8 +156,8 @@ fn hello_survives_partial_accepts_and_gates_app_writes() {
 
 #[test]
 fn gates_plaintext_until_validated_then_strips_the_hello() {
-  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7));
-  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7)).unwrap();
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   a.write_plaintext(b"appdata");
   let mut got = Vec::new();
   assert_eq!(
@@ -176,8 +176,8 @@ fn gates_plaintext_until_validated_then_strips_the_hello() {
 
 #[test]
 fn hello_delivered_byte_at_a_time_still_validates() {
-  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7));
-  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7)).unwrap();
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   let mut wire = Vec::new();
   a.poll_transport_transmit(&mut wire);
   for byte in &wire {
@@ -194,9 +194,11 @@ fn hello_delivered_byte_at_a_time_still_validates() {
 #[test]
 fn magic_and_version_mismatches_are_rejected() {
   // Wrong magic.
-  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   let mut hello = Vec::new();
-  Labeled::dialer(Passthrough::new(), &opts(1, 7)).poll_transport_transmit(&mut hello);
+  Labeled::dialer(Passthrough::new(), &opts(1, 7))
+    .unwrap()
+    .poll_transport_transmit(&mut hello);
   let mut bad_magic = hello.clone();
   bad_magic[0] ^= 0xFF;
   assert_eq!(
@@ -205,7 +207,7 @@ fn magic_and_version_mismatches_are_rejected() {
   );
 
   // Wrong version (a future wire format must be rejected at the handshake).
-  let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   let mut bad_ver = hello.clone();
   bad_ver[1] ^= 0xFF;
   assert_eq!(
@@ -220,7 +222,7 @@ fn zero_length_and_oversized_peer_ids_are_rejected() {
   let mut zero = std::vec![0xCA_u8, 1];
   zero.extend_from_slice(&[1u8; 16]); // cluster
   zero.extend_from_slice(&0u16.to_be_bytes());
-  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   assert_eq!(
     b.handle_transport_data(&zero, Instant::ORIGIN),
     Intake::Failed,
@@ -232,7 +234,7 @@ fn zero_length_and_oversized_peer_ids_are_rejected() {
   let mut huge = std::vec![0xCA_u8, 1];
   huge.extend_from_slice(&[1u8; 16]);
   huge.extend_from_slice(&u16::MAX.to_be_bytes());
-  let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
   assert_eq!(
     b2.handle_transport_data(&huge, Instant::ORIGIN),
     Intake::Failed,
@@ -245,9 +247,11 @@ fn zero_length_and_oversized_peer_ids_are_rejected() {
 #[test]
 fn every_two_chunk_hello_split_validates() {
   let mut hello = Vec::new();
-  Labeled::dialer(Passthrough::new(), &opts(1, 7)).poll_transport_transmit(&mut hello);
+  Labeled::dialer(Passthrough::new(), &opts(1, 7))
+    .unwrap()
+    .poll_transport_transmit(&mut hello);
   for cut in 0..=hello.len() {
-    let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+    let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
     assert_ne!(
       b.handle_transport_data(&hello[..cut], Instant::ORIGIN),
       Intake::Failed,
@@ -264,4 +268,44 @@ fn every_two_chunk_hello_split_validates() {
       "cut {cut}: peer bound"
     );
   }
+}
+
+// ── local-id bounds at construction ────────────────────────────────────────────────────
+
+/// The OUTBOUND mirror of the inbound peer-id bound: a local id we would reject on receipt must
+/// be rejected at construction, for both roles. (An oversized id would wrap through the hello's
+/// u16 length field; an empty one is no identity at all.)
+#[test]
+fn out_of_bounds_local_id_is_rejected_at_construction() {
+  let empty = LabelOptions {
+    cluster: ClusterId([7; 16]),
+    local_id: Vec::new(),
+  };
+  let oversized = LabelOptions {
+    cluster: ClusterId([7; 16]),
+    local_id: std::vec![0xAB; MAX_PEER_ID_LEN + 1],
+  };
+  for bad in [&empty, &oversized] {
+    assert_eq!(
+      Labeled::dialer(Passthrough::default(), bad).err(),
+      Some(crate::transport::TransportError::InvalidLocalId),
+      "dialer must reject an out-of-bounds local id"
+    );
+    assert_eq!(
+      Labeled::acceptor(Passthrough::default(), bad).err(),
+      Some(crate::transport::TransportError::InvalidLocalId),
+      "acceptor must reject an out-of-bounds local id"
+    );
+  }
+  // The boundary values themselves are fine.
+  let max = LabelOptions {
+    cluster: ClusterId([7; 16]),
+    local_id: std::vec![0xAB; MAX_PEER_ID_LEN],
+  };
+  assert!(Labeled::dialer(Passthrough::default(), &max).is_ok());
+  let one = LabelOptions {
+    cluster: ClusterId([7; 16]),
+    local_id: std::vec![0x01],
+  };
+  assert!(Labeled::acceptor(Passthrough::default(), &one).is_ok());
 }
