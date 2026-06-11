@@ -22,17 +22,38 @@ pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
 /// before any payload is buffered — so a peer cannot drive unbounded memory growth.
 pub(crate) struct FrameDecoder {
   buf: Vec<u8>,
+  /// Latched once an oversized length prefix is seen; the stream is terminally broken.
+  failed: bool,
 }
 
 impl FrameDecoder {
   /// A decoder with an empty buffer.
   pub(crate) fn new() -> Self {
-    Self { buf: Vec::new() }
+    Self {
+      buf: Vec::new(),
+      failed: false,
+    }
   }
 
-  /// Feed received bytes (any chunking) into the decoder.
+  /// The declared payload length of the frame at the front of the buffer, once the 4-byte header
+  /// has arrived.
+  fn declared_len(&self) -> Option<usize> {
+    (self.buf.len() >= 4)
+      .then(|| u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize)
+  }
+
+  /// Feed received bytes (any chunking) into the decoder. As soon as the length header reveals a
+  /// frame larger than [`MAX_FRAME_LEN`], the decoder latches failed and frees its buffer — so an
+  /// oversized declared length is never accumulated across calls.
   pub(crate) fn push(&mut self, bytes: &[u8]) {
+    if self.failed {
+      return;
+    }
     self.buf.extend_from_slice(bytes);
+    if self.declared_len().is_some_and(|len| len > MAX_FRAME_LEN) {
+      self.failed = true;
+      self.buf = Vec::new();
+    }
   }
 
   /// Pop the next complete frame's payload into `out` (which is cleared first).
@@ -41,11 +62,15 @@ impl FrameDecoder {
   /// `Err(FrameTooLarge)` if the length prefix exceeds [`MAX_FRAME_LEN`] (a terminal stream error;
   /// the caller closes the connection).
   pub(crate) fn poll(&mut self, out: &mut Vec<u8>) -> Result<bool, TransportError> {
-    if self.buf.len() < 4 {
-      return Ok(false);
+    if self.failed {
+      return Err(TransportError::FrameTooLarge);
     }
-    let len = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
+    let Some(len) = self.declared_len() else {
+      return Ok(false);
+    };
     if len > MAX_FRAME_LEN {
+      self.failed = true;
+      self.buf = Vec::new();
       return Err(TransportError::FrameTooLarge);
     }
     let end = 4 + len;
@@ -56,6 +81,12 @@ impl FrameDecoder {
     out.extend_from_slice(&self.buf[4..end]);
     self.buf.drain(..end);
     Ok(true)
+  }
+
+  /// Test-only: whether the decoder has latched the terminal oversized-frame failure.
+  #[cfg(test)]
+  pub(crate) fn is_failed_for_test(&self) -> bool {
+    self.failed
   }
 }
 
