@@ -43,6 +43,10 @@ pub struct Labeled<R> {
   role: ConnRole,
   /// Inbound plaintext: accumulates the hello pre-validation, then holds application bytes.
   pending: Vec<u8>,
+  /// Local hello bytes the inner layer has not yet accepted. `write_plaintext` may accept only a
+  /// prefix under backpressure; the tail is retained here and re-offered before ANY application
+  /// plaintext, so the hello can never truncate or interleave with app bytes on the wire.
+  hello_out: Vec<u8>,
   /// The peer's raw id bytes once the hello validates.
   validated: Option<Vec<u8>>,
   failed: bool,
@@ -50,18 +54,20 @@ pub struct Labeled<R> {
 
 impl<R: RecordIo> Labeled<R> {
   /// The dialer side: queues its hello eagerly into the inner layer.
-  pub fn dialer(mut inner: R, opts: &LabelOptions) -> Self {
+  pub fn dialer(inner: R, opts: &LabelOptions) -> Self {
     let local_hello = build_hello(&opts.cluster, &opts.local_id);
-    inner.write_plaintext(&local_hello);
-    Self {
+    let mut this = Self {
       inner,
       cluster: opts.cluster,
-      local_hello,
+      local_hello: local_hello.clone(),
       role: ConnRole::Dialer,
       pending: Vec::new(),
+      hello_out: local_hello,
       validated: None,
       failed: false,
-    }
+    };
+    this.flush_hello();
+    this
   }
 
   /// The acceptor side: holds its hello until the inbound hello validates.
@@ -73,8 +79,20 @@ impl<R: RecordIo> Labeled<R> {
       local_hello,
       role: ConnRole::Acceptor,
       pending: Vec::new(),
+      hello_out: Vec::new(),
       validated: None,
       failed: false,
+    }
+  }
+
+  /// Offer pending hello bytes to the inner layer, advancing by exactly the count it accepts.
+  fn flush_hello(&mut self) {
+    while !self.hello_out.is_empty() {
+      let n = self.inner.write_plaintext(&self.hello_out);
+      if n == 0 {
+        break;
+      }
+      self.hello_out.drain(..n);
     }
   }
 
@@ -101,7 +119,9 @@ impl<R: RecordIo> Labeled<R> {
     self.pending.drain(..hello_end);
     self.validated = Some(peer_id);
     if self.role == ConnRole::Acceptor {
-      self.inner.write_plaintext(&self.local_hello);
+      let hello = self.local_hello.clone();
+      self.hello_out.extend_from_slice(&hello);
+      self.flush_hello();
     }
     Intake::Done
   }
@@ -127,6 +147,7 @@ impl<R: RecordIo> RecordIo for Labeled<R> {
   }
 
   fn poll_transport_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    self.flush_hello();
     self.inner.poll_transport_transmit(out)
   }
 
@@ -141,6 +162,13 @@ impl<R: RecordIo> RecordIo for Labeled<R> {
   }
 
   fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    // The hello must FULLY precede any application plaintext: while a hello tail is pending, accept
+    // nothing (the caller's own pending buffer holds the app bytes), else app bytes could splice
+    // into the middle of the hello on the wire.
+    self.flush_hello();
+    if !self.hello_out.is_empty() {
+      return 0;
+    }
     self.inner.write_plaintext(plaintext)
   }
 

@@ -74,8 +74,51 @@ fn oversize_length_latches_failed_at_push_and_frees_buffer() {
   dec.push(&hostile);
   // The decoder latched failed at push time and dropped the buffered bytes (no retention).
   assert!(dec.is_failed_for_test());
+  assert_eq!(
+    dec.buffered_for_test(),
+    0,
+    "no hostile payload byte is retained"
+  );
   // A subsequent push is ignored, and poll keeps reporting the terminal error.
   dec.push(b"more bytes that must be ignored");
+  assert_eq!(dec.buffered_for_test(), 0);
   let mut out = Vec::new();
   assert_eq!(dec.poll(&mut out), Err(TransportError::FrameTooLarge));
+}
+
+#[test]
+fn oversize_payload_is_never_buffered_even_mid_stream() {
+  // A valid frame followed by an oversized frame inside the SAME push: the oversized frame's
+  // header is validated the moment it arrives, before any of its payload is copied.
+  let mut chunk = Vec::new();
+  encode_frame(b"ok", &mut chunk);
+  chunk.extend_from_slice(&(MAX_FRAME_LEN as u32 + 1).to_be_bytes());
+  chunk.extend_from_slice(&[0u8; 4096]); // hostile payload that must never land in the buffer
+  let mut dec = FrameDecoder::new();
+  dec.push(&chunk);
+  assert!(dec.is_failed_for_test());
+  assert_eq!(
+    dec.buffered_for_test(),
+    0,
+    "the latch releases everything; the hostile payload was never accumulated"
+  );
+  let mut out = Vec::new();
+  assert_eq!(dec.poll(&mut out), Err(TransportError::FrameTooLarge));
+}
+
+#[test]
+fn split_header_still_validates_before_payload() {
+  // Deliver the oversized header ONE BYTE at a time: the decoder must latch on the 4th header byte,
+  // before any payload byte arrives.
+  let header = (MAX_FRAME_LEN as u32 + 1).to_be_bytes();
+  let mut dec = FrameDecoder::new();
+  for b in &header {
+    assert!(!dec.is_failed_for_test());
+    dec.push(&[*b]);
+  }
+  assert!(
+    dec.is_failed_for_test(),
+    "latched exactly at the completed header"
+  );
+  assert_eq!(dec.buffered_for_test(), 0);
 }

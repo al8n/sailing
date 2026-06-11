@@ -84,8 +84,14 @@ pub(crate) use tracker::Tracker;
 
 #[cfg(any(feature = "tcp", feature = "quic"))]
 mod transport;
+#[cfg(feature = "tls")]
+pub use transport::TlsRecords;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
+#[cfg(feature = "tcp")]
+pub use transport::{
+  Intake, LabelOptions, Labeled, Passthrough, RecordIo, StreamCoordinator, StreamTransport,
+};
 
 #[cfg(test)]
 pub(crate) mod testkit;

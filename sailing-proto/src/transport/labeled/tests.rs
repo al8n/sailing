@@ -59,6 +59,98 @@ fn rejects_cluster_mismatch() {
   assert!(b.peer_identity().is_none());
 }
 
+/// An inner record layer with a tiny bounded outbound buffer (`cap` total) — writes accept only up
+/// to the remaining room, forcing the partial-accept path on the hello itself until the wire side
+/// drains the buffer.
+struct ThrottledInner {
+  cap: usize,
+  inbound: Vec<u8>,
+  outbound: Vec<u8>,
+}
+
+impl ThrottledInner {
+  fn new(cap: usize) -> Self {
+    Self {
+      cap,
+      inbound: Vec::new(),
+      outbound: Vec::new(),
+    }
+  }
+}
+
+impl super::super::stream::sealed::Sealed for ThrottledInner {}
+
+impl RecordIo for ThrottledInner {
+  fn handle_transport_data(&mut self, input: &[u8], _now: Instant) -> Intake {
+    self.inbound.extend_from_slice(input);
+    Intake::Done
+  }
+  fn poll_transport_transmit(&mut self, out: &mut Vec<u8>) -> usize {
+    let n = self.outbound.len();
+    out.extend_from_slice(&self.outbound);
+    self.outbound.clear();
+    n
+  }
+  fn read_plaintext(&mut self, out: &mut Vec<u8>) -> usize {
+    let n = self.inbound.len();
+    out.extend_from_slice(&self.inbound);
+    self.inbound.clear();
+    n
+  }
+  fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    let room = self.cap.saturating_sub(self.outbound.len());
+    let take = plaintext.len().min(room);
+    self.outbound.extend_from_slice(&plaintext[..take]);
+    take
+  }
+  fn is_handshaking(&self) -> bool {
+    false
+  }
+  fn peer_identity(&self) -> Option<&[u8]> {
+    None
+  }
+  fn peer_has_closed(&self) -> bool {
+    false
+  }
+  fn is_secure() -> bool {
+    false
+  }
+}
+
+#[test]
+fn hello_survives_partial_accepts_and_gates_app_writes() {
+  // The inner layer holds at most ONE byte: the dialer's hello drains a byte at a time, and must
+  // still reach the wire complete and uncorrupted; app writes are refused (0) until it has.
+  let mut a = Labeled::dialer(ThrottledInner::new(1), &opts(1, 7));
+  assert_eq!(
+    a.write_plaintext(b"app"),
+    0,
+    "app plaintext is refused while the hello tail is pending"
+  );
+
+  // Drain the wire one byte per poll (each poll re-offers the hello tail into the freed room).
+  let mut wire = Vec::new();
+  for _ in 0..256 {
+    let mut chunk = Vec::new();
+    a.poll_transport_transmit(&mut chunk);
+    wire.extend_from_slice(&chunk);
+    if wire.len() >= 28 {
+      break; // hello header (20) + 8-byte u64 id
+    }
+  }
+
+  // A fresh acceptor must validate the dialer from that wire — i.e. the hello arrived intact.
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9));
+  assert_ne!(
+    b.handle_transport_data(&wire, Instant::ORIGIN),
+    Intake::Failed
+  );
+  assert_eq!(b.peer_identity(), Some(enc(7).as_slice()));
+
+  // And once the hello is fully out, app writes flow again.
+  assert!(a.write_plaintext(b"app") > 0);
+}
+
 #[test]
 fn gates_plaintext_until_validated_then_strips_the_hello() {
   let mut a = Labeled::dialer(Passthrough::new(), &opts(1, 7));

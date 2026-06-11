@@ -18,6 +18,13 @@ enum ConnState<I> {
   Closed,
 }
 
+/// The most outbound framed bytes a connection may hold un-accepted by its record layer (64 MiB).
+/// A peer that has stalled long enough to leave this much consensus traffic undrained is broken;
+/// exceeding the cap closes the connection (an honest signal — the router drops the route and the
+/// retry-driven consensus layer re-sends once a fresh connection binds) rather than growing memory
+/// without bound.
+const MAX_CONN_OUT_BUF: usize = 64 * 1024 * 1024;
+
 /// A single transport connection: a record layer + a frame decoder + a lifecycle state.
 pub struct Conn<I, R> {
   record: R,
@@ -26,8 +33,10 @@ pub struct Conn<I, R> {
   /// Framed outbound bytes not yet accepted by the record layer. `write_plaintext` may accept only
   /// a prefix under backpressure, so the unwritten tail is retained here and re-offered on the next
   /// drain — a frame is never truncated on the wire (which could otherwise let a later frame's bytes
-  /// complete a short one and decode as a corrupted-but-valid message).
+  /// complete a short one and decode as a corrupted-but-valid message). Bounded by `max_out`.
   out_plain: Vec<u8>,
+  /// The `out_plain` bound (the [`MAX_CONN_OUT_BUF`] constant; overridable in tests).
+  max_out: usize,
 }
 
 impl<I: NodeId, R: RecordIo> Conn<I, R> {
@@ -38,6 +47,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       decoder: FrameDecoder::new(),
       state: ConnState::Handshaking,
       out_plain: Vec::new(),
+      max_out: MAX_CONN_OUT_BUF,
     }
   }
 
@@ -79,7 +89,9 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
         break;
       }
     }
-    if eof {
+    // Both close signals end the connection: the out-of-band socket EOF, and the record layer's
+    // in-band close (a TLS close_notify arrives as ordinary ciphertext, never as an EOF).
+    if eof || self.record.peer_has_closed() {
       self.state = ConnState::Closed;
     }
     Ok(())
@@ -126,6 +138,8 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
 
   /// Encode + frame `msg` and queue it for transmission. A closed connection drops the message (it
   /// has no route); the router clears the peer binding so the consensus layer re-routes/retries.
+  /// If queuing would exceed the outbound cap (the peer has stopped draining), the connection
+  /// closes instead of growing without bound.
   pub fn send_message(&mut self, msg: &Message<I>) {
     if matches!(self.state, ConnState::Closed) {
       return;
@@ -134,6 +148,10 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     msg.encode(&mut payload);
     encode_frame(&payload, &mut self.out_plain);
     self.drain_out();
+    if self.out_plain.len() > self.max_out {
+      self.state = ConnState::Closed;
+      self.out_plain = Vec::new();
+    }
   }
 
   /// Feed pending framed bytes into the record layer, advancing by exactly the count it accepts. A
@@ -177,6 +195,12 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
   #[cfg(test)]
   pub(crate) fn record_write_for_test(&mut self, bytes: &[u8]) {
     self.record.write_plaintext(bytes);
+  }
+
+  /// Test-only: shrink the outbound cap so the cap-exceeded close is testable without 64 MiB.
+  #[cfg(test)]
+  pub(crate) fn set_max_out_for_test(&mut self, max: usize) {
+    self.max_out = max;
   }
 }
 

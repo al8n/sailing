@@ -150,3 +150,25 @@ fn newer_connection_wins_duplicate_peer() {
   assert_eq!(router.conn_of(&7), Some(id2), "newer conn wins");
   assert!(router.route(7, &hb(10)));
 }
+
+#[test]
+fn older_connection_validating_late_does_not_evict_newer() {
+  let mut router = R::new();
+  let (id1, id2) = (ConnId(1), ConnId(2));
+  // Both registered up front; the NEWER one (id2) completes its handshake first and binds.
+  router.register(id1, acceptor(10));
+  router.register(id2, acceptor(10));
+  let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
+  pump(&mut router, id2, &mut peer2);
+  assert_eq!(router.conn_of(&7), Some(id2), "newer conn bound first");
+
+  // The OLDER connection's hello arrives late: it must be dropped, never evicting the newer one.
+  pump(&mut router, id1, &mut peer1);
+  assert_eq!(
+    router.conn_of(&7),
+    Some(id2),
+    "a stale older duplicate cannot evict the healthy newer binding"
+  );
+  assert!(router.route(7, &hb(10)), "the newer route still works");
+}
