@@ -45,6 +45,11 @@ pub trait RecordIo: sealed::Sealed {
   fn read_plaintext(&mut self, out: &mut Vec<u8>) -> usize;
   /// Queue outbound plaintext for encoding; returns the number of bytes accepted.
   fn write_plaintext(&mut self, plaintext: &[u8]) -> usize;
+  /// Bytes currently queued inside this layer awaiting transmission (its own buffering plus any
+  /// inner layer's). The occupancy projection lets the connection enforce ONE outbound bound that
+  /// covers every layer of buffering — without it, per-layer caps drift apart and the true
+  /// outstanding total is invisible to backpressure decisions.
+  fn buffered_outbound(&self) -> usize;
   /// Whether the handshake (record-layer and/or identity) is still in progress.
   fn is_handshaking(&self) -> bool;
   /// The authenticated peer's raw id bytes (the `NodeId` encoding), once the handshake has bound

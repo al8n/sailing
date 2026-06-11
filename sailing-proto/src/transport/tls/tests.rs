@@ -46,6 +46,52 @@ fn pump(c: &mut TlsRecords, s: &mut TlsRecords) {
   }
 }
 
+/// A consensus-sized payload (well past rustls's ~16 KiB internal received-plaintext cap) must
+/// flow through `TlsRecords` via `Intake::Pending` backpressure — NOT kill the connection.
+/// rustls signals the full receive buffer as `ErrorKind::Other` from `read_tls`; treating that as
+/// fatal closed the connection on every message over ~16 KiB (a permanent redial/kill flap for
+/// ordinary AppendEntries batches). The feed loop below mirrors `Conn::handle_data`: on Pending,
+/// drain plaintext and re-feed the remainder.
+#[test]
+fn large_plaintext_backpressures_and_reassembles() {
+  let (client_cfg, server_cfg) = test_configs();
+  let mut c = TlsRecords::client(client_cfg, "localhost".try_into().unwrap()).unwrap();
+  let mut s = TlsRecords::server(server_cfg).unwrap();
+  pump(&mut c, &mut s);
+  assert!(!c.is_handshaking() && !s.is_handshaking());
+
+  // 64 KiB of patterned plaintext — 4x the rustls receive cap.
+  let big: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+  let mut received = Vec::new();
+  let mut offered = 0;
+  while offered < big.len() {
+    offered += c.write_plaintext(&big[offered..]);
+    // Drain ciphertext to the server in one chunk, honoring Pending by draining plaintext
+    // and re-feeding the unconsumed remainder.
+    let mut wire = Vec::new();
+    c.poll_transport_transmit(&mut wire);
+    let mut input = &wire[..];
+    let mut got_chunk = Vec::new();
+    loop {
+      match s.handle_transport_data(input, Instant::ORIGIN) {
+        Intake::Done => break,
+        Intake::Pending(consumed) => {
+          input = &input[consumed..];
+          let drained = s.read_plaintext(&mut got_chunk);
+          assert!(
+            drained > 0 || consumed > 0,
+            "backpressure must always be resolvable by draining plaintext"
+          );
+        }
+        Intake::Failed => panic!("a large message must backpressure, never fail the record layer"),
+      }
+    }
+    s.read_plaintext(&mut got_chunk);
+    received.extend_from_slice(&got_chunk);
+  }
+  assert_eq!(received, big, "the full 64 KiB reassembles intact");
+}
+
 #[test]
 fn completes_handshake_and_carries_plaintext() {
   let (client_cfg, server_cfg) = test_configs();

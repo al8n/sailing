@@ -67,6 +67,10 @@ impl RecordIo for Passthrough {
     take
   }
 
+  fn buffered_outbound(&self) -> usize {
+    self.outbound.len()
+  }
+
   fn is_handshaking(&self) -> bool {
     false
   }

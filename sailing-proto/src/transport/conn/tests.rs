@@ -65,6 +65,9 @@ impl RecordIo for Throttle {
     self.outbound.extend_from_slice(&plaintext[..take]);
     take
   }
+  fn buffered_outbound(&self) -> usize {
+    self.outbound.len()
+  }
   fn is_handshaking(&self) -> bool {
     self.ident.is_none()
   }
@@ -248,4 +251,25 @@ fn peer_id_with_trailing_bytes_is_rejected() {
   );
   assert!(conn.is_closed());
   assert_eq!(conn.peer(), None);
+}
+
+#[test]
+fn frames_in_the_final_read_before_eof_still_deliver() {
+  let mut d = dialer(7);
+  let mut a = acceptor(9);
+  pump(&mut d, &mut a); // validated
+  d.send_message(&sample_msg());
+  let mut wire = Vec::new();
+  d.poll_transmit(&mut wire);
+  // The frame and the EOF arrive in the SAME read: a clean close retains the peer so the final
+  // frames still decode and deliver before the route drops.
+  a.handle_data(&wire, true, Instant::ORIGIN).unwrap();
+  assert!(a.is_closed());
+  let mut msgs = Vec::new();
+  a.poll_decoded(&mut msgs).unwrap();
+  assert_eq!(
+    msgs,
+    std::vec![sample_msg()],
+    "final-read frames deliver on a clean close"
+  );
 }

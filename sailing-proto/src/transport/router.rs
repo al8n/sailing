@@ -1,18 +1,38 @@
 //! `PeerRouter<I, R>`: the per-peer connection table. It owns every live `Conn`, binds each to its
-//! peer once validated, and routes an outbound `Message` to the right connection.
+//! peer once validated, routes an outbound `Message` to the right connection, and reports every
+//! connection the transport closes on its own initiative so the driver can release the socket.
 use super::{ConnId, TransportError, conn::Conn, stream::RecordIo};
 use crate::{Instant, Message, NodeId};
-use std::{collections::BTreeMap, vec::Vec};
+use core::time::Duration;
+use std::{
+  collections::{BTreeMap, VecDeque},
+  vec::Vec,
+};
+
+/// How long a registered connection may sit un-validated (handshake incomplete) before it is
+/// reaped. Without a deadline, a peer that connects and never completes the hello (or a dialed
+/// socket whose peer never answers) would hold its `Conn` — and the driver's socket — forever.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Routes consensus messages over a table of per-peer connections.
 ///
 /// A connection is registered by [`ConnId`] while still handshaking; once it validates, the router
-/// binds `peer → conn`. If a second connection validates for an already-bound peer, the newer one
-/// wins (a redial after a half-open connection) and the older is dropped — a deterministic
+/// binds `peer → conn`. If a second connection validates for an already-bound peer, the HIGHER id
+/// (the newer dial — ids are driver-monotonic) wins and the other is dropped — a deterministic
 /// tie-break, since both connections carry the same authenticated peer.
+///
+/// Every connection the router drops on its OWN initiative (transport fault, clean close,
+/// duplicate tie-break, outbound-cap stall, handshake timeout) is queued and surfaced via
+/// [`poll_conn_closed`](Self::poll_conn_closed) so the driver can close the socket and, for a
+/// dialed peer, redial. Driver-initiated removals ([`remove`](Self::remove)) are not echoed back.
 pub struct PeerRouter<I, R> {
   conns: BTreeMap<ConnId, Conn<I, R>>,
   peer_of: BTreeMap<I, ConnId>,
+  /// Handshake deadline per not-yet-validated connection (registration time + the timeout).
+  handshake_deadline: BTreeMap<ConnId, Instant>,
+  /// Connections the router closed on its own initiative, with the fault that closed them
+  /// (`None` = a clean close: peer EOF/close_notify, duplicate eviction, outbound-cap stall).
+  closed: VecDeque<(ConnId, Option<TransportError>)>,
 }
 
 impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
@@ -21,23 +41,64 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     Self {
       conns: BTreeMap::new(),
       peer_of: BTreeMap::new(),
+      handshake_deadline: BTreeMap::new(),
+      closed: VecDeque::new(),
     }
   }
 
-  /// Register a freshly opened connection (still handshaking) under `id`.
-  pub fn register(&mut self, id: ConnId, record: R) {
+  /// Register a freshly opened connection (still handshaking) under `id`, starting its handshake
+  /// deadline. Re-registering a live id is a driver contract violation (ids are monotonic); the
+  /// previous connection is dropped and reported closed rather than silently merged.
+  pub fn register(&mut self, id: ConnId, record: R, now: Instant) {
+    if self.conns.contains_key(&id) {
+      debug_assert!(
+        false,
+        "ConnId re-registered: driver ids must be unique/monotonic"
+      );
+      self.remove_internal(id, None);
+    }
     self.conns.insert(id, Conn::new(record));
+    self.handshake_deadline.insert(id, now + HANDSHAKE_TIMEOUT);
   }
 
-  /// Remove a connection and clear any peer binding it held.
+  /// Driver-initiated removal (the driver already knows the socket is gone — not echoed back).
   pub fn remove(&mut self, id: ConnId) {
     self.conns.remove(&id);
+    self.handshake_deadline.remove(&id);
     self.peer_of.retain(|_, &mut c| c != id);
   }
 
+  /// Router-initiated removal: drop the connection AND queue the close notification.
+  fn remove_internal(&mut self, id: ConnId, reason: Option<TransportError>) {
+    self.remove(id);
+    self.closed.push_back((id, reason));
+  }
+
+  /// The next connection the router closed on its own initiative, with the fault (if any). The
+  /// driver must close the underlying socket; for a dialed peer it may redial (the redial gets a
+  /// fresh, higher `ConnId`).
+  pub fn poll_conn_closed(&mut self) -> Option<(ConnId, Option<TransportError>)> {
+    self.closed.pop_front()
+  }
+
+  /// Reap connections whose handshake deadline has passed without validating. Closes each as
+  /// [`TransportError::NotValidated`] so the driver releases the socket.
+  pub fn reap_handshakes(&mut self, now: Instant) {
+    let expired: Vec<ConnId> = self
+      .handshake_deadline
+      .iter()
+      .filter(|&(_, &deadline)| deadline <= now)
+      .map(|(&id, _)| id)
+      .collect();
+    for id in expired {
+      self.remove_internal(id, Some(TransportError::NotValidated));
+    }
+  }
+
   /// Feed inbound bytes to connection `id`, decode any complete messages, and bind the peer on
-  /// validation. Returns the decoded `(peer, message)` pairs. A transport fault closes the
-  /// connection (reported via [`TransportError`]); the caller then calls [`remove`](Self::remove).
+  /// validation. Returns the decoded `(peer, message)` pairs. A connection that faults or reaches a
+  /// clean close is removed and reported via [`poll_conn_closed`](Self::poll_conn_closed) — after
+  /// its final decoded frames (clean close only) have been delivered.
   pub fn handle_conn_data(
     &mut self,
     id: ConnId,
@@ -49,8 +110,13 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     let result = self.handle_conn_data_inner(id, bytes, eof, now, out);
     // A connection that errored OR reached EOF/Closed must drop its peer binding — otherwise the
     // next `route` to that peer would send into a dead connection and silently drop the message.
-    if result.is_err() || self.conns.get(&id).is_some_and(|c| c.is_closed()) {
-      self.remove(id);
+    match &result {
+      Err(e) => self.remove_internal(id, Some(e.clone())),
+      Ok(()) => {
+        if self.conns.get(&id).is_some_and(|c| c.is_closed()) {
+          self.remove_internal(id, None);
+        }
+      }
     }
     result
   }
@@ -72,18 +138,24 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     // driver-assigned and monotonically increasing, so "newer connection wins" is exactly
     // "higher id wins": a NEWER duplicate (a redial) evicts the older binding, while an OLDER
     // duplicate that validates late is itself dropped — it must never evict the healthy
-    // replacement.
-    if let Some(peer) = conn.peer() {
-      if let Some(&prev) = self.peer_of.get(&peer) {
-        if prev > id {
-          self.conns.remove(&id); // stale older duplicate: drop it, keep the newer binding
-          return Ok(());
+    // replacement. Only a LIVE connection binds: one that validated and clean-closed in the same
+    // read still delivers its final frames below (attributed via `conn.peer()`), but must not
+    // claim the route or evict a healthy binding on its way out.
+    if !conn.is_closed() {
+      if let Some(peer) = conn.peer() {
+        self.handshake_deadline.remove(&id);
+        if let Some(&prev) = self.peer_of.get(&peer) {
+          if prev > id {
+            // A stale older duplicate validated late: drop it, keep the newer binding.
+            self.remove_internal(id, None);
+            return Ok(());
+          }
+          if prev != id {
+            self.remove_internal(prev, None); // newer connection wins
+          }
         }
-        if prev != id {
-          self.conns.remove(&prev); // newer connection wins
-        }
+        self.peer_of.insert(peer, id);
       }
-      self.peer_of.insert(peer, id);
     }
     let conn = self.conns.get_mut(&id).expect("conn present");
     let mut msgs = Vec::new();
@@ -100,7 +172,8 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   /// Encode `msg` once and queue it to `to`'s connection. Returns `false` if no validated connection
   /// to `to` exists (the message is dropped; the consensus layer will retry on its own cadence).
   /// A send that closes the connection (the outbound cap tripped — the peer stopped draining) drops
-  /// the route immediately, so no later message is silently queued into a dead connection.
+  /// the route immediately and reports the close, so no later message is silently queued into a
+  /// dead connection.
   pub fn route(&mut self, to: I, msg: &Message<I>) -> bool {
     let Some(&id) = self.peer_of.get(&to) else {
       return false;
@@ -110,7 +183,7 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     };
     conn.send_message(msg);
     if conn.is_closed() {
-      self.remove(id);
+      self.remove_internal(id, None);
       return false;
     }
     true

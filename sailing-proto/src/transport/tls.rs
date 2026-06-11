@@ -10,11 +10,19 @@ use std::{
   vec::Vec,
 };
 
+/// Bound on rustls's internal plaintext send buffer. With the limit set, `writer().write` accepts
+/// only what fits (a genuine partial accept) instead of buffering without bound.
+const SEND_LIMIT: usize = 64 * 1024 * 1024;
+
 /// A rustls connection driven through the Sans-I/O `RecordIo` interface.
 pub struct TlsRecords {
   conn: Connection,
   peer_closed: bool,
   aborted: bool,
+  /// Conservative count of accepted plaintext not yet drained as ciphertext: incremented by
+  /// `write_plaintext`'s accepted count, reset when a transmit poll leaves rustls with nothing
+  /// further to write. An upper bound, not byte-exact (rustls exposes no buffered-byte getter).
+  queued_plain: usize,
 }
 
 impl TlsRecords {
@@ -23,19 +31,25 @@ impl TlsRecords {
     config: Arc<ClientConfig>,
     server_name: ServerName<'static>,
   ) -> Result<Self, rustls::Error> {
+    let mut conn: Connection = rustls::ClientConnection::new(config, server_name)?.into();
+    conn.set_buffer_limit(Some(SEND_LIMIT));
     Ok(Self {
-      conn: rustls::ClientConnection::new(config, server_name)?.into(),
+      conn,
       peer_closed: false,
       aborted: false,
+      queued_plain: 0,
     })
   }
 
   /// A server-side TLS record layer.
   pub fn server(config: Arc<ServerConfig>) -> Result<Self, rustls::Error> {
+    let mut conn: Connection = rustls::ServerConnection::new(config)?.into();
+    conn.set_buffer_limit(Some(SEND_LIMIT));
     Ok(Self {
-      conn: rustls::ServerConnection::new(config)?.into(),
+      conn,
       peer_closed: false,
       aborted: false,
+      queued_plain: 0,
     })
   }
 }
@@ -50,9 +64,21 @@ impl RecordIo for TlsRecords {
     let mut rest = input;
     while !rest.is_empty() {
       match self.conn.read_tls(&mut rest) {
-        // rustls's receive buffer is full — apply backpressure with the count consumed so far.
-        Ok(0) => return Intake::Pending(input.len() - rest.len()),
+        // Post-close_notify latch: once the peer's close_notify has been processed, rustls
+        // consumes no further input. The close is surfaced via `peer_has_closed`; any trailing
+        // bytes are discarded (a conforming peer sends nothing after close_notify).
+        Ok(0) => return Intake::Done,
         Ok(_) => {}
+        // rustls signals RECEIVED-PLAINTEXT backpressure as `ErrorKind::Other` ("received
+        // plaintext buffer full" — an internal ~16 KiB cap that `set_buffer_limit` does NOT
+        // raise; that limit governs the send side only). This is the routine path for any
+        // ciphertext chunk decrypting past the cap — e.g. one socket read of a 1 MiB
+        // AppendEntries batch — NOT a fault: report Pending so the caller drains plaintext and
+        // re-feeds the remainder. Treating it as fatal would kill the connection on every
+        // consensus message over ~16 KiB, in a permanent redial/kill flap.
+        Err(e) if e.kind() == std::io::ErrorKind::Other => {
+          return Intake::Pending(input.len() - rest.len());
+        }
         Err(_) => {
           self.aborted = true;
           return Intake::Failed;
@@ -80,6 +106,10 @@ impl RecordIo for TlsRecords {
         break;
       }
     }
+    if !self.conn.wants_write() {
+      // Everything queued has been emitted as ciphertext into `out`.
+      self.queued_plain = 0;
+    }
     out.len() - before
   }
 
@@ -98,7 +128,15 @@ impl RecordIo for TlsRecords {
   }
 
   fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
-    self.conn.writer().write(plaintext).unwrap_or(0)
+    // With the buffer limit set, rustls accepts only what fits — a genuine partial accept the
+    // caller's pending buffer absorbs.
+    let n = self.conn.writer().write(plaintext).unwrap_or(0);
+    self.queued_plain += n;
+    n
+  }
+
+  fn buffered_outbound(&self) -> usize {
+    self.queued_plain
   }
 
   fn is_handshaking(&self) -> bool {

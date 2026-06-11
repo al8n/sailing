@@ -103,6 +103,9 @@ impl RecordIo for ThrottledInner {
     self.outbound.extend_from_slice(&plaintext[..take]);
     take
   }
+  fn buffered_outbound(&self) -> usize {
+    self.outbound.len()
+  }
   fn is_handshaking(&self) -> bool {
     false
   }
