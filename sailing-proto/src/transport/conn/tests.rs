@@ -98,11 +98,11 @@ fn opts(id: u64) -> LabelOptions {
 }
 
 fn dialer(id: u64) -> C {
-  Conn::new(Labeled::dialer(Passthrough::new(), &opts(id)))
+  Conn::new(Labeled::dialer(Passthrough::new(), &opts(id)).unwrap())
 }
 
 fn acceptor(id: u64) -> C {
-  Conn::new(Labeled::acceptor(Passthrough::new(), &opts(id)))
+  Conn::new(Labeled::acceptor(Passthrough::new(), &opts(id)).unwrap())
 }
 
 /// Shuttle wire bytes between two conns until quiescent.

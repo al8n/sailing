@@ -107,9 +107,18 @@ where
   /// internal counter, making the uniqueness/monotonicity the duplicate-peer tie-break relies on
   /// hold by construction. `now` starts the handshake deadline — a connection that never validates
   /// is reaped and reported closed.
+  ///
+  /// # Panics
+  ///
+  /// Panics if the `u64` id space is exhausted (~10^19 opens — unreachable in practice, but a
+  /// silent release-mode wrap would reuse a live id and break the uniqueness guarantee the
+  /// tie-break relies on, so it is checked).
   pub fn on_conn_open(&mut self, record: R, now: Instant) -> ConnId {
     let id = ConnId(self.next_conn_id);
-    self.next_conn_id += 1;
+    self.next_conn_id = self
+      .next_conn_id
+      .checked_add(1)
+      .expect("connection id space exhausted");
     self.router.register(id, record, now);
     id
   }

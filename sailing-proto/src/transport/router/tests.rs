@@ -21,11 +21,11 @@ fn opts(id: u64) -> LabelOptions {
 }
 
 fn dialer(id: u64) -> Labeled<Passthrough> {
-  Labeled::dialer(Passthrough::new(), &opts(id))
+  Labeled::dialer(Passthrough::new(), &opts(id)).unwrap()
 }
 
 fn acceptor(id: u64) -> Labeled<Passthrough> {
-  Labeled::acceptor(Passthrough::new(), &opts(id))
+  Labeled::acceptor(Passthrough::new(), &opts(id)).unwrap()
 }
 
 fn hb(from: u64) -> Message<u64> {
