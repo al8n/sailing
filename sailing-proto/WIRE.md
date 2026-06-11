@@ -84,22 +84,36 @@ Each `Message` rides one frame:
 - A frame's payload must decode as **exactly one** `Message` (trailing bytes close the
   connection).
 
-## 5. The `Labeled` hello (`tcp`/`tls` features)
+## 5. The `Labeled` hello (`tcp`/`tls`/`quic` features)
 
-One-time, before any application frame, in each direction (dialer eagerly; acceptor after
-validating the dialer's):
+One-time, before any application frame, in each direction:
 
 ```text
 [ magic 0xCA ][ version 0x01 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
 ```
 
+The ENCODING is shared by both transports — one format, one parser family, one version byte
+(the `LABEL_VERSION` bump rule governs both). The ordering and local-id validation differ by
+transport:
+
 - The peer id is the `NodeId`'s `Data` encoding; it must be 1..=1024 bytes and must decode
-  consuming exactly its length. The bound is enforced on BOTH sides: a received id outside it
-  terminally rejects the stream, and a local id outside it is refused at construction (it could
-  not be represented faithfully through the u16 length field).
-- A magic, version, or cluster mismatch — or a malformed id — terminally rejects the stream.
-- Over `Labeled<TlsRecords>` the hello is ordinary plaintext, i.e. encrypted inside the TLS
-  session.
+  consuming exactly its length. A received id outside the bound terminally rejects the
+  stream/connection on EITHER transport.
+- A magic, version, or cluster mismatch — or a malformed id — terminally rejects the
+  stream/connection on either transport.
+- **Stream transport (`tcp`/`tls`)**: the dialer sends its hello eagerly; the acceptor emits its
+  own only AFTER validating the dialer's, and before any application plaintext. A local id
+  outside the bound is refused at construction (it could not be represented faithfully through
+  the u16 length field). The hello may arrive as an incremental byte-stream prefix (a short
+  prefix waits for more bytes). Over `Labeled<TlsRecords>` it is ordinary plaintext, i.e.
+  encrypted inside the TLS session.
+- **QUIC transport**: the hello is the identity preface — the FIRST frame (§4) on each side's
+  consensus stream, written EAGERLY by BOTH sides the moment the QUIC handshake completes
+  (mutual TLS has already authenticated the peer's cluster certificate; the hello binds the
+  node id within it). It is delivered as one complete frame, so the parse is TOTAL: a short,
+  truncated, or trailing-bytes frame is a hard reject, never a deferral. A misconfigured local
+  id surfaces as a connection-level failure (an oversized preface closes the connection before
+  any byte is sent; a malformed one is rejected by the peer), not a construction error.
 
 ## 6. Durable state
 
