@@ -58,7 +58,9 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Apply clippy lints
-      run: cargo hack clippy --each-feature --exclude-no-default-features
+      # The crate needs std-or-alloc (a compile_error! enforces it); --at-least-one-of keeps the
+      # sweep off the impossible bare combos (e.g. `tcp` alone) while still covering every feature.
+      run: cargo hack clippy --feature-powerset --depth 2 --at-least-one-of std,alloc
 
   # Run tests on some extra platforms
   cross:
@@ -103,6 +105,20 @@ jobs:
           rustup target add ${{ matrix.target }}
           cargo build --target ${{ matrix.target }}
 
+  # Verify the declared MSRV (rust-version in Cargo.toml) actually compiles the library and its
+  # feature surface — without this job the declaration is aspirational.
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Install MSRV toolchain
+      run: rustup toolchain install 1.85 --no-self-update && rustup default 1.85
+    - name: Check sailing-proto on the MSRV (default + tls)
+      run: |
+        cargo check -p sailing-proto
+        cargo check -p sailing-proto --features tls
+
   # Prove the no_std core (sailing-proto) links on a real bare-metal target with only `alloc` and
   # no `std`. Any accidental std dependency fails to build here.
   no-std:
@@ -116,8 +132,11 @@ jobs:
       run: rustup target add thumbv7em-none-eabi
     - name: Build sailing-proto (no_std + alloc) on bare metal
       run: cargo build -p sailing-proto --no-default-features --features alloc --target thumbv7em-none-eabi
+    - name: Build sailing-proto (no_std + alloc + tcp transport) on bare metal
+      # The plain-TCP stream transport is documented as no_std-capable; prove it links bare-metal.
+      run: cargo build -p sailing-proto --no-default-features --features alloc,tcp --target thumbv7em-none-eabi
     - name: Clippy sailing-proto (no_std + alloc)
-      run: cargo clippy -p sailing-proto --no-default-features --features alloc -- -D warnings
+      run: cargo clippy -p sailing-proto --no-default-features --features alloc,tcp -- -D warnings
 
   build:
     name: build
@@ -146,7 +165,7 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run build
-      run: cargo hack build --feature-powerset --exclude-no-default-features
+      run: cargo hack build --feature-powerset --at-least-one-of std,alloc
 
   test:
     name: test
@@ -175,7 +194,7 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run test
-      run: cargo hack test --feature-powerset --exclude-no-default-features
+      run: cargo hack test --feature-powerset --at-least-one-of std,alloc
 
   coverage:
     name: coverage
