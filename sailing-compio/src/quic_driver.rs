@@ -102,11 +102,12 @@ where
   /// `handle_storage` runs every iteration regardless — so the latch only downgrades storage
   /// completions to timer/I/O cadence.
   storage_closed: bool,
-  /// Leadership as of the END of the last pass: the SWEEP BACKSTOP. The proto does not emit
-  /// `LeaderChanged` on every leader-clearing path (a check-quorum stepdown sets follower
-  /// silently), so the event-driven supersede alone could strand pending completions (and
-  /// their budget) until some later leader is learned. A leader→non-leader edge observed here
-  /// sweeps everything parked, exactly like the event would.
+  /// Leadership as of the END of the last pass: the sweep backstop, DEFENSE-IN-DEPTH. The
+  /// proto announces every leader-belief transition with `LeaderChanged` — including the
+  /// to-`None` ones (check-quorum stepdown, campaign start, higher-term adoption, self-
+  /// removal) — so the event-driven supersede covers every loss; this edge-detect stays as a
+  /// second, event-independent witness that parked completions (and their budget) can never
+  /// be stranded by an event path regression.
   was_leader: bool,
 }
 
@@ -547,10 +548,10 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    // The sweep BACKSTOP (see the `was_leader` field): a silent leadership loss — one with no
-    // `LeaderChanged` event, like the check-quorum stepdown — must still supersede everything
-    // parked. Runs AFTER the event drain so an event-driven sweep this pass is not doubled
-    // (fail_all on an empty map is a no-op).
+    // The sweep backstop (see the `was_leader` field): defense-in-depth behind the event-
+    // driven supersede — every leadership loss also emits `LeaderChanged(None)`, so this
+    // edge normally observes an already-swept map. Runs AFTER the event drain so a doubled
+    // sweep is a no-op on the emptied maps.
     let is_leader = self.coord.role().is_leader();
     if self.was_leader && !is_leader {
       self.routing.fail_all(&DriverError::Superseded);
