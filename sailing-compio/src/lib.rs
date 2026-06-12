@@ -32,8 +32,10 @@
 mod clock;
 mod config;
 mod error;
+mod handle;
 mod shared;
 
 pub use clock::Clock;
 pub use config::DriverConfig;
 pub use error::DriverError;
+pub use handle::Handle;
