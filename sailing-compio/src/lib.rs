@@ -29,6 +29,7 @@
 //! that thread's `Runtime` (e.g. at the top of its `block_on`), never on a coordinating thread
 //! that then ships it elsewhere.
 
+mod bridge;
 mod clock;
 mod config;
 mod error;
