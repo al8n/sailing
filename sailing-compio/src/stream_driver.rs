@@ -148,8 +148,10 @@ where
   /// downgrading storage completions to timer/I/O cadence — `handle_storage` runs every
   /// iteration regardless.
   storage_closed: bool,
-  /// Leadership as of the END of the last pass — the supersede backstop for leadership losses
-  /// the proto does not announce with a `LeaderChanged` event (the check-quorum stepdown).
+  /// Leadership as of the END of the last pass — the supersede backstop, defense-in-depth
+  /// behind the event-driven sweep (see the QUIC driver's twin field): the proto announces
+  /// every leadership loss with `LeaderChanged(None)`, so this edge-detect is a second,
+  /// event-independent witness, not the primary path.
   was_leader: bool,
 }
 
@@ -777,8 +779,8 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    // The supersede backstop (see `was_leader`): leadership losses with no `LeaderChanged`
-    // event still sweep everything parked, after the event drain.
+    // The supersede backstop (see `was_leader`): defense-in-depth after the event drain — a
+    // loss the events already swept makes this a no-op on the emptied maps.
     let is_leader = self.coord.role().is_leader();
     if self.was_leader && !is_leader {
       self.routing.fail_all(&DriverError::Superseded);
