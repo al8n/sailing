@@ -98,6 +98,13 @@ pub struct VoprReport {
   pub faults_fired: u64,
   /// Number of calm windows opened (each asserted liveness/progress).
   pub calm_windows: u64,
+  /// Number of `read_index` requests a node ACCEPTED (leader-direct or follower-forwarded).
+  pub reads_issued: u64,
+  /// Number of accepted reads whose `ReadState` confirmation was observed AND passed the
+  /// read-linearizability assertion (`index >= the completed-write floor at invocation`).
+  pub reads_confirmed: u64,
+  /// Number of leader transfers the leader ACCEPTED (the transfer itself may still abort).
+  pub transfers: u64,
   /// The number of voters in the cluster at the end of the run (after all conf-changes).
   pub final_cluster_size: usize,
 }
@@ -119,6 +126,12 @@ enum Action {
   ConfChange,
   /// Re-roll the network + storage fault intensities to a new seed-chosen level.
   FaultReroll,
+  /// Issue 1..=k linearizable reads — on the leader, or (one third of draws) on a follower to
+  /// exercise the forward path. Each records the completed-write floor for the oracle.
+  ReadIndex,
+  /// Ask the leader to transfer leadership to a random other voter (the transfer may abort —
+  /// the oracles and calm windows catch anything it breaks).
+  TransferLeader,
 }
 
 /// `(action, weight)` menu. Tuned so client load dominates and faults are frequent.
@@ -129,6 +142,8 @@ const MENU: &[(Action, u32)] = &[
   (Action::Crash, 6),
   (Action::ConfChange, 5),
   (Action::FaultReroll, 8),
+  (Action::ReadIndex, 12),
+  (Action::TransferLeader, 4),
 ];
 
 /// The number of consecutive reconciliation passes a wired joiner must stay both SETTLED (no
@@ -250,6 +265,110 @@ impl VoprState {
   }
 }
 
+/// The read-linearizability ledger: every accepted `read_index` records the completed-write
+/// FLOOR at invocation (the max commit index anywhere in the cluster — an entry committed
+/// anywhere is durably on a quorum and acknowledged, i.e. a completed write); every observed
+/// `ReadState` confirmation must satisfy `index >= floor`, or the read could serve a state
+/// missing a write that completed before the read began — a linearizability violation.
+///
+/// This is exactly the property the proto's current-term-commit gate (a new leader confirms
+/// reads only after its own no-op commits) and the lease fence (a deposed leaseholder must
+/// not confirm past its persisted promise) exist to provide; under `LeaseBased` seeds the
+/// sim's single virtual clock makes the bound exact (no drift allowance).
+///
+/// An accepted read that NEVER confirms is legal under faults (a leader change clears
+/// forwarded reads; a crash drops pending confirmations): never-confirmed beats wrongly
+/// confirmed. Liveness is asserted separately — the calm window and quiesce each drive one
+/// read through confirm-and-serve on a healthy cluster.
+struct ReadLedger {
+  /// Monotone context mint (8-byte BE on the wire); never reused, even for refused issues.
+  next_ctx: u64,
+  /// Accepted, unconfirmed reads: context -> the floor recorded at invocation.
+  inflight: std::collections::BTreeMap<u64, sailing_proto::Index>,
+  /// Per-node scan offset into the cluster's monotone `read_states_of` history.
+  scan_off: std::collections::BTreeMap<u64, usize>,
+  /// Retired reads: context -> (confirming node, confirmed index). Kept for the duplicate-
+  /// confirmation oracle and for the calm/quiesce serve checks; bounded by reads issued.
+  confirmed: std::collections::BTreeMap<u64, (u64, sailing_proto::Index)>,
+}
+
+impl ReadLedger {
+  fn new() -> Self {
+    Self {
+      next_ctx: 0,
+      inflight: std::collections::BTreeMap::new(),
+      scan_off: std::collections::BTreeMap::new(),
+      confirmed: std::collections::BTreeMap::new(),
+    }
+  }
+
+  /// Issue one read on `target`, recording the floor iff the node accepts. Returns the minted
+  /// context (accepted or not; contexts are never reused).
+  fn issue(&mut self, c: &mut Cluster, target: u64, report: &mut VoprReport) -> u64 {
+    let ctx = self.next_ctx;
+    self.next_ctx += 1;
+    let floor = c.max_commit();
+    if c.read_index_on(target, &ctx.to_be_bytes()) {
+      self.inflight.insert(ctx, floor);
+      report.reads_issued += 1;
+    }
+    ctx
+  }
+
+  /// Scan every node's newly-confirmed `ReadState`s and run the linearizability assertion.
+  /// Panics (with seed+tick) on a violation, an unknown context, or a duplicate confirmation
+  /// — each is a real bug (the VOPR mints every context; the proto dedups in-flight reads).
+  fn scan(&mut self, c: &Cluster, report: &mut VoprReport, seed: u64) {
+    for id in c.node_ids() {
+      let states = c.read_states_of(id);
+      let off = self.scan_off.entry(id).or_insert(0);
+      while *off < states.len() {
+        let rs = &states[*off];
+        *off += 1;
+        let raw: [u8; 8] = rs
+          .context()
+          .as_ref()
+          .try_into()
+          .unwrap_or_else(|_| panic!(
+            "[read-linearizability] non-VOPR read context {:?} confirmed on n{id} — the VOPR              mints every context in a VOPR run
+  seed={seed} tick={}",
+            rs.context(),
+            c.view().tick,
+          ));
+        let ctx = u64::from_be_bytes(raw);
+        match self.inflight.remove(&ctx) {
+          Some(floor) => {
+            assert!(
+              rs.index() >= floor,
+              "[read-linearizability] read ctx={ctx} confirmed on n{id} at index {} BELOW the                completed-write floor {} recorded at invocation — the read could serve a state                missing a committed write
+  seed={seed} tick={} (replay: run_vopr({seed}, ticks))",
+              rs.index().get(),
+              floor.get(),
+              c.view().tick,
+            );
+            self.confirmed.insert(ctx, (id, rs.index()));
+            report.reads_confirmed += 1;
+          }
+          None => {
+            let dup = self.confirmed.contains_key(&ctx);
+            panic!(
+              "[read-linearizability] {} for read ctx={ctx} on n{id} (index {})
+                 seed={seed} tick={} (replay: run_vopr({seed}, ticks))",
+              if dup {
+                "DUPLICATE confirmation — one read context confirmed twice"
+              } else {
+                "confirmation for a context the VOPR never accepted"
+              },
+              rs.index().get(),
+              c.view().tick,
+            );
+          }
+        }
+      }
+    }
+  }
+}
+
 /// Run one deterministic VOPR episode.
 ///
 /// `seed` seeds every random choice (cluster size, actions, victims, fault intensities); `ticks` is
@@ -266,7 +385,21 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 
   // ── Setup: seed-chosen cluster size in 2..=7 (INCLUDING even sizes). ───────────────────────────
   let size = 2 + (prng.next_u64() % 6) as usize; // 2..=7
-  let mut c = Cluster::new_async_with(size, seed, |cfg| cfg.with_pre_vote(true));
+  // Seed-chosen read/lease regime: a third of seeds run today's shape (Safe, no CheckQuorum), a
+  // third add CheckQuorum (its stepdown now interacts with reads under partitions), and a third
+  // run LeaseBased reads (which REQUIRE CheckQuorum) — the lease-promise machinery's only
+  // randomized-fault coverage. Drawn from the master PRNG like every other choice.
+  let read_mode = prng.next_u64() % 3;
+  let mut c = Cluster::new_async_with(size, seed, move |cfg| {
+    let cfg = cfg.with_pre_vote(true);
+    match read_mode {
+      0 => cfg,
+      1 => cfg.with_check_quorum(true),
+      _ => cfg
+        .with_check_quorum(true)
+        .with_read_only(sailing_proto::ReadOnlyOption::LeaseBased),
+    }
+  });
 
   // Install a seed-chosen baseline network + per-node storage fault config (modest — the run must
   // still be able to make progress; calm windows back it off entirely).
@@ -291,6 +424,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     proposed: Vec::new(),
     cmd_counter: 0,
   };
+  let mut reads = ReadLedger::new();
 
   let mut report = VoprReport {
     seed,
@@ -323,6 +457,8 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
       Action::Crash => crash_one(&mut c, &mut st, &mut prng, &mut report),
       Action::ConfChange => conf_change(&mut c, &mut st, &mut prng, &mut report),
       Action::FaultReroll => fault_reroll(&mut c, &st, &mut prng, seed),
+      Action::ReadIndex => read_index_load(&mut c, &st, &mut reads, &mut prng, &mut report),
+      Action::TransferLeader => transfer_leader(&mut c, &st, &mut prng, &mut report),
     }
 
     // Let messages flow a seed-chosen small number of ticks (1..=4). The safety-oracle checker runs every tick
@@ -333,11 +469,13 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
       report.ticks_run += 1;
     }
     observe(&mut c, &mut st, &mut report);
+    reads.scan(&c, &mut report, seed);
     refresh_conf_in_flight(&c, &mut st);
 
     // ── Calm window ───────────────────────────────────────────────────────────────────────────
     if iter + 1 >= next_calm {
       calm_window(&mut c, &mut st, &mut prng, &mut report, seed);
+      read_round(&mut c, &mut reads, &mut report, seed, "calm-window");
       report.calm_windows += 1;
       let jitter = (prng.next_u64() % 60) as usize;
       next_calm = iter + 1 + calm_period + jitter;
@@ -346,12 +484,147 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 
   // ── Quiesce ───────────────────────────────────────────────────────────────────────────────────
   quiesce(&mut c, &mut st, &mut report, seed);
+  // One final linearizable read on the converged cluster: it must confirm, pass the oracle, and
+  // become servable. Also drains any confirmations that surfaced during quiesce itself.
+  read_round(&mut c, &mut reads, &mut report, seed, "quiesce");
 
   report.final_cluster_size = st.voters.len();
   report
 }
 
 // ─── Liveness: calm window + quiesce ─────────────────────────────────────────────────────────────
+
+/// Drive ONE linearizable read through confirm-and-serve on a healthy cluster — the read-path
+/// liveness assertion (the per-iteration oracle only checks reads that happen to confirm; this
+/// proves a read CAN confirm and become servable once the adversary backs off).
+///
+/// A pending read DIES SILENTLY when its node loses leadership (the step-down clears pending
+/// and forwarded reads — by design, and the ledger treats never-confirmed as legal), and a
+/// transfer or CheckQuorum round can still move leadership right after quiesce settles. So the
+/// liveness claim is per-STABLE-leader: issue on the current leader and wait; if leadership
+/// moves, re-issue on the new leader (bounded attempts). A read that fails to confirm while
+/// its leader REMAINS leader — or attempts exhausting under endless churn on a calm cluster —
+/// is the livelock, and panics with seed+tick. The ledger scan runs while waiting, so the read
+/// also passes the linearizability assertion like any other.
+fn read_round(
+  c: &mut Cluster,
+  reads: &mut ReadLedger,
+  report: &mut VoprReport,
+  seed: u64,
+  phase: &str,
+) {
+  const ATTEMPTS: u32 = 8;
+  const CONFIRM_BUDGET: u32 = 1_000; // per attempt; a healthy confirm is a heartbeat round
+  const SERVE_BUDGET: u32 = 2_000;
+
+  let mut last: Option<(u64, u64)> = None; // (issued-on, ctx) of the latest attempt, for the dump
+  for _ in 0..ATTEMPTS {
+    let Some(leader) = c.leader() else {
+      // Leaderless moment (e.g. a transfer completing): let the election settle a little.
+      for _ in 0..50 {
+        c.tick();
+        report.ticks_run += 1;
+      }
+      continue;
+    };
+    // The churn signal is the (leader id, term) PAIR, not the id alone: a step-down clears the
+    // accepted read, and the SAME node can re-win at a higher term within one coarse tick — the
+    // id alone would look stable while the context is already dead. A leader never advances its
+    // term without stepping down first, so a term move on the same id is exactly re-election.
+    let issued_term = c.term_of(leader);
+    let ctx = reads.issue(c, leader, report);
+    last = Some((leader, ctx));
+    if !reads.inflight.contains_key(&ctx) {
+      // Refused (capacity / a racing step-down): settle briefly and retry.
+      for _ in 0..50 {
+        c.tick();
+        report.ticks_run += 1;
+      }
+      continue;
+    }
+
+    let mut budget = CONFIRM_BUDGET;
+    let confirmed = loop {
+      reads.scan(c, report, seed);
+      if let Some(hit) = reads.confirmed.get(&ctx) {
+        break Some(*hit);
+      }
+      if c.leader() != Some(leader) || c.term_of(leader) != issued_term {
+        break None; // leadership (or its term) moved: the pending read died — re-issue
+      }
+      if budget == 0 {
+        let tick = c.view().tick;
+        let per_node = read_round_dump(c);
+        panic!(
+          "VOPR LIVELOCK ({phase} read): a read on a STABLE leader failed to confirm within \
+           {CONFIRM_BUDGET} ticks\n  seed={seed} tick={tick} (replay: run_vopr({seed}, ticks))\n  \
+           leader=n{leader} ctx={ctx}\n  nodes: {per_node}",
+        );
+      }
+      c.tick();
+      report.ticks_run += 1;
+      budget -= 1;
+    };
+
+    let Some((node, index)) = confirmed else {
+      continue; // next attempt on the new leader
+    };
+    let mut budget = SERVE_BUDGET;
+    while c.applied_index_of(node) < index {
+      // Keep the oracle running while we wait: OTHER in-flight reads can confirm during these
+      // ticks, and after the final (quiesce) round nothing else would ever assert them.
+      reads.scan(c, report, seed);
+      if budget == 0 {
+        let tick = c.view().tick;
+        panic!(
+          "VOPR LIVELOCK ({phase} read): read ctx={ctx} confirmed at index {} on n{node} but \
+           the node failed to APPLY up to it within {SERVE_BUDGET} ticks (applied={})\n  \
+           seed={seed} tick={tick} (replay: run_vopr({seed}, ticks))",
+          index.get(),
+          c.applied_index_of(node).get(),
+        );
+      }
+      c.tick();
+      report.ticks_run += 1;
+      budget -= 1;
+    }
+    // The closing sweep: assert every confirmation that surfaced up to this instant (the final
+    // quiesce round returns straight into run_vopr's return — this is the last scan).
+    reads.scan(c, report, seed);
+    return; // confirmed + servable: the read path is live
+  }
+
+  let tick = c.view().tick;
+  let per_node = read_round_dump(c);
+  let (on, ctx) = last.unwrap_or((u64::MAX, u64::MAX));
+  panic!(
+    "VOPR LIVELOCK ({phase} read): no read confirmed across {ATTEMPTS} attempts — leadership \
+     churned endlessly on a calm cluster\n  seed={seed} tick={tick} (replay: run_vopr({seed}, \
+     ticks))\n  last attempt: issued-on=n{on} ctx={ctx} leader-now={:?}\n  nodes: {per_node}",
+    c.leader(),
+  );
+}
+
+/// The per-node state dump for read-liveness panics (the house livelock format).
+fn read_round_dump(c: &Cluster) -> String {
+  let per_node: Vec<_> = c
+    .node_ids()
+    .into_iter()
+    .map(|id| {
+      std::format!(
+        "n{id}[{:?} term={:?} commit={} applied={} poison={} reads={} {}]",
+        c.role_of(id),
+        c.term_of(id),
+        c.commit_index_of(id).get(),
+        c.applied_index_of(id).get(),
+        c.is_poisoned(id),
+        c.read_states_of(id).len(),
+        c.dbg_membership(id),
+      )
+    })
+    .collect();
+  per_node.join(" ")
+}
 
 /// Open a CALM WINDOW: back the adversary off entirely (heal every partition, clear all faults) and
 /// assert the cluster makes fresh PROGRESS — it must elect a leader and commit+apply new client load

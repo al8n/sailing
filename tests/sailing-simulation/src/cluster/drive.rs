@@ -41,6 +41,32 @@ impl Cluster {
     true
   }
 
+  /// Initiate a linearizable read on a SPECIFIC node (the VOPR's non-panicking entry): a
+  /// follower target exercises the forward path, the leader target the direct path. Returns
+  /// whether the node ACCEPTED the read (a `ReadState` with this context may eventually
+  /// surface in `read_states_of(node)`). A refusal — no known leader, forwarding capacity,
+  /// poison — is a legitimate no-op under faults. A `DuplicateContext` refusal panics: the
+  /// caller mints unique contexts, so a duplicate is a harness bug, not weather.
+  pub fn read_index_on(&mut self, node: u64, context: &[u8]) -> bool {
+    let i = self.node_idx[&node];
+    let log = &self.logs[i];
+    let stable = &self.stables[i];
+    match self.nodes[i].read_index(
+      self.now,
+      log,
+      stable,
+      bytes::Bytes::copy_from_slice(context),
+    ) {
+      Ok(()) => true,
+      Err(sailing_proto::ReadIndexError::DuplicateContext) => {
+        panic!(
+          "read_index_on: duplicate context {context:?} — the caller must mint unique contexts"
+        )
+      }
+      Err(_) => false,
+    }
+  }
+
   /// Initiate a leader transfer: ask the current leader to transfer to `to`.
   ///
   /// Returns `Ok(())` if the leader accepted the transfer, or an error if there is no
