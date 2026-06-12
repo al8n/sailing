@@ -4,7 +4,7 @@ members = ["sailing-proto", "sailing-compio", "tests/sailing-simulation"]
 
 [workspace.package]
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.91"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/al8n/sailing"
 

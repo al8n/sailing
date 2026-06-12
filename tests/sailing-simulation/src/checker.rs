@@ -302,26 +302,26 @@ impl Checker {
     // committed high-water, so entries committed under the prior config are not re-judged against the
     // new voter set. Only a genuine change of an already-known set counts — the first observation
     // (None -> Some, the initial config) does not raise the floor.
-    if let (Some(old), Some(new)) = (&self.last_committed_voters, &view.committed_voters) {
-      if old != new {
-        // Raise the floor to the high-water commit among the OLD voter set — the configuration under
-        // which everything up to here was committed — INCLUDING any voter this change REMOVES. Using
-        // only the NEW voters misses entries a removed voter legitimately committed (under the old
-        // quorum) that the survivors have not yet caught up to; those entries would then be wrongly
-        // re-judged against the smaller new voter set and flagged as non-quorum-durable. They are
-        // safe — already validated against their own config before this change, and still covered by
-        // agreement / no_committed_rewrite / durable_prefix. (e.g. leader 0 commits index
-        // 375 under {0,2,3}; 0 is then removed → {2,3} with voter 2 still behind, so 375 must stay
-        // exempt.) A removed voter is still present in `view.nodes` (isolated, not dropped).
-        let hw = view
-          .nodes
-          .iter()
-          .filter(|n| old.contains(&n.id))
-          .map(|n| n.commit)
-          .max()
-          .unwrap_or(0);
-        self.commit_floor = self.commit_floor.max(hw);
-      }
+    if let (Some(old), Some(new)) = (&self.last_committed_voters, &view.committed_voters)
+      && old != new
+    {
+      // Raise the floor to the high-water commit among the OLD voter set — the configuration under
+      // which everything up to here was committed — INCLUDING any voter this change REMOVES. Using
+      // only the NEW voters misses entries a removed voter legitimately committed (under the old
+      // quorum) that the survivors have not yet caught up to; those entries would then be wrongly
+      // re-judged against the smaller new voter set and flagged as non-quorum-durable. They are
+      // safe — already validated against their own config before this change, and still covered by
+      // agreement / no_committed_rewrite / durable_prefix. (e.g. leader 0 commits index
+      // 375 under {0,2,3}; 0 is then removed → {2,3} with voter 2 still behind, so 375 must stay
+      // exempt.) A removed voter is still present in `view.nodes` (isolated, not dropped).
+      let hw = view
+        .nodes
+        .iter()
+        .filter(|n| old.contains(&n.id))
+        .map(|n| n.commit)
+        .max()
+        .unwrap_or(0);
+      self.commit_floor = self.commit_floor.max(hw);
     }
     if view.committed_voters.is_some() {
       self.last_committed_voters = view.committed_voters.clone();
@@ -686,17 +686,17 @@ pub fn no_committed_rewrite(checker: &mut Checker, view: &ClusterView) -> Result
       continue;
     }
     for (idx, cmd) in n.applied_log.iter() {
-      if let Some(prev) = checker.committed_hw.get(idx) {
-        if prev != cmd {
-          return Err(Violation::new(
-            "no_committed_rewrite",
-            std::format!(
-              "committed index {idx} was applied as {prev:?} but node {} now applies {cmd:?} — a \
+      if let Some(prev) = checker.committed_hw.get(idx)
+        && prev != cmd
+      {
+        return Err(Violation::new(
+          "no_committed_rewrite",
+          std::format!(
+            "committed index {idx} was applied as {prev:?} but node {} now applies {cmd:?} — a \
                committed entry was overwritten (State Machine Safety violation)",
-              n.id,
-            ),
-          ));
-        }
+            n.id,
+          ),
+        ));
       }
     }
   }

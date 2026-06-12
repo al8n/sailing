@@ -400,14 +400,14 @@ fn no_broken_append_entries_for_compacted_peer() {
 
   // Must NOT see any AppendEntries with prev_log_term == ZERO for this peer.
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        assert_ne!(
-          ae.prev_log_term(),
-          Term::ZERO,
-          "a broken AppendEntries with prev_log_term=ZERO must not be sent to a compacted peer"
-        );
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+    {
+      assert_ne!(
+        ae.prev_log_term(),
+        Term::ZERO,
+        "a broken AppendEntries with prev_log_term=ZERO must not be sent to a compacted peer"
+      );
     }
   }
 }
@@ -481,14 +481,14 @@ fn normal_append_at_boundary_not_snapshot() {
 
   // And the prev_log_term must be the boundary term (Term::new(1)), NOT ZERO.
   for out in &msgs {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        assert_ne!(
-          ae.prev_log_term(),
-          crate::Term::ZERO,
-          "AppendEntries at the compaction boundary must carry the boundary term, not ZERO"
-        );
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+    {
+      assert_ne!(
+        ae.prev_log_term(),
+        crate::Term::ZERO,
+        "AppendEntries at the compaction boundary must carry the boundary term, not ZERO"
+      );
     }
   }
 }

@@ -214,12 +214,11 @@ impl<I: NodeId> ConnTable<I> {
   /// that still points at it.
   pub(crate) fn remove(&mut self, h: ConnectionHandle) {
     // Nested rather than a let-chain: the crate's MSRV (1.85) predates stabilized let-chains.
-    if let Some(e) = self.entries.remove(&h) {
-      if let Some(p) = e.peer {
-        if self.by_peer.get(&p) == Some(&h) {
-          self.by_peer.remove(&p);
-        }
-      }
+    if let Some(e) = self.entries.remove(&h)
+      && let Some(p) = e.peer
+      && self.by_peer.get(&p) == Some(&h)
+    {
+      self.by_peer.remove(&p);
     }
   }
 
@@ -227,10 +226,10 @@ impl<I: NodeId> ConnTable<I> {
   /// KEPT so the service pump can drive the quinn connection to `Drained`.
   pub(crate) fn unbind(&mut self, h: ConnectionHandle) {
     let peer = self.entries.get(&h).and_then(|e| e.peer);
-    if let Some(p) = peer {
-      if self.by_peer.get(&p) == Some(&h) {
-        self.by_peer.remove(&p);
-      }
+    if let Some(p) = peer
+      && self.by_peer.get(&p) == Some(&h)
+    {
+      self.by_peer.remove(&p);
     }
   }
 

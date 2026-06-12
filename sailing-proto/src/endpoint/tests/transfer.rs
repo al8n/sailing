@@ -198,10 +198,10 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
   // Exactly one TimeoutNow to peer 2 must be in the outgoing queue.
   let mut tn_count = 0;
   while let Some(out) = leader.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::TimeoutNow(_) = out.message() {
-        tn_count += 1;
-      }
+    if out.to() == 2u64
+      && let Message::TimeoutNow(_) = out.message()
+    {
+      tn_count += 1;
     }
   }
   assert_eq!(tn_count, 1, "exactly one TimeoutNow must be sent to peer 2");
@@ -331,10 +331,10 @@ fn transfer_to_lagging_follower_waits_for_catch_up() {
   // Must NOT have sent a TimeoutNow yet.
   let mut tn_sent = false;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::TimeoutNow(_) = out.message() {
-        tn_sent = true;
-      }
+    if out.to() == 2u64
+      && let Message::TimeoutNow(_) = out.message()
+    {
+      tn_sent = true;
     }
   }
   assert!(!tn_sent, "TimeoutNow must NOT be sent to a lagging peer");
@@ -358,10 +358,10 @@ fn transfer_to_lagging_follower_waits_for_catch_up() {
   // Now TimeoutNow MUST have been sent.
   let mut tn_after = false;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::TimeoutNow(_) = out.message() {
-        tn_after = true;
-      }
+    if out.to() == 2u64
+      && let Message::TimeoutNow(_) = out.message()
+    {
+      tn_after = true;
     }
   }
   assert!(
@@ -603,10 +603,10 @@ fn timeout_now_bypasses_prevote_and_lease() {
   // follower3 must have granted the vote (not rejected it due to the lease).
   let mut granted = false;
   while let Some(out) = follower3.poll_message() {
-    if let Message::VoteResp(vr) = out.message() {
-      if !vr.reject() {
-        granted = true;
-      }
+    if let Message::VoteResp(vr) = out.message()
+      && !vr.reject()
+    {
+      granted = true;
     }
   }
   assert!(
