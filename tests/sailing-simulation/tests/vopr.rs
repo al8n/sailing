@@ -50,6 +50,9 @@ struct Coverage {
   committed: u64,
   max_term: u64,
   faults_fired: u64,
+  reads_issued: u64,
+  reads_confirmed: u64,
+  transfers: u64,
 }
 
 fn coverage(reports: &[VoprReport]) -> Coverage {
@@ -60,6 +63,9 @@ fn coverage(reports: &[VoprReport]) -> Coverage {
     committed: reports.iter().map(|r| r.committed).sum(),
     max_term: reports.iter().map(|r| r.max_term_seen).max().unwrap_or(0),
     faults_fired: reports.iter().map(|r| r.faults_fired).sum(),
+    reads_issued: reports.iter().map(|r| r.reads_issued).sum(),
+    reads_confirmed: reports.iter().map(|r| r.reads_confirmed).sum(),
+    transfers: reports.iter().map(|r| r.transfers).sum(),
   }
 }
 
@@ -79,14 +85,27 @@ fn vopr_seed_band_holds_and_is_non_vacuous() {
   assert!(cov.partitions > 0, "band never partitioned a node");
   assert!(cov.conf_changes > 0, "band never reconfigured");
   assert!(cov.faults_fired > 0, "band never fired a seeded fault");
+  assert!(
+    cov.reads_issued > 0,
+    "band never issued a linearizable read"
+  );
+  assert!(
+    cov.reads_confirmed > 0,
+    "band never CONFIRMED a linearizable read — the read oracle ran vacuously"
+  );
+  assert!(cov.transfers > 0, "band never transferred leadership");
   std::eprintln!(
-    "vopr band 0..24 @200: committed={} crashes={} partitions={} conf_changes={} max_term={} faults={}",
+    "vopr band 0..24 @200: committed={} crashes={} partitions={} conf_changes={} max_term={} \
+     faults={} reads={}/{} transfers={}",
     cov.committed,
     cov.crashes,
     cov.partitions,
     cov.conf_changes,
     cov.max_term,
     cov.faults_fired,
+    cov.reads_confirmed,
+    cov.reads_issued,
+    cov.transfers,
   );
 }
 
@@ -150,13 +169,32 @@ fn vopr_long_sweep() {
     cov.committed,
     n * 4
   );
+  // Reads confirm at a high rate (most are issued on a live leader and the calm/quiesce rounds
+  // each drive one through); one-per-seed is far below the observed rate while still rejecting a
+  // vacuous oracle. Transfers are accepted less often (no leader / no other voter draws) — n/12
+  // mirrors the conf-change floor.
+  assert!(
+    cov.reads_confirmed >= n,
+    "sweep [{start},{end}) under-exercised confirmed reads: {} (< {n})",
+    cov.reads_confirmed,
+  );
+  assert!(
+    cov.transfers * 12 >= n,
+    "sweep [{start},{end}) under-exercised leader transfers: {} (< {})",
+    cov.transfers,
+    n / 12
+  );
   std::eprintln!(
-    "vopr long sweep {start}..{end} @{ticks}: committed={} crashes={} partitions={} conf_changes={} max_term={} faults={}",
+    "vopr long sweep {start}..{end} @{ticks}: committed={} crashes={} partitions={} \
+     conf_changes={} max_term={} faults={} reads={}/{} transfers={}",
     cov.committed,
     cov.crashes,
     cov.partitions,
     cov.conf_changes,
     cov.max_term,
     cov.faults_fired,
+    cov.reads_confirmed,
+    cov.reads_issued,
+    cov.transfers,
   );
 }
