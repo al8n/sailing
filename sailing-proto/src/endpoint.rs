@@ -1241,10 +1241,10 @@ where
     // is reachable. Mark it active so it counts toward the next quorum_active check.
     // We do this AFTER the term pre-pass (so a higher-term message that steps us down doesn't
     // mark a peer active on the stale term's leader) and only if we're still the leader.
-    if self.role.is_leader() {
-      if let Some(pr) = self.tracker.progress_mut(&from) {
-        pr.set_recent_active(true);
-      }
+    if self.role.is_leader()
+      && let Some(pr) = self.tracker.progress_mut(&from)
+    {
+      pr.set_recent_active(true);
     }
 
     #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for future variants

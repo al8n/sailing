@@ -251,10 +251,10 @@ fn lease_based_confirms_immediately() {
   // non-empty context (the internal round token); the immediate LeaseBased path sends none.
   let mut read_hb_sent = false;
   while let Some(out) = ep.poll_message() {
-    if let Message::Heartbeat(hb) = out.message() {
-      if !hb.context().is_empty() {
-        read_hb_sent = true;
-      }
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      read_hb_sent = true;
     }
   }
   assert!(
@@ -882,10 +882,10 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
   // Must have broadcast a read heartbeat (Safe path), carrying the internal round token.
   let mut round = None;
   while let Some(out) = ep.poll_message() {
-    if let Message::Heartbeat(hb) = out.message() {
-      if !hb.context().is_empty() {
-        round = Some(bytes::Bytes::copy_from_slice(hb.context()));
-      }
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      round = Some(bytes::Bytes::copy_from_slice(hb.context()));
     }
   }
   let round = round.expect(
@@ -993,10 +993,10 @@ fn lease_based_expired_lease_degrades_to_safe() {
   // Must degrade to Safe: broadcast a read heartbeat round carrying the internal round token.
   let mut round = None;
   while let Some(out) = ep.poll_message() {
-    if let Message::Heartbeat(hb) = out.message() {
-      if !hb.context().is_empty() {
-        round = Some(bytes::Bytes::copy_from_slice(hb.context()));
-      }
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      round = Some(bytes::Bytes::copy_from_slice(hb.context()));
     }
   }
   let round =

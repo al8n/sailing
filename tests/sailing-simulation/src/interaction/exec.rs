@@ -107,10 +107,10 @@ impl InteractionEnv {
       (n.ep.role(), n.ep.term())
     };
     // Advance the clock to this node's election deadline and fire its timer.
-    if let Some(deadline) = self.nodes.get(&id).and_then(|n| n.ep.poll_timeout()) {
-      if deadline > self.now {
-        self.now = deadline;
-      }
+    if let Some(deadline) = self.nodes.get(&id).and_then(|n| n.ep.poll_timeout())
+      && deadline > self.now
+    {
+      self.now = deadline;
     }
     {
       let now = self.now;
@@ -676,17 +676,17 @@ impl InteractionEnv {
         first.get() - 1
       ));
     }
-    if last >= first {
-      if let Ok(entries) = n.log.entries(first..Index::new(last.get() + 1), u64::MAX) {
-        for e in entries {
-          out.push_str(&std::format!(
-            "  {}/{} {}{}\n",
-            e.term().get(),
-            e.index().get(),
-            kind_str(e.kind()),
-            fmt_data(e.data()),
-          ));
-        }
+    if last >= first
+      && let Ok(entries) = n.log.entries(first..Index::new(last.get() + 1), u64::MAX)
+    {
+      for e in entries {
+        out.push_str(&std::format!(
+          "  {}/{} {}{}\n",
+          e.term().get(),
+          e.index().get(),
+          kind_str(e.kind()),
+          fmt_data(e.data()),
+        ));
       }
     }
     out

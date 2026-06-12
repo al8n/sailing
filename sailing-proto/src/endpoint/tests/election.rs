@@ -457,11 +457,11 @@ fn deferred_vote_does_not_leak_across_term_bump() {
   // Step 4: collect all VoteResp messages.
   let mut grants: std::vec::Vec<(u64, u64)> = std::vec::Vec::new(); // (from, to/candidate)
   while let Some(out) = ep.poll_message() {
-    if let Message::VoteResp(vr) = out.message() {
-      if !vr.reject() {
-        // out.to() is the candidate we're replying to
-        grants.push((vr.from(), out.to()));
-      }
+    if let Message::VoteResp(vr) = out.message()
+      && !vr.reject()
+    {
+      // out.to() is the candidate we're replying to
+      grants.push((vr.from(), out.to()));
     }
   }
 

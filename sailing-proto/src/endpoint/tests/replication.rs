@@ -187,10 +187,10 @@ fn propose_appends_and_replicates() {
   assert_eq!(idx, crate::Index::new(2)); // after the no-op at 1
   let mut appends = 0;
   while let Some(o) = ep.poll_message() {
-    if let Message::AppendEntries(ae) = o.message() {
-      if !ae.entries().is_empty() {
-        appends += 1;
-      }
+    if let Message::AppendEntries(ae) = o.message()
+      && !ae.entries().is_empty()
+    {
+      appends += 1;
     }
   }
   assert_eq!(appends, 2); // to peers 2 and 3
@@ -910,10 +910,10 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
   // Collect the heartbeat advertised to the LAGGING peer 3.
   let mut hb_to_3: Option<Index> = None;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 3u64 {
-      if let Message::Heartbeat(hb) = out.message() {
-        hb_to_3 = Some(hb.commit());
-      }
+    if out.to() == 3u64
+      && let Message::Heartbeat(hb) = out.message()
+    {
+      hb_to_3 = Some(hb.commit());
     }
   }
   let advertised = hb_to_3.expect("a heartbeat must be sent to peer 3");
@@ -998,14 +998,13 @@ fn leader_paces_by_inflight_window() {
   let mut appends_to_2: usize = 0;
   let mut last_sent_index = Index::ZERO;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        if !ae.entries().is_empty() {
-          appends_to_2 += 1;
-          if let Some(last) = ae.entries().last() {
-            last_sent_index = last.index();
-          }
-        }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+      && !ae.entries().is_empty()
+    {
+      appends_to_2 += 1;
+      if let Some(last) = ae.entries().last() {
+        last_sent_index = last.index();
       }
     }
   }
@@ -1034,12 +1033,11 @@ fn leader_paces_by_inflight_window() {
   // After the ack, the leader should pipeline more entries (entries 5 and beyond).
   let mut resumed = false;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        if !ae.entries().is_empty() {
-          resumed = true;
-        }
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+      && !ae.entries().is_empty()
+    {
+      resumed = true;
     }
   }
   assert!(
@@ -1165,18 +1163,17 @@ fn single_ack_does_not_rewind_replicate_window() {
   let mut min_sent_index = Index::new(u64::MAX);
   let mut max_sent_index = Index::ZERO;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        if !ae.entries().is_empty() {
-          appends_after += 1;
-          for e in ae.entries() {
-            if e.index() < min_sent_index {
-              min_sent_index = e.index();
-            }
-            if e.index() > max_sent_index {
-              max_sent_index = e.index();
-            }
-          }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+      && !ae.entries().is_empty()
+    {
+      appends_after += 1;
+      for e in ae.entries() {
+        if e.index() < min_sent_index {
+          min_sent_index = e.index();
+        }
+        if e.index() > max_sent_index {
+          max_sent_index = e.index();
         }
       }
     }
@@ -1461,12 +1458,11 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
   // back only one slot per reject (a much higher prev_log_index here).
   let mut found_correct_prev = false;
   while let Some(out) = leader.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        if ae.prev_log_index() == Index::new(2) {
-          found_correct_prev = true;
-        }
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+      && ae.prev_log_index() == Index::new(2)
+    {
+      found_correct_prev = true;
     }
   }
   assert!(
@@ -1542,10 +1538,10 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
   // The leader must probe at prev_log_index = 0 (next_index jumped straight to 1) in ONE step.
   let mut prev = None;
   while let Some(out) = leader.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        prev = Some(ae.prev_log_index());
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+    {
+      prev = Some(ae.prev_log_index());
     }
   }
   assert_eq!(
@@ -1619,10 +1615,10 @@ fn heartbeat_resp_resumes_stalled_probe() {
   ep.handle_storage(d, &mut log, &mut stable);
   let mut probe_blocked = true;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(_) = out.message() {
-        probe_blocked = false;
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(_) = out.message()
+    {
+      probe_blocked = false;
     }
   }
   assert!(
@@ -1645,10 +1641,10 @@ fn heartbeat_resp_resumes_stalled_probe() {
   );
   let mut resumed = false;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(_) = out.message() {
-        resumed = true;
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(_) = out.message()
+    {
+      resumed = true;
     }
   }
   assert!(
@@ -1725,10 +1721,10 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
   );
   let mut sent = None;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        sent = Some(ae.entries().len());
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+    {
+      sent = Some(ae.entries().len());
     }
   }
   let n = sent.expect("an AppendEntries was sent to peer 2");
@@ -1825,12 +1821,11 @@ fn empty_appends_do_not_wedge_inflight_window() {
 
   let mut delivered = false;
   while let Some(out) = ep.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        if !ae.entries().is_empty() {
-          delivered = true;
-        }
-      }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+      && !ae.entries().is_empty()
+    {
+      delivered = true;
     }
   }
   assert!(
@@ -2023,12 +2018,12 @@ fn lagging_follower_hint_is_two_sided() {
   // (because find_conflict_by_term walks to 0 with ceiling=0 → safe_next = cur_next-1).
   let mut found_low_prev = false;
   while let Some(out) = leader.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::AppendEntries(ae) = out.message() {
-        // With two-sided hint the leader jumps to next=2 → prev=1.
-        if ae.prev_log_index() <= Index::new(2) {
-          found_low_prev = true;
-        }
+    if out.to() == 2u64
+      && let Message::AppendEntries(ae) = out.message()
+    {
+      // With two-sided hint the leader jumps to next=2 → prev=1.
+      if ae.prev_log_index() <= Index::new(2) {
+        found_low_prev = true;
       }
     }
   }

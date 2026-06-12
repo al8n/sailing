@@ -78,15 +78,15 @@ where
     // a DEFERRED success ack also caps its proven match to the new boundary — the discarded
     // tail can no longer back it. (The flush already clamps by `ack_watermark()`, which regresses here,
     // so this is defense-in-depth that keeps the stored extent honest.)
-    if let Some((to, term, proven)) = self.term_gated_append_ack {
-      if proven > boundary {
-        self.term_gated_append_ack = Some((to, term, boundary));
-      }
+    if let Some((to, term, proven)) = self.term_gated_append_ack
+      && proven > boundary
+    {
+      self.term_gated_append_ack = Some((to, term, boundary));
     }
-    if let Some((to, term, proven)) = self.term_gated_snapshot_ack {
-      if proven > boundary {
-        self.term_gated_snapshot_ack = Some((to, term, boundary));
-      }
+    if let Some((to, term, proven)) = self.term_gated_snapshot_ack
+      && proven > boundary
+    {
+      self.term_gated_snapshot_ack = Some((to, term, boundary));
     }
   }
 
@@ -314,11 +314,11 @@ where
           // Deferred compaction: fire only after the snapshot is durable.
           // This mirrors append-before-ack: the log is never compacted before the
           // snapshot backing it is safely on stable storage.
-          if let Some((pid, up_to)) = self.pending_compact {
-            if pid == opid {
-              log.compact(up_to);
-              self.pending_compact = None;
-            }
+          if let Some((pid, up_to)) = self.pending_compact
+            && pid == opid
+          {
+            log.compact(up_to);
+            self.pending_compact = None;
           }
           // a DEFERRED follower install whose blob just became durable — run the destructive
           // install body NOW (SM restore, commit/applied advance, the log re-baseline, membership, ack).
@@ -350,11 +350,11 @@ where
     // ahead of a durable snapshot (safety preserved). It runs before `maybe_snapshot` so a node that
     // was wedged can snapshot again in this same call. (Keyed on `durable_snapshot()` — the
     // fsync'd slot — NOT `snapshot()`, the submit-visible slot, for uniformity with the install fallback.)
-    if let Some((_pid, up_to)) = self.pending_compact {
-      if matches!(stable.durable_snapshot(), Some(m) if m.last_index() >= up_to) {
-        log.compact(up_to);
-        self.pending_compact = None;
-      }
+    if let Some((_pid, up_to)) = self.pending_compact
+      && matches!(stable.durable_snapshot(), Some(m) if m.last_index() >= up_to)
+    {
+      log.compact(up_to);
+      self.pending_compact = None;
     }
     // same missed/coalesced-completion fallback for a DEFERRED install — if the DURABLE snapshot
     // already covers the pending boundary, the blob is durable, so run the install now (else a single

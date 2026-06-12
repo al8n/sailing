@@ -256,10 +256,10 @@ where
     // max_inflight_msgs heartbeat-resp cycles the window fills and newly proposed entries
     // are silently not delivered. (etcd guards SentEntries on len(entries) > 0.)
     let is_empty = bytes_sent == 0 && entries_len == 0;
-    if let Some(p) = self.tracker.progress_mut(&peer) {
-      if (!is_empty && p.state().is_replicate()) || sent_partial {
-        p.sent_entries(last_sent, bytes_sent);
-      }
+    if let Some(p) = self.tracker.progress_mut(&peer)
+      && ((!is_empty && p.state().is_replicate()) || sent_partial)
+    {
+      p.sent_entries(last_sent, bytes_sent);
     }
   }
 

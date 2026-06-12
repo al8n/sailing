@@ -18,11 +18,11 @@ fn safe_read_confirmed_after_heartbeat_quorum() {
   let mut round = None;
   let mut ctx_hb_count = 0usize;
   while let Some(out) = ep.poll_message() {
-    if let Message::Heartbeat(hb) = out.message() {
-      if !hb.context().is_empty() {
-        round = Some(bytes::Bytes::copy_from_slice(hb.context()));
-        ctx_hb_count += 1;
-      }
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      round = Some(bytes::Bytes::copy_from_slice(hb.context()));
+      ctx_hb_count += 1;
     }
   }
   assert_eq!(
@@ -91,10 +91,10 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
   fn read_round(ep: &mut Endpoint<u64, crate::testkit::CountSm>) -> bytes::Bytes {
     let mut token = None;
     while let Some(out) = ep.poll_message() {
-      if let Message::Heartbeat(hb) = out.message() {
-        if !hb.context().is_empty() {
-          token = Some(bytes::Bytes::copy_from_slice(hb.context()));
-        }
+      if let Message::Heartbeat(hb) = out.message()
+        && !hb.context().is_empty()
+      {
+        token = Some(bytes::Bytes::copy_from_slice(hb.context()));
       }
     }
     token.expect("a read heartbeat round token")
@@ -570,10 +570,10 @@ fn fifo_confirmation_and_index_correctness() {
   // reads (FIFO). With internal round tokens the heartbeat carries the token, not the user ctx.
   let mut last_round = None;
   while let Some(out) = ep.poll_message() {
-    if let Message::Heartbeat(hb) = out.message() {
-      if !hb.context().is_empty() {
-        last_round = Some(bytes::Bytes::copy_from_slice(hb.context()));
-      }
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      last_round = Some(bytes::Bytes::copy_from_slice(hb.context()));
     }
   }
   let last_round = last_round.expect("two read heartbeat rounds were broadcast");
@@ -673,10 +673,10 @@ fn no_current_term_commit_defers_read() {
   // No read heartbeats (non-empty context) should have been sent (the read is deferred).
   let mut read_hb_before = false;
   while let Some(out) = ep.poll_message() {
-    if let Message::Heartbeat(hb) = out.message() {
-      if !hb.context().is_empty() {
-        read_hb_before = true;
-      }
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      read_hb_before = true;
     }
   }
   assert!(
@@ -715,10 +715,10 @@ fn no_current_term_commit_defers_read() {
   // the internal round token. Capture it to echo back.
   let mut round = None;
   while let Some(out) = ep.poll_message() {
-    if let Message::Heartbeat(hb) = out.message() {
-      if !hb.context().is_empty() {
-        round = Some(bytes::Bytes::copy_from_slice(hb.context()));
-      }
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      round = Some(bytes::Bytes::copy_from_slice(hb.context()));
     }
   }
   let round = round.expect("deferred read must broadcast heartbeats after no-op commits");
@@ -978,10 +978,10 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
   // Exactly one rejecting ReadIndexResp addressed back to the forwarder (node 2).
   let mut reject_resp = None;
   while let Some(out) = leader.poll_message() {
-    if out.to() == 2u64 {
-      if let Message::ReadIndexResp(r) = out.message() {
-        reject_resp = Some(r.clone());
-      }
+    if out.to() == 2u64
+      && let Message::ReadIndexResp(r) = out.message()
+    {
+      reject_resp = Some(r.clone());
     }
   }
   let reject_resp = reject_resp.expect("leader at capacity must reply with a ReadIndexResp");

@@ -146,10 +146,10 @@ impl Progress {
     self.inflight.free_le(n);
     self.msg_app_flow_paused = false;
     // If we were waiting for a snapshot ack and the peer is now caught up, resume.
-    if let ProgressState::Snapshot(pending) = self.state {
-      if n >= pending {
-        self.become_probe();
-      }
+    if let ProgressState::Snapshot(pending) = self.state
+      && n >= pending
+    {
+      self.become_probe();
     }
     updated
   }
