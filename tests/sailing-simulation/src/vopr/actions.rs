@@ -263,6 +263,56 @@ pub(crate) fn conf_change(
   }
 }
 
+/// Issue 1..=3 linearizable reads. Two thirds of draws target the LEADER (the direct path);
+/// one third targets a random OTHER live node (the follower-forward path — and, leaderless,
+/// the NoLeader refusal path, a legitimate no-op). Each accepted read records the
+/// completed-write floor in the ledger; the per-iteration scan asserts its confirmation.
+pub(crate) fn read_index_load(
+  c: &mut Cluster,
+  st: &VoprState,
+  reads: &mut ReadLedger,
+  prng: &mut FaultPrng,
+  report: &mut VoprReport,
+) {
+  let k = 1 + (prng.next_u64() % 3) as usize; // 1..=3 reads
+  for _ in 0..k {
+    let leader = c.leader();
+    let forward = prng.next_u64() % 3 == 0;
+    let target = if forward {
+      // A live node that is not the leader, when one exists (sorted pick = deterministic).
+      let others: BTreeSet<u64> = st
+        .live_ids()
+        .into_iter()
+        .filter(|id| Some(*id) != leader)
+        .collect();
+      pick_from(&others, prng).or(leader)
+    } else {
+      leader.or_else(|| pick_from(&st.live_ids(), prng))
+    };
+    let Some(target) = target else { return };
+    reads.issue(c, target, report);
+  }
+}
+
+/// Ask the leader to transfer leadership to a random other voter. The target may be isolated
+/// or lagging — the transfer aborting on its deadline is a legitimate, valuable case; the
+/// oracles and calm windows catch anything the handoff breaks.
+pub(crate) fn transfer_leader(
+  c: &mut Cluster,
+  st: &VoprState,
+  prng: &mut FaultPrng,
+  report: &mut VoprReport,
+) {
+  let Some(leader) = c.leader() else { return };
+  let others: BTreeSet<u64> = st.voters.iter().copied().filter(|&v| v != leader).collect();
+  let Some(target) = pick_from(&others, prng) else {
+    return;
+  };
+  if c.transfer_leader(target).is_ok() {
+    report.transfers += 1;
+  }
+}
+
 /// Re-roll the network + per-node storage fault intensities to a new seed-chosen level (an
 /// adversarial schedule that shifts over the run). Uses a fresh per-call seed derived from the master
 /// PRNG so the schedule stays deterministic.

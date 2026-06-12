@@ -189,6 +189,38 @@ impl Cluster {
     &self.read_states[i]
   }
 
+  /// Every node id the cluster has ever wired, in sorted (deterministic) order. Includes
+  /// removed nodes — their histories (e.g. confirmed `ReadState`s) remain observable.
+  pub fn node_ids(&self) -> std::vec::Vec<u64> {
+    self.node_idx.keys().copied().collect()
+  }
+
+  /// The highest commit index any node (including removed ones) currently believes — the
+  /// completed-write watermark. An entry committed ANYWHERE is durably replicated to a quorum
+  /// and acknowledged, so a linearizable read invoked after this instant must observe it.
+  pub fn max_commit(&self) -> sailing_proto::Index {
+    self
+      .nodes
+      .iter()
+      .map(|n| n.commit_index())
+      .max()
+      .unwrap_or(sailing_proto::Index::ZERO)
+  }
+
+  /// Node `id`'s commit watermark (the endpoint's belief).
+  pub fn commit_index_of(&self, id: u64) -> sailing_proto::Index {
+    let i = self.node_idx[&id];
+    self.nodes[i].commit_index()
+  }
+
+  /// Node `id`'s applied watermark (the endpoint's applied index, NOT the state-machine entry
+  /// count — empty/conf entries advance it without a state-machine record). A confirmed read
+  /// with `ReadState.index <= applied_index_of(id)` is servable on `id`.
+  pub fn applied_index_of(&self, id: u64) -> sailing_proto::Index {
+    let i = self.node_idx[&id];
+    self.nodes[i].applied_index()
+  }
+
   /// The `first_index()` of node `id`'s durable log (advances after compaction).
   pub fn first_index_of(&self, id: u64) -> sailing_proto::Index {
     let i = self.node_idx[&id];
