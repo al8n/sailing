@@ -1,0 +1,27 @@
+[package]
+name = "sailing-compio"
+version = "0.1.0"
+description = "Proactor (compio) reference driver for sailing-proto"
+edition.workspace = true
+# compio's tree floors this well above the workspace's 1.85 (cfg_select in
+# compio-executor needs 1.95); the no_std protocol crate keeps the lower MSRV.
+rust-version = "1.95"
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+sailing-proto = { workspace = true, features = ["tls", "quic"] }
+bytes = { workspace = true }
+thiserror = { workspace = true }
+compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io-uring", "polling"] }
+flume = { workspace = true }
+futures-channel = { workspace = true }
+futures-util = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+rustls = { workspace = true }
+futures-executor = { version = "0.3", default-features = false, features = ["std"] }
+
+[lints]
+workspace = true
