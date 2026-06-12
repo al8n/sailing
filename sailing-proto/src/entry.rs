@@ -1,5 +1,5 @@
 //! A replicated-log entry and its kind.
-use crate::{Data, Index, Term};
+use crate::{Index, Term};
 use bytes::Bytes;
 
 /// What a log entry carries. Only `Normal` entries reach `StateMachine::apply`.
@@ -74,43 +74,6 @@ impl Entry {
   #[inline(always)]
   pub fn data_bytes(&self) -> Bytes {
     self.data.clone()
-  }
-}
-
-impl Data for EntryKind {
-  fn encode(&self, buf: &mut std::vec::Vec<u8>) {
-    buf.push(match self {
-      Self::Normal => 0,
-      Self::ConfChange => 1,
-      Self::Empty => 2,
-    });
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, crate::DecodeError> {
-    match cur.take_u8()? {
-      0 => Ok(Self::Normal),
-      1 => Ok(Self::ConfChange),
-      2 => Ok(Self::Empty),
-      _ => Err(crate::DecodeError::Invalid("EntryKind")),
-    }
-  }
-}
-
-impl Data for Entry {
-  fn encode(&self, buf: &mut std::vec::Vec<u8>) {
-    self.term.encode(buf);
-    self.index.encode(buf);
-    self.kind.encode(buf);
-    self.data.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, crate::DecodeError> {
-    let term = Term::decode(cur)?;
-    let index = Index::decode(cur)?;
-    let kind = EntryKind::decode(cur)?;
-    // Zero-copy: the payload is an O(1) shared slice of the frame's allocation.
-    let data = Bytes::decode(cur)?;
-    Ok(Self::new(term, index, kind, data))
   }
 }
 

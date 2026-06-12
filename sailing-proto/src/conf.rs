@@ -7,7 +7,7 @@
 //! - [`ConfChangeSingle`] — a single add/remove operation.
 //! - [`ConfChange`] — the simple (v1) single-op change entry payload.
 //! - [`ConfChangeV2`] — the general (possibly multi-op / joint-consensus) change entry payload.
-use crate::{Data, DecodeError, NodeId};
+use crate::NodeId;
 use bytes::Bytes;
 use std::{collections::BTreeSet, vec::Vec};
 
@@ -192,31 +192,6 @@ impl<I: NodeId> ConfState<I> {
   }
 }
 
-impl<I: NodeId> Data for ConfState<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.voters.encode(buf);
-    self.learners.encode(buf);
-    self.voters_outgoing.encode(buf);
-    self.learners_next.encode(buf);
-    self.auto_leave.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let voters = BTreeSet::<I>::decode(cur)?;
-    let learners = BTreeSet::<I>::decode(cur)?;
-    let voters_outgoing = BTreeSet::<I>::decode(cur)?;
-    let learners_next = BTreeSet::<I>::decode(cur)?;
-    let auto_leave = bool::decode(cur)?;
-    Ok(Self::new(
-      voters,
-      learners,
-      voters_outgoing,
-      learners_next,
-      auto_leave,
-    ))
-  }
-}
-
 // ─── ConfChangeType ───────────────────────────────────────────────────────────
 
 /// The operation a [`ConfChangeSingle`] or [`ConfChange`] performs on the cluster.
@@ -242,25 +217,6 @@ impl ConfChangeType {
       Self::AddNode => "add_node",
       Self::RemoveNode => "remove_node",
       Self::AddLearnerNode => "add_learner_node",
-    }
-  }
-}
-
-impl Data for ConfChangeType {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    buf.push(match self {
-      Self::AddNode => 0u8,
-      Self::RemoveNode => 1u8,
-      Self::AddLearnerNode => 2u8,
-    });
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    match cur.take_u8()? {
-      0 => Ok(Self::AddNode),
-      1 => Ok(Self::RemoveNode),
-      2 => Ok(Self::AddLearnerNode),
-      _ => Err(DecodeError::Invalid("ConfChangeType")),
     }
   }
 }
@@ -303,25 +259,6 @@ impl ConfChangeTransition {
   }
 }
 
-impl Data for ConfChangeTransition {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    buf.push(match self {
-      Self::Auto => 0u8,
-      Self::Implicit => 1u8,
-      Self::Explicit => 2u8,
-    });
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    match cur.take_u8()? {
-      0 => Ok(Self::Auto),
-      1 => Ok(Self::Implicit),
-      2 => Ok(Self::Explicit),
-      _ => Err(DecodeError::Invalid("ConfChangeTransition")),
-    }
-  }
-}
-
 // ─── ConfChangeSingle ─────────────────────────────────────────────────────────
 
 /// A single membership-change operation: add/remove a node.
@@ -351,19 +288,6 @@ impl<I: NodeId> ConfChangeSingle<I> {
   #[inline(always)]
   pub fn node(&self) -> I {
     self.node
-  }
-}
-
-impl<I: NodeId + Data> Data for ConfChangeSingle<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.ty.encode(buf);
-    self.node.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let ty = ConfChangeType::decode(cur)?;
-    let node = I::decode(cur)?;
-    Ok(Self { ty, node })
   }
 }
 
@@ -418,21 +342,6 @@ impl<I: NodeId> ConfChange<I> {
       }],
       context: self.context,
     }
-  }
-}
-
-impl<I: NodeId + Data> Data for ConfChange<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.ty.encode(buf);
-    self.node.encode(buf);
-    self.context.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let ty = ConfChangeType::decode(cur)?;
-    let node = I::decode(cur)?;
-    let context = Bytes::decode(cur)?;
-    Ok(Self { ty, node, context })
   }
 }
 
@@ -493,32 +402,6 @@ impl<I: NodeId> ConfChangeV2<I> {
       changes: Vec::new(),
       context: Bytes::new(),
     }
-  }
-}
-
-impl<I: NodeId + Data> Data for ConfChangeV2<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.transition.encode(buf);
-    // Length-prefix the changes vec: encode length as u64 then each element.
-    (self.changes.len() as u64).encode(buf);
-    for c in &self.changes {
-      c.encode(buf);
-    }
-    self.context.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let transition = ConfChangeTransition::decode(cur)?;
-    // Changes: the generic `Vec<T>` decoder is the length-prefixed-collection choke-point — no
-    // count-based preallocation, per-element input progress required, so a hostile count fails on
-    // the first missing element.
-    let changes = Vec::<ConfChangeSingle<I>>::decode(cur)?;
-    let context = Bytes::decode(cur)?;
-    Ok(Self {
-      transition,
-      changes,
-      context,
-    })
   }
 }
 

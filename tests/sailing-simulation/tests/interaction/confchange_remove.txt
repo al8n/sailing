@@ -67,13 +67,13 @@ stabilize
 propose-conf-change 1 remove 3
 ----
 n1 proposed conf-change remove n3 at index 2
-AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000103000000000000000000000000000000]
-AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000103000000000000000000000000000000]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080112080300000000000000]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080112080300000000000000]
 
 stabilize
 ----
-> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000103000000000000000000000000000000]
-> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0001000000000000000103000000000000000000000000000000]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080112080300000000000000]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080112080300000000000000]
 > n2 ready
   AppendResp term=1 match=2
 > n3 ready

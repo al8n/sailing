@@ -45,7 +45,7 @@ use super::{
   conn::{ConnEntry, ConnTable, Phase},
   crypto::QuicOptions,
 };
-use crate::{Data, Message, NodeId, TransportError};
+use crate::{Message, NodeId, TransportError};
 
 /// Maximum number of LIVE connections the bridge keeps for any ONE peer. On validation the bridge
 /// closes the OLDEST same-peer connections beyond this bound, so a flapping or crash-looping
@@ -482,10 +482,10 @@ impl<I: NodeId> Bridge<I> {
         continue;
       }
       // Nested rather than a let-chain: the crate's MSRV (1.85) predates stabilized let-chains.
-      if let Some(conn_ev) = self.endpoint.handle_event(h, ev) {
-        if let Some(e) = self.table.entry(h) {
-          e.conn.handle_event(conn_ev);
-        }
+      if let Some(conn_ev) = self.endpoint.handle_event(h, ev)
+        && let Some(e) = self.table.entry(h)
+      {
+        e.conn.handle_event(conn_ev);
       }
     }
   }
@@ -853,7 +853,7 @@ impl<I: NodeId> Bridge<I> {
       return;
     }
     let mut payload = Vec::new();
-    msg.encode(&mut payload);
+    crate::wire::encode_message(msg, &mut payload);
     if payload.len() > MAX_FRAME_LEN {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return;

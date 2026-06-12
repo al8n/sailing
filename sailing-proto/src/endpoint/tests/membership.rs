@@ -264,11 +264,10 @@ fn inherited_uncommitted_conf_change_blocks_new_proposal() {
   //   - index 1: the leader's no-op (Empty entry)
   //   - index 2: a ConfChange entry (AddNode 4)
   // leader_commit = 0 → neither entry is committed on node 2.
-  use crate::Data as _;
   let cc_payload = {
     let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()).into_v2();
     let mut buf = std::vec::Vec::new();
-    cc.encode(&mut buf);
+    crate::wire::encode_conf_change_v2(&cc, &mut buf);
     bytes::Bytes::from(buf)
   };
   let noop = Entry::new(
@@ -370,11 +369,10 @@ fn changer_error_at_apply_poisons_node() {
 
   // Build a leave-joint ConfChange payload. The node is not in joint config, so
   // when this entry commits the Changer will return Err(NotInJointConfig).
-  use crate::Data as _;
   let leave_payload = {
     let cc = crate::ConfChangeV2::<u64>::leave_joint();
     let mut buf = std::vec::Vec::new();
-    cc.encode(&mut buf);
+    crate::wire::encode_conf_change_v2(&cc, &mut buf);
     bytes::Bytes::from(buf)
   };
 
@@ -562,7 +560,7 @@ fn leader_steps_down_on_demotion_to_learner() {
 /// `election_deadline` stayed `None` and `is_some()` below was false.
 #[test]
 fn promoted_learner_arms_election_timer() {
-  use crate::{ConfChange, ConfChangeType, Data as _, Entry, EntryKind, Instant, Term};
+  use crate::{ConfChange, ConfChangeType, Entry, EntryKind, Instant, Term};
   use core::time::Duration;
 
   // Node 4 starts as a LEARNER in {voters:[1,2,3], learners:[4]}.
@@ -585,7 +583,7 @@ fn promoted_learner_arms_election_timer() {
   // Append a committed AddNode(4) conf-change entry — it promotes node 4 from learner to voter.
   let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()).into_v2();
   let mut buf = std::vec::Vec::new();
-  cc.encode(&mut buf);
+  crate::wire::encode_conf_change_v2(&cc, &mut buf);
   let idx = log.last_index().next();
   log.force_append(&[Entry::new(
     Term::new(1),
@@ -907,4 +905,61 @@ fn self_removal_step_down_emits_leader_changed_none() {
     std::vec![(Term::new(1), None)],
     "the self-removal step-down must surface exactly one LeaderChanged(None)"
   );
+}
+
+/// An id whose `Data` encoding exceeds the 1024-byte wire bound. `NodeId` is
+/// blanket-implemented, so nothing stops an embedder from shipping one — the propose
+/// path must be the gate.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+struct OverwideId(u64);
+
+impl core::fmt::Display for OverwideId {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    write!(f, "overwide-{}", self.0)
+  }
+}
+
+impl crate::Data for OverwideId {
+  fn encode(&self, buf: &mut std::vec::Vec<u8>) {
+    buf.extend_from_slice(&[0u8; 1020]);
+    self.0.encode(buf);
+  }
+  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, crate::DecodeError> {
+    let _pad = cur.take_bytes(1020)?;
+    Ok(Self(u64::decode(cur)?))
+  }
+}
+
+/// A conf change whose target id encodes OUTSIDE the wire bound must be REJECTED AT
+/// PROPOSE (`InvalidConfChange`, nothing appended): appended-and-committed, the apply
+/// path's envelope decode would reject the id and poison EVERY node applying the entry.
+#[test]
+fn conf_change_with_overwide_id_is_rejected_at_propose() {
+  use crate::{ConfChange, ConfChangeType, ProposeError};
+  use core::time::Duration;
+
+  let cfg = crate::Config::try_new(
+    OverwideId(1),
+    std::vec![OverwideId(1)],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Single voter: elect on the first timeout (the self-vote completes synchronously).
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  let before = log.last_index();
+
+  let cc = ConfChange::new(ConfChangeType::AddNode, OverwideId(2), bytes::Bytes::new());
+  let err = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect_err("an overwide id must not enter the log");
+  assert!(matches!(err, ProposeError::InvalidConfChange));
+  assert_eq!(log.last_index(), before, "nothing was appended");
 }

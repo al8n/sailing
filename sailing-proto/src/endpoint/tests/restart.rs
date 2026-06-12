@@ -57,9 +57,7 @@ fn restart_replays_committed_log() {
 /// reconstructed config must be {1,2,3,5}: drop-4 applied, drop-5 ignored.
 #[test]
 fn restart_reconstructs_committed_config_ignoring_uncommitted_tail() {
-  use crate::{
-    ConfChange, ConfChangeType, Config, Data as _, Entry, EntryKind, Index, Instant, Term,
-  };
+  use crate::{ConfChange, ConfChangeType, Config, Entry, EntryKind, Index, Instant, Term};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -75,7 +73,7 @@ fn restart_reconstructs_committed_config_ignoring_uncommitted_tail() {
   let remove = |node: u64| -> bytes::Bytes {
     let cc = ConfChange::new(ConfChangeType::RemoveNode, node, bytes::Bytes::new()).into_v2();
     let mut buf = std::vec::Vec::new();
-    cc.encode(&mut buf);
+    crate::wire::encode_conf_change_v2(&cc, &mut buf);
     bytes::Bytes::from(buf)
   };
 

@@ -16,7 +16,7 @@ pub(crate) fn roll_network_faults(prng: &mut FaultPrng, calm: bool) -> NetworkFa
   // Drop up to ~18%, dup up to ~12% — bounded loss the proto re-replicates through.
   let drop_per_mille = (prng.next_u64() % 181) as u32;
   let duplicate_per_mille = (prng.next_u64() % 121) as u32;
-  let reorder = prng.next_u64() % 2 == 0;
+  let reorder = prng.next_u64().is_multiple_of(2);
   NetworkFaults {
     latency,
     jitter,

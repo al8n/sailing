@@ -9,7 +9,7 @@ use super::{
   frame::{FrameDecoder, MAX_FRAME_LEN, encode_frame},
   stream::{Intake, RecordIo},
 };
-use crate::{Data, Instant, Message, NodeId};
+use crate::{Instant, Message, NodeId};
 use std::vec::Vec;
 
 enum ConnState<I> {
@@ -166,10 +166,10 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       return Ok(());
     }
     while let Some(frame) = self.decoder.poll()? {
-      // ZERO-COPY: the frame is a shared slice of the decoder's buffer, and `decode_exact` slices
-      // the message's `Bytes` fields (entry payloads, blobs, contexts) out of the SAME allocation;
-      // exact consumption is required — a frame must be exactly one `Message`.
-      match Message::<I>::decode_exact(frame) {
+      // ZERO-COPY: the frame is a shared slice of the decoder's buffer, and the wire decode
+      // slices the message's `Bytes` fields (entry payloads, blobs, contexts, encoded ids) out
+      // of the SAME allocation; a frame must carry exactly one well-formed envelope.
+      match crate::wire::decode_message::<I>(frame) {
         Ok(msg) => out.push(msg),
         Err(_) => {
           self.close_suspect();
@@ -194,7 +194,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       return;
     }
     let mut payload = Vec::new();
-    msg.encode(&mut payload);
+    crate::wire::encode_message(msg, &mut payload);
     // The bound covers EVERY layer of outbound buffering: this connection's pending frames PLUS
     // whatever the record layer (and its inner layers) already hold — `buffered_outbound` is the
     // occupancy projection that keeps the cap from drifting per layer.
