@@ -346,20 +346,9 @@ where
     log: &mut L,
     hb: crate::Heartbeat<I>,
   ) {
-    let changed = self.leader != Some(hb.leader());
     self.role = Role::Follower;
-    self.leader = Some(hb.leader());
+    self.set_leader(Some(hb.leader()));
     self.arm_election_timer(now);
-    if changed {
-      // New leader: drop reads forwarded to the previous one (see on_append_entries).
-      self.forwarded_reads.clear();
-      self
-        .events
-        .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
-          self.term,
-          Some(hb.leader()),
-        )));
-    }
     // Advance commit from heartbeat and apply any newly committed entries.
     let new_commit = core::cmp::min(hb.commit(), log.last_index());
     if new_commit > self.commit {
@@ -424,21 +413,9 @@ where
     stable: &mut S,
     ae: crate::AppendEntries<I>,
   ) {
-    let changed = self.leader != Some(ae.leader());
     self.role = Role::Follower;
-    self.leader = Some(ae.leader());
+    self.set_leader(Some(ae.leader()));
     self.arm_election_timer(now);
-    if changed {
-      // New leader: reads forwarded to the previous leader are moot — clear so they can be
-      // re-issued to this one.
-      self.forwarded_reads.clear();
-      self
-        .events
-        .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
-          self.term,
-          Some(ae.leader()),
-        )));
-    }
 
     // Log-consistency check at prev_log_index/term. A fatal term-read poisons via `log_term` and
     // produces `None` → not consistent → reject path; the poisoned node's later dispatch no-ops.

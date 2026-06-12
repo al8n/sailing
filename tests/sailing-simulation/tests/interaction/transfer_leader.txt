@@ -74,12 +74,15 @@ stabilize
 > n2 ready
   RequestVote term=2 last=1/1 prevote=false
   RequestVote term=2 last=1/1 prevote=false
+  n2 leader-changed term=2 lead=none
 > n1 recv RequestVote term=2 last=1/1 prevote=false
 > n3 recv RequestVote term=2 last=1/1 prevote=false
 > n1 ready
   VoteResp term=2 prevote=false reject=false
+  n1 leader-changed term=2 lead=none
 > n3 ready
   VoteResp term=2 prevote=false reject=false
+  n3 leader-changed term=2 lead=none
 > n2 recv VoteResp term=2 prevote=false reject=false
 > n2 recv VoteResp term=2 prevote=false reject=false
 > n2 ready

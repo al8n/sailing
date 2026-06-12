@@ -824,3 +824,87 @@ fn propose_invalid_conf_change_is_rejected_not_poisoned() {
     "a rejected conf-change proposal must NOT poison the node"
   );
 }
+
+/// A leader removed by its own committed conf change steps down at the same term — the
+/// embedder holding leadership-scoped work must hear `LeaderChanged(None)`, exactly as for
+/// the check-quorum step-down.
+#[test]
+fn self_removal_step_down_emits_leader_changed_none() {
+  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+  use core::time::Duration;
+
+  let cfg = crate::Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap(); // step_down_on_removal defaults ON
+
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // Propose and commit RemoveNode(self).
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 1u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(self) must be accepted");
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  assert!(ep.role().is_follower(), "removed leader steps down");
+
+  let mut leader_events = std::vec::Vec::new();
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::LeaderChanged(lc) = ev {
+      leader_events.push((lc.term(), lc.leader()));
+    }
+  }
+  assert_eq!(
+    leader_events,
+    std::vec![(Term::new(1), None)],
+    "the self-removal step-down must surface exactly one LeaderChanged(None)"
+  );
+}
