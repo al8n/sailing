@@ -36,9 +36,11 @@ mod error;
 mod handle;
 mod quic_driver;
 mod shared;
+mod stream_driver;
 
 pub use clock::Clock;
 pub use config::DriverConfig;
 pub use error::DriverError;
 pub use handle::Handle;
 pub use quic_driver::CompioQuicDriver;
+pub use stream_driver::{AcceptorFactory, CompioStreamDriver, DialerFactory};
