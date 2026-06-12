@@ -303,7 +303,7 @@ mod tests {
   fn stable_store_submit_snapshot_and_read_via_noop_stable() {
     // NoopStable has no snapshot; snapshot() returns None
     use crate::testkit::NoopStable;
-    let s = NoopStable::default();
+    let s = NoopStable::<u64>::default();
     assert!(s.snapshot().is_none());
   }
 

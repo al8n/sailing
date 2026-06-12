@@ -1,6 +1,6 @@
 //! Raft RPC messages. Payloads are named structs; `Message<I>` wraps them as newtype
 //! variants (no multi-field enum variants). Types only — behavior lives elsewhere.
-use crate::{Data, DecodeError, Entry, Index, NodeId, Term, conf::ConfState};
+use crate::{Entry, Index, Term, conf::ConfState};
 use bytes::Bytes;
 use std::vec::Vec;
 
@@ -310,6 +310,11 @@ impl<I: Copy> Heartbeat<I> {
     &self.context
   }
 
+  /// The context as a shared handle (an O(1) refcount clone — never a byte copy).
+  pub fn context_bytes(&self) -> Bytes {
+    self.context.clone()
+  }
+
   /// The per-round CheckQuorum lease token (0 when the lease is not in use).
   #[inline(always)]
   pub const fn lease_round(&self) -> u64 {
@@ -376,6 +381,11 @@ impl<I: Copy> HeartbeatResp<I> {
   #[inline(always)]
   pub fn context(&self) -> &[u8] {
     &self.context
+  }
+
+  /// The context as a shared handle (an O(1) refcount clone — never a byte copy).
+  pub fn context_bytes(&self) -> Bytes {
+    self.context.clone()
   }
 
   /// The per-round CheckQuorum lease token echoed from the heartbeat (0 when not in use).
@@ -595,6 +605,11 @@ impl<I: Copy> ReadIndex<I> {
   pub fn context(&self) -> &[u8] {
     &self.context
   }
+
+  /// The context as a shared handle (an O(1) refcount clone — never a byte copy).
+  pub fn context_bytes(&self) -> Bytes {
+    self.context.clone()
+  }
 }
 
 /// Leader → follower: the confirmed read index for a forwarded read request.
@@ -653,6 +668,11 @@ impl<I: Copy> ReadIndexResp<I> {
   #[inline(always)]
   pub fn context(&self) -> &[u8] {
     &self.context
+  }
+
+  /// The context as a shared handle (an O(1) refcount clone — never a byte copy).
+  pub fn context_bytes(&self) -> Bytes {
+    self.context.clone()
   }
 
   /// Whether the leader DECLINED this forwarded read (it was at read back-pressure capacity).
@@ -784,319 +804,6 @@ impl<I: crate::NodeId> Message<I> {
 // The NORMATIVE byte-level format (tag table, field orders, canonicality rules, the frame and
 // hello layouts) is pinned in `sailing-proto/WIRE.md`; any change here updates that document, the
 // golden vectors in `message/tests.rs`, and the transport hello version in the same commit.
-
-impl<I: NodeId> Data for SnapshotMeta<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.last_index.encode(buf);
-    self.last_term.encode(buf);
-    self.conf.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let last_index = <Index>::decode(cur)?;
-    let last_term = <Term>::decode(cur)?;
-    let conf = <ConfState<I>>::decode(cur)?;
-    Ok(Self::new(last_index, last_term, conf))
-  }
-}
-
-impl<I: NodeId> Data for AppendEntries<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.leader.encode(buf);
-    self.prev_log_index.encode(buf);
-    self.prev_log_term.encode(buf);
-    self.entries.encode(buf);
-    self.leader_commit.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let leader = <I>::decode(cur)?;
-    let prev_log_index = <Index>::decode(cur)?;
-    let prev_log_term = <Term>::decode(cur)?;
-    let entries = <Vec<Entry>>::decode(cur)?;
-    let leader_commit = <Index>::decode(cur)?;
-    Ok(Self::new(
-      term,
-      leader,
-      prev_log_index,
-      prev_log_term,
-      entries,
-      leader_commit,
-    ))
-  }
-}
-
-impl<I: NodeId> Data for AppendResp<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.from.encode(buf);
-    self.reject.encode(buf);
-    self.reject_hint_index.encode(buf);
-    self.reject_hint_term.encode(buf);
-    self.match_index.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let from = <I>::decode(cur)?;
-    let reject = <bool>::decode(cur)?;
-    let reject_hint_index = <Index>::decode(cur)?;
-    let reject_hint_term = <Term>::decode(cur)?;
-    let match_index = <Index>::decode(cur)?;
-    Ok(Self::new(
-      term,
-      from,
-      reject,
-      reject_hint_index,
-      reject_hint_term,
-      match_index,
-    ))
-  }
-}
-
-impl<I: NodeId> Data for RequestVote<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.candidate.encode(buf);
-    self.last_log_index.encode(buf);
-    self.last_log_term.encode(buf);
-    self.pre_vote.encode(buf);
-    self.leader_transfer.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let candidate = <I>::decode(cur)?;
-    let last_log_index = <Index>::decode(cur)?;
-    let last_log_term = <Term>::decode(cur)?;
-    let pre_vote = <bool>::decode(cur)?;
-    let leader_transfer = <bool>::decode(cur)?;
-    Ok(Self::new(
-      term,
-      candidate,
-      last_log_index,
-      last_log_term,
-      pre_vote,
-      leader_transfer,
-    ))
-  }
-}
-
-impl<I: NodeId> Data for VoteResp<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.from.encode(buf);
-    self.pre_vote.encode(buf);
-    self.reject.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let from = <I>::decode(cur)?;
-    let pre_vote = <bool>::decode(cur)?;
-    let reject = <bool>::decode(cur)?;
-    Ok(Self::new(term, from, pre_vote, reject))
-  }
-}
-
-impl<I: NodeId> Data for Heartbeat<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.leader.encode(buf);
-    self.commit.encode(buf);
-    self.context.encode(buf);
-    self.lease_round.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let leader = <I>::decode(cur)?;
-    let commit = <Index>::decode(cur)?;
-    let context = <Bytes>::decode(cur)?;
-    let lease_round = <u64>::decode(cur)?;
-    Ok(Self::new(term, leader, commit, context).with_lease_round(lease_round))
-  }
-}
-
-impl<I: NodeId> Data for HeartbeatResp<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.from.encode(buf);
-    self.context.encode(buf);
-    self.lease_round.encode(buf);
-    self.lease_support.as_secs().encode(buf);
-    (self.lease_support.subsec_nanos() as u64).encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let from = <I>::decode(cur)?;
-    let context = <Bytes>::decode(cur)?;
-    let lease_round = <u64>::decode(cur)?;
-    let secs = <u64>::decode(cur)?;
-    let nanos = <u64>::decode(cur)?;
-    if nanos >= 1_000_000_000 {
-      return Err(DecodeError::Invalid("duration nanos"));
-    }
-    let lease_support = core::time::Duration::new(secs, nanos as u32);
-    Ok(
-      Self::new(term, from, context)
-        .with_lease_round(lease_round)
-        .with_lease_support(lease_support),
-    )
-  }
-}
-
-impl<I: NodeId> Data for InstallSnapshot<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.leader.encode(buf);
-    self.snapshot.encode(buf);
-    self.data.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let leader = <I>::decode(cur)?;
-    let snapshot = <SnapshotMeta<I>>::decode(cur)?;
-    let data = <Bytes>::decode(cur)?;
-    Ok(Self::new(term, leader, snapshot, data))
-  }
-}
-
-impl<I: NodeId> Data for SnapshotResp<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.from.encode(buf);
-    self.reject.encode(buf);
-    self.match_index.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let from = <I>::decode(cur)?;
-    let reject = <bool>::decode(cur)?;
-    let match_index = <Index>::decode(cur)?;
-    Ok(Self::new(term, from, reject, match_index))
-  }
-}
-
-impl<I: NodeId> Data for TimeoutNow<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.leader.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let leader = <I>::decode(cur)?;
-    Ok(Self::new(term, leader))
-  }
-}
-
-impl<I: NodeId> Data for ReadIndex<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.from.encode(buf);
-    self.context.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let from = <I>::decode(cur)?;
-    let context = <Bytes>::decode(cur)?;
-    Ok(Self::new(term, from, context))
-  }
-}
-
-impl<I: NodeId> Data for ReadIndexResp<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    self.term.encode(buf);
-    self.from.encode(buf);
-    self.index.encode(buf);
-    self.context.encode(buf);
-    self.reject.encode(buf);
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    let term = <Term>::decode(cur)?;
-    let from = <I>::decode(cur)?;
-    let index = <Index>::decode(cur)?;
-    let context = <Bytes>::decode(cur)?;
-    let reject = <bool>::decode(cur)?;
-    Ok(Self::new(term, from, index, context, reject))
-  }
-}
-
-impl<I: NodeId> Data for Message<I> {
-  fn encode(&self, buf: &mut Vec<u8>) {
-    match self {
-      Self::AppendEntries(m) => {
-        buf.push(0);
-        m.encode(buf);
-      }
-      Self::AppendResp(m) => {
-        buf.push(1);
-        m.encode(buf);
-      }
-      Self::RequestVote(m) => {
-        buf.push(2);
-        m.encode(buf);
-      }
-      Self::VoteResp(m) => {
-        buf.push(3);
-        m.encode(buf);
-      }
-      Self::Heartbeat(m) => {
-        buf.push(4);
-        m.encode(buf);
-      }
-      Self::HeartbeatResp(m) => {
-        buf.push(5);
-        m.encode(buf);
-      }
-      Self::InstallSnapshot(m) => {
-        buf.push(6);
-        m.encode(buf);
-      }
-      Self::SnapshotResp(m) => {
-        buf.push(7);
-        m.encode(buf);
-      }
-      Self::TimeoutNow(m) => {
-        buf.push(8);
-        m.encode(buf);
-      }
-      Self::ReadIndex(m) => {
-        buf.push(9);
-        m.encode(buf);
-      }
-      Self::ReadIndexResp(m) => {
-        buf.push(10);
-        m.encode(buf);
-      }
-    }
-  }
-
-  fn decode(cur: &mut crate::data::ByteCursor) -> Result<Self, DecodeError> {
-    match cur.take_u8()? {
-      0 => Ok(Self::AppendEntries(AppendEntries::<I>::decode(cur)?)),
-      1 => Ok(Self::AppendResp(AppendResp::<I>::decode(cur)?)),
-      2 => Ok(Self::RequestVote(RequestVote::<I>::decode(cur)?)),
-      3 => Ok(Self::VoteResp(VoteResp::<I>::decode(cur)?)),
-      4 => Ok(Self::Heartbeat(Heartbeat::<I>::decode(cur)?)),
-      5 => Ok(Self::HeartbeatResp(HeartbeatResp::<I>::decode(cur)?)),
-      6 => Ok(Self::InstallSnapshot(InstallSnapshot::<I>::decode(cur)?)),
-      7 => Ok(Self::SnapshotResp(SnapshotResp::<I>::decode(cur)?)),
-      8 => Ok(Self::TimeoutNow(TimeoutNow::<I>::decode(cur)?)),
-      9 => Ok(Self::ReadIndex(ReadIndex::<I>::decode(cur)?)),
-      10 => Ok(Self::ReadIndexResp(ReadIndexResp::<I>::decode(cur)?)),
-      _ => Err(DecodeError::Invalid("Message tag")),
-    }
-  }
-}
 
 #[cfg(test)]
 mod term_test {

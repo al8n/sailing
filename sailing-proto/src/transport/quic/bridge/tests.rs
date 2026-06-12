@@ -5,7 +5,7 @@ use std::{
 
 use super::{Bridge, DialError};
 use crate::{
-  Data, Message, TimeoutNow,
+  Message, TimeoutNow,
   transport::quic::crypto::{QuicTuning, tests::TestClusterCa},
 };
 
@@ -106,7 +106,7 @@ fn loopback_pair_exchanges_a_framed_message() {
     .next_frame(hb)
     .expect("no framing violation")
     .expect("one complete frame");
-  let decoded = Message::<u64>::decode_exact(frame).expect("frame decodes");
+  let decoded = crate::wire::decode_message::<u64>(frame).expect("frame decodes");
   assert_eq!(decoded, msg, "the message survives the QUIC round-trip");
   assert!(
     matches!(b.next_frame(hb), Ok(None)),
@@ -123,7 +123,10 @@ fn loopback_pair_exchanges_a_framed_message() {
   assert!(ready.contains(&ha));
   assert!(!a.ingest_recv(now, ha));
   let frame = a.next_frame(ha).expect("ok").expect("one frame");
-  assert_eq!(Message::<u64>::decode_exact(frame).expect("decodes"), reply);
+  assert_eq!(
+    crate::wire::decode_message::<u64>(frame).expect("decodes"),
+    reply
+  );
 }
 
 #[test]
@@ -224,7 +227,7 @@ fn pipelined_frames_behind_the_hello_stay_unread_until_validated() {
   // …with a consensus frame PIPELINED directly behind it, before any validation handshake.
   let msg = Message::TimeoutNow(TimeoutNow::new(crate::Term::new(3), 1u64));
   let mut payload = std::vec::Vec::new();
-  crate::Data::encode(&msg, &mut payload);
+  crate::wire::encode_message(&msg, &mut payload);
   let mut framed = std::vec::Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
   a.stage_outbound_for_test(ha, &framed);
@@ -258,7 +261,7 @@ fn pipelined_frames_behind_the_hello_stay_unread_until_validated() {
   assert!(!b.ingest_recv(now, hb));
   let tail = b.next_frame(hb).expect("ok").expect("the pipelined frame");
   assert_eq!(
-    Message::<u64>::decode_exact(tail).expect("decodes"),
+    crate::wire::decode_message::<u64>(tail).expect("decodes"),
     msg,
     "the backpressured tail is delivered after validation, nothing lost"
   );

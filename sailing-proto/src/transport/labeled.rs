@@ -14,7 +14,7 @@ const LABEL_MAGIC: u8 = 0xCA;
 /// The hello wire version. CONTRACT: any change to the transport wire format — the hello layout,
 /// the frame format, or the `Message` codec itself — MUST bump this byte, so mixed-version nodes
 /// reject each other at the handshake instead of mis-decoding consensus traffic.
-const LABEL_VERSION: u8 = 1;
+const LABEL_VERSION: u8 = 2;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 /// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes

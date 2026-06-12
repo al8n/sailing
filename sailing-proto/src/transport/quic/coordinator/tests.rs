@@ -111,11 +111,11 @@ impl World {
   /// Whether this datagram is the deterministically-dropped one.
   fn drops(&mut self) -> bool {
     self.moved += 1;
-    if let Some(n) = self.drop_every {
-      if self.moved % n == 0 {
-        self.dropped += 1;
-        return true;
-      }
+    if let Some(n) = self.drop_every
+      && self.moved.is_multiple_of(n)
+    {
+      self.dropped += 1;
+      return true;
     }
     false
   }

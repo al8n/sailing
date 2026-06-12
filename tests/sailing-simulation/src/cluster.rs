@@ -35,11 +35,9 @@ type Node = Endpoint<u64, LogSm>;
 /// (`decode(encode(m)) == m`), so it does not change behavior or determinism.
 #[cfg(feature = "wire")]
 fn wire_roundtrip(message: Message<u64>) -> Message<u64> {
-  use sailing_proto::Data;
   let mut buf = Vec::new();
-  message.encode(&mut buf);
-  // `decode_exact` enforces whole-buffer consumption (the framing invariant).
-  let decoded = Message::<u64>::decode_exact(bytes::Bytes::from(buf))
+  sailing_proto::wire::encode_message(&message, &mut buf);
+  let decoded = sailing_proto::wire::decode_message::<u64>(bytes::Bytes::from(buf))
     .expect("a consensus message must round-trip through the wire codec");
   // Assert VALUE identity, not just consumption — a field swap that still consumes the frame
   // would otherwise silently alter the delivered message and change fuzzer behavior.
@@ -229,19 +227,19 @@ impl Cluster {
     // does not flag the legitimate "duplicate AppendEntries, entries already present" ack path that
     // can fire for a visible-but-in-flight suffix. The per-entry quorum-durability of every COMMITTED
     // index is enforced separately by the `commit_is_quorum_durable` oracle on the durable snapshot.)
-    if let Message::AppendResp(a) = &message {
-      if !a.reject() {
-        assert!(
-          self.logs[i].last_index() >= a.match_index(),
-          "append-before-ack violated: node {from} acked {:?} but last_index is {:?} \
+    if let Message::AppendResp(a) = &message
+      && !a.reject()
+    {
+      assert!(
+        self.logs[i].last_index() >= a.match_index(),
+        "append-before-ack violated: node {from} acked {:?} but last_index is {:?} \
            (durable_last={:?} inflight={} restarts={})",
-          a.match_index(),
-          self.logs[i].last_index(),
-          self.logs[i].durable_last_index(),
-          self.logs[i].has_inflight(),
-          self.restarts[i],
-        );
-      }
+        a.match_index(),
+        self.logs[i].last_index(),
+        self.logs[i].durable_last_index(),
+        self.logs[i].has_inflight(),
+        self.restarts[i],
+      );
     }
     // ── Structural assertion (b): one-grant-per-(node,term) ──────────────────────
     // A success VoteResp from `from` in term `T` to candidate `to` must not appear a second time
