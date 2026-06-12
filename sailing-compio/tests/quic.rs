@@ -1,0 +1,280 @@
+//! Real-socket integration: three QUIC drivers on loopback UDP, cluster-private mTLS, real
+//! quinn-proto datagrams, real timers — the whole stack the simulator cannot exercise.
+
+mod common;
+
+use std::{net::SocketAddr, time::Duration};
+
+use bytes::Bytes;
+use common::{CountSm, MemLog, MemStable, TestCa};
+use sailing_compio::{CompioQuicDriver, DriverConfig, DriverError, Handle};
+use sailing_proto::{ClusterId, Config};
+
+const ELECTION: Duration = Duration::from_millis(300);
+const HEARTBEAT: Duration = Duration::from_millis(60);
+
+fn cluster() -> ClusterId {
+  ClusterId([7; 16])
+}
+
+fn addrs(base_port: u16, n: u16) -> Vec<SocketAddr> {
+  (0..n)
+    .map(|i| format!("127.0.0.1:{}", base_port + i).parse().unwrap())
+    .collect()
+}
+
+async fn build_node(
+  ca: &TestCa,
+  id: u64,
+  addr: SocketAddr,
+  peers: Vec<(u64, SocketAddr)>,
+  cfg: DriverConfig,
+) -> (
+  CompioQuicDriver<u64, CountSm, MemLog, MemStable>,
+  Handle<u64, CountSm>,
+) {
+  let config = Config::try_new(id, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap();
+  CompioQuicDriver::bind(
+    addr,
+    config,
+    id, // election-jitter seed: distinct per node
+    CountSm::default(),
+    ca.options(id, &cluster()),
+    cluster(),
+    peers,
+    MemLog::new(),
+    MemStable::new(),
+    cfg,
+  )
+  .await
+  .expect("driver binds")
+}
+
+/// Spawn a full 3-node cluster, each driver detached on this test's runtime; returns the
+/// handles indexed by node id - 1.
+async fn spawn_cluster(ca: &TestCa, base_port: u16) -> Vec<Handle<u64, CountSm>> {
+  let addrs = addrs(base_port, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| (p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = build_node(
+      ca,
+      id,
+      addrs[(id - 1) as usize],
+      peers,
+      DriverConfig::default(),
+    )
+    .await;
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+  handles
+}
+
+/// Submit through whichever node is (or redirects to) the leader, retrying the NotLeader hint
+/// until the cluster elects and the command commits.
+async fn submit_anywhere(handles: &[Handle<u64, CountSm>], payload: &'static [u8]) -> u64 {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let mut at = 0usize;
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no commit within the deadline"
+    );
+    match handles[at].submit(Bytes::from_static(payload)).await {
+      Ok(resp) => return resp,
+      // Redirect: the hint names the leader; no hint yet means no leader yet — try the next
+      // node after a beat.
+      Err(DriverError::NotLeader { leader }) => {
+        at = leader
+          .map(|l| (l - 1) as usize)
+          .unwrap_or((at + 1) % handles.len());
+        compio::time::sleep(Duration::from_millis(50)).await;
+      }
+      // A leadership change voided the outcome: retry (the test payload is idempotent).
+      Err(DriverError::Superseded) => {}
+      Err(e) => panic!("unexpected submit error: {e:?}"),
+    }
+  }
+}
+
+/// The gate: a real 3-node cluster over mandatory-mTLS QUIC on loopback elects, commits a
+/// command submitted with NotLeader redirects, answers through the submitting handle, and
+/// serves a linearizable query against the leader's state machine.
+#[compio::test]
+async fn three_node_cluster_commits_and_queries() {
+  let ca = TestCa::new();
+  let handles = spawn_cluster(&ca, 42_000).await;
+
+  let resp = submit_anywhere(&handles, b"hello").await;
+  assert_eq!(resp, 1, "the first committed command counts to one");
+
+  // A second command through any node (the redirect loop finds the leader again).
+  let resp = submit_anywhere(&handles, b"world").await;
+  assert_eq!(resp, 2);
+
+  // A linearizable query: runs against the FSM on the driver thread at a confirmed read index.
+  // Find the leader (the node whose submit succeeds is leader-adjacent; query needs the leader
+  // or a forwarding follower — sailing forwards follower reads, so any node serves).
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let count = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no query within the deadline"
+    );
+    let mut served = None;
+    for h in &handles {
+      match h.query(|sm: &CountSm| sm.count()).await {
+        Ok(c) => {
+          served = Some(c);
+          break;
+        }
+        Err(_) => continue,
+      }
+    }
+    if let Some(c) = served {
+      break c;
+    }
+    compio::time::sleep(Duration::from_millis(50)).await;
+  };
+  assert!(
+    count >= 2,
+    "the linearizable read observes both commits, got {count}"
+  );
+
+  // The events tail saw the applies (best-effort, but nothing here overflows it).
+  let mut applied = 0;
+  while let Ok(ev) = handles[0].events().try_recv() {
+    if ev.is_applied() {
+      applied += 1;
+    }
+  }
+  assert!(applied >= 1, "the tail observed at least one apply");
+}
+
+/// The budget gate is at the HANDLE, before anything queues: a payload larger than the byte
+/// budget is Busy synchronously — no cluster, no timing.
+#[compio::test]
+async fn submit_budget_exhaustion_is_busy() {
+  let ca = TestCa::new();
+  let addrs = addrs(42_100, 1);
+  let cfg = DriverConfig {
+    max_pending_bytes: 4,
+    ..Default::default()
+  };
+  let (_driver, handle) = build_node(&ca, 1, addrs[0], Vec::new(), cfg).await;
+  // The driver is never run: the budget rejects before the command channel is involved.
+  match handle.submit(Bytes::from_static(b"oversized")).await {
+    Err(DriverError::Busy) => {}
+    other => panic!("expected Busy, got {other:?}"),
+  }
+}
+
+/// The shutdown ack is an immediate-rebind contract: when it arrives the socket fd is fully
+/// released, so binding the SAME address again succeeds at once.
+#[compio::test]
+async fn shutdown_ack_means_immediate_rebind() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42200".parse().unwrap();
+
+  let (driver, handle) = build_node(&ca, 1, addr, Vec::new(), DriverConfig::default()).await;
+  let task = compio::runtime::spawn(driver.run());
+  handle.shutdown().await.expect("shutdown acks");
+  // The ack means the fd is RELEASED — not merely that teardown was scheduled.
+  let rebound = compio::net::UdpSocket::bind(addr)
+    .await
+    .expect("the address is immediately rebindable after the ack");
+  drop(rebound);
+  let _ = task.await;
+
+  // Post-shutdown operations fail with the typed teardown error.
+  match handle.submit(Bytes::from_static(b"late")).await {
+    Err(DriverError::ShuttingDown) => {}
+    other => panic!("expected ShuttingDown, got {other:?}"),
+  }
+}
+
+/// A node with no quorum never leads: submits are NotLeader (no silent parking), and the
+/// redirect hint is absent while no leader is known.
+#[compio::test]
+async fn no_quorum_means_not_leader_not_a_hang() {
+  let ca = TestCa::new();
+  let addrs = addrs(42_300, 3);
+  // Only node 1 runs; 2 and 3 are configured but never started.
+  let peers = vec![(2u64, addrs[1]), (3u64, addrs[2])];
+  let (driver, handle) = build_node(&ca, 1, addrs[0], peers, DriverConfig::default()).await;
+  compio::runtime::spawn(driver.run()).detach();
+
+  // Give it a few election timeouts: without quorum it can never win.
+  compio::time::sleep(ELECTION * 4).await;
+  match handle.submit(Bytes::from_static(b"nope")).await {
+    Err(DriverError::NotLeader { leader }) => {
+      assert_eq!(leader, None, "no leader is known without a quorum");
+    }
+    other => panic!("expected NotLeader, got {other:?}"),
+  }
+}
+
+/// A storage fault fail-stops the endpoint (poison); the driver must fail everything parked
+/// with the TYPED verdict — not strand it holding budget — and exit its run loop.
+#[compio::test]
+async fn storage_fault_poisons_with_a_typed_verdict() {
+  use common::PoisonableLog;
+
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42400".parse().unwrap();
+  // A single-voter cluster: elects itself and commits without peers, so the only failure
+  // injected is the storage fault.
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (log, fail_appends) = PoisonableLog::new();
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log,
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  let task = compio::runtime::spawn(driver.run());
+
+  // A healthy commit first (the cluster works end to end before the fault).
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no leadership in time"
+    );
+    match handle.submit(Bytes::from_static(b"ok")).await {
+      Ok(1) => break,
+      Ok(n) => panic!("unexpected count {n}"),
+      Err(DriverError::NotLeader { .. }) => {
+        compio::time::sleep(Duration::from_millis(30)).await;
+      }
+      Err(e) => panic!("unexpected error: {e:?}"),
+    }
+  }
+
+  // Inject the fault: the NEXT append's completion is a storage error → fail-stop.
+  fail_appends.store(true, std::sync::atomic::Ordering::Release);
+  match handle.submit(Bytes::from_static(b"doomed")).await {
+    Err(DriverError::Poisoned) => {}
+    other => panic!("expected Poisoned, got {other:?}"),
+  }
+
+  // The run loop exited on the poison: the driver task ends and later operations surface the
+  // teardown error.
+  let _ = task.await;
+  match handle.submit(Bytes::from_static(b"late")).await {
+    Err(DriverError::ShuttingDown) => {}
+    other => panic!("expected ShuttingDown, got {other:?}"),
+  }
+}

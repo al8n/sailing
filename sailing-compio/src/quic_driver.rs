@@ -1,0 +1,595 @@
+//! [`CompioQuicDriver`]: one task owning a [`QuicCoordinator`], the embedder's stores, and a UDP
+//! socket, driving consensus over real datagrams.
+
+use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
+
+use bytes::Bytes;
+use compio::net::UdpSocket;
+use sailing_proto::{
+  ClusterId, Config, Instant, LogStore, ProposeError, StableStore, StateMachine,
+  quic::{QuicCoordinator, QuicOptions},
+};
+
+use crate::{
+  DriverError,
+  clock::{Clock, jittered},
+  config::DriverConfig,
+  handle::{Command, Handle},
+  shared::{InflightBudget, ParkedQuery, Pending, Routing},
+};
+
+/// IP-layer maximum UDP payload — the persistent receive buffer's size.
+const RECV_BUF_LEN: usize = 65_507;
+/// Backoff before retrying a failed `recv_from`, bounding the retry rate under a persistent
+/// synchronously-resolving error so the thread always makes progress.
+const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+/// The persistent datagram-receive task: owns a clone of the driver's socket (compio sockets
+/// share one fd across clones) plus ONE receive buffer for its whole life, looping `recv_from`
+/// and forwarding each datagram — copied exact-sized — into the bounded channel the run loop
+/// selects on.
+///
+/// Keeping the read in its own task is what makes the run loop's recv arm a plain channel wait:
+/// on a proactor, DROPPING a not-yet-finished op future (what a losing select arm does) submits
+/// an asynchronous CANCEL and forfeits the op's buffer, so a loop that re-armed `recv_from` per
+/// iteration would pay a cancel syscall plus a zeroed 64 KiB allocation on every
+/// submit/timer/storage wake. Here the op is never dropped while the driver runs; each completed
+/// read hands the buffer back in its `BufResult` and it is re-lent forever.
+///
+/// A receive error is transient for an unconnected UDP socket (anything lost under it is QUIC
+/// loss recovery's to repair), so the loop keeps receiving after a paced backoff. The task exits
+/// when the driver drops the channel receiver; the driver also OWNS the task's `JoinHandle`,
+/// whose drop cancels the task on every run-loop exit path.
+async fn recv_datagrams(socket: UdpSocket, inbound: flume::Sender<(Vec<u8>, SocketAddr)>) {
+  let mut buf = vec![0u8; RECV_BUF_LEN];
+  loop {
+    let compio::buf::BufResult(res, returned) = socket.recv_from(buf).await;
+    buf = returned;
+    match res {
+      Ok((n, from)) => {
+        // Exact-sized copy so the long-lived receive buffer is immediately re-lent; a full
+        // channel parks here, leaving NO receive in flight — arrivals then queue in (and
+        // overflow) the kernel socket buffer, which is exactly UDP backpressure.
+        if inbound.send_async((buf[..n].to_vec(), from)).await.is_err() {
+          return; // the driver dropped its receiver: tear down
+        }
+      }
+      Err(_) => {
+        compio::time::sleep(RECV_ERROR_BACKOFF).await;
+      }
+    }
+  }
+}
+
+/// Per-peer redial state: the next attempt instant and the current (pre-jitter) backoff.
+struct Redial {
+  at: std::time::Instant,
+  backoff: Duration,
+}
+
+/// A consensus node over QUIC on compio: the driver owns the coordinator, the stores, and the
+/// socket; [`Handle`]s own the conversation with it.
+///
+/// Construct AND run on the same thread (see the crate docs): the socket attaches to the
+/// constructing thread's proactor.
+pub struct CompioQuicDriver<I, F, L, S>
+where
+  I: sailing_proto::NodeId,
+  F: StateMachine,
+{
+  coord: QuicCoordinator<I, F>,
+  log: L,
+  stable: S,
+  socket: UdpSocket,
+  clock: Clock,
+  commands: futures_channel::mpsc::Receiver<Command<I, F>>,
+  routing: Routing<I, F::Response, F>,
+  storage_ready: flume::Receiver<()>,
+  /// Keeps a `None`-seam storage channel parked forever (a sender-less receiver would resolve
+  /// `Err` immediately and busy-loop the select arm).
+  _storage_ready_keepalive: Option<flume::Sender<()>>,
+  /// The configured peer book: every OTHER node's address, dialed and redialed as needed.
+  peers: Vec<(I, SocketAddr)>,
+  redial: BTreeMap<I, Redial>,
+  cmd_budget: usize,
+  recv_cap: usize,
+  redial_base: Duration,
+  redial_cap: Duration,
+  /// Latched when every storage-ready sender has dropped: a disconnected flume receiver
+  /// resolves `recv_async` immediately (and forever), so without the latch the dead channel
+  /// would turn the storage arm into an always-ready select winner and the loop into a hot
+  /// spin. The notifier is a wake-latency optimization, not a liveness dependency —
+  /// `handle_storage` runs every iteration regardless — so the latch only downgrades storage
+  /// completions to timer/I/O cadence.
+  storage_closed: bool,
+  /// Leadership as of the END of the last pass: the SWEEP BACKSTOP. The proto does not emit
+  /// `LeaderChanged` on every leader-clearing path (a check-quorum stepdown sets follower
+  /// silently), so the event-driven supersede alone could strand pending completions (and
+  /// their budget) until some later leader is learned. A leader→non-leader edge observed here
+  /// sweeps everything parked, exactly like the event would.
+  was_leader: bool,
+}
+
+impl<I, F, L, S> CompioQuicDriver<I, F, L, S>
+where
+  I: sailing_proto::NodeId + Send,
+  F: StateMachine,
+  F::Command: sailing_proto::Data + Send,
+  F::Snapshot: sailing_proto::Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+  L: LogStore,
+  S: StableStore<NodeId = I>,
+{
+  /// Bind `addr` and build the driver plus its [`Handle`].
+  ///
+  /// `peers` is the static peer book (every other node's id + address): the driver dials each at
+  /// startup and REDIALS (jittered exponential backoff) whenever a peer has no bound connection.
+  /// `opts` must be a [`ClusterTls`](sailing_proto::quic::ClusterTls) bundle (the provided
+  /// identity scheme requires mandatory mTLS); `seed` seeds the consensus endpoint's election
+  /// jitter. Storage is the embedder's; a genuinely-async store wires
+  /// [`DriverConfig::storage_ready`].
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<(I, SocketAddr)>,
+    log: L,
+    stable: S,
+    driver_cfg: DriverConfig,
+  ) -> std::io::Result<(Self, Handle<I, F>)> {
+    let socket = UdpSocket::bind(addr).await?;
+    let clock = Clock::new();
+    let endpoint = sailing_proto::Endpoint::new(config, clock.now(), seed, fsm);
+    let coord = QuicCoordinator::with_identity(endpoint, opts, None, cluster);
+
+    // The command channel's buffer is sized to the submit budget plus one: the budget — not the
+    // channel — is the binding bound on in-flight operations (see the memory model).
+    let (cmd_tx, cmd_rx) = futures_channel::mpsc::channel(driver_cfg.max_inflight + 1);
+    let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
+    let budget = InflightBudget::new(driver_cfg.max_inflight, driver_cfg.max_pending_bytes);
+    let handle = Handle::new(cmd_tx, event_rx, budget);
+
+    let (storage_ready, keepalive) = match driver_cfg.storage_ready {
+      Some(rx) => (rx, None),
+      None => {
+        // No async store: hold the sender so the receiver parks forever instead of erroring.
+        let (tx, rx) = flume::bounded(1);
+        (rx, Some(tx))
+      }
+    };
+
+    Ok((
+      Self {
+        coord,
+        log,
+        stable,
+        socket,
+        clock,
+        commands: cmd_rx,
+        routing: Routing::new(event_tx),
+        storage_ready,
+        _storage_ready_keepalive: keepalive,
+        peers,
+        redial: BTreeMap::new(),
+        // Clamped to at least one: the iter-top drain is the only flood-independent command
+        // path, and shutdown's stoppable-under-load guarantee rides on it.
+        cmd_budget: driver_cfg.cmd_budget.max(1),
+        recv_cap: driver_cfg.recv_cap,
+        redial_base: driver_cfg.redial_base,
+        redial_cap: driver_cfg.redial_cap,
+        storage_closed: false,
+        was_leader: false,
+      },
+      handle,
+    ))
+  }
+
+  /// Drive consensus until shutdown (or until every `Handle` clone has dropped AND the buffered
+  /// commands are drained — a driver nobody can talk to has no reason to run).
+  pub async fn run(mut self) {
+    use futures_util::{FutureExt, select_biased};
+
+    let (recv_tx, recv_rx) = flume::bounded(self.recv_cap);
+    // The recv task's JoinHandle is OWNED by this scope — never detached — so every exit path
+    // drops it, cancelling the task with its in-flight recv and its socket clone. The cancel is
+    // mark-and-schedule, not synchronous teardown: the orderly exits below follow it with the
+    // socket close().await as the true fd-release barrier.
+    let recv_task = compio::runtime::spawn(recv_datagrams(self.socket.clone(), recv_tx));
+
+    let now = self.clock.now();
+    self.reconcile_peer_links(now);
+    let mut poisoned = self.pump(now).await;
+
+    let mut shutdown_ack: Option<futures_channel::oneshot::Sender<()>> = None;
+    while !poisoned {
+      let now = self.clock.now();
+
+      // (1) Fairness: drain up to the command budget before the biased I/O select, so a
+      // continuous recv backlog cannot starve Shutdown/Submit.
+      let mut exit = false;
+      for _ in 0..self.cmd_budget {
+        match self.commands.try_recv() {
+          Ok(cmd) => {
+            if self.handle_command(now, cmd, &mut shutdown_ack) {
+              exit = true;
+              break;
+            }
+          }
+          Err(e) => {
+            // Closed = every Handle clone dropped AND the buffer drained: the command stream
+            // has ENDED for good — exit (a continuously-readable socket would otherwise keep
+            // the task and the socket alive forever). Empty just falls through to the select.
+            if e.is_closed() {
+              exit = true;
+            }
+            break;
+          }
+        }
+      }
+      if exit {
+        break;
+      }
+
+      // (2) Fairness: fire an already-due deadline before the select, so a recv flood cannot
+      // suppress heartbeats/elections. The coordinator's poll_timeout already folds the
+      // consensus deadline, quinn's timers, and the auth deadline into ONE crate instant.
+      if self
+        .coord
+        .poll_timeout()
+        .is_some_and(|d| d <= self.clock.now())
+      {
+        self
+          .coord
+          .handle_timeout(now, &mut self.log, &mut self.stable);
+      }
+      // Redial any configured peer with no bound connection BEFORE the pump, so a fresh dial's
+      // handshake Initial transmits this iteration rather than after the next wake.
+      self.reconcile_peer_links(now);
+      if self.pump(now).await {
+        break;
+      }
+
+      // Recomputed AFTER the iter-top fire so it reflects the NEXT deadline.
+      let deadline = self
+        .coord
+        .poll_timeout()
+        .map(|d| self.clock.to_std(d))
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
+
+      // The select arms are plain channel/timer waits — the socket I/O lives in the recv task
+      // and the pump — so a losing arm never cancels an in-flight socket op. The pinned futures
+      // are confined to this scope; each arm only writes a captured local.
+      let (inbound, fire_timeout, command, ended) = {
+        let recv_fut = recv_rx.recv_async().fuse();
+        let timer_fut = compio::time::sleep_until(deadline).fuse();
+        // Once every notifier sender has dropped, the channel is dead (recv resolves Err
+        // immediately, forever) and would win the select every iteration — when latched, this
+        // arm becomes PENDING instead, parking it for good. (An always-ready placeholder like a
+        // resolved Option future would itself re-create the hot spin the latch closes.)
+        let storage_closed = self.storage_closed;
+        let storage_rx = &self.storage_ready;
+        let storage_fut = async move {
+          if storage_closed {
+            std::future::pending::<Result<(), flume::RecvError>>().await
+          } else {
+            storage_rx.recv_async().await
+          }
+        }
+        .fuse();
+        futures_util::pin_mut!(recv_fut, timer_fut, storage_fut);
+        let mut cmd_next = futures_util::StreamExt::next(&mut self.commands).fuse();
+
+        let mut inbound: Option<(Vec<u8>, SocketAddr)> = None;
+        let mut fire_timeout = false;
+        let mut command: Option<Command<I, F>> = None;
+        let mut ended = false;
+        let mut storage_disconnected = false;
+
+        select_biased! {
+          // Err (a closed channel) is unreachable while this scope holds recv_task: the task
+          // only exits when the receiver it sends to drops.
+          got = recv_fut => {
+            if let Ok(datagram) = got { inbound = Some(datagram); }
+          }
+          _ = timer_fut => { fire_timeout = true; }
+          cmd = cmd_next => {
+            match cmd { Some(c) => command = Some(c), None => ended = true }
+          }
+          got = storage_fut => {
+            if got.is_err() { storage_disconnected = true; }
+          }
+        }
+        if storage_disconnected {
+          self.storage_closed = true;
+        }
+        (inbound, fire_timeout, command, ended)
+      };
+      // Coalesce any burst of storage signals: handle_storage below drains ALL completions.
+      while self.storage_ready.try_recv().is_ok() {}
+      if ended {
+        break;
+      }
+
+      let now = self.clock.now();
+      if let Some((datagram, from)) = inbound {
+        self
+          .coord
+          .handle_udp(now, from, None, &datagram, &mut self.log, &mut self.stable);
+      }
+      if fire_timeout {
+        self
+          .coord
+          .handle_timeout(now, &mut self.log, &mut self.stable);
+      }
+      // ALWAYS drain storage completions: synchronous stores complete inline with the calls
+      // above, async ones signalled the arm we just coalesced.
+      self
+        .coord
+        .handle_storage(now, &mut self.log, &mut self.stable);
+      if let Some(cmd) = command
+        && self.handle_command(now, cmd, &mut shutdown_ack)
+      {
+        break;
+      }
+      poisoned = self.pump(now).await;
+    }
+
+    // Teardown. Fail everything parked (each entry's reservation releases on drop), cancel the
+    // recv task, then make the command queue airtight: close-then-drain refuses a racing
+    // try_send WITH its command (the handle's own rollback runs) while everything already
+    // buffered is drained and dropped here — no command, queued or in flight, survives the ack.
+    // Classify the fail-stop FIRST: an exit that raced a poison (a Shutdown command winning
+    // the select after the poisoning storage drain) must still fail parked work with the typed
+    // verdict; the ShuttingDown sweep below is then a no-op on the emptied maps.
+    if self.coord.endpoint().is_poisoned() {
+      self.routing.fail_all(&DriverError::Poisoned);
+    }
+    self.routing.fail_all(&DriverError::ShuttingDown);
+    drop(recv_task);
+    drop(recv_rx);
+    self.commands.close();
+    while let Ok(cmd) = self.commands.try_recv() {
+      drop(cmd);
+    }
+    // The fd-release barrier: close() parks until every other reference to the socket's fd —
+    // the recv task's clone and its cancelled-but-unprocessed op — has dropped, then closes the
+    // fd with a real close op. Once this await returns the bound address is free, which is what
+    // makes the ack an immediate-rebind contract.
+    let _ = self.socket.close().await;
+    if let Some(ack) = shutdown_ack {
+      let _ = ack.send(());
+    }
+  }
+
+  /// Handle one command; returns `true` when the loop should exit (a `Shutdown`).
+  fn handle_command(
+    &mut self,
+    now: Instant,
+    cmd: Command<I, F>,
+    shutdown_ack: &mut Option<futures_channel::oneshot::Sender<()>>,
+  ) -> bool {
+    match cmd {
+      Command::Submit {
+        cmd,
+        reply,
+        reservation,
+      } => {
+        match self
+          .coord
+          .submit_propose(now, &mut self.log, &self.stable, &cmd)
+        {
+          Ok(index) => {
+            self.routing.pending.insert(
+              index,
+              Pending::Submit {
+                reply,
+                _reservation: reservation,
+              },
+            );
+          }
+          Err(e) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+        }
+      }
+      Command::Conf {
+        cc,
+        reply,
+        reservation,
+      } => {
+        match self
+          .coord
+          .propose_conf_change(now, &mut self.log, &self.stable, cc)
+        {
+          Ok(index) => {
+            self.routing.pending.insert(
+              index,
+              Pending::Conf {
+                reply,
+                _reservation: reservation,
+              },
+            );
+          }
+          Err(e) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+        }
+      }
+      Command::ConfV2 {
+        cc,
+        reply,
+        reservation,
+      } => {
+        match self
+          .coord
+          .propose_conf_change_v2(now, &mut self.log, &self.stable, cc)
+        {
+          Ok(index) => {
+            self.routing.pending.insert(
+              index,
+              Pending::Conf {
+                reply,
+                _reservation: reservation,
+              },
+            );
+          }
+          Err(e) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+        }
+      }
+      Command::Query {
+        complete,
+        reservation,
+      } => {
+        let ctx = self.routing.mint_query_ctx();
+        match self.coord.read_index(
+          now,
+          &self.log,
+          &self.stable,
+          Bytes::copy_from_slice(&ctx.to_be_bytes()),
+        ) {
+          Ok(()) => {
+            self.routing.queries.insert(
+              ctx,
+              ParkedQuery {
+                ready_at: None,
+                complete,
+                _reservation: reservation,
+              },
+            );
+          }
+          Err(e) => {
+            complete(Err(map_read_err(e)));
+          }
+        }
+      }
+      Command::Transfer {
+        to,
+        reply,
+        reservation,
+      } => {
+        let r = self
+          .coord
+          .transfer_leader(now, &self.log, &self.stable, to)
+          .map_err(map_transfer_err);
+        let _ = reply.send(r);
+        // A transfer parks nothing (the verdict is immediate); release with the reply.
+        drop(reservation);
+      }
+      Command::Shutdown { ack } => {
+        *shutdown_ack = Some(ack);
+        return true;
+      }
+    }
+    false
+  }
+
+  /// Dial every configured peer that has no bound connection and whose backoff has elapsed; a
+  /// peer that re-binds resets its backoff.
+  fn reconcile_peer_links(&mut self, now: Instant) {
+    let std_now = std::time::Instant::now();
+    for (peer, addr) in self.peers.clone() {
+      if self.coord.has_bound_conn(&peer) {
+        self.redial.remove(&peer);
+        continue;
+      }
+      let due = self.redial.get(&peer).is_none_or(|r| std_now >= r.at);
+      if !due {
+        continue;
+      }
+      // A refused dial (cap, config) is just retried on the schedule; the typed error matters
+      // to interactive callers, not to the background reconciler.
+      let _ = self.coord.connect(now, addr, peer);
+      let backoff = self
+        .redial
+        .get(&peer)
+        .map(|r| (r.backoff * 2).min(self.redial_cap))
+        .unwrap_or(self.redial_base);
+      self.redial.insert(
+        peer,
+        Redial {
+          at: std_now + jittered(backoff),
+          backoff,
+        },
+      );
+    }
+  }
+
+  /// Drain the coordinator's outputs: transmits to the socket, events into the routing (and any
+  /// queries whose read index the apply watermark now covers, run against the state machine).
+  async fn pump(&mut self, _now: Instant) -> bool {
+    while let Some((dest, bytes)) = self.coord.poll_transmit() {
+      // A send error is transient for UDP (the peer redials / QUIC retransmits); dropping the
+      // datagram is the same observable as the network dropping it.
+      let _ = self.socket.send_to(bytes, dest).await;
+    }
+    let mut run_queries = false;
+    while let Some(ev) = self.coord.poll_event() {
+      run_queries |= self.routing.route_event(ev);
+    }
+    if run_queries {
+      for q in self.routing.take_runnable_queries() {
+        (q.complete)(Ok(self.coord.state_machine()));
+      }
+    }
+    // The fail-stop check: a poisoned endpoint suppresses poll_event and poll_timeout by
+    // design, so anything parked would otherwise wait forever holding its reservation. Fail it
+    // all with the typed verdict and tell the run loop to exit — the NODE is dead; an operator
+    // restart (or re-provisioning) is the only recovery, and keeping the socket bound would
+    // only mislead peers.
+    if self.coord.endpoint().is_poisoned() {
+      self.routing.fail_all(&DriverError::Poisoned);
+      return true;
+    }
+    // The sweep BACKSTOP (see the `was_leader` field): a silent leadership loss — one with no
+    // `LeaderChanged` event, like the check-quorum stepdown — must still supersede everything
+    // parked. Runs AFTER the event drain so an event-driven sweep this pass is not doubled
+    // (fail_all on an empty map is a no-op).
+    let is_leader = self.coord.role().is_leader();
+    if self.was_leader && !is_leader {
+      self.routing.fail_all(&DriverError::Superseded);
+    }
+    self.was_leader = is_leader;
+    false
+  }
+}
+
+/// Map the proto's propose-time error to the driver's typed surface.
+fn map_propose_err<I: core::fmt::Debug>(e: ProposeError<I>) -> DriverError<I> {
+  match e {
+    ProposeError::NotLeader { leader } => DriverError::NotLeader { leader },
+    ProposeError::Poisoned => DriverError::Poisoned,
+    other => DriverError::Rejected {
+      reason: format!("{other:?}"),
+    },
+  }
+}
+
+/// Map the proto's transfer-time error, preserving the redirect hint.
+fn map_transfer_err<I: core::fmt::Debug>(e: sailing_proto::TransferError<I>) -> DriverError<I> {
+  match e {
+    sailing_proto::TransferError::NotLeader { leader } => DriverError::NotLeader { leader },
+    sailing_proto::TransferError::Poisoned => DriverError::Poisoned,
+    other => DriverError::Rejected {
+      reason: format!("{other:?}"),
+    },
+  }
+}
+
+/// Map the proto's read-index error: a missing leader is the same redirect signal as a propose
+/// rejection (retry once a leader is known), the rest carry their reason.
+fn map_read_err<I>(e: sailing_proto::ReadIndexError) -> DriverError<I> {
+  match e {
+    sailing_proto::ReadIndexError::NoLeader => DriverError::NotLeader { leader: None },
+    sailing_proto::ReadIndexError::Poisoned => DriverError::Poisoned,
+    other => DriverError::Rejected {
+      reason: other.to_string(),
+    },
+  }
+}

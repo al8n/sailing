@@ -33,9 +33,11 @@ mod clock;
 mod config;
 mod error;
 mod handle;
+mod quic_driver;
 mod shared;
 
 pub use clock::Clock;
 pub use config::DriverConfig;
 pub use error::DriverError;
 pub use handle::Handle;
+pub use quic_driver::CompioQuicDriver;
