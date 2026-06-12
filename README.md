@@ -23,9 +23,12 @@ deterministic simulator.
 
 ## Status
 
-**Pre-release.** The consensus core and the TCP/TLS/QUIC transports are implemented and heavily
-tested (see *Correctness* below); a reference async driver is in progress. The wire format and
-public API may still change until 0.1.
+**Pre-release.** The consensus core, the TCP/TLS/QUIC transports, and the reference proactor
+driver (`sailing-compio`: io_uring/IOCP via [compio], one consensus group per thread, typed
+cross-thread handles) are implemented and heavily tested (see *Correctness* below). The wire
+format and public API may still change until 0.1.
+
+[compio]: https://github.com/compio-rs/compio
 
 ## Features
 
