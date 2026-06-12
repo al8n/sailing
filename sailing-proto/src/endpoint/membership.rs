@@ -47,9 +47,8 @@ where
     // Allocate a fresh, usable index (see `next_log_index`): refuse at the ceiling rather than
     // alias-and-truncate or allocate the unreadable sentinel `u64::MAX`.
     let index = Self::next_log_index(log.last_index())?;
-    use crate::Data as _;
     let mut buf = std::vec::Vec::new();
-    cc.encode(&mut buf);
+    crate::wire::encode_conf_change_v2(&cc, &mut buf);
     let entry = crate::Entry::new(
       self.term,
       index,
@@ -127,6 +126,19 @@ where
     // One change in flight at a time: refuse if a ConfChange entry is not yet applied.
     if self.pending_conf_index > self.applied {
       return Err(crate::ProposeError::ConfChangeInFlight);
+    }
+    // Every id entering the LOG must satisfy the wire bound (1..=1024-byte encoding):
+    // the apply path decodes committed conf changes through the envelope, whose id
+    // validation would otherwise reject the entry and POISON every node that applies
+    // it. `NodeId` is blanket-implemented, so a pathological embedder encoding passes
+    // semantic validation — this is the rejected-at-propose backstop, same contract as
+    // the Changer pre-validation below.
+    if !cc
+      .changes()
+      .iter()
+      .all(|c| crate::wire::id_within_wire_bound(&c.node()))
+    {
+      return Err(crate::ProposeError::InvalidConfChange);
     }
     // Pre-validate against the CURRENT tracker using the SAME Changer dispatch `apply_committed`
     // uses (apply-time membership, spec §9). An invalid change (e.g. `leave_joint` while not in a

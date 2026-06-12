@@ -1,0 +1,200 @@
+// The sailing consensus wire envelope (normative; WIRE.md references this file).
+//
+// Generic seams: every `bytes` field named `*_id`, the `voters`/`learners`/
+// `voters_outgoing`/`learners_next` sets, and `ConfChangeSingle.node_id` carry the
+// embedder's NodeId encoded by its `Data` impl (1..=1024 bytes, decoded with
+// decode_exact — trailing bytes reject). Entry payloads and snapshot blobs are opaque
+// application bytes.
+//
+// Envelope semantics are protobuf (proto3): absent scalars decode as zero/empty —
+// identical in meaning to an explicit zero; duplicate scalars are last-wins while
+// duplicate embedded messages MERGE (and a same-variant oneof re-occurrence merges
+// too — see WIRE.md for the precise rules); unknown fields are skipped (forward
+// compatibility). Sailing's stricter validation —
+// set elements strictly ascending by decoded value, id presence and bounds, nanos
+// bounds, body presence — is enforced at the wire→programming conversion and
+// documented in WIRE.md.
+
+syntax = "proto3";
+
+package sailing.v1;
+
+// One replicated log entry.
+message Entry {
+  uint64 term = 1;
+  uint64 index = 2;
+  EntryKind kind = 3;
+  // The application command (Normal), the encoded ConfChange (ConfChange), or empty.
+  bytes data = 4;
+}
+
+// Entry discriminant. Zero = Normal so the dominant case is the proto3 default.
+enum EntryKind {
+  ENTRY_KIND_NORMAL = 0;
+  ENTRY_KIND_CONF_CHANGE = 1;
+  ENTRY_KIND_EMPTY = 2;
+}
+
+// Cluster membership. Each repeated field is a SET: elements are the embedder's
+// Data-encoded node ids, required strictly ascending by decoded value (duplicates and
+// disorder reject at conversion — one set has one accepted encoding).
+message ConfState {
+  repeated bytes voters = 1;
+  repeated bytes learners = 2;
+  repeated bytes voters_outgoing = 3;
+  repeated bytes learners_next = 4;
+  bool auto_leave = 5;
+}
+
+// Snapshot metadata: the compaction boundary and the membership AT that boundary.
+message SnapshotMeta {
+  uint64 last_index = 1;
+  uint64 last_term = 2;
+  ConfState conf = 3;
+}
+
+// Log replication / heartbeat-with-entries.
+message AppendEntries {
+  uint64 term = 1;
+  bytes leader_id = 2;
+  uint64 prev_log_index = 3;
+  uint64 prev_log_term = 4;
+  repeated Entry entries = 5;
+  uint64 leader_commit = 6;
+}
+
+message AppendResp {
+  uint64 term = 1;
+  bytes from_id = 2;
+  bool reject = 3;
+  uint64 reject_hint_index = 4;
+  uint64 reject_hint_term = 5;
+  uint64 match_index = 6;
+}
+
+// Vote / PreVote request.
+message RequestVote {
+  uint64 term = 1;
+  bytes candidate_id = 2;
+  uint64 last_log_index = 3;
+  uint64 last_log_term = 4;
+  bool pre_vote = 5;
+  bool leader_transfer = 6;
+}
+
+message VoteResp {
+  uint64 term = 1;
+  bytes from_id = 2;
+  bool pre_vote = 3;
+  bool reject = 4;
+}
+
+message Heartbeat {
+  uint64 term = 1;
+  bytes leader_id = 2;
+  uint64 commit = 3;
+  // ReadIndex correlation context (opaque; empty when the round confirms no read).
+  bytes context = 4;
+  uint64 lease_round = 5;
+}
+
+message HeartbeatResp {
+  uint64 term = 1;
+  bytes from_id = 2;
+  bytes context = 3;
+  uint64 lease_round = 4;
+  // The lease-support promise window. nanos must be < 1_000_000_000, validated at
+  // conversion BEFORE narrowing - the field is uint64 so an oversized varint is seen
+  // and rejected rather than silently truncated to 32 bits (protobuf uint32 decoding
+  // truncates by spec, which would make the bound unenforceable at the envelope).
+  uint64 lease_support_secs = 5;
+  uint64 lease_support_nanos = 6;
+}
+
+// Leader -> follower: install a snapshot (the follower is too far behind).
+message InstallSnapshot {
+  uint64 term = 1;
+  bytes leader_id = 2;
+  SnapshotMeta snapshot = 3;
+  bytes data = 4;
+}
+
+message SnapshotResp {
+  uint64 term = 1;
+  bytes from_id = 2;
+  bool reject = 3;
+  uint64 match_index = 4;
+}
+
+// Leader -> transfer target: campaign NOW (bypasses the pre-vote lease).
+message TimeoutNow {
+  uint64 term = 1;
+  bytes leader_id = 2;
+}
+
+// Follower -> leader: confirm a linearizable read (forwarded read-index).
+message ReadIndex {
+  uint64 term = 1;
+  bytes from_id = 2;
+  bytes context = 3;
+}
+
+message ReadIndexResp {
+  uint64 term = 1;
+  bytes from_id = 2;
+  uint64 index = 3;
+  bytes context = 4;
+  bool reject = 5;
+}
+
+// A single configuration change step.
+message ConfChangeSingle {
+  ConfChangeType change_type = 1;
+  bytes node_id = 2;
+}
+
+// Conf-change discriminant. Zero = AddNode so the dominant case is the proto3 default.
+enum ConfChangeType {
+  CONF_CHANGE_TYPE_ADD_NODE = 0;
+  CONF_CHANGE_TYPE_REMOVE_NODE = 1;
+  CONF_CHANGE_TYPE_ADD_LEARNER_NODE = 2;
+}
+
+// The v1 (single-step) conf change, carried as an Entry payload.
+message ConfChange {
+  ConfChangeType change_type = 1;
+  bytes node_id = 2;
+  bytes context = 3;
+}
+
+// The v2 (joint-capable) conf change, carried as an Entry payload.
+message ConfChangeV2 {
+  ConfChangeTransition transition = 1;
+  repeated ConfChangeSingle changes = 2;
+  bytes context = 3;
+}
+
+// Joint-consensus transition policy.
+enum ConfChangeTransition {
+  CONF_CHANGE_TRANSITION_AUTO = 0;
+  CONF_CHANGE_TRANSITION_IMPLICIT = 1;
+  CONF_CHANGE_TRANSITION_EXPLICIT = 2;
+}
+
+// The consensus RPC envelope: exactly one frame carries exactly one Message.
+// An absent body rejects at conversion (parity with the prior unknown-tag reject).
+message Message {
+  oneof body {
+    AppendEntries append_entries = 1;
+    AppendResp append_resp = 2;
+    RequestVote request_vote = 3;
+    VoteResp vote_resp = 4;
+    Heartbeat heartbeat = 5;
+    HeartbeatResp heartbeat_resp = 6;
+    InstallSnapshot install_snapshot = 7;
+    SnapshotResp snapshot_resp = 8;
+    TimeoutNow timeout_now = 9;
+    ReadIndex read_index = 10;
+    ReadIndexResp read_index_resp = 11;
+  }
+}

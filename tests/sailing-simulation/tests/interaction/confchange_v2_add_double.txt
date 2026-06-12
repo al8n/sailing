@@ -68,13 +68,13 @@ stabilize
 propose-conf-change-v2 1 add=4 add=5
 ----
 n1 proposed conf-change-v2 (2 change(s)) at index 2
-AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000]
-AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000]
 
 stabilize
 ----
-> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000]
-> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000]
 > n2 ready
   AppendResp term=1 match=2
 > n3 ready
@@ -84,17 +84,17 @@ stabilize
 > n1 ready
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
-  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x0000000000000000000000000000000000]
-  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x0000000000000000000000000000000000]
-  AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
-  AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
+  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+  AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
+  AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
   n1 conf-changed index=2 voters={1,2,3,4,5}|{1,2,3}(joint)
 > n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
 > n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
-> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x0000000000000000000000000000000000]
-> n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x0000000000000000000000000000000000]
-> n4 recv AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
-> n5 recv AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+> n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+> n4 recv AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
+> n5 recv AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
 > n2 ready
   AppendResp term=1 match=2
   AppendResp term=1 match=3
@@ -118,13 +118,13 @@ stabilize
 > n1 ready
   AppendEntries term=1 prev=1/3 commit=2 entries=[]
   AppendEntries term=1 prev=1/3 commit=3 entries=[]
-  AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
-  AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
+  AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
+  AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
   n1 conf-changed index=3 voters={1,2,3,4,5}
 > n2 recv AppendEntries term=1 prev=1/3 commit=2 entries=[]
 > n3 recv AppendEntries term=1 prev=1/3 commit=3 entries=[]
-> n4 recv AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
-> n5 recv AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x0002000000000000000004000000000000000005000000000000000000000000000000, 1/3 conf-change 0x0000000000000000000000000000000000]
+> n4 recv AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
+> n5 recv AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120a12080400000000000000120a12080500000000000000, 1/3 conf-change]
 > n2 ready
   AppendResp term=1 match=3
 > n3 ready

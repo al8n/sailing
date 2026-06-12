@@ -52,6 +52,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v6
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Install Rust
       # --no-self-update is necessary because the windows environment cannot self-update rustup.exe.
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
@@ -88,6 +92,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Cache cargo build and registry
         uses: actions/cache@v5
         with:
@@ -110,12 +118,16 @@ jobs:
   # Verify the declared MSRV (rust-version in Cargo.toml) actually compiles the library and its
   # feature surface — without this job the declaration is aspirational.
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.91)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Install MSRV toolchain
-      run: rustup toolchain install 1.85 --no-self-update && rustup default 1.85
+      run: rustup toolchain install 1.91 --no-self-update && rustup default 1.91
     - name: Check sailing-proto on the MSRV (default + tls + quic)
       run: |
         cargo check -p sailing-proto
@@ -129,6 +141,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v6
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Install Rust
       run: rustup update stable --no-self-update && rustup default stable && rustup component add clippy
     - name: Add bare-metal no_std target
@@ -152,6 +168,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v6
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Cache cargo build and registry
       uses: actions/cache@v5
       with:
@@ -181,6 +201,10 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v6
+    - name: Install protoc
+      uses: arduino/setup-protoc@v3
+      with:
+        repo-token: ${{ secrets.GITHUB_TOKEN }}
     - name: Cache cargo build and registry
       uses: actions/cache@v5
       with:
@@ -210,6 +234,10 @@ jobs:
       - test
     steps:
       - uses: actions/checkout@v6
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust
         run: rustup update nightly && rustup default nightly
       - name: Install cargo-tarpaulin

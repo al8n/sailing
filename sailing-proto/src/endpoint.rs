@@ -1418,7 +1418,7 @@ where
         crate::EntryKind::Empty => {} // no-op: just advance applied
         crate::EntryKind::ConfChange => {
           // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
-          let cc = match <crate::ConfChangeV2<I> as crate::Data>::decode_exact(entry.data_bytes()) {
+          let cc = match crate::wire::decode_conf_change_v2::<I>(entry.data_bytes()) {
             Ok(c) => c,
             Err(_) => {
               self.poison(PoisonReason::ConfChangeDecode);

@@ -318,12 +318,12 @@ impl crate::StateMachine for CountSm {
 /// the candidate `Campaign` (become-leader gated on the self-vote being durable) and the follower
 /// `CastVote` — so a driver must call `handle_storage` to drain it.
 #[derive(Debug)]
-pub(crate) struct NoopStable {
-  hard_state: HardState<u64>,
+pub(crate) struct NoopStable<I: crate::NodeId = u64> {
+  hard_state: HardState<I>,
   completions: VecDeque<StableDone>,
 }
 
-impl Default for NoopStable {
+impl<I: crate::NodeId> Default for NoopStable<I> {
   fn default() -> Self {
     Self {
       hard_state: HardState::initial(),
@@ -332,9 +332,9 @@ impl Default for NoopStable {
   }
 }
 
-impl NoopStable {
+impl<I: crate::NodeId> NoopStable<I> {
   /// Seed the stable store with a specific (term, vote, commit). Used in restart tests.
-  pub(crate) fn force_state(&mut self, term: Term, vote: Option<u64>, commit: Index) {
+  pub(crate) fn force_state(&mut self, term: Term, vote: Option<I>, commit: Index) {
     self.hard_state = HardState::initial()
       .with_term(term)
       .with_vote(vote)
@@ -342,28 +342,28 @@ impl NoopStable {
   }
 }
 
-impl StableStore for NoopStable {
-  type NodeId = u64;
+impl<I: crate::NodeId> StableStore for NoopStable<I> {
+  type NodeId = I;
   type Error = core::convert::Infallible;
 
-  fn hard_state(&self) -> HardState<u64> {
+  fn hard_state(&self) -> HardState<I> {
     self.hard_state
   }
 
-  fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {
+  fn submit_write(&mut self, id: OpId, hard_state: HardState<I>) {
     self.hard_state = hard_state;
     self.completions.push_back(StableDone::Wrote(id));
   }
 
-  fn submit_snapshot(&mut self, _id: OpId, _meta: SnapshotMeta<u64>, _data: Bytes) {
+  fn submit_snapshot(&mut self, _id: OpId, _meta: SnapshotMeta<I>, _data: Bytes) {
     // No-op: NoopStable does not persist snapshots and enqueues no completion.
   }
 
-  fn snapshot(&self) -> Option<(SnapshotMeta<u64>, Bytes)> {
+  fn snapshot(&self) -> Option<(SnapshotMeta<I>, Bytes)> {
     None
   }
 
-  fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
+  fn durable_snapshot(&self) -> Option<SnapshotMeta<I>> {
     None
   }
 

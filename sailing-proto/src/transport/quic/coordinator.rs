@@ -15,8 +15,8 @@ use super::{
   crypto::{QuicOptions, mesh_connection_floor},
 };
 use crate::{
-  Config, Data, Endpoint, Event, Index, Instant, LogStore, Message, NodeId, ProposeError,
-  StableStore, StateMachine, TransferError, transport::ClusterId,
+  Config, Data, Endpoint, Event, Index, Instant, LogStore, NodeId, ProposeError, StableStore,
+  StateMachine, TransferError, transport::ClusterId,
 };
 
 /// Derive the SNI server-name a dial presents for `peer` in `cluster`, matching the per-node cert
@@ -559,7 +559,7 @@ where
           // connection (consensus retransmission re-drives anything lost); the endpoint is never
           // poisoned by transport input.
           let from = self.bridge.bound_peer_of(h);
-          match (from, Message::<I>::decode_exact(frame)) {
+          match (from, crate::wire::decode_message::<I>(frame)) {
             (Some(from), Ok(msg)) => {
               self.endpoint.handle_message(now, log, stable, from, msg);
             }

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  Index, Term,
+  Data as _, Index, Term,
   transport::{
     ClusterId,
     labeled::{LabelOptions, Labeled},
@@ -125,11 +125,13 @@ fn pump(a: &mut C, b: &mut C) {
 }
 
 fn sample_msg() -> Message<u64> {
+  // A 64-byte context keeps the frame comfortably multi-chunk for the tiny-receive tests
+  // regardless of how compactly the envelope encodes the scalar fields.
   Message::Heartbeat(crate::message::Heartbeat::new(
     Term::new(2),
     7,
     Index::new(4),
-    bytes::Bytes::from_static(b"ctx"),
+    bytes::Bytes::from_static(&[0xC7; 64]),
   ))
 }
 
