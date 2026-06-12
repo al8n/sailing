@@ -83,6 +83,7 @@ stabilize
 > n1 ready
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
   n1 conf-changed index=2 voters={2,3}
+  n1 leader-changed term=1 lead=none
 > n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
 > n2 ready
   AppendResp term=1 match=2
@@ -93,12 +94,14 @@ campaign 2
 ----
 n2 candidate term=2
 RequestVote term=2 last=1/2 prevote=false
+n2 leader-changed term=2 lead=none
 
 stabilize
 ----
 > n3 recv RequestVote term=2 last=1/2 prevote=false
 > n3 ready
   VoteResp term=2 prevote=false reject=false
+  n3 leader-changed term=2 lead=none
 > n2 recv VoteResp term=2 prevote=false reject=false
 > n2 ready
   Heartbeat term=2 commit=0

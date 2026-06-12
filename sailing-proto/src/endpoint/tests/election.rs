@@ -1763,3 +1763,319 @@ fn spoofed_sender_vote_resp_is_rejected() {
     "the legitimate grant from peer 2 must reach quorum and elect the candidate"
   );
 }
+
+// --- LeaderChanged event-contract tests ---
+// The belief transitions an embedder routes on: every observable change of (term, leader)
+// surfaces, INCLUDING to-`None` — leader loss is announced, never inferred from silence.
+
+/// A check-quorum step-down makes a known leader (self) unknown at the SAME term — the
+/// embedder sweeping leadership-scoped work must hear it.
+#[test]
+fn check_quorum_step_down_emits_leader_changed_none() {
+  let cfg = cq_config(1, std::vec![1u64, 2, 3]);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(crate::VoteResp::new(
+      crate::Term::new(1),
+      2u64,
+      false,
+      false,
+    )),
+  );
+  assert!(ep.role().is_leader());
+  let leader_term = ep.term();
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {} // drain the become-leader LeaderChanged(Some(self))
+
+  let cq_deadline = ep.election_deadline.expect("CQ deadline armed");
+  ep.handle_timeout(cq_deadline, &mut log, &mut stable);
+  assert!(ep.role().is_follower(), "isolated leader steps down");
+
+  let mut leader_events = std::vec::Vec::new();
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::LeaderChanged(lc) = ev {
+      leader_events.push((lc.term(), lc.leader()));
+    }
+  }
+  assert_eq!(
+    leader_events,
+    std::vec![(leader_term, None)],
+    "the same-term step-down must surface exactly one LeaderChanged(None)"
+  );
+}
+
+/// A campaign start clears a known leader and bumps the term — the event carries the NEW
+/// term with no leader.
+#[test]
+fn campaign_start_emits_leader_changed_none_at_the_bumped_term() {
+  let cfg = crate::Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Learn a leader, then drain its event.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(
+      crate::Term::new(1),
+      2u64,
+      crate::Index::ZERO,
+      bytes::Bytes::new(),
+    )),
+  );
+  assert_eq!(ep.leader(), Some(2));
+  while ep.poll_event().is_some() {}
+
+  // The leader goes silent; the election timeout fires a campaign.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  assert!(ep.role().is_candidate());
+
+  let mut leader_events = std::vec::Vec::new();
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::LeaderChanged(lc) = ev {
+      leader_events.push((lc.term(), lc.leader()));
+    }
+  }
+  assert_eq!(
+    leader_events,
+    std::vec![(crate::Term::new(2), None)],
+    "campaign start must announce the lost leader at the bumped term"
+  );
+}
+
+/// A pre-vote probe clears the leader at the UNCHANGED term; the real campaign that follows
+/// a won probe finds the belief already `None` and must NOT re-emit.
+#[test]
+fn pre_vote_probe_emits_leader_changed_none_once() {
+  let cfg = crate::Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_pre_vote(true);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(
+      crate::Term::new(1),
+      2u64,
+      crate::Index::ZERO,
+      bytes::Bytes::new(),
+    )),
+  );
+  assert_eq!(ep.leader(), Some(2));
+  while ep.poll_event().is_some() {}
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  assert!(ep.role().is_pre_candidate());
+  let mut leader_events = std::vec::Vec::new();
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::LeaderChanged(lc) = ev {
+      leader_events.push((lc.term(), lc.leader()));
+    }
+  }
+  assert_eq!(
+    leader_events,
+    std::vec![(crate::Term::new(1), None)],
+    "the probe announces leader loss at the UNBUMPED term"
+  );
+
+  // Win the probe: the real campaign bumps the term but the belief is already None —
+  // identity dedup means no second event.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(crate::VoteResp::new(crate::Term::new(2), 2u64, true, false)),
+  );
+  assert!(
+    ep.role().is_candidate(),
+    "won probe starts the real campaign"
+  );
+  while let Some(ev) = ep.poll_event() {
+    assert!(
+      !matches!(ev, crate::Event::LeaderChanged(_)),
+      "an unchanged None belief must not re-emit across the term bump"
+    );
+  }
+}
+
+/// A higher-term RequestVote (no lease configured) adopts the term with NO leader — the
+/// step-down must say so.
+#[test]
+fn higher_term_vote_request_emits_leader_changed_none() {
+  let cfg = crate::Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(
+      crate::Term::new(1),
+      2u64,
+      crate::Index::ZERO,
+      bytes::Bytes::new(),
+    )),
+  );
+  assert_eq!(ep.leader(), Some(2));
+  while ep.poll_event().is_some() {}
+
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::RequestVote(crate::RequestVote::new(
+      crate::Term::new(5),
+      3u64,
+      crate::Index::ZERO,
+      crate::Term::ZERO,
+      false,
+      false,
+    )),
+  );
+  assert_eq!(ep.term(), crate::Term::new(5));
+
+  let mut leader_events = std::vec::Vec::new();
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::LeaderChanged(lc) = ev {
+      leader_events.push((lc.term(), lc.leader()));
+    }
+  }
+  assert_eq!(
+    leader_events,
+    std::vec![(crate::Term::new(5), None)],
+    "a leaderless higher-term adoption must announce the unknown leader"
+  );
+}
+
+/// A higher-term append from a NEW leader surfaces the honest adoption sequence in one
+/// drain: `(term, None)` when the term is adopted, then `(term, Some(sender))`.
+#[test]
+fn higher_term_append_surfaces_the_adoption_pair_in_order() {
+  let cfg = crate::Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(
+      crate::Term::new(1),
+      2u64,
+      crate::Index::ZERO,
+      bytes::Bytes::new(),
+    )),
+  );
+  assert_eq!(ep.leader(), Some(2));
+  while ep.poll_event().is_some() {}
+
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      crate::Term::new(2),
+      3u64,
+      crate::Index::ZERO,
+      crate::Term::ZERO,
+      std::vec![],
+      crate::Index::ZERO,
+    )),
+  );
+
+  let mut leader_events = std::vec::Vec::new();
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::LeaderChanged(lc) = ev {
+      leader_events.push((lc.term(), lc.leader()));
+    }
+  }
+  assert_eq!(
+    leader_events,
+    std::vec![(crate::Term::new(2), None), (crate::Term::new(2), Some(3)),],
+    "term adoption then leader installation, in order"
+  );
+}
+
+/// An unchanged belief never re-emits: the same leader's next heartbeat is event-silent.
+#[test]
+fn same_leader_reheartbeat_emits_no_leader_changed() {
+  let cfg = crate::Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  let hb = || {
+    Message::Heartbeat(crate::Heartbeat::new(
+      crate::Term::new(1),
+      2u64,
+      crate::Index::ZERO,
+      bytes::Bytes::new(),
+    ))
+  };
+  ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, hb());
+  while ep.poll_event().is_some() {}
+  ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, hb());
+  while let Some(ev) = ep.poll_event() {
+    assert!(
+      !matches!(ev, crate::Event::LeaderChanged(_)),
+      "an unchanged leader must not re-emit"
+    );
+  }
+}

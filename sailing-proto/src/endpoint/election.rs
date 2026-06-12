@@ -55,15 +55,12 @@ where
   /// timer so the node will eventually campaign again (with PreVote, non-disruptively).
   pub(crate) fn step_down_to_follower(&mut self, now: Instant) {
     self.role = Role::Follower;
-    self.leader = None;
+    self.set_leader(None);
     self.heartbeat_deadline = None;
     // Drop all pending reads — a stepped-down node is no longer the leader and
     // cannot confirm any outstanding read requests.
     self.read_only.reset(self.config.read_only());
     self.pending_reads.clear();
-    // Leadership is gone: any reads we forwarded to the old leader are moot — clear so they can be
-    // re-issued once we learn a new leader.
-    self.forwarded_reads.clear();
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
     self.lead_transferee = None;
     self.transfer_deadline = None;
@@ -299,10 +296,7 @@ where
     // the self-vote below so old completions that arrive later are harmlessly ignored.
     self.pending.clear();
     self.role = Role::Candidate;
-    self.leader = None;
-    // Campaigning: no leader to forward reads to, and the term is advancing — drop any forwarded
-    // reads so they can be re-issued to whoever wins.
-    self.forwarded_reads.clear();
+    self.set_leader(None);
     self.voted_for = Some(self.config.id());
     // Record self-vote in the ballot map (true = grant).
     self.votes.clear();
@@ -364,10 +358,7 @@ where
       return false;
     }
     self.role = Role::PreCandidate;
-    self.leader = None;
-    // No leader to forward reads to while probing — drop any forwarded reads (a pre-vote that fails
-    // returns to Follower; a successful one bumps the term via become_candidate).
-    self.forwarded_reads.clear();
+    self.set_leader(None);
     // Clear the ballot and record self pre-vote.
     self.votes.clear();
     self.votes.insert(self.config.id(), true);
@@ -406,7 +397,7 @@ where
     stable: &mut S,
   ) {
     self.role = Role::Leader;
-    self.leader = Some(self.config.id());
+    self.set_leader(Some(self.config.id()));
     // Reset read-index state from the previous term (stale pending reads must not
     // be confirmed against the new term's commit index).
     self.read_only.reset(self.config.read_only());
@@ -488,12 +479,8 @@ where
       .pending
       .insert(opid, Pending::LeaderAppend { upto: noop_index });
 
-    self
-      .events
-      .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
-        self.term,
-        Some(self.config.id()),
-      )));
+    // (`set_leader` above emitted `LeaderChanged(Some(self))` — a candidate's leader belief is
+    // always `None`, so the transition always fires.)
 
     // Broadcast heartbeats and kick off replication to peers.
     self.broadcast_heartbeat(now);
