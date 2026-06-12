@@ -34,6 +34,14 @@ impl<R> Applied<R> {
 }
 
 /// The leader changed (soft-state; for routing/observability).
+///
+/// Fires on EVERY observable change of the leader belief, including to-`None` transitions: a
+/// campaign start, a check-quorum step-down, a higher-term adoption, and a leader's removal by
+/// conf change all make a known leader unknown, and they all emit — an embedder routing on the
+/// hint never has to infer leader loss from silence. A higher-term message from a leader
+/// surfaces an ordered pair in one drain: `(term, None)` when the term is adopted, then
+/// `(term, Some(sender))` when the handler installs the sender — the honest transition
+/// sequence. Identity-deduplicated: an unchanged belief never re-emits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct LeaderChanged<I> {
   term: Term,

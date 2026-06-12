@@ -140,12 +140,14 @@ campaign 2
 ----
 n2 candidate term=2
 RequestVote term=2 last=1/3 prevote=false
+n2 leader-changed term=2 lead=none
 
 stabilize
 ----
 > n3 recv RequestVote term=2 last=1/3 prevote=false
 > n3 ready
   VoteResp term=2 prevote=false reject=false
+  n3 leader-changed term=2 lead=none
 > n2 recv VoteResp term=2 prevote=false reject=false
 > n2 ready
   Heartbeat term=2 commit=0

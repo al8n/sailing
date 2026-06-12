@@ -113,6 +113,7 @@ stabilize
   AppendEntries term=1 prev=1/3 commit=2 entries=[]
   AppendEntries term=1 prev=1/3 commit=3 entries=[]
   n1 conf-changed index=3 voters={2,3,4}
+  n1 leader-changed term=1 lead=none
 > n2 recv AppendEntries term=1 prev=1/3 commit=2 entries=[]
 > n3 recv AppendEntries term=1 prev=1/3 commit=3 entries=[]
 > n2 ready
@@ -137,6 +138,7 @@ n2 candidate term=2
 RequestVote term=2 last=1/3 prevote=false
 RequestVote term=2 last=1/3 prevote=false
 RequestVote term=2 last=1/3 prevote=false
+n2 leader-changed term=2 lead=none
 
 stabilize
 ----
@@ -147,8 +149,10 @@ stabilize
   VoteResp term=2 prevote=false reject=false
 > n3 ready
   VoteResp term=2 prevote=false reject=false
+  n3 leader-changed term=2 lead=none
 > n4 ready
   VoteResp term=2 prevote=false reject=false
+  n4 leader-changed term=2 lead=none
 > n2 recv VoteResp term=2 prevote=false reject=false
 > n2 recv VoteResp term=2 prevote=false reject=false
 > n2 recv VoteResp term=2 prevote=false reject=false

@@ -113,20 +113,9 @@ where
     F::Snapshot: crate::Data,
   {
     // Preamble: mirror on_append_entries — reset to Follower, track leader, re-arm election timer.
-    let changed = self.leader != Some(is.leader());
     self.role = Role::Follower;
-    self.leader = Some(is.leader());
+    self.set_leader(Some(is.leader()));
     self.arm_election_timer(now);
-    if changed {
-      // New leader: drop reads forwarded to the previous one (see on_append_entries).
-      self.forwarded_reads.clear();
-      self
-        .events
-        .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
-          self.term,
-          Some(is.leader()),
-        )));
-    }
 
     let meta = is.snapshot();
 

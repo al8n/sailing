@@ -198,6 +198,7 @@ campaign 3
 n3 candidate term=2
 RequestVote term=2 last=1/1 prevote=false
 RequestVote term=2 last=1/1 prevote=false
+n3 leader-changed term=2 lead=none
 
 flush 3
 ----
@@ -207,6 +208,10 @@ stabilize
 ----
 > n4 recv RequestVote term=2 last=1/1 prevote=false
 > n5 recv RequestVote term=2 last=1/1 prevote=false
+> n4 ready
+  n4 leader-changed term=2 lead=none
+> n5 ready
+  n5 leader-changed term=2 lead=none
 
 flush 3 4 5
 ----
@@ -322,6 +327,7 @@ stabilize
 > n5 recv Heartbeat term=2 commit=2
 > n2 ready
   HeartbeatResp term=2
+  n2 leader-changed term=2 lead=none
   n2 leader-changed term=2 lead=3
 > n4 ready
   HeartbeatResp term=2

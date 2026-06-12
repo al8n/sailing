@@ -839,6 +839,29 @@ where
     self.leader
   }
 
+  /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
+  /// identity changes, clears reads forwarded to the previous leader (the forward target is
+  /// gone; re-issue against the new belief) and emits [`LeaderChanged`](crate::LeaderChanged)
+  /// carrying the CURRENT term — so callers adopting a term alongside the leader must bump
+  /// `self.term` FIRST. `None` transitions are emitted like any other: a campaign start, a
+  /// check-quorum step-down, a higher-term adoption, and a leader's self-removal all make a
+  /// known leader unknown, and an embedder routing on the hint must hear about it rather than
+  /// infer it from silence. A higher-term message from a leader therefore surfaces an ordered
+  /// PAIR in one drain — `(term, None)` at adoption, then `(term, Some(sender))` from the
+  /// handler — the honest transition sequence, deduplicated only on identity.
+  pub(crate) fn set_leader(&mut self, leader: Option<I>) {
+    if self.leader == leader {
+      return;
+    }
+    self.leader = leader;
+    self.forwarded_reads.clear();
+    self
+      .events
+      .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
+        self.term, leader,
+      )));
+  }
+
   /// The current commit index — the highest log index this node believes is committed
   /// (durably replicated to a quorum and safe to apply).
   ///
@@ -1145,7 +1168,7 @@ where
         self.term = msg.term();
         self.role = Role::Follower;
         self.voted_for = None;
-        self.leader = None;
+        self.set_leader(None);
         // All pending work from the old term is now stale (spec §7). Drop it before any new
         // grant is recorded below — a fresh CastVote added by on_request_vote will survive.
         // (`pending_install` is a SEPARATE field, so it survives this clear — a deferred install
@@ -1157,9 +1180,7 @@ where
         // leader-gated, so this is robustness, not a behavior change).
         self.read_only.reset(self.config.read_only());
         self.pending_reads.clear();
-        // A read forwarded under the old term/leader is stale across this term change — clear so a
-        // re-issue to the new leader is not blocked.
-        self.forwarded_reads.clear();
+        // (Reads forwarded under the old term/leader were cleared by `set_leader` above.)
         // Abort any in-progress leader transfer — leadership is changing.
         self.lead_transferee = None;
         self.transfer_deadline = None;
@@ -1472,7 +1493,7 @@ where
             && !self.tracker.is_voter(&self.config.id())
           {
             self.role = Role::Follower;
-            self.leader = None;
+            self.set_leader(None);
             self.heartbeat_deadline = None;
             // Do NOT arm the election timer: a non-voter must not campaign (see handle_timeout /
             // become_candidate guards). Leaving election_deadline disarmed is the right choice — a
