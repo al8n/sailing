@@ -97,7 +97,7 @@ connection routing — the driver only moves bytes between sockets and the coord
 The byte-level wire format is pinned in
 [`sailing-proto/WIRE.md`](sailing-proto/WIRE.md) (normative, with golden vectors in the tests).
 
-MSRV: **1.85**.
+MSRV: **1.91**.
 
 #### License
 

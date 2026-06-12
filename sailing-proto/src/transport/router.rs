@@ -143,21 +143,21 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     // replacement. Only a LIVE connection binds: one that validated and clean-closed in the same
     // read still delivers its final frames below (attributed via `conn.peer()`), but must not
     // claim the route or evict a healthy binding on its way out.
-    if !conn.is_closed() {
-      if let Some(peer) = conn.peer() {
-        self.handshake_deadline.remove(&id);
-        if let Some(&prev) = self.peer_of.get(&peer) {
-          if prev > id {
-            // A stale older duplicate validated late: drop it, keep the newer binding.
-            self.remove_internal(id, None);
-            return Ok(());
-          }
-          if prev != id {
-            self.remove_internal(prev, None); // newer connection wins
-          }
+    if !conn.is_closed()
+      && let Some(peer) = conn.peer()
+    {
+      self.handshake_deadline.remove(&id);
+      if let Some(&prev) = self.peer_of.get(&peer) {
+        if prev > id {
+          // A stale older duplicate validated late: drop it, keep the newer binding.
+          self.remove_internal(id, None);
+          return Ok(());
         }
-        self.peer_of.insert(peer, id);
+        if prev != id {
+          self.remove_internal(prev, None); // newer connection wins
+        }
       }
+      self.peer_of.insert(peer, id);
     }
     let conn = self.conns.get_mut(&id).expect("conn present");
     let mut msgs = Vec::new();

@@ -277,7 +277,7 @@ pub(crate) fn read_index_load(
   let k = 1 + (prng.next_u64() % 3) as usize; // 1..=3 reads
   for _ in 0..k {
     let leader = c.leader();
-    let forward = prng.next_u64() % 3 == 0;
+    let forward = prng.next_u64().is_multiple_of(3);
     let target = if forward {
       // A live node that is not the leader, when one exists (sorted pick = deterministic).
       let others: BTreeSet<u64> = st

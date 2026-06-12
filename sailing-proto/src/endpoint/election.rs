@@ -124,11 +124,11 @@ where
     // (a Leader-Completeness violation, strictly worse than the orphan the deferral closes). One local floor on
     // the comparison pair only; sound because the boundary is committed, so it never understates our
     // true committed freshness.
-    if let Some((_, meta, ..)) = &self.pending_install {
-      if (meta.last_term(), meta.last_index()) > (my_term, my_index) {
-        my_index = meta.last_index();
-        my_term = meta.last_term();
-      }
+    if let Some((_, meta, ..)) = &self.pending_install
+      && (meta.last_term(), meta.last_index()) > (my_term, my_index)
+    {
+      my_index = meta.last_index();
+      my_term = meta.last_term();
     }
     let log_ok = (rv.last_log_term(), rv.last_log_index()) >= (my_term, my_index);
 
