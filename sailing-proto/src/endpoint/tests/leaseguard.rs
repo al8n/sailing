@@ -174,3 +174,110 @@ fn leaseguard_commit_wait_holds_first_commit_until_deadline() {
     "the commit-wait releases the first commit at lease_duration + clock_drift_bound"
   );
 }
+
+/// The LeaseGuard read gate: a leader whose most-recent committed entry is still within the lease
+/// window serves a read IMMEDIATELY from the local commit (a `ReadState` with no heartbeat round);
+/// once that entry ages past `lease_duration` the read degrades to the always-safe heartbeat round
+/// (no immediate `ReadState` — it must await a quorum ack).
+#[test]
+fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
+  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Elect at the election deadline `d`; no-op lands at index 1.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  // peer 2 acks the no-op (held by the commit-wait), then release the commit-wait at d+350ms.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  let t1 = d + Duration::from_millis(350);
+  ep.handle_timeout(t1, &mut log, &mut stable);
+  assert_eq!(ep.commit_index(), Index::new(1));
+
+  // Propose a FRESH entry at t1 (stamped t1) and commit it via a quorum ack — the lease anchor is
+  // now this entry's timestamp, t1, NOT the aged no-op.
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  let idx2 = ep
+    .propose(t1, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+    .unwrap();
+  ep.handle_storage(t1, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  ep.handle_message(
+    t1,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx2,
+    )),
+  );
+  assert_eq!(ep.commit_index(), idx2, "the fresh entry commits (no wait)");
+  while ep.poll_event().is_some() {}
+
+  // LIVE: a read at t1 (anchor t1 + Δ=300ms >= t1) serves immediately — a ReadState with no round.
+  ep.read_index(t1, &log, &stable, bytes::Bytes::from_static(b"r1"))
+    .unwrap();
+  let live: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  assert!(
+    live
+      .iter()
+      .any(|e| matches!(e, crate::Event::ReadState(rs) if rs.index() == idx2)),
+    "a live LeaseGuard lease serves the read immediately from the local commit"
+  );
+
+  // STALE: a read at t1+400ms (anchor t1 + 300ms < t1+400ms) degrades to the safe heartbeat round —
+  // no immediate ReadState (it now awaits a quorum HeartbeatResp).
+  let stale_now = t1 + Duration::from_millis(400);
+  ep.read_index(stale_now, &log, &stable, bytes::Bytes::from_static(b"r2"))
+    .unwrap();
+  let stale: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  assert!(
+    !stale
+      .iter()
+      .any(|e| matches!(e, crate::Event::ReadState(_))),
+    "a stale LeaseGuard lease degrades to the safe round (no immediate ReadState)"
+  );
+}

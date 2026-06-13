@@ -121,15 +121,50 @@ where
       && self.lease_valid_until.is_some_and(|d| d > now)
   }
 
+  /// Confirm a read immediately at `index` (a lease fast-path — no heartbeat round): emit
+  /// `Event::ReadState` for a local read, or reply `ReadIndexResp` to the forwarding follower.
+  /// Shared by the LeaseBased and LeaseGuard immediate-serve paths.
+  fn emit_or_reply_read(&mut self, index: Index, context: Bytes, from: Option<I>) {
+    match from {
+      None => self.emit_read_state(index, context),
+      Some(follower) => {
+        let (term, me) = (self.term, self.config.id());
+        self.send(
+          follower,
+          Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, index, context, false)),
+        );
+      }
+    }
+  }
+
+  /// LeaseGuard same-leader read gate ("the log is the lease"): the leader's most-recent committed
+  /// entry — a current-term entry THIS leader stamped, guaranteed by the caller's
+  /// `has_current_term_commit` gate — is still within the lease window on the leader's OWN monotonic
+  /// clock. Both the anchor (the entry's in-log stamp) and `now` are this leader's clock, so the
+  /// comparison needs NO cross-node skew assumption; the cross-leader safety (a fresh leader cannot
+  /// serve before any deposed leader's lease expires) is upheld separately by the post-election
+  /// commit-wait. Fails CLOSED — degrade to the safe heartbeat round — on a missing `lease_duration`
+  /// (misconfigured) or an unreadable/absent anchor.
+  fn lease_guard_read_live<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
+    let Some(delta) = self.config.lease_duration() else {
+      return false;
+    };
+    let Some(ts) = self.log_timestamp(log, self.commit) else {
+      return false;
+    };
+    let now_ts = now.since_origin().as_nanos() as u64;
+    // ts + Δ >= now (saturating: a pathological Δ must not wrap to a falsely-live lease).
+    ts.saturating_add(delta.as_nanos() as u64) >= now_ts
+  }
+
   /// Core leader read logic: register the read and broadcast / confirm.
   pub(crate) fn do_leader_read<L: LogStore>(
     &mut self,
     now: Instant,
-    _log: &L,
+    log: &L,
     context: Bytes,
     from: Option<I>,
   ) {
-    let me = self.config.id();
     let commit = self.commit;
     match self.config.read_only() {
       crate::ReadOnlyOption::Safe => {
@@ -140,22 +175,8 @@ where
         // `lease_read_available` — the single source of truth for LeaseBased safety). Otherwise degrade
         // to the Safe heartbeat round, which re-confirms a quorum before emitting; degrading is silent
         // and always safe.
-        let use_lease = self.lease_read_available(now);
-        if use_lease {
-          match from {
-            None => {
-              self.emit_read_state(commit, context);
-            }
-            Some(follower) => {
-              let (term, me2) = (self.term, me);
-              self.send(
-                follower,
-                Message::ReadIndexResp(crate::ReadIndexResp::new(
-                  term, me2, commit, context, false,
-                )),
-              );
-            }
-          }
+        if self.lease_read_available(now) {
+          self.emit_or_reply_read(commit, context, from);
         } else {
           // Degrade to the FULL Safe read path — including the single-node self-quorum fast-path —
           // so a one-voter leader still completes the read immediately instead of waiting forever for
@@ -166,10 +187,18 @@ where
         }
       }
       crate::ReadOnlyOption::LeaseGuard => {
-        // The LeaseGuard lease-read fast path is not implemented yet (it lands with the mode's
-        // later layers); until then LeaseGuard serves reads via the always-safe heartbeat round,
-        // exactly like `Safe`. This keeps the config addition behavior-free.
-        self.do_safe_read(now, context, from);
+        // "The log is the lease": serve from the local commit WITHOUT a round-trip iff the leader's
+        // most-recent committed entry is still within the lease window on the leader's OWN monotonic
+        // clock (see `lease_guard_read_live`). The caller already gated on `has_current_term_commit`,
+        // so the anchor is a current-term entry THIS leader stamped — anchor and `now` share one
+        // clock, no skew assumption; the cross-leader safety (a fresh leader cannot serve before a
+        // deposed lease expires) is upheld by the commit-wait. A stale lease (idle / read-only
+        // workload) degrades to the always-safe heartbeat round — never a stale serve.
+        if self.lease_guard_read_live(now, log) {
+          self.emit_or_reply_read(commit, context, from);
+        } else {
+          self.do_safe_read(now, context, from);
+        }
       }
     }
   }
