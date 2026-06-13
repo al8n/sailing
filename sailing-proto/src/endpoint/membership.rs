@@ -54,7 +54,8 @@ where
       index,
       crate::EntryKind::ConfChange,
       bytes::Bytes::from(buf),
-    );
+    )
+    .with_timestamp(self.lease_stamp(now));
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
     self

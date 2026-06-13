@@ -327,7 +327,8 @@ where
       index,
       crate::EntryKind::Normal,
       bytes::Bytes::from(buf),
-    );
+    )
+    .with_timestamp(self.lease_stamp(now));
     // Self-match advance is deferred until the append is durable (on_log_appended).
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
