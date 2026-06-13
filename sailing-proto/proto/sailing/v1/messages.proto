@@ -26,6 +26,12 @@ message Entry {
   EntryKind kind = 3;
   // The application command (Normal), the encoded ConfChange (ConfChange), or empty.
   bytes data = 4;
+  // The leader's clock when it appended this entry (nanos since the node's monotonic ORIGIN),
+  // used ONLY by the LeaseGuard read mode to age the entry across a leader change. Zero (the
+  // proto3 default) in every other mode — absent on the wire, so a non-LeaseGuard entry encodes
+  // exactly as before. Cross-node comparability requires the driver to anchor each node's ORIGIN
+  // to a synchronized epoch (the LeaseGuard bounded-skew assumption); see WIRE.md.
+  uint64 timestamp = 5;
 }
 
 // Entry discriminant. Zero = Normal so the dominant case is the proto3 default.

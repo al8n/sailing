@@ -44,6 +44,12 @@ reference — this section pins the SEMANTICS:
   **strictly ascending by decoded value** — duplicates and disorder reject, so one set has
   exactly one accepted encoding.
 - `lease_support_nanos` must be `< 1_000_000_000`.
+- `Entry.timestamp` is the leader's append-time clock (nanos since its monotonic ORIGIN), read
+  ONLY by the LeaseGuard read mode to age an entry across a leader change. It is `0` (and absent
+  on the wire) in every other mode, so a non-LeaseGuard `Entry` is byte-identical to before the
+  field existed. Cross-leader comparability requires the deployment to anchor each node's ORIGIN
+  to a synchronized epoch within the configured skew bound — the LeaseGuard mode's documented
+  clock assumption, NOT a property the protocol can enforce.
 - An enum field must carry a KNOWN value; the `Message.body` oneof must be present. Either
   failure rejects the message (parity with the old codec's unknown-tag reject).
 - A rejected message closes the connection (transport) — the endpoint is never poisoned by

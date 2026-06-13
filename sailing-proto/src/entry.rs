@@ -32,10 +32,16 @@ pub struct Entry {
   index: Index,
   kind: EntryKind,
   data: Bytes,
+  /// The leader's append-time clock (nanos since its monotonic ORIGIN), used ONLY by the
+  /// LeaseGuard read mode to age the entry across a leader change. `0` (and ignored) in every
+  /// other mode; it then encodes absent on the wire, so a non-LeaseGuard entry is byte-identical
+  /// to before this field existed.
+  timestamp: u64,
 }
 
 impl Entry {
-  /// Construct an entry.
+  /// Construct an entry (`timestamp` defaults to `0`; set it with
+  /// [`with_timestamp`](Self::with_timestamp) in LeaseGuard mode).
   #[inline(always)]
   pub const fn new(term: Term, index: Index, kind: EntryKind, data: Bytes) -> Self {
     Self {
@@ -43,7 +49,23 @@ impl Entry {
       index,
       kind,
       data,
+      timestamp: 0,
     }
+  }
+
+  /// Set the LeaseGuard append-timestamp (nanos since the leader's ORIGIN). A builder, so the
+  /// common 4-arg [`new`](Self::new) stays untouched in non-LeaseGuard paths.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_timestamp(mut self, timestamp: u64) -> Self {
+    self.timestamp = timestamp;
+    self
+  }
+
+  /// The LeaseGuard append-timestamp (nanos since the leader's ORIGIN), or `0` if unset.
+  #[inline(always)]
+  pub const fn timestamp(&self) -> u64 {
+    self.timestamp
   }
 
   /// The entry's term.
