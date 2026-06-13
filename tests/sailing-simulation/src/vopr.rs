@@ -58,6 +58,29 @@ const MIN_VOTERS: usize = 2;
 /// the node-id space small and deterministic.
 const MAX_NODES: usize = 9;
 
+/// The LeaseGuard lease window Δ used for every LeaseGuard VOPR run. Shared between the cluster config
+/// and the per-node clock-drift bound below so the two can never drift apart (a drift rate outside
+/// ±ε/Δ would inject more skew than the protocol assumes and could surface a stale read that is the
+/// harness's fault, not a proto bug).
+const LEASEGUARD_DELTA: Duration = Duration::from_millis(300);
+/// The LeaseGuard drift bound ε_drift (the commit-wait's clock-drift slack). `ε < Δ` and
+/// `Δ + ε < election_timeout` (1000ms) keep the config valid.
+const LEASEGUARD_EPS: Duration = Duration::from_millis(50);
+
+/// A deterministic per-node clock RATE for a LeaseGuard VOPR run: `(Δ + k, Δ)` nanos with
+/// `k ∈ [−ε, +ε]` hashed from `(drift_seed, id)`. The node's clock then runs between `(Δ−ε)/Δ`
+/// (slowest) and `(Δ+ε)/Δ` (fastest) — exactly the protocol's assumed drift bound, never beyond it.
+/// A PURE function of `(drift_seed, id)`, so a founder and a mid-run joiner sharing an id get the same
+/// rate no matter when [`Cluster::set_clock_drift`] queries the policy. The slow-leader / fast-successor
+/// pairings this produces are the only thing that exercises the cross-leader commit-wait margin.
+fn leaseguard_node_rate(drift_seed: u64, id: u64) -> (u64, u64) {
+  let delta_ns = LEASEGUARD_DELTA.as_nanos() as u64;
+  let eps_ns = LEASEGUARD_EPS.as_nanos() as u64;
+  let mut p = FaultPrng::new(drift_seed ^ id.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+  let k = (p.next_u64() % (2 * eps_ns + 1)) as i64 - eps_ns as i64; // k ∈ [−ε, +ε] nanos
+  ((delta_ns as i64 + k) as u64, delta_ns)
+}
+
 /// Non-vacuity counters: a tally of what a single [`run_vopr`] actually EXERCISED.
 ///
 /// The seed sweep aggregates these across many seeds and asserts real coverage (e.g. some
@@ -70,6 +93,10 @@ const MAX_NODES: usize = 9;
 pub struct VoprReport {
   /// The cluster seed this run replays from (echoed for convenience / replay).
   pub seed: u64,
+  /// Whether this run installed per-node clock drift (true iff it drew the LeaseGuard read mode). Lets
+  /// the gated band assert that LeaseGuard-under-drift was ACTUALLY exercised, not just that the seeds
+  /// happened not to draw it.
+  pub drifted: bool,
   /// Number of `tick`s actually executed across the whole run (main loop + calm windows + quiesce).
   pub ticks_run: u64,
   /// Number of `crash(id)` injections (each loses the fsync window and recovers from durable state).
@@ -105,6 +132,18 @@ pub struct VoprReport {
   pub reads_confirmed: u64,
   /// Number of leader transfers the leader ACCEPTED (the transfer itself may still abort).
   pub transfers: u64,
+  /// Non-vacuity WITNESS: the number of reads CONFIRMED by a node that was a SUPERSEDED leader at
+  /// confirm time — still in Leader role yet outranked by another node in Leader role at a strictly
+  /// higher term. This is the cross-leader case LeaseGuard governs: a leader serving from its lease
+  /// while a fresh higher-term leader has already taken over. Per-node drift makes it REACHABLE — a slow
+  /// leader's heartbeats arrive late, a follower times out and elects a successor while the slow
+  /// leader's lease is still fresh and it has not yet learned it was deposed — and deep sweeps record a
+  /// healthy count (the single-clock VOPR produced almost none). Every such serve still passed the
+  /// `index >= floor` linearizability assertion above: the successor's commit-wait held its first
+  /// commit back far enough that the deposed leader's serve stayed linearizable. So a positive count
+  /// proves the dangerous cross-leader path was REACHED under drift and judged SAFE — the coverage that
+  /// motivates the whole harness.
+  pub reads_served_by_superseded_leader: u64,
   /// The number of voters in the cluster at the end of the run (after all conf-changes).
   pub final_cluster_size: usize,
 }
@@ -405,10 +444,22 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
         .with_read_only(sailing_proto::ReadOnlyOption::LeaseBased),
       _ => cfg
         .with_read_only(sailing_proto::ReadOnlyOption::LeaseGuard)
-        .with_lease_duration(Duration::from_millis(300))
-        .with_clock_drift_bound(Duration::from_millis(50)),
+        .with_lease_duration(LEASEGUARD_DELTA)
+        .with_clock_drift_bound(LEASEGUARD_EPS),
     }
   });
+
+  // For LeaseGuard runs, install per-node clock RATE drift bounded by ε/Δ, drawn from a DEDICATED
+  // sub-seed so the master PRNG stream (and thus every other choice + every non-LeaseGuard run) is
+  // untouched. This is the one thing that exercises the cross-leader commit-wait: a slow deposed
+  // leader's lease outlives a fast successor's wait in real time ONLY if the Δ·(Δ+ε)/(Δ−ε) window is
+  // too short, and the mode-agnostic read-linearizability oracle catches any resulting stale serve.
+  // Every other mode keeps a single clock (no drift), so their runs are bit-for-bit unchanged.
+  let drifted = read_mode == 3;
+  if drifted {
+    let drift_seed = seed.rotate_left(40) ^ 0x4452_4946_545F_5631; // "DRIF_TV1"
+    c.set_clock_drift(move |id| leaseguard_node_rate(drift_seed, id));
+  }
 
   // Install a seed-chosen baseline network + per-node storage fault config (modest — the run must
   // still be able to make progress; calm windows back it off entirely).
@@ -437,6 +488,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 
   let mut report = VoprReport {
     seed,
+    drifted,
     final_cluster_size: size,
     ..VoprReport::default()
   };
@@ -498,6 +550,9 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   read_round(&mut c, &mut reads, &mut report, seed, "quiesce");
 
   report.final_cluster_size = st.voters.len();
+  // The superseded-leader serve count is tallied event-time inside the cluster (at ReadState drain),
+  // so it is sound regardless of when this scan runs; copy the final total into the report.
+  report.reads_served_by_superseded_leader = c.lease_superseded_serves();
   report
 }
 
