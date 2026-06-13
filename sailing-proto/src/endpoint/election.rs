@@ -472,7 +472,8 @@ where
       noop_index,
       crate::EntryKind::Empty,
       bytes::Bytes::new(),
-    );
+    )
+    .with_timestamp(self.lease_stamp(now));
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&noop));
     self
