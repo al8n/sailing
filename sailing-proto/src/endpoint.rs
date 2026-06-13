@@ -1103,6 +1103,21 @@ where
     }
   }
 
+  /// The in-log LeaseGuard timestamp (nanos on the appending leader's clock) of the entry at `idx`,
+  /// or `None` if the index is absent. A genuine storage READ failure poisons the node
+  /// (`PoisonReason::LogRead`, the same policy as the replication-range read) and returns `None`:
+  /// an absent index is the store's job to answer with `Ok` (empty slice), `Err` is reserved for
+  /// I/O failure. Mirrors [`Self::log_term`]'s fail-stop choke-point for the timestamp axis.
+  fn log_timestamp<L: LogStore>(&mut self, log: &L, idx: Index) -> Option<u64> {
+    match log.entries(idx..idx.next(), u64::MAX) {
+      Ok(slice) => slice.first().map(|e| e.timestamp()),
+      Err(_) => {
+        self.poison(PoisonReason::LogRead);
+        None
+      }
+    }
+  }
+
   /// Our log's `(last_index, last_term)` for the §5.4.1 up-to-date comparison, or `None` on a genuine
   /// storage error reading the last term of a NON-empty log (the node is poisoned via
   /// [`Self::log_term`]).
