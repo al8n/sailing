@@ -32,6 +32,14 @@ message Entry {
   // exactly as before. Cross-node comparability requires the driver to anchor each node's ORIGIN
   // to a synchronized epoch (the LeaseGuard bounded-skew assumption); see WIRE.md.
   uint64 timestamp = 5;
+  // The LeaseGuard commit-wait window of the appending leader (nanos; the exact
+  // lease_duration*(lease_duration+clock_drift_bound)/(lease_duration-clock_drift_bound), see the
+  // Config::clock_drift_bound docs): how long a successor must wait, from a lower bound on this
+  // entry's creation, before this
+  // leader's read-lease has provably expired. Self-describing, so a successor sizes its commit-wait
+  // by the MAX window over inherited entries with no assumption about other nodes' config. Zero (the
+  // proto3 default) in every other mode — absent on the wire, byte-identical to before.
+  uint64 lease_window = 6;
 }
 
 // Entry discriminant. Zero = Normal so the dominant case is the proto3 default.
@@ -57,6 +65,11 @@ message SnapshotMeta {
   uint64 last_index = 1;
   uint64 last_term = 2;
   ConfState conf = 3;
+  // The max LeaseGuard commit-wait window (nanos) over the entries this snapshot subsumes — carried
+  // so a node that compacts (or installs this snapshot) still bounds any deposed leader's lease on a
+  // now-compacted entry. Zero in non-LeaseGuard clusters — absent on the wire, byte-identical to
+  // before.
+  uint64 max_lease_window = 4;
 }
 
 // Log replication / heartbeat-with-entries.

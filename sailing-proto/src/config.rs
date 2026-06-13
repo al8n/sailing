@@ -28,7 +28,18 @@ pub enum ReadOnlyOption {
   LeaseBased,
   /// The commit-anchored LeaseGuard lease. **Requires** [`Config::lease_duration`] and
   /// [`Config::clock_drift_bound`]; [`Config::bounded_clock_uncertainty`] enables inherited-lease
-  /// reads. [`Config::validate`] enforces `lease_duration + clock_drift_bound < election_timeout`.
+  /// reads. The per-entry commit-wait window is the exact `Δ·(Δ+ε)/(Δ−ε)` (covering a slow deposed
+  /// leader AND a fast successor; see [`Config::clock_drift_bound`]); [`Config::validate`] requires
+  /// `clock_drift_bound < lease_duration` and the window `< election_timeout`.
+  ///
+  /// **Deployment contract — a fresh-cluster / matched-schema choice.** Cross-leader safety relies on
+  /// each entry's self-describing `lease_window` (and each snapshot's `max_lease_window`) being
+  /// preserved end to end, so EVERY voter must run a LeaseGuard-aware build and persist those wire
+  /// fields. Enabling LeaseGuard on a partially-upgraded cluster, or on storage that strips unknown
+  /// proto fields, can leave a successor's commit-wait under-sized (a stale read). The duplicate
+  /// AppendEntries / snapshot RUNTIME paths fold a newly-visible window defensively, but durable
+  /// survival across a restart of a stripped window is the operator's responsibility — like
+  /// `LeaseBased`'s bounded-drift contract, mid-life migration is out of scope (see WIRE.md).
   LeaseGuard,
 }
 
@@ -82,11 +93,15 @@ pub struct Config<I> {
   /// entry is younger than this. Required when `read_only = LeaseGuard`; ignored otherwise.
   /// Default: `None`.
   lease_duration: Option<Duration>,
-  /// The bounded clock-DRIFT (rate) ε a node may gain or lose while measuring a `lease_duration`.
-  /// REQUIRED for `LeaseGuard`: the commit-wait blocks a new leader from committing past a
-  /// prior-term entry until that entry is `lease_duration + clock_drift_bound` old by the node's
-  /// own local timer — needing only local clocks with bounded drift, no cross-node sync. Default:
-  /// `None`.
+  /// The bounded one-sided clock drift ε — the most a SINGLE node's clock may gain OR lose (in real
+  /// time) while measuring a `lease_duration` interval; equivalently the rate drift is `ρ = ε/Δ`
+  /// (`Δ` = `lease_duration`). REQUIRED for `LeaseGuard`, and must be `< lease_duration`. The
+  /// post-election commit-wait window stamped per entry is the EXACT `Δ·(Δ+ε)/(Δ−ε) = Δ·(1+ρ)/(1−ρ)`
+  /// (≈ `lease_duration + 2·clock_drift_bound` for small drift): it provably covers BOTH a slow
+  /// deposed leader (whose lease lasts up to real time `Δ/(1−ρ)`) AND a fast successor (whose local
+  /// wait finishes at real time `window/(1+ρ)`), so the successor commits only after the deposed
+  /// leader's read-lease has expired. Needs only local clocks with bounded drift, no cross-node sync.
+  /// Default: `None`.
   clock_drift_bound: Option<Duration>,
   /// The bounded cross-node clock-UNCERTAINTY (skew). OPTIONAL: `Some(ε)` enables LeaseGuard's
   /// inherited-lease reads (a fresh leader serves reads for unaffected keys during the commit-wait
@@ -398,27 +413,62 @@ impl<I: NodeId> Config<I> {
       return Err(ConfigError::LeaseRequiresCheckQuorum);
     }
     if self.read_only == ReadOnlyOption::LeaseGuard {
-      let lease = self
-        .lease_duration
-        .ok_or(ConfigError::LeaseGuardRequiresLeaseDuration)?;
-      let drift = self
-        .clock_drift_bound
-        .ok_or(ConfigError::LeaseGuardRequiresDriftBound)?;
-      // The commit-wait blocks until a prior-term entry is `lease + drift` old by the node's own
-      // timer; the lease itself must expire strictly before a new leader can be elected, or a
-      // stale lease could outlive its successor.
-      if lease
-        .checked_add(drift)
-        .is_none_or(|d| d >= self.election_timeout)
-      {
-        return Err(ConfigError::LeaseTimingTooLong {
-          lease,
-          drift,
-          election: self.election_timeout,
-        });
-      }
+      // The single source of truth for the LeaseGuard timing — same computation used to STAMP the
+      // per-entry window and to gate the read fast-path, so validation, stamping, and liveness never
+      // diverge. Propagates the specific error (missing knob / timing too long).
+      self.leaseguard_window_result()?;
     }
     Ok(())
+  }
+
+  /// The EXACT LeaseGuard commit-wait window in nanoseconds for a valid config, or the specific
+  /// [`ConfigError`] if the timing is invalid. Assumes `read_only == LeaseGuard` (validate-gated).
+  ///
+  /// `W = Δ·(Δ+ε)/(Δ−ε)` = `Δ·(1+ρ)/(1−ρ)` for the rate drift `ρ = clock_drift_bound/lease_duration`
+  /// (`Δ` = lease_duration, `ε` = clock_drift_bound). This is the smallest wait that, with the strict
+  /// read gate, provably outlasts a SLOW deposed leader's lease (real time `Δ/(1−ρ)`) as measured by
+  /// a FAST successor (whose local wait finishes at real time `W/(1+ρ)`): `W/(1+ρ) ≥ Δ/(1−ρ)`. A flat
+  /// `Δ + 2ε` is first-order correct but a hair short (a 2ρ² term), so the exact ratio is required.
+  /// Computed in `u128` and rounded UP (never short), then range-checked to fit the `u64`
+  /// `Entry.lease_window` field AND stay below the election timeout (the liveness bound). Requires
+  /// `ε < Δ` (the rate drift below 100%).
+  fn leaseguard_window_result(&self) -> Result<u64, ConfigError> {
+    let lease = self
+      .lease_duration
+      .ok_or(ConfigError::LeaseGuardRequiresLeaseDuration)?;
+    let drift = self
+      .clock_drift_bound
+      .ok_or(ConfigError::LeaseGuardRequiresDriftBound)?;
+    let too_long = || ConfigError::LeaseTimingTooLong {
+      lease,
+      drift,
+      election: self.election_timeout,
+    };
+    let (d, e) = (lease.as_nanos(), drift.as_nanos());
+    // ε < Δ (denominator `Δ − ε` must be positive); else the window diverges / the config is degenerate.
+    let denom = d.checked_sub(e).filter(|&x| x > 0).ok_or_else(too_long)?;
+    // W = Δ·(Δ+ε)/(Δ−ε), in u128 (no truncation), rounded UP. `checked_mul` rejects an absurd Δ near
+    // the u128 ceiling rather than wrapping.
+    let w = d
+      .checked_mul(d + e)
+      .map(|num| num.div_ceil(denom))
+      .ok_or_else(too_long)?;
+    // Must fit the u64 wire field AND stay strictly below the election timeout (so a fresh leader
+    // commits before a follower could depose it mid-wait).
+    if w > u64::MAX as u128 || w >= self.election_timeout.as_nanos() {
+      return Err(too_long());
+    }
+    Ok(w as u64)
+  }
+
+  /// The EXACT LeaseGuard commit-wait window (nanos) when the mode is ACTIVE and the config is valid,
+  /// else `None`. The single source of truth that the per-entry stamp, the read fast-path, and the
+  /// commit-wait all gate on.
+  pub(crate) fn leaseguard_commit_wait_ns(&self) -> Option<u64> {
+    if self.read_only != ReadOnlyOption::LeaseGuard {
+      return None;
+    }
+    self.leaseguard_window_result().ok()
   }
 }
 

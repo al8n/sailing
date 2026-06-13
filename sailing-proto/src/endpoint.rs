@@ -553,20 +553,25 @@ where
   votes: BTreeMap<I, bool>,
   election_deadline: Option<Instant>,
   heartbeat_deadline: Option<Instant>,
-  /// LeaseGuard post-election commit-wait deadline (`ReadOnlyOption::LeaseGuard` only; `None` in
-  /// every other mode and on every non-leader). Set at [`become_leader`](Self::become_leader) to
-  /// `now + lease_duration + clock_drift_bound`: a CONSERVATIVE anchor, because become-leader time
-  /// is trivially ≥ every inherited entry's creation time (this node replicated them before winning
-  /// the election), so any deposed leader's lease — anchored on a committed entry this node now
-  /// holds — has expired by `lease_duration` (plus the `clock_drift_bound` slack ε that absorbs the
-  /// two leaders' clock-RATE difference) past that point. `maybe_advance_commit` HOLDS the first
-  /// post-election commit while `now < commit_wait_until`; once the deadline passes the gate is
-  /// lifted for good (cleared in `maybe_advance_commit`) until the next election. The conservative
-  /// anchor needs NO per-append age tracking — its safety is local to `become_leader`, regardless of
-  /// how the log was built (append, snapshot install, restart). A tighter per-entry anchor (commit
-  /// immediately when inherited entries are already older than the window) is a deferred
-  /// failover-latency optimization, not a safety requirement.
+  /// LeaseGuard post-election commit-wait deadline (`None` in every other mode and on every
+  /// non-leader). Set at [`become_leader`](Self::become_leader) to `now + max_lease_window` — two
+  /// CONSERVATIVE bounds (see that method): the TIME anchor `now` is ≥ every inherited entry's
+  /// creation time, and the WINDOW bound `max_lease_window` is the MAX self-describing
+  /// [`Entry::lease_window`](crate::Entry::lease_window) over the inherited entries, so it covers ANY
+  /// deposed leader's lease (each entry carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), even under
+  /// heterogeneous per-node config, with NO cross-node clock comparison. `maybe_advance_commit` HOLDS
+  /// the first post-election commit while `now < commit_wait_until`; once the deadline passes the gate
+  /// is lifted for good (cleared in `maybe_advance_commit`) until the next election.
   commit_wait_until: Option<Instant>,
+  /// The MAX LeaseGuard commit-wait window (`Entry::lease_window`, nanos) over every entry this node
+  /// has ever held — the SELF-DESCRIBING cross-leader safety bound. `become_leader` sizes its
+  /// commit-wait at `now + max_lease_window`, which covers ANY deposed leader's lease on an inherited
+  /// entry (each carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), no assumption about other configs.
+  /// Monotonically non-decreasing in memory (a stale-HIGH value is safe — it only over-waits): raised
+  /// on `submit_append` over appended entries and on snapshot install over `SnapshotMeta`; carried
+  /// through compaction (into the created `SnapshotMeta`) and recomputed at restart from the durable
+  /// log + restored snapshot. `0` in non-LeaseGuard clusters (every `lease_window` is `0`) ⇒ no wait.
+  max_lease_window: u64,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -793,6 +798,8 @@ where
       heartbeat_deadline: None,
       // Set fresh at each `become_leader` (LeaseGuard only); a non-leader never gates commit.
       commit_wait_until: None,
+      // Fresh node, empty log: no inherited lease window to cover yet. Raised as entries arrive.
+      max_lease_window: 0,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       tracker,
@@ -867,12 +874,48 @@ where
   /// since its ORIGIN) when `read_only = LeaseGuard`, else `0` (the field is then absent on the
   /// wire and ignored). Cross-node comparability is the deployment's synchronized-origin
   /// assumption (see WIRE.md); within the sim and a single node it is the monotonic clock.
+  ///
+  /// `0` if `since_origin` exceeds the `u64` wire field (a >584-year incarnation): the read gate then
+  /// measures the entry's age as `now − 0` (huge) and degrades to Safe — FAIL-CLOSED, never wrapping
+  /// the truncated timestamp to a falsely-fresh value.
   pub(crate) fn lease_stamp(&self, now: Instant) -> u64 {
     if self.config.read_only() == crate::ReadOnlyOption::LeaseGuard {
-      now.since_origin().as_nanos() as u64
+      u64::try_from(now.since_origin().as_nanos()).unwrap_or(0)
     } else {
       0
     }
+  }
+
+  /// The LeaseGuard commit-wait window (the exact `Δ·(Δ+ε)/(Δ−ε)`, nanos; see
+  /// [`Config::clock_drift_bound`]) this leader stamps into every entry it appends — how long a
+  /// successor must wait, from a lower bound on the entry's creation, to cover THIS leader's
+  /// read-lease on it. `0` (proto-omitted) when
+  /// LeaseGuard is inactive/invalid: such a leader serves no lease reads, so no successor need wait
+  /// for it (a `0` contribution to the inherited max is correct, not just safe).
+  pub(crate) fn lease_window_stamp(&self) -> u64 {
+    // The EXACT commit-wait window `Δ·(Δ+ε)/(Δ−ε)`; the single source of truth lives in `Config` so
+    // stamping, the read gate, and validation never diverge. `0` when LeaseGuard is inactive/invalid.
+    self.config.leaseguard_commit_wait_ns().unwrap_or(0)
+  }
+
+  /// The validated LeaseGuard `(lease_duration Δ, clock_drift_bound ε)` when the mode is ACTIVE, else
+  /// `None`. Active means the config yields a valid commit-wait window — both knobs present, `ε < Δ`,
+  /// and the exact window `Δ·(Δ+ε)/(Δ−ε)` fits the `u64` field AND is below the election timeout (the
+  /// single check lives in [`Config::leaseguard_commit_wait_ns`]). The mode serves lease reads,
+  /// stamps the per-entry window, and arms the commit-wait ONLY when active; an invalid/incomplete
+  /// config DEGRADES TO SAFE — a missing knob is never coerced to zero, no lease fast-path runs.
+  ///
+  /// The `window < election_timeout` bound is a LIVENESS guard (a fresh leader commits before a
+  /// follower could depose it). Cross-leader SAFETY (covering a deposed leader's lease) rests on the
+  /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX), needing no assumption
+  /// about any other node's config. Gated HERE, not only in the optional `Config::validate`, so an
+  /// unvalidated config degrades to Safe. Returns `(Δ, ε)` for the read gate's same-leader check.
+  pub(crate) fn leaseguard_timing(&self) -> Option<(core::time::Duration, core::time::Duration)> {
+    self.config.leaseguard_commit_wait_ns()?;
+    Some((
+      self.config.lease_duration()?,
+      self.config.clock_drift_bound()?,
+    ))
   }
 
   /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
@@ -1098,21 +1141,6 @@ where
       Ok(t) => Some(t),
       Err(_) => {
         self.poison(PoisonReason::LogTerm);
-        None
-      }
-    }
-  }
-
-  /// The in-log LeaseGuard timestamp (nanos on the appending leader's clock) of the entry at `idx`,
-  /// or `None` if the index is absent. A genuine storage READ failure poisons the node
-  /// (`PoisonReason::LogRead`, the same policy as the replication-range read) and returns `None`:
-  /// an absent index is the store's job to answer with `Ok` (empty slice), `Err` is reserved for
-  /// I/O failure. Mirrors [`Self::log_term`]'s fail-stop choke-point for the timestamp axis.
-  fn log_timestamp<L: LogStore>(&mut self, log: &L, idx: Index) -> Option<u64> {
-    match log.entries(idx..idx.next(), u64::MAX) {
-      Ok(slice) => slice.first().map(|e| e.timestamp()),
-      Err(_) => {
-        self.poison(PoisonReason::LogRead);
         None
       }
     }
