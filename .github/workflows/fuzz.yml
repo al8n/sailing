@@ -1,0 +1,69 @@
+name: Fuzz
+
+# cargo-fuzz campaigns against the wire codec (sailing-proto/fuzz) — arbitrary bytes through the
+# decode surface that faces the network, with per-target round-trip oracles (idempotence for the
+# protobuf envelope, canonical byte-identity for the Data seam, the frame-length bound). This is the
+# adversarial complement to the VOPR, whose `wire` feature only round-trips VALID messages.
+#
+# Too heavy for the per-commit gate (nightly + a libfuzzer/C++ toolchain, minutes per target), so it
+# runs on a schedule + on demand. The build step alone catches API drift in the targets; the run step
+# is a bounded campaign per target. A crash writes a deterministic reproducer — replay it locally with
+# `cargo +nightly fuzz run <target> <artifact>`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      max_total_time:
+        description: "Seconds to fuzz EACH target (try 300 for a quick pass, 3600 for a real one)"
+        default: "300"
+        required: false
+  schedule:
+    # Weekly: Monday 05:17 UTC (offset from the deep sweep at 04:17 to avoid contention).
+    - cron: "17 5 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  fuzz:
+    name: fuzz ${{ matrix.target }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [wire_message, wire_conf_change, data_codec, frame_decoder]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install nightly Rust
+        run: rustup toolchain install nightly --no-self-update && rustup default nightly
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Build the target (catches API drift even when the run is short)
+        working-directory: sailing-proto
+        run: cargo fuzz build ${{ matrix.target }}
+      - name: Fuzz ${{ matrix.target }}
+        working-directory: sailing-proto
+        env:
+          MAX_TOTAL_TIME: ${{ github.event.inputs.max_total_time || '300' }}
+        run: cargo fuzz run ${{ matrix.target }} -- -max_total_time=${MAX_TOTAL_TIME}
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-artifacts-${{ matrix.target }}
+          path: sailing-proto/fuzz/artifacts/
+          if-no-files-found: ignore
+
+  # One aggregate status: green iff every target survived its campaign.
+  fuzz-result:
+    name: fuzz result
+    needs: fuzz
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "All fuzz targets survived their campaigns."
