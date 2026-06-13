@@ -1,0 +1,70 @@
+name: Benchmark
+
+# Criterion benches for the wire codec (sailing-proto) and the endpoint hot paths
+# (sailing-simulation). Two needs, two jobs: a cheap COMPILE guard on every push/PR so the
+# benches cannot bitrot against API drift, and an on-demand / scheduled RUN that actually
+# measures (the heavy part — kept off the per-commit path, like the fuzz and deep-sweep
+# workflows). Criterion numbers are machine-relative; this run is for tracking + manual
+# comparison, not a pass/fail gate.
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'README'
+      - 'COPYRIGHT'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+  pull_request:
+    paths-ignore:
+      - 'README'
+      - 'COPYRIGHT'
+      - 'LICENSE-*'
+      - '**.md'
+      - '**.txt'
+  workflow_dispatch:
+  schedule:
+    # Weekly: Monday 06:17 UTC (offset from the deep sweep 04:17 and fuzz 05:17).
+    - cron: "17 6 * * 1"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Bitrot guard: compile (don't run) the benches on every push/PR. Cheap; catches API drift.
+  compile:
+    name: benches (compile)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Compile the benches
+        run: cargo bench --no-run -p sailing-proto -p sailing-simulation
+
+  # The real measurement, on demand or weekly. Not a gate — criterion numbers are
+  # machine-relative; the value is the run output (and a future baseline comparison).
+  run:
+    name: benches (run)
+    if: github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Rust
+        run: rustup update stable --no-self-update && rustup default stable
+      - name: Run the benches
+        run: |
+          cargo bench -p sailing-proto --bench codec -- --noplot
+          cargo bench -p sailing-simulation --bench endpoint -- --noplot
