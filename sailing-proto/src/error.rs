@@ -115,6 +115,25 @@ pub enum ConfigError {
   /// The configured `id` was not present in the voter set.
   #[error("id is not among the configured voters")]
   IdNotAVoter,
+  /// `read_only = LeaseGuard` but no `lease_duration` was set.
+  #[error("the LeaseGuard read mode requires a lease_duration")]
+  LeaseGuardRequiresLeaseDuration,
+  /// `read_only = LeaseGuard` but no `clock_drift_bound` was set (the commit-wait needs it).
+  #[error("the LeaseGuard read mode requires a clock_drift_bound")]
+  LeaseGuardRequiresDriftBound,
+  /// `lease_duration + clock_drift_bound` was not strictly less than the election timeout, so a
+  /// stale LeaseGuard lease could outlive a new leader's election.
+  #[error(
+    "lease_duration ({lease:?}) + drift ({drift:?}) must be < election timeout ({election:?})"
+  )]
+  LeaseTimingTooLong {
+    /// The configured lease window.
+    lease: core::time::Duration,
+    /// The configured clock-drift bound.
+    drift: core::time::Duration,
+    /// The election timeout it must stay under.
+    election: core::time::Duration,
+  },
   /// `max_inflight_msgs` was zero.
   #[error("max_inflight_msgs must be greater than zero")]
   ZeroInflight,
