@@ -28,16 +28,18 @@ impl Cluster {
       None => return false,
     };
     let i = self.node_idx[&leader];
-    let log = &self.logs[i];
-    let stable = &self.stables[i];
-    self.nodes[i]
-      .read_index(
-        self.now,
-        log,
-        stable,
-        bytes::Bytes::copy_from_slice(context),
-      )
-      .expect("leader must accept the read_index for a fresh context");
+    let now_i = self.now_for(i);
+    {
+      let log = &self.logs[i];
+      let stable = &self.stables[i];
+      self.nodes[i]
+        .read_index(now_i, log, stable, bytes::Bytes::copy_from_slice(context))
+        .expect("leader must accept the read_index for a fresh context");
+    }
+    // Serve-time non-vacuity: record whether this read was served by a superseded leader (a LeaseGuard
+    // immediate serve happened synchronously above). The matching ReadState is counted when it drains;
+    // recording touches only a private set the VOPR never observes, so the run is unchanged.
+    self.note_read_issue(i, context, true);
     true
   }
 
@@ -49,22 +51,26 @@ impl Cluster {
   /// caller mints unique contexts, so a duplicate is a harness bug, not weather.
   pub fn read_index_on(&mut self, node: u64, context: &[u8]) -> bool {
     let i = self.node_idx[&node];
-    let log = &self.logs[i];
-    let stable = &self.stables[i];
-    match self.nodes[i].read_index(
-      self.now,
-      log,
-      stable,
-      bytes::Bytes::copy_from_slice(context),
-    ) {
-      Ok(()) => true,
-      Err(sailing_proto::ReadIndexError::DuplicateContext) => {
-        panic!(
-          "read_index_on: duplicate context {context:?} — the caller must mint unique contexts"
-        )
+    let now_i = self.now_for(i);
+    let accepted = {
+      let log = &self.logs[i];
+      let stable = &self.stables[i];
+      match self.nodes[i].read_index(now_i, log, stable, bytes::Bytes::copy_from_slice(context)) {
+        Ok(()) => true,
+        Err(sailing_proto::ReadIndexError::DuplicateContext) => {
+          panic!(
+            "read_index_on: duplicate context {context:?} — the caller must mint unique contexts"
+          )
+        }
+        Err(_) => false,
       }
-      Err(_) => false,
-    }
+    };
+    // Serve-time non-vacuity: record whether this read was served by a superseded leader (the
+    // LeaseGuard immediate serve, if any, happened synchronously above). The matching ReadState is
+    // counted when it drains; recording touches only a private set the VOPR never observes, so the run
+    // is unchanged.
+    self.note_read_issue(i, context, accepted);
+    accepted
   }
 
   /// Initiate a leader transfer: ask the current leader to transfer to `to`.
@@ -76,9 +82,10 @@ impl Cluster {
       .leader()
       .ok_or(sailing_proto::TransferError::NotLeader { leader: None })?;
     let i = self.node_idx[&leader];
+    let now_i = self.now_for(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
-    self.nodes[i].transfer_leader(self.now, log, stable, to)
+    self.nodes[i].transfer_leader(now_i, log, stable, to)
   }
 
   /// Propose `data` on the current leader; returns the assigned index (or `None` if no leader).
@@ -87,10 +94,11 @@ impl Cluster {
     let i = self.node_idx[&leader];
     // Split into disjoint borrows: nodes[i], logs[i], stables[i] are each in a
     // separate Vec, so borrowing them simultaneously is safe.
+    let now_i = self.now_for(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
     self.nodes[i]
-      .propose(self.now, log, stable, &bytes::Bytes::copy_from_slice(data))
+      .propose(now_i, log, stable, &bytes::Bytes::copy_from_slice(data))
       .ok()
   }
 
@@ -98,10 +106,11 @@ impl Cluster {
   pub fn propose_conf_change(&mut self, cc: ConfChange<u64>) -> Option<sailing_proto::Index> {
     let leader = self.leader()?;
     let i = self.node_idx[&leader];
+    let now_i = self.now_for(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
     self.nodes[i]
-      .propose_conf_change(self.now, log, stable, cc)
+      .propose_conf_change(now_i, log, stable, cc)
       .ok()
   }
 
@@ -109,10 +118,11 @@ impl Cluster {
   pub fn propose_conf_change_v2(&mut self, cc: ConfChangeV2<u64>) -> Option<sailing_proto::Index> {
     let leader = self.leader()?;
     let i = self.node_idx[&leader];
+    let now_i = self.now_for(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
     self.nodes[i]
-      .propose_conf_change_v2(self.now, log, stable, cc)
+      .propose_conf_change_v2(now_i, log, stable, cc)
       .ok()
   }
 

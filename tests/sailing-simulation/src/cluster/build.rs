@@ -116,6 +116,12 @@ impl Cluster {
       checker: Checker::new(),
       seed,
       tick_count: 0,
+      // No clock drift by default: every node's rate is 1/1, so `now_for` is the identity and the
+      // cluster is byte-identical to the original single-clock model. `set_clock_drift` overrides this.
+      clock_rate: vec![(1, 1); n],
+      drift_policy: std::boxed::Box::new(|_| (1, 1)),
+      lease_superseded_serves: 0,
+      superseded_read_contexts: std::collections::BTreeSet::new(),
     }
   }
 
@@ -165,8 +171,13 @@ impl Cluster {
     let pos = self.nodes.len();
     self.node_idx.insert(id, pos);
     self.node_ids.push(id);
+    // Assign this mid-run joiner its clock rate from the drift policy BEFORE reading its local `now`,
+    // so a dynamically-added node drifts like the founders (default `(1, 1)` = no drift).
+    let rate = validate_rate((self.drift_policy)(id));
+    self.clock_rate.push(rate);
+    let now_pos = self.now_for(pos);
 
-    let ep = Endpoint::new(base.clone(), self.now, 0x5EED ^ id, LogSm::new());
+    let ep = Endpoint::new(base.clone(), now_pos, 0x5EED ^ id, LogSm::new());
     self.nodes.push(ep);
     // Honor the cluster's store mode so a node added mid-run matches the rest (async clusters
     // must not silently gain a synchronous store).
