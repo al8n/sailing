@@ -356,7 +356,7 @@ where
       // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_resp).
       pr.maybe_update(resp.match_index());
       // Re-borrow self for the resume sequence (pr is dropped above).
-      self.maybe_advance_commit(log);
+      self.maybe_advance_commit(now, log);
       self.apply_committed(log);
       self.maybe_flush_deferred_reads(now, log, stable);
       self.maybe_send_append(now, from, log, stable);

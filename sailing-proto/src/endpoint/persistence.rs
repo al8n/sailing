@@ -453,7 +453,7 @@ where
         if let Some(p) = self.tracker.progress_mut(&self.config.id()) {
           p.maybe_update(upto);
         }
-        self.maybe_advance_commit(log);
+        self.maybe_advance_commit(now, log);
         self.apply_committed(log);
         // ReadIndex deferred-flush: if this commit advanced to the first current-term
         // entry, flush any reads that were deferred waiting for it.
