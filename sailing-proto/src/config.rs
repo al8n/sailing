@@ -9,6 +9,12 @@ use std::vec::Vec;
 /// `Safe` (the default) issues a heartbeat round to confirm leadership before serving the
 /// read. `LeaseBased` skips the round-trip by relying on the election-timeout lease — it
 /// requires [`Config::check_quorum`] to be enabled (validated by [`Config::validate`]).
+/// `LeaseGuard` is the commit-anchored lease (the LeaseGuard protocol): the leader serves a
+/// read while its last committed entry is younger than [`Config::lease_duration`]. It requires
+/// `lease_duration` AND a [`Config::clock_drift_bound`] (the local-timer drift the commit-wait
+/// needs); a [`Config::bounded_clock_uncertainty`] additionally enables inherited-lease reads.
+/// It does NOT need `check_quorum` (its safety rests on the commit-wait, not
+/// election-prevention).
 #[derive(
   Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
 )]
@@ -20,6 +26,10 @@ pub enum ReadOnlyOption {
   ///
   /// **Requires** [`Config::check_quorum`] = `true`; [`Config::validate`] enforces this.
   LeaseBased,
+  /// The commit-anchored LeaseGuard lease. **Requires** [`Config::lease_duration`] and
+  /// [`Config::clock_drift_bound`]; [`Config::bounded_clock_uncertainty`] enables inherited-lease
+  /// reads. [`Config::validate`] enforces `lease_duration + clock_drift_bound < election_timeout`.
+  LeaseGuard,
 }
 
 impl ReadOnlyOption {
@@ -29,6 +39,7 @@ impl ReadOnlyOption {
     match self {
       Self::Safe => "safe",
       Self::LeaseBased => "lease_based",
+      Self::LeaseGuard => "lease_guard",
     }
   }
 }
@@ -67,6 +78,22 @@ pub struct Config<I> {
   disable_proposal_forwarding: bool,
   /// How linearizable read-only queries are satisfied. Default: [`ReadOnlyOption::Safe`].
   read_only: ReadOnlyOption,
+  /// The LeaseGuard lease window Δ: a leader serves a `LeaseGuard` read while its last committed
+  /// entry is younger than this. Required when `read_only = LeaseGuard`; ignored otherwise.
+  /// Default: `None`.
+  lease_duration: Option<Duration>,
+  /// The bounded clock-DRIFT (rate) ε a node may gain or lose while measuring a `lease_duration`.
+  /// REQUIRED for `LeaseGuard`: the commit-wait blocks a new leader from committing past a
+  /// prior-term entry until that entry is `lease_duration + clock_drift_bound` old by the node's
+  /// own local timer — needing only local clocks with bounded drift, no cross-node sync. Default:
+  /// `None`.
+  clock_drift_bound: Option<Duration>,
+  /// The bounded cross-node clock-UNCERTAINTY (skew). OPTIONAL: `Some(ε)` enables LeaseGuard's
+  /// inherited-lease reads (a fresh leader serves reads for unaffected keys during the commit-wait
+  /// by comparing in-log timestamp INTERVALS across leaders), which need synchronized clocks
+  /// within ε. `None` = the new leader simply waits out the prior lease (safe, less available).
+  /// Default: `None`.
+  bounded_clock_uncertainty: Option<Duration>,
 }
 
 impl<I: NodeId> Config<I> {
@@ -103,6 +130,9 @@ impl<I: NodeId> Config<I> {
       check_quorum: false,
       disable_proposal_forwarding: false,
       read_only: ReadOnlyOption::Safe,
+      lease_duration: None,
+      clock_drift_bound: None,
+      bounded_clock_uncertainty: None,
     })
   }
 
@@ -144,6 +174,9 @@ impl<I: NodeId> Config<I> {
       check_quorum: false,
       disable_proposal_forwarding: false,
       read_only: ReadOnlyOption::Safe,
+      lease_duration: None,
+      clock_drift_bound: None,
+      bounded_clock_uncertainty: None,
     })
   }
 
@@ -312,6 +345,45 @@ impl<I: NodeId> Config<I> {
     self
   }
 
+  /// The LeaseGuard lease window Δ (required when `read_only = LeaseGuard`).
+  #[inline(always)]
+  pub const fn lease_duration(&self) -> Option<Duration> {
+    self.lease_duration
+  }
+
+  /// Set the LeaseGuard lease window Δ.
+  #[must_use]
+  pub fn with_lease_duration(mut self, v: Duration) -> Self {
+    self.lease_duration = Some(v);
+    self
+  }
+
+  /// The bounded clock-drift ε for the commit-wait (required for `LeaseGuard`).
+  #[inline(always)]
+  pub const fn clock_drift_bound(&self) -> Option<Duration> {
+    self.clock_drift_bound
+  }
+
+  /// Set the bounded clock-drift ε (required for `LeaseGuard`).
+  #[must_use]
+  pub fn with_clock_drift_bound(mut self, v: Duration) -> Self {
+    self.clock_drift_bound = Some(v);
+    self
+  }
+
+  /// The bounded cross-node clock-uncertainty (`Some` enables LeaseGuard inherited-lease reads).
+  #[inline(always)]
+  pub const fn bounded_clock_uncertainty(&self) -> Option<Duration> {
+    self.bounded_clock_uncertainty
+  }
+
+  /// Set the bounded cross-node clock-uncertainty (enables LeaseGuard inherited-lease reads).
+  #[must_use]
+  pub fn with_bounded_clock_uncertainty(mut self, v: Duration) -> Self {
+    self.bounded_clock_uncertainty = Some(v);
+    self
+  }
+
   /// Validate cross-field invariants that cannot be checked at construction time.
   ///
   /// Currently enforces: `ReadOnlyOption::LeaseBased` requires `check_quorum = true`.
@@ -324,6 +396,27 @@ impl<I: NodeId> Config<I> {
   pub fn validate(&self) -> Result<(), ConfigError> {
     if self.read_only == ReadOnlyOption::LeaseBased && !self.check_quorum {
       return Err(ConfigError::LeaseRequiresCheckQuorum);
+    }
+    if self.read_only == ReadOnlyOption::LeaseGuard {
+      let lease = self
+        .lease_duration
+        .ok_or(ConfigError::LeaseGuardRequiresLeaseDuration)?;
+      let drift = self
+        .clock_drift_bound
+        .ok_or(ConfigError::LeaseGuardRequiresDriftBound)?;
+      // The commit-wait blocks until a prior-term entry is `lease + drift` old by the node's own
+      // timer; the lease itself must expire strictly before a new leader can be elected, or a
+      // stale lease could outlive its successor.
+      if lease
+        .checked_add(drift)
+        .is_none_or(|d| d >= self.election_timeout)
+      {
+        return Err(ConfigError::LeaseTimingTooLong {
+          lease,
+          drift,
+          election: self.election_timeout,
+        });
+      }
     }
     Ok(())
   }

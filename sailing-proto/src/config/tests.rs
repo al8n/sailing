@@ -229,3 +229,62 @@ fn validate_lease_requires_check_quorum() {
       .is_ok()
   );
 }
+
+#[test]
+fn leaseguard_config_validation() {
+  use crate::{ConfigError, ReadOnlyOption};
+  let base = || {
+    Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+
+  // LeaseGuard without a lease_duration is rejected.
+  let c = base().with_read_only(ReadOnlyOption::LeaseGuard);
+  assert!(matches!(
+    c.validate(),
+    Err(ConfigError::LeaseGuardRequiresLeaseDuration)
+  ));
+
+  // LeaseGuard also requires a clock_drift_bound (the commit-wait needs it).
+  let c = base()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(400));
+  assert!(matches!(
+    c.validate(),
+    Err(ConfigError::LeaseGuardRequiresDriftBound)
+  ));
+
+  // lease_duration + clock_drift_bound must be < election timeout.
+  let c = base()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(900))
+    .with_clock_drift_bound(Duration::from_millis(200)); // 1100 >= 1000
+  assert!(matches!(
+    c.validate(),
+    Err(ConfigError::LeaseTimingTooLong { .. })
+  ));
+
+  // A valid LeaseGuard config — it does NOT require check_quorum (its safety is the commit-wait,
+  // not election-prevention). bounded_clock_uncertainty is optional (enables inherited reads).
+  let c = base()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(400))
+    .with_clock_drift_bound(Duration::from_millis(50));
+  assert!(c.validate().is_ok());
+  assert_eq!(c.lease_duration(), Some(Duration::from_millis(400)));
+  assert_eq!(c.clock_drift_bound(), Some(Duration::from_millis(50)));
+  assert_eq!(c.bounded_clock_uncertainty(), None);
+
+  let c = c.with_bounded_clock_uncertainty(Duration::from_millis(10));
+  assert!(c.validate().is_ok());
+  assert_eq!(
+    c.bounded_clock_uncertainty(),
+    Some(Duration::from_millis(10))
+  );
+  assert_eq!(ReadOnlyOption::LeaseGuard.as_str(), "lease_guard");
+}

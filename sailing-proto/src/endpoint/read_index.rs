@@ -165,6 +165,12 @@ where
           self.do_safe_read(now, context, from);
         }
       }
+      crate::ReadOnlyOption::LeaseGuard => {
+        // The LeaseGuard lease-read fast path is not implemented yet (it lands with the mode's
+        // later layers); until then LeaseGuard serves reads via the always-safe heartbeat round,
+        // exactly like `Safe`. This keeps the config addition behavior-free.
+        self.do_safe_read(now, context, from);
+      }
     }
   }
 
