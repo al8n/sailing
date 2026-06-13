@@ -217,6 +217,7 @@ fn pb_entry(e: &Entry) -> pb::Entry {
       EntryKind::Empty => pb::EntryKind::Empty,
     }),
     data: e.data_bytes(),
+    timestamp: e.timestamp(),
     ..Default::default()
   }
 }
@@ -228,12 +229,7 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
     EnumValue::Known(pb::EntryKind::Empty) => EntryKind::Empty,
     EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
   };
-  Ok(Entry::new(
-    Term::new(w.term),
-    Index::new(w.index),
-    kind,
-    w.data,
-  ))
+  Ok(Entry::new(Term::new(w.term), Index::new(w.index), kind, w.data).with_timestamp(w.timestamp))
 }
 
 fn pb_conf_state<I: crate::NodeId>(c: &ConfState<I>) -> pb::ConfState {
