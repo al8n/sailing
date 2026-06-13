@@ -794,6 +794,7 @@ fn normal_entry(term: u64, index: u64, payload: &[u8]) -> crate::Entry {
 // Tests are split by concern into these submodules.
 mod election;
 mod lease;
+mod leaseguard;
 mod membership;
 mod misc;
 mod read_index;

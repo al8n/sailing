@@ -839,6 +839,18 @@ where
     self.leader
   }
 
+  /// The LeaseGuard append-timestamp to stamp on a new leader entry: the leader's clock (nanos
+  /// since its ORIGIN) when `read_only = LeaseGuard`, else `0` (the field is then absent on the
+  /// wire and ignored). Cross-node comparability is the deployment's synchronized-origin
+  /// assumption (see WIRE.md); within the sim and a single node it is the monotonic clock.
+  pub(crate) fn lease_stamp(&self, now: Instant) -> u64 {
+    if self.config.read_only() == crate::ReadOnlyOption::LeaseGuard {
+      now.since_origin().as_nanos() as u64
+    } else {
+      0
+    }
+  }
+
   /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
   /// identity changes, clears reads forwarded to the previous leader (the forward target is
   /// gone; re-issue against the new belief) and emits [`LeaderChanged`](crate::LeaderChanged)
