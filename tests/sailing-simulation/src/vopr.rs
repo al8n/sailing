@@ -385,19 +385,28 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 
   // ── Setup: seed-chosen cluster size in 2..=7 (INCLUDING even sizes). ───────────────────────────
   let size = 2 + (prng.next_u64() % 6) as usize; // 2..=7
-  // Seed-chosen read/lease regime: a third of seeds run today's shape (Safe, no CheckQuorum), a
-  // third add CheckQuorum (its stepdown now interacts with reads under partitions), and a third
-  // run LeaseBased reads (which REQUIRE CheckQuorum) — the lease-promise machinery's only
-  // randomized-fault coverage. Drawn from the master PRNG like every other choice.
-  let read_mode = prng.next_u64() % 3;
+  // Seed-chosen read/lease regime: a quarter of seeds run today's shape (Safe, no CheckQuorum), a
+  // quarter add CheckQuorum (its stepdown now interacts with reads under partitions), a quarter run
+  // LeaseBased reads (which REQUIRE CheckQuorum), and a quarter run LeaseGuard reads (the
+  // commit-anchored lease: the post-election commit-wait + the read gate, drift-bounded, NO
+  // CheckQuorum needed) — the lease machinery's only randomized-fault coverage. The mode-agnostic
+  // read-linearizability oracle validates every confirmed read regardless of how it was served, so a
+  // stale LeaseGuard serve (a commit-wait or read-gate bug) panics with seed+tick. Δ=300ms +
+  // ε_drift=50ms < the 1000ms election timeout (the LeaseGuard validity bound). Drawn from the
+  // master PRNG like every other choice.
+  let read_mode = prng.next_u64() % 4;
   let mut c = Cluster::new_async_with(size, seed, move |cfg| {
     let cfg = cfg.with_pre_vote(true);
     match read_mode {
       0 => cfg,
       1 => cfg.with_check_quorum(true),
-      _ => cfg
+      2 => cfg
         .with_check_quorum(true)
         .with_read_only(sailing_proto::ReadOnlyOption::LeaseBased),
+      _ => cfg
+        .with_read_only(sailing_proto::ReadOnlyOption::LeaseGuard)
+        .with_lease_duration(Duration::from_millis(300))
+        .with_clock_drift_bound(Duration::from_millis(50)),
     }
   });
 
