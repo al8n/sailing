@@ -275,6 +275,10 @@ where
       votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
+      // A restarted node recovers as Follower; the commit-wait is (re)computed at the next
+      // `become_leader` from that election's `now` — the conservative anchor needs nothing carried
+      // across the crash (it does not depend on any lost in-memory per-append timer).
+      commit_wait_until: None,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
       // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup
