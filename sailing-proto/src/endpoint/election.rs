@@ -456,22 +456,23 @@ where
       self.election_deadline = Some(now + self.config.election_timeout());
     }
 
-    // LeaseGuard commit-wait: arm the post-election deferred-commit window. A LeaseGuard leader may
-    // not commit (and so may not begin serving reads from its own-term lease) until any deposed
-    // leader's read-lease has provably expired. The anchor is THIS election's `now`, a conservative
-    // lower bound — every entry this node inherited was created (by its originating leader) before
-    // this node replicated it, which was before it won this election, so `now` is ≥ every inherited
-    // entry's creation time. Waiting `lease_duration + clock_drift_bound` past `now` therefore
-    // outlasts any deposed leader's lease (`created + lease_duration` on the deposed clock), the
-    // `clock_drift_bound` slack ε absorbing the two clocks' RATE difference. `maybe_advance_commit`
-    // holds the first commit until this deadline; non-LeaseGuard modes arm nothing (`None`).
-    self.commit_wait_until = if self.config.read_only() == crate::ReadOnlyOption::LeaseGuard {
-      let delta = self.config.lease_duration().unwrap_or_default();
-      let drift = self.config.clock_drift_bound().unwrap_or_default();
-      Some(now + delta + drift)
-    } else {
-      None
-    };
+    // LeaseGuard commit-wait: arm the post-election deferred-commit window whenever this node
+    // INHERITED a nonzero lease window — REGARDLESS of this node's own read mode. The wait covers a
+    // DEPOSED leader's still-live read-lease, which is independent of whether THIS successor serves
+    // LeaseGuard reads: a node rolled to Safe/LeaseBased (or holding an invalid LeaseGuard config)
+    // that committed new entries while a deposed LeaseGuard leader's lease was still live would
+    // recreate the stale read. TWO conservative bounds, with no cross-node clock comparison and no
+    // assumption about any other node's config:
+    //   • TIME anchor = THIS election's `now` — a lower bound on every inherited entry's creation
+    //     time (this node replicated them all before winning the election).
+    //   • WINDOW bound = `max_lease_window` — the MAX of every inherited entry's SELF-DESCRIBING
+    //     `lease_window` (its appending leader's own exact `Δ·(Δ+ε)/(Δ−ε)`). So whatever window any
+    //     deposed leader actually used is carried in the entries it created and covered exactly, even
+    //     under heterogeneous per-node config. `0` on a cluster that never ran LeaseGuard (every
+    //     `lease_window` is 0) ⇒ no wait, so Safe/LeaseBased clusters are unaffected.
+    // (`leaseguard_timing` gates STAMPING new entries and serving lease reads, NOT this wait.)
+    self.commit_wait_until = (self.max_lease_window > 0)
+      .then(|| now + core::time::Duration::from_nanos(self.max_lease_window));
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
     // Self-match advance is deferred until the append is durable (on_log_appended).
@@ -490,7 +491,8 @@ where
       crate::EntryKind::Empty,
       bytes::Bytes::new(),
     )
-    .with_timestamp(self.lease_stamp(now));
+    .with_timestamp(self.lease_stamp(now))
+    .with_lease_window(self.lease_window_stamp());
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&noop));
     self

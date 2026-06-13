@@ -50,6 +50,18 @@ reference — this section pins the SEMANTICS:
   field existed. Cross-leader comparability requires the deployment to anchor each node's ORIGIN
   to a synchronized epoch within the configured skew bound — the LeaseGuard mode's documented
   clock assumption, NOT a property the protocol can enforce.
+- `Entry.lease_window` (and `SnapshotMeta.max_lease_window`) carry the LeaseGuard commit-wait window
+  of the appending leader (nanos) — the exact `lease_duration·(lease_duration + clock_drift_bound) /
+  (lease_duration − clock_drift_bound)`, which covers a slow deposed leader and a fast successor (see
+  `Config::clock_drift_bound`). A successor sizes its post-election commit-wait by the MAX over
+  inherited entries — self-describing cross-leader safety with no assumption about other nodes'
+  config. `0` (and absent on the wire) in every other mode.
+  **Deployment contract:** this is safe only on a fresh, fully-LeaseGuard-aware cluster whose storage
+  PRESERVES these fields. On a partially-upgraded cluster, or storage that strips unknown proto
+  fields, a stored window can read `0` while the true window is nonzero; the duplicate AppendEntries /
+  snapshot runtime paths re-fold a newly-visible window, but durable survival across a restart of a
+  stripped window is the operator's responsibility (mid-life migration is out of scope — like
+  `LeaseBased`'s bounded-drift contract, the protocol consumes the bound, it cannot enforce it).
 - An enum field must carry a KNOWN value; the `Message.body` oneof must be present. Either
   failure rejects the message (parity with the old codec's unknown-tag reject).
 - A rejected message closes the connection (transport) — the endpoint is never poisoned by

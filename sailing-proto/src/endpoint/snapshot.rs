@@ -93,7 +93,13 @@ where
     let Some(last_term) = self.log_term(log, self.applied) else {
       return;
     };
-    let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state());
+    // Carry the self-describing LeaseGuard bound: this snapshot will subsume entries whose stamped
+    // lease windows are about to leave the live log, so it records the node's current
+    // `max_lease_window` (a conservative over-bound — the global max ≥ the compacted prefix's max).
+    // A successor that compacts past — or installs — these entries then still covers any deposed
+    // leader's lease on a now-unavailable entry.
+    let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
+      .with_max_lease_window(self.max_lease_window);
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
@@ -128,6 +134,17 @@ where
       self.poison(PoisonReason::LogExhausted);
       return;
     }
+
+    // Fold this snapshot's carried LeaseGuard bound into `max_lease_window` HERE — before EVERY early
+    // return below (redundant short-circuit, duplicate-install guard) and before the destructive
+    // install is deferred to `install_snapshot_now`. Otherwise a follower elected (a) while the blob
+    // fsync is still pending, or (b) after acking a redundant/duplicate snapshot whose carried bound a
+    // field-stripped local copy lost, would size its commit-wait from a stale max and miss a deposed
+    // lease on an entry the snapshot subsumes (a stale read). Folding a not-yet-validated meta is safe
+    // (the bound is just a number; a corrupt snapshot poisons below and an inert node never leads), and
+    // monotonic so the later re-folds are harmless idempotent re-raises. (Durable cross-restart
+    // survival of a stripped bound is the fresh-cluster / matched-schema contract; see WIRE.md.)
+    self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
 
     // Staleness guard: short-circuit ONLY when the snapshot is ALREADY part of this follower's durable
     // RECOVERABLE prefix — `ack_watermark()` = max(durable log tip, durable snapshot boundary). Such a
@@ -236,6 +253,11 @@ where
     // in-window appends advanced `commit` over a not-yet-flushed tail (so `durable_index < boundary`)
     // under-acks `durable_index` and pins the leader in `ProgressState::Snapshot` until the tail flushes.
     self.durable_snapshot_index = core::cmp::max(self.durable_snapshot_index, meta.last_index());
+    // Raise the self-describing LeaseGuard bound over the snapshot's carried max — BEFORE the
+    // stale-drop, like `durable_snapshot_index`, so even a dropped-stale install contributes its
+    // bound (the sender held entries this follower may not have all of). Monotonic, so the redundant
+    // raise from an already-covered install is harmless.
+    self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
     // Completion-time staleness re-check (mirror the receipt-time guard): in-window AppendEntries can
     // have caught this follower up to/past the boundary while the blob was in flight. Installing now
     // would REGRESS committed/applied state, so DROP the deferred install (the durable blob is harmless;

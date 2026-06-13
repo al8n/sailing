@@ -408,16 +408,31 @@ pub struct SnapshotMeta<I> {
   last_index: Index,
   last_term: Term,
   conf: ConfState<I>,
+  /// The max LeaseGuard commit-wait window (nanos) over the entries this snapshot subsumes (`0` in
+  /// non-LeaseGuard clusters). Carried so a node that compacts past — or installs — these entries
+  /// still bounds any deposed leader's lease on a now-unavailable entry. See [`with_max_lease_window`].
+  max_lease_window: u64,
 }
 
 impl<I: crate::NodeId> SnapshotMeta<I> {
-  /// Construct.
+  /// Construct (`max_lease_window` defaults to `0`; set it with
+  /// [`with_max_lease_window`](Self::with_max_lease_window) in LeaseGuard mode).
   pub fn new(last_index: Index, last_term: Term, conf: ConfState<I>) -> Self {
     Self {
       last_index,
       last_term,
       conf,
+      max_lease_window: 0,
     }
+  }
+
+  /// Set the max LeaseGuard commit-wait window (nanos) over the subsumed entries. A builder, so the
+  /// common 3-arg [`new`](Self::new) stays untouched in non-LeaseGuard paths.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_max_lease_window(mut self, max_lease_window: u64) -> Self {
+    self.max_lease_window = max_lease_window;
+    self
   }
 
   /// The last log index covered by this snapshot.
@@ -436,6 +451,12 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   #[inline(always)]
   pub fn conf(&self) -> &ConfState<I> {
     &self.conf
+  }
+
+  /// The max LeaseGuard commit-wait window (nanos) over the subsumed entries, or `0` if unset.
+  #[inline(always)]
+  pub const fn max_lease_window(&self) -> u64 {
+    self.max_lease_window
   }
 }
 

@@ -212,6 +212,9 @@ pub(crate) struct FailTermLog {
   inner: VecLog,
   /// When `Some(i)`, `term(i)` returns `Err(())`; every other index delegates to `inner`.
   fail_index: Option<Index>,
+  /// When `Some(i)`, `entries(range)` returns `Err(())` for any range CONTAINING `i`; otherwise
+  /// delegates to `inner`. Proves a fatal log-read mid-scan fail-stops rather than fabricating a default.
+  fail_entries_index: Option<Index>,
 }
 
 impl FailTermLog {
@@ -223,6 +226,11 @@ impl FailTermLog {
   /// Arm the fatal term-read failure at `index` (cleared with `None`).
   pub(crate) fn fail_term_at(&mut self, index: Option<Index>) {
     self.fail_index = index;
+  }
+
+  /// Arm the fatal `entries` failure at `index`: any range containing it returns `Err(())`.
+  pub(crate) fn fail_entries_at(&mut self, index: Option<Index>) {
+    self.fail_entries_index = index;
   }
 }
 
@@ -249,6 +257,9 @@ impl LogStore for FailTermLog {
     range: core::ops::Range<Index>,
     max_bytes: u64,
   ) -> Result<&[Entry], Self::Error> {
+    if self.fail_entries_index.is_some_and(|i| range.contains(&i)) {
+      return Err(());
+    }
     Ok(
       self
         .inner

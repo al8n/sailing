@@ -68,18 +68,18 @@ fn leaseguard_leader_stamps_appended_entries() {
   );
 }
 
-/// The LeaseGuard post-election commit-wait: a freshly-elected LeaseGuard leader HOLDS its first
-/// commit (its own-term no-op) until `lease_duration + clock_drift_bound` past the election, even
-/// with a quorum ack in hand, so any deposed leader's read-lease has provably expired before this
-/// leader can commit (and begin serving lease reads). A `Safe` leader has no such wait.
+/// A FRESH LeaseGuard cluster's first leader has no inherited entries (`max_lease_window = 0`), so it
+/// has no deposed lease to wait out — its no-op commits immediately on a quorum ack, exactly like
+/// Safe. (The commit-wait engages only on a real failover; see
+/// [`leaseguard_commit_wait_covers_inherited_max_window`].)
 #[test]
-fn leaseguard_commit_wait_holds_first_commit_until_deadline() {
+fn leaseguard_fresh_cluster_has_no_commit_wait() {
   use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
   use core::time::Duration;
 
   // Drive a fresh leader to the point where peer 2 has acked the no-op at index 1, returning
   // `(endpoint, election_instant)`. `read_only` selects the mode; LeaseGuard also sets Δ=300ms,
-  // ε_drift=50ms (so the wait is 350ms and Δ+ε_drift < the 1000ms election timeout).
+  // ε_drift=50ms (the exact window 300·350/250 = 420ms < the 1000ms election timeout, so valid).
   fn elected_with_quorum_ack(
     read_only: crate::ReadOnlyOption,
   ) -> (
@@ -139,39 +139,137 @@ fn leaseguard_commit_wait_holds_first_commit_until_deadline() {
     (ep, log, stable, d)
   }
 
-  // Safe mode: the quorum ack commits the no-op immediately — no wait.
-  let (safe, _log, _stable, _d) = elected_with_quorum_ack(crate::ReadOnlyOption::Safe);
+  // Both Safe AND a fresh LeaseGuard leader commit immediately: a fresh node inherited no windowed
+  // entries, so max_lease_window = 0 and there is no deposed lease to wait out.
+  let (safe, ..) = elected_with_quorum_ack(crate::ReadOnlyOption::Safe);
   assert_eq!(
     safe.commit_index(),
     Index::new(1),
     "a Safe leader commits its no-op as soon as a quorum acks"
   );
-
-  // LeaseGuard mode: the same quorum ack does NOT commit — the commit-wait holds it.
-  let (mut lg, mut log, mut stable, d) = elected_with_quorum_ack(crate::ReadOnlyOption::LeaseGuard);
-  assert_eq!(
-    lg.commit_index(),
-    Index::ZERO,
-    "a LeaseGuard leader holds its first commit despite a quorum ack (commit-wait armed)"
-  );
-
-  // One nanosecond before the deadline (Δ+ε_drift = 350ms): still held. A timeout here fires the
-  // heartbeat but NOT the commit-wait, so commit stays at ZERO.
-  let just_before = d + Duration::from_nanos(350_000_000 - 1);
-  lg.handle_timeout(just_before, &mut log, &mut stable);
-  assert_eq!(
-    lg.commit_index(),
-    Index::ZERO,
-    "the commit-wait must not release one nanosecond before the deadline"
-  );
-
-  // At exactly Δ+ε_drift past the election: the commit-wait fires and the no-op commits.
-  let deadline = d + Duration::from_millis(350);
-  lg.handle_timeout(deadline, &mut log, &mut stable);
+  let (lg, ..) = elected_with_quorum_ack(crate::ReadOnlyOption::LeaseGuard);
   assert_eq!(
     lg.commit_index(),
     Index::new(1),
-    "the commit-wait releases the first commit at lease_duration + clock_drift_bound"
+    "a fresh LeaseGuard leader has max_lease_window=0, so it also commits immediately (no wait)"
+  );
+}
+
+/// The LeaseGuard commit-wait covers the MAX inherited lease window (the self-describing cross-leader
+/// safety). A node that inherits entries a deposed leader stamped — each carrying that leader's own
+/// window — holds its first post-election commit until `now + max(inherited window)`, so any deposed
+/// leader's read-lease has provably expired, even under heterogeneous per-node windows (the LARGER
+/// of two inherited windows binds, regardless of entry order — no assumption about other configs).
+#[test]
+fn leaseguard_commit_wait_covers_inherited_max_window() {
+  use crate::{
+    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // A deposed leader (node 2, term 5) replicated two entries to node 1. The LARGER window (350ms) is
+  // on the EARLIER index, so the test pins "wait the MAX", not "wait the last entry's window".
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(350_000_000),
+        Entry::new(
+          Term::new(5),
+          Index::new(2),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"b"),
+        )
+        .with_lease_window(200_000_000),
+      ],
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // The deposed leader goes silent; node 1 times out, campaigns (term 6), wins, appends its no-op.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // peer 3 acks the no-op at index 3 → quorum, but the commit-wait holds it (max window = 350ms).
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(3),
+    )),
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "held by the commit-wait sized at the MAX inherited lease window"
+  );
+
+  // 1ns before now+350ms: still held — proves the wait is the 350ms MAX, not the 200ms or 0.
+  ep.handle_timeout(
+    d + Duration::from_nanos(350_000_000 - 1),
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released before now + max(inherited window)"
+  );
+
+  // At now+350ms: the commit-wait fires; the no-op and the inherited entries commit.
+  ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(3),
+    "released at now + max(inherited window) = 350ms"
   );
 }
 
@@ -212,7 +310,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
   ep.handle_storage(d, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
-  // peer 2 acks the no-op (held by the commit-wait), then release the commit-wait at d+350ms.
+  // peer 2 acks the no-op (held by the commit-wait), then release the commit-wait at d+1000ms.
   ep.handle_message(
     d,
     &mut log,
@@ -227,7 +325,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
       Index::new(1),
     )),
   );
-  let t1 = d + Duration::from_millis(350);
+  let t1 = d + Duration::from_millis(1000);
   ep.handle_timeout(t1, &mut log, &mut stable);
   assert_eq!(ep.commit_index(), Index::new(1));
 
@@ -257,7 +355,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
   assert_eq!(ep.commit_index(), idx2, "the fresh entry commits (no wait)");
   while ep.poll_event().is_some() {}
 
-  // LIVE: a read at t1 (anchor t1 + Δ=300ms >= t1) serves immediately — a ReadState with no round.
+  // LIVE: a read at t1 (anchor t1 + Δ=300ms > t1) serves immediately — a ReadState with no round.
   ep.read_index(t1, &log, &stable, bytes::Bytes::from_static(b"r1"))
     .unwrap();
   let live: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
@@ -266,6 +364,24 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
       .iter()
       .any(|e| matches!(e, crate::Event::ReadState(rs) if rs.index() == idx2)),
     "a live LeaseGuard lease serves the read immediately from the local commit"
+  );
+
+  // BOUNDARY: a read at EXACTLY ts + Δ (t1+300ms). The STRICT gate (`ts + Δ > now`) treats the lease
+  // as already DEAD at its expiry instant, so the read degrades to the safe round — closing the
+  // equal-timestamp race with a successor whose commit-wait releases at `now >= deadline`.
+  ep.read_index(
+    t1 + Duration::from_millis(300),
+    &log,
+    &stable,
+    bytes::Bytes::from_static(b"rb"),
+  )
+  .unwrap();
+  let at_boundary: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  assert!(
+    !at_boundary
+      .iter()
+      .any(|e| matches!(e, crate::Event::ReadState(_))),
+    "the lease is DEAD at exactly ts + lease_duration (strict gate), so the read degrades to Safe"
   );
 
   // STALE: a read at t1+400ms (anchor t1 + 300ms < t1+400ms) degrades to the safe heartbeat round —
@@ -279,5 +395,484 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
       .iter()
       .any(|e| matches!(e, crate::Event::ReadState(_))),
     "a stale LeaseGuard lease degrades to the safe round (no immediate ReadState)"
+  );
+}
+
+/// An INVALID LeaseGuard config (a missing required knob, or Δ+drift not below the election timeout)
+/// must DEGRADE TO SAFE: no commit-wait is armed, so the first commit is NOT held, and reads take the
+/// safe heartbeat round — never an uncoverable lease fast-path or a missing-knob coerced to zero.
+#[test]
+fn leaseguard_invalid_config_degrades_to_safe() {
+  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use core::time::Duration;
+
+  // LeaseGuard with lease_duration but NO clock_drift_bound: invalid (Config::validate would reject),
+  // so the activation gate `leaseguard_lease_window` returns None and the mode is inert.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  // peer 2 acks the no-op at index 1. With an invalid config NO commit-wait is armed, so the no-op
+  // commits IMMEDIATELY at `d` (exactly like Safe), not held to election_timeout.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(1),
+    "an invalid LeaseGuard config arms no commit-wait — the no-op commits immediately like Safe"
+  );
+
+  // And a read degrades to the safe heartbeat round: no immediate ReadState (it awaits a quorum ack).
+  while ep.poll_event().is_some() {}
+  ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r"))
+    .unwrap();
+  let evs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  assert!(
+    !evs.iter().any(|e| matches!(e, crate::Event::ReadState(_))),
+    "an invalid LeaseGuard config serves reads via the safe round, not a lease fast-path"
+  );
+}
+
+/// A successor whose OWN read mode is NOT active LeaseGuard (here `Safe`) must STILL defer its first
+/// commit to cover a DEPOSED LeaseGuard leader's lease: the commit-wait keys on the inherited
+/// `max_lease_window`, not on whether the successor serves LeaseGuard reads. Otherwise a node rolled
+/// to Safe/LeaseBased could commit a new entry while the deposed leader still serves a stale read.
+#[test]
+fn leaseguard_inherited_window_defers_commit_even_for_a_safe_successor() {
+  use crate::{
+    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+  };
+  use core::time::Duration;
+
+  // Node 1 runs SAFE — it serves no lease reads and stamps no windows — but it inherits a windowed
+  // entry (window 350ms) from a deposed LeaseGuard leader (node 2, term 5).
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert_eq!(cfg.read_only(), crate::ReadOnlyOption::Safe);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(350_000_000),
+      ],
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // Node 1 times out, campaigns (term 6), wins, appends its no-op at index 2.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // peer 3 acks the no-op at index 2 → quorum, but the commit-wait holds it despite Safe mode.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "a Safe successor must still defer commit while a deposed LeaseGuard lease may be live"
+  );
+
+  // Released at now + the inherited window (350ms) — proving the wait keyed on the inherited window,
+  // not on the successor's own read mode.
+  ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(2),
+    "released at now + inherited max_lease_window, independent of the successor's read mode"
+  );
+}
+
+/// A FATAL log-read fault during the restart `max_lease_window` scan must POISON, not recover with a
+/// partial (under-sized) bound — otherwise a successor could under-wait and serve a stale read. The
+/// restart recompute is exactly the path that makes the bound self-describing across a crash, so it
+/// must fail-stop on a read fault like every other durable read.
+#[test]
+fn leaseguard_restart_scan_read_fault_poisons() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, Term};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+
+  let mut stable = crate::testkit::AsyncStable::default();
+  stable.force_state(Term::new(2), None, Index::new(1));
+  let mut log = crate::testkit::FailTermLog::default();
+  log.force_append(&[Entry::new(
+    Term::new(2),
+    Index::new(1),
+    EntryKind::Normal,
+    bytes::Bytes::from_static(b"a"),
+  )
+  .with_lease_window(350_000_000)]);
+  // Reading the entry during the LeaseGuard window scan fails (a fatal storage fault).
+  log.fail_entries_at(Some(Index::new(1)));
+
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    42,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(
+    ep.is_poisoned(),
+    "a fatal log-read during the LeaseGuard window scan must poison"
+  );
+  assert_eq!(ep.poison_reason().map(|r| r.as_str()), Some("log_read"));
+}
+
+/// `on_install_snapshot` folds the snapshot's carried lease window into `max_lease_window` at
+/// RECEIPT — before the destructive install is deferred to `install_snapshot_now`. Otherwise a
+/// follower that times out and is elected while the blob fsync is still pending would size its
+/// commit-wait from the stale max, missing a deposed lease on an entry the snapshot subsumes.
+#[test]
+fn leaseguard_pending_snapshot_folds_window_at_receipt() {
+  use crate::{
+    Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::AsyncStable::default();
+
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  )
+  .with_max_lease_window(350_000_000);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      2u64,
+      meta,
+      super::encode_snapshot(0),
+    )),
+  );
+  // The destructive install is DEFERRED (no `handle_storage`, so the blob is not yet durable and
+  // `install_snapshot_now` has NOT run), but the window is folded at receipt.
+  assert_eq!(
+    ep.max_lease_window, 350_000_000,
+    "the snapshot's lease window is folded at receipt, before the deferred install completes"
+  );
+}
+
+/// Defense-in-depth (schema drift): a DUPLICATE AppendEntries whose entry matches an already-present
+/// one by index+term but carries a LARGER lease_window still folds that window into max_lease_window —
+/// so a follower whose stored copy lost the field (mixed-version / field-stripped) is not left under-
+/// sized at the runtime path. (Durable cross-restart survival is the fresh-cluster contract.)
+#[test]
+fn leaseguard_duplicate_append_folds_a_newly_visible_window() {
+  use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  let ae = |window: u64| {
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(window)
+      ],
+      Index::ZERO,
+    ))
+  };
+  // First copy carries a ZERO window (a field-stripped / pre-upgrade entry).
+  ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, ae(0));
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(ep.max_lease_window, 0, "stored copy had a zero window");
+  // A DUPLICATE (same index+term) from a LeaseGuard-aware leader carries the real window.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    ae(350_000_000),
+  );
+  assert_eq!(
+    ep.max_lease_window, 350_000_000,
+    "the duplicate's lease_window is folded even though the entry was already present"
+  );
+}
+
+/// Defense-in-depth (schema drift): a DUPLICATE InstallSnapshot at the same boundary but carrying a
+/// LARGER max_lease_window folds that bound BEFORE the duplicate-install guard returns — so a stale or
+/// field-stripped local copy is not left under-sized at the runtime path.
+#[test]
+fn leaseguard_duplicate_snapshot_folds_a_newly_visible_window() {
+  use crate::{
+    Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::AsyncStable::default();
+
+  let is = |window: u64| {
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      2u64,
+      SnapshotMeta::new(
+        Index::new(5),
+        Term::new(1),
+        ConfState::from_voters(std::vec![1u64, 2, 3]),
+      )
+      .with_max_lease_window(window),
+      super::encode_snapshot(0),
+    ))
+  };
+  // First receipt carries a ZERO bound (stale / field-stripped); install is left pending.
+  ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, is(0));
+  assert_eq!(
+    ep.max_lease_window, 0,
+    "first snapshot carried a zero bound"
+  );
+  // A DUPLICATE at the same boundary carries the real bound — folded before the duplicate guard returns.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    is(350_000_000),
+  );
+  assert_eq!(
+    ep.max_lease_window, 350_000_000,
+    "the duplicate snapshot's carried bound is folded even though the install is a duplicate"
+  );
+}
+
+/// The read gate compares ages as Durations, NOT a lossy `u128 → u64` nanos cast: an entry stamped
+/// near `u64::MAX` nanoseconds since ORIGIN must read STALE once real time crosses the boundary, not
+/// wrap `now` to a small value and stay falsely live (which would let a deposed leader serve stale).
+#[test]
+fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
+  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Elect at the (small) election deadline; the no-op commits immediately (fresh cluster, no wait).
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Propose+commit a fresh entry stamped at ~u64::MAX nanos since ORIGIN.
+  let t_huge = Instant::ORIGIN + Duration::from_nanos(u64::MAX - 100);
+  let idx = ep
+    .propose(t_huge, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+    .unwrap();
+  ep.handle_storage(t_huge, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  ep.handle_message(
+    t_huge,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  assert_eq!(ep.commit_index(), idx);
+  while ep.poll_event().is_some() {}
+
+  // LIVE at t_huge (age 0 < Δ).
+  ep.read_index(t_huge, &log, &stable, bytes::Bytes::from_static(b"r1"))
+    .unwrap();
+  let live: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  assert!(
+    live.iter().any(|e| matches!(e, crate::Event::ReadState(_))),
+    "a fresh near-u64::MAX-stamped lease serves immediately"
+  );
+
+  // STALE 1s later — `since_origin` now exceeds u64::MAX nanos. A u64 cast would WRAP `now` to a small
+  // value and keep `ts + Δ > now` true (falsely live); the Duration age `now − ts = 1s > Δ` is stale.
+  let t_past = t_huge + Duration::from_secs(1);
+  ep.read_index(t_past, &log, &stable, bytes::Bytes::from_static(b"r2"))
+    .unwrap();
+  let stale: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  assert!(
+    !stale
+      .iter()
+      .any(|e| matches!(e, crate::Event::ReadState(_))),
+    "past the u64::MAX boundary the lease is STALE (no wrap to falsely-live), so the read degrades"
   );
 }

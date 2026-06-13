@@ -344,7 +344,8 @@ where
       crate::EntryKind::Normal,
       bytes::Bytes::from(buf),
     )
-    .with_timestamp(self.lease_stamp(now));
+    .with_timestamp(self.lease_stamp(now))
+    .with_lease_window(self.lease_window_stamp());
     // Self-match advance is deferred until the append is durable (on_log_appended).
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
@@ -574,6 +575,15 @@ where
         // revert is needed, and `conf_state()` always means the committed voter set.
       }
       // else: every entry already present (pure duplicate) — append nothing.
+      // Defense-in-depth: fold EVERY incoming entry's lease_window into max_lease_window — including
+      // already-present ones the append above skipped. In a matched-schema cluster this is redundant
+      // (each window was folded on first receipt via submit_append), but if a duplicate from a
+      // LeaseGuard-aware leader carries a window a field-stripped local copy lost, this still captures
+      // it so a later post-election commit-wait is not under-sized. (Durable cross-restart survival of
+      // a stripped window is the fresh-cluster / matched-schema deployment contract; see WIRE.md.)
+      for e in entries.iter() {
+        self.max_lease_window = self.max_lease_window.max(e.lease_window());
+      }
     }
 
     // Commit advance and apply proceed independently of the local ack (committed entries

@@ -121,10 +121,12 @@ pub enum ConfigError {
   /// `read_only = LeaseGuard` but no `clock_drift_bound` was set (the commit-wait needs it).
   #[error("the LeaseGuard read mode requires a clock_drift_bound")]
   LeaseGuardRequiresDriftBound,
-  /// `lease_duration + clock_drift_bound` was not strictly less than the election timeout, so a
-  /// stale LeaseGuard lease could outlive a new leader's election.
+  /// The LeaseGuard commit-wait window `lease_duration·(lease_duration + clock_drift_bound) /
+  /// (lease_duration − clock_drift_bound)` is invalid: `clock_drift_bound >= lease_duration`, the
+  /// window overflows the `u64` wire field, or it is not strictly less than the election timeout (so
+  /// a stale lease could outlive a new leader's election, or a fresh leader could never commit).
   #[error(
-    "lease_duration ({lease:?}) + drift ({drift:?}) must be < election timeout ({election:?})"
+    "the LeaseGuard commit-wait window for lease_duration ({lease:?}) and clock_drift_bound ({drift:?}) is invalid (must have drift < lease and window < election timeout {election:?})"
   )]
   LeaseTimingTooLong {
     /// The configured lease window.
