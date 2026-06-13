@@ -8,7 +8,7 @@ mod conn;
 #[cfg(feature = "tcp")]
 mod coordinator;
 #[cfg(feature = "tcp")]
-mod frame;
+pub(crate) mod frame;
 #[cfg(feature = "tcp")]
 mod labeled;
 #[cfg(feature = "tcp")]

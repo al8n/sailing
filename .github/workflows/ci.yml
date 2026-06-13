@@ -64,7 +64,7 @@ jobs:
     - name: Apply clippy lints
       # The crate needs std-or-alloc (a compile_error! enforces it); --at-least-one-of keeps the
       # sweep off the impossible bare combos (e.g. `tcp` alone) while still covering every feature.
-      run: cargo hack clippy --feature-powerset --depth 2 --at-least-one-of std,alloc
+      run: cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing --at-least-one-of std,alloc
 
   # Run tests on some extra platforms
   cross:
@@ -188,7 +188,7 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run build
-      run: cargo hack build --feature-powerset --at-least-one-of std,alloc
+      run: cargo hack build --feature-powerset --exclude-features fuzzing --at-least-one-of std,alloc
 
   test:
     name: test
@@ -221,7 +221,7 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run test
-      run: cargo hack test --feature-powerset --at-least-one-of std,alloc
+      run: cargo hack test --feature-powerset --exclude-features fuzzing --at-least-one-of std,alloc
 
   coverage:
     name: coverage

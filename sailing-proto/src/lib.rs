@@ -83,6 +83,51 @@ pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 mod tracker;
 pub(crate) use tracker::Tracker;
 
+/// Decode entry points exposed ONLY for the `sailing-proto/fuzz` cargo-fuzz crate, behind the
+/// `fuzzing` feature (off by default, never enabled by a normal build). These thin wrappers
+/// reach `pub(crate)` codec paths the harness cannot otherwise call, monomorphized to a `u64`
+/// id. They are NOT part of the public API or the semver surface — do not depend on this module.
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz_internals {
+  use bytes::Bytes;
+  use std::vec::Vec;
+
+  /// [`wire::decode_conf_change_v2`](crate::wire) over a `u64` id — the entry-payload decode
+  /// path (the apply-poison surface).
+  pub fn decode_conf_change_v2(
+    data: Bytes,
+  ) -> Result<crate::ConfChangeV2<u64>, crate::DecodeError> {
+    crate::wire::decode_conf_change_v2::<u64>(data)
+  }
+
+  /// [`wire::encode_conf_change_v2`](crate::wire) over a `u64` id.
+  pub fn encode_conf_change_v2(cc: &crate::ConfChangeV2<u64>, buf: &mut Vec<u8>) {
+    crate::wire::encode_conf_change_v2::<u64>(cc, buf)
+  }
+
+  /// Drive the stream [`FrameDecoder`](crate::transport) over a chunked byte stream (modelling
+  /// arbitrary socket reads): push each chunk, drain every complete frame. Returns the frames
+  /// or the terminal decode error. The harness asserts no panic and that every yielded frame
+  /// is within [`MAX_FRAME_LEN`].
+  #[cfg(feature = "tcp")]
+  pub fn drive_frame_decoder(chunks: &[Vec<u8>]) -> Result<Vec<Bytes>, crate::TransportError> {
+    let mut dec = crate::transport::frame::FrameDecoder::new();
+    let mut out = Vec::new();
+    for chunk in chunks {
+      dec.push(chunk);
+      while let Some(frame) = dec.poll()? {
+        out.push(frame);
+      }
+    }
+    Ok(out)
+  }
+
+  /// The frame-length bound, for the frame-decoder harness's post-condition.
+  #[cfg(feature = "tcp")]
+  pub const MAX_FRAME_LEN: usize = crate::transport::frame::MAX_FRAME_LEN;
+}
+
 #[cfg(any(feature = "tcp", feature = "quic"))]
 mod transport;
 #[cfg(feature = "tls")]

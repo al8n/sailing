@@ -1,0 +1,51 @@
+[package]
+name = "sailing-proto-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+bytes = "1"
+
+[dependencies.sailing-proto]
+path = ".."
+features = ["fuzzing", "tcp"]
+
+# Detach from the parent workspace: this crate is nightly + libfuzzer, with its own target dir.
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "wire_message"
+path = "fuzz_targets/wire_message.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wire_conf_change"
+path = "fuzz_targets/wire_conf_change.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "data_codec"
+path = "fuzz_targets/data_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "frame_decoder"
+path = "fuzz_targets/frame_decoder.rs"
+test = false
+doc = false
+bench = false

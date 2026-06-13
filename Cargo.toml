@@ -1,6 +1,8 @@
 [workspace]
 resolver = "3"
 members = ["sailing-proto", "sailing-compio", "tests/sailing-simulation"]
+# The cargo-fuzz crate is nightly + libfuzzer with its own target dir; it is its own workspace.
+exclude = ["sailing-proto/fuzz"]
 
 [workspace.package]
 edition = "2024"
