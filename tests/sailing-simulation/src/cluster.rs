@@ -148,9 +148,157 @@ pub struct Cluster {
   /// (e.g. `pre_vote`/`check_quorum`) as the founders. Without this a freshly-added voter would run
   /// the default config and, sitting far behind, could disrupt elections.
   node_configure: std::boxed::Box<dyn Fn(Config<u64>) -> Config<u64>>,
+  /// Per-node clock RATE as a `(num, den)` rational: node `i`'s local clock reads
+  /// `floor(global_now · num/den)` (see [`now_for`](Self::now_for)). `(1, 1)` for every node by
+  /// default — a single global clock, byte-identical to the original. A [`set_clock_drift`] policy
+  /// makes each node's clock run fast (`num > den`) or slow (`num < den`) within a bound, which is the
+  /// ONLY thing that exercises LeaseGuard's cross-leader commit-wait margin (a same-clock read gate is
+  /// blind to a constant offset; only differing RATES age a deposed lease and a successor's wait apart
+  /// in real time). Indexed by Vec position, parallel to `nodes`; persists across `crash`/restart (a
+  /// node's hardware clock rate does not change when it reboots).
+  clock_rate: Vec<(u64, u64)>,
+  /// The id → `(num, den)` rate policy, applied to every node (founders and mid-run joiners) so a
+  /// dynamically-added node gets a deterministic rate. Default `|_| (1, 1)` (no drift). Installed via
+  /// [`set_clock_drift`](Self::set_clock_drift).
+  drift_policy: std::boxed::Box<dyn Fn(u64) -> (u64, u64)>,
+  /// Count of LeaseGuard immediate reads served by a SUPERSEDED leader, classified at SERVE time: a
+  /// read recorded by [`note_read_issue`] (its target was a superseded leader at `read_index` time) is
+  /// counted when its `ReadState` later drains. Monotone, never reset; a clock-drift non-vacuity witness
+  /// (a positive count proves the cross-leader read path was reached). `0` without drift, since a single
+  /// global clock leaves no superseded-leader window.
+  lease_superseded_serves: u64,
+  /// Contexts of reads issued on a node that was a superseded leader at `read_index` time (the
+  /// serve-time snapshot — see [`note_read_issue`]). Drained-and-retired when the matching `ReadState`
+  /// is confirmed; contexts are unique per read, so a recorded read that never serves simply never
+  /// matches. Kept separate from any node-observable state so recording cannot perturb the run.
+  superseded_read_contexts: std::collections::BTreeSet<Vec<u8>>,
+}
+
+/// Scale a duration by `num/den`, rounding DOWN (the `local_now` direction). u128 intermediate so a
+/// long run cannot overflow; the result is clamped into `u64` nanos (a >584-year run would saturate,
+/// never wrap). `num == den` is the exact identity.
+fn scale_floor(d: Duration, num: u64, den: u64) -> Duration {
+  let ns = d.as_nanos() * num as u128 / den as u128;
+  Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+}
+
+/// Scale a duration by `num/den`, rounding UP (the `global_of` inverse direction). Pairing ceil here
+/// with floor in [`scale_floor`] makes the global instant at which a node's local deadline fires
+/// EXACT: `local_now(global_of(ld)) >= ld` and no smaller global instant satisfies it.
+fn scale_ceil(d: Duration, num: u64, den: u64) -> Duration {
+  let ns = (d.as_nanos() * num as u128).div_ceil(den as u128);
+  Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
+}
+
+/// Reject a degenerate clock rate at policy-install time: a zero denominator is a divide-by-zero in
+/// the scaling and a zero numerator is a frozen clock (time never advances for that node) — neither is
+/// a meaningful drift, and both would corrupt or panic the scheduler. The per-protocol drift ENVELOPE
+/// (e.g. LeaseGuard's `±ε/Δ`) is the caller's contract; this enforces only the non-degeneracy the
+/// scheduler arithmetic itself requires, so an invalid policy fails loudly at install, not mid-run.
+fn validate_rate((num, den): (u64, u64)) -> (u64, u64) {
+  assert!(
+    num > 0 && den > 0,
+    "clock-drift rate must have a positive numerator and denominator, got ({num}, {den})"
+  );
+  (num, den)
 }
 
 impl Cluster {
+  /// Node `i`'s LOCAL clock reading at the current global virtual time: `floor(now · num/den)` for the
+  /// node's rate. With the default `(1, 1)` rate this is exactly `self.now`, so every node-facing call
+  /// is byte-identical to the original single-clock cluster. Under a [`set_clock_drift`] policy a fast
+  /// node (`num > den`) reads ahead and a slow node behind — the per-node `now` every `handle_*` /
+  /// `read_index` / `propose` / restart sees, so the proto stamps and ages entries on each node's OWN
+  /// drifting clock.
+  fn now_for(&self, i: usize) -> Instant {
+    let (num, den) = self.clock_rate[i];
+    if num == den {
+      return self.now; // exact identity — no rounding, byte-identical to the single-clock path.
+    }
+    Instant::from_origin(scale_floor(self.now.since_origin(), num, den))
+  }
+
+  /// The earliest GLOBAL virtual time at which node `i`'s LOCAL deadline `local` is reached, i.e. the
+  /// inverse of [`now_for`]: `ceil(local · den/num)`. Used to fold each node's `poll_timeout()` (which
+  /// the node expressed on its own local clock) back onto the shared global timeline so the
+  /// discrete-event scheduler advances to the correct next wake-up. Exact: `now_for(i)` at this instant
+  /// is `>= local`, and no earlier global instant qualifies.
+  fn global_of(&self, i: usize, local: Instant) -> Instant {
+    let (num, den) = self.clock_rate[i];
+    if num == den {
+      return local;
+    }
+    Instant::from_origin(scale_ceil(local.since_origin(), den, num))
+  }
+
+  /// Node `i`'s next timer deadline expressed in GLOBAL time (its local `poll_timeout()` folded through
+  /// [`global_of`]). `None` when the node has no armed timer.
+  fn global_timeout(&self, i: usize) -> Option<Instant> {
+    self.nodes[i].poll_timeout().map(|d| self.global_of(i, d))
+  }
+
+  /// Is the node at Vec position `server` a SUPERSEDED leader right now — still in Leader role, but
+  /// outranked by ANOTHER live node in Leader role at a strictly higher term? Removed harness artifacts
+  /// are excluded on BOTH sides: a node `mark_removed`'d but frozen in Leader role is neither a valid
+  /// superseded server nor a valid superseding higher-term leader (it is no longer a protocol
+  /// participant). Counted ONLY where it is genuinely serve-time — immediately after the `read_index`
+  /// call that produced a LeaseGuard immediate serve, before any tick can advance the cluster (see
+  /// [`drain_events`]). That captures the cross-leader case LeaseGuard governs: a leader serving from
+  /// its lease while a fresh higher-term leader has already taken over.
+  fn serve_was_superseded(&self, server: usize) -> bool {
+    if self.removed.contains(&self.node_ids[server]) || !self.nodes[server].role().is_leader() {
+      return false;
+    }
+    let server_term = self.nodes[server].term();
+    self.node_ids.iter().enumerate().any(|(j, id)| {
+      j != server
+        && !self.removed.contains(id)
+        && self.nodes[j].role().is_leader()
+        && self.nodes[j].term() > server_term
+    })
+  }
+
+  /// Drain node `i`'s event queue: bump the snapshot/conf-change tallies and append every `ReadState`
+  /// to its confirmed-reads history. Returns whether anything was drained (so the tick loop can mark
+  /// progress). The cross-leader non-vacuity counter is driven by the SERVE-TIME context set, not by the
+  /// cluster state at this (later, possibly drifted) drain: a `ReadState` whose context was recorded at
+  /// `read_index` time as served by a superseded leader (see [`note_read_issue`]) bumps the counter and
+  /// retires its context. Draining itself is unchanged from the original single-clock cluster, so it has
+  /// no effect on the run — only the bookkeeping is new.
+  fn drain_events(&mut self, i: usize) -> bool {
+    let mut drained = false;
+    while let Some(ev) = self.nodes[i].poll_event() {
+      drained = true;
+      if ev.is_snapshot_installed() {
+        self.snapshot_installs[i] += 1;
+      }
+      if ev.is_conf_changed() {
+        self.conf_changed[i] += 1;
+      }
+      if let sailing_proto::Event::ReadState(rs) = ev {
+        if self.superseded_read_contexts.remove(rs.context().as_ref()) {
+          self.lease_superseded_serves += 1;
+        }
+        self.read_states[i].push(rs);
+      }
+    }
+    drained
+  }
+
+  /// Record, at SERVE time, that a read with `context` was just issued on node `i` and that node is a
+  /// superseded leader RIGHT NOW. For a LeaseGuard immediate serve the `read_index` call already
+  /// produced the `ReadState` synchronously, so this is the true serve-time classification; the matching
+  /// `ReadState` is counted when it later drains (see [`drain_events`]). Only `accepted` reads are
+  /// recorded. A read that is accepted but does NOT serve immediately (a superseded leader whose lease
+  /// expired degrades to a quorum round it can never complete while outranked) emits no `ReadState`, so
+  /// its unique context simply never matches — no over-count. Recording only TOUCHES a private set the
+  /// VOPR never observes, so the run is unchanged.
+  fn note_read_issue(&mut self, i: usize, context: &[u8], accepted: bool) {
+    if accepted && self.serve_was_superseded(i) {
+      self.superseded_read_contexts.insert(context.to_vec());
+    }
+  }
+
   /// Async mode: flush every node's staged (in-flight) writes to durable state, modeling the
   /// fsync for the in-flight window completing between driver iterations. No-op for sync stores
   /// (their `flush` is a no-op) but only ever called when `async_mode` is set.
@@ -166,8 +314,9 @@ impl Cluster {
   fn drain_storage_all(&mut self) -> bool {
     let mut any_new = false;
     for i in 0..self.nodes.len() {
+      let now_i = self.now_for(i);
       let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-      self.nodes[i].handle_storage(self.now, log, stable);
+      self.nodes[i].handle_storage(now_i, log, stable);
     }
     // Collect outgoing messages produced by completion handlers (e.g. deferred acks once a staged
     // append flushes). Same path as the `tick` outgoing-drain: the structural oracles + seeded
@@ -183,17 +332,7 @@ impl Cluster {
           self.schedule_send(i, to, message);
         }
       }
-      while let Some(ev) = self.nodes[i].poll_event() {
-        if ev.is_snapshot_installed() {
-          self.snapshot_installs[i] += 1;
-        }
-        if ev.is_conf_changed() {
-          self.conf_changed[i] += 1;
-        }
-        if let sailing_proto::Event::ReadState(rs) = ev {
-          self.read_states[i].push(rs);
-        }
-      }
+      self.drain_events(i);
     }
     any_new
   }
@@ -331,9 +470,10 @@ impl Cluster {
           // Drop silently — partition swallows it.
         } else if let Some(&to_idx) = self.node_idx.get(&m.to) {
           delivered = true;
+          let now_to = self.now_for(to_idx);
           let (log, stable) = (&mut self.logs[to_idx], &mut self.stables[to_idx]);
           let message = wire_roundtrip(m.message);
-          self.nodes[to_idx].handle_message(self.now, log, stable, m.from, message);
+          self.nodes[to_idx].handle_message(now_to, log, stable, m.from, message);
         }
         // else: message to an unknown id (shouldn't happen, but drop safely)
       } else {
@@ -356,8 +496,14 @@ impl Cluster {
   pub fn tick(&mut self) -> bool {
     let mut progressed = false;
 
-    // Step a+b: advance clock and fire timers.
-    let next_timer = self.nodes.iter().filter_map(Endpoint::poll_timeout).min();
+    // Step a+b: advance clock and fire timers. Each node's `poll_timeout()` is expressed on its OWN
+    // (possibly drifting) local clock; `global_timeout` folds it onto the shared global timeline so the
+    // discrete-event scheduler advances to the correct real wake-up, and a node fires exactly when
+    // global time reaches that folded deadline. With no drift this is byte-identical to the original
+    // `poll_timeout().min()` / `poll_timeout() <= now` form.
+    let next_timer = (0..self.nodes.len())
+      .filter_map(|i| self.global_timeout(i))
+      .min();
     let next_msg = self.bus.iter().map(|m| m.deliver_at).min();
     if let Some(target) = [next_timer, next_msg].into_iter().flatten().min() {
       if target > self.now {
@@ -365,10 +511,11 @@ impl Cluster {
         progressed = true;
       }
       for i in 0..self.nodes.len() {
-        if self.nodes[i].poll_timeout().is_some_and(|d| d <= self.now) {
+        if self.global_timeout(i).is_some_and(|d| d <= self.now) {
           progressed = true;
+          let now_i = self.now_for(i);
           let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-          self.nodes[i].handle_timeout(self.now, log, stable);
+          self.nodes[i].handle_timeout(now_i, log, stable);
         }
       }
     }
@@ -401,17 +548,8 @@ impl Cluster {
             self.schedule_send(i, to, message);
           }
         }
-        while let Some(ev) = self.nodes[i].poll_event() {
+        if self.drain_events(i) {
           progressed = true;
-          if ev.is_snapshot_installed() {
-            self.snapshot_installs[i] += 1;
-          }
-          if ev.is_conf_changed() {
-            self.conf_changed[i] += 1;
-          }
-          if let sailing_proto::Event::ReadState(rs) = ev {
-            self.read_states[i].push(rs);
-          }
         }
       }
 
@@ -515,6 +653,78 @@ mod tests {
     drive_and_capture(&mut c, 8);
     assert_eq!(c.net_dropped(), 0);
     assert_eq!(c.net_duplicated(), 0);
+  }
+
+  #[test]
+  fn clock_drift_off_is_byte_identical_to_baseline() {
+    // The byte-identity floor of the drift machinery: a no-drift policy (every node `(1, 1)`) makes
+    // `now_for` the exact identity, so every node-facing call sees the same global `now` it always
+    // did — the run must be bit-for-bit the baseline single-clock cluster.
+    let baseline = {
+      let mut c = Cluster::new(3);
+      drive_and_capture(&mut c, 8)
+    };
+    let with_off_drift = {
+      let mut c = Cluster::new(3);
+      c.set_clock_drift(|_| (1, 1));
+      drive_and_capture(&mut c, 8)
+    };
+    assert_eq!(
+      baseline, with_off_drift,
+      "a no-drift (1/1) clock policy must be byte-identical to the single-clock cluster"
+    );
+  }
+
+  #[test]
+  fn clock_drift_is_deterministic() {
+    // Same drift policy ⇒ identical run. Bounded per-node rates (node 0 slowest, node 1 fastest,
+    // within the ±ε/Δ = ±1/6 band for the 50ms/300ms LeaseGuard config) must still drive a
+    // reproducible, convergent run.
+    let run = || -> Vec<AppliedLog> {
+      let mut c = Cluster::new(3);
+      c.set_clock_drift(|id| match id {
+        0 => (5, 6), // slowest valid rate (Δ−ε)/Δ
+        1 => (7, 6), // fastest valid rate (Δ+ε)/Δ
+        _ => (1, 1),
+      });
+      drive_and_capture(&mut c, 8)
+    };
+    assert_eq!(run(), run(), "same drift policy ⇒ identical run");
+  }
+
+  #[test]
+  fn clock_drift_diverges_node_clocks_but_scheduler_holds() {
+    // The core invariant: differing per-node clock RATES, one consistent global timeline. Each node's
+    // local clock advances at its own rate (so the readings genuinely diverge), yet the discrete-event
+    // scheduler — folding each node's local deadline back to global time via `global_of` — still drives
+    // the cluster to a leader and commits a batch.
+    let mut c = Cluster::new(3);
+    c.set_clock_drift(|id| match id {
+      0 => (5, 6),
+      1 => (7, 6),
+      _ => (1, 1),
+    });
+    assert!(
+      c.run_until(400, |c| c.leader_count() == 1),
+      "a drifted cluster must still elect a single leader"
+    );
+    for i in 0..8u32 {
+      c.run_until(100, |c| c.leader_count() == 1);
+      c.propose(&i.to_le_bytes());
+      c.run_until(80, |_| false);
+    }
+    assert!(
+      c.run_until(800, |c| c.agreement_holds() && c.min_applied_len() >= 8),
+      "a drifted cluster must still commit + apply the batch consistently"
+    );
+    // The clocks have genuinely diverged: at a positive global time the fast node (7/6) reads strictly
+    // ahead of the slow node (5/6). (Index == id for the three founders.)
+    let slow = c.now_for(0).since_origin();
+    let fast = c.now_for(1).since_origin();
+    assert!(
+      fast > slow,
+      "the fast node (7/6) must read ahead of the slow node (5/6): fast={fast:?} slow={slow:?}"
+    );
   }
 
   #[test]
