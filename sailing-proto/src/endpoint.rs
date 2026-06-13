@@ -78,14 +78,21 @@ pub enum TimerKind {
   Heartbeat,
   /// Leader transfer abort window (one election timeout after transfer start).
   Transfer,
+  /// LeaseGuard post-election commit-wait: a newly-elected `ReadOnlyOption::LeaseGuard` leader
+  /// holds its first commit until any deposed leader's read-lease has provably expired. The driver
+  /// wakes at this deadline to retry the commit (the quorum match may already be satisfied — only
+  /// the clock is pending), so the new leader's first commit lands promptly rather than at the next
+  /// ack/heartbeat.
+  CommitWait,
 }
 
 impl TimerKind {
   /// All timer kinds in a fixed order.
-  pub const ALL: [TimerKind; 3] = [
+  pub const ALL: [TimerKind; 4] = [
     TimerKind::Election,
     TimerKind::Heartbeat,
     TimerKind::Transfer,
+    TimerKind::CommitWait,
   ];
 
   /// The stable snake_case name.
@@ -94,6 +101,7 @@ impl TimerKind {
       Self::Election => "election",
       Self::Heartbeat => "heartbeat",
       Self::Transfer => "transfer",
+      Self::CommitWait => "commit_wait",
     }
   }
 }
@@ -545,6 +553,20 @@ where
   votes: BTreeMap<I, bool>,
   election_deadline: Option<Instant>,
   heartbeat_deadline: Option<Instant>,
+  /// LeaseGuard post-election commit-wait deadline (`ReadOnlyOption::LeaseGuard` only; `None` in
+  /// every other mode and on every non-leader). Set at [`become_leader`](Self::become_leader) to
+  /// `now + lease_duration + clock_drift_bound`: a CONSERVATIVE anchor, because become-leader time
+  /// is trivially ≥ every inherited entry's creation time (this node replicated them before winning
+  /// the election), so any deposed leader's lease — anchored on a committed entry this node now
+  /// holds — has expired by `lease_duration` (plus the `clock_drift_bound` slack ε that absorbs the
+  /// two leaders' clock-RATE difference) past that point. `maybe_advance_commit` HOLDS the first
+  /// post-election commit while `now < commit_wait_until`; once the deadline passes the gate is
+  /// lifted for good (cleared in `maybe_advance_commit`) until the next election. The conservative
+  /// anchor needs NO per-append age tracking — its safety is local to `become_leader`, regardless of
+  /// how the log was built (append, snapshot install, restart). A tighter per-entry anchor (commit
+  /// immediately when inherited entries are already older than the window) is a deferred
+  /// failover-latency optimization, not a safety requirement.
+  commit_wait_until: Option<Instant>,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -769,6 +791,8 @@ where
       votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
+      // Set fresh at each `become_leader` (LeaseGuard only); a non-leader never gates commit.
+      commit_wait_until: None,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       tracker,
@@ -999,6 +1023,7 @@ where
       TimerKind::Election => self.election_deadline,
       TimerKind::Heartbeat => self.heartbeat_deadline,
       TimerKind::Transfer => self.transfer_deadline,
+      TimerKind::CommitWait => self.commit_wait_until,
     }
   }
 
@@ -1030,6 +1055,10 @@ where
         }
       }
       TimerKind::Transfer => self.role.is_leader() && self.lead_transferee.is_some(),
+      // Only a leader with an armed post-election commit-wait services it. `commit_wait_until` is
+      // set to `Some` exclusively in LeaseGuard mode (at `become_leader`), so this is implicitly
+      // gated on the mode — a Safe/LeaseBased leader never arms it and never surfaces the timer.
+      TimerKind::CommitWait => self.role.is_leader() && self.commit_wait_until.is_some(),
     }
   }
 
@@ -1303,6 +1332,16 @@ where
         if self.heartbeat_deadline.is_some_and(|d| d <= now) {
           self.broadcast_heartbeat(now);
           self.arm_heartbeat_timer(now);
+        }
+        // LeaseGuard commit-wait: the post-election deferred-commit window has elapsed. Retry the
+        // commit (and apply + flush deferred reads) now, so the new leader's first commit lands as
+        // soon as any deposed leader's lease has expired rather than at the next ack/heartbeat.
+        // `maybe_advance_commit` clears `commit_wait_until` (the deadline has passed), so the
+        // CommitWait timer is left non-serviceable and the wedge tripwire below stays satisfied.
+        if self.commit_wait_until.is_some_and(|d| d <= now) {
+          self.maybe_advance_commit(now, log);
+          self.apply_committed(log);
+          self.maybe_flush_deferred_reads(now, log, stable);
         }
         // Leader transfer abort: if the transfer deadline has passed without the target
         // taking over, abort the transfer and resume accepting proposals.

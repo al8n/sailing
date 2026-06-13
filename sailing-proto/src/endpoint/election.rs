@@ -456,6 +456,23 @@ where
       self.election_deadline = Some(now + self.config.election_timeout());
     }
 
+    // LeaseGuard commit-wait: arm the post-election deferred-commit window. A LeaseGuard leader may
+    // not commit (and so may not begin serving reads from its own-term lease) until any deposed
+    // leader's read-lease has provably expired. The anchor is THIS election's `now`, a conservative
+    // lower bound — every entry this node inherited was created (by its originating leader) before
+    // this node replicated it, which was before it won this election, so `now` is ≥ every inherited
+    // entry's creation time. Waiting `lease_duration + clock_drift_bound` past `now` therefore
+    // outlasts any deposed leader's lease (`created + lease_duration` on the deposed clock), the
+    // `clock_drift_bound` slack ε absorbing the two clocks' RATE difference. `maybe_advance_commit`
+    // holds the first commit until this deadline; non-LeaseGuard modes arm nothing (`None`).
+    self.commit_wait_until = if self.config.read_only() == crate::ReadOnlyOption::LeaseGuard {
+      let delta = self.config.lease_duration().unwrap_or_default();
+      let drift = self.config.clock_drift_bound().unwrap_or_default();
+      Some(now + delta + drift)
+    } else {
+      None
+    };
+
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
     // Self-match advance is deferred until the append is durable (on_log_appended).
     // Allocate a fresh, usable index for the no-op (see `next_log_index`). If the log is at the ceiling

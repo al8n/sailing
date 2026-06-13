@@ -263,7 +263,14 @@ where
     }
   }
 
-  pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, log: &L) {
+  pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: Instant, log: &L) {
+    // LeaseGuard commit-wait: once the post-election deferred-commit window elapses, lift the gate
+    // FOR GOOD — clearing here (not only when a commit actually advances) keeps poll_timeout and
+    // handle_timeout consistent: a fired CommitWait timer must leave no serviceable-and-due deadline
+    // (the §8 wedge tripwire). After this clear the gate stays down until the next `become_leader`.
+    if self.commit_wait_until.is_some_and(|until| now >= until) {
+      self.commit_wait_until = None;
+    }
     // Delegate to the Tracker's joint-quorum committed index. For a simple (non-joint)
     // config this is identical to the old sorted-match logic:
     //   old: matches.sort(); candidate = matches[n - (n/2+1)]
@@ -277,6 +284,15 @@ where
       .map(|t| t == self.term)
       .unwrap_or(false);
     if candidate > self.commit && current_term {
+      // Hold the FIRST post-election commit (it would cross into committing this leader's own-term
+      // no-op and thus begin serving lease reads) until the commit-wait window has elapsed. Still
+      // armed (`now < commit_wait_until`, else the block above cleared it) ⇒ defer; the CommitWait
+      // timer (surfaced by poll_timeout) wakes the leader at the deadline to retry, and an ack that
+      // arrives after the deadline lifts the gate via the clear above. Non-LeaseGuard leaders never
+      // arm it, so this is a no-op for Safe/LeaseBased.
+      if self.commit_wait_until.is_some() {
+        return;
+      }
       self.commit = candidate;
     }
   }
@@ -882,7 +898,7 @@ where
           }
           crate::ProgressState::Replicate | crate::ProgressState::Snapshot(_) => {}
         }
-        self.maybe_advance_commit(log);
+        self.maybe_advance_commit(now, log);
         self.apply_committed(log);
         self.maybe_flush_deferred_reads(now, log, stable);
         self.pump_appends(now, from, log, stable); // fill the peer's inflight window if still behind
