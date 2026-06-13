@@ -103,6 +103,52 @@ fn vopr_smoke_runs_a_few_seeds() {
   );
 }
 
+/// The clock-drift harness, end-to-end: seeds 2, 4, and 8 draw the LeaseGuard read mode, so each runs
+/// the whole adversarial schedule (crash + partition + lossy network + membership churn) under PER-NODE
+/// clock RATE drift bounded by ε/Δ. Each must complete WITHOUT a safety-oracle / read-linearizability /
+/// liveness panic AND confirm reads — proving the read-linearizability oracle actually judged reads
+/// served by leaders whose clocks drift against the rest of the cluster, not merely that the machinery
+/// is present. The single-clock VOPR never exercised any of LeaseGuard's clock-dependent paths under
+/// divergent clocks; this is that coverage.
+#[test]
+fn vopr_exercises_leaseguard_under_drift() {
+  for seed in [2u64, 4, 8] {
+    let r = run_vopr(seed, 1_500);
+    assert!(
+      r.drifted,
+      "seed {seed} was expected to draw the LeaseGuard+drift mode but did not — the mode draw moved; \
+       pick fresh drifted seeds via the drift_sweep example"
+    );
+    assert!(
+      r.reads_confirmed > 0,
+      "LeaseGuard-drift seed {seed} confirmed no reads — the read-linearizability oracle never judged \
+       a drifted read (report={r:?})"
+    );
+    assert!(
+      r.committed > 0 && r.partitions > 0,
+      "LeaseGuard-drift seed {seed} was vacuous — it must commit client load AND partition a node so \
+       the drifted clocks meet leadership churn (report={r:?})"
+    );
+  }
+
+  // Strong non-vacuity: seed 309 (a longer run) drives the CROSS-LEADER path — under drift a slow
+  // leader's heartbeats arrive late, a follower elects a successor while the slow leader's lease is
+  // still fresh, and that SUPERSEDED leader (still Leader-role, outranked by a higher-term leader)
+  // serves reads — every one kept linearizable by the successor's commit-wait. That is the coverage a
+  // single global clock cannot produce. A zero here means drift no longer reaches the contested regime
+  // (find a fresh seed with the drift_sweep example).
+  let r = run_vopr(309, 2_000);
+  assert!(
+    r.drifted,
+    "seed 309 was expected to draw the LeaseGuard+drift mode"
+  );
+  assert!(
+    r.reads_served_by_superseded_leader > 0,
+    "seed 309 under drift never reached the superseded-leader read path — the cross-leader coverage is \
+     vacuous (report={r:?})"
+  );
+}
+
 /// Determinism: `run_vopr(seed, ticks)` is a pure function of `(seed, ticks)`. Two independent runs
 /// of the same arguments must produce an IDENTICAL `VoprReport` and an identical content
 /// fingerprint. Proves the run is driven solely by the seeded PRNG — no wall-clock / `rand` /
