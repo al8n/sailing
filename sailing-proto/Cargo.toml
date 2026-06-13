@@ -15,6 +15,9 @@ default = ["std"]
 std = ["bytes/std", "thiserror/std", "derive_more/std", "buffa/std"]
 alloc = []
 tcp = []                                   # no_std + alloc OK (no crypto)
+# Exposes pub(crate) decode entry points to the `fuzz/` cargo-fuzz crate via a doc-hidden
+# `fuzz_internals` module. Off by default, never enabled by a normal build; NOT semver-stable.
+fuzzing = []
 tls = ["tcp", "std", "dep:rustls", "tls-ring"]
 tls-ring = ["rustls?/ring"]
 tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
