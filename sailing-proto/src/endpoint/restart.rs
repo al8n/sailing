@@ -120,6 +120,12 @@ where
     let snap_nt: Option<(Index, Term)> = snapshot
       .as_ref()
       .map(|(meta, _)| (meta.last_index(), meta.last_term()));
+    // The LeaseGuard bound this snapshot carries over its compacted entries — combined below with a
+    // scan of the live log to recompute `max_lease_window` from durable state alone.
+    let snap_max_window: u64 = snapshot
+      .as_ref()
+      .map(|(meta, _)| meta.max_lease_window())
+      .unwrap_or(0);
     if let Some((meta, data)) = snapshot {
       // Validate the durable snapshot's BOUNDARY before decoding/restoring the SM or installing the
       // tracker (which copies the ConfState verbatim) — a corrupt-on-disk or version-skewed snapshot
@@ -251,6 +257,24 @@ where
         (None, None)
       }
     };
+    // Recompute the self-describing LeaseGuard bound from DURABLE state — the snapshot's carried max
+    // over compacted entries, plus a scan of the recovered live log. Derived from the durable log
+    // (never a lagging in-memory or HardState value), so a successor's commit-wait always covers any
+    // deposed leader's lease on a recovered entry. Skipped when already poisoned (an inert node never
+    // leads); a scan read-fault fail-stops here rather than recover with a partial, under-sized bound.
+    // `0` for non-LeaseGuard clusters (every `lease_window` is `0`).
+    let recovered_max_lease_window = if poisoned {
+      0
+    } else {
+      match Self::scan_max_lease_window(log) {
+        Ok(m) => snap_max_window.max(m),
+        Err(reason) => {
+          poisoned = true;
+          poison_reason = Some(reason);
+          0
+        }
+      }
+    };
     // Misconfiguration is handled by degradation, not rejection (see `Endpoint::new`); restart
     // construction stays infallible and identical across build profiles.
     let mut ep = Self {
@@ -276,9 +300,9 @@ where
       election_deadline: None,
       heartbeat_deadline: None,
       // A restarted node recovers as Follower; the commit-wait is (re)computed at the next
-      // `become_leader` from that election's `now` — the conservative anchor needs nothing carried
-      // across the crash (it does not depend on any lost in-memory per-append timer).
+      // `become_leader` from that election's `now` and the recovered `max_lease_window` below.
       commit_wait_until: None,
+      max_lease_window: recovered_max_lease_window,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
       // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup
@@ -345,5 +369,37 @@ where
     ep.events.clear();
     ep.arm_election_timer(now);
     ep
+  }
+
+  /// Scan the durable live log `[first_index ..= last_index]` for the MAX LeaseGuard `lease_window`
+  /// — the restart recompute of `max_lease_window`, combined with the restored snapshot's carried max
+  /// (compacted entries no longer in the live log). Derived from durable state, not a lagging
+  /// in-memory/HardState value, so a successor's commit-wait always covers any deposed lease on a
+  /// recovered entry. Bounded by the live log (≤ `snapshot_threshold`).
+  ///
+  /// FAIL-STOP on any read fault: an `entries` error — or an unexpectedly empty chunk for a non-empty
+  /// in-range read — is fatal, NOT end-of-scan. Stopping early could miss a larger inherited window
+  /// in the durable suffix and let a successor under-wait (a stale read), so the caller poisons
+  /// rather than constructing a live endpoint with a partial bound.
+  fn scan_max_lease_window<L: LogStore>(log: &L) -> Result<u64, PoisonReason> {
+    let last = log.last_index();
+    let mut idx = log.first_index();
+    let mut max = 0u64;
+    while idx <= last {
+      let chunk = match log.entries(idx..last.next(), 1 << 20) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return Err(PoisonReason::LogRead),
+      };
+      for e in chunk {
+        max = max.max(e.lease_window());
+      }
+      // `entries` may return a prefix of the requested range; advance past the last entry it gave
+      // (always `Some` — the chunk is non-empty — so the `ok_or` is a defensive fail-stop).
+      idx = chunk
+        .last()
+        .map(|e| e.index().next())
+        .ok_or(PoisonReason::LogRead)?;
+    }
+    Ok(max)
   }
 }

@@ -56,6 +56,14 @@ where
       return;
     }
     log.submit_append(id, entries);
+    // Raise the self-describing LeaseGuard commit-wait bound over these entries' stamped lease
+    // windows (each carries its appending leader's own exact window). The choke-point for EVERY append — leader
+    // propose/no-op/conf-change AND follower replication — so a node always bounds any deposed
+    // leader's lease on an entry it holds. Monotonic in memory; recomputed from durable state at
+    // restart. `0` (non-LeaseGuard / inactive-config entries) never raises it.
+    for e in entries {
+      self.max_lease_window = self.max_lease_window.max(e.lease_window());
+    }
     // Track this append's last index independently of `pending` so `on_log_appended` can advance
     // `durable_index` unconditionally when the completion fires (see the field comment).
     if let Some(last) = entries.last() {

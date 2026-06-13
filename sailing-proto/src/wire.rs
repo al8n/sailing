@@ -218,6 +218,7 @@ fn pb_entry(e: &Entry) -> pb::Entry {
     }),
     data: e.data_bytes(),
     timestamp: e.timestamp(),
+    lease_window: e.lease_window(),
     ..Default::default()
   }
 }
@@ -229,7 +230,11 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
     EnumValue::Known(pb::EntryKind::Empty) => EntryKind::Empty,
     EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
   };
-  Ok(Entry::new(Term::new(w.term), Index::new(w.index), kind, w.data).with_timestamp(w.timestamp))
+  Ok(
+    Entry::new(Term::new(w.term), Index::new(w.index), kind, w.data)
+      .with_timestamp(w.timestamp)
+      .with_lease_window(w.lease_window),
+  )
 }
 
 fn pb_conf_state<I: crate::NodeId>(c: &ConfState<I>) -> pb::ConfState {
@@ -258,6 +263,7 @@ fn pb_snapshot_meta<I: crate::NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
     last_index: m.last_index().get(),
     last_term: m.last_term().get(),
     conf: buffa::MessageField::some(pb_conf_state(m.conf())),
+    max_lease_window: m.max_lease_window(),
     ..Default::default()
   }
 }
@@ -269,11 +275,14 @@ fn snapshot_meta_from<I: crate::NodeId>(
     .conf
     .as_option()
     .ok_or(DecodeError::Invalid("SnapshotMeta.conf"))?;
-  Ok(SnapshotMeta::new(
-    Index::new(w.last_index),
-    Term::new(w.last_term),
-    conf_state_from(conf)?,
-  ))
+  Ok(
+    SnapshotMeta::new(
+      Index::new(w.last_index),
+      Term::new(w.last_term),
+      conf_state_from(conf)?,
+    )
+    .with_max_lease_window(w.max_lease_window),
+  )
 }
 
 // ─── Message ───────────────────────────────────────────────────────────────────────

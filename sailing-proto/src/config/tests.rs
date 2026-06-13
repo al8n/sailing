@@ -259,15 +259,59 @@ fn leaseguard_config_validation() {
     Err(ConfigError::LeaseGuardRequiresDriftBound)
   ));
 
-  // lease_duration + clock_drift_bound must be < election timeout.
+  // The EXACT commit-wait window Δ·(Δ+ε)/(Δ−ε) must be < election timeout.
   let c = base()
     .with_read_only(ReadOnlyOption::LeaseGuard)
     .with_lease_duration(Duration::from_millis(900))
-    .with_clock_drift_bound(Duration::from_millis(200)); // 1100 >= 1000
+    .with_clock_drift_bound(Duration::from_millis(200)); // 900*1100/700 ≈ 1414 >= 1000
   assert!(matches!(
     c.validate(),
     Err(ConfigError::LeaseTimingTooLong { .. })
   ));
+  // The exact ratio binds tighter than the Δ+ε approximation: Δ+ε=900 < 1000, but 600*900/300=1800.
+  let c = base()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(600))
+    .with_clock_drift_bound(Duration::from_millis(300));
+  assert!(matches!(
+    c.validate(),
+    Err(ConfigError::LeaseTimingTooLong { .. })
+  ));
+  // clock_drift_bound >= lease_duration is degenerate (rate drift >= 100%) — rejected.
+  let c = base()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(200))
+    .with_clock_drift_bound(Duration::from_millis(200));
+  assert!(matches!(
+    c.validate(),
+    Err(ConfigError::LeaseTimingTooLong { .. })
+  ));
+
+  // The stamped window is the EXACT Δ·(Δ+ε)/(Δ−ε), not the Δ+2ε approximation: Δ=300ms, ε=50ms →
+  // 300·350/250 = 420ms (the approximation would be 400ms — a stale-read-unsafe under-wait).
+  let c = base()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(300))
+    .with_clock_drift_bound(Duration::from_millis(50));
+  assert_eq!(c.leaseguard_commit_wait_ns(), Some(420_000_000));
+
+  // A window that overflows the u64 wire field (an absurd multi-century lease) is rejected, NOT
+  // silently truncated to a small value.
+  let huge = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_secs(u64::MAX),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_secs(20_000_000_000))
+  .with_clock_drift_bound(Duration::from_secs(1));
+  assert!(matches!(
+    huge.validate(),
+    Err(ConfigError::LeaseTimingTooLong { .. })
+  ));
+  assert_eq!(huge.leaseguard_commit_wait_ns(), None);
 
   // A valid LeaseGuard config — it does NOT require check_quorum (its safety is the commit-wait,
   // not election-prevention). bounded_clock_uncertainty is optional (enables inherited reads).

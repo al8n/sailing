@@ -37,6 +37,13 @@ pub struct Entry {
   /// other mode; it then encodes absent on the wire, so a non-LeaseGuard entry is byte-identical
   /// to before this field existed.
   timestamp: u64,
+  /// The LeaseGuard commit-wait window (nanos; the exact `Δ·(Δ+ε)/(Δ−ε)`, see `Config::clock_drift_bound`) of the leader
+  /// that appended this entry — i.e. how long a SUCCESSOR must wait, from a lower bound on this
+  /// entry's creation, before that leader's read-lease on it has provably expired (the lease Δ plus
+  /// the drift slack ε). Self-describing, so a successor sizes its commit-wait by the MAX window
+  /// over inherited entries and needs NO assumption about other nodes' config. `0` (and ignored) in
+  /// every other mode — absent on the wire, byte-identical to before this field existed.
+  lease_window: u64,
 }
 
 impl Entry {
@@ -50,6 +57,7 @@ impl Entry {
       kind,
       data,
       timestamp: 0,
+      lease_window: 0,
     }
   }
 
@@ -66,6 +74,22 @@ impl Entry {
   #[inline(always)]
   pub const fn timestamp(&self) -> u64 {
     self.timestamp
+  }
+
+  /// Set the LeaseGuard commit-wait window (nanos; the exact `Δ·(Δ+ε)/(Δ−ε)`, see `Config::clock_drift_bound`) of the
+  /// appending leader. A builder, so the common 4-arg [`new`](Self::new) stays untouched.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_lease_window(mut self, lease_window: u64) -> Self {
+    self.lease_window = lease_window;
+    self
+  }
+
+  /// The LeaseGuard commit-wait window (nanos; the exact `Δ·(Δ+ε)/(Δ−ε)`, see `Config::clock_drift_bound`) of the
+  /// appending leader, or `0` if unset (non-LeaseGuard).
+  #[inline(always)]
+  pub const fn lease_window(&self) -> u64 {
+    self.lease_window
   }
 
   /// The entry's term.

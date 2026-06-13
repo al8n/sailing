@@ -138,23 +138,41 @@ where
   }
 
   /// LeaseGuard same-leader read gate ("the log is the lease"): the leader's most-recent committed
-  /// entry — a current-term entry THIS leader stamped, guaranteed by the caller's
-  /// `has_current_term_commit` gate — is still within the lease window on the leader's OWN monotonic
-  /// clock. Both the anchor (the entry's in-log stamp) and `now` are this leader's clock, so the
-  /// comparison needs NO cross-node skew assumption; the cross-leader safety (a fresh leader cannot
-  /// serve before any deposed leader's lease expires) is upheld separately by the post-election
-  /// commit-wait. Fails CLOSED — degrade to the safe heartbeat round — on a missing `lease_duration`
-  /// (misconfigured) or an unreadable/absent anchor.
+  /// entry is still within the lease window Δ on the leader's OWN monotonic clock. Fails CLOSED —
+  /// degrade to the safe heartbeat round — on an inactive/invalid config (see
+  /// [`leaseguard_timing`](Self::leaseguard_timing)) or an unreadable/absent anchor.
   fn lease_guard_read_live<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
-    let Some(delta) = self.config.lease_duration() else {
+    let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
     };
-    let Some(ts) = self.log_timestamp(log, self.commit) else {
-      return false;
+    // Read the committed anchor entry ONCE for both its term and timestamp. The lease is live only if
+    // the anchor is a CURRENT-TERM entry — so THIS leader stamped it, making the ts/now comparison
+    // same-clock (no skew) — AND still within Δ. The current-term check keeps the no-skew guarantee
+    // LOCAL here rather than relying solely on the caller's `has_current_term_commit` gate. A storage
+    // read failure poisons and fails closed (an absent index answers `Ok` empty, not `Err`).
+    let (term, ts) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
+      Ok(s) => match s.first() {
+        Some(e) => (e.term(), e.timestamp()),
+        None => return false,
+      },
+      Err(_) => {
+        self.poison(PoisonReason::LogRead);
+        return false;
+      }
     };
-    let now_ts = now.since_origin().as_nanos() as u64;
-    // ts + Δ >= now (saturating: a pathological Δ must not wrap to a falsely-live lease).
-    ts.saturating_add(delta.as_nanos() as u64) >= now_ts
+    if term != self.term {
+      return false;
+    }
+    // The lease is live iff the entry's age is below Δ — equivalently `ts + Δ > now`. STRICT (`<`):
+    // dead at the EXACT expiry instant, so a deposed leader stops serving strictly before a successor
+    // (whose commit-wait releases at `now >= deadline`) can commit, closing the equal-timestamp race
+    // (matches LeaseBased's strict `deadline > now`). Computed as DURATIONS (u128 internally), never a
+    // lossy `u128 → u64` cast: a huge `Instant` cannot wrap `now` to a small value and keep the gate
+    // falsely live. `saturating_sub` floors a future-stamped (clock-non-monotone) anchor at age 0.
+    now
+      .since_origin()
+      .saturating_sub(core::time::Duration::from_nanos(ts))
+      < delta
   }
 
   /// Core leader read logic: register the read and broadcast / confirm.
