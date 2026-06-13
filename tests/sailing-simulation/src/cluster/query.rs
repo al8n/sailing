@@ -195,6 +195,13 @@ impl Cluster {
     self.node_idx.keys().copied().collect()
   }
 
+  /// Total reads confirmed by a SUPERSEDED leader over the cluster's life, tallied at `ReadState`
+  /// drain time (event-time, not a later scan). A clock-drift non-vacuity witness: a positive count
+  /// proves the cross-leader read path was reached. `0` without drift. Monotone; never reset.
+  pub fn lease_superseded_serves(&self) -> u64 {
+    self.lease_superseded_serves
+  }
+
   /// The highest commit index any node (including removed ones) currently believes — the
   /// completed-write watermark. An entry committed ANYWHERE is durably replicated to a quorum
   /// and acknowledged, so a linearizable read invoked after this instant must observe it.
@@ -268,7 +275,7 @@ impl Cluster {
   pub fn dbg_timer(&self, id: u64) -> (bool, bool) {
     let i = self.node_idx[&id];
     match self.nodes[i].poll_timeout() {
-      Some(d) => (true, d <= self.now),
+      Some(d) => (true, d <= self.now_for(i)),
       None => (false, false),
     }
   }

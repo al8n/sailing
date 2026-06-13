@@ -34,10 +34,13 @@ impl Cluster {
     // the restarted node's forwarded-read tokens so a pre-crash ReadIndexResp cannot complete a
     // post-restart read. `restarts[i]` counts PRIOR restarts, so +1 is unique per incarnation.
     let boot_epoch = self.restarts[i] + 1;
+    // The node reboots on its OWN clock (rate persists — a crash does not change hardware clock rate;
+    // `clock_rate[i]` stays put). With no drift this is `self.now`, byte-identical to the original.
+    let now_i = self.now_for(i);
     let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
     self.nodes[i] = Endpoint::restart(
       cfg,
-      self.now,
+      now_i,
       0x5EED ^ id,
       LogSm::new(),
       boot_epoch,
@@ -81,6 +84,29 @@ impl Cluster {
     self.net_last_sched.clear();
   }
 
+  /// Install a per-node clock-drift policy: `policy(id)` returns node `id`'s clock RATE as a
+  /// `(num, den)` rational, so its local clock reads `floor(global · num/den)`. Applied to every
+  /// CURRENT node and stored so any mid-run joiner gets a rate too. The default is `|_| (1, 1)` (no
+  /// drift — a single global clock, byte-identical to the original cluster).
+  ///
+  /// This is what gives LeaseGuard its cross-leader coverage: a same-clock read gate is blind to a
+  /// constant per-node OFFSET, so only differing clock RATES age a deposed leader's lease and a
+  /// successor's commit-wait apart in real time — the exact `Δ·(Δ+ε)/(Δ−ε)` margin. Keep every rate
+  /// within the configured drift bound ε (`|num/den − 1| ≤ ε/Δ`); a rate outside it would inject MORE
+  /// drift than the protocol assumes and could surface a stale read that is the harness's fault, not a
+  /// proto bug.
+  ///
+  /// Call it right after construction (before any tick): it rewrites every founder's rate, which is
+  /// sound because the founders were created at `Instant::ORIGIN` (local time 0 under any rate).
+  pub fn set_clock_drift(&mut self, policy: impl Fn(u64) -> (u64, u64) + 'static) {
+    self.clock_rate = self
+      .node_ids
+      .iter()
+      .map(|&id| validate_rate(policy(id)))
+      .collect();
+    self.drift_policy = std::boxed::Box::new(policy);
+  }
+
   /// Deterministically drive the cluster until node `keep` is sitting inside the fsync window
   /// (has a staged-but-unflushed append), WITHOUT ever flushing `keep`. Returns `true` once the
   /// window is open, or `false` if it did not open within `max_iters`.
@@ -100,16 +126,19 @@ impl Cluster {
       // Advance time to the next deadline and fire due timers (leader heartbeat replicates the
       // durable entry; followers' timers keep their state fresh). `keep`'s timers fire too — a
       // heartbeat will reset its election timer on delivery.
-      let next_timer = self.nodes.iter().filter_map(Endpoint::poll_timeout).min();
+      let next_timer = (0..self.nodes.len())
+        .filter_map(|i| self.global_timeout(i))
+        .min();
       let next_msg = self.bus.iter().map(|m| m.deliver_at).min();
       if let Some(target) = [next_timer, next_msg].into_iter().flatten().min() {
         if target > self.now {
           self.now = target;
         }
         for i in 0..self.nodes.len() {
-          if self.nodes[i].poll_timeout().is_some_and(|d| d <= self.now) {
+          if self.global_timeout(i).is_some_and(|d| d <= self.now) {
+            let now_i = self.now_for(i);
             let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-            self.nodes[i].handle_timeout(self.now, log, stable);
+            self.nodes[i].handle_timeout(now_i, log, stable);
           }
         }
       }
@@ -173,8 +202,9 @@ impl Cluster {
       }
       self.logs[i].flush();
       self.stables[i].flush();
+      let now_i = self.now_for(i);
       let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-      self.nodes[i].handle_storage(self.now, log, stable);
+      self.nodes[i].handle_storage(now_i, log, stable);
     }
     let mut produced = false;
     for i in 0..self.nodes.len() {
