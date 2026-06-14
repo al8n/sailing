@@ -330,5 +330,26 @@ fn leaseguard_config_validation() {
     c.bounded_clock_uncertainty(),
     Some(Duration::from_millis(10))
   );
+
+  // FAILOVER tier validation: bounded_clock_uncertainty requires LeaseGuard AND ε_unc < Δ.
+  // (a) the skew bound set without LeaseGuard is rejected (it gates LeaseGuard-only failover paths).
+  let bad = base()
+    .with_read_only(ReadOnlyOption::Safe)
+    .with_bounded_clock_uncertainty(Duration::from_millis(10));
+  assert!(matches!(
+    bad.validate(),
+    Err(ConfigError::BoundedUncertaintyInvalid { .. })
+  ));
+  // (b) ε_unc ≥ Δ is rejected (it would make the cross-node age comparison vacuous).
+  let bad = base()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(300))
+    .with_clock_drift_bound(Duration::from_millis(50))
+    .with_bounded_clock_uncertainty(Duration::from_millis(300));
+  assert!(matches!(
+    bad.validate(),
+    Err(ConfigError::BoundedUncertaintyInvalid { .. })
+  ));
+
   assert_eq!(ReadOnlyOption::LeaseGuard.as_str(), "lease_guard");
 }
