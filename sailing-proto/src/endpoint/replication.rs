@@ -349,7 +349,8 @@ where
       bytes::Bytes::from(buf),
     )
     .with_timestamp(self.lease_stamp(now.mono()))
-    .with_lease_window(self.lease_window_stamp());
+    .with_lease_window(self.lease_window_stamp())
+    .with_wall_timestamp(self.lease_wall_stamp(now));
     // Self-match advance is deferred until the append is durable (on_log_appended).
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));

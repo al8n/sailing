@@ -68,6 +68,74 @@ fn leaseguard_leader_stamps_appended_entries() {
   );
 }
 
+/// Under the FAILOVER tier (`bounded_clock_uncertainty` set), a LeaseGuard leader stamps every entry
+/// it appends with the SYNCHRONIZED wall reading carried by `Now::synchronized`. Without the tier the
+/// wall stamp stays 0 (absent on the wire) even when a wall is supplied.
+#[test]
+fn leaseguard_failover_leader_stamps_wall_timestamp() {
+  fn proposed_wall(uncertainty: Option<Duration>) -> u64 {
+    let mut cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(300))
+    .with_clock_drift_bound(Duration::from_millis(50));
+    if let Some(u) = uncertainty {
+      cfg = cfg.with_bounded_clock_uncertainty(u);
+    }
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+    let mut log = crate::testkit::VecLog::default();
+    let mut stable = crate::testkit::NoopStable::default();
+
+    // Supply the synchronized wall on EVERY call (the failover tier debug_asserts a present wall).
+    let mono = ep.poll_timeout().unwrap();
+    let now = crate::Now::synchronized(mono, crate::Wall::from_nanos(1_700_000_000_000_000_000));
+    ep.handle_timeout(now, &mut log, &mut stable);
+    ep.handle_storage(now, &mut log, &mut stable);
+    ep.handle_message(
+      now,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::VoteResp(crate::VoteResp::new(
+        crate::Term::new(1),
+        2u64,
+        false,
+        false,
+      )),
+    );
+    assert!(ep.role().is_leader());
+    ep.handle_storage(now, &mut log, &mut stable);
+
+    let idx = ep
+      .propose(now, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
+      .expect("leader accepts the proposal");
+    while let Some(out) = ep.poll_message() {
+      if let Message::AppendEntries(ae) = out.message()
+        && let Some(e) = ae.entries().iter().find(|e| e.index() == idx)
+      {
+        return e.wall_timestamp();
+      }
+    }
+    panic!("the proposed entry was not broadcast");
+  }
+
+  assert_eq!(
+    proposed_wall(Some(Duration::from_millis(20))),
+    1_700_000_000_000_000_000,
+    "the failover tier stamps the entry with the synchronized wall"
+  );
+  assert_eq!(
+    proposed_wall(None),
+    0,
+    "without the failover tier the wall stamp stays 0 (absent on the wire)"
+  );
+}
+
 /// A FRESH LeaseGuard cluster's first leader has no inherited entries (`max_lease_window = 0`), so it
 /// has no deposed lease to wait out — its no-op commits immediately on a quorum ack, exactly like
 /// Safe. (The commit-wait engages only on a real failover; see

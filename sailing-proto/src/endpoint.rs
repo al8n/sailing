@@ -908,6 +908,25 @@ where
     self.config.leaseguard_commit_wait_ns().unwrap_or(0)
   }
 
+  /// The LeaseGuard FAILOVER wall stamp for a new leader entry: the leader's SYNCHRONIZED wall
+  /// reading (nanos since the cluster epoch) when the failover tier is on (`bounded_clock_uncertainty`
+  /// set), else `0` (absent on the wire). Distinct from [`lease_stamp`](Self::lease_stamp), which
+  /// reads the per-node MONOTONIC clock for the same-leader gate; this is the CROSS-LEADER wall the
+  /// inherited-read / precise-anchor tier compares. FAIL-CLOSED: if the tier is on but the caller
+  /// supplied no wall (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never
+  /// a falsely-fresh stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
+  pub(crate) fn lease_wall_stamp(&self, now: crate::Now) -> u64 {
+    if self.config.bounded_clock_uncertainty().is_some() {
+      debug_assert!(
+        !now.wall().is_absent(),
+        "LeaseGuard failover tier is active but the caller supplied no synchronized wall (Now::monotonic)"
+      );
+      now.wall().as_nanos()
+    } else {
+      0
+    }
+  }
+
   /// The validated LeaseGuard `(lease_duration Δ, clock_drift_bound ε)` when the mode is ACTIVE, else
   /// `None`. Active means the config yields a valid commit-wait window — both knobs present, `ε < Δ`,
   /// and the exact window `Δ·(Δ+ε)/(Δ−ε)` fits the `u64` field AND is below the election timeout (the
