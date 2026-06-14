@@ -665,6 +665,117 @@ fn pre_candidate_loses_stays_at_same_term() {
   );
 }
 
+/// A pre-candidate that is BEHIND must adopt the responder's REAL higher term from a pre-vote
+/// REJECT. A pre-vote reject carries the responder's current term (not the candidate's advertised
+/// one), so it is the candidate's signal that it is stale. Without adopting it, a pair with no third
+/// node to bump the term — a 2-voter cluster, or any pair where the peer already self-voted at a
+/// higher term — leaves the pre-candidate re-proposing a term the peer keeps rejecting forever: a
+/// livelock. (Contrast: a pre-vote GRANT, below, echoes the advertised future term and must NOT be
+/// adopted until a quorum lands — the anti-disruption guarantee.)
+#[test]
+fn pre_vote_reject_at_higher_term_is_adopted() {
+  use crate::{Config, Instant, Message, Term, VoteResp};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64], // a 2-voter cluster: no third node can ever bump the term
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_pre_vote(true);
+
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Drive to PreCandidate (term 0, pre-voting for term 1) and drain the pre-vote requests.
+  let deadline = ep.poll_timeout().unwrap();
+  ep.handle_timeout(deadline, &mut log, &mut stable);
+  assert!(ep.role().is_pre_candidate(), "must become PreCandidate");
+  assert_eq!(ep.term(), Term::ZERO);
+  while ep.poll_message().is_some() {}
+
+  // Peer 2 REJECTS the pre-vote, replying at its REAL, higher term 5 (it has moved on / self-voted).
+  let higher = Term::new(5);
+  ep.handle_message(
+    deadline,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(VoteResp::new(
+      higher, 2u64, true, /* pre_vote */
+      true, /* reject */
+    )),
+  );
+
+  // It must adopt the higher real term and step down — so its NEXT election pre-votes for term 6,
+  // high enough to clear the peer's term-5 ballot and finally win. Before the fix it stayed at term
+  // 0, re-proposing term 1 the peer rejects forever.
+  assert_eq!(
+    ep.term(),
+    higher,
+    "a pre-vote REJECT carries the responder's real higher term and MUST be adopted"
+  );
+  assert!(
+    ep.role().is_follower(),
+    "adopting a higher term steps the pre-candidate down to Follower"
+  );
+}
+
+/// The anti-disruption counterpart: a pre-vote GRANT echoes the candidate's ADVERTISED future term,
+/// so a grant SHORT of quorum must NOT raise the receiver's term — only a granted quorum does, via the
+/// real campaign. This pins the `!reject` half of the term-adoption condition (a grant is not adopted;
+/// a reject is).
+#[test]
+fn pre_vote_grant_at_higher_term_does_not_raise_term() {
+  use crate::{Config, Instant, Message, Term, VoteResp};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64, 4u64, 5u64], // 5 voters: self + ONE grant = 2, short of the 3-vote quorum
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_pre_vote(true);
+
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
+  let mut log = crate::testkit::NoopLog;
+  let mut stable = crate::testkit::NoopStable::default();
+
+  let deadline = ep.poll_timeout().unwrap();
+  ep.handle_timeout(deadline, &mut log, &mut stable);
+  assert!(ep.role().is_pre_candidate());
+  while ep.poll_message().is_some() {}
+
+  // A single pre-vote GRANT carrying the advertised future term 1 — short of the 3-vote quorum.
+  ep.handle_message(
+    deadline,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(VoteResp::new(
+      Term::new(1),
+      2u64,
+      true,  /* pre_vote */
+      false, /* grant */
+    )),
+  );
+
+  assert_eq!(
+    ep.term(),
+    Term::ZERO,
+    "a pre-vote GRANT echoes the advertised term and must not raise our term short of a quorum"
+  );
+  assert!(
+    ep.role().is_pre_candidate(),
+    "still PreCandidate: one grant is short of quorum, so no real campaign starts"
+  );
+}
+
 /// Test 2: A partitioned node's pre-vote requests do NOT cause grantors to adopt the higher
 /// advertised term. A follower that receives RequestVote{pre_vote:true, term: self.term+5}
 /// must NOT adopt term+5; its term remains unchanged.

@@ -1214,16 +1214,23 @@ where
       return;
     }
     // Universal term handling (Raft §5.1): a higher term forces us to a follower.
-    // Exception (PreVote anti-disruption): pre-vote traffic carries an *advertised* term
+    // Exception (PreVote anti-disruption): pre-vote traffic that carries an *advertised* term
     // that has not been adopted — do NOT step down or adopt it.
     if msg.term() > self.term {
-      let is_prevote_req = matches!(&msg, Message::RequestVote(rv) if rv.pre_vote());
-      let is_prevote_resp = matches!(&msg, Message::VoteResp(vr) if vr.pre_vote());
-      if is_prevote_req || is_prevote_resp {
-        // A PreVote request/response carries an *advertised* future term — the candidate
-        // has only proposed it, not adopted it. Fall through without adopting the term,
-        // stepping down, or persisting. The anti-disruption guarantee: a partitioned node's
-        // pre-votes can never raise the cluster term.
+      // A pre-vote REQUEST, and a GRANTED pre-vote response, both echo the pre-candidate's
+      // *advertised* future term (it has only proposed it; it adopts only once a quorum grants) —
+      // adopting it would let a partitioned node's pre-votes raise the cluster term, the very
+      // disruption PreVote exists to prevent. But a REJECTED pre-vote response carries the
+      // responder's REAL current term (`on_request_vote`: `resp_term = if grant { rv.term() } else
+      // { self.term }`), so a pre-candidate that is genuinely behind MUST adopt it. Otherwise, with
+      // no third node to bump its term — a 2-voter cluster, or any pair where the peer self-voted at
+      // a higher term — it stays a stale PreCandidate forever, re-proposing a term the peer keeps
+      // rejecting: a livelock. (Matches etcd, which skips the term bump only for `MsgPreVote` and a
+      // granted `MsgPreVoteResp`.)
+      let advertised_prevote = matches!(&msg, Message::RequestVote(rv) if rv.pre_vote())
+        || matches!(&msg, Message::VoteResp(vr) if vr.pre_vote() && !vr.reject());
+      if advertised_prevote {
+        // Fall through without adopting the term, stepping down, or persisting.
       } else {
         // CheckQuorum / PreVote follower lease: a follower that has heard from its current
         // leader within the election timeout ignores a disruptive higher-term REAL vote
