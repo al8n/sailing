@@ -5,21 +5,21 @@ where
   I: NodeId,
   F: StateMachine,
 {
-  pub(crate) fn arm_heartbeat_timer(&mut self, now: Instant) {
-    self.heartbeat_deadline = Some(now + self.config.heartbeat_interval());
+  pub(crate) fn arm_heartbeat_timer(&mut self, now: crate::Now) {
+    self.heartbeat_deadline = Some(now.mono() + self.config.heartbeat_interval());
     // Callers that need to clear election_deadline (e.g. become_leader when check_quorum is
     // false) do so explicitly; we do NOT touch election_deadline here so the CQ timer
     // (set by become_leader when check_quorum is true) is not clobbered on each heartbeat.
   }
 
-  pub(crate) fn broadcast_heartbeat(&mut self, now: Instant) {
+  pub(crate) fn broadcast_heartbeat(&mut self, now: crate::Now) {
     // Start a FRESH CheckQuorum lease round: bump the round, record its SEND instant, and clear the
     // per-round ack set, so the read lease (`lease_valid_until`) is renewed only by HeartbeatResp
     // echoing THIS round and is bounded by this round's send time. A stale/duplicated
     // earlier-round response then cannot keep an isolated leader's lease alive, and a delayed
     // current-round response cannot extend it past the quorum's election window.
     self.lease_round += 1;
-    self.lease_round_start = now;
+    self.lease_round_start = now.mono();
     self.lease_acks.clear();
     // the contributing quorum's min support resets to the leader's OWN election_timeout (its self
     // support); each enforcing ack this round mins it down so a shorter-timeout voter caps the lease.
@@ -58,7 +58,7 @@ where
   ///
   /// Used by the ReadIndex Safe path to kick off a dedicated heartbeat round that
   /// proves the leader is still reachable by a quorum.
-  pub(crate) fn broadcast_heartbeat_with_ctx(&mut self, _now: Instant, ctx: Bytes) {
+  pub(crate) fn broadcast_heartbeat_with_ctx(&mut self, _now: crate::Now, ctx: Bytes) {
     // Carry the CURRENT lease round (do NOT bump — only the periodic `broadcast_heartbeat` opens a new
     // round) so responses to this read-path heartbeat also count toward the lease.
     let (term, me, lease_round) = (self.term, self.config.id(), self.lease_round);
@@ -105,7 +105,7 @@ where
   /// a healed follower's commit forever (caught by the VOPR quiesce oracle, seed 3).
   pub(crate) fn pump_appends<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     peer: I,
     log: &L,
     stable: &S,
@@ -130,7 +130,7 @@ where
 
   pub(crate) fn maybe_send_append<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     peer: I,
     log: &L,
     stable: &S,
@@ -167,7 +167,7 @@ where
         // may have exited Snapshot via `maybe_update` without a heartbeat observation to clean up).
         self
           .snapshot_resend_after
-          .insert(peer, now + self.config.election_timeout());
+          .insert(peer, now.mono() + self.config.election_timeout());
       }
       // No snapshot persisted yet → nothing to send; retry later.
       return;
@@ -263,12 +263,15 @@ where
     }
   }
 
-  pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: Instant, log: &L) {
+  pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: crate::Now, log: &L) {
     // LeaseGuard commit-wait: once the post-election deferred-commit window elapses, lift the gate
     // FOR GOOD — clearing here (not only when a commit actually advances) keeps poll_timeout and
     // handle_timeout consistent: a fired CommitWait timer must leave no serviceable-and-due deadline
     // (the §8 wedge tripwire). After this clear the gate stays down until the next `become_leader`.
-    if self.commit_wait_until.is_some_and(|until| now >= until) {
+    if self
+      .commit_wait_until
+      .is_some_and(|until| now.mono() >= until)
+    {
       self.commit_wait_until = None;
     }
     // Delegate to the Tracker's joint-quorum committed index. For a simple (non-joint)
@@ -308,7 +311,7 @@ where
   /// Takes `cmd` by reference (encoding only borrows; the caller keeps it to retry).
   pub fn propose<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
@@ -317,6 +320,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     if self.poisoned {
       return Err(crate::ProposeError::Poisoned);
     }
@@ -344,7 +348,7 @@ where
       crate::EntryKind::Normal,
       bytes::Bytes::from(buf),
     )
-    .with_timestamp(self.lease_stamp(now))
+    .with_timestamp(self.lease_stamp(now.mono()))
     .with_lease_window(self.lease_window_stamp());
     // Self-match advance is deferred until the append is durable (on_log_appended).
     let opid = self.mint_op_id();
@@ -360,7 +364,7 @@ where
 
   pub(crate) fn on_heartbeat<L: LogStore>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     hb: crate::Heartbeat<I>,
   ) {
@@ -426,7 +430,7 @@ where
 
   pub(crate) fn on_append_entries<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &mut S,
     ae: crate::AppendEntries<I>,
@@ -638,7 +642,7 @@ where
   ///    reached a voter quorum.
   pub(crate) fn on_heartbeat_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     from: I,
     log: &L,
     stable: &S,
@@ -725,11 +729,11 @@ where
       let due = self
         .snapshot_resend_after
         .get(&from)
-        .is_none_or(|&after| now >= after);
+        .is_none_or(|&after| now.mono() >= after);
       if due {
         self
           .snapshot_resend_after
-          .insert(from, now + self.config.election_timeout());
+          .insert(from, now.mono() + self.config.election_timeout());
         self.resend_snapshot(from, stable);
       }
     } else {
@@ -827,7 +831,7 @@ where
 
   pub(crate) fn on_append_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &S,
     from: I,

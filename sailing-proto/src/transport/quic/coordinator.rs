@@ -15,7 +15,7 @@ use super::{
   crypto::{QuicOptions, mesh_connection_floor},
 };
 use crate::{
-  Config, Data, Endpoint, Event, Index, Instant, LogStore, NodeId, ProposeError, StableStore,
+  Config, Data, Endpoint, Event, Index, Instant, LogStore, NodeId, Now, ProposeError, StableStore,
   StateMachine, TransferError, transport::ClusterId,
 };
 
@@ -133,12 +133,13 @@ where
   /// embedder owns the trust boundary.
   pub fn new(
     config: Config<I>,
-    now: Instant,
+    now: impl Into<Now>,
     seed: u64,
     fsm: F,
     opts: QuicOptions,
     cluster: ClusterId,
   ) -> Self {
+    let now: crate::Now = now.into();
     Self::with_identity(Endpoint::new(config, now, seed, fsm), opts, None, cluster)
   }
 
@@ -307,7 +308,7 @@ where
   /// safe).
   pub fn handle_udp<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     remote: SocketAddr,
     ecn: Option<EcnCodepoint>,
     data: &[u8],
@@ -317,34 +318,37 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let std_now = self.quinn_now(now);
+    let now: crate::Now = now.into();
+    let std_now = self.quinn_now(now.mono());
     self.bridge.handle_datagram(std_now, remote, ecn, data);
     self.drain_bridge(now, log, stable);
-    self.pump(now);
+    self.pump(now.mono());
   }
 
   /// Fire all QUIC + consensus timers at `now`, then drain the bridge and pump.
-  pub fn handle_timeout<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  pub fn handle_timeout<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let std_now = self.quinn_now(now);
+    let now: crate::Now = now.into();
+    let std_now = self.quinn_now(now.mono());
     self.bridge.handle_timeout(std_now);
     self.endpoint.handle_timeout(now, log, stable);
     self.drain_bridge(now, log, stable);
-    self.pump(now);
+    self.pump(now.mono());
   }
 
   /// Drain storage completions into the consensus endpoint, then drain the bridge and pump.
-  pub fn handle_storage<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  pub fn handle_storage<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     self.endpoint.handle_storage(now, log, stable);
     self.drain_bridge(now, log, stable);
-    self.pump(now);
+    self.pump(now.mono());
   }
 
   /// Pop one outbound datagram (destination + owned bytes), or `None` when the queue is empty.
@@ -402,7 +406,7 @@ where
   /// [`Endpoint::propose`]; the resulting replication messages are pumped out immediately.
   pub fn submit_propose<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
@@ -411,15 +415,16 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.propose(now, log, stable, cmd);
-    self.pump(now);
+    self.pump(now.mono());
     r
   }
 
   /// Propose a membership change (single-step). Mirrors [`Endpoint::propose_conf_change`].
   pub fn propose_conf_change<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChange<I>,
@@ -429,15 +434,16 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.propose_conf_change(now, log, stable, cc);
-    self.pump(now);
+    self.pump(now.mono());
     r
   }
 
   /// Propose a joint-consensus membership change. Mirrors [`Endpoint::propose_conf_change_v2`].
   pub fn propose_conf_change_v2<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
@@ -447,15 +453,16 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.propose_conf_change_v2(now, log, stable, cc);
-    self.pump(now);
+    self.pump(now.mono());
     r
   }
 
   /// Initiate a linearizable read; the resulting `ReadState` surfaces via [`Self::poll_event`].
   pub fn read_index<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &L,
     stable: &S,
     context: bytes::Bytes,
@@ -464,15 +471,16 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.read_index(now, log, stable, context);
-    self.pump(now);
+    self.pump(now.mono());
     r
   }
 
   /// Begin transferring leadership to `to`. Mirrors [`Endpoint::transfer_leader`].
   pub fn transfer_leader<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &L,
     stable: &S,
     to: I,
@@ -481,8 +489,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.transfer_leader(now, log, stable, to);
-    self.pump(now);
+    self.pump(now.mono());
     r
   }
 
@@ -496,12 +505,15 @@ where
   ///   framing violation closes the connection; a latched graceful FIN closes it AFTER the
   ///   already-decoded frames are delivered (deliver-before-close);
   /// - `lost` → reap the closed connection from routing (the entry drains to quinn's `Drained`).
-  fn drain_bridge<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  // Takes the full `Now` (not a bare `Instant`): a decoded consensus message dispatched below reaches
+  // `endpoint.handle_message`, and a network-driven election there (VoteResp → become_leader → no-op)
+  // must stamp the SYNCHRONIZED wall. Only the quinn/bridge timers use the monotonic `now.mono()`.
+  fn drain_bridge<L, S>(&mut self, now: crate::Now, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let std_now = self.quinn_now(now);
+    let std_now = self.quinn_now(now.mono());
     while let Some(h) = self.bridge.take_connected() {
       // Open the send stream and write our preface as frame zero. The send stream is empty here
       // (consensus frames are gated until `Validated`), so the preface leads the stream.

@@ -21,7 +21,7 @@ where
   /// Returns `Err(TransferError::AlreadyLeader)` if `to == self.id()`.
   pub fn transfer_leader<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &L,
     stable: &S,
     to: I,
@@ -30,6 +30,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     if self.poisoned {
       return Err(crate::TransferError::Poisoned);
     }
@@ -50,7 +51,7 @@ where
     }
     // Arm the transfer: stop accepting proposals, start the deadline window.
     self.lead_transferee = Some(to);
-    self.transfer_deadline = Some(now + self.config.election_timeout());
+    self.transfer_deadline = Some(now.mono() + self.config.election_timeout());
     // revoke the LeaseBased read authority for the duration of the transfer. Authorizing a transfer
     // lets the transferee become leader (forced campaign, bypassing the post-restart fence), so this leader must
     // relinquish its lease — otherwise it could keep serving stale LeaseBased reads at its old commit
@@ -88,7 +89,7 @@ where
   /// voter it ignores the message (etcd: removed/learner nodes silently drop TimeoutNow).
   pub(crate) fn on_timeout_now<L, S>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &mut S,
     tn: crate::TimeoutNow<I>,

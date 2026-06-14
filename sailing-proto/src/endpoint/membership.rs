@@ -35,7 +35,7 @@ where
   /// Requires `I: crate::Data` because the ConfChangeV2 encodes node ids.
   pub(crate) fn append_conf_change<L, S>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
@@ -55,7 +55,7 @@ where
       crate::EntryKind::ConfChange,
       bytes::Bytes::from(buf),
     )
-    .with_timestamp(self.lease_stamp(now))
+    .with_timestamp(self.lease_stamp(now.mono()))
     .with_lease_window(self.lease_window_stamp());
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
@@ -83,7 +83,7 @@ where
   /// - a previous conf-change entry is still pending (`ConfChangeInFlight`).
   pub fn propose_conf_change<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChange<I>,
@@ -92,6 +92,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     self.propose_conf_change_v2(now, log, stable, cc.into_v2())
   }
 
@@ -104,7 +105,7 @@ where
   ///   causes `ConfChangeInFlight`).
   pub fn propose_conf_change_v2<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
@@ -113,6 +114,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     if self.poisoned {
       return Err(crate::ProposeError::Poisoned);
     }

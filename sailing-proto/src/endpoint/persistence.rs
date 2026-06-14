@@ -296,12 +296,13 @@ where
   F::Error: core::error::Error,
 {
   /// Drain storage completions (append-before-ack / persist-vote).
-  pub fn handle_storage<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  pub fn handle_storage<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
     F::Snapshot: crate::Data,
   {
+    let now: crate::Now = now.into();
     if self.poisoned {
       return;
     }
@@ -424,7 +425,7 @@ where
 
   pub(crate) fn on_log_appended<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &S,
     opid: crate::OpId,
@@ -473,7 +474,7 @@ where
 
   pub(crate) fn on_stable_wrote<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &mut S,
     opid: crate::OpId,

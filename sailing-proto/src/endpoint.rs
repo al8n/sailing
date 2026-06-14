@@ -1,8 +1,8 @@
 //! The Sans-I/O Raft core. It owns the consensus state and exposes the
 //! `handle_*`/`poll_*` surface; leader election and log replication run through it.
 use crate::{
-  Config, Event, Index, Instant, LogStore, Message, NodeId, Outgoing, Prng, ReadOnly, StableStore,
-  StateMachine, Term,
+  Config, Event, Index, Instant, LogStore, Message, NodeId, Now, Outgoing, Prng, ReadOnly,
+  StableStore, StateMachine, Term,
 };
 use bytes::Bytes;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -770,7 +770,8 @@ where
 {
   /// Create a fresh node (status Follower, term 0, empty log view).
   /// Arms the election timer immediately.
-  pub fn new(config: Config<I>, now: Instant, seed: u64, fsm: F) -> Self {
+  pub fn new(config: Config<I>, now: impl Into<Now>, seed: u64, fsm: F) -> Self {
+    let now: crate::Now = now.into();
     // Bootstrap the Tracker from the static seed voter set. Read the needed config
     // values BEFORE moving `config` into the struct literal below.
     let cs = crate::ConfState::from_voters(config.voters().iter().copied());
@@ -840,7 +841,7 @@ where
       // incarnation's forwarded-read tokens can never collide with a post-restart incarnation's.
       forwarded_reads: ForwardedReads::new(0),
       lease_round: 0,
-      lease_round_start: now,
+      lease_round_start: now.mono(),
       lease_acks: BTreeSet::new(),
       lease_min_support: core::time::Duration::ZERO,
       lease_valid_until: None,
@@ -1202,7 +1203,7 @@ where
   /// Feed an inbound message. Runs the universal term pre-pass then dispatches.
   pub fn handle_message<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &mut S,
     from: I,
@@ -1212,6 +1213,7 @@ where
     S: StableStore<NodeId = I>,
     F::Snapshot: crate::Data,
   {
+    let now: crate::Now = now.into();
     if self.poisoned {
       return;
     }
@@ -1256,7 +1258,7 @@ where
           let force = rv.leader_transfer();
           let in_lease = (self.config.check_quorum() || self.config.pre_vote())
             && self.leader.is_some()
-            && self.election_deadline.is_some_and(|d| d > now);
+            && self.election_deadline.is_some_and(|d| d > now.mono());
           if !force && in_lease {
             // We've heard from our leader recently; ignore this challenger.
             // Do NOT adopt the term, do NOT grant, do NOT reply.
@@ -1378,17 +1380,18 @@ where
   }
 
   /// Fire due timers (election for followers/candidates, heartbeat for leaders).
-  pub fn handle_timeout<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  pub fn handle_timeout<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     if self.poisoned {
       return;
     }
     match self.role {
       Role::Leader => {
-        if self.heartbeat_deadline.is_some_and(|d| d <= now) {
+        if self.heartbeat_deadline.is_some_and(|d| d <= now.mono()) {
           self.broadcast_heartbeat(now);
           self.arm_heartbeat_timer(now);
         }
@@ -1417,14 +1420,15 @@ where
         // soon as any deposed leader's lease has expired rather than at the next ack/heartbeat.
         // `maybe_advance_commit` clears `commit_wait_until` (the deadline has passed), so the
         // CommitWait timer is left non-serviceable and the wedge tripwire below stays satisfied.
-        if self.commit_wait_until.is_some_and(|d| d <= now) {
+        if self.commit_wait_until.is_some_and(|d| d <= now.mono()) {
           self.maybe_advance_commit(now, log);
           self.apply_committed(log);
           self.maybe_flush_deferred_reads(now, log, stable);
         }
         // Leader transfer abort: if the transfer deadline has passed without the target
         // taking over, abort the transfer and resume accepting proposals.
-        if self.lead_transferee.is_some() && self.transfer_deadline.is_some_and(|d| d <= now) {
+        if self.lead_transferee.is_some() && self.transfer_deadline.is_some_and(|d| d <= now.mono())
+        {
           self.lead_transferee = None;
           self.transfer_deadline = None;
         }
@@ -1433,19 +1437,19 @@ where
         // voters have been recently active (no message from them this window), the leader is
         // likely partitioned from the majority — step down so we stop serving stale reads
         // and allow a reachable node to be elected.
-        if self.config.check_quorum() && self.election_deadline.is_some_and(|d| d <= now) {
+        if self.config.check_quorum() && self.election_deadline.is_some_and(|d| d <= now.mono()) {
           if !self.tracker.quorum_active() {
             self.step_down_to_follower(now);
           } else {
             // Quorum still reachable: reset the activity window and re-arm for the next check.
             let me = self.config.id();
             self.tracker.reset_recent_active(me);
-            self.election_deadline = Some(now + self.config.election_timeout());
+            self.election_deadline = Some(now.mono() + self.config.election_timeout());
           }
         }
       }
       _ => {
-        if self.election_deadline.is_some_and(|d| d <= now) {
+        if self.election_deadline.is_some_and(|d| d <= now.mono()) {
           // A learner or removed node must never start an election.
           // Clear the deadline so `poll_timeout` returns `None` for this node and
           // the sim's clock can advance past it. Non-voters do not re-arm — they
@@ -1474,9 +1478,9 @@ where
     // If this fires, `serviceable_now` has diverged from the actual dispatch (a branch acted
     // on a timer but forgot to re-arm it to a future instant or clear it).
     debug_assert!(
-      TimerKind::ALL
-        .iter()
-        .all(|&k| { !(self.serviceable_now(k) && self.deadline_of(k).is_some_and(|d| d <= now)) }),
+      TimerKind::ALL.iter().all(|&k| {
+        !(self.serviceable_now(k) && self.deadline_of(k).is_some_and(|d| d <= now.mono()))
+      }),
       "handle_timeout left a serviceable timer armed-and-due (serviceable_now diverged from dispatch)"
     );
   }
