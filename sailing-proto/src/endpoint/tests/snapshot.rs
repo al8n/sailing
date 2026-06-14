@@ -334,6 +334,84 @@ fn non_failover_leaseguard_snapshot_has_zero_wall_plus_window() {
   );
 }
 
+/// A NON-failover LeaseGuard snapshot carries `max_unwalled_lease_window == max_lease_window`: the
+/// unwalled-fallback floor is gated by the ENTRY property (`lease_window > 0 && wall_timestamp == 0`),
+/// NOT the local failover tier — the exact dual of the wall floor — so every wall-absent lease entry
+/// folds itself on every node and the floor stays complete. On a non-failover cluster every entry is
+/// wall-absent, so the floor equals `max_lease_window`; it is INERT here (the sole consumer,
+/// `precise_release_ready`, is hard-gated off off-tier).
+///
+/// MUTATION (re-gate the fold on the local tier): the floor drops to 0 on a non-failover node, and a
+/// later failover restart from such a snapshot under-counts its inherited leases — a cross-tier stale
+/// read.
+#[test]
+fn non_failover_leaseguard_snapshot_unwalled_tracks_lease_window() {
+  use crate::Config;
+  use core::time::Duration;
+
+  // LeaseGuard WITHOUT the failover tier (no `bounded_clock_uncertainty`): every appended entry
+  // carries a non-zero `lease_window` while the wall stamp stays absent (0) — i.e. every entry meets
+  // the `lease_window > 0 && wall_timestamp == 0` fold condition, so the entry-property fold raises the
+  // bound to `max_lease_window` on this non-failover node.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_snapshot_threshold(3);
+
+  let mut ep = Endpoint::new(
+    cfg,
+    crate::Instant::ORIGIN,
+    42,
+    crate::testkit::CountSm::default(),
+  );
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::AsyncStable::default();
+
+  // Elect the single-node leader (self-vote durable first), drain the stamped no-op.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Apply past `snapshot_threshold` so the next `handle_storage` submits a snapshot.
+  for i in 0..3 {
+    let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
+    let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+  }
+
+  let (meta, _data) = stable
+    .snapshot()
+    .expect("a snapshot crossed the threshold and was persisted");
+
+  // The lease window IS populated (every entry has a non-zero `lease_window`) ...
+  assert!(
+    meta.max_lease_window() > 0,
+    "a LeaseGuard snapshot must carry the inherited commit-wait window"
+  );
+  // ... and the unwalled-lease fallback bound EQUALS it: the entry-property fold folds every wall-absent
+  // lease entry, so on a non-failover cluster (all entries wall-absent) the floor is `max_lease_window`.
+  // Inert here (the precise anchor is off-tier), but complete by construction so a later failover restart
+  // from this snapshot covers every inherited lease.
+  assert_eq!(
+    meta.max_unwalled_lease_window(),
+    meta.max_lease_window(),
+    "the entry-property fold folds every wall-absent lease entry, so the bound tracks max_lease_window"
+  );
+}
+
 /// A dropped `SnapshotWritten` completion must NOT permanently wedge `pending_compact`
 /// (and thus all future snapshots/compaction). `handle_storage` reconciles `pending_compact`
 /// against the durable snapshot: once the persisted snapshot covers `up_to`, the deferred

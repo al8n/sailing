@@ -341,6 +341,289 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
   );
 }
 
+/// FAILOVER-tier PRECISE commit-anchor: a successor that inherited a deposed FAILOVER leader's
+/// WALL-STAMPED entries lifts its post-election commit-wait as soon as the synchronized wall passes
+/// each inherited entry's own `wall_timestamp + lease_window` by `2·ε_unc` — committing FAR sooner
+/// than the shipped conservative anchor (which restarts the whole window at THIS election's `now`),
+/// because the inherited lease was created well before the election. Pins the `+2·ε_unc` boundary and
+/// the absent-wall fallback.
+#[test]
+fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
+  use crate::{
+    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    Wall,
+  };
+  use core::time::Duration;
+
+  const S: u64 = 1_700_000_000_000_000_000; // the deposed leader's stamp on the inherited entry
+  const W: u64 = 1_500_000_000; // its self-describing window (1500ms — still live at this election)
+  const EPS: u64 = 20_000_000; // ε_unc = 20ms
+  const DEADLINE: u64 = S + W; // inherited_release_deadline = max(s_e + W_e)
+  const THRESHOLD: u64 = DEADLINE + 2 * EPS; // now_wall must EXCEED this to release
+  const W_E: u64 = S + 1_000_000_000; // this node's synchronized wall at the election instant `d`
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // A deposed FAILOVER leader (node 2, term 5) replicated ONE wall-stamped entry to node 1.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(W)
+        .with_wall_timestamp(S)
+      ],
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // node 1 campaigns (term 6) under a SYNCHRONIZED wall. `at(off)` = the synchronized clock at
+  // `d + off`: mono `d + off`, wall `W_E + off` (the wall advances with mono).
+  let d = ep.poll_timeout().unwrap();
+  let at =
+    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(W_E + off));
+  ep.handle_timeout(at(0), &mut log, &mut stable);
+  ep.handle_storage(at(0), &mut log, &mut stable);
+  ep.handle_message(
+    at(0),
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(at(0), &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // peer 3 acks the no-op at index 2 → quorum, but the commit-wait holds (at election wall
+  // W_E = S+1000ms the inherited lease lives until S+1500ms).
+  ep.handle_message(
+    at(0),
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "held at election: the inherited wall-stamped lease is still live"
+  );
+  // Absent-wall fallback: with NO synchronized wall the precise anchor never fires, even far past the
+  // deadline — the shipped conservative anchor governs.
+  assert!(
+    !ep.precise_release_ready(crate::Now::monotonic(d + Duration::from_secs(10))),
+    "an absent wall must not lift the commit-wait early"
+  );
+
+  // Drive `maybe_advance_commit` at a chosen wall by appending a fresh proposal and making it durable
+  // (`on_log_appended` re-runs the commit gate). These post-election proposals never change the
+  // CAPTURED `inherited_release_deadline`, so the precise anchor still keys off the inherited entry.
+  // 1ns BEFORE the precise threshold: still held — pins the +2·ε_unc boundary.
+  let before = (THRESHOLD - 1) - W_E;
+  ep.propose(
+    at(before),
+    &mut log,
+    &stable,
+    &bytes::Bytes::from_static(b"x"),
+  )
+  .expect("a leader appends during the commit-wait");
+  ep.handle_storage(at(before), &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released until now_wall exceeds inherited_release_deadline + 2·ε_unc"
+  );
+
+  // 1ns PAST the precise threshold: the precise anchor lifts the wait — at d+~540ms, far before the
+  // conservative d+1500ms, proving the inherited entry's own wall (not THIS election's now) drove it.
+  let after = (THRESHOLD + 1) - W_E;
+  assert!(
+    after < W,
+    "the precise release must beat the conservative anchor d + max_lease_window (else vacuous)"
+  );
+  ep.propose(
+    at(after),
+    &mut log,
+    &stable,
+    &bytes::Bytes::from_static(b"y"),
+  )
+  .expect("a leader appends during the commit-wait");
+  ep.handle_storage(at(after), &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(2),
+    "the precise anchor commits the inherited entry + no-op once now_wall > deadline + 2·ε_unc"
+  );
+}
+
+/// FAILOVER-tier PRECISE commit-anchor SAFETY: an inherited entry that is LEASE-bearing but
+/// WALL-ABSENT (a fail-closed failover stamp) is NOT covered by the wall floor, so the precise anchor
+/// must additionally hold until its conservative mono-frame fallback elapses — never skipping a
+/// fail-closed lease, even once the synchronized wall has raced far past every WALLED entry's
+/// deadline.
+#[test]
+fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
+  use crate::{
+    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    Wall,
+  };
+  use core::time::Duration;
+
+  const S: u64 = 1_700_000_000_000_000_000;
+  const W_WALLED: u64 = 500_000_000; // the walled entry's window (its wall deadline = S + 500ms)
+  const W_UNWALLED: u64 = 1_500_000_000; // the fail-closed entry's window (mono fallback = d + 1500ms)
+  const EPS: u64 = 20_000_000;
+  const W_E: u64 = S + 1_000_000_000; // election wall — already PAST the walled deadline S + 540ms
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Inherit TWO entries from a deposed failover leader: a WALL-STAMPED one (short window) and a
+  // fail-closed WALL-ABSENT one (longer window, wall_timestamp == 0).
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(W_WALLED)
+        .with_wall_timestamp(S),
+        Entry::new(
+          Term::new(5),
+          Index::new(2),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"b"),
+        )
+        .with_lease_window(W_UNWALLED),
+      ],
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  let d = ep.poll_timeout().unwrap();
+  let at =
+    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(W_E + off));
+  ep.handle_timeout(at(0), &mut log, &mut stable);
+  ep.handle_storage(at(0), &mut log, &mut stable);
+  ep.handle_message(
+    at(0),
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(at(0), &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  ep.handle_message(
+    at(0),
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(3),
+    )),
+  );
+
+  // At election the WALLED entry's wall deadline (S + 540ms) has already passed (wall W_E = S+1000ms),
+  // yet the precise anchor must NOT fire — the fail-closed entry's mono fallback (d + 1500ms) governs.
+  assert!(
+    !ep.precise_release_ready(at(0)),
+    "the fail-closed (wall-absent) inherited lease gates the precise release"
+  );
+  // Even with the wall raced 1400ms past election (S + 2400ms, far past the walled deadline), the
+  // mono fallback still holds (d + 1400ms < d + 1500ms): the fail-closed lease is never skipped.
+  assert!(
+    !ep.precise_release_ready(at(1_400_000_000)),
+    "the mono-frame fallback still holds the fail-closed lease before its conservative deadline"
+  );
+  // Once the mono fallback elapses (d + 1500ms) the precise anchor is satisfied.
+  assert!(
+    ep.precise_release_ready(at(1_500_000_000)),
+    "both the wall floor and the unwalled mono fallback are satisfied at d + 1500ms"
+  );
+  // And the conservative CommitWait timer at d + 1500ms commits the inherited entries + the no-op.
+  ep.handle_timeout(
+    d + Duration::from_nanos(1_500_000_000),
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(3),
+    "released at the fail-closed entry's conservative mono deadline (no early skip)"
+  );
+}
+
 /// The LeaseGuard read gate: a leader whose most-recent committed entry is still within the lease
 /// window serves a read IMMEDIATELY from the local commit (a `ReadState` with no heartbeat round);
 /// once that entry ages past `lease_duration` the read degrades to the always-safe heartbeat round

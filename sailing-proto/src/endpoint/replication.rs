@@ -263,16 +263,55 @@ where
     }
   }
 
+  /// The FAILOVER-tier PRECISE commit-anchor gate. Under the bounded-skew tier with a synchronized
+  /// wall, the post-election commit-wait may lift as soon as EVERY inherited read-lease has PROVABLY
+  /// expired — the WALLED entries by a wall-level compare (`now_wall − ε_unc > max(s_e + W_e) + ε_unc`,
+  /// i.e. `now_wall > inherited_release_deadline + 2·ε_unc`) and any WALL-ABSENT (fail-closed) entries
+  /// by the conservative mono-frame fallback `unwalled_commit_wait_until`. Returns `false` off-tier or
+  /// when this leader holds no synchronized wall, so the shipped conservative anchor governs unchanged.
+  pub(crate) fn precise_release_ready(&self, now: crate::Now) -> bool {
+    let Some(eps) = self.config.bounded_clock_uncertainty() else {
+      return false;
+    };
+    // No synchronized wall this tick ⇒ cannot evaluate the wall compare ⇒ fall back to conservative.
+    if now.wall().is_absent() {
+      return false;
+    }
+    let eps_ns = u64::try_from(eps.as_nanos()).unwrap_or(u64::MAX);
+    // WALLED inherited leases: the successor's wall (a lower bound on real time is `now_wall − ε_unc`)
+    // must pass the latest creation-stamp+window (an upper bound is `inherited_release_deadline +
+    // ε_unc`). `0` ⇒ no walled inherited entry ⇒ vacuously satisfied (and avoids a small-wall test
+    // artifact where a tiny synthetic `now_wall` would otherwise fail `> 2·ε_unc`).
+    let walled_expired = self.inherited_release_deadline == 0
+      || now.wall().as_nanos()
+        > self
+          .inherited_release_deadline
+          .saturating_add(eps_ns.saturating_mul(2));
+    // WALL-ABSENT (fail-closed) inherited leases: no wall to compare, so wait the conservative
+    // mono-frame bound. `None` ⇒ no such entry ⇒ satisfied.
+    let unwalled_expired = self
+      .unwalled_commit_wait_until
+      .is_none_or(|until| now.mono() >= until);
+    walled_expired && unwalled_expired
+  }
+
   pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: crate::Now, log: &L) {
     // LeaseGuard commit-wait: once the post-election deferred-commit window elapses, lift the gate
     // FOR GOOD — clearing here (not only when a commit actually advances) keeps poll_timeout and
     // handle_timeout consistent: a fired CommitWait timer must leave no serviceable-and-due deadline
     // (the §8 wedge tripwire). After this clear the gate stays down until the next `become_leader`.
-    if self
-      .commit_wait_until
-      .is_some_and(|until| now.mono() >= until)
-    {
-      self.commit_wait_until = None;
+    if let Some(until) = self.commit_wait_until {
+      // Lift the gate when EITHER the shipped CONSERVATIVE deadline elapses (mono `now ≥ until`) OR the
+      // FAILOVER-tier PRECISE anchor proves every inherited lease has already expired — the latter
+      // commits up to ~an election timeout sooner by anchoring on each inherited entry's own
+      // synchronized wall stamp rather than this election's `now`. The conservative `until` is the
+      // backstop CommitWait timer that guarantees release if the precise path never fires (it is
+      // opportunistic — only acks/appends carrying the wall re-enter here). Clearing `commit_wait_until`
+      // lifts the gate FOR GOOD and removes that deadline, so `poll_timeout` then surfaces no CommitWait
+      // wakeup and the §8 wedge tripwire (a serviceable timer is never left due) stays satisfied.
+      if now.mono() >= until || self.precise_release_ready(now) {
+        self.commit_wait_until = None;
+      }
     }
     // Delegate to the Tracker's joint-quorum committed index. For a simple (non-joint)
     // config this is identical to the old sorted-match logic:
