@@ -162,6 +162,68 @@ fn entry_timestamp_round_trips() {
   assert_eq!(a, b, "a zero timestamp must be absent on the wire");
 }
 
+/// A LeaseGuard failover wall-timestamp round-trips through the envelope, and a zero one is absent
+/// on the wire (so non-failover entries stay byte-identical to before the field existed).
+#[test]
+fn entry_wall_timestamp_round_trips() {
+  let stamped = Entry::new(
+    Term::new(2),
+    Index::new(3),
+    EntryKind::Normal,
+    Bytes::from_static(b"x"),
+  )
+  .with_wall_timestamp(1_700_000_000_000_000_000);
+  let m = Message::AppendEntries(AppendEntries::new(
+    Term::new(2),
+    1,
+    Index::ZERO,
+    Term::ZERO,
+    std::vec![stamped.clone()],
+    Index::ZERO,
+  ));
+  let mut buf = std::vec::Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::AppendEntries(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(back.entries()[0].wall_timestamp(), 1_700_000_000_000_000_000);
+  assert_eq!(back.entries()[0], stamped);
+
+  // A zero wall_timestamp is omitted on the wire: byte-identical to an entry that never set it.
+  let plain = Entry::new(
+    Term::new(2),
+    Index::new(3),
+    EntryKind::Normal,
+    Bytes::from_static(b"x"),
+  );
+  let mut a = std::vec::Vec::new();
+  let mut b = std::vec::Vec::new();
+  encode_message(
+    &Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![plain.clone()],
+      Index::ZERO,
+    )),
+    &mut a,
+  );
+  encode_message(
+    &Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![plain.with_wall_timestamp(0)],
+      Index::ZERO,
+    )),
+    &mut b,
+  );
+  assert_eq!(a, b, "a zero wall_timestamp must be absent on the wire");
+}
+
 /// Zero-valued scalars (proto3 omits them) round-trip to the same values.
 #[test]
 fn round_trips_zero_defaults() {

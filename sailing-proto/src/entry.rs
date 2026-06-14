@@ -44,6 +44,12 @@ pub struct Entry {
   /// over inherited entries and needs NO assumption about other nodes' config. `0` (and ignored) in
   /// every other mode — absent on the wire, byte-identical to before this field existed.
   lease_window: u64,
+  /// The appending leader's SYNCHRONIZED WALL-CLOCK reading (nanos since a cluster-wide epoch),
+  /// used ONLY by the LeaseGuard FAILOVER tier for cross-node stamp comparison (which needs bounded
+  /// skew). Distinct from `timestamp` (per-node monotonic, never compared cross-node). `0` (and
+  /// absent on the wire) outside the failover tier. NEVER back-fill this from `timestamp` /
+  /// `since_origin()` — those assume per-node monotonic origins, not a synchronized epoch.
+  wall_timestamp: u64,
 }
 
 impl Entry {
@@ -58,6 +64,7 @@ impl Entry {
       data,
       timestamp: 0,
       lease_window: 0,
+      wall_timestamp: 0,
     }
   }
 
@@ -90,6 +97,21 @@ impl Entry {
   #[inline(always)]
   pub const fn lease_window(&self) -> u64 {
     self.lease_window
+  }
+
+  /// Set the LeaseGuard failover wall-clock stamp (nanos since the cluster epoch). A builder, so the
+  /// common 4-arg [`new`](Self::new) stays untouched outside the failover tier.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_wall_timestamp(mut self, wall_timestamp: u64) -> Self {
+    self.wall_timestamp = wall_timestamp;
+    self
+  }
+
+  /// The LeaseGuard failover wall-clock stamp (nanos since the cluster epoch), or `0` if unset.
+  #[inline(always)]
+  pub const fn wall_timestamp(&self) -> u64 {
+    self.wall_timestamp
   }
 
   /// The entry's term.
