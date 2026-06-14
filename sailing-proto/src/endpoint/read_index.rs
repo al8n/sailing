@@ -27,7 +27,7 @@ where
   /// Called once the leader first commits an entry in its current term.
   pub(crate) fn flush_deferred_reads<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &L,
     _stable: &S,
   ) {
@@ -44,7 +44,7 @@ where
   /// leader has committed its first current-term entry.
   pub(crate) fn maybe_flush_deferred_reads<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &L,
     stable: &S,
   ) {
@@ -114,11 +114,11 @@ where
   /// Deployments that cannot bound clock drift MUST use `ReadOnlyOption::Safe` (the default), whose
   /// per-read heartbeat round needs no timing assumption.
   #[inline]
-  pub(crate) fn lease_read_available(&self, now: Instant) -> bool {
+  pub(crate) fn lease_read_available(&self, now: crate::Now) -> bool {
     self.config.check_quorum()
       && self.lead_transferee.is_none()
       && !self.forced_handoff_this_term
-      && self.lease_valid_until.is_some_and(|d| d > now)
+      && self.lease_valid_until.is_some_and(|d| d > now.mono())
   }
 
   /// Confirm a read immediately at `index` (a lease fast-path — no heartbeat round): emit
@@ -141,7 +141,7 @@ where
   /// entry is still within the lease window Δ on the leader's OWN monotonic clock. Fails CLOSED —
   /// degrade to the safe heartbeat round — on an inactive/invalid config (see
   /// [`leaseguard_timing`](Self::leaseguard_timing)) or an unreadable/absent anchor.
-  pub(crate) fn lease_guard_read_live<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
+  pub(crate) fn lease_guard_read_live<L: LogStore>(&mut self, now: crate::Now, log: &L) -> bool {
     let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
     };
@@ -170,6 +170,7 @@ where
     // lossy `u128 → u64` cast: a huge `Instant` cannot wrap `now` to a small value and keep the gate
     // falsely live. `saturating_sub` floors a future-stamped (clock-non-monotone) anchor at age 0.
     now
+      .mono()
       .since_origin()
       .saturating_sub(core::time::Duration::from_nanos(ts))
       < delta
@@ -178,7 +179,7 @@ where
   /// Core leader read logic: register the read and broadcast / confirm.
   pub(crate) fn do_leader_read<L: LogStore>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &L,
     context: Bytes,
     from: Option<I>,
@@ -237,7 +238,7 @@ where
   /// Shared by the `Safe` read-only config AND the `LeaseBased` degradation fallback so single-node
   /// completion holds for both: the lease-unavailable fallback MUST run the self-quorum fast-path,
   /// not merely register-and-broadcast, or a one-voter leader's read would never emit `ReadState`.
-  pub(crate) fn do_safe_read(&mut self, now: Instant, context: Bytes, from: Option<I>) {
+  pub(crate) fn do_safe_read(&mut self, now: crate::Now, context: Bytes, from: Option<I>) {
     let me = self.config.id();
     let commit = self.commit;
     // Register the read and seed the heartbeat round with its INTERNAL token (not the user
@@ -314,7 +315,7 @@ where
   /// stopping on `poison_reason()`).
   pub fn read_index<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &L,
     _stable: &S,
     context: Bytes,
@@ -323,6 +324,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     // A poisoned node suppresses `poll_event`, so no `ReadState` can ever be emitted. Returning
     // `Ok(())` here would violate the `read_index` contract ("accepted onto a confirmation path"):
     // the promised acknowledgement never arrives and the caller blocks forever. Reject up front,
@@ -416,7 +418,7 @@ where
   /// Leader receives a forwarded `ReadIndex` from a follower.
   pub(crate) fn on_read_index<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &L,
     _stable: &S,
     ri: crate::ReadIndex<I>,
