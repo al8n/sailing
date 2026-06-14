@@ -285,6 +285,63 @@ fn snapshot_meta_max_wall_plus_window_round_trips() {
   );
 }
 
+/// SnapshotMeta.max_unwalled_lease_window round-trips, and a hand-built ZERO is omitted on the wire
+/// (the codec's absent-when-zero rule — note the entry-property fold makes the value NON-zero for any
+/// real LeaseGuard snapshot, so this exercises the codec directly, not a non-failover snapshot).
+#[test]
+fn snapshot_meta_max_unwalled_lease_window_round_trips() {
+  let conf = ConfState::new(
+    std::vec![1u64, 2, 3],
+    std::vec![],
+    std::vec![],
+    std::vec![],
+    false,
+  );
+  let meta = SnapshotMeta::new(Index::new(10), Term::new(4), conf.clone())
+    .with_max_unwalled_lease_window(420_000_000);
+  let m = Message::InstallSnapshot(InstallSnapshot::new(
+    Term::new(4),
+    1,
+    meta,
+    Bytes::from_static(b"blob"),
+  ));
+  let mut buf = std::vec::Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(back.snapshot().max_unwalled_lease_window(), 420_000_000);
+
+  // A zero max_unwalled_lease_window is omitted on the wire (the codec's absent-when-zero rule; a real
+  // LeaseGuard snapshot's value is non-zero under the entry-property fold).
+  let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
+  let mut a = std::vec::Vec::new();
+  let mut b = std::vec::Vec::new();
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.clone(),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut a,
+  );
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.with_max_unwalled_lease_window(0),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut b,
+  );
+  assert_eq!(
+    a, b,
+    "a zero max_unwalled_lease_window must be absent on the wire"
+  );
+}
+
 /// Zero-valued scalars (proto3 omits them) round-trip to the same values.
 #[test]
 fn round_trips_zero_defaults() {

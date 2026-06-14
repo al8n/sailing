@@ -66,14 +66,26 @@ where
       // The precise-anchor release floor: the per-entry wall stamp PLUS its window (paired per
       // entry, never the max stamp with a different entry's window). ONLY a real (non-zero) wall
       // contributes — an ABSENT wall (`wall_timestamp == 0`: non-failover LeaseGuard, or a
-      // fail-closed failover entry) folds NOTHING, so the floor stays `0` outside the failover tier.
-      // That keeps non-failover snapshots byte-identical AND keeps the floor strictly wall-derived
-      // (a later consumer never mistakes `lease_window` alone for a wall+window floor). `saturating_add`
-      // is defensive — `wall_timestamp` is nanos-since-epoch + a small window, never overflowing u64.
+      // fail-closed failover entry) folds NOTHING, so THIS floor stays `0` outside the failover tier
+      // (strictly wall-derived — a later consumer never mistakes `lease_window` alone for a wall+window
+      // floor; the wall-ABSENT windows are the SEPARATE entry-gated `max_unwalled_lease_window` fold
+      // below). `saturating_add` is defensive — `wall_timestamp` is nanos-since-epoch + a small window,
+      // never overflowing u64.
       if e.wall_timestamp() != 0 {
         self.max_wall_plus_window = self
           .max_wall_plus_window
           .max(e.wall_timestamp().saturating_add(e.lease_window()));
+      }
+      // The mono-frame fallback bound for inherited entries that are LEASE-bearing but WALL-ABSENT.
+      // Gated by the ENTRY property (`lease_window > 0 && wall_timestamp == 0`) — the exact dual of the
+      // wall floor above (`wall_timestamp != 0`) — NOT by the local failover tier: an entry-property gate
+      // folds the same value on every node that holds the entry, so the floor stays complete across
+      // heterogeneous per-node tiers (a per-node-config gate could not). On a non-failover LeaseGuard
+      // cluster this equals `max_lease_window` (every entry is wall-absent), but is inert there — the
+      // sole consumer, `precise_release_ready`, returns false off-tier. Safe/LeaseBased keep it 0
+      // (`lease_window` is 0).
+      if e.lease_window() > 0 && e.wall_timestamp() == 0 {
+        self.max_unwalled_lease_window = self.max_unwalled_lease_window.max(e.lease_window());
       }
     }
     // Track this append's last index independently of `pending` so `on_log_appended` can advance

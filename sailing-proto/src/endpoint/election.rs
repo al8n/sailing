@@ -511,6 +511,15 @@ where
     // (`leaseguard_timing` gates STAMPING new entries and serving lease reads, NOT this wait.)
     self.commit_wait_until = (self.max_lease_window > 0)
       .then(|| now.mono() + core::time::Duration::from_nanos(self.max_lease_window));
+    // FAILOVER-tier PRECISE commit-anchor (consumed by `maybe_advance_commit`'s precise early-release).
+    // Pin, immutable for this term: the WALL-frame release floor = `max_wall_plus_window` (max over
+    // WALLED inherited entries of `wall_timestamp + lease_window`), and the MONO-frame fallback deadline
+    // = `now + max_unwalled_lease_window` for any WALL-ABSENT (fail-closed) inherited lease entry. Both
+    // inert (`0` / `None`) on a cluster with no such inherited entry, so off-tier the shipped
+    // conservative anchor above governs unchanged.
+    self.inherited_release_deadline = self.max_wall_plus_window;
+    self.unwalled_commit_wait_until = (self.max_unwalled_lease_window > 0)
+      .then(|| now.mono() + core::time::Duration::from_nanos(self.max_unwalled_lease_window));
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
     // Self-match advance is deferred until the append is durable (on_log_appended). A log at the index

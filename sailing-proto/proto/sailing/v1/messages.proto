@@ -83,6 +83,18 @@ message SnapshotMeta {
   // PER ENTRY (never the max stamp with a different entry's window). Zero outside the failover tier —
   // absent on the wire, byte-identical to before.
   uint64 max_wall_plus_window = 5;
+  // The max lease_window over the entries this snapshot subsumes that are LEASE-bearing but
+  // WALL-ABSENT (lease_window > 0, wall_timestamp == 0) — the failover precise commit-anchor's
+  // mono-frame fallback bound for wall-absent inherited leases, carried so a successor that compacted
+  // (or installed) these entries still bounds a deposed leader's lease when no precise wall anchor
+  // exists. Folded by the ENTRY property on EVERY node (the exact dual of max_wall_plus_window's
+  // wall_timestamp != 0), so the floor is complete across heterogeneous per-node tiers: every
+  // wall-absent lease entry contributes regardless of any node's config. It therefore EQUALS
+  // max_lease_window in a non-failover LeaseGuard cluster (every entry is wall-absent), but is inert
+  // there (only the failover tier reads it). A successor consuming this floor relies on every peer
+  // populating it identically — which is exactly why this precise-anchor release bumps LABEL_VERSION
+  // (mixed-version nodes that predate the consumed floors reject at the handshake).
+  uint64 max_unwalled_lease_window = 6;
 }
 
 // Log replication / heartbeat-with-entries.

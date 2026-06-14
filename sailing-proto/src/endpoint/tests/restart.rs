@@ -388,6 +388,98 @@ fn restart_restores_snapshot_then_replays_tail() {
   assert!(!ep.is_poisoned(), "node must not be poisoned");
 }
 
+/// The unwalled fallback floor (`max_unwalled_lease_window`) is an ENTRY-property floor — folded for
+/// every wall-absent lease entry on every node, like its sibling wall floor — so a snapshot's carried
+/// value is COMPLETE, and the restart recompute propagates it UNGATED (snapshot carry ⊔ live scan,
+/// exactly like `max_lease_window`). A failover and a non-failover restart recover it IDENTICALLY: no
+/// tier-dependent stripping. (A snapshot with `max_unwalled == 0` but `max_lease_window > 0` carries no
+/// unwalled floor —
+/// never produced by a matched-binary cluster, whose entry-property fold always carries it. It only
+/// arises from a PRE-FIELD snapshot, out-of-scope either way: a pre-field PEER install rejects at the
+/// Labeled handshake (version fence), while a pre-field LOCAL durable snapshot — which a self-restart
+/// cannot fence — is the storage / fresh-cluster contract, WIRE.md.)
+#[test]
+fn restart_propagates_unwalled_floor_ungated_across_tiers() {
+  use crate::{Config, Index, Term, conf::ConfState};
+  use core::time::Duration;
+
+  const W: u64 = 300_000_000;
+
+  // Restart a single-node cluster from a snapshot with the given precise-metadata shape, returning the
+  // recovered `(max_unwalled_lease_window, max_wall_plus_window, max_lease_window)`.
+  fn recover(failover: bool, wall_plus: u64, unwalled: u64) -> (u64, u64, u64) {
+    let mut cfg = Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(300))
+    .with_clock_drift_bound(Duration::from_millis(50));
+    if failover {
+      cfg = cfg.with_bounded_clock_uncertainty(Duration::from_millis(20));
+    }
+    let mut stable = crate::testkit::AsyncStable::default();
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    )
+    .with_max_lease_window(W)
+    .with_max_wall_plus_window(wall_plus)
+    .with_max_unwalled_lease_window(unwalled);
+    stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(10));
+    while stable.poll().is_some() {}
+    stable.force_state(Term::new(2), None, Index::new(5));
+    let mut log = crate::testkit::VecLog::default();
+    log.restore(Index::new(5), Term::new(2));
+    let ep = Endpoint::restart(
+      cfg,
+      crate::Instant::ORIGIN,
+      42,
+      crate::testkit::CountSm::default(),
+      1,
+      &mut log,
+      &mut stable,
+    );
+    (
+      ep.max_unwalled_lease_window,
+      ep.max_wall_plus_window,
+      ep.max_lease_window,
+    )
+  }
+
+  // The unwalled floor propagates from the snapshot UNGATED: a FAILOVER and a NON-failover restart
+  // recover it IDENTICALLY (no tier-dependent stripping).
+  const U: u64 = 200_000_000;
+  let (unwalled_failover, wall_plus, lease) = recover(true, W, U);
+  assert_eq!(
+    unwalled_failover, U,
+    "a failover restart recovers the carried unwalled floor"
+  );
+  assert_eq!(wall_plus, W, "the wall floor is carried");
+  assert_eq!(lease, W, "the conservative bound is carried");
+
+  let (unwalled_nonfailover, ..) = recover(false, W, U);
+  assert_eq!(
+    unwalled_nonfailover, U,
+    "a NON-failover restart recovers the SAME floor — the entry-property floor is never tier-stripped"
+  );
+
+  // A snapshot with no unwalled metadata (`max_unwalled == 0`, `max_lease_window > 0`) recovers 0: a
+  // PRE-FIELD snapshot, never produced by a matched-binary cluster (whose entry-property fold always
+  // carries the floor). Out-of-scope either way — a pre-field PEER install rejects at the handshake, a
+  // pre-field LOCAL durable snapshot (this self-restart path) is the storage / fresh-cluster contract
+  // (WIRE.md). Recovering 0 here is that out-of-scope contract, not an in-scope stale read.
+  let (unwalled_prefield, ..) = recover(true, 0, 0);
+  assert_eq!(
+    unwalled_prefield, 0,
+    "a pre-field snapshot carries no unwalled floor (out-of-scope: peer handshake / local storage contract)"
+  );
+}
+
 /// Test 2: restart with snapshot only, no post-snapshot tail.
 /// SM == snapshot state, applied==commit==5.
 #[test]

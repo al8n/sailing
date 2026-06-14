@@ -579,6 +579,31 @@ where
   /// `submit_append` + snapshot install, carried through compaction, recomputed at restart. `0`
   /// outside the failover tier (every `wall_timestamp` is `0`).
   max_wall_plus_window: u64,
+  /// The MAX `lease_window` over every entry this node has ever held that is LEASE-bearing but
+  /// WALL-ABSENT (`lease_window > 0`, `wall_timestamp == 0`) — the failover precise commit-anchor's
+  /// mono-frame fallback bound for wall-absent inherited leases. Folded by the ENTRY property (the exact
+  /// dual of [`max_wall_plus_window`](Self::max_wall_plus_window)'s `wall_timestamp != 0`), NOT the local
+  /// tier, so it is complete BY CONSTRUCTION across heterogeneous per-node tiers — every wall-absent lease
+  /// entry folds itself on every node. Equals [`max_lease_window`](Self::max_lease_window) in a
+  /// non-failover LeaseGuard cluster, but inert there (the consumer `precise_release_ready` is off-tier);
+  /// `0` for Safe/LeaseBased. Monotonic in memory, folded on `submit_append` + snapshot install, carried
+  /// through compaction, recomputed at restart (snapshot carry ⊔ live scan, like `max_lease_window`).
+  max_unwalled_lease_window: u64,
+  /// FAILOVER-tier precise commit-anchor — the WALL-frame release floor, captured ONCE at
+  /// [`become_leader`](Self::become_leader) as the then-current
+  /// [`max_wall_plus_window`](Self::max_wall_plus_window) (max over WALLED inherited entries of
+  /// `wall_timestamp + lease_window`) and immutable for the term. `maybe_advance_commit` lifts the
+  /// post-election commit-wait early once the successor's synchronized wall passes this floor by
+  /// `2·ε_unc`. `0` ⇒ no walled inherited entry ⇒ the wall gate is vacuously satisfied; the shipped
+  /// conservative anchor still governs off-tier or when the leader holds no synchronized wall.
+  inherited_release_deadline: u64,
+  /// FAILOVER-tier precise commit-anchor — the MONO-frame fallback deadline for any WALL-ABSENT
+  /// (fail-closed) inherited lease entry, captured ONCE at [`become_leader`](Self::become_leader) as
+  /// `now + max_unwalled_lease_window` and immutable for the term. The precise early-release ALSO
+  /// requires this deadline to pass, so a fail-closed entry (uncovered by the wall floor) still waits
+  /// out its lease on the conservative mono bound. `None` ⇒ no such entry ⇒ that half of the gate is
+  /// satisfied.
+  unwalled_commit_wait_until: Option<Instant>,
   /// LeaseGuard lease-refresh demand: set when a LeaseGuard read finds the lease stale (and so degrades
   /// to the Safe round), consumed at the next leader heartbeat tick, which appends ONE stamped no-op to
   /// re-commit and re-stamp the lease so subsequent reads serve fast again. A flag (not a count): the
@@ -816,6 +841,10 @@ where
       // Fresh node, empty log: no inherited lease window to cover yet. Raised as entries arrive.
       max_lease_window: 0,
       max_wall_plus_window: 0,
+      max_unwalled_lease_window: 0,
+      // Precise failover commit-anchor captures — armed only at become_leader.
+      inherited_release_deadline: 0,
+      unwalled_commit_wait_until: None,
       // No read has found the lease stale yet (set by a degraded LeaseGuard read; only a leader acts).
       lease_refresh_wanted: false,
       outgoing: VecDeque::new(),
