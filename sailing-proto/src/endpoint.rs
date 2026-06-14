@@ -572,6 +572,13 @@ where
   /// through compaction (into the created `SnapshotMeta`) and recomputed at restart from the durable
   /// log + restored snapshot. `0` in non-LeaseGuard clusters (every `lease_window` is `0`) ⇒ no wait.
   max_lease_window: u64,
+  /// LeaseGuard lease-refresh demand: set when a LeaseGuard read finds the lease stale (and so degrades
+  /// to the Safe round), consumed at the next leader heartbeat tick, which appends ONE stamped no-op to
+  /// re-commit and re-stamp the lease so subsequent reads serve fast again. A flag (not a count): the
+  /// refresh is rate-limited to one in-flight no-op (the heartbeat only appends when the log is fully
+  /// committed). Never set outside LeaseGuard, so it cannot perturb Safe/LeaseBased. Reset on
+  /// step-down/restart (only a leader acts on it, and a stale read re-sets it as needed).
+  lease_refresh_wanted: bool,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -800,6 +807,8 @@ where
       commit_wait_until: None,
       // Fresh node, empty log: no inherited lease window to cover yet. Raised as entries arrive.
       max_lease_window: 0,
+      // No read has found the lease stale yet (set by a degraded LeaseGuard read; only a leader acts).
+      lease_refresh_wanted: false,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       tracker,
@@ -1382,6 +1391,26 @@ where
         if self.heartbeat_deadline.is_some_and(|d| d <= now) {
           self.broadcast_heartbeat(now);
           self.arm_heartbeat_timer(now);
+        }
+        // LeaseGuard lease refresh: a recent read found the lease stale and degraded to Safe. Consume
+        // the demand (clearing the flag rate-limits to one in-flight no-op) and append ONE stamped no-op
+        // iff: the config is active; NO leader transfer is in progress (a refresh would advance
+        // last_index AFTER TimeoutNow was sent, stranding the authorized transferee with a now-stale log
+        // so it loses the forced election — mirror `propose`'s LeaderTransferInProgress freeze); the log
+        // is FULLY committed (last==commit, so nothing pending re-stamps the lease and we never stack a
+        // second refresh no-op); and the committed lease is STILL stale (an intervening client write may
+        // already have re-stamped it). Replication carries it to the quorum; once it commits, subsequent
+        // reads serve fast for Δ. On a fully idle cluster (no reads) the flag is never set ⇒ no write amp.
+        if self.lease_refresh_wanted {
+          self.lease_refresh_wanted = false;
+          let last = log.last_index();
+          if self.leaseguard_timing().is_some()
+            && self.lead_transferee.is_none()
+            && last == self.commit
+            && !self.lease_guard_read_live(now, log)
+          {
+            self.append_leader_noop(now, log, last);
+          }
         }
         // LeaseGuard commit-wait: the post-election deferred-commit window has elapsed. Retry the
         // commit (and apply + flush deferred reads) now, so the new leader's first commit lands as

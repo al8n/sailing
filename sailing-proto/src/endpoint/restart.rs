@@ -303,6 +303,8 @@ where
       // `become_leader` from that election's `now` and the recovered `max_lease_window` below.
       commit_wait_until: None,
       max_lease_window: recovered_max_lease_window,
+      // A restarted node comes up a fresh Follower with no pending lease-refresh demand.
+      lease_refresh_wanted: false,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
       // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup
