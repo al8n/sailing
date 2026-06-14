@@ -876,3 +876,179 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
     "past the u64::MAX boundary the lease is STALE (no wrap to falsely-live), so the read degrades"
   );
 }
+
+/// Build a single-voter LeaseGuard leader (Δ=300ms, ε=50ms) whose become-leader no-op is committed, and
+/// return `(endpoint, log, stable, election_instant)`. A 1-voter cluster self-quorums, so the no-op
+/// commits without peer acks and the lease is fresh as of the election instant.
+fn elected_leaseguard_single_voter() -> (
+  Endpoint<u64, crate::testkit::CountSm>,
+  crate::testkit::VecLog,
+  crate::testkit::NoopStable<u64>,
+  Instant,
+) {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  // Flush the self-vote + the appended no-op to durable storage and self-commit (1-voter quorum).
+  ep.handle_storage(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(
+    ep.role().is_leader(),
+    "a single-voter cluster elects immediately"
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable, t0)
+}
+
+/// A LeaseGuard read that finds the lease stale degrades to Safe AND records a refresh demand; the
+/// leader's next timer tick appends ONE stamped no-op, re-stamping the committed lease so subsequent
+/// reads serve fast again. This is the no-op refresh that fixes post-election "dead on arrival" and
+/// read-only-workload staleness.
+#[test]
+fn leaseguard_stale_read_triggers_a_refresh_noop() {
+  let (mut ep, mut log, stable, t0) = elected_leaseguard_single_voter();
+  let last_after_election = log.last_index();
+
+  // The committed no-op's lease expires after Δ=300ms; a read at +400ms is stale.
+  let stale = t0 + Duration::from_millis(400);
+  ep.read_index(stale, &log, &stable, bytes::Bytes::from_static(b"r1"))
+    .expect("a fresh-context read is accepted");
+  // (the stale read degraded to the Safe round and recorded the refresh demand)
+  while ep.poll_event().is_some() {}
+  assert_eq!(
+    log.last_index(),
+    last_after_election,
+    "the read itself must NOT append anything — reads take an immutable log"
+  );
+
+  // The leader's next timer tick consumes the demand and appends ONE stamped refresh no-op.
+  let mut stable = stable;
+  ep.handle_timeout(stale, &mut log, &mut stable);
+  assert!(
+    log.last_index() > last_after_election,
+    "a stale read must trigger a refresh no-op at the next leader tick"
+  );
+  let refreshed = log
+    .entries(
+      last_after_election.next()..log.last_index().next(),
+      u64::MAX,
+    )
+    .unwrap();
+  assert_eq!(refreshed.len(), 1, "exactly one refresh no-op is appended");
+  assert_eq!(
+    refreshed[0].timestamp(),
+    u64::try_from(stale.since_origin().as_nanos()).unwrap(),
+    "the refresh no-op is stamped at the refresh time, re-stamping the lease fresh"
+  );
+}
+
+/// An IDLE LeaseGuard leader (no reads) appends NO refresh no-ops even as its lease goes stale — the
+/// refresh is reactive (driven by read demand), so a read-free cluster pays zero write amplification.
+#[test]
+fn leaseguard_idle_leader_does_not_append_refresh_noops() {
+  let (mut ep, mut log, mut stable, t0) = elected_leaseguard_single_voter();
+  let last = log.last_index();
+  // No reads. Fire many leader timer ticks well past the lease window.
+  for k in 1..=10u64 {
+    let t = t0 + Duration::from_millis(400 * k);
+    ep.handle_timeout(t, &mut log, &mut stable);
+  }
+  assert_eq!(
+    log.last_index(),
+    last,
+    "an idle LeaseGuard leader appends no refresh no-ops — the refresh is read-driven, not a timer"
+  );
+}
+
+/// A stale LeaseGuard read DURING a leader transfer must NOT trigger a refresh no-op. Appending one
+/// would advance `last_index` after `TimeoutNow` was sent, leaving the authorized transferee with a
+/// now-stale log so it loses the forced election (especially in a small cluster) — the refresh mirrors
+/// `propose`'s leader-transfer write freeze.
+#[test]
+fn leaseguard_no_refresh_during_leader_transfer() {
+  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Elect and commit the become-leader no-op with peer 2 caught up (so a transfer to 2 is immediate).
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert_eq!(ep.commit_index(), Index::new(1));
+  let last = log.last_index();
+
+  // Authorize a transfer to the caught-up peer 2 — this arms `lead_transferee` and sends TimeoutNow.
+  ep.transfer_leader(d, &log, &stable, 2u64).unwrap();
+  assert_eq!(
+    ep.lead_transferee,
+    Some(2u64),
+    "the transfer arms lead_transferee"
+  );
+
+  // A stale LeaseGuard read during the transfer still records a refresh demand (the read itself is
+  // safe — the successor's commit-wait covers this leader's lease).
+  let stale = d + Duration::from_millis(400);
+  ep.read_index(stale, &log, &stable, bytes::Bytes::from_static(b"r1"))
+    .unwrap();
+  while ep.poll_event().is_some() {}
+
+  // The next timer tick must NOT append a refresh no-op while the transfer is in flight.
+  ep.handle_timeout(stale, &mut log, &mut stable);
+  assert_eq!(
+    log.last_index(),
+    last,
+    "no refresh no-op may be appended during a leader transfer (it would strand the transferee)"
+  );
+}

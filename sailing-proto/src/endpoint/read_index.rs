@@ -141,7 +141,7 @@ where
   /// entry is still within the lease window Δ on the leader's OWN monotonic clock. Fails CLOSED —
   /// degrade to the safe heartbeat round — on an inactive/invalid config (see
   /// [`leaseguard_timing`](Self::leaseguard_timing)) or an unreadable/absent anchor.
-  fn lease_guard_read_live<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
+  pub(crate) fn lease_guard_read_live<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
     let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
     };
@@ -215,6 +215,15 @@ where
         if self.lease_guard_read_live(now, log) {
           self.emit_or_reply_read(commit, context, from);
         } else {
+          // Stale lease: degrade THIS read to the always-safe heartbeat round, and (only under an
+          // active LeaseGuard config) record a refresh demand. The leader's next heartbeat tick appends
+          // ONE stamped no-op to re-commit and re-stamp the lease, so subsequent reads serve fast again
+          // — fixing the post-election "lease dead on arrival" and read-only-workload staleness without
+          // ever changing the read gate or commit-wait. (An inactive/invalid config or a poisoned read
+          // also lands here; `leaseguard_timing().is_some()` keeps the demand to genuine staleness.)
+          if self.leaseguard_timing().is_some() {
+            self.lease_refresh_wanted = true;
+          }
           self.do_safe_read(now, context, from);
         }
       }
