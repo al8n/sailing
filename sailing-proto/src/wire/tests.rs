@@ -187,7 +187,10 @@ fn entry_wall_timestamp_round_trips() {
   else {
     panic!("variant")
   };
-  assert_eq!(back.entries()[0].wall_timestamp(), 1_700_000_000_000_000_000);
+  assert_eq!(
+    back.entries()[0].wall_timestamp(),
+    1_700_000_000_000_000_000
+  );
   assert_eq!(back.entries()[0], stamped);
 
   // A zero wall_timestamp is omitted on the wire: byte-identical to an entry that never set it.
@@ -222,6 +225,64 @@ fn entry_wall_timestamp_round_trips() {
     &mut b,
   );
   assert_eq!(a, b, "a zero wall_timestamp must be absent on the wire");
+}
+
+/// SnapshotMeta.max_wall_plus_window round-trips, and a zero is absent on the wire (byte-identical
+/// to a snapshot built before the field existed).
+#[test]
+fn snapshot_meta_max_wall_plus_window_round_trips() {
+  let conf = ConfState::new(
+    std::vec![1u64, 2, 3],
+    std::vec![],
+    std::vec![],
+    std::vec![],
+    false,
+  );
+  let meta = SnapshotMeta::new(Index::new(10), Term::new(4), conf.clone())
+    .with_max_wall_plus_window(1_700_000_000_000_000_999);
+  let m = Message::InstallSnapshot(InstallSnapshot::new(
+    Term::new(4),
+    1,
+    meta,
+    Bytes::from_static(b"blob"),
+  ));
+  let mut buf = std::vec::Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back.snapshot().max_wall_plus_window(),
+    1_700_000_000_000_000_999
+  );
+
+  // A zero max_wall_plus_window is omitted on the wire: byte-identical to a snapshot that never set it.
+  let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
+  let mut a = std::vec::Vec::new();
+  let mut b = std::vec::Vec::new();
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.clone(),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut a,
+  );
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.with_max_wall_plus_window(0),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut b,
+  );
+  assert_eq!(
+    a, b,
+    "a zero max_wall_plus_window must be absent on the wire"
+  );
 }
 
 /// Zero-valued scalars (proto3 omits them) round-trip to the same values.
