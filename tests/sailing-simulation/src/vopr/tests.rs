@@ -131,21 +131,22 @@ fn vopr_exercises_leaseguard_under_drift() {
     );
   }
 
-  // Strong non-vacuity: seed 309 (a longer run) drives the CROSS-LEADER path — under drift a slow
-  // leader's heartbeats arrive late, a follower elects a successor while the slow leader's lease is
-  // still fresh, and that SUPERSEDED leader (still Leader-role, outranked by a higher-term leader)
-  // serves reads — every one kept linearizable by the successor's commit-wait. That is the coverage a
-  // single global clock cannot produce. A zero here means drift no longer reaches the contested regime
-  // (find a fresh seed with the drift_sweep example).
-  let r = run_vopr(309, 2_000);
+  // Strong non-vacuity (the cross-leader coverage a single global clock cannot produce): under drift a
+  // slow leader's heartbeats arrive late, a follower elects a successor while the slow leader's lease
+  // is still fresh, and that SUPERSEDED leader (still Leader-role, outranked by a higher-term leader)
+  // serves reads — each kept linearizable by the successor's commit-wait. Pinned across SEVERAL drift
+  // seeds so one drifting out as the consensus schedule evolves does not silently vacate the coverage
+  // (the prior single pin, seed 309, drifted to zero after later consensus changes). Each seed draws
+  // the drift mode — `reads_served_by_superseded_leader > 0` implies it. Re-derive the set with the
+  // `drift_sweep` example if they ALL fall to zero.
+  let superseded: u64 = [56u64, 464]
+    .iter()
+    .map(|&seed| run_vopr(seed, 2_000).reads_served_by_superseded_leader)
+    .sum();
   assert!(
-    r.drifted,
-    "seed 309 was expected to draw the LeaseGuard+drift mode"
-  );
-  assert!(
-    r.reads_served_by_superseded_leader > 0,
-    "seed 309 under drift never reached the superseded-leader read path — the cross-leader coverage is \
-     vacuous (report={r:?})"
+    superseded > 0,
+    "no pinned drift seed reached the superseded-leader read path — the cross-leader coverage is \
+     vacuous; re-derive the seed set with the drift_sweep example"
   );
 }
 
