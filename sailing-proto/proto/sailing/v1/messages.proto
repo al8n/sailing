@@ -40,6 +40,13 @@ message Entry {
   // by the MAX window over inherited entries with no assumption about other nodes' config. Zero (the
   // proto3 default) in every other mode — absent on the wire, byte-identical to before.
   uint64 lease_window = 6;
+  // The appending leader's SYNCHRONIZED WALL-CLOCK reading (nanos since a cluster-wide epoch) when
+  // it appended this entry — used ONLY by the LeaseGuard FAILOVER tier (inherited reads + the precise
+  // commit-anchor) to compare a prior leader's stamp to a successor's clock across nodes, which needs
+  // bounded clock skew. Distinct from timestamp (5), which is per-node MONOTONIC and never compared
+  // cross-node. Zero (the proto3 default) outside the failover tier — absent on the wire, byte-identical
+  // to before. See WIRE.md and the 2026-06-14 failover-reads design.
+  uint64 wall_timestamp = 7;
 }
 
 // Entry discriminant. Zero = Normal so the dominant case is the proto3 default.
