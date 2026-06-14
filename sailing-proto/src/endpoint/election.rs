@@ -60,6 +60,9 @@ where
     // Drop all pending reads — a stepped-down node is no longer the leader and
     // cannot confirm any outstanding read requests.
     self.read_only.reset(self.config.read_only());
+    // A stepped-down node no longer serves LeaseGuard reads, so drop any pending lease-refresh demand
+    // (only a leader appends the refresh no-op; a re-election re-stamps the lease via its own no-op).
+    self.lease_refresh_wanted = false;
     self.pending_reads.clear();
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
     self.lead_transferee = None;
@@ -390,6 +393,39 @@ where
     self.tracker.vote_result(&self.votes).is_won()
   }
 
+  /// Append THIS leader's stamped empty (no-op) entry at the next free index after `last`, tracked as a
+  /// `LeaderAppend` so its durability advances the leader's own match. The entry carries the LeaseGuard
+  /// `timestamp` + `lease_window` stamps (both `0` / proto-omitted outside LeaseGuard). Used by
+  /// `become_leader` (to commit prior-term entries, §5.4.2) and by the LeaseGuard lease refresh (to
+  /// re-stamp a stale committed lease under a read-only workload). Returns the appended index, or `None`
+  /// after poisoning when the log is at the index ceiling (`next_log_index` cannot allocate a fresh,
+  /// non-aliased index — a corrupt/terminal node).
+  pub(crate) fn append_leader_noop<L: LogStore>(
+    &mut self,
+    now: Instant,
+    log: &mut L,
+    last: crate::Index,
+  ) -> Option<crate::Index> {
+    let Some(noop_index) = Self::next_log_index(last) else {
+      self.poison(PoisonReason::LogExhausted);
+      return None;
+    };
+    let noop = crate::Entry::new(
+      self.term,
+      noop_index,
+      crate::EntryKind::Empty,
+      bytes::Bytes::new(),
+    )
+    .with_timestamp(self.lease_stamp(now))
+    .with_lease_window(self.lease_window_stamp());
+    let opid = self.mint_op_id();
+    self.submit_append(log, opid, core::slice::from_ref(&noop));
+    self
+      .pending
+      .insert(opid, Pending::LeaderAppend { upto: noop_index });
+    Some(noop_index)
+  }
+
   pub(crate) fn become_leader<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Instant,
@@ -475,29 +511,11 @@ where
       .then(|| now + core::time::Duration::from_nanos(self.max_lease_window));
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
-    // Self-match advance is deferred until the append is durable (on_log_appended).
-    // Allocate a fresh, usable index for the no-op (see `next_log_index`). If the log is at the ceiling
-    // the leader cannot append its no-op (and so could never commit a current-term entry); allocating
-    // the aliased/sentinel index would truncate-replace the existing entry or commit an entry that
-    // can never be applied/replicated. A node whose log is at the ceiling is corrupt/terminal —
-    // fail-stop.
-    let Some(noop_index) = Self::next_log_index(last) else {
-      self.poison(PoisonReason::LogExhausted);
+    // Self-match advance is deferred until the append is durable (on_log_appended). A log at the index
+    // ceiling is corrupt/terminal — `append_leader_noop` poisons and returns `None`; fail-stop.
+    if self.append_leader_noop(now, log, last).is_none() {
       return;
-    };
-    let noop = crate::Entry::new(
-      self.term,
-      noop_index,
-      crate::EntryKind::Empty,
-      bytes::Bytes::new(),
-    )
-    .with_timestamp(self.lease_stamp(now))
-    .with_lease_window(self.lease_window_stamp());
-    let opid = self.mint_op_id();
-    self.submit_append(log, opid, core::slice::from_ref(&noop));
-    self
-      .pending
-      .insert(opid, Pending::LeaderAppend { upto: noop_index });
+    }
 
     // (`set_leader` above emitted `LeaderChanged(Some(self))` — a candidate's leader belief is
     // always `None`, so the transition always fires.)
