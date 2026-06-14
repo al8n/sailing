@@ -56,7 +56,8 @@ where
       bytes::Bytes::from(buf),
     )
     .with_timestamp(self.lease_stamp(now.mono()))
-    .with_lease_window(self.lease_window_stamp());
+    .with_lease_window(self.lease_window_stamp())
+    .with_wall_timestamp(self.lease_wall_stamp(now));
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
     self
