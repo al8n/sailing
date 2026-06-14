@@ -266,6 +266,7 @@ fn pb_snapshot_meta<I: crate::NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
     last_term: m.last_term().get(),
     conf: buffa::MessageField::some(pb_conf_state(m.conf())),
     max_lease_window: m.max_lease_window(),
+    max_wall_plus_window: m.max_wall_plus_window(),
     ..Default::default()
   }
 }
@@ -283,7 +284,8 @@ fn snapshot_meta_from<I: crate::NodeId>(
       Term::new(w.last_term),
       conf_state_from(conf)?,
     )
-    .with_max_lease_window(w.max_lease_window),
+    .with_max_lease_window(w.max_lease_window)
+    .with_max_wall_plus_window(w.max_wall_plus_window),
   )
 }
 
