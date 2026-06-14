@@ -606,7 +606,7 @@ fn promoted_learner_arms_election_timer() {
     ep.election_deadline.is_none(),
     "promotion alone must NOT arm — arming is the reconcile's job, by construction"
   );
-  ep.reconcile_election_timer(Instant::ORIGIN);
+  ep.reconcile_election_timer(crate::Now::monotonic(Instant::ORIGIN));
 
   // Node 4 is now a voter AND the reconcile armed its election timer so it can campaign.
   assert!(

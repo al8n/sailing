@@ -25,7 +25,7 @@ where
   /// because re-acquiring leadership requires a strictly-higher term, which fences stale responses.
   pub fn restart<L, S>(
     config: Config<I>,
-    now: Instant,
+    now: impl Into<Now>,
     seed: u64,
     fsm: F,
     boot_epoch: u64,
@@ -38,6 +38,7 @@ where
     F::Snapshot: crate::Data,
     I: crate::Data,
   {
+    let now: crate::Now = now.into();
     Self::restart_inner(config, now, seed, fsm, boot_epoch, None, log, stable)
   }
 
@@ -54,7 +55,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub fn restart_migrating<L, S>(
     config: Config<I>,
-    now: Instant,
+    now: impl Into<Now>,
     seed: u64,
     fsm: F,
     boot_epoch: u64,
@@ -68,6 +69,7 @@ where
     F::Snapshot: crate::Data,
     I: crate::Data,
   {
+    let now: crate::Now = now.into();
     Self::restart_inner(
       config,
       now,
@@ -83,7 +85,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn restart_inner<L, S>(
     config: Config<I>,
-    now: Instant,
+    now: crate::Now,
     seed: u64,
     fsm: F,
     boot_epoch: u64,
@@ -245,7 +247,10 @@ where
       config.election_timeout(),
       assume_prior_lease_support,
     ) {
-      LeaseReconcile::Ok(d) => (d.lease_support_floor, d.fence_window.map(|w| now + w)),
+      LeaseReconcile::Ok(d) => (
+        d.lease_support_floor,
+        d.fence_window.map(|w| now.mono() + w),
+      ),
       // A legacy `Unrecorded` record with no operator bound: fail-stop — the prior promise is
       // unbounded, so no finite fence is safe; recover via `restart_migrating(assume_prior = ..)`. A
       // poisoned node is inert (it emits nothing and persists nothing), so it can never grant a vote.
@@ -341,7 +346,7 @@ where
       pending_reads: std::vec::Vec::new(),
       forwarded_reads: ForwardedReads::new(boot_epoch),
       lease_round: 0,
-      lease_round_start: now,
+      lease_round_start: now.mono(),
       lease_acks: BTreeSet::new(),
       lease_min_support: core::time::Duration::ZERO,
       lease_valid_until: None,

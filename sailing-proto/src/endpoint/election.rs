@@ -7,9 +7,9 @@ where
 {
   // --- PRIVATE HELPERS (no Data bound) ---
 
-  pub(crate) fn arm_election_timer(&mut self, now: Instant) {
+  pub(crate) fn arm_election_timer(&mut self, now: crate::Now) {
     let t = self.prng.election_timeout(self.config.election_timeout());
-    self.election_deadline = Some(now + t);
+    self.election_deadline = Some(now.mono() + t);
     self.heartbeat_deadline = None;
   }
 
@@ -37,7 +37,7 @@ where
   /// Mirrors the guarantee etcd gets for free from its always-incrementing `electionElapsed` counter
   /// (every node ticks, so a voter always eventually campaigns); we reconstruct it for the
   /// deadline-based model without giving up the event-driven clock skip for non-voters.
-  pub(crate) fn reconcile_election_timer(&mut self, now: Instant) {
+  pub(crate) fn reconcile_election_timer(&mut self, now: crate::Now) {
     if !self.role.is_leader()
       && self.election_deadline.is_none()
       && self.tracker.is_voter(&self.config.id())
@@ -53,7 +53,7 @@ where
   ///
   /// Sets `role = Follower`, clears `leader` and `heartbeat_deadline`, and arms the election
   /// timer so the node will eventually campaign again (with PreVote, non-disruptively).
-  pub(crate) fn step_down_to_follower(&mut self, now: Instant) {
+  pub(crate) fn step_down_to_follower(&mut self, now: crate::Now) {
     self.role = Role::Follower;
     self.set_leader(None);
     self.heartbeat_deadline = None;
@@ -89,13 +89,13 @@ where
   /// leader is voluntarily handing off (relinquishing its lease), so granting cannot strand a live lease
   /// — mirrors the `in_lease` bypass. Only ever armed under `ReadOnlyOption::LeaseBased` (see `restart`).
   #[inline]
-  pub(crate) fn lease_vote_fenced(&self, now: Instant, force: bool) -> bool {
-    !force && self.lease_vote_fence_until.is_some_and(|d| now < d)
+  pub(crate) fn lease_vote_fenced(&self, now: crate::Now, force: bool) -> bool {
+    !force && self.lease_vote_fence_until.is_some_and(|d| now.mono() < d)
   }
 
   pub(crate) fn on_request_vote<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &mut S,
     rv: crate::RequestVote<I>,
@@ -149,7 +149,8 @@ where
         && (rv.term() > self.term
           || self.voted_for.is_none()
           || self.voted_for == Some(rv.candidate()));
-      let lease_open = !(self.leader.is_some() && self.election_deadline.is_some_and(|d| d > now));
+      let lease_open =
+        !(self.leader.is_some() && self.election_deadline.is_some_and(|d| d > now.mono()));
       // (d) post-restart fence: a restarted node under LeaseBased withholds even its PRE-vote during
       //     the fence window, so a lease it may have acked before crashing cannot be undermined by a
       //     fresh election (a forced transfer bypasses — see `lease_vote_fenced`).
@@ -208,7 +209,7 @@ where
 
   pub(crate) fn on_vote_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &mut S,
     vr: crate::VoteResp<I>,
@@ -264,7 +265,7 @@ where
   /// (election-timeout path, pre-vote quorum reached) pass `transfer = false`.
   pub(crate) fn become_candidate<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &mut S,
     transfer: bool,
@@ -349,7 +350,7 @@ where
   ///
   /// Returns `true` if the pre-vote quorum is already satisfied (single-node fast path), so
   /// the caller can immediately proceed to `become_candidate`.
-  pub(crate) fn become_pre_candidate<L: LogStore>(&mut self, now: Instant, log: &L) -> bool {
+  pub(crate) fn become_pre_candidate<L: LogStore>(&mut self, now: crate::Now, log: &L) -> bool {
     // Non-voter guard (mirrors become_candidate for defense-in-depth).
     if !self.tracker.is_voter(&self.config.id()) {
       return false;
@@ -402,7 +403,7 @@ where
   /// non-aliased index — a corrupt/terminal node).
   pub(crate) fn append_leader_noop<L: LogStore>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     last: crate::Index,
   ) -> Option<crate::Index> {
@@ -416,7 +417,7 @@ where
       crate::EntryKind::Empty,
       bytes::Bytes::new(),
     )
-    .with_timestamp(self.lease_stamp(now))
+    .with_timestamp(self.lease_stamp(now.mono()))
     .with_lease_window(self.lease_window_stamp());
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&noop));
@@ -428,7 +429,7 @@ where
 
   pub(crate) fn become_leader<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &mut S,
   ) {
@@ -489,7 +490,7 @@ where
       }
       // Use the base election_timeout (not randomized) for the CheckQuorum interval, matching
       // etcd's behavior (checkQuorumActive is checked every electionTimeout ticks).
-      self.election_deadline = Some(now + self.config.election_timeout());
+      self.election_deadline = Some(now.mono() + self.config.election_timeout());
     }
 
     // LeaseGuard commit-wait: arm the post-election deferred-commit window whenever this node
@@ -508,7 +509,7 @@ where
     //     `lease_window` is 0) ⇒ no wait, so Safe/LeaseBased clusters are unaffected.
     // (`leaseguard_timing` gates STAMPING new entries and serving lease reads, NOT this wait.)
     self.commit_wait_until = (self.max_lease_window > 0)
-      .then(|| now + core::time::Duration::from_nanos(self.max_lease_window));
+      .then(|| now.mono() + core::time::Duration::from_nanos(self.max_lease_window));
 
     // Append the new leader's no-op entry (lets it commit prior-term entries, §5.4.2).
     // Self-match advance is deferred until the append is durable (on_log_appended). A log at the index

@@ -6,7 +6,7 @@
 //! deterministic and Sans-I/O.
 use super::{ConnId, router::PeerRouter, stream::RecordIo};
 use crate::{
-  Config, Endpoint, Event, Index, Instant, LogStore, NodeId, ProposeError, StableStore,
+  Config, Endpoint, Event, Index, Instant, LogStore, NodeId, Now, ProposeError, StableStore,
   StateMachine, TransferError,
 };
 use bytes::Bytes;
@@ -36,7 +36,8 @@ where
   R: RecordIo,
 {
   /// Create a coordinator wrapping a fresh [`Endpoint`] and an empty connection table.
-  pub fn new(config: Config<I>, now: Instant, seed: u64, fsm: F) -> Self {
+  pub fn new(config: Config<I>, now: impl Into<Now>, seed: u64, fsm: F) -> Self {
+    let now: crate::Now = now.into();
     Self::from_endpoint(Endpoint::new(config, now, seed, fsm))
   }
 
@@ -45,7 +46,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub fn restart<L, S>(
     config: Config<I>,
-    now: Instant,
+    now: impl Into<Now>,
     seed: u64,
     fsm: F,
     boot_epoch: u64,
@@ -57,6 +58,7 @@ where
     S: StableStore<NodeId = I>,
     I: crate::Data,
   {
+    let now: crate::Now = now.into();
     Self::from_endpoint(Endpoint::restart(
       config, now, seed, fsm, boot_epoch, log, stable,
     ))
@@ -67,7 +69,7 @@ where
   #[allow(clippy::too_many_arguments)]
   pub fn restart_migrating<L, S>(
     config: Config<I>,
-    now: Instant,
+    now: impl Into<Now>,
     seed: u64,
     fsm: F,
     boot_epoch: u64,
@@ -80,6 +82,7 @@ where
     S: StableStore<NodeId = I>,
     I: crate::Data,
   {
+    let now: crate::Now = now.into();
     Self::from_endpoint(Endpoint::restart_migrating(
       config,
       now,
@@ -145,19 +148,20 @@ where
     conn: ConnId,
     bytes: &[u8],
     eof: bool,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &mut S,
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let mut decoded = Vec::new();
     // The router removes a faulted/closed connection itself and queues the close (with its reason)
     // for poll_conn_closed; the error needs no extra handling here.
     let _ = self
       .router
-      .handle_conn_data(conn, bytes, eof, now, &mut decoded);
+      .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
     for (from, msg) in decoded {
       self.endpoint.handle_message(now, log, stable, from, msg);
     }
@@ -173,7 +177,7 @@ where
   /// `encoded_len`, tracked for the zero-copy round).
   pub fn submit_propose<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
@@ -182,6 +186,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.propose(now, log, stable, cmd);
     self.flush();
     r
@@ -190,7 +195,7 @@ where
   /// Initiate a linearizable read; the resulting `ReadState` surfaces via [`Self::poll_event`].
   pub fn read_index<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &L,
     stable: &S,
     context: Bytes,
@@ -199,6 +204,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.read_index(now, log, stable, context);
     self.flush();
     r
@@ -207,7 +213,7 @@ where
   /// Begin transferring leadership to `to`.
   pub fn transfer_leader<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &L,
     stable: &S,
     to: I,
@@ -216,6 +222,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.transfer_leader(now, log, stable, to);
     self.flush();
     r
@@ -223,12 +230,13 @@ where
 
   /// Fire the endpoint's timers and the transport's housekeeping (handshake-deadline reaping),
   /// then flush any resulting outbound messages.
-  pub fn handle_timeout<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  pub fn handle_timeout<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    self.router.reap_handshakes(now);
+    let now: crate::Now = now.into();
+    self.router.reap_handshakes(now.mono());
     self.endpoint.handle_timeout(now, log, stable);
     self.flush();
   }
@@ -236,7 +244,7 @@ where
   /// Propose a membership change (single-step). Mirrors [`Endpoint::propose_conf_change`].
   pub fn propose_conf_change<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChange<I>,
@@ -245,6 +253,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.propose_conf_change(now, log, stable, cc);
     self.flush();
     r
@@ -254,7 +263,7 @@ where
   /// [`Endpoint::propose_conf_change_v2`].
   pub fn propose_conf_change_v2<L, S>(
     &mut self,
-    now: Instant,
+    now: impl Into<Now>,
     log: &mut L,
     stable: &S,
     cc: crate::ConfChangeV2<I>,
@@ -263,17 +272,19 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     let r = self.endpoint.propose_conf_change_v2(now, log, stable, cc);
     self.flush();
     r
   }
 
   /// Drain storage completions into the endpoint, then flush.
-  pub fn handle_storage<L, S>(&mut self, now: Instant, log: &mut L, stable: &mut S)
+  pub fn handle_storage<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    let now: crate::Now = now.into();
     self.endpoint.handle_storage(now, log, stable);
     self.flush();
   }

@@ -111,7 +111,7 @@ where
   /// log) to `install_snapshot_now` once the blob is durable, so it needs no `LogStore`.
   pub(crate) fn on_install_snapshot<S>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     stable: &mut S,
     is: crate::InstallSnapshot<I>,
   ) where
@@ -342,7 +342,7 @@ where
   /// Receive a `SnapshotResp` from a follower (leader path).
   pub(crate) fn on_snapshot_resp<L, S>(
     &mut self,
-    now: Instant,
+    now: crate::Now,
     log: &mut L,
     stable: &S,
     from: I,

@@ -63,6 +63,29 @@ fn coord_with_cap(ca: &TestClusterCa, id: u64, c: ClusterId, cap: Option<usize>)
   QuicCoordinator::with_identity(endpoint, opts, Some(seed), c)
 }
 
+/// As [`coord`], but a LeaseGuard FAILOVER coordinator (`bounded_clock_uncertainty` set): a
+/// network-driven election here stamps the leader no-op with the SYNCHRONIZED wall the driver
+/// supplies, and the failover tier debug-asserts a present wall on every endpoint hop. The timing is
+/// valid under the module's 100ms election timeout (Δ=30ms, ε=5ms → 30·35/25 = 42ms < 100ms; the
+/// uncertainty 20ms < Δ).
+fn coord_failover(ca: &TestClusterCa, id: u64, c: ClusterId) -> Coord {
+  use crate::transport::quic::QuicTuning;
+  let cfg = Config::try_new(id, std::vec![1u64, 2u64], ELECTION, HEARTBEAT)
+    .unwrap()
+    .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(30))
+    .with_clock_drift_bound(Duration::from_millis(5))
+    .with_bounded_clock_uncertainty(Duration::from_millis(20));
+  let endpoint = crate::Endpoint::new(cfg, Instant::ORIGIN, id, CountSm::default());
+  let opts = ca
+    .cluster_tls(&san(id, &c))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut seed = [0u8; 32];
+  seed[0] = id as u8;
+  QuicCoordinator::with_identity(endpoint, opts, Some(seed), c)
+}
+
 /// A two-node world over an in-memory UDP pipe with optional deterministic datagram loss: every
 /// `drop_every`-th moved datagram is silently discarded (quinn's loss recovery must retransmit).
 struct World {
@@ -470,4 +493,123 @@ fn committed_membership_growth_raises_the_connection_cap() {
     "the cap grows with the committed membership"
   );
   assert_eq!(w.b.effective_max_connections(), 6);
+}
+
+/// FAILS-ON-OLD (FIX 2: `drain_bridge` must forward the full `Now` to `handle_message`): a
+/// network-driven election over QUIC, with EVERY coordinator hop driven by a SYNCHRONIZED `Now`,
+/// must preserve the synchronized wall onto the elected leader's term-current no-op (Empty) entry.
+/// The winning `VoteResp` rides a QUIC stream into `drain_bridge`, which decodes it and calls
+/// `endpoint.handle_message` → `become_leader` → `append_leader_noop`, stamping
+/// `lease_wall_stamp(now)`. Under the FAILOVER tier that stamp is `now.wall().as_nanos()`.
+///
+/// MUTATION (revert FIX 2 — `drain_bridge(now.mono(), ..)`): the decoded `VoteResp` reaches
+/// `handle_message` with the wall STRIPPED (`Now::monotonic`), so the failover tier's
+/// `lease_wall_stamp` debug-asserts the absent wall and PANICS the election (and, with the assert
+/// compiled out, the no-op would stamp `0`, also failing the `== W` assertion).
+#[test]
+fn quic_election_preserves_synchronized_wall_on_leader_noop() {
+  use crate::{EntryKind, Index, LogStore, Now, Wall};
+
+  // A fixed cluster-epoch wall reading carried on every endpoint hop.
+  const W: u64 = 1_700_000_000_000_000_000;
+  let synced = |mono: Instant| Now::synchronized(mono, Wall::from_nanos(W));
+
+  let ca = TestClusterCa::generate();
+  let c = cluster(7);
+  let mut a = coord_failover(&ca, 1, c);
+  let mut b = coord_failover(&ca, 2, c);
+  let (mut la, mut sa) = (VecLog::default(), NoopStable::default());
+  let (mut lb, mut sb) = (VecLog::default(), NoopStable::default());
+  let mut now = Instant::ORIGIN;
+
+  // Node 1 dials node 2 once; the single connection carries both directions.
+  a.connect(Instant::ORIGIN, addr(2), 2u64).expect("dial");
+
+  // Move every queued datagram across the pipe, draining storage on both sides under a SYNCHRONIZED
+  // `Now`, until quiescent — the synchronized-wall analogue of `World::settle`.
+  let settle = |a: &mut Coord,
+                b: &mut Coord,
+                la: &mut VecLog,
+                sa: &mut NoopStable,
+                lb: &mut VecLog,
+                sb: &mut NoopStable,
+                now: Instant| {
+    for _ in 0..400 {
+      a.handle_storage(synced(now), la, sa);
+      b.handle_storage(synced(now), lb, sb);
+      let mut from_a = std::vec::Vec::new();
+      while let Some(t) = a.poll_transmit() {
+        from_a.push(t);
+      }
+      let mut from_b = std::vec::Vec::new();
+      while let Some(t) = b.poll_transmit() {
+        from_b.push(t);
+      }
+      let mut progressed = false;
+      for (_dest, bytes) in from_a {
+        progressed = true;
+        b.handle_udp(synced(now), addr(1), None, &bytes, lb, sb);
+      }
+      for (_dest, bytes) in from_b {
+        progressed = true;
+        a.handle_udp(synced(now), addr(2), None, &bytes, la, sa);
+      }
+      if !progressed {
+        return;
+      }
+    }
+    panic!("the UDP pipe did not quiesce");
+  };
+
+  settle(&mut a, &mut b, &mut la, &mut sa, &mut lb, &mut sb, now);
+  assert!(
+    a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
+    "both bound"
+  );
+
+  // Drive timers (each node on its own randomized deadline) under a SYNCHRONIZED `Now` until a
+  // leader emerges — the winning VoteResp flows over QUIC into `drain_bridge` → `handle_message`.
+  for _ in 0..200 {
+    let da = a.poll_timeout();
+    let db = b.poll_timeout();
+    let next = match (da, db) {
+      (Some(x), Some(y)) => x.min(y),
+      (Some(x), None) => x,
+      (None, Some(y)) => y,
+      (None, None) => now + HEARTBEAT,
+    };
+    now = now.max(next);
+    if da.is_some_and(|d| d <= now) {
+      a.handle_timeout(synced(now), &mut la, &mut sa);
+    }
+    if db.is_some_and(|d| d <= now) {
+      b.handle_timeout(synced(now), &mut lb, &mut sb);
+    }
+    settle(&mut a, &mut b, &mut la, &mut sa, &mut lb, &mut sb, now);
+    if a.role().is_leader() || b.role().is_leader() {
+      break;
+    }
+  }
+  assert!(
+    a.role().is_leader() || b.role().is_leader(),
+    "a leader emerged over QUIC under the failover tier"
+  );
+
+  // Inspect the elected leader's log for its term-current no-op (the Empty entry `become_leader`
+  // appended) and assert it carries the synchronized wall — proving `drain_bridge` forwarded the
+  // full `Now` to `handle_message`.
+  let leader_log = if a.role().is_leader() { &la } else { &lb };
+  let last = leader_log.last_index();
+  let entries = leader_log
+    .entries(Index::new(1)..last.next(), u64::MAX)
+    .expect("read the leader log");
+  let noop = entries
+    .iter()
+    .find(|e| e.kind() == EntryKind::Empty)
+    .expect("the elected leader appended a term-current no-op");
+  assert_eq!(
+    noop.wall_timestamp(),
+    W,
+    "the network-driven election must stamp the no-op with the synchronized wall (FIX 2)"
+  );
 }

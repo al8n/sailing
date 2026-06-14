@@ -342,7 +342,12 @@ fn sends_install_snapshot_on_compacted_hole() {
   }
 
   // Call maybe_send_append; it should detect next_index < first_index and send snapshot.
-  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
+  ep.maybe_send_append(
+    crate::Now::monotonic(crate::Instant::ORIGIN),
+    2u64,
+    &log,
+    &stable,
+  );
 
   // Exactly one outgoing message to peer 2 must be InstallSnapshot.
   let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
@@ -396,7 +401,12 @@ fn no_broken_append_entries_for_compacted_peer() {
     p.set_next_index(Index::new(3));
   }
 
-  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
+  ep.maybe_send_append(
+    crate::Now::monotonic(crate::Instant::ORIGIN),
+    2u64,
+    &log,
+    &stable,
+  );
 
   // Must NOT see any AppendEntries with prev_log_term == ZERO for this peer.
   while let Some(out) = ep.poll_message() {
@@ -427,11 +437,21 @@ fn snapshot_state_peer_is_paused_no_second_send() {
   }
 
   // First call: sends the snapshot and transitions peer to Snapshot state.
-  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
+  ep.maybe_send_append(
+    crate::Now::monotonic(crate::Instant::ORIGIN),
+    2u64,
+    &log,
+    &stable,
+  );
   while ep.poll_message().is_some() {} // drain
 
   // Second call: peer is now paused (Snapshot state), must send nothing.
-  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
+  ep.maybe_send_append(
+    crate::Now::monotonic(crate::Instant::ORIGIN),
+    2u64,
+    &log,
+    &stable,
+  );
   let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
   assert!(
     msgs.is_empty(),
@@ -455,7 +475,12 @@ fn normal_append_at_boundary_not_snapshot() {
     p.set_next_index(first); // exactly at boundary
   }
 
-  ep.maybe_send_append(crate::Instant::ORIGIN, 2u64, &log, &stable);
+  ep.maybe_send_append(
+    crate::Now::monotonic(crate::Instant::ORIGIN),
+    2u64,
+    &log,
+    &stable,
+  );
 
   let msgs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
 
