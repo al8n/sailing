@@ -418,6 +418,20 @@ impl<I: NodeId> Config<I> {
       // diverge. Propagates the specific error (missing knob / timing too long).
       self.leaseguard_window_result()?;
     }
+    // The LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set) only makes sense under
+    // `LeaseGuard` — it gates the inherited-lease reads + the precise commit-anchor — and the skew
+    // bound must be a real fraction of the lease (`ε_unc < Δ`); `ε_unc ≥ Δ` would make the cross-node
+    // age comparison vacuous. (When `read_only == LeaseGuard`, the check above already proved
+    // `lease_duration` is `Some`; the `is_none_or` only fires for a misordered non-LeaseGuard config.)
+    if let Some(unc) = self.bounded_clock_uncertainty
+      && (self.read_only != ReadOnlyOption::LeaseGuard
+        || self.lease_duration.is_none_or(|d| unc >= d))
+    {
+      return Err(ConfigError::BoundedUncertaintyInvalid {
+        uncertainty: unc,
+        lease: self.lease_duration,
+      });
+    }
     Ok(())
   }
 

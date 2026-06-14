@@ -143,4 +143,15 @@ pub enum ConfigError {
   /// the leader knowing it still holds a quorum; without CheckQuorum that guarantee is absent).
   #[error("ReadOnlyOption::LeaseBased requires check_quorum to be enabled")]
   LeaseRequiresCheckQuorum,
+  /// `bounded_clock_uncertainty` (the LeaseGuard failover tier's synchronized-clock skew bound) was
+  /// set without `read_only = LeaseGuard`, or it was not strictly less than `lease_duration`.
+  #[error(
+    "bounded_clock_uncertainty ({uncertainty:?}) requires read_only = LeaseGuard and must be < lease_duration ({lease:?})"
+  )]
+  BoundedUncertaintyInvalid {
+    /// The configured bounded clock uncertainty (the failover skew bound).
+    uncertainty: core::time::Duration,
+    /// The configured lease duration it must be under (`None` if unset).
+    lease: Option<core::time::Duration>,
+  },
 }
