@@ -134,6 +134,13 @@ where
       .as_ref()
       .map(|(meta, _)| meta.max_wall_plus_window())
       .unwrap_or(0);
+    // The mono-frame fallback bound this snapshot carries over its compacted entries — combined below
+    // with a live-log scan, exactly like `max_lease_window`. An ENTRY-property floor (folded for every
+    // wall-absent lease entry on every node), so the carried value is already complete.
+    let snap_max_unwalled: u64 = snapshot
+      .as_ref()
+      .map(|(meta, _)| meta.max_unwalled_lease_window())
+      .unwrap_or(0);
     if let Some((meta, data)) = snapshot {
       // Validate the durable snapshot's BOUNDARY before decoding/restoring the SM or installing the
       // tracker (which copies the ConfState verbatim) — a corrupt-on-disk or version-skewed snapshot
@@ -301,6 +308,24 @@ where
         }
       }
     };
+    // The mono-frame fallback bound, recomputed from durable state the same way as `max_lease_window`
+    // (snapshot carry ⊔ live scan) with the IDENTICAL fail-stop discipline. UNGATED — it is an
+    // ENTRY-property floor, so the scan folds every wall-absent lease entry on every node and the carry
+    // is already complete; there is nothing tier-specific to gate. On a non-failover LeaseGuard log this
+    // recovers `max_lease_window` (every entry is wall-absent), but it is inert (the precise anchor is
+    // off-tier); Safe/LeaseBased recover 0 (`lease_window` is 0).
+    let recovered_max_unwalled_lease_window = if poisoned {
+      0
+    } else {
+      match Self::scan_max_unwalled_lease_window(log) {
+        Ok(m) => snap_max_unwalled.max(m),
+        Err(reason) => {
+          poisoned = true;
+          poison_reason = Some(reason);
+          0
+        }
+      }
+    };
     // Misconfiguration is handled by degradation, not rejection (see `Endpoint::new`); restart
     // construction stays infallible and identical across build profiles.
     let mut ep = Self {
@@ -330,6 +355,11 @@ where
       commit_wait_until: None,
       max_lease_window: recovered_max_lease_window,
       max_wall_plus_window: recovered_max_wall_plus_window,
+      max_unwalled_lease_window: recovered_max_unwalled_lease_window,
+      // A restarted node comes up a fresh Follower — the precise commit-anchor captures arm only when
+      // it (re-)wins an election, so start them cleared.
+      inherited_release_deadline: 0,
+      unwalled_commit_wait_until: None,
       // A restarted node comes up a fresh Follower with no pending lease-refresh demand.
       lease_refresh_wanted: false,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
@@ -453,6 +483,39 @@ where
         // outside the failover tier).
         if e.wall_timestamp() != 0 {
           max = max.max(e.wall_timestamp().saturating_add(e.lease_window()));
+        }
+      }
+      idx = chunk
+        .last()
+        .map(|e| e.index().next())
+        .ok_or(PoisonReason::LogRead)?;
+    }
+    Ok(max)
+  }
+
+  /// Scan the durable live log for the MAX `lease_window` over entries that are LEASE-bearing but
+  /// WALL-ABSENT (`lease_window > 0`, `wall_timestamp == 0`) — the restart recompute of
+  /// `max_unwalled_lease_window` (the failover mono-frame fallback bound), combined with the restored
+  /// snapshot's carried max. The wall-absent analogue of
+  /// [`scan_max_wall_plus_window`](Self::scan_max_wall_plus_window), with the SAME fail-stop
+  /// discipline: a read fault poisons rather than recover a partial, under-sized bound (which would
+  /// let the fallback anchor release early — a stale read). Folds by the ENTRY property and is invoked
+  /// UNCONDITIONALLY (every node, every tier — the dual of `scan_max_wall_plus_window`), so the floor
+  /// is complete by construction; a non-failover cluster recovers `max_lease_window` here, inert.
+  fn scan_max_unwalled_lease_window<L: LogStore>(log: &L) -> Result<u64, PoisonReason> {
+    let last = log.last_index();
+    let mut idx = log.first_index();
+    let mut max = 0u64;
+    while idx <= last {
+      let chunk = match log.entries(idx..last.next(), 1 << 20) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return Err(PoisonReason::LogRead),
+      };
+      for e in chunk {
+        // Mirror the gated `submit_append` fold: a LEASE-bearing but WALL-ABSENT entry (fail-closed
+        // failover) contributes its window; a walled or zero-window entry contributes nothing.
+        if e.wall_timestamp() == 0 && e.lease_window() > 0 {
+          max = max.max(e.lease_window());
         }
       }
       idx = chunk

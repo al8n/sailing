@@ -416,6 +416,14 @@ pub struct SnapshotMeta<I> {
   /// failover tier) — the precise commit-anchor's release floor carried past compaction. Paired per
   /// entry. See [`with_max_wall_plus_window`].
   max_wall_plus_window: u64,
+  /// The max `lease_window` over the subsumed entries that are LEASE-bearing but WALL-ABSENT
+  /// (`lease_window > 0`, `wall_timestamp == 0`) — the mono-frame fallback bound the failover precise
+  /// commit-anchor uses for wall-absent inherited leases, carried past compaction. Folded by the ENTRY
+  /// property on every node (the dual of [`max_wall_plus_window`](Self::max_wall_plus_window)'s
+  /// `wall_timestamp != 0`), so it is complete across heterogeneous tiers; equals `max_lease_window` in a
+  /// non-failover LeaseGuard cluster (all entries wall-absent) but is inert there. `0` for Safe/LeaseBased
+  /// (`lease_window` is 0). See [`with_max_unwalled_lease_window`].
+  max_unwalled_lease_window: u64,
 }
 
 impl<I: crate::NodeId> SnapshotMeta<I> {
@@ -428,6 +436,7 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
       conf,
       max_lease_window: 0,
       max_wall_plus_window: 0,
+      max_unwalled_lease_window: 0,
     }
   }
 
@@ -446,6 +455,17 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   #[must_use]
   pub const fn with_max_wall_plus_window(mut self, max_wall_plus_window: u64) -> Self {
     self.max_wall_plus_window = max_wall_plus_window;
+    self
+  }
+
+  /// Set the max `lease_window` over the subsumed entries that are LEASE-bearing but WALL-ABSENT. A
+  /// builder so the common 3-arg [`new`](Self::new) stays untouched. Folded by the ENTRY property (not
+  /// the local tier), so a non-failover LeaseGuard snapshot DOES populate it (equal to
+  /// `max_lease_window`); only Safe/LeaseBased and no-lease entries leave it `0`.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_max_unwalled_lease_window(mut self, max_unwalled_lease_window: u64) -> Self {
+    self.max_unwalled_lease_window = max_unwalled_lease_window;
     self
   }
 
@@ -477,6 +497,13 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   #[inline(always)]
   pub const fn max_wall_plus_window(&self) -> u64 {
     self.max_wall_plus_window
+  }
+
+  /// The max `lease_window` over the subsumed entries that are LEASE-bearing but WALL-ABSENT, or `0`
+  /// if unset (and `0` for Safe/LeaseBased, where `lease_window` is 0).
+  #[inline(always)]
+  pub const fn max_unwalled_lease_window(&self) -> u64 {
+    self.max_unwalled_lease_window
   }
 }
 

@@ -13,8 +13,13 @@ use std::vec::Vec;
 const LABEL_MAGIC: u8 = 0xCA;
 /// The hello wire version. CONTRACT: any change to the transport wire format — the hello layout,
 /// the frame format, or the `Message` codec itself — MUST bump this byte, so mixed-version nodes
-/// reject each other at the handshake instead of mis-decoding consensus traffic.
-const LABEL_VERSION: u8 = 2;
+/// reject each other at the handshake instead of mis-decoding consensus traffic. The same fence
+/// covers a field whose MEANING a peer must not under-populate: version 3 is the failover precise
+/// commit-anchor — the first CONSUMER of `SnapshotMeta.max_wall_plus_window` and
+/// `max_unwalled_lease_window` (added inert at version 2). A pre-anchor peer that does not fold those
+/// floors would feed a successor an under-sized release bound (a stale read), so it must be rejected at
+/// the handshake, not tolerated as a forward-compatible additive field.
+const LABEL_VERSION: u8 = 3;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 /// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes

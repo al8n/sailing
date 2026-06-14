@@ -104,9 +104,11 @@ pub struct Config<I> {
   /// Default: `None`.
   clock_drift_bound: Option<Duration>,
   /// The bounded cross-node clock-UNCERTAINTY (skew). OPTIONAL: `Some(ε)` enables LeaseGuard's
-  /// inherited-lease reads (a fresh leader serves reads for unaffected keys during the commit-wait
-  /// by comparing in-log timestamp INTERVALS across leaders), which need synchronized clocks
-  /// within ε. `None` = the new leader simply waits out the prior lease (safe, less available).
+  /// FAILOVER tier — the precise commit-anchor (and, later, inherited-lease reads) compares in-log
+  /// wall timestamps ACROSS leaders, so it requires each node's synchronized wall to stay within ε of
+  /// true cluster-epoch time. That one convention supplies both terms of the anchor's `2·ε` margin: a
+  /// deposed leader's stamp lags real time by ≤ ε, and a successor's evaluation leads it by ≤ ε.
+  /// `None` = the new leader simply waits out the prior lease on local clocks (safe, less available).
   /// Default: `None`.
   bounded_clock_uncertainty: Option<Duration>,
 }

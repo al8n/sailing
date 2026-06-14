@@ -100,7 +100,8 @@ where
     // leader's lease on a now-unavailable entry.
     let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
       .with_max_lease_window(self.max_lease_window)
-      .with_max_wall_plus_window(self.max_wall_plus_window);
+      .with_max_wall_plus_window(self.max_wall_plus_window)
+      .with_max_unwalled_lease_window(self.max_unwalled_lease_window);
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
@@ -147,6 +148,13 @@ where
     // survival of a stripped bound is the fresh-cluster / matched-schema contract; see WIRE.md.)
     self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
     self.max_wall_plus_window = self.max_wall_plus_window.max(meta.max_wall_plus_window());
+    // The unwalled fallback bound — folded UNGATED, like `max_lease_window` above. An ENTRY-property
+    // floor (every wall-absent lease entry folds itself on every node), so a snapshot's carried value
+    // is already complete. A pre-FIELD snapshot (no `max_unwalled` field at all) is a mixed-version
+    // case the Labeled handshake rejects.
+    self.max_unwalled_lease_window = self
+      .max_unwalled_lease_window
+      .max(meta.max_unwalled_lease_window());
 
     // Staleness guard: short-circuit ONLY when the snapshot is ALREADY part of this follower's durable
     // RECOVERABLE prefix — `ack_watermark()` = max(durable log tip, durable snapshot boundary). Such a
@@ -261,6 +269,13 @@ where
     // raise from an already-covered install is harmless.
     self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
     self.max_wall_plus_window = self.max_wall_plus_window.max(meta.max_wall_plus_window());
+    // The unwalled fallback bound — folded UNGATED, like `max_lease_window` above. An ENTRY-property
+    // floor (every wall-absent lease entry folds itself on every node), so a snapshot's carried value
+    // is already complete. A pre-FIELD snapshot (no `max_unwalled` field at all) is a mixed-version
+    // case the Labeled handshake rejects.
+    self.max_unwalled_lease_window = self
+      .max_unwalled_lease_window
+      .max(meta.max_unwalled_lease_window());
     // Completion-time staleness re-check (mirror the receipt-time guard): in-window AppendEntries can
     // have caught this follower up to/past the boundary while the blob was in flight. Installing now
     // would REGRESS committed/applied state, so DROP the deferred install (the durable blob is harmless;

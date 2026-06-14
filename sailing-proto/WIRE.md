@@ -62,14 +62,24 @@ reference — this section pins the SEMANTICS:
   snapshot runtime paths re-fold a newly-visible window, but durable survival across a restart of a
   stripped window is the operator's responsibility (mid-life migration is out of scope — like
   `LeaseBased`'s bounded-drift contract, the protocol consumes the bound, it cannot enforce it).
-- `Entry.wall_timestamp` (7) and `SnapshotMeta.max_wall_plus_window` (5) carry the synchronized
-  wall-clock data the LeaseGuard FAILOVER tier needs (inherited reads + the precise commit-anchor).
-  Both are `0` (and absent on the wire — byte-identical to a pre-failover peer) unless the cluster
-  opts into the failover tier (`bounded_clock_uncertainty` set). `wall_timestamp` is a
+- `Entry.wall_timestamp` (7), `SnapshotMeta.max_wall_plus_window` (5), and
+  `SnapshotMeta.max_unwalled_lease_window` (6) carry the synchronized wall-clock data the LeaseGuard
+  FAILOVER tier needs (inherited reads + the precise commit-anchor). `wall_timestamp` and
+  `max_wall_plus_window` are `0` (absent on the wire — byte-identical to a pre-failover peer) unless the
+  cluster opts into the failover tier (`bounded_clock_uncertainty` set). `wall_timestamp` is a
   SYNCHRONIZED-EPOCH stamp and is NEVER compared against the per-node monotonic `timestamp` (5);
-  `max_wall_plus_window` is the max per-entry `wall_timestamp + lease_window` over the subsumed
-  entries (paired per entry, never the max stamp with a different entry's window). Mixed-version /
-  field-stripping remains out of scope (the same fresh-cluster / matched-schema contract as above).
+  `max_wall_plus_window` is the max per-entry `wall_timestamp + lease_window` over the subsumed entries
+  (paired per entry). `max_unwalled_lease_window` is its dual — the max `lease_window` over subsumed
+  entries that are LEASE-bearing but WALL-ABSENT — folded by the ENTRY property on EVERY node, so it is
+  NOT zero off-tier (it equals `max_lease_window` in a non-failover LeaseGuard cluster) but is inert
+  there (only the failover tier reads it). **The precise commit-anchor is the first CONSUMER of these
+  release floors, so `LABEL_VERSION` is now 3:** a peer predating the consumed floors would feed a
+  successor an under-sized release bound (a stale read), so it is rejected at the handshake — the
+  mixed-version / field-strip fence (the fresh-cluster / matched-schema contract above) is ENFORCED for
+  the failover floors, not merely documented. The handshake fences a PEER; the one residual it cannot
+  fence — a node restarting from its OWN durable snapshot written by a pre-anchor binary (no tag 6) —
+  is the same storage-preservation contract as `max_lease_window` above (fresh-cluster, no mid-life
+  field-strip).
 - An enum field must carry a KNOWN value; the `Message.body` oneof must be present. Either
   failure rejects the message (parity with the old codec's unknown-tag reject).
 - A rejected message closes the connection (transport) — the endpoint is never poisoned by
@@ -123,7 +133,7 @@ Each `Message` rides one frame:
 One-time, before any application frame, in each direction:
 
 ```text
-[ magic 0xCA ][ version 0x02 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
+[ magic 0xCA ][ version 0x03 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
 ```
 
 The ENCODING is shared by both transports — one format, one parser family, one version byte
