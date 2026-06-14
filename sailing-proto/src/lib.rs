@@ -25,7 +25,7 @@ mod id;
 pub use id::NodeId;
 
 mod time;
-pub use time::Instant;
+pub use time::{Instant, Now, Wall};
 
 mod data;
 pub use data::{ByteCursor, Data, DecodeError};
