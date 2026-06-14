@@ -77,6 +77,12 @@ message SnapshotMeta {
   // now-compacted entry. Zero in non-LeaseGuard clusters — absent on the wire, byte-identical to
   // before.
   uint64 max_lease_window = 4;
+  // The max per-entry wall_timestamp + lease_window over the entries this snapshot subsumes — the
+  // FAILOVER-tier precise commit-anchor's release floor, carried so a successor that compacted (or
+  // installed) these entries still bounds a deposed leader's lease on a now-unavailable entry. Paired
+  // PER ENTRY (never the max stamp with a different entry's window). Zero outside the failover tier —
+  // absent on the wire, byte-identical to before.
+  uint64 max_wall_plus_window = 5;
 }
 
 // Log replication / heartbeat-with-entries.

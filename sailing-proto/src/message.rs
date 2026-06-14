@@ -412,6 +412,10 @@ pub struct SnapshotMeta<I> {
   /// non-LeaseGuard clusters). Carried so a node that compacts past — or installs — these entries
   /// still bounds any deposed leader's lease on a now-unavailable entry. See [`with_max_lease_window`].
   max_lease_window: u64,
+  /// The max per-entry `wall_timestamp + lease_window` over the subsumed entries (`0` outside the
+  /// failover tier) — the precise commit-anchor's release floor carried past compaction. Paired per
+  /// entry. See [`with_max_wall_plus_window`].
+  max_wall_plus_window: u64,
 }
 
 impl<I: crate::NodeId> SnapshotMeta<I> {
@@ -423,6 +427,7 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
       last_term,
       conf,
       max_lease_window: 0,
+      max_wall_plus_window: 0,
     }
   }
 
@@ -432,6 +437,15 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   #[must_use]
   pub const fn with_max_lease_window(mut self, max_lease_window: u64) -> Self {
     self.max_lease_window = max_lease_window;
+    self
+  }
+
+  /// Set the max per-entry `wall_timestamp + lease_window` over the subsumed entries. A builder, so
+  /// the common 3-arg [`new`](Self::new) stays untouched outside the failover tier.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_max_wall_plus_window(mut self, max_wall_plus_window: u64) -> Self {
+    self.max_wall_plus_window = max_wall_plus_window;
     self
   }
 
@@ -457,6 +471,12 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   #[inline(always)]
   pub const fn max_lease_window(&self) -> u64 {
     self.max_lease_window
+  }
+
+  /// The max per-entry `wall_timestamp + lease_window` over the subsumed entries, or `0` if unset.
+  #[inline(always)]
+  pub const fn max_wall_plus_window(&self) -> u64 {
+    self.max_wall_plus_window
   }
 }
 
