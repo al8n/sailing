@@ -219,6 +219,7 @@ fn pb_entry(e: &Entry) -> pb::Entry {
     data: e.data_bytes(),
     timestamp: e.timestamp(),
     lease_window: e.lease_window(),
+    wall_timestamp: e.wall_timestamp(),
     ..Default::default()
   }
 }
@@ -233,7 +234,8 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
   Ok(
     Entry::new(Term::new(w.term), Index::new(w.index), kind, w.data)
       .with_timestamp(w.timestamp)
-      .with_lease_window(w.lease_window),
+      .with_lease_window(w.lease_window)
+      .with_wall_timestamp(w.wall_timestamp),
   )
 }
 
