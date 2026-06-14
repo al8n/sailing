@@ -63,6 +63,18 @@ where
     // restart. `0` (non-LeaseGuard / inactive-config entries) never raises it.
     for e in entries {
       self.max_lease_window = self.max_lease_window.max(e.lease_window());
+      // The precise-anchor release floor: the per-entry wall stamp PLUS its window (paired per
+      // entry, never the max stamp with a different entry's window). ONLY a real (non-zero) wall
+      // contributes — an ABSENT wall (`wall_timestamp == 0`: non-failover LeaseGuard, or a
+      // fail-closed failover entry) folds NOTHING, so the floor stays `0` outside the failover tier.
+      // That keeps non-failover snapshots byte-identical AND keeps the floor strictly wall-derived
+      // (a later consumer never mistakes `lease_window` alone for a wall+window floor). `saturating_add`
+      // is defensive — `wall_timestamp` is nanos-since-epoch + a small window, never overflowing u64.
+      if e.wall_timestamp() != 0 {
+        self.max_wall_plus_window = self
+          .max_wall_plus_window
+          .max(e.wall_timestamp().saturating_add(e.lease_window()));
+      }
     }
     // Track this append's last index independently of `pending` so `on_log_appended` can advance
     // `durable_index` unconditionally when the completion fires (see the field comment).

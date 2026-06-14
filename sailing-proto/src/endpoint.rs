@@ -572,6 +572,13 @@ where
   /// through compaction (into the created `SnapshotMeta`) and recomputed at restart from the durable
   /// log + restored snapshot. `0` in non-LeaseGuard clusters (every `lease_window` is `0`) ⇒ no wait.
   max_lease_window: u64,
+  /// The MAX per-entry `wall_timestamp + lease_window` over every entry this node has ever held —
+  /// the FAILOVER-tier precise commit-anchor's release floor (consumed by a later PR). The
+  /// synchronized-wall analogue of [`max_lease_window`](Self::max_lease_window): paired PER ENTRY
+  /// (never the max stamp with a different entry's window), monotonic in memory, folded on
+  /// `submit_append` + snapshot install, carried through compaction, recomputed at restart. `0`
+  /// outside the failover tier (every `wall_timestamp` is `0`).
+  max_wall_plus_window: u64,
   /// LeaseGuard lease-refresh demand: set when a LeaseGuard read finds the lease stale (and so degrades
   /// to the Safe round), consumed at the next leader heartbeat tick, which appends ONE stamped no-op to
   /// re-commit and re-stamp the lease so subsequent reads serve fast again. A flag (not a count): the
@@ -808,6 +815,7 @@ where
       commit_wait_until: None,
       // Fresh node, empty log: no inherited lease window to cover yet. Raised as entries arrive.
       max_lease_window: 0,
+      max_wall_plus_window: 0,
       // No read has found the lease stale yet (set by a degraded LeaseGuard read; only a leader acts).
       lease_refresh_wanted: false,
       outgoing: VecDeque::new(),

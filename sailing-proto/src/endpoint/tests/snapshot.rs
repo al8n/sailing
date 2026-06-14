@@ -253,6 +253,87 @@ fn maybe_snapshot_does_not_refire_while_pending() {
   );
 }
 
+/// A NON-failover LeaseGuard snapshot carries a non-zero `max_lease_window` but a ZERO
+/// `max_wall_plus_window`: every entry such a leader appends has a real `lease_window` (the
+/// commit-wait window) yet an ABSENT wall (`wall_timestamp == 0`, the failover tier is off), so the
+/// per-entry `wall + window` floor must fold NOTHING. The two floors are independent — a non-failover
+/// snapshot must never let `lease_window` alone masquerade as a wall-derived release floor.
+///
+/// MUTATION (revert FIX 1 — drop the `e.wall_timestamp() != 0` guard in `submit_append`): each
+/// `0`-wall entry then folds `0.saturating_add(lease_window) == lease_window` into
+/// `max_wall_plus_window`, so it rises to equal `max_lease_window` and the `== 0` assertion FAILS.
+#[test]
+fn non_failover_leaseguard_snapshot_has_zero_wall_plus_window() {
+  use crate::{Config, Index};
+  use core::time::Duration;
+
+  // LeaseGuard WITHOUT the failover tier (no `bounded_clock_uncertainty`): a valid window
+  // (Δ=300ms, ε=50ms → 300·350/250 = 420ms < the 1000ms election timeout) so every appended entry
+  // carries a non-zero `lease_window`, while the wall stamp stays absent (0).
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_snapshot_threshold(3);
+
+  let mut ep = Endpoint::new(
+    cfg,
+    crate::Instant::ORIGIN,
+    42,
+    crate::testkit::CountSm::default(),
+  );
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::AsyncStable::default();
+
+  // Elect the single-node leader (self-vote durable first), drain the stamped no-op.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Apply past `snapshot_threshold`: no-op (idx 1) + 3 Normal entries (idx 2,3,4) → applied=4,
+  // first_index=1 → gap=3, so the next `handle_storage` submits a snapshot.
+  for i in 0..3 {
+    let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
+    let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    while ep.poll_event().is_some() {}
+  }
+
+  // The snapshot must have been submitted to stable; capture its carried meta.
+  let (meta, _data) = stable
+    .snapshot()
+    .expect("a snapshot crossed the threshold and was persisted");
+  assert_eq!(
+    log.first_index(),
+    Index::new(1),
+    "the snapshot is in flight (compaction deferred until SnapshotWritten)"
+  );
+
+  // The lease floor IS populated (LeaseGuard stamps a real window on every entry) ...
+  assert!(
+    meta.max_lease_window() > 0,
+    "a LeaseGuard snapshot must carry the inherited commit-wait window"
+  );
+  // ... but the wall+window floor is ZERO: a `0`-wall entry folds nothing into it. Without FIX 1
+  // it would instead equal `max_lease_window` (the bug this regression pins).
+  assert_eq!(
+    meta.max_wall_plus_window(),
+    0,
+    "a non-failover (wall-absent) entry must contribute 0 to the wall+window release floor"
+  );
+}
+
 /// A dropped `SnapshotWritten` completion must NOT permanently wedge `pending_compact`
 /// (and thus all future snapshots/compaction). `handle_storage` reconciles `pending_compact`
 /// against the durable snapshot: once the persisted snapshot covers `up_to`, the deferred
