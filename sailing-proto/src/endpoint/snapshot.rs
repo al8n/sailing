@@ -99,7 +99,8 @@ where
     // A successor that compacts past — or installs — these entries then still covers any deposed
     // leader's lease on a now-unavailable entry.
     let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
-      .with_max_lease_window(self.max_lease_window);
+      .with_max_lease_window(self.max_lease_window)
+      .with_max_wall_plus_window(self.max_wall_plus_window);
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
@@ -145,6 +146,7 @@ where
     // monotonic so the later re-folds are harmless idempotent re-raises. (Durable cross-restart
     // survival of a stripped bound is the fresh-cluster / matched-schema contract; see WIRE.md.)
     self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
+    self.max_wall_plus_window = self.max_wall_plus_window.max(meta.max_wall_plus_window());
 
     // Staleness guard: short-circuit ONLY when the snapshot is ALREADY part of this follower's durable
     // RECOVERABLE prefix — `ack_watermark()` = max(durable log tip, durable snapshot boundary). Such a
@@ -258,6 +260,7 @@ where
     // bound (the sender held entries this follower may not have all of). Monotonic, so the redundant
     // raise from an already-covered install is harmless.
     self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
+    self.max_wall_plus_window = self.max_wall_plus_window.max(meta.max_wall_plus_window());
     // Completion-time staleness re-check (mirror the receipt-time guard): in-window AppendEntries can
     // have caught this follower up to/past the boundary while the blob was in flight. Installing now
     // would REGRESS committed/applied state, so DROP the deferred install (the durable blob is harmless;
