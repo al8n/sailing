@@ -128,6 +128,12 @@ where
       .as_ref()
       .map(|(meta, _)| meta.max_lease_window())
       .unwrap_or(0);
+    // The failover release floor this snapshot carries over its compacted entries — combined below
+    // with a scan of the live log to recompute `max_wall_plus_window` from durable state alone.
+    let snap_max_wall_plus: u64 = snapshot
+      .as_ref()
+      .map(|(meta, _)| meta.max_wall_plus_window())
+      .unwrap_or(0);
     if let Some((meta, data)) = snapshot {
       // Validate the durable snapshot's BOUNDARY before decoding/restoring the SM or installing the
       // tracker (which copies the ConfState verbatim) — a corrupt-on-disk or version-skewed snapshot
@@ -280,6 +286,21 @@ where
         }
       }
     };
+    // The failover release floor, recomputed from durable state the same way (snapshot carry ⊔ live
+    // scan), with the IDENTICAL fail-stop discipline: a scan read-fault poisons rather than recover a
+    // partial, under-sized floor (which would let the precise anchor release early — a stale read).
+    let recovered_max_wall_plus_window = if poisoned {
+      0
+    } else {
+      match Self::scan_max_wall_plus_window(log) {
+        Ok(m) => snap_max_wall_plus.max(m),
+        Err(reason) => {
+          poisoned = true;
+          poison_reason = Some(reason);
+          0
+        }
+      }
+    };
     // Misconfiguration is handled by degradation, not rejection (see `Endpoint::new`); restart
     // construction stays infallible and identical across build profiles.
     let mut ep = Self {
@@ -308,6 +329,7 @@ where
       // `become_leader` from that election's `now` and the recovered `max_lease_window` below.
       commit_wait_until: None,
       max_lease_window: recovered_max_lease_window,
+      max_wall_plus_window: recovered_max_wall_plus_window,
       // A restarted node comes up a fresh Follower with no pending lease-refresh demand.
       lease_refresh_wanted: false,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
@@ -402,6 +424,37 @@ where
       }
       // `entries` may return a prefix of the requested range; advance past the last entry it gave
       // (always `Some` — the chunk is non-empty — so the `ok_or` is a defensive fail-stop).
+      idx = chunk
+        .last()
+        .map(|e| e.index().next())
+        .ok_or(PoisonReason::LogRead)?;
+    }
+    Ok(max)
+  }
+
+  /// Scan the durable live log for the MAX per-entry `wall_timestamp + lease_window` — the restart
+  /// recompute of `max_wall_plus_window` (the failover precise-anchor release floor), combined with
+  /// the restored snapshot's carried max. The synchronized-wall analogue of
+  /// [`scan_max_lease_window`](Self::scan_max_lease_window), with the SAME fail-stop discipline: a
+  /// read fault poisons rather than recover a partial, under-sized floor (which would let the precise
+  /// anchor release early — a stale read).
+  fn scan_max_wall_plus_window<L: LogStore>(log: &L) -> Result<u64, PoisonReason> {
+    let last = log.last_index();
+    let mut idx = log.first_index();
+    let mut max = 0u64;
+    while idx <= last {
+      let chunk = match log.entries(idx..last.next(), 1 << 20) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return Err(PoisonReason::LogRead),
+      };
+      for e in chunk {
+        // Only a real (non-zero) wall contributes — mirrors the `submit_append` fold so the restart
+        // recompute matches the in-memory value (an absent wall folds nothing; the floor stays `0`
+        // outside the failover tier).
+        if e.wall_timestamp() != 0 {
+          max = max.max(e.wall_timestamp().saturating_add(e.lease_window()));
+        }
+      }
       idx = chunk
         .last()
         .map(|e| e.index().next())
