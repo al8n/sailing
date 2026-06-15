@@ -126,6 +126,12 @@ const LEASEGUARD_DELTA: Duration = Duration::from_millis(300);
 /// The LeaseGuard drift bound ε_drift (the commit-wait's clock-drift slack). `ε < Δ` and
 /// `Δ + ε < election_timeout` (1000ms) keep the config valid.
 const LEASEGUARD_EPS: Duration = Duration::from_millis(50);
+/// The FAILOVER-tier synchronized-wall uncertainty bound ε_unc — the half-width of the per-node wall
+/// offset the failover sub-mode injects (`|offset[i]| ≤ ε_unc`). DISTINCT from [`LEASEGUARD_EPS`]
+/// (ε_drift, the MONOTONIC-clock rate bound): the design keeps the two separate and conflating them is
+/// a bug. It must equal the config's `bounded_clock_uncertainty` so the precise anchor's `+2·ε_unc`
+/// margin is stressed by exactly the worst-case cross-node skew (±ε_unc on each of two nodes).
+const LEASEGUARD_EPS_UNC: Duration = Duration::from_millis(50);
 
 /// A deterministic per-node clock RATE for a LeaseGuard VOPR run: `(Δ + k, Δ)` nanos with
 /// `k ∈ [−ε, +ε]` hashed from `(drift_seed, id)`. The node's clock then runs between `(Δ−ε)/Δ`
@@ -212,6 +218,19 @@ pub struct VoprReport {
   /// proves the dangerous cross-leader path was REACHED under drift and judged SAFE — the coverage that
   /// motivates the whole harness.
   pub reads_served_by_superseded_leader: u64,
+  /// Whether this run drew the FAILOVER sub-mode: a LeaseGuard run with `bounded_clock_uncertainty`
+  /// armed, a SYNCHRONIZED wall supplied to every proto call, and a per-node bounded wall offset that
+  /// re-syncs across the run. The mutually-exclusive alternative to `drifted` within the LeaseGuard
+  /// read mode (a failover run carries the wall + offset; a drift run carries rate drift + no wall).
+  pub failover: bool,
+  /// Number of NTP re-sync events fired (each re-draws every node's wall offset within `±ε_unc`). `0`
+  /// outside the failover sub-mode. A determinism-fingerprinted behavioral counter.
+  pub offset_resyncs: u64,
+  /// Non-vacuity WITNESS for the failover sub-mode: the total times the PRECISE commit-anchor (not the
+  /// conservative mono deadline) lifted a post-election commit-wait, summed over live nodes. A positive
+  /// count proves the offset clock model actually exercised the early-release path under cross-node wall
+  /// skew — the whole point of the failover harness. `0` outside the sub-mode.
+  pub precise_releases: u64,
   /// The number of voters in the cluster at the end of the run (after all conf-changes).
   pub final_cluster_size: usize,
 }
@@ -613,6 +632,22 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   // ε_drift=50ms < the 1000ms election timeout (the LeaseGuard validity bound). Drawn from the
   // master PRNG like every other choice.
   let read_mode = prng.next_u64() % 4;
+  // Within the LeaseGuard read mode, split into two MUTUALLY-EXCLUSIVE clock regimes, chosen from a
+  // DEDICATED sub-seed so the master PRNG stream (every other choice + every non-LeaseGuard run) is
+  // untouched and bit-for-bit unchanged:
+  //   • DRIFT (today's shape): per-node monotonic RATE drift, NO synchronized wall. Exercises the
+  //     basic-mode same-leader gate and the conservative cross-leader commit-wait.
+  //   • FAILOVER: `bounded_clock_uncertainty` armed + a SYNCHRONIZED wall carrying a per-node bounded,
+  //     re-syncing OFFSET, and NO rate drift. Exercises the PRECISE commit-anchor under worst-case
+  //     cross-node wall skew — the monotonic-only harness leaves the wall absent, so the anchor would
+  //     otherwise never fire in a randomized run. Complementary per the failover design: drift keeps
+  //     the basic-mode coverage, and the successor's own rate drift is irrelevant to the wall-LEVEL
+  //     precise release (its window absorbs the predecessor's monotonic drift).
+  let failover = read_mode == 3 && {
+    let mut p = FaultPrng::new(seed.rotate_left(24) ^ 0x4F46_4653_4554_5631); // "OFFSETV1"
+    (p.next_u64() & 1) == 1
+  };
+  let drifted = read_mode == 3 && !failover;
   let mut c = Cluster::new_async_with(size, seed, move |cfg| {
     let cfg = cfg.with_pre_vote(true);
     match read_mode {
@@ -621,23 +656,37 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
       2 => cfg
         .with_check_quorum(true)
         .with_read_only(sailing_proto::ReadOnlyOption::LeaseBased),
-      _ => cfg
-        .with_read_only(sailing_proto::ReadOnlyOption::LeaseGuard)
-        .with_lease_duration(LEASEGUARD_DELTA)
-        .with_clock_drift_bound(LEASEGUARD_EPS),
+      _ => {
+        let cfg = cfg
+          .with_read_only(sailing_proto::ReadOnlyOption::LeaseGuard)
+          .with_lease_duration(LEASEGUARD_DELTA)
+          .with_clock_drift_bound(LEASEGUARD_EPS);
+        // The failover sub-mode arms the precise commit-anchor (ε_unc); the drift sub-mode leaves it off.
+        if failover {
+          cfg.with_bounded_clock_uncertainty(LEASEGUARD_EPS_UNC)
+        } else {
+          cfg
+        }
+      }
     }
   });
 
-  // For LeaseGuard runs, install per-node clock RATE drift bounded by ε/Δ, drawn from a DEDICATED
-  // sub-seed so the master PRNG stream (and thus every other choice + every non-LeaseGuard run) is
-  // untouched. This is the one thing that exercises the cross-leader commit-wait: a slow deposed
-  // leader's lease outlives a fast successor's wait in real time ONLY if the Δ·(Δ+ε)/(Δ−ε) window is
-  // too short, and the mode-agnostic read-linearizability oracle catches any resulting stale serve.
-  // Every other mode keeps a single clock (no drift), so their runs are bit-for-bit unchanged.
-  let drifted = read_mode == 3;
+  // DRIFT sub-mode: install per-node clock RATE drift bounded by ε/Δ from a dedicated sub-seed (the one
+  // thing that exercises the conservative cross-leader commit-wait: a slow deposed leader's lease
+  // outlives a fast successor's wait in real time only if the Δ·(Δ+ε)/(Δ−ε) window is too short, which
+  // the read-linearizability oracle catches).
   if drifted {
     let drift_seed = seed.rotate_left(40) ^ 0x4452_4946_545F_5631; // "DRIF_TV1"
     c.set_clock_drift(move |id| leaseguard_node_rate(drift_seed, id));
+  }
+  // FAILOVER sub-mode: arm the synchronized-wall clock and draw the initial per-node offsets from a
+  // dedicated offset sub-PRNG (re-drawn across the run by the re-sync schedule in the main loop). The
+  // sub-PRNG is constructed unconditionally (it draws nothing unless `failover`), so non-failover runs
+  // are untouched.
+  let mut off_prng = FaultPrng::new(seed.rotate_left(8) ^ 0x4F46_4653_4554_5F32); // "OFFSET_2"
+  if failover {
+    c.enable_failover_clock(LEASEGUARD_EPS_UNC);
+    c.resync_offsets(&mut off_prng);
   }
 
   // Install a seed-chosen baseline network + per-node storage fault config (modest — the run must
@@ -668,6 +717,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   let mut report = VoprReport {
     seed,
     drifted,
+    failover,
     final_cluster_size: size,
     ..VoprReport::default()
   };
@@ -682,8 +732,29 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   let calm_period = 60 + (prng.next_u64() % 60) as usize; // every 60..=119 iterations
   let mut next_calm = calm_period;
 
+  // FAILOVER sub-mode: the next iteration at which to RE-SYNC every node's wall offset (an NTP step). A
+  // jittered ~30..=59-iteration cadence, drawn from the offset sub-PRNG so the master stream is
+  // untouched. `usize::MAX` outside the sub-mode ⇒ the re-sync block never fires and `off_prng` is never
+  // drawn in the loop (non-failover runs stay bit-for-bit identical).
+  let resync_base = 30usize;
+  let mut next_resync = if failover {
+    resync_base + (off_prng.next_u64() % 30) as usize
+  } else {
+    usize::MAX
+  };
+
   // ── Main loop ─────────────────────────────────────────────────────────────────────────────────
   for iter in 0..ticks {
+    // FAILOVER sub-mode: re-sync the per-node wall offsets at the jittered cadence BEFORE this
+    // iteration's proposes/reads/handlers, so they observe fresh cross-node skew. A re-draw below the
+    // prior offset is a BACKWARD NTP step (the hazard a static offset can never model). Inert off-mode.
+    if iter + 1 >= next_resync {
+      c.resync_offsets(&mut off_prng);
+      report.offset_resyncs += 1;
+      let jitter = (off_prng.next_u64() % 30) as usize;
+      next_resync = iter + 1 + resync_base + jitter;
+    }
+
     // Reconcile the tracked membership from the cluster's REAL committed state BEFORE any
     // budget/conf-change decision this iteration, so a phantom (accepted-but-never-committed) voter
     // never inflates the fault budget and an orphaned joiner is abandoned promptly.
@@ -739,6 +810,9 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   // The superseded-leader serve count is tallied event-time inside the cluster (at ReadState drain),
   // so it is sound regardless of when this scan runs; copy the final total into the report.
   report.reads_served_by_superseded_leader = c.lease_superseded_serves();
+  // FAILOVER non-vacuity: how many times the precise commit-anchor early-released, summed over live
+  // nodes. `0` outside the failover sub-mode (no synchronized wall ⇒ the anchor never fires).
+  report.precise_releases = c.precise_releases_total();
   report
 }
 
