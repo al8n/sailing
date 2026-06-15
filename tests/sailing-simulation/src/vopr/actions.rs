@@ -39,7 +39,11 @@ pub(crate) fn client_load(
 ) {
   let k = 1 + (prng.next_u64() % 4) as usize; // 1..=4 commands
   for _ in 0..k {
-    let payload = st.cmd_counter.to_le_bytes().to_vec();
+    // Keyed-value payload: round-robin the monotonic counter across NUM_KEYS keys. cmd_counter stays
+    // globally monotonic, so each (key, value) is distinct (the `proposed`/quiesce distinctness checks
+    // hold) AND per-key values strictly increase (so the latest entry for a key carries its max value).
+    let key = (st.cmd_counter % NUM_KEYS as u64) as u16;
+    let payload = encode_kv(key, st.cmd_counter);
     if c.propose(&payload).is_some() {
       st.proposed.push(payload);
       st.cmd_counter += 1;
@@ -290,7 +294,9 @@ pub(crate) fn read_index_load(
       leader.or_else(|| pick_from(&st.live_ids(), prng))
     };
     let Some(target) = target else { return };
-    reads.issue(c, target, report);
+    // Each read targets a seed-chosen key in 0..NUM_KEYS (deterministic from the master PRNG).
+    let key = (prng.next_u64() % NUM_KEYS as u64) as u16;
+    reads.issue(c, target, key, report);
   }
 }
 
