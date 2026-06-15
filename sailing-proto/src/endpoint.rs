@@ -604,6 +604,13 @@ where
   /// out its lease on the conservative mono bound. `None` ⇒ no such entry ⇒ that half of the gate is
   /// satisfied.
   unwalled_commit_wait_until: Option<Instant>,
+  /// FAILOVER-tier observability: how many times the PRECISE commit-anchor (not the conservative
+  /// mono deadline) lifted the post-election commit-wait over this node's lifetime. Pure in-memory
+  /// metric — never persisted, never on the wire, reset to `0` on construction and restart, and read
+  /// only via [`precise_releases`](Self::precise_releases). Lets an operator (and the randomized
+  /// tester) confirm the failover early-release path is actually being exercised rather than always
+  /// deferring to the conservative anchor; `0` outside the failover tier.
+  precise_releases: u64,
   /// LeaseGuard lease-refresh demand: set when a LeaseGuard read finds the lease stale (and so degrades
   /// to the Safe round), consumed at the next leader heartbeat tick, which appends ONE stamped no-op to
   /// re-commit and re-stamp the lease so subsequent reads serve fast again. A flag (not a count): the
@@ -845,6 +852,7 @@ where
       // Precise failover commit-anchor captures — armed only at become_leader.
       inherited_release_deadline: 0,
       unwalled_commit_wait_until: None,
+      precise_releases: 0,
       // No read has found the lease stale yet (set by a degraded LeaseGuard read; only a leader acts).
       lease_refresh_wanted: false,
       outgoing: VecDeque::new(),
@@ -1017,6 +1025,15 @@ where
   #[inline(always)]
   pub const fn commit_index(&self) -> Index {
     self.commit
+  }
+
+  /// How many times the FAILOVER-tier PRECISE commit-anchor lifted the post-election commit-wait on
+  /// this node (vs the conservative mono deadline) over its lifetime. Read-only observability (see
+  /// [`commit_index`](Self::commit_index)); never persisted, reset to `0` on restart, `0` outside the
+  /// failover tier. The randomized tester reads it to confirm the early-release path is non-vacuous.
+  #[inline(always)]
+  pub const fn precise_releases(&self) -> u64 {
+    self.precise_releases
   }
 
   /// The current applied index — the highest log index this node has applied to its
