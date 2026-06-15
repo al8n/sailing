@@ -295,6 +295,47 @@ impl Cluster {
       .collect()
   }
 
+  /// Node `id`'s COMMITTED keyed `(index, command-bytes)` sequence — the same shape as
+  /// [`applied_entries_of`](Self::applied_entries_of), but read from the raw LOG up to the node's
+  /// COMMIT index rather than from the state machine's APPLIED prefix.
+  ///
+  /// This reflects the committed FRONTIER independent of apply lag. Apply lags commit: an entry can be
+  /// committed at `commit_index` (hence durably on a quorum and acknowledged — a completed write) yet
+  /// not yet handed to `StateMachine::apply` on ANY node. A read oracle that takes its per-key
+  /// invocation floor from `applied_entries_of` would, in that window, record the PREVIOUS value and so
+  /// fail to catch a stale read that still serves the old value. Folding THIS over the cluster gives the
+  /// true committed per-key floor, so the floor is never under-counted.
+  ///
+  /// Reads the log through [`MemLog::committed_entries_no_fault`], NOT `LogStore::entries`: this is a
+  /// pure VOPR observer, and the trait read would draw the `transient_read` fault PRNG and could poison
+  /// the node, perturbing the deterministic run (the same reason the checker reads `durable_entries`).
+  ///
+  /// Only `EntryKind::Normal` entries are returned (as `(index, command-bytes)`); no-op (`Empty`) and
+  /// `ConfChange` entries carry no client payload and are skipped — matching what
+  /// `applied_entries_of` records (the state machine only ever sees `Normal` entries).
+  ///
+  /// The returned bytes are the DECODED command, byte-identical to what the state machine receives — a
+  /// `Normal` entry's stored `data()` is the `Data`-ENCODED command (a length-prefixed buffer), and the
+  /// proto's `apply_committed` hands `StateMachine::apply` the `decode_exact`'d value. Decoding here too
+  /// keeps `committed_entries_of` and `applied_entries_of` directly comparable (e.g. by `value_of`).
+  pub fn committed_entries_of(&self, id: u64) -> AppliedLog {
+    use sailing_proto::Data as _;
+    let i = self.node_idx[&id];
+    let commit = self.nodes[i].commit_index();
+    self.logs[i]
+      .committed_entries_no_fault(commit)
+      .iter()
+      .filter(|e| e.kind() == sailing_proto::EntryKind::Normal)
+      // Decode the stored payload to the raw command (mirrors `apply_committed`); skip any entry whose
+      // payload is not a valid `Bytes` encoding (a correct `Normal` entry always is).
+      .filter_map(|e| {
+        bytes::Bytes::decode_exact(e.data_bytes())
+          .ok()
+          .map(|cmd| (e.index().get(), cmd.to_vec()))
+      })
+      .collect()
+  }
+
   /// Number of messages DROPPED by the seeded network fault model since construction (a non-vacuity
   /// counter so tests can assert the model actually fired). Excludes partition/isolation drops.
   pub fn net_dropped(&self) -> u64 {
