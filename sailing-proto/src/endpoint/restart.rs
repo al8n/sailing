@@ -360,6 +360,8 @@ where
       // it (re-)wins an election, so start them cleared.
       inherited_release_deadline: 0,
       unwalled_commit_wait_until: None,
+      // Observability counter resets on restart (in-memory only, never persisted).
+      precise_releases: 0,
       // A restarted node comes up a fresh Follower with no pending lease-refresh demand.
       lease_refresh_wanted: false,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior

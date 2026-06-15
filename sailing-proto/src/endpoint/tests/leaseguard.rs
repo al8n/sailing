@@ -470,6 +470,11 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
     Index::ZERO,
     "not released until now_wall exceeds inherited_release_deadline + 2·ε_unc"
   );
+  assert_eq!(
+    ep.precise_releases(),
+    0,
+    "the precise anchor has not fired while the commit-wait is still held"
+  );
 
   // 1ns PAST the precise threshold: the precise anchor lifts the wait — at d+~540ms, far before the
   // conservative d+1500ms, proving the inherited entry's own wall (not THIS election's now) drove it.
@@ -491,6 +496,11 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
     ep.commit_index(),
     Index::new(2),
     "the precise anchor commits the inherited entry + no-op once now_wall > deadline + 2·ε_unc"
+  );
+  assert_eq!(
+    ep.precise_releases(),
+    1,
+    "the precise anchor fired exactly once — the early-release path lifted the commit-wait"
   );
 }
 

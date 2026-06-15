@@ -309,8 +309,17 @@ where
       // opportunistic — only acks/appends carrying the wall re-enter here). Clearing `commit_wait_until`
       // lifts the gate FOR GOOD and removes that deadline, so `poll_timeout` then surfaces no CommitWait
       // wakeup and the §8 wedge tripwire (a serviceable timer is never left due) stays satisfied.
-      if now.mono() >= until || self.precise_release_ready(now) {
+      // Attribute the lift: the conservative mono deadline takes precedence (and short-circuits the
+      // precise check, exactly as before); the precise anchor counts ONLY when it alone cleared the
+      // gate. `conservative || precise` is identical to the prior `now.mono() >= until ||
+      // precise_release_ready(now)`, so behavior is unchanged — the counter is pure observability.
+      let conservative = now.mono() >= until;
+      let precise = !conservative && self.precise_release_ready(now);
+      if conservative || precise {
         self.commit_wait_until = None;
+        if precise {
+          self.precise_releases += 1;
+        }
       }
     }
     // Delegate to the Tracker's joint-quorum committed index. For a simple (non-joint)
