@@ -386,6 +386,28 @@ impl MemLog {
     }
   }
 
+  /// The VISIBLE log entries in the committed prefix `[first_index, commit]`, read WITHOUT drawing the
+  /// `transient_read` fault PRNG — a pure observer for the VOPR's committed-frontier oracle.
+  ///
+  /// Like [`durable_entries`](Self::durable_entries), this exists so an oracle can inspect the log
+  /// without perturbing the simulated run: the `LogStore::entries` trait read advances the read-fault
+  /// PRNG and can inject an error that POISONS the node, so an oracle that read through it would change
+  /// the run's fault schedule (and could mask or fabricate a poison). This reads the VISIBLE `entries`
+  /// (what the proto's `apply_committed` sees — including an async submitted-but-unflushed tail the
+  /// leader's commit already covers), bounded above by `commit`. Entries strictly above `commit` are
+  /// excluded; a `commit` below `first_index` (e.g. everything compacted away) yields an empty slice.
+  pub fn committed_entries_no_fault(&self, commit: Index) -> &[Entry] {
+    let offset = self.offset.get();
+    let len = self.entries.len() as u64;
+    // `entries` holds indices `(offset, offset+len]`; position = index - offset - 1. The committed
+    // prefix starts at `first_index` (position 0) and ends at `commit` (inclusive).
+    if commit.get() <= offset {
+      return &[];
+    }
+    let hi = (commit.get() - offset).min(len) as usize;
+    &self.entries[..hi]
+  }
+
   /// The number of durable in-memory entries (above the compaction offset). Used by the
   /// boundedness oracle to assert per-node bookkeeping stays bounded under compaction. Returns the
   /// durable-snapshot length in async mode, the visible length in sync mode (they coincide in

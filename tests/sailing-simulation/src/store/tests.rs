@@ -136,6 +136,52 @@ fn entries_and_term_correct_after_compaction() {
 }
 
 #[test]
+fn committed_entries_no_fault_bounds_and_ignores_read_fault() {
+  let mut log = MemLog::new_async(7);
+  let entries: Vec<Entry> = (1..=5).map(|i| make_entry(i, i)).collect();
+  log.submit_append(OpId::new(1), &entries);
+  log.flush();
+  let _ = log.poll();
+  // Arm an always-firing committed-range read fault: the trait `entries()` would now ERROR and draw the
+  // read PRNG, but `committed_entries_no_fault` must be a pure observer — it neither errors nor perturbs.
+  log.set_faults(
+    StorageFaults {
+      transient_read_per_mille: 1000,
+      ..StorageFaults::none()
+    },
+    42,
+  );
+  assert!(
+    log.entries(Index::new(1)..Index::new(2), u64::MAX).is_err(),
+    "the faulting trait read errors (the path the oracle must avoid)"
+  );
+
+  // commit covers a prefix [1..=3]: exactly entries 1, 2, 3 (entries above commit excluded).
+  let prefix = log.committed_entries_no_fault(Index::new(3));
+  let idxs: Vec<u64> = prefix.iter().map(|e| e.index().get()).collect();
+  assert_eq!(idxs, vec![1, 2, 3]);
+  // commit at the last index returns everything; commit past the last index clamps to it.
+  assert_eq!(log.committed_entries_no_fault(Index::new(5)).len(), 5);
+  assert_eq!(log.committed_entries_no_fault(Index::new(99)).len(), 5);
+  // commit ZERO (nothing committed) → empty.
+  assert!(log.committed_entries_no_fault(Index::ZERO).is_empty());
+
+  // After compaction the prefix starts at first_index; a commit at/below the compaction offset is empty.
+  log.compact(Index::new(3));
+  let after = log.committed_entries_no_fault(Index::new(5));
+  let after_idxs: Vec<u64> = after.iter().map(|e| e.index().get()).collect();
+  assert_eq!(
+    after_idxs,
+    vec![4, 5],
+    "prefix begins at the post-compaction first_index"
+  );
+  assert!(
+    log.committed_entries_no_fault(Index::new(3)).is_empty(),
+    "a commit at the compaction boundary leaves no in-memory committed entries"
+  );
+}
+
+#[test]
 fn compact_noop_on_already_compacted_range() {
   let mut log = MemLog::new();
   let entries: Vec<Entry> = (1..=5).map(|i| make_entry(1, i)).collect();

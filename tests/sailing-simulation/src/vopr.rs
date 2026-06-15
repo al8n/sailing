@@ -54,6 +54,66 @@ use std::{collections::BTreeSet, vec::Vec};
 /// quorum (and never trips the proto's `EmptyVoterSet` apply-time poison).
 const MIN_VOTERS: usize = 2;
 
+/// The number of distinct KEYS the keyed-value workload writes to (and the per-key VALUE oracle reads
+/// from). The client payload is a `(key, value)` pair so the oracle can assert per-key linearizability
+/// — a confirmed read of a key must never observe a value older than the one committed for that key at
+/// the read's invocation. A small fixed key space keeps several writes landing on each key (so the
+/// oracle exercises real per-key history, not one write per key).
+const NUM_KEYS: u16 = 8;
+
+/// Encode a client command as a fixed 10-byte `(key, value)` pair: `key` (2 bytes LE) ++ `value`
+/// (8 bytes LE). The VOPR draws `value` from its monotonic `cmd_counter`, so every `(key, value)` is
+/// globally distinct (keeping the existing distinctness/quiesce checks intact) AND per-key values are
+/// strictly increasing (so the LATEST entry for a key always carries its MAX value — the property the
+/// VALUE oracle relies on).
+fn encode_kv(key: u16, value: u64) -> Vec<u8> {
+  let mut buf = Vec::with_capacity(10);
+  buf.extend_from_slice(&key.to_le_bytes());
+  buf.extend_from_slice(&value.to_le_bytes());
+  buf
+}
+
+/// Decode a keyed-value client command, the inverse of [`encode_kv`]. `Some((key, value))` iff `cmd`
+/// is EXACTLY 10 bytes; `None` otherwise — so empty / conf-change entries (which carry no client
+/// payload) and any non-keyed command decode to `None` and are skipped by the per-key oracle.
+fn decode_kv(cmd: &[u8]) -> Option<(u16, u64)> {
+  if cmd.len() != 10 {
+    return None;
+  }
+  let key = u16::from_le_bytes([cmd[0], cmd[1]]);
+  let value = u64::from_le_bytes([
+    cmd[2], cmd[3], cmd[4], cmd[5], cmd[6], cmd[7], cmd[8], cmd[9],
+  ]);
+  Some((key, value))
+}
+
+/// The value of the LATEST keyed entry for `key` whose log index is `<= upto`, over a node's applied
+/// `(index, command)` log; `None` if no such entry exists. Because the VOPR's per-key values are
+/// strictly increasing (the `cmd_counter` source is monotonic), the latest-index entry for a key also
+/// carries the maximum value — so this is the value a read served at index `upto` on this node must
+/// observe for `key`.
+fn value_of_asof(applied: &[(u64, Vec<u8>)], key: u16, upto: u64) -> Option<u64> {
+  let mut best: Option<(u64, u64)> = None; // (index, value) of the latest matching entry
+  for (idx, cmd) in applied {
+    if *idx > upto {
+      continue;
+    }
+    if let Some((k, v)) = decode_kv(cmd)
+      && k == key
+      && best.is_none_or(|(bi, _)| *idx >= bi)
+    {
+      best = Some((*idx, v));
+    }
+  }
+  best.map(|(_, v)| v)
+}
+
+/// The value of `key` over a node's ENTIRE applied log (no index bound) — the node's current committed
+/// value for that key. A thin wrapper over [`value_of_asof`] with `upto = u64::MAX`.
+fn value_of(applied: &[(u64, Vec<u8>)], key: u16) -> Option<u64> {
+  value_of_asof(applied, key, u64::MAX)
+}
+
 /// The largest cluster the VOPR will grow to (caps `AddNode`/`AddLearner`). Bounds the run and keeps
 /// the node-id space small and deterministic.
 const MAX_NODES: usize = 9;
@@ -130,6 +190,14 @@ pub struct VoprReport {
   /// Number of accepted reads whose `ReadState` confirmation was observed AND passed the
   /// read-linearizability assertion (`index >= the completed-write floor at invocation`).
   pub reads_confirmed: u64,
+  /// Number of reads checked by the per-KEY VALUE oracle: at each read's SERVE point (the serving node
+  /// having applied up to the confirmed index), `value_of_asof(key, served_index)` was asserted
+  /// `>= the per-key value committed cluster-wide at the read's invocation`. A stricter, value-level
+  /// companion to the index oracle that does NOT false-positive on inherited reads (where the served
+  /// index can predate the invocation floor yet the per-key VALUE is still fresh). A SUBSET of
+  /// `reads_confirmed` — a confirmed read whose node never applies that far is never served, hence
+  /// unchecked. A positive count proves the value oracle actually judged reads.
+  pub reads_value_checked: u64,
   /// Number of leader transfers the leader ACCEPTED (the transfer itself may still abort).
   pub transfers: u64,
   /// Non-vacuity WITNESS: the number of reads CONFIRMED by a node that was a SUPERSEDED leader at
@@ -322,13 +390,52 @@ impl VoprState {
 struct ReadLedger {
   /// Monotone context mint (8-byte BE on the wire); never reused, even for refused issues.
   next_ctx: u64,
-  /// Accepted, unconfirmed reads: context -> the floor recorded at invocation.
-  inflight: std::collections::BTreeMap<u64, sailing_proto::Index>,
+  /// Accepted, unconfirmed reads: context -> the invocation snapshot the two oracles assert against.
+  inflight: std::collections::BTreeMap<u64, ReadInvocation>,
   /// Per-node scan offset into the cluster's monotone `read_states_of` history.
   scan_off: std::collections::BTreeMap<u64, usize>,
   /// Retired reads: context -> (confirming node, confirmed index). Kept for the duplicate-
   /// confirmation oracle and for the calm/quiesce serve checks; bounded by reads issued.
   confirmed: std::collections::BTreeMap<u64, (u64, sailing_proto::Index)>,
+  /// Confirmed reads whose per-KEY VALUE check is DEFERRED until the serving node has APPLIED up to
+  /// the read's index. A read confirms at its index but is only truly SERVED — its value materialized
+  /// in the node's state machine — once `applied_index_of(node) >= index`; evaluating the value before
+  /// apply catches up reads a stale prefix and false-positives. Each `scan` drains every entry whose
+  /// node has now applied far enough, runs the value assertion at that serve point, and tallies it.
+  /// Bounded by reads confirmed.
+  pending_value: Vec<PendingValueCheck>,
+}
+
+/// A confirmed read awaiting its per-key VALUE assertion at the point the serving node applies up to
+/// the read's index (its true serve point).
+#[derive(Debug, Clone, Copy)]
+struct PendingValueCheck {
+  /// The read's context (for the panic message / replay).
+  ctx: u64,
+  /// The node that confirmed (and will serve) the read.
+  node: u64,
+  /// The confirmed read index — the value is asserted AS OF this index, once the node applies to it.
+  index: sailing_proto::Index,
+  /// The invocation snapshot (key + the committed per-key value floor `v_inv`).
+  inv: ReadInvocation,
+}
+
+/// What a single accepted read recorded at INVOCATION — the ground truth both read oracles assert
+/// the eventual confirmation against.
+#[derive(Debug, Clone, Copy)]
+struct ReadInvocation {
+  /// The completed-write FLOOR (max commit index anywhere) at invocation — the INDEX oracle's bound
+  /// (`confirmed index >= floor`).
+  floor: sailing_proto::Index,
+  /// The KEY this read targets — drawn from the seeded PRNG in `0..NUM_KEYS` at issue.
+  key: u16,
+  /// The per-KEY committed VALUE at invocation: `max over ALL nodes of value_of(committed_entries_of(node), key)`
+  /// (0 if no node has a committed entry for `key` yet). Read from the COMMITTED LOG frontier, NOT the
+  /// applied state machine — apply lags commit, so an applied-state floor would miss a just-committed
+  /// write and fail to catch a stale read of the old value. The VALUE oracle's bound: the served node,
+  /// at its confirmed index, must show `value_of_asof(node, key, index) >= v_inv` — any committed value
+  /// is on a quorum and the read index is `>= floor`, so a fresher-or-equal per-key value MUST be visible.
+  v_inv: u64,
 }
 
 impl ReadLedger {
@@ -338,17 +445,46 @@ impl ReadLedger {
       inflight: std::collections::BTreeMap::new(),
       scan_off: std::collections::BTreeMap::new(),
       confirmed: std::collections::BTreeMap::new(),
+      pending_value: Vec::new(),
     }
   }
 
-  /// Issue one read on `target`, recording the floor iff the node accepts. Returns the minted
-  /// context (accepted or not; contexts are never reused).
-  fn issue(&mut self, c: &mut Cluster, target: u64, report: &mut VoprReport) -> u64 {
+  /// Issue one read on `target` for `key`, recording the invocation snapshot iff the node accepts.
+  /// Returns the minted context (accepted or not; contexts are never reused).
+  ///
+  /// The snapshot captures BOTH oracles' bounds at the SAME instant: the index `floor` (max commit
+  /// anywhere) and the per-key value `v_inv` (max over ALL nodes of that node's committed value for the
+  /// key). Reading `v_inv` over every node — not just `target` or the leader — is what makes the value
+  /// oracle SOUND: an entry committed anywhere is on a quorum and acknowledged, so it is a completed
+  /// write that any later linearizable read of that key must observe.
+  ///
+  /// A node's committed value for the key is the MAX of two pure views, because NEITHER ALONE is
+  /// complete: its APPLIED state machine (which retains the snapshot-compacted prefix the live log no
+  /// longer holds) ⊔ its live COMMITTED log tail (`committed_entries_of`, which holds writes committed
+  /// but not yet applied). Apply lags commit, so the applied view alone under-counts the committed tail;
+  /// compaction drops the prefix from the live log, so the committed-log view alone under-counts the
+  /// compacted prefix. Their max is the true completed-write floor — never under-counted by apply lag
+  /// OR by compaction.
+  fn issue(&mut self, c: &mut Cluster, target: u64, key: u16, report: &mut VoprReport) -> u64 {
     let ctx = self.next_ctx;
     self.next_ctx += 1;
     let floor = c.max_commit();
+    let v_inv = c
+      .node_ids()
+      .into_iter()
+      .filter_map(|id| {
+        // applied (retains the compacted prefix) ⊔ live committed log tail (committed-but-not-applied).
+        value_of(&c.applied_entries_of(id), key)
+          .into_iter()
+          .chain(value_of(&c.committed_entries_of(id), key))
+          .max()
+      })
+      .max()
+      .unwrap_or(0);
     if c.read_index_on(target, &ctx.to_be_bytes()) {
-      self.inflight.insert(ctx, floor);
+      self
+        .inflight
+        .insert(ctx, ReadInvocation { floor, key, v_inv });
       report.reads_issued += 1;
     }
     ctx
@@ -376,15 +512,26 @@ impl ReadLedger {
           ));
         let ctx = u64::from_be_bytes(raw);
         match self.inflight.remove(&ctx) {
-          Some(floor) => {
+          Some(inv) => {
             assert!(
-              rs.index() >= floor,
+              rs.index() >= inv.floor,
               "[read-linearizability] read ctx={ctx} confirmed on n{id} at index {} BELOW the                completed-write floor {} recorded at invocation — the read could serve a state                missing a committed write
   seed={seed} tick={} (replay: run_vopr({seed}, ticks))",
               rs.index().get(),
-              floor.get(),
+              inv.floor.get(),
               c.view().tick,
             );
+            // The per-KEY VALUE oracle is DEFERRED to the read's true serve point: a read confirms at
+            // `rs.index()` but its value is only materialized in the node's state machine once the node
+            // has APPLIED up to that index. Evaluating now (apply may lag the confirmed index) would
+            // read a stale prefix and false-positive. Queue it; the drain below asserts each once its
+            // node applies far enough.
+            self.pending_value.push(PendingValueCheck {
+              ctx,
+              node: id,
+              index: rs.index(),
+              inv,
+            });
             self.confirmed.insert(ctx, (id, rs.index()));
             report.reads_confirmed += 1;
           }
@@ -405,6 +552,38 @@ impl ReadLedger {
         }
       }
     }
+
+    // Drain the deferred per-KEY VALUE checks: assert each confirmed read whose serving node has now
+    // APPLIED up to the read's index (its true serve point). `value_of_asof(node, key, index)` reads
+    // the SERVED snapshot — the entries materialized at/below the read index — which, now that the node
+    // has applied to it, contains every committed write up to `index >= floor`. The floor `v_inv` was
+    // captured from the COMMITTED frontier at invocation (not applied state, which can lag commit), and
+    // any write committed by then is at an index `<= floor <= index`, so the served snapshot includes it.
+    // Reads whose node has not yet caught up stay queued for a later scan. Retaining in place keeps the
+    // queue order deterministic; the drain is a pure function of applied indices and the queue.
+    let mut still_pending = Vec::with_capacity(self.pending_value.len());
+    for p in core::mem::take(&mut self.pending_value) {
+      if c.applied_index_of(p.node) < p.index {
+        still_pending.push(p); // serve point not reached yet — re-check on a later scan
+        continue;
+      }
+      let observed =
+        value_of_asof(&c.applied_entries_of(p.node), p.inv.key, p.index.get()).unwrap_or(0);
+      assert!(
+        observed >= p.inv.v_inv,
+        "[read-value-linearizability] read ctx={} key={} served on n{} at index {} showed value \
+         {observed} BELOW the committed value {} for that key at invocation — a stale per-key read\n  \
+         seed={seed} tick={} (replay: run_vopr({seed}, ticks))",
+        p.ctx,
+        p.inv.key,
+        p.node,
+        p.index.get(),
+        p.inv.v_inv,
+        c.view().tick,
+      );
+      report.reads_value_checked += 1;
+    }
+    self.pending_value = still_pending;
   }
 }
 
@@ -536,7 +715,14 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     // ── Calm window ───────────────────────────────────────────────────────────────────────────
     if iter + 1 >= next_calm {
       calm_window(&mut c, &mut st, &mut prng, &mut report, seed);
-      read_round(&mut c, &mut reads, &mut report, seed, "calm-window");
+      read_round(
+        &mut c,
+        &mut reads,
+        &mut prng,
+        &mut report,
+        seed,
+        "calm-window",
+      );
       report.calm_windows += 1;
       let jitter = (prng.next_u64() % 60) as usize;
       next_calm = iter + 1 + calm_period + jitter;
@@ -547,7 +733,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   quiesce(&mut c, &mut st, &mut report, seed);
   // One final linearizable read on the converged cluster: it must confirm, pass the oracle, and
   // become servable. Also drains any confirmations that surfaced during quiesce itself.
-  read_round(&mut c, &mut reads, &mut report, seed, "quiesce");
+  read_round(&mut c, &mut reads, &mut prng, &mut report, seed, "quiesce");
 
   report.final_cluster_size = st.voters.len();
   // The superseded-leader serve count is tallied event-time inside the cluster (at ReadState drain),
@@ -573,6 +759,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 fn read_round(
   c: &mut Cluster,
   reads: &mut ReadLedger,
+  prng: &mut FaultPrng,
   report: &mut VoprReport,
   seed: u64,
   phase: &str,
@@ -596,7 +783,8 @@ fn read_round(
     // id alone would look stable while the context is already dead. A leader never advances its
     // term without stepping down first, so a term move on the same id is exactly re-election.
     let issued_term = c.term_of(leader);
-    let ctx = reads.issue(c, leader, report);
+    let key = (prng.next_u64() % NUM_KEYS as u64) as u16;
+    let ctx = reads.issue(c, leader, key, report);
     last = Some((leader, ctx));
     if !reads.inflight.contains_key(&ctx) {
       // Refused (capacity / a racing step-down): settle briefly and retry.
@@ -855,7 +1043,8 @@ fn calm_window(
     }
     // Top up client load if there is a leader to accept it (re-propose past any non-committing ones).
     if c.leader_count() == 1 {
-      let payload = st.cmd_counter.to_le_bytes().to_vec();
+      let key = (st.cmd_counter % NUM_KEYS as u64) as u16;
+      let payload = encode_kv(key, st.cmd_counter);
       if c.propose(&payload).is_some() {
         st.proposed.push(payload);
         st.cmd_counter += 1;
@@ -1004,6 +1193,31 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
       "VOPR APPLY FAILURE: after quiesce, voter {id} applied a different committed client history \
        than the leader {leader} — the committed history was not applied consistently everywhere\n  \
        seed={seed} (replay: run_vopr({seed}, ticks))",
+    );
+  }
+
+  // Per-KEY consistency: for every key, the leader's CURRENT state-machine value (`value_of`) must
+  // equal the MAX value over the `proposed` writes for that key that COMMITTED (appear in the leader's
+  // applied log). The committed-write max is computed INDEPENDENTLY of `value_of` — by scanning the
+  // leader's applied entries for keyed commands that are also in the `proposed` set and taking the max
+  // value — so this cross-checks that the SM's latest-by-index per-key value really is the latest
+  // committed write for that key (and, since per-key values are monotonic, that no out-of-order or
+  // phantom keyed value slipped in). A key with no committed write has no SM value (both sides absent).
+  for key in 0..NUM_KEYS {
+    let committed_max: Option<u64> = leader_applied
+      .iter()
+      .filter(|(_, cmd)| proposed_set.contains(cmd))
+      .filter_map(|(_, cmd)| decode_kv(cmd))
+      .filter(|(k, _)| *k == key)
+      .map(|(_, v)| v)
+      .max();
+    let sm_value = value_of(&leader_applied, key);
+    assert_eq!(
+      sm_value, committed_max,
+      "VOPR PER-KEY FAILURE: after quiesce, the leader {leader}'s state-machine value for key {key} \
+       ({sm_value:?}) does not equal the max COMMITTED proposed value for that key ({committed_max:?}) \
+       — the latest committed write for the key was not the SM's value\n  seed={seed} (replay: \
+       run_vopr({seed}, ticks))",
     );
   }
 
