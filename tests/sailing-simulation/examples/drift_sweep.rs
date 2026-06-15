@@ -30,6 +30,12 @@ fn main() {
   let superseded = Arc::new(AtomicU64::new(0));
   let superseded_seeds = Arc::new(AtomicU64::new(0));
   let partitions = Arc::new(AtomicU64::new(0));
+  // FAILOVER sub-mode witnesses: seeds that drew it, seeds whose precise anchor actually fired, and the
+  // total precise early-releases + offset re-syncs.
+  let failover_seeds = Arc::new(AtomicU64::new(0));
+  let precise_seeds = Arc::new(AtomicU64::new(0));
+  let precise_total = Arc::new(AtomicU64::new(0));
+  let resync_total = Arc::new(AtomicU64::new(0));
   std::thread::scope(|scope| {
     for _ in 0..threads {
       let failures = Arc::clone(&failures);
@@ -39,6 +45,10 @@ fn main() {
       let superseded = Arc::clone(&superseded);
       let superseded_seeds = Arc::clone(&superseded_seeds);
       let partitions = Arc::clone(&partitions);
+      let failover_seeds = Arc::clone(&failover_seeds);
+      let precise_seeds = Arc::clone(&precise_seeds);
+      let precise_total = Arc::clone(&precise_total);
+      let resync_total = Arc::clone(&resync_total);
       scope.spawn(move || {
         loop {
           let seed = next.fetch_add(1, Ordering::Relaxed);
@@ -56,9 +66,24 @@ fn main() {
               partitions.fetch_add(rep.partitions, Ordering::Relaxed);
               if rep.reads_served_by_superseded_leader > 0 {
                 eprintln!(
-                  "  SUPERSEDED-SERVE seed {seed}: count={} confirmed={} partitions={}",
-                  rep.reads_served_by_superseded_leader, rep.reads_confirmed, rep.partitions
+                  "  SUPERSEDED-SERVE seed {seed}: count={} drifted={} failover={} confirmed={}",
+                  rep.reads_served_by_superseded_leader,
+                  rep.drifted,
+                  rep.failover,
+                  rep.reads_confirmed
                 );
+              }
+              if rep.failover {
+                failover_seeds.fetch_add(1, Ordering::Relaxed);
+                resync_total.fetch_add(rep.offset_resyncs, Ordering::Relaxed);
+                precise_total.fetch_add(rep.precise_releases, Ordering::Relaxed);
+                if rep.precise_releases > 0 {
+                  precise_seeds.fetch_add(1, Ordering::Relaxed);
+                  eprintln!(
+                    "  FAILOVER-PRECISE seed {seed}: precise_releases={} offset_resyncs={} committed={} confirmed={}",
+                    rep.precise_releases, rep.offset_resyncs, rep.committed, rep.reads_confirmed
+                  );
+                }
               }
             }
             Err(payload) => {
@@ -90,6 +115,13 @@ fn main() {
     superseded.load(Ordering::Relaxed),
     superseded_seeds.load(Ordering::Relaxed),
     partitions.load(Ordering::Relaxed),
+  );
+  eprintln!(
+    "  failover: seeds={} (precise-firing={}) precise_releases={} offset_resyncs={}",
+    failover_seeds.load(Ordering::Relaxed),
+    precise_seeds.load(Ordering::Relaxed),
+    precise_total.load(Ordering::Relaxed),
+    resync_total.load(Ordering::Relaxed),
   );
   for (seed, msg) in f.iter() {
     eprintln!("  seed {seed}: {msg}");
