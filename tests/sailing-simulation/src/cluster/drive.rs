@@ -28,7 +28,7 @@ impl Cluster {
       None => return false,
     };
     let i = self.node_idx[&leader];
-    let now_i = self.now_for(i);
+    let now_i = self.now_now(i);
     {
       let log = &self.logs[i];
       let stable = &self.stables[i];
@@ -51,7 +51,7 @@ impl Cluster {
   /// caller mints unique contexts, so a duplicate is a harness bug, not weather.
   pub fn read_index_on(&mut self, node: u64, context: &[u8]) -> bool {
     let i = self.node_idx[&node];
-    let now_i = self.now_for(i);
+    let now_i = self.now_now(i);
     let accepted = {
       let log = &self.logs[i];
       let stable = &self.stables[i];
@@ -82,7 +82,7 @@ impl Cluster {
       .leader()
       .ok_or(sailing_proto::TransferError::NotLeader { leader: None })?;
     let i = self.node_idx[&leader];
-    let now_i = self.now_for(i);
+    let now_i = self.now_now(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
     self.nodes[i].transfer_leader(now_i, log, stable, to)
@@ -94,7 +94,7 @@ impl Cluster {
     let i = self.node_idx[&leader];
     // Split into disjoint borrows: nodes[i], logs[i], stables[i] are each in a
     // separate Vec, so borrowing them simultaneously is safe.
-    let now_i = self.now_for(i);
+    let now_i = self.now_now(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
     self.nodes[i]
@@ -106,7 +106,7 @@ impl Cluster {
   pub fn propose_conf_change(&mut self, cc: ConfChange<u64>) -> Option<sailing_proto::Index> {
     let leader = self.leader()?;
     let i = self.node_idx[&leader];
-    let now_i = self.now_for(i);
+    let now_i = self.now_now(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
     self.nodes[i]
@@ -118,7 +118,7 @@ impl Cluster {
   pub fn propose_conf_change_v2(&mut self, cc: ConfChangeV2<u64>) -> Option<sailing_proto::Index> {
     let leader = self.leader()?;
     let i = self.node_idx[&leader];
-    let now_i = self.now_for(i);
+    let now_i = self.now_now(i);
     let log = &mut self.logs[i];
     let stable = &mut self.stables[i];
     self.nodes[i]

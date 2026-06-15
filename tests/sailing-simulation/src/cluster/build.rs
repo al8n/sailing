@@ -122,6 +122,12 @@ impl Cluster {
       drift_policy: std::boxed::Box::new(|_| (1, 1)),
       lease_superseded_serves: 0,
       superseded_read_contexts: std::collections::BTreeSet::new(),
+      // No synchronized wall by default: every call carries the monotonic instant only (wall absent),
+      // byte-identical to the original, and the precise commit-anchor never fires. `enable_failover_clock`
+      // overrides this. Offsets start at zero (a perfectly synchronized wall) for every node.
+      failover: false,
+      clock_offset: vec![0; n],
+      eps_unc_ns: 0,
     }
   }
 
@@ -175,6 +181,9 @@ impl Cluster {
     // so a dynamically-added node drifts like the founders (default `(1, 1)` = no drift).
     let rate = validate_rate((self.drift_policy)(id));
     self.clock_rate.push(rate);
+    // A mid-run joiner starts at a zero wall offset; it gets its first non-zero offset at the next
+    // `resync_offsets` (parallel to `clock_rate`, indexed by Vec position).
+    self.clock_offset.push(0);
     let now_pos = self.now_for(pos);
 
     let ep = Endpoint::new(base.clone(), now_pos, 0x5EED ^ id, LogSm::new());

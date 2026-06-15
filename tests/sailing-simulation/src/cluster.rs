@@ -6,8 +6,8 @@ use crate::{
 };
 use core::time::Duration;
 use sailing_proto::{
-  ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Outgoing, ReadState,
-  StableStore, Term,
+  ConfChange, ConfChangeV2, Config, Endpoint, Instant, LogStore, Message, Now, Outgoing, ReadState,
+  StableStore, Term, Wall,
 };
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -172,6 +172,33 @@ pub struct Cluster {
   /// is confirmed; contexts are unique per read, so a recorded read that never serves simply never
   /// matches. Kept separate from any node-observable state so recording cannot perturb the run.
   superseded_read_contexts: std::collections::BTreeSet<Vec<u8>>,
+  /// FAILOVER-tier wall clock: when `true`, every node-facing call supplies a SYNCHRONIZED wall reading
+  /// (`Now::synchronized`) alongside the monotonic instant, activating the precise commit-anchor. When
+  /// `false` (the default), calls carry the monotonic instant ONLY (`Now::monotonic`, wall absent) —
+  /// byte-identical to the original, and the precise anchor never fires. Set by [`enable_failover_clock`].
+  failover: bool,
+  /// Per-node SYNCHRONIZED-WALL offset in nanos, `offset[i] ∈ [−ε_unc, +ε_unc]`: node `i`'s wall reads
+  /// `global_now + offset[i]` (saturating at 0), modelling `|W_i(t) − t| ≤ ε_unc`. Distinct from
+  /// [`clock_rate`](Self::clock_rate) (which drifts the MONOTONIC clock): the offset perturbs ONLY the
+  /// wall. `0` for every node by default and whenever `failover` is off (the wall is absent then). Varies
+  /// across the run via [`resync_offsets`] (a re-draw smaller than the prior value is a backward NTP
+  /// step). Indexed by Vec position; a mid-run joiner is appended a `0` and gets its first offset at the
+  /// next resync.
+  clock_offset: Vec<i64>,
+  /// The synchronized-wall uncertainty bound ε_unc in nanos — the half-width of the per-node offset
+  /// range drawn by [`resync_offsets`]. `0` until [`enable_failover_clock`] installs it.
+  eps_unc_ns: u64,
+}
+
+/// Project a SYNCHRONIZED wall reading (nanos) from the global base time and a per-node offset,
+/// SATURATING into the valid `u64` range at BOTH ends: a negative sum clamps to `0`, a sum past
+/// `u64::MAX` clamps to `u64::MAX`. So an extreme base or offset can neither go negative nor WRAP to a
+/// small value — a wrap would silently break the bounded cross-node wall skew the precise commit-anchor
+/// relies on (one node's wall near `u64::MAX`, another wrapped near `0`). `i128` holds `base + offset`
+/// exactly for every `base` a virtual-time run reaches and every offset the install accepts
+/// (`|offset| ≤ i64::MAX`).
+fn project_wall(base: u128, offset: i64) -> u64 {
+  (base as i128 + offset as i128).clamp(0, u64::MAX as i128) as u64
 }
 
 /// Scale a duration by `num/den`, rounding DOWN (the `local_now` direction). u128 intermediate so a
@@ -216,6 +243,21 @@ impl Cluster {
       return self.now; // exact identity — no rounding, byte-identical to the single-clock path.
     }
     Instant::from_origin(scale_floor(self.now.since_origin(), num, den))
+  }
+
+  /// The full clock reading the driver hands node `i` on every call: the monotonic
+  /// [`now_for`](Self::now_for) instant ALWAYS, plus — under the failover tier — a SYNCHRONIZED wall
+  /// reading `global_now + offset[i]` (saturating ≥ 0). Off-tier (`failover == false`) this is the bare
+  /// monotonic `Now` (wall absent), byte-identical to the original single-clock path. The wall carries
+  /// the per-node [`clock_offset`](Self::clock_offset) but NOT the monotonic [`clock_rate`](Self::clock_rate):
+  /// the two clock kinds are perturbed independently, matching the design's distinct ε_unc / ε_drift.
+  fn now_now(&self, i: usize) -> Now {
+    let mono = self.now_for(i);
+    if !self.failover {
+      return Now::monotonic(mono);
+    }
+    let wall = project_wall(self.now.since_origin().as_nanos(), self.clock_offset[i]);
+    Now::synchronized(mono, Wall::from_nanos(wall))
   }
 
   /// The earliest GLOBAL virtual time at which node `i`'s LOCAL deadline `local` is reached, i.e. the
@@ -314,7 +356,7 @@ impl Cluster {
   fn drain_storage_all(&mut self) -> bool {
     let mut any_new = false;
     for i in 0..self.nodes.len() {
-      let now_i = self.now_for(i);
+      let now_i = self.now_now(i);
       let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
       self.nodes[i].handle_storage(now_i, log, stable);
     }
@@ -470,7 +512,7 @@ impl Cluster {
           // Drop silently — partition swallows it.
         } else if let Some(&to_idx) = self.node_idx.get(&m.to) {
           delivered = true;
-          let now_to = self.now_for(to_idx);
+          let now_to = self.now_now(to_idx);
           let (log, stable) = (&mut self.logs[to_idx], &mut self.stables[to_idx]);
           let message = wire_roundtrip(m.message);
           self.nodes[to_idx].handle_message(now_to, log, stable, m.from, message);
@@ -513,7 +555,7 @@ impl Cluster {
       for i in 0..self.nodes.len() {
         if self.global_timeout(i).is_some_and(|d| d <= self.now) {
           progressed = true;
-          let now_i = self.now_for(i);
+          let now_i = self.now_now(i);
           let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
           self.nodes[i].handle_timeout(now_i, log, stable);
         }
@@ -597,6 +639,22 @@ impl Cluster {
 #[cfg(test)]
 mod tests {
   use super::*;
+
+  #[test]
+  fn project_wall_saturates_both_ends() {
+    // Interior: exact base + offset.
+    assert_eq!(project_wall(1_000, 250), 1_250);
+    assert_eq!(project_wall(1_000, -250), 750);
+    // Lower end: a negative sum clamps to 0, never an underflow.
+    assert_eq!(project_wall(10, -25), 0);
+    assert_eq!(project_wall(0, i64::MIN), 0);
+    // Upper end: a sum past u64::MAX clamps to u64::MAX, never a WRAP to a small value.
+    assert_eq!(project_wall(u64::MAX as u128, 1), u64::MAX);
+    assert_eq!(project_wall(u64::MAX as u128, i64::MAX), u64::MAX);
+    assert_eq!(project_wall(u64::MAX as u128 - 5, 100), u64::MAX);
+    // Exactly at the boundary stays exact.
+    assert_eq!(project_wall(u64::MAX as u128 - 5, 5), u64::MAX);
+  }
 
   #[test]
   fn three_node_cluster_ticks_and_eventually_elects() {

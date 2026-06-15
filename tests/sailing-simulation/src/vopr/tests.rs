@@ -32,6 +32,8 @@ fn run_and_fingerprint(seed: u64, ticks: usize) -> (VoprReport, u64) {
     report.faults_fired,
     report.calm_windows,
     report.reads_value_checked,
+    report.offset_resyncs,
+    report.precise_releases,
     report.final_cluster_size as u64,
   ] {
     h = fnv1a(&v.to_le_bytes(), h);
@@ -104,21 +106,24 @@ fn vopr_smoke_runs_a_few_seeds() {
   );
 }
 
-/// The clock-drift harness, end-to-end: seeds 8, 56, and 464 draw the LeaseGuard read mode, so each
-/// runs the whole adversarial schedule (crash + partition + lossy network + membership churn) under
-/// PER-NODE clock RATE drift bounded by ε/Δ. Each must complete WITHOUT a safety-oracle /
-/// read-linearizability / liveness panic AND confirm reads — proving the read-linearizability oracle
-/// actually judged reads served by leaders whose clocks drift against the rest of the cluster, not
-/// merely that the machinery is present. The single-clock VOPR never exercised any of LeaseGuard's
-/// clock-dependent paths under divergent clocks; this is that coverage.
+/// The clock-drift harness, end-to-end: seeds 20, 31, and 56 draw the LeaseGuard read mode's DRIFT
+/// sub-mode, so each runs the whole adversarial schedule (crash + partition + lossy network +
+/// membership churn) under PER-NODE clock RATE drift bounded by ε/Δ. Each must complete WITHOUT a
+/// safety-oracle / read-linearizability / liveness panic AND confirm reads — proving the
+/// read-linearizability oracle actually judged reads served by leaders whose clocks drift against the
+/// rest of the cluster, not merely that the machinery is present. The single-clock VOPR never exercised
+/// any of LeaseGuard's clock-dependent paths under divergent clocks; this is that coverage. (The
+/// LeaseGuard read mode also has a FAILOVER sub-mode — wall + offset, no rate drift — covered
+/// separately by `vopr_exercises_failover_precise_anchor_under_offset`; these seeds must stay in the
+/// DRIFT sub-mode, asserted below.)
 #[test]
 fn vopr_exercises_leaseguard_under_drift() {
-  for seed in [8u64, 56, 464] {
+  for seed in [20u64, 31, 56] {
     let r = run_vopr(seed, 1_500);
     assert!(
-      r.drifted,
-      "seed {seed} was expected to draw the LeaseGuard+drift mode but did not — the mode draw moved; \
-       pick fresh drifted seeds via the drift_sweep example"
+      r.drifted && !r.failover,
+      "seed {seed} was expected to draw the LeaseGuard DRIFT sub-mode but did not — the mode draw \
+       moved; pick fresh drift seeds via the drift_sweep example"
     );
     assert!(
       r.reads_confirmed > 0,
@@ -135,19 +140,131 @@ fn vopr_exercises_leaseguard_under_drift() {
   // Strong non-vacuity (the cross-leader coverage a single global clock cannot produce): under drift a
   // slow leader's heartbeats arrive late, a follower elects a successor while the slow leader's lease
   // is still fresh, and that SUPERSEDED leader (still Leader-role, outranked by a higher-term leader)
-  // serves reads — each kept linearizable by the successor's commit-wait. Pinned across SEVERAL drift
-  // seeds so one drifting out as the consensus schedule evolves does not silently vacate the coverage
-  // (the prior single pin, seed 309, drifted to zero after later consensus changes). Each seed draws
-  // the drift mode — `reads_served_by_superseded_leader > 0` implies it. Re-derive the set with the
-  // `drift_sweep` example if they ALL fall to zero.
-  let superseded: u64 = [2u64, 21, 97]
+  // serves reads — each kept linearizable by the successor's commit-wait. Pinned across two independent
+  // strongly-superseded drift seeds so one drifting out as the consensus schedule evolves does not
+  // silently vacate the coverage. Both must stay in the DRIFT sub-mode (the failover sub-mode reaches
+  // the superseded path too, but this assertion is specifically the rate-drift cross-leader case). Re-
+  // derive from the `drift_sweep` example's `SUPERSEDED-SERVE ... drifted=true` lines if they fall to
+  // zero.
+  let superseded: u64 = [2u64, 97]
     .iter()
-    .map(|&seed| run_vopr(seed, 2_000).reads_served_by_superseded_leader)
+    .map(|&seed| {
+      let r = run_vopr(seed, 2_000);
+      assert!(
+        r.drifted && !r.failover,
+        "superseded pin {seed} must stay in the DRIFT sub-mode (report={r:?})"
+      );
+      r.reads_served_by_superseded_leader
+    })
     .sum();
   assert!(
     superseded > 0,
     "no pinned drift seed reached the superseded-leader read path — the cross-leader coverage is \
      vacuous; re-derive the seed set with the drift_sweep example"
+  );
+}
+
+/// The FAILOVER sub-mode of the LeaseGuard read mode, end-to-end: seeds 28, 33, and 52 draw a LeaseGuard
+/// run with `bounded_clock_uncertainty` armed, a SYNCHRONIZED wall supplied to every proto call, and a
+/// per-node bounded wall OFFSET that re-syncs across the run (modelling NTP steps, incl. backward ones).
+/// Each must run the whole adversarial schedule WITHOUT a safety / read-linearizability / liveness panic
+/// AND actually FIRE the precise commit-anchor — proving the offset clock model exercises the failover
+/// early-release under worst-case cross-node wall skew, with the keyed-value oracle as the detector. The
+/// monotonic-only harness never supplies a synchronized wall, so this is the precise anchor's ONLY
+/// randomized coverage. Re-derive the set from the `drift_sweep` example's FAILOVER-PRECISE lines if the
+/// `precise_releases` witnesses fall to zero as the schedule evolves.
+#[test]
+fn vopr_exercises_failover_precise_anchor_under_offset() {
+  for seed in [28u64, 33, 52] {
+    let r = run_vopr(seed, 1_500);
+    assert!(
+      r.failover && !r.drifted,
+      "seed {seed} was expected to draw the LeaseGuard FAILOVER sub-mode but did not — the mode draw \
+       moved; pick fresh failover seeds via the drift_sweep example"
+    );
+    assert!(
+      r.offset_resyncs > 0,
+      "failover seed {seed} never re-synced its wall offset — a static offset cannot model an NTP step \
+       (report={r:?})"
+    );
+    assert!(
+      r.precise_releases > 0,
+      "failover seed {seed} never fired the PRECISE commit-anchor — the offset coverage is VACUOUS (the \
+       conservative anchor governed every release); re-derive via the drift_sweep example (report={r:?})"
+    );
+    assert!(
+      r.committed > 0,
+      "failover seed {seed} committed nothing — vacuous (report={r:?})"
+    );
+  }
+}
+
+/// The OFFSET injection is a pure no-op at ε_unc = 0: with the failover wall armed but a zero
+/// uncertainty bound, every `resync_offsets` draw collapses to the range `[0, 0]`, so the synchronized
+/// wall stays PERFECTLY synchronized (`global_now + 0`) for every node no matter how many re-syncs fire.
+/// This is the "offset ≡ 0 reproduces the synchronized baseline byte-identically" guard: the harness can
+/// perturb a run ONLY through a non-zero offset, never as a side effect of the re-sync machinery itself.
+#[test]
+fn failover_offset_zero_is_a_synchronized_noop() {
+  let mut c = crate::Cluster::new_async(3, 7);
+  c.enable_failover_clock(core::time::Duration::ZERO);
+  let mut prng = crate::store::FaultPrng::new(0xABCD);
+  for _ in 0..64 {
+    c.resync_offsets(&mut prng);
+    assert_eq!(
+      c.max_abs_offset(),
+      0,
+      "at ε_unc = 0 every wall offset must stay zero — the re-sync draw must collapse to [0, 0]"
+    );
+  }
+}
+
+/// `enable_failover_clock` REJECTS an ε_unc beyond `i64::MAX` nanos at install, rather than letting an
+/// out-of-range bound silently overflow `resync_offsets` (or produce an offset that no longer fits in
+/// `i64`). The arithmetic is total only within this bound, so the contract is enforced loudly up front.
+#[test]
+#[should_panic(expected = "bounded_clock_uncertainty must be at most")]
+fn enable_failover_clock_rejects_oversized_eps_unc() {
+  let mut c = crate::Cluster::new_async(3, 1);
+  // `Duration::from_nanos(u64::MAX)` is ~1.8e19 ns, well past i64::MAX (~9.2e18) — must panic at install.
+  c.enable_failover_clock(core::time::Duration::from_nanos(u64::MAX));
+}
+
+/// `resync_offsets` is TOTAL up to the maximum accepted ε_unc: at the `i64::MAX`-nanos boundary it never
+/// overflows or wraps, and every drawn offset stays within `[−ε_unc, +ε_unc]` (so `max_abs_offset`, which
+/// calls `abs()`, can never meet `i64::MIN`). This is the upper boundary the install validation admits.
+#[test]
+fn resync_offsets_is_total_at_the_max_bound() {
+  let mut c = crate::Cluster::new_async(4, 2);
+  let eps_ns = i64::MAX as u64;
+  c.enable_failover_clock(core::time::Duration::from_nanos(eps_ns));
+  let mut prng = crate::store::FaultPrng::new(0xFEED);
+  for _ in 0..256 {
+    c.resync_offsets(&mut prng);
+    // No panic/wrap, and the magnitude never exceeds the bound (max_abs_offset would panic on i64::MIN).
+    assert!(c.max_abs_offset() <= eps_ns as i64);
+  }
+}
+
+/// A FAILOVER run is DETERMINISTIC: the same (seed, ticks) replays to a byte-identical report AND
+/// fingerprint, so the seeded offset schedule and the precise-release timing it drives are fully
+/// reproducible (a re-sync schedule that drew from wall-clock entropy, or a non-deterministic offset
+/// fold, would break this). The `offset_resyncs` + `precise_releases` counters are in the fingerprint.
+#[test]
+fn vopr_failover_run_is_deterministic() {
+  let (r1, h1) = run_and_fingerprint(28, 1_500);
+  assert!(
+    r1.failover,
+    "seed 28 must draw the failover sub-mode for this determinism check (report={r1:?})"
+  );
+  let (r2, h2) = run_and_fingerprint(28, 1_500);
+  assert_eq!(
+    r1, r2,
+    "a failover run must replay to an identical VoprReport"
+  );
+  assert_eq!(
+    h1, h2,
+    "a failover run must replay to an identical fingerprint"
   );
 }
 

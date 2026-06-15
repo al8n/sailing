@@ -107,6 +107,62 @@ impl Cluster {
     self.drift_policy = std::boxed::Box::new(policy);
   }
 
+  /// Activate the FAILOVER-tier SYNCHRONIZED WALL clock: every subsequent node-facing call carries a
+  /// `Now::synchronized` reading (so the precise commit-anchor can fire), and [`resync_offsets`] draws
+  /// each node's wall offset uniformly from `[−ε_unc, +ε_unc]`. Call right after construction, before any
+  /// tick (like [`set_clock_drift`]). This is the ONLY thing that gives the failover precise-release its
+  /// randomized coverage — the monotonic-only clock the rest of the harness uses leaves the wall absent,
+  /// so the anchor permanently defers to the conservative bound. Offsets stay at their last-drawn values
+  /// (zero until the first `resync_offsets`).
+  pub fn enable_failover_clock(&mut self, eps_unc: Duration) {
+    // Bound ε_unc at install so EVERY downstream offset computation is total: an offset in
+    // `[−ε_unc, +ε_unc]` must fit in `i64`, and `resync_offsets`' span `2·ε_unc + 1` must not overflow.
+    // Reject anything larger here (like `validate_rate` for clock rates) — a real uncertainty bound is
+    // milliseconds, so this fails only for a bogus test input, loudly at install, rather than silently
+    // producing an out-of-bound or wrapped offset during a redraw.
+    assert!(
+      eps_unc.as_nanos() <= i64::MAX as u128,
+      "bounded_clock_uncertainty must be at most i64::MAX nanos, got {eps_unc:?}"
+    );
+    self.failover = true;
+    self.eps_unc_ns = eps_unc.as_nanos() as u64;
+  }
+
+  /// Re-draw every node's synchronized-wall offset uniformly from `[−ε_unc, +ε_unc]` — one NTP re-sync
+  /// event (a draw smaller than the prior value is a BACKWARD step, the hazard a static offset can never
+  /// model). No-op unless [`enable_failover_clock`] armed the tier. Deterministic in the supplied PRNG,
+  /// so the same seed reproduces the same offset schedule; at `ε_unc == 0` every offset stays `0` (the
+  /// wall is then perfectly synchronized — the determinism-guard baseline).
+  pub(crate) fn resync_offsets(&mut self, prng: &mut crate::store::FaultPrng) {
+    if !self.failover {
+      return;
+    }
+    // `i128` throughout so neither the span `2·ε_unc + 1` nor the draw can overflow for any ε_unc the
+    // install accepted (`ε_unc ≤ i64::MAX`). The result lies in `[−ε_unc, +ε_unc] ⊆ i64`, so the final
+    // cast is exact (it can never produce `i64::MIN`, which would later trip `abs()`).
+    let eps = self.eps_unc_ns as i128;
+    let span = 2 * eps + 1;
+    for off in &mut self.clock_offset {
+      *off = ((prng.next_u64() as i128) % span - eps) as i64;
+    }
+  }
+
+  /// Total FAILOVER-tier PRECISE commit-anchor early-releases summed over all live nodes — the
+  /// non-vacuity witness that the offset clock model actually exercised the early-release path (not only
+  /// the conservative anchor). Sums each node's in-memory `precise_releases()`; a restarted node resets
+  /// to zero, so this is a lower bound on the lifetime total.
+  pub fn precise_releases_total(&self) -> u64 {
+    self.nodes.iter().map(|n| n.precise_releases()).sum()
+  }
+
+  /// The largest absolute per-node wall offset currently installed (nanos) — `0` when the wall is
+  /// perfectly synchronized (every offset zero), which is exactly the state [`resync_offsets`] produces
+  /// at `ε_unc == 0`. Lets a test prove the offset injection is a no-op at zero offset.
+  #[cfg(test)]
+  pub(crate) fn max_abs_offset(&self) -> i64 {
+    self.clock_offset.iter().map(|o| o.abs()).max().unwrap_or(0)
+  }
+
   /// Deterministically drive the cluster until node `keep` is sitting inside the fsync window
   /// (has a staged-but-unflushed append), WITHOUT ever flushing `keep`. Returns `true` once the
   /// window is open, or `false` if it did not open within `max_iters`.
@@ -136,7 +192,7 @@ impl Cluster {
         }
         for i in 0..self.nodes.len() {
           if self.global_timeout(i).is_some_and(|d| d <= self.now) {
-            let now_i = self.now_for(i);
+            let now_i = self.now_now(i);
             let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
             self.nodes[i].handle_timeout(now_i, log, stable);
           }
@@ -202,7 +258,7 @@ impl Cluster {
       }
       self.logs[i].flush();
       self.stables[i].flush();
-      let now_i = self.now_for(i);
+      let now_i = self.now_now(i);
       let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
       self.nodes[i].handle_storage(now_i, log, stable);
     }
