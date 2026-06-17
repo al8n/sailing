@@ -2408,6 +2408,121 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
   );
 }
 
+/// FAILOVER observability regression (the silent-wedge counter the architecture review surfaced): a failover
+/// (ε_unc) node arms its commit-wait under a wall, then is driven with a WALL-ABSENT `Now` on the release
+/// path — a driver that armed the tier but did not supply a wall to `handle_timeout`. The veto holds the
+/// commit-wait FAIL-CLOSED (R11) — safe (it never undercuts the walled lease) but otherwise SILENT and, for
+/// a persistently wall-absent driver, permanent. `unprovable_floor_holds` counts each such hold so the wedge
+/// is observable (and so the VOPR can assert the failover commit-wait does not silently wedge). A
+/// wall-PRESENT, not-yet-released hold is NORMAL and is NOT counted.
+#[test]
+fn failover_unprovable_floor_hold_is_counted() {
+  use crate::{
+    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    Wall,
+  };
+  use core::time::Duration;
+
+  const S: u64 = 1_700_000_000_000_000_000;
+  const W: u64 = 100_000_000; // bare mono wait = 100ms
+  const EPS: u64 = 20_000_000; // floor = S + 140ms
+  const HB: u64 = 100_000_000; // heartbeat — the re-poll quantum
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_nanos(HB),
+  )
+  .unwrap()
+  .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        )
+        .with_lease_window(W)
+        .with_wall_timestamp(S)
+      ],
+      Index::new(1),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // Elect under a synchronized wall (the no-op stamps; the node is NOT inflated → the veto governs).
+  let d = ep.poll_timeout().unwrap();
+  let at =
+    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  ep.handle_timeout(at(0), &mut log, &mut stable);
+  ep.handle_storage(at(0), &mut log, &mut stable);
+  ep.handle_message(
+    at(0),
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(at(0), &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  ep.handle_message(
+    at(0),
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResp(AppendResp::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert_eq!(ep.commit_index(), Index::new(1));
+  assert_eq!(
+    ep.unprovable_floor_holds(),
+    0,
+    "a wall-present election holds nothing unprovably"
+  );
+
+  // The driver now drops the wall on the release path: drive WALL-ABSENT due ticks. Each holds fail-closed
+  // (R11) and is COUNTED; commit stays pinned (the walled lease is never undercut).
+  let mono = |off: u64| crate::Now::monotonic(d + Duration::from_nanos(off));
+  for k in 1..=3u64 {
+    ep.handle_timeout(mono(W + (k - 1) * HB), &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+    assert_eq!(
+      ep.commit_index(),
+      Index::new(1),
+      "wedge-safe: a wall-absent hold never undercuts the walled lease"
+    );
+    assert_eq!(
+      ep.unprovable_floor_holds(),
+      k,
+      "each wall-absent commit-wait hold is counted — the otherwise-silent wedge is now observable"
+    );
+  }
+}
+
 /// FAILOVER R11 regression (the absent-wall fail-OPEN): a NON-armed Safe+ε_unc successor driven with a
 /// MONOTONIC-only `Now` (no synchronized wall) at its bare deadline must FAIL CLOSED — hold the
 /// commit-wait — NOT clear via the bare mono path. Without the wall-absent veto, `walled_lease_vetoes_
@@ -2657,6 +2772,12 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
     ep.commit_index(),
     Index::new(1),
     "still held far past E′ — a node outside the clock contract never clears the walled floor unaided"
+  );
+  // The no-ε_unc walled-inheritor hold is the OTHER unprovable-floor entry point (L1 of the architecture
+  // review) — it too is counted, so this otherwise-silent wedge is observable.
+  assert!(
+    ep.unprovable_floor_holds() >= 1,
+    "a no-ε_unc walled-inheritor's fail-closed hold is counted (the L1 silent-wedge entry point)"
   );
 }
 

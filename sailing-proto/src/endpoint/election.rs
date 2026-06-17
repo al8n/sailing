@@ -458,7 +458,7 @@ where
   /// `ceil(max_lease_window · (Δ + ε_drift)/Δ) = max_lease_window · (1+ρ)`. The inflation makes the MONO
   /// deadline cover the inherited entry's drift-padded window `W_c` (the LENGTH) in REAL time even at the
   /// fastest admissible clock rate. That alone does NOT bound the absolute wall floor `s_c + W_c`: a mono
-  /// wait is blind to the wall offset `s_c`, so a crafted/corrupt FUTURE `s_c` can outrun it (R19). The
+  /// wait is blind to the wall offset `s_c`, so a crafted/corrupt FUTURE `s_c` can outrun it (a crafted future wall stamp). The
   /// caller therefore only lets this inflation SKIP the wall veto behind a synchronized-wall proof
   /// (`wall_proves_floor`); absent that, the veto governs. `(1+ρ)` uses THIS (successor) node's own config
   /// (the node whose clock runs this wait).
@@ -467,7 +467,7 @@ where
   /// CRUCIALLY — `None` when the EXACT ceil inflation exceeds `u64::MAX`: that wait is NOT representable
   /// as the `Duration::from_nanos` schedule `become_leader` uses, so it must FAIL CLOSED. Clamping it to
   /// `u64::MAX` (the prior behavior) would let `become_leader` ARM the serve while scheduling a wait
-  /// SHORTER than the E′ bound — re-opening the R2 mono-undercut under a (pathological but constructible)
+  /// SHORTER than the E′ bound — re-opening the mono-undercut-under-drift under a (pathological but constructible)
   /// election timeout above `u64::MAX` nanos. On `None` the caller uses the bare `max_lease_window` and
   /// does not arm the inherited serve. Ceil division (rounding UP only ever over-waits — safe); the value
   /// must also stay `< election_timeout` (checked by the caller, the failover deployment contract).
@@ -493,7 +493,7 @@ where
     // EXACTLY. A `saturating_mul` overflow would clamp the product and divide back to a PLAUSIBLE but
     // too-SHORT `u64`, wrongly setting `commit_wait_inflated` and skipping the fail-closed veto — a
     // successor clearing early and undercutting a serve. So any overflowing add/mul FAILS the proof
-    // (`None`). CEILING division (rounding UP only ever over-waits — safe against the strict R2 boundary).
+    // (`None`). CEILING division (rounding UP only ever over-waits — safe against the strict mono-undercut boundary).
     let sum = delta_ns.checked_add(drift.as_nanos())?;
     let inflated = u128::from(self.max_lease_window)
       .checked_mul(sum)?
@@ -589,9 +589,9 @@ where
     // linearizable EVERY electable successor's commit-past-c must be ≥ that floor — including via THIS
     // conservative MONO deadline. The bare `now.mono() + max_lease_window` covers only a deposed leader's
     // read-LEASE (`Δ_D/(1−ρ)` real), SHORTER than the window `W_c` the serve keys on, so under rate drift
-    // it can fire BEFORE the serve withdraws (R2). Inflating by `(Δ+ε_drift)/Δ = (1+ρ)` makes the mono
+    // it can fire BEFORE the serve withdraws (the mono-undercut under drift). Inflating by `(Δ+ε_drift)/Δ = (1+ρ)` makes the mono
     // deadline land no earlier than `s_c + W_c` even at the fastest rate — PROVIDED `s_c` is a real PAST
-    // stamp (`s_c ≤` this election's wall). A crafted/corrupt FUTURE `s_c` breaks that (R19: E′ is a window-
+    // stamp (`s_c ≤` this election's wall). A crafted/corrupt FUTURE `s_c` breaks that (a crafted future stamp: E′ is a window-
     // only mono duration, blind to the wall offset), so the inflation is ADDITIONALLY gated below on a
     // synchronized-wall proof (`wall_proves_floor`); absent that proof the node holds via the veto, never on
     // E′ alone.
@@ -603,8 +603,8 @@ where
     // AND stays strictly below the election timeout (else the first failover commit could not land before
     // a follower deposes the leader). The schedulability gate is load-bearing: an exact inflation above
     // `u64::MAX` cannot be scheduled as a `from_nanos` wait, so arming on a clamped value would back the
-    // serve with a too-short wait and re-open R2. When NOT armed, use the bare shipped wait and serve no
-    // inherited reads (no serve ⇒ no R2 ⇒ no inflation needed): liveness preserved, safety fail-closed.
+    // serve with a too-short wait and re-open the mono-undercut. When NOT armed, use the bare shipped wait and serve no
+    // inherited reads (no serve ⇒ no mono-undercut ⇒ no inflation needed): liveness preserved, safety fail-closed.
     let inflated = self.failover_inflated_commit_wait();
     // The wall horizon `max_wall_plus_window + 2·ε_unc` (the release floor the serve duals, ≥ the serve's
     // own `s_c + W_c`) must be PASSABLE by a u64 wall reading. A near-`u64::MAX` inherited wall stamp makes
@@ -622,7 +622,7 @@ where
     // the election timeout.
     let e_prime_fits =
       inflated.is_some_and(|w| u128::from(w) < self.config.election_timeout().as_nanos());
-    // R19 — the E′ MONO wait may only SKIP the wall veto (clear the commit-wait without ever consulting a
+    // CRAFTED-FUTURE-WALL-STAMP — the E′ MONO wait may only SKIP the wall veto (clear the commit-wait without ever consulting a
     // wall) when a synchronized wall reading AT THIS ELECTION proves it reaches the absolute walled release
     // floor `max_wall_plus_window`. E′ is sized from `max_lease_window` (a window-ONLY bound) and carries NO
     // wall-offset information, so a crafted/corrupt `max_wall_plus_window` — a `wall_stamp + lease_window`
@@ -749,7 +749,7 @@ where
     // never serving past a dead lease.
     self.limbo_upper = last;
     let (anchor_wall, anchor_window) = self.committed_anchor_at_election(log);
-    // R19 SERVE-SIDE DUAL (Gap-G2): the committed anchor is read VERBATIM from `log[commit]`; a
+    // SERVE-SIDE DUAL (the future committed-anchor hazard): the committed anchor is read VERBATIM from `log[commit]`; a
     // crafted/corrupt entry could carry a FUTURE `wall_timestamp`, making `inherited_lease_live` (which
     // serves while `now_wall + 2·ε_unc < s_c + W_c`) offer the inherited read far past the real lease — the
     // serve-side mirror of the release hole. Trust the anchor only when a synchronized wall AT THIS ELECTION
