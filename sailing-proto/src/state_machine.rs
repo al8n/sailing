@@ -3,6 +3,14 @@
 use crate::Index;
 
 /// A deterministic application state machine.
+///
+/// CONTRACT: `apply`/`snapshot`/`restore` must be TOTAL — return `Err(Self::Error)`, never PANIC, on any
+/// committed input. The core converts a returned `Err` into a fail-stop (`poison`), but it does NOT
+/// `catch_unwind` a panicking method: a panic unwinds through the public `handle_*`/`handle_storage` call
+/// and aborts the node (`apply` mutates only node-local state, so a `panic = abort` restart re-applies the
+/// committed prefix deterministically). `apply` must also be DETERMINISTIC across replicas — the same
+/// `(index, cmd)` yields the same transition on every node — and `snapshot`/`restore` must round-trip; the
+/// core relies on both but cannot check them.
 pub trait StateMachine {
   /// The decoded command type (bound to the codec on the `Endpoint` impl, not here).
   type Command;

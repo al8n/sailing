@@ -78,6 +78,15 @@ impl ByteCursor {
 }
 
 /// A value that can be encoded to and decoded from bytes.
+/// A codec for a self-describing value on sailing's hand-rolled wire (entry commands, conf-change records,
+/// the `Data` collection types).
+///
+/// CONTRACT: the decode side MUST be TOTAL. `decode`/`decode_exact` must return `Err(DecodeError)` — never
+/// PANIC — on ANY input bytes, including truncated, overlong, or adversarial ones. The core converts a
+/// returned `Err` into a fail-stop (`poison`), but it does NOT `catch_unwind` a panicking decoder: a panic
+/// unwinds through the public `handle_*` call and tears down the driver task, so a non-total decoder is a
+/// liveness bug the core cannot contain. `encode` then `decode` must round-trip, and distinct values must
+/// not share an encoding (canonicality).
 pub trait Data: Sized {
   /// Append the encoding of `self` to `buf`.
   fn encode(&self, buf: &mut Vec<u8>);
