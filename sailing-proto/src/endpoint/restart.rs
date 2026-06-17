@@ -362,6 +362,12 @@ where
       unwalled_commit_wait_until: None,
       // Observability counter resets on restart (in-memory only, never persisted).
       precise_releases: 0,
+      // Inherited-read serve anchors arm only when a restarted follower (re-)wins an election.
+      limbo_upper: Index::ZERO,
+      committed_anchor_wall: 0,
+      committed_anchor_window: 0,
+      inherited_serve_armed: false,
+      commit_wait_inflated: false,
       // A restarted node comes up a fresh Follower with no pending lease-refresh demand.
       lease_refresh_wanted: false,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
@@ -480,10 +486,12 @@ where
         _ => return Err(PoisonReason::LogRead),
       };
       for e in chunk {
-        // Only a real (non-zero) wall contributes — mirrors the `submit_append` fold so the restart
-        // recompute matches the in-memory value (an absent wall folds nothing; the floor stays `0`
-        // outside the failover tier).
-        if e.wall_timestamp() != 0 {
+        // Only a real (non-zero) wall AND a real (non-zero) lease window contribute — mirrors the
+        // `submit_append` fold EXACTLY so the restart recompute matches the in-memory value (an absent
+        // wall, or a degenerate wall-without-window entry, folds nothing; the floor stays `0` outside the
+        // failover tier). The `lease_window > 0` conjunct must match `submit_append` or restart and live
+        // append would diverge.
+        if e.wall_timestamp() != 0 && e.lease_window() > 0 {
           max = max.max(e.wall_timestamp().saturating_add(e.lease_window()));
         }
       }

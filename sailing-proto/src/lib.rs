@@ -72,7 +72,7 @@ pub use config::{Config, ReadOnlyOption};
 
 mod read_only;
 pub(crate) use read_only::ReadOnly;
-pub use read_only::ReadState;
+pub use read_only::{FailoverReadWindow, ReadState};
 
 mod event;
 pub use event::{Applied, ConfChanged, Event, LeaderChanged};

@@ -423,11 +423,14 @@ impl<I: NodeId> Config<I> {
     // The LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set) only makes sense under
     // `LeaseGuard` — it gates the inherited-lease reads + the precise commit-anchor — and the skew
     // bound must be a real fraction of the lease (`ε_unc < Δ`); `ε_unc ≥ Δ` would make the cross-node
-    // age comparison vacuous. (When `read_only == LeaseGuard`, the check above already proved
-    // `lease_duration` is `Some`; the `is_none_or` only fires for a misordered non-LeaseGuard config.)
+    // age comparison vacuous. Reject via the SAME predicate the runtime activates on
+    // ([`failover_tier_valid`](Self::failover_tier_valid)) so a rejected config can never silently
+    // activate the failover tier at runtime (validation and `failover_tier_active` share one source of
+    // truth). The window timing was already validated above, so for a LeaseGuard config the only
+    // remaining failover condition is `ε_unc < Δ`; a non-LeaseGuard config carrying `ε_unc` is rejected
+    // because `failover_tier_valid` requires LeaseGuard mode.
     if let Some(unc) = self.bounded_clock_uncertainty
-      && (self.read_only != ReadOnlyOption::LeaseGuard
-        || self.lease_duration.is_none_or(|d| unc >= d))
+      && !self.failover_tier_valid()
     {
       return Err(ConfigError::BoundedUncertaintyInvalid {
         uncertainty: unc,
@@ -435,6 +438,25 @@ impl<I: NodeId> Config<I> {
       });
     }
     Ok(())
+  }
+
+  /// Whether this config is a VALID, ACTIVE LeaseGuard FAILOVER tier — the SINGLE source of truth shared
+  /// by [`validate`](Self::validate) (which surfaces the specific [`ConfigError`]) and the runtime
+  /// `failover_tier_active` (which gates the inherited serve, the precise commit-anchor, and the
+  /// synchronized-wall stamp). All three conditions: `LeaseGuard` read mode, a COMPUTABLE commit-wait
+  /// window (Δ and ε_drift present with `ε_drift < Δ` and the window below the election timeout — the
+  /// same [`leaseguard_commit_wait_ns`](Self::leaseguard_commit_wait_ns) check stamping uses), AND a
+  /// bounded clock-uncertainty that is a real fraction of the lease (`ε_unc < Δ`, else the cross-node age
+  /// comparison is vacuous). Keeping validation and the runtime gate on ONE predicate is what stops a
+  /// config the crate would reject from activating the failover tier (the class of defect where
+  /// `Endpoint::new` does not call `validate`).
+  pub(crate) fn failover_tier_valid(&self) -> bool {
+    self.read_only == ReadOnlyOption::LeaseGuard
+      && self.leaseguard_commit_wait_ns().is_some()
+      && matches!(
+        (self.bounded_clock_uncertainty, self.lease_duration),
+        (Some(unc), Some(d)) if unc < d
+      )
   }
 
   /// The EXACT LeaseGuard commit-wait window in nanoseconds for a valid config, or the specific
@@ -474,6 +496,13 @@ impl<I: NodeId> Config<I> {
     if w > u64::MAX as u128 || w >= self.election_timeout.as_nanos() {
       return Err(too_long());
     }
+    // NOTE: the FAILOVER-tier E′ inflation of the conservative commit-wait (`max_lease_window · (1+ρ)`)
+    // must also fit below the election timeout, but it is gated at RUNTIME (`inherited_serve_armed` in
+    // `become_leader`), NOT here: the wait keys on `max_lease_window` — the MAX window INHERITED from
+    // entries possibly stamped by another node's larger config — which config-time validation cannot
+    // bound (there is no cluster-wide config check, §1). A node whose inflated wait would exceed its
+    // election timeout simply does not arm the inherited serve that term (falling back to the shipped
+    // bare wait); it is not an invalid config.
     Ok(w as u64)
   }
 
