@@ -263,6 +263,41 @@ where
     }
   }
 
+  /// THE single definition of the FAILOVER wall horizon: has a successor's commit-wait on a walled
+  /// inherited lease whose creation-stamp+window fold to `deadline = s_e + W_e` PROVABLY released on the
+  /// synchronized wall? — `now_wall > deadline + 2·ε_unc` (or `deadline == 0`, no walled inherited entry
+  /// ⇒ vacuously released). The precise RELEASE ([`precise_release_ready`](Self::precise_release_ready))
+  /// tests it on the MAX over inherited entries (`inherited_release_deadline`); the inherited-read SERVE
+  /// ([`inherited_lease_live`](Self::inherited_lease_live)) is its strict DUAL — live while
+  /// `now_wall + 2·ε_unc < deadline` — on the COMMITTED anchor's own `s_c + W_c`. Both key on this ONE
+  /// predicate over the SAME committed entry, so the serve horizon can never drift out of step with the
+  /// release bound (the R1/R2 defect class). The serve's `< deadline` and the release's `> deadline + 4ε`
+  /// (after the dual's `+2ε`) leave a `4·ε_unc` wall gap = the cross-node skew margin.
+  #[inline]
+  pub(crate) fn walled_wall_released(now_wall: u64, deadline: u64, eps_ns: u64) -> bool {
+    // `u128` so `deadline + 2·ε` never saturates: a SATURATING `+` would collapse a near-ceiling horizon
+    // to `u64::MAX`, and `now_wall > u64::MAX` is impossible for the `u64` wall — the predicate would
+    // wedge `false` forever. In `u128` the threshold is exact; when it exceeds `u64::MAX` the `u64`
+    // `now_wall` simply can never pass it (the precise release correctly does not fire — it cannot prove
+    // expiry of a horizon no wall reading can reach). The VETO consumer separately fences that
+    // unrepresentable case so it does not wedge the commit-wait (see `walled_lease_vetoes_conservative`).
+    deadline == 0 || u128::from(now_wall) > u128::from(deadline) + 2 * u128::from(eps_ns)
+  }
+
+  /// Whether the wall horizon `deadline + 2·ε_unc` is PASSABLE by some `u64` wall reading — the SINGLE
+  /// source of truth shared by the inherited-serve arming gate (`become_leader`) and the conservative
+  /// veto skip ([`walled_lease_vetoes_conservative`](Self::walled_lease_vetoes_conservative)), so the two
+  /// can never disagree at the boundary. [`walled_wall_released`](Self::walled_wall_released) is STRICT
+  /// (`now_wall > threshold`), so the largest passable threshold is `u64::MAX − 1`: a threshold of EXACTLY
+  /// `u64::MAX` is unpassable (no `u64` exceeds `u64::MAX`), hence strict `<`. Computed in `u128` so the
+  /// sum never wraps. When NOT passable: the serve disarms AND the veto is skipped (the conservative mono
+  /// backstop governs, terminating with no serve to undercut). Unreachable under synchronized clocks
+  /// (every stamp ~now = real nanos-since-epoch ≪ `u64::MAX` ≈ year 2554), but kept TOTAL for any input.
+  #[inline]
+  pub(crate) fn failover_horizon_passable(deadline: u64, eps_ns: u64) -> bool {
+    u128::from(deadline) + 2 * u128::from(eps_ns) < u128::from(u64::MAX)
+  }
+
   /// The FAILOVER-tier PRECISE commit-anchor gate. Under the bounded-skew tier with a synchronized
   /// wall, the post-election commit-wait may lift as soon as EVERY inherited read-lease has PROVABLY
   /// expired — the WALLED entries by a wall-level compare (`now_wall − ε_unc > max(s_e + W_e) + ε_unc`,
@@ -277,22 +312,95 @@ where
     if now.wall().is_absent() {
       return false;
     }
+    // DEFENSE-IN-DEPTH (R20): if NEITHER floor is classified (`inherited_release_deadline == 0` AND
+    // `unwalled_commit_wait_until == None`) yet a conservative commit-wait is active, both halves below
+    // would be VACUOUSLY satisfied and this would clear the wait immediately — bypassing the
+    // `max_lease_window` window. A consistent fold never reaches here that way (a nonzero `max_lease_window`
+    // always classifies a floor; `become_leader` fail-stops the inconsistent shape before arming), but this
+    // refuses the vacuous release regardless, deferring to the conservative deadline.
+    if self.inherited_release_deadline == 0 && self.unwalled_commit_wait_until.is_none() {
+      return false;
+    }
     let eps_ns = u64::try_from(eps.as_nanos()).unwrap_or(u64::MAX);
     // WALLED inherited leases: the successor's wall (a lower bound on real time is `now_wall − ε_unc`)
     // must pass the latest creation-stamp+window (an upper bound is `inherited_release_deadline +
     // ε_unc`). `0` ⇒ no walled inherited entry ⇒ vacuously satisfied (and avoids a small-wall test
-    // artifact where a tiny synthetic `now_wall` would otherwise fail `> 2·ε_unc`).
-    let walled_expired = self.inherited_release_deadline == 0
-      || now.wall().as_nanos()
-        > self
-          .inherited_release_deadline
-          .saturating_add(eps_ns.saturating_mul(2));
+    // artifact where a tiny synthetic `now_wall` would otherwise fail `> 2·ε_unc`). Folded over ALL
+    // inherited entries (the MAX `s_e + W_e`); the inherited-read serve is the strict DUAL of this same
+    // predicate on the COMMITTED anchor (`walled_wall_released`).
+    let walled_expired = Self::walled_wall_released(
+      now.wall().as_nanos(),
+      self.inherited_release_deadline,
+      eps_ns,
+    );
     // WALL-ABSENT (fail-closed) inherited leases: no wall to compare, so wait the conservative
     // mono-frame bound. `None` ⇒ no such entry ⇒ satisfied.
     let unwalled_expired = self
       .unwalled_commit_wait_until
       .is_none_or(|until| now.mono() >= until);
     walled_expired && unwalled_expired
+  }
+
+  /// Whether a still-live WALLED inherited lease must VETO the conservative mono commit-wait clear this
+  /// tick. The invariant: a node may clear its commit-wait for inherited WALLED entries ONLY when it has
+  /// proven the wall floor `s_c + W_c` expired — via the WALL, or because its wait is E′-INFLATED (covers
+  /// the floor in REAL time without a wall). Otherwise its BARE `max_lease_window` mono wait could, under
+  /// rate drift, fire before the floor and commit past `c` while a peer serves an inherited read at `c`
+  /// (design threats T2 / T4). This veto enforces that for every successor — armed or not, ε_unc or not.
+  ///
+  /// Decision order:
+  /// - no walled inherited lease (`inherited_release_deadline == 0`) ⇒ no veto;
+  /// - the wait is E′-inflated (`commit_wait_inflated`) ⇒ no veto — `become_leader` sets that flag ONLY after
+  ///   a synchronized-wall proof at election showed E′ reaches the walled floor (R19: `wall_proves_floor`,
+  ///   which REQUIRES ε_unc AND a present wall — a mono duration cannot bound an absolute wall floor against a
+  ///   crafted future stamp without one), so the conservative clear is already proven safe. The wall PRECISE
+  ///   path still releases earlier when a wall is present; this only declines to HOLD an already-proven wait;
+  /// - BARE wait with walled entries but NO `bounded_clock_uncertainty` ⇒ FAIL CLOSED (veto): the node can
+  ///   neither E′-inflate (no valid lease timing) nor wall-gate (no ε_unc), so it cannot prove the floor —
+  ///   it must HOLD rather than undercut a peer's serve (a Safe/LeaseBased successor that inherited
+  ///   failover entries; a deep misconfiguration the library holds safe, never silently corrupts);
+  /// - non-passable horizon ⇒ no veto (the serve is disarmed there, nothing to undercut — see R7/R8);
+  /// - BARE wait, ε_unc, wall ABSENT ⇒ FAIL CLOSED (veto): cannot evaluate the wall this tick and the bare
+  ///   mono wait is unsafe; hold until a wall is supplied;
+  /// - BARE wait, ε_unc, wall PRESENT ⇒ veto until `walled_wall_released` (the Option B wall-gate).
+  ///
+  /// Keys on `inherited_release_deadline` (folded ENTRY-property-gated, so present on EVERY holder
+  /// regardless of read mode) — NOT `failover_tier_active`. The fail-closed branches hold a misconfigured
+  /// node rather than serve a stale read (safety over the liveness of a node outside the clock contract).
+  fn walled_lease_vetoes_conservative(&self, now: crate::Now) -> bool {
+    if self.inherited_release_deadline == 0 {
+      return false; // no walled inherited lease to honor
+    }
+    if self.commit_wait_inflated {
+      return false; // E′ covers the floor in real time — the conservative clear is already safe
+    }
+    // BARE wait with inherited walled entries: the conservative mono clear is allowed ONLY when the wall
+    // proves the floor expired.
+    let Some(eps) = self.config.bounded_clock_uncertainty() else {
+      // No ε_unc AND no E′ (bare wait): the node can neither wall-gate nor inflate, so it cannot bound the
+      // inherited walled lease at all — FAIL CLOSED. (A Safe/LeaseBased successor that inherited failover
+      // entries; outside the synchronized-clock contract the serve assumes.)
+      return true;
+    };
+    let eps_ns = u64::try_from(eps.as_nanos()).unwrap_or(u64::MAX);
+    // NON-PASSABLE horizon (`deadline + 2·ε > u64::MAX`) is NOT skipped here: a bare ε_unc successor with a
+    // non-passable inherited horizon already FAIL-STOPPED at `become_leader`
+    // (`PoisonReason::WallHorizonUnrepresentable`), so a poisoned node never reaches this veto. Were it
+    // reached, falling through to `walled_wall_released` (which a `u64` `now_wall` can never satisfy
+    // against a `> u64::MAX` threshold) returns `true` — VETO (fail closed). So the prior R7/R8 SKIP (which
+    // could fail OPEN cross-node — a non-passable LOCAL max does not prove no peer serves a lower passable
+    // anchor) is gone; both the poison and this fall-through are fail-CLOSED.
+    //
+    // No synchronized wall THIS tick: the bare wait cannot prove the floor — FAIL CLOSED, hold until a
+    // wall is supplied (R11). (An ε_unc node that is never given a wall violates the clock contract.)
+    if now.wall().is_absent() {
+      return true;
+    }
+    !Self::walled_wall_released(
+      now.wall().as_nanos(),
+      self.inherited_release_deadline,
+      eps_ns,
+    )
   }
 
   pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: crate::Now, log: &L) {
@@ -310,15 +418,51 @@ where
       // lifts the gate FOR GOOD and removes that deadline, so `poll_timeout` then surfaces no CommitWait
       // wakeup and the §8 wedge tripwire (a serviceable timer is never left due) stays satisfied.
       // Attribute the lift: the conservative mono deadline takes precedence (and short-circuits the
-      // precise check, exactly as before); the precise anchor counts ONLY when it alone cleared the
-      // gate. `conservative || precise` is identical to the prior `now.mono() >= until ||
-      // precise_release_ready(now)`, so behavior is unchanged — the counter is pure observability.
-      let conservative = now.mono() >= until;
+      // precise check); the precise anchor counts ONLY when it alone cleared the gate.
+      //
+      // The conservative mono clear is WALL-GATED for the WALLED inherited class: when the wall is
+      // evaluable and a walled inherited lease is still live, a due mono deadline must NOT clear it (a
+      // non-armed successor's bare mono wait could otherwise undercut a peer's inherited-read serve in
+      // wall time under drift — threats T2/T4). The walled class then releases only via the wall (the
+      // precise path, or a later tick once the wall passes the floor). The veto keys on
+      // `inherited_release_deadline` (ungated by read mode), so it fences non-armed successors too. Off
+      // the bounded-uncertainty tier the veto is inert (`inherited_release_deadline == 0`), so the clear
+      // is byte-identical to the shipped `now.mono() >= until || precise_release_ready(now)`.
+      let conservative_mono = now.mono() >= until;
+      let walled_vetoes = conservative_mono && self.walled_lease_vetoes_conservative(now);
+      let conservative = conservative_mono && !walled_vetoes;
       let precise = !conservative && self.precise_release_ready(now);
       if conservative || precise {
         self.commit_wait_until = None;
         if precise {
           self.precise_releases += 1;
+        }
+      } else if walled_vetoes {
+        // The mono deadline is DUE but a still-live walled inherited lease vetoes the clear. Re-arm a
+        // strictly-FUTURE mono deadline (one heartbeat) so `poll_timeout` keeps surfacing a serviceable
+        // CommitWait wakeup — the §8 wedge tripwire forbids leaving a due-but-uncleared serviceable timer
+        // — and the leader re-tests the wall next tick. The wall advances in real time so this lifts
+        // within the residual wall window; an ack/append bearing a wall clears it sooner via the precise
+        // path. The original wall floor `s_c + W_c < election_timeout`, so the re-poll cannot outlast the
+        // election timer.
+        //
+        // TOTALITY: `Instant::add` SATURATES. A node whose monotonic clock is within one heartbeat of
+        // `Instant::MAX` would re-arm to a CLAMPED `Instant::MAX` — a deadline that is DUE forever: the §8
+        // serviceable-timer tripwire trips in debug, and a release driver busy-loops on the perpetually-due
+        // CommitWait (it can never advance the clock past `Instant::MAX` to clear it). Re-arm only when the
+        // strictly-future deadline is REPRESENTABLE; otherwise FAIL-STOP (a poisoned node holds, never
+        // undercutting the walled lease the veto is protecting). Unreachable by any real monotonic clock
+        // (`Instant::MAX` ≈ 5.8·10¹¹ years), kept TOTAL for any input.
+        let heartbeat = self.config.heartbeat_interval();
+        if now.mono().since_origin().checked_add(heartbeat).is_some() {
+          self.commit_wait_until = Some(now.mono() + heartbeat);
+        } else {
+          self.commit_wait_until = None;
+          self.poison(crate::PoisonReason::CommitWaitUnrepresentable);
+          // RETURN before the quorum-commit advance below: the walled lease the veto was protecting is still
+          // live, so a poisoned-mid-function node must NOT fall through and advance commit (which would
+          // undercut it). A poisoned node holds.
+          return;
         }
       }
     }
