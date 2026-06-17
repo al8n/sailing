@@ -360,8 +360,9 @@ where
       // it (re-)wins an election, so start them cleared.
       inherited_release_deadline: 0,
       unwalled_commit_wait_until: None,
-      // Observability counter resets on restart (in-memory only, never persisted).
+      // Observability counters reset on restart (in-memory only, never persisted).
       precise_releases: 0,
+      unprovable_floor_holds: 0,
       // Inherited-read serve anchors arm only when a restarted follower (re-)wins an election.
       limbo_upper: Index::ZERO,
       committed_anchor_wall: 0,

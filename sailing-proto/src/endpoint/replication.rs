@@ -271,7 +271,7 @@ where
   /// ([`inherited_lease_live`](Self::inherited_lease_live)) is its strict DUAL — live while
   /// `now_wall + 2·ε_unc < deadline` — on the COMMITTED anchor's own `s_c + W_c`. Both key on this ONE
   /// predicate over the SAME committed entry, so the serve horizon can never drift out of step with the
-  /// release bound (the R1/R2 defect class). The serve's `< deadline` and the release's `> deadline + 4ε`
+  /// release bound (the serve/release horizon-desync class). The serve's `< deadline` and the release's `> deadline + 4ε`
   /// (after the dual's `+2ε`) leave a `4·ε_unc` wall gap = the cross-node skew margin.
   #[inline]
   pub(crate) fn walled_wall_released(now_wall: u64, deadline: u64, eps_ns: u64) -> bool {
@@ -312,7 +312,7 @@ where
     if now.wall().is_absent() {
       return false;
     }
-    // DEFENSE-IN-DEPTH (R20): if NEITHER floor is classified (`inherited_release_deadline == 0` AND
+    // DEFENSE-IN-DEPTH (no-classified-floor): if NEITHER floor is classified (`inherited_release_deadline == 0` AND
     // `unwalled_commit_wait_until == None`) yet a conservative commit-wait is active, both halves below
     // would be VACUOUSLY satisfied and this would clear the wait immediately — bypassing the
     // `max_lease_window` window. A consistent fold never reaches here that way (a nonzero `max_lease_window`
@@ -351,7 +351,7 @@ where
   /// Decision order:
   /// - no walled inherited lease (`inherited_release_deadline == 0`) ⇒ no veto;
   /// - the wait is E′-inflated (`commit_wait_inflated`) ⇒ no veto — `become_leader` sets that flag ONLY after
-  ///   a synchronized-wall proof at election showed E′ reaches the walled floor (R19: `wall_proves_floor`,
+  ///   a synchronized-wall proof at election showed E′ reaches the walled floor (`wall_proves_floor`,
   ///   which REQUIRES ε_unc AND a present wall — a mono duration cannot bound an absolute wall floor against a
   ///   crafted future stamp without one), so the conservative clear is already proven safe. The wall PRECISE
   ///   path still releases earlier when a wall is present; this only declines to HOLD an already-proven wait;
@@ -359,7 +359,10 @@ where
   ///   neither E′-inflate (no valid lease timing) nor wall-gate (no ε_unc), so it cannot prove the floor —
   ///   it must HOLD rather than undercut a peer's serve (a Safe/LeaseBased successor that inherited
   ///   failover entries; a deep misconfiguration the library holds safe, never silently corrupts);
-  /// - non-passable horizon ⇒ no veto (the serve is disarmed there, nothing to undercut — see R7/R8);
+  /// - non-passable horizon (`inherited_release_deadline + 2·ε_unc ≥ u64::MAX` (`!failover_horizon_passable`)) ⇒ a bare ε_unc successor
+  ///   already FAIL-STOPPED at `become_leader` (`WallHorizonUnrepresentable`), so a poisoned node never
+  ///   reaches here; were it reached, the fall-through to `walled_wall_released` (no `u64` wall can pass a
+  ///   `≥ u64::MAX` threshold) stays VETO/fail-closed — NOT a skip (the prior fail-open skip is gone);
   /// - BARE wait, ε_unc, wall ABSENT ⇒ FAIL CLOSED (veto): cannot evaluate the wall this tick and the bare
   ///   mono wait is unsafe; hold until a wall is supplied;
   /// - BARE wait, ε_unc, wall PRESENT ⇒ veto until `walled_wall_released` (the Option B wall-gate).
@@ -383,16 +386,16 @@ where
       return true;
     };
     let eps_ns = u64::try_from(eps.as_nanos()).unwrap_or(u64::MAX);
-    // NON-PASSABLE horizon (`deadline + 2·ε > u64::MAX`) is NOT skipped here: a bare ε_unc successor with a
+    // NON-PASSABLE horizon (`deadline + 2·ε ≥ u64::MAX`) is NOT skipped here: a bare ε_unc successor with a
     // non-passable inherited horizon already FAIL-STOPPED at `become_leader`
     // (`PoisonReason::WallHorizonUnrepresentable`), so a poisoned node never reaches this veto. Were it
     // reached, falling through to `walled_wall_released` (which a `u64` `now_wall` can never satisfy
-    // against a `> u64::MAX` threshold) returns `true` — VETO (fail closed). So the prior R7/R8 SKIP (which
+    // against a `≥ u64::MAX` threshold) returns `true` — VETO (fail closed). So the prior non-passable SKIP (which
     // could fail OPEN cross-node — a non-passable LOCAL max does not prove no peer serves a lower passable
     // anchor) is gone; both the poison and this fall-through are fail-CLOSED.
     //
     // No synchronized wall THIS tick: the bare wait cannot prove the floor — FAIL CLOSED, hold until a
-    // wall is supplied (R11). (An ε_unc node that is never given a wall violates the clock contract.)
+    // wall is supplied (the absent-wall fail-closed). (An ε_unc node that is never given a wall violates the clock contract.)
     if now.wall().is_absent() {
       return true;
     }
@@ -438,6 +441,16 @@ where
           self.precise_releases += 1;
         }
       } else if walled_vetoes {
+        // OBSERVABILITY (the silent-wedge class the architecture review surfaced): the veto holds a still-
+        // live walled lease. Count the hold when the floor is UNPROVABLE this tick — NO synchronized wall on
+        // this release path (a driver that armed the failover tier but withheld the wall here), or NO ε_unc
+        // to wall-gate (a node outside the synchronized-clock contract that inherited walled entries).
+        // Either is fail-closed and SAFE but does NOT self-resolve until a wall is supplied / the node is
+        // reconfigured, so it would otherwise be a SILENT permanent commit-wait wedge. A wall-PRESENT, ε_unc,
+        // not-yet-released hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted.
+        if now.wall().is_absent() || self.config.bounded_clock_uncertainty().is_none() {
+          self.unprovable_floor_holds = self.unprovable_floor_holds.saturating_add(1);
+        }
         // The mono deadline is DUE but a still-live walled inherited lease vetoes the clear. Re-arm a
         // strictly-FUTURE mono deadline (one heartbeat) so `poll_timeout` keeps surfacing a serviceable
         // CommitWait wakeup — the §8 wedge tripwire forbids leaving a due-but-uncleared serviceable timer

@@ -588,7 +588,11 @@ where
   election_deadline: Option<Instant>,
   heartbeat_deadline: Option<Instant>,
   /// LeaseGuard post-election commit-wait deadline (`None` in every other mode and on every
-  /// non-leader). Set at [`become_leader`](Self::become_leader) to `now + max_lease_window` — two
+  /// non-leader). Set at [`become_leader`](Self::become_leader) to `now + max_lease_window` (the bare
+  /// conservative bound; ONLY when `become_leader` sets [`commit_wait_inflated`](Self::commit_wait_inflated)
+  /// — a failover node that PROVED the wall floor at election — is the window instead E′-INFLATED to
+  /// `max_lease_window·(1+ρ)`; otherwise the wait stays bare and a still-live walled lease is held by
+  /// `walled_lease_vetoes_conservative` until the wall proves expiry or the node fails closed) — two
   /// CONSERVATIVE bounds (see that method): the TIME anchor `now` is ≥ every inherited entry's
   /// creation time, and the WINDOW bound `max_lease_window` is the MAX self-describing
   /// [`Entry::lease_window`](crate::Entry::lease_window) over the inherited entries, so it covers ANY
@@ -652,6 +656,22 @@ where
   /// tester) confirm the failover early-release path is actually being exercised rather than always
   /// deferring to the conservative anchor; `0` outside the failover tier.
   precise_releases: u64,
+  /// FAILOVER-tier observability: how many times the post-election commit-wait HELD because the inherited
+  /// walled lease floor was UNPROVABLE this tick — either NO synchronized wall on the release path (a driver
+  /// that armed the failover tier but did not supply a wall to `handle_timeout`/`handle_storage` here), or
+  /// NO bounded clock-uncertainty to wall-gate (a node outside the synchronized-clock contract that
+  /// inherited walled entries). Such a hold is FAIL-CLOSED and SAFE — it never undercuts a peer's inherited
+  /// serve — but it does NOT self-resolve until a wall is supplied or the node is reconfigured, so it would
+  /// otherwise be a SILENT permanent commit-wait wedge. Pure in-memory metric — never persisted, never on
+  /// the wire, reset to `0` on construction and restart, read only via
+  /// [`unprovable_floor_holds`](Self::unprovable_floor_holds). It climbs ONLY while an inherited WALLED
+  /// commit-wait holds unprovably, so it is `0` with no inherited walled lease and for a healthy failover
+  /// node whose wall is always supplied — but it CAN be nonzero on a no-ε_unc node (which is OUTSIDE the
+  /// active failover tier) that inherited walled entries from an ε_unc leader. A steadily climbing value
+  /// flags a misconfigured driver or a heterogeneous-ε_unc cluster (the silent-wedge class the architecture
+  /// review surfaced). A wall-PRESENT, not-yet-released
+  /// hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted here.
+  unprovable_floor_holds: u64,
   /// FAILOVER-tier inherited-read serve anchor — the election TAIL, captured ONCE at
   /// [`become_leader`](Self::become_leader) as `log.last_index()` BEFORE the leader's own no-op (which
   /// would otherwise inflate it). Immutable for the term (`log.last_index()` drifts as the leader
@@ -680,7 +700,7 @@ where
   /// [`become_leader`](Self::become_leader): `true` iff a VALID active failover tier is configured AND
   /// the E′-inflated conservative commit-wait (`max_lease_window · (1+ρ)`, ceil) fits strictly below the
   /// election timeout. When `false` the leader uses the bare (shipped) conservative wait and
-  /// [`failover_read_window`](Self::failover_read_window) returns `None` — no inherited serve, so no R2
+  /// [`failover_read_window`](Self::failover_read_window) returns `None` — no inherited serve, so no mono-undercut risk
   /// to inflate against. This is the RUNTIME liveness gate config validation cannot be: the wait keys on
   /// `max_lease_window`, the MAX window INHERITED (possibly stamped by another node's larger config),
   /// unknown at config time. `false` outside the failover tier and until the first election.
@@ -939,6 +959,7 @@ where
       inherited_release_deadline: 0,
       unwalled_commit_wait_until: None,
       precise_releases: 0,
+      unprovable_floor_holds: 0,
       // Inherited-read serve anchors — armed only at become_leader.
       limbo_upper: Index::ZERO,
       committed_anchor_wall: 0,
@@ -1135,6 +1156,21 @@ where
   #[inline(always)]
   pub const fn precise_releases(&self) -> u64 {
     self.precise_releases
+  }
+
+  /// How many times the post-election commit-wait HELD because the inherited walled lease floor was
+  /// UNPROVABLE — no synchronized wall on the release path, or no bounded clock-uncertainty to wall-gate.
+  /// Read-only observability (see [`commit_index`](Self::commit_index)); never persisted, reset to `0` on
+  /// restart, `0` with no inherited walled lease and for a healthy failover node whose wall is always
+  /// supplied — but nonzero on a no-ε_unc node that inherited walled entries (outside the active failover
+  /// tier). Such a hold is FAIL-CLOSED and
+  /// SAFE but does NOT self-resolve, so a steadily climbing value flags an otherwise-silent commit-wait
+  /// wedge — a driver that armed the failover tier without supplying a wall to every release path, or a
+  /// node outside the synchronized-clock contract that inherited walled entries. The randomized tester
+  /// reads it to assert the failover commit-wait does not silently wedge under a faithful clock.
+  #[inline(always)]
+  pub const fn unprovable_floor_holds(&self) -> u64 {
+    self.unprovable_floor_holds
   }
 
   /// The current applied index — the highest log index this node has applied to its

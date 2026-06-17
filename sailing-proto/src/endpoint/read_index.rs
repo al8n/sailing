@@ -191,9 +191,9 @@ where
   /// released on the SAME wall floor (`now_wall > deadline + 2·ε_unc`), with `deadline = s_c + W_c`. The
   /// horizon is the entry's OWN self-describing window `W_c`, NOT this successor's config Δ, AND it is
   /// the SAME formula (`wall + lease_window`) the precise release folds — so the serve can never use a
-  /// different window than the release (the R1 class: using config Δ over-serves past the release under
+  /// different window than the release (the config-Δ-over-serve class: using config Δ over-serves past the release under
   /// heterogeneous config; the deposed leader's own Δ is irrelevant, only a successor's release-on-`W_c`
-  /// governs freshness). The matching mono-frame undercut (R2) is closed on the release side by the E′
+  /// governs freshness). The matching mono-frame undercut (under drift) is closed on the release side by the E′
   /// inflation in `become_leader` (so every electable successor's CONSERVATIVE release is also
   /// `≥ s_c + W_c`). Fails CLOSED: no synchronized wall this tick, no captured anchor (`s_c = 0`), the
   /// anchor is not lease-bearing (`W_c = 0`), or the failover tier is inactive. STRICT `<`. `u128`
