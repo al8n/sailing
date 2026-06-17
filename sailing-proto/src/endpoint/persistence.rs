@@ -279,12 +279,16 @@ where
   /// AFTER the message-specific READ-ONLY validation has passed — so a fail-stop during that validation
   /// (a corrupt `RequestVote`/`AppendEntries`/`InstallSnapshot`) leaves NO premature term/vote write,
   /// i.e. the fail-stop is side-effect-free — and BEFORE any log entry or snapshot from that term
-  /// reaches its store. The order matters for safety (Raft §5.1): `currentTerm` MUST be durable before
-  /// its own log entries, else a crash that loses the term could let this node vote again in a term it
-  /// has already participated in (it holds an entry/snapshot from that term) → two leaders. The
-  /// entry/snapshot handlers therefore call this just before their durable write (term-before-entries /
-  /// term-before-snapshot), preserving the exact submission order the old eager write had; everything
-  /// else is covered by the post-dispatch catch-all in `handle_message`.
+  /// reaches its store. The entry/snapshot handlers call this just before their own durable write
+  /// (term-before-entries / term-before-snapshot); everything else is covered by the post-dispatch
+  /// catch-all in `handle_message`. NOTE this submission ORDER is DEFENSE-IN-DEPTH, NOT the §5.1 safety
+  /// mechanism: the term/vote (`StableStore`) and the log (`LogStore`) are INDEPENDENT durable stores with
+  /// no cross-store barrier, so their relative fsync order is not guaranteed. §5.1 safety — a node holding
+  /// an entry/snapshot from term T must never vote twice in T (→ two leaders) — is enforced instead by the
+  /// persist-before-RESPOND gates (a vote grant / append ack is WITHHELD until `term_is_durable()` / the
+  /// stable `Wrote`), which hold under ANY cross-store fsync skew (a grant/ack lost-because-not-durable was
+  /// never observed by a peer, plus quorum overlap). A disk `StableStore`/`LogStore` implementer therefore
+  /// needs NO ordering barrier between the two stores.
   ///
   /// Idempotent via the durable `HardState` read: a same-term message, a pre-vote (which never adopts a
   /// term), or a handler that already persisted the step-down (a vote grant) does NOT double-write.

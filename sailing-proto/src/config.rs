@@ -215,7 +215,11 @@ impl<I: NodeId> Config<I> {
     self.voters.contains(&id)
   }
 
-  /// Majority quorum size: `n/2 + 1`.
+  /// Majority size of the configured SEED voter set (`n/2 + 1`) — a convenience accessor, NOT the live
+  /// consensus quorum. The quorum that actually gates commit/elections is derived by the joint-aware
+  /// `Tracker`/`MajorityConfig` from the CURRENT (possibly joint) configuration, which handles an empty
+  /// voter set correctly. For an empty observer seed this returns a degenerate `1`; such a node cannot
+  /// commit anything until it is reconfigured into a real voter set.
   #[inline(always)]
   pub fn quorum(&self) -> usize {
     self.voters.len() / 2 + 1

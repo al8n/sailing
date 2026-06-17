@@ -864,13 +864,14 @@ impl<I: crate::NodeId> Message<I> {
   }
 }
 
-// ─── Wire codec (`Data`) ──────────────────────────────────────────────────────
-// A leading tag byte selects the variant; each field encodes via its own `Data` impl.
-// Variable-length fields (`Bytes`, `Vec<Entry>`, the `ConfState` sets) route through
-// the bounds-checked `decode_len`, so no length prefix can drive an oversized allocation.
+// ─── Wire codec ───────────────────────────────────────────────────────────────
+// `Message` is encoded/decoded via the buffa protobuf envelope (`wire::encode_message` and its decode
+// counterpart) — NOT a hand-rolled `impl Data for Message`. buffa bounds every length-delimited field
+// (so no length prefix can drive an oversized allocation) independently of the `Data` collection codec's
+// own `decode_len` guard.
 //
 // The NORMATIVE byte-level format (tag table, field orders, canonicality rules, the frame and
-// hello layouts) is pinned in `sailing-proto/WIRE.md`; any change here updates that document, the
+// hello layouts) is pinned in `sailing-proto/WIRE.md`; any change there updates that document, the
 // golden vectors in `message/tests.rs`, and the transport hello version in the same commit.
 
 #[cfg(test)]
