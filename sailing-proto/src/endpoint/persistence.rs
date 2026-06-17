@@ -64,14 +64,16 @@ where
     for e in entries {
       self.max_lease_window = self.max_lease_window.max(e.lease_window());
       // The precise-anchor release floor: the per-entry wall stamp PLUS its window (paired per
-      // entry, never the max stamp with a different entry's window). ONLY a real (non-zero) wall
-      // contributes — an ABSENT wall (`wall_timestamp == 0`: non-failover LeaseGuard, or a
-      // fail-closed failover entry) folds NOTHING, so THIS floor stays `0` outside the failover tier
-      // (strictly wall-derived — a later consumer never mistakes `lease_window` alone for a wall+window
-      // floor; the wall-ABSENT windows are the SEPARATE entry-gated `max_unwalled_lease_window` fold
-      // below). `saturating_add` is defensive — `wall_timestamp` is nanos-since-epoch + a small window,
-      // never overflowing u64.
-      if e.wall_timestamp() != 0 {
+      // entry, never the max stamp with a different entry's window). ONLY a real (non-zero) wall AND a
+      // real (non-zero) lease window contribute — the exact dual of the `max_unwalled_lease_window` fold
+      // below (`lease_window > 0 && wall_timestamp == 0`). An ABSENT wall (`wall_timestamp == 0`:
+      // non-failover LeaseGuard, or a fail-closed failover entry) folds NOTHING here; a wall WITHOUT a
+      // lease window (a degenerate `lease_window == 0` walled entry — never produced by a valid failover
+      // leader, since `lease_window_stamp` and `lease_wall_stamp` both fire only on the active tier, but
+      // possible from an arbitrary inbound wire entry) is not a lease horizon and is skipped, so THIS
+      // floor stays `0` outside the failover tier and never folds a non-lease wall. `saturating_add` is
+      // defensive — `wall_timestamp` is nanos-since-epoch + a small window, never overflowing u64.
+      if e.wall_timestamp() != 0 && e.lease_window() > 0 {
         self.max_wall_plus_window = self
           .max_wall_plus_window
           .max(e.wall_timestamp().saturating_add(e.lease_window()));
