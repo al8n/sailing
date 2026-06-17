@@ -176,6 +176,96 @@ where
       < delta
   }
 
+  /// FAILOVER inherited-read lease-live gate: the committed anchor `log[c]` (captured at election as
+  /// [`committed_anchor_wall`](Self::committed_anchor_wall) `= s_c` and
+  /// [`committed_anchor_window`](Self::committed_anchor_window) `= W_c`) is provably still un-overwritten
+  /// on the SYNCHRONIZED wall, accounting for bounded cross-node uncertainty ε_unc:
+  ///
+  /// ```text
+  /// SERVE iff now_wall + ε_unc < committed_anchor_wall + W_c − ε_unc   ⟺   now_wall + 2·ε_unc < s_c + W_c
+  /// ```
+  ///
+  /// This is the strict DUAL of the SINGLE shared horizon predicate
+  /// [`walled_wall_released`](Self::walled_wall_released): serve while
+  /// `now_wall + 2·ε_unc < deadline`, exactly when a successor inheriting `log[c]` would NOT yet be
+  /// released on the SAME wall floor (`now_wall > deadline + 2·ε_unc`), with `deadline = s_c + W_c`. The
+  /// horizon is the entry's OWN self-describing window `W_c`, NOT this successor's config Δ, AND it is
+  /// the SAME formula (`wall + lease_window`) the precise release folds — so the serve can never use a
+  /// different window than the release (the R1 class: using config Δ over-serves past the release under
+  /// heterogeneous config; the deposed leader's own Δ is irrelevant, only a successor's release-on-`W_c`
+  /// governs freshness). The matching mono-frame undercut (R2) is closed on the release side by the E′
+  /// inflation in `become_leader` (so every electable successor's CONSERVATIVE release is also
+  /// `≥ s_c + W_c`). Fails CLOSED: no synchronized wall this tick, no captured anchor (`s_c = 0`), the
+  /// anchor is not lease-bearing (`W_c = 0`), or the failover tier is inactive. STRICT `<`. `u128`
+  /// (wall + window nanos exceed `u64`), never a lossy cast.
+  fn inherited_lease_live(&self, now: crate::Now) -> bool {
+    if !self.failover_tier_active()
+      || now.wall().is_absent()
+      || self.committed_anchor_wall == 0
+      || self.committed_anchor_window == 0
+    {
+      return false;
+    }
+    let Some(eps_unc) = self.config.bounded_clock_uncertainty() else {
+      return false; // unreachable given `failover_tier_active`, but keeps the binding total
+    };
+    let now_wall = now.wall().as_nanos() as u128;
+    let two_eps = 2 * eps_unc.as_nanos();
+    now_wall + two_eps < self.committed_anchor_wall as u128 + self.committed_anchor_window as u128
+  }
+
+  /// Whether a VALID, ACTIVE LeaseGuard FAILOVER tier is configured. Delegates to the SINGLE source of
+  /// truth [`Config::failover_tier_valid`](crate::Config::failover_tier_valid) — the SAME predicate
+  /// `Config::validate` rejects on — so a config the crate would reject can never activate the tier at
+  /// runtime (`Endpoint::new` does not call `validate`). Requires LeaseGuard mode, a computable
+  /// commit-wait window, AND a bounded clock-uncertainty that is a real fraction of the lease
+  /// (`ε_unc < Δ`): `bounded_clock_uncertainty` merely being `Some` is NOT enough (a Safe/LeaseBased,
+  /// timing-invalid, or `ε_unc ≥ Δ` config must degrade to Safe, not serve). Gates the synchronized-wall
+  /// stamp, the precise commit-anchor, AND the inherited-read serve.
+  pub(crate) fn failover_tier_active(&self) -> bool {
+    self.config.failover_tier_valid()
+  }
+
+  /// The FAILOVER inherited-read offer: while this freshly elected leader holds the post-election
+  /// commit-wait under the LeaseGuard failover tier AND the committed anchor's lease is provably live,
+  /// `Some({ index: c, limbo_upper })` authorizes the application to serve a linearizable read on the
+  /// committed prefix at `c` — the SOLE LeaseGuard serve against a PRIOR-term commit index — instead of
+  /// degrading to Safe, PROVIDED it first confirms its key was not written in the limbo region
+  /// `(c, limbo_upper]` (the proto stays key-agnostic; the application owns the command format). The
+  /// limbo check AND this lease-live offer are together the linearizability substitute for the
+  /// current-term-commit gate; the application serves at `c` once `applied >= c`.
+  ///
+  /// `None` once the commit-wait lifts (the leader then serves normally), off the failover tier, when the
+  /// inherited serve was not ARMED this term (the E′-inflated commit-wait would not fit below the
+  /// election timeout — see `become_leader`), when the anchor lease has expired,
+  /// or when this node is POISONED — in every such case the application must fall back to a normal read.
+  /// Pure read-only observer (`&self`, no log): the anchors were captured at `become_leader`.
+  pub fn failover_read_window(
+    &self,
+    now: impl Into<crate::Now>,
+  ) -> Option<crate::FailoverReadWindow> {
+    // A poisoned node has declared itself untrustworthy (it suppresses all messages/events and rejects
+    // the normal read/propose paths); it must never advertise a serve window either. `poison` leaves
+    // `role`/`commit_wait_until`/the anchors intact, so this guard is load-bearing, not redundant.
+    // `inherited_serve_armed` (captured at election) folds in BOTH the valid-active-failover-tier check
+    // AND that the E′-inflated commit-wait fits below the election timeout — so an unvalidated config or
+    // an over-large inherited window degrades to Safe rather than serving.
+    if self.poisoned
+      || self.role != Role::Leader
+      || self.commit_wait_until.is_none()
+      || !self.inherited_serve_armed
+    {
+      return None;
+    }
+    if !self.inherited_lease_live(now.into()) {
+      return None;
+    }
+    Some(crate::FailoverReadWindow::new(
+      self.commit,
+      self.limbo_upper,
+    ))
+  }
+
   /// Core leader read logic: register the read and broadcast / confirm.
   pub(crate) fn do_leader_read<L: LogStore>(
     &mut self,

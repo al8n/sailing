@@ -42,6 +42,46 @@ impl ReadState {
   }
 }
 
+// ─── FailoverReadWindow ───────────────────────────────────────────────────────
+
+/// A FAILOVER inherited-read offer, returned by [`crate::Endpoint::failover_read_window`] while a freshly
+/// elected leader holds the post-election commit-wait under the LeaseGuard failover tier AND the committed
+/// anchor's lease is provably still live.
+///
+/// It authorizes the application to serve a LINEARIZABLE read on the committed prefix at [`index`](Self::index)
+/// — the SOLE LeaseGuard serve against a PRIOR-term commit index — WITHOUT waiting out the commit-wait,
+/// PROVIDED the application first confirms its key was not written in the limbo region
+/// `(index, limbo_upper]` (it scans/decodes those log entries in its own command format; a coarse
+/// application may simply require the limbo region empty). The limbo check AND this lease-live offer
+/// together are the linearizability substitute for the current-term-commit gate. Serve at `index` once
+/// `applied >= index`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FailoverReadWindow {
+  index: Index,
+  limbo_upper: Index,
+}
+
+impl FailoverReadWindow {
+  /// Construct a `FailoverReadWindow`.
+  pub const fn new(index: Index, limbo_upper: Index) -> Self {
+    Self { index, limbo_upper }
+  }
+
+  /// The committed index to serve the inherited read at — the commit index pinned at election. Serve
+  /// once `applied >= index`.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The inclusive upper end of the limbo region `(index, limbo_upper]` the application must check does
+  /// NOT write its key before serving at `index`. `limbo_upper == index` ⇒ empty limbo (nothing to check).
+  #[inline(always)]
+  pub const fn limbo_upper(&self) -> Index {
+    self.limbo_upper
+  }
+}
+
 // ─── ReadIndexStatus ──────────────────────────────────────────────────────────
 
 /// A pending read-index request: tracks who originated it, the commit index at
