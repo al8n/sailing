@@ -36,6 +36,8 @@ fn main() {
   let precise_seeds = Arc::new(AtomicU64::new(0));
   let precise_total = Arc::new(AtomicU64::new(0));
   let resync_total = Arc::new(AtomicU64::new(0));
+  // Inherited-serve witness: total inherited serves recorded across the sweep.
+  let inherited_serves_total = Arc::new(AtomicU64::new(0));
   std::thread::scope(|scope| {
     for _ in 0..threads {
       let failures = Arc::clone(&failures);
@@ -49,6 +51,7 @@ fn main() {
       let precise_seeds = Arc::clone(&precise_seeds);
       let precise_total = Arc::clone(&precise_total);
       let resync_total = Arc::clone(&resync_total);
+      let inherited_serves_total = Arc::clone(&inherited_serves_total);
       scope.spawn(move || {
         loop {
           let seed = next.fetch_add(1, Ordering::Relaxed);
@@ -77,11 +80,12 @@ fn main() {
                 failover_seeds.fetch_add(1, Ordering::Relaxed);
                 resync_total.fetch_add(rep.offset_resyncs, Ordering::Relaxed);
                 precise_total.fetch_add(rep.precise_releases, Ordering::Relaxed);
+                inherited_serves_total.fetch_add(rep.inherited_serves, Ordering::Relaxed);
                 if rep.precise_releases > 0 {
                   precise_seeds.fetch_add(1, Ordering::Relaxed);
                   eprintln!(
-                    "  FAILOVER-PRECISE seed {seed}: precise_releases={} offset_resyncs={} committed={} confirmed={}",
-                    rep.precise_releases, rep.offset_resyncs, rep.committed, rep.reads_confirmed
+                    "  FAILOVER-PRECISE seed {seed}: precise_releases={} offset_resyncs={} inherited_serves={} committed={} confirmed={}",
+                    rep.precise_releases, rep.offset_resyncs, rep.inherited_serves, rep.committed, rep.reads_confirmed
                   );
                 }
               }
@@ -117,11 +121,12 @@ fn main() {
     partitions.load(Ordering::Relaxed),
   );
   eprintln!(
-    "  failover: seeds={} (precise-firing={}) precise_releases={} offset_resyncs={}",
+    "  failover: seeds={} (precise-firing={}) precise_releases={} offset_resyncs={} inherited_serves={}",
     failover_seeds.load(Ordering::Relaxed),
     precise_seeds.load(Ordering::Relaxed),
     precise_total.load(Ordering::Relaxed),
     resync_total.load(Ordering::Relaxed),
+    inherited_serves_total.load(Ordering::Relaxed),
   );
   for (seed, msg) in f.iter() {
     eprintln!("  seed {seed}: {msg}");

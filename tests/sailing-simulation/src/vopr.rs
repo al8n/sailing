@@ -233,6 +233,11 @@ pub struct VoprReport {
   pub precise_releases: u64,
   /// The number of voters in the cluster at the end of the run (after all conf-changes).
   pub final_cluster_size: usize,
+  /// Number of INHERITED-SERVE attempts recorded by `try_inherited_serve`: the failover-tier
+  /// oracle path (serve at the prior-term commit index `cidx`, limbo-clean, value-deferred).
+  /// `0` in every non-failover run (the window never opens without a synchronized wall). A
+  /// non-zero count proves the new oracle path was reached under the failover+drift regime.
+  pub inherited_serves: u64,
 }
 
 /// The weighted action menu. Client load dominates; faults are frequent but not constant; structural
@@ -437,6 +442,11 @@ struct PendingValueCheck {
   index: sailing_proto::Index,
   /// The invocation snapshot (key + the committed per-key value floor `v_inv`).
   inv: ReadInvocation,
+  /// True when this check was created by `try_inherited_serve` (an inherited serve at the
+  /// prior-term commit index `cidx`). The drain skips the index-floor check for inherited
+  /// serves — `cidx` is deliberately BELOW the cluster's global max-commit floor, so the
+  /// normal `index >= floor` guard would false-positive. Only the per-key VALUE check applies.
+  is_inherited_serve: bool,
 }
 
 /// What a single accepted read recorded at INVOCATION — the ground truth both read oracles assert
@@ -550,6 +560,7 @@ impl ReadLedger {
               node: id,
               index: rs.index(),
               inv,
+              is_inherited_serve: false,
             });
             self.confirmed.insert(ctx, (id, rs.index()));
             report.reads_confirmed += 1;
@@ -588,11 +599,19 @@ impl ReadLedger {
       }
       let observed =
         value_of_asof(&c.applied_entries_of(p.node), p.inv.key, p.index.get()).unwrap_or(0);
+      // Inherited serves skip the index-floor check (cidx is below the cluster's max-commit floor
+      // by design — that is what makes inherited reads a distinct code path). Only the per-key
+      // VALUE check applies: the served value must be >= the committed floor at invocation.
       assert!(
         observed >= p.inv.v_inv,
-        "[read-value-linearizability] read ctx={} key={} served on n{} at index {} showed value \
+        "[read-value-linearizability] {} ctx={} key={} served on n{} at index {} showed value \
          {observed} BELOW the committed value {} for that key at invocation — a stale per-key read\n  \
          seed={seed} tick={} (replay: run_vopr({seed}, ticks))",
+        if p.is_inherited_serve {
+          "inherited-serve"
+        } else {
+          "read"
+        },
         p.ctx,
         p.inv.key,
         p.node,
@@ -603,6 +622,69 @@ impl ReadLedger {
       report.reads_value_checked += 1;
     }
     self.pending_value = still_pending;
+  }
+
+  /// Try to record one INHERITED serve on `target` for `key`, if the target currently has a
+  /// live failover-tier read window AND the key is not in limbo on that node's log.
+  ///
+  /// Returns `true` iff a serve was recorded (the caller should not also issue a normal
+  /// `read_index` for this slot, or may — both are fine).
+  ///
+  /// Soundness rules (see module docs):
+  /// - The index-floor check (`index >= floor`) is NOT applied: `cidx` is the PRIOR-term commit
+  ///   index, which is legitimately below the cluster's max-commit floor. Only the per-key VALUE
+  ///   check applies.
+  /// - The limbo check: if `key` appears in the node's log at any index in `(cidx, limbo_upper]`,
+  ///   the key's latest committed value may not be visible at `cidx`, so we skip.
+  /// - The value check is DEFERRED to the serve point (`applied_index_of(target) >= cidx`), then
+  ///   `value_of_asof(applied, key, cidx) >= v_inv`, where `v_inv` is the per-key committed max
+  ///   at invocation. If a successor committed the key past `cidx` while the serve was offered
+  ///   (the cross-successor undercut), `v_inv > served value` and the assertion fires.
+  fn try_inherited_serve(
+    &mut self,
+    c: &Cluster,
+    target: u64,
+    key: u16,
+    report: &mut VoprReport,
+    seed: u64,
+  ) -> bool {
+    let Some((cidx, limbo_upper)) = c.failover_window_on(target) else {
+      return false;
+    };
+    // Limbo check: the key must not have been written in (cidx, limbo_upper] on the target's log.
+    if c.key_in_log_range(target, key, cidx.get(), limbo_upper.get()) {
+      return false;
+    }
+    // Compute v_inv — the per-key committed max at invocation — the same way `issue` does.
+    let v_inv: u64 = c
+      .node_ids()
+      .into_iter()
+      .filter_map(|id| {
+        value_of(&c.applied_entries_of(id), key)
+          .into_iter()
+          .chain(value_of(&c.committed_entries_of(id), key))
+          .max()
+      })
+      .max()
+      .unwrap_or(0);
+    let ctx = self.next_ctx;
+    self.next_ctx += 1;
+    self.pending_value.push(PendingValueCheck {
+      ctx,
+      node: target,
+      index: cidx,
+      inv: ReadInvocation {
+        // `floor` is unused for inherited serves (no index-floor check), but populate it for
+        // completeness (the drain never reads it for is_inherited_serve checks in the message).
+        floor: c.max_commit(),
+        key,
+        v_inv,
+      },
+      is_inherited_serve: true,
+    });
+    report.inherited_serves += 1;
+    let _ = seed; // available for future panic messages; not needed here
+    true
   }
 }
 
@@ -648,6 +730,22 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     (p.next_u64() & 1) == 1
   };
   let drifted = read_mode == 3 && !failover;
+  // HETEROGENEOUS failover sub-variant: with a coin (a DEDICATED sub-seed, drawn only when `failover`, so
+  // non-failover runs stay bit-identical), make ONE voter NON-armed — Safe mode but STILL carrying ε_unc.
+  // This is the exact cross-successor case Option B fixes: a non-armed successor's commit-wait is the BARE
+  // `max_lease_window` (no E′ inflation), which the wall-gate (`walled_lease_vetoes_conservative`, gated on
+  // ε_unc + a wall, NOT on the failover tier) must fence so it cannot commit past `c` and undercut an armed
+  // peer's inherited-read serve at `c`. A single non-armed node leaves a quorum armed, so armed leaders
+  // still get elected and serve. (Homogeneous-armed failover runs — the other coin face — exercise the
+  // serve under the E′-inflated wait; the heterogeneous runs add the bare-wait-wall-gated path.)
+  let (failover_hetero, non_armed_id) = if failover {
+    let mut p = FaultPrng::new(seed.rotate_left(48) ^ 0x4845_5445_524F_5631); // "HETEROV1"
+    let hetero = (p.next_u64() & 1) == 1;
+    let id = 1 + (p.next_u64() % size as u64); // a founder voter in 1..=size
+    (hetero, id)
+  } else {
+    (false, 0)
+  };
   let mut c = Cluster::new_async_with(size, seed, move |cfg| {
     let cfg = cfg.with_pre_vote(true);
     match read_mode {
@@ -657,6 +755,12 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
         .with_check_quorum(true)
         .with_read_only(sailing_proto::ReadOnlyOption::LeaseBased),
       _ => {
+        // Heterogeneous failover: the chosen node runs Safe + ε_unc — NON-armed (cannot serve inherited
+        // reads; its commit-wait is the bare `max_lease_window`, wall-gated by Option B), yet ε_unc-bearing
+        // so the wall-gate applies to it. Every other node is armed LeaseGuard + ε_unc.
+        if failover_hetero && cfg.id() == non_armed_id {
+          return cfg.with_bounded_clock_uncertainty(LEASEGUARD_EPS_UNC);
+        }
         let cfg = cfg
           .with_read_only(sailing_proto::ReadOnlyOption::LeaseGuard)
           .with_lease_duration(LEASEGUARD_DELTA)
@@ -683,8 +787,20 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   // dedicated offset sub-PRNG (re-drawn across the run by the re-sync schedule in the main loop). The
   // sub-PRNG is constructed unconditionally (it draws nothing unless `failover`), so non-failover runs
   // are untouched.
+  //
+  // Also install per-node clock RATE DRIFT for failover runs — the combined drift+wall regime that makes
+  // the inherited-read serve (the wall) and the conservative commit-wait undercut (the mono drift)
+  // co-occur. The wall drives the precise anchor + the inherited serve; the per-node rates make the
+  // commit-wait / lease-expiry timing non-trivial, so a bare (non-armed) wait can race the wall floor —
+  // exactly the cross-successor undercut Option B's wall-gate fences (exercised by the heterogeneous
+  // `failover_hetero` runs, where one node is non-armed but ε_unc-bearing).
   let mut off_prng = FaultPrng::new(seed.rotate_left(8) ^ 0x4F46_4653_4554_5F32); // "OFFSET_2"
   if failover {
+    // Rate drift from a fresh sub-seed that is DISTINCT from the DRIFT sub-mode's seed (which uses
+    // `rotate_left(40)`) and from all other sub-seeds. Non-failover runs never reach this branch, so
+    // their PRNG streams are untouched.
+    let failover_drift_seed = seed.rotate_left(56) ^ 0x4644_5249_4654_5631; // "FDRIFTV1"
+    c.set_clock_drift(move |id| leaseguard_node_rate(failover_drift_seed, id));
     c.enable_failover_clock(LEASEGUARD_EPS_UNC);
     c.resync_offsets(&mut off_prng);
   }
@@ -768,7 +884,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
       Action::Crash => crash_one(&mut c, &mut st, &mut prng, &mut report),
       Action::ConfChange => conf_change(&mut c, &mut st, &mut prng, &mut report),
       Action::FaultReroll => fault_reroll(&mut c, &st, &mut prng, seed),
-      Action::ReadIndex => read_index_load(&mut c, &st, &mut reads, &mut prng, &mut report),
+      Action::ReadIndex => read_index_load(&mut c, &st, &mut reads, &mut prng, &mut report, seed),
       Action::TransferLeader => transfer_leader(&mut c, &st, &mut prng, &mut report),
     }
 
