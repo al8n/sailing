@@ -271,12 +271,21 @@ pub(crate) fn conf_change(
 /// one third targets a random OTHER live node (the follower-forward path — and, leaderless,
 /// the NoLeader refusal path, a legitimate no-op). Each accepted read records the
 /// completed-write floor in the ledger; the per-iteration scan asserts its confirmation.
+///
+/// When the target is a fresh leader in its commit-wait under the failover tier, this FIRST
+/// tries an inherited serve via [`ReadLedger::try_inherited_serve`]: a limbo-clean key is served
+/// at the prior-term commit index without a quorum round. If the window is absent or the key is
+/// in limbo, it falls back to the normal `read_index` path. Both paths may run on the same slot
+/// (if `try_inherited_serve` returns `false`, the normal path always runs; if it returns `true`,
+/// the normal `read_index` is also issued so the slot exercises both oracle paths). The serve
+/// oracle is strictly additive — it never removes a normal read.
 pub(crate) fn read_index_load(
   c: &mut Cluster,
   st: &VoprState,
   reads: &mut ReadLedger,
   prng: &mut FaultPrng,
   report: &mut VoprReport,
+  seed: u64,
 ) {
   let k = 1 + (prng.next_u64() % 3) as usize; // 1..=3 reads
   for _ in 0..k {
@@ -296,6 +305,11 @@ pub(crate) fn read_index_load(
     let Some(target) = target else { return };
     // Each read targets a seed-chosen key in 0..NUM_KEYS (deterministic from the master PRNG).
     let key = (prng.next_u64() % NUM_KEYS as u64) as u16;
+    // Try the inherited-serve path first (failover tier only; no-op outside it). This records
+    // a deferred value check at the prior-term commit index if the window is open and the key
+    // is limbo-clean. Falls through to the normal read_index unconditionally so both paths
+    // can be covered in the same iteration.
+    reads.try_inherited_serve(c, target, key, report, seed);
     reads.issue(c, target, key, report);
   }
 }
