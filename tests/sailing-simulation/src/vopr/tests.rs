@@ -519,6 +519,7 @@ fn value_oracle_panics_on_served_value_below_committed_floor() {
       key: GAP_KEY,
       v_inv: V_NEW,
     },
+    is_inherited_serve: false,
   });
   let mut report = VoprReport::default();
   // Drains the deferred check: observed (V_OLD) < v_inv (V_NEW) → the read-value-linearizability panic.
@@ -723,6 +724,7 @@ fn value_oracle_panics_on_served_value_below_compacted_floor() {
       key: COMPACT_KEY,
       v_inv: V_COMPACTED,
     },
+    is_inherited_serve: false,
   });
   let mut report = VoprReport::default();
   // Drains the deferred check: observed (stale, < V_COMPACTED) < v_inv (V_COMPACTED) → the panic.

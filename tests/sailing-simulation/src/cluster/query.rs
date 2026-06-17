@@ -437,4 +437,65 @@ impl Cluster {
       .min()
       .unwrap_or(0)
   }
+
+  /// Whether node `id` currently has a live inherited-read window, and if so, its bounds
+  /// `(cidx, limbo_upper)` — the serve index and the inclusive upper end of the limbo region.
+  ///
+  /// Calls `Endpoint::failover_read_window` with the node's current full clock reading (both
+  /// monotonic and, under the failover tier, the synchronized wall). Returns `None` if the
+  /// node has no window (not in its commit-wait, not armed, lease expired, poisoned, etc.).
+  /// Pure observer — reads no logs, draws no PRNG, does not perturb the run.
+  pub fn failover_window_on(
+    &self,
+    id: u64,
+  ) -> Option<(sailing_proto::Index, sailing_proto::Index)> {
+    let i = self.node_idx[&id];
+    self.nodes[i]
+      .failover_read_window(self.now_now(i))
+      .map(|w| (w.index(), w.limbo_upper()))
+  }
+
+  /// Whether any `Normal` log entry in node `id`'s VISIBLE log at an index in
+  /// `(lo_exclusive, hi_inclusive]` decodes to a keyed-value command whose key equals `key`.
+  ///
+  /// Used by the VOPR oracle to implement the limbo check: before serving an inherited read
+  /// at `cidx` for `key`, confirm the key was not written in `(cidx, limbo_upper]` on the
+  /// target node's log. A key written there is "in limbo" — its latest committed value may
+  /// not be visible at `cidx`, so the inherited serve cannot assert linearizability for it.
+  ///
+  /// Reads the VISIBLE log via `committed_entries_no_fault` up to `hi_inclusive` (the range
+  /// can exceed the node's commit index — e.g. `limbo_upper` may be the leader's last log
+  /// index, above the current commit). Never draws the read-fault PRNG; does not perturb the
+  /// run. Returns `false` if `hi_inclusive <= lo_exclusive` (empty range).
+  pub fn key_in_log_range(&self, id: u64, key: u16, lo_exclusive: u64, hi_inclusive: u64) -> bool {
+    use sailing_proto::Data as _;
+    if hi_inclusive <= lo_exclusive {
+      return false;
+    }
+    let i = self.node_idx[&id];
+    // Read the VISIBLE log up to hi_inclusive (may exceed commit — limbo_upper can be > commit).
+    // Use `committed_entries_no_fault` with a synthetic "commit" of hi_inclusive so we get the
+    // entries in that range without drawing the transient-read fault PRNG.
+    let up_to = sailing_proto::Index::new(hi_inclusive);
+    self.logs[i]
+      .committed_entries_no_fault(up_to)
+      .iter()
+      .filter(|e| {
+        let idx = e.index().get();
+        idx > lo_exclusive && idx <= hi_inclusive
+      })
+      .filter(|e| e.kind() == sailing_proto::EntryKind::Normal)
+      .any(|e| {
+        bytes::Bytes::decode_exact(e.data_bytes())
+          .ok()
+          .and_then(|cmd| {
+            // Reuse the same 10-byte (key, value) decode as the VOPR's keyed-value workload.
+            if cmd.len() != 10 {
+              return None;
+            }
+            Some(u16::from_le_bytes([cmd[0], cmd[1]]))
+          })
+          .is_some_and(|k| k == key)
+      })
+  }
 }
