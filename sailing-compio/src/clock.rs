@@ -1,31 +1,61 @@
-//! The crate-`Instant` ↔ wall-clock anchor and the redial jitter.
+//! The crate-`Instant` ↔ wall-clock anchor, the synchronized-`Now` source, and the redial jitter.
 
 use std::time::{Duration, Instant as StdInstant};
 
-use sailing_proto::Instant;
+use sailing_proto::{Instant, Now, Wall};
 
-/// Anchors the proto's monotonic [`Instant`] to an epoch captured at startup.
+use crate::wall_clock::{Monotonic, WallClock};
+
+/// Anchors the proto's monotonic [`Instant`] to an epoch captured at startup, owns the [`WallClock`]
+/// source `W` (default [`Monotonic`]), and holds the cluster `ε_unc` (nanos) captured from the proto
+/// `Config` at bind.
 ///
-/// The driver holds one `Clock` and reads [`Clock::now`] once per wake to feed the
-/// coordinator's `handle_*` methods. A proto [`Instant`] deadline returned by the
-/// coordinator's `poll_timeout` maps back to a `std::time::Instant` (for
-/// `compio::time::sleep_until`) via [`Clock::to_std`].
-pub struct Clock {
+/// The driver reads [`Clock::now`] once per wake for a [`Now`] carrying both the monotonic instant and
+/// the synchronized [`Wall`]. The ε_unc gate lives HERE — the SOLE site that compares a source's
+/// self-reported error to the cluster bound — so the source never sees ε_unc and the threshold has one
+/// owner. The load-bearing identity `Now::synchronized(mono, Wall::ABSENT) == Now::monotonic(mono)`
+/// makes the default (`Monotonic` → no reading → `ABSENT`) byte-identical to a monotonic-only driver.
+pub struct Clock<W = Monotonic> {
   base: StdInstant,
+  wall: W,
+  eps_unc_ns: u64,
 }
 
-impl Clock {
-  /// Anchor the epoch to the current instant.
+impl<W: WallClock> Clock<W> {
+  /// Anchor the epoch, take the wall source, and capture the cluster `ε_unc` (nanos; `0` outside the
+  /// failover tier).
   #[must_use]
-  pub fn new() -> Self {
+  pub fn new(eps_unc_ns: u64, wall: W) -> Self {
     Self {
       base: StdInstant::now(),
+      wall,
+      eps_unc_ns,
     }
   }
 
-  /// The current proto [`Instant`] — the elapsed time since the epoch.
+  /// The synchronized reading: the monotonic [`Instant`] since the epoch PLUS the gated wall. A source
+  /// reading is passed through only when its self-reported error is within `ε_unc`; a `None` reading OR
+  /// an over-bound one BOTH collapse to [`Wall::ABSENT`] (fail-closed). Outside the failover tier
+  /// `ε_unc` is `0`, so the gate never opens and the wall is always `ABSENT` — byte-identical to a
+  /// monotonic-only driver.
   #[must_use]
-  pub fn now(&self) -> Instant {
+  pub fn now(&mut self) -> Now {
+    let mono = Instant::from_origin(StdInstant::now().saturating_duration_since(self.base));
+    let wall = match self.wall.now() {
+      // The gate opens only inside the failover tier (eps_unc_ns > 0) AND when the source's
+      // self-reported error fits the bound. A `None` reading, an over-bound one, OR eps_unc 0 (failover
+      // off) all collapse to ABSENT — fail-closed.
+      Some(r) if self.eps_unc_ns > 0 && r.max_error_nanos() <= self.eps_unc_ns => {
+        Wall::from_nanos(r.wall_nanos())
+      }
+      _ => Wall::ABSENT,
+    };
+    Now::synchronized(mono, wall)
+  }
+
+  /// The bare monotonic [`Instant`] since the epoch, for timer/deadline math (no wall read).
+  #[must_use]
+  pub fn mono(&self) -> Instant {
     Instant::from_origin(StdInstant::now().saturating_duration_since(self.base))
   }
 
@@ -34,12 +64,6 @@ impl Clock {
   #[must_use]
   pub fn to_std(&self, at: Instant) -> StdInstant {
     self.base + at.since_origin()
-  }
-}
-
-impl Default for Clock {
-  fn default() -> Self {
-    Self::new()
   }
 }
 
@@ -64,8 +88,8 @@ mod tests {
 
   #[test]
   fn clock_round_trips_through_the_anchor() {
-    let clock = Clock::new();
-    let now = clock.now();
+    let mut clock = Clock::new(0, Monotonic);
+    let now = clock.now().mono();
     let later = now + Duration::from_millis(250);
     let std_later = clock.to_std(later);
     // Re-mapping the std deadline's offset recovers the proto instant exactly: the mapping is
@@ -76,10 +100,43 @@ mod tests {
 
   #[test]
   fn now_is_monotone_nondecreasing() {
-    let clock = Clock::new();
-    let a = clock.now();
-    let b = clock.now();
+    let mut clock = Clock::new(0, Monotonic);
+    let a = clock.now().mono();
+    let b = clock.now().mono();
     assert!(b >= a);
+  }
+
+  #[test]
+  fn monotonic_source_always_yields_absent_wall() {
+    let mut clock = Clock::new(0, Monotonic);
+    // The Monotonic source reports no reading -> the wall is ABSENT, so the Now is byte-identical to a
+    // monotonic-only Now (the load-bearing invariant).
+    let n = clock.now();
+    assert!(n.wall().is_absent());
+    assert_eq!(n, Now::monotonic(n.mono()));
+  }
+
+  #[test]
+  fn the_eps_gate_passes_within_bound_and_fails_over_bound() {
+    use crate::wall_clock::{WallClock, WallReading};
+    // A fixture source that reports a fixed error so we can exercise the gate deterministically.
+    struct Fixed(u64);
+    impl WallClock for Fixed {
+      const SUPPLIES_WALL: bool = true;
+      fn now(&mut self) -> Option<WallReading> {
+        Some(WallReading::new(1_000, self.0))
+      }
+    }
+    // error 40ms <= eps 50ms -> present wall (1000ns); error 60ms > 50ms -> ABSENT.
+    let mut within = Clock::new(50_000_000, Fixed(40_000_000));
+    assert_eq!(within.now().wall(), Wall::from_nanos(1_000));
+    let mut over = Clock::new(50_000_000, Fixed(60_000_000));
+    assert!(over.now().wall().is_absent());
+    // eps 0 (failover off) -> ABSENT regardless of the source's error (the gate never opens).
+    let mut zero_err = Clock::new(0, Fixed(0));
+    assert!(zero_err.now().wall().is_absent());
+    let mut any_err = Clock::new(0, Fixed(1));
+    assert!(any_err.now().wall().is_absent());
   }
 
   #[test]
