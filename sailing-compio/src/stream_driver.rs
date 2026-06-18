@@ -26,7 +26,7 @@ use crate::{
   clock::{Clock, jittered},
   config::DriverConfig,
   handle::{Command, Handle},
-  shared::{InflightBudget, ParkedQuery, Pending, Routing},
+  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
 };
 
 /// Builds the record layer for an OUTBOUND connection to the given peer (the peer parameter
@@ -118,6 +118,9 @@ where
   stable: S,
   listener: TcpListener,
   clock: Clock<W>,
+  /// Byte cap on the failover inherited-read limbo scan (see
+  /// [`DriverConfig::max_failover_limbo_bytes`]).
+  max_failover_limbo_bytes: usize,
   commands: futures_channel::mpsc::Receiver<Command<I, F>>,
   routing: Routing<I, F::Response, F>,
   storage_ready: flume::Receiver<()>,
@@ -249,6 +252,7 @@ where
     // mesh dials are never refused (consensus liveness), so a configured cap below the mesh
     // would let the documented bound be exceeded silently instead of sizing it honestly.
     let max_conns = driver_cfg.max_conns.max(2 * peers.len());
+    let max_failover_limbo_bytes = driver_cfg.max_failover_limbo_bytes;
 
     Ok((
       Self {
@@ -257,6 +261,7 @@ where
         stable,
         listener,
         clock,
+        max_failover_limbo_bytes,
         commands: cmd_rx,
         routing: Routing::new(event_tx),
         storage_ready,
@@ -437,6 +442,7 @@ where
         .coord
         .handle_storage(now, &mut self.log, &mut self.stable);
       poisoned = self.pump().await;
+      self.run_failover_serve(now);
     }
 
     // Teardown: fail everything parked, cancel the accept task and every connection's tasks
@@ -777,6 +783,17 @@ where
           Err(e) => complete(Err(map_read_err(e))),
         }
       }
+      Command::FailoverWindow {
+        complete,
+        reservation,
+      } => {
+        // Park unconditionally; `run_failover_serve` re-validates the serve window and the apply
+        // watermark each pass, then serves the limbo region or falls the query back.
+        self.routing.failovers.push(ParkedFailover {
+          complete,
+          _reservation: reservation,
+        });
+      }
       Command::Transfer {
         to,
         reply,
@@ -796,6 +813,46 @@ where
       }
     }
     false
+  }
+
+  /// Serve (or fall back) the parked failover inherited-read queries. Re-derives the serve window from
+  /// `now` each pass: `None` (the commit-wait lifted, off-tier, the inherited lease expired, or
+  /// poisoned) falls every parked query back to a normal read (`Ok(None)`); a live window whose
+  /// committed prefix has applied serves the whole batch at once against the FSM with the limbo region;
+  /// otherwise the queries stay parked for the next pass (the re-validation that catches a window
+  /// lifting or a lease expiring while parked).
+  fn run_failover_serve(&mut self, now: Now) {
+    if self.routing.failovers.is_empty() {
+      return;
+    }
+    match self.coord.endpoint().failover_read_window(now) {
+      None => {
+        for p in std::mem::take(&mut self.routing.failovers) {
+          (p.complete)(Ok(None));
+        }
+      }
+      Some(window) if self.routing.applied >= window.index() => {
+        match crate::shared::read_limbo(&self.log, &window, self.max_failover_limbo_bytes as u64) {
+          Some(limbo) => {
+            let parked = std::mem::take(&mut self.routing.failovers);
+            let fsm = self.coord.state_machine();
+            for p in parked {
+              (p.complete)(Ok(Some((fsm, &limbo, window))));
+            }
+          }
+          // A limbo log read failed: fail CLOSED — fall the batch back rather than serve a read whose
+          // limbo region could not be verified.
+          None => {
+            for p in std::mem::take(&mut self.routing.failovers) {
+              (p.complete)(Ok(None));
+            }
+          }
+        }
+      }
+      // The window is armed but the committed prefix has not applied yet — keep parked, re-check
+      // next pass.
+      Some(_) => {}
+    }
   }
 
   /// Drain the coordinator's outputs: wire bytes to each conn's writer (byte-budgeted), internal

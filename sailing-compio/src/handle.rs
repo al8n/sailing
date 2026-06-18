@@ -2,7 +2,7 @@
 
 use std::sync::{Mutex, MutexGuard, PoisonError};
 
-use sailing_proto::{ConfChange, ConfChangeV2, Data, Event, Index};
+use sailing_proto::{ConfChange, ConfChangeV2, Data, Entry, Event, FailoverReadWindow, Index};
 
 use crate::{
   DriverError,
@@ -51,6 +51,16 @@ where
     /// The single completion (see [`ParkedQuery`](crate::shared::ParkedQuery)).
     complete: crate::shared::QueryComplete<I, F>,
     /// The owning budget reservation.
+    reservation: ReservationGuard,
+  },
+  /// A failover inherited-read query: the driver offers the serve window (when armed and the
+  /// inherited lease is provably live), parks until the committed prefix applies, then runs the
+  /// closure with the FSM, the limbo entries, and the window — or completes `Ok(None)` when no serve
+  /// window is available (the caller falls back to a normal read).
+  FailoverWindow {
+    /// The single completion (see [`FailoverComplete`](crate::shared::FailoverComplete)).
+    complete: crate::shared::FailoverComplete<I, F>,
+    /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
   /// Begin transferring leadership; answer `reply` with the immediate accept/reject.
@@ -199,6 +209,34 @@ where
       let _ = tx.send(res.map(f));
     });
     self.send(Command::Query {
+      complete,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Run an inherited-read query during the post-election failover commit-wait, awaiting its result.
+  ///
+  /// Under the LeaseGuard failover tier, a freshly elected leader may serve a linearizable read on the
+  /// INHERITED committed prefix BEFORE its own commit-wait lifts — provided the read's key was not
+  /// written in the limbo region `(index, limbo_upper]` (the proto is key-agnostic; the closure owns
+  /// the command format). The closure runs ON the driver thread against the FSM and the limbo entries,
+  /// returning `Some(out)` to serve or `None` to decline (e.g. its key IS in limbo). The call resolves
+  /// to `Ok(None)` when there is no serve window — not the failover tier, the commit-wait already
+  /// lifted (read normally), the inherited lease has expired, or this node is not the leader — OR the
+  /// closure declined; the caller then falls back to [`query`](Self::query). The FSM and the limbo
+  /// entries never leave the driver thread; the closure (and its result) cross instead.
+  pub async fn failover_query<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
+  where
+    Out: Send + 'static,
+    Q: FnOnce(&F, &[Entry], FailoverReadWindow) -> Option<Out> + Send + 'static,
+  {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = futures_channel::oneshot::channel();
+    let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
+      let _ = tx.send(res.map(|opt| opt.and_then(|(fsm, limbo, win)| f(fsm, limbo, win))));
+    });
+    self.send(Command::FailoverWindow {
       complete,
       reservation,
     })?;

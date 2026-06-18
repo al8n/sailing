@@ -32,8 +32,9 @@
 //! # The LeaseGuard failover tier (synchronized wall clock)
 //!
 //! LeaseGuard lets a freshly-elected leader release its post-election commit-wait EARLY — as soon as a
-//! precise wall-clock anchor proves the deposed leader's inherited lease has expired — instead of
-//! waiting out a conservative monotonic deadline. That anchor compares timestamps ACROSS nodes, so
+//! precise wall-clock anchor proves the deposed leader's inherited lease has expired — AND serve
+//! linearizable reads on the inherited committed prefix WHILE that wait holds, instead of waiting out a
+//! conservative monotonic deadline before either. That anchor compares timestamps ACROSS nodes, so
 //! unlike the steady-state lease (which needs only local monotonic clocks) it requires SYNCHRONIZED
 //! wall clocks with a bounded cross-node error `ε_unc`. This driver supplies that wall through a
 //! [`WallClock`] source selected as a type parameter; the default [`Monotonic`] supplies none and the
@@ -60,6 +61,16 @@
 //!
 //! The default `bind` uses [`Monotonic`]; a failover `Config` paired with it is REJECTED at bind
 //! ([`BindError::MissingWallSource`]) rather than silently degrading to a tier that never fires.
+//!
+//! ## Serving inherited reads
+//!
+//! While the commit-wait holds, [`Handle::failover_query`] serves a linearizable read on the inherited
+//! committed prefix: the closure runs ON the driver thread against the FSM and the limbo region
+//! `(index, limbo_upper]`, returning `Some(out)` to serve — having confirmed the read's key was not
+//! written in that region (the proto is key-agnostic; the closure owns the command format) — or `None`
+//! to decline. The call resolves to `Ok(None)` when no serve window is available (the commit-wait
+//! already lifted — read normally — the inherited lease expired, or off the failover tier); the caller
+//! then falls back to [`Handle::query`].
 //!
 //! ## The operator contract (READ THIS)
 //!
