@@ -28,6 +28,56 @@
 //! exactly once, so each driver must be constructed AND run on its own thread — build it inside
 //! that thread's `Runtime` (e.g. at the top of its `block_on`), never on a coordinating thread
 //! that then ships it elsewhere.
+//!
+//! # The LeaseGuard failover tier (synchronized wall clock)
+//!
+//! LeaseGuard lets a freshly-elected leader release its post-election commit-wait EARLY — as soon as a
+//! precise wall-clock anchor proves the deposed leader's inherited lease has expired — instead of
+//! waiting out a conservative monotonic deadline. That anchor compares timestamps ACROSS nodes, so
+//! unlike the steady-state lease (which needs only local monotonic clocks) it requires SYNCHRONIZED
+//! wall clocks with a bounded cross-node error `ε_unc`. This driver supplies that wall through a
+//! [`WallClock`] source selected as a type parameter; the default [`Monotonic`] supplies none and the
+//! tier stays inert.
+//!
+//! ## Enabling it
+//!
+//! Configure the failover tier on the proto `Config` (the LeaseGuard read-only option, a lease
+//! duration, a clock-drift bound, and `bounded_clock_uncertainty` = `ε_unc`), then bind with a
+//! synchronized source via `bind_with_wall_clock` instead of `bind`:
+//!
+//! ```ignore
+//! let config = Config::try_new(id, voters, election_timeout, heartbeat)?
+//!     .with_read_only(ReadOnlyOption::LeaseGuard)
+//!     .with_lease_duration(Duration::from_millis(200))
+//!     .with_clock_drift_bound(Duration::from_millis(2))
+//!     .with_bounded_clock_uncertainty(Duration::from_millis(5)); // ε_unc
+//! let (driver, handle) = CompioQuicDriver::bind_with_wall_clock(
+//!     addr, config, seed, fsm, opts, cluster, peers, log, stable,
+//!     NtpDisciplinedClock,          // the synchronized wall source (a ZST, passed by value)
+//!     DriverConfig::default(),
+//! ).await?;
+//! ```
+//!
+//! The default `bind` uses [`Monotonic`]; a failover `Config` paired with it is REJECTED at bind
+//! ([`BindError::MissingWallSource`]) rather than silently degrading to a tier that never fires.
+//!
+//! ## The operator contract (READ THIS)
+//!
+//! `ε_unc` is an ASSERTION the library cannot verify: every node must keep `|W(t) − t| ≤ ε_unc`
+//! against a SHARED epoch, under the same leap-second policy. [`NtpDisciplinedClock`] enforces it on
+//! Linux by reading the kernel's NTP sync state and supplying no wall when the clock is unsynchronized
+//! or its own worst-case error exceeds `ε_unc` — but a clock that LIES (claims a small error it does
+//! not hold) can still serve a STALE read. `UnverifiedSystemClock` (a raw `SystemTime` that always
+//! claims zero error) is NEVER the production path; it sits behind the off-by-default
+//! `unverified-wall-clock` feature for tests only. Epoch + leap-policy agreement across nodes is as
+//! load-bearing as `ε_unc` itself.
+//!
+//! ## Observing it
+//!
+//! `precise_releases` counts commit-waits the precise wall anchor released EARLY — nonzero proves the
+//! tier is live end-to-end. `unprovable_floor_holds` counts waits held conservatively for want of a
+//! provable wall — nonzero in a configured-failover deployment flags a node OUTSIDE the clock contract
+//! (an unsynchronized clock, a missing source), the intended backstop rather than a wiring fault.
 
 mod bridge;
 mod clock;
