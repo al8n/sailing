@@ -222,10 +222,10 @@ where
   /// written in the limbo region `(index, limbo_upper]` (the proto is key-agnostic; the closure owns
   /// the command format). The closure runs ON the driver thread against the FSM and the limbo entries,
   /// returning `Some(out)` to serve or `None` to decline (e.g. its key IS in limbo). The call resolves
-  /// to `Ok(None)` when there is no serve window — not the failover tier, the commit-wait already
-  /// lifted (read normally), the inherited lease has expired, or this node is not the leader — OR the
-  /// closure declined; the caller then falls back to [`query`](Self::query). The FSM and the limbo
-  /// entries never leave the driver thread; the closure (and its result) cross instead.
+  /// to `Ok(None)` when there is no serve window — off the failover tier, the commit-wait already
+  /// lifted (read normally), the inherited lease expired, or not the leader — or the closure declined;
+  /// the caller then falls back to [`query`](Self::query). The FSM and the limbo entries never leave the
+  /// driver thread; the closure (and its result) cross instead.
   pub async fn failover_query<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,

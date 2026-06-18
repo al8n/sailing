@@ -72,13 +72,12 @@ impl<W: WallClock> Clock<W> {
   }
 }
 
-/// Validate the proto `Config` and capture the cluster `ε_unc` for the [`Clock`] wall gate:
-/// `Some(nanos)` inside the LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set, INCLUDING an
-/// exact `Some(0)`), `None` outside it — the same `Option` the proto keeps, so a `Some(0)` tier is NOT
-/// flattened into failover-off. Rejects a failover tier paired with a wall source `W` that cannot
-/// supply a wall — the loud [`BindError::MissingWallSource`], since the tier would otherwise silently
-/// never fire. Run at `bind`, BEFORE the socket binds; the captured `ε_unc` is the SOLE copy of the
-/// threshold (read from the same `Config` the proto reads).
+/// Validate the proto `Config` and capture the cluster `ε_unc` for the [`Clock`] wall gate — the SOLE
+/// copy of the threshold: `Some(nanos)` inside the LeaseGuard FAILOVER tier (`bounded_clock_uncertainty`
+/// set, INCLUDING an exact `Some(0)`), `None` outside it — the same `Option` the proto keeps, so a
+/// `Some(0)` tier is NOT flattened into failover-off. Rejects a failover tier paired with a wall source
+/// `W` that cannot supply a wall — the loud [`BindError::MissingWallSource`], since the tier would
+/// otherwise silently never fire. Run at `bind`, BEFORE the socket binds.
 pub(crate) fn validate_and_capture_eps<I, W>(config: &Config<I>) -> Result<Option<u64>, BindError>
 where
   I: NodeId,
