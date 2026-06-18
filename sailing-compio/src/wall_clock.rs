@@ -93,8 +93,8 @@ fn system_wall_nanos() -> u64 {
 
 /// adjtimex `maxerror` (signed MICROSECONDS) to nanoseconds. Clamp BEFORE the `*1000` so a
 /// negative/huge value can never wrap. Isolated + unit-tested because a raw µs-vs-ns compare
-/// downstream would be a 1000× fail-OPEN bug — here it is a pure unit normalization with NO threshold
-/// in scope (the driver `Clock` applies ε_unc).
+/// downstream would be a 1000× fail-OPEN bug; here it is a pure unit normalization, no threshold in
+/// scope (the driver `Clock` applies ε_unc).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn maxerror_us_to_ns(maxerror_us: i64) -> u64 {
   (maxerror_us.max(0) as u64).saturating_mul(1_000)
@@ -119,9 +119,8 @@ fn disciplined_reading(status: i32, maxerror_us: i64, unsync_bit: i32) -> Option
 /// error exceeds ε_unc. On non-Linux targets (no `adjtimex` equivalent) it always returns `None` —
 /// supply your own [`WallClock`] there.
 ///
-/// A ZST — selected as the driver's `W` type parameter (passed by value to `bind_with_wall_clock`).
-/// Selecting it does NOT enable failover by itself: you must ALSO set
-/// `Config::bounded_clock_uncertainty`, else the tier is inert (the wall over-bounds against ε_unc 0).
+/// A ZST, selected as the driver's `W` type parameter. Selecting it does NOT enable failover: you must
+/// ALSO set `Config::bounded_clock_uncertainty`, else the tier is inert (the wall over-bounds ε_unc 0).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct NtpDisciplinedClock;
 
@@ -145,9 +144,9 @@ impl NtpDisciplinedClock {
 }
 
 impl WallClock for NtpDisciplinedClock {
-  // Only Linux reads the adjtimex sync state; on every other target `read` always returns `None`, so
-  // the source cannot vouch for a wall and the bind guard MUST reject it for a failover config rather
-  // than let the tier silently never fire. Supply your own platform `WallClock` there.
+  // Only Linux reads the adjtimex sync state; elsewhere `read` always returns `None`, so the source
+  // cannot vouch for a wall and the bind guard MUST reject it for a failover config rather than let the
+  // tier silently never fire.
   const SUPPLIES_WALL: bool = cfg!(target_os = "linux");
 
   fn now(&mut self) -> Option<WallReading> {

@@ -181,9 +181,9 @@ where
     wall: W,
     driver_cfg: DriverConfig,
   ) -> Result<(Self, Handle<I, F>), BindError> {
-    // Validate + capture ε_unc (the sole copy of the wall-gate threshold), rejecting an invalid Config
-    // and the silent failover wedge (a valid failover tier with a non-supplying source) — BEFORE the
-    // socket binds.
+    // Validate + capture ε_unc (the sole copy of the wall-gate threshold) BEFORE the socket binds,
+    // rejecting an invalid Config and the silent failover wedge (a failover tier with a non-supplying
+    // source).
     let eps_unc_ns = crate::clock::validate_and_capture_eps::<I, W>(&config)?;
     let socket = UdpSocket::bind(addr).await?;
     let mut clock = Clock::new(eps_unc_ns, wall);
@@ -592,19 +592,17 @@ where
     }
   }
 
-  /// Serve (or fall back) the parked failover inherited-read queries. Re-derives the serve window from
-  /// `now` each pass: `None` (the commit-wait lifted, off-tier, the inherited lease expired, or
-  /// poisoned) falls every parked query back to a normal read (`Ok(None)`); a live window whose
-  /// committed prefix has applied serves the whole batch at once against the FSM with the limbo region;
-  /// otherwise the queries stay parked for the next pass (the re-validation that catches a window
-  /// lifting or a lease expiring while parked).
-  /// Serve the parked failover reads; returns `true` on a FATAL limbo storage fault (the caller fails
-  /// the parked work `Poisoned` and stops the driver — a corrupt committed-range log is unrecoverable).
+  /// Serve (or fall back) the parked failover inherited-read queries, re-deriving the serve window from
+  /// `now` each pass: `None` (commit-wait lifted, off-tier, inherited lease expired, poisoned) falls
+  /// every query back to a normal read (`Ok(None)`); a live window whose committed prefix has applied
+  /// serves the whole batch against the FSM with the limbo region; otherwise the queries stay parked for
+  /// next pass. Returns `true` on a FATAL limbo storage fault (the caller fails the parked work
+  /// `Poisoned` and stops the driver — a corrupt committed-range log is unrecoverable).
   fn run_failover_serve(&mut self) -> bool {
     if self.routing.failovers.is_empty() {
       return false;
     }
-    // A FRESH wall: the loop-top `now` is stale by here (it predates this pass's pump and callbacks),
+    // A FRESH wall: the loop-top `now` is stale by here (it predates this pass's pump and callbacks)
     // and the proto lease gate is strict at the boundary.
     let now = self.clock.now();
     match self.coord.endpoint().failover_read_window(now) {
@@ -651,12 +649,12 @@ where
   /// queries whose read index the apply watermark now covers, run against the state machine).
   async fn pump(&mut self) -> bool {
     // Drain the coordinator's queued datagrams FIRST. These awaited sends precede the failover serve
-    // below BY DESIGN — the same ordering as the normal-query serve: user-closure serves follow the
-    // consensus output, never the reverse, so unbounded user read closures cannot stall outbound
-    // consensus traffic. The drain is a finite, fire-and-forget, no-ACK UDP send batch, and the
-    // inherited-lease window carries a 2·ε_unc margin, so a bounded send phase cannot expire it; only a
-    // pathological send stall could, which equally stalls the normal-read fallback — so the failover
-    // path is never worse off than the read it would fall back to.
+    // below BY DESIGN — parity with the normal-query serve: user-closure serves follow the consensus
+    // output, never the reverse, so unbounded user read closures cannot stall outbound consensus
+    // traffic. The drain is a finite fire-and-forget UDP batch and the inherited-lease window carries a
+    // 2·ε_unc margin, so a bounded send phase cannot expire it; only a pathological send stall could,
+    // which equally stalls the normal-read fallback — the failover path is never worse off than the
+    // read it falls back to.
     while let Some((dest, bytes)) = self.coord.poll_transmit() {
       // A send error is transient for UDP (the peer redials / QUIC retransmits); dropping the
       // datagram is the same observable as the network dropping it.
@@ -676,12 +674,12 @@ where
     }
     self.was_leader = is_leader;
     // Serve parked failover inherited-reads HERE: after the `route_event` drain (it advanced
-    // `routing.applied` AND ran the event-driven `Superseded` sweep) AND the leadership backstop above —
-    // so the serve runs only on a still-live tier — and BEFORE the UNBOUNDED `take_runnable_queries`
-    // user closures so the strict-wall serve cannot expire behind them. Skip on a poisoned node so the
+    // `routing.applied` and swept on a routed `LeaderChanged`) AND the leadership backstop above — so the
+    // serve runs only on a still-live tier — and BEFORE the UNBOUNDED `take_runnable_queries` user
+    // closures, so the strict-wall serve cannot expire behind them. Skip on a poisoned node so the
     // `fail_all(Poisoned)` sweep below owns the parked reads.
     if !self.coord.endpoint().is_poisoned() && self.run_failover_serve() {
-      // A FATAL limbo storage fault: a corrupt/unreadable committed-range log is unrecoverable, never a
+      // A FATAL limbo storage fault: a corrupt/unreadable committed-range log is unrecoverable, not a
       // safe normal-read fallback — fail all parked work `Poisoned` and stop the driver.
       self.routing.fail_all(&DriverError::Poisoned);
       return true;

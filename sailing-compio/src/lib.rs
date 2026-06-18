@@ -68,9 +68,9 @@
 //! committed prefix: the closure runs ON the driver thread against the FSM and the limbo region
 //! `(index, limbo_upper]`, returning `Some(out)` to serve — having confirmed the read's key was not
 //! written in that region (the proto is key-agnostic; the closure owns the command format) — or `None`
-//! to decline. The call resolves to `Ok(None)` when no serve window is available (the commit-wait
-//! already lifted — read normally — the inherited lease expired, or off the failover tier); the caller
-//! then falls back to [`Handle::query`].
+//! to decline. The call resolves to `Ok(None)` when no serve window is available (commit-wait already
+//! lifted — read normally — inherited lease expired, or off the failover tier); the caller then falls
+//! back to [`Handle::query`].
 //!
 //! ## The operator contract (READ THIS)
 //!
