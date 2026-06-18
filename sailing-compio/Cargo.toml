@@ -9,6 +9,11 @@ rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 
+[features]
+# The raw-SystemTime wall source (UnverifiedSystemClock) — off by default so it cannot be selected in a
+# failover deployment by accident. For tests / tightly-disciplined single-region only.
+unverified-wall-clock = []
+
 [dependencies]
 sailing-proto = { workspace = true, features = ["tls", "quic"] }
 bytes = { workspace = true }
@@ -17,6 +22,10 @@ compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io
 flume = { workspace = true }
 futures-channel = { workspace = true }
 futures-util = { workspace = true }
+
+# Linux-only: the disciplined wall clock reads the kernel's NTP sync state via adjtimex.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
 
 [dev-dependencies]
 rcgen = { workspace = true }

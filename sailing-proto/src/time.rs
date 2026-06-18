@@ -142,5 +142,11 @@ mod tests {
     assert_eq!(s.mono(), i);
     assert_eq!(s.wall().as_nanos(), 42);
     assert!(!s.wall().is_absent());
+    // LOAD-BEARING: a synchronized Now with an ABSENT wall is byte-identical to a monotonic Now. The
+    // sailing-compio `Clock` relies on this to build `Now::synchronized(mono, src.now())`
+    // unconditionally — its Monotonic source yields ABSENT, reproducing the monotonic-only path
+    // exactly. A change that broke this (a nonzero ABSENT sentinel, an added presence flag) would
+    // silently alter the driver's non-failover behavior.
+    assert_eq!(Now::monotonic(i), Now::synchronized(i, Wall::ABSENT));
   }
 }
