@@ -220,15 +220,10 @@ where
     wall: W,
     driver_cfg: DriverConfig,
   ) -> Result<(Self, Handle<I, F>), BindError> {
-    // Fail loud at startup: an invalid Config (degrade-to-Safe) and the silent failover wedge (a valid
-    // failover tier with a non-supplying source) both become errors here, BEFORE the socket binds.
-    config.validate()?;
-    let eps = config.bounded_clock_uncertainty();
-    if eps.is_some() && !W::SUPPLIES_WALL {
-      return Err(BindError::MissingWallSource);
-    }
-    // ε_unc captured ONCE from the same Config the proto reads — the sole owner of the wall gate.
-    let eps_unc_ns = eps.map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
+    // Validate + capture ε_unc (the sole copy of the wall-gate threshold), rejecting an invalid Config
+    // and the silent failover wedge (a valid failover tier with a non-supplying source) — BEFORE the
+    // socket binds.
+    let eps_unc_ns = crate::clock::validate_and_capture_eps::<I, W>(&config)?;
     let listener = TcpListener::bind(addr).await?;
     let mut clock = Clock::new(eps_unc_ns, wall);
     let coord = StreamCoordinator::new(config, clock.now(), seed, fsm);
@@ -289,6 +284,24 @@ where
       },
       handle,
     ))
+  }
+
+  /// The count of times this node released its post-election commit-wait EARLY via the precise
+  /// wall-clock anchor (vs the conservative monotonic deadline) — the observable witness that the
+  /// LeaseGuard failover tier is live end-to-end. `0` outside the failover tier or under a
+  /// monotonic-only clock.
+  #[must_use]
+  pub fn precise_releases(&self) -> u64 {
+    self.coord.endpoint().precise_releases()
+  }
+
+  /// The count of times an inherited walled-lease floor could not be proven (no synchronized wall, or
+  /// no bounded clock uncertainty) and the commit-wait was held conservatively. A nonzero value in a
+  /// configured-failover deployment signals a node OUTSIDE the synchronized-clock contract — the
+  /// intended backstop, not a wiring fault.
+  #[must_use]
+  pub fn unprovable_floor_holds(&self) -> u64 {
+    self.coord.endpoint().unprovable_floor_holds()
   }
 
   /// Drive consensus until shutdown (or until every `Handle` clone has dropped and the buffered

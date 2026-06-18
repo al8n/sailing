@@ -2,9 +2,12 @@
 
 use std::time::{Duration, Instant as StdInstant};
 
-use sailing_proto::{Instant, Now, Wall};
+use sailing_proto::{Config, Instant, NodeId, Now, Wall};
 
-use crate::wall_clock::{Monotonic, WallClock};
+use crate::{
+  BindError,
+  wall_clock::{Monotonic, WallClock},
+};
 
 /// Anchors the proto's monotonic [`Instant`] to an epoch captured at startup, owns the [`WallClock`]
 /// source `W` (default [`Monotonic`]), and holds the cluster `ε_unc` (nanos) captured from the proto
@@ -65,6 +68,24 @@ impl<W: WallClock> Clock<W> {
   pub fn to_std(&self, at: Instant) -> StdInstant {
     self.base + at.since_origin()
   }
+}
+
+/// Validate the proto `Config` and capture the cluster `ε_unc` (nanos) for the [`Clock`] wall gate,
+/// rejecting a valid LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set) paired with a wall
+/// source `W` that cannot supply a wall — the loud [`BindError::MissingWallSource`], since the failover
+/// tier would otherwise silently never fire. Run at `bind`, BEFORE the socket binds; the captured
+/// `ε_unc` is the SOLE copy of the threshold (read from the same `Config` the proto reads).
+pub(crate) fn validate_and_capture_eps<I, W>(config: &Config<I>) -> Result<u64, BindError>
+where
+  I: NodeId,
+  W: WallClock,
+{
+  config.validate()?;
+  let eps = config.bounded_clock_uncertainty();
+  if eps.is_some() && !W::SUPPLIES_WALL {
+    return Err(BindError::MissingWallSource);
+  }
+  Ok(eps.map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)))
 }
 
 /// `base` plus up to 25% jitter, decorrelating redial schedules across nodes so a common-mode
@@ -153,5 +174,44 @@ mod tests {
       // jitter: 2*base > base + base/4.
       assert!(Duration::from_millis(base_ms * 2) > base + base / 4);
     }
+  }
+
+  #[test]
+  fn validate_and_capture_eps_rejects_failover_without_wall_source() {
+    use crate::wall_clock::NtpDisciplinedClock;
+    use sailing_proto::ReadOnlyOption;
+    let failover = Config::try_new(
+      1u64,
+      vec![1u64, 2, 3],
+      Duration::from_millis(1_000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_read_only(ReadOnlyOption::LeaseGuard)
+    .with_lease_duration(Duration::from_millis(200))
+    .with_clock_drift_bound(Duration::from_millis(2))
+    .with_bounded_clock_uncertainty(Duration::from_millis(5));
+    // a valid failover tier + a non-supplying source -> the loud wedge error (NOT a silent inert tier).
+    assert!(matches!(
+      validate_and_capture_eps::<u64, Monotonic>(&failover),
+      Err(BindError::MissingWallSource)
+    ));
+    // a valid failover tier + a supplying source -> Ok, ε_unc captured in nanos (5 ms).
+    assert_eq!(
+      validate_and_capture_eps::<u64, NtpDisciplinedClock>(&failover).unwrap(),
+      5_000_000
+    );
+    // a non-failover Config + any source -> Ok(0): the gate stays inert, no source required.
+    let mono = Config::try_new(
+      1u64,
+      vec![1u64, 2, 3],
+      Duration::from_millis(1_000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    assert_eq!(
+      validate_and_capture_eps::<u64, Monotonic>(&mono).unwrap(),
+      0
+    );
   }
 }
