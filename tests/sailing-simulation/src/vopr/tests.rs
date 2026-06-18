@@ -526,6 +526,42 @@ fn value_oracle_panics_on_served_value_below_committed_floor() {
   ledger.scan(&c, &mut report, 0xBEEF);
 }
 
+/// The value oracle catches a stale INHERITED serve specifically — the failover serve path the
+/// asymmetric-wall mode exercises. Identical construction to the committed-floor case but with
+/// `is_inherited_serve: true`: a deferred check whose served value (V_OLD) is below the committed
+/// `v_inv` (V_NEW) drains to the `read-value-linearizability` panic. This is the PRIMARY, deterministic
+/// proof that the keyed-value oracle detects the clock-discipline class's staleness — sound and
+/// non-vacuous by construction, with no run-wide suppression; the randomized asymmetric sub-mode adds
+/// breadth on top of it.
+#[test]
+#[should_panic(expected = "read-value-linearizability")]
+fn value_oracle_panics_on_stale_inherited_serve() {
+  let (c, node) = drive_committed_unapplied_gap(0xBEEF);
+
+  let serve_index = c
+    .applied_entries_of(node)
+    .iter()
+    .map(|(idx, _)| *idx)
+    .max()
+    .map(sailing_proto::Index::new)
+    .expect("the node has applied entries (at least the V_OLD write)");
+
+  let mut ledger = ReadLedger::new();
+  ledger.pending_value.push(PendingValueCheck {
+    ctx: 0,
+    node,
+    index: serve_index,
+    inv: ReadInvocation {
+      floor: c.commit_index_of(node),
+      key: GAP_KEY,
+      v_inv: V_NEW,
+    },
+    is_inherited_serve: true, // the inherited-serve path — what the asymmetric mode catches
+  });
+  let mut report = VoprReport::default();
+  ledger.scan(&c, &mut report, 0xBEEF);
+}
+
 /// The compaction regression's fixtures. `COMPACT_KEY` receives ONE committed write (`V_COMPACTED`)
 /// and is then never written again; `FILLER_KEY` absorbs the churn that drives the snapshot. A low
 /// `SNAP_THRESHOLD` makes compaction fire after only a few applied entries.
