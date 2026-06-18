@@ -34,7 +34,7 @@ jobs:
     name: rustfmt
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install nightly Rust
       run: rustup toolchain install nightly --component rustfmt
     - name: Check formatting
@@ -51,7 +51,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -91,7 +91,7 @@ jobs:
           - wasm32-wasip2
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
@@ -121,7 +121,7 @@ jobs:
     name: msrv (1.91)
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -140,7 +140,7 @@ jobs:
     name: no-std (bare-metal + alloc)
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -167,7 +167,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -200,7 +200,7 @@ jobs:
           - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -233,7 +233,7 @@ jobs:
       - cross
       - test
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:

@@ -35,7 +35,7 @@ jobs:
         target: [wire_message, wire_conf_change, data_codec, frame_decoder]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - name: Install protoc
         uses: arduino/setup-protoc@v3
         with:
