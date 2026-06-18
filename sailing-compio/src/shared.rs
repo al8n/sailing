@@ -230,6 +230,28 @@ fn contiguous_normal_entries(
   )
 }
 
+/// Serve a batch of parked failover reads against `fsm` and `limbo` for `window`, RE-CHECKING the
+/// inherited lease (`still_live`) with a FRESH wall before EACH completion. The limbo scan and every
+/// preceding user closure consume wall time, and the proto's lease gate is STRICT at the boundary, so a
+/// window live when the batch started can expire mid-batch — a completion past expiry must fall back
+/// (`Ok(None)`) rather than serve a stale inherited read. Shared by both drivers so the freshness rule
+/// cannot drift.
+pub(crate) fn serve_failover_batch<I, F>(
+  parked: Vec<ParkedFailover<I, F>>,
+  fsm: &F,
+  limbo: &[Entry],
+  window: FailoverReadWindow,
+  mut still_live: impl FnMut() -> bool,
+) {
+  for p in parked {
+    if still_live() {
+      (p.complete)(Ok(Some((fsm, limbo, window))));
+    } else {
+      (p.complete)(Ok(None));
+    }
+  }
+}
+
 /// A linearizable query's lifecycle: confirmed by `ReadState` (which fixes `ready_at`), then run
 /// against the state machine once `applied >= ready_at`. The completion is type-erased and
 /// carries its own reply channel; `F` is the driver's state-machine type.
@@ -563,6 +585,48 @@ mod tests {
     // A normal window yields the half-open [lo, hi) = (index, limbo_upper] expressed exclusively.
     let normal = FailoverReadWindow::new(Index::new(4), Index::new(7));
     assert_eq!(limbo_bounds(&normal), Some((Index::new(5), Index::new(8))));
+  }
+
+  #[test]
+  fn failover_batch_falls_back_when_the_lease_expires_mid_batch() {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // `FailoverComplete` is `Send`, so the recorders must be too.
+    let b = InflightBudget::new(8, 8);
+    let served = Arc::new(AtomicU32::new(0));
+    let fell_back = Arc::new(AtomicU32::new(0));
+    let mut batch = Vec::new();
+    for _ in 0..4 {
+      let served = served.clone();
+      let fell_back = fell_back.clone();
+      batch.push(ParkedFailover {
+        complete: Box::new(move |res: FailoverOutcome<'_, u64, ()>| match res {
+          Ok(Some(_)) => {
+            served.fetch_add(1, Ordering::Relaxed);
+          }
+          Ok(None) => {
+            fell_back.fetch_add(1, Ordering::Relaxed);
+          }
+          Err(_) => {}
+        }),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      });
+    }
+    // The inherited lease is live for the first two completions, then expires mid-batch: those two
+    // serve, the rest fall back rather than serve a stale read.
+    let checks = std::cell::Cell::new(0u32);
+    let still_live = || {
+      let n = checks.get();
+      checks.set(n + 1);
+      n < 2
+    };
+    let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
+    serve_failover_batch(batch, &(), &[], window, still_live);
+    assert_eq!(served.load(Ordering::Relaxed), 2, "two served while live");
+    assert_eq!(
+      fell_back.load(Ordering::Relaxed),
+      2,
+      "the rest fell back on expiry"
+    );
   }
 
   #[test]
