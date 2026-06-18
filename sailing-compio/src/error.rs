@@ -42,3 +42,28 @@ pub enum DriverError<I> {
   #[error("driver is shutting down")]
   ShuttingDown,
 }
+
+/// Why a driver `bind` did not start. Distinct from [`DriverError`] (a per-operation outcome): these
+/// are one-time STARTUP faults, surfaced loudly rather than degrading silently.
+#[derive(Debug, thiserror::Error)]
+pub enum BindError {
+  /// The OS socket bind failed.
+  #[error("socket bind failed: {0}")]
+  Io(#[from] std::io::Error),
+  /// The raft `Config` is invalid (e.g. `ε_unc >= lease_duration`, a missing drift bound). The driver
+  /// validates UP FRONT, so a misconfigured failover tier is a loud startup error rather than a
+  /// silent fall back to Safe.
+  #[error("invalid raft config: {0}")]
+  Config(#[from] sailing_proto::ConfigError),
+  /// The `Config` is a valid LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set) but the
+  /// driver's wall source `W` does not supply a wall (the default [`Monotonic`](crate::Monotonic)) —
+  /// the failover tier would silently never fire. Bind via `bind_with_wall_clock` with a synchronized
+  /// source such as [`NtpDisciplinedClock`](crate::NtpDisciplinedClock) (or remove
+  /// `bounded_clock_uncertainty`).
+  #[error(
+    "the Config is a valid LeaseGuard failover tier but the driver's wall source supplies no wall \
+     (the Monotonic default); use bind_with_wall_clock with NtpDisciplinedClock, or remove \
+     bounded_clock_uncertainty"
+  )]
+  MissingWallSource,
+}
