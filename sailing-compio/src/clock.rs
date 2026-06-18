@@ -10,8 +10,9 @@ use crate::{
 };
 
 /// Anchors the proto's monotonic [`Instant`] to an epoch captured at startup, owns the [`WallClock`]
-/// source `W` (default [`Monotonic`]), and holds the cluster `ε_unc` (nanos) captured from the proto
-/// `Config` at bind.
+/// source `W` (default [`Monotonic`]), and holds the cluster `ε_unc` captured from the proto `Config`
+/// at bind: `Some(nanos)` INSIDE the LeaseGuard failover tier (including an exact `Some(0)`), `None`
+/// outside it.
 ///
 /// The driver reads [`Clock::now`] once per wake for a [`Now`] carrying both the monotonic instant and
 /// the synchronized [`Wall`]. The ε_unc gate lives HERE — the SOLE site that compares a source's
@@ -21,14 +22,14 @@ use crate::{
 pub struct Clock<W = Monotonic> {
   base: StdInstant,
   wall: W,
-  eps_unc_ns: u64,
+  eps_unc_ns: Option<u64>,
 }
 
 impl<W: WallClock> Clock<W> {
-  /// Anchor the epoch, take the wall source, and capture the cluster `ε_unc` (nanos; `0` outside the
-  /// failover tier).
+  /// Anchor the epoch, take the wall source, and capture the cluster `ε_unc` (`Some(nanos)` inside the
+  /// failover tier, `None` outside it).
   #[must_use]
-  pub fn new(eps_unc_ns: u64, wall: W) -> Self {
+  pub fn new(eps_unc_ns: Option<u64>, wall: W) -> Self {
     Self {
       base: StdInstant::now(),
       wall,
@@ -37,18 +38,19 @@ impl<W: WallClock> Clock<W> {
   }
 
   /// The synchronized reading: the monotonic [`Instant`] since the epoch PLUS the gated wall. A source
-  /// reading is passed through only when its self-reported error is within `ε_unc`; a `None` reading OR
-  /// an over-bound one BOTH collapse to [`Wall::ABSENT`] (fail-closed). Outside the failover tier
-  /// `ε_unc` is `0`, so the gate never opens and the wall is always `ABSENT` — byte-identical to a
-  /// monotonic-only driver.
+  /// reading is passed through only INSIDE the failover tier (`ε_unc` is `Some`) AND when its
+  /// self-reported error is within that `ε_unc`; a `None` reading, an over-bound one, or a `None` ε_unc
+  /// (failover off) all collapse to [`Wall::ABSENT`] (fail-closed). An exact `Some(0)` tier admits ONLY
+  /// a zero-error reading — never confused with failover-off, which admits nothing at all.
   #[must_use]
   pub fn now(&mut self) -> Now {
     let mono = Instant::from_origin(StdInstant::now().saturating_duration_since(self.base));
     let wall = match self.wall.now() {
-      // The gate opens only inside the failover tier (eps_unc_ns > 0) AND when the source's
-      // self-reported error fits the bound. A `None` reading, an over-bound one, OR eps_unc 0 (failover
-      // off) all collapse to ABSENT — fail-closed.
-      Some(r) if self.eps_unc_ns > 0 && r.max_error_nanos() <= self.eps_unc_ns => {
+      Some(r)
+        if self
+          .eps_unc_ns
+          .is_some_and(|eps| r.max_error_nanos() <= eps) =>
+      {
         Wall::from_nanos(r.wall_nanos())
       }
       _ => Wall::ABSENT,
@@ -70,12 +72,14 @@ impl<W: WallClock> Clock<W> {
   }
 }
 
-/// Validate the proto `Config` and capture the cluster `ε_unc` (nanos) for the [`Clock`] wall gate,
-/// rejecting a valid LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set) paired with a wall
-/// source `W` that cannot supply a wall — the loud [`BindError::MissingWallSource`], since the failover
-/// tier would otherwise silently never fire. Run at `bind`, BEFORE the socket binds; the captured
-/// `ε_unc` is the SOLE copy of the threshold (read from the same `Config` the proto reads).
-pub(crate) fn validate_and_capture_eps<I, W>(config: &Config<I>) -> Result<u64, BindError>
+/// Validate the proto `Config` and capture the cluster `ε_unc` for the [`Clock`] wall gate:
+/// `Some(nanos)` inside the LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set, INCLUDING an
+/// exact `Some(0)`), `None` outside it — the same `Option` the proto keeps, so a `Some(0)` tier is NOT
+/// flattened into failover-off. Rejects a failover tier paired with a wall source `W` that cannot
+/// supply a wall — the loud [`BindError::MissingWallSource`], since the tier would otherwise silently
+/// never fire. Run at `bind`, BEFORE the socket binds; the captured `ε_unc` is the SOLE copy of the
+/// threshold (read from the same `Config` the proto reads).
+pub(crate) fn validate_and_capture_eps<I, W>(config: &Config<I>) -> Result<Option<u64>, BindError>
 where
   I: NodeId,
   W: WallClock,
@@ -85,7 +89,7 @@ where
   if eps.is_some() && !W::SUPPLIES_WALL {
     return Err(BindError::MissingWallSource);
   }
-  Ok(eps.map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)))
+  Ok(eps.map(|d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX)))
 }
 
 /// `base` plus up to 25% jitter, decorrelating redial schedules across nodes so a common-mode
@@ -109,7 +113,7 @@ mod tests {
 
   #[test]
   fn clock_round_trips_through_the_anchor() {
-    let mut clock = Clock::new(0, Monotonic);
+    let mut clock = Clock::new(None, Monotonic);
     let now = clock.now().mono();
     let later = now + Duration::from_millis(250);
     let std_later = clock.to_std(later);
@@ -121,7 +125,7 @@ mod tests {
 
   #[test]
   fn now_is_monotone_nondecreasing() {
-    let mut clock = Clock::new(0, Monotonic);
+    let mut clock = Clock::new(None, Monotonic);
     let a = clock.now().mono();
     let b = clock.now().mono();
     assert!(b >= a);
@@ -129,7 +133,7 @@ mod tests {
 
   #[test]
   fn monotonic_source_always_yields_absent_wall() {
-    let mut clock = Clock::new(0, Monotonic);
+    let mut clock = Clock::new(None, Monotonic);
     // The Monotonic source reports no reading -> the wall is ABSENT, so the Now is byte-identical to a
     // monotonic-only Now (the load-bearing invariant).
     let n = clock.now();
@@ -148,16 +152,19 @@ mod tests {
         Some(WallReading::new(1_000, self.0))
       }
     }
-    // error 40ms <= eps 50ms -> present wall (1000ns); error 60ms > 50ms -> ABSENT.
-    let mut within = Clock::new(50_000_000, Fixed(40_000_000));
+    // ε_unc Some(50ms): error 40ms <= 50ms -> present wall (1000ns); error 60ms > 50ms -> ABSENT.
+    let mut within = Clock::new(Some(50_000_000), Fixed(40_000_000));
     assert_eq!(within.now().wall(), Wall::from_nanos(1_000));
-    let mut over = Clock::new(50_000_000, Fixed(60_000_000));
+    let mut over = Clock::new(Some(50_000_000), Fixed(60_000_000));
     assert!(over.now().wall().is_absent());
-    // eps 0 (failover off) -> ABSENT regardless of the source's error (the gate never opens).
-    let mut zero_err = Clock::new(0, Fixed(0));
-    assert!(zero_err.now().wall().is_absent());
-    let mut any_err = Clock::new(0, Fixed(1));
-    assert!(any_err.now().wall().is_absent());
+    // An EXACT Some(0) failover tier admits ONLY a zero-error reading — it is NOT failover-off.
+    let mut exact_ok = Clock::new(Some(0), Fixed(0));
+    assert_eq!(exact_ok.now().wall(), Wall::from_nanos(1_000));
+    let mut exact_over = Clock::new(Some(0), Fixed(1));
+    assert!(exact_over.now().wall().is_absent());
+    // None (failover off) -> ABSENT regardless of the source's error (the gate never opens).
+    let mut off = Clock::new(None, Fixed(0));
+    assert!(off.now().wall().is_absent());
   }
 
   #[test]
@@ -207,14 +214,14 @@ mod tests {
     // a valid failover tier + a supplying source -> Ok, ε_unc captured in nanos (5 ms).
     assert_eq!(
       validate_and_capture_eps::<u64, AlwaysSupplies>(&failover).unwrap(),
-      5_000_000
+      Some(5_000_000)
     );
     // NtpDisciplinedClock supplies a wall ONLY on Linux; elsewhere it is non-supplying and a failover
     // config is rejected just like Monotonic (the loud non-Linux startup failure).
     #[cfg(target_os = "linux")]
     assert_eq!(
       validate_and_capture_eps::<u64, NtpDisciplinedClock>(&failover).unwrap(),
-      5_000_000
+      Some(5_000_000)
     );
     #[cfg(not(target_os = "linux"))]
     assert!(matches!(
@@ -231,7 +238,7 @@ mod tests {
     .unwrap();
     assert_eq!(
       validate_and_capture_eps::<u64, Monotonic>(&mono).unwrap(),
-      0
+      None
     );
   }
 }
