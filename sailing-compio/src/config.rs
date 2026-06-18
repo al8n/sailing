@@ -7,6 +7,9 @@ use std::time::Duration;
 pub(crate) const DEFAULT_MAX_INFLIGHT: usize = 1_024;
 /// How many bytes of in-flight submit payload the budget admits by default.
 pub(crate) const DEFAULT_MAX_PENDING_BYTES: usize = 64 * 1024 * 1024;
+/// Default byte cap on the failover inherited-read limbo scan (matches the submit byte budget — the
+/// driver's existing single-operation memory ceiling).
+pub(crate) const DEFAULT_MAX_FAILOVER_LIMBO_BYTES: usize = 64 * 1024 * 1024;
 /// Default capacity of the best-effort events tail.
 pub(crate) const DEFAULT_EVENTS_CAP: usize = 1_024;
 /// Default per-iteration command-drain budget (fairness against submit floods).
@@ -74,6 +77,12 @@ pub struct DriverConfig {
   /// signal wakes a sleeping loop so `handle_storage` runs promptly. Synchronous stores leave
   /// this `None` — `handle_storage` already runs every iteration.
   pub storage_ready: Option<flume::Receiver<()>>,
+  /// Byte cap on the failover inherited-read limbo scan — the `(commit, limbo_upper]` region a
+  /// failover query checks its key against. A post-election limbo larger than this (an unbounded
+  /// inherited tail) falls the query back to a normal read instead of loading the whole tail: the read
+  /// is NOT charged to the submit budget, so this is the bound that keeps it from OOMing or stalling
+  /// the driver.
+  pub max_failover_limbo_bytes: usize,
 }
 
 impl Default for DriverConfig {
@@ -91,6 +100,7 @@ impl Default for DriverConfig {
       redial_base: DEFAULT_REDIAL_BASE,
       redial_cap: DEFAULT_REDIAL_CAP,
       storage_ready: None,
+      max_failover_limbo_bytes: DEFAULT_MAX_FAILOVER_LIMBO_BYTES,
     }
   }
 }
