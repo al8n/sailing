@@ -157,24 +157,29 @@ pub(crate) struct ParkedFailover<I, F> {
 /// read under a HARD `max_bytes` cap and FAIL-CLOSED. Shared by both drivers so the bound and the
 /// fail-closed rule cannot drift.
 ///
-/// Returns `None` (the caller falls back to a normal read) when the log read errors OR the `max_bytes`
-/// cap TRUNCATES the region. The post-election limbo can be an arbitrarily large inherited tail, and a
-/// failover read reserves a zero-byte budget slot, so an unbounded scan would let one read OOM/stall
-/// the driver: capping it and refusing a partial limbo (which could not prove the key absent) keeps a
-/// read-only query from becoming an availability failure. The region is contiguous and above the commit
-/// (never compacted), so a COMPLETE read's last entry reaches `limbo_upper`; a short tail means the cap
-/// bit. An empty `Vec` when the region is empty.
+/// `Err` on a FATAL `LogStore::entries` storage fault (corruption / I/O) — the driver fail-stops
+/// (`Poisoned`) rather than hide it. `Ok(None)` is the SAFE fallback to a normal read: the index
+/// ceiling, a cap truncation, or an incomplete region — none of which can prove key-absence.
+/// `Ok(Some(limbo))` is the complete, in-budget, contiguous NORMAL-entry region to serve. The
+/// post-election limbo can be an arbitrarily large inherited tail and a failover read reserves a
+/// zero-byte budget slot, so an unbounded scan would let one read OOM/stall the driver; the region is
+/// contiguous and above the commit (never compacted), so a COMPLETE read's last entry reaches
+/// `limbo_upper`. An empty `Vec` when the region is empty.
 pub(crate) fn read_limbo<L: LogStore>(
   log: &L,
   window: &FailoverReadWindow,
   max_bytes: u64,
-) -> Option<Vec<Entry>> {
-  let (lo, hi) = limbo_bounds(window)?;
+) -> Result<Option<Vec<Entry>>, L::Error> {
+  let Some((lo, hi)) = limbo_bounds(window) else {
+    return Ok(None); // index at the u64 ceiling — a safe fallback, not a fault
+  };
   if lo >= hi {
-    return Some(Vec::new());
+    return Ok(Some(Vec::new()));
   }
-  let entries = log.entries(lo..hi, max_bytes).ok()?;
-  contiguous_normal_entries(entries, lo, hi, max_bytes)
+  // A `LogStore::entries` error is a FATAL storage fault, NOT a safe fallback — propagate it so the
+  // driver fail-stops instead of letting a corrupt committed-range log keep serving normal reads.
+  let entries = log.entries(lo..hi, max_bytes)?;
+  Ok(contiguous_normal_entries(entries, lo, hi, max_bytes))
 }
 
 /// The half-open `[lo, hi)` for the inclusive limbo region `(index, limbo_upper]`, or `None` (FAIL
@@ -585,6 +590,52 @@ mod tests {
     // A normal window yields the half-open [lo, hi) = (index, limbo_upper] expressed exclusively.
     let normal = FailoverReadWindow::new(Index::new(4), Index::new(7));
     assert_eq!(limbo_bounds(&normal), Some((Index::new(5), Index::new(8))));
+  }
+
+  #[test]
+  fn read_limbo_surfaces_a_fatal_log_error_not_a_fallback() {
+    use core::ops::Range;
+    use sailing_proto::{LogDone, OpId, Term};
+    // A `LogStore` whose `entries` always fails — a fatal storage fault (corruption / I/O).
+    struct FailingLog;
+    impl LogStore for FailingLog {
+      type Error = ();
+      fn first_index(&self) -> Index {
+        Index::ZERO
+      }
+      fn last_index(&self) -> Index {
+        Index::new(100)
+      }
+      fn term(&self, _: Index) -> Result<Term, ()> {
+        Ok(Term::ZERO)
+      }
+      fn entries(&self, _: Range<Index>, _: u64) -> Result<&[Entry], ()> {
+        Err(())
+      }
+      fn submit_append(&mut self, _: OpId, _: &[Entry]) {
+        unreachable!()
+      }
+      fn compact(&mut self, _: Index) {
+        unreachable!()
+      }
+      fn restore(&mut self, _: Index, _: Term) {
+        unreachable!()
+      }
+      fn poll(&mut self) -> Option<Result<LogDone, ()>> {
+        unreachable!()
+      }
+    }
+    // A non-empty limbo region forces the log read: the fatal error MUST surface as `Err` (the driver
+    // fail-stops `Poisoned`), NOT collapse to `Ok(None)` — which would hide a corrupt committed-range
+    // log behind a normal-read fallback and let the node keep serving.
+    let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
+    assert!(read_limbo(&FailingLog, &window, u64::MAX).is_err());
+    // An empty region never touches the log -> `Ok(Some(empty))`, no spurious fault.
+    let empty = FailoverReadWindow::new(Index::new(4), Index::new(4));
+    assert_eq!(
+      read_limbo(&FailingLog, &empty, u64::MAX),
+      Ok(Some(Vec::new()))
+    );
   }
 
   #[test]
