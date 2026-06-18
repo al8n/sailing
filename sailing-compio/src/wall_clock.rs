@@ -145,7 +145,10 @@ impl NtpDisciplinedClock {
 }
 
 impl WallClock for NtpDisciplinedClock {
-  const SUPPLIES_WALL: bool = true;
+  // Only Linux reads the adjtimex sync state; on every other target `read` always returns `None`, so
+  // the source cannot vouch for a wall and the bind guard MUST reject it for a failover config rather
+  // than let the tier silently never fire. Supply your own platform `WallClock` there.
+  const SUPPLIES_WALL: bool = cfg!(target_os = "linux");
 
   fn now(&mut self) -> Option<WallReading> {
     self.read()
