@@ -818,9 +818,11 @@ where
   /// committed prefix has applied serves the whole batch at once against the FSM with the limbo region;
   /// otherwise the queries stay parked for the next pass (the re-validation that catches a window
   /// lifting or a lease expiring while parked).
-  fn run_failover_serve(&mut self) {
+  /// Serve the parked failover reads; returns `true` on a FATAL limbo storage fault (the caller fails
+  /// the parked work `Poisoned` and stops the driver — a corrupt committed-range log is unrecoverable).
+  fn run_failover_serve(&mut self) -> bool {
     if self.routing.failovers.is_empty() {
-      return;
+      return false;
     }
     // A FRESH wall: the loop-top `now` is stale by here (it predates this pass's pump and callbacks),
     // and the proto lease gate is strict at the boundary.
@@ -833,7 +835,7 @@ where
       }
       Some(window) if self.routing.applied >= window.index() => {
         match crate::shared::read_limbo(&self.log, &window, self.max_failover_limbo_bytes as u64) {
-          Some(limbo) => {
+          Ok(Some(limbo)) => {
             let parked = std::mem::take(&mut self.routing.failovers);
             let fsm = self.coord.state_machine();
             // Re-check the lease with a FRESH wall before EACH completion — the scan and each closure
@@ -846,19 +848,23 @@ where
                 .is_some()
             });
           }
-          // A limbo log read failed: fail CLOSED — fall the batch back rather than serve a read whose
-          // limbo region could not be verified.
-          None => {
+          // A SAFE fallback (truncated / over-budget / incomplete / index-ceiling limbo): fall the
+          // batch back to a normal read.
+          Ok(None) => {
             for p in std::mem::take(&mut self.routing.failovers) {
               (p.complete)(Ok(None));
             }
           }
+          // A FATAL limbo storage fault (corrupt/unreadable committed-range log): leave the reads
+          // parked for the pump to fail `Poisoned` and stop the driver.
+          Err(_) => return true,
         }
       }
       // The window is armed but the committed prefix has not applied yet — keep parked, re-check
       // next pass.
       Some(_) => {}
     }
+    false
   }
 
   /// Drain the coordinator's outputs: wire bytes to each conn's writer (byte-budgeted), internal
@@ -900,8 +906,11 @@ where
     // so the serve runs only on a still-live tier — and BEFORE the UNBOUNDED `take_runnable_queries`
     // user closures so the strict-wall serve cannot expire behind them. Skip on a poisoned node so the
     // `fail_all(Poisoned)` sweep below owns the parked reads.
-    if !self.coord.endpoint().is_poisoned() {
-      self.run_failover_serve();
+    if !self.coord.endpoint().is_poisoned() && self.run_failover_serve() {
+      // A FATAL limbo storage fault: a corrupt/unreadable committed-range log is unrecoverable, never a
+      // safe normal-read fallback — fail all parked work `Poisoned` and stop the driver.
+      self.routing.fail_all(&DriverError::Poisoned);
+      return true;
     }
     if run_queries {
       for q in self.routing.take_runnable_queries() {
