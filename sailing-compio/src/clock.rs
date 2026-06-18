@@ -178,8 +178,16 @@ mod tests {
 
   #[test]
   fn validate_and_capture_eps_rejects_failover_without_wall_source() {
-    use crate::wall_clock::NtpDisciplinedClock;
+    use crate::wall_clock::{NtpDisciplinedClock, WallClock, WallReading};
     use sailing_proto::ReadOnlyOption;
+    // An always-supplying source so the Ok-with-ε case is platform-independent.
+    struct AlwaysSupplies;
+    impl WallClock for AlwaysSupplies {
+      const SUPPLIES_WALL: bool = true;
+      fn now(&mut self) -> Option<WallReading> {
+        None
+      }
+    }
     let failover = Config::try_new(
       1u64,
       vec![1u64, 2, 3],
@@ -198,9 +206,21 @@ mod tests {
     ));
     // a valid failover tier + a supplying source -> Ok, ε_unc captured in nanos (5 ms).
     assert_eq!(
+      validate_and_capture_eps::<u64, AlwaysSupplies>(&failover).unwrap(),
+      5_000_000
+    );
+    // NtpDisciplinedClock supplies a wall ONLY on Linux; elsewhere it is non-supplying and a failover
+    // config is rejected just like Monotonic (the loud non-Linux startup failure).
+    #[cfg(target_os = "linux")]
+    assert_eq!(
       validate_and_capture_eps::<u64, NtpDisciplinedClock>(&failover).unwrap(),
       5_000_000
     );
+    #[cfg(not(target_os = "linux"))]
+    assert!(matches!(
+      validate_and_capture_eps::<u64, NtpDisciplinedClock>(&failover),
+      Err(BindError::MissingWallSource)
+    ));
     // a non-failover Config + any source -> Ok(0): the gate stays inert, no source required.
     let mono = Config::try_new(
       1u64,
