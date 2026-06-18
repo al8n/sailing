@@ -169,37 +169,57 @@ pub(crate) fn read_limbo<L: LogStore>(
   window: &FailoverReadWindow,
   max_bytes: u64,
 ) -> Option<Vec<Entry>> {
-  let lo = window.index().next();
-  let hi = window.limbo_upper().next();
+  let (lo, hi) = limbo_bounds(window)?;
   if lo >= hi {
     return Some(Vec::new());
   }
   let entries = log.entries(lo..hi, max_bytes).ok()?;
-  normal_entries_if_complete(entries, hi, max_bytes)
+  contiguous_normal_entries(entries, lo, hi, max_bytes)
+}
+
+/// The half-open `[lo, hi)` for the inclusive limbo region `(index, limbo_upper]`, or `None` (FAIL
+/// CLOSED) when either bound is at the `u64` ceiling — an inclusive `limbo_upper == u64::MAX` cannot be
+/// expressed as a half-open upper bound without overflow, so completeness could not be proven and the
+/// failover read must fall back.
+fn limbo_bounds(window: &FailoverReadWindow) -> Option<(Index, Index)> {
+  Some((
+    window.index().checked_next()?,
+    window.limbo_upper().checked_next()?,
+  ))
 }
 
 /// A fixed per-entry charge folded into the limbo cost bound, so a COMPLETE region of zero-payload
-/// entries is still bounded by COUNT — the `LogStore` byte cap counts payload only and is approximate,
-/// so without this a numerous zero-payload tail could pass it and be cloned in full.
+/// entries is still bounded by COUNT — the `LogStore` byte cap counts payload only and is approximate.
 const LIMBO_ENTRY_OVERHEAD: u64 = 64;
 
-/// `Some(normal-filtered)` only when the scanned slice covers the WHOLE limbo region (its last entry
-/// reaches `hi` = `limbo_upper` + 1) AND its total cost — `LIMBO_ENTRY_OVERHEAD` plus payload bytes,
-/// per entry — is within `max_bytes`. A short tail means the cap TRUNCATED the scan; an over-budget
-/// cost means a numerous (e.g. zero-payload) tail slipped past the `LogStore`'s payload-only cap.
-/// Either way the limbo cannot be served, so FAIL CLOSED to a normal read: `None`.
-fn normal_entries_if_complete(entries: &[Entry], hi: Index, max_bytes: u64) -> Option<Vec<Entry>> {
-  if !entries.last().is_some_and(|last| last.index().next() == hi) {
-    return None;
-  }
+/// `Some(normal-filtered)` only when the scanned slice is EXACTLY the contiguous region `[lo, hi)` — it
+/// STARTS at `lo`, every entry is adjacent to the next, and it REACHES `hi` — AND its per-entry cost
+/// (`LIMBO_ENTRY_OVERHEAD` plus payload) is within `max_bytes`. A truncated, suffix, or gapped slice
+/// fails the contiguity check (a tail-only "reaches hi" test would wrongly accept a suffix or a gapped
+/// slice that happens to end at `hi`); an oversized region fails the cost check. Any of these means the
+/// limbo cannot prove the read's key absent, so FAIL CLOSED to a normal read: `None`.
+fn contiguous_normal_entries(
+  entries: &[Entry],
+  lo: Index,
+  hi: Index,
+  max_bytes: u64,
+) -> Option<Vec<Entry>> {
+  let mut expected = lo;
   let mut cost: u64 = 0;
   for e in entries {
+    if e.index() != expected {
+      return None; // a non-`lo` start or a gap: not the contiguous region
+    }
+    expected = e.index().checked_next()?;
     cost = cost
       .saturating_add(LIMBO_ENTRY_OVERHEAD)
       .saturating_add(e.data().len() as u64);
     if cost > max_bytes {
       return None;
     }
+  }
+  if expected != hi {
+    return None; // truncated: the scan did not reach limbo_upper
   }
   Some(
     entries
@@ -494,10 +514,11 @@ mod tests {
   }
 
   #[test]
-  fn limbo_scan_fails_closed_when_truncated_or_over_budget() {
+  fn limbo_scan_requires_a_complete_contiguous_in_budget_region() {
     use sailing_proto::{EntryKind, Term};
     let e = |idx: u64, kind| Entry::new(Term::new(1), Index::new(idx), kind, bytes::Bytes::new());
-    // Region (commit=4, limbo_upper=7]: indices 5,6,7; hi = limbo_upper + 1 = 8.
+    // Region (commit=4, limbo_upper=7]: indices 5,6,7; lo=5, hi=8.
+    let lo = Index::new(5);
     let hi = Index::new(8);
     let cap = 1_000_000; // generous: the three small entries fit.
     let full = [
@@ -505,23 +526,43 @@ mod tests {
       e(6, EntryKind::Empty),
       e(7, EntryKind::Normal),
     ];
-    // COMPLETE and within the cap -> serve, keeping only the Normal entries.
-    let served = normal_entries_if_complete(&full, hi, cap).expect("a complete limbo serves");
+    // COMPLETE contiguous [5,8) within budget -> serve, keeping only the Normal entries.
+    let served =
+      contiguous_normal_entries(&full, lo, hi, cap).expect("a complete contiguous limbo serves");
     assert_eq!(served.len(), 2, "only the two Normal entries are kept");
-    // TRUNCATED (last entry short of limbo_upper) -> fail closed.
+    // TRUNCATED (stops at 6, short of hi) -> fail closed.
     let truncated = [e(5, EntryKind::Normal), e(6, EntryKind::Normal)];
+    assert!(contiguous_normal_entries(&truncated, lo, hi, cap).is_none());
+    // SUFFIX (starts at 6, not lo=5; ends at hi) -> fail closed; a tail-only check would WRONGLY pass.
+    let suffix = [e(6, EntryKind::Normal), e(7, EntryKind::Normal)];
     assert!(
-      normal_entries_if_complete(&truncated, hi, cap).is_none(),
-      "a partial limbo falls back instead of serving"
+      contiguous_normal_entries(&suffix, lo, hi, cap).is_none(),
+      "a suffix that skips lo cannot prove key-absence over the whole region"
     );
-    // Empty -> fail closed.
-    assert!(normal_entries_if_complete(&[], hi, cap).is_none());
-    // COMPLETE but OVER the cap by COUNT — zero-payload entries the LogStore's payload-only cap would
-    // admit -> fail closed on the per-entry overhead the payload cap misses (the R2 bypass).
+    // GAPPED (5 then 7, missing 6; ends at hi) -> fail closed.
+    let gapped = [e(5, EntryKind::Normal), e(7, EntryKind::Normal)];
     assert!(
-      normal_entries_if_complete(&full, hi, 100).is_none(),
-      "a complete-but-numerous zero-payload limbo fails closed on the per-entry cost bound"
+      contiguous_normal_entries(&gapped, lo, hi, cap).is_none(),
+      "a gap in the region cannot prove key-absence"
     );
+    // EMPTY -> fail closed.
+    assert!(contiguous_normal_entries(&[], lo, hi, cap).is_none());
+    // COMPLETE but OVER the cap by COUNT (zero-payload entries the LogStore's payload-only cap admits)
+    // -> fail closed on the per-entry overhead the payload cap misses.
+    assert!(
+      contiguous_normal_entries(&full, lo, hi, 100).is_none(),
+      "a numerous zero-payload region fails closed on the per-entry cost bound"
+    );
+  }
+
+  #[test]
+  fn limbo_bounds_fails_closed_at_the_index_ceiling() {
+    // An inclusive limbo_upper at the u64 ceiling cannot become a half-open upper bound -> fail closed.
+    let at_ceiling = FailoverReadWindow::new(Index::new(4), Index::new(u64::MAX));
+    assert!(limbo_bounds(&at_ceiling).is_none());
+    // A normal window yields the half-open [lo, hi) = (index, limbo_upper] expressed exclusively.
+    let normal = FailoverReadWindow::new(Index::new(4), Index::new(7));
+    assert_eq!(limbo_bounds(&normal), Some((Index::new(5), Index::new(8))));
   }
 
   #[test]
