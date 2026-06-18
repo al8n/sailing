@@ -15,7 +15,7 @@ use crate::{
   clock::{Clock, jittered},
   config::DriverConfig,
   handle::{Command, Handle},
-  shared::{InflightBudget, ParkedQuery, Pending, Routing},
+  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
 };
 
 /// IP-layer maximum UDP payload — the persistent receive buffer's size.
@@ -82,6 +82,9 @@ where
   stable: S,
   socket: UdpSocket,
   clock: Clock<W>,
+  /// Byte cap on the failover inherited-read limbo scan (see
+  /// [`DriverConfig::max_failover_limbo_bytes`]).
+  max_failover_limbo_bytes: usize,
   commands: futures_channel::mpsc::Receiver<Command<I, F>>,
   routing: Routing<I, F::Response, F>,
   storage_ready: flume::Receiver<()>,
@@ -220,6 +223,7 @@ where
         // path, and shutdown's stoppable-under-load guarantee rides on it.
         cmd_budget: driver_cfg.cmd_budget.max(1),
         recv_cap: driver_cfg.recv_cap,
+        max_failover_limbo_bytes: driver_cfg.max_failover_limbo_bytes,
         redial_base: driver_cfg.redial_base,
         redial_cap: driver_cfg.redial_cap,
         storage_closed: false,
@@ -395,6 +399,7 @@ where
         break;
       }
       poisoned = self.pump().await;
+      self.run_failover_serve(now);
     }
 
     // Teardown. Fail everything parked (each entry's reservation releases on drop), cancel the
@@ -527,6 +532,17 @@ where
           }
         }
       }
+      Command::FailoverWindow {
+        complete,
+        reservation,
+      } => {
+        // Park unconditionally; `run_failover_serve` re-validates the serve window and the apply
+        // watermark each pass, then serves the limbo region or falls the query back.
+        self.routing.failovers.push(ParkedFailover {
+          complete,
+          _reservation: reservation,
+        });
+      }
       Command::Transfer {
         to,
         reply,
@@ -576,6 +592,46 @@ where
           backoff,
         },
       );
+    }
+  }
+
+  /// Serve (or fall back) the parked failover inherited-read queries. Re-derives the serve window from
+  /// `now` each pass: `None` (the commit-wait lifted, off-tier, the inherited lease expired, or
+  /// poisoned) falls every parked query back to a normal read (`Ok(None)`); a live window whose
+  /// committed prefix has applied serves the whole batch at once against the FSM with the limbo region;
+  /// otherwise the queries stay parked for the next pass (the re-validation that catches a window
+  /// lifting or a lease expiring while parked).
+  fn run_failover_serve(&mut self, now: Now) {
+    if self.routing.failovers.is_empty() {
+      return;
+    }
+    match self.coord.endpoint().failover_read_window(now) {
+      None => {
+        for p in std::mem::take(&mut self.routing.failovers) {
+          (p.complete)(Ok(None));
+        }
+      }
+      Some(window) if self.routing.applied >= window.index() => {
+        match crate::shared::read_limbo(&self.log, &window, self.max_failover_limbo_bytes as u64) {
+          Some(limbo) => {
+            let parked = std::mem::take(&mut self.routing.failovers);
+            let fsm = self.coord.state_machine();
+            for p in parked {
+              (p.complete)(Ok(Some((fsm, &limbo, window))));
+            }
+          }
+          // A limbo log read failed: fail CLOSED — fall the batch back rather than serve a read whose
+          // limbo region could not be verified.
+          None => {
+            for p in std::mem::take(&mut self.routing.failovers) {
+              (p.complete)(Ok(None));
+            }
+          }
+        }
+      }
+      // The window is armed but the committed prefix has not applied yet — keep parked, re-check
+      // next pass.
+      Some(_) => {}
     }
   }
 

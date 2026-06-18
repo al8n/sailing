@@ -32,7 +32,7 @@ use std::{
   },
 };
 
-use sailing_proto::{Event, Index};
+use sailing_proto::{Entry, EntryKind, Event, FailoverReadWindow, Index, LogStore};
 
 use crate::DriverError;
 
@@ -130,6 +130,86 @@ pub(crate) enum Pending<I, R> {
 /// that voided it — one closure, so the caller keeps full error fidelity across the erasure.
 pub(crate) type QueryComplete<I, F> = Box<dyn FnOnce(Result<&F, DriverError<I>>) + Send>;
 
+/// The argument a [`FailoverComplete`] receives: the served `(FSM, limbo entries, window)` triple to
+/// run the read against, `None` when no serve window is available (the caller falls back to a normal
+/// read), or the error that voided the query.
+pub(crate) type FailoverOutcome<'a, I, F> =
+  Result<Option<(&'a F, &'a [Entry], FailoverReadWindow)>, DriverError<I>>;
+
+/// The type-erased completion of a failover inherited-read query. Called ON the driver thread with the
+/// [`FailoverOutcome`] — the served triple (the closure confirms its key was not written in
+/// `(window.index(), window.limbo_upper()]`), `Ok(None)`, or the error that voided it — one closure, so
+/// the caller keeps full error fidelity across the erasure.
+pub(crate) type FailoverComplete<I, F> = Box<dyn FnOnce(FailoverOutcome<'_, I, F>) + Send>;
+
+/// A parked failover inherited-read query: held until the committed prefix applies AND the serve
+/// window is (re-)confirmed live, then run against the state machine with the limbo region. The
+/// completion is type-erased and carries its own reply channel.
+pub(crate) struct ParkedFailover<I, F> {
+  /// The SINGLE completion (see [`FailoverComplete`]).
+  pub(crate) complete: FailoverComplete<I, F>,
+  /// The budget reservation (a failover query reserves one zero-byte slot).
+  pub(crate) _reservation: ReservationGuard,
+}
+
+/// The limbo region `(window.index(), window.limbo_upper()]` filtered to NORMAL entries — the
+/// committed-but-possibly-superseded prefix a failover inherited read's key must be absent from —
+/// read under a HARD `max_bytes` cap and FAIL-CLOSED. Shared by both drivers so the bound and the
+/// fail-closed rule cannot drift.
+///
+/// Returns `None` (the caller falls back to a normal read) when the log read errors OR the `max_bytes`
+/// cap TRUNCATES the region. The post-election limbo can be an arbitrarily large inherited tail, and a
+/// failover read reserves a zero-byte budget slot, so an unbounded scan would let one read OOM/stall
+/// the driver: capping it and refusing a partial limbo (which could not prove the key absent) keeps a
+/// read-only query from becoming an availability failure. The region is contiguous and above the commit
+/// (never compacted), so a COMPLETE read's last entry reaches `limbo_upper`; a short tail means the cap
+/// bit. An empty `Vec` when the region is empty.
+pub(crate) fn read_limbo<L: LogStore>(
+  log: &L,
+  window: &FailoverReadWindow,
+  max_bytes: u64,
+) -> Option<Vec<Entry>> {
+  let lo = window.index().next();
+  let hi = window.limbo_upper().next();
+  if lo >= hi {
+    return Some(Vec::new());
+  }
+  let entries = log.entries(lo..hi, max_bytes).ok()?;
+  normal_entries_if_complete(entries, hi, max_bytes)
+}
+
+/// A fixed per-entry charge folded into the limbo cost bound, so a COMPLETE region of zero-payload
+/// entries is still bounded by COUNT — the `LogStore` byte cap counts payload only and is approximate,
+/// so without this a numerous zero-payload tail could pass it and be cloned in full.
+const LIMBO_ENTRY_OVERHEAD: u64 = 64;
+
+/// `Some(normal-filtered)` only when the scanned slice covers the WHOLE limbo region (its last entry
+/// reaches `hi` = `limbo_upper` + 1) AND its total cost — `LIMBO_ENTRY_OVERHEAD` plus payload bytes,
+/// per entry — is within `max_bytes`. A short tail means the cap TRUNCATED the scan; an over-budget
+/// cost means a numerous (e.g. zero-payload) tail slipped past the `LogStore`'s payload-only cap.
+/// Either way the limbo cannot be served, so FAIL CLOSED to a normal read: `None`.
+fn normal_entries_if_complete(entries: &[Entry], hi: Index, max_bytes: u64) -> Option<Vec<Entry>> {
+  if !entries.last().is_some_and(|last| last.index().next() == hi) {
+    return None;
+  }
+  let mut cost: u64 = 0;
+  for e in entries {
+    cost = cost
+      .saturating_add(LIMBO_ENTRY_OVERHEAD)
+      .saturating_add(e.data().len() as u64);
+    if cost > max_bytes {
+      return None;
+    }
+  }
+  Some(
+    entries
+      .iter()
+      .filter(|e| e.kind() == EntryKind::Normal)
+      .cloned()
+      .collect(),
+  )
+}
+
 /// A linearizable query's lifecycle: confirmed by `ReadState` (which fixes `ready_at`), then run
 /// against the state machine once `applied >= ready_at`. The completion is type-erased and
 /// carries its own reply channel; `F` is the driver's state-machine type.
@@ -154,6 +234,10 @@ pub(crate) struct Routing<I, R, F> {
   pub(crate) queries: BTreeMap<u64, ParkedQuery<I, F>>,
   /// The next read-context value.
   pub(crate) next_query_ctx: u64,
+  /// Parked failover inherited-read queries: served as a batch each pass once the serve window is
+  /// confirmed live and the committed prefix has applied (see the drivers' `run_failover_serve`).
+  /// Swept by [`Self::fail_all`] on every leadership change, exactly like the parked queries.
+  pub(crate) failovers: Vec<ParkedFailover<I, F>>,
   /// The apply watermark (highest `Applied`/`ConfChanged` index seen): gates query execution.
   pub(crate) applied: Index,
   /// The best-effort events tail (dropped-on-full; never blocks the driver).
@@ -166,6 +250,7 @@ impl<I, R, F> Routing<I, R, F> {
       pending: BTreeMap::new(),
       queries: BTreeMap::new(),
       next_query_ctx: 1,
+      failovers: Vec::new(),
       applied: Index::ZERO,
       events,
     }
@@ -220,6 +305,9 @@ impl<I, R, F> Routing<I, R, F> {
     }
     for (_, q) in std::mem::take(&mut self.queries) {
       (q.complete)(Err(err.clone()));
+    }
+    for p in std::mem::take(&mut self.failovers) {
+      (p.complete)(Err(err.clone()));
     }
   }
 }
@@ -374,6 +462,66 @@ mod tests {
       9,
     )));
     assert!(advanced, "the watermark still advances");
+  }
+
+  #[test]
+  fn leader_change_supersedes_parked_failover_reads() {
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    let (tx, mut rx) = futures_channel::oneshot::channel();
+    r.failovers.push(ParkedFailover {
+      complete: Box::new(move |res: FailoverOutcome<'_, u64, ()>| {
+        // A parked inherited-read MUST be voided on a leadership change — its serve window belonged to
+        // the old leadership's reasoning, exactly like a parked query.
+        let _ = tx.send(matches!(res, Err(DriverError::Superseded)));
+      }),
+      _reservation: b.try_reserve::<u64>(0).unwrap(),
+    });
+    r.route_event(Event::LeaderChanged(sailing_proto::LeaderChanged::new(
+      sailing_proto::Term::new(3),
+      Some(2u64),
+    )));
+    assert_eq!(
+      rx.try_recv().unwrap(),
+      Some(true),
+      "the parked failover read was superseded"
+    );
+    assert!(
+      r.failovers.is_empty(),
+      "the sweep drained the parked failover"
+    );
+    assert_eq!(b.in_flight(), (0, 0), "the sweep released the reservation");
+  }
+
+  #[test]
+  fn limbo_scan_fails_closed_when_truncated_or_over_budget() {
+    use sailing_proto::{EntryKind, Term};
+    let e = |idx: u64, kind| Entry::new(Term::new(1), Index::new(idx), kind, bytes::Bytes::new());
+    // Region (commit=4, limbo_upper=7]: indices 5,6,7; hi = limbo_upper + 1 = 8.
+    let hi = Index::new(8);
+    let cap = 1_000_000; // generous: the three small entries fit.
+    let full = [
+      e(5, EntryKind::Normal),
+      e(6, EntryKind::Empty),
+      e(7, EntryKind::Normal),
+    ];
+    // COMPLETE and within the cap -> serve, keeping only the Normal entries.
+    let served = normal_entries_if_complete(&full, hi, cap).expect("a complete limbo serves");
+    assert_eq!(served.len(), 2, "only the two Normal entries are kept");
+    // TRUNCATED (last entry short of limbo_upper) -> fail closed.
+    let truncated = [e(5, EntryKind::Normal), e(6, EntryKind::Normal)];
+    assert!(
+      normal_entries_if_complete(&truncated, hi, cap).is_none(),
+      "a partial limbo falls back instead of serving"
+    );
+    // Empty -> fail closed.
+    assert!(normal_entries_if_complete(&[], hi, cap).is_none());
+    // COMPLETE but OVER the cap by COUNT — zero-payload entries the LogStore's payload-only cap would
+    // admit -> fail closed on the per-entry overhead the payload cap misses (the R2 bypass).
+    assert!(
+      normal_entries_if_complete(&full, hi, 100).is_none(),
+      "a complete-but-numerous zero-payload limbo fails closed on the per-entry cost bound"
+    );
   }
 
   #[test]
