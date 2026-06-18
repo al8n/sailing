@@ -399,7 +399,6 @@ where
         break;
       }
       poisoned = self.pump().await;
-      self.run_failover_serve();
     }
 
     // Teardown. Fail everything parked (each entry's reservation releases on drop), cancel the
@@ -536,8 +535,6 @@ where
         complete,
         reservation,
       } => {
-        // Park unconditionally; `run_failover_serve` re-validates the serve window and the apply
-        // watermark each pass, then serves the limbo region or falls the query back.
         self.routing.failovers.push(ParkedFailover {
           complete,
           _reservation: reservation,
@@ -647,6 +644,13 @@ where
   /// Drain the coordinator's outputs: transmits to the socket, events into the routing (and any
   /// queries whose read index the apply watermark now covers, run against the state machine).
   async fn pump(&mut self) -> bool {
+    // Drain the coordinator's queued datagrams FIRST. These awaited sends precede the failover serve
+    // below BY DESIGN — the same ordering as the normal-query serve: user-closure serves follow the
+    // consensus output, never the reverse, so unbounded user read closures cannot stall outbound
+    // consensus traffic. The drain is a finite, fire-and-forget, no-ACK UDP send batch, and the
+    // inherited-lease window carries a 2·ε_unc margin, so a bounded send phase cannot expire it; only a
+    // pathological send stall could, which equally stalls the normal-read fallback — so the failover
+    // path is never worse off than the read it would fall back to.
     while let Some((dest, bytes)) = self.coord.poll_transmit() {
       // A send error is transient for UDP (the peer redials / QUIC retransmits); dropping the
       // datagram is the same observable as the network dropping it.
@@ -655,6 +659,23 @@ where
     let mut run_queries = false;
     while let Some(ev) = self.coord.poll_event() {
       run_queries |= self.routing.route_event(ev);
+    }
+    // Leadership-loss backstop, BEFORE the serve: defense-in-depth for a loss NOT carried by a routed
+    // `LeaderChanged` (which `route_event` already swept). Sweeping ahead of the serve voids parked
+    // inherited-reads `Err(Superseded)` — the serve's None arm can never drain them `Ok(None)` first.
+    // Normally a no-op (the routed event already emptied the map).
+    let is_leader = self.coord.role().is_leader();
+    if self.was_leader && !is_leader {
+      self.routing.fail_all(&DriverError::Superseded);
+    }
+    self.was_leader = is_leader;
+    // Serve parked failover inherited-reads HERE: after the `route_event` drain (it advanced
+    // `routing.applied` AND ran the event-driven `Superseded` sweep) AND the leadership backstop above —
+    // so the serve runs only on a still-live tier — and BEFORE the UNBOUNDED `take_runnable_queries`
+    // user closures so the strict-wall serve cannot expire behind them. Skip on a poisoned node so the
+    // `fail_all(Poisoned)` sweep below owns the parked reads.
+    if !self.coord.endpoint().is_poisoned() {
+      self.run_failover_serve();
     }
     if run_queries {
       for q in self.routing.take_runnable_queries() {
@@ -670,15 +691,6 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    // The sweep backstop (see the `was_leader` field): defense-in-depth behind the event-
-    // driven supersede — every leadership loss also emits `LeaderChanged(None)`, so this
-    // edge normally observes an already-swept map. Runs AFTER the event drain so a doubled
-    // sweep is a no-op on the emptied maps.
-    let is_leader = self.coord.role().is_leader();
-    if self.was_leader && !is_leader {
-      self.routing.fail_all(&DriverError::Superseded);
-    }
-    self.was_leader = is_leader;
     false
   }
 }
