@@ -6,12 +6,12 @@ use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 use bytes::Bytes;
 use compio::net::UdpSocket;
 use sailing_proto::{
-  ClusterId, Config, Instant, LogStore, ProposeError, StableStore, StateMachine,
+  ClusterId, Config, Instant, LogStore, Now, ProposeError, StableStore, StateMachine,
   quic::{QuicCoordinator, QuicOptions},
 };
 
 use crate::{
-  DriverError,
+  BindError, DriverError, Monotonic, WallClock,
   clock::{Clock, jittered},
   config::DriverConfig,
   handle::{Command, Handle},
@@ -72,7 +72,7 @@ struct Redial {
 ///
 /// Construct AND run on the same thread (see the crate docs): the socket attaches to the
 /// constructing thread's proactor.
-pub struct CompioQuicDriver<I, F, L, S>
+pub struct CompioQuicDriver<I, F, L, S, W = Monotonic>
 where
   I: sailing_proto::NodeId,
   F: StateMachine,
@@ -81,7 +81,7 @@ where
   log: L,
   stable: S,
   socket: UdpSocket,
-  clock: Clock,
+  clock: Clock<W>,
   commands: futures_channel::mpsc::Receiver<Command<I, F>>,
   routing: Routing<I, F::Response, F>,
   storage_ready: flume::Receiver<()>,
@@ -111,7 +111,7 @@ where
   was_leader: bool,
 }
 
-impl<I, F, L, S> CompioQuicDriver<I, F, L, S>
+impl<I, F, L, S> CompioQuicDriver<I, F, L, S, Monotonic>
 where
   I: sailing_proto::NodeId + Send,
   F: StateMachine,
@@ -122,14 +122,8 @@ where
   L: LogStore,
   S: StableStore<NodeId = I>,
 {
-  /// Bind `addr` and build the driver plus its [`Handle`].
-  ///
-  /// `peers` is the static peer book (every other node's id + address): the driver dials each at
-  /// startup and REDIALS (jittered exponential backoff) whenever a peer has no bound connection.
-  /// `opts` must be a [`ClusterTls`](sailing_proto::quic::ClusterTls) bundle (the provided
-  /// identity scheme requires mandatory mTLS); `seed` seeds the consensus endpoint's election
-  /// jitter. Storage is the embedder's; a genuinely-async store wires
-  /// [`DriverConfig::storage_ready`].
+  /// Bind with the default monotonic-only clock — the failover tier stays inert. For a failover
+  /// deployment, use [`bind_with_wall_clock`](Self::bind_with_wall_clock) with a synchronized source.
   #[allow(clippy::too_many_arguments)]
   pub async fn bind(
     addr: SocketAddr,
@@ -142,9 +136,59 @@ where
     log: L,
     stable: S,
     driver_cfg: DriverConfig,
-  ) -> std::io::Result<(Self, Handle<I, F>)> {
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    Self::bind_with_wall_clock(
+      addr, config, seed, fsm, opts, cluster, peers, log, stable, Monotonic, driver_cfg,
+    )
+    .await
+  }
+}
+
+impl<I, F, L, S, W> CompioQuicDriver<I, F, L, S, W>
+where
+  I: sailing_proto::NodeId + Send,
+  F: StateMachine,
+  F::Command: sailing_proto::Data + Send,
+  F::Snapshot: sailing_proto::Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+  L: LogStore,
+  S: StableStore<NodeId = I>,
+  W: WallClock,
+{
+  /// Bind `addr` and build the driver plus its [`Handle`].
+  ///
+  /// `peers` is the static peer book (every other node's id + address): the driver dials each at
+  /// startup and REDIALS (jittered exponential backoff) whenever a peer has no bound connection.
+  /// `opts` must be a [`ClusterTls`](sailing_proto::quic::ClusterTls) bundle (the provided
+  /// identity scheme requires mandatory mTLS); `seed` seeds the consensus endpoint's election
+  /// jitter. Storage is the embedder's; a genuinely-async store wires
+  /// [`DriverConfig::storage_ready`].
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_with_wall_clock(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<(I, SocketAddr)>,
+    log: L,
+    stable: S,
+    wall: W,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    // Fail loud at startup: an invalid Config and the silent failover wedge (a valid failover tier
+    // with a non-supplying source) both become errors here, BEFORE the socket binds.
+    config.validate()?;
+    let eps = config.bounded_clock_uncertainty();
+    if eps.is_some() && !W::SUPPLIES_WALL {
+      return Err(BindError::MissingWallSource);
+    }
+    // ε_unc captured ONCE from the same Config the proto reads — the sole owner of the wall gate.
+    let eps_unc_ns = eps.map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     let socket = UdpSocket::bind(addr).await?;
-    let clock = Clock::new();
+    let mut clock = Clock::new(eps_unc_ns, wall);
     let endpoint = sailing_proto::Endpoint::new(config, clock.now(), seed, fsm);
     let coord = QuicCoordinator::with_identity(endpoint, opts, None, cluster);
 
@@ -203,8 +247,8 @@ where
     let recv_task = compio::runtime::spawn(recv_datagrams(self.socket.clone(), recv_tx));
 
     let now = self.clock.now();
-    self.reconcile_peer_links(now);
-    let mut poisoned = self.pump(now).await;
+    self.reconcile_peer_links(now.mono());
+    let mut poisoned = self.pump().await;
 
     let mut shutdown_ack: Option<futures_channel::oneshot::Sender<()>> = None;
     while !poisoned {
@@ -242,7 +286,7 @@ where
       if self
         .coord
         .poll_timeout()
-        .is_some_and(|d| d <= self.clock.now())
+        .is_some_and(|d| d <= self.clock.mono())
       {
         self
           .coord
@@ -250,8 +294,8 @@ where
       }
       // Redial any configured peer with no bound connection BEFORE the pump, so a fresh dial's
       // handshake Initial transmits this iteration rather than after the next wake.
-      self.reconcile_peer_links(now);
-      if self.pump(now).await {
+      self.reconcile_peer_links(now.mono());
+      if self.pump().await {
         break;
       }
 
@@ -337,7 +381,7 @@ where
       {
         break;
       }
-      poisoned = self.pump(now).await;
+      poisoned = self.pump().await;
     }
 
     // Teardown. Fail everything parked (each entry's reservation releases on drop), cancel the
@@ -370,7 +414,7 @@ where
   /// Handle one command; returns `true` when the loop should exit (a `Shutdown`).
   fn handle_command(
     &mut self,
-    now: Instant,
+    now: Now,
     cmd: Command<I, F>,
     shutdown_ack: &mut Option<futures_channel::oneshot::Sender<()>>,
   ) -> bool {
@@ -524,7 +568,7 @@ where
 
   /// Drain the coordinator's outputs: transmits to the socket, events into the routing (and any
   /// queries whose read index the apply watermark now covers, run against the state machine).
-  async fn pump(&mut self, _now: Instant) -> bool {
+  async fn pump(&mut self) -> bool {
     while let Some((dest, bytes)) = self.coord.poll_transmit() {
       // A send error is transient for UDP (the peer redials / QUIC retransmits); dropping the
       // datagram is the same observable as the network dropping it.

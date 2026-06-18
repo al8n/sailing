@@ -16,12 +16,12 @@ use std::{
 use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
 use sailing_proto::{
-  Config, ConnId, Instant, LogStore, ProposeError, RecordIo, StableStore, StateMachine,
+  Config, ConnId, Instant, LogStore, Now, ProposeError, RecordIo, StableStore, StateMachine,
   StreamCoordinator,
 };
 
 use crate::{
-  DriverError,
+  BindError, DriverError, Monotonic, WallClock,
   bridge::{BridgeInbound, BridgeOut, DialReady, bridge_read, bridge_write},
   clock::{Clock, jittered},
   config::DriverConfig,
@@ -107,7 +107,7 @@ struct Conn<I> {
 ///
 /// Construct AND run on the same thread (see the crate docs); the `Rc` factories make this
 /// driver structurally `!Send`, enforcing that pinning.
-pub struct CompioStreamDriver<I, F, R, L, S>
+pub struct CompioStreamDriver<I, F, R, L, S, W = Monotonic>
 where
   I: sailing_proto::NodeId,
   F: StateMachine,
@@ -117,7 +117,7 @@ where
   log: L,
   stable: S,
   listener: TcpListener,
-  clock: Clock,
+  clock: Clock<W>,
   commands: futures_channel::mpsc::Receiver<Command<I, F>>,
   routing: Routing<I, F::Response, F>,
   storage_ready: flume::Receiver<()>,
@@ -155,7 +155,7 @@ where
   was_leader: bool,
 }
 
-impl<I, F, R, L, S> CompioStreamDriver<I, F, R, L, S>
+impl<I, F, R, L, S> CompioStreamDriver<I, F, R, L, S, Monotonic>
 where
   I: sailing_proto::NodeId + Send,
   F: StateMachine,
@@ -167,10 +167,8 @@ where
   L: LogStore,
   S: StableStore<NodeId = I>,
 {
-  /// Bind the listener and build the driver plus its [`Handle`]. The configured peers are dialed
-  /// at `run()` start and redialed (jittered exponential backoff) whenever their connection
-  /// dies; handshake reaping and duplicate tie-breaks are the coordinator's, surfaced through
-  /// its close reporting.
+  /// Bind with the default monotonic-only clock — the failover tier stays inert. For a failover
+  /// deployment, use [`bind_with_wall_clock`](Self::bind_with_wall_clock) with a synchronized source.
   #[allow(clippy::too_many_arguments)]
   pub async fn bind(
     addr: SocketAddr,
@@ -183,9 +181,56 @@ where
     log: L,
     stable: S,
     driver_cfg: DriverConfig,
-  ) -> std::io::Result<(Self, Handle<I, F>)> {
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    Self::bind_with_wall_clock(
+      addr, config, seed, fsm, peers, dialer, acceptor, log, stable, Monotonic, driver_cfg,
+    )
+    .await
+  }
+}
+
+impl<I, F, R, L, S, W> CompioStreamDriver<I, F, R, L, S, W>
+where
+  I: sailing_proto::NodeId + Send,
+  F: StateMachine,
+  F::Command: sailing_proto::Data + Send,
+  F::Snapshot: sailing_proto::Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+  R: RecordIo,
+  L: LogStore,
+  S: StableStore<NodeId = I>,
+  W: WallClock,
+{
+  /// Bind the listener and build the driver plus its [`Handle`]. The configured peers are dialed
+  /// at `run()` start and redialed (jittered exponential backoff) whenever their connection
+  /// dies; handshake reaping and duplicate tie-breaks are the coordinator's, surfaced through
+  /// its close reporting.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_with_wall_clock(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    peers: Vec<(I, SocketAddr)>,
+    dialer: DialerFactory<I, R>,
+    acceptor: AcceptorFactory<R>,
+    log: L,
+    stable: S,
+    wall: W,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    // Fail loud at startup: an invalid Config (degrade-to-Safe) and the silent failover wedge (a valid
+    // failover tier with a non-supplying source) both become errors here, BEFORE the socket binds.
+    config.validate()?;
+    let eps = config.bounded_clock_uncertainty();
+    if eps.is_some() && !W::SUPPLIES_WALL {
+      return Err(BindError::MissingWallSource);
+    }
+    // ε_unc captured ONCE from the same Config the proto reads — the sole owner of the wall gate.
+    let eps_unc_ns = eps.map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
     let listener = TcpListener::bind(addr).await?;
-    let clock = Clock::new();
+    let mut clock = Clock::new(eps_unc_ns, wall);
     let coord = StreamCoordinator::new(config, clock.now(), seed, fsm);
 
     let (cmd_tx, cmd_rx) = futures_channel::mpsc::channel(driver_cfg.max_inflight + 1);
@@ -256,8 +301,8 @@ where
 
     // The first reconciler pass dials the full configured mesh (nothing is bound yet).
     let now = self.clock.now();
-    self.reconcile_peer_links(now);
-    let mut poisoned = self.pump(now).await;
+    self.reconcile_peer_links(now.mono());
+    let mut poisoned = self.pump().await;
 
     let mut shutdown_ack: Option<futures_channel::oneshot::Sender<()>> = None;
     while !poisoned {
@@ -290,14 +335,14 @@ where
       if self
         .coord
         .poll_timeout()
-        .is_some_and(|d| d <= self.clock.now())
+        .is_some_and(|d| d <= self.clock.mono())
       {
         self
           .coord
           .handle_timeout(now, &mut self.log, &mut self.stable);
       }
-      self.reconcile_peer_links(now);
-      if self.pump(now).await {
+      self.reconcile_peer_links(now.mono());
+      if self.pump().await {
         break;
       }
 
@@ -359,8 +404,8 @@ where
       let now = self.clock.now();
       match wake {
         Wake::Inbound(inbound) => self.handle_inbound(now, inbound),
-        Wake::Accepted(socket) => self.handle_accept(now, socket),
-        Wake::DialReady(ready) => self.handle_dial_ready(now, ready),
+        Wake::Accepted(socket) => self.handle_accept(now.mono(), socket),
+        Wake::DialReady(ready) => self.handle_dial_ready(ready),
         Wake::Timer => {
           self
             .coord
@@ -378,7 +423,7 @@ where
       self
         .coord
         .handle_storage(now, &mut self.log, &mut self.stable);
-      poisoned = self.pump(now).await;
+      poisoned = self.pump().await;
     }
 
     // Teardown: fail everything parked, cancel the accept task and every connection's tasks
@@ -407,7 +452,7 @@ where
   }
 
   /// One inbound bridge frame: feed bytes/EOF to the coordinator (errors close the conn).
-  fn handle_inbound(&mut self, now: Instant, inbound: BridgeInbound) {
+  fn handle_inbound(&mut self, now: Now, inbound: BridgeInbound) {
     match inbound {
       BridgeInbound::Bytes { id, bytes } => {
         self
@@ -580,7 +625,7 @@ where
   }
 
   /// One dial completion: bridge the socket, or close (the reconciler retries).
-  fn handle_dial_ready(&mut self, _now: Instant, ready: DialReady) {
+  fn handle_dial_ready(&mut self, ready: DialReady) {
     let DialReady {
       id,
       result,
@@ -627,7 +672,7 @@ where
   /// Handle one command (same dispatch as the QUIC driver).
   fn handle_command(
     &mut self,
-    now: Instant,
+    now: Now,
     cmd: Command<I, F>,
     shutdown_ack: &mut Option<futures_channel::oneshot::Sender<()>>,
   ) -> bool {
@@ -742,7 +787,7 @@ where
 
   /// Drain the coordinator's outputs: wire bytes to each conn's writer (byte-budgeted), internal
   /// closes into teardown (the reconciler repairs), events into completions and queries.
-  async fn pump(&mut self, _now: Instant) -> bool {
+  async fn pump(&mut self) -> bool {
     for (id, bytes) in self.coord.poll_transmit() {
       let Some(conn) = self.conns.get(&id) else {
         continue; // already closed; the coordinator's stale bytes die with it
