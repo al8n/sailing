@@ -442,7 +442,7 @@ where
         .coord
         .handle_storage(now, &mut self.log, &mut self.stable);
       poisoned = self.pump().await;
-      self.run_failover_serve(now);
+      self.run_failover_serve();
     }
 
     // Teardown: fail everything parked, cancel the accept task and every connection's tasks
@@ -821,10 +821,13 @@ where
   /// committed prefix has applied serves the whole batch at once against the FSM with the limbo region;
   /// otherwise the queries stay parked for the next pass (the re-validation that catches a window
   /// lifting or a lease expiring while parked).
-  fn run_failover_serve(&mut self, now: Now) {
+  fn run_failover_serve(&mut self) {
     if self.routing.failovers.is_empty() {
       return;
     }
+    // A FRESH wall: the loop-top `now` is stale by here (it predates this pass's pump and callbacks),
+    // and the proto lease gate is strict at the boundary.
+    let now = self.clock.now();
     match self.coord.endpoint().failover_read_window(now) {
       None => {
         for p in std::mem::take(&mut self.routing.failovers) {
@@ -836,9 +839,15 @@ where
           Some(limbo) => {
             let parked = std::mem::take(&mut self.routing.failovers);
             let fsm = self.coord.state_machine();
-            for p in parked {
-              (p.complete)(Ok(Some((fsm, &limbo, window))));
-            }
+            // Re-check the lease with a FRESH wall before EACH completion — the scan and each closure
+            // burn wall time, so the window can expire mid-batch.
+            crate::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+              self
+                .coord
+                .endpoint()
+                .failover_read_window(self.clock.now())
+                .is_some()
+            });
           }
           // A limbo log read failed: fail CLOSED — fall the batch back rather than serve a read whose
           // limbo region could not be verified.
