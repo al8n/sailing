@@ -137,8 +137,7 @@ pub(crate) type FailoverOutcome<'a, I, F> =
   Result<Option<(&'a F, &'a [Entry], FailoverReadWindow)>, DriverError<I>>;
 
 /// The type-erased completion of a failover inherited-read query. Called ON the driver thread with the
-/// [`FailoverOutcome`] — the served triple (the closure confirms its key was not written in
-/// `(window.index(), window.limbo_upper()]`), `Ok(None)`, or the error that voided it — one closure, so
+/// [`FailoverOutcome`] — the served triple, `Ok(None)`, or the error that voided it — one closure, so
 /// the caller keeps full error fidelity across the erasure.
 pub(crate) type FailoverComplete<I, F> = Box<dyn FnOnce(FailoverOutcome<'_, I, F>) + Send>;
 
@@ -160,11 +159,11 @@ pub(crate) struct ParkedFailover<I, F> {
 /// `Err` on a FATAL `LogStore::entries` storage fault (corruption / I/O) — the driver fail-stops
 /// (`Poisoned`) rather than hide it. `Ok(None)` is the SAFE fallback to a normal read: the index
 /// ceiling, a cap truncation, or an incomplete region — none of which can prove key-absence.
-/// `Ok(Some(limbo))` is the complete, in-budget, contiguous NORMAL-entry region to serve. The
-/// post-election limbo can be an arbitrarily large inherited tail and a failover read reserves a
-/// zero-byte budget slot, so an unbounded scan would let one read OOM/stall the driver; the region is
-/// contiguous and above the commit (never compacted), so a COMPLETE read's last entry reaches
-/// `limbo_upper`. An empty `Vec` when the region is empty.
+/// `Ok(Some(limbo))` is the complete, in-budget, contiguous NORMAL-entry region to serve (an empty
+/// `Vec` when the region is empty). The cap is load-bearing: the post-election limbo can be an
+/// arbitrarily large inherited tail and a failover read reserves a zero-byte budget slot, so an
+/// unbounded scan would let one read OOM/stall the driver. The region is contiguous and above the
+/// commit (never compacted), so a COMPLETE read's last entry reaches `limbo_upper`.
 pub(crate) fn read_limbo<L: LogStore>(
   log: &L,
   window: &FailoverReadWindow,
@@ -236,8 +235,8 @@ fn contiguous_normal_entries(
 }
 
 /// Serve a batch of parked failover reads against `fsm` and `limbo` for `window`, RE-CHECKING the
-/// inherited lease (`still_live`) with a FRESH wall before EACH completion. The limbo scan and every
-/// preceding user closure consume wall time, and the proto's lease gate is STRICT at the boundary, so a
+/// inherited lease (`still_live`) with a FRESH wall before EACH completion: the limbo scan and every
+/// preceding user closure consume wall time and the proto's lease gate is STRICT at the boundary, so a
 /// window live when the batch started can expire mid-batch — a completion past expiry must fall back
 /// (`Ok(None)`) rather than serve a stale inherited read. Shared by both drivers so the freshness rule
 /// cannot drift.
@@ -282,8 +281,8 @@ pub(crate) struct Routing<I, R, F> {
   /// The next read-context value.
   pub(crate) next_query_ctx: u64,
   /// Parked failover inherited-read queries: served as a batch each pass once the serve window is
-  /// confirmed live and the committed prefix has applied (see the drivers' `run_failover_serve`).
-  /// Swept by [`Self::fail_all`] on every leadership change, exactly like the parked queries.
+  /// confirmed live and the committed prefix has applied (see the drivers' `run_failover_serve`), and
+  /// swept by [`Self::fail_all`] on every leadership change, exactly like the parked queries.
   pub(crate) failovers: Vec<ParkedFailover<I, F>>,
   /// The apply watermark (highest `Applied`/`ConfChanged` index seen): gates query execution.
   pub(crate) applied: Index,
