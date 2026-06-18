@@ -442,7 +442,6 @@ where
         .coord
         .handle_storage(now, &mut self.log, &mut self.stable);
       poisoned = self.pump().await;
-      self.run_failover_serve();
     }
 
     // Teardown: fail everything parked, cancel the accept task and every connection's tasks
@@ -787,8 +786,6 @@ where
         complete,
         reservation,
       } => {
-        // Park unconditionally; `run_failover_serve` re-validates the serve window and the apply
-        // watermark each pass, then serves the limbo region or falls the query back.
         self.routing.failovers.push(ParkedFailover {
           complete,
           _reservation: reservation,
@@ -889,6 +886,23 @@ where
     while let Some(ev) = self.coord.poll_event() {
       run_queries |= self.routing.route_event(ev);
     }
+    // Leadership-loss backstop, BEFORE the serve: defense-in-depth for a loss NOT carried by a routed
+    // `LeaderChanged` (which `route_event` already swept). Sweeping ahead of the serve voids parked
+    // inherited-reads `Err(Superseded)` — the serve's None arm can never drain them `Ok(None)` first.
+    // Normally a no-op (the routed event already emptied the map).
+    let is_leader = self.coord.role().is_leader();
+    if self.was_leader && !is_leader {
+      self.routing.fail_all(&DriverError::Superseded);
+    }
+    self.was_leader = is_leader;
+    // Serve parked failover inherited-reads HERE: after the `route_event` drain (it advanced
+    // `routing.applied` AND ran the event-driven `Superseded` sweep) AND the leadership backstop above —
+    // so the serve runs only on a still-live tier — and BEFORE the UNBOUNDED `take_runnable_queries`
+    // user closures so the strict-wall serve cannot expire behind them. Skip on a poisoned node so the
+    // `fail_all(Poisoned)` sweep below owns the parked reads.
+    if !self.coord.endpoint().is_poisoned() {
+      self.run_failover_serve();
+    }
     if run_queries {
       for q in self.routing.take_runnable_queries() {
         (q.complete)(Ok(self.coord.state_machine()));
@@ -903,13 +917,6 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    // The supersede backstop (see `was_leader`): defense-in-depth after the event drain — a
-    // loss the events already swept makes this a no-op on the emptied maps.
-    let is_leader = self.coord.role().is_leader();
-    if self.was_leader && !is_leader {
-      self.routing.fail_all(&DriverError::Superseded);
-    }
-    self.was_leader = is_leader;
     false
   }
 }
