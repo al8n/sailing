@@ -2405,3 +2405,42 @@ fn restart_from_legacy_snapshot_recovers_static_mode() {
     "a legacy snapshot (read_only=None) must recover the static config mode, not be misread as Safe"
   );
 }
+
+/// REGRESSION: a committed SetReadMode with a non-canonical payload (not exactly 1 byte) is rejected at
+/// apply — it poisons rather than silently accepting [mode, junk] or an empty payload.
+#[test]
+fn set_read_mode_rejects_non_canonical_payload() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, PoisonReason, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  // A committed SetReadMode whose payload is 2 bytes (a valid mode byte + trailing junk).
+  log.force_append(&[Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::SetReadMode,
+    bytes::Bytes::copy_from_slice(&[0u8, 0xFFu8]),
+  )]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::SetReadModeDecode),
+    "a non-canonical SetReadMode payload (trailing bytes) must poison, not be silently accepted"
+  );
+}

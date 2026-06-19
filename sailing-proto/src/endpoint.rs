@@ -848,6 +848,12 @@ where
   /// immutable genesis default + knob source — only this active mode migrates. The fold floors stay
   /// mode-INDEPENDENT, so a mid-flip / migrated-away node is strictly conservative on the commit-wait.
   active_read_mode: crate::ReadOnlyOption,
+  /// Whether a committed `SetReadMode` has EVER applied on this node (read-mode provenance). Gates whether
+  /// `maybe_snapshot` carries an EXPLICIT `SnapshotMeta.read_only`: a migrated node records the mode (so
+  /// restart recovers it), a NON-migrated node leaves it absent (so restart falls back to the static
+  /// config rather than pinning the active mode across a config edit). Recovered at restart from the
+  /// snapshot's presence ⊔ the committed-tail replay; adopted from the snapshot's presence on install.
+  read_mode_migrated: bool,
   /// Deferred read requests that arrived before the leader has committed an entry in its
   /// current term.  Flushed once `maybe_advance_commit` advances `self.commit` to a
   /// current-term entry.
@@ -994,6 +1000,7 @@ where
       read_since_anchor: false,
       // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
       active_read_mode: read_only_opt,
+      read_mode_migrated: false,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       tracker,
@@ -1859,15 +1866,15 @@ where
         }
         crate::EntryKind::Empty => {} // no-op: just advance applied
         crate::EntryKind::SetReadMode => {
-          // Decode the target mode from the 1-byte payload; unrecoverable on failure → poison (mirror
-          // ConfChange). This is the apply-time flip — the SOLE site the active mode changes
-          // (commit-before-apply means it never takes effect on an uncommitted tail). NO commit-wait
-          // re-arm: the monotone fold floors + the mode-independent become_leader arming already cover a
-          // deposed LeaseGuard lease, so a read-mode flip needs no new barrier (spec §1, §3.1).
-          let mode = match entry
-            .data()
-            .first()
-            .copied()
+          // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison
+          // (mirror ConfChange's exact decode). An empty, trailing-junk, or out-of-range payload is a
+          // non-canonical committed entry → fail-stop, never a silent partial decode. This is the
+          // apply-time flip — the SOLE site the active mode changes (commit-before-apply means it never
+          // takes effect on an uncommitted tail). NO commit-wait re-arm: the monotone fold floors + the
+          // mode-independent become_leader arming already cover a deposed LeaseGuard lease (spec §1).
+          let data = entry.data();
+          let mode = match (data.len() == 1)
+            .then(|| data[0])
             .and_then(crate::ReadOnlyOption::from_u8)
           {
             Some(m) => m,
@@ -1877,6 +1884,11 @@ where
             }
           };
           self.active_read_mode = mode;
+          // A committed SetReadMode has applied — record the read-mode provenance so a snapshot at/after
+          // this boundary carries the mode EXPLICITLY. A node that NEVER migrated leaves it absent (None),
+          // so a restart falls back to the static config rather than pinning the active mode across a
+          // config edit (see `maybe_snapshot`).
+          self.read_mode_migrated = true;
           // Update the read-mode option WITHOUT discarding in-flight accepted reads (`set_option`, NOT
           // `reset`): a read already accepted at its commit index stays valid and still confirms under the
           // mode-INDEPENDENT ReadIndex heartbeat quorum — clearing it (as a mid-term `reset` would) strands

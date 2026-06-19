@@ -98,11 +98,16 @@ where
     // `max_lease_window` (a conservative over-bound — the global max ≥ the compacted prefix's max).
     // A successor that compacts past — or installs — these entries then still covers any deposed
     // leader's lease on a now-unavailable entry.
-    let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
+    let mut meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
       .with_max_lease_window(self.max_lease_window)
       .with_max_wall_plus_window(self.max_wall_plus_window)
-      .with_max_unwalled_lease_window(self.max_unwalled_lease_window)
-      .with_read_only(self.active_read_mode);
+      .with_max_unwalled_lease_window(self.max_unwalled_lease_window);
+    // Carry the read mode EXPLICITLY only if a committed SetReadMode has applied (provenance). A
+    // non-migrated node leaves it absent, so a restart from this snapshot falls back to the static config
+    // — the presence bit then means "a migration was compacted", not merely "whatever mode was active".
+    if self.read_mode_migrated {
+      meta = meta.with_read_only(self.active_read_mode);
+    }
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
@@ -312,6 +317,9 @@ where
     // snapshot carries None → keep the current mode (a defensive default — unreachable in a same-version
     // cluster, where the LABEL_VERSION-4 handshake fences a pre-migration peer).
     self.active_read_mode = meta.read_only().unwrap_or(self.active_read_mode);
+    // Adopt the snapshot's read-mode provenance (Some ⇒ a migration was compacted at/before the boundary);
+    // a None/legacy snapshot keeps the current provenance, consistent with keeping the current mode above.
+    self.read_mode_migrated = meta.read_only().is_some() || self.read_mode_migrated;
 
     // Step 4: re-baseline the log on the now-durable snapshot. Discards the follower's stale/short log;
     // after this call first_index == last_index + 1 and term(last_index) == last_term, so the next

@@ -2344,3 +2344,57 @@ fn install_snapshot_adopts_read_mode() {
     "the install adopts the snapshot's carried read mode"
   );
 }
+
+/// REGRESSION: a NON-migrated node leaves SnapshotMeta.read_only ABSENT (None), so a restart from its own
+/// snapshot falls back to the static config rather than pinning the active mode. The presence bit means
+/// "a SetReadMode was compacted", not "whatever mode was active".
+#[test]
+fn non_migrated_snapshot_leaves_read_mode_absent() {
+  let (_ep, _log, stable) = make_single_node_leader_with_entries(3, 3);
+  let (meta, _data) = stable.snapshot().expect("a snapshot was submitted");
+  assert_eq!(
+    meta.read_only(),
+    None,
+    "a non-migrated node must leave the snapshot read_only absent (falls back to config on restart)"
+  );
+}
+
+/// A MIGRATED node carries the explicit mode in its snapshot (read_only = Some), so a restart recovers it.
+#[test]
+fn migrated_snapshot_carries_explicit_read_mode() {
+  use crate::{Config, Instant, ReadOnlyOption};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_snapshot_threshold(1);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  // Migrate to LeaseGuard; committing it past the threshold triggers a compaction.
+  ep.propose_read_mode_change(d, &mut log, &stable, ReadOnlyOption::LeaseGuard)
+    .expect("proposed");
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(ep.active_read_mode(), ReadOnlyOption::LeaseGuard);
+  let (meta, _data) = stable
+    .snapshot()
+    .expect("a snapshot was submitted past the threshold");
+  assert_eq!(
+    meta.read_only(),
+    Some(ReadOnlyOption::LeaseGuard),
+    "a migrated node must carry the explicit mode in its snapshot"
+  );
+}
