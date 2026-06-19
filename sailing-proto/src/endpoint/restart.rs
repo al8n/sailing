@@ -330,6 +330,9 @@ where
     // construction stays infallible and identical across build profiles.
     let mut ep = Self {
       config,
+      // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later
+      // commit (the active mode is replicated state, not static config). See spec §6.
+      active_read_mode: read_only_opt,
       fsm,
       role: Role::Follower,
       term: hs.term(),

@@ -59,7 +59,7 @@ where
     self.heartbeat_deadline = None;
     // Drop all pending reads — a stepped-down node is no longer the leader and
     // cannot confirm any outstanding read requests.
-    self.read_only.reset(self.config.read_only());
+    self.read_only.reset(self.active_read_mode);
     // A stepped-down node no longer serves LeaseGuard reads, so drop any pending lease-refresh demand
     // (only a leader appends the refresh no-op; a re-election re-stamps the lease via its own no-op).
     self.lease_refresh_wanted = false;
@@ -515,7 +515,7 @@ where
     self.set_leader(Some(self.config.id()));
     // Reset read-index state from the previous term (stale pending reads must not
     // be confirmed against the new term's commit index).
-    self.read_only.reset(self.config.read_only());
+    self.read_only.reset(self.active_read_mode);
     self.pending_reads.clear();
     // a fresh leader holds NO read lease until a quorum freshly acks its first CheckQuorum
     // round. Reset the lease round/ack set and clear the deadline, so no LeaseBased read can be

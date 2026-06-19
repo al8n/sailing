@@ -833,6 +833,12 @@ where
   pending_conf_index: Index,
   /// ReadIndex tracking (pending reads, heartbeat-ack sets, confirmed read states).
   read_only: ReadOnly<I>,
+  /// The ACTIVE read mode the serve dispatch + stamp helpers consult. Seeded from `config.read_only()`,
+  /// then overwritten apply-time when a committed `SetReadMode` entry applies (a mid-life migration);
+  /// recovered from replicated state (snapshot ⊔ tail-replay) on restart. `Config.read_only` stays the
+  /// immutable genesis default + knob source — only this active mode migrates. The fold floors stay
+  /// mode-INDEPENDENT, so a mid-flip / migrated-away node is strictly conservative on the commit-wait.
+  active_read_mode: crate::ReadOnlyOption,
   /// Deferred read requests that arrived before the leader has committed an entry in its
   /// current term.  Flushed once `maybe_advance_commit` advances `self.commit` to a
   /// current-term entry.
@@ -977,6 +983,8 @@ where
       lease_refresh_wanted: false,
       // No read since the (not-yet-existent) anchor — the proactive-refresh gate starts clear.
       read_since_anchor: false,
+      // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
+      active_read_mode: read_only_opt,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       tracker,
@@ -1056,7 +1064,7 @@ where
   /// measures the entry's age as `now − 0` (huge) and degrades to Safe — FAIL-CLOSED, never wrapping
   /// the truncated timestamp to a falsely-fresh value.
   pub(crate) fn lease_stamp(&self, now: Instant) -> u64 {
-    if self.config.read_only() == crate::ReadOnlyOption::LeaseGuard {
+    if self.active_read_mode == crate::ReadOnlyOption::LeaseGuard {
       u64::try_from(now.since_origin().as_nanos()).unwrap_or(0)
     } else {
       0
@@ -1072,7 +1080,10 @@ where
   pub(crate) fn lease_window_stamp(&self) -> u64 {
     // The EXACT commit-wait window `Δ·(Δ+ε)/(Δ−ε)`; the single source of truth lives in `Config` so
     // stamping, the read gate, and validation never diverge. `0` when LeaseGuard is inactive/invalid.
-    self.config.leaseguard_commit_wait_ns().unwrap_or(0)
+    self
+      .config
+      .leaseguard_commit_wait_ns(self.active_read_mode)
+      .unwrap_or(0)
   }
 
   /// The LeaseGuard FAILOVER wall stamp for a new leader entry: the leader's SYNCHRONIZED wall
@@ -1092,7 +1103,7 @@ where
   /// (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never a falsely-fresh
   /// stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
   pub(crate) fn lease_wall_stamp(&self, now: crate::Now) -> u64 {
-    if self.config.failover_tier_valid() {
+    if self.config.failover_tier_valid(self.active_read_mode) {
       debug_assert!(
         !now.wall().is_absent(),
         "LeaseGuard failover tier is active but the caller supplied no synchronized wall (Now::monotonic)"
@@ -1116,11 +1127,25 @@ where
   /// about any other node's config. Gated HERE, not only in the optional `Config::validate`, so an
   /// unvalidated config degrades to Safe. Returns `(Δ, ε)` for the read gate's same-leader check.
   pub(crate) fn leaseguard_timing(&self) -> Option<(core::time::Duration, core::time::Duration)> {
-    self.config.leaseguard_commit_wait_ns()?;
+    self
+      .config
+      .leaseguard_commit_wait_ns(self.active_read_mode)?;
     Some((
       self.config.lease_duration()?,
       self.config.clock_drift_bound()?,
     ))
+  }
+
+  /// The read mode CURRENTLY IN EFFECT — the last applied `SetReadMode` mode, or the `Config` default if
+  /// none. The serve dispatch and the stamp helpers consult this, NOT the immutable `Config.read_only`.
+  #[inline(always)]
+  pub const fn active_read_mode(&self) -> crate::ReadOnlyOption {
+    self.active_read_mode
+  }
+
+  #[cfg(test)]
+  pub(crate) fn set_active_read_mode_for_test(&mut self, mode: crate::ReadOnlyOption) {
+    self.active_read_mode = mode;
   }
 
   /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
@@ -1499,7 +1524,7 @@ where
         // Drop all ReadIndex state too: a stale read confirmation must never leak across a term
         // change. Mirrors `step_down_to_follower` / `become_leader` (read confirmation is
         // leader-gated, so this is robustness, not a behavior change).
-        self.read_only.reset(self.config.read_only());
+        self.read_only.reset(self.active_read_mode);
         self.pending_reads.clear();
         // (Reads forwarded under the old term/leader were cleared by `set_leader` above.)
         // Abort any in-progress leader transfer — leadership is changing.

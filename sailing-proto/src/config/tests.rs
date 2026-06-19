@@ -378,7 +378,10 @@ fn leaseguard_config_validation() {
     .with_read_only(ReadOnlyOption::LeaseGuard)
     .with_lease_duration(Duration::from_millis(300))
     .with_clock_drift_bound(Duration::from_millis(50));
-  assert_eq!(c.leaseguard_commit_wait_ns(), Some(420_000_000));
+  assert_eq!(
+    c.leaseguard_commit_wait_ns(c.read_only()),
+    Some(420_000_000)
+  );
 
   // A window that overflows the u64 wire field (an absurd multi-century lease) is rejected, NOT
   // silently truncated to a small value.
@@ -396,7 +399,7 @@ fn leaseguard_config_validation() {
     huge.validate(),
     Err(ConfigError::LeaseTimingTooLong { .. })
   ));
-  assert_eq!(huge.leaseguard_commit_wait_ns(), None);
+  assert_eq!(huge.leaseguard_commit_wait_ns(huge.read_only()), None);
 
   // A valid LeaseGuard config — it does NOT require check_quorum (its safety is the commit-wait,
   // not election-prevention). bounded_clock_uncertainty is optional (enables inherited reads).
