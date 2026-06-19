@@ -101,7 +101,8 @@ where
     let meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
       .with_max_lease_window(self.max_lease_window)
       .with_max_wall_plus_window(self.max_wall_plus_window)
-      .with_max_unwalled_lease_window(self.max_unwalled_lease_window);
+      .with_max_unwalled_lease_window(self.max_unwalled_lease_window)
+      .with_read_only(self.active_read_mode);
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
@@ -305,6 +306,10 @@ where
     // Step 3: advance commit + applied to the snapshot boundary.
     self.commit = meta.last_index();
     self.applied = meta.last_index();
+    // Adopt the active read mode at the snapshot boundary (a SetReadMode compacted into it). The
+    // re-baseline discards the stale tail, so this is the boundary mode; subsequent AppendEntries replay
+    // any post-snapshot SetReadMode via apply_committed (last-writer-wins by index).
+    self.active_read_mode = meta.read_only();
 
     // Step 4: re-baseline the log on the now-durable snapshot. Discards the follower's stale/short log;
     // after this call first_index == last_index + 1 and term(last_index) == last_term, so the next

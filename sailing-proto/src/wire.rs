@@ -270,6 +270,7 @@ fn pb_snapshot_meta<I: crate::NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
     max_lease_window: m.max_lease_window(),
     max_wall_plus_window: m.max_wall_plus_window(),
     max_unwalled_lease_window: m.max_unwalled_lease_window(),
+    read_only: u64::from(m.read_only().as_u8()),
     ..Default::default()
   }
 }
@@ -281,6 +282,10 @@ fn snapshot_meta_from<I: crate::NodeId>(
     .conf
     .as_option()
     .ok_or(DecodeError::Invalid("SnapshotMeta.conf"))?;
+  let read_only = u8::try_from(w.read_only)
+    .ok()
+    .and_then(crate::ReadOnlyOption::from_u8)
+    .ok_or(DecodeError::Invalid("SnapshotMeta.read_only"))?;
   Ok(
     SnapshotMeta::new(
       Index::new(w.last_index),
@@ -289,7 +294,8 @@ fn snapshot_meta_from<I: crate::NodeId>(
     )
     .with_max_lease_window(w.max_lease_window)
     .with_max_wall_plus_window(w.max_wall_plus_window)
-    .with_max_unwalled_lease_window(w.max_unwalled_lease_window),
+    .with_max_unwalled_lease_window(w.max_unwalled_lease_window)
+    .with_read_only(read_only),
   )
 }
 

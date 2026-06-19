@@ -424,6 +424,10 @@ pub struct SnapshotMeta<I> {
   /// non-failover LeaseGuard cluster (all entries wall-absent) but is inert there. `0` for Safe/LeaseBased
   /// (`lease_window` is 0). See [`with_max_unwalled_lease_window`].
   max_unwalled_lease_window: u64,
+  /// The ACTIVE read mode at the snapshot boundary (a `SetReadMode` compacted into this snapshot). Carried
+  /// so a restarting node recovers its migrated mode from replicated state, not its stale construction
+  /// config. `Safe` (the genesis default) ⇒ absent on the wire (byte-identical to a pre-migration peer).
+  read_only: crate::ReadOnlyOption,
 }
 
 impl<I: crate::NodeId> SnapshotMeta<I> {
@@ -437,6 +441,7 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
       max_lease_window: 0,
       max_wall_plus_window: 0,
       max_unwalled_lease_window: 0,
+      read_only: crate::ReadOnlyOption::Safe,
     }
   }
 
@@ -469,6 +474,15 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
     self
   }
 
+  /// Set the active read mode at the snapshot boundary. A builder, so the common 3-arg
+  /// [`new`](Self::new) stays untouched for non-migrated clusters (where the mode is the genesis default).
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_read_only(mut self, read_only: crate::ReadOnlyOption) -> Self {
+    self.read_only = read_only;
+    self
+  }
+
   /// The last log index covered by this snapshot.
   #[inline(always)]
   pub const fn last_index(&self) -> Index {
@@ -491,6 +505,12 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   #[inline(always)]
   pub const fn max_lease_window(&self) -> u64 {
     self.max_lease_window
+  }
+
+  /// The active read mode at the snapshot boundary (the genesis default if never migrated).
+  #[inline(always)]
+  pub const fn read_only(&self) -> crate::ReadOnlyOption {
+    self.read_only
   }
 
   /// The max per-entry `wall_timestamp + lease_window` over the subsumed entries, or `0` if unset.

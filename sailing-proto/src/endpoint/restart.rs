@@ -128,6 +128,13 @@ where
       .as_ref()
       .map(|(meta, _)| meta.max_lease_window())
       .unwrap_or(0);
+    // The active read mode this snapshot carries at its boundary (a SetReadMode compacted into it). The
+    // committed-tail replay below (apply_committed) re-applies any post-snapshot SetReadMode
+    // (last-writer-wins by index); the static config is only the genesis default for a node that never
+    // snapshotted. Recovering from replicated state — not config — is what stops a migrated-away node
+    // coming back under its stale construction mode.
+    let snap_read_only: Option<crate::ReadOnlyOption> =
+      snapshot.as_ref().map(|(meta, _)| meta.read_only());
     // The failover release floor this snapshot carries over its compacted entries — combined below
     // with a scan of the live log to recompute `max_wall_plus_window` from durable state alone.
     let snap_max_wall_plus: u64 = snapshot
@@ -242,7 +249,7 @@ where
     // until their RemoveNode commits — see the membership driver contract in spec §9).
     // Never trust commit beyond the durable log; never below the snapshot baseline.
     let commit = core::cmp::min(hs.commit(), log.last_index()).max(applied);
-    let read_only_opt = config.read_only();
+    let read_only_opt = snap_read_only.unwrap_or_else(|| config.read_only());
     // Size the post-restart vote fence by the DURABLE PRE-CRASH PROMISE, not the
     // (possibly weaker) post-restart config, so this node cannot help elect a new leader inside a read-lease
     // it promised (as a follower) but has since forgotten (the in-memory `in_lease` state is lost on crash).
