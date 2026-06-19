@@ -96,6 +96,11 @@ message SnapshotMeta {
   // populating it identically — which is exactly why this precise-anchor release bumps LABEL_VERSION
   // (mixed-version nodes that predate the consumed floors reject at the handshake).
   uint64 max_unwalled_lease_window = 6;
+  // The ACTIVE read mode at the snapshot boundary (a SetReadMode compacted into this snapshot), as a
+  // ReadOnlyOption discriminant (0=Safe, 1=LeaseBased, 2=LeaseGuard). Carried so a restarting node
+  // recovers its migrated mode from replicated state, not its stale construction config. Zero (Safe, the
+  // genesis default) — absent on the wire, byte-identical to a pre-migration peer. Rides LABEL_VERSION 4.
+  uint64 read_only = 7;
 }
 
 // Log replication / heartbeat-with-entries.

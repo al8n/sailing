@@ -666,3 +666,58 @@ fn decode_aliases_the_frame_allocation() {
     "the decoded entry payload must alias the frame allocation (zero-copy)"
   );
 }
+
+/// SnapshotMeta.read_only round-trips, and Safe (the genesis default) is absent on the wire
+/// (byte-identical to a snapshot built before the field existed).
+#[test]
+fn snapshot_meta_read_only_round_trips() {
+  let conf = ConfState::new(
+    std::vec![1u64, 2, 3],
+    std::vec![],
+    std::vec![],
+    std::vec![],
+    false,
+  );
+  let meta = SnapshotMeta::new(Index::new(10), Term::new(4), conf.clone())
+    .with_read_only(crate::ReadOnlyOption::LeaseGuard);
+  let m = Message::InstallSnapshot(InstallSnapshot::new(
+    Term::new(4),
+    1,
+    meta,
+    Bytes::from_static(b"blob"),
+  ));
+  let mut buf = std::vec::Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back.snapshot().read_only(),
+    crate::ReadOnlyOption::LeaseGuard
+  );
+
+  // Safe (default) is omitted on the wire: byte-identical to a snapshot that never set it.
+  let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
+  let mut a = std::vec::Vec::new();
+  let mut b = std::vec::Vec::new();
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.clone(),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut a,
+  );
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.with_read_only(crate::ReadOnlyOption::Safe),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut b,
+  );
+  assert_eq!(a, b, "a Safe read_only is byte-identical to unset");
+}

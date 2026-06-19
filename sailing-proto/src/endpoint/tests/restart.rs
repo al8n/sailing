@@ -2315,3 +2315,46 @@ fn restarted_follower_ignores_heartbeat_resp_read_acks() {
     "a restarted follower must not complete a read from a HeartbeatResp"
   );
 }
+
+/// On restart the active read mode is recovered from replicated state: a committed SetReadMode in the
+/// durable log re-applies via apply_committed, so a node migrated away from its construction config comes
+/// back under the MIGRATED mode (the misrecovery-bug regression — the seed must not win over the log).
+#[test]
+fn restart_recovers_migrated_mode_from_committed_tail() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, ReadOnlyOption, Term};
+  use core::time::Duration;
+  // Construction config is LeaseGuard, but the durable committed log holds a SetReadMode(Safe).
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  log.force_append(&[Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::SetReadMode,
+    bytes::Bytes::copy_from_slice(&[ReadOnlyOption::Safe.as_u8()]),
+  )]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(1)); // commit = 1
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.active_read_mode(),
+    ReadOnlyOption::Safe,
+    "restart recovers the migrated mode from the committed log, not the static config"
+  );
+}

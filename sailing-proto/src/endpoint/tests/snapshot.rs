@@ -2310,3 +2310,37 @@ fn conf_change_removal_prunes_snapshot_resend_deadline() {
     "applying the removal must prune peer 2's resend-pacing deadline (no leak across membership)"
   );
 }
+
+/// Installing a snapshot adopts the active read mode carried in its metadata (a SetReadMode compacted
+/// into the snapshot) — recovered from replicated state, not the static config.
+#[test]
+fn install_snapshot_adopts_read_mode() {
+  use crate::{Index, Instant, Message, ReadOnlyOption, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  assert_eq!(
+    ep.active_read_mode(),
+    ReadOnlyOption::Safe,
+    "the follower starts in the genesis Safe mode"
+  );
+  let snap_data = encode_snapshot(0);
+  let meta = crate::SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  )
+  .with_read_only(ReadOnlyOption::LeaseGuard);
+  let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, snap_data);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(is),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(
+    ep.active_read_mode(),
+    ReadOnlyOption::LeaseGuard,
+    "the install adopts the snapshot's carried read mode"
+  );
+}
