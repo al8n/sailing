@@ -28,6 +28,12 @@ fn round_trips_every_variant() {
       EntryKind::ConfChange,
       Bytes::from_static(b"cc")
     ),
+    Entry::new(
+      Term::new(2),
+      Index::new(4),
+      EntryKind::SetReadMode,
+      Bytes::from_static(b"\x02"),
+    ),
   ];
   rt(Message::AppendEntries(AppendEntries::new(
     Term::new(3),

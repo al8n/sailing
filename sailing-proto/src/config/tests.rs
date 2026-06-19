@@ -26,6 +26,26 @@ fn quorum_and_voters() {
 }
 
 #[test]
+fn read_only_option_u8_round_trips() {
+  for m in [
+    ReadOnlyOption::Safe,
+    ReadOnlyOption::LeaseBased,
+    ReadOnlyOption::LeaseGuard,
+  ] {
+    assert_eq!(
+      ReadOnlyOption::from_u8(m.as_u8()),
+      Some(m),
+      "round-trips: {m:?}"
+    );
+  }
+  assert_eq!(
+    ReadOnlyOption::from_u8(3),
+    None,
+    "unknown discriminant rejected"
+  );
+}
+
+#[test]
 fn config_validation_and_defaults() {
   let c = Config::try_new(
     1u64,

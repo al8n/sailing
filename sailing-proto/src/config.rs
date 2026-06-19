@@ -53,6 +53,27 @@ impl ReadOnlyOption {
       Self::LeaseGuard => "lease_guard",
     }
   }
+
+  /// The canonical wire discriminant — the byte a `SetReadMode` log entry carries as its payload.
+  #[inline(always)]
+  pub const fn as_u8(self) -> u8 {
+    match self {
+      Self::Safe => 0,
+      Self::LeaseBased => 1,
+      Self::LeaseGuard => 2,
+    }
+  }
+
+  /// Parse the canonical wire discriminant; `None` for an unknown byte.
+  #[inline(always)]
+  pub const fn from_u8(b: u8) -> Option<Self> {
+    match b {
+      0 => Some(Self::Safe),
+      1 => Some(Self::LeaseBased),
+      2 => Some(Self::LeaseGuard),
+      _ => None,
+    }
+  }
 }
 
 /// When (if ever) a LeaseGuard leader proactively re-anchors its read lease with a no-op, so reads do not

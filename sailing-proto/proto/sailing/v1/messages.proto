@@ -54,6 +54,7 @@ enum EntryKind {
   ENTRY_KIND_NORMAL = 0;
   ENTRY_KIND_CONF_CHANGE = 1;
   ENTRY_KIND_EMPTY = 2;
+  ENTRY_KIND_SET_READ_MODE = 3;
 }
 
 // Cluster membership. Each repeated field is a SET: elements are the embedder's

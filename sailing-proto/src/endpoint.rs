@@ -1800,6 +1800,9 @@ where
           }
         }
         crate::EntryKind::Empty => {} // no-op: just advance applied
+        // The apply-time read-mode flip lands in a later commit; the wire kind is introduced first, so
+        // applying a SetReadMode is a no-op for now (no proposer exists yet to create one). See spec §3.1.
+        crate::EntryKind::SetReadMode => {}
         crate::EntryKind::ConfChange => {
           // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
           let cc = match crate::wire::decode_conf_change_v2::<I>(entry.data_bytes()) {

@@ -215,6 +215,7 @@ fn pb_entry(e: &Entry) -> pb::Entry {
       EntryKind::Normal => pb::EntryKind::Normal,
       EntryKind::ConfChange => pb::EntryKind::ConfChange,
       EntryKind::Empty => pb::EntryKind::Empty,
+      EntryKind::SetReadMode => pb::EntryKind::SetReadMode,
     }),
     data: e.data_bytes(),
     timestamp: e.timestamp(),
@@ -229,6 +230,7 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
     EnumValue::Known(pb::EntryKind::Normal) => EntryKind::Normal,
     EnumValue::Known(pb::EntryKind::ConfChange) => EntryKind::ConfChange,
     EnumValue::Known(pb::EntryKind::Empty) => EntryKind::Empty,
+    EnumValue::Known(pb::EntryKind::SetReadMode) => EntryKind::SetReadMode,
     EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
   };
   Ok(
