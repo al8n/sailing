@@ -63,6 +63,8 @@ where
     // A stepped-down node no longer serves LeaseGuard reads, so drop any pending lease-refresh demand
     // (only a leader appends the refresh no-op; a re-election re-stamps the lease via its own no-op).
     self.lease_refresh_wanted = false;
+    // ...and the proactive-refresh read-activity signal (a re-election starts its own anchor afresh).
+    self.read_since_anchor = false;
     self.pending_reads.clear();
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
     self.lead_transferee = None;

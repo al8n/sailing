@@ -724,6 +724,11 @@ where
   /// committed). Never set outside LeaseGuard, so it cannot perturb Safe/LeaseBased. Reset on
   /// step-down/restart (only a leader acts on it, and a stale read re-sets it as needed).
   lease_refresh_wanted: bool,
+  /// Whether a LeaseGuard read has been served (or degraded) since the current committed anchor — the
+  /// gate for the proactive [`crate::LeaseRefresh`] modes. Set by any leader LeaseGuard read, cleared
+  /// when the leader appends a fresh current-term entry (its own re-anchor) and on step-down/restart.
+  /// A leader with NO reads since its anchor never proactively refreshes (no write amplification when idle).
+  read_since_anchor: bool,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -968,6 +973,8 @@ where
       commit_wait_inflated: false,
       // No read has found the lease stale yet (set by a degraded LeaseGuard read; only a leader acts).
       lease_refresh_wanted: false,
+      // No read since the (not-yet-existent) anchor — the proactive-refresh gate starts clear.
+      read_since_anchor: false,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),
       tracker,
