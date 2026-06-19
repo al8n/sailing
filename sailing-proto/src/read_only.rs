@@ -177,6 +177,20 @@ impl<I: NodeId> ReadOnly<I> {
     self.queue.clear();
   }
 
+  /// Update the read-mode option WITHOUT discarding in-flight accepted reads. Used by the apply-time
+  /// read-mode migration: the mode flips, but a read ALREADY accepted (added at its commit index) stays
+  /// valid and still confirms under the mode-INDEPENDENT ReadIndex heartbeat quorum. `reset` (used on
+  /// step-down / become_leader, where the term changes) instead discards them — which on a mid-term mode
+  /// flip would strand the caller or a forwarding follower on a read `read_index` had already accepted.
+  pub fn set_option(&mut self, option: ReadOnlyOption) {
+    self.option = option;
+  }
+
+  #[cfg(test)]
+  pub(crate) fn pending_len(&self) -> usize {
+    self.pending.len()
+  }
+
   /// Record a new pending read request and assign it a fresh, internally-unique **round token**.
   ///
   /// `index` is the leader's commit index at receipt.  `context` is the opaque application token

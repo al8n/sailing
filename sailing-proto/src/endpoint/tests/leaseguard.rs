@@ -4844,3 +4844,89 @@ fn pending_read_mode_recomputed_at_become_leader() {
     "the inherited uncommitted SetReadMode blocks a new migration until it applies"
   );
 }
+
+/// REGRESSION (codex R1 [high]): a YOUNG leader (now.since_origin() < Δ) into-LeaseGuard must NOT serve
+/// off the unstamped migration anchor. The Safe→LeaseGuard SetReadMode is stamped ts=0/window=0 under the
+/// OLD Safe mode; the age gate alone (now − 0 < Δ) would serve it, but the window check degrades to Safe
+/// until a stamped current-term anchor commits. (The earlier warm-up test only covered now > Δ, missing
+/// young / forced-transfer leaders.)
+#[test]
+fn young_leader_into_leaseguard_degrades_off_unstamped_anchor() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  let now = crate::Now::monotonic(t0);
+  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+    .expect("proposed");
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  // The committed anchor is the unstamped SetReadMode entry (window=0). At a YOUNG now (since_origin < Δ),
+  // where the age gate alone would serve, the read MUST still degrade — the anchor is not LeaseGuard-stamped.
+  let young = crate::Now::monotonic(Instant::ORIGIN + Duration::from_millis(5));
+  assert!(
+    !ep.lease_guard_read_live(young, &log),
+    "a young leader must NOT serve off the unstamped migration anchor (window=0)"
+  );
+}
+
+/// REGRESSION (codex R1 [medium]): applying a SetReadMode must NOT discard in-flight accepted reads
+/// (`set_option`, not `reset`). A read accepted before the flip stays pending and confirms under the
+/// mode-INDEPENDENT ReadIndex quorum, instead of stranding the caller / a forwarding follower.
+#[test]
+fn mode_flip_preserves_inflight_accepted_read() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // A read accepted (added at its commit index) and awaiting its heartbeat quorum.
+  ep.inject_pending_read_for_test(bytes::Bytes::from_static(b"r"));
+  assert_eq!(
+    ep.pending_read_count(),
+    1,
+    "the read is accepted and pending"
+  );
+  // Flip the mode; the apply must NOT discard the accepted read.
+  let now = crate::Now::monotonic(t0);
+  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+    .expect("proposed");
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert_eq!(
+    ep.pending_read_count(),
+    1,
+    "the apply-time flip must preserve the in-flight accepted read (set_option, not reset)"
+  );
+}

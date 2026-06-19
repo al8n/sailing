@@ -1168,6 +1168,19 @@ where
     self.lease_valid_until = until;
   }
 
+  #[cfg(test)]
+  pub(crate) fn inject_pending_read_for_test(&mut self, context: bytes::Bytes) {
+    let leader = self.config.id();
+    let _ = self
+      .read_only
+      .add_request(self.commit, context, None, leader);
+  }
+
+  #[cfg(test)]
+  pub(crate) fn pending_read_count(&self) -> usize {
+    self.read_only.pending_len()
+  }
+
   /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
   /// identity changes, clears reads forwarded to the previous leader (the forward target is
   /// gone; re-issue against the new belief) and emits [`LeaderChanged`](crate::LeaderChanged)
@@ -1864,10 +1877,12 @@ where
             }
           };
           self.active_read_mode = mode;
-          // Reset the read-confirmation tracker (stale pending reads must not confirm under the new
-          // discipline) and revoke any live LeaseBased lease (its granting quorum may not match the new
-          // mode) — mirror the ConfChange revocation below.
-          self.read_only.reset(mode);
+          // Update the read-mode option WITHOUT discarding in-flight accepted reads (`set_option`, NOT
+          // `reset`): a read already accepted at its commit index stays valid and still confirms under the
+          // mode-INDEPENDENT ReadIndex heartbeat quorum — clearing it (as a mid-term `reset` would) strands
+          // the caller / a forwarding follower on a read `read_index` already accepted. Still revoke any
+          // live LeaseBased lease (its granting quorum may not match the new mode) — mirror ConfChange.
+          self.read_only.set_option(mode);
           self.lease_valid_until = None;
           self.lease_acks.clear();
           self
