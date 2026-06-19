@@ -342,6 +342,11 @@ where
       // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later
       // commit (the active mode is replicated state, not static config). See spec §6.
       active_read_mode: read_only_opt,
+      // Read-mode provenance: a Some snapshot was written past a committed SetReadMode (migrated); a
+      // None/legacy snapshot is not. The committed-tail replay below (apply_committed) sets it true if a
+      // post-snapshot SetReadMode applies. A non-migrated node stays false, so its own future snapshots
+      // leave read_only absent (restart falls back to config, not the pinned active mode).
+      read_mode_migrated: snap_read_only.is_some(),
       fsm,
       role: Role::Follower,
       term: hs.term(),
