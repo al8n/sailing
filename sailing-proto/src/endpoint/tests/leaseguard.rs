@@ -4533,3 +4533,47 @@ fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
     "a poisoned node never advances commit past the inherited index"
   );
 }
+
+/// The serve dispatch and the stamp helpers read the RUNTIME `active_read_mode`, not the static
+/// `Config.read_only` — and they move in LOCKSTEP. A LeaseGuard-configured endpoint whose active mode is
+/// overridden to Safe degrades both the serve gate (`leaseguard_timing`) and the per-entry stamp
+/// (`lease_window_stamp`) together, while the static config is untouched. (Task 2 of the read-mode
+/// migration; the migration flips this runtime field apply-time, exercised directly here.)
+#[test]
+fn active_read_mode_drives_serve_and_stamp_not_config() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+
+  // Active mode seeded from the config (LeaseGuard): serve gate live, stamp carries the exact window.
+  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert!(
+    ep.leaseguard_timing().is_some(),
+    "LeaseGuard: serve gate live"
+  );
+  assert!(
+    ep.lease_window_stamp() > 0,
+    "LeaseGuard: a window is stamped"
+  );
+
+  // Override the RUNTIME mode to Safe; the static config stays LeaseGuard.
+  ep.set_active_read_mode_for_test(crate::ReadOnlyOption::Safe);
+  // Serve + stamp degrade TOGETHER off the runtime mode.
+  assert!(
+    ep.leaseguard_timing().is_none(),
+    "Safe runtime mode: the serve gate degrades"
+  );
+  assert_eq!(
+    ep.lease_window_stamp(),
+    0,
+    "Safe runtime mode: no window stamped (serve + stamp move in lockstep)"
+  );
+}

@@ -517,7 +517,7 @@ impl<I: NodeId> Config<I> {
     // remaining failover condition is `ε_unc < Δ`; a non-LeaseGuard config carrying `ε_unc` is rejected
     // because `failover_tier_valid` requires LeaseGuard mode.
     if let Some(unc) = self.bounded_clock_uncertainty
-      && !self.failover_tier_valid()
+      && !self.failover_tier_valid(self.read_only)
     {
       return Err(ConfigError::BoundedUncertaintyInvalid {
         uncertainty: unc,
@@ -537,9 +537,9 @@ impl<I: NodeId> Config<I> {
   /// comparison is vacuous). Keeping validation and the runtime gate on ONE predicate is what stops a
   /// config the crate would reject from activating the failover tier (the class of defect where
   /// `Endpoint::new` does not call `validate`).
-  pub(crate) fn failover_tier_valid(&self) -> bool {
-    self.read_only == ReadOnlyOption::LeaseGuard
-      && self.leaseguard_commit_wait_ns().is_some()
+  pub(crate) fn failover_tier_valid(&self, mode: ReadOnlyOption) -> bool {
+    mode == ReadOnlyOption::LeaseGuard
+      && self.leaseguard_commit_wait_ns(mode).is_some()
       && matches!(
         (self.bounded_clock_uncertainty, self.lease_duration),
         (Some(unc), Some(d)) if unc < d
@@ -596,8 +596,8 @@ impl<I: NodeId> Config<I> {
   /// The EXACT LeaseGuard commit-wait window (nanos) when the mode is ACTIVE and the config is valid,
   /// else `None`. The single source of truth that the per-entry stamp, the read fast-path, and the
   /// commit-wait all gate on.
-  pub(crate) fn leaseguard_commit_wait_ns(&self) -> Option<u64> {
-    if self.read_only != ReadOnlyOption::LeaseGuard {
+  pub(crate) fn leaseguard_commit_wait_ns(&self, mode: ReadOnlyOption) -> Option<u64> {
+    if mode != ReadOnlyOption::LeaseGuard {
       return None;
     }
     self.leaseguard_window_result().ok()

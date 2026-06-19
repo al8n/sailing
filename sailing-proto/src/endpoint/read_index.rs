@@ -260,7 +260,7 @@ where
   /// timing-invalid, or `ε_unc ≥ Δ` config must degrade to Safe, not serve). Gates the synchronized-wall
   /// stamp, the precise commit-anchor, AND the inherited-read serve.
   pub(crate) fn failover_tier_active(&self) -> bool {
-    self.config.failover_tier_valid()
+    self.config.failover_tier_valid(self.active_read_mode)
   }
 
   /// The FAILOVER inherited-read offer: while this freshly elected leader holds the post-election
@@ -312,7 +312,7 @@ where
     from: Option<I>,
   ) {
     let commit = self.commit;
-    match self.config.read_only() {
+    match self.active_read_mode {
       crate::ReadOnlyOption::Safe => {
         self.do_safe_read(now, context, from);
       }
