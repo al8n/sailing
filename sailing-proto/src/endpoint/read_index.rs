@@ -176,6 +176,41 @@ where
       < delta
   }
 
+  /// Whether the committed LeaseGuard anchor is WITHIN a refresh margin of expiring — the trigger for the
+  /// proactive [`crate::LeaseRefresh::OnExpiry`] refresh. The dual of [`Self::lease_guard_read_live`]:
+  /// that gate serves while `age < Δ`; this one fires once `age + margin >= Δ`, i.e. the anchor would
+  /// expire within `margin = 2 · heartbeat_interval` — enough for a refresh no-op to replicate and commit
+  /// BEFORE the old anchor dies. Identical anchor fetch + current-term gate + age formula as the read
+  /// gate, so a refresh can never disagree with the read about which anchor is live. Fails CLOSED (no
+  /// refresh) on the same conditions: inactive/invalid timing, no/compacted anchor, a prior-term anchor,
+  /// or a storage fault (which poisons). When `margin >= Δ` (a very short lease) it reports near-expiry
+  /// from age 0, so `OnExpiry` approaches `Continuous` — acceptable, a lease that short needs it.
+  pub(crate) fn lease_near_expiry<L: LogStore>(&mut self, now: crate::Now, log: &L) -> bool {
+    let Some((delta, _drift)) = self.leaseguard_timing() else {
+      return false;
+    };
+    let (term, ts) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
+      Ok(s) => match s.first() {
+        Some(e) => (e.term(), e.timestamp()),
+        None => return false,
+      },
+      Err(_) => {
+        self.poison(PoisonReason::LogRead);
+        return false;
+      }
+    };
+    if term != self.term {
+      return false;
+    }
+    let margin = self.config.heartbeat_interval().saturating_mul(2);
+    now
+      .mono()
+      .since_origin()
+      .saturating_sub(core::time::Duration::from_nanos(ts))
+      .saturating_add(margin)
+      >= delta
+  }
+
   /// FAILOVER inherited-read lease-live gate: the committed anchor `log[c]` (captured at election as
   /// [`committed_anchor_wall`](Self::committed_anchor_wall) `= s_c` and
   /// [`committed_anchor_window`](Self::committed_anchor_window) `= W_c`) is provably still un-overwritten
