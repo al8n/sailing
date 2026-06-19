@@ -164,7 +164,7 @@ fn vopr_exercises_leaseguard_under_drift() {
   );
 }
 
-/// The FAILOVER sub-mode of the LeaseGuard read mode, end-to-end: seeds 28, 33, and 52 draw a LeaseGuard
+/// The FAILOVER OFFSET sub-mode of the LeaseGuard read mode, end-to-end: seeds 107, 159, and 167 draw a LeaseGuard
 /// run with `bounded_clock_uncertainty` armed, a SYNCHRONIZED wall supplied to every proto call, and a
 /// per-node bounded wall OFFSET that re-syncs across the run (modelling NTP steps, incl. backward ones).
 /// Each must run the whole adversarial schedule WITHOUT a safety / read-linearizability / liveness panic
@@ -175,7 +175,10 @@ fn vopr_exercises_leaseguard_under_drift() {
 /// `precise_releases` witnesses fall to zero as the schedule evolves.
 #[test]
 fn vopr_exercises_failover_precise_anchor_under_offset() {
-  for seed in [28u64, 33, 52] {
+  // OFFSET (valid-skew, non-asymmetric) failover seeds. The `offset_resyncs > 0` assertion below doubles
+  // as the C1 guard: if a coin/rotation change ever flips one of these to the asymmetric sub-mode it draws
+  // `violating_resyncs` instead and this test fails LOUDLY rather than silently losing offset coverage.
+  for seed in [107u64, 159, 167] {
     let r = run_vopr(seed, 1_500);
     assert!(
       r.failover && !r.drifted,
@@ -195,6 +198,53 @@ fn vopr_exercises_failover_precise_anchor_under_offset() {
     assert!(
       r.committed > 0,
       "failover seed {seed} committed nothing — vacuous (report={r:?})"
+    );
+  }
+}
+
+/// The FAILOVER ASYMMETRIC sub-mode, end-to-end: seeds 52, 67, 186 draw a LeaseGuard failover run that
+/// injects a BACKWARD-only clock-CONTRACT violation (a node's wall jumped past −ε_unc; the forward side
+/// stays in-contract so no anchor inflates). Each must run the whole adversarial schedule SOUNDLY: no
+/// `read-value-linearizability` panic (the run completing IS the assertion — a stale inherited serve would
+/// panic like any other), the injection actually FIRED (`violating_resyncs > 0`, the asymmetric-sub-mode
+/// witness), the inherited-serve path was REACHED under the violation (`inherited_serves > 0`), and
+/// LIVENESS held (`committed > 0` — the gross clock violation did not starve the cluster).
+///
+/// It does NOT try to CATCH a stale serve in-band (there is no record-caught suppression — a stale
+/// inherited serve always panics). A multi-expert audit proved a stale inherited serve is STRUCTURALLY
+/// UNREACHABLE in a random run via a clock-offset injection: the inherited-serve window holder is ALWAYS a
+/// live Leader still inside its post-election commit-wait, and the serve gate (`now_wall + 2·ε_unc < s_c +
+/// W_c`) and the release gate (`now_wall > s_c + W_c + 2·ε_unc`) are exact DUALS on the same wall floor —
+/// so any backward wall low enough to hold the window open is by the same inequality low enough to wedge
+/// that leader's OWN commit-wait (a livelock): enough-to-catch == enough-to-starve, with no third wall
+/// value (`0` is `Wall::ABSENT`). The cross-successor undercut (a window-open stale leader while a
+/// successor commits the key past `cidx`) is a split-brain single-instant coincidence the schedule
+/// essentially never hits (measured: 22 opportunity node-ticks over ~1.5M). So a stale serve here simply
+/// never occurs; the DETECTION that the oracle CATCHES one is proven, soundly and deterministically, by
+/// `value_oracle_panics_on_stale_inherited_serve`. THIS test is the randomized STRUCTURAL coverage that
+/// the violation injection runs without breaking the cluster.
+#[test]
+fn vopr_exercises_asymmetric_wall_injection() {
+  for seed in [52u64, 67, 186] {
+    let r = run_vopr(seed, 1_500);
+    assert!(
+      r.failover,
+      "seed {seed} was expected to draw the LeaseGuard FAILOVER sub-mode but did not (report={r:?})"
+    );
+    assert!(
+      r.violating_resyncs > 0,
+      "asymmetric seed {seed} never fired a violating resync — the backward-violation injection did not \
+       run (the asymmetric sub-coin moved; re-derive the seed set) (report={r:?})"
+    );
+    assert!(
+      r.inherited_serves > 0,
+      "asymmetric seed {seed} never reached the inherited-serve path under the violation — the \
+       backward-violating wall never met the inherited-serve path (report={r:?})"
+    );
+    assert!(
+      r.committed > 0,
+      "asymmetric seed {seed} committed nothing — the gross clock violation starved the cluster, or the \
+       run is vacuous (report={r:?})"
     );
   }
 }
@@ -244,6 +294,68 @@ fn resync_offsets_is_total_at_the_max_bound() {
     // No panic/wrap, and the magnitude never exceeds the bound (max_abs_offset would panic on i64::MIN).
     assert!(c.max_abs_offset() <= eps_ns as i64);
   }
+}
+
+/// `resync_offsets_violating` draws BACKWARD-only: every offset stays `≤ +ε_unc` (forward in-contract, so
+/// no node inflates an anchor) while the backward tail can exceed `−ε_unc` (the injected violation), all
+/// within `[−factor·ε_unc, +ε_unc]`. Over many draws a genuine backward violation MUST appear.
+#[test]
+fn resync_offsets_violating_is_backward_only() {
+  let mut c = crate::Cluster::new_async(5, 11);
+  let eps_ns = 50_000_000i64; // 50ms
+  c.enable_failover_clock(core::time::Duration::from_nanos(eps_ns as u64));
+  let mut prng = crate::store::FaultPrng::new(0x5151);
+  let mut saw_backward_violation = false;
+  for _ in 0..256 {
+    c.resync_offsets_violating(&mut prng, 3);
+    let offs = c.clock_offsets();
+    let min = *offs.iter().min().unwrap();
+    let max = *offs.iter().max().unwrap();
+    assert!(min >= -3 * eps_ns, "offset below the −3·ε_unc floor: {min}");
+    assert!(
+      max <= eps_ns,
+      "offset above +ε_unc — the forward side must stay in-contract so no anchor inflates: {max}"
+    );
+    if min < -eps_ns {
+      saw_backward_violation = true; // a genuine backward contract violation occurred
+    }
+  }
+  assert!(
+    saw_backward_violation,
+    "256 violating draws never produced a backward violation (offset < −ε_unc)"
+  );
+}
+
+/// `resync_offsets_violating` is TOTAL at the boundary the precondition admits: `ε = i64::MAX / MAX_FACTOR`
+/// with `factor = MAX_FACTOR` makes `factor·ε = i64::MAX` exactly — the draw must not wrap or panic.
+#[test]
+fn resync_offsets_violating_is_total_at_the_max_bound() {
+  let mut c = crate::Cluster::new_async(4, 3);
+  let eps_ns = (i64::MAX / 4) as u64;
+  c.enable_failover_clock(core::time::Duration::from_nanos(eps_ns));
+  let mut prng = crate::store::FaultPrng::new(0xF00D);
+  let lo = -(4i128) * eps_ns as i128;
+  let hi = eps_ns as i128;
+  for _ in 0..256 {
+    c.resync_offsets_violating(&mut prng, 4); // factor·ε = i64::MAX, the boundary
+    // No panic / wrap: every offset stays in the exact [−4·ε, +ε] range (a wrapped cast would escape it).
+    assert!(
+      c.clock_offsets()
+        .iter()
+        .all(|&o| (o as i128) >= lo && (o as i128) <= hi)
+    );
+  }
+}
+
+/// `resync_offsets_violating` REJECTS a `factor·ε_unc` past `i64::MAX` at the call, rather than wrapping
+/// the `as i64` cast mid-draw (the H4 totality precondition).
+#[test]
+#[should_panic(expected = "factor*eps_unc must be in")]
+fn resync_offsets_violating_rejects_overflowing_factor() {
+  let mut c = crate::Cluster::new_async(3, 5);
+  c.enable_failover_clock(core::time::Duration::from_nanos(i64::MAX as u64));
+  let mut prng = crate::store::FaultPrng::new(1);
+  c.resync_offsets_violating(&mut prng, 4); // 4·i64::MAX > i64::MAX → panics at the precondition
 }
 
 /// A FAILOVER run is DETERMINISTIC: the same (seed, ticks) replays to a byte-identical report AND
@@ -556,7 +668,7 @@ fn value_oracle_panics_on_stale_inherited_serve() {
       key: GAP_KEY,
       v_inv: V_NEW,
     },
-    is_inherited_serve: true, // the inherited-serve path — what the asymmetric mode catches
+    is_inherited_serve: true, // the inherited-serve path — the failover serve the oracle must catch
   });
   let mut report = VoprReport::default();
   ledger.scan(&c, &mut report, 0xBEEF);
