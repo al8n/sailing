@@ -68,11 +68,11 @@ fn leaseguard_leader_stamps_appended_entries() {
   );
 }
 
-/// The proactive-refresh read-activity signal: a LeaseGuard read sets `read_since_anchor`; a fresh
-/// leader append (the leader's own re-anchor) clears it; and a step-down clears it. This is the gate
-/// that keeps an idle leader (no reads) from proactively refreshing.
+/// The proactive-refresh read-activity signal: a LeaseGuard read sets `read_since_anchor`; COMMITTING a
+/// fresh current-term entry (the leader's own re-anchor) clears it — an un-committed append does NOT; and
+/// a step-down clears it. This is the gate that keeps an idle leader (no reads) from proactively refreshing.
 #[test]
-fn read_since_anchor_set_on_read_cleared_on_append_and_stepdown() {
+fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
   let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
@@ -123,7 +123,7 @@ fn read_since_anchor_set_on_read_cleared_on_append_and_stepdown() {
   while ep.poll_event().is_some() {}
   while ep.poll_message().is_some() {}
 
-  // The election no-op's own append cleared the signal — a fresh leader has no read activity yet.
+  // A fresh leader has no read activity yet — the signal starts unset.
   assert!(!ep.read_since_anchor());
 
   // A LeaseGuard read (served or degraded) sets it.
@@ -135,12 +135,36 @@ fn read_since_anchor_set_on_read_cleared_on_append_and_stepdown() {
     "a LeaseGuard read sets read_since_anchor"
   );
 
-  // The leader appending a fresh entry (a no-op = its own re-anchor) clears it.
+  // An un-committed leader append does NOT clear the signal — the lease re-anchors when that entry
+  // COMMITS, not when it is appended (clearing at append would let a read in the append->commit window
+  // survive into the new anchor; see read_in_refresh_inflight_window_does_not_cause_extra_refresh).
   let last = log.last_index();
   ep.append_leader_noop(crate::Now::monotonic(now), &mut log, last);
   assert!(
+    ep.read_since_anchor(),
+    "an un-committed append must NOT clear read_since_anchor"
+  );
+  // Commit the no-op (persist on the leader + a quorum ack) → the committed anchor advances and clears it.
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(crate::AppendResp::new(
+      crate::Term::new(1),
+      2u64,
+      false,
+      crate::Index::ZERO,
+      crate::Term::ZERO,
+      crate::Index::new(2),
+    )),
+  );
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  assert!(
     !ep.read_since_anchor(),
-    "a leader append re-anchors and clears read_since_anchor"
+    "committing the fresh current-term anchor clears read_since_anchor"
   );
 
   // Set it once more, then a step-down clears it.
@@ -338,6 +362,85 @@ fn continuous_refresh_is_heartbeat_paced() {
   assert!(
     log.last_index() > before,
     "Continuous refreshes once the heartbeat is due"
+  );
+}
+
+/// A LeaseGuard read arriving in the WINDOW between a refresh no-op's APPEND and its COMMIT must not
+/// survive into the freshly-committed anchor and trigger an extra idle no-op after reads stop. The signal
+/// is cleared at the anchor's COMMIT, so the in-window read is consumed and a quiesced leader emits no
+/// further refreshes.
+#[test]
+fn read_in_refresh_inflight_window_does_not_cause_extra_refresh() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_lease_refresh(crate::LeaseRefresh::Continuous);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Self-elect (single voter) and commit the election no-op.
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // A read arms the signal against the committed anchor.
+  ep.read_index(t0, &log, &stable, bytes::Bytes::from_static(b"r1"))
+    .expect("leader accepts the read");
+  assert!(ep.read_since_anchor());
+  let anchor = log.last_index();
+
+  // Due heartbeat → the proactive refresh APPENDS a no-op (still pending storage; commit has not moved).
+  let hb = t0 + Duration::from_millis(100);
+  ep.handle_timeout(hb, &mut log, &mut stable);
+  assert_eq!(
+    log.last_index(),
+    anchor.next(),
+    "the due heartbeat appended a refresh no-op"
+  );
+  assert!(
+    ep.read_since_anchor(),
+    "the un-committed append must NOT clear the signal"
+  );
+
+  // A read in the [append, commit) window re-arms the signal against the still-current OLD anchor.
+  ep.read_index(hb, &log, &stable, bytes::Bytes::from_static(b"r2"))
+    .expect("leader accepts the in-window read");
+  assert!(ep.read_since_anchor());
+
+  // Commit the refresh no-op → the anchor advances → the in-window read is consumed (signal clears).
+  ep.handle_storage(hb, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  assert!(
+    !ep.read_since_anchor(),
+    "committing the new anchor clears the in-window read"
+  );
+
+  // Reads stop. Drive several heartbeats (the lease even expires) — NO further no-op fires.
+  let after = log.last_index();
+  for k in 2..8u64 {
+    let t = t0 + Duration::from_millis(100 * k);
+    ep.handle_timeout(t, &mut log, &mut stable);
+    ep.handle_storage(t, &mut log, &mut stable);
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+  }
+  assert_eq!(
+    log.last_index(),
+    after,
+    "an in-flight-window read must not survive the commit and cause an extra idle refresh"
   );
 }
 
