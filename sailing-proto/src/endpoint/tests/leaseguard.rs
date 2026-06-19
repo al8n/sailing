@@ -4604,8 +4604,8 @@ fn read_mode_flips_at_apply_not_append() {
   assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::Safe);
   let now = crate::Now::monotonic(t0);
   let idx = ep
-    .append_set_read_mode_for_test(now, &mut log, crate::ReadOnlyOption::LeaseGuard)
-    .expect("appended");
+    .propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+    .expect("proposed");
   assert_eq!(
     ep.active_read_mode(),
     crate::ReadOnlyOption::Safe,
@@ -4653,7 +4653,8 @@ fn into_leaseguard_warms_up_to_safe() {
   while ep.poll_message().is_some() {}
 
   let now = crate::Now::monotonic(t0);
-  ep.append_set_read_mode_for_test(now, &mut log, crate::ReadOnlyOption::LeaseGuard);
+  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+    .expect("proposed");
   ep.handle_storage(t0, &mut log, &mut stable);
   assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
   // The committed anchor is the SetReadMode entry, stamped ts=0 under Safe → no live lease yet.
@@ -4699,11 +4700,147 @@ fn flip_revokes_leasebased_lease() {
   ep.set_lease_valid_until_for_test(Some(t0 + Duration::from_secs(10)));
   assert!(ep.lease_valid_until_for_test().is_some());
   let now = crate::Now::monotonic(t0);
-  ep.append_set_read_mode_for_test(now, &mut log, crate::ReadOnlyOption::LeaseGuard);
+  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+    .expect("proposed");
   ep.handle_storage(t0, &mut log, &mut stable);
   assert_eq!(
     ep.lease_valid_until_for_test(),
     None,
     "the apply-time flip revokes the LeaseBased lease"
+  );
+}
+
+/// A proposal to a mode this leader is not configured for is rejected at propose time (nothing appended).
+#[test]
+fn propose_rejects_unconfigured_target() {
+  // A Safe leader with NO LeaseGuard knobs and NO check_quorum.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  let now = crate::Now::monotonic(t0);
+  assert_eq!(
+    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard),
+    Err(crate::ProposeError::InvalidReadMode),
+    "into-LeaseGuard without a configured lease window is rejected"
+  );
+  assert_eq!(
+    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseBased),
+    Err(crate::ProposeError::InvalidReadMode),
+    "into-LeaseBased without check_quorum is rejected"
+  );
+  assert!(
+    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::Safe)
+      .is_ok(),
+    "into-Safe always validates"
+  );
+}
+
+/// Only one read-mode migration may be in flight at a time (mirror pending_conf_index).
+#[test]
+fn one_read_mode_change_in_flight() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  let now = crate::Now::monotonic(t0);
+  assert!(
+    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+      .is_ok(),
+    "the first migration is accepted"
+  );
+  assert_eq!(
+    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::Safe),
+    Err(crate::ProposeError::ReadModeChangeInFlight),
+    "a second migration before the first applies is rejected"
+  );
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(
+    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::Safe)
+      .is_ok(),
+    "a new migration is accepted once the prior one applies"
+  );
+}
+
+/// become_leader recomputes pending_read_mode_index to the last log index, so an inherited uncommitted
+/// SetReadMode in a fresh leader's tail blocks a new migration until it commits-and-applies.
+#[test]
+fn pending_read_mode_recomputed_at_become_leader() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  // Durable log: a committed Empty at 1, an UNCOMMITTED SetReadMode at 2 (commit = 1).
+  log.force_append(&[
+    crate::Entry::new(
+      crate::Term::new(1),
+      crate::Index::new(1),
+      crate::EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    crate::Entry::new(
+      crate::Term::new(1),
+      crate::Index::new(2),
+      crate::EntryKind::SetReadMode,
+      bytes::Bytes::copy_from_slice(&[crate::ReadOnlyOption::Safe.as_u8()]),
+    ),
+  ]);
+  stable.force_state(crate::Term::new(1), Some(1u64), crate::Index::new(1));
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  // Win the election (single voter), inheriting the uncommitted SetReadMode at index 2.
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  let now = crate::Now::monotonic(t0);
+  assert_eq!(
+    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard),
+    Err(crate::ProposeError::ReadModeChangeInFlight),
+    "the inherited uncommitted SetReadMode blocks a new migration until it applies"
   );
 }

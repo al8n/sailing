@@ -15,6 +15,15 @@ pub enum ProposeError<I> {
   /// committed and applied.
   #[error("a conf change is already in flight")]
   ConfChangeInFlight,
+  /// A previous read-mode migration is still in flight (not yet applied). Only one `SetReadMode` entry
+  /// may be pending at a time — propose another after the first is committed and applied.
+  #[error("a read-mode change is already in flight")]
+  ReadModeChangeInFlight,
+  /// The proposed read mode requires knobs this leader lacks: into-LeaseGuard needs a valid lease window
+  /// (`lease_duration` + `clock_drift_bound`), into-LeaseBased needs `check_quorum`. Rejected at propose
+  /// time — nothing appended — rather than committed and then degrading to Safe everywhere.
+  #[error("the target read mode requires knobs this node lacks")]
+  InvalidReadMode,
   /// A leader transfer is in progress; the leader is not accepting new proposals until
   /// the transfer completes or times out.
   #[error("a leader transfer is in progress")]

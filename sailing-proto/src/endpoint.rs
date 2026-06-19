@@ -13,6 +13,7 @@ mod election;
 mod membership;
 mod persistence;
 mod read_index;
+mod read_mode;
 mod replication;
 mod restart;
 mod snapshot;
@@ -834,6 +835,11 @@ where
   /// the one-in-flight guard will be permissive (ZERO <= applied), but correctness is maintained
   /// because the entry will still be applied exactly once in `apply_committed`.
   pending_conf_index: Index,
+  /// The index of the last appended `SetReadMode` entry — the one-in-flight guard for read-mode
+  /// migrations (mirror [`pending_conf_index`](Self::pending_conf_index)). `> applied` ⇒ a migration is
+  /// still in flight; recomputed to `last` at `become_leader` so an inherited uncommitted SetReadMode in a
+  /// fresh leader's tail blocks a new proposal until it commits-and-applies.
+  pending_read_mode_index: Index,
   /// ReadIndex tracking (pending reads, heartbeat-ack sets, confirmed read states).
   read_only: ReadOnly<I>,
   /// The ACTIVE read mode the serve dispatch + stamp helpers consult. Seeded from `config.read_only()`,
@@ -1013,6 +1019,7 @@ where
       term_gated_append_ack: None,
       term_gated_snapshot_ack: None,
       pending_conf_index: Index::ZERO,
+      pending_read_mode_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
       // Fresh node: boot epoch 0. A later restart provides a strictly-higher epoch, so this
