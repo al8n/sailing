@@ -150,9 +150,9 @@ where
     // same-clock (no skew) — AND still within Δ. The current-term check keeps the no-skew guarantee
     // LOCAL here rather than relying solely on the caller's `has_current_term_commit` gate. A storage
     // read failure poisons and fails closed (an absent index answers `Ok` empty, not `Err`).
-    let (term, ts) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
+    let (term, ts, window) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
       Ok(s) => match s.first() {
-        Some(e) => (e.term(), e.timestamp()),
+        Some(e) => (e.term(), e.timestamp(), e.lease_window()),
         None => return false,
       },
       Err(_) => {
@@ -161,6 +161,16 @@ where
       }
     };
     if term != self.term {
+      return false;
+    }
+    // The anchor must be LeaseGuard-STAMPED: a `lease_window` of 0 marks a NON-LeaseGuard entry — a
+    // Safe/LeaseBased entry, or (the migration hazard) a Safe→LeaseGuard `SetReadMode` created under the
+    // OLD Safe mode (timestamp=0, window=0). Without this the age formula below reads `timestamp=0` as a
+    // stamp at the monotonic ORIGIN and serves a YOUNG leader (now.since_origin() < Δ — e.g. just after a
+    // forced transfer, before an election timeout has elapsed) off an anchor that carries NO lease, with
+    // no window for a successor to wait on. Degrade to the safe round until a fresh LeaseGuard-stamped
+    // current-term entry commits (the into-LeaseGuard warm-up).
+    if window == 0 {
       return false;
     }
     // The lease is live iff the entry's age is below Δ — equivalently `ts + Δ > now`. STRICT (`<`):
@@ -191,9 +201,9 @@ where
     let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
     };
-    let (term, ts) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
+    let (term, ts, window) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
       Ok(s) => match s.first() {
-        Some(e) => (e.term(), e.timestamp()),
+        Some(e) => (e.term(), e.timestamp(), e.lease_window()),
         None => return false,
       },
       Err(_) => {
@@ -203,6 +213,13 @@ where
     };
     if term != self.term {
       return false;
+    }
+    // The strict DUAL of the read gate's window check (so the refresh can NEVER disagree with the read
+    // about a live anchor): an unstamped anchor (`lease_window == 0`, e.g. a Safe→LeaseGuard migration
+    // entry) is treated as expiring NOW, so the proactive refresh appends a fresh LeaseGuard-stamped
+    // no-op to warm up — exactly when the read gate above degrades off the same anchor.
+    if window == 0 {
+      return true;
     }
     let margin = self.config.heartbeat_interval().saturating_mul(2);
     now
