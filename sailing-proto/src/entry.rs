@@ -12,6 +12,9 @@ pub enum EntryKind {
   ConfChange,
   /// A leader's no-op entry, appended on election.
   Empty,
+  /// A committed read-mode migration, applied by the core at apply-time (like `ConfChange`). The
+  /// payload is the target [`crate::ReadOnlyOption`] as a canonical byte.
+  SetReadMode,
 }
 
 impl EntryKind {
@@ -21,6 +24,7 @@ impl EntryKind {
       Self::Normal => "normal",
       Self::ConfChange => "conf_change",
       Self::Empty => "empty",
+      Self::SetReadMode => "set_read_mode",
     }
   }
 }
