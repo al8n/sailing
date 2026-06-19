@@ -430,6 +430,34 @@ where
     Some(noop_index)
   }
 
+  /// Append a committed-pending `SetReadMode` entry (test-only injector for the apply-time flip, before
+  /// the public `propose_read_mode_change` lands). Mirrors `append_leader_noop`: stamps under the CURRENT
+  /// active mode (so a Safe→LeaseGuard entry is ts=0, the warm-up), then drives commit via the usual path.
+  #[cfg(test)]
+  pub(crate) fn append_set_read_mode_for_test<L: LogStore>(
+    &mut self,
+    now: crate::Now,
+    log: &mut L,
+    mode: crate::ReadOnlyOption,
+  ) -> Option<crate::Index> {
+    let idx = Self::next_log_index(log.last_index())?;
+    let entry = crate::Entry::new(
+      self.term,
+      idx,
+      crate::EntryKind::SetReadMode,
+      bytes::Bytes::copy_from_slice(&[mode.as_u8()]),
+    )
+    .with_timestamp(self.lease_stamp(now.mono()))
+    .with_lease_window(self.lease_window_stamp())
+    .with_wall_timestamp(self.lease_wall_stamp(now));
+    let opid = self.mint_op_id();
+    self.submit_append(log, opid, core::slice::from_ref(&entry));
+    self
+      .pending
+      .insert(opid, Pending::LeaderAppend { upto: idx });
+    Some(idx)
+  }
+
   /// The committed anchor `log[commit]` at election — its EXACT `(wall_timestamp, lease_window)` =
   /// `(s_c, W_c)` — for the inherited-read SERVE gate ([`failover_read_window`](Self::failover_read_window)).
   /// Stale-HIGH here would serve past a dead lease (UNSAFE), so both are exact-or-fail-closed: `(0, 0)`
