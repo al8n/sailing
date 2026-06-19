@@ -39,7 +39,10 @@ pub enum ReadOnlyOption {
   /// proto fields, can leave a successor's commit-wait under-sized (a stale read). The duplicate
   /// AppendEntries / snapshot RUNTIME paths fold a newly-visible window defensively, but durable
   /// survival across a restart of a stripped window is the operator's responsibility — like
-  /// `LeaseBased`'s bounded-drift contract, mid-life migration is out of scope (see WIRE.md).
+  /// `LeaseBased`'s bounded-drift contract, mid-life WIRE-FORMAT migration (retrofitting these fields
+  /// onto a running cluster) is out of scope (see WIRE.md). Changing the read MODE itself on a running
+  /// cluster (Safe ↔ LeaseBased ↔ LeaseGuard) IS supported when the target's knobs are pre-provisioned —
+  /// see [`Endpoint::propose_read_mode_change`](crate::Endpoint::propose_read_mode_change).
   LeaseGuard,
 }
 
@@ -144,7 +147,10 @@ pub struct Config<I> {
   /// When `true`, a follower that receives a `Propose` request does not forward it to the
   /// leader; it returns `NotLeader` immediately. Default: `false`.
   disable_proposal_forwarding: bool,
-  /// How linearizable read-only queries are satisfied. Default: [`ReadOnlyOption::Safe`].
+  /// How linearizable read-only queries are satisfied — the GENESIS default and knob source. The LIVE
+  /// serving mode is recovered from replicated state and migrates at runtime via a committed `SetReadMode`
+  /// (see [`Endpoint::propose_read_mode_change`](crate::Endpoint::propose_read_mode_change)); this field
+  /// stays the immutable construction seed. Default: [`ReadOnlyOption::Safe`].
   read_only: ReadOnlyOption,
   /// When (if ever) a LeaseGuard leader proactively re-anchors its read lease with a no-op so reads do
   /// not pay a Safe round after the lease ages. Only meaningful under `LeaseGuard`. Default:
@@ -416,7 +422,8 @@ impl<I: NodeId> Config<I> {
     self
   }
 
-  /// How linearizable read-only queries are satisfied.
+  /// The GENESIS read mode (the construction default + knob source) — NOT the live serving mode after a
+  /// runtime migration, which is [`Endpoint::active_read_mode`](crate::Endpoint::active_read_mode).
   #[inline(always)]
   pub const fn read_only(&self) -> ReadOnlyOption {
     self.read_only
