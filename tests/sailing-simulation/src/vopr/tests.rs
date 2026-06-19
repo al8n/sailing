@@ -878,3 +878,46 @@ fn value_oracle_panics_on_served_value_below_compacted_floor() {
   // Drains the deferred check: observed (stale, < V_COMPACTED) < v_inv (V_COMPACTED) → the panic.
   ledger.scan(&c, &mut report, 0xCAFE);
 }
+
+/// The proactive lease-refresh modes, end-to-end: the sweep draws `Off`, `OnExpiry`, AND `Continuous`
+/// LeaseGuard runs; every run stays read-linearizable (the sweep COMPLETING is the safety assertion — a
+/// stale serve panics in the value/index oracle); and a proactive run still commits (liveness). This is
+/// the randomized proof that adding proactive no-ops under reads never breaks linearizability. The refresh
+/// GATING and the no-op FIRING themselves are unit-tested in `sailing-proto`
+/// (`read_since_anchor_set_on_read_cleared_on_append_and_stepdown`, `lease_near_expiry_fires_within_margin_of_delta`).
+#[test]
+fn vopr_exercises_lease_refresh_modes() {
+  use sailing_proto::LeaseRefresh::{Continuous, Off, OnExpiry};
+  let (mut saw_off, mut saw_on_expiry, mut saw_continuous) = (false, false, false);
+  let mut progressed_under_proactive = false;
+  for seed in 0..256u64 {
+    let r = run_vopr_refresh(seed, 500);
+    match r.lease_refresh {
+      Off => saw_off = true,
+      OnExpiry => {
+        saw_on_expiry = true;
+        progressed_under_proactive |= r.committed > 0;
+      }
+      Continuous => {
+        saw_continuous = true;
+        progressed_under_proactive |= r.committed > 0;
+      }
+    }
+  }
+  assert!(
+    saw_off,
+    "no seed in 0..256 stayed LeaseRefresh::Off (the bit-identical default)"
+  );
+  assert!(
+    saw_on_expiry,
+    "no seed in 0..256 exercised LeaseRefresh::OnExpiry"
+  );
+  assert!(
+    saw_continuous,
+    "no seed in 0..256 exercised LeaseRefresh::Continuous"
+  );
+  assert!(
+    progressed_under_proactive,
+    "a proactive-refresh run must still commit (liveness held under the extra no-ops)"
+  );
+}

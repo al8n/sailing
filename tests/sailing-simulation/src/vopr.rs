@@ -223,6 +223,10 @@ pub struct VoprReport {
   /// re-syncs across the run. The mutually-exclusive alternative to `drifted` within the LeaseGuard
   /// read mode (a failover run carries the wall + offset; a drift run carries rate drift + no wall).
   pub failover: bool,
+  /// The proactive lease-refresh mode this run configured on its LeaseGuard nodes. `Off` for every
+  /// non-LeaseGuard run and for the demand-driven default; `OnExpiry` / `Continuous` re-anchor the lease
+  /// under reads (extra no-ops the read oracle still proves linearizable).
+  pub lease_refresh: sailing_proto::LeaseRefresh,
   /// Number of NTP re-sync events fired (each re-draws every node's wall offset within `±ε_unc`). `0`
   /// outside the failover sub-mode. A determinism-fingerprinted behavioral counter.
   pub offset_resyncs: u64,
@@ -703,6 +707,21 @@ impl ReadLedger {
 /// progress within a generous bound), or a quiesce failure (a fully-healed cluster failed to
 /// converge / apply the committed history).
 pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
+  run_vopr_inner(seed, ticks, false)
+}
+
+/// Like [`run_vopr`] but additionally draws the proactive [`sailing_proto::LeaseRefresh`] sub-coin on
+/// LeaseGuard runs, so reads are served while the leader re-anchors its lease under `OnExpiry` /
+/// `Continuous`. A SEPARATE entry (not folded into `run_vopr`) so the broad sweeps AND the
+/// drift/failover/offset/asymmetric non-vacuity pins stay on the demand-driven `Off` default — the extra
+/// no-ops shift timing-sensitive paths (e.g. the superseded-leader serve), which would silently vacate
+/// that coverage. Only the dedicated lease-refresh coverage opts into the volume.
+#[cfg(test)]
+pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
+  run_vopr_inner(seed, ticks, true)
+}
+
+fn run_vopr_inner(seed: u64, ticks: usize, draw_refresh: bool) -> VoprReport {
   // The single master PRNG. Every draw in the run comes from here (deterministic from `seed`).
   let mut prng = FaultPrng::new(seed ^ 0x564F_5052_5F5F_5631); // "VOPR__V1"
 
@@ -758,6 +777,20 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
   } else {
     (false, 0)
   };
+  // LEASE-REFRESH sub-coin: a DEDICATED sub-seed (drawn ONLY when LeaseGuard, `read_mode == 3`) selects the
+  // proactive lease-refresh mode, so every non-LeaseGuard run AND the demand-driven `Off` default stay
+  // bit-identical. `OnExpiry` / `Continuous` re-anchor the lease under reads (extra no-ops); the read
+  // oracle proves they stay linearizable and the determinism guard proves they replay.
+  let lease_refresh = if draw_refresh && read_mode == 3 {
+    let mut p = FaultPrng::new(seed.rotate_left(16) ^ 0x4C53_5246_5253_4831); // "LSRFRSH1"
+    match p.next_u64() % 3 {
+      1 => sailing_proto::LeaseRefresh::OnExpiry,
+      2 => sailing_proto::LeaseRefresh::Continuous,
+      _ => sailing_proto::LeaseRefresh::Off,
+    }
+  } else {
+    sailing_proto::LeaseRefresh::Off
+  };
   let mut c = Cluster::new_async_with(size, seed, move |cfg| {
     let cfg = cfg.with_pre_vote(true);
     match read_mode {
@@ -776,7 +809,8 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
         let cfg = cfg
           .with_read_only(sailing_proto::ReadOnlyOption::LeaseGuard)
           .with_lease_duration(LEASEGUARD_DELTA)
-          .with_clock_drift_bound(LEASEGUARD_EPS);
+          .with_clock_drift_bound(LEASEGUARD_EPS)
+          .with_lease_refresh(lease_refresh);
         // The failover sub-mode arms the precise commit-anchor (ε_unc); the drift sub-mode leaves it off.
         if failover {
           cfg.with_bounded_clock_uncertainty(LEASEGUARD_EPS_UNC)
@@ -850,6 +884,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     seed,
     drifted,
     failover,
+    lease_refresh,
     final_cluster_size: size,
     ..VoprReport::default()
   };
@@ -1321,9 +1356,50 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
   // apply-everywhere check below — `agreement_holds` only guarantees a consistent prefix, so a voter
   // a few entries behind would pass it yet legitimately have a shorter log; quiesce must wait for it
   // to finish applying. A generous bound; failure to converge is a genuine liveness bug.
-  let converged = c.run_until(10_000, |c| {
-    c.leader_count() == 1 && c.agreement_holds() && voters_fully_caught_up(c, st)
-  });
+  // Drain to convergence: a single stable leader, agreement, and every settled voter fully caught up.
+  // Each pass first RECONCILES `st` membership with the leader's committed config (an AddNode whose joiner
+  // is still `wired`, or a RemoveNode delayed past the settle loop by a proactive-refresh run's extra
+  // no-ops, both commit DURING this drain) — so `voters_fully_caught_up`'s settled set is neither missing a
+  // newly-committed voter nor waiting forever on a removed one; and recovers any node that poisoned LATE (a
+  // pre-heal in-flight faulty storage op completing here, which the one-shot `restart_poisoned` cannot
+  // catch — a poisoned node is inert and never catches up on its own). A generous bound; a node that keeps
+  // re-poisoning, or genuine non-convergence, still fails below. `reconcile_membership` leaves `st.voters`
+  // synced to the committed config, so the final read + size report (and any non-convergence dump) are
+  // accurate without a separate fixup.
+  let mut converged = false;
+  for _ in 0..10_000 {
+    if c.leader_count() == 1 {
+      reconcile_membership(c, st);
+      // A node reconcile RESURRECTS (a `gone` node the committed config still lists) was skipped by the
+      // one-time fault clear at quiesce setup, so it would rejoin with its OLD storage faults still
+      // installed and `restart_poisoned` would keep re-poisoning it under that stale model — breaking the
+      // "healed, fault-free" convergence. Re-clear faults for the reconciled live set each pass (idempotent
+      // for nodes already cleared) so a resurrected committed voter can actually catch up.
+      for id in st.voters.iter().chain(st.learners.iter()).copied() {
+        c.set_node_faults(id, StorageFaults::none(), seed.wrapping_add(id));
+      }
+    }
+    // Recover any poisoned node, then advance one tick, and ONLY THEN test convergence — so the predicate
+    // observes the post-tick state. Convergence additionally requires every live voter/learner to be
+    // UNPOISONED: a node that re-poisons after reaching the right applied length would otherwise satisfy
+    // `voters_fully_caught_up` (role/length-based) while being inert. A node that keeps re-poisoning from a
+    // genuine defect (not a stale fault the clear above removes) therefore never lets the predicate hold,
+    // so the 10_000-pass bound still catches it.
+    restart_poisoned(c, st, report);
+    c.tick();
+    if c.leader_count() == 1
+      && c.agreement_holds()
+      && voters_fully_caught_up(c, st)
+      && st
+        .voters
+        .iter()
+        .chain(st.learners.iter())
+        .all(|&id| !c.is_poisoned(id))
+    {
+      converged = true;
+      break;
+    }
+  }
   if !converged {
     let leader_len = c.leader().map(|l| c.applied_len_of(l)).unwrap_or(0);
     let per_node: Vec<_> = st

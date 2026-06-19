@@ -113,6 +113,12 @@ pub(crate) fn refresh_conf_in_flight(c: &Cluster, st: &mut VoprState) {
 /// precondition for the quiesce apply-everywhere equality check. A voter whose removal is in flight is
 /// excluded (it is departing and may legitimately lag — see [`VoprState::settled_voters`]).
 pub(crate) fn voters_fully_caught_up(c: &Cluster, st: &VoprState) -> bool {
+  // The quiesce convergence loop calls `reconcile_membership` every pass, which sets `st.voters` to the
+  // leader's COMMITTED voter set minus `gone` (an AddNode's joiner moves out of `wired` into `st.voters`;
+  // a committed RemoveNode's victim is dropped; a `gone` node the leader still lists is resurrected). So
+  // by the time this check runs, `settled_voters` (= `st.voters` − in-flight removals) is already the
+  // correct set to wait for — it includes a newly-committed add and excludes both a committed and an
+  // in-flight removal, with no stale-tracking gap.
   let lens: Vec<usize> = st
     .settled_voters()
     .iter()
