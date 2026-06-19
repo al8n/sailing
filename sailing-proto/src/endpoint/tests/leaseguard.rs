@@ -68,6 +68,92 @@ fn leaseguard_leader_stamps_appended_entries() {
   );
 }
 
+/// The proactive-refresh read-activity signal: a LeaseGuard read sets `read_since_anchor`; a fresh
+/// leader append (the leader's own re-anchor) clears it; and a step-down clears it. This is the gate
+/// that keeps an idle leader (no reads) from proactively refreshing.
+#[test]
+fn read_since_anchor_set_on_read_cleared_on_append_and_stepdown() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Elect, then commit the election no-op so a current-term anchor exists (a fresh cluster has no
+  // commit-wait, so the no-op commits on the first quorum ack).
+  let now = ep.poll_timeout().unwrap();
+  ep.handle_timeout(now, &mut log, &mut stable);
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(crate::VoteResp::new(
+      crate::Term::new(1),
+      2u64,
+      false,
+      false,
+    )),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(crate::AppendResp::new(
+      crate::Term::new(1),
+      2u64,
+      false,
+      crate::Index::ZERO,
+      crate::Term::ZERO,
+      crate::Index::new(1),
+    )),
+  );
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // The election no-op's own append cleared the signal — a fresh leader has no read activity yet.
+  assert!(!ep.read_since_anchor());
+
+  // A LeaseGuard read (served or degraded) sets it.
+  let ctx = bytes::Bytes::from_static(b"r");
+  ep.read_index(now, &log, &stable, ctx.clone())
+    .expect("leader accepts the read");
+  assert!(
+    ep.read_since_anchor(),
+    "a LeaseGuard read sets read_since_anchor"
+  );
+
+  // The leader appending a fresh entry (a no-op = its own re-anchor) clears it.
+  let last = log.last_index();
+  ep.append_leader_noop(crate::Now::monotonic(now), &mut log, last);
+  assert!(
+    !ep.read_since_anchor(),
+    "a leader append re-anchors and clears read_since_anchor"
+  );
+
+  // Set it once more, then a step-down clears it.
+  ep.read_index(now, &log, &stable, ctx)
+    .expect("leader accepts the read");
+  assert!(ep.read_since_anchor());
+  ep.step_down_to_follower(crate::Now::monotonic(now));
+  assert!(
+    !ep.read_since_anchor(),
+    "step-down clears read_since_anchor"
+  );
+}
+
 /// Under the FAILOVER tier (`bounded_clock_uncertainty` set), a LeaseGuard leader stamps every entry
 /// it appends with the SYNCHRONIZED wall reading carried by `Now::synchronized`. Without the tier the
 /// wall stamp stays 0 (absent on the wire) even when a wall is supplied.
