@@ -68,7 +68,11 @@ pub enum LeaseRefresh {
   #[default]
   Off,
   /// Proactive, read-gated: if a read occurred since the current anchor AND the anchor is within a margin
-  /// of expiry, append one no-op before it dies. At most one no-op per `lease_duration` while reads flow.
+  /// of expiry (`2 · heartbeat_interval`, to cover the no-op's commit round-trip), append one no-op before
+  /// it dies. While reads flow this re-anchors roughly once per `lease_duration − 2 · heartbeat_interval`,
+  /// so the LOW-AMPLIFICATION regime requires `lease_duration` to be well above `2 · heartbeat_interval`;
+  /// as the lease shrinks toward that margin the rate climbs and OnExpiry degenerates toward `Continuous`
+  /// (a no-op every heartbeat).
   OnExpiry,
   /// Refresh every heartbeat while reads are recent — keeps the lease maximally fresh at the cost of up to
   /// one no-op per heartbeat under continuous reads (operator-accepted write amplification).
