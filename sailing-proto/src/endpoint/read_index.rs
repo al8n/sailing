@@ -183,8 +183,10 @@ where
   /// BEFORE the old anchor dies. Identical anchor fetch + current-term gate + age formula as the read
   /// gate, so a refresh can never disagree with the read about which anchor is live. Fails CLOSED (no
   /// refresh) on the same conditions: inactive/invalid timing, no/compacted anchor, a prior-term anchor,
-  /// or a storage fault (which poisons). When `margin >= Δ` (a very short lease) it reports near-expiry
-  /// from age 0, so `OnExpiry` approaches `Continuous` — acceptable, a lease that short needs it.
+  /// or a storage fault (which poisons). Because the anchor re-anchors at age 0, the OnExpiry refresh
+  /// INTERVAL while reads flow is `Δ − margin`: it stays near `Δ` only when `Δ ≫ margin`, and shrinks
+  /// toward the heartbeat cadence (`OnExpiry` → `Continuous`) as `Δ` approaches `margin` (and fires every
+  /// heartbeat once `margin >= Δ`).
   pub(crate) fn lease_near_expiry<L: LogStore>(&mut self, now: crate::Now, log: &L) -> bool {
     let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
