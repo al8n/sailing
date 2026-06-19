@@ -921,3 +921,46 @@ fn vopr_exercises_lease_refresh_modes() {
     "a proactive-refresh run must still commit (liveness held under the extra no-ops)"
   );
 }
+
+/// The read-mode MIGRATION harness: across a band of seeds the MigrateReadMode action proposes
+/// cluster-wide migrations (Safe / LeaseBased / LeaseGuard) mid-run; each accepted SetReadMode flips the
+/// active mode at APPLY-TIME on every node, under the VOPR's faults. Every run completes WITHOUT a
+/// read-linearizability / safety-oracle / liveness panic (`run_vopr` panics on a violation) — proving the
+/// apply-time flip + the mode-INDEPENDENT commit-wait keep reads linearizable ACROSS a migration, not
+/// merely that the machinery is present. The aggregate confirms migrations were ACTUALLY exercised: a
+/// LeaseGuard run tore down / re-established its lease, and a read was confirmed in a run that migrated.
+#[test]
+fn vopr_exercises_read_mode_migrations() {
+  let mut total_migrations = 0u64;
+  let mut leaseguard_migrated = 0u32;
+  let mut migrated_and_confirmed_a_read = 0u32;
+  for seed in 0u64..48 {
+    let r = run_vopr_migrate(seed, 600);
+    total_migrations += r.read_mode_migrations;
+    if (r.drifted || r.failover) && r.read_mode_migrations > 0 {
+      leaseguard_migrated += 1;
+    }
+    if r.read_mode_migrations > 0 && r.reads_confirmed > 0 {
+      migrated_and_confirmed_a_read += 1;
+    }
+  }
+  std::eprintln!(
+    "vopr read-mode-migration coverage (seeds 0..48, 600 ticks): total_migrations={total_migrations} \
+     leaseguard_migrated={leaseguard_migrated} migrated_and_confirmed_a_read={migrated_and_confirmed_a_read}"
+  );
+  assert!(
+    total_migrations > 0,
+    "no read-mode migration was accepted across seeds 0..48 — the MigrateReadMode action never fired or \
+     the proto always rejected it (the action draw moved, or the migration path regressed)"
+  );
+  assert!(
+    leaseguard_migrated > 0,
+    "no LeaseGuard run migrated its read mode across seeds 0..48 — the high-value LeaseGuard teardown / \
+     warm-up was never exercised (the mode draw moved, or LeaseGuard migrations regressed)"
+  );
+  assert!(
+    migrated_and_confirmed_a_read > 0,
+    "no run both migrated its read mode AND confirmed a read — the read-linearizability oracle never \
+     judged a read in a run that also migrated, so the cross-migration coverage is vacuous"
+  );
+}

@@ -178,6 +178,10 @@ pub struct VoprReport {
   /// Number of conf-changes successfully PROPOSED (AddNode/AddLearner/RemoveNode that the leader
   /// accepted — not necessarily yet committed).
   pub conf_changes: u64,
+  /// Number of read-mode migrations successfully PROPOSED (a Safe/LeaseBased/LeaseGuard SetReadMode the
+  /// leader accepted — not necessarily yet committed). Exercises the apply-time mode flip; the
+  /// read-linearizability oracle verifies each migration preserved safety.
+  pub read_mode_migrations: u64,
   /// Number of client commands successfully PROPOSED (the leader accepted them; tracked in the
   /// `expected` log for the quiesce apply-everywhere check).
   pub proposals: u64,
@@ -707,7 +711,7 @@ impl ReadLedger {
 /// progress within a generous bound), or a quiesce failure (a fully-healed cluster failed to
 /// converge / apply the committed history).
 pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false)
+  run_vopr_inner(seed, ticks, false, false)
 }
 
 /// Like [`run_vopr`] but additionally draws the proactive [`sailing_proto::LeaseRefresh`] sub-coin on
@@ -718,10 +722,21 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 /// that coverage. Only the dedicated lease-refresh coverage opts into the volume.
 #[cfg(test)]
 pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, true)
+  run_vopr_inner(seed, ticks, true, false)
 }
 
-fn run_vopr_inner(seed: u64, ticks: usize, draw_refresh: bool) -> VoprReport {
+/// Like [`run_vopr`] but additionally opts into mid-run READ-MODE migrations: the leader occasionally
+/// proposes a cluster-wide mode change (Safe / LeaseBased / LeaseGuard), flipping the active mode at
+/// apply-time. A SEPARATE entry (not folded into `run_vopr`) for the SAME reason as [`run_vopr_refresh`]:
+/// a mid-run flip tears down / re-establishes the lease machinery and shifts timing-sensitive paths,
+/// which would silently vacate the drift / failover / asymmetric non-vacuity pins. Only the dedicated
+/// migration coverage opts in; the read-linearizability oracle judges reads across each migration.
+#[cfg(test)]
+pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
+  run_vopr_inner(seed, ticks, false, true)
+}
+
+fn run_vopr_inner(seed: u64, ticks: usize, draw_refresh: bool, migrate: bool) -> VoprReport {
   // The single master PRNG. Every draw in the run comes from here (deterministic from `seed`).
   let mut prng = FaultPrng::new(seed ^ 0x564F_5052_5F5F_5631); // "VOPR__V1"
 
@@ -942,6 +957,15 @@ fn run_vopr_inner(seed: u64, ticks: usize, draw_refresh: bool) -> VoprReport {
       Action::FaultReroll => fault_reroll(&mut c, &st, &mut prng, seed),
       Action::ReadIndex => read_index_load(&mut c, &st, &mut reads, &mut prng, &mut report, seed),
       Action::TransferLeader => transfer_leader(&mut c, &st, &mut prng, &mut report),
+    }
+
+    // Read-mode MIGRATION (opt-in — `migrate` runs only): occasionally propose a cluster-wide read-mode
+    // change so the apply-time flip is exercised mid-run under faults. Gated AND drawn ONLY when
+    // `migrate`, so a default `run_vopr` makes ZERO migration draws and stays byte-identical (the same
+    // isolation `draw_refresh` uses) — the broad sweeps + the drift / failover / asymmetric pins are
+    // unaffected. The read-linearizability oracle judges reads across each migration.
+    if migrate && prng.next_u64().is_multiple_of(25) {
+      migrate_read_mode(&mut c, &mut prng, &mut report);
     }
 
     // Let messages flow a seed-chosen small number of ticks (1..=4). The safety-oracle checker runs every tick

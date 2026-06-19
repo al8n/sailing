@@ -267,6 +267,25 @@ pub(crate) fn conf_change(
   }
 }
 
+/// Propose a cluster-wide read-mode migration on the current leader (best-effort). The target mode is
+/// drawn uniformly from {Safe, LeaseBased, LeaseGuard}; the proto rejects a target the leader lacks the
+/// knobs for (InvalidReadMode) or a migration already in flight (ReadModeChangeInFlight), both surfacing
+/// as `None` here. A successful migration flips the active mode at apply-time on every node — exercising
+/// the apply-time flip and the mode-INDEPENDENT commit-wait under the VOPR's faults — and the
+/// read-linearizability oracle then verifies it preserved safety (a LeaseGuard teardown, a Safe→LeaseGuard
+/// warm-up, or a re-affirmation). Drawing all three targets (most rejected on non-LeaseGuard runs) keeps
+/// the draw deterministic regardless of the run's configured mode.
+pub(crate) fn migrate_read_mode(c: &mut Cluster, prng: &mut FaultPrng, report: &mut VoprReport) {
+  let mode = match prng.next_u64() % 3 {
+    0 => sailing_proto::ReadOnlyOption::Safe,
+    1 => sailing_proto::ReadOnlyOption::LeaseBased,
+    _ => sailing_proto::ReadOnlyOption::LeaseGuard,
+  };
+  if c.propose_read_mode_change(mode).is_some() {
+    report.read_mode_migrations += 1;
+  }
+}
+
 /// Issue 1..=3 linearizable reads. Two thirds of draws target the LEADER (the direct path);
 /// one third targets a random OTHER live node (the follower-forward path — and, leaderless,
 /// the NoLeader refusal path, a legitimate no-op). Each accepted read records the

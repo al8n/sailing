@@ -126,6 +126,22 @@ impl Cluster {
       .ok()
   }
 
+  /// Propose a read-mode migration on the current leader; returns the assigned index (or `None` when
+  /// there is no leader, a migration is already in flight, or the leader lacks the target mode's knobs).
+  pub fn propose_read_mode_change(
+    &mut self,
+    mode: sailing_proto::ReadOnlyOption,
+  ) -> Option<sailing_proto::Index> {
+    let leader = self.leader()?;
+    let i = self.node_idx[&leader];
+    let now_i = self.now_now(i);
+    let log = &mut self.logs[i];
+    let stable = &mut self.stables[i];
+    self.nodes[i]
+      .propose_read_mode_change(now_i, log, stable, mode)
+      .ok()
+  }
+
   /// Add a new **voter** node with `id` mid-run.
   ///
   /// **Bootstrap rule:** the new node's `Endpoint` is constructed with `Config.voters` =
