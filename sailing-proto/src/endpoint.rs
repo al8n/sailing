@@ -1632,6 +1632,31 @@ where
             self.append_leader_noop(now, log, last);
           }
         }
+        // LeaseGuard PROACTIVE refresh (`LeaseRefresh::OnExpiry` / `Continuous`): re-anchor the lease
+        // BEFORE it expires so reads never pay a Safe round — but ONLY when a read has occurred since the
+        // current anchor (`read_since_anchor`), so an idle leader refreshes nothing (no write amp). The
+        // CHEAP guards (mode active, a read since the anchor, valid timing, no transfer, log fully
+        // committed) come FIRST — only then the storage-reading `lease_near_expiry` (which poisons on a log
+        // fault) — so a heartbeat never fail-stops on that anchor read during a leader transfer or with an
+        // append already in flight, where the `last == commit` / `lead_transferee` guard would suppress the
+        // refresh anyway. The `last == commit` guard also makes this mutually exclusive with the demand
+        // block above (if it appended, `last != commit` here, so we never stack two).
+        let mode = self.config.lease_refresh();
+        if mode != crate::LeaseRefresh::Off
+          && self.read_since_anchor
+          && self.leaseguard_timing().is_some()
+          && self.lead_transferee.is_none()
+          && log.last_index() == self.commit
+        {
+          let fire = match mode {
+            crate::LeaseRefresh::Continuous => true,
+            crate::LeaseRefresh::OnExpiry => self.lease_near_expiry(now, log),
+            crate::LeaseRefresh::Off => false, // unreachable — gated by `mode != Off` above
+          };
+          if fire {
+            self.append_leader_noop(now, log, self.commit);
+          }
+        }
         // LeaseGuard commit-wait: the post-election deferred-commit window has elapsed. Retry the
         // commit (and apply + flush deferred reads) now, so the new leader's first commit lands as
         // soon as any deposed leader's lease has expired rather than at the next ack/heartbeat.

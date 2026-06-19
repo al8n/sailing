@@ -154,6 +154,132 @@ fn read_since_anchor_set_on_read_cleared_on_append_and_stepdown() {
   );
 }
 
+/// `lease_near_expiry` (the `OnExpiry` trigger) fires once the anchor is within `margin =
+/// 2·heartbeat_interval` of `Δ`. With Δ = 300ms and heartbeat = 100ms, margin = 200ms, so the threshold
+/// is age `>= Δ - margin = 100ms`.
+#[test]
+fn lease_near_expiry_fires_within_margin_of_delta() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Elect + commit the election no-op, stamped at `now` (the anchor `lease_near_expiry` reads).
+  let now = ep.poll_timeout().unwrap();
+  ep.handle_timeout(now, &mut log, &mut stable);
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(crate::VoteResp::new(
+      crate::Term::new(1),
+      2u64,
+      false,
+      false,
+    )),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResp(crate::AppendResp::new(
+      crate::Term::new(1),
+      2u64,
+      false,
+      crate::Index::ZERO,
+      crate::Term::ZERO,
+      crate::Index::new(1),
+    )),
+  );
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  let at = |ms: u64| crate::Now::monotonic(now + Duration::from_millis(ms));
+  // Age below the 100ms threshold: not near expiry.
+  assert!(!ep.lease_near_expiry(at(0), &log));
+  assert!(!ep.lease_near_expiry(at(50), &log));
+  assert!(!ep.lease_near_expiry(at(99), &log));
+  // Age at/after the threshold (the `>=` boundary at 100ms): near expiry, including while still live.
+  assert!(ep.lease_near_expiry(at(100), &log));
+  assert!(ep.lease_near_expiry(at(150), &log));
+  assert!(ep.lease_near_expiry(at(250), &log));
+}
+
+/// A `Continuous` leader STOPS appending once reads stop: a read sets `read_since_anchor`, the next
+/// heartbeat spends ONE proactive no-op (clearing it), and with no further reads the log stabilizes — an
+/// idle cluster converges. (Regression for the VOPR quiesce path: a leader that kept refreshing forever
+/// would never let a healed cluster catch up.)
+#[test]
+fn continuous_refresh_drains_when_reads_stop() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_lease_refresh(crate::LeaseRefresh::Continuous);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Self-elect (single voter = self-quorum) and commit the election no-op.
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // One read sets the activity signal.
+  ep.read_index(t0, &log, &stable, bytes::Bytes::from_static(b"r"))
+    .expect("leader accepts the read");
+  assert!(ep.read_since_anchor());
+
+  // Drive many heartbeats with NO further reads. The first fires one proactive no-op; the rest must not
+  // keep growing the log.
+  let hb = Duration::from_millis(100);
+  let mut t = t0;
+  // First heartbeat: one proactive no-op fires and clears the signal.
+  t = t + hb;
+  ep.handle_timeout(t, &mut log, &mut stable);
+  ep.handle_storage(t, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  let after_first = log.last_index();
+  // Many more heartbeats with no reads: the log must NOT keep growing.
+  for _ in 0..50 {
+    t = t + hb;
+    ep.handle_timeout(t, &mut log, &mut stable);
+    ep.handle_storage(t, &mut log, &mut stable);
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+  }
+  assert_eq!(
+    log.last_index(),
+    after_first,
+    "a Continuous leader must STOP appending once reads stop (read_since_anchor must drain)"
+  );
+}
+
 /// Under the FAILOVER tier (`bounded_clock_uncertainty` set), a LeaseGuard leader stamps every entry
 /// it appends with the SYNCHRONIZED wall reading carried by `Now::synchronized`. Without the tier the
 /// wall stamp stays 0 (absent on the wire) even when a wall is supplied.
