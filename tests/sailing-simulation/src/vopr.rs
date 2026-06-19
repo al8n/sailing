@@ -238,6 +238,10 @@ pub struct VoprReport {
   /// `0` in every non-failover run (the window never opens without a synchronized wall). A
   /// non-zero count proves the new oracle path was reached under the failover+drift regime.
   pub inherited_serves: u64,
+  /// Number of VIOLATING NTP re-syncs fired by the asymmetric sub-mode (each draws backward,
+  /// out-of-contract offsets via `resync_offsets_violating`). Distinct from `offset_resyncs` (valid-skew).
+  /// `0` outside the asymmetric sub-mode — the witness that the injection actually ran.
+  pub violating_resyncs: u64,
 }
 
 /// The weighted action menu. Client load dominates; faults are frequent but not constant; structural
@@ -729,6 +733,14 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     let mut p = FaultPrng::new(seed.rotate_left(24) ^ 0x4F46_4653_4554_5631); // "OFFSETV1"
     (p.next_u64() & 1) == 1
   };
+  // ASYMMETRIC sub-coin + the per-resync violation factor: ONE dedicated stream (a fresh, unused
+  // rotation), drawn ONLY when `failover` so non-failover AND offset runs keep their master/off_prng
+  // streams bit-for-bit unchanged. The asymmetric path draws a BACKWARD-only contract violation; a stale
+  // inherited serve under it always panics like any other (the random schedule does not reach one — the
+  // serve and release gates are exact duals on the same wall floor, so holding a window open wedges that
+  // leader's own commit-wait; detection is proven by `value_oracle_panics_on_stale_inherited_serve`).
+  let mut asym_prng = FaultPrng::new(seed.rotate_left(20) ^ 0x4153_594D_4D45_5431); // "ASYMMET1"
+  let asymmetric = failover && (asym_prng.next_u64() & 1) == 1;
   let drifted = read_mode == 3 && !failover;
   // HETEROGENEOUS failover sub-variant: with a coin (a DEDICATED sub-seed, drawn only when `failover`, so
   // non-failover runs stay bit-identical), make ONE voter NON-armed — Safe mode but STILL carrying ε_unc.
@@ -802,7 +814,11 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     let failover_drift_seed = seed.rotate_left(56) ^ 0x4644_5249_4654_5631; // "FDRIFTV1"
     c.set_clock_drift(move |id| leaseguard_node_rate(failover_drift_seed, id));
     c.enable_failover_clock(LEASEGUARD_EPS_UNC);
-    c.resync_offsets(&mut off_prng);
+    if asymmetric {
+      c.resync_offsets_violating(&mut off_prng, 3 + (asym_prng.next_u64() % 2)); // factor ∈ 3..=4
+    } else {
+      c.resync_offsets(&mut off_prng);
+    }
   }
 
   // Install a seed-chosen baseline network + per-node storage fault config (modest — the run must
@@ -865,8 +881,13 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
     // iteration's proposes/reads/handlers, so they observe fresh cross-node skew. A re-draw below the
     // prior offset is a BACKWARD NTP step (the hazard a static offset can never model). Inert off-mode.
     if iter + 1 >= next_resync {
-      c.resync_offsets(&mut off_prng);
-      report.offset_resyncs += 1;
+      if asymmetric {
+        c.resync_offsets_violating(&mut off_prng, 3 + (asym_prng.next_u64() % 2)); // factor ∈ 3..=4
+        report.violating_resyncs += 1;
+      } else {
+        c.resync_offsets(&mut off_prng);
+        report.offset_resyncs += 1;
+      }
       let jitter = (off_prng.next_u64() % 30) as usize;
       next_resync = iter + 1 + resync_base + jitter;
     }

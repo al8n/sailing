@@ -147,6 +147,39 @@ impl Cluster {
     }
   }
 
+  /// Re-draw every node's wall offset from `[−factor·ε_unc, +ε_unc]` (`factor ≥ 1`) — a BACKWARD contract
+  /// violation. The backward tail breaks `|offset| ≤ ε_unc`; the forward side stays WITHIN contract (a
+  /// forward stamp is bounded by `+ε_unc`, a backward stamp only deflates `s_c` and fail-closes the serve
+  /// gate). Drives the asymmetric sub-mode's STRUCTURAL coverage — the proto must SURVIVE the violation.
+  /// Any stale inherited serve it could induce is deferred to the value oracle and panics like any other
+  /// (there is no suppression; the random schedule never reaches one — see
+  /// `vopr_exercises_asymmetric_wall_injection`). Heterogeneous (independent per-node draws). A no-op
+  /// unless the failover tier is armed. Deterministic in `prng`.
+  pub(crate) fn resync_offsets_violating(
+    &mut self,
+    prng: &mut crate::store::FaultPrng,
+    factor: u64,
+  ) {
+    if !self.failover {
+      return;
+    }
+    // Totality: `factor·ε_unc` (the backward bound) must fit in `i64` so the final `as i64` cast is exact
+    // and a later `abs()` cannot overflow. `enable_failover_clock` bounds `ε_unc ≤ i64::MAX`; bound the
+    // factor on top, failing LOUDLY at the call rather than wrapping mid-draw.
+    let eps = self.eps_unc_ns as i128;
+    assert!(
+      factor >= 1 && (factor as i128) * eps <= i64::MAX as i128,
+      "resync_offsets_violating: factor*eps_unc must be in [eps_unc, i64::MAX] (factor={factor}, eps_unc_ns={})",
+      self.eps_unc_ns
+    );
+    // Draw uniformly in `[−factor·ε_unc, +ε_unc]` (i128 so neither the span nor the draw can overflow).
+    let lo = -(factor as i128) * eps;
+    let span = (factor as i128) * eps + eps + 1; // |[−factor·ε_unc, +ε_unc]| inclusive
+    for off in &mut self.clock_offset {
+      *off = ((prng.next_u64() as i128) % span + lo) as i64;
+    }
+  }
+
   /// Total FAILOVER-tier PRECISE commit-anchor early-releases summed over all live nodes — the
   /// non-vacuity witness that the offset clock model actually exercised the early-release path (not only
   /// the conservative anchor). Sums each node's in-memory `precise_releases()`; a restarted node resets
@@ -161,6 +194,13 @@ impl Cluster {
   #[cfg(test)]
   pub(crate) fn max_abs_offset(&self) -> i64 {
     self.clock_offset.iter().map(|o| o.abs()).max().unwrap_or(0)
+  }
+
+  /// The current per-node wall offsets (nanos) — test-only, for asserting an injection's RANGE: e.g. that
+  /// a violating draw is BACKWARD-only (every offset `≤ +ε_unc`, the violating ones `< −ε_unc`).
+  #[cfg(test)]
+  pub(crate) fn clock_offsets(&self) -> &[i64] {
+    &self.clock_offset
   }
 
   /// Deterministically drive the cluster until node `keep` is sitting inside the fsync window
