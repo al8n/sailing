@@ -56,12 +56,6 @@ where
       return;
     }
     log.submit_append(id, entries);
-    // A leader appending a fresh current-term entry re-anchors its LeaseGuard lease, so clear the
-    // read-activity signal: the proactive refresh (`LeaseRefresh::OnExpiry`/`Continuous`) waits for a
-    // NEW read before spending another no-op. Leader-only — a follower's replication never set it.
-    if self.role.is_leader() {
-      self.read_since_anchor = false;
-    }
     // Raise the self-describing LeaseGuard commit-wait bound over these entries' stamped lease
     // windows (each carries its appending leader's own exact window). The choke-point for EVERY append — leader
     // propose/no-op/conf-change AND follower replication — so a node always bounds any deposed

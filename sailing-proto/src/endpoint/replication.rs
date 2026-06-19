@@ -502,6 +502,13 @@ where
         return;
       }
       self.commit = candidate;
+      // The committed LeaseGuard anchor just advanced to a fresh CURRENT-TERM entry (this leader's
+      // refresh no-op, a client write, or the election no-op), re-anchoring the lease. Reads counted
+      // against the OLD anchor are now consumed, so clear the proactive-refresh demand; it re-arms only
+      // on a NEW read against the fresh anchor. Clearing HERE (anchor commit) rather than at append is
+      // what bounds idle amplification: a read arriving between a refresh no-op's APPEND and its COMMIT
+      // would otherwise survive into the new anchor and fire one extra idle no-op after traffic stops.
+      self.read_since_anchor = false;
     }
   }
 }

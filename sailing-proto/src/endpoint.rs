@@ -726,8 +726,10 @@ where
   lease_refresh_wanted: bool,
   /// Whether a LeaseGuard read has been served (or degraded) since the current committed anchor — the
   /// gate for the proactive [`crate::LeaseRefresh`] modes. Set by any leader LeaseGuard read, cleared
-  /// when the leader appends a fresh current-term entry (its own re-anchor) and on step-down/restart.
-  /// A leader with NO reads since its anchor never proactively refreshes (no write amplification when idle).
+  /// when a fresh current-term entry COMMITS (the committed anchor advances, re-anchoring the lease) and
+  /// on step-down/restart. Cleared at the COMMIT, not the append: a read landing between a refresh no-op's
+  /// append and its commit must not survive into the new anchor and fire one idle no-op after reads stop.
+  /// A leader with NO reads since its anchor never proactively refreshes (no idle write amplification).
   read_since_anchor: bool,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
