@@ -60,8 +60,9 @@ reference — this section pins the SEMANTICS:
   PRESERVES these fields. On a partially-upgraded cluster, or storage that strips unknown proto
   fields, a stored window can read `0` while the true window is nonzero; the duplicate AppendEntries /
   snapshot runtime paths re-fold a newly-visible window, but durable survival across a restart of a
-  stripped window is the operator's responsibility (mid-life migration is out of scope — like
-  `LeaseBased`'s bounded-drift contract, the protocol consumes the bound, it cannot enforce it).
+  stripped window is the operator's responsibility (mid-life WIRE-FORMAT migration is out of scope — like
+  `LeaseBased`'s bounded-drift contract, the protocol consumes the bound, it cannot enforce it). (The read
+  MODE itself IS migratable on a running cluster, via the `SetReadMode` entry kind below.)
 - `Entry.wall_timestamp` (7), `SnapshotMeta.max_wall_plus_window` (5), and
   `SnapshotMeta.max_unwalled_lease_window` (6) carry the synchronized wall-clock data the LeaseGuard
   FAILOVER tier needs (inherited reads + the precise commit-anchor). `wall_timestamp` and
@@ -73,13 +74,23 @@ reference — this section pins the SEMANTICS:
   entries that are LEASE-bearing but WALL-ABSENT — folded by the ENTRY property on EVERY node, so it is
   NOT zero off-tier (it equals `max_lease_window` in a non-failover LeaseGuard cluster) but is inert
   there (only the failover tier reads it). **The precise commit-anchor is the first CONSUMER of these
-  release floors, so `LABEL_VERSION` is now 3:** a peer predating the consumed floors would feed a
+  release floors, so `LABEL_VERSION` was bumped to 3:** a peer predating the consumed floors would feed a
   successor an under-sized release bound (a stale read), so it is rejected at the handshake — the
   mixed-version / field-strip fence (the fresh-cluster / matched-schema contract above) is ENFORCED for
   the failover floors, not merely documented. The handshake fences a PEER; the one residual it cannot
   fence — a node restarting from its OWN durable snapshot written by a pre-anchor binary (no tag 6) —
   is the same storage-preservation contract as `max_lease_window` above (fresh-cluster, no mid-life
   field-strip).
+- `Entry` kind `SetReadMode` (`ENTRY_KIND_SET_READ_MODE` = 3) and `SnapshotMeta.read_only` (7) carry a
+  cluster-wide READ-MODE migration. A committed `SetReadMode` entry flips the active read mode (Safe /
+  LeaseBased / LeaseGuard) at APPLY-TIME on every node; its 1-byte payload is the target `ReadOnlyOption`
+  discriminant (`0`/`1`/`2`). `SnapshotMeta.read_only` is the same discriminant as a `uint64` (`0` = Safe —
+  absent on the wire, byte-identical to a pre-migration snapshot), carried so a restart / snapshot-install
+  recovers the migrated mode from replicated state, not the static config. **A node predating the
+  `SetReadMode` kind would poison on (or silently drop) a committed migration — diverging the replicated
+  mode across the cluster — so `LABEL_VERSION` is now 4:** the handshake fences a pre-migration peer. (A
+  node restarting from its OWN pre-migration durable log never sees a `SetReadMode`, so there is no
+  divergence to fence — the same residual as the floors above.)
 - An enum field must carry a KNOWN value; the `Message.body` oneof must be present. Either
   failure rejects the message (parity with the old codec's unknown-tag reject).
 - A rejected message closes the connection (transport) — the endpoint is never poisoned by
@@ -133,7 +144,7 @@ Each `Message` rides one frame:
 One-time, before any application frame, in each direction:
 
 ```text
-[ magic 0xCA ][ version 0x03 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
+[ magic 0xCA ][ version 0x04 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
 ```
 
 The ENCODING is shared by both transports — one format, one parser family, one version byte
