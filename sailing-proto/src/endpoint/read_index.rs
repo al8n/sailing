@@ -296,6 +296,10 @@ where
         }
       }
       crate::ReadOnlyOption::LeaseGuard => {
+        // Record read activity since the current anchor — the gate for the proactive `LeaseRefresh`
+        // modes (a served read AND a degraded one both count; an idle leader with no reads never
+        // proactively refreshes, so an idle cluster keeps its no-write-amplification guarantee).
+        self.read_since_anchor = true;
         // "The log is the lease": serve from the local commit WITHOUT a round-trip iff the leader's
         // most-recent committed entry is still within the lease window on the leader's OWN monotonic
         // clock (see `lease_guard_read_live`). The caller already gated on `has_current_term_commit`,
@@ -319,6 +323,13 @@ where
         }
       }
     }
+  }
+
+  /// Test-only: whether a LeaseGuard read has occurred since the current committed anchor — the gate
+  /// for the proactive [`crate::LeaseRefresh`] modes.
+  #[cfg(test)]
+  pub(crate) fn read_since_anchor(&self) -> bool {
+    self.read_since_anchor
   }
 
   /// The Safe linearizable-read confirmation path: register the read against the heartbeat-ack
