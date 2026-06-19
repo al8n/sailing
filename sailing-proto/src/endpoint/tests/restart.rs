@@ -2358,3 +2358,50 @@ fn restart_recovers_migrated_mode_from_committed_tail() {
     "restart recovers the migrated mode from the committed log, not the static config"
   );
 }
+
+/// REGRESSION: a LEGACY/pre-migration snapshot (read_only never set = None) plus a static LeaseGuard
+/// config and NO committed SetReadMode must recover the STATIC config mode (LeaseGuard), NOT Safe. The
+/// snapshot field encodes presence (discriminant + 1, 0 = absent), so a snapshot written before the field
+/// existed decodes as None and falls back to config — instead of being misread as an explicit
+/// migrate-to-Safe (which would silently downgrade an upgraded LeaseBased/LeaseGuard node to Safe).
+#[test]
+fn restart_from_legacy_snapshot_recovers_static_mode() {
+  use crate::{ConfState, Config, Index, Instant, ReadOnlyOption, SnapshotMeta, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut stable = crate::testkit::AsyncStable::default();
+  // A legacy snapshot at index 5: read_only NEVER set (None), as if written before the field existed.
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64]),
+  );
+  stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(0));
+  while stable.poll().is_some() {}
+  stable.force_state(Term::new(2), Some(1u64), Index::new(5));
+  let mut log = crate::testkit::VecLog::default();
+  log.restore(Index::new(5), Term::new(2));
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.active_read_mode(),
+    ReadOnlyOption::LeaseGuard,
+    "a legacy snapshot (read_only=None) must recover the static config mode, not be misread as Safe"
+  );
+}

@@ -694,10 +694,12 @@ fn snapshot_meta_read_only_round_trips() {
   };
   assert_eq!(
     back.snapshot().read_only(),
-    crate::ReadOnlyOption::LeaseGuard
+    Some(crate::ReadOnlyOption::LeaseGuard)
   );
 
-  // Safe (default) is omitted on the wire: byte-identical to a snapshot that never set it.
+  // A snapshot that NEVER set the mode (a pre-migration / legacy snapshot) is ABSENT on the wire and
+  // decodes as None; an EXPLICIT Safe is PRESENT (discriminant + 1), so the two are NOT byte-identical —
+  // a migrate-to-Safe stays distinguishable from legacy, and recovery falls back to config (not Safe).
   let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
   let mut a = std::vec::Vec::new();
   let mut b = std::vec::Vec::new();
@@ -719,5 +721,27 @@ fn snapshot_meta_read_only_round_trips() {
     )),
     &mut b,
   );
-  assert_eq!(a, b, "a Safe read_only is byte-identical to unset");
+  assert_ne!(
+    a, b,
+    "an explicit Safe must NOT be byte-identical to a legacy (absent) snapshot"
+  );
+  let Message::InstallSnapshot(back_legacy) =
+    decode_message::<u64>(Bytes::from(a)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back_legacy.snapshot().read_only(),
+    None,
+    "an unset read_only decodes as None (legacy/pre-migration), not Safe"
+  );
+  let Message::InstallSnapshot(back_safe) = decode_message::<u64>(Bytes::from(b)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back_safe.snapshot().read_only(),
+    Some(crate::ReadOnlyOption::Safe),
+    "an explicit Safe round-trips as Some(Safe)"
+  );
 }

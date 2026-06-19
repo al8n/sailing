@@ -308,8 +308,10 @@ where
     self.applied = meta.last_index();
     // Adopt the active read mode at the snapshot boundary (a SetReadMode compacted into it). The
     // re-baseline discards the stale tail, so this is the boundary mode; subsequent AppendEntries replay
-    // any post-snapshot SetReadMode via apply_committed (last-writer-wins by index).
-    self.active_read_mode = meta.read_only();
+    // any post-snapshot SetReadMode via apply_committed (last-writer-wins by index). A legacy/pre-migration
+    // snapshot carries None → keep the current mode (a defensive default — unreachable in a same-version
+    // cluster, where the LABEL_VERSION-4 handshake fences a pre-migration peer).
+    self.active_read_mode = meta.read_only().unwrap_or(self.active_read_mode);
 
     // Step 4: re-baseline the log on the now-durable snapshot. Discards the follower's stale/short log;
     // after this call first_index == last_index + 1 and term(last_index) == last_term, so the next

@@ -424,10 +424,13 @@ pub struct SnapshotMeta<I> {
   /// non-failover LeaseGuard cluster (all entries wall-absent) but is inert there. `0` for Safe/LeaseBased
   /// (`lease_window` is 0). See [`with_max_unwalled_lease_window`].
   max_unwalled_lease_window: u64,
-  /// The ACTIVE read mode at the snapshot boundary (a `SetReadMode` compacted into this snapshot). Carried
-  /// so a restarting node recovers its migrated mode from replicated state, not its stale construction
-  /// config. `Safe` (the genesis default) ⇒ absent on the wire (byte-identical to a pre-migration peer).
-  read_only: crate::ReadOnlyOption,
+  /// The ACTIVE read mode at the snapshot boundary (a `SetReadMode` compacted into this snapshot), or
+  /// `None` when the snapshot predates this field (a legacy/pre-migration snapshot) or never set it.
+  /// Carried so a restarting node recovers its migrated mode from REPLICATED state, not its stale
+  /// construction config — while `None` falls back to the static config, so a pre-migration snapshot is
+  /// NOT misread as an explicit migrate-to-Safe. `None` ⇒ absent on the wire (byte-identical to a
+  /// pre-migration peer); an explicit mode is PRESENT (the discriminant + 1), so Safe stays distinguishable.
+  read_only: Option<crate::ReadOnlyOption>,
 }
 
 impl<I: crate::NodeId> SnapshotMeta<I> {
@@ -441,7 +444,7 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
       max_lease_window: 0,
       max_wall_plus_window: 0,
       max_unwalled_lease_window: 0,
-      read_only: crate::ReadOnlyOption::Safe,
+      read_only: None,
     }
   }
 
@@ -474,12 +477,13 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
     self
   }
 
-  /// Set the active read mode at the snapshot boundary. A builder, so the common 3-arg
-  /// [`new`](Self::new) stays untouched for non-migrated clusters (where the mode is the genesis default).
+  /// Set the active read mode at the snapshot boundary, marking it EXPLICITLY present (distinct from a
+  /// legacy/absent snapshot). A builder, so the common 3-arg [`new`](Self::new) stays `None` for a
+  /// non-migrated / pre-migration snapshot, which falls back to the static config on recovery.
   #[inline(always)]
   #[must_use]
   pub const fn with_read_only(mut self, read_only: crate::ReadOnlyOption) -> Self {
-    self.read_only = read_only;
+    self.read_only = Some(read_only);
     self
   }
 
@@ -507,9 +511,10 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
     self.max_lease_window
   }
 
-  /// The active read mode at the snapshot boundary (the genesis default if never migrated).
+  /// The active read mode at the snapshot boundary, or `None` for a legacy/pre-migration snapshot (or one
+  /// that never set it) — recovery then falls back to the static config rather than forcing Safe.
   #[inline(always)]
-  pub const fn read_only(&self) -> crate::ReadOnlyOption {
+  pub const fn read_only(&self) -> Option<crate::ReadOnlyOption> {
     self.read_only
   }
 
