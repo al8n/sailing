@@ -231,6 +231,71 @@ fn validate_lease_requires_check_quorum() {
 }
 
 #[test]
+fn validate_lease_refresh_requires_leaseguard() {
+  use crate::{ConfigError, LeaseRefresh, ReadOnlyOption};
+  let base = || {
+    Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+  // A valid LeaseGuard config: window 300·350/250 = 420ms < 1000ms election timeout.
+  let leaseguard = || {
+    base()
+      .with_read_only(ReadOnlyOption::LeaseGuard)
+      .with_lease_duration(Duration::from_millis(300))
+      .with_clock_drift_bound(Duration::from_millis(50))
+  };
+
+  // The default is Off, and Off validates in every read mode.
+  assert_eq!(base().lease_refresh(), LeaseRefresh::Off);
+  assert!(base().validate().is_ok());
+  assert!(
+    base()
+      .with_lease_refresh(LeaseRefresh::Off)
+      .validate()
+      .is_ok()
+  );
+  assert!(
+    leaseguard()
+      .with_lease_refresh(LeaseRefresh::Off)
+      .validate()
+      .is_ok()
+  );
+
+  // A proactive mode under LeaseGuard validates.
+  assert!(
+    leaseguard()
+      .with_lease_refresh(LeaseRefresh::OnExpiry)
+      .validate()
+      .is_ok()
+  );
+  assert!(
+    leaseguard()
+      .with_lease_refresh(LeaseRefresh::Continuous)
+      .validate()
+      .is_ok()
+  );
+
+  // A proactive mode outside LeaseGuard (Safe / LeaseBased) is rejected.
+  assert!(matches!(
+    base().with_lease_refresh(LeaseRefresh::OnExpiry).validate(),
+    Err(ConfigError::LeaseRefreshRequiresLeaseGuard)
+  ));
+  assert!(matches!(
+    base()
+      .with_read_only(ReadOnlyOption::LeaseBased)
+      .with_check_quorum(true)
+      .with_lease_refresh(LeaseRefresh::Continuous)
+      .validate(),
+    Err(ConfigError::LeaseRefreshRequiresLeaseGuard)
+  ));
+}
+
+#[test]
 fn leaseguard_config_validation() {
   use crate::{ConfigError, ReadOnlyOption};
   let base = || {

@@ -55,6 +55,38 @@ impl ReadOnlyOption {
   }
 }
 
+/// When (if ever) a LeaseGuard leader proactively re-anchors its read lease with a no-op, so reads do not
+/// pay a Safe round after the lease ages out. The re-anchor fires ONLY when reads are active since the
+/// current anchor, so an idle leader never amplifies writes. Only meaningful under
+/// [`ReadOnlyOption::LeaseGuard`]; [`Config::validate`] rejects a proactive mode in any other read mode.
+#[derive(
+  Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
+)]
+pub enum LeaseRefresh {
+  /// Demand-driven only (DEFAULT): a stale read triggers one no-op at the next heartbeat. The first read
+  /// after the lease ages pays one Safe round. Byte-identical to pre-feature behavior.
+  #[default]
+  Off,
+  /// Proactive, read-gated: if a read occurred since the current anchor AND the anchor is within a margin
+  /// of expiry, append one no-op before it dies. At most one no-op per `lease_duration` while reads flow.
+  OnExpiry,
+  /// Refresh every heartbeat while reads are recent — keeps the lease maximally fresh at the cost of up to
+  /// one no-op per heartbeat under continuous reads (operator-accepted write amplification).
+  Continuous,
+}
+
+impl LeaseRefresh {
+  /// The stable snake_case name.
+  #[inline(always)]
+  pub const fn as_str(self) -> &'static str {
+    match self {
+      Self::Off => "off",
+      Self::OnExpiry => "on_expiry",
+      Self::Continuous => "continuous",
+    }
+  }
+}
+
 /// Static configuration for an [`crate::Endpoint`]. Holds the initial voter set (dynamic
 /// membership is via `ConfChange`). `Clone`, not `Copy` (it owns the voter list).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -89,6 +121,10 @@ pub struct Config<I> {
   disable_proposal_forwarding: bool,
   /// How linearizable read-only queries are satisfied. Default: [`ReadOnlyOption::Safe`].
   read_only: ReadOnlyOption,
+  /// When (if ever) a LeaseGuard leader proactively re-anchors its read lease with a no-op so reads do
+  /// not pay a Safe round after the lease ages. Only meaningful under `LeaseGuard`. Default:
+  /// [`LeaseRefresh::Off`] (demand-driven only — byte-identical to pre-feature behavior).
+  lease_refresh: LeaseRefresh,
   /// The LeaseGuard lease window Δ: a leader serves a `LeaseGuard` read while its last committed
   /// entry is younger than this. Required when `read_only = LeaseGuard`; ignored otherwise.
   /// Default: `None`.
@@ -147,6 +183,7 @@ impl<I: NodeId> Config<I> {
       check_quorum: false,
       disable_proposal_forwarding: false,
       read_only: ReadOnlyOption::Safe,
+      lease_refresh: LeaseRefresh::Off,
       lease_duration: None,
       clock_drift_bound: None,
       bounded_clock_uncertainty: None,
@@ -191,6 +228,7 @@ impl<I: NodeId> Config<I> {
       check_quorum: false,
       disable_proposal_forwarding: false,
       read_only: ReadOnlyOption::Safe,
+      lease_refresh: LeaseRefresh::Off,
       lease_duration: None,
       clock_drift_bound: None,
       bounded_clock_uncertainty: None,
@@ -366,6 +404,21 @@ impl<I: NodeId> Config<I> {
     self
   }
 
+  /// When (if ever) a LeaseGuard leader proactively re-anchors its read lease. Default:
+  /// [`LeaseRefresh::Off`].
+  #[inline(always)]
+  pub const fn lease_refresh(&self) -> LeaseRefresh {
+    self.lease_refresh
+  }
+
+  /// Override the `lease_refresh` knob (only meaningful under [`ReadOnlyOption::LeaseGuard`];
+  /// [`Self::validate`] rejects a proactive mode in any other read mode).
+  #[must_use]
+  pub fn with_lease_refresh(mut self, v: LeaseRefresh) -> Self {
+    self.lease_refresh = v;
+    self
+  }
+
   /// The LeaseGuard lease window Δ (required when `read_only = LeaseGuard`).
   #[inline(always)]
   pub const fn lease_duration(&self) -> Option<Duration> {
@@ -417,6 +470,11 @@ impl<I: NodeId> Config<I> {
   pub fn validate(&self) -> Result<(), ConfigError> {
     if self.read_only == ReadOnlyOption::LeaseBased && !self.check_quorum {
       return Err(ConfigError::LeaseRequiresCheckQuorum);
+    }
+    // A proactive `lease_refresh` re-anchors the per-entry LeaseGuard timestamp; Safe and LeaseBased have
+    // no such anchor, so the knob is meaningless there — reject rather than silently ignore.
+    if self.lease_refresh != LeaseRefresh::Off && self.read_only != ReadOnlyOption::LeaseGuard {
+      return Err(ConfigError::LeaseRefreshRequiresLeaseGuard);
     }
     if self.read_only == ReadOnlyOption::LeaseGuard {
       // The single source of truth for the LeaseGuard timing — same computation used to STAMP the

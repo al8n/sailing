@@ -68,7 +68,7 @@ pub(crate) use progress::Progress;
 pub use progress::ProgressState;
 
 mod config;
-pub use config::{Config, ReadOnlyOption};
+pub use config::{Config, LeaseRefresh, ReadOnlyOption};
 
 mod read_only;
 pub(crate) use read_only::ReadOnly;

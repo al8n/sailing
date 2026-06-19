@@ -154,4 +154,9 @@ pub enum ConfigError {
     /// The configured lease duration it must be under (`None` if unset).
     lease: Option<core::time::Duration>,
   },
+  /// `lease_refresh` was set to a proactive mode (`OnExpiry` / `Continuous`) without
+  /// `read_only = LeaseGuard`. Safe and LeaseBased reads have no per-entry timestamp anchor to refresh,
+  /// so the knob is meaningless there.
+  #[error("a proactive lease_refresh requires read_only = LeaseGuard")]
+  LeaseRefreshRequiresLeaseGuard,
 }
