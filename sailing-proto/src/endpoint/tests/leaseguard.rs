@@ -4577,3 +4577,133 @@ fn active_read_mode_drives_serve_and_stamp_not_config() {
     "Safe runtime mode: no window stamped (serve + stamp move in lockstep)"
   );
 }
+
+/// A committed SetReadMode flips the active mode at APPLY (not append) and emits ReadModeChanged.
+#[test]
+fn read_mode_flips_at_apply_not_append() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::Safe);
+  let now = crate::Now::monotonic(t0);
+  let idx = ep
+    .append_set_read_mode_for_test(now, &mut log, crate::ReadOnlyOption::LeaseGuard)
+    .expect("appended");
+  assert_eq!(
+    ep.active_read_mode(),
+    crate::ReadOnlyOption::Safe,
+    "not flipped before the entry commits + applies"
+  );
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert_eq!(
+    ep.active_read_mode(),
+    crate::ReadOnlyOption::LeaseGuard,
+    "flipped at apply"
+  );
+  let mut rmc = None;
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::ReadModeChanged(r) = ev {
+      rmc = Some(r);
+    }
+  }
+  let rmc = rmc.expect("ReadModeChanged emitted");
+  assert_eq!(rmc.mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert_eq!(rmc.index(), idx);
+}
+
+/// Into-LeaseGuard warm-up: the SetReadMode entry is stamped under the OLD mode (Safe ⇒ ts=0), so it is
+/// not a usable anchor — reads degrade to Safe until a fresh stamped current-term entry commits.
+#[test]
+fn into_leaseguard_warms_up_to_safe() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  let now = crate::Now::monotonic(t0);
+  ep.append_set_read_mode_for_test(now, &mut log, crate::ReadOnlyOption::LeaseGuard);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  // The committed anchor is the SetReadMode entry, stamped ts=0 under Safe → no live lease yet.
+  assert!(
+    !ep.lease_guard_read_live(now, &log),
+    "into-LeaseGuard warm-up: no live lease until a fresh stamped anchor"
+  );
+  // A fresh stamped current-term no-op (now under LeaseGuard) establishes the anchor.
+  let last = log.last_index();
+  ep.append_leader_noop(now, &mut log, last);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(
+    ep.lease_guard_read_live(now, &log),
+    "lease live once a fresh stamped current-term anchor commits"
+  );
+}
+
+/// Applying a SetReadMode revokes any live LeaseBased lease (its granting quorum may not match the new
+/// mode) — mirror the ConfChange revocation.
+#[test]
+fn flip_revokes_leasebased_lease() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // Simulate a live LeaseBased lease, then flip the mode.
+  ep.set_lease_valid_until_for_test(Some(t0 + Duration::from_secs(10)));
+  assert!(ep.lease_valid_until_for_test().is_some());
+  let now = crate::Now::monotonic(t0);
+  ep.append_set_read_mode_for_test(now, &mut log, crate::ReadOnlyOption::LeaseGuard);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert_eq!(
+    ep.lease_valid_until_for_test(),
+    None,
+    "the apply-time flip revokes the LeaseBased lease"
+  );
+}

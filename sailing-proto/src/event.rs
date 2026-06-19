@@ -95,6 +95,34 @@ impl<I: Clone> ConfChanged<I> {
   }
 }
 
+/// A `SetReadMode` entry was committed and applied; the active read mode changed (a mid-life migration).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReadModeChanged {
+  /// The log index of the applied `SetReadMode` entry.
+  index: Index,
+  /// The new active read mode.
+  mode: crate::ReadOnlyOption,
+}
+
+impl ReadModeChanged {
+  /// Construct.
+  pub fn new(index: Index, mode: crate::ReadOnlyOption) -> Self {
+    Self { index, mode }
+  }
+
+  /// The log index of the applied `SetReadMode` entry.
+  #[inline(always)]
+  pub fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The new active read mode after applying the change.
+  #[inline(always)]
+  pub fn mode(&self) -> crate::ReadOnlyOption {
+    self.mode
+  }
+}
+
 /// Outputs the application observes.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
@@ -112,6 +140,8 @@ pub enum Event<I, R> {
   SnapshotInstalled(SnapshotMeta<I>),
   /// A `ConfChange` entry was committed and applied; the cluster membership changed.
   ConfChanged(ConfChanged<I>),
+  /// A `SetReadMode` entry was committed and applied; the active read mode changed.
+  ReadModeChanged(ReadModeChanged),
   /// A linearizable read index has been confirmed.  The application may serve the
   /// associated read once `applied >= ReadState.index`.
   ReadState(ReadState),

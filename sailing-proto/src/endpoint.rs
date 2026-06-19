@@ -134,6 +134,8 @@ pub enum PoisonReason {
   SnapshotCapture,
   /// A committed `ConfChange` entry's payload failed to decode as `ConfChangeV2`.
   ConfChangeDecode,
+  /// A committed `SetReadMode` entry's payload failed to decode as a `ReadOnlyOption`.
+  SetReadModeDecode,
   /// The `Changer` rejected a committed, validly-decoded `ConfChange`.
   ConfChangeApply,
   /// A snapshot blob failed to decode as `F::Snapshot` (install or restart).
@@ -217,6 +219,7 @@ impl PoisonReason {
       Self::Apply => "apply",
       Self::SnapshotCapture => "snapshot_capture",
       Self::ConfChangeDecode => "conf_change_decode",
+      Self::SetReadModeDecode => "set_read_mode_decode",
       Self::ConfChangeApply => "conf_change_apply",
       Self::SnapshotDecode => "snapshot_decode",
       Self::SnapshotRestore => "snapshot_restore",
@@ -1148,6 +1151,16 @@ where
     self.active_read_mode = mode;
   }
 
+  #[cfg(test)]
+  pub(crate) fn lease_valid_until_for_test(&self) -> Option<Instant> {
+    self.lease_valid_until
+  }
+
+  #[cfg(test)]
+  pub(crate) fn set_lease_valid_until_for_test(&mut self, until: Option<Instant>) {
+    self.lease_valid_until = until;
+  }
+
   /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
   /// identity changes, clears reads forwarded to the previous leader (the forward target is
   /// gone; re-issue against the new belief) and emits [`LeaderChanged`](crate::LeaderChanged)
@@ -1825,9 +1838,37 @@ where
           }
         }
         crate::EntryKind::Empty => {} // no-op: just advance applied
-        // The apply-time read-mode flip lands in a later commit; the wire kind is introduced first, so
-        // applying a SetReadMode is a no-op for now (no proposer exists yet to create one). See spec §3.1.
-        crate::EntryKind::SetReadMode => {}
+        crate::EntryKind::SetReadMode => {
+          // Decode the target mode from the 1-byte payload; unrecoverable on failure → poison (mirror
+          // ConfChange). This is the apply-time flip — the SOLE site the active mode changes
+          // (commit-before-apply means it never takes effect on an uncommitted tail). NO commit-wait
+          // re-arm: the monotone fold floors + the mode-independent become_leader arming already cover a
+          // deposed LeaseGuard lease, so a read-mode flip needs no new barrier (spec §1, §3.1).
+          let mode = match entry
+            .data()
+            .first()
+            .copied()
+            .and_then(crate::ReadOnlyOption::from_u8)
+          {
+            Some(m) => m,
+            None => {
+              self.poison(PoisonReason::SetReadModeDecode);
+              break;
+            }
+          };
+          self.active_read_mode = mode;
+          // Reset the read-confirmation tracker (stale pending reads must not confirm under the new
+          // discipline) and revoke any live LeaseBased lease (its granting quorum may not match the new
+          // mode) — mirror the ConfChange revocation below.
+          self.read_only.reset(mode);
+          self.lease_valid_until = None;
+          self.lease_acks.clear();
+          self
+            .events
+            .push_back(crate::Event::ReadModeChanged(crate::ReadModeChanged::new(
+              idx, mode,
+            )));
+        }
         crate::EntryKind::ConfChange => {
           // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
           let cc = match crate::wire::decode_conf_change_v2::<I>(entry.data_bytes()) {
