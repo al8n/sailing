@@ -278,6 +278,26 @@ where
     r
   }
 
+  /// Propose a cluster-wide read-mode migration. Mirrors [`Endpoint::propose_read_mode_change`].
+  pub fn propose_read_mode_change<L, S>(
+    &mut self,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    mode: crate::ReadOnlyOption,
+  ) -> Result<Index, ProposeError<I>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: crate::Now = now.into();
+    let r = self
+      .endpoint
+      .propose_read_mode_change(now, log, stable, mode);
+    self.flush();
+    r
+  }
+
   /// Drain storage completions into the endpoint, then flush.
   pub fn handle_storage<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
   where

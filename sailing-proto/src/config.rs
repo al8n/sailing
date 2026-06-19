@@ -602,6 +602,19 @@ impl<I: NodeId> Config<I> {
     }
     self.leaseguard_window_result().ok()
   }
+
+  /// Whether THIS node may PROPOSE migrating to `mode` — i.e. it holds the target mode's required knobs.
+  /// Into-LeaseGuard needs a valid commit-wait window (Δ + ε present, ε < Δ, window < election timeout);
+  /// into-LeaseBased needs `check_quorum` (a non-enforcing follower cannot uphold the lease). Safe always
+  /// validates. A straggler lacking the knobs safely degrades to Safe, so only the PROPOSER is checked
+  /// (spec §7); the migration entry carries only the mode discriminant — knobs are pre-provisioned.
+  pub(crate) fn read_mode_change_valid(&self, mode: ReadOnlyOption) -> bool {
+    match mode {
+      ReadOnlyOption::Safe => true,
+      ReadOnlyOption::LeaseBased => self.check_quorum,
+      ReadOnlyOption::LeaseGuard => self.leaseguard_window_result().is_ok(),
+    }
+  }
 }
 
 #[cfg(test)]

@@ -412,6 +412,7 @@ where
       term_gated_snapshot_ack: None,
       // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
       pending_conf_index: Index::ZERO,
+      pending_read_mode_index: Index::ZERO,
       tracker,
       outgoing: VecDeque::new(),
       events: VecDeque::new(),

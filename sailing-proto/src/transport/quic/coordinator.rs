@@ -459,6 +459,27 @@ where
     r
   }
 
+  /// Propose a cluster-wide read-mode migration. Mirrors [`Endpoint::propose_read_mode_change`].
+  pub fn propose_read_mode_change<L, S>(
+    &mut self,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    mode: crate::ReadOnlyOption,
+  ) -> Result<Index, ProposeError<I>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    I: Data,
+  {
+    let now: crate::Now = now.into();
+    let r = self
+      .endpoint
+      .propose_read_mode_change(now, log, stable, mode);
+    self.pump(now.mono());
+    r
+  }
+
   /// Initiate a linearizable read; the resulting `ReadState` surfaces via [`Self::poll_event`].
   pub fn read_index<L, S>(
     &mut self,
