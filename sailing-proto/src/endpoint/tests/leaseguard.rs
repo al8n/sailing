@@ -280,6 +280,67 @@ fn continuous_refresh_drains_when_reads_stop() {
   );
 }
 
+/// A `Continuous` leader is HEARTBEAT-PACED: calling `handle_timeout` repeatedly BEFORE the heartbeat is
+/// due appends nothing (the proactive block gates on the heartbeat deadline), and the refresh no-op fires
+/// only at the due heartbeat. Guards against an embedder's fixed-tick loop driving caller-rate write
+/// amplification past the advertised one-per-heartbeat bound.
+#[test]
+fn continuous_refresh_is_heartbeat_paced() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_lease_refresh(crate::LeaseRefresh::Continuous);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::VecLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Self-elect (single voter) and commit the election no-op; the heartbeat deadline is now t0 + 100ms.
+  let t0 = ep.poll_timeout().unwrap();
+  ep.handle_timeout(t0, &mut log, &mut stable);
+  ep.handle_storage(t0, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(t0, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // A read arms read_since_anchor.
+  ep.read_index(t0, &log, &stable, bytes::Bytes::from_static(b"r"))
+    .expect("leader accepts the read");
+  assert!(ep.read_since_anchor());
+
+  // Many handle_timeout calls at t0 — the heartbeat is NOT due (deadline t0 + 100ms), so NO refresh fires
+  // even with read_since_anchor set: the rate is bounded by the heartbeat, not the caller's tick rate.
+  let before = log.last_index();
+  for _ in 0..20 {
+    ep.handle_timeout(t0, &mut log, &mut stable);
+    ep.handle_storage(t0, &mut log, &mut stable);
+    while ep.poll_event().is_some() {}
+    while ep.poll_message().is_some() {}
+  }
+  assert_eq!(
+    log.last_index(),
+    before,
+    "Continuous must NOT refresh before the heartbeat is due (caller-rate ticking)"
+  );
+
+  // At the due heartbeat the refresh fires.
+  ep.handle_timeout(t0 + Duration::from_millis(100), &mut log, &mut stable);
+  ep.handle_storage(t0 + Duration::from_millis(100), &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  assert!(
+    log.last_index() > before,
+    "Continuous refreshes once the heartbeat is due"
+  );
+}
+
 /// Under the FAILOVER tier (`bounded_clock_uncertainty` set), a LeaseGuard leader stamps every entry
 /// it appends with the SYNCHRONIZED wall reading carried by `Now::synchronized`. Without the tier the
 /// wall stamp stays 0 (absent on the wire) even when a wall is supplied.

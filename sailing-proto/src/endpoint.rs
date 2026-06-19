@@ -1608,7 +1608,12 @@ where
     }
     match self.role {
       Role::Leader => {
-        if self.heartbeat_deadline.is_some_and(|d| d <= now.mono()) {
+        // Whether the heartbeat is DUE this tick. BOTH lease-refresh blocks below gate on it, so the
+        // refresh rate is bounded by the heartbeat cadence no matter how often the embedder calls
+        // `handle_timeout` — a fixed-tick caller (ticking faster than `heartbeat_interval`) cannot drive
+        // proactive no-ops at caller rate.
+        let heartbeat_due = self.heartbeat_deadline.is_some_and(|d| d <= now.mono());
+        if heartbeat_due {
           self.broadcast_heartbeat(now);
           self.arm_heartbeat_timer(now);
         }
@@ -1621,7 +1626,7 @@ where
         // second refresh no-op); and the committed lease is STILL stale (an intervening client write may
         // already have re-stamped it). Replication carries it to the quorum; once it commits, subsequent
         // reads serve fast for Δ. On a fully idle cluster (no reads) the flag is never set ⇒ no write amp.
-        if self.lease_refresh_wanted {
+        if heartbeat_due && self.lease_refresh_wanted {
           self.lease_refresh_wanted = false;
           let last = log.last_index();
           if self.leaseguard_timing().is_some()
@@ -1642,7 +1647,8 @@ where
         // refresh anyway. The `last == commit` guard also makes this mutually exclusive with the demand
         // block above (if it appended, `last != commit` here, so we never stack two).
         let mode = self.config.lease_refresh();
-        if mode != crate::LeaseRefresh::Off
+        if heartbeat_due
+          && mode != crate::LeaseRefresh::Off
           && self.read_since_anchor
           && self.leaseguard_timing().is_some()
           && self.lead_transferee.is_none()
