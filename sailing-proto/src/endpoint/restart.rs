@@ -128,13 +128,15 @@ where
       .as_ref()
       .map(|(meta, _)| meta.max_lease_window())
       .unwrap_or(0);
-    // The active read mode this snapshot carries at its boundary (a SetReadMode compacted into it). The
+    // The EXPLICIT active read mode this snapshot carries at its boundary (a SetReadMode compacted into
+    // it), or None for a LEGACY/pre-migration snapshot (written before this field existed). The
     // committed-tail replay below (apply_committed) re-applies any post-snapshot SetReadMode
-    // (last-writer-wins by index); the static config is only the genesis default for a node that never
-    // snapshotted. Recovering from replicated state — not config — is what stops a migrated-away node
-    // coming back under its stale construction mode.
+    // (last-writer-wins by index). Recovering an EXPLICIT mode from replicated state — not config — is
+    // what stops a migrated-away node coming back under its stale construction mode; a None (legacy)
+    // snapshot instead falls back to the static config below, so a pre-migration snapshot is NEVER misread
+    // as an explicit migrate-to-Safe.
     let snap_read_only: Option<crate::ReadOnlyOption> =
-      snapshot.as_ref().map(|(meta, _)| meta.read_only());
+      snapshot.as_ref().and_then(|(meta, _)| meta.read_only());
     // The failover release floor this snapshot carries over its compacted entries — combined below
     // with a scan of the live log to recompute `max_wall_plus_window` from durable state alone.
     let snap_max_wall_plus: u64 = snapshot

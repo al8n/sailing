@@ -96,10 +96,12 @@ message SnapshotMeta {
   // populating it identically — which is exactly why this precise-anchor release bumps LABEL_VERSION
   // (mixed-version nodes that predate the consumed floors reject at the handshake).
   uint64 max_unwalled_lease_window = 6;
-  // The ACTIVE read mode at the snapshot boundary (a SetReadMode compacted into this snapshot), as a
-  // ReadOnlyOption discriminant (0=Safe, 1=LeaseBased, 2=LeaseGuard). Carried so a restarting node
-  // recovers its migrated mode from replicated state, not its stale construction config. Zero (Safe, the
-  // genesis default) — absent on the wire, byte-identical to a pre-migration peer. Rides LABEL_VERSION 4.
+  // The ACTIVE read mode at the snapshot boundary (a SetReadMode compacted into this snapshot), encoded
+  // WITH PRESENCE: 0 = absent/legacy (a pre-migration snapshot, or one that never set the mode), n = the
+  // ReadOnlyOption discriminant + 1 (1=Safe, 2=LeaseBased, 3=LeaseGuard). Carried so a restarting node
+  // recovers its migrated mode from replicated state; an ABSENT (0) value falls back to the static config,
+  // so a pre-migration snapshot is NOT misread as an explicit migrate-to-Safe. Zero is absent on the wire
+  // (byte-identical to a pre-migration peer); an explicit mode is present. Rides LABEL_VERSION 4.
   uint64 read_only = 7;
 }
 

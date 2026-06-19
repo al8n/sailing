@@ -84,9 +84,12 @@ reference — this section pins the SEMANTICS:
 - `Entry` kind `SetReadMode` (`ENTRY_KIND_SET_READ_MODE` = 3) and `SnapshotMeta.read_only` (7) carry a
   cluster-wide READ-MODE migration. A committed `SetReadMode` entry flips the active read mode (Safe /
   LeaseBased / LeaseGuard) at APPLY-TIME on every node; its 1-byte payload is the target `ReadOnlyOption`
-  discriminant (`0`/`1`/`2`). `SnapshotMeta.read_only` is the same discriminant as a `uint64` (`0` = Safe —
-  absent on the wire, byte-identical to a pre-migration snapshot), carried so a restart / snapshot-install
-  recovers the migrated mode from replicated state, not the static config. **A node predating the
+  discriminant (`0`/`1`/`2`). `SnapshotMeta.read_only` encodes the mode WITH PRESENCE as a `uint64` (`0` =
+  absent/legacy, `n` = the discriminant + 1), carried so a restart / snapshot-install recovers the migrated
+  mode from replicated state, not the static config — while an ABSENT (`0`) value falls back to config, so
+  a pre-migration snapshot (the field absent ⇒ `0`) is NOT misread as an explicit migrate-to-Safe. `0` is
+  absent on the wire (byte-identical to a pre-migration snapshot); an explicit mode is present. **A node
+  predating the
   `SetReadMode` kind would poison on (or silently drop) a committed migration — diverging the replicated
   mode across the cluster — so `LABEL_VERSION` is now 4:** the handshake fences a pre-migration peer. (A
   node restarting from its OWN pre-migration durable log never sees a `SetReadMode`, so there is no

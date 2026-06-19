@@ -270,7 +270,7 @@ fn pb_snapshot_meta<I: crate::NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
     max_lease_window: m.max_lease_window(),
     max_wall_plus_window: m.max_wall_plus_window(),
     max_unwalled_lease_window: m.max_unwalled_lease_window(),
-    read_only: u64::from(m.read_only().as_u8()),
+    read_only: m.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1),
     ..Default::default()
   }
 }
@@ -282,21 +282,30 @@ fn snapshot_meta_from<I: crate::NodeId>(
     .conf
     .as_option()
     .ok_or(DecodeError::Invalid("SnapshotMeta.conf"))?;
-  let read_only = u8::try_from(w.read_only)
-    .ok()
-    .and_then(crate::ReadOnlyOption::from_u8)
-    .ok_or(DecodeError::Invalid("SnapshotMeta.read_only"))?;
-  Ok(
-    SnapshotMeta::new(
-      Index::new(w.last_index),
-      Term::new(w.last_term),
-      conf_state_from(conf)?,
-    )
-    .with_max_lease_window(w.max_lease_window)
-    .with_max_wall_plus_window(w.max_wall_plus_window)
-    .with_max_unwalled_lease_window(w.max_unwalled_lease_window)
-    .with_read_only(read_only),
+  // 0 = legacy/absent (a pre-migration snapshot, or one that never set the mode) → leave the meta's
+  // read_only as None so restart/install falls back to the static config; 1.. = an explicit migrated mode
+  // (the ReadOnlyOption discriminant + 1, so an explicit Safe is DISTINCT from absent).
+  let read_only = match w.read_only {
+    0 => None,
+    n => Some(
+      u8::try_from(n - 1)
+        .ok()
+        .and_then(crate::ReadOnlyOption::from_u8)
+        .ok_or(DecodeError::Invalid("SnapshotMeta.read_only"))?,
+    ),
+  };
+  let meta = SnapshotMeta::new(
+    Index::new(w.last_index),
+    Term::new(w.last_term),
+    conf_state_from(conf)?,
   )
+  .with_max_lease_window(w.max_lease_window)
+  .with_max_wall_plus_window(w.max_wall_plus_window)
+  .with_max_unwalled_lease_window(w.max_unwalled_lease_window);
+  Ok(match read_only {
+    Some(mode) => meta.with_read_only(mode),
+    None => meta,
+  })
 }
 
 // ─── Message ───────────────────────────────────────────────────────────────────────
