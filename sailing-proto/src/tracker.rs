@@ -114,6 +114,14 @@ impl<I: NodeId> Tracker<I> {
     self.voters.vote_result(|id| votes.get(&id).copied())
   }
 
+  /// Like [`vote_result`](Self::vote_result) but driven by a closure `id → granted?` instead of a
+  /// materialized map. The read/lease confirmation paths call this per heartbeat response, so the
+  /// closure form avoids allocating a `BTreeMap` (and the `ids()` set) on every ack; only voter ids are
+  /// ever queried, so a definite `bool` per id suffices.
+  pub fn vote_result_by(&self, granted: impl Fn(I) -> bool) -> VoteResult {
+    self.voters.vote_result(|id| Some(granted(id)))
+  }
+
   /// Whether a voter quorum is currently active (i.e. `recent_active` is true for a quorum
   /// of voters in each joint-config half).
   ///
