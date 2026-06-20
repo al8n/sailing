@@ -336,6 +336,7 @@ where
     if self.poisoned {
       return;
     }
+    self.debug_assert_queues_drained();
     while let Some(done) = log.poll() {
       match done {
         Ok(crate::LogDone::Appended(opid)) => self.on_log_appended(now, log, stable, opid),
