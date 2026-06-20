@@ -777,6 +777,113 @@ fn single_node_leader_commits_after_storage_drain() {
   );
 }
 
+/// A cold (`EntriesRead::Pending`) committed-range read at apply time DEFERS: the node applies nothing
+/// this pass and retries on the next pump (the `cold_read_defers` wedge counter bumps), and crucially
+/// does NOT poison — a cold read is not a fault (unlike an `Err`). Single-node leader: commit advances
+/// on append durability without any log read, so apply is the only reader and it defers cleanly.
+#[test]
+fn apply_defers_on_cold_read_without_poisoning() {
+  use crate::{Config, Instant};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::FailTermLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Self-elect (quorum == 1), drain so the no-op commits and applies.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {} // drain the no-op's Applied event
+  assert_eq!(
+    ep.cold_read_defers(),
+    0,
+    "no cold defers before arming the fault"
+  );
+
+  // Arm the cold read, then propose + drain so commit advances over the new entry; apply reads it cold.
+  log.return_cold_on_read();
+  ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
+    .unwrap();
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_timeout(d, &mut log, &mut stable);
+
+  assert!(
+    ep.poison_reason().is_none(),
+    "a cold read is not a fault — apply must defer, never poison"
+  );
+  assert!(
+    ep.cold_read_defers() > 0,
+    "the apply cold-read defer must bump the wedge counter"
+  );
+  assert!(
+    !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    "the proposed entry must NOT apply while the read is cold (deferred)"
+  );
+}
+
+/// A cold (`EntriesRead::Pending`) replication read DEFERS the send: `maybe_send_append` returns
+/// without emitting an AppendEntries and WITHOUT poisoning. This is the one real behavior change — an
+/// `Err` here is fatal (poison), but a cold read retries on the next pump, so a lagging follower whose
+/// evicted range is being fetched no longer fail-stops the leader.
+#[test]
+fn replication_defers_on_cold_read_without_poisoning() {
+  use crate::{Config, Index, Instant, Message, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::FailTermLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Elect node 1 leader (peer 2 votes) so it appends a no-op at index 1.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable); // the no-op append fires
+  while ep.poll_message().is_some() {} // drain the initial broadcast
+
+  // Point follower 2 at index 1 (Probe) so a send must read entries(1..2), then make that read cold.
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_probe();
+    p.set_next_index(Index::new(1));
+  }
+  log.return_cold_on_read();
+  ep.maybe_send_append(crate::Now::monotonic(Instant::ORIGIN), 2u64, &log, &stable);
+
+  assert!(
+    ep.poison_reason().is_none(),
+    "a cold replication read is not a fault — defer, never poison"
+  );
+  assert!(
+    !core::iter::from_fn(|| ep.poll_message())
+      .any(|m| matches!(m.message(), Message::AppendEntries(_))),
+    "a cold replication read must defer the send — no AppendEntries emitted"
+  );
+}
+
 /// A follower must not send AppendResp until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]

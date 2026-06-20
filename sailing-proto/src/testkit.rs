@@ -233,6 +233,10 @@ pub(crate) struct FailTermLog {
   /// but OVERLONG read returning entries past the requested range (e.g. past `commit`). Apply's
   /// `idx > commit` guard must fail-stop rather than fold an uncommitted entry into state.
   return_overlong: bool,
+  /// When `true`, `entries` returns [`EntriesRead::Pending`] (the range is "cold") for EVERY read —
+  /// a store that defers. Proves the per-site Pending dispositions: apply/replication defer without
+  /// poisoning, the restart scans poison.
+  return_cold: bool,
 }
 
 impl FailTermLog {
@@ -272,6 +276,11 @@ impl FailTermLog {
   pub(crate) fn return_overlong_on_read(&mut self) {
     self.return_overlong = true;
   }
+
+  /// Make `entries` return [`EntriesRead::Pending`] (a cold read) for every read.
+  pub(crate) fn return_cold_on_read(&mut self) {
+    self.return_cold = true;
+  }
 }
 
 impl LogStore for FailTermLog {
@@ -297,6 +306,9 @@ impl LogStore for FailTermLog {
     range: core::ops::Range<Index>,
     max_bytes: u64,
   ) -> Result<EntriesRead<'_>, Self::Error> {
+    if self.return_cold {
+      return Ok(EntriesRead::Pending);
+    }
     if self.fail_entries_index.is_some_and(|i| range.contains(&i)) {
       return Err(());
     }
