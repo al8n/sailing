@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use sailing_proto::{
-  Entry, HardState, Index, LogDone, LogStore, OpId, SnapshotMeta, StableDone, StableStore,
-  StateMachine, Term,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotMeta,
+  StableDone, StableStore, StateMachine, Term,
 };
 
 /// A counting state machine: applies are counted; the response is the post-apply count.
@@ -95,7 +95,7 @@ impl LogStore for MemLog {
     &self,
     range: std::ops::Range<Index>,
     max_bytes: u64,
-  ) -> Result<&[Entry], Self::Error> {
+  ) -> Result<EntriesRead<'_>, Self::Error> {
     let start = (range.start.get() - self.first) as usize;
     let end = (range.end.get() - self.first) as usize;
     let slice = &self.entries[start..end.min(self.entries.len())];
@@ -111,7 +111,7 @@ impl LogStore for MemLog {
       budget = budget.saturating_sub(sz);
       count += 1;
     }
-    Ok(&slice[..count])
+    Ok(EntriesRead::Ready(MaybeOwned::Borrowed(&slice[..count])))
   }
 
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
@@ -270,8 +270,13 @@ impl LogStore for PoisonableLog {
     &self,
     range: std::ops::Range<Index>,
     max_bytes: u64,
-  ) -> Result<&[Entry], Self::Error> {
-    Ok(self.inner.entries(range, max_bytes).unwrap_or(&[]))
+  ) -> Result<EntriesRead<'_>, Self::Error> {
+    Ok(
+      self
+        .inner
+        .entries(range, max_bytes)
+        .unwrap_or(EntriesRead::Ready(MaybeOwned::Borrowed(&[]))),
+    )
   }
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
     if self.fail_appends.load(std::sync::atomic::Ordering::Acquire) {

@@ -145,13 +145,13 @@ fn become_leader_appends_noop_and_inits_progress() {
   );
   assert!(ep.role().is_leader());
   assert_eq!(log.last_index(), crate::Index::new(1)); // no-op at index 1
-  assert!(
-    log
-      .entries(crate::Index::new(1)..crate::Index::new(2), u64::MAX)
-      .unwrap()[0]
-      .kind()
-      .is_empty()
-  );
+  let crate::EntriesRead::Ready(entries) = log
+    .entries(crate::Index::new(1)..crate::Index::new(2), u64::MAX)
+    .unwrap()
+  else {
+    panic!("a resident store never returns Pending");
+  };
+  assert!(entries[0].kind().is_empty());
 }
 
 #[test]

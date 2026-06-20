@@ -1,6 +1,7 @@
 //! Throwaway store impls for proto-level unit tests. Not compiled outside `#[cfg(test)]`.
 use crate::{
-  Entry, HardState, Index, LogDone, LogStore, OpId, SnapshotMeta, StableDone, StableStore, Term,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotMeta,
+  StableDone, StableStore, Term,
 };
 use bytes::Bytes;
 use std::collections::VecDeque;
@@ -32,8 +33,8 @@ impl LogStore for NoopLog {
     &self,
     _range: core::ops::Range<Index>,
     _max_bytes: u64,
-  ) -> Result<&[crate::Entry], Self::Error> {
-    Ok(&[])
+  ) -> Result<EntriesRead<'_>, Self::Error> {
+    Ok(EntriesRead::Ready(MaybeOwned::Borrowed(&[])))
   }
 
   fn submit_append(&mut self, _id: OpId, _entries: &[crate::Entry]) {}
@@ -129,7 +130,7 @@ impl LogStore for VecLog {
     &self,
     range: core::ops::Range<Index>,
     _max_bytes: u64,
-  ) -> Result<&[Entry], Self::Error> {
+  ) -> Result<EntriesRead<'_>, Self::Error> {
     let start = range.start.get();
     let end = range.end.get();
     let offset = self.offset.get();
@@ -146,7 +147,9 @@ impl LogStore for VecLog {
     };
     let lo = lo.min(self.entries.len());
     let hi = hi.max(lo).min(self.entries.len());
-    Ok(&self.entries[lo..hi])
+    Ok(EntriesRead::Ready(MaybeOwned::Borrowed(
+      &self.entries[lo..hi],
+    )))
   }
 
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
@@ -293,7 +296,7 @@ impl LogStore for FailTermLog {
     &self,
     range: core::ops::Range<Index>,
     max_bytes: u64,
-  ) -> Result<&[Entry], Self::Error> {
+  ) -> Result<EntriesRead<'_>, Self::Error> {
     if self.fail_entries_index.is_some_and(|i| range.contains(&i)) {
       return Err(());
     }
@@ -303,14 +306,23 @@ impl LogStore for FailTermLog {
     } else {
       range
     };
-    let s = self
+    // Destructure `Borrowed` to recover the `&self` lifetime — re-slicing the local MaybeOwned
+    // would borrow the local, not the inner store. VecLog always returns Ready(Borrowed).
+    let s = match self
       .inner
       .entries(read, max_bytes)
-      .expect("VecLog::entries is Infallible");
+      .expect("VecLog::entries is Infallible")
+    {
+      EntriesRead::Ready(MaybeOwned::Borrowed(slice)) => slice,
+      EntriesRead::Ready(MaybeOwned::Owned(_)) | EntriesRead::Pending => {
+        unreachable!("VecLog::entries always returns Ready(Borrowed)")
+      }
+    };
     if self.gap_first_entry && !s.is_empty() {
-      return Ok(&s[1..]); // gapped: a contiguous suffix starting above range.start
+      // gapped: a contiguous suffix starting above range.start
+      return Ok(EntriesRead::Ready(MaybeOwned::Borrowed(&s[1..])));
     }
-    Ok(s)
+    Ok(EntriesRead::Ready(MaybeOwned::Borrowed(s)))
   }
 
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {

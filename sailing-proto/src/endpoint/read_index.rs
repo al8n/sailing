@@ -151,10 +151,12 @@ where
     // LOCAL here rather than relying solely on the caller's `has_current_term_commit` gate. A storage
     // read failure poisons and fails closed (an absent index answers `Ok` empty, not `Err`).
     let (term, ts, window) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
-      Ok(s) => match s.first() {
+      Ok(crate::EntriesRead::Ready(s)) => match s.first() {
         Some(e) => (e.term(), e.timestamp(), e.lease_window()),
         None => return false,
       },
+      // Cold anchor: fail closed (degrade to the Safe round / no refresh), same as an absent anchor.
+      Ok(crate::EntriesRead::Pending) => return false,
       Err(_) => {
         self.poison(PoisonReason::LogRead);
         return false;
@@ -202,10 +204,12 @@ where
       return false;
     };
     let (term, ts, window) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
-      Ok(s) => match s.first() {
+      Ok(crate::EntriesRead::Ready(s)) => match s.first() {
         Some(e) => (e.term(), e.timestamp(), e.lease_window()),
         None => return false,
       },
+      // Cold anchor: fail closed (degrade to the Safe round / no refresh), same as an absent anchor.
+      Ok(crate::EntriesRead::Pending) => return false,
       Err(_) => {
         self.poison(PoisonReason::LogRead);
         return false;

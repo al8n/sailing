@@ -392,6 +392,7 @@ where
       // Observability counters reset on restart (in-memory only, never persisted).
       precise_releases: 0,
       unprovable_floor_holds: 0,
+      cold_read_defers: 0,
       // Inherited-read serve anchors arm only when a restarted follower (re-)wins an election.
       limbo_upper: Index::ZERO,
       committed_anchor_wall: 0,
@@ -487,10 +488,12 @@ where
     let mut max = 0u64;
     while idx <= last {
       let chunk = match log.entries(idx..last.next(), 1 << 20) {
-        Ok(c) if !c.is_empty() => c,
+        // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
+        // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
+        Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
         _ => return Err(PoisonReason::LogRead),
       };
-      for e in chunk {
+      for e in chunk.iter() {
         max = max.max(e.lease_window());
       }
       // `entries` may return a prefix of the requested range; advance past the last entry it gave
@@ -515,10 +518,12 @@ where
     let mut max = 0u64;
     while idx <= last {
       let chunk = match log.entries(idx..last.next(), 1 << 20) {
-        Ok(c) if !c.is_empty() => c,
+        // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
+        // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
+        Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
         _ => return Err(PoisonReason::LogRead),
       };
-      for e in chunk {
+      for e in chunk.iter() {
         // Only a real (non-zero) wall AND a real (non-zero) lease window contribute — mirrors the
         // `submit_append` fold EXACTLY so the restart recompute matches the in-memory value (an absent
         // wall, or a degenerate wall-without-window entry, folds nothing; the floor stays `0` outside the
@@ -551,10 +556,12 @@ where
     let mut max = 0u64;
     while idx <= last {
       let chunk = match log.entries(idx..last.next(), 1 << 20) {
-        Ok(c) if !c.is_empty() => c,
+        // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
+        // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
+        Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
         _ => return Err(PoisonReason::LogRead),
       };
-      for e in chunk {
+      for e in chunk.iter() {
         // Mirror the gated `submit_append` fold: a LEASE-bearing but WALL-ABSENT entry (fail-closed
         // failover) contributes its window; a walled or zero-window entry contributes nothing.
         if e.wall_timestamp() == 0 && e.lease_window() > 0 {

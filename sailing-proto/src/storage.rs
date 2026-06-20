@@ -110,6 +110,22 @@ pub enum StableDone {
   SnapshotWritten(OpId),
 }
 
+/// The result of a [`LogStore::entries`] range read: resident entries (owned or borrowed) or a
+/// cold-read deferral.
+///
+/// Deliberately NOT `#[non_exhaustive]`: `Ready` and `Pending` require distinct handling at every
+/// call site (serve vs defer), so a future variant SHOULD break consumers' matches rather than fall
+/// silently into a catch-all — there is no safe default for an unknown read outcome.
+pub enum EntriesRead<'a> {
+  /// Entries for the requested range (the range-read contract on [`LogStore::entries`]), borrowed
+  /// (resident — zero-copy) or owned (the store materialised them, e.g. decoded from cold storage).
+  Ready(crate::MaybeOwned<'a, [Entry]>),
+  /// The in-domain range is NOT resident; the store has begun fetching it. A BENIGN, retryable
+  /// answer (NOT an error): the core makes no progress on this range now and re-reads it on a later
+  /// pump. A fully-resident store NEVER returns this.
+  Pending,
+}
+
 /// The replicated-log store. Reads are synchronous; appends are deferred.
 pub trait LogStore {
   /// A failure reading the log (fatal to the node).
@@ -141,9 +157,11 @@ pub trait LogStore {
   /// out-of-domain probes will be permanently poisoned by ordinary protocol traffic.
   fn term(&self, index: Index) -> Result<Term, Self::Error>;
 
-  /// Entries in `range`, as a CONTIGUOUS borrowed slice beginning exactly at `range.start`.
+  /// Entries in `range`, as an [`EntriesRead`] holding a CONTIGUOUS run of entries (borrowed when
+  /// resident, owned when the store materialised them) beginning exactly at `range.start`.
   ///
-  /// **Range-read contract (NORMATIVE):**
+  /// **Range-read contract (NORMATIVE)** — the clauses below describe the entries inside
+  /// [`EntriesRead::Ready`]:
   /// - **Contiguous, range-aligned:** when the result is non-empty, `slice[0].index() == range.start`
   ///   and `slice[k].index() == range.start + k`. The result is a PREFIX of `[range.start, range.end)` —
   ///   never a suffix, never reordered, never with a gap. Callers (apply, replication, the restart scans)
@@ -153,14 +171,25 @@ pub trait LogStore {
   ///   whole range MUST loop, re-reading `slice.last().index().next()..range.end` until it is drained.
   ///   With `max_bytes == u64::MAX` the cap cannot fire, so the whole in-range portion comes back in one
   ///   call (returning MORE than `max_bytes` is also allowed — "roughly").
-  /// - **Empty vs error:** an empty slice means "no entries in view for this range" (e.g.
-  ///   `range.start > last_index()`, or a committed entry not yet in the durable read view) — a BENIGN,
-  ///   retryable answer, NOT an error. `Err` is reserved for genuine storage faults (I/O, corruption) and
-  ///   is FATAL: the core poisons (fail-stop) on any `entries` error.
+  /// - **Three `Ok` outcomes (NORMATIVE):** `Ready(non-empty)` serves; `Ready(empty)` means "no entries
+  ///   in view for this range" (e.g. `range.start > last_index()`, or a committed entry not yet in the
+  ///   durable read view) — a BENIGN, retryable answer; [`EntriesRead::Pending`] means the in-domain range
+  ///   EXISTS but is NOT resident and the store has begun fetching it — also benign and retryable, but
+  ///   DISTINCT from empty (empty asserts there is nothing here; `Pending` asserts there is, just cold).
+  ///   A store MUST NOT report a cold range as `Ready(empty)`. `Err` is reserved for genuine storage faults
+  ///   (I/O, corruption) and is FATAL: the core poisons (fail-stop, `PoisonReason::LogRead`) on any error.
+  /// - **Cold-read obligation (NORMATIVE):** a store that returns `Pending` MUST eventually return `Ready`
+  ///   (or `Err` on a genuine fault) for that range, and signal the driver via its storage-ready seam so the
+  ///   core re-pumps; a never-resolving `Pending` is a contract violation (the liveness analogue of a store
+  ///   that never makes a committed read available). A fully-resident store NEVER returns `Pending`.
+  /// - **Restart is resident-only (NORMATIVE):** during [`Endpoint::restart`](crate::Endpoint::restart)
+  ///   the store MUST keep `[first_index(), last_index()]` resident — the synchronous lease-floor scans
+  ///   cannot defer, and a partial scan would under-size the post-election commit-wait (a stale-read break).
+  ///   A `Pending` (or empty) in-range read during restart is treated as a fatal `LogRead` poison.
   ///
   /// **Domain contract:** the core only requests ranges within the retained log
   /// (`first_index() <= range.start` and `range.end <= last_index() + 1`).
-  fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<&[Entry], Self::Error>;
+  fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<EntriesRead<'_>, Self::Error>;
 
   /// Queue an append (truncating any conflicting suffix first). Durable on the matching `poll`
   /// (a [`LogDone::Appended`] for this `id`).

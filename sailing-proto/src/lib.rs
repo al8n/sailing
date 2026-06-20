@@ -58,7 +58,7 @@ mod state_machine;
 pub use state_machine::StateMachine;
 
 mod storage;
-pub use storage::{LogDone, LogStore, OpId, StableDone, StableStore};
+pub use storage::{EntriesRead, LogDone, LogStore, OpId, StableDone, StableStore};
 
 mod error;
 pub use error::{ConfigError, ProposeError, ReadIndexError, TransferError};

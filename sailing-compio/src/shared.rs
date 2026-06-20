@@ -32,7 +32,7 @@ use std::{
   },
 };
 
-use sailing_proto::{Entry, EntryKind, Event, FailoverReadWindow, Index, LogStore};
+use sailing_proto::{EntriesRead, Entry, EntryKind, Event, FailoverReadWindow, Index, LogStore};
 
 use crate::DriverError;
 
@@ -177,8 +177,13 @@ pub(crate) fn read_limbo<L: LogStore>(
   }
   // A `LogStore::entries` error is a FATAL storage fault, NOT a safe fallback — propagate it so the
   // driver fail-stops instead of letting a corrupt committed-range log keep serving normal reads.
-  let entries = log.entries(lo..hi, max_bytes)?;
-  Ok(contiguous_normal_entries(entries, lo, hi, max_bytes))
+  let entries = match log.entries(lo..hi, max_bytes)? {
+    EntriesRead::Ready(e) => e,
+    // Cold limbo range: fail closed (serve nothing this pass), same as the ceiling fallback — the
+    // driver re-pumps when the store signals storage-ready.
+    EntriesRead::Pending => return Ok(None),
+  };
+  Ok(contiguous_normal_entries(&entries, lo, hi, max_bytes))
 }
 
 /// The half-open `[lo, hi)` for the inclusive limbo region `(index, limbo_upper]`, or `None` (FAIL
@@ -608,7 +613,7 @@ mod tests {
       fn term(&self, _: Index) -> Result<Term, ()> {
         Ok(Term::ZERO)
       }
-      fn entries(&self, _: Range<Index>, _: u64) -> Result<&[Entry], ()> {
+      fn entries(&self, _: Range<Index>, _: u64) -> Result<sailing_proto::EntriesRead<'_>, ()> {
         Err(())
       }
       fn submit_append(&mut self, _: OpId, _: &[Entry]) {
