@@ -1272,6 +1272,14 @@ where
   }
 
   /// Next outbound message, if any.
+  ///
+  /// **Driver drain obligation.** The endpoint queues outbound messages and application events in
+  /// unbounded `VecDeque`s and tracks in-flight storage ops in unbounded maps; nothing inside the pure
+  /// state machine bounds them (a Sans-I/O core applies backpressure nowhere). A driver MUST drain
+  /// `poll_message` and [`poll_event`](Self::poll_event) — and call
+  /// [`handle_storage`](Self::handle_storage) so storage ops complete — between dispatches, or these
+  /// queues grow without bound under a fast input rate, a slow store, or a stalled poll loop. A debug
+  /// build trips an assertion at the next dispatch if they run away.
   #[inline]
   pub fn poll_message(&mut self) -> Option<Outgoing<I>> {
     // A poisoned node emits nothing — not even already-queued messages. The emit-halt must live at
@@ -1293,6 +1301,30 @@ where
       return None;
     }
     self.events.pop_front()
+  }
+
+  /// Debug-only tripwire for the driver's drain obligation (see [`poll_message`](Self::poll_message)):
+  /// the unbounded work queues — outbound messages, application events, and the in-flight storage-op maps
+  /// — should never approach this in correct operation, so crossing it signals a driver that is not
+  /// draining `poll_message` / `poll_event` or not calling `handle_storage`. Checked at each dispatch
+  /// start, so it measures what a correct driver should already have drained. Far above any legitimate
+  /// burst (peers × batches, or in-flight storage ops); a no-op in release (`debug_assert!`).
+  #[inline]
+  fn debug_assert_queues_drained(&self) {
+    const TRIPWIRE: usize = 1 << 20;
+    debug_assert!(
+      self.outgoing.len() < TRIPWIRE
+        && self.events.len() < TRIPWIRE
+        && self.pending.len() < TRIPWIRE
+        && self.inflight_append_upto.len() < TRIPWIRE,
+      "endpoint work queues exceeded the drain tripwire (outgoing={}, events={}, pending={}, \
+       inflight={}) — a driver MUST drain poll_message/poll_event and call handle_storage between \
+       dispatches (see poll_message)",
+      self.outgoing.len(),
+      self.events.len(),
+      self.pending.len(),
+      self.inflight_append_upto.len(),
+    );
   }
 
   /// Test-only: drain all pending events, returning whether ANY was an `Event::ReadState`.
@@ -1509,6 +1541,7 @@ where
     if self.poisoned {
       return;
     }
+    self.debug_assert_queues_drained();
     // Sender-authenticity choke-point: reject any message whose self-reported sender disagrees with
     // the transport peer it actually arrived from. This single check closes payload-sender spoofing
     // for EVERY message type — past this point vote tallies, append acks, and read confirmations may
@@ -1681,6 +1714,7 @@ where
     if self.poisoned {
       return;
     }
+    self.debug_assert_queues_drained();
     match self.role {
       Role::Leader => {
         // Whether the heartbeat is DUE this tick. BOTH lease-refresh blocks below gate on it, so the
