@@ -984,6 +984,66 @@ fn apply_reads_are_byte_capped_and_handle_owned_entries() {
   );
 }
 
+/// A large backlog of ZERO-payload committed entries (no-ops / empty / conf — common in Raft) must NOT
+/// let an owned cold store materialise the whole backlog in one read: the payload-byte cap charges 0 for
+/// them, so the CORE bounds the requested range WIDTH (entry count) at `MAX_READ_BATCH_ENTRIES`. Driven
+/// via the restart replay (the lease-floor scans AND the apply replay) over an owned store, asserting
+/// every committed-range read stays within the cap and the cap actually fires.
+#[test]
+fn owned_zero_payload_backlog_reads_are_count_bounded() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  // A committed backlog LARGER than the cap, every entry zero-payload (the byte cap charges 0 bytes).
+  let n = crate::endpoint::MAX_READ_BATCH_ENTRIES + 200;
+  let mut log = crate::testkit::FailTermLog::default();
+  log.return_owned_on_read(); // materialise OWNED — the cold/disk store shape
+  let entries: std::vec::Vec<Entry> = (1..=n)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+  let mut stable = crate::testkit::NoopStable::default();
+  stable.force_state(Term::new(1), Some(1u64), Index::new(n)); // commit = n
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+
+  assert!(
+    ep.poison_reason().is_none(),
+    "restart + apply over a large owned zero-payload backlog must succeed"
+  );
+  assert!(
+    log.observed_max_range_width() <= crate::endpoint::MAX_READ_BATCH_ENTRIES,
+    "every committed-range read must request at most MAX_READ_BATCH_ENTRIES indices ({} requested) — else \
+     an owned store could materialise the whole zero-payload backlog in one read",
+    log.observed_max_range_width()
+  );
+  assert_eq!(
+    log.observed_max_range_width(),
+    crate::endpoint::MAX_READ_BATCH_ENTRIES,
+    "the entry-count cap must actually FIRE for a backlog larger than it (non-vacuous coverage)"
+  );
+}
+
 /// A follower must not send AppendResp until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]

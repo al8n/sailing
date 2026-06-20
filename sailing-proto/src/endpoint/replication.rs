@@ -192,9 +192,15 @@ where
     // per-send allocation. `max_bytes` is also passed to the store so an implementation that honours
     // it can return a shorter slice.
     let max_bytes = self.config.max_size_per_msg();
+    // Cap the requested range at MAX_READ_BATCH_ENTRIES indices (the entry-count bound): the store byte
+    // cap is PAYLOAD-only, so a far-behind follower's zero-payload suffix would otherwise let an owned
+    // store materialize O(suffix) structs. The byte cap below trims further; a later pump sends the rest.
+    let read_end = end.min(Index::new(
+      next.get().saturating_add(MAX_READ_BATCH_ENTRIES),
+    ));
     // Bind the MaybeOwned to a local so a cold-fetch store's OWNED buffer outlives the `slice` borrow.
     let read: crate::MaybeOwned<'_, [crate::Entry]> = if next < end {
-      match log.entries(next..end, max_bytes) {
+      match log.entries(next..read_end, max_bytes) {
         Ok(crate::EntriesRead::Ready(e)) => e,
         // Cold: the range isn't resident. Defer the whole send — no Progress mutation, no inflight
         // slot consumed — and retry on the next pump. A cold read is NOT a fault, so never poison

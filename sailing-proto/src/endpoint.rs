@@ -19,6 +19,12 @@ mod restart;
 mod snapshot;
 mod transfer;
 
+/// The max ENTRY COUNT a single committed-range read requests (apply, replication, the restart scans).
+/// The store's byte cap is PAYLOAD-only, so a backlog of zero-payload entries (no-ops, empty/conf) would
+/// let an owned store materialize O(backlog) structs despite it; bounding the requested range WIDTH caps
+/// the count regardless of payload. The caller's loop re-reads the remainder.
+pub(crate) const MAX_READ_BATCH_ENTRIES: u64 = 8192;
+
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
@@ -1903,11 +1909,13 @@ where
   /// A bare `break` is used ONLY for the benign "committed entry not yet readable" case (the
   /// log slice is empty), which is transient and retried on the next `handle_*`.
   fn apply_committed<L: LogStore>(&mut self, log: &L) {
-    // Bound the per-pass read so a COLD/disk store returning `Ready(Owned(..))` materializes at most this
-    // many payload bytes per call instead of the whole unapplied backlog (a panic-OOM for a node catching
-    // up after a large committed backlog). The outer `while` re-reads from the new `applied.next()`, so a
-    // short prefix just costs another pass; the in-memory borrowed path is unaffected (a small range comes
-    // back in one pass). Mirrors the restart scans' `1 << 20` cap.
+    // Bound BOTH the per-pass payload bytes AND the entry COUNT so a COLD/disk store returning
+    // `Ready(Owned(..))` materializes a bounded amount per call instead of the whole unapplied backlog (a
+    // panic-OOM for a node catching up). The byte cap alone is INSUFFICIENT: it charges PAYLOAD bytes, so a
+    // backlog of ZERO-payload entries (no-ops, empty/conf) would slip the whole range through — hence the
+    // entry-count cap on the requested range width too. The outer `while` re-reads from the new
+    // `applied.next()`, so a short prefix just costs another pass; the in-memory borrowed path is unaffected
+    // (a small range comes back in one pass).
     const APPLY_READ_MAX_BYTES: u64 = 1 << 20;
     while self.applied < self.commit {
       // Halt the drain the moment the node poisons (including a poison set EARLIER in the same
@@ -1921,10 +1929,14 @@ where
       // (the LogStore::entries contract), capped at `APPLY_READ_MAX_BYTES`; a short prefix is re-fetched
       // by the outer while. An empty slice is the benign "committed entry not yet in the read view" case
       // → break and retry next tick; an Err is a fatal committed-range read fault → poison.
-      let batch = match log.entries(
-        self.applied.next()..self.commit.next(),
-        APPLY_READ_MAX_BYTES,
-      ) {
+      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices (the entry-count bound).
+      let read_end = self.commit.next().min(Index::new(
+        self
+          .applied
+          .get()
+          .saturating_add(MAX_READ_BATCH_ENTRIES + 1),
+      ));
+      let batch = match log.entries(self.applied.next()..read_end, APPLY_READ_MAX_BYTES) {
         Ok(crate::EntriesRead::Ready(e)) if e.is_empty() => break,
         Ok(crate::EntriesRead::Ready(e)) => e,
         // Present but cold: stop applying this pass and retry on the next pump (the store signals
