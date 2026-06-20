@@ -88,6 +88,15 @@ fn main() {
                     rep.precise_releases, rep.offset_resyncs, rep.inherited_serves, rep.committed, rep.reads_confirmed
                   );
                 }
+                // ASYMMETRIC sub-mode witness (the backward-only wall-contract violation): a failover seed
+                // that FIRED a violating resync AND reached the inherited-serve path under it — the
+                // candidates for `vopr_exercises_asymmetric_wall_injection`'s pinned seed set.
+                if rep.violating_resyncs > 0 && rep.inherited_serves > 0 && rep.committed > 0 {
+                  eprintln!(
+                    "  ASYMMETRIC seed {seed}: violating_resyncs={} inherited_serves={} committed={} confirmed={}",
+                    rep.violating_resyncs, rep.inherited_serves, rep.committed, rep.reads_confirmed
+                  );
+                }
               }
             }
             Err(payload) => {
