@@ -487,7 +487,12 @@ where
     let mut idx = log.first_index();
     let mut max = 0u64;
     while idx <= last {
-      let chunk = match log.entries(idx..last.next(), 1 << 20) {
+      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices too (the store byte cap is payload-only;
+      // a zero-payload retained tail would otherwise let an owned store materialize O(tail) in one read).
+      let read_end = last
+        .next()
+        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+      let chunk = match log.entries(idx..read_end, 1 << 20) {
         // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
         // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
         Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
@@ -517,7 +522,12 @@ where
     let mut idx = log.first_index();
     let mut max = 0u64;
     while idx <= last {
-      let chunk = match log.entries(idx..last.next(), 1 << 20) {
+      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices too (the store byte cap is payload-only;
+      // a zero-payload retained tail would otherwise let an owned store materialize O(tail) in one read).
+      let read_end = last
+        .next()
+        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+      let chunk = match log.entries(idx..read_end, 1 << 20) {
         // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
         // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
         Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
@@ -555,7 +565,12 @@ where
     let mut idx = log.first_index();
     let mut max = 0u64;
     while idx <= last {
-      let chunk = match log.entries(idx..last.next(), 1 << 20) {
+      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices too (the store byte cap is payload-only;
+      // a zero-payload retained tail would otherwise let an owned store materialize O(tail) in one read).
+      let read_end = last
+        .next()
+        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+      let chunk = match log.entries(idx..read_end, 1 << 20) {
         // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
         // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
         Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,

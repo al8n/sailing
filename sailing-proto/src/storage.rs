@@ -171,6 +171,11 @@ pub trait LogStore {
   ///   whole range MUST loop, re-reading `slice.last().index().next()..range.end` until it is drained.
   ///   With `max_bytes == u64::MAX` the cap cannot fire, so the whole in-range portion comes back in one
   ///   call (returning MORE than `max_bytes` is also allowed — "roughly").
+  /// - **Width-bounded requests:** the byte cap charges PAYLOAD bytes only, so it does not bound the entry
+  ///   COUNT for zero-payload entries (no-ops, empty/conf). The core therefore bounds the WIDTH of every
+  ///   multi-entry committed-range request it issues (apply, replication, the restart scans) — a store
+  ///   materialising an OWNED result allocates a bounded count per call regardless of payload, and the
+  ///   caller re-reads the remainder. Single-entry reads (the lease/election anchors) are bounded trivially.
   /// - **Three `Ok` outcomes (NORMATIVE):** `Ready(non-empty)` serves; `Ready(empty)` means "no entries
   ///   in view for this range" (e.g. `range.start > last_index()`, or a committed entry not yet in the
   ///   durable read view) — a BENIGN, retryable answer; [`EntriesRead::Pending`] means the in-domain range

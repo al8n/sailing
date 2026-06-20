@@ -244,6 +244,9 @@ pub(crate) struct FailTermLog {
   /// Records the `max_bytes` of the most recent `entries` call, so a test can assert apply reads are
   /// byte-capped (bounded), never `u64::MAX`.
   observed_max_bytes: Cell<u64>,
+  /// Records the MAX range width (`end - start`) of any `entries` call, so a test can assert the core
+  /// bounds its committed-range requests to `MAX_READ_BATCH_ENTRIES` regardless of payload.
+  observed_max_range_width: Cell<u64>,
 }
 
 impl FailTermLog {
@@ -303,6 +306,11 @@ impl FailTermLog {
   pub(crate) fn observed_max_bytes(&self) -> u64 {
     self.observed_max_bytes.get()
   }
+
+  /// The largest range WIDTH (`end - start`) requested across all `entries` calls (`0` if none yet).
+  pub(crate) fn observed_max_range_width(&self) -> u64 {
+    self.observed_max_range_width.get()
+  }
 }
 
 impl LogStore for FailTermLog {
@@ -329,6 +337,12 @@ impl LogStore for FailTermLog {
     max_bytes: u64,
   ) -> Result<EntriesRead<'_>, Self::Error> {
     self.observed_max_bytes.set(max_bytes);
+    self.observed_max_range_width.set(
+      self
+        .observed_max_range_width
+        .get()
+        .max(range.end.get().saturating_sub(range.start.get())),
+    );
     if self.return_cold {
       return Ok(EntriesRead::Pending);
     }
