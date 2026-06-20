@@ -141,11 +141,25 @@ pub trait LogStore {
   /// out-of-domain probes will be permanently poisoned by ordinary protocol traffic.
   fn term(&self, index: Index) -> Result<Term, Self::Error>;
 
-  /// Entries in `range`, capped at roughly `max_bytes` (always at least one if non-empty).
+  /// Entries in `range`, as a CONTIGUOUS borrowed slice beginning exactly at `range.start`.
+  ///
+  /// **Range-read contract (NORMATIVE):**
+  /// - **Contiguous, range-aligned:** when the result is non-empty, `slice[0].index() == range.start`
+  ///   and `slice[k].index() == range.start + k`. The result is a PREFIX of `[range.start, range.end)` —
+  ///   never a suffix, never reordered, never with a gap. Callers (apply, replication, the restart scans)
+  ///   advance by `slice.last().index().next()` and rely on this alignment.
+  /// - **May be a prefix (byte cap):** the slice is capped at roughly `max_bytes` (payload bytes), but
+  ///   ALWAYS contains at least one entry when the range is non-empty and in view. A caller that needs the
+  ///   whole range MUST loop, re-reading `slice.last().index().next()..range.end` until it is drained.
+  ///   With `max_bytes == u64::MAX` the cap cannot fire, so the whole in-range portion comes back in one
+  ///   call (returning MORE than `max_bytes` is also allowed — "roughly").
+  /// - **Empty vs error:** an empty slice means "no entries in view for this range" (e.g.
+  ///   `range.start > last_index()`, or a committed entry not yet in the durable read view) — a BENIGN,
+  ///   retryable answer, NOT an error. `Err` is reserved for genuine storage faults (I/O, corruption) and
+  ///   is FATAL: the core poisons (fail-stop) on any `entries` error.
   ///
   /// **Domain contract:** the core only requests ranges within the retained log
-  /// (`first_index() <= range.start` and `range.end <= last_index() + 1`); as with
-  /// [`term`](Self::term), `Err` is reserved for genuine storage faults and poisons the node.
+  /// (`first_index() <= range.start` and `range.end <= last_index() + 1`).
   fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<&[Entry], Self::Error>;
 
   /// Queue an append (truncating any conflicting suffix first). Durable on the matching `poll`
