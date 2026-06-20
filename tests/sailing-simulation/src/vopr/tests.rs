@@ -146,7 +146,7 @@ fn vopr_exercises_leaseguard_under_drift() {
   // the superseded path too, but this assertion is specifically the rate-drift cross-leader case). Re-
   // derive from the `drift_sweep` example's `SUPERSEDED-SERVE ... drifted=true` lines if they fall to
   // zero.
-  let superseded: u64 = [2u64, 97]
+  let superseded: u64 = [405u64, 573]
     .iter()
     .map(|&seed| {
       let r = run_vopr(seed, 2_000);
