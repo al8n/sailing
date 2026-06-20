@@ -234,7 +234,19 @@ where
       ) {
         RestartLogAction::None => {}
         RestartLogAction::Compact(n) => log.compact(n),
-        RestartLogAction::Restore(n, term) => log.restore(n, term),
+        RestartLogAction::Restore(n, term) => {
+          log.restore(n, term);
+          // Fail-stop unless the store re-baselined EXACTLY to `(n, term)` — the full `restore`
+          // postcondition (first_index, NO stale suffix, boundary term) shared with the install check via
+          // `restore_rebaselined`. This is what makes that `SnapshotRebaseline` poison RESTART-STABLE: a
+          // node restarting against the same contract-violating store re-runs this restore; without the
+          // check it would come back healthy with commit/applied at `n` but a torn read-view (e.g. a
+          // retained suffix above `n`), laundering the install-time poison.
+          if !super::restore_rebaselined(log, n, term) {
+            poisoned = true;
+            poison_reason = Some(PoisonReason::SnapshotRebaseline);
+          }
+        }
         RestartLogAction::Poison(reason) => {
           poisoned = true;
           poison_reason = Some(reason);

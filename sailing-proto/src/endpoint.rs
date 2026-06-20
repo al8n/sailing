@@ -245,6 +245,28 @@ impl PoisonReason {
   }
 }
 
+/// The full [`LogStore::restore`] postcondition for re-baselining the log to snapshot boundary
+/// `(n, term)`: `first_index == n + 1` (the prefix is discarded), `last_index == n` (NO stale suffix is
+/// retained above `n`), and `term(n) == term` (the boundary term). A store that violates ANY of these
+/// leaves a torn read-view — a retained suffix above `n` could later be advertised by a campaign and a
+/// current-term commit could apply an entry the snapshot was meant to discard — so the snapshot install
+/// AND the restart `Restore` path both fail-stop ([`PoisonReason::SnapshotRebaseline`]) when this returns
+/// `false`. A `term(n)` read error also fails the check (a faulty store, not a healthy boundary).
+///
+/// **Scope (CFT, defense-in-depth).** This is a best-effort fail-stop on the two IN-BAND re-baseline paths
+/// — the snapshot install and the restart `Restore` action — against an obvious `LogStore` contract bug or
+/// a bug in our own fold; a conforming store always passes. It is NOT a complete defense against Byzantine
+/// / corrupt storage. In particular the restart `None` path legitimately KEEPS an uncommitted tail above a
+/// snapshot boundary (a snapshot at `n` followed by not-yet-committed replication — standard Raft), and a
+/// suffix-retaining store that crashed between `restore` and this check would land on exactly that shape,
+/// indistinguishable from the legitimate one at the durable level. Discriminating them would wrongly
+/// discard a correct store's valid uncommitted tail, so a fully contract-violating store is the
+/// out-of-CFT corrupt-storage class — as for [`PoisonReason::InconsistentLeaseFloor`] and the failover
+/// forged-floor decision — and is not exhaustively chased.
+pub(crate) fn restore_rebaselined<L: LogStore>(log: &L, n: Index, term: Term) -> bool {
+  log.first_index() == n.next() && log.last_index() == n && log.term(n).ok() == Some(term)
+}
+
 /// The derived in-memory lease-safety state produced by [`reconcile_durable`] from the durable record + the
 /// post-restart config: the floor to seed and the post-restart vote-fence WINDOW (the caller adds `now`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

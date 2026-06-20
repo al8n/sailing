@@ -2444,3 +2444,88 @@ fn set_read_mode_rejects_non_canonical_payload() {
     "a non-canonical SetReadMode payload (trailing bytes) must poison, not be silently accepted"
   );
 }
+
+/// RESTART-STABILITY of the snapshot re-baseline fail-stop: a restart that re-baselines a behind log from
+/// a durable snapshot (RestartLogAction::Restore) against a contract-violating store whose restore does
+/// NOT re-baseline must POISON, not come back healthy on a torn boundary — otherwise a restart would
+/// launder the install-time SnapshotRebaseline poison.
+#[test]
+fn restart_with_torn_rebaseline_poisons() {
+  use crate::{Config, Index, Instant, PoisonReason, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut stable = crate::testkit::AsyncStable::default();
+  let meta = crate::SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64]),
+  );
+  stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(10));
+  while stable.poll().is_some() {}
+  stable.force_state(Term::new(2), None, Index::new(5));
+  // A contract-violating log: behind the snapshot (first_index=1), and its restore is a no-op, so the
+  // reconcile's Restore(5, ..) leaves first_index un-rebaselined.
+  let mut log = crate::testkit::FailTermLog::default();
+  log.break_restore_rebaseline();
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    42,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::SnapshotRebaseline),
+    "a torn restore re-baseline on restart must fail-stop, not launder the install-time poison"
+  );
+}
+
+/// RESTART full-postcondition: a restart Restore against a store that re-baselines first_index correctly
+/// but RETAINS a stale suffix above the boundary (last_index > n) must also fail-stop — not just the
+/// first_index half of the contract.
+#[test]
+fn restart_with_stale_suffix_after_restore_poisons() {
+  use crate::{Config, Index, Instant, PoisonReason, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut stable = crate::testkit::AsyncStable::default();
+  let meta = crate::SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64]),
+  );
+  stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(10));
+  while stable.poll().is_some() {}
+  stable.force_state(Term::new(2), None, Index::new(5));
+  let mut log = crate::testkit::FailTermLog::default();
+  log.break_restore_keeping_suffix();
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    42,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::SnapshotRebaseline),
+    "a restore that keeps a stale suffix above the boundary must fail-stop on restart too"
+  );
+}

@@ -339,13 +339,12 @@ where
     // reporting it would over-ack an entry this node no longer stores (symmetric with the §5.3 scrub).
     self.scrub_acks_above(meta.last_index());
 
-    // Fail-stop tripwire: the install just advanced commit/applied to `meta.last_index` and the
-    // re-baseline took effect, so the log read-view must now reflect the snapshot boundary
-    // (`first_index == last_index + 1`). A `LogStore` whose `restore` does NOT re-baseline this way leaves
-    // the read-view inconsistent with commit/applied — every later AppendEntries consistency check and
-    // committed-entry fetch would read a wrong boundary — so poison rather than serve off a torn boundary
-    // (a release-mode check, not a debug-only assert).
-    if log.first_index() != meta.last_index().next() {
+    // Fail-stop tripwire: the install just advanced commit/applied to `meta.last_index`, so the log must
+    // now be re-baselined EXACTLY to that boundary — the full `restore` postcondition (first_index, NO
+    // stale suffix, boundary term), checked by `restore_rebaselined` and shared with the restart path. A
+    // `LogStore` that violates it leaves a torn read-view (a retained suffix could later campaign and
+    // commit a discarded entry), so poison rather than serve off it (a release check, not a debug assert).
+    if !super::restore_rebaselined(log, meta.last_index(), meta.last_term()) {
       self.poison(PoisonReason::SnapshotRebaseline);
       return;
     }
