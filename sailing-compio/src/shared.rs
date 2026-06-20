@@ -175,6 +175,16 @@ pub(crate) fn read_limbo<L: LogStore>(
   if lo >= hi {
     return Ok(Some(Vec::new()));
   }
+  // PREFLIGHT the region WIDTH before reading: the `LogStore` byte cap counts PAYLOAD only, so a large
+  // inherited limbo tail of ZERO-payload entries would materialize (owned) in full before
+  // `contiguous_normal_entries` rejects it on cost — re-opening the OOM the cap is meant to prevent. A
+  // region wider than `max_bytes / LIMBO_ENTRY_OVERHEAD` cannot fit the cost budget even at zero payload
+  // (each entry charges at least `LIMBO_ENTRY_OVERHEAD`), so FAIL CLOSED here — degrade to the Safe read —
+  // rather than read and materialize it. The byte cap still bounds the large-payload case below.
+  let max_entries = (max_bytes / LIMBO_ENTRY_OVERHEAD).max(1);
+  if hi.get() - lo.get() > max_entries {
+    return Ok(None);
+  }
   // A `LogStore::entries` error is a FATAL storage fault, NOT a safe fallback — propagate it so the
   // driver fail-stops instead of letting a corrupt committed-range log keep serving normal reads.
   let entries = match log.entries(lo..hi, max_bytes)? {
@@ -639,6 +649,51 @@ mod tests {
     assert_eq!(
       read_limbo(&FailingLog, &empty, u64::MAX),
       Ok(Some(Vec::new()))
+    );
+  }
+
+  #[test]
+  fn read_limbo_preflights_an_oversized_region_without_reading() {
+    use core::ops::Range;
+    use sailing_proto::{LogDone, OpId, Term};
+    // A `LogStore` whose `entries` PANICS — proving the preflight fails closed WITHOUT reading, so a
+    // large owned zero-payload inherited limbo tail is never materialized (the OOM a payload-only byte
+    // cap would miss). Without the width preflight, `read_limbo` would call `entries` and panic here.
+    struct PanicOnReadLog;
+    impl LogStore for PanicOnReadLog {
+      type Error = ();
+      fn first_index(&self) -> Index {
+        Index::ZERO
+      }
+      fn last_index(&self) -> Index {
+        Index::new(u64::MAX - 1)
+      }
+      fn term(&self, _: Index) -> Result<Term, ()> {
+        Ok(Term::ZERO)
+      }
+      fn entries(&self, _: Range<Index>, _: u64) -> Result<sailing_proto::EntriesRead<'_>, ()> {
+        panic!("the preflight must reject an oversized limbo region before reading")
+      }
+      fn submit_append(&mut self, _: OpId, _: &[Entry]) {
+        unreachable!()
+      }
+      fn compact(&mut self, _: Index) {
+        unreachable!()
+      }
+      fn restore(&mut self, _: Index, _: Term) {
+        unreachable!()
+      }
+      fn poll(&mut self) -> Option<Result<LogDone, ()>> {
+        unreachable!()
+      }
+    }
+    // Budget 640 / LIMBO_ENTRY_OVERHEAD (64) = 10 entries max; a ~1000-index limbo region far exceeds it,
+    // so the preflight fails closed (`Ok(None)`) WITHOUT touching the log.
+    let window = FailoverReadWindow::new(Index::new(4), Index::new(1003)); // half-open width 999 >> 10
+    assert_eq!(
+      read_limbo(&PanicOnReadLog, &window, 640),
+      Ok(None),
+      "an oversized limbo region must fail closed via the preflight, never reading + materializing it"
     );
   }
 
