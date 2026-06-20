@@ -135,11 +135,14 @@ where
     log: &L,
     stable: &S,
   ) {
-    let Some(pr) = self.tracker.progress(&peer).cloned() else {
-      return;
+    // Read only the two scalars the send decision needs — avoid cloning the whole Progress (and its
+    // Inflights VecDeque) on every call; the post-send mutations re-fetch via progress_mut below.
+    let (paused, next) = match self.tracker.progress(&peer) {
+      Some(pr) => (pr.is_paused(), pr.next_index()),
+      None => return,
     };
     // Respect the in-flight window — if paused, don't send.
-    if pr.is_paused() {
+    if paused {
       return;
     }
 
@@ -148,7 +151,7 @@ where
     // prev_log_term across the compaction boundary — send the snapshot instead.
     // At next_index == first_index the normal path still works: prev_index == offset
     // whose boundary term is retained.
-    if pr.next_index().get() < log.first_index().get() {
+    if next.get() < log.first_index().get() {
       if let Some((meta, data)) = stable.snapshot() {
         let (term, me) = (self.term, self.config.id());
         let pending = meta.last_index();
@@ -173,7 +176,6 @@ where
       return;
     }
 
-    let next = pr.next_index();
     let prev_index = Index::new(next.get().saturating_sub(1));
     let prev_term = if prev_index == Index::ZERO {
       Term::ZERO
