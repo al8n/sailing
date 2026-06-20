@@ -888,14 +888,11 @@ where
       self.lease_acks.insert(from);
       self.lease_min_support = self.lease_min_support.min(resp.lease_support());
       let me = self.config.id();
-      let fresh: BTreeMap<I, bool> = self
+      if self
         .tracker
-        .ids()
-        .into_iter()
-        .filter(|id| self.tracker.is_voter(id))
-        .map(|id| (id, id == me || self.lease_acks.contains(&id)))
-        .collect();
-      if self.tracker.vote_result(&fresh).is_won() {
+        .vote_result_by(|id| id == me || self.lease_acks.contains(&id))
+        .is_won()
+      {
         // Re-set every contributing ack: `lease_min_support` only shrinks within a round, so this never
         // EXTENDS the lease past a supporter's window (a later, shorter-support ack lowers it).
         self.lease_valid_until = Some(self.lease_round_start + self.lease_min_support);
@@ -968,21 +965,13 @@ where
     // Quorum check: the ack set (including the self-ack seeded at add_request) must
     // form a voter quorum across the joint config.  Reuse vote_result machinery:
     // treat each voter as "granted" iff its id is in the ack set.
-    let quorum_reached = {
-      let acks = self
-        .read_only
-        .acks_for(ctx_bytes.as_ref())
-        .cloned()
-        .unwrap_or_default();
-      // vote_result(|id| Some(acks.contains(id))).is_won() covers both joint halves.
-      let votes: BTreeMap<I, bool> = self
+    // vote_result_by(|id| acks.contains(id)) covers both joint halves; no acks recorded → not reached.
+    let quorum_reached = match self.read_only.acks_for(ctx_bytes.as_ref()) {
+      Some(acks) => self
         .tracker
-        .ids()
-        .into_iter()
-        .filter(|id| self.tracker.is_voter(id))
-        .map(|id| (id, acks.contains(&id)))
-        .collect();
-      self.tracker.vote_result(&votes).is_won()
+        .vote_result_by(|id| acks.contains(&id))
+        .is_won(),
+      None => false,
     };
     if quorum_reached {
       let confirmed = self.read_only.advance(ctx_bytes.as_ref());
