@@ -222,6 +222,14 @@ pub(crate) struct FailTermLog {
   /// boundary (`last_index > n`) — a store that discards the prefix but not the suffix; proves the full
   /// postcondition check (not just `first_index`) catches a divergent retained suffix.
   restore_keeps_stale_suffix: bool,
+  /// When `true`, `entries` drops the FIRST element of every non-empty result — a CONTIGUOUS suffix that
+  /// starts ABOVE `range.start` (a non-conforming, gapped read). Folding scans tolerate it (they don't
+  /// check contiguity); apply's `entry.index() == applied.next()` guard must fail-stop on it.
+  gap_first_entry: bool,
+  /// When `true`, `entries` extends every read to `last_index` regardless of `range.end` — a CONTIGUOUS
+  /// but OVERLONG read returning entries past the requested range (e.g. past `commit`). Apply's
+  /// `idx > commit` guard must fail-stop rather than fold an uncommitted entry into state.
+  return_overlong: bool,
 }
 
 impl FailTermLog {
@@ -248,6 +256,18 @@ impl FailTermLog {
   /// Make `restore` re-baseline `first_index` correctly but RETAIN a stale entry above the boundary.
   pub(crate) fn break_restore_keeping_suffix(&mut self) {
     self.restore_keeps_stale_suffix = true;
+  }
+
+  /// Make `entries` return a gapped (non-contiguous) read by dropping the first element — for apply's
+  /// contiguity guard.
+  pub(crate) fn gap_first_entry_on_read(&mut self) {
+    self.gap_first_entry = true;
+  }
+
+  /// Make `entries` return an OVERLONG read (extended to `last_index`, ignoring `range.end`) — for apply's
+  /// past-commit guard.
+  pub(crate) fn return_overlong_on_read(&mut self) {
+    self.return_overlong = true;
   }
 }
 
@@ -277,12 +297,20 @@ impl LogStore for FailTermLog {
     if self.fail_entries_index.is_some_and(|i| range.contains(&i)) {
       return Err(());
     }
-    Ok(
-      self
-        .inner
-        .entries(range, max_bytes)
-        .expect("VecLog::entries is Infallible"),
-    )
+    // Overlong: extend the read to last_index, ignoring range.end — a contiguous slice past the range.
+    let read = if self.return_overlong {
+      range.start..self.inner.last_index().next()
+    } else {
+      range
+    };
+    let s = self
+      .inner
+      .entries(read, max_bytes)
+      .expect("VecLog::entries is Infallible");
+    if self.gap_first_entry && !s.is_empty() {
+      return Ok(&s[1..]); // gapped: a contiguous suffix starting above range.start
+    }
+    Ok(s)
   }
 
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
