@@ -124,9 +124,14 @@ impl Progress {
     self.inflight.reset();
   }
 
-  /// Revert to probing (on a reject or a step-down).
+  /// Revert to probing (on a reject or a step-down), re-probing from `match_index + 1` — etcd's
+  /// `BecomeProbe`. Resetting `next_index` here makes the transition correct by construction rather than
+  /// resting on every caller to follow with `set_next_index`: a caller with a more precise target (the
+  /// append-reject conflict jump) still overrides it, and the snapshot-reject path re-probes — re-sending
+  /// the snapshot when `next < first_index` — without depending on a stale pre-snapshot `next_index`.
   pub fn become_probe(&mut self) {
     self.state = ProgressState::Probe;
+    self.next_index = self.match_index.next();
     self.inflight.reset();
     self.msg_app_flow_paused = false;
   }

@@ -138,3 +138,23 @@ fn free_inflight_on_heartbeat_snapshot_noop() {
     "Snapshot pause must not be cleared by free_inflight_on_heartbeat"
   );
 }
+
+/// become_probe re-probes from match+1 (etcd BecomeProbe), even when next_index is stale-HIGH — so the
+/// transition is correct by construction and does not rest on the caller to reset it.
+#[test]
+fn become_probe_resets_next_to_match_plus_one() {
+  let mut p = Progress::new(Index::new(100), 256, 0); // next=100, match=0
+  assert!(p.maybe_update(Index::new(5))); // match=5; next stays 100 (100 > 5, not advanced)
+  assert_eq!(
+    p.next_index(),
+    Index::new(100),
+    "next is stale-high before the reset"
+  );
+  p.become_probe();
+  assert_eq!(
+    p.next_index(),
+    Index::new(6),
+    "become_probe must re-probe from match+1, not retain the stale-high next"
+  );
+  assert_eq!(p.match_index(), Index::new(5));
+}
