@@ -301,7 +301,7 @@ pub mod confchange {
   /// structured diagnostics without re-parsing strings.
   #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
   #[non_exhaustive]
-  pub enum ConfChangeError<I: core::fmt::Debug + core::fmt::Display> {
+  pub enum ConfChangeError {
     /// [`Changer::enter_joint`] was called while already in a joint configuration.
     #[error("config is already joint")]
     AlreadyJoint,
@@ -331,13 +331,10 @@ pub mod confchange {
     #[error("can't make a zero-voter config joint")]
     EmptyIncomingForJoint,
 
-    /// Invariant violation detected (bug in Changer logic or caller).
+    /// Invariant violation detected (bug in Changer logic or caller) — a defensive catch-all that never
+    /// fires in correct operation; the payload names the violated invariant.
     #[error("config invariant violated: {0}")]
     InvariantViolation(std::string::String),
-
-    #[doc(hidden)]
-    #[error("{0}")]
-    _Phantom(std::string::String, core::marker::PhantomData<I>),
   }
 
   // ── Changer ────────────────────────────────────────────────────────────────
@@ -350,7 +347,9 @@ pub mod confchange {
   /// Port of etcd `confchange.Changer`.
   #[derive(Debug, Clone, Copy)]
   pub struct Changer {
-    /// The last log index at the time of the change; new peers probe from `last_index + 1`.
+    /// The last log index at the time of the change. New peers probe from `last_index` (floored at 1),
+    /// matching etcd `initProgress` — deliberately distinct from `become_leader` / `from_conf_state`,
+    /// which start at `last_index + 1`; the probe/reject walk converges the true match either way.
     pub last_index: Index,
     /// Maximum number of in-flight messages per peer (passed to [`Progress::new`]).
     pub max_inflight_msgs: usize,
@@ -383,7 +382,7 @@ pub mod confchange {
       &self,
       tr: &Tracker<I>,
       changes: &[ConfChangeSingle<I>],
-    ) -> Result<Tracker<I>, ConfChangeError<I>> {
+    ) -> Result<Tracker<I>, ConfChangeError> {
       if tr.is_joint() {
         return Err(ConfChangeError::SimpleInJoint);
       }
@@ -423,7 +422,7 @@ pub mod confchange {
       tr: &Tracker<I>,
       auto_leave: bool,
       changes: &[ConfChangeSingle<I>],
-    ) -> Result<Tracker<I>, ConfChangeError<I>> {
+    ) -> Result<Tracker<I>, ConfChangeError> {
       if tr.is_joint() {
         return Err(ConfChangeError::AlreadyJoint);
       }
@@ -457,10 +456,7 @@ pub mod confchange {
     /// Returns an error if `tr` is not currently joint.
     ///
     /// Port of etcd `Changer.LeaveJoint`.
-    pub fn leave_joint<I: NodeId>(
-      &self,
-      tr: &Tracker<I>,
-    ) -> Result<Tracker<I>, ConfChangeError<I>> {
+    pub fn leave_joint<I: NodeId>(&self, tr: &Tracker<I>) -> Result<Tracker<I>, ConfChangeError> {
       if !tr.is_joint() {
         return Err(ConfChangeError::NotJoint);
       }
@@ -515,7 +511,7 @@ pub mod confchange {
       &self,
       tr: &mut Tracker<I>,
       changes: &[ConfChangeSingle<I>],
-    ) -> Result<(), ConfChangeError<I>> {
+    ) -> Result<(), ConfChangeError> {
       for cc in changes {
         match cc.ty() {
           ConfChangeType::AddNode => self.make_voter(tr, cc.node()),
@@ -657,7 +653,7 @@ pub mod confchange {
     ///
     /// These are the same checks etcd's `checkInvariants` performs. Failures here indicate a
     /// bug in the Changer logic.
-    fn check_invariants<I: NodeId>(&self, tr: &Tracker<I>) -> Result<(), ConfChangeError<I>> {
+    fn check_invariants<I: NodeId>(&self, tr: &Tracker<I>) -> Result<(), ConfChangeError> {
       // 1. Every member in voters(both) ∪ learners ∪ learners_next must have a Progress.
       for id in tr.voters.incoming().ids() {
         if !tr.progress.contains_key(id) {
