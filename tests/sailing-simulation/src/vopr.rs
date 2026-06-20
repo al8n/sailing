@@ -250,6 +250,9 @@ pub struct VoprReport {
   /// out-of-contract offsets via `resync_offsets_violating`). Distinct from `offset_resyncs` (valid-skew).
   /// `0` outside the asymmetric sub-mode — the witness that the injection actually ran.
   pub violating_resyncs: u64,
+  /// Total COLD (`EntriesRead::Pending`) reads returned across node logs — the cold-fetch coverage
+  /// non-vacuity witness. `0` outside `run_vopr_cold` (cold-fetch is off in every other entry).
+  pub cold_reads: u64,
 }
 
 /// The weighted action menu. Client load dominates; faults are frequent but not constant; structural
@@ -711,7 +714,7 @@ impl ReadLedger {
 /// progress within a generous bound), or a quiesce failure (a fully-healed cluster failed to
 /// converge / apply the committed history).
 pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, false)
+  run_vopr_inner(seed, ticks, false, false, false)
 }
 
 /// Like [`run_vopr`] but additionally draws the proactive [`sailing_proto::LeaseRefresh`] sub-coin on
@@ -722,7 +725,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 /// that coverage. Only the dedicated lease-refresh coverage opts into the volume.
 #[cfg(test)]
 pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, true, false)
+  run_vopr_inner(seed, ticks, true, false, false)
 }
 
 /// Like [`run_vopr`] but additionally opts into mid-run READ-MODE migrations: the leader occasionally
@@ -733,10 +736,27 @@ pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
 /// migration coverage opts in; the read-linearizability oracle judges reads across each migration.
 #[cfg(test)]
 pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, true)
+  run_vopr_inner(seed, ticks, false, true, false)
 }
 
-fn run_vopr_inner(seed: u64, ticks: usize, draw_refresh: bool, migrate: bool) -> VoprReport {
+/// Like [`run_vopr`] but arms the seeded COLD-read fault on every node: a fraction of committed-range
+/// reads return `EntriesRead::Pending`, so apply and replication DEFER and retry and the lease/election
+/// anchors fail closed — under the full fault model. Every run stays read-linearizable and still commits
+/// (the run completing IS the safety assertion). A SEPARATE entry (cold-fetch is OFF in every other entry)
+/// so the broad sweeps + all non-vacuity pins stay byte-identical — the cold path is store-side, drawing
+/// only the per-store read PRNG, so the master action/topology stream is unchanged.
+#[cfg(test)]
+pub(crate) fn run_vopr_cold(seed: u64, ticks: usize) -> VoprReport {
+  run_vopr_inner(seed, ticks, false, false, true)
+}
+
+fn run_vopr_inner(
+  seed: u64,
+  ticks: usize,
+  draw_refresh: bool,
+  migrate: bool,
+  cold: bool,
+) -> VoprReport {
   // The single master PRNG. Every draw in the run comes from here (deterministic from `seed`).
   let mut prng = FaultPrng::new(seed ^ 0x564F_5052_5F5F_5631); // "VOPR__V1"
 
@@ -875,7 +895,13 @@ fn run_vopr_inner(seed: u64, ticks: usize, draw_refresh: bool, migrate: bool) ->
   let baseline_net = roll_network_faults(&mut prng, /* calm */ false);
   c.set_network_faults(baseline_net, seed.rotate_left(16) ^ 0x004E_4554); // "NET"
   for id in 0..size as u64 {
-    let sf = roll_storage_faults(&mut prng);
+    let mut sf = roll_storage_faults(&mut prng);
+    if cold {
+      // ~8% of reads defer (Pending): high enough the cold path fires non-vacuously across the run,
+      // modest enough apply/replication still make progress. Off (0) in every other entry, and the
+      // field assignment draws NOTHING from `prng` — the master stream stays byte-identical.
+      sf.cold_fetch_per_mille = 80;
+    }
     c.set_node_faults(id, sf, seed.wrapping_add(id).rotate_left(11));
   }
 
@@ -1533,6 +1559,7 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
   }
 
   report.committed = committed_count;
+  report.cold_reads = c.total_cold_reads();
   // One final oracle sweep at the fully-quiesced state (belt-and-suspenders; tick already ran it).
   c.run_oracles();
 }
