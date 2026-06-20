@@ -2398,3 +2398,40 @@ fn migrated_snapshot_carries_explicit_read_mode() {
     "a migrated node must carry the explicit mode in its snapshot"
   );
 }
+
+/// A snapshot install whose LogStore::restore does NOT re-baseline (first_index != last_index + 1
+/// afterward) is a storage-contract violation: the read-view would be inconsistent with the advanced
+/// commit/applied. The install must fail-stop (poison), not silently serve off a torn boundary — a
+/// release-mode check, where the old debug_assert was a no-op.
+#[test]
+fn install_with_torn_rebaseline_poisons() {
+  use crate::{Index, Instant, Message, PoisonReason, Term, conf::ConfState};
+  let (mut ep, _vlog, mut stable) = make_follower();
+  // A contract-violating log: its restore is a no-op, so first_index stays un-rebaselined.
+  let mut log = crate::testkit::FailTermLog::default();
+  log.break_restore_rebaseline();
+
+  let snap_data = encode_snapshot(7);
+  let meta = crate::SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, snap_data);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(is),
+  );
+  // Drive storage so the deferred install runs install_snapshot_now (where the re-baseline is checked).
+  for _ in 0..4 {
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::SnapshotRebaseline),
+    "a torn restore re-baseline must fail-stop the install, not be silently accepted"
+  );
+}
