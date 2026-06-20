@@ -964,3 +964,34 @@ fn vopr_exercises_read_mode_migrations() {
      judged a read in a run that also migrated, so the cross-migration coverage is vacuous"
   );
 }
+
+/// The COLD-read fault, end-to-end: across a band of seeds a fraction of committed-range reads return
+/// `EntriesRead::Pending`, so apply and replication DEFER (and the lease/election anchors fail closed)
+/// under the full fault model. Every run completes WITHOUT a read-linearizability / safety-oracle /
+/// liveness panic (`run_vopr_cold` panics on a violation) — proving deferred reads stay linearizable and
+/// the cluster still converges. The aggregate confirms the cold path actually FIRED (non-vacuity) and a
+/// cold run still committed (liveness held despite the deferrals). The per-site dispositions are
+/// unit-tested in `sailing-proto` (`restart_scan_poisons_on_cold_read`,
+/// `apply_defers_on_cold_read_without_poisoning`, `replication_defers_on_cold_read_without_poisoning`).
+#[test]
+fn vopr_exercises_cold_reads() {
+  let mut total_cold_reads = 0u64;
+  let mut progressed_under_cold = false;
+  for seed in 0u64..64 {
+    let r = run_vopr_cold(seed, 600);
+    total_cold_reads += r.cold_reads;
+    progressed_under_cold |= r.committed > 0;
+  }
+  std::eprintln!(
+    "vopr cold-read coverage (seeds 0..64, 600 ticks): total_cold_reads={total_cold_reads}"
+  );
+  assert!(
+    total_cold_reads > 0,
+    "no cold (Pending) read fired across seeds 0..64 — the cold-fetch fault never armed or the read path \
+     regressed (cold-read coverage is vacuous)"
+  );
+  assert!(
+    progressed_under_cold,
+    "no cold run committed — liveness failed under the cold-read deferrals (apply/replication wedged)"
+  );
+}

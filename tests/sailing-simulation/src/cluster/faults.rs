@@ -37,6 +37,9 @@ impl Cluster {
     // The node reboots on its OWN clock (rate persists — a crash does not change hardware clock rate;
     // `clock_rate[i]` stays put). With no drift this is `self.now`, byte-identical to the original.
     let now_i = self.now_for(i);
+    // Restart is resident-only: suspend the cold-fetch fault across the synchronous lease-floor scans so
+    // they read RESIDENT (a Pending scan read would poison). The store loads the retained log at boot.
+    let saved_cold = self.logs[i].suspend_cold_fetch();
     let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
     self.nodes[i] = Endpoint::restart(
       cfg,
@@ -47,6 +50,7 @@ impl Cluster {
       log,
       stable,
     );
+    self.logs[i].restore_cold_fetch(saved_cold);
     // Reset the snapshot-install counter for the restarted node.
     self.snapshot_installs[i] = 0;
     self.restarts[i] += 1;
@@ -66,6 +70,12 @@ impl Cluster {
     let i = self.node_idx[&id];
     self.logs[i].set_faults(faults, seed);
     self.stables[i].set_faults(faults, seed.rotate_left(17));
+  }
+
+  /// Total COLD (`EntriesRead::Pending`) reads returned across all node logs — the cold-fetch coverage
+  /// non-vacuity signal (summed at run end into the report).
+  pub fn total_cold_reads(&self) -> u64 {
+    self.logs.iter().map(|l| l.cold_reads()).sum()
   }
 
   /// Install a seeded [`NetworkFaults`] config on the typed-message bus: per-message

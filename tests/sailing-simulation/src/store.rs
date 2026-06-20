@@ -174,6 +174,11 @@ pub struct StorageFaults {
   pub bit_rot_per_mille: u16,
   /// Misdirected read — return another slot's bytes. Reserved; not yet wired.
   pub misdirected_read_per_mille: u16,
+  /// Probability (per mille) a committed-range read returns `EntriesRead::Pending`: a COLD read — the
+  /// range is not resident and the store is fetching it. The proto DEFERS (apply and replication retry
+  /// on the next pump; the lease/election anchors fail closed) and NEVER poisons. OFF by default and OFF
+  /// in the broad sweep (the byte-identical default); driven only by `run_vopr_cold`. Implemented.
+  pub cold_fetch_per_mille: u16,
 }
 
 impl StorageFaults {
@@ -184,6 +189,7 @@ impl StorageFaults {
       torn_write_per_mille: 0,
       bit_rot_per_mille: 0,
       misdirected_read_per_mille: 0,
+      cold_fetch_per_mille: 0,
     }
   }
 
@@ -193,6 +199,7 @@ impl StorageFaults {
       && self.torn_write_per_mille == 0
       && self.bit_rot_per_mille == 0
       && self.misdirected_read_per_mille == 0
+      && self.cold_fetch_per_mille == 0
   }
 }
 
@@ -270,6 +277,9 @@ pub struct MemLog {
   prng: FaultPrng,
   /// Read-side fault PRNG (drives `transient_read` on the `&self` `term`/`entries` reads).
   read_prng: ReadFaultPrng,
+  /// Count of COLD (`EntriesRead::Pending`) reads returned — interior-mutable (the read is `&self`) so the
+  /// cold-fetch coverage can assert non-vacuity. `0` unless `cold_fetch_per_mille > 0`.
+  cold_reads: Cell<u64>,
 }
 
 impl MemLog {
@@ -311,6 +321,23 @@ impl MemLog {
     self.faults = faults;
     self.prng = FaultPrng::new(seed);
     self.read_prng.reseed(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
+  }
+
+  /// Suspend the cold-fetch fault (zero its rate), returning the prior rate, so the SYNCHRONOUS restart
+  /// lease-floor scans read RESIDENT — restart is resident-only, and a Pending scan read would poison.
+  /// Pair with `restore_cold_fetch` around an `Endpoint::restart`.
+  pub fn suspend_cold_fetch(&mut self) -> u16 {
+    core::mem::replace(&mut self.faults.cold_fetch_per_mille, 0)
+  }
+
+  /// Restore a rate previously taken by `suspend_cold_fetch`.
+  pub fn restore_cold_fetch(&mut self, rate: u16) {
+    self.faults.cold_fetch_per_mille = rate;
+  }
+
+  /// Total COLD (`EntriesRead::Pending`) reads returned so far — the cold-fetch coverage non-vacuity signal.
+  pub fn cold_reads(&self) -> u64 {
+    self.cold_reads.get()
   }
 
   /// Async mode: make the in-flight (already-visible) appends DURABLE by snapshotting the visible
@@ -509,6 +536,12 @@ impl LogStore for MemLog {
     // (PoisonReason::LogRead), so this makes that poison path reachable in the sim.
     if self.read_prng.fires(self.faults.transient_read_per_mille) {
       return Err(MemStoreError::TransientRead);
+    }
+    // Seeded COLD-read fault: the range is "not resident" — defer (Pending). The proto retries on the
+    // next pump (apply/replication) or fails closed (the lease/election anchors); it never poisons.
+    if self.read_prng.fires(self.faults.cold_fetch_per_mille) {
+      self.cold_reads.set(self.cold_reads.get().wrapping_add(1));
+      return Ok(EntriesRead::Pending);
     }
     let start = range.start.get();
     let end = range.end.get();
