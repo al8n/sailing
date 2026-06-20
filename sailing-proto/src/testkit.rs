@@ -218,6 +218,10 @@ pub(crate) struct FailTermLog {
   /// When `true`, `restore` is a NO-OP: it does NOT re-baseline `first_index` to `last_index + 1`,
   /// modelling a store that violates the restore contract — to prove a snapshot install fail-stops.
   skip_restore_rebaseline: bool,
+  /// When `true`, `restore` re-baselines `first_index` correctly BUT retains a stale entry above the
+  /// boundary (`last_index > n`) — a store that discards the prefix but not the suffix; proves the full
+  /// postcondition check (not just `first_index`) catches a divergent retained suffix.
+  restore_keeps_stale_suffix: bool,
 }
 
 impl FailTermLog {
@@ -239,6 +243,11 @@ impl FailTermLog {
   /// Make `restore` a no-op (skip the re-baseline) — a contract-violating store, for the install fail-stop.
   pub(crate) fn break_restore_rebaseline(&mut self) {
     self.skip_restore_rebaseline = true;
+  }
+
+  /// Make `restore` re-baseline `first_index` correctly but RETAIN a stale entry above the boundary.
+  pub(crate) fn break_restore_keeping_suffix(&mut self) {
+    self.restore_keeps_stale_suffix = true;
   }
 }
 
@@ -289,6 +298,16 @@ impl LogStore for FailTermLog {
       return; // contract-violating store: leave first_index un-rebaselined
     }
     self.inner.restore(last_index, last_term);
+    if self.restore_keeps_stale_suffix {
+      // Correct re-baseline (first_index = n+1) but leave a divergent entry above n (last_index = n+1):
+      // a store that discards the prefix but not the suffix.
+      self.inner.force_append(&[Entry::new(
+        last_term,
+        last_index.next(),
+        crate::EntryKind::Empty,
+        bytes::Bytes::new(),
+      )]);
+    }
   }
 
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {

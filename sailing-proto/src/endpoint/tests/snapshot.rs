@@ -2435,3 +2435,37 @@ fn install_with_torn_rebaseline_poisons() {
     "a torn restore re-baseline must fail-stop the install, not be silently accepted"
   );
 }
+
+/// A snapshot install whose restore sets first_index correctly but RETAINS a stale suffix above the
+/// boundary (last_index > n) must also fail-stop — the full postcondition, not just first_index. A
+/// divergent retained suffix could later campaign and commit an entry the snapshot was meant to discard.
+#[test]
+fn install_with_stale_suffix_after_restore_poisons() {
+  use crate::{Index, Instant, Message, PoisonReason, Term, conf::ConfState};
+  let (mut ep, _vlog, mut stable) = make_follower();
+  let mut log = crate::testkit::FailTermLog::default();
+  log.break_restore_keeping_suffix();
+
+  let snap_data = encode_snapshot(7);
+  let meta = crate::SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  let is = crate::InstallSnapshot::new(Term::new(1), 1u64, meta, snap_data);
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(is),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::SnapshotRebaseline),
+    "a restore that keeps a stale suffix above the boundary must fail-stop the install"
+  );
+}
