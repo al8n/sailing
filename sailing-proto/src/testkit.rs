@@ -281,6 +281,11 @@ impl FailTermLog {
   pub(crate) fn return_cold_on_read(&mut self) {
     self.return_cold = true;
   }
+
+  /// Stop returning cold reads (the range became resident) — `entries` serves normally again.
+  pub(crate) fn clear_cold_on_read(&mut self) {
+    self.return_cold = false;
+  }
 }
 
 impl LogStore for FailTermLog {

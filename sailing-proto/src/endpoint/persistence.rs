@@ -409,6 +409,18 @@ where
       }
     }
 
+    // Re-drive a deferred apply. A cold (`EntriesRead::Pending`) committed-range read leaves
+    // `applied < commit` with NO `LogDone` to re-trigger apply through `on_log_appended`, so the store's
+    // storage-ready wake (which the driver services by calling `handle_storage`) MUST re-attempt apply
+    // here — otherwise an idle or single-node leader whose cold read just resolved would never re-pump
+    // apply, a SILENT stall (`applied < commit`, no poison). Idempotent: a no-op when caught up, and a
+    // still-cold or not-yet-viewable read simply defers again. (Replication has the periodic heartbeat
+    // re-pump; apply did not, which is the gap this closes.)
+    if !self.poisoned && self.applied < self.commit {
+      self.apply_committed(log);
+      self.maybe_flush_deferred_reads(now, log, stable);
+    }
+
     // After all completions are drained, check whether a new snapshot is warranted.
     self.maybe_snapshot(log, stable);
 

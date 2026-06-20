@@ -884,6 +884,60 @@ fn replication_defers_on_cold_read_without_poisoning() {
   );
 }
 
+/// The storage-ready re-drive for a deferred apply: a cold (`EntriesRead::Pending`) apply read leaves
+/// `applied < commit` with NO LogDone to re-trigger apply via `on_log_appended`. When the store later
+/// makes the range resident and signals storage-ready — which the driver services by calling
+/// `handle_storage` with NO new completion — apply MUST re-pump, else an idle/single-node leader stalls
+/// silently. Without the re-drive in `handle_storage`, the proposed entry would never apply.
+#[test]
+fn cold_apply_is_redriven_by_handle_storage_without_a_completion() {
+  use crate::{Config, Instant};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::FailTermLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+
+  // Become leader, commit + apply the no-op (applied catches up).
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Arm cold, propose + drain: commit advances (the proposal's LogDone drains) but every apply read is
+  // cold, so applied stays behind — NO Applied event yet, and no poison.
+  log.return_cold_on_read();
+  ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
+    .unwrap();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    "the entry must NOT apply while the read is cold"
+  );
+
+  // The cold range becomes resident; the store signals storage-ready → `handle_storage` runs again with
+  // NO new LogDone. The re-drive must apply the now-resident entry.
+  log.clear_cold_on_read();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.poison_reason().is_none(),
+    "the re-drive must apply cleanly, never poison"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    "handle_storage with no LogDone must re-pump the deferred apply once the cold read resolves"
+  );
+}
+
 /// A follower must not send AppendResp until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]
