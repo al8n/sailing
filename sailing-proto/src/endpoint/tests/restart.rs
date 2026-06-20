@@ -2642,3 +2642,44 @@ fn apply_with_overlong_read_poisons() {
     "an overlong read returning an uncommitted entry past commit must fail-stop apply"
   );
 }
+
+/// Restart is RESIDENT-ONLY: a cold (`EntriesRead::Pending`) committed-range read during the
+/// synchronous lease-floor scans cannot be retried (no pump exists yet) and a partial scan would
+/// under-size the post-election commit-wait (a stale-read break), so a cold scan read fail-stops
+/// (`PoisonReason::LogRead`) — exactly like an empty or faulted scan read.
+#[test]
+fn restart_scan_poisons_on_cold_read() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, PoisonReason, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = crate::testkit::FailTermLog::default();
+  log.force_append(&[Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::Empty,
+    bytes::Bytes::new(),
+  )]);
+  log.return_cold_on_read(); // every entries() read defers (Pending) — a cold store
+  let mut stable = crate::testkit::NoopStable::default();
+  stable.force_state(Term::new(1), Some(1u64), Index::new(1)); // commit = 1
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::LogRead),
+    "a cold (Pending) read during the restart lease-floor scan must fail-stop, not defer"
+  );
+}
