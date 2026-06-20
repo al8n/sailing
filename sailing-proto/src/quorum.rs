@@ -93,13 +93,26 @@ impl<I: NodeId> MajorityConfig<I> {
     if n == 0 {
       return Index::new(u64::MAX);
     }
-    let mut srt: std::vec::Vec<Index> = self.ids.iter().map(|id| acked(*id)).collect();
-    srt.sort_unstable();
-    // The element at position `n - (n/2 + 1)` is the highest index held by a majority.
-    // Worked example: n=3, q=2, pos=1 → srt[1] is acked by the top-2 members (indices 1
-    // and 2 in ascending order), so it is on a majority.
+    // The element at position `n - (n/2 + 1)` in ascending order is the highest index held by a
+    // majority (n=3 → pos 1, the median; n=5 → pos 2). Only that ONE element is needed, so
+    // `select_nth_unstable` (O(n)) replaces a full `sort_unstable` (O(n log n)) — `s[pos]` afterward is
+    // exactly the value the sort would have placed there — and a stack buffer for the common
+    // small-cluster case avoids the per-ack heap allocation. `pos` depends only on `n`, never the values.
     let pos = n - (n / 2 + 1);
-    srt[pos]
+    const STACK_CAP: usize = 16;
+    if n <= STACK_CAP {
+      let mut buf = [Index::ZERO; STACK_CAP];
+      for (slot, id) in buf[..n].iter_mut().zip(self.ids.iter()) {
+        *slot = acked(*id);
+      }
+      let s = &mut buf[..n];
+      s.select_nth_unstable(pos);
+      s[pos]
+    } else {
+      let mut srt: std::vec::Vec<Index> = self.ids.iter().map(|id| acked(*id)).collect();
+      srt.select_nth_unstable(pos);
+      srt[pos]
+    }
   }
 
   /// Whether a majority has voted.

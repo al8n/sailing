@@ -57,6 +57,40 @@ fn majority_committed_five_members() {
 }
 
 #[test]
+fn majority_committed_two_members() {
+  // n=2, pos=0: a majority of 2 is both, so the committed index is the LOWER ack. sorted [5,9] → srt[0]=5.
+  let c = mc(&[1, 2]);
+  let acked = |id| match id {
+    1 => Index::new(9),
+    2 => Index::new(5),
+    _ => Index::ZERO,
+  };
+  assert_eq!(c.committed_index(acked), Index::new(5));
+}
+
+#[test]
+fn majority_committed_four_members() {
+  // n=4, pos=1: a majority of 4 is 3, so the committed index is the 3rd-largest. sorted [10,20,30,40] → 20.
+  let c = mc(&[1, 2, 3, 4]);
+  let acked = |id| match id {
+    1 => Index::new(30),
+    2 => Index::new(10),
+    3 => Index::new(40),
+    4 => Index::new(20),
+    _ => Index::ZERO,
+  };
+  assert_eq!(c.committed_index(acked), Index::new(20));
+}
+
+#[test]
+fn majority_committed_large_cluster_uses_vec_fallback() {
+  // n=17 > STACK_CAP exercises the Vec branch. pos=17-(8+1)=8; acks 1..=17 → sorted srt[8]=9.
+  let ids: std::vec::Vec<u64> = (1..=17).collect();
+  let c = mc(&ids);
+  assert_eq!(c.committed_index(Index::new), Index::new(9));
+}
+
+#[test]
 fn majority_committed_zero_drags_down() {
   // n=3, pos=1: sorted [0,12,14] → srt[1] = 12.
   // Member 1 hasn't acked (returns 0), so sorted is [0,12,14] and pos=1 gives 12.
