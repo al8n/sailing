@@ -4,6 +4,7 @@ use crate::{
   StableDone, StableStore, Term,
 };
 use bytes::Bytes;
+use core::cell::Cell;
 use std::collections::VecDeque;
 
 /// A no-op log that is always empty — last_index=0, term(any)=Term::ZERO.
@@ -237,6 +238,12 @@ pub(crate) struct FailTermLog {
   /// a store that defers. Proves the per-site Pending dispositions: apply/replication defer without
   /// poisoning, the restart scans poison.
   return_cold: bool,
+  /// When `true`, `entries` returns its result OWNED (`Ready(Owned(..))`) instead of borrowed — a
+  /// cold/disk store that materialises the range. Exercises the owned apply-iteration path.
+  return_owned: bool,
+  /// Records the `max_bytes` of the most recent `entries` call, so a test can assert apply reads are
+  /// byte-capped (bounded), never `u64::MAX`.
+  observed_max_bytes: Cell<u64>,
 }
 
 impl FailTermLog {
@@ -286,6 +293,16 @@ impl FailTermLog {
   pub(crate) fn clear_cold_on_read(&mut self) {
     self.return_cold = false;
   }
+
+  /// Make `entries` return its result OWNED (`Ready(Owned(..))`) — a cold/disk store that materialises.
+  pub(crate) fn return_owned_on_read(&mut self) {
+    self.return_owned = true;
+  }
+
+  /// The `max_bytes` of the most recent `entries` call (`0` if none yet).
+  pub(crate) fn observed_max_bytes(&self) -> u64 {
+    self.observed_max_bytes.get()
+  }
 }
 
 impl LogStore for FailTermLog {
@@ -311,6 +328,7 @@ impl LogStore for FailTermLog {
     range: core::ops::Range<Index>,
     max_bytes: u64,
   ) -> Result<EntriesRead<'_>, Self::Error> {
+    self.observed_max_bytes.set(max_bytes);
     if self.return_cold {
       return Ok(EntriesRead::Pending);
     }
@@ -335,11 +353,17 @@ impl LogStore for FailTermLog {
         unreachable!("VecLog::entries always returns Ready(Borrowed)")
       }
     };
-    if self.gap_first_entry && !s.is_empty() {
-      // gapped: a contiguous suffix starting above range.start
-      return Ok(EntriesRead::Ready(MaybeOwned::Borrowed(&s[1..])));
+    // Apply the gap transform, then return borrowed (default) or OWNED (a cold/disk store materialising).
+    let out: &[Entry] = if self.gap_first_entry && !s.is_empty() {
+      &s[1..] // gapped: a contiguous suffix starting above range.start
+    } else {
+      s
+    };
+    if self.return_owned {
+      Ok(EntriesRead::Ready(out.to_vec().into()))
+    } else {
+      Ok(EntriesRead::Ready(MaybeOwned::Borrowed(out)))
     }
-    Ok(EntriesRead::Ready(MaybeOwned::Borrowed(s)))
   }
 
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {

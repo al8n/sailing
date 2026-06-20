@@ -1903,6 +1903,12 @@ where
   /// A bare `break` is used ONLY for the benign "committed entry not yet readable" case (the
   /// log slice is empty), which is transient and retried on the next `handle_*`.
   fn apply_committed<L: LogStore>(&mut self, log: &L) {
+    // Bound the per-pass read so a COLD/disk store returning `Ready(Owned(..))` materializes at most this
+    // many payload bytes per call instead of the whole unapplied backlog (a panic-OOM for a node catching
+    // up after a large committed backlog). The outer `while` re-reads from the new `applied.next()`, so a
+    // short prefix just costs another pass; the in-memory borrowed path is unaffected (a small range comes
+    // back in one pass). Mirrors the restart scans' `1 << 20` cap.
+    const APPLY_READ_MAX_BYTES: u64 = 1 << 20;
     while self.applied < self.commit {
       // Halt the drain the moment the node poisons (including a poison set EARLIER in the same
       // dispatch, e.g. by a storage completion processed just before this call): once fail-stopped,
@@ -1910,12 +1916,15 @@ where
       if self.poisoned {
         return;
       }
-      // ONE range fetch per pass (was one call per index — and on restart the whole tail that way),
-      // iterated BY REFERENCE (no per-entry clone). A conforming store returns a CONTIGUOUS prefix
-      // starting at `applied.next()` (the LogStore::entries contract); a short prefix is re-fetched by
-      // the outer while. An empty slice is the benign "committed entry not yet in the read view" case →
-      // break and retry next tick; an Err is a fatal committed-range read fault → poison.
-      let batch = match log.entries(self.applied.next()..self.commit.next(), u64::MAX) {
+      // ONE byte-capped range fetch per pass (was one call per index), iterated BY REFERENCE (no
+      // per-entry clone). A conforming store returns a CONTIGUOUS prefix starting at `applied.next()`
+      // (the LogStore::entries contract), capped at `APPLY_READ_MAX_BYTES`; a short prefix is re-fetched
+      // by the outer while. An empty slice is the benign "committed entry not yet in the read view" case
+      // → break and retry next tick; an Err is a fatal committed-range read fault → poison.
+      let batch = match log.entries(
+        self.applied.next()..self.commit.next(),
+        APPLY_READ_MAX_BYTES,
+      ) {
         Ok(crate::EntriesRead::Ready(e)) if e.is_empty() => break,
         Ok(crate::EntriesRead::Ready(e)) => e,
         // Present but cold: stop applying this pass and retry on the next pump (the store signals

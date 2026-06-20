@@ -938,6 +938,52 @@ fn cold_apply_is_redriven_by_handle_storage_without_a_completion() {
   );
 }
 
+/// A COLD/disk store may return `Ready(Owned(..))`, materialising the range. Apply must (a) iterate the
+/// OWNED slice correctly and (b) request a BOUNDED `max_bytes` (the 1 MiB cap, never `u64::MAX`), so a
+/// node catching up after a large committed backlog cannot force an O(backlog) materialisation in one read.
+#[test]
+fn apply_reads_are_byte_capped_and_handle_owned_entries() {
+  use crate::{Config, Instant};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
+  let mut log = crate::testkit::FailTermLog::default();
+  let mut stable = crate::testkit::NoopStable::default();
+  log.return_owned_on_read(); // every read materialises OWNED — the cold/disk store shape
+
+  // Become leader, propose, and drive apply over the OWNED read path.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
+    .unwrap();
+  ep.handle_storage(d, &mut log, &mut stable);
+
+  assert!(
+    ep.poison_reason().is_none(),
+    "apply over an OWNED cold read must not poison"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    "the entry must apply via the owned cold-read path"
+  );
+  assert_eq!(
+    log.observed_max_bytes(),
+    1 << 20,
+    "apply must request a BOUNDED max_bytes (the 1 MiB cap), never u64::MAX — else an owned cold store \
+     could materialise the whole committed backlog in one read"
+  );
+}
+
 /// A follower must not send AppendResp until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]
