@@ -677,9 +677,10 @@ impl InteractionEnv {
       ));
     }
     if last >= first
-      && let Ok(entries) = n.log.entries(first..Index::new(last.get() + 1), u64::MAX)
+      && let Ok(sailing_proto::EntriesRead::Ready(entries)) =
+        n.log.entries(first..Index::new(last.get() + 1), u64::MAX)
     {
-      for e in entries {
+      for e in entries.iter() {
         out.push_str(&std::format!(
           "  {}/{} {}{}\n",
           e.term().get(),

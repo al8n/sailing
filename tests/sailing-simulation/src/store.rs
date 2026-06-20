@@ -32,7 +32,8 @@
 //! stays deterministic without changing the trait signature.
 use bytes::Bytes;
 use sailing_proto::{
-  Entry, HardState, Index, LogDone, LogStore, OpId, SnapshotMeta, StableDone, StableStore, Term,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotMeta,
+  StableDone, StableStore, Term,
 };
 use std::{cell::Cell, collections::VecDeque, vec::Vec};
 
@@ -502,7 +503,7 @@ impl LogStore for MemLog {
     &self,
     range: core::ops::Range<Index>,
     max_bytes: u64,
-  ) -> Result<&[Entry], Self::Error> {
+  ) -> Result<EntriesRead<'_>, Self::Error> {
     // Seeded transient-read fault on the committed-range read: surface as a fatal read error. The
     // proto's `apply_committed` treats an `entries` error as unrecoverable and POISONS the node
     // (PoisonReason::LogRead), so this makes that poison path reachable in the sim.
@@ -543,7 +544,9 @@ impl LogStore for MemLog {
     }
     let lo = lo.min(self.entries.len());
     let hi = hi.max(lo).min(self.entries.len());
-    Ok(&self.entries[lo..hi])
+    Ok(EntriesRead::Ready(MaybeOwned::Borrowed(
+      &self.entries[lo..hi],
+    )))
   }
 
   fn submit_append(&mut self, id: OpId, entries: &[Entry]) {

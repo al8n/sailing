@@ -445,10 +445,12 @@ where
       return (0, 0);
     }
     match log.entries(self.commit..self.commit.next(), u64::MAX) {
-      Ok(s) => s
+      Ok(crate::EntriesRead::Ready(s)) => s
         .first()
         .map(|e| (e.wall_timestamp(), e.lease_window()))
         .unwrap_or((0, 0)),
+      // Cold anchor: fail closed (the serve gate refuses, degrades to Safe), same as the absent case.
+      Ok(crate::EntriesRead::Pending) => (0, 0),
       Err(_) => {
         self.poison(PoisonReason::LogRead);
         (0, 0)

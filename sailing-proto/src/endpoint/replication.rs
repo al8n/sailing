@@ -186,24 +186,29 @@ where
       }
     };
     let end = log.last_index().next();
-    // Read the BORROWED suffix slice (no allocation) and apply the byte cap on the slice, cloning
-    // ONLY the capped prefix below. A lagging follower must never force the whole suffix to be
-    // cloned: the configured `max_size_per_msg` bounds the per-send allocation. `max_bytes` is also
-    // passed to the store so an implementation that honours it can return a shorter slice.
+    // Read the suffix (borrowed when resident — no allocation; owned if a cold store materialised it)
+    // and apply the byte cap on the slice, cloning ONLY the capped prefix below. A lagging follower
+    // must never force the whole suffix to be cloned: the configured `max_size_per_msg` bounds the
+    // per-send allocation. `max_bytes` is also passed to the store so an implementation that honours
+    // it can return a shorter slice.
     let max_bytes = self.config.max_size_per_msg();
-    let slice: &[crate::Entry] = if next < end {
-      // A replicable-range read failure is fatal, same policy as `apply_committed`'s LogRead: poison
-      // rather than silently shipping an empty AppendEntries that stalls the follower forever.
+    // Bind the MaybeOwned to a local so a cold-fetch store's OWNED buffer outlives the `slice` borrow.
+    let read: crate::MaybeOwned<'_, [crate::Entry]> = if next < end {
       match log.entries(next..end, max_bytes) {
-        Ok(s) => s,
+        Ok(crate::EntriesRead::Ready(e)) => e,
+        // Cold: the range isn't resident. Defer the whole send — no Progress mutation, no inflight
+        // slot consumed — and retry on the next pump. A cold read is NOT a fault, so never poison
+        // (unlike an Err, which IS fatal, same policy as `apply_committed`'s LogRead).
+        Ok(crate::EntriesRead::Pending) => return,
         Err(_) => {
           self.poison(PoisonReason::LogRead);
           return;
         }
       }
     } else {
-      &[]
+      crate::MaybeOwned::Borrowed(&[])
     };
+    let slice: &[crate::Entry] = &read;
 
     // Cap at max_size_per_msg bytes, but always send at least one entry.
     let entries = if slice.is_empty() || max_bytes == u64::MAX {

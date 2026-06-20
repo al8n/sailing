@@ -706,6 +706,13 @@ where
   /// review surfaced). A wall-PRESENT, not-yet-released
   /// hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted here.
   unprovable_floor_holds: u64,
+  /// Cold-read wedge observability counter (sibling of [`unprovable_floor_holds`](Self::unprovable_floor_holds)).
+  /// Bumped each time `apply_committed` defers on an [`EntriesRead::Pending`](crate::EntriesRead::Pending)
+  /// cold read. A healthy resident store never returns `Pending`, so this stays `0`; a steadily climbing
+  /// value flags a store wedging on a range it never makes resident (the cold-read liveness obligation
+  /// broken). Pure in-memory metric — never persisted, never on the wire, reset to `0` on construction and
+  /// restart, read only via [`cold_read_defers`](Self::cold_read_defers). Not a poison.
+  cold_read_defers: u64,
   /// FAILOVER-tier inherited-read serve anchor — the election TAIL, captured ONCE at
   /// [`become_leader`](Self::become_leader) as `log.last_index()` BEFORE the leader's own no-op (which
   /// would otherwise inflate it). Immutable for the term (`log.last_index()` drifts as the leader
@@ -1018,6 +1025,7 @@ where
       unwalled_commit_wait_until: None,
       precise_releases: 0,
       unprovable_floor_holds: 0,
+      cold_read_defers: 0,
       // Inherited-read serve anchors — armed only at become_leader.
       limbo_upper: Index::ZERO,
       committed_anchor_wall: 0,
@@ -1275,6 +1283,16 @@ where
   #[inline(always)]
   pub const fn unprovable_floor_holds(&self) -> u64 {
     self.unprovable_floor_holds
+  }
+
+  /// Cold-read wedge counter: how many times `apply_committed` deferred on a cold
+  /// ([`EntriesRead::Pending`](crate::EntriesRead::Pending)) committed-range read. `0` for a
+  /// fully-resident store; a steadily climbing value flags a store that returns `Pending` for a range
+  /// it never makes resident (the cold-read liveness obligation broken). Diagnostic only — a cold read
+  /// is not a fault, so it never poisons.
+  #[inline(always)]
+  pub const fn cold_read_defers(&self) -> u64 {
+    self.cold_read_defers
   }
 
   /// The current applied index — the highest log index this node has applied to its
@@ -1898,14 +1916,20 @@ where
       // the outer while. An empty slice is the benign "committed entry not yet in the read view" case →
       // break and retry next tick; an Err is a fatal committed-range read fault → poison.
       let batch = match log.entries(self.applied.next()..self.commit.next(), u64::MAX) {
-        Ok([]) => break,
-        Ok(s) => s,
+        Ok(crate::EntriesRead::Ready(e)) if e.is_empty() => break,
+        Ok(crate::EntriesRead::Ready(e)) => e,
+        // Present but cold: stop applying this pass and retry on the next pump (the store signals
+        // storage-ready when the range lands). A cold defer is not a fault — never poison.
+        Ok(crate::EntriesRead::Pending) => {
+          self.cold_read_defers = self.cold_read_defers.saturating_add(1);
+          break;
+        }
         Err(_) => {
           self.poison(PoisonReason::LogRead);
           break;
         }
       };
-      for entry in batch {
+      for entry in &*batch {
         // The apply index is the entry's OWN identity, never a parallel counter. It must be EXACTLY the
         // next committed index: contiguous from `applied.next()` AND not past `commit`. A non-conforming
         // store that returns a gap/duplicate (`idx != applied.next()`), or a slice OVERLONG past the

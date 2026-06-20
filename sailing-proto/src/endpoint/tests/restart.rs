@@ -263,11 +263,14 @@ fn veclog_restore_rebaselines_correctly() {
     "term(last_index) must equal last_term"
   );
   // No entries above last_index.
+  let crate::EntriesRead::Ready(entries) = log
+    .entries(Index::new(11)..Index::new(11), u64::MAX)
+    .unwrap()
+  else {
+    panic!("a resident store never returns Pending");
+  };
   assert!(
-    log
-      .entries(Index::new(11)..Index::new(11), u64::MAX)
-      .unwrap()
-      .is_empty(),
+    entries.is_empty(),
     "entries(11..11) must be empty after restore"
   );
   // No stale completions should leak out.

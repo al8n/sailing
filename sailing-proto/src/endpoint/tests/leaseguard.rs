@@ -1692,12 +1692,15 @@ fn leaseguard_stale_read_triggers_a_refresh_noop() {
     log.last_index() > last_after_election,
     "a stale read must trigger a refresh no-op at the next leader tick"
   );
-  let refreshed = log
+  let crate::EntriesRead::Ready(refreshed) = log
     .entries(
       last_after_election.next()..log.last_index().next(),
       u64::MAX,
     )
-    .unwrap();
+    .unwrap()
+  else {
+    panic!("a resident store never returns Pending");
+  };
   assert_eq!(refreshed.len(), 1, "exactly one refresh no-op is appended");
   assert_eq!(
     refreshed[0].timestamp(),

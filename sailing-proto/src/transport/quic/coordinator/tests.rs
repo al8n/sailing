@@ -600,9 +600,12 @@ fn quic_election_preserves_synchronized_wall_on_leader_noop() {
   // full `Now` to `handle_message`.
   let leader_log = if a.role().is_leader() { &la } else { &lb };
   let last = leader_log.last_index();
-  let entries = leader_log
+  let crate::EntriesRead::Ready(entries) = leader_log
     .entries(Index::new(1)..last.next(), u64::MAX)
-    .expect("read the leader log");
+    .expect("read the leader log")
+  else {
+    panic!("a resident store never returns Pending");
+  };
   let noop = entries
     .iter()
     .find(|e| e.kind() == EntryKind::Empty)

@@ -1,6 +1,8 @@
 use super::*;
 use bytes::Bytes;
-use sailing_proto::{EntryKind, LogDone, LogStore, SnapshotMeta, StableStore, conf::ConfState};
+use sailing_proto::{
+  EntriesRead, EntryKind, LogDone, LogStore, SnapshotMeta, StableStore, conf::ConfState,
+};
 
 #[test]
 fn mem_log_append_is_durable_after_poll() {
@@ -120,7 +122,10 @@ fn entries_and_term_correct_after_compaction() {
   log.compact(Index::new(3));
 
   // entries 4 and 5 still accessible
-  let slice = log.entries(Index::new(4)..Index::new(6), u64::MAX).unwrap();
+  let EntriesRead::Ready(slice) = log.entries(Index::new(4)..Index::new(6), u64::MAX).unwrap()
+  else {
+    panic!("a resident store never returns Pending");
+  };
   assert_eq!(slice.len(), 2);
   assert_eq!(slice[0].index(), Index::new(4));
   assert_eq!(slice[0].term(), Term::new(4));
@@ -430,9 +435,12 @@ fn transient_read_fault_surfaces_as_error_not_panic() {
     },
     42,
   );
-  assert_eq!(
-    log.entries(Index::new(1)..Index::new(2), u64::MAX),
-    Err(MemStoreError::TransientRead)
+  assert!(
+    matches!(
+      log.entries(Index::new(1)..Index::new(2), u64::MAX),
+      Err(MemStoreError::TransientRead)
+    ),
+    "the faulting trait read errors"
   );
   assert!(
     log.term(Index::new(1)).is_ok(),
