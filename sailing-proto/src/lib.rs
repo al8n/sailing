@@ -33,6 +33,9 @@ pub use data::{ByteCursor, Data, DecodeError};
 mod entry;
 pub use entry::{Entry, EntryKind};
 
+mod maybe_owned;
+pub use maybe_owned::MaybeOwned;
+
 mod hard_state;
 pub use hard_state::{HardState, LeaseSupport};
 
