@@ -1892,185 +1892,198 @@ where
       if self.poisoned {
         return;
       }
-      let idx = self.applied.next();
-      let entry = match log.entries(idx..idx.next(), u64::MAX) {
-        Ok(s) => match s.first() {
-          Some(e) => e.clone(),
-          // Benign: the committed entry is not yet in the read view. Retry next tick.
-          None => break,
-        },
-        // A committed-range read failed. A healthy LogStore never fails this read, so treat it
-        // as unrecoverable: poison rather than silently stall applied behind commit.
+      // ONE range fetch per pass (was one call per index — and on restart the whole tail that way),
+      // iterated BY REFERENCE (no per-entry clone). A conforming store returns a CONTIGUOUS prefix
+      // starting at `applied.next()` (the LogStore::entries contract); a short prefix is re-fetched by
+      // the outer while. An empty slice is the benign "committed entry not yet in the read view" case →
+      // break and retry next tick; an Err is a fatal committed-range read fault → poison.
+      let batch = match log.entries(self.applied.next()..self.commit.next(), u64::MAX) {
+        Ok([]) => break,
+        Ok(s) => s,
         Err(_) => {
           self.poison(PoisonReason::LogRead);
           break;
         }
       };
-      match entry.kind() {
-        crate::EntryKind::Normal => {
-          // Zero-copy: the command decodes from a shared slice of the entry's payload.
-          let cmd = match <F::Command as crate::Data>::decode_exact(entry.data_bytes()) {
-            Ok(c) => c,
-            // A committed entry whose payload won't decode is corrupt/unrecoverable → poison.
-            Err(_) => {
-              self.poison(PoisonReason::NormalEntryDecode);
-              break;
+      for entry in batch {
+        // The apply index is the entry's OWN identity, never a parallel counter. It must be EXACTLY the
+        // next committed index: contiguous from `applied.next()` AND not past `commit`. A non-conforming
+        // store that returns a gap/duplicate (`idx != applied.next()`), or a slice OVERLONG past the
+        // requested `commit.next()` (`idx > commit`, an UNCOMMITTED entry), would otherwise apply the
+        // wrong command at the wrong index or fold an uncommitted entry into the FSM/core state — both an
+        // out-of-range embedded index, so fail-stop rather than silently corrupt state.
+        let idx = entry.index();
+        if idx != self.applied.next() || idx > self.commit {
+          self.poison(PoisonReason::NonContiguousAppend);
+          break;
+        }
+        match entry.kind() {
+          crate::EntryKind::Normal => {
+            // Zero-copy: the command decodes from a shared slice of the entry's payload.
+            let cmd = match <F::Command as crate::Data>::decode_exact(entry.data_bytes()) {
+              Ok(c) => c,
+              // A committed entry whose payload won't decode is corrupt/unrecoverable → poison.
+              Err(_) => {
+                self.poison(PoisonReason::NormalEntryDecode);
+                break;
+              }
+            };
+            match self.fsm.apply(idx, cmd) {
+              Ok(resp) => self
+                .events
+                .push_back(crate::Event::Applied(crate::Applied::new(idx, resp))),
+              // An FSM apply error is fatal (the SM diverges from the committed log) → poison.
+              Err(_) => {
+                self.poison(PoisonReason::Apply);
+                break;
+              }
             }
-          };
-          match self.fsm.apply(idx, cmd) {
-            Ok(resp) => self
+          }
+          crate::EntryKind::Empty => {} // no-op: just advance applied
+          crate::EntryKind::SetReadMode => {
+            // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison
+            // (mirror ConfChange's exact decode). An empty, trailing-junk, or out-of-range payload is a
+            // non-canonical committed entry → fail-stop, never a silent partial decode. This is the
+            // apply-time flip — the SOLE site the active mode changes (commit-before-apply means it never
+            // takes effect on an uncommitted tail). NO commit-wait re-arm: the monotone fold floors + the
+            // mode-independent become_leader arming already cover a deposed LeaseGuard lease (spec §1).
+            let data = entry.data();
+            let mode = match (data.len() == 1)
+              .then(|| data[0])
+              .and_then(crate::ReadOnlyOption::from_u8)
+            {
+              Some(m) => m,
+              None => {
+                self.poison(PoisonReason::SetReadModeDecode);
+                break;
+              }
+            };
+            self.active_read_mode = mode;
+            // A committed SetReadMode has applied — record the read-mode provenance so a snapshot at/after
+            // this boundary carries the mode EXPLICITLY. A node that NEVER migrated leaves it absent (None),
+            // so a restart falls back to the static config rather than pinning the active mode across a
+            // config edit (see `maybe_snapshot`).
+            self.read_mode_migrated = true;
+            // Update the read-mode option WITHOUT discarding in-flight accepted reads (`set_option`, NOT
+            // `reset`): a read already accepted at its commit index stays valid and still confirms under the
+            // mode-INDEPENDENT ReadIndex heartbeat quorum — clearing it (as a mid-term `reset` would) strands
+            // the caller / a forwarding follower on a read `read_index` already accepted. Still revoke any
+            // live LeaseBased lease (its granting quorum may not match the new mode) — mirror ConfChange.
+            self.read_only.set_option(mode);
+            self.lease_valid_until = None;
+            self.lease_acks.clear();
+            self
               .events
-              .push_back(crate::Event::Applied(crate::Applied::new(idx, resp))),
-            // An FSM apply error is fatal (the SM diverges from the committed log) → poison.
-            Err(_) => {
-              self.poison(PoisonReason::Apply);
-              break;
+              .push_back(crate::Event::ReadModeChanged(crate::ReadModeChanged::new(
+                idx, mode,
+              )));
+          }
+          crate::EntryKind::ConfChange => {
+            // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
+            let cc = match crate::wire::decode_conf_change_v2::<I>(entry.data_bytes()) {
+              Ok(c) => c,
+              Err(_) => {
+                self.poison(PoisonReason::ConfChangeDecode);
+                break;
+              }
+            };
+            // Dispatch to the Changer using the etcd rules (apply-time, spec §9): a committed ConfChange
+            // takes effect on the tracker HERE — `apply_committed` is the SOLE fold site, so each change
+            // (including a joint enter/leave) is folded exactly once by construction.
+            //   empty changes + Auto transition  → leave_joint
+            //   transition != Auto OR >1 change   → enter_joint (auto_leave = transition != Explicit)
+            //   else (1 change, Auto transition)  → simple
+            let changer = crate::tracker::confchange::Changer::new(
+              log.last_index(),
+              self.config.max_inflight_msgs(),
+              self.config.max_inflight_bytes(),
+            );
+            let result = if cc.changes().is_empty()
+              && cc.transition() == crate::ConfChangeTransition::Auto
+            {
+              changer.leave_joint(&self.tracker)
+            } else if cc.transition() != crate::ConfChangeTransition::Auto || cc.changes().len() > 1
+            {
+              let auto_leave = cc.transition() != crate::ConfChangeTransition::Explicit;
+              changer.enter_joint(&self.tracker, auto_leave, cc.changes())
+            } else {
+              changer.simple(&self.tracker, cc.changes())
+            };
+            match result {
+              Ok(new_tracker) => {
+                self.tracker = new_tracker;
+                // Membership-change lease revocation: the LeaseBased read lease is safe only because
+                // the lease quorum OVERLAPS any new-leader quorum (one shared voter's `in_lease` blocks the
+                // disruptive vote) — and that overlap is guaranteed ONLY within a SINGLE configuration. A
+                // committed membership change can produce a new config whose quorum is DISJOINT from the
+                // quorum that granted the live lease, so the lease no longer proves "no other leader". Revoke
+                // it; `do_leader_read` degrades to Safe until a fresh quorum re-confirms under the new config.
+                self.lease_valid_until = None;
+                self.lease_acks.clear();
+                // Prune resend-pacing deadlines to the new membership. A peer this change REMOVED
+                // while still in Snapshot state can never be observed leaving it (its Progress is
+                // gone, and a dead peer sends no further responses), so its entry would linger for
+                // the rest of the term — and add/remove churn of lagging peers would grow the map
+                // past the live peer set. This is the sole fold site for configuration changes, so
+                // pruning here bounds the map by the tracked peers by construction.
+                let tracker = &self.tracker;
+                self
+                  .snapshot_resend_after
+                  .retain(|id, _| tracker.progress(id).is_some());
+              }
+              // A committed, validly-decoded ConfChange that the Changer rejects is an unrecoverable
+              // logic violation (e.g. an overlapping change that should have been prevented upstream).
+              // Poison so the failure is detectable rather than a silent apply stall.
+              Err(_) => {
+                self.poison(PoisonReason::ConfChangeApply);
+                break;
+              }
             }
+            let conf = self.tracker.conf_state();
+            self
+              .events
+              .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
+                idx, conf,
+              )));
+            // A leader that this change removed (or demoted to learner) is no longer a voter in the
+            // new configuration and must stop acting as leader. `is_voter()` checks BOTH joint halves,
+            // so during a joint phase where we are still in the outgoing config we keep leading (we must
+            // shepherd the joint → simple transition). We only step down once removed from BOTH halves.
+            // The step-down is at the SAME term (no term bump): a leader yielding to its own removal,
+            // not losing an election.
+            if self.role.is_leader()
+              && self.config.step_down_on_removal()
+              && !self.tracker.is_voter(&self.config.id())
+            {
+              self.role = Role::Follower;
+              self.set_leader(None);
+              self.heartbeat_deadline = None;
+              // Do NOT arm the election timer: a non-voter must not campaign (see handle_timeout /
+              // become_candidate guards). Leaving election_deadline disarmed is the right choice — a
+              // removed/demoted node has no business holding an election timer.
+              self.election_deadline = None;
+              // Abort any in-progress leader transfer — the leader is being removed.
+              self.lead_transferee = None;
+              self.transfer_deadline = None;
+            }
+            // If an in-flight leader transfer's target was removed or demoted by this conf change,
+            // abort it (the target can no longer be elected, and proposals must not stay blocked until
+            // the transfer deadline). Mirrors etcd's abortLeaderTransfer on conf-change apply.
+            if self
+              .lead_transferee
+              .is_some_and(|t| !self.tracker.is_voter(&t))
+            {
+              self.lead_transferee = None;
+              self.transfer_deadline = None;
+            }
+            // NOTE: a learner promoted to voter by this change may be left without an election timer (a
+            // non-voter disarms it and never re-arms). `reconcile_election_timer`, run at the end of the
+            // public entry point that drove this apply, restores the invariant — no per-site arm needed.
+            // Do NOT call F::apply for ConfChange entries — they advance `applied` only.
           }
         }
-        crate::EntryKind::Empty => {} // no-op: just advance applied
-        crate::EntryKind::SetReadMode => {
-          // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison
-          // (mirror ConfChange's exact decode). An empty, trailing-junk, or out-of-range payload is a
-          // non-canonical committed entry → fail-stop, never a silent partial decode. This is the
-          // apply-time flip — the SOLE site the active mode changes (commit-before-apply means it never
-          // takes effect on an uncommitted tail). NO commit-wait re-arm: the monotone fold floors + the
-          // mode-independent become_leader arming already cover a deposed LeaseGuard lease (spec §1).
-          let data = entry.data();
-          let mode = match (data.len() == 1)
-            .then(|| data[0])
-            .and_then(crate::ReadOnlyOption::from_u8)
-          {
-            Some(m) => m,
-            None => {
-              self.poison(PoisonReason::SetReadModeDecode);
-              break;
-            }
-          };
-          self.active_read_mode = mode;
-          // A committed SetReadMode has applied — record the read-mode provenance so a snapshot at/after
-          // this boundary carries the mode EXPLICITLY. A node that NEVER migrated leaves it absent (None),
-          // so a restart falls back to the static config rather than pinning the active mode across a
-          // config edit (see `maybe_snapshot`).
-          self.read_mode_migrated = true;
-          // Update the read-mode option WITHOUT discarding in-flight accepted reads (`set_option`, NOT
-          // `reset`): a read already accepted at its commit index stays valid and still confirms under the
-          // mode-INDEPENDENT ReadIndex heartbeat quorum — clearing it (as a mid-term `reset` would) strands
-          // the caller / a forwarding follower on a read `read_index` already accepted. Still revoke any
-          // live LeaseBased lease (its granting quorum may not match the new mode) — mirror ConfChange.
-          self.read_only.set_option(mode);
-          self.lease_valid_until = None;
-          self.lease_acks.clear();
-          self
-            .events
-            .push_back(crate::Event::ReadModeChanged(crate::ReadModeChanged::new(
-              idx, mode,
-            )));
-        }
-        crate::EntryKind::ConfChange => {
-          // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
-          let cc = match crate::wire::decode_conf_change_v2::<I>(entry.data_bytes()) {
-            Ok(c) => c,
-            Err(_) => {
-              self.poison(PoisonReason::ConfChangeDecode);
-              break;
-            }
-          };
-          // Dispatch to the Changer using the etcd rules (apply-time, spec §9): a committed ConfChange
-          // takes effect on the tracker HERE — `apply_committed` is the SOLE fold site, so each change
-          // (including a joint enter/leave) is folded exactly once by construction.
-          //   empty changes + Auto transition  → leave_joint
-          //   transition != Auto OR >1 change   → enter_joint (auto_leave = transition != Explicit)
-          //   else (1 change, Auto transition)  → simple
-          let changer = crate::tracker::confchange::Changer::new(
-            log.last_index(),
-            self.config.max_inflight_msgs(),
-            self.config.max_inflight_bytes(),
-          );
-          let result = if cc.changes().is_empty()
-            && cc.transition() == crate::ConfChangeTransition::Auto
-          {
-            changer.leave_joint(&self.tracker)
-          } else if cc.transition() != crate::ConfChangeTransition::Auto || cc.changes().len() > 1 {
-            let auto_leave = cc.transition() != crate::ConfChangeTransition::Explicit;
-            changer.enter_joint(&self.tracker, auto_leave, cc.changes())
-          } else {
-            changer.simple(&self.tracker, cc.changes())
-          };
-          match result {
-            Ok(new_tracker) => {
-              self.tracker = new_tracker;
-              // Membership-change lease revocation: the LeaseBased read lease is safe only because
-              // the lease quorum OVERLAPS any new-leader quorum (one shared voter's `in_lease` blocks the
-              // disruptive vote) — and that overlap is guaranteed ONLY within a SINGLE configuration. A
-              // committed membership change can produce a new config whose quorum is DISJOINT from the
-              // quorum that granted the live lease, so the lease no longer proves "no other leader". Revoke
-              // it; `do_leader_read` degrades to Safe until a fresh quorum re-confirms under the new config.
-              self.lease_valid_until = None;
-              self.lease_acks.clear();
-              // Prune resend-pacing deadlines to the new membership. A peer this change REMOVED
-              // while still in Snapshot state can never be observed leaving it (its Progress is
-              // gone, and a dead peer sends no further responses), so its entry would linger for
-              // the rest of the term — and add/remove churn of lagging peers would grow the map
-              // past the live peer set. This is the sole fold site for configuration changes, so
-              // pruning here bounds the map by the tracked peers by construction.
-              let tracker = &self.tracker;
-              self
-                .snapshot_resend_after
-                .retain(|id, _| tracker.progress(id).is_some());
-            }
-            // A committed, validly-decoded ConfChange that the Changer rejects is an unrecoverable
-            // logic violation (e.g. an overlapping change that should have been prevented upstream).
-            // Poison so the failure is detectable rather than a silent apply stall.
-            Err(_) => {
-              self.poison(PoisonReason::ConfChangeApply);
-              break;
-            }
-          }
-          let conf = self.tracker.conf_state();
-          self
-            .events
-            .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
-              idx, conf,
-            )));
-          // A leader that this change removed (or demoted to learner) is no longer a voter in the
-          // new configuration and must stop acting as leader. `is_voter()` checks BOTH joint halves,
-          // so during a joint phase where we are still in the outgoing config we keep leading (we must
-          // shepherd the joint → simple transition). We only step down once removed from BOTH halves.
-          // The step-down is at the SAME term (no term bump): a leader yielding to its own removal,
-          // not losing an election.
-          if self.role.is_leader()
-            && self.config.step_down_on_removal()
-            && !self.tracker.is_voter(&self.config.id())
-          {
-            self.role = Role::Follower;
-            self.set_leader(None);
-            self.heartbeat_deadline = None;
-            // Do NOT arm the election timer: a non-voter must not campaign (see handle_timeout /
-            // become_candidate guards). Leaving election_deadline disarmed is the right choice — a
-            // removed/demoted node has no business holding an election timer.
-            self.election_deadline = None;
-            // Abort any in-progress leader transfer — the leader is being removed.
-            self.lead_transferee = None;
-            self.transfer_deadline = None;
-          }
-          // If an in-flight leader transfer's target was removed or demoted by this conf change,
-          // abort it (the target can no longer be elected, and proposals must not stay blocked until
-          // the transfer deadline). Mirrors etcd's abortLeaderTransfer on conf-change apply.
-          if self
-            .lead_transferee
-            .is_some_and(|t| !self.tracker.is_voter(&t))
-          {
-            self.lead_transferee = None;
-            self.transfer_deadline = None;
-          }
-          // NOTE: a learner promoted to voter by this change may be left without an election timer (a
-          // non-voter disarms it and never re-arms). `reconcile_election_timer`, run at the end of the
-          // public entry point that drove this apply, restores the invariant — no per-site arm needed.
-          // Do NOT call F::apply for ConfChange entries — they advance `applied` only.
-        }
+        self.applied = idx;
       }
-      self.applied = idx;
     }
   }
 }

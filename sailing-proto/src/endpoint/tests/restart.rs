@@ -2529,3 +2529,113 @@ fn restart_with_stale_suffix_after_restore_poisons() {
     "a restore that keeps a stale suffix above the boundary must fail-stop on restart too"
   );
 }
+
+/// The batched apply iterates the returned slice POSITIONALLY, so it must fail-stop on a non-conforming
+/// store that returns a gapped (non-contiguous) committed-range read — otherwise it would apply the wrong
+/// command at the wrong index and silently skip a committed entry. The contiguity guard
+/// (`entry.index() == applied.next()`) poisons NonContiguousAppend. Driven via the restart replay.
+#[test]
+fn apply_with_non_contiguous_read_poisons() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, PoisonReason, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = crate::testkit::FailTermLog::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+  ]);
+  log.gap_first_entry_on_read(); // entries(1..4) returns [2,3] — a gap at the start of the apply read
+  let mut stable = crate::testkit::NoopStable::default();
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3)); // commit = 3, applied = 0
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::NonContiguousAppend),
+    "a gapped committed-range read must fail-stop apply, not silently skip + corrupt the FSM"
+  );
+}
+
+/// The batched apply must also reject an OVERLONG committed-range read (entries past commit): a
+/// non-conforming store that returns more than the requested range would otherwise fold an UNCOMMITTED
+/// entry into the FSM/core state. The `idx > commit` guard poisons NonContiguousAppend. Driven via the
+/// restart replay with commit < last_index (an uncommitted tail entry the overlong read includes).
+#[test]
+fn apply_with_overlong_read_poisons() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, PoisonReason, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = crate::testkit::FailTermLog::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+  ]);
+  log.return_overlong_on_read(); // entries(1..3) returns [1,2,3] — entry 3 is past commit=2
+  let mut stable = crate::testkit::NoopStable::default();
+  stable.force_state(Term::new(1), Some(1u64), Index::new(2)); // commit = 2 (< last_index = 3)
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    1,
+    crate::testkit::CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::NonContiguousAppend),
+    "an overlong read returning an uncommitted entry past commit must fail-stop apply"
+  );
+}
