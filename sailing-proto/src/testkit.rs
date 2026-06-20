@@ -215,6 +215,9 @@ pub(crate) struct FailTermLog {
   /// When `Some(i)`, `entries(range)` returns `Err(())` for any range CONTAINING `i`; otherwise
   /// delegates to `inner`. Proves a fatal log-read mid-scan fail-stops rather than fabricating a default.
   fail_entries_index: Option<Index>,
+  /// When `true`, `restore` is a NO-OP: it does NOT re-baseline `first_index` to `last_index + 1`,
+  /// modelling a store that violates the restore contract — to prove a snapshot install fail-stops.
+  skip_restore_rebaseline: bool,
 }
 
 impl FailTermLog {
@@ -231,6 +234,11 @@ impl FailTermLog {
   /// Arm the fatal `entries` failure at `index`: any range containing it returns `Err(())`.
   pub(crate) fn fail_entries_at(&mut self, index: Option<Index>) {
     self.fail_entries_index = index;
+  }
+
+  /// Make `restore` a no-op (skip the re-baseline) — a contract-violating store, for the install fail-stop.
+  pub(crate) fn break_restore_rebaseline(&mut self) {
+    self.skip_restore_rebaseline = true;
   }
 }
 
@@ -277,6 +285,9 @@ impl LogStore for FailTermLog {
   }
 
   fn restore(&mut self, last_index: Index, last_term: Term) {
+    if self.skip_restore_rebaseline {
+      return; // contract-violating store: leave first_index un-rebaselined
+    }
     self.inner.restore(last_index, last_term);
   }
 

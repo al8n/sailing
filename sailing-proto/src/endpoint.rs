@@ -154,6 +154,13 @@ pub enum PoisonReason {
   /// invariants (empty voters, learner/voter overlap, bad `learners_next`, non-joint `auto_leave`).
   /// Installing it verbatim would corrupt the membership tracker; a correct leader never sends one.
   InvalidConfState,
+  /// On a snapshot INSTALL, `LogStore::restore` did not re-baseline the log to the snapshot boundary
+  /// (`first_index() != last_index() + 1` afterward), so the log read-view is inconsistent with the
+  /// commit/applied watermarks the install just advanced — every later AppendEntries consistency check
+  /// and committed-entry fetch would read a wrong boundary. A conforming store re-baselines on `restore`,
+  /// so this is a storage-contract violation or a buggy store; fail-stop rather than serve off a torn
+  /// boundary (a release-mode promotion of what was a debug-only tripwire).
+  SnapshotRebaseline,
   /// On restart the durable log is re-baselined past index 1 (`first_index() > 1`) but no durable
   /// snapshot exists to baseline the discarded prefix — committed entries below `first_index` are
   /// unrecoverable. A conforming `LogStore` orders the `restore` re-baseline durability AFTER the
@@ -227,6 +234,7 @@ impl PoisonReason {
       Self::CommittedTruncation => "committed_truncation",
       Self::NonContiguousAppend => "non_contiguous_append",
       Self::InvalidConfState => "invalid_conf_state",
+      Self::SnapshotRebaseline => "snapshot_rebaseline",
       Self::OrphanedLog => "orphaned_log",
       Self::InconsistentLeaseFloor => "inconsistent_lease_floor",
       Self::WallHorizonUnrepresentable => "wall_horizon_unrepresentable",
