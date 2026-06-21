@@ -1106,7 +1106,7 @@ where
   }
 }
 
-// ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
+// ─── RNG-driven constructor (the only entry here that draws the election RNG) ────────────────────
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -1237,7 +1237,15 @@ where
     ep.arm_election_timer(now);
     ep
   }
+}
 
+// ─── Pure-accessor impl (no `R` bound: none of these draw the election RNG) ──────────────────────
+
+impl<I, F, R> Endpoint<I, F, R>
+where
+  I: NodeId,
+  F: StateMachine,
+{
   /// This node's id.
   #[inline(always)]
   pub const fn id(&self) -> I {

@@ -5,7 +5,6 @@ impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
-  R: rand::Rng,
 {
   /// The current committed-configuration membership ([`ConfState`](crate::ConfState)) derived from
   /// the runtime `Tracker`.
