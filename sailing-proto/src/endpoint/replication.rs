@@ -645,10 +645,10 @@ where
     // sibling of the term-before-respond ack gating.
     let lease_support = if self.config.check_quorum() || self.config.pre_vote() {
       let this_run = self.config.election_timeout();
-      if self.lease_support_floor < Some(this_run) {
-        self.lease_support_floor = Some(this_run);
+      if self.durable.lease_support_floor < Some(this_run) {
+        self.durable.lease_support_floor = Some(this_run);
       }
-      if self.durable_lease_support >= Some(this_run) {
+      if self.durable.durable_lease_support >= Some(this_run) {
         this_run
       } else {
         core::time::Duration::ZERO

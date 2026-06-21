@@ -138,7 +138,7 @@ where
   /// and also upgrades a legacy `Unrecorded` record to `Recorded` — the self-heal). A future monotone field
   /// `F` adds exactly ONE line here: `.with_f(hs.f().max(self.f_floor))`.
   pub(crate) fn stamp_floors(&self, hs: crate::HardState<I>) -> crate::HardState<I> {
-    hs.with_lease_support(hs.lease_support().raise(self.lease_support_floor))
+    hs.with_lease_support(hs.lease_support().raise(self.durable.lease_support_floor))
   }
 
   pub(crate) fn submit_write<S: StableStore<NodeId = I>>(
@@ -157,16 +157,16 @@ where
     // remember the FIRST write that carries each newly-higher term, so `term_is_durable` can tell
     // when `self.term` has actually reached stable storage. Terms are monotonic and all HardState writes
     // carry the current term, so the first write at a higher term establishes that term's durability.
-    if hard_state.term() > self.last_submitted_term {
-      self.last_submitted_term = hard_state.term();
-      self.term_persist_opid = id;
+    if hard_state.term() > self.durable.last_submitted_term {
+      self.durable.last_submitted_term = hard_state.term();
+      self.durable.term_persist_opid = id;
     }
     // the same watermark for the monotone-increasing lease-support floor (MAGNITUDE), so
     // `on_stable_wrote` can tell when a newly-RAISED floor has reached stable storage and the follower may
     // begin advertising its real lease support (the persist-before-advertise gate in `on_heartbeat`).
-    if hard_state.lease_support().promised() > self.last_submitted_lease_support {
-      self.last_submitted_lease_support = hard_state.lease_support().promised();
-      self.lease_support_persist_opid = id;
+    if hard_state.lease_support().promised() > self.durable.last_submitted_lease_support {
+      self.durable.last_submitted_lease_support = hard_state.lease_support().promised();
+      self.durable.lease_support_persist_opid = id;
     }
     stable.submit_write(id, hard_state);
   }
@@ -178,7 +178,7 @@ where
   /// ADOPTED term (in memory, write still in flight) reads false.
   #[inline]
   pub(crate) fn term_is_durable(&self) -> bool {
-    self.durable_term >= self.term
+    self.durable.durable_term >= self.term
   }
 
   /// Flush any term-gated success ack once `self.term` is durable (called from `on_stable_wrote` after
@@ -306,7 +306,7 @@ where
     // enforcing Heartbeat would otherwise early-return and never persist the promise it is about to advertise.
     if durable.term() == self.term
       && durable.vote() == self.voted_for
-      && durable.promised_lease_support() == self.lease_support_floor
+      && durable.promised_lease_support() == self.durable.lease_support_floor
     {
       return;
     }
@@ -528,16 +528,18 @@ where
   ) {
     // a completion at or past the current term's write makes that term durable (stable completions
     // are ordered). Advance `durable_term`, which may now release a term-gated success ack below.
-    if self.last_submitted_term > self.durable_term && opid >= self.term_persist_opid {
-      self.durable_term = self.last_submitted_term;
+    if self.durable.last_submitted_term > self.durable.durable_term
+      && opid >= self.durable.term_persist_opid
+    {
+      self.durable.durable_term = self.durable.last_submitted_term;
     }
     // the same advance for the lease-support floor — a completion at/past the floor write makes the
     // raised floor durable, releasing the persist-before-advertise gate so `on_heartbeat` may now advertise
     // this node's real lease support.
-    if self.last_submitted_lease_support > self.durable_lease_support
-      && opid >= self.lease_support_persist_opid
+    if self.durable.last_submitted_lease_support > self.durable.durable_lease_support
+      && opid >= self.durable.lease_support_persist_opid
     {
-      self.durable_lease_support = self.last_submitted_lease_support;
+      self.durable.durable_lease_support = self.durable.last_submitted_lease_support;
     }
     match self.pending.remove(&opid) {
       Some(Pending::CastVote { to, term }) => {
