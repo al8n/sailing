@@ -9,16 +9,12 @@ fn ctx(b: &'static [u8]) -> Bytes {
   Bytes::from_static(b)
 }
 
-// ── ReadState accessors ────────────────────────────────────────────────────
-
 #[test]
 fn read_state_accessors() {
   let rs = ReadState::new(idx(42), ctx(b"hello"));
   assert_eq!(rs.index(), idx(42));
   assert_eq!(rs.context().as_ref(), b"hello");
 }
-
-// ── add_request / recv_ack / advance ──────────────────────────────────────
 
 /// Three voters (1=leader, 2, 3).  A read is added (round token t); peers 2 and 3 ack t →
 /// quorum reached (leader self-ack + peer2 = 2/3, not yet; + peer3 = 3/3).
@@ -155,8 +151,6 @@ fn recv_ack_nonexistent_returns_zero() {
   let mut ro: ReadOnly<u64> = ReadOnly::new(ReadOnlyOption::Safe);
   assert_eq!(ro.recv_ack(2u64, b"ghost"), 0);
 }
-
-// ── ReadState: PartialEq / Clone ───────────────────────────────────────────
 
 #[test]
 fn read_state_clone_and_eq() {

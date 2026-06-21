@@ -12,8 +12,6 @@ use sailing_proto::{
 };
 use sailing_simulation::Cluster;
 
-// ── Helpers ──────────────────────────────────────────────────────────────────────────────────────
-
 /// Wait until the cluster has elected a stable leader.
 fn wait_for_leader(c: &mut Cluster, msg: &str) -> u64 {
   assert!(c.run_until(400, |c| c.leader_count() == 1), "{msg}");
@@ -48,7 +46,6 @@ fn wait_for_conf_change(c: &mut Cluster, baseline: u64, delta: u64, msg: &str) -
   c.conf_changed_count(leader)
 }
 
-// ── Test 1 ──────────────────────────────────────────────────────────────────────────────────────
 /// A 3-node cluster grows to 5 voters one node at a time (3→4→5), with commands proposed
 /// between additions. All nodes must end up with the same applied log, and each new node
 /// must have fully caught up.
@@ -116,7 +113,6 @@ fn add_voter_grows_quorum() {
   assert!(c.agreement_holds(), "agreement must hold at the end");
 }
 
-// ── Test 2 ──────────────────────────────────────────────────────────────────────────────────────
 /// A 5-node cluster shrinks down to 3 voters. We remove a follower first, then command
 /// more entries, then remove the OLD leader (which triggers step-down + new election).
 /// Agreement holds throughout.
@@ -230,7 +226,6 @@ fn remove_voter_shrinks_quorum() {
   let _ = original_leader; // suppress unused warning
 }
 
-// ── Test 3 ──────────────────────────────────────────────────────────────────────────────────────
 /// A `ConfChangeV2` with `Implicit` transition atomically swaps two nodes (add node 4,
 /// remove node 2) in a single joint-consensus round. The cluster enters joint config
 /// then auto-leaves once committed. Agreement holds across the entire joint → simple
@@ -334,7 +329,6 @@ fn joint_consensus_replace_two() {
   );
 }
 
-// ── Test 4 ──────────────────────────────────────────────────────────────────────────────────────
 /// A learner does NOT count for quorum: commands commit without the learner's ack.
 /// Then the learner is promoted to voter and must now count for quorum.
 #[test]
@@ -469,7 +463,6 @@ fn learner_does_not_count_for_quorum() {
   );
 }
 
-// ── Test 5 ──────────────────────────────────────────────────────────────────────────────────────
 /// The current leader is removed from the cluster. It must step down, and a new
 /// leader must emerge among the remaining voters.
 #[test]
@@ -529,7 +522,6 @@ fn remove_leader_steps_down() {
   );
 }
 
-// ── Test 6 ──────────────────────────────────────────────────────────────────────────────────────
 /// Regression: a healed follower (learner) resumes replication via heartbeats alone.
 ///
 /// Before the `free_inflight_on_heartbeat` fix (etcd `FreeFirstOne`), a `Replicate` peer

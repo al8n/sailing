@@ -6,8 +6,6 @@
 use crate::{ConfState, Index, JointConfig, MajorityConfig, NodeId, Progress, VoteResult};
 use std::collections::{BTreeMap, BTreeSet};
 
-// ─── Tracker ──────────────────────────────────────────────────────────────────
-
 /// Runtime membership state: joint voter configuration, learner sets, and per-peer [`Progress`].
 ///
 /// Port of etcd `tracker.ProgressTracker`. The `voters` field is a [`JointConfig`]; during a
@@ -90,8 +88,6 @@ impl<I: NodeId> Tracker<I> {
     }
   }
 
-  // ── Quorum / vote ──────────────────────────────────────────────────────────
-
   /// The largest log index jointly committed by both joint-config halves (or by the sole
   /// incoming half when not in a joint transition).
   ///
@@ -149,8 +145,6 @@ impl<I: NodeId> Tracker<I> {
     }
   }
 
-  // ── Membership predicates ──────────────────────────────────────────────────
-
   /// Whether `id` is a voter in either the incoming or outgoing joint-config half.
   pub fn is_voter(&self, id: &I) -> bool {
     self.voters.incoming().contains(id) || self.voters.outgoing().contains(id)
@@ -173,8 +167,6 @@ impl<I: NodeId> Tracker<I> {
     !self.voters.outgoing().is_empty()
   }
 
-  // ── ID sets ────────────────────────────────────────────────────────────────
-
   /// All node IDs tracked: voters (both halves) ∪ learners ∪ learners_next.
   pub fn ids(&self) -> BTreeSet<I> {
     let mut ids = self.voters.ids();
@@ -182,8 +174,6 @@ impl<I: NodeId> Tracker<I> {
     ids.extend(self.learners_next.iter().copied());
     ids
   }
-
-  // ── ConfState snapshot ─────────────────────────────────────────────────────
 
   /// Produce a [`ConfState`] snapshot of the current configuration.
   pub fn conf_state(&self) -> ConfState<I> {
@@ -195,8 +185,6 @@ impl<I: NodeId> Tracker<I> {
       self.auto_leave,
     )
   }
-
-  // ── Progress accessors ─────────────────────────────────────────────────────
 
   /// Shared reference to the progress entry for `id`, if any.
   pub fn progress(&self, id: &I) -> Option<&Progress> {
@@ -258,8 +246,6 @@ impl<I: NodeId> Tracker<I> {
     self.progress.remove(id);
   }
 
-  // ── Joint-config halves (needed by confchange) ─────────────────────────────
-
   /// The joint voter configuration.
   #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
   pub fn voters(&self) -> &JointConfig<I> {
@@ -287,8 +273,6 @@ impl<I: NodeId> Tracker<I> {
   }
 }
 
-// ─── confchange ───────────────────────────────────────────────────────────────
-
 /// Pure configuration-change transforms. Port of etcd `confchange/confchange.go`.
 ///
 /// The [`Changer`] carries only the parameters needed to mint new [`Progress`] entries; it takes
@@ -300,8 +284,6 @@ pub mod confchange {
     ConfChangeSingle, ConfChangeType, Index, JointConfig, MajorityConfig, NodeId, Progress,
   };
   use std::collections::BTreeSet;
-
-  // ── ConfChangeError ────────────────────────────────────────────────────────
 
   /// Why a configuration-change operation was rejected.
   ///
@@ -345,8 +327,6 @@ pub mod confchange {
     InvariantViolation(std::string::String),
   }
 
-  // ── Changer ────────────────────────────────────────────────────────────────
-
   /// Pure configuration-change transformer.
   ///
   /// Carries the parameters needed to initialize [`Progress`] for newly added nodes; the
@@ -374,8 +354,6 @@ pub mod confchange {
         max_inflight_bytes,
       }
     }
-
-    // ── Public transforms ──────────────────────────────────────────────────
 
     /// Apply `changes` as a *simple* (non-joint) configuration change.
     ///
@@ -498,8 +476,6 @@ pub mod confchange {
       self.check_invariants(&next)?;
       Ok(next)
     }
-
-    // ── Internal helpers ───────────────────────────────────────────────────
 
     /// Deep-clone `tr` into a new [`Tracker`] (the Changer only mutates its copy).
     fn clone_tracker<I: NodeId>(&self, tr: &Tracker<I>) -> Tracker<I> {
@@ -742,8 +718,6 @@ pub mod confchange {
     }
   }
 
-  // ── Helpers ────────────────────────────────────────────────────────────────
-
   /// Count of the symmetric difference between two `BTreeSet`s:
   /// `|(a - b) ∪ (b - a)|`.
   ///
@@ -754,8 +728,6 @@ pub mod confchange {
     only_a + only_b
   }
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests;

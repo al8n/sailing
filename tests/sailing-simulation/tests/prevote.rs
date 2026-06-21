@@ -39,7 +39,6 @@ fn rejoining_node_does_not_disrupt() {
   // recently would grant the vote.
   let mut c = Cluster::new_with(3, |cfg| cfg.with_pre_vote(true).with_check_quorum(true));
 
-  // ── Phase 1: elect a stable leader and commit a few entries ────────────────
   let initial_leader = wait_for_leader(&mut c, "initial leader must emerge");
   for i in 0u32..5 {
     let payload = i.to_le_bytes();
@@ -58,7 +57,6 @@ fn rejoining_node_does_not_disrupt() {
     .find(|&id| id != initial_leader)
     .expect("must have a follower");
 
-  // ── Phase 2: isolate the follower for MANY election timeouts ───────────────
   // The election timeout is 1 000 ms.  We run for ~15 election timeouts so that,
   // without PreVote, the isolated node would have bumped its term many times.
   c.isolate(isolated_node);
@@ -75,8 +73,6 @@ fn rejoining_node_does_not_disrupt() {
   // Keep running through many more timeouts so the isolated node has ample
   // opportunity to bump its term (it won't, because PreVote holds it back).
   c.run_until(20_000, |_| false);
-
-  // ── Phase 3: verify the cluster is undisrupted during isolation ────────────
 
   // The original leader must still be leader (CheckQuorum keeps the majority
   // reachable, so the leader does not step down; the isolated node cannot
@@ -96,7 +92,6 @@ fn rejoining_node_does_not_disrupt() {
     "isolated node's term must not have inflated (PreVote held it in PreCandidate)"
   );
 
-  // ── Phase 4: heal and let the cluster reconverge ───────────────────────────
   c.heal(isolated_node);
 
   assert!(

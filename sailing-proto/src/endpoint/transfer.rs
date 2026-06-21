@@ -9,8 +9,6 @@ where
   F::Command: crate::Data,
   F::Error: core::error::Error,
 {
-  // ─── Leader transfer ──────────────────────────────────────────────────────────
-
   /// Initiate a graceful leader transfer to `to`.
   ///
   /// The leader stops accepting proposals, catches `to` up to its log, then sends it a

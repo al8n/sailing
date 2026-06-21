@@ -1089,7 +1089,7 @@ where
   transfer: Transfer<I>,
 }
 
-// ─── Default-`Prng` seed constructors (the public, byte-identical-preserving entry points) ───────
+// Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
 
 impl<I, F> Endpoint<I, F, Prng>
 where
@@ -1106,7 +1106,7 @@ where
   }
 }
 
-// ─── RNG-driven constructor (the only entry here that draws the election RNG) ────────────────────
+// The only entry that draws the election RNG, hence the `R: rand::Rng` bound.
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -1239,7 +1239,7 @@ where
   }
 }
 
-// ─── Pure-accessor impl (no `R` bound: none of these draw the election RNG) ──────────────────────
+// No `R` bound: none of these draw the election RNG.
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -1712,7 +1712,7 @@ where
   }
 }
 
-// ─── Full replication impl (F::Command: Data required for apply_committed) ──────────────────────
+// `F::Command: Data`, required by `apply_committed`.
 
 impl<I, F, R> Endpoint<I, F, R>
 where

@@ -230,8 +230,6 @@ fn non_leader_conf_change_is_refused() {
   );
 }
 
-// ── conf-change regression tests ────────────────────────────────────────────────────
-
 /// Regression: a freshly-elected leader must not accept a new ConfChange while an inherited
 /// one is uncommitted.
 ///

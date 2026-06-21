@@ -1162,8 +1162,6 @@ impl<I: NodeId> Bridge<I> {
     }
   }
 
-  // ── test observables ─────────────────────────────────────────────────────────
-
   /// The number of connections quinn's endpoint still tracks in its slab (the reconnect-churn
   /// regression asserts `Drained` connections actually free it).
   #[cfg(test)]

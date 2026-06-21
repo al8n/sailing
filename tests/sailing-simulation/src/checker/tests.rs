@@ -81,8 +81,6 @@ fn healthy_cluster_passes_full_suite() {
   }
 }
 
-// ─── agreement teeth ───────────────────────────────────────────────────────────────────────────
-
 #[test]
 fn agreement_detects_divergent_applied() {
   // Two nodes disagree on the command applied at index 2.
@@ -94,8 +92,6 @@ fn agreement_detects_divergent_applied() {
   assert_eq!(v.oracle, "agreement");
   assert!(v.detail.contains("applied[1] diverges"), "{}", v.detail);
 }
-
-// ─── append-before-ack teeth ─────────────────────────────────────────────────────────────────
 
 #[test]
 fn append_before_ack_detects_applied_beyond_visible() {
@@ -124,8 +120,6 @@ fn append_before_ack_allows_applied_within_visible_unflushed_tail() {
     "applied within the visible (un-flushed) tail is legal"
   );
 }
-
-// ─── commit-is-quorum-durable teeth ──────────────────────────────────────────────────────────
 
 #[test]
 fn commit_is_quorum_durable_detects_solo_commit() {
@@ -248,8 +242,6 @@ fn commit_is_quorum_durable_keeps_teeth_with_authoritative_voter_set() {
   );
 }
 
-// ─── monotonic-commit teeth ──────────────────────────────────────────────────────────────────
-
 #[test]
 fn monotonic_commit_detects_regression() {
   let mut ck = Checker::new();
@@ -267,8 +259,6 @@ fn monotonic_commit_detects_regression() {
   );
 }
 
-// ─── no-committed-rewrite teeth ──────────────────────────────────────────────────────────────
-
 #[test]
 fn no_committed_rewrite_detects_conflicting_apply() {
   let mut ck = Checker::new();
@@ -285,8 +275,6 @@ fn no_committed_rewrite_detects_conflicting_apply() {
   assert_eq!(v.oracle, "no_committed_rewrite");
   assert!(v.detail.contains("committed index 2"), "{}", v.detail);
 }
-
-// ─── term-monotonic teeth ────────────────────────────────────────────────────────────────────
 
 #[test]
 fn term_monotonic_detects_regression() {
@@ -309,8 +297,6 @@ fn term_monotonic_detects_regression() {
     v.detail
   );
 }
-
-// ─── boundedness teeth ───────────────────────────────────────────────────────────────────────
 
 #[test]
 fn boundedness_detects_offset_desync() {
@@ -336,8 +322,6 @@ fn boundedness_detects_staged_leak() {
   assert_eq!(v.oracle, "boundedness");
   assert!(v.detail.contains("staged"), "{}", v.detail);
 }
-
-// ─── durable-prefix-after-restart teeth (the lost-commit-on-restart test) ───────────────────────────────
 
 #[test]
 fn durable_prefix_detects_c1_lost_commit_on_restart() {
@@ -386,8 +370,6 @@ fn durable_prefix_accepts_resynced_lost_log_tail() {
   let view = cv(1, 1, std::vec![n]);
   assert_eq!(durable_prefix(&view), Ok(()));
 }
-
-// ─── full-suite panic wrapper ────────────────────────────────────────────────────────────────
 
 #[test]
 #[should_panic(expected = "SAFETY ORACLE VIOLATION")]

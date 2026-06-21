@@ -583,8 +583,6 @@ fn step_down_on_higher_term_arms_voter_election_timer() {
   );
 }
 
-// ─── PreVote tests ─────────────────────────────────────────────────────────────────────
-
 /// Test 1: A PreCandidate that loses pre-vote stays at the SAME term.
 /// A node with pre_vote=true times out → PreCandidate; peers reject (they have a live leader)
 /// → the node does NOT advance to Candidate, and self.term is UNCHANGED.
@@ -1110,8 +1108,6 @@ fn term_pre_pass_exemption_for_pre_vote_request() {
     "no additional VoteResponse after handle_storage — pre-vote must not persist"
   );
 }
-
-// ─── N1: stale-term pre-vote rejection (etcd PreVote fidelity) ───────────────────────────────
 
 /// Regression N1: a follower at term 5 with no voted_for and no live leader receives a
 /// pre-vote whose advertised term (3) is BELOW its own term.

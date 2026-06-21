@@ -66,8 +66,6 @@ pub(crate) fn id_within_wire_bound<I: Data>(id: &I) -> bool {
   !v.is_empty() && v.len() <= MAX_ID_LEN
 }
 
-// ─── Entry points ──────────────────────────────────────────────────────────────────
-
 /// Encode one consensus message into `buf` as the protobuf envelope — the payload of one
 /// transport frame. The public seam for custom transports (the built-in stream/QUIC
 /// transports and the simulation harness all route through here).
@@ -125,8 +123,6 @@ pub(crate) fn decode_conf_change_v2<I: NodeId>(
     .collect::<Result<Vec<_>, DecodeError>>()?;
   Ok(ConfChangeV2::new(transition, changes, w.context))
 }
-
-// ─── Error + id + set helpers ──────────────────────────────────────────────────────
 
 /// Map buffa's structural decode errors onto the crate's error surface. The envelope
 /// rejects-and-closes at the transport either way; the distinction that matters to
@@ -202,8 +198,6 @@ fn pb_transition(t: ConfChangeTransition) -> pb::ConfChangeTransition {
     ConfChangeTransition::Explicit => pb::ConfChangeTransition::Explicit,
   }
 }
-
-// ─── Entry / ConfState / SnapshotMeta ──────────────────────────────────────────────
 
 fn pb_entry(e: &Entry) -> pb::Entry {
   pb::Entry {
@@ -303,8 +297,6 @@ fn snapshot_meta_from<I: NodeId>(w: &pb::SnapshotMeta) -> Result<SnapshotMeta<I>
     None => meta,
   })
 }
-
-// ─── Message ───────────────────────────────────────────────────────────────────────
 
 fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
   use pb::message::Body;

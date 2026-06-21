@@ -11,8 +11,6 @@ use crate::NodeId;
 use bytes::Bytes;
 use std::{collections::BTreeSet, vec::Vec};
 
-// ─── ConfState ────────────────────────────────────────────────────────────────
-
 /// The full Raft configuration state. Stored inside [`crate::SnapshotMeta`] and consulted
 /// during snapshot install and restart.
 ///
@@ -81,8 +79,6 @@ impl<I: NodeId> ConfState<I> {
     }
   }
 
-  // ── Accessors ───────────────────────────────────────────────────────────────
-
   /// The current (or incoming) voter set.
   #[inline(always)]
   pub fn voters(&self) -> &BTreeSet<I> {
@@ -113,8 +109,6 @@ impl<I: NodeId> ConfState<I> {
   pub fn auto_leave(&self) -> bool {
     self.auto_leave
   }
-
-  // ── Predicates ──────────────────────────────────────────────────────────────
 
   /// Whether `id` is in the current (or incoming) voter set.
   #[inline(always)]
@@ -192,8 +186,6 @@ impl<I: NodeId> ConfState<I> {
   }
 }
 
-// ─── ConfChangeType ───────────────────────────────────────────────────────────
-
 /// The operation a [`ConfChangeSingle`] or [`ConfChange`] performs on the cluster.
 ///
 /// Mirrors etcd `raftpb.ConfChangeType`.
@@ -220,8 +212,6 @@ impl ConfChangeType {
     }
   }
 }
-
-// ─── ConfChangeTransition ─────────────────────────────────────────────────────
 
 /// Governs how a [`ConfChangeV2`] transitions the cluster through the joint-consensus
 /// algorithm.
@@ -259,8 +249,6 @@ impl ConfChangeTransition {
   }
 }
 
-// ─── ConfChangeSingle ─────────────────────────────────────────────────────────
-
 /// A single membership-change operation: add/remove a node.
 ///
 /// A [`ConfChangeV2`] carries a `Vec<ConfChangeSingle<I>>`; a plain [`ConfChange`] wraps a
@@ -290,8 +278,6 @@ impl<I: NodeId> ConfChangeSingle<I> {
     self.node
   }
 }
-
-// ─── ConfChange (v1) ──────────────────────────────────────────────────────────
 
 /// A simple (single-operation) membership-change entry payload (v1).
 ///
@@ -344,8 +330,6 @@ impl<I: NodeId> ConfChange<I> {
     }
   }
 }
-
-// ─── ConfChangeV2 ─────────────────────────────────────────────────────────────
 
 /// The general (possibly multi-operation / joint-consensus) membership-change entry payload.
 ///
@@ -404,8 +388,6 @@ impl<I: NodeId> ConfChangeV2<I> {
     }
   }
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests;

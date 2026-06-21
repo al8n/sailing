@@ -36,8 +36,6 @@ use sailing_proto::{EntriesRead, Entry, EntryKind, Event, FailoverReadWindow, In
 
 use crate::DriverError;
 
-// ── submit budget ─────────────────────────────────────────────────────────────
-
 /// The shared in-flight submit budget (count AND payload bytes), cloned into every
 /// [`Handle`](crate::Handle) — the caps apply across all clones, not per clone.
 #[derive(Clone)]
@@ -104,8 +102,6 @@ impl Drop for ReservationGuard {
     self.budget.bytes.fetch_sub(self.len, Ordering::AcqRel);
   }
 }
-
-// ── pending completions ───────────────────────────────────────────────────────
 
 /// What a parked operation is waiting for, keyed by log index.
 pub(crate) enum Pending<I, R> {
