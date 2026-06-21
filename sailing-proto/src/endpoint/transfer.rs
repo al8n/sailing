@@ -58,8 +58,8 @@ where
     // while the transferee commits ahead. `do_leader_read` also gates the lease on `lead_transferee`, so
     // a heartbeat that re-renews `lease_valid_until` during the transfer still cannot be used; this clear
     // is the immediate revocation.
-    self.lease_valid_until = None;
-    self.lease_acks.clear();
+    self.check_quorum_lease.lease_valid_until = None;
+    self.check_quorum_lease.lease_acks.clear();
 
     // If the target is already caught up, send TimeoutNow immediately.
     let target_match = self

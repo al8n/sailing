@@ -18,13 +18,17 @@ where
     // echoing THIS round and is bounded by this round's send time. A stale/duplicated
     // earlier-round response then cannot keep an isolated leader's lease alive, and a delayed
     // current-round response cannot extend it past the quorum's election window.
-    self.lease_round += 1;
-    self.lease_round_start = now.mono();
-    self.lease_acks.clear();
+    self.check_quorum_lease.lease_round += 1;
+    self.check_quorum_lease.lease_round_start = now.mono();
+    self.check_quorum_lease.lease_acks.clear();
     // the contributing quorum's min support resets to the leader's OWN election_timeout (its self
     // support); each enforcing ack this round mins it down so a shorter-timeout voter caps the lease.
-    self.lease_min_support = self.config.election_timeout();
-    let (term, me, lease_round) = (self.term, self.config.id(), self.lease_round);
+    self.check_quorum_lease.lease_min_support = self.config.election_timeout();
+    let (term, me, lease_round) = (
+      self.term,
+      self.config.id(),
+      self.check_quorum_lease.lease_round,
+    );
     // Carry the last-pending-read context so followers can echo it back, giving the
     // leader the acks it needs to confirm outstanding safe reads.  An empty context
     // means there are no pending reads (the echo is harmless either way).
@@ -61,7 +65,11 @@ where
   pub(crate) fn broadcast_heartbeat_with_ctx(&mut self, _now: crate::Now, ctx: Bytes) {
     // Carry the CURRENT lease round (do NOT bump — only the periodic `broadcast_heartbeat` opens a new
     // round) so responses to this read-path heartbeat also count toward the lease.
-    let (term, me, lease_round) = (self.term, self.config.id(), self.lease_round);
+    let (term, me, lease_round) = (
+      self.term,
+      self.config.id(),
+      self.check_quorum_lease.lease_round,
+    );
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       let peer_commit = self
         .tracker
@@ -882,7 +890,7 @@ where
       return;
     }
     // Renew the LeaseBased read lease ONLY from a FRESH response to the CURRENT CheckQuorum round.
-    // A HeartbeatResp echoing `self.lease_round` proves `from` was reachable for THIS round — not via a
+    // A HeartbeatResp echoing `self.check_quorum_lease.lease_round` proves `from` was reachable for THIS round — not via a
     // stale or duplicated earlier-round message (which carries a different round and is ignored here).
     // Bound the renewed lease by the round's SEND instant (`lease_round_start`), NOT this
     // response's receipt time: followers reset their election timers when they RECEIVED this round
@@ -899,18 +907,25 @@ where
     // The lease deadline is bounded by the MIN support across the contributing quorum (`lease_min_support`,
     // min'd here, seeded to the leader's own election_timeout each round), so a voter with a SHORTER
     // election_timeout caps the lease at its real election window — the leader never out-lives a supporter.
-    if resp.lease_round() == self.lease_round && resp.lease_support() > core::time::Duration::ZERO {
-      self.lease_acks.insert(from);
-      self.lease_min_support = self.lease_min_support.min(resp.lease_support());
+    if resp.lease_round() == self.check_quorum_lease.lease_round
+      && resp.lease_support() > core::time::Duration::ZERO
+    {
+      self.check_quorum_lease.lease_acks.insert(from);
+      self.check_quorum_lease.lease_min_support = self
+        .check_quorum_lease
+        .lease_min_support
+        .min(resp.lease_support());
       let me = self.config.id();
       if self
         .tracker
-        .vote_result_by(|id| id == me || self.lease_acks.contains(&id))
+        .vote_result_by(|id| id == me || self.check_quorum_lease.lease_acks.contains(&id))
         .is_won()
       {
         // Re-set every contributing ack: `lease_min_support` only shrinks within a round, so this never
         // EXTENDS the lease past a supporter's window (a later, shorter-support ack lowers it).
-        self.lease_valid_until = Some(self.lease_round_start + self.lease_min_support);
+        self.check_quorum_lease.lease_valid_until = Some(
+          self.check_quorum_lease.lease_round_start + self.check_quorum_lease.lease_min_support,
+        );
       }
     }
     if let Some(pr) = self.tracker.progress_mut(&from) {

@@ -522,9 +522,9 @@ where
     // a fresh leader holds NO read lease until a quorum freshly acks its first CheckQuorum
     // round. Reset the lease round/ack set and clear the deadline, so no LeaseBased read can be
     // served until `on_heartbeat_resp` confirms a fresh current-round quorum.
-    self.lease_round = 0;
-    self.lease_acks.clear();
-    self.lease_valid_until = None;
+    self.check_quorum_lease.lease_round = 0;
+    self.check_quorum_lease.lease_acks.clear();
+    self.check_quorum_lease.lease_valid_until = None;
     // Fresh leadership starts fresh snapshot-resend pacing (the per-peer deadlines belong to the
     // previous leadership's transfer windows).
     self.snapshot_resend_after.clear();

@@ -118,7 +118,10 @@ where
     self.config.check_quorum()
       && self.lead_transferee.is_none()
       && !self.forced_handoff_this_term
-      && self.lease_valid_until.is_some_and(|d| d > now.mono())
+      && self
+        .check_quorum_lease
+        .lease_valid_until
+        .is_some_and(|d| d > now.mono())
   }
 
   /// Confirm a read immediately at `index` (a lease fast-path — no heartbeat round): emit

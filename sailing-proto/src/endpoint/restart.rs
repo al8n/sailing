@@ -441,11 +441,13 @@ where
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
       forwarded_reads: ForwardedReads::new(boot_epoch),
-      lease_round: 0,
-      lease_round_start: now.mono(),
-      lease_acks: BTreeSet::new(),
-      lease_min_support: core::time::Duration::ZERO,
-      lease_valid_until: None,
+      check_quorum_lease: CheckQuorumLease {
+        lease_round: 0,
+        lease_round_start: now.mono(),
+        lease_acks: BTreeSet::new(),
+        lease_min_support: core::time::Duration::ZERO,
+        lease_valid_until: None,
+      },
       lease_vote_fence_until,
       // A restarted node is not leader (recovers as Follower) and has authorized no handoff.
       forced_handoff_this_term: false,

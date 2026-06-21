@@ -61,7 +61,7 @@ fn leader_transfer_revokes_leasebased_read_authority() {
   while ep.poll_message().is_some() {}
 
   // (1) Live lease, no transfer → a LeaseBased read is served IMMEDIATELY (the lease shortcut works).
-  ep.lease_valid_until = Some(d + election);
+  ep.check_quorum_lease.lease_valid_until = Some(d + election);
   ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r1"))
     .unwrap();
   assert!(
@@ -72,14 +72,14 @@ fn leader_transfer_revokes_leasebased_read_authority() {
   // (2) Arming a transfer REVOKES the lease read authority (immediate clear).
   ep.transfer_leader(d, &log, &stable, 2u64).unwrap();
   assert_eq!(
-    ep.lease_valid_until, None,
+    ep.check_quorum_lease.lease_valid_until, None,
     "arming a transfer must revoke the read lease"
   );
 
   // (3) Even if a heartbeat RE-RENEWS the lease during the transfer window, a read must NOT serve from
   //     it — the transferee may already be leader. Re-arm the lease and confirm the read Safe-degrades
   //     (no immediate ReadState; it broadcasts a heartbeat to re-confirm a quorum instead).
-  ep.lease_valid_until = Some(d + election);
+  ep.check_quorum_lease.lease_valid_until = Some(d + election);
   while ep.poll_message().is_some() {}
   ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r2"))
     .unwrap();
@@ -172,7 +172,7 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
 
   // Even with the transfer aborted AND the lease re-renewed, a read must NOT serve from the lease:
   // the forced campaign authorized earlier can still elect a new leader at any later point this term.
-  ep.lease_valid_until = Some(after + election);
+  ep.check_quorum_lease.lease_valid_until = Some(after + election);
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
   ep.read_index(after, &log, &stable, bytes::Bytes::from_static(b"r"))
