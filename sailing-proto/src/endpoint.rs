@@ -567,6 +567,45 @@ impl ForwardedReads {
   }
 }
 
+/// The term + lease-support durability watermarks (persist-before-respond / -advertise), grouped out
+/// of `Endpoint`.
+#[derive(Debug, Default)]
+struct DurablePromises {
+  /// Term-before-respond durability. The highest `Term` whose HardState write has reached stable
+  /// storage — `term_is_durable()` is simply `durable_term >= self.term`. Seeded to the initial/recovered
+  /// term (trivially durable: it came from durable HardState or is the bootstrap term), then advanced in
+  /// [`on_stable_wrote`] when an adopted term's write completes. The core observes the stable seam's
+  /// completions, so it enforces currentTerm-before-respond itself rather than delegating the ordering to
+  /// the storage layer.
+  durable_term: crate::Term,
+  /// The highest `Term` ever submitted to the `StableStore` (via `submit_write`). Paired with
+  /// `term_persist_opid` so [`on_stable_wrote`] can recognise when the current term's write completes and
+  /// advance `durable_term` (a freshly-adopted term is set in memory before its write is even submitted).
+  last_submitted_term: crate::Term,
+  /// The `OpId` of the FIRST HardState write that carried `last_submitted_term`. When a `Wrote` completion
+  /// with `opid >= term_persist_opid` arrives (stable completions are ordered), that term is durable.
+  term_persist_opid: crate::OpId,
+  /// Persist-before-ADVERTISE for the lease promise; exact mirror of the term machinery above.
+  /// The in-memory lease-support floor: the max lease window this node will uphold this incarnation =
+  /// `max(recovered durable floor, this run's own election_timeout if it enforces)`. Bumped at most ONCE
+  /// per incarnation (election_timeout is process-constant); persisted to `HardState.lease_support` so the
+  /// restart vote fence honors the PRE-CRASH promise regardless of post-restart config. `None` = no
+  /// enforcing promise (fresh / legacy / never-enforced); `Some(d)` = a real promise of `d`.
+  lease_support_floor: Option<core::time::Duration>,
+  /// The highest lease-support floor ever submitted to the `StableStore` (paired with
+  /// `lease_support_persist_opid`, exactly like `last_submitted_term`/`term_persist_opid`).
+  last_submitted_lease_support: Option<core::time::Duration>,
+  /// The highest lease-support floor whose HardState write has reached stable storage. A follower must NOT
+  /// advertise its real `lease_support` until `durable_lease_support >= Some(this_run)` — otherwise a crash
+  /// in the fsync window erases a promise the leader already counted toward a live lease (persist-before-
+  /// advertise, the lease sibling of the term-before-respond gate). Seeded to the recovered durable floor.
+  durable_lease_support: Option<core::time::Duration>,
+  /// The `OpId` of the FIRST HardState write that carried `last_submitted_lease_support`. When a `Wrote`
+  /// completion with `opid >= lease_support_persist_opid` arrives, that floor is durable (advanced in
+  /// [`on_stable_wrote`], releasing the persist-before-advertise gate in `on_heartbeat`).
+  lease_support_persist_opid: crate::OpId,
+}
+
 /// The leader's CheckQuorum read-lease (LeaseBased) round state, grouped out of `Endpoint`.
 #[derive(Debug)]
 struct CheckQuorumLease<I> {
@@ -869,39 +908,8 @@ where
   /// dropped blob is still retried within one election timeout of the next response (liveness).
   /// Entries clear when the peer leaves `Snapshot` state and on leadership change.
   snapshot_resend_after: BTreeMap<I, Instant>,
-  /// Term-before-respond durability. The highest `Term` whose HardState write has reached stable
-  /// storage — `term_is_durable()` is simply `durable_term >= self.term`. Seeded to the initial/recovered
-  /// term (trivially durable: it came from durable HardState or is the bootstrap term), then advanced in
-  /// [`on_stable_wrote`] when an adopted term's write completes. The core observes the stable seam's
-  /// completions, so it enforces currentTerm-before-respond itself rather than delegating the ordering to
-  /// the storage layer.
-  durable_term: crate::Term,
-  /// The highest `Term` ever submitted to the `StableStore` (via `submit_write`). Paired with
-  /// `term_persist_opid` so [`on_stable_wrote`] can recognise when the current term's write completes and
-  /// advance `durable_term` (a freshly-adopted term is set in memory before its write is even submitted).
-  last_submitted_term: crate::Term,
-  /// The `OpId` of the FIRST HardState write that carried `last_submitted_term`. When a `Wrote` completion
-  /// with `opid >= term_persist_opid` arrives (stable completions are ordered), that term is durable.
-  term_persist_opid: crate::OpId,
-  /// Persist-before-ADVERTISE for the lease promise; exact mirror of the term machinery above.
-  /// The in-memory lease-support floor: the max lease window this node will uphold this incarnation =
-  /// `max(recovered durable floor, this run's own election_timeout if it enforces)`. Bumped at most ONCE
-  /// per incarnation (election_timeout is process-constant); persisted to `HardState.lease_support` so the
-  /// restart vote fence honors the PRE-CRASH promise regardless of post-restart config. `None` = no
-  /// enforcing promise (fresh / legacy / never-enforced); `Some(d)` = a real promise of `d`.
-  lease_support_floor: Option<core::time::Duration>,
-  /// The highest lease-support floor ever submitted to the `StableStore` (paired with
-  /// `lease_support_persist_opid`, exactly like `last_submitted_term`/`term_persist_opid`).
-  last_submitted_lease_support: Option<core::time::Duration>,
-  /// The highest lease-support floor whose HardState write has reached stable storage. A follower must NOT
-  /// advertise its real `lease_support` until `durable_lease_support >= Some(this_run)` — otherwise a crash
-  /// in the fsync window erases a promise the leader already counted toward a live lease (persist-before-
-  /// advertise, the lease sibling of the term-before-respond gate). Seeded to the recovered durable floor.
-  durable_lease_support: Option<core::time::Duration>,
-  /// The `OpId` of the FIRST HardState write that carried `last_submitted_lease_support`. When a `Wrote`
-  /// completion with `opid >= lease_support_persist_opid` arrives, that floor is durable (advanced in
-  /// [`on_stable_wrote`], releasing the persist-before-advertise gate in `on_heartbeat`).
-  lease_support_persist_opid: crate::OpId,
+  /// The term + lease-support durability watermarks (persist-before-respond / -advertise).
+  durable: DurablePromises,
   /// A SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
   /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
   /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
@@ -1071,18 +1079,20 @@ where
       poison_reason: None,
       pending_compact: None,
       snapshot_resend_after: BTreeMap::new(),
-      // fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
-      // `term_is_durable()` is true and acks are never spuriously deferred at startup.
-      durable_term: Term::ZERO,
-      last_submitted_term: Term::ZERO,
-      term_persist_opid: crate::OpId::ZERO,
-      // a fresh node has made no lease promise. `new()` has no StableStore, so the floor is recorded
-      // lazily on the first enforcing heartbeat (bumped in `on_heartbeat`, persisted by the post-dispatch
-      // `ensure_term_durable`); until then `durable_lease_support` is None and the advertise gate emits ZERO.
-      lease_support_floor: None,
-      last_submitted_lease_support: None,
-      durable_lease_support: None,
-      lease_support_persist_opid: crate::OpId::ZERO,
+      durable: DurablePromises {
+        // fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
+        // `term_is_durable()` is true and acks are never spuriously deferred at startup.
+        durable_term: Term::ZERO,
+        last_submitted_term: Term::ZERO,
+        term_persist_opid: crate::OpId::ZERO,
+        // a fresh node has made no lease promise. `new()` has no StableStore, so the floor is recorded
+        // lazily on the first enforcing heartbeat (bumped in `on_heartbeat`, persisted by the post-dispatch
+        // `ensure_term_durable`); until then `durable_lease_support` is None and the advertise gate emits ZERO.
+        lease_support_floor: None,
+        last_submitted_lease_support: None,
+        durable_lease_support: None,
+        lease_support_persist_opid: crate::OpId::ZERO,
+      },
       term_gated_append_ack: None,
       term_gated_snapshot_ack: None,
       pending_conf_index: Index::ZERO,

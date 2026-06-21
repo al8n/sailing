@@ -416,20 +416,22 @@ where
       poison_reason,
       pending_compact: None,
       snapshot_resend_after: BTreeMap::new(),
-      // the recovered `hs.term()` came from durable HardState, so it IS durable. Seed both
-      // `durable_term` and `last_submitted_term` to it so `term_is_durable()` is true immediately after
-      // restart and follower acks are not spuriously deferred.
-      durable_term: hs.term(),
-      last_submitted_term: hs.term(),
-      term_persist_opid: crate::OpId::ZERO,
-      // `recovered_floor` (= hs.lease_support()) is what is durable NOW; `lease_support_floor` may be
-      // larger (a config grow this incarnation), in which case the post-construction step below persists it
-      // and the advertise gate holds at ZERO until that write drains. On a same/shrunk-config restart the
-      // floor already equals the recovered value, so the gate is true immediately (no advertise stall).
-      lease_support_floor,
-      last_submitted_lease_support: recovered_floor,
-      durable_lease_support: recovered_floor,
-      lease_support_persist_opid: crate::OpId::ZERO,
+      durable: DurablePromises {
+        // the recovered `hs.term()` came from durable HardState, so it IS durable. Seed both
+        // `durable_term` and `last_submitted_term` to it so `term_is_durable()` is true immediately after
+        // restart and follower acks are not spuriously deferred.
+        durable_term: hs.term(),
+        last_submitted_term: hs.term(),
+        term_persist_opid: crate::OpId::ZERO,
+        // `recovered_floor` (= hs.lease_support()) is what is durable NOW; `lease_support_floor` may be
+        // larger (a config grow this incarnation), in which case the post-construction step below persists it
+        // and the advertise gate holds at ZERO until that write drains. On a same/shrunk-config restart the
+        // floor already equals the recovered value, so the gate is true immediately (no advertise stall).
+        lease_support_floor,
+        last_submitted_lease_support: recovered_floor,
+        durable_lease_support: recovered_floor,
+        lease_support_persist_opid: crate::OpId::ZERO,
+      },
       term_gated_append_ack: None,
       term_gated_snapshot_ack: None,
       // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
@@ -464,9 +466,9 @@ where
     // here. `submit_write` records the watermark so the advertise gate holds at ZERO until it drains. On a
     // same/shrunk-config restart the floor already equals the recovered value, so this is a no-op (no
     // write, no advertise stall). Skipped when poisoned (no side effects from a poisoned restart).
-    if !ep.poisoned && ep.lease_support_floor > ep.durable_lease_support {
+    if !ep.poisoned && ep.durable.lease_support_floor > ep.durable.durable_lease_support {
       let opid = ep.mint_op_id();
-      // The `submit_write` choke-point `raise`s `ep.lease_support_floor` onto this write, recording the
+      // The `submit_write` choke-point `raise`s `ep.durable.lease_support_floor` onto this write, recording the
       // floor AND upgrading a legacy `Unrecorded` recovered record to `Recorded` (the self-heal).
       let hsw = stable.hard_state();
       ep.submit_write(stable, opid, hsw);
