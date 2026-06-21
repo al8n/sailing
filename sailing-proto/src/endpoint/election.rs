@@ -59,13 +59,13 @@ where
     self.heartbeat_deadline = None;
     // Drop all pending reads — a stepped-down node is no longer the leader and
     // cannot confirm any outstanding read requests.
-    self.read_only.reset(self.active_read_mode);
+    self.reads.read_only.reset(self.reads.active_read_mode);
     // A stepped-down node no longer serves LeaseGuard reads, so drop any pending lease-refresh demand
     // (only a leader appends the refresh no-op; a re-election re-stamps the lease via its own no-op).
     self.lease_guard.lease_refresh_wanted = false;
     // ...and the proactive-refresh read-activity signal (a re-election starts its own anchor afresh).
     self.lease_guard.read_since_anchor = false;
-    self.pending_reads.clear();
+    self.reads.pending_reads.clear();
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
     self.transfer.lead_transferee = None;
     self.transfer.transfer_deadline = None;
@@ -521,8 +521,8 @@ where
     self.set_leader(Some(self.config.id()));
     // Reset read-index state from the previous term (stale pending reads must not
     // be confirmed against the new term's commit index).
-    self.read_only.reset(self.active_read_mode);
-    self.pending_reads.clear();
+    self.reads.read_only.reset(self.reads.active_read_mode);
+    self.reads.pending_reads.clear();
     // a fresh leader holds NO read lease until a quorum freshly acks its first CheckQuorum
     // round. Reset the lease round/ack set and clear the deadline, so no LeaseBased read can be
     // served until `on_heartbeat_resp` confirms a fresh current-round quorum.
@@ -558,7 +558,7 @@ where
     self.pending_conf_index = last;
     // Mirror for read-mode migrations: a fresh leader may inherit an uncommitted SetReadMode in its tail;
     // block a new mode proposal until the whole inherited tail commits-and-applies (spec §9).
-    self.pending_read_mode_index = last;
+    self.reads.pending_read_mode_index = last;
     self.tracker.reset_progress(
       last.next(),
       self.config.max_inflight_msgs(),

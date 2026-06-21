@@ -105,8 +105,8 @@ where
     // Carry the read mode EXPLICITLY only if a committed SetReadMode has applied (provenance). A
     // non-migrated node leaves it absent, so a restart from this snapshot falls back to the static config
     // — the presence bit then means "a migration was compacted", not merely "whatever mode was active".
-    if self.read_mode_migrated {
-      meta = meta.with_read_only(self.active_read_mode);
+    if self.reads.read_mode_migrated {
+      meta = meta.with_read_only(self.reads.active_read_mode);
     }
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
@@ -331,10 +331,10 @@ where
     // any post-snapshot SetReadMode via apply_committed (last-writer-wins by index). A legacy/pre-migration
     // snapshot carries None → keep the current mode (a defensive default — unreachable in a same-version
     // cluster, where the LABEL_VERSION-4 handshake fences a pre-migration peer).
-    self.active_read_mode = meta.read_only().unwrap_or(self.active_read_mode);
+    self.reads.active_read_mode = meta.read_only().unwrap_or(self.reads.active_read_mode);
     // Adopt the snapshot's read-mode provenance (Some ⇒ a migration was compacted at/before the boundary);
     // a None/legacy snapshot keeps the current provenance, consistent with keeping the current mode above.
-    self.read_mode_migrated = meta.read_only().is_some() || self.read_mode_migrated;
+    self.reads.read_mode_migrated = meta.read_only().is_some() || self.reads.read_mode_migrated;
 
     // Step 4: re-baseline the log on the now-durable snapshot. Discards the follower's stale/short log;
     // after this call first_index == last_index + 1 and term(last_index) == last_term, so the next
