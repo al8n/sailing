@@ -286,7 +286,7 @@ fn serviceable_now_mirrors_dispatch() {
   let (ep_l, log_leader, stable_leader, _) = make_three_node_leader();
   assert!(ep_l.role().is_leader());
   assert!(!ep_l.config.check_quorum());
-  assert!(ep_l.lead_transferee.is_none());
+  assert!(ep_l.transfer.lead_transferee.is_none());
   assert!(
     ep_l.serviceable_now(TimerKind::Heartbeat),
     "leader: Heartbeat serviceable"
@@ -353,7 +353,7 @@ fn serviceable_now_mirrors_dispatch() {
   ep_cq
     .transfer_leader(d_cq, ep_cq_log_ref, ep_cq_stable_ref, 2u64)
     .expect("transfer_leader must succeed");
-  assert!(ep_cq.lead_transferee.is_some());
+  assert!(ep_cq.transfer.lead_transferee.is_some());
   assert!(
     ep_cq.serviceable_now(TimerKind::Transfer),
     "leader CQ + transfer: Transfer serviceable"
@@ -480,7 +480,10 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
   ep_cq
     .transfer_leader(d_cq, &log_cq, &stable_cq, 2u64)
     .expect("transfer_leader must succeed");
-  let tr = ep_cq.transfer_deadline.expect("transfer_deadline armed");
+  let tr = ep_cq
+    .transfer
+    .transfer_deadline
+    .expect("transfer_deadline armed");
   let pt_cq_tr = ep_cq
     .poll_timeout()
     .expect("CQ+transfer leader poll_timeout must be Some");
@@ -666,17 +669,17 @@ fn handle_timeout_makes_progress_no_wedge() {
     .expect("transfer_leader must succeed");
   while ep_tr.poll_message().is_some() {}
   // Force transfer deadline to now.
-  ep_tr.transfer_deadline = Some(now);
+  ep_tr.transfer.transfer_deadline = Some(now);
   ep_tr.heartbeat_deadline = Some(now + Duration::from_millis(100)); // not due
   ep_tr.handle_timeout(now, &mut log_tr, &mut stable_tr);
   ep_tr.handle_storage(now, &mut log_tr, &mut stable_tr);
   while ep_tr.poll_message().is_some() {}
   assert!(
-    ep_tr.lead_transferee.is_none(),
+    ep_tr.transfer.lead_transferee.is_none(),
     "transfer abort: lead_transferee must be cleared"
   );
   assert!(
-    ep_tr.transfer_deadline.is_none(),
+    ep_tr.transfer.transfer_deadline.is_none(),
     "transfer abort: transfer_deadline must be cleared"
   );
   assert!(

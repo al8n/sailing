@@ -1788,7 +1788,7 @@ fn leaseguard_no_refresh_during_leader_transfer() {
   // Authorize a transfer to the caught-up peer 2 — this arms `lead_transferee` and sends TimeoutNow.
   ep.transfer_leader(d, &log, &stable, 2u64).unwrap();
   assert_eq!(
-    ep.lead_transferee,
+    ep.transfer.lead_transferee,
     Some(2u64),
     "the transfer arms lead_transferee"
   );

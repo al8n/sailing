@@ -96,7 +96,7 @@ fn leader_transfer_revokes_leasebased_read_authority() {
 /// leader must keep LeaseBased reads disabled until re-election, NOT re-enable them when
 /// `lead_transferee` clears on abort.
 ///
-/// MUTATION: drop the `!self.forced_handoff_this_term` term from `use_lease` in `do_leader_read` →
+/// MUTATION: drop the `!self.transfer.forced_handoff_this_term` term from `use_lease` in `do_leader_read` →
 /// after the abort the leader serves an immediate LeaseBased read from a re-renewed lease.
 #[test]
 fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
@@ -149,7 +149,7 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
   // Transfer to node 2 (caught up at index 1) → TimeoutNow sent immediately → forced-handoff armed.
   ep.transfer_leader(d, &log, &stable, 2u64).unwrap();
   assert!(
-    ep.forced_handoff_this_term,
+    ep.transfer.forced_handoff_this_term,
     "sending TimeoutNow arms the forced-handoff flag"
   );
 
@@ -162,11 +162,11 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
     "leader survives the abort (peer was recently active)"
   );
   assert!(
-    ep.lead_transferee.is_none(),
+    ep.transfer.lead_transferee.is_none(),
     "the transfer aborted on the deadline"
   );
   assert!(
-    ep.forced_handoff_this_term,
+    ep.transfer.forced_handoff_this_term,
     "the forced-handoff flag PERSISTS past the abort"
   );
 
@@ -436,7 +436,7 @@ fn transfer_aborts_on_deadline() {
   ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
     .unwrap();
   // lead_transferee must be set.
-  assert!(ep.lead_transferee.is_some());
+  assert!(ep.transfer.lead_transferee.is_some());
 
   // Fire handle_timeout BEFORE the deadline → still in transfer.
   let before_deadline = Instant::ORIGIN + Duration::from_millis(500);
@@ -444,7 +444,7 @@ fn transfer_aborts_on_deadline() {
   ep.handle_storage(before_deadline, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert!(
-    ep.lead_transferee.is_some(),
+    ep.transfer.lead_transferee.is_some(),
     "transfer must still be active before deadline"
   );
 
@@ -454,11 +454,11 @@ fn transfer_aborts_on_deadline() {
   ep.handle_storage(after_deadline, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert!(
-    ep.lead_transferee.is_none(),
+    ep.transfer.lead_transferee.is_none(),
     "transfer must be aborted after deadline"
   );
   assert!(
-    ep.transfer_deadline.is_none(),
+    ep.transfer.transfer_deadline.is_none(),
     "transfer_deadline must be cleared after abort"
   );
 
@@ -709,7 +709,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
   ep.transfer_leader(d, &log, &stable, 2u64)
     .expect("transfer_leader must succeed");
   assert!(
-    ep.lead_transferee == Some(2u64),
+    ep.transfer.lead_transferee == Some(2u64),
     "lead_transferee must be Some(2) after transfer_leader"
   );
   // Drain the outgoing TimeoutNow.
@@ -736,7 +736,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
   ep.handle_storage(past_first_deadline, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert!(
-    ep.lead_transferee.is_none(),
+    ep.transfer.lead_transferee.is_none(),
     "deadline abort must clear lead_transferee"
   );
 
@@ -753,7 +753,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
   ep.transfer_leader(past_first_deadline, &log, &stable, 2u64)
     .expect("transfer_leader to node 2 (still a voter) must succeed");
   assert!(
-    ep.lead_transferee == Some(2u64),
+    ep.transfer.lead_transferee == Some(2u64),
     "lead_transferee must be node 2 for the re-started transfer"
   );
   while ep.poll_message().is_some() {}
@@ -793,11 +793,11 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
 
   // After the conf change applies: the transfer must have been aborted immediately.
   assert!(
-    ep.lead_transferee.is_none(),
+    ep.transfer.lead_transferee.is_none(),
     "lead_transferee must be None after the transferee is removed by conf change"
   );
   assert!(
-    ep.transfer_deadline.is_none(),
+    ep.transfer.transfer_deadline.is_none(),
     "transfer_deadline must be None after transfer aborted on conf-change apply"
   );
 

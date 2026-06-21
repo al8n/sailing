@@ -804,6 +804,30 @@ struct Poison {
   poison_reason: Option<PoisonReason>,
 }
 
+/// The leader-transfer state, grouped out of `Endpoint`.
+#[derive(Debug)]
+struct Transfer<I> {
+  /// Whether a forced leader handoff (`TimeoutNow`) was emitted during the CURRENT leader term.
+  /// Sending `TimeoutNow` authorizes the transferee to campaign FORCED (bypassing the follower/restart
+  /// lease fences), and under Raft's unbounded message delay that forced campaign — or its already-sent
+  /// forced `RequestVote`s — can elect a new leader at ANY later point this term, even AFTER the transfer
+  /// aborts (`lead_transferee` is cleared on the deadline). So once set, this leader MUST NOT serve a
+  /// LeaseBased read for the rest of the term (`do_leader_read` Safe-degrades); it regains the lease
+  /// shortcut only on re-election (a fresh term resets this in `become_leader`). Meaningful only while
+  /// leader. (The `lead_transferee` gate covers the lagging-transfer window BEFORE `TimeoutNow` is
+  /// sent; this flag covers everything AFTER it, including post-abort.)
+  forced_handoff_this_term: bool,
+  /// Target of an in-progress leader transfer, or `None` if no transfer is active.
+  ///
+  /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
+  /// `step_down_to_follower`, `become_leader`) and on `transfer_deadline` expiry.
+  lead_transferee: Option<I>,
+  /// When to abort a stalled leader transfer (abort window = one election timeout).
+  ///
+  /// Armed when `lead_transferee` is set; cleared together with `lead_transferee`.
+  transfer_deadline: Option<Instant>,
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -985,25 +1009,8 @@ where
   /// run enforces nothing. Safety rests on `now >= the pre-crash ack instants` (follower clock
   /// monotonicity across restart) — the irreducible clock residual common to all lease reads.
   lease_vote_fence_until: Option<Instant>,
-  /// Whether a forced leader handoff (`TimeoutNow`) was emitted during the CURRENT leader term.
-  /// Sending `TimeoutNow` authorizes the transferee to campaign FORCED (bypassing the follower/restart
-  /// lease fences), and under Raft's unbounded message delay that forced campaign — or its already-sent
-  /// forced `RequestVote`s — can elect a new leader at ANY later point this term, even AFTER the transfer
-  /// aborts (`lead_transferee` is cleared on the deadline). So once set, this leader MUST NOT serve a
-  /// LeaseBased read for the rest of the term (`do_leader_read` Safe-degrades); it regains the lease
-  /// shortcut only on re-election (a fresh term resets this in `become_leader`). Meaningful only while
-  /// leader. (The `lead_transferee` gate covers the lagging-transfer window BEFORE `TimeoutNow` is
-  /// sent; this flag covers everything AFTER it, including post-abort.)
-  forced_handoff_this_term: bool,
-  /// Target of an in-progress leader transfer, or `None` if no transfer is active.
-  ///
-  /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
-  /// `step_down_to_follower`, `become_leader`) and on `transfer_deadline` expiry.
-  lead_transferee: Option<I>,
-  /// When to abort a stalled leader transfer (abort window = one election timeout).
-  ///
-  /// Armed when `lead_transferee` is set; cleared together with `lead_transferee`.
-  transfer_deadline: Option<Instant>,
+  /// The leader-transfer state (forced-handoff flag + transferee target + abort deadline).
+  transfer: Transfer<I>,
 }
 
 // ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
@@ -1117,10 +1124,12 @@ where
       },
       // A fresh node never acked any leader's read-lease, so no post-restart vote fence.
       lease_vote_fence_until: None,
-      // No forced handoff authorized yet.
-      forced_handoff_this_term: false,
-      lead_transferee: None,
-      transfer_deadline: None,
+      transfer: Transfer {
+        // No forced handoff authorized yet.
+        forced_handoff_this_term: false,
+        lead_transferee: None,
+        transfer_deadline: None,
+      },
     };
     ep.arm_election_timer(now);
     ep
@@ -1479,7 +1488,7 @@ where
     match kind {
       TimerKind::Election => self.election_deadline,
       TimerKind::Heartbeat => self.heartbeat_deadline,
-      TimerKind::Transfer => self.transfer_deadline,
+      TimerKind::Transfer => self.transfer.transfer_deadline,
       TimerKind::CommitWait => self.lease_guard.commit_wait_until,
     }
   }
@@ -1511,7 +1520,7 @@ where
           self.tracker.is_voter(&self.config.id())
         }
       }
-      TimerKind::Transfer => self.role.is_leader() && self.lead_transferee.is_some(),
+      TimerKind::Transfer => self.role.is_leader() && self.transfer.lead_transferee.is_some(),
       // Only a leader with an armed post-election commit-wait services it. `commit_wait_until` is
       // set to `Some` exclusively in LeaseGuard mode (at `become_leader`), so this is implicitly
       // gated on the mode — a Safe/LeaseBased leader never arms it and never surfaces the timer.
@@ -1691,8 +1700,8 @@ where
         self.pending_reads.clear();
         // (Reads forwarded under the old term/leader were cleared by `set_leader` above.)
         // Abort any in-progress leader transfer — leadership is changing.
-        self.lead_transferee = None;
-        self.transfer_deadline = None;
+        self.transfer.lead_transferee = None;
+        self.transfer.transfer_deadline = None;
         // The term step-down is NOT persisted here. Persisting before dispatch would put the
         // term/vote write AHEAD of the message handler's read-only fatal validation, so a fail-stop in
         // that handler (a corrupt RequestVote/AppendEntries/InstallSnapshot) would leave a premature
@@ -1821,7 +1830,7 @@ where
           self.lease_guard.lease_refresh_wanted = false;
           let last = log.last_index();
           if self.leaseguard_timing().is_some()
-            && self.lead_transferee.is_none()
+            && self.transfer.lead_transferee.is_none()
             && last == self.commit
             && !self.lease_guard_read_live(now, log)
           {
@@ -1842,7 +1851,7 @@ where
           && mode != crate::LeaseRefresh::Off
           && self.lease_guard.read_since_anchor
           && self.leaseguard_timing().is_some()
-          && self.lead_transferee.is_none()
+          && self.transfer.lead_transferee.is_none()
           && log.last_index() == self.commit
         {
           let fire = match mode {
@@ -1870,10 +1879,14 @@ where
         }
         // Leader transfer abort: if the transfer deadline has passed without the target
         // taking over, abort the transfer and resume accepting proposals.
-        if self.lead_transferee.is_some() && self.transfer_deadline.is_some_and(|d| d <= now.mono())
+        if self.transfer.lead_transferee.is_some()
+          && self
+            .transfer
+            .transfer_deadline
+            .is_some_and(|d| d <= now.mono())
         {
-          self.lead_transferee = None;
-          self.transfer_deadline = None;
+          self.transfer.lead_transferee = None;
+          self.transfer.transfer_deadline = None;
         }
         // CheckQuorum: the leader uses the otherwise-idle election_deadline to run a
         // periodic quorum-activity check every election_timeout. If fewer than a quorum of
@@ -2148,18 +2161,19 @@ where
               // removed/demoted node has no business holding an election timer.
               self.election_deadline = None;
               // Abort any in-progress leader transfer — the leader is being removed.
-              self.lead_transferee = None;
-              self.transfer_deadline = None;
+              self.transfer.lead_transferee = None;
+              self.transfer.transfer_deadline = None;
             }
             // If an in-flight leader transfer's target was removed or demoted by this conf change,
             // abort it (the target can no longer be elected, and proposals must not stay blocked until
             // the transfer deadline). Mirrors etcd's abortLeaderTransfer on conf-change apply.
             if self
+              .transfer
               .lead_transferee
               .is_some_and(|t| !self.tracker.is_voter(&t))
             {
-              self.lead_transferee = None;
-              self.transfer_deadline = None;
+              self.transfer.lead_transferee = None;
+              self.transfer.transfer_deadline = None;
             }
             // NOTE: a learner promoted to voter by this change may be left without an election timer (a
             // non-voter disarms it and never re-arms). `reconcile_election_timer`, run at the end of the

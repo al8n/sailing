@@ -116,8 +116,8 @@ where
   #[inline]
   pub(crate) fn lease_read_available(&self, now: crate::Now) -> bool {
     self.config.check_quorum()
-      && self.lead_transferee.is_none()
-      && !self.forced_handoff_this_term
+      && self.transfer.lead_transferee.is_none()
+      && !self.transfer.forced_handoff_this_term
       && self
         .check_quorum_lease
         .lease_valid_until

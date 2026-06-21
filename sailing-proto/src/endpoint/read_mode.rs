@@ -41,7 +41,7 @@ where
       });
     }
     // A leader transfer is in progress: no new proposals until it completes or times out.
-    if self.lead_transferee.is_some() {
+    if self.transfer.lead_transferee.is_some() {
       return Err(crate::ProposeError::LeaderTransferInProgress);
     }
     // One migration in flight at a time: refuse if a SetReadMode entry is not yet applied (mirror
