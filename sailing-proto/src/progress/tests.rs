@@ -32,8 +32,6 @@ fn pause_semantics() {
   assert!(p.is_paused()); // window (2) now full
 }
 
-// --- ProgressState::Snapshot ---
-
 #[test]
 fn snapshot_state_as_str_and_predicate() {
   assert_eq!(ProgressState::Snapshot(Index::new(10)).as_str(), "snapshot");
@@ -91,8 +89,6 @@ fn snapshot_state_display() {
     "snapshot"
   );
 }
-
-// --- free_inflight_on_heartbeat (etcd FreeFirstOne) ---
 
 #[test]
 fn free_inflight_on_heartbeat_replicate_full_frees_one() {

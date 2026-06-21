@@ -1443,7 +1443,6 @@ fn check_quorum_disabled_preserves_m1_m6_behavior() {
   use crate::{Config, Index, Instant, Message, RequestVote, Term};
   use core::time::Duration;
 
-  // --- Part 1: Leader has no CQ election_deadline when check_quorum=false ---
   let cfg_leader = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
@@ -1472,7 +1471,6 @@ fn check_quorum_disabled_preserves_m1_m6_behavior() {
     "check_quorum=false: election_deadline must not be armed for leader"
   );
 
-  // --- Part 2: Follower with no check_quorum does NOT block higher-term vote ---
   let cfg_follower = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
@@ -1861,7 +1859,6 @@ fn spoofed_sender_vote_response_is_rejected() {
   );
 }
 
-// --- LeaderChanged event-contract tests ---
 // The belief transitions an embedder routes on: every observable change of (term, leader)
 // surfaces, INCLUDING to-`None` — leader loss is announced, never inferred from silence.
 

@@ -108,7 +108,6 @@ fn check_quorum_follower_lease_blocks_disruptive_vote() {
   let deadline = ep.election_deadline.expect("election timer must be armed");
   assert!(deadline > base, "election deadline must be in the future");
 
-  // --- Case A: non-forced RequestVote at higher term while lease is active ---
   // Simulate a small time advance that is still within the lease window.
   let now_in_lease = base + Duration::from_millis(50); // well before deadline
   ep.handle_message(
@@ -138,7 +137,6 @@ fn check_quorum_follower_lease_blocks_disruptive_vote() {
     "no reply must be sent while lease blocks disruptive vote"
   );
 
-  // --- Case B: forced (leader_transfer) RequestVote at higher term ---
   // leader_transfer bypasses the lease; this IS processed normally.
   ep.handle_message(
     now_in_lease,

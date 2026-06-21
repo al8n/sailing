@@ -26,8 +26,6 @@ impl StateMachine for Noop {
   }
 }
 
-// --- restart test ---
-
 /// Encode a Bytes command through the Data codec (as propose does internally).
 fn encode_cmd(b: &[u8]) -> bytes::Bytes {
   use crate::Data;
@@ -35,8 +33,6 @@ fn encode_cmd(b: &[u8]) -> bytes::Bytes {
   bytes::Bytes::copy_from_slice(b).encode(&mut buf);
   bytes::Bytes::from(buf)
 }
-
-// ---- snapshot threshold + deferred compaction ----
 
 /// Helper: elect a single-node leader, drain the no-op, and apply `n` Normal entries.
 /// Returns the endpoint with `applied == n + 1` (no-op + n commands, all committed).
@@ -126,8 +122,6 @@ fn make_single_node_leader_dropping_snapshot_completion(
   (ep, log, stable)
 }
 
-// ---- send InstallSnapshot to lagging follower ----
-
 /// Helper: build a 3-voter leader (node 1) with a compacted log.
 /// Returns the endpoint, a VecLog compacted up to `offset` with the snapshot persisted
 /// in an AsyncStable, and the stable store.
@@ -206,8 +200,6 @@ fn make_leader_with_compacted_log(
   (ep, log, stable)
 }
 
-// ---- heartbeat-driven snapshot resend (no wedge on dropped InstallSnapshot) ----
-
 /// Helper: drive `make_leader_with_compacted_log` peer 2 into Snapshot state and DROP the
 /// resulting InstallSnapshot (clear the outgoing queue), simulating the §11 message loss.
 /// Returns the leader, log, stable, and the snapshot's pending index (= offset).
@@ -238,8 +230,6 @@ fn wedged_snapshot_follower(
   (ep, log, stable, Index::new(offset))
 }
 
-// ---- InstallSnapshot receive + SnapshotResponse ----
-
 /// Encode a `u64` snapshot value into a `Bytes` blob (the wire format used by CountSm).
 fn encode_snapshot(v: u64) -> bytes::Bytes {
   use crate::Data as _;
@@ -264,8 +254,6 @@ fn make_follower() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
   let stable = AsyncStable::default();
   (ep, log, stable)
 }
-
-// ---- restore-from-snapshot on restart ----
 
 /// Build a `CountSm` snapshot blob for the given count value.
 fn encode_count_snapshot(count: u64) -> bytes::Bytes {
@@ -485,8 +473,6 @@ fn make_leader_with_current_term_commit() -> (Endpoint<u64, CountSm>, VecLog, No
   (ep, log, stable, d)
 }
 
-// ---- self-validating lease regressions ----
-
 /// Build a `LeaseBased + check_quorum` leader at term 1 with a current-term commit (no lease yet).
 fn leasebased_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable) {
   use crate::{Config, Instant, Message, Term};
@@ -550,8 +536,6 @@ fn tick_lease_round(
   }
   (at, lr.expect("the heartbeat carried a lease round"))
 }
-
-// ---- persist the lease-support PROMISE across restart (config-drift safety) ----
 
 /// Build a fresh enforcing follower (node 2 in {1,2,3}, check_quorum on, LeaseBased) at term 0 on an
 /// async store. Drive it with `follower_advertised_support` to exercise the persist-before-advertise gate.

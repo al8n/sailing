@@ -219,8 +219,6 @@ fn restart_recovers_commit_persisted_via_real_path() {
   );
 }
 
-// ---- LogStore::restore unit tests ----
-
 /// After `restore(10, 4)` on a VecLog with arbitrary prior content, the log has the
 /// expected re-baseline invariants.
 #[test]

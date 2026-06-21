@@ -119,8 +119,6 @@ fn quorum_makes_a_leader_and_heartbeats_follow() {
   assert!(matches!(ep.poll_event(), Some(Event::LeaderChanged(_))));
 }
 
-// --- log-replication tests ---
-
 #[test]
 fn become_leader_appends_noop_and_inits_progress() {
   use crate::{Config, Instant, Message, Term, VoteResponse};
@@ -737,8 +735,6 @@ fn stale_append_entries_does_not_erase_committed_entries() {
   );
 }
 
-// --- single-node leader commits after storage drain ---
-
 #[test]
 fn single_node_leader_commits_after_storage_drain() {
   use crate::{Config, Instant};
@@ -1192,8 +1188,6 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
   );
 }
 
-// ---- leader pacing ----
-
 /// A leader in Replicate mode with a window of 2 in-flight messages must stop sending
 /// once both slots are occupied, and resume after an ack frees a slot.
 #[test]
@@ -1500,8 +1494,6 @@ fn single_ack_does_not_rewind_replicate_window() {
        leaving next=5; the bug re-sends in-flight index 3 and leaves next=4"
   );
 }
-
-// ---- term-skip reject hint ----
 
 /// A divergent follower's reject carries a term hint that lets the leader skip a whole
 /// conflicting term instead of backing off one entry at a time.
@@ -1810,8 +1802,6 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
   );
 }
 
-// ---- heartbeat response resumes a stalled probe ----
-
 /// A peer in Probe mode that has stalled (msg_app_flow_paused set because only a partial
 /// batch was sent due to the byte cap) must resume replication when a HeartbeatResponse arrives.
 #[test]
@@ -2116,7 +2106,6 @@ fn lagging_follower_hint_is_two_sided() {
   };
   use core::time::Duration;
 
-  // --- Follower side: verify the hint ----------------------------------------
   // Follower has [1@1, 2@1]; receives AppendEntries(prev=20, prev_term=1).
   let follower_cfg = Config::try_new(
     2u64,
@@ -2182,7 +2171,6 @@ fn lagging_follower_hint_is_two_sided() {
     "hint term must be 1 (the term at the follower's last index)"
   );
 
-  // --- Leader side: verify the one-step jump ----------------------------------
   // Leader has [1..20]@term1. Receives reject hint (2, term1).
   // find_conflict_by_term(leader_log, 2, ceiling=1): term(2)=1 ≤ 1 → stop at 2 → next=2.
   // This gives prev=1 on the follow-up send — O(1) not O(entries).
