@@ -52,7 +52,7 @@ where
     id: crate::OpId,
     entries: &[crate::Entry],
   ) {
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     log.submit_append(id, entries);
@@ -147,7 +147,7 @@ where
     id: crate::OpId,
     hard_state: crate::HardState<I>,
   ) {
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     // fold every monotone durable safety floor onto this write at the choke-point (see `stamp_floors`),
@@ -297,7 +297,7 @@ where
   /// Idempotent via the durable `HardState` read: a same-term message, a pre-vote (which never adopts a
   /// term), or a handler that already persisted the step-down (a vote grant) does NOT double-write.
   pub(crate) fn ensure_term_durable<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     let durable = stable.hard_state();
@@ -337,7 +337,7 @@ where
     F::Snapshot: crate::Data,
   {
     let now: crate::Now = now.into();
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     self.debug_assert_queues_drained();
@@ -420,7 +420,7 @@ where
     // apply, a SILENT stall (`applied < commit`, no poison). Idempotent: a no-op when caught up, and a
     // still-cold or not-yet-viewable read simply defers again. (Replication has the periodic heartbeat
     // re-pump; apply did not, which is the gap this closes.)
-    if !self.poisoned && self.applied < self.commit {
+    if !self.poison.poisoned && self.applied < self.commit {
       self.apply_committed(log);
       self.maybe_flush_deferred_reads(now, log, stable);
     }
@@ -454,7 +454,7 @@ where
     // holds those committed entries, so no committed entry is lost, just a brief re-sync.
     // No `Pending` entry: a commit-watermark write owes no ack (like the step-down /
     // become_candidate writes); its completion drains harmlessly through `on_stable_wrote`.
-    if !self.poisoned && self.durable_commit() > self.committed_persisted {
+    if !self.poison.poisoned && self.durable_commit() > self.committed_persisted {
       let opid = self.mint_op_id();
       let hs = stable
         .hard_state()

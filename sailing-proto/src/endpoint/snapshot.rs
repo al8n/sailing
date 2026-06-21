@@ -12,7 +12,7 @@ where
     meta: crate::SnapshotMeta<I>,
     data: Bytes,
   ) {
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     stable.submit_snapshot(id, meta, data);
@@ -266,7 +266,7 @@ where
     snap: F::Snapshot,
     leader: I,
   ) {
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     // this runs ONLY once the blob is durable (the matching `SnapshotWritten` or `durable_snapshot()`
