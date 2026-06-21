@@ -58,7 +58,8 @@ where
       self.send(
         peer,
         Message::Heartbeat(
-          Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
+          Heartbeat::new(term, me.cheap_clone(), peer_commit, ctx.clone())
+            .with_lease_round(lease_round),
         ),
       );
     }
@@ -85,7 +86,8 @@ where
       self.send(
         peer,
         Message::Heartbeat(
-          Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
+          Heartbeat::new(term, me.cheap_clone(), peer_commit, ctx.clone())
+            .with_lease_round(lease_round),
         ),
       );
     }
@@ -132,7 +134,7 @@ where
         return;
       }
       let before = pr.next_index();
-      self.maybe_send_append(now, peer, log, stable);
+      self.maybe_send_append(now, peer.cheap_clone(), log, stable);
       let Some(pr) = self.tracker.progress(&peer) else {
         return;
       };
@@ -170,7 +172,7 @@ where
         let (term, me) = (self.term, self.config.id());
         let pending = meta.last_index();
         self.send(
-          peer,
+          peer.cheap_clone(),
           Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, data)),
         );
         if let Some(p) = self.tracker.progress_mut(&peer) {
@@ -269,7 +271,7 @@ where
 
     let (term, me, commit) = (self.term, self.config.id(), self.commit);
     self.send(
-      peer,
+      peer.cheap_clone(),
       Message::AppendEntries(AppendEntries::new(
         term, me, prev_index, prev_term, entries, commit,
       )),
@@ -571,7 +573,7 @@ where
     }
     if !self.role.is_leader() {
       return Err(ProposeError::NotLeader {
-        leader: self.leader,
+        leader: self.leader.cheap_clone(),
       });
     }
     // A leader transfer is in progress: stop accepting new entries so the target can
@@ -917,7 +919,10 @@ where
     if response.lease_round() == self.check_quorum_lease.lease_round
       && response.lease_support() > Duration::ZERO
     {
-      self.check_quorum_lease.lease_acks.insert(from);
+      self
+        .check_quorum_lease
+        .lease_acks
+        .insert(from.cheap_clone());
       self.check_quorum_lease.lease_min_support = self
         .check_quorum_lease
         .lease_min_support
@@ -942,7 +947,7 @@ where
       // round instead of wedging until an unrelated proposal triggers a send.
       pr.free_inflight_on_heartbeat();
     }
-    self.pump_appends(now, from, log, stable);
+    self.pump_appends(now, from.cheap_clone(), log, stable);
 
     // Liveness fix: if this peer is still in Snapshot state and has NOT yet
     // caught up to its pending snapshot index, RE-SEND the snapshot. The single
@@ -981,11 +986,11 @@ where
         .get(&from)
         .is_none_or(|&after| now.mono() >= after);
       if due {
-        self
-          .snapshot
-          .snapshot_resend_after
-          .insert(from, now.mono() + self.config.election_timeout());
-        self.resend_snapshot(from, stable);
+        self.snapshot.snapshot_resend_after.insert(
+          from.cheap_clone(),
+          now.mono() + self.config.election_timeout(),
+        );
+        self.resend_snapshot(from.cheap_clone(), stable);
       }
     } else {
       // Observed out of Snapshot state: drop the pacing entry. (A peer that exits via
@@ -1027,7 +1032,11 @@ where
             self.send(
               follower,
               Message::ReadIndexResponse(crate::ReadIndexResponse::new(
-                term, me, index, context, false,
+                term,
+                me.cheap_clone(),
+                index,
+                context,
+                false,
               )),
             );
           }
@@ -1160,9 +1169,9 @@ where
         self.maybe_advance_commit(now, log);
         self.apply_committed(log);
         self.maybe_flush_deferred_reads(now, log, stable);
-        self.pump_appends(now, from, log, stable); // fill the peer's inflight window if still behind
+        self.pump_appends(now, from.cheap_clone(), log, stable); // fill the peer's inflight window if still behind
         // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
-        if self.transfer.lead_transferee == Some(from) {
+        if self.transfer.lead_transferee.as_ref() == Some(&from) {
           let peer_match = self
             .tracker
             .progress(&from)

@@ -3,7 +3,9 @@
 //! that computes the next configuration from a sequence of [`ConfChangeSingle`] operations.
 //!
 //! Faithful port of etcd `tracker/tracker.go` and `confchange/confchange.go`.
-use crate::{ConfState, Index, JointConfig, MajorityConfig, NodeId, Progress, VoteResult};
+use crate::{
+  CheapClone, ConfState, Index, JointConfig, MajorityConfig, NodeId, Progress, VoteResult,
+};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Runtime membership state: joint voter configuration, learner sets, and per-peer [`Progress`].
@@ -65,14 +67,14 @@ impl<I: NodeId> Tracker<I> {
     let mut p: BTreeMap<I, Progress> = BTreeMap::new();
 
     // Install a fresh Progress for every member that needs one, without duplicates.
-    for &id in cs
+    for id in cs
       .voters()
       .iter()
       .chain(cs.voters_outgoing().iter())
       .chain(cs.learners().iter())
       .chain(cs.learners_next().iter())
     {
-      p.entry(id)
+      p.entry(id.cheap_clone())
         .or_insert_with(|| Progress::new(next, max_inflight_msgs, max_inflight_bytes));
     }
 
@@ -170,18 +172,28 @@ impl<I: NodeId> Tracker<I> {
   /// All node IDs tracked: voters (both halves) ∪ learners ∪ learners_next.
   pub fn ids(&self) -> BTreeSet<I> {
     let mut ids = self.voters.ids();
-    ids.extend(self.learners.iter().copied());
-    ids.extend(self.learners_next.iter().copied());
+    ids.extend(self.learners.iter().map(CheapClone::cheap_clone));
+    ids.extend(self.learners_next.iter().map(CheapClone::cheap_clone));
     ids
   }
 
   /// Produce a [`ConfState`] snapshot of the current configuration.
   pub fn conf_state(&self) -> ConfState<I> {
     ConfState::new(
-      self.voters.incoming().ids().iter().copied(),
-      self.learners.iter().copied(),
-      self.voters.outgoing().ids().iter().copied(),
-      self.learners_next.iter().copied(),
+      self
+        .voters
+        .incoming()
+        .ids()
+        .iter()
+        .map(CheapClone::cheap_clone),
+      self.learners.iter().map(CheapClone::cheap_clone),
+      self
+        .voters
+        .outgoing()
+        .ids()
+        .iter()
+        .map(CheapClone::cheap_clone),
+      self.learners_next.iter().map(CheapClone::cheap_clone),
       self.auto_leave,
     )
   }
@@ -565,11 +577,11 @@ pub mod confchange {
       let saved_pr = tr.progress.get(&id).cloned();
 
       // Remove from incoming voters / learners / learners_next.
-      self.remove(tr, id);
+      self.remove(tr, id.cheap_clone());
 
       // Restore Progress that remove() may have deleted (we still need it).
       if let Some(pr) = saved_pr {
-        tr.progress.entry(id).or_insert(pr);
+        tr.progress.entry(id.cheap_clone()).or_insert(pr);
       }
 
       // If id is in the outgoing voters half, it still participates in the old quorum.
@@ -619,7 +631,7 @@ pub mod confchange {
     fn init_progress<I: NodeId>(&self, tr: &mut Tracker<I>, id: I, is_learner: bool) {
       let next = Index::new(self.last_index.get().max(1)); // invariant: match < next
       let pr = Progress::new(next, self.max_inflight_msgs, self.max_inflight_bytes);
-      tr.progress.insert(id, pr);
+      tr.progress.insert(id.cheap_clone(), pr);
 
       if is_learner {
         tr.learners.insert(id);
@@ -722,7 +734,7 @@ pub mod confchange {
   /// `|(a - b) ∪ (b - a)|`.
   ///
   /// Port of etcd `symdiff`.
-  fn sym_diff<I: Ord + Copy>(a: &BTreeSet<I>, b: &BTreeSet<I>) -> usize {
+  fn sym_diff<I: Ord>(a: &BTreeSet<I>, b: &BTreeSet<I>) -> usize {
     let only_a = a.iter().filter(|id| !b.contains(id)).count();
     let only_b = b.iter().filter(|id| !a.contains(id)).count();
     only_a + only_b

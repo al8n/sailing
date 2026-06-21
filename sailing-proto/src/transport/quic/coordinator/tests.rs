@@ -378,6 +378,8 @@ fn oversized_node_id_encoding_fails_the_dial_with_a_typed_error() {
     }
   }
 
+  impl crate::CheapClone for WideId {}
+
   let ca = TestClusterCa::generate();
   let cfg = Config::try_new(
     WideId([1; 32]),

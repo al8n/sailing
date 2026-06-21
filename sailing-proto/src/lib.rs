@@ -22,6 +22,7 @@ mod num;
 pub use num::{Index, Term};
 
 mod id;
+pub use cheap_clone::CheapClone;
 pub use id::NodeId;
 
 mod time;

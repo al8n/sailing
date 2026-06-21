@@ -760,7 +760,7 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
       return;
     }
     // Normal flush: snapshot visible → durable, then release the deferred completions in order.
-    self.durable_hard_state = self.hard_state;
+    self.durable_hard_state = self.hard_state.clone();
     self.durable_snapshot.clone_from(&self.snapshot);
     for (id, kind) in self.in_flight.drain(..) {
       match kind {
@@ -781,7 +781,7 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     if !self.mode.is_async() {
       return;
     }
-    self.hard_state = self.durable_hard_state;
+    self.hard_state = self.durable_hard_state.clone();
     self.snapshot.clone_from(&self.durable_snapshot);
     self.in_flight.clear();
   }
@@ -814,9 +814,9 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
     // conformant-but-broken in ways the sim never exercises. Return the durable snapshot, exactly
     // what a disk store would read back.
     if self.mode.is_async() {
-      self.durable_hard_state
+      self.durable_hard_state.clone()
     } else {
-      self.hard_state
+      self.hard_state.clone()
     }
   }
 

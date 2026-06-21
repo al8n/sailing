@@ -275,7 +275,7 @@ impl<I: NodeId> ConfChangeSingle<I> {
   /// The target node.
   #[inline(always)]
   pub fn node(&self) -> I {
-    self.node
+    self.node.cheap_clone()
   }
 }
 
@@ -307,7 +307,7 @@ impl<I: NodeId> ConfChange<I> {
   /// The target node.
   #[inline(always)]
   pub fn node(&self) -> I {
-    self.node
+    self.node.cheap_clone()
   }
 
   /// The opaque application context (empty when unused).

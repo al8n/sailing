@@ -12,8 +12,8 @@ default = ["std"]
 # `std` and `alloc` are INDEPENDENT (never `std = ["alloc"]`): `std` layers each dependency's std
 # feature; `alloc` is the no_std heap tier (the deps use `alloc` automatically under
 # `default-features = false`, so there is nothing to layer). The crate requires at least one.
-std = ["bytes/std", "thiserror/std", "derive_more/std", "buffa/std", "rand/std", "rand_core/std"]
-alloc = []
+std = ["bytes/std", "thiserror/std", "derive_more/std", "buffa/std", "rand/std", "rand_core/std", "cheap-clone/default"]
+alloc = ["cheap-clone/alloc"]
 tcp = []                                   # no_std + alloc OK (no crypto)
 # Exposes pub(crate) decode entry points to the `fuzz/` cargo-fuzz crate via a doc-hidden
 # `fuzz_internals` module. Off by default, never enabled by a normal build; NOT semver-stable.
@@ -25,6 +25,7 @@ quic = ["tcp", "std", "dep:rustls", "dep:quinn-proto", "tls-ring"]
 
 [dependencies]
 buffa = { version = "0.7", default-features = false }
+cheap-clone = { version = "0.3", default-features = false }
 bytes.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true

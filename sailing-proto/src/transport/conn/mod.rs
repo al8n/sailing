@@ -9,7 +9,7 @@ use super::{
   frame::{FrameDecoder, MAX_FRAME_LEN, encode_frame},
   stream::{Intake, RecordIo},
 };
-use crate::{Instant, Message, NodeId};
+use crate::{CheapClone, Instant, Message, NodeId};
 use std::vec::Vec;
 
 enum ConnState<I> {
@@ -244,17 +244,17 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
   /// The peer this connection authenticated as: bound while `Validated`, and retained through a
   /// CLEAN close so the final frames can still be attributed and delivered.
   pub fn peer(&self) -> Option<I> {
-    match self.state {
-      ConnState::Validated { peer } => Some(peer),
-      ConnState::Closed { peer } => peer,
+    match &self.state {
+      ConnState::Validated { peer } => Some(peer.cheap_clone()),
+      ConnState::Closed { peer } => peer.cheap_clone(),
       ConnState::Handshaking => None,
     }
   }
 
   /// The peer if currently validated (close-transition helper).
   fn current_peer(&self) -> Option<I> {
-    match self.state {
-      ConnState::Validated { peer } => Some(peer),
+    match &self.state {
+      ConnState::Validated { peer } => Some(peer.cheap_clone()),
       _ => None,
     }
   }

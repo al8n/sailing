@@ -174,7 +174,8 @@ where
     let mut poison_reason: Option<PoisonReason> = None;
     // Bootstrap tracker from the static seed first; may be overridden below if a
     // durable snapshot carries a more recent ConfState.
-    let seed_cs = crate::ConfState::from_voters(config.voters().iter().copied());
+    let seed_cs =
+      crate::ConfState::from_voters(config.voters().iter().map(CheapClone::cheap_clone));
     let mut tracker = Tracker::from_conf_state(
       &seed_cs,
       Index::ZERO,

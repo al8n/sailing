@@ -406,7 +406,10 @@ where
     // `context`): the token is unique per round, so a stale/duplicated HeartbeatResponse echoing an
     // earlier round's token can never confirm this read — the linearizability hazard when a user
     // reuses a `context` after an earlier read with it completed.
-    let round = self.reads.read_only.add_request(commit, context, from, me);
+    let round = self
+      .reads
+      .read_only
+      .add_request(commit, context, from, me.cheap_clone());
     // Single-node cluster fast-path: self-ack is already a quorum.
     let single_node_quorum = {
       let acks = self
@@ -420,7 +423,10 @@ where
         .ids()
         .into_iter()
         .filter(|id| self.tracker.is_voter(id))
-        .map(|id| (id, acks.contains(&id)))
+        .map(|id| {
+          let acked = acks.contains(&id);
+          (id, acked)
+        })
         .collect();
       self.tracker.vote_result(&votes).is_won()
     };
@@ -436,7 +442,13 @@ where
           Some(follower) => {
             self.send(
               follower,
-              Message::ReadIndexResponse(ReadIndexResponse::new(term, me2, index, context, false)),
+              Message::ReadIndexResponse(ReadIndexResponse::new(
+                term,
+                me2.cheap_clone(),
+                index,
+                context,
+                false,
+              )),
             );
           }
         }
@@ -521,7 +533,7 @@ where
         if self.config.disable_proposal_forwarding() {
           return Err(ReadIndexError::ForwardingDisabled);
         }
-        let Some(leader) = self.leader else {
+        let Some(leader) = self.leader.cheap_clone() else {
           return Err(ReadIndexError::NoLeader);
         };
         // Follower-side duplicate-context guard (mirror of the leader's `read_context_in_flight`):
@@ -653,7 +665,8 @@ where
     // `response.from()`, which a wrong peer could forge to the leader's id. Membership is
     // checked BEFORE consuming the token, so a spoofed / wrong-leader response never clears a real
     // in-flight slot.
-    if self.role != Role::Follower || self.leader != Some(from) || response.from() != from {
+    if self.role != Role::Follower || self.leader.as_ref() != Some(&from) || response.from() != from
+    {
       return;
     }
     // `remove_by_token` is the authoritative clear of the in-flight slot AND the already-completed /

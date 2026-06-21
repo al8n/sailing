@@ -296,8 +296,8 @@ impl<I: NodeId> Config<I> {
 
   /// This node's id.
   #[inline(always)]
-  pub const fn id(&self) -> I {
-    self.id
+  pub fn id(&self) -> I {
+    self.id.cheap_clone()
   }
 
   /// The voter set.

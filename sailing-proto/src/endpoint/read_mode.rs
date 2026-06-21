@@ -39,7 +39,7 @@ where
     }
     if !self.role.is_leader() {
       return Err(ProposeError::NotLeader {
-        leader: self.leader,
+        leader: self.leader.cheap_clone(),
       });
     }
     // A leader transfer is in progress: no new proposals until it completes or times out.

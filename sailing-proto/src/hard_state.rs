@@ -1,5 +1,5 @@
 //! The durable Raft metadata: `(term, vote, commit, lease_support)`, persisted before acting.
-use crate::{Index, Term};
+use crate::{CheapClone, Index, NodeId, Term};
 use core::time::Duration;
 
 /// The durable provenance + magnitude of this node's LeaseBased read-lease promise.
@@ -142,17 +142,17 @@ impl<I> HardState<I> {
   }
 }
 
-impl<I: Copy> HardState<I> {
+impl<I: NodeId> HardState<I> {
   /// Whom this node voted for in `term`, if anyone.
   #[inline(always)]
-  pub const fn vote(&self) -> Option<I> {
-    self.vote
+  pub fn vote(&self) -> Option<I> {
+    self.vote.cheap_clone()
   }
 
   /// Replace the vote (consuming builder).
   #[inline(always)]
   #[must_use]
-  pub const fn with_vote(mut self, vote: Option<I>) -> Self {
+  pub fn with_vote(mut self, vote: Option<I>) -> Self {
     self.vote = vote;
     self
   }

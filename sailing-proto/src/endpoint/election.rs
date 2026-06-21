@@ -195,7 +195,7 @@ where
       let hs = stable
         .hard_state()
         .with_term(self.term)
-        .with_vote(self.voted_for)
+        .with_vote(self.voted_for.cheap_clone())
         .with_commit(self.durable_commit());
       self.submit_write(stable, opid, hs);
       self.durable.committed_persisted = self.durable_commit();
@@ -322,7 +322,7 @@ where
     let hs = stable
       .hard_state()
       .with_term(self.term)
-      .with_vote(self.voted_for)
+      .with_vote(self.voted_for.cheap_clone())
       .with_commit(self.durable_commit());
     self.submit_write(stable, opid, hs);
     self.durable.committed_persisted = self.durable_commit();
@@ -343,7 +343,12 @@ where
       self.send(
         peer,
         Message::RequestVote(RequestVote::new(
-          term, me, last_index, last_term, false, transfer,
+          term,
+          me.cheap_clone(),
+          last_index,
+          last_term,
+          false,
+          transfer,
         )),
       );
     }
@@ -391,7 +396,7 @@ where
         peer,
         Message::RequestVote(RequestVote::new(
           advertised_term,
-          me,
+          me.cheap_clone(),
           last_index,
           last_term,
           true,  // pre_vote

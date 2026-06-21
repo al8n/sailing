@@ -1,5 +1,5 @@
 //! Application-facing outputs drained via `Endpoint::poll_event`.
-use crate::{ConfState, Index, ReadOnlyOption, ReadState, SnapshotMeta, Term};
+use crate::{CheapClone, ConfState, Index, ReadOnlyOption, ReadState, SnapshotMeta, Term};
 
 /// A committed `Normal` entry was applied; `response` is the `StateMachine::Response`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -48,7 +48,7 @@ pub struct LeaderChanged<I> {
   leader: Option<I>,
 }
 
-impl<I: Copy> LeaderChanged<I> {
+impl<I: CheapClone> LeaderChanged<I> {
   /// Construct.
   pub const fn new(term: Term, leader: Option<I>) -> Self {
     Self { term, leader }
@@ -62,8 +62,8 @@ impl<I: Copy> LeaderChanged<I> {
 
   /// The new leader, if known.
   #[inline(always)]
-  pub const fn leader(&self) -> Option<I> {
-    self.leader
+  pub fn leader(&self) -> Option<I> {
+    self.leader.cheap_clone()
   }
 }
 

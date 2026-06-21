@@ -121,15 +121,17 @@ where
     // a DEFERRED success ack also caps its proven match to the new boundary — the discarded
     // tail can no longer back it. (The flush already clamps by `ack_watermark()`, which regresses here,
     // so this is defense-in-depth that keeps the stored extent honest.)
-    if let Some((to, term, proven)) = self.durable.term_gated_append_ack
-      && proven > boundary
+    if let Some((to, term, proven)) = self.durable.term_gated_append_ack.as_ref()
+      && *proven > boundary
     {
-      self.durable.term_gated_append_ack = Some((to, term, boundary));
+      let capped = Some((to.cheap_clone(), *term, boundary));
+      self.durable.term_gated_append_ack = capped;
     }
-    if let Some((to, term, proven)) = self.durable.term_gated_snapshot_ack
-      && proven > boundary
+    if let Some((to, term, proven)) = self.durable.term_gated_snapshot_ack.as_ref()
+      && *proven > boundary
     {
-      self.durable.term_gated_snapshot_ack = Some((to, term, boundary));
+      let capped = Some((to.cheap_clone(), *term, boundary));
+      self.durable.term_gated_snapshot_ack = capped;
     }
   }
 
@@ -143,7 +145,8 @@ where
   /// and also upgrades a legacy `Unrecorded` record to `Recorded` — the self-heal). A future monotone field
   /// `F` adds exactly ONE line here: `.with_f(hs.f().max(self.f_floor))`.
   pub(crate) fn stamp_floors(&self, hs: HardState<I>) -> HardState<I> {
-    hs.with_lease_support(hs.lease_support().raise(self.durable.lease_support_floor))
+    let raised = hs.lease_support().raise(self.durable.lease_support_floor);
+    hs.with_lease_support(raised)
   }
 
   pub(crate) fn submit_write<S: StableStore<NodeId = I>>(
@@ -208,7 +211,12 @@ where
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::SnapshotResponse(SnapshotResponse::new(term, me, false, match_index)),
+        Message::SnapshotResponse(SnapshotResponse::new(
+          term,
+          me.cheap_clone(),
+          false,
+          match_index,
+        )),
       );
     }
     if let Some((to, _, proven)) = self.durable.term_gated_append_ack.take() {
@@ -250,9 +258,9 @@ where
         )),
       );
     } else {
-      let proven = match self.durable.term_gated_append_ack {
-        Some((prev_to, prev_term, prev)) if prev_to == to && prev_term == self.term => {
-          prev.max(proven)
+      let proven = match self.durable.term_gated_append_ack.as_ref() {
+        Some((prev_to, prev_term, prev)) if *prev_to == to && *prev_term == self.term => {
+          (*prev).max(proven)
         }
         _ => proven,
       };
@@ -272,9 +280,9 @@ where
         Message::SnapshotResponse(SnapshotResponse::new(term, me, false, match_index)),
       );
     } else {
-      let proven = match self.durable.term_gated_snapshot_ack {
-        Some((prev_to, prev_term, prev)) if prev_to == to && prev_term == self.term => {
-          prev.max(proven)
+      let proven = match self.durable.term_gated_snapshot_ack.as_ref() {
+        Some((prev_to, prev_term, prev)) if *prev_to == to && *prev_term == self.term => {
+          (*prev).max(proven)
         }
         _ => proven,
       };
@@ -321,7 +329,7 @@ where
     // `Recorded` on this write (self-heal).
     let hs = durable
       .with_term(self.term)
-      .with_vote(self.voted_for)
+      .with_vote(self.voted_for.cheap_clone())
       .with_commit(self.durable_commit());
     self.submit_write(stable, opid, hs);
     self.durable.committed_persisted = self.durable_commit();
@@ -472,7 +480,7 @@ where
       let hs = stable
         .hard_state()
         .with_term(self.term)
-        .with_vote(self.voted_for)
+        .with_vote(self.voted_for.cheap_clone())
         .with_commit(self.durable_commit());
       self.submit_write(stable, opid, hs);
       self.durable.committed_persisted = self.durable_commit();
@@ -558,9 +566,9 @@ where
       Some(Pending::CastVote { to, term }) => {
         // Only emit the grant if the term hasn't changed and we still hold the vote for `to`.
         // If either condition is false the write was superseded by a term advance; drop silently.
-        if term == self.term && self.voted_for == Some(to) {
+        if term == self.term && self.voted_for.as_ref() == Some(&to) {
           debug_assert!(
-            self.voted_for == Some(to),
+            self.voted_for.as_ref() == Some(&to),
             "releasing a CastVote we no longer hold"
           );
           let me = self.config.id();
