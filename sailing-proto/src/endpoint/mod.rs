@@ -1089,6 +1089,7 @@ where
   transfer: Transfer<I>,
 }
 
+// Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
 impl<I, F> Endpoint<I, F, Prng>
 where
   I: NodeId,
@@ -1104,6 +1105,7 @@ where
   }
 }
 
+// Constructors that draw the election RNG, hence the `R: rand::Rng` bound.
 impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
@@ -1235,10 +1237,10 @@ where
   }
 }
 
-// No `I` bound: these neither key by, encode, nor clone a node id — they read scalar state, move
-// id-bearing values without inspecting them, or touch storage that is generic over `I`. `I: NodeId`
-// lives only on the sibling block whose methods reach into `Config`/`Tracker`/`Message` (all
-// `I: NodeId`-gated) or clone an id. `F: StateMachine` is the struct's required bound, kept here.
+// No `I` or `R` bound: these neither key by, encode, nor clone a node id, nor draw the election RNG.
+// They read scalar state, move id-bearing values without inspecting them, or touch storage generic
+// over `I`. The id-using bound lives only on the sibling block whose methods key/encode/clone ids
+// (needing the full `NodeId` bundle); `F: StateMachine` is the struct's required bound, kept here.
 impl<I, F, R> Endpoint<I, F, R>
 where
   F: StateMachine,
