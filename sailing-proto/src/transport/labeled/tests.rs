@@ -270,8 +270,6 @@ fn every_two_chunk_hello_split_validates() {
   }
 }
 
-// ── local-id bounds at construction ────────────────────────────────────────────────────
-
 /// The OUTBOUND mirror of the inbound peer-id bound: a local id we would reject on receipt must
 /// be rejected at construction, for both roles. (An oversized id would wrap through the hello's
 /// u16 length field; an empty one is no identity at all.)

@@ -64,7 +64,6 @@ fn leader_transfer_completes() {
     .find(|&id| id != initial_leader)
     .expect("must have a follower");
 
-  // ── Initiate the transfer ────────────────────────────────────────────────────
   c.transfer_leader(target)
     .expect("transfer_leader must succeed when target is a voter");
 

@@ -1,7 +1,5 @@
 use super::*;
 
-// ─── Action selection ──────────────────────────────────────────────────────────────────────────
-
 /// Draw a weighted action from [`MENU`] using the master PRNG (deterministic from the seed).
 pub(crate) fn pick_action(prng: &mut FaultPrng) -> Action {
   let total: u32 = MENU.iter().map(|(_, w)| w).sum();
@@ -26,8 +24,6 @@ pub(crate) fn pick_from(set: &BTreeSet<u64>, prng: &mut FaultPrng) -> Option<u64
   let k = (prng.next_u64() % set.len() as u64) as usize;
   set.iter().nth(k).copied()
 }
-
-// ─── Actions ─────────────────────────────────────────────────────────────────────────────────────
 
 /// Propose 1..=k distinct client commands on the current leader (no-op if momentarily leaderless).
 /// Each accepted command is recorded in `proposed` (and counted) so quiesce can verify it applied.
@@ -365,8 +361,6 @@ pub(crate) fn fault_reroll(c: &mut Cluster, st: &VoprState, prng: &mut FaultPrng
     c.set_node_faults(id, sf, seed.wrapping_add(id).wrapping_add(prng.next_u64()));
   }
 }
-
-// ─── Observation / bookkeeping ───────────────────────────────────────────────────────────────────
 
 /// Fold the current cluster state into the report's running maxima / fault tallies. Called after
 /// every batch of ticks. Cheap (reads public accessors only) and never perturbs the run.

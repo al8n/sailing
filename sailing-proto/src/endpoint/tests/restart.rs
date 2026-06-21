@@ -1209,11 +1209,11 @@ fn reconcile_restart_log_is_exhaustive() {
     A,
   );
   let cases: &[Case] = &[
-    // ── No durable snapshot ──
+    // No durable snapshot
     (None, i(0), i(1), i(0), None, A::None), // fresh/empty log
     (None, i(7), i(1), i(7), None, A::None), // uncompacted log with a committed range
     (None, i(0), i(3), i(7), None, A::Poison(P::OrphanedLog)), // compacted, no snapshot → prefix gone
-    // ── Durable snapshot at N=5 ──
+    // Durable snapshot at N=5
     (
       Some((n, t)),
       i(0),
@@ -1290,7 +1290,7 @@ fn reconcile_restart_log_is_exhaustive() {
       Some(Err(())),
       A::Poison(P::LogTerm),
     ), // fatal boundary term-read
-    // ── Log-validity precondition (structural gaps) ──
+    // Log-validity precondition (structural gaps)
     (
       Some((n, t)),
       i(0),
@@ -1300,7 +1300,7 @@ fn reconcile_restart_log_is_exhaustive() {
       A::Poison(P::OrphanedLog),
     ), // first_index=N+1 but last_index<N → gap
     (None, i(0), i(6), i(4), None, A::Poison(P::OrphanedLog)), // gap with no snapshot
-    // ── Empty log baselined exactly at N (first==last+1, NOT a gap) ──
+    // Empty log baselined exactly at N (first==last+1, NOT a gap)
     (Some((n, t)), i(5), i(6), i(5), Some(Ok(t)), A::None), // snapshot at N, empty log above it, boundary matches
   ];
 

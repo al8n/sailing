@@ -210,8 +210,6 @@ fn compact_empty_log_is_noop() {
   assert_eq!(log.last_index(), Index::ZERO);
 }
 
-// ─── async-write mode (fsync-loss window) ──────────────────────────────
-
 #[test]
 fn async_log_submit_then_discard_loses_inflight_append() {
   // Async mode (visible-state + durable-snapshot): submit_append is VISIBLE to reads immediately
@@ -416,8 +414,6 @@ fn async_stable_snapshot_is_visible_then_flushes() {
     Some(Ok(StableDone::SnapshotWritten(OpId::new(7))))
   );
 }
-
-// ─── seeded storage faults (faults-as-data, never panics) ──────────────
 
 #[test]
 fn transient_read_fault_surfaces_as_error_not_panic() {

@@ -44,7 +44,6 @@ fn max_confirmed_read_index(c: &Cluster, id: u64) -> sailing_proto::Index {
 
 #[test]
 fn read_index_is_linearizable() {
-  // ── Setup ────────────────────────────────────────────────────────────────────
   // 3-node cluster; ReadOnlySafe (the default); CheckQuorum enabled.
   // CheckQuorum is needed for Scenario B (leader steps down when isolated).
   let mut c = Cluster::new_with(3, |cfg| cfg.with_check_quorum(true));
@@ -61,7 +60,6 @@ fn read_index_is_linearizable() {
     "initial entry must be applied on all nodes"
   );
 
-  // ── Scenario A: linearizability (read confirms >= last committed write) ─────
   //
   // For each round:
   // 1. Propose a write and wait until it is applied on all live nodes.
@@ -140,7 +138,6 @@ fn read_index_is_linearizable() {
     );
   }
 
-  // ── Scenario B: a stale/isolated leader cannot confirm a read ────────────────
   //
   // Steps:
   // 1. Record the current leader.

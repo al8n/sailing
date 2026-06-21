@@ -1,7 +1,5 @@
 use super::*;
 
-// ─── Fault rolls (seeded intensities) ────────────────────────────────────────────────────────────
-
 /// Roll a seed-chosen [`NetworkFaults`] intensity. `calm == true` returns a near-faultless bus (used
 /// inside calm windows / quiesce so liveness is achievable); otherwise a modest-to-spicy adversarial
 /// schedule whose drop/jitter stay BOUNDED (a healthy majority can still re-replicate and beat the

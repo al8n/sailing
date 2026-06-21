@@ -890,7 +890,6 @@ impl<I: NodeId> Message<I> {
   }
 }
 
-// ─── Wire codec ───────────────────────────────────────────────────────────────
 // `Message` is encoded/decoded via the buffa protobuf envelope (`wire::encode_message` and its decode
 // counterpart) — NOT a hand-rolled `impl Data for Message`. buffa bounds every length-delimited field
 // (so no length prefix can drive an oversized allocation) independently of the `Data` collection codec's

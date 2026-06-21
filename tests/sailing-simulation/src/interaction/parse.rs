@@ -112,8 +112,6 @@ pub(crate) fn tokenize(line: &str) -> std::vec::IntoIter<String> {
   out.into_iter()
 }
 
-// ─────────────────────── data-driven file runner ───────────────────────
-
 /// One parsed `command / ---- / expected-output` block, with the comment/blank lines that preceded
 /// it (preserved verbatim so a rewrite round-trips the file's documentation).
 pub(crate) struct Block {

@@ -760,7 +760,6 @@ fn run_vopr_inner(
   // The single master PRNG. Every draw in the run comes from here (deterministic from `seed`).
   let mut prng = FaultPrng::new(seed ^ 0x564F_5052_5F5F_5631); // "VOPR__V1"
 
-  // ── Setup: seed-chosen cluster size in 2..=7 (INCLUDING even sizes). ───────────────────────────
   let size = 2 + (prng.next_u64() % 6) as usize; // 2..=7
   // Seed-chosen read/lease regime: a quarter of seeds run today's shape (Safe, no CheckQuorum), a
   // quarter add CheckQuorum (its stepdown now interacts with reads under partitions), a quarter run
@@ -951,7 +950,6 @@ fn run_vopr_inner(
     usize::MAX
   };
 
-  // ── Main loop ─────────────────────────────────────────────────────────────────────────────────
   for iter in 0..ticks {
     // FAILOVER sub-mode: re-sync the per-node wall offsets at the jittered cadence BEFORE this
     // iteration's proposes/reads/handlers, so they observe fresh cross-node skew. A re-draw below the
@@ -1005,7 +1003,6 @@ fn run_vopr_inner(
     reads.scan(&c, &mut report, seed);
     refresh_conf_in_flight(&c, &mut st);
 
-    // ── Calm window ───────────────────────────────────────────────────────────────────────────
     if iter + 1 >= next_calm {
       calm_window(&mut c, &mut st, &mut prng, &mut report, seed);
       read_round(
@@ -1022,7 +1019,6 @@ fn run_vopr_inner(
     }
   }
 
-  // ── Quiesce ───────────────────────────────────────────────────────────────────────────────────
   quiesce(&mut c, &mut st, &mut report, seed);
   // One final linearizable read on the converged cluster: it must confirm, pass the oracle, and
   // become servable. Also drains any confirmations that surfaced during quiesce itself.
@@ -1037,8 +1033,6 @@ fn run_vopr_inner(
   report.precise_releases = c.precise_releases_total();
   report
 }
-
-// ─── Liveness: calm window + quiesce ─────────────────────────────────────────────────────────────
 
 /// Drive ONE linearizable read through confirm-and-serve on a healthy cluster — the read-path
 /// liveness assertion (the per-iteration oracle only checks reads that happen to confirm; this

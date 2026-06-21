@@ -1,8 +1,6 @@
 use super::*;
 use std::vec;
 
-// ── ConfState ──────────────────────────────────────────────────────────────
-
 #[test]
 fn conf_state_from_voters_deduplicates() {
   let c = ConfState::from_voters(vec![3u64, 1u64, 2u64, 1u64]);
@@ -114,8 +112,6 @@ fn conf_state_default_is_empty() {
   assert!(!c.auto_leave());
 }
 
-// ── ConfChangeType ─────────────────────────────────────────────────────────
-
 #[test]
 fn conf_change_type_display() {
   assert_eq!(ConfChangeType::AddNode.as_str(), "add_node");
@@ -135,8 +131,6 @@ fn conf_change_type_is_variant() {
   assert!(ConfChangeType::AddLearnerNode.is_add_learner_node());
 }
 
-// ── ConfChangeTransition ───────────────────────────────────────────────────
-
 #[test]
 fn conf_change_transition_default_is_auto() {
   assert_eq!(ConfChangeTransition::default(), ConfChangeTransition::Auto);
@@ -152,10 +146,6 @@ fn conf_change_transition_display_and_variants() {
   assert!(ConfChangeTransition::Explicit.is_explicit());
 }
 
-// ── ConfChangeSingle ───────────────────────────────────────────────────────
-
-// ── ConfChange ─────────────────────────────────────────────────────────────
-
 #[test]
 fn conf_change_into_v2() {
   let c = ConfChange::new(ConfChangeType::AddNode, 5u64, Bytes::from_static(b"x"));
@@ -166,5 +156,3 @@ fn conf_change_into_v2() {
   assert_eq!(v2.changes()[0].node(), 5u64);
   assert_eq!(v2.context(), &Bytes::from_static(b"x"));
 }
-
-// ── ConfChangeV2 ───────────────────────────────────────────────────────────

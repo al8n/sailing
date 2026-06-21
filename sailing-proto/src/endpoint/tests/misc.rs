@@ -223,10 +223,6 @@ fn follower_defers_success_ack_until_term_durable() {
   );
 }
 
-// ──────────────────────────────────────────────────────────────────────────────────────────
-// serviceable-timer filter (timer-wedge defense)
-// ──────────────────────────────────────────────────────────────────────────────────────────
-
 /// `serviceable_now` mirrors the `handle_timeout` dispatch exactly.
 ///
 /// - Follower: Heartbeat not serviceable; Election serviceable iff voter.

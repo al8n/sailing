@@ -9,8 +9,6 @@ where
   F::Command: crate::Data,
   F::Error: core::error::Error,
 {
-  // ─── ReadIndex helpers ────────────────────────────────────────────────────────
-
   /// Whether the leader has committed an entry in its current term.
   ///
   /// A newly-elected leader cannot confirm reads against a commit index whose entry is from

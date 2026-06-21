@@ -367,8 +367,6 @@ impl Checker {
   }
 }
 
-// ─── Cross-node oracles (stateless) ──────────────────────────────────────────────────────────────
-
 /// **agreement** (applied-prefix): for any two non-removed nodes, the shorter applied log is a
 /// prefix of the longer — they agree on `(index→command)` at every shared position.
 ///
@@ -666,8 +664,6 @@ pub fn boundedness(view: &ClusterView) -> Result<(), Violation> {
   }
   Ok(())
 }
-
-// ─── History oracles (read-then-fold the Checker state) ──────────────────────────────────────────
 
 /// **no-committed-rewrite**: once index `i` is committed clusterwide with command `c`, no node ever
 /// applies a different command at `i` — the strongest State Machine Safety check.

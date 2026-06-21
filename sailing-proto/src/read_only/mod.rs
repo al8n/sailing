@@ -9,8 +9,6 @@ use std::{
   vec::Vec,
 };
 
-// ─── ReadState ────────────────────────────────────────────────────────────────
-
 /// A confirmed linearizable read: the application may serve the read once
 /// `applied >= index`.
 ///
@@ -41,8 +39,6 @@ impl ReadState {
     &self.context
   }
 }
-
-// ─── FailoverReadWindow ───────────────────────────────────────────────────────
 
 /// A FAILOVER inherited-read offer, returned by [`crate::Endpoint::failover_read_window`] while a freshly
 /// elected leader holds the post-election commit-wait under the LeaseGuard failover tier AND the committed
@@ -81,8 +77,6 @@ impl FailoverReadWindow {
     self.limbo_upper
   }
 }
-
-// ─── ReadIndexStatus ──────────────────────────────────────────────────────────
 
 /// A pending read-index request: tracks who originated it, the commit index at
 /// the time of receipt, and which voters have acked the heartbeat round.
@@ -123,8 +117,6 @@ impl<I: NodeId> ReadIndexStatus<I> {
     (self.context, self.req_from, self.index)
   }
 }
-
-// ─── ReadOnly ─────────────────────────────────────────────────────────────────
 
 /// Manages in-flight read-index requests for the leader.
 ///
@@ -298,8 +290,6 @@ impl<I: NodeId> ReadOnly<I> {
     self.pending.get(token).map(|s| &s.acks)
   }
 }
-
-// ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests;

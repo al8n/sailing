@@ -108,7 +108,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
       .collect()
   }
 
-  // ── Read #1: register, capture its round token, confirm via a quorum ack. ──
+  // Read #1: register, capture its round token, confirm via a quorum ack.
   ep.read_index(d, &log, &stable, ctx.clone())
     .expect("read #1 accepted");
   let token1 = read_round(&mut ep);
@@ -122,7 +122,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
   while ep.poll_message().is_some() {}
   assert_eq!(read_states(&mut ep).len(), 1, "read #1 must confirm");
 
-  // ── Read #2: REUSE the same context (allowed now that #1 completed). ──
+  // Read #2: REUSE the same context (allowed now that #1 completed).
   ep.read_index(d, &log, &stable, ctx.clone())
     .expect("read #2 (reused context) accepted after #1 completed");
   let token2 = read_round(&mut ep);
@@ -131,7 +131,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     "the reused context must get a fresh internal round token"
   );
 
-  // ── The STALE HeartbeatResponse from read #1's round arrives (delayed/duplicated). ──
+  // The STALE HeartbeatResponse from read #1's round arrives (delayed/duplicated).
   ep.handle_message(
     d,
     &mut log,
@@ -145,7 +145,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     "a stale ack echoing read #1's token must NOT confirm the reused read #2 (no fresh quorum)"
   );
 
-  // ── A FRESH ack echoing read #2's token confirms it. ──
+  // A FRESH ack echoing read #2's token confirms it.
   ep.handle_message(
     d,
     &mut log,
@@ -335,7 +335,7 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_response() {
       .collect()
   }
 
-  // ── Read #1: forward, capture token, complete via the leader's response. ──
+  // Read #1: forward, capture token, complete via the leader's response.
   let token1 = forward(&mut ep, &log, &stable, ctx.clone());
   ep.handle_message(
     Instant::ORIGIN,
@@ -355,14 +355,14 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_response() {
   assert_eq!(s1[0].index(), Index::new(5));
   assert_eq!(s1[0].context().as_ref(), ctx.as_ref());
 
-  // ── Read #2: REUSE the context (allowed now that #1 completed). ──
+  // Read #2: REUSE the context (allowed now that #1 completed).
   let token2 = forward(&mut ep, &log, &stable, ctx.clone());
   assert_ne!(
     token1, token2,
     "the reused forwarded context must get a fresh internal token"
   );
 
-  // ── A STALE duplicate ReadIndexResponse echoing read #1's token arrives. ──
+  // A STALE duplicate ReadIndexResponse echoing read #1's token arrives.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -381,7 +381,7 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_response() {
     "a stale response echoing read #1's token must NOT complete the reused read #2"
   );
 
-  // ── The fresh response for read #2's token completes it at the FRESH index. ──
+  // The fresh response for read #2's token completes it at the FRESH index.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -926,7 +926,7 @@ fn duplicate_follower_read_index_is_rejected_then_clears() {
 fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
   use crate::{Index, ReadIndex, ReadIndexError};
 
-  // ── Leader half: at capacity, a forwarded ReadIndex yields a rejecting ReadIndexResponse to ri.from.
+  // Leader half: at capacity, a forwarded ReadIndex yields a rejecting ReadIndexResponse to ri.from.
   let (mut leader, mut llog, mut lstable, lnow) = make_leader_with_current_term_commit();
   // Saturate the leader's read backlog so `leader_reads_at_capacity()` holds.
   for i in 0..MAX_LEADER_READS {
@@ -968,7 +968,7 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
     "the rejecting reply echoes the forwarded context"
   );
 
-  // ── Follower half: receiving a rejecting ReadIndexResponse clears the strand (no ReadState, and the
+  // Follower half: receiving a rejecting ReadIndexResponse clears the strand (no ReadState, and the
   // context becomes re-issuable rather than a stuck DuplicateContext).
   use crate::{AppendEntries, Config, Term};
   use core::time::Duration;

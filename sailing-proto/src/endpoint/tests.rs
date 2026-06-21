@@ -275,7 +275,7 @@ fn encode_count_snapshot(count: u64) -> bytes::Bytes {
   bytes::Bytes::from(buf)
 }
 
-// ── deferred snapshot install (golden, core-enforced durability ordering) ──────────
+// deferred snapshot install (golden, core-enforced durability ordering)
 
 /// A 3-voter follower (node 2) at term 2 with a durable, committed log `[1..=3]` (commit=3), ready to
 /// receive a snapshot install. Returns `(ep, log, stable, cfg)` — `cfg` for a later `restart`.
@@ -346,8 +346,6 @@ fn install_at(boundary: u64) -> Message<u64> {
   ))
 }
 
-// ── propose_conf_change + apply-at-commit tests ────────────────────────────────────────
-
 /// Helper: build a single-node leader (node 1) with a VecLog + NoopStable, and drain storage
 /// so the no-op entry at index 1 is committed and applied. Returns (ep, log, stable, d).
 fn make_single_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant) {
@@ -374,8 +372,6 @@ fn make_single_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Ins
   while ep.poll_message().is_some() {}
   (ep, log, stable, d)
 }
-
-// ── leader step-down on self-removal/demotion ─────────────────────────────────────────
 
 /// Helper: elect node 1 as leader of a 3-voter cluster {1, 2, 3}, drive the no-op to
 /// committed+applied, then return (ep, log, stable, d).
@@ -428,8 +424,6 @@ fn make_three_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Inst
   (ep, log, stable, d)
 }
 
-// ─── CheckQuorum tests ────────────────────────────────────────────────────────────────
-
 /// Helper: build a Config with check_quorum=true for a cluster of `voters` with 1s/100ms.
 fn cq_config(id: u64, voters: Vec<u64>) -> Config<u64> {
   Config::try_new(
@@ -441,8 +435,6 @@ fn cq_config(id: u64, voters: Vec<u64>) -> Config<u64> {
   .unwrap()
   .with_check_quorum(true)
 }
-
-// ── ReadIndex tests ─────────────────────────────────────────────────────────────────────
 
 /// Helper: elect node 1 leader in a 3-voter cluster, drain the no-op so the leader has
 /// a committed current-term entry.  Returns (ep, log, stable, now).
@@ -611,8 +603,6 @@ fn follower_advertised_support(
   support.expect("the follower produced a HeartbeatResponse")
 }
 
-// ─── leader transfer tests ────────────────────────────────────────────
-
 /// Elect node 1 as leader and return (ep, log, stable) ready for transfer tests.
 /// The log has the no-op at index 1 committed; peer 2's match_index is caught up.
 fn setup_leader_with_peer2_caught_up() -> (Endpoint<u64, CountSm>, VecLog, NoopStable) {
@@ -662,8 +652,6 @@ fn setup_leader_with_peer2_caught_up() -> (Endpoint<u64, CountSm>, VecLog, NoopS
   while ep.poll_event().is_some() {}
   (ep, log, stable)
 }
-
-// ── fatal apply_committed errors poison (no silent stall) + carry a cause ──────
 
 /// A state machine whose `apply` returns `Err` for a sentinel command. `Error` is a real
 /// `core::error::Error` (the §6.3 bound). Used to exercise the `PoisonReason::Apply` path.

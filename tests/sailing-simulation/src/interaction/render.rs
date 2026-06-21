@@ -1,7 +1,5 @@
 use super::*;
 
-// ─────────────────────────── rendering ───────────────────────────
-
 /// Render a wire message as `Kind term=.. <fields>` (the `from->to` prefix is added by the caller).
 pub(crate) fn render_msg(_from: u64, _to: u64, msg: &Message<u64>) -> String {
   match msg {

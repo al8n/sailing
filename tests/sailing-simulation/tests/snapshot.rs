@@ -6,7 +6,6 @@ use sailing_simulation::Cluster;
 /// number of proposals so tests run fast without hundreds of entries.
 const SNAP_THRESHOLD: usize = 5;
 
-// ── Test 1 ──────────────────────────────────────────────────────────────────────────────────────
 /// A 3-node cluster with a low snapshot threshold takes snapshots and compacts its log
 /// after enough entries are committed, while maintaining agreement across all nodes.
 ///
@@ -53,7 +52,6 @@ fn leader_snapshots_and_compacts() {
   );
 }
 
-// ── Test 2 ──────────────────────────────────────────────────────────────────────────────────────
 /// A partitioned follower that falls so far behind that the leader's log is compacted past
 /// its `next_index` must catch up via `InstallSnapshot` once the partition heals.
 ///
@@ -122,7 +120,6 @@ fn lagging_follower_catches_up_via_snapshot() {
   );
 }
 
-// ── Test 3 ──────────────────────────────────────────────────────────────────────────────────────
 /// After a node crashes and is restarted from its durable snapshot + committed log tail,
 /// it must converge to the same state as the rest of the cluster.
 ///

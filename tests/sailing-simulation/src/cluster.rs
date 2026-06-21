@@ -400,7 +400,7 @@ impl Cluster {
   fn schedule_send(&mut self, i: usize, to: u64, message: Message<u64>) -> bool {
     let from = self.node_ids[i];
 
-    // ── Structural assertion (a): append-before-ack ──────────────────────────────
+    // Structural assertion (a): append-before-ack
     // A success AppendResponse must not outrun the node's readable log. (The proto's append-before-ack
     // ordering — deferring a NEW suffix's ack to its durability via `on_log_appended` — is exercised
     // by the fsync-window integration test; this send-time tripwire is a coarse outran-the-log
@@ -422,7 +422,7 @@ impl Cluster {
         self.restarts[i],
       );
     }
-    // ── Structural assertion (b): one-grant-per-(node,term) ──────────────────────
+    // Structural assertion (b): one-grant-per-(node,term)
     // A success VoteResponse from `from` in term `T` to candidate `to` must not appear a second time
     // for a different candidate — that would be a double-vote. Holds under reorder+dup: a duplicate
     // grant to the SAME candidate is fine; a grant to a DIFFERENT one in the same term is a bug.
@@ -456,7 +456,6 @@ impl Cluster {
       return true;
     }
 
-    // ── Seeded drop ───────────────────────────────────────────────────────────────
     if self
       .net_prng
       .chance_per_mille(self.net_faults.drop_per_mille)
@@ -465,7 +464,6 @@ impl Cluster {
       return false; // lost in flight
     }
 
-    // ── Seeded duplicate ──────────────────────────────────────────────────────────
     let copies = if self
       .net_prng
       .chance_per_mille(self.net_faults.duplicate_per_mille)

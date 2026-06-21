@@ -3,8 +3,6 @@ use crate::{ConfChangeSingle, ConfChangeType, Index, VoteResult};
 use confchange::{Changer, ConfChangeError};
 use std::{collections::BTreeMap, vec};
 
-// ── Helpers ────────────────────────────────────────────────────────────────
-
 /// Build a `Changer` with sensible defaults for tests.
 fn changer(last_index: u64) -> Changer {
   Changer::new(Index::new(last_index), 256, 0)
@@ -26,8 +24,6 @@ fn remove(id: u64) -> ConfChangeSingle<u64> {
 fn add_learner(id: u64) -> ConfChangeSingle<u64> {
   ConfChangeSingle::new(ConfChangeType::AddLearnerNode, id)
 }
-
-// ── Tracker basics ─────────────────────────────────────────────────────────
 
 #[test]
 fn tracker_default_is_empty() {
@@ -60,8 +56,6 @@ fn tracker_conf_state_roundtrip() {
   assert_eq!(out.auto_leave(), cs.auto_leave());
 }
 
-// ── quorum_committed ───────────────────────────────────────────────────────
-
 #[test]
 fn quorum_committed_simple() {
   // 3-voter config, match indices 10, 12, 14 → median = 12.
@@ -80,8 +74,6 @@ fn quorum_committed_absent_voter_is_zero() {
   t.progress_mut(&3).unwrap().maybe_update(Index::new(7));
   assert_eq!(t.quorum_committed(), Index::new(5));
 }
-
-// ── vote_result ────────────────────────────────────────────────────────────
 
 #[test]
 fn vote_result_simple_won() {
@@ -103,8 +95,6 @@ fn vote_result_simple_pending() {
   let votes = BTreeMap::from([(1u64, true)]);
   assert_eq!(t.vote_result(&votes), VoteResult::Pending);
 }
-
-// ── simple: add a voter ───────────────────────────────────────────────────
 
 #[test]
 fn simple_add_voter() {
@@ -136,8 +126,6 @@ fn simple_add_learner() {
   assert!(next.progress(&4).is_some());
 }
 
-// ── simple: rejection cases ────────────────────────────────────────────────
-
 #[test]
 fn simple_rejects_multiple_voter_changes() {
   // Adding 2 voters at once requires joint.
@@ -162,8 +150,6 @@ fn simple_rejects_all_voters_removed() {
   let err = changer(5).simple(&t, &[remove(1)]).unwrap_err();
   assert_eq!(err, ConfChangeError::EmptyVoterSet);
 }
-
-// ── enter_joint + leave_joint ─────────────────────────────────────────────
 
 #[test]
 fn enter_joint_basic_swap() {
@@ -211,8 +197,6 @@ fn leave_joint_rejects_not_joint() {
   assert_eq!(err, ConfChangeError::NotJoint);
 }
 
-// ── learners_next: demotion via joint ─────────────────────────────────────
-
 #[test]
 fn add_learner_on_outgoing_voter_goes_to_learners_next() {
   // {1,2,3}: demote node 3 to learner via joint.
@@ -240,8 +224,6 @@ fn add_learner_on_outgoing_voter_goes_to_learners_next() {
   assert!(simple.progress(&3).is_some());
 }
 
-// ── remove keeps Progress while in outgoing ───────────────────────────────
-
 #[test]
 fn remove_keeps_progress_while_in_outgoing() {
   // enter_joint removes node 3 from incoming but keeps its Progress (still in outgoing).
@@ -261,7 +243,7 @@ fn remove_keeps_progress_while_in_outgoing() {
   assert!(simple.progress(&3).is_none());
 }
 
-// ── invariant: voters ∩ learners = ∅ after promote/demote ─────────────────
+// invariant: voters ∩ learners = ∅ after promote/demote
 
 #[test]
 fn no_voter_learner_overlap_after_promote_demote() {
@@ -290,8 +272,6 @@ fn no_voter_learner_overlap_after_promote_demote() {
     assert!(!simple.is_voter(id), "voter-learner overlap: {id}");
   }
 }
-
-// ── quorum_committed and vote_result over a joint tracker ─────────────────
 
 #[test]
 fn quorum_committed_joint_blocked_by_outgoing() {
@@ -344,8 +324,6 @@ fn vote_result_joint_won() {
   ]);
   assert_eq!(jt.vote_result(&votes), VoteResult::Won);
 }
-
-// ── progress map stays in sync ────────────────────────────────────────────
 
 #[test]
 fn progress_map_in_sync_after_operations() {
