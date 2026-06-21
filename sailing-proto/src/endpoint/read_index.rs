@@ -259,8 +259,8 @@ where
   fn inherited_lease_live(&self, now: crate::Now) -> bool {
     if !self.failover_tier_active()
       || now.wall().is_absent()
-      || self.committed_anchor_wall == 0
-      || self.committed_anchor_window == 0
+      || self.lease_guard.committed_anchor_wall == 0
+      || self.lease_guard.committed_anchor_window == 0
     {
       return false;
     }
@@ -269,7 +269,9 @@ where
     };
     let now_wall = now.wall().as_nanos() as u128;
     let two_eps = 2 * eps_unc.as_nanos();
-    now_wall + two_eps < self.committed_anchor_wall as u128 + self.committed_anchor_window as u128
+    now_wall + two_eps
+      < self.lease_guard.committed_anchor_wall as u128
+        + self.lease_guard.committed_anchor_window as u128
   }
 
   /// Whether a VALID, ACTIVE LeaseGuard FAILOVER tier is configured. Delegates to the SINGLE source of
@@ -310,8 +312,8 @@ where
     // an over-large inherited window degrades to Safe rather than serving.
     if self.poisoned
       || self.role != Role::Leader
-      || self.commit_wait_until.is_none()
-      || !self.inherited_serve_armed
+      || self.lease_guard.commit_wait_until.is_none()
+      || !self.lease_guard.inherited_serve_armed
     {
       return None;
     }
@@ -320,7 +322,7 @@ where
     }
     Some(crate::FailoverReadWindow::new(
       self.commit,
-      self.limbo_upper,
+      self.lease_guard.limbo_upper,
     ))
   }
 
@@ -357,7 +359,7 @@ where
         // Record read activity since the current anchor — the gate for the proactive `LeaseRefresh`
         // modes (a served read AND a degraded one both count; an idle leader with no reads never
         // proactively refreshes, so an idle cluster keeps its no-write-amplification guarantee).
-        self.read_since_anchor = true;
+        self.lease_guard.read_since_anchor = true;
         // "The log is the lease": serve from the local commit WITHOUT a round-trip iff the leader's
         // most-recent committed entry is still within the lease window on the leader's OWN monotonic
         // clock (see `lease_guard_read_live`). The caller already gated on `has_current_term_commit`,
@@ -375,7 +377,7 @@ where
           // ever changing the read gate or commit-wait. (An inactive/invalid config or a poisoned read
           // also lands here; `leaseguard_timing().is_some()` keeps the demand to genuine staleness.)
           if self.leaseguard_timing().is_some() {
-            self.lease_refresh_wanted = true;
+            self.lease_guard.lease_refresh_wanted = true;
           }
           self.do_safe_read(now, context, from);
         }
@@ -387,7 +389,7 @@ where
   /// for the proactive [`crate::LeaseRefresh`] modes.
   #[cfg(test)]
   pub(crate) fn read_since_anchor(&self) -> bool {
-    self.read_since_anchor
+    self.lease_guard.read_since_anchor
   }
 
   /// The Safe linearizable-read confirmation path: register the read against the heartbeat-ack

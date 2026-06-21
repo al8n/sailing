@@ -1408,7 +1408,7 @@ fn leaseguard_pending_snapshot_folds_window_at_receipt() {
   // The destructive install is DEFERRED (no `handle_storage`, so the blob is not yet durable and
   // `install_snapshot_now` has NOT run), but the window is folded at receipt.
   assert_eq!(
-    ep.max_lease_window, 350_000_000,
+    ep.lease_guard.max_lease_window, 350_000_000,
     "the snapshot's lease window is folded at receipt, before the deferred install completes"
   );
 }
@@ -1457,7 +1457,10 @@ fn leaseguard_duplicate_append_folds_a_newly_visible_window() {
   // First copy carries a ZERO window (a field-stripped / pre-upgrade entry).
   ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, ae(0));
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
-  assert_eq!(ep.max_lease_window, 0, "stored copy had a zero window");
+  assert_eq!(
+    ep.lease_guard.max_lease_window, 0,
+    "stored copy had a zero window"
+  );
   // A DUPLICATE (same index+term) from a LeaseGuard-aware leader carries the real window.
   ep.handle_message(
     Instant::ORIGIN,
@@ -1467,7 +1470,7 @@ fn leaseguard_duplicate_append_folds_a_newly_visible_window() {
     ae(350_000_000),
   );
   assert_eq!(
-    ep.max_lease_window, 350_000_000,
+    ep.lease_guard.max_lease_window, 350_000_000,
     "the duplicate's lease_window is folded even though the entry was already present"
   );
 }
@@ -1512,7 +1515,7 @@ fn leaseguard_duplicate_snapshot_folds_a_newly_visible_window() {
   // First receipt carries a ZERO bound (stale / field-stripped); install is left pending.
   ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, is(0));
   assert_eq!(
-    ep.max_lease_window, 0,
+    ep.lease_guard.max_lease_window, 0,
     "first snapshot carried a zero bound"
   );
   // A DUPLICATE at the same boundary carries the real bound — folded before the duplicate guard returns.
@@ -1524,7 +1527,7 @@ fn leaseguard_duplicate_snapshot_folds_a_newly_visible_window() {
     is(350_000_000),
   );
   assert_eq!(
-    ep.max_lease_window, 350_000_000,
+    ep.lease_guard.max_lease_window, 350_000_000,
     "the duplicate snapshot's carried bound is folded even though the install is a duplicate"
   );
 }

@@ -448,9 +448,9 @@ fn restart_propagates_unwalled_floor_ungated_across_tiers() {
       &mut stable,
     );
     (
-      ep.max_unwalled_lease_window,
-      ep.max_wall_plus_window,
-      ep.max_lease_window,
+      ep.lease_guard.max_unwalled_lease_window,
+      ep.lease_guard.max_wall_plus_window,
+      ep.lease_guard.max_lease_window,
     )
   }
 

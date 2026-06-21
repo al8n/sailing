@@ -99,9 +99,9 @@ where
     // A successor that compacts past — or installs — these entries then still covers any deposed
     // leader's lease on a now-unavailable entry.
     let mut meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
-      .with_max_lease_window(self.max_lease_window)
-      .with_max_wall_plus_window(self.max_wall_plus_window)
-      .with_max_unwalled_lease_window(self.max_unwalled_lease_window);
+      .with_max_lease_window(self.lease_guard.max_lease_window)
+      .with_max_wall_plus_window(self.lease_guard.max_wall_plus_window)
+      .with_max_unwalled_lease_window(self.lease_guard.max_unwalled_lease_window);
     // Carry the read mode EXPLICITLY only if a committed SetReadMode has applied (provenance). A
     // non-migrated node leaves it absent, so a restart from this snapshot falls back to the static config
     // — the presence bit then means "a migration was compacted", not merely "whatever mode was active".
@@ -152,13 +152,20 @@ where
     // (the bound is just a number; a corrupt snapshot poisons below and an inert node never leads), and
     // monotonic so the later re-folds are harmless idempotent re-raises. (Durable cross-restart
     // survival of a stripped bound is the fresh-cluster / matched-schema contract; see WIRE.md.)
-    self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
-    self.max_wall_plus_window = self.max_wall_plus_window.max(meta.max_wall_plus_window());
+    self.lease_guard.max_lease_window = self
+      .lease_guard
+      .max_lease_window
+      .max(meta.max_lease_window());
+    self.lease_guard.max_wall_plus_window = self
+      .lease_guard
+      .max_wall_plus_window
+      .max(meta.max_wall_plus_window());
     // The unwalled fallback bound — folded UNGATED, like `max_lease_window` above. An ENTRY-property
     // floor (every wall-absent lease entry folds itself on every node), so a snapshot's carried value
     // is already complete. A pre-FIELD snapshot (no `max_unwalled` field at all) is a mixed-version
     // case the Labeled handshake rejects.
-    self.max_unwalled_lease_window = self
+    self.lease_guard.max_unwalled_lease_window = self
+      .lease_guard
       .max_unwalled_lease_window
       .max(meta.max_unwalled_lease_window());
 
@@ -273,13 +280,20 @@ where
     // stale-drop, like `durable_snapshot_index`, so even a dropped-stale install contributes its
     // bound (the sender held entries this follower may not have all of). Monotonic, so the redundant
     // raise from an already-covered install is harmless.
-    self.max_lease_window = self.max_lease_window.max(meta.max_lease_window());
-    self.max_wall_plus_window = self.max_wall_plus_window.max(meta.max_wall_plus_window());
+    self.lease_guard.max_lease_window = self
+      .lease_guard
+      .max_lease_window
+      .max(meta.max_lease_window());
+    self.lease_guard.max_wall_plus_window = self
+      .lease_guard
+      .max_wall_plus_window
+      .max(meta.max_wall_plus_window());
     // The unwalled fallback bound — folded UNGATED, like `max_lease_window` above. An ENTRY-property
     // floor (every wall-absent lease entry folds itself on every node), so a snapshot's carried value
     // is already complete. A pre-FIELD snapshot (no `max_unwalled` field at all) is a mixed-version
     // case the Labeled handshake rejects.
-    self.max_unwalled_lease_window = self
+    self.lease_guard.max_unwalled_lease_window = self
+      .lease_guard
       .max_unwalled_lease_window
       .max(meta.max_unwalled_lease_window());
     // Completion-time staleness re-check (mirror the receipt-time guard): in-window AppendEntries can
