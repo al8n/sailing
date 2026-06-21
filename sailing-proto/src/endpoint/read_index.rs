@@ -313,7 +313,7 @@ where
     // `inherited_serve_armed` (captured at election) folds in BOTH the valid-active-failover-tier check
     // AND that the E′-inflated commit-wait fits below the election timeout — so an unvalidated config or
     // an over-large inherited window degrades to Safe rather than serving.
-    if self.poisoned
+    if self.poison.poisoned
       || self.role != Role::Leader
       || self.lease_guard.commit_wait_until.is_none()
       || !self.lease_guard.inherited_serve_armed
@@ -493,7 +493,7 @@ where
     // `Ok(())` here would violate the `read_index` contract ("accepted onto a confirmation path"):
     // the promised acknowledgement never arrives and the caller blocks forever. Reject up front,
     // before any state change, so the caller learns no confirmation is coming.
-    if self.poisoned {
+    if self.poison.poisoned {
       return Err(crate::ReadIndexError::Poisoned);
     }
     match self.role {
@@ -635,7 +635,7 @@ where
   /// validated `ReadIndexResp` completion — routes through here so the poison check lives in one
   /// place. Mirrors `send`'s central emit-halt for the event channel.
   pub(crate) fn emit_read_state(&mut self, index: Index, context: Bytes) {
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     self

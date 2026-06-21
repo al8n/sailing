@@ -558,7 +558,7 @@ where
     S: StableStore<NodeId = I>,
   {
     let now: crate::Now = now.into();
-    if self.poisoned {
+    if self.poison.poisoned {
       return Err(crate::ProposeError::Poisoned);
     }
     if !self.role.is_leader() {
@@ -687,7 +687,7 @@ where
           .unwrap_or(false));
     // A fatal term-read inside the consistency check poisoned us; stop before emitting any reply —
     // a poisoned node must not send (the later dispatch no-ops, but this in-flight handler must too).
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
 

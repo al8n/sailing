@@ -791,6 +791,19 @@ struct LeaseGuardState {
   read_since_anchor: bool,
 }
 
+/// The fail-stop state, grouped out of `Endpoint`.
+#[derive(Debug, Default)]
+struct Poison {
+  /// Sticky fatal error: once set, all `handle_*` are no-ops. The fast-path flag checked by
+  /// every `handle_*` guard; the cause is recorded separately in `poison_reason`.
+  poisoned: bool,
+  /// The CLASS of the *first* fatal failure that poisoned this node, or `None` if healthy.
+  /// First-cause-wins: a later poison never clobbers the original diagnosis. Surfaced to the
+  /// driver via `poison_reason()` so an operator can distinguish (e.g.) a corrupt snapshot
+  /// from an FSM bug from a disk read error.
+  poison_reason: Option<PoisonReason>,
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -879,14 +892,8 @@ where
   /// `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init empty
   /// in `new` and `restart`.
   inflight_append_upto: BTreeMap<crate::OpId, Index>,
-  /// Sticky fatal error: once set, all `handle_*` are no-ops. The fast-path flag checked by
-  /// every `handle_*` guard; the cause is recorded separately in `poison_reason`.
-  poisoned: bool,
-  /// The CLASS of the *first* fatal failure that poisoned this node, or `None` if healthy.
-  /// First-cause-wins: a later poison never clobbers the original diagnosis. Surfaced to the
-  /// driver via `poison_reason()` so an operator can distinguish (e.g.) a corrupt snapshot
-  /// from an FSM bug from a disk read error.
-  poison_reason: Option<PoisonReason>,
+  /// The fail-stop state (poisoned flag + first-cause reason).
+  poison: Poison,
   /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
   /// is durable (crash-safe: we never compact before the snapshot write completes).
   ///
@@ -1075,8 +1082,7 @@ where
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
       inflight_append_upto: BTreeMap::new(),
-      poisoned: false,
-      poison_reason: None,
+      poison: Poison::default(),
       pending_compact: None,
       snapshot_resend_after: BTreeMap::new(),
       durable: DurablePromises {
@@ -1360,7 +1366,7 @@ where
     // the EGRESS (here), not only at `send`'s enqueue: a handler can queue a message (e.g. a leader
     // broadcasts heartbeats) and then hit a fatal op later in the SAME dispatch, and those queued
     // messages must never reach the wire from a dead node.
-    if self.poisoned {
+    if self.poison.poisoned {
       return None;
     }
     self.outgoing.pop_front()
@@ -1371,7 +1377,7 @@ where
   pub fn poll_event(&mut self) -> Option<Event<I, F::Response>> {
     // Same egress emit-halt as `poll_message`: a poisoned node completes no reads and surfaces no
     // events (a queued `ReadState` from before a mid-dispatch poison must not leak).
-    if self.poisoned {
+    if self.poison.poisoned {
       return None;
     }
     self.events.pop_front()
@@ -1424,7 +1430,7 @@ where
   pub fn poll_timeout(&self) -> Option<Instant> {
     // A poisoned node has nothing to service; returning `None` also avoids a busy-loop where a
     // driver re-feeds a stale deadline that `handle_timeout` no-ops without re-arming.
-    if self.poisoned {
+    if self.poison.poisoned {
       return None;
     }
     TimerKind::ALL
@@ -1448,14 +1454,14 @@ where
   /// poisoned, the original `reason` is preserved so the diagnosis is not clobbered by a
   /// downstream failure.
   fn poison(&mut self, reason: PoisonReason) {
-    self.poisoned = true;
-    self.poison_reason.get_or_insert(reason);
+    self.poison.poisoned = true;
+    self.poison.poison_reason.get_or_insert(reason);
   }
 
   /// Whether this node has hit an unrecoverable error.
   #[inline(always)]
   pub const fn is_poisoned(&self) -> bool {
-    self.poisoned
+    self.poison.poisoned
   }
 
   /// The CLASS of the first fatal failure that poisoned this node, or `None` if healthy.
@@ -1465,7 +1471,7 @@ where
   /// surface *why* a node died (a corrupt snapshot vs. an FSM bug vs. a storage read error).
   #[inline(always)]
   pub const fn poison_reason(&self) -> Option<PoisonReason> {
-    self.poison_reason
+    self.poison.poison_reason
   }
 
   /// The armed deadline for the given timer kind, regardless of whether it is serviceable now.
@@ -1493,7 +1499,7 @@ where
   ///   campaign, so their election timer firing is a silent no-op — we should not surface it).
   /// - `Transfer`: the leader services it only when a leader transfer is in progress.
   fn serviceable_now(&self, kind: TimerKind) -> bool {
-    if self.poisoned {
+    if self.poison.poisoned {
       return false;
     }
     match kind {
@@ -1524,7 +1530,7 @@ where
   /// per-handler guard. `poison()` only sets a flag and emits no event, so this drops the message
   /// silently; the driver surfaces the fault via `poison_reason()`.
   fn send(&mut self, to: I, msg: Message<I>) {
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     self.outgoing.push_back(Outgoing::new(to, msg));
@@ -1614,7 +1620,7 @@ where
     F::Snapshot: crate::Data,
   {
     let now: crate::Now = now.into();
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     self.debug_assert_queues_drained();
@@ -1787,7 +1793,7 @@ where
     S: StableStore<NodeId = I>,
   {
     let now: crate::Now = now.into();
-    if self.poisoned {
+    if self.poison.poisoned {
       return;
     }
     self.debug_assert_queues_drained();
@@ -1955,7 +1961,7 @@ where
       // Halt the drain the moment the node poisons (including a poison set EARLIER in the same
       // dispatch, e.g. by a storage completion processed just before this call): once fail-stopped,
       // the user FSM must not be re-invoked with further applies.
-      if self.poisoned {
+      if self.poison.poisoned {
         return;
       }
       // ONE byte-capped range fetch per pass (was one call per index), iterated BY REFERENCE (no

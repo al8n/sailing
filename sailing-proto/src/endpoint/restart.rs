@@ -412,8 +412,10 @@ where
       next_op_id: crate::OpId::first_of_epoch(boot_epoch),
       pending: BTreeMap::new(),
       inflight_append_upto: BTreeMap::new(),
-      poisoned,
-      poison_reason,
+      poison: Poison {
+        poisoned,
+        poison_reason,
+      },
       pending_compact: None,
       snapshot_resend_after: BTreeMap::new(),
       durable: DurablePromises {
@@ -458,7 +460,7 @@ where
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
-    if !ep.poisoned {
+    if !ep.poison.poisoned {
       ep.apply_committed(log);
     }
     // if this incarnation's enforcement window GREW the durable floor (a config grow, or a legacy
@@ -466,7 +468,7 @@ where
     // here. `submit_write` records the watermark so the advertise gate holds at ZERO until it drains. On a
     // same/shrunk-config restart the floor already equals the recovered value, so this is a no-op (no
     // write, no advertise stall). Skipped when poisoned (no side effects from a poisoned restart).
-    if !ep.poisoned && ep.durable.lease_support_floor > ep.durable.durable_lease_support {
+    if !ep.poison.poisoned && ep.durable.lease_support_floor > ep.durable.durable_lease_support {
       let opid = ep.mint_op_id();
       // The `submit_write` choke-point `raise`s `ep.durable.lease_support_floor` onto this write, recording the
       // floor AND upgrading a legacy `Unrecorded` recovered record to `Recorded` (the self-heal).

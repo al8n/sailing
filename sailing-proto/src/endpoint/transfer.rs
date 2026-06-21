@@ -31,7 +31,7 @@ where
     S: StableStore<NodeId = I>,
   {
     let now: crate::Now = now.into();
-    if self.poisoned {
+    if self.poison.poisoned {
       return Err(crate::TransferError::Poisoned);
     }
     if !self.role.is_leader() {
