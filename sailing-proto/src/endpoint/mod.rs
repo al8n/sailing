@@ -1235,17 +1235,14 @@ where
   }
 }
 
+// No `I` bound: these neither key by, encode, nor clone a node id — they read scalar state, move
+// id-bearing values without inspecting them, or touch storage that is generic over `I`. `I: NodeId`
+// lives only on the sibling block whose methods reach into `Config`/`Tracker`/`Message` (all
+// `I: NodeId`-gated) or clone an id. `F: StateMachine` is the struct's required bound, kept here.
 impl<I, F, R> Endpoint<I, F, R>
 where
-  I: NodeId,
   F: StateMachine,
 {
-  /// This node's id.
-  #[inline(always)]
-  pub fn id(&self) -> I {
-    self.config.id()
-  }
-
   /// The current role.
   #[inline(always)]
   pub const fn role(&self) -> Role {
@@ -1256,12 +1253,6 @@ where
   #[inline(always)]
   pub const fn term(&self) -> Term {
     self.term
-  }
-
-  /// The believed leader, if any.
-  #[inline(always)]
-  pub fn leader(&self) -> Option<I> {
-    self.leader.cheap_clone()
   }
 
   /// The LeaseGuard append-timestamp to stamp on a new leader entry: the leader's clock (nanos
@@ -1278,71 +1269,6 @@ where
     } else {
       0
     }
-  }
-
-  /// The LeaseGuard commit-wait window (the exact `Δ·(Δ+ε)/(Δ−ε)`, nanos; see
-  /// [`Config::clock_drift_bound`]) this leader stamps into every entry it appends — how long a
-  /// successor must wait, from a lower bound on the entry's creation, to cover THIS leader's
-  /// read-lease on it. `0` (proto-omitted) when
-  /// LeaseGuard is inactive/invalid: such a leader serves no lease reads, so no successor need wait
-  /// for it (a `0` contribution to the inherited max is correct, not just safe).
-  pub(crate) fn lease_window_stamp(&self) -> u64 {
-    // The EXACT commit-wait window `Δ·(Δ+ε)/(Δ−ε)`; the single source of truth lives in `Config` so
-    // stamping, the read gate, and validation never diverge. `0` when LeaseGuard is inactive/invalid.
-    self
-      .config
-      .leaseguard_commit_wait_ns(self.reads.active_read_mode)
-      .unwrap_or(0)
-  }
-
-  /// The LeaseGuard FAILOVER wall stamp for a new leader entry: the leader's SYNCHRONIZED wall
-  /// reading (nanos since the cluster epoch) when the failover tier is ACTIVE, else `0` (absent on the
-  /// wire). Distinct from [`lease_stamp`](Self::lease_stamp), which reads the per-node MONOTONIC clock
-  /// for the same-leader gate; this is the CROSS-LEADER wall the inherited-read / precise-anchor tier
-  /// compares.
-  ///
-  /// Gated on the centralized [`Config::failover_tier_valid`](crate::Config::failover_tier_valid) (the
-  /// SAME predicate the runtime `failover_tier_active`, the serve/arming, and `Config::validate` use —
-  /// called directly here as this impl block's bounds do not include the `failover_tier_active`
-  /// convenience) — NOT the raw `bounded_clock_uncertainty` option. Otherwise a config the crate REJECTS
-  /// (e.g. valid timing but
-  /// `ε_unc ≥ Δ`) would still emit nonzero `wall_timestamp`s, which a VALID successor would fold into
-  /// `max_wall_plus_window` and trust as an inherited-read / release horizon — a rejected config seeding
-  /// the failover tier. FAIL-CLOSED: if the tier is active but the caller supplied no wall
-  /// (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never a falsely-fresh
-  /// stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
-  pub(crate) fn lease_wall_stamp(&self, now: Now) -> u64 {
-    if self.config.failover_tier_valid(self.reads.active_read_mode) {
-      debug_assert!(
-        !now.wall().is_absent(),
-        "LeaseGuard failover tier is active but the caller supplied no synchronized wall (Now::monotonic)"
-      );
-      now.wall().as_nanos()
-    } else {
-      0
-    }
-  }
-
-  /// The validated LeaseGuard `(lease_duration Δ, clock_drift_bound ε)` when the mode is ACTIVE, else
-  /// `None`. Active means the config yields a valid commit-wait window — both knobs present, `ε < Δ`,
-  /// and the exact window `Δ·(Δ+ε)/(Δ−ε)` fits the `u64` field AND is below the election timeout (the
-  /// single check lives in [`Config::leaseguard_commit_wait_ns`]). The mode serves lease reads,
-  /// stamps the per-entry window, and arms the commit-wait ONLY when active; an invalid/incomplete
-  /// config DEGRADES TO SAFE — a missing knob is never coerced to zero, no lease fast-path runs.
-  ///
-  /// The `window < election_timeout` bound is a LIVENESS guard (a fresh leader commits before a
-  /// follower could depose it). Cross-leader SAFETY (covering a deposed leader's lease) rests on the
-  /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX), needing no assumption
-  /// about any other node's config. Gated HERE, not only in the optional `Config::validate`, so an
-  /// unvalidated config degrades to Safe. Returns `(Δ, ε)` for the read gate's same-leader check.
-  pub(crate) fn leaseguard_timing(&self) -> Option<(Duration, Duration)> {
-    self
-      .config
-      .leaseguard_commit_wait_ns(self.reads.active_read_mode)?;
-    Some((
-      self.config.lease_duration()?,
-      self.config.clock_drift_bound()?,
-    ))
   }
 
   /// The read mode CURRENTLY IN EFFECT — the last applied `SetReadMode` mode, or the `Config` default if
@@ -1365,44 +1291,6 @@ where
   #[cfg(test)]
   pub(crate) fn set_lease_valid_until_for_test(&mut self, until: Option<Instant>) {
     self.check_quorum_lease.lease_valid_until = until;
-  }
-
-  #[cfg(test)]
-  pub(crate) fn inject_pending_read_for_test(&mut self, context: bytes::Bytes) {
-    let leader = self.config.id();
-    let _ = self
-      .reads
-      .read_only
-      .add_request(self.commit, context, None, leader);
-  }
-
-  #[cfg(test)]
-  pub(crate) fn pending_read_count(&self) -> usize {
-    self.reads.read_only.pending_len()
-  }
-
-  /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
-  /// identity changes, clears reads forwarded to the previous leader (the forward target is
-  /// gone; re-issue against the new belief) and emits [`LeaderChanged`](crate::LeaderChanged)
-  /// carrying the CURRENT term — so callers adopting a term alongside the leader must bump
-  /// `self.term` FIRST. `None` transitions are emitted like any other: a campaign start, a
-  /// check-quorum step-down, a higher-term adoption, and a leader's self-removal all make a
-  /// known leader unknown, and an embedder routing on the hint must hear about it rather than
-  /// infer it from silence. A higher-term message from a leader therefore surfaces an ordered
-  /// PAIR in one drain — `(term, None)` at adoption, then `(term, Some(sender))` from the
-  /// handler — the honest transition sequence, deduplicated only on identity.
-  pub(crate) fn set_leader(&mut self, leader: Option<I>) {
-    if self.leader == leader {
-      return;
-    }
-    self.leader = leader.cheap_clone();
-    self.reads.forwarded_reads.clear();
-    self
-      .outputs
-      .events
-      .push_back(Event::LeaderChanged(crate::LeaderChanged::new(
-        self.term, leader,
-      )));
   }
 
   /// The current commit index — the highest log index this node believes is committed
@@ -1534,28 +1422,6 @@ where
     any
   }
 
-  /// The earliest deadline the current `(role, state)` will ACTUALLY service in
-  /// `handle_timeout` (the §8 timer-wedge defense).
-  ///
-  /// Only deadlines that `serviceable_now` considers active for the current role+state are
-  /// candidates; the minimum of those is returned.  A driver that feeds `poll_timeout` back
-  /// into `handle_timeout` is guaranteed to make progress: every returned deadline will be
-  /// re-armed to a strictly-future instant (or cleared) by the dispatch, so the loop never
-  /// busy-spins on a stale deadline.
-  #[inline]
-  pub fn poll_timeout(&self) -> Option<Instant> {
-    // A poisoned node has nothing to service; returning `None` also avoids a busy-loop where a
-    // driver re-feeds a stale deadline that `handle_timeout` no-ops without re-arming.
-    if self.poison.poisoned {
-      return None;
-    }
-    TimerKind::ALL
-      .iter()
-      .filter(|&&k| self.serviceable_now(k))
-      .filter_map(|&k| self.deadline_of(k))
-      .min()
-  }
-
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
   fn mint_op_id(&mut self) -> OpId {
     let id = self.next_op_id;
@@ -1598,6 +1464,182 @@ where
       TimerKind::Transfer => self.transfer.transfer_deadline,
       TimerKind::CommitWait => self.lease_guard.commit_wait_until,
     }
+  }
+
+  /// The single term-read choke-point. `LogStore::term` returning `Err` is a FATAL storage failure
+  /// (per the trait contract) — never "absent" — so every term read in the core funnels through here:
+  /// on `Err` the node poisons (`PoisonReason::LogTerm`) and returns `None`, and the caller
+  /// short-circuits. This replaces the scattered `log.term(idx).unwrap_or(<default>)` reads, each of
+  /// which silently swallowed a fatal error into a fabricated default — the defect class behind the
+  /// `last_log` and `on_append_entries` term reads. An index that legitimately has no
+  /// entry (index 0, out of range, compacted) is the store's job to answer with `Ok`; `Err` is
+  /// reserved for I/O failure, and there is exactly one correct response to that: poison.
+  fn log_term<L: LogStore>(&mut self, log: &L, idx: Index) -> Option<Term> {
+    match log.term(idx) {
+      Ok(t) => Some(t),
+      Err(_) => {
+        self.poison(PoisonReason::LogTerm);
+        None
+      }
+    }
+  }
+
+  /// Our log's `(last_index, last_term)` for the §5.4.1 up-to-date comparison, or `None` on a genuine
+  /// storage error reading the last term of a NON-empty log (the node is poisoned via
+  /// [`Self::log_term`]).
+  ///
+  /// An empty log (`last_index == 0`) legitimately has last term `0`. A term-READ FAILURE on a
+  /// non-empty log poisons rather than fabricating a stale `Term::ZERO` (which could make us grant a
+  /// vote to a candidate whose log is actually staler than ours — a leader-completeness hazard).
+  fn last_log(&mut self, log: &impl LogStore) -> Option<(Index, Term)> {
+    let li = log.last_index();
+    if li == Index::ZERO {
+      return Some((Index::ZERO, Term::ZERO));
+    }
+    self.log_term(log, li).map(|lt| (li, lt))
+  }
+}
+
+impl<I, F, R> Endpoint<I, F, R>
+where
+  I: NodeId,
+  F: StateMachine,
+{
+  /// This node's id.
+  #[inline(always)]
+  pub fn id(&self) -> I {
+    self.config.id()
+  }
+
+  /// The believed leader, if any.
+  #[inline(always)]
+  pub fn leader(&self) -> Option<I> {
+    self.leader.cheap_clone()
+  }
+
+  /// The LeaseGuard commit-wait window (the exact `Δ·(Δ+ε)/(Δ−ε)`, nanos; see
+  /// [`Config::clock_drift_bound`]) this leader stamps into every entry it appends — how long a
+  /// successor must wait, from a lower bound on the entry's creation, to cover THIS leader's
+  /// read-lease on it. `0` (proto-omitted) when
+  /// LeaseGuard is inactive/invalid: such a leader serves no lease reads, so no successor need wait
+  /// for it (a `0` contribution to the inherited max is correct, not just safe).
+  pub(crate) fn lease_window_stamp(&self) -> u64 {
+    // The EXACT commit-wait window `Δ·(Δ+ε)/(Δ−ε)`; the single source of truth lives in `Config` so
+    // stamping, the read gate, and validation never diverge. `0` when LeaseGuard is inactive/invalid.
+    self
+      .config
+      .leaseguard_commit_wait_ns(self.reads.active_read_mode)
+      .unwrap_or(0)
+  }
+
+  /// The LeaseGuard FAILOVER wall stamp for a new leader entry: the leader's SYNCHRONIZED wall
+  /// reading (nanos since the cluster epoch) when the failover tier is ACTIVE, else `0` (absent on the
+  /// wire). Distinct from [`lease_stamp`](Self::lease_stamp), which reads the per-node MONOTONIC clock
+  /// for the same-leader gate; this is the CROSS-LEADER wall the inherited-read / precise-anchor tier
+  /// compares.
+  ///
+  /// Gated on the centralized [`Config::failover_tier_valid`](crate::Config::failover_tier_valid) (the
+  /// SAME predicate the runtime `failover_tier_active`, the serve/arming, and `Config::validate` use —
+  /// called directly here as this impl block's bounds do not include the `failover_tier_active`
+  /// convenience) — NOT the raw `bounded_clock_uncertainty` option. Otherwise a config the crate REJECTS
+  /// (e.g. valid timing but
+  /// `ε_unc ≥ Δ`) would still emit nonzero `wall_timestamp`s, which a VALID successor would fold into
+  /// `max_wall_plus_window` and trust as an inherited-read / release horizon — a rejected config seeding
+  /// the failover tier. FAIL-CLOSED: if the tier is active but the caller supplied no wall
+  /// (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never a falsely-fresh
+  /// stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
+  pub(crate) fn lease_wall_stamp(&self, now: Now) -> u64 {
+    if self.config.failover_tier_valid(self.reads.active_read_mode) {
+      debug_assert!(
+        !now.wall().is_absent(),
+        "LeaseGuard failover tier is active but the caller supplied no synchronized wall (Now::monotonic)"
+      );
+      now.wall().as_nanos()
+    } else {
+      0
+    }
+  }
+
+  /// The validated LeaseGuard `(lease_duration Δ, clock_drift_bound ε)` when the mode is ACTIVE, else
+  /// `None`. Active means the config yields a valid commit-wait window — both knobs present, `ε < Δ`,
+  /// and the exact window `Δ·(Δ+ε)/(Δ−ε)` fits the `u64` field AND is below the election timeout (the
+  /// single check lives in [`Config::leaseguard_commit_wait_ns`]). The mode serves lease reads,
+  /// stamps the per-entry window, and arms the commit-wait ONLY when active; an invalid/incomplete
+  /// config DEGRADES TO SAFE — a missing knob is never coerced to zero, no lease fast-path runs.
+  ///
+  /// The `window < election_timeout` bound is a LIVENESS guard (a fresh leader commits before a
+  /// follower could depose it). Cross-leader SAFETY (covering a deposed leader's lease) rests on the
+  /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX), needing no assumption
+  /// about any other node's config. Gated HERE, not only in the optional `Config::validate`, so an
+  /// unvalidated config degrades to Safe. Returns `(Δ, ε)` for the read gate's same-leader check.
+  pub(crate) fn leaseguard_timing(&self) -> Option<(Duration, Duration)> {
+    self
+      .config
+      .leaseguard_commit_wait_ns(self.reads.active_read_mode)?;
+    Some((
+      self.config.lease_duration()?,
+      self.config.clock_drift_bound()?,
+    ))
+  }
+
+  #[cfg(test)]
+  pub(crate) fn inject_pending_read_for_test(&mut self, context: bytes::Bytes) {
+    let leader = self.config.id();
+    let _ = self
+      .reads
+      .read_only
+      .add_request(self.commit, context, None, leader);
+  }
+
+  #[cfg(test)]
+  pub(crate) fn pending_read_count(&self) -> usize {
+    self.reads.read_only.pending_len()
+  }
+
+  /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
+  /// identity changes, clears reads forwarded to the previous leader (the forward target is
+  /// gone; re-issue against the new belief) and emits [`LeaderChanged`](crate::LeaderChanged)
+  /// carrying the CURRENT term — so callers adopting a term alongside the leader must bump
+  /// `self.term` FIRST. `None` transitions are emitted like any other: a campaign start, a
+  /// check-quorum step-down, a higher-term adoption, and a leader's self-removal all make a
+  /// known leader unknown, and an embedder routing on the hint must hear about it rather than
+  /// infer it from silence. A higher-term message from a leader therefore surfaces an ordered
+  /// PAIR in one drain — `(term, None)` at adoption, then `(term, Some(sender))` from the
+  /// handler — the honest transition sequence, deduplicated only on identity.
+  pub(crate) fn set_leader(&mut self, leader: Option<I>) {
+    if self.leader == leader {
+      return;
+    }
+    self.leader = leader.cheap_clone();
+    self.reads.forwarded_reads.clear();
+    self
+      .outputs
+      .events
+      .push_back(Event::LeaderChanged(crate::LeaderChanged::new(
+        self.term, leader,
+      )));
+  }
+
+  /// The earliest deadline the current `(role, state)` will ACTUALLY service in
+  /// `handle_timeout` (the §8 timer-wedge defense).
+  ///
+  /// Only deadlines that `serviceable_now` considers active for the current role+state are
+  /// candidates; the minimum of those is returned.  A driver that feeds `poll_timeout` back
+  /// into `handle_timeout` is guaranteed to make progress: every returned deadline will be
+  /// re-armed to a strictly-future instant (or cleared) by the dispatch, so the loop never
+  /// busy-spins on a stale deadline.
+  #[inline]
+  pub fn poll_timeout(&self) -> Option<Instant> {
+    // A poisoned node has nothing to service; returning `None` also avoids a busy-loop where a
+    // driver re-feeds a stale deadline that `handle_timeout` no-ops without re-arming.
+    if self.poison.poisoned {
+      return None;
+    }
+    TimerKind::ALL
+      .iter()
+      .filter(|&&k| self.serviceable_now(k))
+      .filter_map(|&k| self.deadline_of(k))
+      .min()
   }
 
   /// Whether the current `(role, state)` will service `kind` in `handle_timeout`.
@@ -1658,39 +1700,6 @@ where
     // The leader replicates to learners too; quorum is still computed over voters only
     // (tracker.quorum_committed / tracker.vote_result read only the voter halves).
     self.tracker.ids().into_iter().filter(move |p| *p != me)
-  }
-
-  /// The single term-read choke-point. `LogStore::term` returning `Err` is a FATAL storage failure
-  /// (per the trait contract) — never "absent" — so every term read in the core funnels through here:
-  /// on `Err` the node poisons (`PoisonReason::LogTerm`) and returns `None`, and the caller
-  /// short-circuits. This replaces the scattered `log.term(idx).unwrap_or(<default>)` reads, each of
-  /// which silently swallowed a fatal error into a fabricated default — the defect class behind the
-  /// `last_log` and `on_append_entries` term reads. An index that legitimately has no
-  /// entry (index 0, out of range, compacted) is the store's job to answer with `Ok`; `Err` is
-  /// reserved for I/O failure, and there is exactly one correct response to that: poison.
-  fn log_term<L: LogStore>(&mut self, log: &L, idx: Index) -> Option<Term> {
-    match log.term(idx) {
-      Ok(t) => Some(t),
-      Err(_) => {
-        self.poison(PoisonReason::LogTerm);
-        None
-      }
-    }
-  }
-
-  /// Our log's `(last_index, last_term)` for the §5.4.1 up-to-date comparison, or `None` on a genuine
-  /// storage error reading the last term of a NON-empty log (the node is poisoned via
-  /// [`Self::log_term`]).
-  ///
-  /// An empty log (`last_index == 0`) legitimately has last term `0`. A term-READ FAILURE on a
-  /// non-empty log poisons rather than fabricating a stale `Term::ZERO` (which could make us grant a
-  /// vote to a candidate whose log is actually staler than ours — a leader-completeness hazard).
-  fn last_log(&mut self, log: &impl LogStore) -> Option<(Index, Term)> {
-    let li = log.last_index();
-    if li == Index::ZERO {
-      return Some((Index::ZERO, Term::ZERO));
-    }
-    self.log_term(log, li).map(|lt| (li, lt))
   }
 
   /// The leader's replication [`PeerProgress`] for `peer` (its match/next index, flow-control state,
