@@ -5,7 +5,7 @@ use super::stream::{Intake, RecordIo, sealed};
 use crate::Instant;
 use rustls::{ClientConfig, Connection, ServerConfig, pki_types::ServerName};
 use std::{
-  io::{Read, Write},
+  io::{ErrorKind, Read, Write},
   sync::Arc,
   vec::Vec,
 };
@@ -89,7 +89,7 @@ impl RecordIo for TlsRecords {
         // AppendEntries batch — NOT a fault: report Pending so the caller drains plaintext and
         // re-feeds the remainder. Treating it as fatal would kill the connection on every
         // consensus message over ~16 KiB, in a permanent redial/kill flap.
-        Err(e) if e.kind() == std::io::ErrorKind::Other => {
+        Err(e) if e.kind() == ErrorKind::Other => {
           return Intake::Pending(input.len() - rest.len());
         }
         Err(_) => {
@@ -147,7 +147,7 @@ impl RecordIo for TlsRecords {
           break;
         }
         Ok(n) => out.truncate(len + n),
-        Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+        Err(ref e) if e.kind() == ErrorKind::WouldBlock => {
           out.truncate(len);
           break;
         }

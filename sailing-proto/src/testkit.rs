@@ -1,11 +1,11 @@
 //! Throwaway store impls for proto-level unit tests. Not compiled outside `#[cfg(test)]`.
 use crate::{
-  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotMeta,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, NodeId, OpId, SnapshotMeta,
   StableDone, StableStore, Term,
 };
 use bytes::Bytes;
-use core::cell::Cell;
-use std::collections::VecDeque;
+use core::{cell::Cell, convert::Infallible, ops::Range, time::Duration};
+use std::{collections::VecDeque, vec::Vec};
 
 /// A no-op log that is always empty — last_index=0, term(any)=Term::ZERO.
 ///
@@ -16,7 +16,7 @@ use std::collections::VecDeque;
 pub(crate) struct NoopLog;
 
 impl LogStore for NoopLog {
-  type Error = core::convert::Infallible;
+  type Error = Infallible;
 
   fn first_index(&self) -> Index {
     Index::new(1)
@@ -30,11 +30,7 @@ impl LogStore for NoopLog {
     Ok(Term::ZERO)
   }
 
-  fn entries(
-    &self,
-    _range: core::ops::Range<Index>,
-    _max_bytes: u64,
-  ) -> Result<EntriesRead<'_>, Self::Error> {
+  fn entries(&self, _range: Range<Index>, _max_bytes: u64) -> Result<EntriesRead<'_>, Self::Error> {
     Ok(EntriesRead::Ready(MaybeOwned::Borrowed(&[])))
   }
 
@@ -57,7 +53,7 @@ impl LogStore for NoopLog {
 /// Starts at `Index::ZERO`. `compacted_term` is the term at `offset`.
 #[derive(Debug, Default)]
 pub(crate) struct VecLog {
-  entries: std::vec::Vec<Entry>,
+  entries: Vec<Entry>,
   completions: VecDeque<LogDone>,
   /// Index before entries[0]. Starts at ZERO (no compaction).
   offset: Index,
@@ -102,7 +98,7 @@ impl VecLog {
 }
 
 impl LogStore for VecLog {
-  type Error = core::convert::Infallible;
+  type Error = Infallible;
 
   fn first_index(&self) -> Index {
     Index::new(self.offset.get() + 1)
@@ -127,11 +123,7 @@ impl LogStore for VecLog {
     Ok(self.entries[pos].term())
   }
 
-  fn entries(
-    &self,
-    range: core::ops::Range<Index>,
-    _max_bytes: u64,
-  ) -> Result<EntriesRead<'_>, Self::Error> {
+  fn entries(&self, range: Range<Index>, _max_bytes: u64) -> Result<EntriesRead<'_>, Self::Error> {
     let start = range.start.get();
     let end = range.end.get();
     let offset = self.offset.get();
@@ -331,11 +323,7 @@ impl LogStore for FailTermLog {
     Ok(self.inner.term(index).expect("VecLog::term is Infallible"))
   }
 
-  fn entries(
-    &self,
-    range: core::ops::Range<Index>,
-    max_bytes: u64,
-  ) -> Result<EntriesRead<'_>, Self::Error> {
+  fn entries(&self, range: Range<Index>, max_bytes: u64) -> Result<EntriesRead<'_>, Self::Error> {
     self.observed_max_bytes.set(max_bytes);
     self.observed_max_range_width.set(
       self
@@ -431,7 +419,7 @@ impl crate::StateMachine for CountSm {
   type Command = Bytes;
   type Response = usize;
   type Snapshot = u64;
-  type Error = core::convert::Infallible;
+  type Error = Infallible;
 
   fn apply(&mut self, _index: Index, _cmd: Bytes) -> Result<usize, Self::Error> {
     self.count += 1;
@@ -454,12 +442,12 @@ impl crate::StateMachine for CountSm {
 /// the candidate `Campaign` (become-leader gated on the self-vote being durable) and the follower
 /// `CastVote` — so a driver must call `handle_storage` to drain it.
 #[derive(Debug)]
-pub(crate) struct NoopStable<I: crate::NodeId = u64> {
+pub(crate) struct NoopStable<I: NodeId = u64> {
   hard_state: HardState<I>,
   completions: VecDeque<StableDone>,
 }
 
-impl<I: crate::NodeId> Default for NoopStable<I> {
+impl<I: NodeId> Default for NoopStable<I> {
   fn default() -> Self {
     Self {
       hard_state: HardState::initial(),
@@ -468,7 +456,7 @@ impl<I: crate::NodeId> Default for NoopStable<I> {
   }
 }
 
-impl<I: crate::NodeId> NoopStable<I> {
+impl<I: NodeId> NoopStable<I> {
   /// Seed the stable store with a specific (term, vote, commit). Used in restart tests.
   pub(crate) fn force_state(&mut self, term: Term, vote: Option<I>, commit: Index) {
     self.hard_state = HardState::initial()
@@ -478,9 +466,9 @@ impl<I: crate::NodeId> NoopStable<I> {
   }
 }
 
-impl<I: crate::NodeId> StableStore for NoopStable<I> {
+impl<I: NodeId> StableStore for NoopStable<I> {
   type NodeId = I;
-  type Error = core::convert::Infallible;
+  type Error = Infallible;
 
   fn hard_state(&self) -> HardState<I> {
     self.hard_state
@@ -540,7 +528,7 @@ pub(crate) struct AsyncStable {
   last_durable_reads: bool,
   /// The `lease_support` of every HardState actually handed to `submit_write` (post choke-point
   /// stamp). Lets a test assert the durable floor is monotone non-decreasing across all writes.
-  submitted_lease: std::vec::Vec<Option<core::time::Duration>>,
+  submitted_lease: Vec<Option<Duration>>,
 }
 
 impl Default for AsyncStable {
@@ -554,7 +542,7 @@ impl Default for AsyncStable {
       drop_next_snapshot_completion: false,
       fail_next_snapshot_durability: false,
       last_durable_reads: false,
-      submitted_lease: std::vec::Vec::new(),
+      submitted_lease: Vec::new(),
     }
   }
 }
@@ -595,7 +583,7 @@ impl AsyncStable {
   }
 
   /// The `lease_support` of every HardState handed to `submit_write`, in order.
-  pub(crate) fn submitted_lease_supports(&self) -> &[Option<core::time::Duration>] {
+  pub(crate) fn submitted_lease_supports(&self) -> &[Option<Duration>] {
     &self.submitted_lease
   }
 
@@ -626,7 +614,7 @@ impl AsyncStable {
 
 impl StableStore for AsyncStable {
   type NodeId = u64;
-  type Error = core::convert::Infallible;
+  type Error = Infallible;
 
   fn hard_state(&self) -> HardState<u64> {
     // A strict store returns the LAST-DURABLE state; the default models a submit-visible store.
