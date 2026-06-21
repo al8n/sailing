@@ -442,12 +442,12 @@ impl crate::StateMachine for CountSm {
 /// the candidate `Campaign` (become-leader gated on the self-vote being durable) and the follower
 /// `CastVote` — so a driver must call `handle_storage` to drain it.
 #[derive(Debug)]
-pub(crate) struct NoopStable<I: NodeId = u64> {
+pub(crate) struct NoopStable<I = u64> {
   hard_state: HardState<I>,
   completions: VecDeque<StableDone>,
 }
 
-impl<I: NodeId> Default for NoopStable<I> {
+impl<I> Default for NoopStable<I> {
   fn default() -> Self {
     Self {
       hard_state: HardState::initial(),
@@ -456,7 +456,7 @@ impl<I: NodeId> Default for NoopStable<I> {
   }
 }
 
-impl<I: NodeId> NoopStable<I> {
+impl<I> NoopStable<I> {
   /// Seed the stable store with a specific (term, vote, commit). Used in restart tests.
   pub(crate) fn force_state(&mut self, term: Term, vote: Option<I>, commit: Index) {
     self.hard_state = HardState::initial()

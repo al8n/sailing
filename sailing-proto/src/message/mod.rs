@@ -1,6 +1,6 @@
 //! Raft RPC messages. Payloads are named structs; `Message<I>` wraps them as newtype
 //! variants (no multi-field enum variants). Types only — behavior lives elsewhere.
-use crate::{Entry, Index, NodeId, ReadOnlyOption, Term, conf::ConfState};
+use crate::{CheapClone, Entry, Index, ReadOnlyOption, Term, conf::ConfState};
 use bytes::Bytes;
 use core::time::Duration;
 use std::vec::Vec;
@@ -16,7 +16,7 @@ pub struct AppendEntries<I> {
   leader_commit: Index,
 }
 
-impl<I: NodeId> AppendEntries<I> {
+impl<I: CheapClone> AppendEntries<I> {
   /// Construct.
   #[allow(clippy::too_many_arguments)]
   pub fn new(
@@ -85,7 +85,7 @@ pub struct AppendResponse<I> {
   match_index: Index,
 }
 
-impl<I: NodeId> AppendResponse<I> {
+impl<I: CheapClone> AppendResponse<I> {
   /// Construct.
   #[allow(clippy::too_many_arguments)]
   pub const fn new(
@@ -154,7 +154,7 @@ pub struct RequestVote<I> {
   leader_transfer: bool,
 }
 
-impl<I: NodeId> RequestVote<I> {
+impl<I: CheapClone> RequestVote<I> {
   /// Construct.
   #[allow(clippy::too_many_arguments)]
   pub const fn new(
@@ -221,7 +221,7 @@ pub struct VoteResponse<I> {
   reject: bool,
 }
 
-impl<I: NodeId> VoteResponse<I> {
+impl<I: CheapClone> VoteResponse<I> {
   /// Construct.
   pub const fn new(term: Term, from: I, pre_vote: bool, reject: bool) -> Self {
     Self {
@@ -267,7 +267,7 @@ pub struct Heartbeat<I> {
   lease_round: u64,
 }
 
-impl<I: NodeId> Heartbeat<I> {
+impl<I: CheapClone> Heartbeat<I> {
   /// Construct. `lease_round` defaults to 0; the leader sets it via [`Self::with_lease_round`].
   pub fn new(term: Term, leader: I, commit: Index, context: Bytes) -> Self {
     Self {
@@ -333,7 +333,7 @@ pub struct HeartbeatResponse<I> {
   lease_support: Duration,
 }
 
-impl<I: NodeId> HeartbeatResponse<I> {
+impl<I: CheapClone> HeartbeatResponse<I> {
   /// Construct. `lease_round` defaults to 0 and `lease_support` to ZERO; the follower echoes the
   /// heartbeat's round via [`Self::with_lease_round`] and advertises its lease support via
   /// [`Self::with_lease_support`].
@@ -434,7 +434,7 @@ pub struct SnapshotMeta<I> {
   read_only: Option<ReadOnlyOption>,
 }
 
-impl<I: NodeId> SnapshotMeta<I> {
+impl<I> SnapshotMeta<I> {
   /// Construct (`max_lease_window` defaults to `0`; set it with
   /// [`with_max_lease_window`](Self::with_max_lease_window) in LeaseGuard mode).
   pub fn new(last_index: Index, last_term: Term, conf: ConfState<I>) -> Self {
@@ -542,7 +542,7 @@ pub struct InstallSnapshot<I> {
   data: Bytes,
 }
 
-impl<I: NodeId> InstallSnapshot<I> {
+impl<I: CheapClone> InstallSnapshot<I> {
   /// Construct.
   pub fn new(term: Term, leader: I, snapshot: SnapshotMeta<I>, data: Bytes) -> Self {
     Self {
@@ -587,7 +587,7 @@ pub struct SnapshotResponse<I> {
   match_index: Index,
 }
 
-impl<I: NodeId> SnapshotResponse<I> {
+impl<I: CheapClone> SnapshotResponse<I> {
   /// Construct.
   pub const fn new(term: Term, from: I, reject: bool, match_index: Index) -> Self {
     Self {
@@ -634,7 +634,7 @@ pub struct TimeoutNow<I> {
   leader: I,
 }
 
-impl<I: NodeId> TimeoutNow<I> {
+impl<I: CheapClone> TimeoutNow<I> {
   /// Construct.
   pub const fn new(term: Term, leader: I) -> Self {
     Self { term, leader }
@@ -669,7 +669,7 @@ pub struct ReadIndex<I> {
   context: Bytes,
 }
 
-impl<I: NodeId> ReadIndex<I> {
+impl<I: CheapClone> ReadIndex<I> {
   /// Construct.
   pub fn new(term: Term, from: I, context: Bytes) -> Self {
     Self {
@@ -720,7 +720,7 @@ pub struct ReadIndexResponse<I> {
   reject: bool,
 }
 
-impl<I: NodeId> ReadIndexResponse<I> {
+impl<I: CheapClone> ReadIndexResponse<I> {
   /// Construct.
   ///
   /// `reject` is `true` when the leader is at its read back-pressure capacity and is declining
@@ -816,7 +816,7 @@ pub struct Outgoing<I> {
   message: Message<I>,
 }
 
-impl<I: NodeId> Outgoing<I> {
+impl<I: CheapClone> Outgoing<I> {
   /// Construct.
   pub const fn new(to: I, message: Message<I>) -> Self {
     Self { to, message }
@@ -841,7 +841,7 @@ impl<I: NodeId> Outgoing<I> {
   }
 }
 
-impl<I: NodeId> Message<I> {
+impl<I: CheapClone> Message<I> {
   /// The term carried by this message.
   ///
   /// Every variant carries a term field. For [`TimeoutNow`], [`ReadIndex`], and

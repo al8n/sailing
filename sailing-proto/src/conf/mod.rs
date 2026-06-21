@@ -7,7 +7,7 @@
 //! - [`ConfChangeSingle`] — a single add/remove operation.
 //! - [`ConfChange`] — the simple (v1) single-op change entry payload.
 //! - [`ConfChangeV2`] — the general (possibly multi-op / joint-consensus) change entry payload.
-use crate::NodeId;
+use crate::CheapClone;
 use bytes::Bytes;
 use std::{collections::BTreeSet, vec::Vec};
 
@@ -48,37 +48,7 @@ impl<I> Default for ConfState<I> {
   }
 }
 
-impl<I: NodeId> ConfState<I> {
-  /// Construct the full configuration state from all five fields.
-  ///
-  /// The sets are stored as-is; callers are responsible for deduplication if needed (the
-  /// `BTreeSet` type deduplicates automatically on insertion, but duplicate inputs in the
-  /// iterators are silently dropped).
-  pub fn new(
-    voters: impl IntoIterator<Item = I>,
-    learners: impl IntoIterator<Item = I>,
-    voters_outgoing: impl IntoIterator<Item = I>,
-    learners_next: impl IntoIterator<Item = I>,
-    auto_leave: bool,
-  ) -> Self {
-    Self {
-      voters: voters.into_iter().collect(),
-      learners: learners.into_iter().collect(),
-      voters_outgoing: voters_outgoing.into_iter().collect(),
-      learners_next: learners_next.into_iter().collect(),
-      auto_leave,
-    }
-  }
-
-  /// Convenience constructor for the common single-config (non-joint) case: only the voter
-  /// set is populated; all other fields take their default (empty / `false`).
-  pub fn from_voters(voters: impl IntoIterator<Item = I>) -> Self {
-    Self {
-      voters: voters.into_iter().collect(),
-      ..Default::default()
-    }
-  }
-
+impl<I> ConfState<I> {
   /// The current (or incoming) voter set.
   #[inline(always)]
   pub fn voters(&self) -> &BTreeSet<I> {
@@ -110,18 +80,6 @@ impl<I: NodeId> ConfState<I> {
     self.auto_leave
   }
 
-  /// Whether `id` is in the current (or incoming) voter set.
-  #[inline(always)]
-  pub fn is_voter(&self, id: &I) -> bool {
-    self.voters.contains(id)
-  }
-
-  /// Whether `id` is in the learner set.
-  #[inline(always)]
-  pub fn is_learner(&self, id: &I) -> bool {
-    self.learners.contains(id)
-  }
-
   /// Whether the cluster is currently in a joint (two-phase) configuration transition.
   ///
   /// A joint transition is active when `voters_outgoing` is non-empty.
@@ -140,6 +98,50 @@ impl<I: NodeId> ConfState<I> {
   #[inline(always)]
   pub fn is_empty(&self) -> bool {
     self.voters.is_empty()
+  }
+}
+
+impl<I: Ord> ConfState<I> {
+  /// Construct the full configuration state from all five fields.
+  ///
+  /// The sets are stored as-is; callers are responsible for deduplication if needed (the
+  /// `BTreeSet` type deduplicates automatically on insertion, but duplicate inputs in the
+  /// iterators are silently dropped).
+  pub fn new(
+    voters: impl IntoIterator<Item = I>,
+    learners: impl IntoIterator<Item = I>,
+    voters_outgoing: impl IntoIterator<Item = I>,
+    learners_next: impl IntoIterator<Item = I>,
+    auto_leave: bool,
+  ) -> Self {
+    Self {
+      voters: voters.into_iter().collect(),
+      learners: learners.into_iter().collect(),
+      voters_outgoing: voters_outgoing.into_iter().collect(),
+      learners_next: learners_next.into_iter().collect(),
+      auto_leave,
+    }
+  }
+
+  /// Convenience constructor for the common single-config (non-joint) case: only the voter
+  /// set is populated; all other fields take their default (empty / `false`).
+  pub fn from_voters(voters: impl IntoIterator<Item = I>) -> Self {
+    Self {
+      voters: voters.into_iter().collect(),
+      ..Default::default()
+    }
+  }
+
+  /// Whether `id` is in the current (or incoming) voter set.
+  #[inline(always)]
+  pub fn is_voter(&self, id: &I) -> bool {
+    self.voters.contains(id)
+  }
+
+  /// Whether `id` is in the learner set.
+  #[inline(always)]
+  pub fn is_learner(&self, id: &I) -> bool {
+    self.learners.contains(id)
   }
 
   /// Whether this is a valid, installable *live* configuration — the invariant a
@@ -259,7 +261,7 @@ pub struct ConfChangeSingle<I> {
   node: I,
 }
 
-impl<I: NodeId> ConfChangeSingle<I> {
+impl<I: CheapClone> ConfChangeSingle<I> {
   /// Construct from a change type and the target node id.
   #[inline(always)]
   pub fn new(ty: ConfChangeType, node: I) -> Self {
@@ -291,7 +293,7 @@ pub struct ConfChange<I> {
   context: Bytes,
 }
 
-impl<I: NodeId> ConfChange<I> {
+impl<I: CheapClone> ConfChange<I> {
   /// Construct from a change type, target node, and application context.
   #[inline(always)]
   pub fn new(ty: ConfChangeType, node: I, context: Bytes) -> Self {
@@ -343,7 +345,7 @@ pub struct ConfChangeV2<I> {
   context: Bytes,
 }
 
-impl<I: NodeId> ConfChangeV2<I> {
+impl<I> ConfChangeV2<I> {
   /// Construct from a transition, change list, and application context.
   #[inline(always)]
   pub fn new(

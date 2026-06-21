@@ -4,7 +4,7 @@
 //! These are the building blocks for commit-index advancement and vote tallying under both
 //! simple and joint-consensus configurations. Correctness is critical: the committed index
 //! and vote result ride directly on the safety of replication and leader election.
-use crate::{CheapClone, Index, NodeId};
+use crate::{CheapClone, Index};
 use std::collections::BTreeSet;
 
 /// The outcome of a quorum vote.
@@ -42,7 +42,7 @@ pub struct MajorityConfig<I> {
   ids: BTreeSet<I>,
 }
 
-impl<I: NodeId> MajorityConfig<I> {
+impl<I> MajorityConfig<I> {
   /// Construct from a set of member IDs.
   #[inline(always)]
   pub fn new(ids: BTreeSet<I>) -> Self {
@@ -68,13 +68,17 @@ impl<I: NodeId> MajorityConfig<I> {
   pub fn is_empty(&self) -> bool {
     self.ids.is_empty()
   }
+}
 
+impl<I: Ord> MajorityConfig<I> {
   /// Whether `id` is a member of this config.
   #[inline(always)]
   pub fn contains(&self, id: &I) -> bool {
     self.ids.contains(id)
   }
+}
 
+impl<I: CheapClone> MajorityConfig<I> {
   /// The largest index that a majority of members have matched (acked).
   ///
   /// Port of etcd `MajorityConfig.CommittedIndex`. Each member's acked index is obtained by
@@ -162,7 +166,7 @@ pub struct JointConfig<I> {
   outgoing: MajorityConfig<I>,
 }
 
-impl<I: NodeId> JointConfig<I> {
+impl<I> JointConfig<I> {
   /// Construct from explicit incoming and outgoing halves.
   #[inline(always)]
   pub fn new(incoming: MajorityConfig<I>, outgoing: MajorityConfig<I>) -> Self {
@@ -189,9 +193,14 @@ impl<I: NodeId> JointConfig<I> {
   pub fn outgoing(&self) -> &MajorityConfig<I> {
     &self.outgoing
   }
+}
 
+impl<I: CheapClone> JointConfig<I> {
   /// The union of all member IDs across both halves.
-  pub fn ids(&self) -> BTreeSet<I> {
+  pub fn ids(&self) -> BTreeSet<I>
+  where
+    I: Ord,
+  {
     self
       .incoming
       .ids

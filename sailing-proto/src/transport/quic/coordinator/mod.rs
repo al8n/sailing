@@ -35,7 +35,7 @@ use std::collections::BTreeSet;
 /// [`connect_with_server_name`](QuicCoordinator::connect_with_server_name) (paired with
 /// [`dangerous_custom_identity`](QuicCoordinator::dangerous_custom_identity) when the identity
 /// scheme changes too) and certs minted to match.
-fn sni_for<I: NodeId>(peer: &I, cluster: &ClusterId) -> String {
+fn sni_for<I: Data>(peer: &I, cluster: &ClusterId) -> String {
   use core::fmt::Write as _;
   let mut id = Vec::new();
   peer.encode(&mut id);
@@ -57,7 +57,7 @@ fn sni_for<I: NodeId>(peer: &I, cluster: &ClusterId) -> String {
 /// node itself. The transport meshes with every one of them, so the connection-cap floor is
 /// sized from this — not from the incoming voter set alone, which would undercount learners and
 /// joint transitions (and a node that is itself a learner).
-fn tracked_peer_count<I: NodeId>(conf: &crate::ConfState<I>, me: &I) -> usize {
+fn tracked_peer_count<I: Ord>(conf: &crate::ConfState<I>, me: &I) -> usize {
   let mut peers: BTreeSet<&I> = BTreeSet::new();
   peers.extend(conf.voters().iter());
   peers.extend(conf.voters_outgoing().iter());

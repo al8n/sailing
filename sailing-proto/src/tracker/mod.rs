@@ -3,9 +3,7 @@
 //! that computes the next configuration from a sequence of [`ConfChangeSingle`] operations.
 //!
 //! Faithful port of etcd `tracker/tracker.go` and `confchange/confchange.go`.
-use crate::{
-  CheapClone, ConfState, Index, JointConfig, MajorityConfig, NodeId, Progress, VoteResult,
-};
+use crate::{CheapClone, ConfState, Index, JointConfig, MajorityConfig, Progress, VoteResult};
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Runtime membership state: joint voter configuration, learner sets, and per-peer [`Progress`].
@@ -32,14 +30,14 @@ pub struct Tracker<I> {
   progress: BTreeMap<I, Progress>,
 }
 
-impl<I: NodeId> Default for Tracker<I> {
+impl<I> Default for Tracker<I> {
   /// An empty tracker (no voters, no learners, not in a joint transition).
   fn default() -> Self {
     Self::new()
   }
 }
 
-impl<I: NodeId> Tracker<I> {
+impl<I> Tracker<I> {
   /// Construct an empty tracker. Use [`Tracker::from_conf_state`] to bootstrap from a
   /// snapshot's [`ConfState`].
   pub fn new() -> Self {
@@ -52,6 +50,107 @@ impl<I: NodeId> Tracker<I> {
     }
   }
 
+  /// Whether the cluster is currently in a joint (two-phase) configuration transition.
+  pub fn is_joint(&self) -> bool {
+    !self.voters.outgoing().is_empty()
+  }
+
+  /// The full progress map (all voters + learners + learners_next).
+  #[allow(dead_code, reason = "exercised by unit tests; progress accessor")]
+  pub fn progress_map(&self) -> &BTreeMap<I, Progress> {
+    &self.progress
+  }
+
+  /// The joint voter configuration.
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
+  pub fn voters(&self) -> &JointConfig<I> {
+    &self.voters
+  }
+
+  /// The current learner set (not staged).
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
+  pub fn learners(&self) -> &BTreeSet<I> {
+    &self.learners
+  }
+
+  /// The staged learner set (waiting for `leave_joint`).
+  #[allow(
+    dead_code,
+    reason = "internal membership accessor; retained for completeness"
+  )]
+  pub fn learners_next(&self) -> &BTreeSet<I> {
+    &self.learners_next
+  }
+
+  /// Whether the joint config should be left automatically after it is committed.
+  pub fn auto_leave(&self) -> bool {
+    self.auto_leave
+  }
+}
+
+impl<I: Ord> Tracker<I> {
+  /// Reset every tracked member's `recent_active` to `false`, then set `leader_id`'s back to
+  /// `true` (the leader is always active to itself).
+  ///
+  /// Called at the start of each CheckQuorum window so that only peers heard from *in this
+  /// window* count toward the next `quorum_active` check.
+  pub fn reset_recent_active(&mut self, leader_id: I) {
+    for pr in self.progress.values_mut() {
+      pr.set_recent_active(false);
+    }
+    if let Some(pr) = self.progress.get_mut(&leader_id) {
+      pr.set_recent_active(true);
+    }
+  }
+
+  /// Whether `id` is a voter in either the incoming or outgoing joint-config half.
+  pub fn is_voter(&self, id: &I) -> bool {
+    self.voters.incoming().contains(id) || self.voters.outgoing().contains(id)
+  }
+
+  /// Whether `id` is a learner (not staged — see `is_learner_next`).
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
+  pub fn is_learner(&self, id: &I) -> bool {
+    self.learners.contains(id)
+  }
+
+  /// Whether `id` is staged in `learners_next` (will become a learner after `leave_joint`).
+  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
+  pub fn is_learner_next(&self, id: &I) -> bool {
+    self.learners_next.contains(id)
+  }
+
+  /// Shared reference to the progress entry for `id`, if any.
+  pub fn progress(&self, id: &I) -> Option<&Progress> {
+    self.progress.get(id)
+  }
+
+  /// Exclusive reference to the progress entry for `id`, if any.
+  pub fn progress_mut(&mut self, id: &I) -> Option<&mut Progress> {
+    self.progress.get_mut(id)
+  }
+
+  /// Insert or replace a progress entry.
+  #[allow(
+    dead_code,
+    reason = "internal progress mutator; retained for completeness"
+  )]
+  pub fn insert_progress(&mut self, id: I, p: Progress) {
+    self.progress.insert(id, p);
+  }
+
+  /// Remove a progress entry. Only use this when you have separately ensured the node is
+  /// no longer in any membership set; the invariant checker will catch misuse in tests.
+  #[allow(
+    dead_code,
+    reason = "internal progress mutator; retained for completeness"
+  )]
+  pub fn remove_progress(&mut self, id: &I) {
+    self.progress.remove(id);
+  }
+}
+
+impl<I: Ord + CheapClone> Tracker<I> {
   /// Bootstrap or restore a tracker from a [`ConfState`] (e.g., from a snapshot or initial
   /// cluster configuration). Creates a fresh [`Progress`] for every voter and learner.
   ///
@@ -133,42 +232,6 @@ impl<I: NodeId> Tracker<I> {
       .is_won()
   }
 
-  /// Reset every tracked member's `recent_active` to `false`, then set `leader_id`'s back to
-  /// `true` (the leader is always active to itself).
-  ///
-  /// Called at the start of each CheckQuorum window so that only peers heard from *in this
-  /// window* count toward the next `quorum_active` check.
-  pub fn reset_recent_active(&mut self, leader_id: I) {
-    for pr in self.progress.values_mut() {
-      pr.set_recent_active(false);
-    }
-    if let Some(pr) = self.progress.get_mut(&leader_id) {
-      pr.set_recent_active(true);
-    }
-  }
-
-  /// Whether `id` is a voter in either the incoming or outgoing joint-config half.
-  pub fn is_voter(&self, id: &I) -> bool {
-    self.voters.incoming().contains(id) || self.voters.outgoing().contains(id)
-  }
-
-  /// Whether `id` is a learner (not staged — see `is_learner_next`).
-  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
-  pub fn is_learner(&self, id: &I) -> bool {
-    self.learners.contains(id)
-  }
-
-  /// Whether `id` is staged in `learners_next` (will become a learner after `leave_joint`).
-  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
-  pub fn is_learner_next(&self, id: &I) -> bool {
-    self.learners_next.contains(id)
-  }
-
-  /// Whether the cluster is currently in a joint (two-phase) configuration transition.
-  pub fn is_joint(&self) -> bool {
-    !self.voters.outgoing().is_empty()
-  }
-
   /// All node IDs tracked: voters (both halves) ∪ learners ∪ learners_next.
   pub fn ids(&self) -> BTreeSet<I> {
     let mut ids = self.voters.ids();
@@ -198,22 +261,6 @@ impl<I: NodeId> Tracker<I> {
     )
   }
 
-  /// Shared reference to the progress entry for `id`, if any.
-  pub fn progress(&self, id: &I) -> Option<&Progress> {
-    self.progress.get(id)
-  }
-
-  /// Exclusive reference to the progress entry for `id`, if any.
-  pub fn progress_mut(&mut self, id: &I) -> Option<&mut Progress> {
-    self.progress.get_mut(id)
-  }
-
-  /// The full progress map (all voters + learners + learners_next).
-  #[allow(dead_code, reason = "exercised by unit tests; progress accessor")]
-  pub fn progress_map(&self) -> &BTreeMap<I, Progress> {
-    &self.progress
-  }
-
   /// Re-initialize a fresh [`Progress`] for **every** current member (voters both halves
   /// ∪ learners ∪ learners_next) starting at `next_index`. Existing progress entries are
   /// discarded and replaced, so calling this after `become_leader` guarantees no member is
@@ -237,51 +284,6 @@ impl<I: NodeId> Tracker<I> {
         Progress::new(next_index, max_inflight_msgs, max_inflight_bytes),
       );
     }
-  }
-
-  /// Insert or replace a progress entry.
-  #[allow(
-    dead_code,
-    reason = "internal progress mutator; retained for completeness"
-  )]
-  pub fn insert_progress(&mut self, id: I, p: Progress) {
-    self.progress.insert(id, p);
-  }
-
-  /// Remove a progress entry. Only use this when you have separately ensured the node is
-  /// no longer in any membership set; the invariant checker will catch misuse in tests.
-  #[allow(
-    dead_code,
-    reason = "internal progress mutator; retained for completeness"
-  )]
-  pub fn remove_progress(&mut self, id: &I) {
-    self.progress.remove(id);
-  }
-
-  /// The joint voter configuration.
-  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
-  pub fn voters(&self) -> &JointConfig<I> {
-    &self.voters
-  }
-
-  /// The current learner set (not staged).
-  #[allow(dead_code, reason = "exercised by unit tests; membership accessor")]
-  pub fn learners(&self) -> &BTreeSet<I> {
-    &self.learners
-  }
-
-  /// The staged learner set (waiting for `leave_joint`).
-  #[allow(
-    dead_code,
-    reason = "internal membership accessor; retained for completeness"
-  )]
-  pub fn learners_next(&self) -> &BTreeSet<I> {
-    &self.learners_next
-  }
-
-  /// Whether the joint config should be left automatically after it is committed.
-  pub fn auto_leave(&self) -> bool {
-    self.auto_leave
   }
 }
 
