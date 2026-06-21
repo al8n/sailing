@@ -453,10 +453,12 @@ where
         lease_valid_until: None,
       },
       lease_vote_fence_until,
-      // A restarted node is not leader (recovers as Follower) and has authorized no handoff.
-      forced_handoff_this_term: false,
-      lead_transferee: None,
-      transfer_deadline: None,
+      transfer: Transfer {
+        // A restarted node is not leader (recovers as Follower) and has authorized no handoff.
+        forced_handoff_this_term: false,
+        lead_transferee: None,
+        transfer_deadline: None,
+      },
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).

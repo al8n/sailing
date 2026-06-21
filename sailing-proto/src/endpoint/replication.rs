@@ -568,7 +568,7 @@ where
     }
     // A leader transfer is in progress: stop accepting new entries so the target can
     // catch up to a fixed last_index and receive TimeoutNow.
-    if self.lead_transferee.is_some() {
+    if self.transfer.lead_transferee.is_some() {
       return Err(crate::ProposeError::LeaderTransferInProgress);
     }
     // Allocate a fresh, usable log index (see `next_log_index`): refuse rather than alias-and-truncate
@@ -1151,7 +1151,7 @@ where
         self.maybe_flush_deferred_reads(now, log, stable);
         self.pump_appends(now, from, log, stable); // fill the peer's inflight window if still behind
         // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
-        if self.lead_transferee == Some(from) {
+        if self.transfer.lead_transferee == Some(from) {
           let peer_match = self
             .tracker
             .progress(&from)
@@ -1162,7 +1162,7 @@ where
             self.send(from, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
             // a forced campaign is now authorized for this term — disable LeaseBased reads for the
             // rest of it (the forced campaign can elect a new leader at any later point, even post-abort).
-            self.forced_handoff_this_term = true;
+            self.transfer.forced_handoff_this_term = true;
           }
         }
       }

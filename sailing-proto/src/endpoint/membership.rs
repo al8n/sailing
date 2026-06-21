@@ -125,7 +125,7 @@ where
       });
     }
     // A leader transfer is in progress: no membership changes mid-transfer either.
-    if self.lead_transferee.is_some() {
+    if self.transfer.lead_transferee.is_some() {
       return Err(crate::ProposeError::LeaderTransferInProgress);
     }
     // One change in flight at a time: refuse if a ConfChange entry is not yet applied.

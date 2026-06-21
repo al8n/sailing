@@ -67,8 +67,8 @@ where
     self.lease_guard.read_since_anchor = false;
     self.pending_reads.clear();
     // Abort any in-progress leader transfer — leadership is changing, the transfer is moot.
-    self.lead_transferee = None;
-    self.transfer_deadline = None;
+    self.transfer.lead_transferee = None;
+    self.transfer.transfer_deadline = None;
     // The partitioned former leader arms the election timer; once it heals and
     // pre-vote/real vote succeeds it can campaign again without disrupting the cluster.
     self.arm_election_timer(now);
@@ -530,11 +530,11 @@ where
     self.snapshot_resend_after.clear();
     // Clear any in-progress leader transfer — becoming the leader means the transfer
     // target (us) has won; the previous leader's transfer state is irrelevant.
-    self.lead_transferee = None;
-    self.transfer_deadline = None;
+    self.transfer.lead_transferee = None;
+    self.transfer.transfer_deadline = None;
     // a fresh leader term has authorized no forced handoff yet, so the LeaseBased read shortcut is
     // available again once a fresh quorum lease forms. (A `TimeoutNow` sent later this term re-arms it.)
-    self.forced_handoff_this_term = false;
+    self.transfer.forced_handoff_this_term = false;
     // Clear the candidate/follower election_deadline unconditionally; it will be re-armed
     // below only if check_quorum is enabled. Without this clear, a CQ-disabled leader would
     // inherit the stale candidate election_deadline (arm_heartbeat_timer no longer clears it).

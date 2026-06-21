@@ -46,12 +46,12 @@ where
       return Err(crate::TransferError::NotAVoter);
     }
     // Already targeting this node — idempotent, just return Ok.
-    if self.lead_transferee == Some(to) {
+    if self.transfer.lead_transferee == Some(to) {
       return Ok(());
     }
     // Arm the transfer: stop accepting proposals, start the deadline window.
-    self.lead_transferee = Some(to);
-    self.transfer_deadline = Some(now.mono() + self.config.election_timeout());
+    self.transfer.lead_transferee = Some(to);
+    self.transfer.transfer_deadline = Some(now.mono() + self.config.election_timeout());
     // revoke the LeaseBased read authority for the duration of the transfer. Authorizing a transfer
     // lets the transferee become leader (forced campaign, bypassing the post-restart fence), so this leader must
     // relinquish its lease — otherwise it could keep serving stale LeaseBased reads at its old commit
@@ -73,7 +73,7 @@ where
       // a forced campaign is now authorized for this term — disable LeaseBased reads for the rest
       // of it (the forced campaign can elect a new leader at any later point, even after this transfer
       // aborts on the deadline).
-      self.forced_handoff_this_term = true;
+      self.transfer.forced_handoff_this_term = true;
     } else {
       // Target is lagging: kick replication so it catches up.
       // TimeoutNow will be sent from on_append_resp once match_index == last_index.
