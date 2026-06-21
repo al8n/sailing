@@ -12,6 +12,11 @@ use core::{
 /// embedder can use an `Arc<str>`/`Arc<[u8]>`, a string-backed, a UUID-backed, or any custom id
 /// whose clone is O(1). `u64: CheapClone` with `cheap_clone() == *self`, so the built-in numeric
 /// id stays behaviour-identical. `Ord` is required because ids are `BTreeMap` keys.
+///
+/// A **custom** id type must implement [`CheapClone`] explicitly — even one deriving [`Copy`] —
+/// because [`CheapClone`] is not blanket-implemented for `Copy`: the crate covers the primitives,
+/// `Arc`, and `Rc`, but not arbitrary `Copy` newtypes. The impl is one line taking the default
+/// `cheap_clone()` = `clone()`: `impl CheapClone for MyId {}`.
 pub trait NodeId: Data + CheapClone + Ord + Hash + Debug + Display + 'static {}
 
 impl<T> NodeId for T where T: Data + CheapClone + Ord + Hash + Debug + Display + 'static {}
