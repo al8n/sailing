@@ -379,30 +379,32 @@ where
       votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
-      // A restarted node recovers as Follower; the commit-wait is (re)computed at the next
-      // `become_leader` from that election's `now` and the recovered `max_lease_window` below.
-      commit_wait_until: None,
-      max_lease_window: recovered_max_lease_window,
-      max_wall_plus_window: recovered_max_wall_plus_window,
-      max_unwalled_lease_window: recovered_max_unwalled_lease_window,
-      // A restarted node comes up a fresh Follower — the precise commit-anchor captures arm only when
-      // it (re-)wins an election, so start them cleared.
-      inherited_release_deadline: 0,
-      unwalled_commit_wait_until: None,
-      // Observability counters reset on restart (in-memory only, never persisted).
-      precise_releases: 0,
-      unprovable_floor_holds: 0,
+      lease_guard: LeaseGuardState {
+        // A restarted node recovers as Follower; the commit-wait is (re)computed at the next
+        // `become_leader` from that election's `now` and the recovered `max_lease_window` below.
+        commit_wait_until: None,
+        max_lease_window: recovered_max_lease_window,
+        max_wall_plus_window: recovered_max_wall_plus_window,
+        max_unwalled_lease_window: recovered_max_unwalled_lease_window,
+        // A restarted node comes up a fresh Follower — the precise commit-anchor captures arm only when
+        // it (re-)wins an election, so start them cleared.
+        inherited_release_deadline: 0,
+        unwalled_commit_wait_until: None,
+        // Observability counters reset on restart (in-memory only, never persisted).
+        precise_releases: 0,
+        unprovable_floor_holds: 0,
+        // Inherited-read serve anchors arm only when a restarted follower (re-)wins an election.
+        limbo_upper: Index::ZERO,
+        committed_anchor_wall: 0,
+        committed_anchor_window: 0,
+        inherited_serve_armed: false,
+        commit_wait_inflated: false,
+        // A restarted node comes up a fresh Follower with no pending lease-refresh demand.
+        lease_refresh_wanted: false,
+        // ...and no read-activity since its anchor (the proactive-refresh gate starts clear).
+        read_since_anchor: false,
+      },
       cold_read_defers: 0,
-      // Inherited-read serve anchors arm only when a restarted follower (re-)wins an election.
-      limbo_upper: Index::ZERO,
-      committed_anchor_wall: 0,
-      committed_anchor_window: 0,
-      inherited_serve_armed: false,
-      commit_wait_inflated: false,
-      // A restarted node comes up a fresh Follower with no pending lease-refresh demand.
-      lease_refresh_wanted: false,
-      // ...and no read-activity since its anchor (the proactive-refresh gate starts clear).
-      read_since_anchor: false,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
       // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup

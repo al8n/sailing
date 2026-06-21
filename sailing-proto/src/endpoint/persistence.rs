@@ -62,7 +62,7 @@ where
     // leader's lease on an entry it holds. Monotonic in memory; recomputed from durable state at
     // restart. `0` (non-LeaseGuard / inactive-config entries) never raises it.
     for e in entries {
-      self.max_lease_window = self.max_lease_window.max(e.lease_window());
+      self.lease_guard.max_lease_window = self.lease_guard.max_lease_window.max(e.lease_window());
       // The precise-anchor release floor: the per-entry wall stamp PLUS its window (paired per
       // entry, never the max stamp with a different entry's window). ONLY a real (non-zero) wall AND a
       // real (non-zero) lease window contribute — the exact dual of the `max_unwalled_lease_window` fold
@@ -74,7 +74,8 @@ where
       // floor stays `0` outside the failover tier and never folds a non-lease wall. `saturating_add` is
       // defensive — `wall_timestamp` is nanos-since-epoch + a small window, never overflowing u64.
       if e.wall_timestamp() != 0 && e.lease_window() > 0 {
-        self.max_wall_plus_window = self
+        self.lease_guard.max_wall_plus_window = self
+          .lease_guard
           .max_wall_plus_window
           .max(e.wall_timestamp().saturating_add(e.lease_window()));
       }
@@ -87,7 +88,10 @@ where
       // sole consumer, `precise_release_ready`, returns false off-tier. Safe/LeaseBased keep it 0
       // (`lease_window` is 0).
       if e.lease_window() > 0 && e.wall_timestamp() == 0 {
-        self.max_unwalled_lease_window = self.max_unwalled_lease_window.max(e.lease_window());
+        self.lease_guard.max_unwalled_lease_window = self
+          .lease_guard
+          .max_unwalled_lease_window
+          .max(e.lease_window());
       }
     }
     // Track this append's last index independently of `pending` so `on_log_appended` can advance

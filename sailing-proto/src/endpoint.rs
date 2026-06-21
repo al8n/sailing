@@ -567,6 +567,155 @@ impl ForwardedReads {
   }
 }
 
+/// The LeaseGuard / failover commit-wait + inherited-read serve state, grouped out of `Endpoint`.
+#[derive(Debug, Default)]
+struct LeaseGuardState {
+  /// LeaseGuard post-election commit-wait deadline (`None` in every other mode and on every
+  /// non-leader). Set at [`become_leader`](Endpoint::become_leader) to `now + max_lease_window` (the bare
+  /// conservative bound; ONLY when `become_leader` sets [`commit_wait_inflated`](Self::commit_wait_inflated)
+  /// — a failover node that PROVED the wall floor at election — is the window instead E′-INFLATED to
+  /// `max_lease_window·(1+ρ)`; otherwise the wait stays bare and a still-live walled lease is held by
+  /// `walled_lease_vetoes_conservative` until the wall proves expiry or the node fails closed) — two
+  /// CONSERVATIVE bounds (see that method): the TIME anchor `now` is ≥ every inherited entry's
+  /// creation time, and the WINDOW bound `max_lease_window` is the MAX self-describing
+  /// [`Entry::lease_window`](crate::Entry::lease_window) over the inherited entries, so it covers ANY
+  /// deposed leader's lease (each entry carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), even under
+  /// heterogeneous per-node config, with NO cross-node clock comparison. `maybe_advance_commit` HOLDS
+  /// the first post-election commit while `now < commit_wait_until`; once the deadline passes the gate
+  /// is lifted for good (cleared in `maybe_advance_commit`) until the next election.
+  ///
+  /// On the FAILOVER tier the mono clear is additionally WALL-GATED for the WALLED inherited class
+  /// (`walled_lease_vetoes_conservative`): a due mono deadline does not clear a still-live walled
+  /// inherited lease (whose wall floor `s_c + W_c` a peer's inherited-read serve duals); on such a veto
+  /// this field is RE-ARMED to a strictly-future mono instant (one heartbeat) so the wedge tripwire holds
+  /// and the leader re-tests the wall. The E′ inflation in `become_leader` remains as the mono backstop
+  /// for the WALL-ABSENT transient (when the wall-gate cannot evaluate and falls back to mono).
+  commit_wait_until: Option<Instant>,
+  /// The MAX LeaseGuard commit-wait window (`Entry::lease_window`, nanos) over every entry this node
+  /// has ever held — the SELF-DESCRIBING cross-leader safety bound. `become_leader` sizes its
+  /// commit-wait at `now + max_lease_window`, which covers ANY deposed leader's lease on an inherited
+  /// entry (each carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), no assumption about other configs.
+  /// Monotonically non-decreasing in memory (a stale-HIGH value is safe — it only over-waits): raised
+  /// on `submit_append` over appended entries and on snapshot install over `SnapshotMeta`; carried
+  /// through compaction (into the created `SnapshotMeta`) and recomputed at restart from the durable
+  /// log + restored snapshot. `0` in non-LeaseGuard clusters (every `lease_window` is `0`) ⇒ no wait.
+  max_lease_window: u64,
+  /// The MAX per-entry `wall_timestamp + lease_window` over every entry this node has ever held —
+  /// the FAILOVER-tier precise commit-anchor's release floor (consumed by a later PR). The
+  /// synchronized-wall analogue of [`max_lease_window`](Self::max_lease_window): paired PER ENTRY
+  /// (never the max stamp with a different entry's window), monotonic in memory, folded on
+  /// `submit_append` + snapshot install, carried through compaction, recomputed at restart. `0`
+  /// outside the failover tier (every `wall_timestamp` is `0`).
+  max_wall_plus_window: u64,
+  /// The MAX `lease_window` over every entry this node has ever held that is LEASE-bearing but
+  /// WALL-ABSENT (`lease_window > 0`, `wall_timestamp == 0`) — the failover precise commit-anchor's
+  /// mono-frame fallback bound for wall-absent inherited leases. Folded by the ENTRY property (the exact
+  /// dual of [`max_wall_plus_window`](Self::max_wall_plus_window)'s `wall_timestamp != 0`), NOT the local
+  /// tier, so it is complete BY CONSTRUCTION across heterogeneous per-node tiers — every wall-absent lease
+  /// entry folds itself on every node. Equals [`max_lease_window`](Self::max_lease_window) in a
+  /// non-failover LeaseGuard cluster, but inert there (the consumer `precise_release_ready` is off-tier);
+  /// `0` for Safe/LeaseBased. Monotonic in memory, folded on `submit_append` + snapshot install, carried
+  /// through compaction, recomputed at restart (snapshot carry ⊔ live scan, like `max_lease_window`).
+  max_unwalled_lease_window: u64,
+  /// FAILOVER-tier precise commit-anchor — the WALL-frame release floor, captured ONCE at
+  /// [`become_leader`](Endpoint::become_leader) as the then-current
+  /// [`max_wall_plus_window`](Self::max_wall_plus_window) (max over WALLED inherited entries of
+  /// `wall_timestamp + lease_window`) and immutable for the term. `maybe_advance_commit` lifts the
+  /// post-election commit-wait early once the successor's synchronized wall passes this floor by
+  /// `2·ε_unc`. `0` ⇒ no walled inherited entry ⇒ the wall gate is vacuously satisfied; the shipped
+  /// conservative anchor still governs off-tier or when the leader holds no synchronized wall.
+  inherited_release_deadline: u64,
+  /// FAILOVER-tier precise commit-anchor — the MONO-frame fallback deadline for any WALL-ABSENT
+  /// (fail-closed) inherited lease entry, captured ONCE at [`become_leader`](Endpoint::become_leader) as
+  /// `now + max_unwalled_lease_window` and immutable for the term. The precise early-release ALSO
+  /// requires this deadline to pass, so a fail-closed entry (uncovered by the wall floor) still waits
+  /// out its lease on the conservative mono bound. `None` ⇒ no such entry ⇒ that half of the gate is
+  /// satisfied.
+  unwalled_commit_wait_until: Option<Instant>,
+  /// FAILOVER-tier observability: how many times the PRECISE commit-anchor (not the conservative
+  /// mono deadline) lifted the post-election commit-wait over this node's lifetime. Pure in-memory
+  /// metric — never persisted, never on the wire, reset to `0` on construction and restart, and read
+  /// only via [`precise_releases`](Endpoint::precise_releases). Lets an operator (and the randomized
+  /// tester) confirm the failover early-release path is actually being exercised rather than always
+  /// deferring to the conservative anchor; `0` outside the failover tier.
+  precise_releases: u64,
+  /// FAILOVER-tier observability: how many times the post-election commit-wait HELD because the inherited
+  /// walled lease floor was UNPROVABLE this tick — either NO synchronized wall on the release path (a driver
+  /// that armed the failover tier but did not supply a wall to `handle_timeout`/`handle_storage` here), or
+  /// NO bounded clock-uncertainty to wall-gate (a node outside the synchronized-clock contract that
+  /// inherited walled entries). Such a hold is FAIL-CLOSED and SAFE — it never undercuts a peer's inherited
+  /// serve — but it does NOT self-resolve until a wall is supplied or the node is reconfigured, so it would
+  /// otherwise be a SILENT permanent commit-wait wedge. Pure in-memory metric — never persisted, never on
+  /// the wire, reset to `0` on construction and restart, read only via
+  /// [`unprovable_floor_holds`](Endpoint::unprovable_floor_holds). It climbs ONLY while an inherited WALLED
+  /// commit-wait holds unprovably, so it is `0` with no inherited walled lease and for a healthy failover
+  /// node whose wall is always supplied — but it CAN be nonzero on a no-ε_unc node (which is OUTSIDE the
+  /// active failover tier) that inherited walled entries from an ε_unc leader. A steadily climbing value
+  /// flags a misconfigured driver or a heterogeneous-ε_unc cluster (the silent-wedge class the architecture
+  /// review surfaced). A wall-PRESENT, not-yet-released
+  /// hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted here.
+  unprovable_floor_holds: u64,
+  /// FAILOVER-tier inherited-read serve anchor — the election TAIL, captured ONCE at
+  /// [`become_leader`](Endpoint::become_leader) as `log.last_index()` BEFORE the leader's own no-op (which
+  /// would otherwise inflate it). Immutable for the term (`log.last_index()` drifts as the leader
+  /// proposes, so it may NOT be recomputed live). With the committed index `c`, the limbo region the
+  /// application checks before an inherited serve is `(c, limbo_upper]`. `Index::ZERO` until the first
+  /// election; meaningful only while this node leads and holds the post-election commit-wait.
+  limbo_upper: Index,
+  /// FAILOVER-tier inherited-read serve anchor — the EXACT `wall_timestamp` of `log[c]` (the committed
+  /// entry at election, shared by this leader and every electable higher-term leader), captured ONCE at
+  /// [`become_leader`](Endpoint::become_leader). The [`failover_read_window`](Endpoint::failover_read_window)
+  /// lease-live gate keys on it; stale-HIGH would serve past a dead lease (UNSAFE), so it is
+  /// exact-or-`0` (fail-closed when `log[c]` is absent/compacted — the gate then refuses). `0` outside
+  /// the failover tier and until the first election.
+  committed_anchor_wall: u64,
+  /// FAILOVER-tier inherited-read serve HORIZON — the EXACT `lease_window` (`W_c`) of the SAME committed
+  /// anchor entry `log[c]`, captured ONCE at [`become_leader`](Endpoint::become_leader) from the same fetch
+  /// as [`committed_anchor_wall`](Self::committed_anchor_wall). The serve gate is `now_wall + 2·ε_unc <
+  /// committed_anchor_wall + committed_anchor_window`: the horizon is the entry's OWN self-describing
+  /// window, NOT this successor's config `lease_duration` — exactly like the release floor
+  /// ([`inherited_release_deadline`](Self::inherited_release_deadline)), so serve and release dovetail on
+  /// the same shared entry's window for ANY per-node config (a successor configured with a longer lease
+  /// than the entry's creator can NOT over-serve past the release). `0` (fail-closed, refuse) when the
+  /// anchor is absent/compacted or not lease-bearing.
+  committed_anchor_window: u64,
+  /// FAILOVER-tier inherited-read SERVE armed-this-term flag, captured ONCE at
+  /// [`become_leader`](Endpoint::become_leader): `true` iff a VALID active failover tier is configured AND
+  /// the E′-inflated conservative commit-wait (`max_lease_window · (1+ρ)`, ceil) fits strictly below the
+  /// election timeout. When `false` the leader uses the bare (shipped) conservative wait and
+  /// [`failover_read_window`](Endpoint::failover_read_window) returns `None` — no inherited serve, so no mono-undercut risk
+  /// to inflate against. This is the RUNTIME liveness gate config validation cannot be: the wait keys on
+  /// `max_lease_window`, the MAX window INHERITED (possibly stamped by another node's larger config),
+  /// unknown at config time. `false` outside the failover tier and until the first election.
+  inherited_serve_armed: bool,
+  /// Whether THIS term's post-election commit-wait is the E′-INFLATED window (vs the bare
+  /// `max_lease_window`), captured ONCE at [`become_leader`](Endpoint::become_leader): `true` iff a computable
+  /// E′ inflation (`max_lease_window·(Δ+ε_drift)/Δ`) FITS below the election timeout AND this node
+  /// inherited WALLED entries (`max_wall_plus_window != 0`). The E′ inflation needs ONLY the lease timing
+  /// (Δ, ε_drift), NOT `bounded_clock_uncertainty` — so a LeaseGuard successor that lacks ε_unc still gets
+  /// an E′-safe wait (it covers the walled wall floor in REAL time without a synchronized wall). The veto
+  /// [`walled_lease_vetoes_conservative`](Endpoint::walled_lease_vetoes_conservative) does NOT veto an
+  /// inflated wait (E′ already makes the conservative clear safe); a BARE wait with inherited walled
+  /// entries must instead prove the floor via the wall, else fail closed. DISTINCT from
+  /// `inherited_serve_armed` (which additionally requires ε_unc for the SERVE). `false` with no walled
+  /// inherited entries (basic LeaseGuard / Safe), and until the first election.
+  commit_wait_inflated: bool,
+  /// LeaseGuard lease-refresh demand: set when a LeaseGuard read finds the lease stale (and so degrades
+  /// to the Safe round), consumed at the next leader heartbeat tick, which appends ONE stamped no-op to
+  /// re-commit and re-stamp the lease so subsequent reads serve fast again. A flag (not a count): the
+  /// refresh is rate-limited to one in-flight no-op (the heartbeat only appends when the log is fully
+  /// committed). Never set outside LeaseGuard, so it cannot perturb Safe/LeaseBased. Reset on
+  /// step-down/restart (only a leader acts on it, and a stale read re-sets it as needed).
+  lease_refresh_wanted: bool,
+  /// Whether a LeaseGuard read has been served (or degraded) since the current committed anchor — the
+  /// gate for the proactive [`crate::LeaseRefresh`] modes. Set by any leader LeaseGuard read, cleared
+  /// when a fresh current-term entry COMMITS (the committed anchor advances, re-anchoring the lease) and
+  /// on step-down/restart. Cleared at the COMMIT, not the append: a read landing between a refresh no-op's
+  /// append and its commit must not survive into the new anchor and fire one idle no-op after reads stop.
+  /// A leader with NO reads since its anchor never proactively refreshes (no idle write amplification).
+  read_since_anchor: bool,
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -627,91 +776,8 @@ where
   votes: BTreeMap<I, bool>,
   election_deadline: Option<Instant>,
   heartbeat_deadline: Option<Instant>,
-  /// LeaseGuard post-election commit-wait deadline (`None` in every other mode and on every
-  /// non-leader). Set at [`become_leader`](Self::become_leader) to `now + max_lease_window` (the bare
-  /// conservative bound; ONLY when `become_leader` sets [`commit_wait_inflated`](Self::commit_wait_inflated)
-  /// — a failover node that PROVED the wall floor at election — is the window instead E′-INFLATED to
-  /// `max_lease_window·(1+ρ)`; otherwise the wait stays bare and a still-live walled lease is held by
-  /// `walled_lease_vetoes_conservative` until the wall proves expiry or the node fails closed) — two
-  /// CONSERVATIVE bounds (see that method): the TIME anchor `now` is ≥ every inherited entry's
-  /// creation time, and the WINDOW bound `max_lease_window` is the MAX self-describing
-  /// [`Entry::lease_window`](crate::Entry::lease_window) over the inherited entries, so it covers ANY
-  /// deposed leader's lease (each entry carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), even under
-  /// heterogeneous per-node config, with NO cross-node clock comparison. `maybe_advance_commit` HOLDS
-  /// the first post-election commit while `now < commit_wait_until`; once the deadline passes the gate
-  /// is lifted for good (cleared in `maybe_advance_commit`) until the next election.
-  ///
-  /// On the FAILOVER tier the mono clear is additionally WALL-GATED for the WALLED inherited class
-  /// (`walled_lease_vetoes_conservative`): a due mono deadline does not clear a still-live walled
-  /// inherited lease (whose wall floor `s_c + W_c` a peer's inherited-read serve duals); on such a veto
-  /// this field is RE-ARMED to a strictly-future mono instant (one heartbeat) so the wedge tripwire holds
-  /// and the leader re-tests the wall. The E′ inflation in `become_leader` remains as the mono backstop
-  /// for the WALL-ABSENT transient (when the wall-gate cannot evaluate and falls back to mono).
-  commit_wait_until: Option<Instant>,
-  /// The MAX LeaseGuard commit-wait window (`Entry::lease_window`, nanos) over every entry this node
-  /// has ever held — the SELF-DESCRIBING cross-leader safety bound. `become_leader` sizes its
-  /// commit-wait at `now + max_lease_window`, which covers ANY deposed leader's lease on an inherited
-  /// entry (each carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), no assumption about other configs.
-  /// Monotonically non-decreasing in memory (a stale-HIGH value is safe — it only over-waits): raised
-  /// on `submit_append` over appended entries and on snapshot install over `SnapshotMeta`; carried
-  /// through compaction (into the created `SnapshotMeta`) and recomputed at restart from the durable
-  /// log + restored snapshot. `0` in non-LeaseGuard clusters (every `lease_window` is `0`) ⇒ no wait.
-  max_lease_window: u64,
-  /// The MAX per-entry `wall_timestamp + lease_window` over every entry this node has ever held —
-  /// the FAILOVER-tier precise commit-anchor's release floor (consumed by a later PR). The
-  /// synchronized-wall analogue of [`max_lease_window`](Self::max_lease_window): paired PER ENTRY
-  /// (never the max stamp with a different entry's window), monotonic in memory, folded on
-  /// `submit_append` + snapshot install, carried through compaction, recomputed at restart. `0`
-  /// outside the failover tier (every `wall_timestamp` is `0`).
-  max_wall_plus_window: u64,
-  /// The MAX `lease_window` over every entry this node has ever held that is LEASE-bearing but
-  /// WALL-ABSENT (`lease_window > 0`, `wall_timestamp == 0`) — the failover precise commit-anchor's
-  /// mono-frame fallback bound for wall-absent inherited leases. Folded by the ENTRY property (the exact
-  /// dual of [`max_wall_plus_window`](Self::max_wall_plus_window)'s `wall_timestamp != 0`), NOT the local
-  /// tier, so it is complete BY CONSTRUCTION across heterogeneous per-node tiers — every wall-absent lease
-  /// entry folds itself on every node. Equals [`max_lease_window`](Self::max_lease_window) in a
-  /// non-failover LeaseGuard cluster, but inert there (the consumer `precise_release_ready` is off-tier);
-  /// `0` for Safe/LeaseBased. Monotonic in memory, folded on `submit_append` + snapshot install, carried
-  /// through compaction, recomputed at restart (snapshot carry ⊔ live scan, like `max_lease_window`).
-  max_unwalled_lease_window: u64,
-  /// FAILOVER-tier precise commit-anchor — the WALL-frame release floor, captured ONCE at
-  /// [`become_leader`](Self::become_leader) as the then-current
-  /// [`max_wall_plus_window`](Self::max_wall_plus_window) (max over WALLED inherited entries of
-  /// `wall_timestamp + lease_window`) and immutable for the term. `maybe_advance_commit` lifts the
-  /// post-election commit-wait early once the successor's synchronized wall passes this floor by
-  /// `2·ε_unc`. `0` ⇒ no walled inherited entry ⇒ the wall gate is vacuously satisfied; the shipped
-  /// conservative anchor still governs off-tier or when the leader holds no synchronized wall.
-  inherited_release_deadline: u64,
-  /// FAILOVER-tier precise commit-anchor — the MONO-frame fallback deadline for any WALL-ABSENT
-  /// (fail-closed) inherited lease entry, captured ONCE at [`become_leader`](Self::become_leader) as
-  /// `now + max_unwalled_lease_window` and immutable for the term. The precise early-release ALSO
-  /// requires this deadline to pass, so a fail-closed entry (uncovered by the wall floor) still waits
-  /// out its lease on the conservative mono bound. `None` ⇒ no such entry ⇒ that half of the gate is
-  /// satisfied.
-  unwalled_commit_wait_until: Option<Instant>,
-  /// FAILOVER-tier observability: how many times the PRECISE commit-anchor (not the conservative
-  /// mono deadline) lifted the post-election commit-wait over this node's lifetime. Pure in-memory
-  /// metric — never persisted, never on the wire, reset to `0` on construction and restart, and read
-  /// only via [`precise_releases`](Self::precise_releases). Lets an operator (and the randomized
-  /// tester) confirm the failover early-release path is actually being exercised rather than always
-  /// deferring to the conservative anchor; `0` outside the failover tier.
-  precise_releases: u64,
-  /// FAILOVER-tier observability: how many times the post-election commit-wait HELD because the inherited
-  /// walled lease floor was UNPROVABLE this tick — either NO synchronized wall on the release path (a driver
-  /// that armed the failover tier but did not supply a wall to `handle_timeout`/`handle_storage` here), or
-  /// NO bounded clock-uncertainty to wall-gate (a node outside the synchronized-clock contract that
-  /// inherited walled entries). Such a hold is FAIL-CLOSED and SAFE — it never undercuts a peer's inherited
-  /// serve — but it does NOT self-resolve until a wall is supplied or the node is reconfigured, so it would
-  /// otherwise be a SILENT permanent commit-wait wedge. Pure in-memory metric — never persisted, never on
-  /// the wire, reset to `0` on construction and restart, read only via
-  /// [`unprovable_floor_holds`](Self::unprovable_floor_holds). It climbs ONLY while an inherited WALLED
-  /// commit-wait holds unprovably, so it is `0` with no inherited walled lease and for a healthy failover
-  /// node whose wall is always supplied — but it CAN be nonzero on a no-ε_unc node (which is OUTSIDE the
-  /// active failover tier) that inherited walled entries from an ε_unc leader. A steadily climbing value
-  /// flags a misconfigured driver or a heterogeneous-ε_unc cluster (the silent-wedge class the architecture
-  /// review surfaced). A wall-PRESENT, not-yet-released
-  /// hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted here.
-  unprovable_floor_holds: u64,
+  /// LeaseGuard / failover commit-wait + inherited-read serve state.
+  lease_guard: LeaseGuardState,
   /// Cold-read wedge observability counter (sibling of [`unprovable_floor_holds`](Self::unprovable_floor_holds)).
   /// Bumped each time `apply_committed` defers on an [`EntriesRead::Pending`](crate::EntriesRead::Pending)
   /// cold read. A healthy resident store never returns `Pending`, so this stays `0`; a steadily climbing
@@ -719,65 +785,6 @@ where
   /// broken). Pure in-memory metric — never persisted, never on the wire, reset to `0` on construction and
   /// restart, read only via [`cold_read_defers`](Self::cold_read_defers). Not a poison.
   cold_read_defers: u64,
-  /// FAILOVER-tier inherited-read serve anchor — the election TAIL, captured ONCE at
-  /// [`become_leader`](Self::become_leader) as `log.last_index()` BEFORE the leader's own no-op (which
-  /// would otherwise inflate it). Immutable for the term (`log.last_index()` drifts as the leader
-  /// proposes, so it may NOT be recomputed live). With the committed index `c`, the limbo region the
-  /// application checks before an inherited serve is `(c, limbo_upper]`. `Index::ZERO` until the first
-  /// election; meaningful only while this node leads and holds the post-election commit-wait.
-  limbo_upper: Index,
-  /// FAILOVER-tier inherited-read serve anchor — the EXACT `wall_timestamp` of `log[c]` (the committed
-  /// entry at election, shared by this leader and every electable higher-term leader), captured ONCE at
-  /// [`become_leader`](Self::become_leader). The [`failover_read_window`](Self::failover_read_window)
-  /// lease-live gate keys on it; stale-HIGH would serve past a dead lease (UNSAFE), so it is
-  /// exact-or-`0` (fail-closed when `log[c]` is absent/compacted — the gate then refuses). `0` outside
-  /// the failover tier and until the first election.
-  committed_anchor_wall: u64,
-  /// FAILOVER-tier inherited-read serve HORIZON — the EXACT `lease_window` (`W_c`) of the SAME committed
-  /// anchor entry `log[c]`, captured ONCE at [`become_leader`](Self::become_leader) from the same fetch
-  /// as [`committed_anchor_wall`](Self::committed_anchor_wall). The serve gate is `now_wall + 2·ε_unc <
-  /// committed_anchor_wall + committed_anchor_window`: the horizon is the entry's OWN self-describing
-  /// window, NOT this successor's config `lease_duration` — exactly like the release floor
-  /// ([`inherited_release_deadline`](Self::inherited_release_deadline)), so serve and release dovetail on
-  /// the same shared entry's window for ANY per-node config (a successor configured with a longer lease
-  /// than the entry's creator can NOT over-serve past the release). `0` (fail-closed, refuse) when the
-  /// anchor is absent/compacted or not lease-bearing.
-  committed_anchor_window: u64,
-  /// FAILOVER-tier inherited-read SERVE armed-this-term flag, captured ONCE at
-  /// [`become_leader`](Self::become_leader): `true` iff a VALID active failover tier is configured AND
-  /// the E′-inflated conservative commit-wait (`max_lease_window · (1+ρ)`, ceil) fits strictly below the
-  /// election timeout. When `false` the leader uses the bare (shipped) conservative wait and
-  /// [`failover_read_window`](Self::failover_read_window) returns `None` — no inherited serve, so no mono-undercut risk
-  /// to inflate against. This is the RUNTIME liveness gate config validation cannot be: the wait keys on
-  /// `max_lease_window`, the MAX window INHERITED (possibly stamped by another node's larger config),
-  /// unknown at config time. `false` outside the failover tier and until the first election.
-  inherited_serve_armed: bool,
-  /// Whether THIS term's post-election commit-wait is the E′-INFLATED window (vs the bare
-  /// `max_lease_window`), captured ONCE at [`become_leader`](Self::become_leader): `true` iff a computable
-  /// E′ inflation (`max_lease_window·(Δ+ε_drift)/Δ`) FITS below the election timeout AND this node
-  /// inherited WALLED entries (`max_wall_plus_window != 0`). The E′ inflation needs ONLY the lease timing
-  /// (Δ, ε_drift), NOT `bounded_clock_uncertainty` — so a LeaseGuard successor that lacks ε_unc still gets
-  /// an E′-safe wait (it covers the walled wall floor in REAL time without a synchronized wall). The veto
-  /// [`walled_lease_vetoes_conservative`](Self::walled_lease_vetoes_conservative) does NOT veto an
-  /// inflated wait (E′ already makes the conservative clear safe); a BARE wait with inherited walled
-  /// entries must instead prove the floor via the wall, else fail closed. DISTINCT from
-  /// `inherited_serve_armed` (which additionally requires ε_unc for the SERVE). `false` with no walled
-  /// inherited entries (basic LeaseGuard / Safe), and until the first election.
-  commit_wait_inflated: bool,
-  /// LeaseGuard lease-refresh demand: set when a LeaseGuard read finds the lease stale (and so degrades
-  /// to the Safe round), consumed at the next leader heartbeat tick, which appends ONE stamped no-op to
-  /// re-commit and re-stamp the lease so subsequent reads serve fast again. A flag (not a count): the
-  /// refresh is rate-limited to one in-flight no-op (the heartbeat only appends when the log is fully
-  /// committed). Never set outside LeaseGuard, so it cannot perturb Safe/LeaseBased. Reset on
-  /// step-down/restart (only a leader acts on it, and a stale read re-sets it as needed).
-  lease_refresh_wanted: bool,
-  /// Whether a LeaseGuard read has been served (or degraded) since the current committed anchor — the
-  /// gate for the proactive [`crate::LeaseRefresh`] modes. Set by any leader LeaseGuard read, cleared
-  /// when a fresh current-term entry COMMITS (the committed anchor advances, re-anchoring the lease) and
-  /// on step-down/restart. Cleared at the COMMIT, not the append: a read landing between a refresh no-op's
-  /// append and its commit must not survive into the new anchor and fire one idle no-op after reads stop.
-  /// A leader with NO reads since its anchor never proactively refreshes (no idle write amplification).
-  read_since_anchor: bool,
   outgoing: VecDeque<Outgoing<I>>,
   events: VecDeque<Event<I, F::Response>>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -1020,28 +1027,30 @@ where
       votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
-      // Set fresh at each `become_leader` (LeaseGuard only); a non-leader never gates commit.
-      commit_wait_until: None,
-      // Fresh node, empty log: no inherited lease window to cover yet. Raised as entries arrive.
-      max_lease_window: 0,
-      max_wall_plus_window: 0,
-      max_unwalled_lease_window: 0,
-      // Precise failover commit-anchor captures — armed only at become_leader.
-      inherited_release_deadline: 0,
-      unwalled_commit_wait_until: None,
-      precise_releases: 0,
-      unprovable_floor_holds: 0,
+      lease_guard: LeaseGuardState {
+        // Set fresh at each `become_leader` (LeaseGuard only); a non-leader never gates commit.
+        commit_wait_until: None,
+        // Fresh node, empty log: no inherited lease window to cover yet. Raised as entries arrive.
+        max_lease_window: 0,
+        max_wall_plus_window: 0,
+        max_unwalled_lease_window: 0,
+        // Precise failover commit-anchor captures — armed only at become_leader.
+        inherited_release_deadline: 0,
+        unwalled_commit_wait_until: None,
+        precise_releases: 0,
+        unprovable_floor_holds: 0,
+        // Inherited-read serve anchors — armed only at become_leader.
+        limbo_upper: Index::ZERO,
+        committed_anchor_wall: 0,
+        committed_anchor_window: 0,
+        inherited_serve_armed: false,
+        commit_wait_inflated: false,
+        // No read has found the lease stale yet (set by a degraded LeaseGuard read; only a leader acts).
+        lease_refresh_wanted: false,
+        // No read since the (not-yet-existent) anchor — the proactive-refresh gate starts clear.
+        read_since_anchor: false,
+      },
       cold_read_defers: 0,
-      // Inherited-read serve anchors — armed only at become_leader.
-      limbo_upper: Index::ZERO,
-      committed_anchor_wall: 0,
-      committed_anchor_window: 0,
-      inherited_serve_armed: false,
-      commit_wait_inflated: false,
-      // No read has found the lease stale yet (set by a degraded LeaseGuard read; only a leader acts).
-      lease_refresh_wanted: false,
-      // No read since the (not-yet-existent) anchor — the proactive-refresh gate starts clear.
-      read_since_anchor: false,
       // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
       active_read_mode: read_only_opt,
       read_mode_migrated: false,
@@ -1273,7 +1282,7 @@ where
   /// failover tier. The randomized tester reads it to confirm the early-release path is non-vacuous.
   #[inline(always)]
   pub const fn precise_releases(&self) -> u64 {
-    self.precise_releases
+    self.lease_guard.precise_releases
   }
 
   /// How many times the post-election commit-wait HELD because the inherited walled lease floor was
@@ -1288,7 +1297,7 @@ where
   /// reads it to assert the failover commit-wait does not silently wedge under a faithful clock.
   #[inline(always)]
   pub const fn unprovable_floor_holds(&self) -> u64 {
-    self.unprovable_floor_holds
+    self.lease_guard.unprovable_floor_holds
   }
 
   /// Cold-read wedge counter: how many times `apply_committed` deferred on a cold
@@ -1446,7 +1455,7 @@ where
       TimerKind::Election => self.election_deadline,
       TimerKind::Heartbeat => self.heartbeat_deadline,
       TimerKind::Transfer => self.transfer_deadline,
-      TimerKind::CommitWait => self.commit_wait_until,
+      TimerKind::CommitWait => self.lease_guard.commit_wait_until,
     }
   }
 
@@ -1481,7 +1490,9 @@ where
       // Only a leader with an armed post-election commit-wait services it. `commit_wait_until` is
       // set to `Some` exclusively in LeaseGuard mode (at `become_leader`), so this is implicitly
       // gated on the mode — a Safe/LeaseBased leader never arms it and never surfaces the timer.
-      TimerKind::CommitWait => self.role.is_leader() && self.commit_wait_until.is_some(),
+      TimerKind::CommitWait => {
+        self.role.is_leader() && self.lease_guard.commit_wait_until.is_some()
+      }
     }
   }
 
@@ -1781,8 +1792,8 @@ where
         // second refresh no-op); and the committed lease is STILL stale (an intervening client write may
         // already have re-stamped it). Replication carries it to the quorum; once it commits, subsequent
         // reads serve fast for Δ. On a fully idle cluster (no reads) the flag is never set ⇒ no write amp.
-        if heartbeat_due && self.lease_refresh_wanted {
-          self.lease_refresh_wanted = false;
+        if heartbeat_due && self.lease_guard.lease_refresh_wanted {
+          self.lease_guard.lease_refresh_wanted = false;
           let last = log.last_index();
           if self.leaseguard_timing().is_some()
             && self.lead_transferee.is_none()
@@ -1804,7 +1815,7 @@ where
         let mode = self.config.lease_refresh();
         if heartbeat_due
           && mode != crate::LeaseRefresh::Off
-          && self.read_since_anchor
+          && self.lease_guard.read_since_anchor
           && self.leaseguard_timing().is_some()
           && self.lead_transferee.is_none()
           && log.last_index() == self.commit
@@ -1823,7 +1834,11 @@ where
         // soon as any deposed leader's lease has expired rather than at the next ack/heartbeat.
         // `maybe_advance_commit` clears `commit_wait_until` (the deadline has passed), so the
         // CommitWait timer is left non-serviceable and the wedge tripwire below stays satisfied.
-        if self.commit_wait_until.is_some_and(|d| d <= now.mono()) {
+        if self
+          .lease_guard
+          .commit_wait_until
+          .is_some_and(|d| d <= now.mono())
+        {
           self.maybe_advance_commit(now, log);
           self.apply_committed(log);
           self.maybe_flush_deferred_reads(now, log, stable);

@@ -331,7 +331,9 @@ where
     // `max_lease_window` window. A consistent fold never reaches here that way (a nonzero `max_lease_window`
     // always classifies a floor; `become_leader` fail-stops the inconsistent shape before arming), but this
     // refuses the vacuous release regardless, deferring to the conservative deadline.
-    if self.inherited_release_deadline == 0 && self.unwalled_commit_wait_until.is_none() {
+    if self.lease_guard.inherited_release_deadline == 0
+      && self.lease_guard.unwalled_commit_wait_until.is_none()
+    {
       return false;
     }
     let eps_ns = u64::try_from(eps.as_nanos()).unwrap_or(u64::MAX);
@@ -343,12 +345,13 @@ where
     // predicate on the COMMITTED anchor (`walled_wall_released`).
     let walled_expired = Self::walled_wall_released(
       now.wall().as_nanos(),
-      self.inherited_release_deadline,
+      self.lease_guard.inherited_release_deadline,
       eps_ns,
     );
     // WALL-ABSENT (fail-closed) inherited leases: no wall to compare, so wait the conservative
     // mono-frame bound. `None` ⇒ no such entry ⇒ satisfied.
     let unwalled_expired = self
+      .lease_guard
       .unwalled_commit_wait_until
       .is_none_or(|until| now.mono() >= until);
     walled_expired && unwalled_expired
@@ -384,10 +387,10 @@ where
   /// regardless of read mode) — NOT `failover_tier_active`. The fail-closed branches hold a misconfigured
   /// node rather than serve a stale read (safety over the liveness of a node outside the clock contract).
   fn walled_lease_vetoes_conservative(&self, now: crate::Now) -> bool {
-    if self.inherited_release_deadline == 0 {
+    if self.lease_guard.inherited_release_deadline == 0 {
       return false; // no walled inherited lease to honor
     }
-    if self.commit_wait_inflated {
+    if self.lease_guard.commit_wait_inflated {
       return false; // E′ covers the floor in real time — the conservative clear is already safe
     }
     // BARE wait with inherited walled entries: the conservative mono clear is allowed ONLY when the wall
@@ -414,7 +417,7 @@ where
     }
     !Self::walled_wall_released(
       now.wall().as_nanos(),
-      self.inherited_release_deadline,
+      self.lease_guard.inherited_release_deadline,
       eps_ns,
     )
   }
@@ -424,7 +427,7 @@ where
     // FOR GOOD — clearing here (not only when a commit actually advances) keeps poll_timeout and
     // handle_timeout consistent: a fired CommitWait timer must leave no serviceable-and-due deadline
     // (the §8 wedge tripwire). After this clear the gate stays down until the next `become_leader`.
-    if let Some(until) = self.commit_wait_until {
+    if let Some(until) = self.lease_guard.commit_wait_until {
       // Lift the gate when EITHER the shipped CONSERVATIVE deadline elapses (mono `now ≥ until`) OR the
       // FAILOVER-tier PRECISE anchor proves every inherited lease has already expired — the latter
       // commits up to ~an election timeout sooner by anchoring on each inherited entry's own
@@ -449,9 +452,9 @@ where
       let conservative = conservative_mono && !walled_vetoes;
       let precise = !conservative && self.precise_release_ready(now);
       if conservative || precise {
-        self.commit_wait_until = None;
+        self.lease_guard.commit_wait_until = None;
         if precise {
-          self.precise_releases += 1;
+          self.lease_guard.precise_releases += 1;
         }
       } else if walled_vetoes {
         // OBSERVABILITY (the silent-wedge class the architecture review surfaced): the veto holds a still-
@@ -462,7 +465,8 @@ where
         // reconfigured, so it would otherwise be a SILENT permanent commit-wait wedge. A wall-PRESENT, ε_unc,
         // not-yet-released hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted.
         if now.wall().is_absent() || self.config.bounded_clock_uncertainty().is_none() {
-          self.unprovable_floor_holds = self.unprovable_floor_holds.saturating_add(1);
+          self.lease_guard.unprovable_floor_holds =
+            self.lease_guard.unprovable_floor_holds.saturating_add(1);
         }
         // The mono deadline is DUE but a still-live walled inherited lease vetoes the clear. Re-arm a
         // strictly-FUTURE mono deadline (one heartbeat) so `poll_timeout` keeps surfacing a serviceable
@@ -481,9 +485,9 @@ where
         // (`Instant::MAX` ≈ 5.8·10¹¹ years), kept TOTAL for any input.
         let heartbeat = self.config.heartbeat_interval();
         if now.mono().since_origin().checked_add(heartbeat).is_some() {
-          self.commit_wait_until = Some(now.mono() + heartbeat);
+          self.lease_guard.commit_wait_until = Some(now.mono() + heartbeat);
         } else {
-          self.commit_wait_until = None;
+          self.lease_guard.commit_wait_until = None;
           self.poison(crate::PoisonReason::CommitWaitUnrepresentable);
           // RETURN before the quorum-commit advance below: the walled lease the veto was protecting is still
           // live, so a poisoned-mid-function node must NOT fall through and advance commit (which would
@@ -511,7 +515,7 @@ where
       // timer (surfaced by poll_timeout) wakes the leader at the deadline to retry, and an ack that
       // arrives after the deadline lifts the gate via the clear above. Non-LeaseGuard leaders never
       // arm it, so this is a no-op for Safe/LeaseBased.
-      if self.commit_wait_until.is_some() {
+      if self.lease_guard.commit_wait_until.is_some() {
         return;
       }
       self.commit = candidate;
@@ -521,7 +525,7 @@ where
       // on a NEW read against the fresh anchor. Clearing HERE (anchor commit) rather than at append is
       // what bounds idle amplification: a read arriving between a refresh no-op's APPEND and its COMMIT
       // would otherwise survive into the new anchor and fire one extra idle no-op after traffic stops.
-      self.read_since_anchor = false;
+      self.lease_guard.read_since_anchor = false;
     }
   }
 }
@@ -812,7 +816,7 @@ where
       // it so a later post-election commit-wait is not under-sized. (Durable cross-restart survival of
       // a stripped window is the fresh-cluster / matched-schema deployment contract; see WIRE.md.)
       for e in entries.iter() {
-        self.max_lease_window = self.max_lease_window.max(e.lease_window());
+        self.lease_guard.max_lease_window = self.lease_guard.max_lease_window.max(e.lease_window());
       }
     }
 
