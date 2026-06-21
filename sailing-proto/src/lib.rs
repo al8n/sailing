@@ -109,7 +109,7 @@ pub mod fuzz_internals {
     crate::wire::encode_conf_change_v2::<u64>(cc, buf)
   }
 
-  /// Drive the stream [`FrameDecoder`](crate::transport) over a chunked byte stream (modelling
+  /// Drive the stream `FrameDecoder` over a chunked byte stream (modelling
   /// arbitrary socket reads): push each chunk, drain every complete frame. Returns the frames
   /// or the terminal decode error. The harness asserts no panic and that every yielded frame
   /// is within [`MAX_FRAME_LEN`].
