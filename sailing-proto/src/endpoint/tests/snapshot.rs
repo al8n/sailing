@@ -10,7 +10,7 @@ use super::*;
 /// and a DUPLICATE of it arrives before `handle_storage` drains. The immediate-ack clamp
 /// (`last_new.min(durable_index)`) must report 2 (the snapshot boundary), not the unflushed 3.
 ///
-/// MUTATION: revert FIX 1 to `self.durable_index = self.durable_index.max(meta.last_index())`.
+/// MUTATION: revert FIX 1 to `self.durable.durable_index = self.durable.durable_index.max(meta.last_index())`.
 /// Then after install `durable_index` stays at the stale-high 3, the duplicate clamps to
 /// `min(3, 3) = 3`, and the assertion (duplicate acks 2) FAILS — the follower over-acks an
 /// unflushed entry, reopening the phantom-replica commit hole.
@@ -60,7 +60,11 @@ fn snapshot_install_resets_durable_index_below_divergent_tail() {
   // Flush so the divergent tail becomes durable: durable_index == 3, commit still 0.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
-  assert_eq!(ep.durable_index, Index::new(3), "tail flushed → durable=3");
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(3),
+    "tail flushed → durable=3"
+  );
   assert_eq!(ep.commit, Index::ZERO, "tail is uncommitted");
 
   // Install a LOWER snapshot (last_index=2 > commit=0 → install proceeds, discards the tail).
@@ -87,7 +91,7 @@ fn snapshot_install_resets_durable_index_below_divergent_tail() {
     "restore re-baselined the log to the snapshot boundary"
   );
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(2),
     "RESET: durable boundary IS the snapshot's last index (not the stale-high tail at 3)"
   );
@@ -113,7 +117,7 @@ fn snapshot_install_resets_durable_index_below_divergent_tail() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(2),
     "the term-2 heartbeat made the term durable without flushing a tail"
   );
@@ -1160,7 +1164,7 @@ fn stale_snapshot_does_not_install() {
   // this the stale-snapshot ack would (correctly) clamp to durable_commit() = min(15, 0) = 0.
   ep.commit = Index::new(15);
   ep.applied = Index::new(15);
-  ep.durable_index = Index::new(15);
+  ep.durable.durable_index = Index::new(15);
   // SM count is arbitrary (doesn't matter — must not change).
   let sm_count_before = ep.state_machine().count();
 
@@ -1591,7 +1595,7 @@ fn install_defers_commit_advance_until_blob_durable() {
     )),
   );
   ep.handle_storage(d, &mut log, &mut stable);
-  assert_eq!(ep.committed_persisted, Index::new(3));
+  assert_eq!(ep.durable.committed_persisted, Index::new(3));
 
   // Install a snapshot at index 10 — commit/durable_index jump to 10, but the blob is DEFERRED
   // (AsyncStable), so SnapshotWritten has not fired yet.
@@ -1624,7 +1628,7 @@ fn install_defers_commit_advance_until_blob_durable() {
     "commit NOT advanced until the blob is durable"
   );
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(3),
     "durable_index NOT advanced until the blob is durable"
   );
@@ -1646,7 +1650,7 @@ fn install_defers_commit_advance_until_blob_durable() {
     Index::new(10),
     "commit advances to the boundary once the blob is durable"
   );
-  assert_eq!(ep.durable_index, Index::new(10));
+  assert_eq!(ep.durable.durable_index, Index::new(10));
   assert_eq!(
     ep.durable_commit(),
     Index::new(10),
@@ -1723,7 +1727,7 @@ fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
     )),
   );
   ep.handle_storage(d, &mut log, &mut stable);
-  assert_eq!(ep.durable_index, Index::new(3));
+  assert_eq!(ep.durable.durable_index, Index::new(3));
   assert_eq!(ep.commit, Index::new(3));
 
   // Second AppendEntries [4..=5] with leader_commit=5: commit jumps to 5, but the 4/5 append is NOT
@@ -1761,7 +1765,7 @@ fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
     "commit advanced to the leader_commit"
   );
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(3),
     "but the 4/5 append is not yet durable"
   );
@@ -2100,7 +2104,7 @@ fn completion_time_staleness_drops_superseded_install() {
 /// `reconcile_restart_log::Restore` to that snapshot, so acking it is honest; the boundary is already
 /// quorum-committed, so it is phantom-safe.
 ///
-/// MUTATION: revert `ack_watermark()` to `self.durable_index` (drop the durable-snapshot max) → the
+/// MUTATION: revert `ack_watermark()` to `self.durable.durable_index` (drop the durable-snapshot max) → the
 /// watermark reports 3 not 5, and the leader would stay pinned in Snapshot until the tail flushes.
 #[test]
 fn stale_drop_acks_durable_snapshot_boundary() {
@@ -2155,7 +2159,7 @@ fn stale_drop_acks_durable_snapshot_boundary() {
   );
   assert_eq!(ep.commit, Index::new(7));
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(3),
     "the appended tail is visible but UNFLUSHED"
   );
@@ -2168,7 +2172,7 @@ fn stale_drop_acks_durable_snapshot_boundary() {
     "stale install dropped"
   );
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(3),
     "no re-baseline → durable_index unchanged"
   );
@@ -2183,7 +2187,7 @@ fn stale_drop_acks_durable_snapshot_boundary() {
   // When the held tail finally flushes, durable_index overtakes and ack_watermark rises with it (MAX).
   log.flush_held_appends();
   ep.handle_storage(d, &mut log, &mut stable);
-  assert_eq!(ep.durable_index, Index::new(7));
+  assert_eq!(ep.durable.durable_index, Index::new(7));
   assert_eq!(
     ep.ack_watermark(),
     Index::new(7),
@@ -2252,7 +2256,7 @@ fn receipt_stale_above_watermark_records_durable_snapshot() {
   assert!(ep.snapshot.pending_install.is_none());
   assert_eq!(ep.commit, Index::new(12), "commit did NOT regress");
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(3),
     "no re-baseline of the still-unflushed log"
   );

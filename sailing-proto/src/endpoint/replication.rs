@@ -802,11 +802,15 @@ where
         // queued success ack / pending FollowerAck whose match index lies in the overwritten range.
         self.scrub_acks_above(Index::new(truncate_from.get() - 1));
         // The truncated tail is no longer durable; regress the watermark below it (truncate_from >= 1).
-        self.durable_index = self.durable_index.min(Index::new(truncate_from.get() - 1));
+        self.durable.durable_index = self
+          .durable
+          .durable_index
+          .min(Index::new(truncate_from.get() - 1));
         // Drop in-flight append records the truncation supersedes: those entries are overwritten,
         // so their (possibly still-pending) completions must NOT re-advance `durable_index` into
         // the truncated range. The new suffix's own record is added by `submit_append` below.
         self
+          .durable
           .inflight_append_upto
           .retain(|_, upto| *upto < truncate_from);
         let opid = self.mint_op_id();

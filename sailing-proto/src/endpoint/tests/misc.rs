@@ -187,7 +187,7 @@ fn follower_defers_success_ack_until_term_durable() {
     "a freshly-adopted term is not durable until its write completes"
   );
   assert!(
-    ep.term_gated_append_ack.is_some(),
+    ep.durable.term_gated_append_ack.is_some(),
     "the success ack must be deferred while the term is not durable"
   );
   let early: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())
@@ -206,7 +206,7 @@ fn follower_defers_success_ack_until_term_durable() {
     "term 5 is durable once its HardState write completes"
   );
   assert!(
-    ep.term_gated_append_ack.is_none(),
+    ep.durable.term_gated_append_ack.is_none(),
     "the deferred ack was released"
   );
   let acks: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())

@@ -20,7 +20,10 @@ where
   /// durable snapshot boundary is also phantom-safe: a snapshot's boundary is already quorum-committed
   /// (a leader only snapshots committed state), so the leader cannot newly-commit it.
   pub(crate) fn ack_watermark(&self) -> Index {
-    core::cmp::max(self.durable_index, self.durable_snapshot_index)
+    core::cmp::max(
+      self.durable.durable_index,
+      self.durable.durable_snapshot_index,
+    )
   }
 
   /// The commit watermark that is actually backed by the DURABLE log: `min(commit, durable_index)`.
@@ -38,7 +41,7 @@ where
   /// only AFTER the blob lands — `min(commit, durable_index)` is then a boundary the durable snapshot
   /// already backs, never above durable storage.
   pub(crate) fn durable_commit(&self) -> Index {
-    core::cmp::min(self.commit, self.durable_index)
+    core::cmp::min(self.commit, self.durable.durable_index)
   }
 
   /// Storage-submission choke-point: a poisoned node must never persist new work. Routing every
@@ -97,7 +100,7 @@ where
     // Track this append's last index independently of `pending` so `on_log_appended` can advance
     // `durable_index` unconditionally when the completion fires (see the field comment).
     if let Some(last) = entries.last() {
-      self.inflight_append_upto.insert(id, last.index());
+      self.durable.inflight_append_upto.insert(id, last.index());
     }
   }
 
@@ -116,15 +119,15 @@ where
     // a DEFERRED success ack also caps its proven match to the new boundary — the discarded
     // tail can no longer back it. (The flush already clamps by `ack_watermark()`, which regresses here,
     // so this is defense-in-depth that keeps the stored extent honest.)
-    if let Some((to, term, proven)) = self.term_gated_append_ack
+    if let Some((to, term, proven)) = self.durable.term_gated_append_ack
       && proven > boundary
     {
-      self.term_gated_append_ack = Some((to, term, boundary));
+      self.durable.term_gated_append_ack = Some((to, term, boundary));
     }
-    if let Some((to, term, proven)) = self.term_gated_snapshot_ack
+    if let Some((to, term, proven)) = self.durable.term_gated_snapshot_ack
       && proven > boundary
     {
-      self.term_gated_snapshot_ack = Some((to, term, boundary));
+      self.durable.term_gated_snapshot_ack = Some((to, term, boundary));
     }
   }
 
@@ -189,24 +192,24 @@ where
   /// never replicated), and `ack_watermark()` is the live durability cap (so it never
   /// reports a since-truncated index either).
   pub(crate) fn flush_term_gated_acks(&mut self) {
-    if matches!(self.term_gated_snapshot_ack, Some((_, t, _)) if t != self.term) {
-      self.term_gated_snapshot_ack = None;
+    if matches!(self.durable.term_gated_snapshot_ack, Some((_, t, _)) if t != self.term) {
+      self.durable.term_gated_snapshot_ack = None;
     }
-    if matches!(self.term_gated_append_ack, Some((_, t, _)) if t != self.term) {
-      self.term_gated_append_ack = None;
+    if matches!(self.durable.term_gated_append_ack, Some((_, t, _)) if t != self.term) {
+      self.durable.term_gated_append_ack = None;
     }
     if !self.term_is_durable() {
       return;
     }
     let (term, me) = (self.term, self.config.id());
-    if let Some((to, _, proven)) = self.term_gated_snapshot_ack.take() {
+    if let Some((to, _, proven)) = self.durable.term_gated_snapshot_ack.take() {
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
         Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
       );
     }
-    if let Some((to, _, proven)) = self.term_gated_append_ack.take() {
+    if let Some((to, _, proven)) = self.durable.term_gated_append_ack.take() {
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
@@ -245,13 +248,13 @@ where
         )),
       );
     } else {
-      let proven = match self.term_gated_append_ack {
+      let proven = match self.durable.term_gated_append_ack {
         Some((prev_to, prev_term, prev)) if prev_to == to && prev_term == self.term => {
           prev.max(proven)
         }
         _ => proven,
       };
-      self.term_gated_append_ack = Some((to, self.term, proven));
+      self.durable.term_gated_append_ack = Some((to, self.term, proven));
     }
   }
 
@@ -267,13 +270,13 @@ where
         Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
       );
     } else {
-      let proven = match self.term_gated_snapshot_ack {
+      let proven = match self.durable.term_gated_snapshot_ack {
         Some((prev_to, prev_term, prev)) if prev_to == to && prev_term == self.term => {
           prev.max(proven)
         }
         _ => proven,
       };
-      self.term_gated_snapshot_ack = Some((to, self.term, proven));
+      self.durable.term_gated_snapshot_ack = Some((to, self.term, proven));
     }
   }
 
@@ -319,7 +322,7 @@ where
       .with_vote(self.voted_for)
       .with_commit(self.durable_commit());
     self.submit_write(stable, opid, hs);
-    self.committed_persisted = self.durable_commit();
+    self.durable.committed_persisted = self.durable_commit();
   }
 }
 impl<I, F> Endpoint<I, F>
@@ -461,7 +464,7 @@ where
     // holds those committed entries, so no committed entry is lost, just a brief re-sync.
     // No `Pending` entry: a commit-watermark write owes no ack (like the step-down /
     // become_candidate writes); its completion drains harmlessly through `on_stable_wrote`.
-    if !self.poison.poisoned && self.durable_commit() > self.committed_persisted {
+    if !self.poison.poisoned && self.durable_commit() > self.durable.committed_persisted {
       let opid = self.mint_op_id();
       let hs = stable
         .hard_state()
@@ -469,7 +472,7 @@ where
         .with_vote(self.voted_for)
         .with_commit(self.durable_commit());
       self.submit_write(stable, opid, hs);
-      self.committed_persisted = self.durable_commit();
+      self.durable.committed_persisted = self.durable_commit();
     }
 
     // Invariant restore: a learner promoted to voter by an applied conf-change above may have been
@@ -496,8 +499,8 @@ where
     // through `upto` is durable, so this watermark is a true durable-PREFIX bound no matter what
     // order completions arrive in — a later append cannot complete ahead of an earlier index that is
     // still crash-losable.
-    if let Some(upto) = self.inflight_append_upto.remove(&opid) {
-      self.durable_index = self.durable_index.max(upto);
+    if let Some(upto) = self.durable.inflight_append_upto.remove(&opid) {
+      self.durable.durable_index = self.durable.durable_index.max(upto);
     }
     match self.pending.remove(&opid) {
       Some(Pending::FollowerAck { to, match_index }) => {

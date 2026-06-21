@@ -381,7 +381,7 @@ fn duplicate_append_does_not_ack_in_flight_tail() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::ZERO,
     "the term-1 heartbeat made the term durable without flushing a tail"
   );
@@ -510,7 +510,7 @@ fn durable_index_advances_after_term_cleared_follower_ack() {
   );
   while ep.poll_message().is_some() {}
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::ZERO,
     "append in-flight, not yet durable"
   );
@@ -541,7 +541,7 @@ fn durable_index_advances_after_term_cleared_follower_ack() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
-    ep.durable_index,
+    ep.durable.durable_index,
     Index::new(1),
     "the completed append advanced durable_index independently of the cleared pending"
   );
@@ -2326,7 +2326,7 @@ fn deferred_ack_does_not_over_ack_divergent_tail() {
     })
     .collect();
   log.force_append(&entries);
-  ep.durable_index = Index::new(10);
+  ep.durable.durable_index = Index::new(10);
 
   // A NEW leader at a higher term (5) sends a heartbeat-shaped AppendEntries proving only through 8
   // (prev=8, term 1 matches; no entries). The follower adopts term 5 (not yet durable) → the success
@@ -2594,7 +2594,7 @@ fn commit_persist_is_fenced_by_durable_index() {
   );
   ep.handle_storage(d, &mut log, &mut stable); // make [1..=5] durable → durable_index=5, committed_persisted=5
   assert_eq!(ep.commit, Index::new(5));
-  assert_eq!(ep.durable_index, Index::new(5));
+  assert_eq!(ep.durable.durable_index, Index::new(5));
 
   // Append [6,7] and commit to 7, but DO NOT run handle_storage — the tail stays visible-but-not-
   // durable, so durable_index stays at 5 while commit advances to 7.
@@ -2630,7 +2630,11 @@ fn commit_persist_is_fenced_by_durable_index() {
     Index::new(7),
     "commit advanced over the visible tail"
   );
-  assert_eq!(ep.durable_index, Index::new(5), "tail not yet durable");
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(5),
+    "tail not yet durable"
+  );
   assert_eq!(
     ep.durable_commit(),
     Index::new(5),
@@ -2654,7 +2658,7 @@ fn commit_persist_is_fenced_by_durable_index() {
     )),
   );
   assert_eq!(
-    ep.committed_persisted,
+    ep.durable.committed_persisted,
     Index::new(5),
     "persisted commit must be fenced to the durable log (5), not the over-committed 7"
   );
