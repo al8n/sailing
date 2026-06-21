@@ -153,24 +153,23 @@ mod tests {
 
   #[test]
   fn event_construct_and_classify() {
-    let e: Event<u64, u32> = Event::Applied(Applied::new(crate::Index::new(3), 99u32));
+    let e: Event<u64, u32> = Event::Applied(Applied::new(Index::new(3), 99u32));
     assert!(e.is_applied());
-    let lc: Event<u64, u32> =
-      Event::LeaderChanged(LeaderChanged::new(crate::Term::new(2), Some(1u64)));
+    let lc: Event<u64, u32> = Event::LeaderChanged(LeaderChanged::new(Term::new(2), Some(1u64)));
     assert!(lc.is_leader_changed());
   }
 
   #[test]
   fn read_state_event_construct_and_classify() {
     use crate::ReadState;
-    let rs = ReadState::new(crate::Index::new(7), bytes::Bytes::from_static(b"ctx"));
+    let rs = ReadState::new(Index::new(7), bytes::Bytes::from_static(b"ctx"));
     let ev: Event<u64, u32> = Event::ReadState(rs.clone());
     assert!(ev.is_read_state());
     assert!(!ev.is_applied());
     assert!(!ev.is_leader_changed());
     // Unwrap gives back the ReadState.
     let rs2 = ev.unwrap_read_state_ref();
-    assert_eq!(rs2.index(), crate::Index::new(7));
+    assert_eq!(rs2.index(), Index::new(7));
     assert_eq!(rs2.context().as_ref(), b"ctx");
   }
 
@@ -178,8 +177,8 @@ mod tests {
   fn conf_changed_construct_and_classify() {
     use crate::conf::ConfState;
     let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
-    let cc = ConfChanged::new(crate::Index::new(5), conf.clone());
-    assert_eq!(cc.index(), crate::Index::new(5));
+    let cc = ConfChanged::new(Index::new(5), conf.clone());
+    assert_eq!(cc.index(), Index::new(5));
     assert_eq!(cc.conf(), &conf);
     let ev: Event<u64, u32> = Event::ConfChanged(cc);
     assert!(ev.is_conf_changed());
@@ -192,8 +191,8 @@ mod tests {
   fn snapshot_installed_event_construct_and_classify() {
     use crate::{SnapshotMeta, conf::ConfState};
     let meta = SnapshotMeta::new(
-      crate::Index::new(10),
-      crate::Term::new(4),
+      Index::new(10),
+      Term::new(4),
       ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
     );
     let ev: Event<u64, u32> = Event::SnapshotInstalled(meta.clone());

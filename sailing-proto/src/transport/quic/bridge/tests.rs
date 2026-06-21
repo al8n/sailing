@@ -1,11 +1,12 @@
 use std::{
   net::SocketAddr,
   time::{Duration, Instant},
+  vec::Vec,
 };
 
 use super::{Bridge, DialError};
 use crate::{
-  Message, TimeoutNow,
+  Message, Term, TimeoutNow,
   transport::quic::crypto::{QuicTuning, tests::TestClusterCa},
 };
 
@@ -93,7 +94,7 @@ fn loopback_pair_exchanges_a_framed_message() {
   pump(now, &mut a, &mut b);
 
   // A framed consensus message from a to b…
-  let msg = Message::TimeoutNow(TimeoutNow::new(crate::Term::new(8), 1u64));
+  let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(8), 1u64));
   a.write_framed(now, ha, &msg);
   a.service_if_deferred(now);
   pump(now, &mut a, &mut b);
@@ -115,7 +116,7 @@ fn loopback_pair_exchanges_a_framed_message() {
 
   // …and the reverse direction works over the SAME connection (each side writes the stream it
   // opened and reads the stream the peer opened).
-  let reply = Message::TimeoutNow(TimeoutNow::new(crate::Term::new(9), 2u64));
+  let reply = Message::TimeoutNow(TimeoutNow::new(Term::new(9), 2u64));
   b.write_framed(now, hb, &reply);
   b.service_if_deferred(now);
   pump(now, &mut a, &mut b);
@@ -159,7 +160,7 @@ fn unvalidated_connections_stage_no_consensus_bytes() {
   a.open_send_and_preface(now, ha, &[]);
   // Still `Authenticating`: a consensus write must stage NOTHING (no byte rides out ahead of the
   // identity preface / before the peer is bound).
-  let msg = Message::TimeoutNow(TimeoutNow::new(crate::Term::new(1), 1u64));
+  let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64));
   a.write_framed(now, ha, &msg);
   a.service_if_deferred(now);
   pump(now, &mut a, &mut b);
@@ -220,15 +221,15 @@ fn pipelined_frames_behind_the_hello_stay_unread_until_validated() {
   let (ha, hb) = handshake(now, &mut a, &mut b);
 
   // a's preface: a real (short) hello — 8-byte id, far under the hello cap.
-  let mut id = std::vec::Vec::new();
+  let mut id = Vec::new();
   crate::Data::encode(&1u64, &mut id);
   let hello = labeled::build_hello(&ClusterId([7; 16]), &id);
   a.open_send_and_preface(now, ha, &hello);
   // …with a consensus frame PIPELINED directly behind it, before any validation handshake.
-  let msg = Message::TimeoutNow(TimeoutNow::new(crate::Term::new(3), 1u64));
-  let mut payload = std::vec::Vec::new();
+  let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(3), 1u64));
+  let mut payload = Vec::new();
   crate::wire::encode_message(&msg, &mut payload);
-  let mut framed = std::vec::Vec::new();
+  let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&payload, &mut framed);
   a.stage_outbound_for_test(ha, &framed);
   a.flush_stream(now, ha);
@@ -279,7 +280,7 @@ fn over_declared_preface_closes_at_the_header() {
 
   // a stages a frame declaring 1 MiB — over the framed-hello bound — as its FIRST bytes.
   a.open_send_and_preface(now, ha, &[]);
-  let mut framed = std::vec::Vec::new();
+  let mut framed = Vec::new();
   crate::transport::frame::encode_frame(&[0xAB; 1024 * 1024], &mut framed);
   a.stage_outbound_for_test(ha, &framed);
   a.flush_stream(now, ha);

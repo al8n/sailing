@@ -1,4 +1,8 @@
 use super::*;
+use crate::{
+  SnapshotMeta,
+  testkit::{AsyncStable, CountSm, FailTermLog, NoopStable, VecLog},
+};
 
 #[test]
 fn restart_replays_committed_log() {
@@ -11,8 +15,8 @@ fn restart_replays_committed_log() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   // Seed the stores as if a prior incarnation had committed 2 Normal entries.
   log.force_append(&[
     Entry::new(
@@ -34,7 +38,7 @@ fn restart_replays_committed_log() {
     cfg,
     Instant::ORIGIN,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -67,12 +71,12 @@ fn restart_reconstructs_committed_config_ignoring_uncommitted_tail() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let remove = |node: u64| -> bytes::Bytes {
     let cc = ConfChange::new(ConfChangeType::RemoveNode, node, bytes::Bytes::new()).into_v2();
-    let mut buf = std::vec::Vec::new();
+    let mut buf = Vec::new();
     crate::wire::encode_conf_change_v2(&cc, &mut buf);
     bytes::Bytes::from(buf)
   };
@@ -99,7 +103,7 @@ fn restart_reconstructs_committed_config_ignoring_uncommitted_tail() {
     cfg,
     Instant::ORIGIN,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -141,18 +145,13 @@ fn restart_recovers_commit_persisted_via_real_path() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   // AsyncStable enqueues a Wrote completion for every submit_write, so handle_storage also
   // drains the commit-watermark completion (verifying it passes harmlessly through
   // on_stable_wrote with no Pending entry). Both testkit stores persist synchronously, so
   // the durable HardState reflects each write immediately.
-  let mut stable = crate::testkit::AsyncStable::default();
-  let mut ep = Endpoint::new(
-    cfg.clone(),
-    Instant::ORIGIN,
-    7,
-    crate::testkit::CountSm::default(),
-  );
+  let mut stable = AsyncStable::default();
+  let mut ep = Endpoint::new(cfg.clone(), Instant::ORIGIN, 7, CountSm::default());
 
   // Self-elect (quorum == 1) and let the no-op LeaderAppend commit.
   let d = ep.poll_timeout().unwrap();
@@ -196,7 +195,7 @@ fn restart_recovers_commit_persisted_via_real_path() {
     cfg,
     Instant::ORIGIN,
     9,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -228,10 +227,10 @@ fn restart_recovers_commit_persisted_via_real_path() {
 fn veclog_restore_rebaselines_correctly() {
   use crate::{Entry, EntryKind, Index, Term};
 
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
 
   // Seed with entries 1..=5 at term 1.
-  let entries: std::vec::Vec<_> = (1u64..=5)
+  let entries: Vec<_> = (1u64..=5)
     .map(|i| {
       Entry::new(
         Term::new(1),
@@ -241,7 +240,7 @@ fn veclog_restore_rebaselines_correctly() {
       )
     })
     .collect();
-  log.submit_append(crate::OpId::new(1), &entries);
+  log.submit_append(OpId::new(1), &entries);
   let _ = log.poll(); // drain completion
 
   // Restore to last_index=10, last_term=4 (simulating a received snapshot).
@@ -282,7 +281,7 @@ fn veclog_restore_rebaselines_correctly() {
 fn veclog_submit_append_after_restore() {
   use crate::{Entry, EntryKind, Index, Term};
 
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
 
   // Seed and restore to last_index=10, last_term=4.
   log.restore(Index::new(10), Term::new(4));
@@ -294,7 +293,7 @@ fn veclog_submit_append_after_restore() {
     EntryKind::Normal,
     bytes::Bytes::from_static(b"next"),
   );
-  log.submit_append(crate::OpId::new(1), core::slice::from_ref(&e));
+  log.submit_append(OpId::new(1), core::slice::from_ref(&e));
   let _ = log.poll(); // drain
 
   assert_eq!(
@@ -332,15 +331,15 @@ fn restart_restores_snapshot_then_replays_tail() {
   .unwrap();
 
   // Build a durable stable: snapshot at last_index=5, last_term=2, SM count=10.
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_count: u64 = 10;
   let snap_data = encode_count_snapshot(snap_count);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   // Drain the SnapshotWritten completion so stable.snapshot() is readable.
   while stable.poll().is_some() {}
 
@@ -348,7 +347,7 @@ fn restart_restores_snapshot_then_replays_tail() {
   stable.force_state(Term::new(2), None, Index::new(7));
 
   // Build a durable log: compacted to baseline 5, entries 6 and 7 present.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   // Restore the log to the snapshot baseline (offset=5, compacted_term=2).
   log.restore(Index::new(5), Term::new(2));
   // Force-append entries 6 and 7 (post-snapshot tail).
@@ -374,7 +373,7 @@ fn restart_restores_snapshot_then_replays_tail() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -418,14 +417,14 @@ fn restart_propagates_unwalled_floor_ungated_across_tiers() {
       Duration::from_millis(100),
     )
     .unwrap()
-    .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+    .with_read_only(ReadOnlyOption::LeaseGuard)
     .with_lease_duration(Duration::from_millis(300))
     .with_clock_drift_bound(Duration::from_millis(50));
     if failover {
       cfg = cfg.with_bounded_clock_uncertainty(Duration::from_millis(20));
     }
-    let mut stable = crate::testkit::AsyncStable::default();
-    let meta = crate::SnapshotMeta::new(
+    let mut stable = AsyncStable::default();
+    let meta = SnapshotMeta::new(
       Index::new(5),
       Term::new(2),
       ConfState::from_voters(std::vec![1u64]),
@@ -433,16 +432,16 @@ fn restart_propagates_unwalled_floor_ungated_across_tiers() {
     .with_max_lease_window(W)
     .with_max_wall_plus_window(wall_plus)
     .with_max_unwalled_lease_window(unwalled);
-    stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(10));
+    stable.submit_snapshot(OpId::new(1), meta, encode_count_snapshot(10));
     while stable.poll().is_some() {}
     stable.force_state(Term::new(2), None, Index::new(5));
-    let mut log = crate::testkit::VecLog::default();
+    let mut log = VecLog::default();
     log.restore(Index::new(5), Term::new(2));
     let ep = Endpoint::restart(
       cfg,
       crate::Instant::ORIGIN,
       42,
-      crate::testkit::CountSm::default(),
+      CountSm::default(),
       1,
       &mut log,
       &mut stable,
@@ -498,27 +497,27 @@ fn restart_restores_snapshot_no_tail() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_count: u64 = 7;
   let snap_data = encode_count_snapshot(snap_count);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(5));
 
   // Log baseline = 5, no entries above it.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(5), Term::new(2));
 
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -556,14 +555,9 @@ fn restart_no_snapshot_replays_from_one() {
 
   // No snapshot. Drive a live single-node leader so commit advances and is persisted to
   // HardState by the handle_storage choke-point (no force_state injection).
-  let mut stable = crate::testkit::AsyncStable::default();
-  let mut log = crate::testkit::VecLog::default();
-  let mut ep = Endpoint::new(
-    cfg.clone(),
-    Instant::ORIGIN,
-    42,
-    crate::testkit::CountSm::default(),
-  );
+  let mut stable = AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut ep = Endpoint::new(cfg.clone(), Instant::ORIGIN, 42, CountSm::default());
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // self-elect (quorum == 1)
@@ -598,7 +592,7 @@ fn restart_no_snapshot_replays_from_one() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -625,26 +619,26 @@ fn restart_corrupt_snapshot_poisons_node() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   // Store garbage — too short to decode a u64 count.
   let bad_data = bytes::Bytes::from_static(b"\x01\x02\x03");
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, bad_data);
+  stable.submit_snapshot(OpId::new(1), meta, bad_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(7));
 
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(5), Term::new(2));
 
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -681,29 +675,29 @@ fn restart_with_invalid_snapshot_conf_state_poisons() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   // Durable snapshot with an INVALID ConfState (empty voters); the data is never reached.
-  let bad_meta = crate::SnapshotMeta::new(
+  let bad_meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::<u64>::from_voters(std::vec![]),
   );
   stable.submit_snapshot(
-    crate::OpId::new(1),
+    OpId::new(1),
     bad_meta,
     bytes::Bytes::from_static(b"anything"),
   );
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(7));
 
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(5), Term::new(2));
 
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -748,30 +742,30 @@ fn restart_sentinel_snapshot_poisons_without_restoring_sm() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   // Durable snapshot at the RESERVED SENTINEL boundary (last_index == u64::MAX) with a VALID
   // ConfState (so the sentinel gate — not the conf gate — is what poisons) and a blob that decodes
   // to count=99 (so a restore, if it wrongly ran, is observable as count==99).
   let snap_data = encode_count_snapshot(99);
-  let bad_meta = crate::SnapshotMeta::new(
+  let bad_meta = SnapshotMeta::new(
     Index::new(u64::MAX),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), bad_meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), bad_meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(0));
 
   // Empty durable log: the snapshot boundary is rejected before reconciliation, so the log is never
   // consulted here — this isolates the SNAPSHOT-boundary sentinel (the log-boundary sentinel has its
   // own regression).
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
 
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -816,11 +810,11 @@ fn restart_orphaned_log_without_snapshot_poisons() {
 
   // No durable snapshot is submitted (simulating a crash after `restore` reached disk but before
   // the snapshot blob): `stable.snapshot()` is None.
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   stable.force_state(Term::new(2), None, Index::new(7));
 
   // The log was re-baselined to last_index=5 (first_index becomes 6) with nothing backing it.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(5), Term::new(2));
   assert!(log.first_index() > Index::new(1), "log is re-baselined");
 
@@ -828,7 +822,7 @@ fn restart_orphaned_log_without_snapshot_poisons() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -865,26 +859,26 @@ fn restart_log_behind_durable_snapshot_repairs() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_data = encode_count_snapshot(10);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(5));
 
   // The log re-baseline never reached disk: a FRESH log (first_index=1), behind the snapshot at 5.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   assert!(log.first_index() <= Index::new(5));
 
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -934,19 +928,19 @@ fn restart_log_compacted_past_snapshot_poisons() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_data = encode_count_snapshot(10);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(9));
 
   // The log is compacted to baseline 8 (first_index=9), PAST the snapshot at 5.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(8), Term::new(2));
   assert!(log.first_index() > Index::new(6));
 
@@ -954,7 +948,7 @@ fn restart_log_compacted_past_snapshot_poisons() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -990,20 +984,20 @@ fn restart_local_snapshot_compaction_window_preserves_tail() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_data = encode_count_snapshot(10);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(7));
 
   // The node snapshotted its OWN log at 5 (blob durable) but the deferred compact has NOT run: the
   // log still holds the FULL committed log 1..=7, INCLUDING the tail 6,7 above the snapshot.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(2),
@@ -1055,7 +1049,7 @@ fn restart_local_snapshot_compaction_window_preserves_tail() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -1110,20 +1104,20 @@ fn restart_boundary_term_read_failure_poisons_not_truncates() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_data = encode_count_snapshot(10);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(7));
 
   // Local compaction window: durable snapshot at 5, the log still holds the committed tail 1..=7 —
   // but reading the boundary term `term(5)` FAILS (a storage fault).
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(2),
@@ -1174,7 +1168,7 @@ fn restart_boundary_term_read_failure_poisons_not_truncates() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -1339,20 +1333,20 @@ fn restart_committed_tail_boundary_mismatch_poisons_not_truncates() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_data = encode_count_snapshot(10);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(3), None, Index::new(7));
 
   // Log 1..=7 with the boundary entry at 5 carrying term 3 — DISAGREEING with the snapshot's term 2
   // — while commit=7 makes 6,7 committed.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(2),
@@ -1402,7 +1396,7 @@ fn restart_committed_tail_boundary_mismatch_poisons_not_truncates() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -1441,20 +1435,20 @@ fn restart_committed_boundary_equality_mismatch_poisons() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_data = encode_count_snapshot(10);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   // commit == 5 == the snapshot boundary: index 5 ITSELF is committed (no committed tail above it).
   stable.force_state(Term::new(3), None, Index::new(5));
 
   // Log 1..=5 with the boundary entry at 5 carrying term 3 — DISAGREEING with the snapshot's term 2.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(2),
@@ -1492,7 +1486,7 @@ fn restart_committed_boundary_equality_mismatch_poisons() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch
     &mut log,
     &mut stable,
@@ -1532,15 +1526,15 @@ fn restarted_leasebased_node_fences_votes() {
   )
   .unwrap()
   .with_check_quorum(true)
-  .with_read_only(crate::ReadOnlyOption::LeaseBased);
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  .with_read_only(ReadOnlyOption::LeaseBased);
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   // Restart under LeaseBased at ORIGIN → arms the post-restart vote fence for one election_timeout.
   let mut ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch
     &mut log,
     &mut stable,
@@ -1643,20 +1637,20 @@ fn restart_compacted_baseline_boundary_mismatch_poisons() {
   )
   .unwrap();
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   let snap_data = encode_count_snapshot(10);
-  let meta = crate::SnapshotMeta::new(
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, snap_data);
+  stable.submit_snapshot(OpId::new(1), meta, snap_data);
   while stable.poll().is_some() {}
   stable.force_state(Term::new(3), None, Index::new(7));
 
   // Log compacted EXACTLY to baseline 5 (first_index == 6 == N+1) but with a retained boundary term
   // of 3 — disagreeing with the snapshot's term 2 — plus a committed tail 6,7.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(5), Term::new(3));
   log.force_append(&[
     Entry::new(
@@ -1683,7 +1677,7 @@ fn restart_compacted_baseline_boundary_mismatch_poisons() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1, // boot_epoch (this incarnation > the prior one)
     &mut log,
     &mut stable,
@@ -1717,13 +1711,13 @@ fn restart_arms_vote_fence_on_enforcement_capability_not_read_mode() {
   let cfg = Config::try_new(2u64, std::vec![1u64, 2u64, 3u64], et, hb)
     .unwrap()
     .with_check_quorum(true); // read_only defaults to Safe
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -1734,13 +1728,13 @@ fn restart_arms_vote_fence_on_enforcement_capability_not_read_mode() {
   );
   // Neither check_quorum nor pre_vote → enforces nothing → no fence needed.
   let cfg2 = Config::try_new(2u64, std::vec![1u64, 2u64, 3u64], et, hb).unwrap();
-  let mut log2 = crate::testkit::VecLog::default();
-  let mut stable2 = crate::testkit::AsyncStable::default();
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
   let ep2 = Endpoint::restart(
     cfg2,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log2,
     &mut stable2,
@@ -1761,12 +1755,11 @@ fn restart_arms_vote_fence_on_enforcement_capability_not_read_mode() {
 fn restart_fence_honors_persisted_floor_under_enforcement_disabled() {
   use crate::{Config, HardState, Instant};
   use core::time::Duration;
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   stable.force_hard_state(
-    HardState::initial().with_lease_support(crate::LeaseSupport::Recorded(Some(
-      Duration::from_millis(1000),
-    ))),
+    HardState::initial()
+      .with_lease_support(LeaseSupport::Recorded(Some(Duration::from_millis(1000)))),
   );
   // Restart with enforcement OFF (check_quorum and pre_vote both default false).
   let cfg = Config::try_new(
@@ -1777,15 +1770,7 @@ fn restart_fence_honors_persisted_floor_under_enforcement_disabled() {
   )
   .unwrap();
   let now = Instant::ORIGIN + Duration::from_millis(5000);
-  let ep = Endpoint::restart(
-    cfg,
-    now,
-    7,
-    crate::testkit::CountSm::default(),
-    1,
-    &mut log,
-    &mut stable,
-  );
+  let ep = Endpoint::restart(cfg, now, 7, CountSm::default(), 1, &mut log, &mut stable);
   assert_eq!(
     ep.durable.lease_vote_fence_until,
     Some(now + Duration::from_millis(1000)),
@@ -1801,12 +1786,11 @@ fn restart_fence_honors_persisted_floor_under_enforcement_disabled() {
 fn restart_fence_honors_persisted_floor_over_shrunk_election_timeout() {
   use crate::{Config, HardState, Instant};
   use core::time::Duration;
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   stable.force_hard_state(
-    HardState::initial().with_lease_support(crate::LeaseSupport::Recorded(Some(
-      Duration::from_millis(1000),
-    ))),
+    HardState::initial()
+      .with_lease_support(LeaseSupport::Recorded(Some(Duration::from_millis(1000)))),
   );
   let cfg = Config::try_new(
     2u64,
@@ -1817,15 +1801,7 @@ fn restart_fence_honors_persisted_floor_over_shrunk_election_timeout() {
   .unwrap()
   .with_check_quorum(true);
   let now = Instant::ORIGIN + Duration::from_millis(5000);
-  let ep = Endpoint::restart(
-    cfg,
-    now,
-    7,
-    crate::testkit::CountSm::default(),
-    1,
-    &mut log,
-    &mut stable,
-  );
+  let ep = Endpoint::restart(cfg, now, 7, CountSm::default(), 1, &mut log, &mut stable);
   assert_eq!(
     ep.durable.lease_vote_fence_until,
     Some(now + Duration::from_millis(1000)),
@@ -1849,7 +1825,7 @@ fn legacy_unrecorded_plain_restart_poisons_migrating_recovers() {
   use core::time::Duration;
   let now = Instant::ORIGIN + Duration::from_millis(5000);
   let legacy = || {
-    let mut s = crate::testkit::AsyncStable::default();
+    let mut s = AsyncStable::default();
     s.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Unrecorded));
     s
   };
@@ -1870,17 +1846,9 @@ fn legacy_unrecorded_plain_restart_poisons_migrating_recovers() {
   .unwrap();
   // Plain restart of a legacy Unrecorded record FAIL-STOPS — both enforcing and non-enforcing.
   for cfg in [enforcing.clone(), non_enforcing] {
-    let mut log = crate::testkit::VecLog::default();
+    let mut log = VecLog::default();
     let mut stable = legacy();
-    let ep = Endpoint::restart(
-      cfg,
-      now,
-      7,
-      crate::testkit::CountSm::default(),
-      1,
-      &mut log,
-      &mut stable,
-    );
+    let ep = Endpoint::restart(cfg, now, 7, CountSm::default(), 1, &mut log, &mut stable);
     assert!(
       ep.is_poisoned(),
       "plain restart of a legacy Unrecorded record must fail-stop (unbounded prior promise)"
@@ -1892,13 +1860,13 @@ fn legacy_unrecorded_plain_restart_poisons_migrating_recovers() {
   }
   // restart_migrating with the operator's known pre-upgrade window (2000ms) RECOVERS — fence honors the
   // bound (now+2000), NOT the shrunk 100ms config, and the node is NOT poisoned.
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   let mut stable = legacy();
   let ep = Endpoint::restart_migrating(
     enforcing,
     now,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     Some(Duration::from_millis(2000)),
     &mut log,
@@ -1999,14 +1967,14 @@ fn native_recorded_none_is_not_overfenced() {
   };
   // A NATIVE Recorded(None) under restart_migrating with a HUGE assume_prior: the native record is
   // authoritative → assume_prior is ignored → non-enforcing config → no fence.
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   stable.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Recorded(None)));
   let ep = Endpoint::restart_migrating(
     cfg(),
     now,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     Some(Duration::from_secs(999)), // huge assume_prior — MUST be ignored for a native record
     &mut log,
@@ -2017,14 +1985,14 @@ fn native_recorded_none_is_not_overfenced() {
     "a native Recorded(None) must ignore assume_prior (authoritative no-promise), not over-fence"
   );
   // Contrast: the SAME huge assume_prior on a legacy Unrecorded record IS honored.
-  let mut log2 = crate::testkit::VecLog::default();
-  let mut stable2 = crate::testkit::AsyncStable::default();
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
   stable2.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Unrecorded));
   let ep2 = Endpoint::restart_migrating(
     cfg(),
     now,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     Some(Duration::from_secs(999)),
     &mut log2,
@@ -2057,25 +2025,20 @@ fn restart_mints_epoch_scoped_op_ids() {
     .unwrap()
   };
   // Fresh node: epoch 0.
-  let mut fresh = Endpoint::new(
-    cfg(),
-    Instant::ORIGIN,
-    1,
-    crate::testkit::CountSm::default(),
-  );
+  let mut fresh = Endpoint::new(cfg(), Instant::ORIGIN, 1, CountSm::default());
   assert_eq!(
     fresh.mint_op_id_for_test(),
     OpId::new(0),
     "fresh node mints epoch-0 ids"
   );
   // Restart at boot_epoch 7: the first minted id is seq 0 of epoch 7.
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   let mut ep = Endpoint::restart(
     cfg(),
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     7,
     &mut log,
     &mut stable,
@@ -2117,12 +2080,12 @@ fn restart_same_config_no_floor_write_and_no_advertise_stall() {
   use crate::{Config, HardState, Instant, Term};
   use core::time::Duration;
   let et = Duration::from_millis(1000);
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   stable.force_hard_state(
     HardState::initial()
       .with_term(Term::new(5))
-      .with_lease_support(crate::LeaseSupport::Recorded(Some(et))),
+      .with_lease_support(LeaseSupport::Recorded(Some(et))),
   );
   let cfg = Config::try_new(
     2u64,
@@ -2132,17 +2095,9 @@ fn restart_same_config_no_floor_write_and_no_advertise_stall() {
   )
   .unwrap()
   .with_check_quorum(true)
-  .with_read_only(crate::ReadOnlyOption::LeaseBased);
+  .with_read_only(ReadOnlyOption::LeaseBased);
   let now = Instant::ORIGIN;
-  let mut ep = Endpoint::restart(
-    cfg,
-    now,
-    7,
-    crate::testkit::CountSm::default(),
-    1,
-    &mut log,
-    &mut stable,
-  );
+  let mut ep = Endpoint::restart(cfg, now, 7, CountSm::default(), 1, &mut log, &mut stable);
   assert_eq!(
     stable.pending_writes(),
     0,
@@ -2167,16 +2122,14 @@ fn poisoned_restart_still_computes_fence_from_floor() {
   use crate::{Config, HardState, Index, Instant, Term};
   use core::time::Duration;
   // An orphaned-log restart (re-baselined log, no durable snapshot) poisons.
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   stable.force_hard_state(
     HardState::initial()
       .with_term(Term::new(2))
       .with_commit(Index::new(7))
-      .with_lease_support(crate::LeaseSupport::Recorded(Some(Duration::from_millis(
-        1000,
-      )))),
+      .with_lease_support(LeaseSupport::Recorded(Some(Duration::from_millis(1000)))),
   );
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(5), Term::new(2));
   let cfg = Config::try_new(
     1u64,
@@ -2186,15 +2139,7 @@ fn poisoned_restart_still_computes_fence_from_floor() {
   )
   .unwrap();
   let now = Instant::ORIGIN + Duration::from_millis(5000);
-  let ep = Endpoint::restart(
-    cfg,
-    now,
-    42,
-    crate::testkit::CountSm::default(),
-    1,
-    &mut log,
-    &mut stable,
-  );
+  let ep = Endpoint::restart(cfg, now, 42, CountSm::default(), 1, &mut log, &mut stable);
   assert!(ep.is_poisoned(), "the orphaned-log restart must poison");
   assert_eq!(
     ep.durable.lease_vote_fence_until,
@@ -2227,15 +2172,14 @@ fn restart_migrating_honors_assumed_prior_lease_support() {
   };
   // Plain restart of a legacy (Unrecorded) record FAIL-STOPS — the prior promise is unbounded, so no
   // finite fence is safe; the operator must use restart_migrating.
-  let mut log0 = crate::testkit::VecLog::default();
-  let mut stable0 = crate::testkit::AsyncStable::default();
-  stable0
-    .force_hard_state(HardState::initial().with_lease_support(crate::LeaseSupport::Unrecorded));
+  let mut log0 = VecLog::default();
+  let mut stable0 = AsyncStable::default();
+  stable0.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Unrecorded));
   let ep0 = Endpoint::restart(
     cfg(),
     now,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log0,
     &mut stable0,
@@ -2245,14 +2189,14 @@ fn restart_migrating_honors_assumed_prior_lease_support() {
     "plain restart of a legacy Unrecorded record must fail-stop, not silently proceed"
   );
   // restart_migrating with the operator-supplied prior closes it.
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
-  stable.force_hard_state(HardState::initial().with_lease_support(crate::LeaseSupport::Unrecorded)); // legacy/pre-format record
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  stable.force_hard_state(HardState::initial().with_lease_support(LeaseSupport::Unrecorded)); // legacy/pre-format record
   let ep = Endpoint::restart_migrating(
     cfg(),
     now,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     Some(Duration::from_millis(1000)), // operator: this node may have promised up to 1000ms pre-crash
     &mut log,
@@ -2287,14 +2231,14 @@ fn restarted_follower_ignores_heartbeat_resp_read_acks() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   stable.force_state(Term::new(1), None, Index::ZERO);
   let mut ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2337,8 +2281,8 @@ fn restart_recovers_migrated_mode_from_committed_tail() {
   .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   log.force_append(&[Entry::new(
     Term::new(1),
     Index::new(1),
@@ -2350,7 +2294,7 @@ fn restart_recovers_migrated_mode_from_committed_tail() {
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2381,23 +2325,23 @@ fn restart_from_legacy_snapshot_recovers_static_mode() {
   .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   // A legacy snapshot at index 5: read_only NEVER set (None), as if written before the field existed.
   let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(0));
+  stable.submit_snapshot(OpId::new(1), meta, encode_count_snapshot(0));
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), Some(1u64), Index::new(5));
-  let mut log = crate::testkit::VecLog::default();
+  let mut log = VecLog::default();
   log.restore(Index::new(5), Term::new(2));
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2422,8 +2366,8 @@ fn set_read_mode_rejects_non_canonical_payload() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   // A committed SetReadMode whose payload is 2 bytes (a valid mode byte + trailing junk).
   log.force_append(&[Entry::new(
     Term::new(1),
@@ -2436,7 +2380,7 @@ fn set_read_mode_rejects_non_canonical_payload() {
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2463,24 +2407,24 @@ fn restart_with_torn_rebaseline_poisons() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut stable = crate::testkit::AsyncStable::default();
-  let meta = crate::SnapshotMeta::new(
+  let mut stable = AsyncStable::default();
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(10));
+  stable.submit_snapshot(OpId::new(1), meta, encode_count_snapshot(10));
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(5));
   // A contract-violating log: behind the snapshot (first_index=1), and its restore is a no-op, so the
   // reconcile's Restore(5, ..) leaves first_index un-rebaselined.
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.break_restore_rebaseline();
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2506,22 +2450,22 @@ fn restart_with_stale_suffix_after_restore_poisons() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut stable = crate::testkit::AsyncStable::default();
-  let meta = crate::SnapshotMeta::new(
+  let mut stable = AsyncStable::default();
+  let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(2),
     ConfState::from_voters(std::vec![1u64]),
   );
-  stable.submit_snapshot(crate::OpId::new(1), meta, encode_count_snapshot(10));
+  stable.submit_snapshot(OpId::new(1), meta, encode_count_snapshot(10));
   while stable.poll().is_some() {}
   stable.force_state(Term::new(2), None, Index::new(5));
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.break_restore_keeping_suffix();
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2548,7 +2492,7 @@ fn apply_with_non_contiguous_read_poisons() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(1),
@@ -2570,13 +2514,13 @@ fn apply_with_non_contiguous_read_poisons() {
     ),
   ]);
   log.gap_first_entry_on_read(); // entries(1..4) returns [2,3] — a gap at the start of the apply read
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut stable = NoopStable::default();
   stable.force_state(Term::new(1), Some(1u64), Index::new(3)); // commit = 3, applied = 0
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2603,7 +2547,7 @@ fn apply_with_overlong_read_poisons() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(1),
@@ -2625,13 +2569,13 @@ fn apply_with_overlong_read_poisons() {
     ),
   ]);
   log.return_overlong_on_read(); // entries(1..3) returns [1,2,3] — entry 3 is past commit=2
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut stable = NoopStable::default();
   stable.force_state(Term::new(1), Some(1u64), Index::new(2)); // commit = 2 (< last_index = 3)
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -2658,7 +2602,7 @@ fn restart_scan_poisons_on_cold_read() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[Entry::new(
     Term::new(1),
     Index::new(1),
@@ -2666,13 +2610,13 @@ fn restart_scan_poisons_on_cold_read() {
     bytes::Bytes::new(),
   )]);
   log.return_cold_on_read(); // every entries() read defers (Pending) — a cold store
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut stable = NoopStable::default();
   stable.force_state(Term::new(1), Some(1u64), Index::new(1)); // commit = 1
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,

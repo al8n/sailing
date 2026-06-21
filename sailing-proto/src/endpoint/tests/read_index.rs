@@ -1,4 +1,8 @@
 use super::{super::*, *};
+use crate::{
+  Heartbeat, HeartbeatResp, ReadIndexError, ReadIndexResp,
+  testkit::{CountSm, NoopStable, VecLog},
+};
 
 /// Test 1: Safe read confirmed only after a heartbeat quorum.
 ///
@@ -43,16 +47,12 @@ fn safe_read_confirmed_after_heartbeat_quorum() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      round.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
 
   // ReadState must be emitted now.
-  let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert_eq!(
     events.len(),
     1,
@@ -60,13 +60,13 @@ fn safe_read_confirmed_after_heartbeat_quorum() {
     events
   );
   let rs = match &events[0] {
-    crate::Event::ReadState(rs) => rs.clone(),
+    Event::ReadState(rs) => rs.clone(),
     other => panic!("expected ReadState, got {:?}", other),
   };
   assert_eq!(rs.context().as_ref(), ctx.as_ref(), "context must match");
   assert_eq!(
     rs.index(),
-    crate::Index::new(1),
+    Index::new(1),
     "index must be the commit at receipt"
   );
 }
@@ -88,7 +88,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
 
   // Helper: drain the leader's outgoing messages, returning the round token its read heartbeat
   // carries (the non-empty Heartbeat context).
-  fn read_round(ep: &mut Endpoint<u64, crate::testkit::CountSm>) -> bytes::Bytes {
+  fn read_round(ep: &mut Endpoint<u64, CountSm>) -> bytes::Bytes {
     let mut token = None;
     while let Some(out) = ep.poll_message() {
       if let Message::Heartbeat(hb) = out.message()
@@ -99,12 +99,10 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     }
     token.expect("a read heartbeat round token")
   }
-  fn read_states(
-    ep: &mut Endpoint<u64, crate::testkit::CountSm>,
-  ) -> std::vec::Vec<crate::ReadState> {
+  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<crate::ReadState> {
     core::iter::from_fn(|| ep.poll_event())
       .filter_map(|e| match e {
-        crate::Event::ReadState(rs) => Some(rs),
+        Event::ReadState(rs) => Some(rs),
         _ => None,
       })
       .collect()
@@ -119,11 +117,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      token1.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, token1.clone())),
   );
   while ep.poll_message().is_some() {}
   assert_eq!(read_states(&mut ep).len(), 1, "read #1 must confirm");
@@ -143,11 +137,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      token1.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, token1.clone())),
   );
   while ep.poll_message().is_some() {}
   assert!(
@@ -161,11 +151,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      token2.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, token2.clone())),
   );
   while ep.poll_message().is_some() {}
   let confirmed2 = read_states(&mut ep);
@@ -191,7 +177,7 @@ fn stale_leader_cannot_confirm_read() {
   while ep.poll_message().is_some() {}
   // No heartbeat acks arrive (partitioned).
   // No ReadState must be emitted.
-  let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
     events.is_empty(),
     "stale/partitioned leader must not emit ReadState without a heartbeat quorum"
@@ -208,21 +194,16 @@ fn follower_forwarded_read() {
   use core::time::Duration;
 
   // Set up a follower (node 2) pointing to leader 1.
-  let follower_cfg = crate::Config::try_new(
+  let follower_cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut follower = Endpoint::new(
-    follower_cfg,
-    Instant::ORIGIN,
-    7,
-    crate::testkit::CountSm::default(),
-  );
-  let mut follower_log = crate::testkit::VecLog::default();
-  let mut follower_stable = crate::testkit::NoopStable::default();
+  let mut follower = Endpoint::new(follower_cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut follower_log = VecLog::default();
+  let mut follower_stable = NoopStable::default();
 
   // Give the follower a heartbeat so it knows about leader 1.
   follower.handle_message(
@@ -230,10 +211,10 @@ fn follower_forwarded_read() {
     &mut follower_log,
     &mut follower_stable,
     1u64,
-    Message::Heartbeat(crate::Heartbeat::new(
-      crate::Term::new(1),
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
       1u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     )),
   );
@@ -268,10 +249,10 @@ fn follower_forwarded_read() {
     &mut follower_log,
     &mut follower_stable,
     1u64,
-    Message::ReadIndexResp(crate::ReadIndexResp::new(
-      crate::Term::new(1),
+    Message::ReadIndexResp(ReadIndexResp::new(
+      Term::new(1),
       1u64,
-      crate::Index::new(5),
+      Index::new(5),
       token.clone(),
       false,
     )),
@@ -283,7 +264,7 @@ fn follower_forwarded_read() {
     .expect("follower must emit ReadState on ReadIndexResp");
   assert!(ev.is_read_state());
   let rs = ev.unwrap_read_state_ref();
-  assert_eq!(rs.index(), crate::Index::new(5));
+  assert_eq!(rs.index(), Index::new(5));
   assert_eq!(rs.context().as_ref(), ctx.as_ref());
 }
 
@@ -299,16 +280,16 @@ fn follower_forwarded_read() {
 #[test]
 fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Learn leader 1 via a heartbeat.
   ep.handle_message(
@@ -316,10 +297,10 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     &mut log,
     &mut stable,
     1u64,
-    Message::Heartbeat(crate::Heartbeat::new(
-      crate::Term::new(1),
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
       1u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     )),
   );
@@ -330,9 +311,9 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
 
   // Forward a read for `ctx` and return the internal token it carried over the wire.
   fn forward(
-    ep: &mut Endpoint<u64, crate::testkit::CountSm>,
-    log: &crate::testkit::VecLog,
-    stable: &crate::testkit::NoopStable,
+    ep: &mut Endpoint<u64, CountSm>,
+    log: &VecLog,
+    stable: &NoopStable,
     ctx: bytes::Bytes,
   ) -> bytes::Bytes {
     ep.read_index(Instant::ORIGIN, log, stable, ctx)
@@ -345,12 +326,10 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     }
     tok.expect("a forwarded ReadIndex")
   }
-  fn read_states(
-    ep: &mut Endpoint<u64, crate::testkit::CountSm>,
-  ) -> std::vec::Vec<crate::ReadState> {
+  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<crate::ReadState> {
     core::iter::from_fn(|| ep.poll_event())
       .filter_map(|e| match e {
-        crate::Event::ReadState(rs) => Some(rs),
+        Event::ReadState(rs) => Some(rs),
         _ => None,
       })
       .collect()
@@ -363,17 +342,17 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(crate::ReadIndexResp::new(
-      crate::Term::new(1),
+    Message::ReadIndexResp(ReadIndexResp::new(
+      Term::new(1),
       1u64,
-      crate::Index::new(5),
+      Index::new(5),
       token1.clone(),
       false,
     )),
   );
   let s1 = read_states(&mut ep);
   assert_eq!(s1.len(), 1, "read #1 completes");
-  assert_eq!(s1[0].index(), crate::Index::new(5));
+  assert_eq!(s1[0].index(), Index::new(5));
   assert_eq!(s1[0].context().as_ref(), ctx.as_ref());
 
   // ── Read #2: REUSE the context (allowed now that #1 completed). ──
@@ -389,10 +368,10 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(crate::ReadIndexResp::new(
-      crate::Term::new(1),
+    Message::ReadIndexResp(ReadIndexResp::new(
+      Term::new(1),
       1u64,
-      crate::Index::new(5),
+      Index::new(5),
       token1.clone(),
       false,
     )),
@@ -408,10 +387,10 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(crate::ReadIndexResp::new(
-      crate::Term::new(1),
+    Message::ReadIndexResp(ReadIndexResp::new(
+      Term::new(1),
       1u64,
-      crate::Index::new(8),
+      Index::new(8),
       token2.clone(),
       false,
     )),
@@ -420,7 +399,7 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
   assert_eq!(s2.len(), 1, "read #2 completes only on its own fresh resp");
   assert_eq!(
     s2[0].index(),
-    crate::Index::new(8),
+    Index::new(8),
     "at the FRESH index, not the stale 5"
   );
   assert_eq!(s2[0].context().as_ref(), ctx.as_ref());
@@ -446,23 +425,23 @@ fn forwarded_read_token_is_unique_across_restart() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   stable.force_state(Term::new(1), None, Index::ZERO); // restart at term 1, no leader yet
 
   // Restart at `boot_epoch`, learn leader 1 (term 1) via a heartbeat, forward `ctx`, return the token.
   fn restart_and_forward(
     cfg: Config<u64>,
-    log: &mut crate::testkit::VecLog,
-    stable: &mut crate::testkit::NoopStable,
+    log: &mut VecLog,
+    stable: &mut NoopStable,
     boot_epoch: u64,
     ctx: bytes::Bytes,
-  ) -> (Endpoint<u64, crate::testkit::CountSm>, bytes::Bytes) {
+  ) -> (Endpoint<u64, CountSm>, bytes::Bytes) {
     let mut ep = Endpoint::restart(
       cfg,
       Instant::ORIGIN,
       7,
-      crate::testkit::CountSm::default(),
+      CountSm::default(),
       boot_epoch,
       log,
       stable,
@@ -472,7 +451,7 @@ fn forwarded_read_token_is_unique_across_restart() {
       log,
       stable,
       1u64,
-      Message::Heartbeat(crate::Heartbeat::new(
+      Message::Heartbeat(Heartbeat::new(
         Term::new(1),
         1u64,
         Index::ZERO,
@@ -490,12 +469,10 @@ fn forwarded_read_token_is_unique_across_restart() {
     }
     (ep, tok.expect("forwarded a ReadIndex"))
   }
-  fn read_states(
-    ep: &mut Endpoint<u64, crate::testkit::CountSm>,
-  ) -> std::vec::Vec<crate::ReadState> {
+  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<crate::ReadState> {
     core::iter::from_fn(|| ep.poll_event())
       .filter_map(|e| match e {
-        crate::Event::ReadState(rs) => Some(rs),
+        Event::ReadState(rs) => Some(rs),
         _ => None,
       })
       .collect()
@@ -584,20 +561,16 @@ fn fifo_confirmation_and_index_correctness() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      last_round.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, last_round.clone())),
   );
   while ep.poll_message().is_some() {}
 
   // Both reads should now be confirmed.
-  let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
-  let read_states: std::vec::Vec<_> = events
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let read_states: Vec<_> = events
     .iter()
     .filter_map(|e| {
-      if let crate::Event::ReadState(rs) = e {
+      if let Event::ReadState(rs) = e {
         Some(rs.clone())
       } else {
         None
@@ -623,8 +596,8 @@ fn fifo_confirmation_and_index_correctness() {
     "second confirmed must be ctx_b"
   );
   // Index correctness: both are at commit=1.
-  assert_eq!(read_states[0].index(), crate::Index::new(1));
-  assert_eq!(read_states[1].index(), crate::Index::new(1));
+  assert_eq!(read_states[0].index(), Index::new(1));
+  assert_eq!(read_states[1].index(), Index::new(1));
 }
 
 /// Test 6: No-current-term-commit defers.
@@ -634,16 +607,16 @@ fn fifo_confirmation_and_index_correctness() {
 #[test]
 fn no_current_term_commit_defers_read() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -653,12 +626,7 @@ fn no_current_term_commit_defers_read() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Do NOT drain storage or advance commit yet.
@@ -701,12 +669,12 @@ fn no_current_term_commit_defers_read() {
     &mut stable,
     2u64,
     Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {} // drain Applied for no-op (it's Empty, so none)
@@ -729,19 +697,15 @@ fn no_current_term_commit_defers_read() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      round.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
 
-  let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
-  let read_states: std::vec::Vec<_> = events
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let read_states: Vec<_> = events
     .iter()
     .filter_map(|e| {
-      if let crate::Event::ReadState(rs) = e {
+      if let Event::ReadState(rs) = e {
         Some(rs.clone())
       } else {
         None
@@ -755,7 +719,7 @@ fn no_current_term_commit_defers_read() {
   );
   assert_eq!(
     read_states[0].index(),
-    crate::Index::new(1),
+    Index::new(1),
     "index must be commit at receipt"
   );
   assert_eq!(read_states[0].context().as_ref(), ctx.as_ref());
@@ -777,8 +741,8 @@ fn term_read_failure_at_committed_index_poisons_no_truncation() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut stable = NoopStable::default();
 
   // Follower holds two durable, COMMITTED entries at indices 1 and 2 (both term 1). Use Empty
   // entries so commit-and-apply needs no payload decode — this test isolates the term-read path.
@@ -875,9 +839,9 @@ fn duplicate_follower_read_index_is_rejected_then_clears() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Establish a known leader (node 1) via a heartbeat-shaped AppendEntries.
   ep.handle_message(
@@ -1006,9 +970,9 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut follower = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut flog = crate::testkit::VecLog::default();
-  let mut fstable = crate::testkit::NoopStable::default();
+  let mut follower = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut flog = VecLog::default();
+  let mut fstable = NoopStable::default();
   follower.handle_message(
     Instant::ORIGIN,
     &mut flog,
@@ -1052,7 +1016,7 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
     &mut flog,
     &mut fstable,
     1u64,
-    Message::ReadIndexResp(crate::ReadIndexResp::new(
+    Message::ReadIndexResp(ReadIndexResp::new(
       Term::new(1),
       1u64,
       Index::ZERO,
@@ -1114,9 +1078,9 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Establish leader = node 1 and forward a read with context "ctx".
   ep.handle_message(
@@ -1200,10 +1164,10 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
       false,
     )),
   );
-  let read_states: std::vec::Vec<_> = {
-    let mut v = std::vec::Vec::new();
+  let read_states: Vec<_> = {
+    let mut v = Vec::new();
     while let Some(e) = ep.poll_event() {
-      if let crate::Event::ReadState(rs) = e {
+      if let Event::ReadState(rs) = e {
         v.push(rs);
       }
     }
@@ -1252,9 +1216,9 @@ fn forwarded_reads_is_bounded() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Establish a stable leader (node 1) so every read FORWARDS (and is then "dropped" — we never
   // deliver a ReadIndexResp).
@@ -1291,7 +1255,7 @@ fn forwarded_reads_is_bounded() {
     } else {
       assert_eq!(
         result,
-        Err(crate::ReadIndexError::TooManyInFlight),
+        Err(ReadIndexError::TooManyInFlight),
         "at capacity the follower back-pressures instead of evicting"
       );
     }
@@ -1327,9 +1291,9 @@ fn read_index_resp_requires_matching_envelope_sender() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Establish leader = node 2 (via an AppendEntries whose envelope sender is 2) and forward a read.
   ep.handle_message(
@@ -1405,10 +1369,10 @@ fn read_index_resp_requires_matching_envelope_sender() {
       false,
     )),
   );
-  let read_states: std::vec::Vec<_> = {
-    let mut v = std::vec::Vec::new();
+  let read_states: Vec<_> = {
+    let mut v = Vec::new();
     while let Some(e) = ep.poll_event() {
-      if let crate::Event::ReadState(rs) = e {
+      if let Event::ReadState(rs) = e {
         v.push(rs);
       }
     }
@@ -1443,9 +1407,9 @@ fn leader_read_backlog_is_bounded() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 leader, but do NOT drain storage / advance commit, so `has_current_term_commit`
   // is false and reads defer into `pending_reads`. Mirrors `no_current_term_commit_defers_read`.
@@ -1487,7 +1451,7 @@ fn leader_read_backlog_is_bounded() {
   let overflow = bytes::Bytes::from_static(b"read-overflow");
   assert_eq!(
     ep.read_index(d, &log, &stable, overflow),
-    Err(crate::ReadIndexError::TooManyInFlight),
+    Err(ReadIndexError::TooManyInFlight),
     "the read past the cap must be rejected with TooManyInFlight"
   );
   assert_eq!(

@@ -1,4 +1,8 @@
 use super::{super::*, *};
+use crate::{
+  ConfChangeSingle, ConfChangeV2, VoteResp,
+  testkit::{CountSm, NoopStable, VecLog},
+};
 
 /// Test 1: One-in-flight refusal.
 /// A second `propose_conf_change` before the first is applied → `ConfChangeInFlight`.
@@ -13,7 +17,7 @@ fn conf_change_in_flight_refusal() {
   let idx1 = ep
     .propose_conf_change(d, &mut log, &stable, cc1)
     .expect("first conf change must be accepted");
-  assert!(idx1 > crate::Index::ZERO);
+  assert!(idx1 > Index::ZERO);
 
   // Second conf-change before first is applied: must be refused.
   let cc2 = ConfChange::new(ConfChangeType::AddNode, 3u64, bytes::Bytes::new());
@@ -79,14 +83,14 @@ fn simple_add_node_applies_at_commit() {
   );
 
   // An Event::ConfChanged must have been emitted.
-  let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
-  let conf_changed: std::vec::Vec<_> = events.iter().filter(|e| e.is_conf_changed()).collect();
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let conf_changed: Vec<_> = events.iter().filter(|e| e.is_conf_changed()).collect();
   assert!(
     !conf_changed.is_empty(),
     "Event::ConfChanged must be emitted when AddNode is applied"
   );
   // The ConfState must contain voter 2.
-  if let crate::Event::ConfChanged(cc_ev) = conf_changed[0] {
+  if let Event::ConfChanged(cc_ev) = conf_changed[0] {
     assert!(
       cc_ev.conf().is_voter(&2u64),
       "ConfChanged event must carry a ConfState with voter 2"
@@ -100,16 +104,16 @@ fn simple_remove_node_applies_at_commit() {
   use crate::{ConfChange, ConfChangeType};
   // Start with a 2-voter cluster (1, 2), single-node leader at id=1.
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // become candidate
@@ -192,7 +196,7 @@ fn simple_remove_node_applies_at_commit() {
   );
 
   // ConfChanged event.
-  let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
     events.iter().any(|e| e.is_conf_changed()),
     "Event::ConfChanged must be emitted when RemoveNode is applied"
@@ -204,16 +208,16 @@ fn simple_remove_node_applies_at_commit() {
 fn non_leader_conf_change_is_refused() {
   use crate::{ConfChange, ConfChangeType, ProposeError};
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let stable = NoopStable::default();
 
   assert!(ep.role().is_follower());
   let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new());
@@ -249,16 +253,16 @@ fn inherited_uncommitted_conf_change_blocks_new_proposal() {
   use core::time::Duration;
 
   // Node 2 is a follower in a 3-voter cluster {1, 2, 3}.
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Step 1: Leader 1 (term 1) sends node 2 an AppendEntries carrying:
   //   - index 1: the leader's no-op (Empty entry)
@@ -266,7 +270,7 @@ fn inherited_uncommitted_conf_change_blocks_new_proposal() {
   // leader_commit = 0 → neither entry is committed on node 2.
   let cc_payload = {
     let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()).into_v2();
-    let mut buf = std::vec::Vec::new();
+    let mut buf = Vec::new();
     crate::wire::encode_conf_change_v2(&cc, &mut buf);
     bytes::Bytes::from(buf)
   };
@@ -356,22 +360,22 @@ fn changer_error_at_apply_poisons_node() {
   use core::time::Duration;
 
   // Node 2 is a follower in a 3-voter cluster {1, 2, 3}.
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Build a leave-joint ConfChange payload. The node is not in joint config, so
   // when this entry commits the Changer will return Err(NotInJointConfig).
   let leave_payload = {
-    let cc = crate::ConfChangeV2::<u64>::leave_joint();
-    let mut buf = std::vec::Vec::new();
+    let cc = ConfChangeV2::<u64>::leave_joint();
+    let mut buf = Vec::new();
     crate::wire::encode_conf_change_v2(&cc, &mut buf);
     bytes::Bytes::from(buf)
   };
@@ -564,17 +568,17 @@ fn promoted_learner_arms_election_timer() {
   use core::time::Duration;
 
   // Node 4 starts as a LEARNER in {voters:[1,2,3], learners:[4]}.
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     4u64,
     std::vec![1u64, 2u64, 3u64, 4u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 99, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 99, CountSm::default());
+  let mut log = VecLog::default();
   let learner_cs = crate::ConfState::new([1u64, 2u64, 3u64], [4u64], [], [], false);
-  ep.tracker = crate::Tracker::from_conf_state(&learner_cs, crate::Index::ZERO, 256, 0);
+  ep.tracker = crate::Tracker::from_conf_state(&learner_cs, Index::ZERO, 256, 0);
   assert!(ep.tracker.is_learner(&4u64), "node 4 must start a learner");
 
   // The non-voter state: the election timer fired once and was cleared to None (never re-armed).
@@ -582,7 +586,7 @@ fn promoted_learner_arms_election_timer() {
 
   // Append a committed AddNode(4) conf-change entry — it promotes node 4 from learner to voter.
   let cc = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()).into_v2();
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   crate::wire::encode_conf_change_v2(&cc, &mut buf);
   let idx = log.last_index().next();
   log.force_append(&[Entry::new(
@@ -622,7 +626,7 @@ fn step_down_disabled_leader_keeps_role_after_self_removal() {
   use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
   use core::time::Duration;
 
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -631,9 +635,9 @@ fn step_down_disabled_leader_keeps_role_after_self_removal() {
   .unwrap()
   .with_step_down_on_removal(false); // opt out
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -643,7 +647,7 @@ fn step_down_disabled_leader_keeps_role_after_self_removal() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -706,16 +710,16 @@ fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
   // 3-voter cluster {1, 2, 3}. We propose a joint change that replaces node 3 with node 4
   // via enter_joint (Explicit transition). Node 1 (leader) is still in both the incoming
   // AND outgoing half → is_voter(1) == true → must not step down.
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -725,7 +729,7 @@ fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -749,11 +753,11 @@ fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
 
   // Propose an Explicit joint change: add node 4, remove node 3. Node 1 stays in BOTH
   // incoming and outgoing halves, so is_voter(1) == true throughout.
-  let ccv2 = crate::ConfChangeV2::new(
+  let ccv2 = ConfChangeV2::new(
     crate::ConfChangeTransition::Explicit,
     std::vec![
-      crate::ConfChangeSingle::new(ConfChangeType::AddNode, 4u64),
-      crate::ConfChangeSingle::new(ConfChangeType::RemoveNode, 3u64),
+      ConfChangeSingle::new(ConfChangeType::AddNode, 4u64),
+      ConfChangeSingle::new(ConfChangeType::RemoveNode, 3u64),
     ],
     bytes::Bytes::new(),
   );
@@ -806,7 +810,7 @@ fn propose_invalid_conf_change_is_rejected_not_poisoned() {
 
   // The leader is in a simple (non-joint) config {1,2,3}; leaving a joint config is invalid here.
   let last_before = log.last_index();
-  let res = ep.propose_conf_change_v2(d, &mut log, &stable, crate::ConfChangeV2::leave_joint());
+  let res = ep.propose_conf_change_v2(d, &mut log, &stable, ConfChangeV2::leave_joint());
 
   assert!(
     matches!(res, Err(crate::ProposeError::InvalidConfChange)),
@@ -831,7 +835,7 @@ fn self_removal_step_down_emits_leader_changed_none() {
   use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
   use core::time::Duration;
 
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -839,9 +843,9 @@ fn self_removal_step_down_emits_leader_changed_none() {
   )
   .unwrap(); // step_down_on_removal defaults ON
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -851,7 +855,7 @@ fn self_removal_step_down_emits_leader_changed_none() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -894,9 +898,9 @@ fn self_removal_step_down_emits_leader_changed_none() {
   );
   assert!(ep.role().is_follower(), "removed leader steps down");
 
-  let mut leader_events = std::vec::Vec::new();
+  let mut leader_events = Vec::new();
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::LeaderChanged(lc) = ev {
+    if let Event::LeaderChanged(lc) = ev {
       leader_events.push((lc.term(), lc.leader()));
     }
   }
@@ -920,7 +924,7 @@ impl core::fmt::Display for OverwideId {
 }
 
 impl crate::Data for OverwideId {
-  fn encode(&self, buf: &mut std::vec::Vec<u8>) {
+  fn encode(&self, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&[0u8; 1020]);
     self.0.encode(buf);
   }
@@ -938,16 +942,16 @@ fn conf_change_with_overwide_id_is_rejected_at_propose() {
   use crate::{ConfChange, ConfChangeType, ProposeError};
   use core::time::Duration;
 
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     OverwideId(1),
     std::vec![OverwideId(1)],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Single voter: elect on the first timeout (the self-vote completes synchronously).
   let d = ep.poll_timeout().unwrap();

@@ -1,4 +1,8 @@
 use super::{super::*, *};
+use crate::{
+  AppendResp, HeartbeatResp, VoteResp,
+  testkit::{AsyncStable, CountSm, NoopStable, VecLog},
+};
 
 /// Regression (LeaseBased degradation shares the FULL Safe read path): when a LeaseBased
 /// read cannot use the lease (here `check_quorum=false`), the fallback must run the Safe single-node
@@ -11,19 +15,19 @@ use super::{super::*, *};
 #[test]
 fn single_voter_leasebased_degraded_read_completes() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseBased)
+  .with_read_only(ReadOnlyOption::LeaseBased)
   .with_check_quorum(false);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Single-node self-election: campaign, flush the self-vote (→ leader + no-op), flush the no-op
   // (→ commit the current-term no-op so the read is admissible).
@@ -36,7 +40,7 @@ fn single_voter_leasebased_degraded_read_completes() {
   while ep.poll_event().is_some() {}
   assert_eq!(
     ep.commit_index(),
-    crate::Index::new(1),
+    Index::new(1),
     "single-node no-op must commit before the read"
   );
 
@@ -78,7 +82,7 @@ fn check_quorum_follower_lease_blocks_disruptive_vote() {
   let base = Instant::ORIGIN;
   let mut ep = Endpoint::new(cfg, base, 7, Noop);
   let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut stable = NoopStable::default();
 
   // The follower must believe it has a live leader. Receive a Heartbeat from leader 1
   // to set leader=Some(1) and arm the election timer.
@@ -166,19 +170,19 @@ fn check_quorum_follower_lease_blocks_disruptive_vote() {
 #[test]
 fn lease_based_confirms_immediately() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseBased)
+  .with_read_only(ReadOnlyOption::LeaseBased)
   .with_check_quorum(true);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -188,12 +192,7 @@ fn lease_based_confirms_immediately() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -202,13 +201,13 @@ fn lease_based_confirms_immediately() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {}
@@ -234,7 +233,7 @@ fn lease_based_confirms_immediately() {
     &mut stable,
     2u64,
     Message::HeartbeatResp(
-      crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
           .with_lease_round(lease_round)
           // advertise enforcement (the follower's own election_timeout) so the leader counts it.
           .with_lease_support(Duration::from_millis(1000)),
@@ -268,7 +267,7 @@ fn lease_based_confirms_immediately() {
     .expect("LeaseBased must emit ReadState immediately");
   assert!(ev.is_read_state(), "expected ReadState event");
   let rs = ev.unwrap_read_state_ref();
-  assert_eq!(rs.index(), crate::Index::new(1));
+  assert_eq!(rs.index(), Index::new(1));
   assert_eq!(rs.context().as_ref(), ctx.as_ref());
 }
 
@@ -283,18 +282,18 @@ fn lease_based_confirms_immediately() {
 #[test]
 fn stale_round_heartbeat_resp_does_not_renew_lease() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseBased)
+  .with_read_only(ReadOnlyOption::LeaseBased)
   .with_check_quorum(true);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   // Elect node 1 leader.
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -304,12 +303,7 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -317,10 +311,10 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
 
   // Tick a heartbeat round and return (time, lease round token).
   fn tick_round(
-    ep: &mut Endpoint<u64, crate::testkit::CountSm>,
-    log: &mut crate::testkit::VecLog,
-    stable: &mut crate::testkit::NoopStable,
-  ) -> (crate::Instant, u64) {
+    ep: &mut Endpoint<u64, CountSm>,
+    log: &mut VecLog,
+    stable: &mut NoopStable,
+  ) -> (Instant, u64) {
     let at = ep.poll_timeout().expect("heartbeat timer armed");
     ep.handle_timeout(at, log, stable);
     let mut lr = None;
@@ -333,7 +327,7 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
   }
   fn hb_resp(round: u64) -> Message<u64> {
     Message::HeartbeatResp(
-      crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
           .with_lease_round(round)
           // advertise enforcement (the follower's own election_timeout) so the leader counts it.
           .with_lease_support(Duration::from_millis(1000)),
@@ -394,18 +388,18 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
 #[test]
 fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseBased)
+  .with_read_only(ReadOnlyOption::LeaseBased)
   .with_check_quorum(true);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_storage(d, &mut log, &mut stable);
@@ -414,12 +408,7 @@ fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -446,7 +435,7 @@ fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
     &mut stable,
     2u64,
     Message::HeartbeatResp(
-      crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
           .with_lease_round(round)
           // advertise enforcement (the follower's own election_timeout) so the leader counts it.
           .with_lease_support(Duration::from_millis(1000)),
@@ -485,8 +474,7 @@ fn lease_not_renewed_by_non_enforcing_voter() {
     &mut stable,
     2u64,
     Message::HeartbeatResp(
-      crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
-        .with_lease_round(round),
+      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new()).with_lease_round(round),
     ),
   );
   assert!(
@@ -515,7 +503,7 @@ fn lease_bounded_by_min_support() {
     &mut stable,
     2u64,
     Message::HeartbeatResp(
-      crate::HeartbeatResp::new(crate::Term::new(1), 2u64, bytes::Bytes::new())
+      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
         .with_lease_round(round)
         .with_lease_support(Duration::from_millis(300)),
     ),
@@ -547,7 +535,7 @@ fn membership_change_revokes_lease() {
     &mut stable,
     2u64,
     Message::HeartbeatResp(
-      crate::HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
+      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
         .with_lease_round(round)
         .with_lease_support(Duration::from_millis(1000)),
     ),
@@ -572,7 +560,7 @@ fn membership_change_revokes_lease() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
+    Message::AppendResp(AppendResp::new(
       Term::new(1),
       2u64,
       false,
@@ -599,7 +587,7 @@ fn advertise_is_zero_until_lease_support_floor_durable_then_full() {
   use core::time::Duration;
   let et = Duration::from_millis(1000);
   let (mut ep, mut log, mut stable) = enforcing_follower(et);
-  let now = crate::Instant::ORIGIN;
+  let now = Instant::ORIGIN;
   let s1 = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
   assert_eq!(
     s1,
@@ -647,15 +635,7 @@ fn persist_before_advertise_survives_crash_in_fsync_window() {
   )
   .unwrap();
   let r_now = now + Duration::from_millis(50);
-  let ep2 = Endpoint::restart(
-    cfg,
-    r_now,
-    7,
-    crate::testkit::CountSm::default(),
-    1,
-    &mut log,
-    &mut stable,
-  );
+  let ep2 = Endpoint::restart(cfg, r_now, 7, CountSm::default(), 1, &mut log, &mut stable);
   assert_eq!(
     ep2.durable.lease_vote_fence_until, None,
     "no durable promise → no fence (safe: only ZERO was ever advertised)"
@@ -672,13 +652,12 @@ fn persist_before_advertise_survives_crash_in_fsync_window() {
 fn grow_then_crash_then_shrink_does_not_underfence() {
   use crate::{Config, HardState, Instant};
   use core::time::Duration;
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   // Run A already persisted+flushed a 1000ms promise.
   stable.force_hard_state(
-    HardState::initial().with_lease_support(crate::LeaseSupport::Recorded(Some(
-      Duration::from_millis(1000),
-    ))),
+    HardState::initial()
+      .with_lease_support(LeaseSupport::Recorded(Some(Duration::from_millis(1000)))),
   );
   // Run B: restart GROWN to et=2000 → submits a floor=2000 write (in flight).
   let cfg_b = Config::try_new(
@@ -694,7 +673,7 @@ fn grow_then_crash_then_shrink_does_not_underfence() {
     cfg_b,
     now_b,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -720,7 +699,7 @@ fn grow_then_crash_then_shrink_does_not_underfence() {
     cfg_c,
     now_c,
     7,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -741,10 +720,10 @@ fn grow_then_crash_then_shrink_does_not_underfence() {
 fn genuine_zero_floor_does_not_force_fence() {
   use crate::{Config, HardState, Instant};
   use core::time::Duration;
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   stable.force_hard_state(
-    HardState::initial().with_lease_support(crate::LeaseSupport::Recorded(Some(Duration::ZERO))),
+    HardState::initial().with_lease_support(LeaseSupport::Recorded(Some(Duration::ZERO))),
   );
   let cfg = Config::try_new(
     2u64,
@@ -754,15 +733,7 @@ fn genuine_zero_floor_does_not_force_fence() {
   )
   .unwrap(); // enforcement off
   let now = Instant::ORIGIN + Duration::from_millis(5000);
-  let ep = Endpoint::restart(
-    cfg,
-    now,
-    7,
-    crate::testkit::CountSm::default(),
-    1,
-    &mut log,
-    &mut stable,
-  );
+  let ep = Endpoint::restart(cfg, now, 7, CountSm::default(), 1, &mut log, &mut stable);
   assert_eq!(
     ep.durable.lease_vote_fence_until, None,
     "a recorded genuine-ZERO floor promised nothing → no fence (must not arm now+0)"
@@ -783,7 +754,7 @@ fn lease_floor_never_lowered_by_any_write_under_last_durable_store() {
   use core::time::Duration;
   let (mut ep, mut log, mut stable) = enforcing_follower(Duration::from_millis(1000));
   stable.set_last_durable_reads(true);
-  let now = crate::Instant::ORIGIN;
+  let now = Instant::ORIGIN;
   // Heartbeat raises the in-memory floor to 1000 and submits the floor write (in flight; durable stays
   // None under last-durable reads).
   let _ = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
@@ -829,19 +800,19 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
   use core::time::Duration;
 
   // Build a leader with LeaseBased but check_quorum=false (the unsafe combination).
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseBased)
+  .with_read_only(ReadOnlyOption::LeaseBased)
   .with_check_quorum(false);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -851,12 +822,7 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -865,13 +831,13 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {}
@@ -906,11 +872,7 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      round.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
 
@@ -919,7 +881,7 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
     .expect("ReadState must be emitted once heartbeat quorum acks");
   assert!(ev.is_read_state(), "expected ReadState");
   let rs = ev.unwrap_read_state_ref();
-  assert_eq!(rs.index(), crate::Index::new(1));
+  assert_eq!(rs.index(), Index::new(1));
   assert_eq!(rs.context().as_ref(), ctx.as_ref());
 }
 
@@ -937,19 +899,19 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
 #[test]
 fn lease_based_expired_lease_degrades_to_safe() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseBased)
+  .with_read_only(ReadOnlyOption::LeaseBased)
   .with_check_quorum(true);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -959,12 +921,7 @@ fn lease_based_expired_lease_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // The leader armed its quorum lease at `d`: election_deadline = d + election_timeout (1s).
@@ -974,13 +931,13 @@ fn lease_based_expired_lease_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {}
@@ -1016,16 +973,12 @@ fn lease_based_expired_lease_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      round.clone(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
   let ev = ep
     .poll_event()
     .expect("ReadState must be emitted once the Safe heartbeat quorum acks");
   assert!(ev.is_read_state(), "expected ReadState");
-  assert_eq!(ev.unwrap_read_state_ref().index(), crate::Index::new(1));
+  assert_eq!(ev.unwrap_read_state_ref().index(), Index::new(1));
 }

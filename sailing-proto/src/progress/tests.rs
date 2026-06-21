@@ -21,14 +21,14 @@ fn next_index_floors_at_one() {
 
 #[test]
 fn pause_semantics() {
-  let mut p = Progress::new(crate::Index::new(1), 2, 0); // next=1, inflight cap 2
+  let mut p = Progress::new(Index::new(1), 2, 0); // next=1, inflight cap 2
   assert!(!p.is_paused()); // fresh probe can send
-  p.sent_entries(crate::Index::new(1), 10);
+  p.sent_entries(Index::new(1), 10);
   assert!(p.is_paused()); // probe sends one, then pauses until ack/heartbeat-resp
   p.become_replicate();
-  p.sent_entries(crate::Index::new(2), 10);
+  p.sent_entries(Index::new(2), 10);
   assert!(!p.is_paused()); // replicate: paused only when the window is full
-  p.sent_entries(crate::Index::new(3), 10);
+  p.sent_entries(Index::new(3), 10);
   assert!(p.is_paused()); // window (2) now full
 }
 
@@ -97,10 +97,10 @@ fn snapshot_state_display() {
 #[test]
 fn free_inflight_on_heartbeat_replicate_full_frees_one() {
   // Replicate peer with inflight cap=2; fill it then call free_inflight_on_heartbeat.
-  let mut p = Progress::new(crate::Index::new(1), 2, 0);
+  let mut p = Progress::new(Index::new(1), 2, 0);
   p.become_replicate();
-  p.sent_entries(crate::Index::new(1), 10);
-  p.sent_entries(crate::Index::new(2), 20);
+  p.sent_entries(Index::new(1), 10);
+  p.sent_entries(Index::new(2), 20);
   assert!(p.is_paused(), "window full => paused");
 
   p.free_inflight_on_heartbeat();
@@ -116,8 +116,8 @@ fn free_inflight_on_heartbeat_replicate_full_frees_one() {
 #[test]
 fn free_inflight_on_heartbeat_probe_noop() {
   // Probe state: free_inflight_on_heartbeat must not touch the probe-pause flag.
-  let mut p = Progress::new(crate::Index::new(1), 2, 0);
-  p.sent_entries(crate::Index::new(1), 10); // probe pause set
+  let mut p = Progress::new(Index::new(1), 2, 0);
+  p.sent_entries(Index::new(1), 10); // probe pause set
   assert!(p.is_paused());
   p.free_inflight_on_heartbeat(); // no-op for Probe
   assert!(
@@ -129,8 +129,8 @@ fn free_inflight_on_heartbeat_probe_noop() {
 #[test]
 fn free_inflight_on_heartbeat_snapshot_noop() {
   // Snapshot state: always paused; free_inflight_on_heartbeat must be a no-op.
-  let mut p = Progress::new(crate::Index::new(1), 2, 0);
-  p.become_snapshot(crate::Index::new(10));
+  let mut p = Progress::new(Index::new(1), 2, 0);
+  p.become_snapshot(Index::new(10));
   assert!(p.is_paused());
   p.free_inflight_on_heartbeat(); // no-op for Snapshot
   assert!(

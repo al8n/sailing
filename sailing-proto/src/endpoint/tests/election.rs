@@ -1,9 +1,13 @@
 use super::{super::*, *};
+use crate::{
+  Heartbeat, HeartbeatResp, VoteResp,
+  testkit::{AsyncStable, CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
+};
 use core::time::Duration;
 
 #[test]
 fn election_timer_is_armed_after_construction() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
     Duration::from_millis(1000),
@@ -28,14 +32,14 @@ fn election_timeout_starts_a_campaign() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
   let deadline = ep.poll_timeout().unwrap();
   ep.handle_timeout(deadline, &mut log, &mut stable);
   assert!(ep.role().is_candidate());
-  assert_eq!(ep.term(), crate::Term::new(1));
+  assert_eq!(ep.term(), Term::new(1));
   // two RequestVotes (to peers 2 and 3), each in term 1
-  let mut targets = std::vec::Vec::new();
+  let mut targets = Vec::new();
   while let Some(out) = ep.poll_message() {
     assert!(matches!(out.message(), Message::RequestVote(_)));
     targets.push(out.to());
@@ -64,8 +68,8 @@ fn max_term_node_does_not_campaign_or_double_vote() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
   let d = Instant::ORIGIN;
 
   // A crafted max-term RequestVote pushes this node to term u64::MAX; it grants the vote to node 2.
@@ -131,9 +135,9 @@ fn follower_grants_then_rejects_second_candidate() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
+  let mut log = NoopLog;
   // Use AsyncStable so that the VoteResp(grant) is released on handle_storage.
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
 
   // candidate 1 in term 1, empty log — grant is deferred behind durability
   ep.handle_message(
@@ -195,9 +199,9 @@ fn durable_index_advances_after_same_term_leader_step_down() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   // Elect node 1 leader at term 1.
   let d = ep.poll_timeout().unwrap();
@@ -273,9 +277,9 @@ fn vote_grant_waits_for_durable_hard_state() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
@@ -320,9 +324,9 @@ fn candidate_does_not_lead_until_self_vote_durable() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   // Campaign at term 1. The self-vote is a single-node quorum, but the hard-state write is in
   // flight (AsyncStable holds the `StableDone::Wrote` until `poll`).
@@ -356,9 +360,9 @@ fn quorum_from_peer_vote_waits_for_durable_self_vote() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   // Campaign at term 1; self-vote write in flight.
   let d = ep.poll_timeout().unwrap();
@@ -403,10 +407,10 @@ fn deferred_vote_does_not_leak_across_term_bump() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
   // AsyncStable: writes complete only when handle_storage / poll is called.
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
 
   // Step 1: candidate 1 requests a vote in term 5. Follower grants it (deferred).
   ep.handle_message(
@@ -455,7 +459,7 @@ fn deferred_vote_does_not_leak_across_term_bump() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
 
   // Step 4: collect all VoteResp messages.
-  let mut grants: std::vec::Vec<(u64, u64)> = std::vec::Vec::new(); // (from, to/candidate)
+  let mut grants: Vec<(u64, u64)> = Vec::new(); // (from, to/candidate)
   while let Some(out) = ep.poll_message() {
     if let Message::VoteResp(vr) = out.message()
       && !vr.reject()
@@ -494,21 +498,21 @@ fn non_voter_does_not_campaign_on_timeout() {
 
   // Node 4 is a learner in {voters: [1,2,3], learners: [4]}.
   // We bootstrap as if 4 is a voter (Config requirement) then manually adjust the Tracker.
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     4u64,
     std::vec![1u64, 2u64, 3u64, 4u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 99, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 99, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Demote node 4 to learner in the Tracker by rebuilding it from a ConfState that has
   // node 4 as a learner, not a voter.
   let learner_cs = crate::ConfState::new([1u64, 2u64, 3u64], [4u64], [], [], false);
-  ep.tracker = crate::Tracker::from_conf_state(&learner_cs, crate::Index::ZERO, 256, 0);
+  ep.tracker = crate::Tracker::from_conf_state(&learner_cs, Index::ZERO, 256, 0);
 
   // Sanity: node 4 is NOT a voter.
   assert!(!ep.tracker.is_voter(&4u64), "node 4 must not be a voter");
@@ -599,8 +603,8 @@ fn pre_candidate_loses_stays_at_same_term() {
   .with_pre_vote(true);
 
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Trigger the election timer — with pre_vote enabled, node becomes PreCandidate.
   let deadline = ep.poll_timeout().unwrap();
@@ -613,7 +617,7 @@ fn pre_candidate_loses_stays_at_same_term() {
   );
 
   // Drain the RequestVote{pre_vote:true, term:1} messages to peers 2 and 3.
-  let mut pre_vote_msgs: std::vec::Vec<u64> = std::vec::Vec::new();
+  let mut pre_vote_msgs: Vec<u64> = Vec::new();
   while let Some(out) = ep.poll_message() {
     match out.message() {
       Message::RequestVote(rv) => {
@@ -687,8 +691,8 @@ fn pre_vote_reject_at_higher_term_is_adopted() {
   .with_pre_vote(true);
 
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Drive to PreCandidate (term 0, pre-voting for term 1) and drain the pre-vote requests.
   let deadline = ep.poll_timeout().unwrap();
@@ -743,8 +747,8 @@ fn pre_vote_grant_at_higher_term_does_not_raise_term() {
   .with_pre_vote(true);
 
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   let deadline = ep.poll_timeout().unwrap();
   ep.handle_timeout(deadline, &mut log, &mut stable);
@@ -793,8 +797,8 @@ fn pre_vote_request_does_not_raise_granter_term() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Establish a live leader so the lease check blocks the grant.
   // Feed a heartbeat from leader 1 in term 3 — this sets leader=Some(1) and re-arms timer.
@@ -803,10 +807,10 @@ fn pre_vote_request_does_not_raise_granter_term() {
     &mut log,
     &mut stable,
     1u64,
-    Message::Heartbeat(crate::Heartbeat::new(
+    Message::Heartbeat(Heartbeat::new(
       Term::new(3),
       1u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     )),
   );
@@ -878,8 +882,8 @@ fn successful_pre_vote_quorum_starts_real_campaign() {
   .with_pre_vote(true);
 
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Fire election → PreCandidate.
   let deadline = ep.poll_timeout().unwrap();
@@ -916,7 +920,7 @@ fn successful_pre_vote_quorum_starts_real_campaign() {
   );
 
   // Must broadcast real RequestVote{pre_vote:false} to peers.
-  let mut real_vote_targets: std::vec::Vec<u64> = std::vec::Vec::new();
+  let mut real_vote_targets: Vec<u64> = Vec::new();
   while let Some(out) = ep.poll_message() {
     if let Message::RequestVote(rv) = out.message() {
       assert!(!rv.pre_vote(), "real campaign must send pre_vote=false");
@@ -952,9 +956,9 @@ fn pre_vote_rejected_for_stale_log() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Seed log with 5 entries in term 3 so our last_log = (5, 3).
   log.force_append(&[
@@ -1045,8 +1049,8 @@ fn term_pre_pass_exemption_for_pre_vote_request() {
   .unwrap();
   // Use AsyncStable to confirm that NO storage write is issued for a pre-vote response.
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut log = NoopLog;
+  let mut stable = AsyncStable::default();
 
   // Node 2 is at term=0, no known leader, election timer just expired (now=ORIGIN).
   // Receive a pre-vote request at term+5 = 5 from node 1.
@@ -1136,8 +1140,8 @@ fn stale_term_pre_vote_is_rejected() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Manually set term to 5 (no voted_for, no leader, election timer expired).
   ep.term = Term::new(5);
@@ -1239,8 +1243,8 @@ fn stale_term_pre_vote_is_rejected() {
 fn check_quorum_isolated_leader_steps_down() {
   let cfg = cq_config(1, std::vec![1u64, 2, 3]);
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Become leader via the normal election path.
   let d = ep.poll_timeout().unwrap();
@@ -1251,12 +1255,7 @@ fn check_quorum_isolated_leader_steps_down() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(
     ep.role().is_leader(),
@@ -1309,8 +1308,8 @@ fn check_quorum_isolated_leader_steps_down() {
 fn check_quorum_active_quorum_stays_leader() {
   let cfg = cq_config(1, std::vec![1u64, 2, 3]);
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Become leader.
   let d = ep.poll_timeout().unwrap();
@@ -1321,12 +1320,7 @@ fn check_quorum_active_quorum_stays_leader() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   while ep.poll_message().is_some() {}
@@ -1344,11 +1338,7 @@ fn check_quorum_active_quorum_stays_leader() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      bytes::Bytes::new(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
   );
   while ep.poll_message().is_some() {}
 
@@ -1391,8 +1381,8 @@ fn check_quorum_active_quorum_stays_leader() {
 fn check_quorum_recent_active_set_on_inbound_message() {
   let cfg = cq_config(1, std::vec![1u64, 2, 3]);
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Become leader.
   let d = ep.poll_timeout().unwrap();
@@ -1403,12 +1393,7 @@ fn check_quorum_recent_active_set_on_inbound_message() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Drain storage (noop write for leader).
@@ -1431,11 +1416,7 @@ fn check_quorum_recent_active_set_on_inbound_message() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      crate::Term::new(1),
-      2u64,
-      bytes::Bytes::new(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
   );
 
   // Peer 2 must now be active.
@@ -1468,8 +1449,8 @@ fn check_quorum_disabled_preserves_m1_m6_behavior() {
   .unwrap();
   // check_quorum defaults to false
   let mut ep = Endpoint::new(cfg_leader, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_storage(d, &mut log, &mut stable);
@@ -1478,7 +1459,7 @@ fn check_quorum_disabled_preserves_m1_m6_behavior() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader(), "should be leader");
   // With check_quorum=false, election_deadline must NOT be armed (arm_heartbeat_timer clears it).
@@ -1498,8 +1479,8 @@ fn check_quorum_disabled_preserves_m1_m6_behavior() {
   // check_quorum=false AND pre_vote=false
   let base = Instant::ORIGIN;
   let mut ep2 = Endpoint::new(cfg_follower, base, 7, Noop);
-  let mut log2 = crate::testkit::NoopLog;
-  let mut stable2 = crate::testkit::NoopStable::default();
+  let mut log2 = NoopLog;
+  let mut stable2 = NoopStable::default();
 
   // Give the follower a live leader via Heartbeat.
   ep2.handle_message(
@@ -1507,7 +1488,7 @@ fn check_quorum_disabled_preserves_m1_m6_behavior() {
     &mut log2,
     &mut stable2,
     1u64,
-    Message::Heartbeat(crate::Heartbeat::new(
+    Message::Heartbeat(Heartbeat::new(
       Term::new(1),
       1u64,
       Index::ZERO,
@@ -1562,10 +1543,10 @@ fn higher_term_request_vote_last_log_failure_poisons_without_persisting_term() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut stable = NoopStable::default();
   // One entry at index 1; arm a fatal term-read at the last index so `last_log` fails.
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[Entry::new(
     Term::new(1),
     Index::new(1),
@@ -1628,10 +1609,10 @@ fn election_time_last_log_failure_poisons_without_self_vote() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut stable = NoopStable::default();
   // One entry at index 1; arm a fatal term-read at the last index so `last_log` fails.
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[Entry::new(
     Term::new(1),
     Index::new(1),
@@ -1689,9 +1670,9 @@ fn find_conflict_by_term_poison_propagation_leader() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut leader = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::FailTermLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut leader = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 (term 1, no-op at index 1).
   let d = leader.poll_timeout().unwrap();
@@ -1826,9 +1807,9 @@ fn spoofed_sender_vote_resp_is_rejected() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Node 1 campaigns: become candidate (term 1, self-vote), then make the self-vote durable so
   // the `Campaign` completes (persist-before-act). Mirrors the election-mechanics of
@@ -1885,8 +1866,8 @@ fn spoofed_sender_vote_resp_is_rejected() {
 fn check_quorum_step_down_emits_leader_changed_none() {
   let cfg = cq_config(1, std::vec![1u64, 2, 3]);
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -1896,12 +1877,7 @@ fn check_quorum_step_down_emits_leader_changed_none() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   let leader_term = ep.term();
@@ -1912,9 +1888,9 @@ fn check_quorum_step_down_emits_leader_changed_none() {
   ep.handle_timeout(cq_deadline, &mut log, &mut stable);
   assert!(ep.role().is_follower(), "isolated leader steps down");
 
-  let mut leader_events = std::vec::Vec::new();
+  let mut leader_events = Vec::new();
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::LeaderChanged(lc) = ev {
+    if let Event::LeaderChanged(lc) = ev {
       leader_events.push((lc.term(), lc.leader()));
     }
   }
@@ -1929,16 +1905,16 @@ fn check_quorum_step_down_emits_leader_changed_none() {
 /// term with no leader.
 #[test]
 fn campaign_start_emits_leader_changed_none_at_the_bumped_term() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    core::time::Duration::from_millis(1000),
-    core::time::Duration::from_millis(100),
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   // Learn a leader, then drain its event.
   ep.handle_message(
@@ -1946,10 +1922,10 @@ fn campaign_start_emits_leader_changed_none_at_the_bumped_term() {
     &mut log,
     &mut stable,
     2u64,
-    Message::Heartbeat(crate::Heartbeat::new(
-      crate::Term::new(1),
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
       2u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     )),
   );
@@ -1961,15 +1937,15 @@ fn campaign_start_emits_leader_changed_none_at_the_bumped_term() {
   ep.handle_timeout(d, &mut log, &mut stable);
   assert!(ep.role().is_candidate());
 
-  let mut leader_events = std::vec::Vec::new();
+  let mut leader_events = Vec::new();
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::LeaderChanged(lc) = ev {
+    if let Event::LeaderChanged(lc) = ev {
       leader_events.push((lc.term(), lc.leader()));
     }
   }
   assert_eq!(
     leader_events,
-    std::vec![(crate::Term::new(2), None)],
+    std::vec![(Term::new(2), None)],
     "campaign start must announce the lost leader at the bumped term"
   );
 }
@@ -1978,27 +1954,27 @@ fn campaign_start_emits_leader_changed_none_at_the_bumped_term() {
 /// a won probe finds the belief already `None` and must NOT re-emit.
 #[test]
 fn pre_vote_probe_emits_leader_changed_none_once() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    core::time::Duration::from_millis(1000),
-    core::time::Duration::from_millis(100),
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
   )
   .unwrap()
   .with_pre_vote(true);
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     2u64,
-    Message::Heartbeat(crate::Heartbeat::new(
-      crate::Term::new(1),
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
       2u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     )),
   );
@@ -2008,15 +1984,15 @@ fn pre_vote_probe_emits_leader_changed_none_once() {
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   assert!(ep.role().is_pre_candidate());
-  let mut leader_events = std::vec::Vec::new();
+  let mut leader_events = Vec::new();
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::LeaderChanged(lc) = ev {
+    if let Event::LeaderChanged(lc) = ev {
       leader_events.push((lc.term(), lc.leader()));
     }
   }
   assert_eq!(
     leader_events,
-    std::vec![(crate::Term::new(1), None)],
+    std::vec![(Term::new(1), None)],
     "the probe announces leader loss at the UNBUMPED term"
   );
 
@@ -2027,7 +2003,7 @@ fn pre_vote_probe_emits_leader_changed_none_once() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(crate::Term::new(2), 2u64, true, false)),
+    Message::VoteResp(VoteResp::new(Term::new(2), 2u64, true, false)),
   );
   assert!(
     ep.role().is_candidate(),
@@ -2035,7 +2011,7 @@ fn pre_vote_probe_emits_leader_changed_none_once() {
   );
   while let Some(ev) = ep.poll_event() {
     assert!(
-      !matches!(ev, crate::Event::LeaderChanged(_)),
+      !matches!(ev, Event::LeaderChanged(_)),
       "an unchanged None belief must not re-emit across the term bump"
     );
   }
@@ -2045,26 +2021,26 @@ fn pre_vote_probe_emits_leader_changed_none_once() {
 /// step-down must say so.
 #[test]
 fn higher_term_vote_request_emits_leader_changed_none() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    core::time::Duration::from_millis(1000),
-    core::time::Duration::from_millis(100),
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     2u64,
-    Message::Heartbeat(crate::Heartbeat::new(
-      crate::Term::new(1),
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
       2u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     )),
   );
@@ -2077,25 +2053,25 @@ fn higher_term_vote_request_emits_leader_changed_none() {
     &mut stable,
     3u64,
     Message::RequestVote(crate::RequestVote::new(
-      crate::Term::new(5),
+      Term::new(5),
       3u64,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
+      Index::ZERO,
+      Term::ZERO,
       false,
       false,
     )),
   );
-  assert_eq!(ep.term(), crate::Term::new(5));
+  assert_eq!(ep.term(), Term::new(5));
 
-  let mut leader_events = std::vec::Vec::new();
+  let mut leader_events = Vec::new();
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::LeaderChanged(lc) = ev {
+    if let Event::LeaderChanged(lc) = ev {
       leader_events.push((lc.term(), lc.leader()));
     }
   }
   assert_eq!(
     leader_events,
-    std::vec![(crate::Term::new(5), None)],
+    std::vec![(Term::new(5), None)],
     "a leaderless higher-term adoption must announce the unknown leader"
   );
 }
@@ -2104,26 +2080,26 @@ fn higher_term_vote_request_emits_leader_changed_none() {
 /// drain: `(term, None)` when the term is adopted, then `(term, Some(sender))`.
 #[test]
 fn higher_term_append_surfaces_the_adoption_pair_in_order() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    core::time::Duration::from_millis(1000),
-    core::time::Duration::from_millis(100),
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     2u64,
-    Message::Heartbeat(crate::Heartbeat::new(
-      crate::Term::new(1),
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
       2u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     )),
   );
@@ -2136,24 +2112,24 @@ fn higher_term_append_surfaces_the_adoption_pair_in_order() {
     &mut stable,
     3u64,
     Message::AppendEntries(crate::AppendEntries::new(
-      crate::Term::new(2),
+      Term::new(2),
       3u64,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
+      Index::ZERO,
+      Term::ZERO,
       std::vec![],
-      crate::Index::ZERO,
+      Index::ZERO,
     )),
   );
 
-  let mut leader_events = std::vec::Vec::new();
+  let mut leader_events = Vec::new();
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::LeaderChanged(lc) = ev {
+    if let Event::LeaderChanged(lc) = ev {
       leader_events.push((lc.term(), lc.leader()));
     }
   }
   assert_eq!(
     leader_events,
-    std::vec![(crate::Term::new(2), None), (crate::Term::new(2), Some(3)),],
+    std::vec![(Term::new(2), None), (Term::new(2), Some(3)),],
     "term adoption then leader installation, in order"
   );
 }
@@ -2161,22 +2137,22 @@ fn higher_term_append_surfaces_the_adoption_pair_in_order() {
 /// An unchanged belief never re-emits: the same leader's next heartbeat is event-silent.
 #[test]
 fn same_leader_reheartbeat_emits_no_leader_changed() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    core::time::Duration::from_millis(1000),
-    core::time::Duration::from_millis(100),
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   let hb = || {
-    Message::Heartbeat(crate::Heartbeat::new(
-      crate::Term::new(1),
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
       2u64,
-      crate::Index::ZERO,
+      Index::ZERO,
       bytes::Bytes::new(),
     ))
   };
@@ -2185,7 +2161,7 @@ fn same_leader_reheartbeat_emits_no_leader_changed() {
   ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, hb());
   while let Some(ev) = ep.poll_event() {
     assert!(
-      !matches!(ev, crate::Event::LeaderChanged(_)),
+      !matches!(ev, Event::LeaderChanged(_)),
       "an unchanged leader must not re-emit"
     );
   }
