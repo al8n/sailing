@@ -442,8 +442,10 @@ where
       pending_conf_index: Index::ZERO,
       pending_read_mode_index: Index::ZERO,
       tracker,
-      outgoing: VecDeque::new(),
-      events: VecDeque::new(),
+      outputs: Outputs {
+        outgoing: VecDeque::new(),
+        events: VecDeque::new(),
+      },
       read_only: ReadOnly::new(read_only_opt),
       pending_reads: std::vec::Vec::new(),
       forwarded_reads: ForwardedReads::new(boot_epoch),
@@ -479,7 +481,7 @@ where
       let hsw = stable.hard_state();
       ep.submit_write(stable, opid, hsw);
     }
-    ep.events.clear();
+    ep.outputs.events.clear();
     ep.arm_election_timer(now);
     ep
   }

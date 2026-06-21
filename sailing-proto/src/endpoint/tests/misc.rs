@@ -750,7 +750,7 @@ fn failing_fsm_apply_poisons_node() {
   );
 
   // The poisoned node is inert: subsequent handle_* are no-ops.
-  let outgoing_before = ep.outgoing.len();
+  let outgoing_before = ep.outputs.outgoing.len();
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -772,7 +772,7 @@ fn failing_fsm_apply_poisons_node() {
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(
-    ep.outgoing.len(),
+    ep.outputs.outgoing.len(),
     outgoing_before,
     "a poisoned node must emit nothing on subsequent handle_*"
   );
@@ -1070,7 +1070,8 @@ fn queued_message_is_suppressed_after_later_dispatch_poisons() {
   // Sanity (without draining): at least one queued message is a RequestVote at term 1 — proving the
   // votes really are sitting in the egress BEFORE the poison happens.
   assert!(
-    ep.outgoing
+    ep.outputs
+      .outgoing
       .iter()
       .any(|o| matches!(o.message(), Message::RequestVote(rv) if rv.term() == Term::new(1))),
     "become_candidate must have QUEUED a RequestVote(term=1) before any poison"

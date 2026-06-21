@@ -365,6 +365,7 @@ where
 
     // Step 5: emit the application event.
     self
+      .outputs
       .events
       .push_back(crate::Event::SnapshotInstalled(meta.clone()));
 
