@@ -68,8 +68,6 @@ fn mem_stable_roundtrips_snapshot() {
   assert_eq!(rmeta2.last_index(), Index::new(20));
 }
 
-// --- Compaction tests ---
-
 fn make_entry(term: u64, index: u64) -> Entry {
   Entry::new(
     Term::new(term),

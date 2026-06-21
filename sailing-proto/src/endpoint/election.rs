@@ -8,8 +8,6 @@ where
   F: StateMachine,
   R: rand::Rng,
 {
-  // --- PRIVATE HELPERS (no Data bound) ---
-
   pub(crate) fn arm_election_timer(&mut self, now: Now) {
     let t = crate::prng::election_timeout(&mut self.rng, self.config.election_timeout());
     self.election_deadline = Some(now.mono() + t);

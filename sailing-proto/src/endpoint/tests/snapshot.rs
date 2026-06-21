@@ -1318,7 +1318,6 @@ fn leader_processes_snapshot_response_success_and_reject() {
   }
   assert!(ep.tracker.progress(&2u64).unwrap().state().is_snapshot());
 
-  // --- Reject case: become_probe, then maybe_send_append re-enters probe ---
   ep.handle_message(
     d,
     &mut log,
@@ -1337,7 +1336,6 @@ fn leader_processes_snapshot_response_success_and_reject() {
     "reject SnapshotResponse must transition peer to Probe"
   );
 
-  // --- Success case: peer has been put back in Snapshot(10). ---
   if let Some(p) = ep.tracker.progress_mut(&2u64) {
     p.become_snapshot(Index::new(10));
   }

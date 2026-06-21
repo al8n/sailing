@@ -10,8 +10,6 @@ fn jc(incoming: &[u64], outgoing: &[u64]) -> JointConfig<u64> {
   JointConfig::new(mc(incoming), mc(outgoing))
 }
 
-// --- MajorityConfig::committed_index ---
-
 #[test]
 fn majority_committed_empty_returns_max() {
   let c = mc(&[]);
@@ -111,8 +109,6 @@ fn majority_committed_all_zero() {
   assert_eq!(c.committed_index(|_| Index::ZERO), Index::ZERO);
 }
 
-// --- MajorityConfig::vote_result ---
-
 #[test]
 fn majority_vote_empty_wins() {
   let c = mc(&[]);
@@ -165,8 +161,6 @@ fn majority_vote_all_missing() {
   assert_eq!(c.vote_result(|_| None), VoteResult::Pending);
 }
 
-// --- JointConfig::committed_index ---
-
 #[test]
 fn joint_committed_non_joint_equals_incoming() {
   // outgoing is empty → sentinel u64::MAX; min(incoming, MAX) = incoming.
@@ -214,8 +208,6 @@ fn joint_committed_classic_etcd_case() {
   };
   assert_eq!(c.committed_index(acked), Index::new(11));
 }
-
-// --- JointConfig::vote_result ---
 
 #[test]
 fn joint_vote_both_won() {

@@ -136,8 +136,6 @@ fn propose_reserves_sentinel_max_index() {
   assert!(ep.poison_reason().is_none());
 }
 
-// --- persistence tests ---
-
 #[test]
 fn op_ids_are_minted_distinctly() {
   let cfg = Config::try_new(
@@ -233,7 +231,6 @@ fn follower_defers_success_ack_until_term_durable() {
 fn serviceable_now_mirrors_dispatch() {
   use core::time::Duration;
 
-  // --- Follower (voter) ---
   let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
@@ -256,7 +253,6 @@ fn serviceable_now_mirrors_dispatch() {
     "follower: Transfer not serviceable"
   );
 
-  // --- Follower (non-voter / observer) ---
   // Use try_new_observer: node 99 joins an existing cluster {1,2,3} as an observer.
   // Its id is not in the voter seed so is_voter(99) = false in its Tracker.
   let cfg_nv = Config::try_new_observer(
@@ -282,7 +278,6 @@ fn serviceable_now_mirrors_dispatch() {
     "non-voter: Transfer not serviceable"
   );
 
-  // --- Leader (no check_quorum, no transfer) ---
   let (ep_l, log_leader, stable_leader, _) = make_three_node_leader();
   assert!(ep_l.role().is_leader());
   assert!(!ep_l.config.check_quorum());
@@ -300,7 +295,6 @@ fn serviceable_now_mirrors_dispatch() {
     "leader (no transfer): Transfer not serviceable"
   );
 
-  // --- Leader (check_quorum=true, no transfer) ---
   let cfg_cq = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
@@ -337,7 +331,6 @@ fn serviceable_now_mirrors_dispatch() {
     "leader CQ (no transfer): Transfer not serviceable"
   );
 
-  // --- Leader (check_quorum=true, transfer in progress) ---
   let ep_cq_log_ref = &log_cq;
   let ep_cq_stable_ref = &stable_cq;
   ep_cq
@@ -365,7 +358,6 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
   let election_timeout = Duration::from_millis(1000);
   let heartbeat_interval = Duration::from_millis(100);
 
-  // --- Follower: stale heartbeat_deadline set, should NOT appear in poll_timeout ---
   let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
@@ -390,7 +382,6 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
     "follower poll_timeout must NOT return heartbeat_deadline"
   );
 
-  // --- Non-voter: election_deadline armed but not serviceable → poll_timeout returns None ---
   let cfg_nv = Config::try_new_observer(
     99u64,
     std::vec![1u64, 2u64, 3u64], // 99 is not in the voter set
@@ -408,7 +399,6 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
     "non-voter poll_timeout must be None even with election_deadline armed"
   );
 
-  // --- Leader (no CQ): poll_timeout returns heartbeat, NOT election ---
   let (ep_l, _log_l, _stable_l, _d_l) = make_three_node_leader();
   assert!(!ep_l.config.check_quorum());
   // The leader has no election_deadline (cleared on become_leader when CQ=false).
@@ -422,7 +412,6 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
     "leader (no CQ) poll_timeout must return heartbeat_deadline"
   );
 
-  // --- Leader (CQ): poll_timeout returns min(heartbeat, election) ---
   let cfg_cq = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
@@ -456,7 +445,6 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
     "CQ leader poll_timeout must be min(hb, el)"
   );
 
-  // --- Leader (CQ + transfer): poll_timeout includes transfer ---
   ep_cq
     .transfer_leader(d_cq, &log_cq, &stable_cq, 2u64)
     .expect("transfer_leader must succeed");
@@ -525,7 +513,6 @@ fn handle_timeout_makes_progress_no_wedge() {
   use core::time::Duration;
   let now = Instant::ORIGIN + Duration::from_millis(5000);
 
-  // --- Follower voter: election timer fires → campaign → election re-armed to future ---
   let cfg_f = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
@@ -548,7 +535,6 @@ fn handle_timeout_makes_progress_no_wedge() {
     );
   }
 
-  // --- Non-voter follower: election timer fires silently → poll_timeout becomes None ---
   let cfg_nv = Config::try_new_observer(
     99u64,
     std::vec![1u64, 2u64, 3u64], // 99 is not in the voter set
@@ -571,7 +557,6 @@ fn handle_timeout_makes_progress_no_wedge() {
     "non-voter: election_deadline must be cleared after handle_timeout"
   );
 
-  // --- Leader (no CQ): heartbeat fires → re-armed to future ---
   let (mut ep_l, mut log_leader, mut stable_leader, _) = make_three_node_leader();
   assert!(!ep_l.config.check_quorum());
   // Force heartbeat deadline to now.
@@ -587,7 +572,6 @@ fn handle_timeout_makes_progress_no_wedge() {
     "leader: poll_timeout after heartbeat must be > now, got {pt_l:?}"
   );
 
-  // --- Leader (CQ): both heartbeat and election fire, both re-armed ---
   let cfg_cq = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
@@ -632,7 +616,6 @@ fn handle_timeout_makes_progress_no_wedge() {
     );
   }
 
-  // --- Leader (transfer): transfer deadline fires → cleared ---
   let (mut ep_tr, mut log_tr, mut stable_tr, d_tr) = make_three_node_leader();
   ep_tr
     .transfer_leader(d_tr, &log_tr, &stable_tr, 2u64)
