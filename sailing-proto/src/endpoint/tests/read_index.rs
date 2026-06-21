@@ -958,7 +958,7 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
   let (mut leader, mut llog, mut lstable, lnow) = make_leader_with_current_term_commit();
   // Saturate the leader's read backlog so `leader_reads_at_capacity()` holds.
   for i in 0..MAX_LEADER_READS {
-    leader.pending_reads.push((
+    leader.reads.pending_reads.push((
       bytes::Bytes::copy_from_slice(&(i as u64).to_le_bytes()),
       None,
     ));
@@ -1297,12 +1297,12 @@ fn forwarded_reads_is_bounded() {
     }
     while ep.poll_message().is_some() {}
     assert!(
-      ep.forwarded_reads.len() <= MAX_FORWARDED_READS,
+      ep.reads.forwarded_reads.len() <= MAX_FORWARDED_READS,
       "forwarded_reads must never exceed the cap"
     );
   }
   assert_eq!(
-    ep.forwarded_reads.len(),
+    ep.reads.forwarded_reads.len(),
     MAX_FORWARDED_READS,
     "the set saturates exactly at the cap"
   );
@@ -1473,12 +1473,12 @@ fn leader_read_backlog_is_bounded() {
     ep.read_index(d, &log, &stable, ctx)
       .expect("reads up to the cap must be accepted");
     assert!(
-      ep.pending_reads.len() <= MAX_LEADER_READS,
+      ep.reads.pending_reads.len() <= MAX_LEADER_READS,
       "the deferred backlog must never exceed MAX_LEADER_READS"
     );
   }
   assert_eq!(
-    ep.pending_reads.len(),
+    ep.reads.pending_reads.len(),
     MAX_LEADER_READS,
     "exactly MAX_LEADER_READS reads are now in the deferred backlog"
   );
@@ -1491,7 +1491,7 @@ fn leader_read_backlog_is_bounded() {
     "the read past the cap must be rejected with TooManyInFlight"
   );
   assert_eq!(
-    ep.pending_reads.len(),
+    ep.reads.pending_reads.len(),
     MAX_LEADER_READS,
     "the rejected read must not be added: the backlog stays at the cap"
   );

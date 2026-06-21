@@ -46,7 +46,7 @@ where
     }
     // One migration in flight at a time: refuse if a SetReadMode entry is not yet applied (mirror
     // `pending_conf_index`). Two stacked flips would otherwise race their apply-time effects.
-    if self.pending_read_mode_index > self.applied {
+    if self.reads.pending_read_mode_index > self.applied {
       return Err(crate::ProposeError::ReadModeChangeInFlight);
     }
     // Reject-at-propose if THIS leader lacks the target mode's required knobs (into-LeaseGuard ⇒ a valid
@@ -79,7 +79,7 @@ where
     // Apply-time migration (mirror apply-time membership): the mode changes only when the entry is
     // committed-and-applied (`apply_committed`). At append the leader records only the one-in-flight
     // guard; `active_read_mode` does not move yet.
-    self.pending_read_mode_index = index;
+    self.reads.pending_read_mode_index = index;
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
     }

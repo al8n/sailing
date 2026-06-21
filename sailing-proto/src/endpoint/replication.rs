@@ -33,6 +33,7 @@ where
     // leader the acks it needs to confirm outstanding safe reads.  An empty context
     // means there are no pending reads (the echo is harmless either way).
     let ctx = self
+      .reads
       .read_only
       .last_pending_request_ctx()
       .cloned()
@@ -998,12 +999,12 @@ where
       return;
     }
     let ctx_bytes = Bytes::copy_from_slice(ctx);
-    self.read_only.recv_ack(from, ctx);
+    self.reads.read_only.recv_ack(from, ctx);
     // Quorum check: the ack set (including the self-ack seeded at add_request) must
     // form a voter quorum across the joint config.  Reuse vote_result machinery:
     // treat each voter as "granted" iff its id is in the ack set.
     // vote_result_by(|id| acks.contains(id)) covers both joint halves; no acks recorded → not reached.
-    let quorum_reached = match self.read_only.acks_for(ctx_bytes.as_ref()) {
+    let quorum_reached = match self.reads.read_only.acks_for(ctx_bytes.as_ref()) {
       Some(acks) => self
         .tracker
         .vote_result_by(|id| acks.contains(&id))
@@ -1011,7 +1012,7 @@ where
       None => false,
     };
     if quorum_reached {
-      let confirmed = self.read_only.advance(ctx_bytes.as_ref());
+      let confirmed = self.reads.read_only.advance(ctx_bytes.as_ref());
       let (term, me) = (self.term, self.config.id());
       for st in confirmed {
         let (context, req_from, index) = st.into_parts();

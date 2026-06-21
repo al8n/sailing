@@ -31,10 +31,10 @@ where
     log: &L,
     _stable: &S,
   ) {
-    if self.pending_reads.is_empty() {
+    if self.reads.pending_reads.is_empty() {
       return;
     }
-    let deferred = core::mem::take(&mut self.pending_reads);
+    let deferred = core::mem::take(&mut self.reads.pending_reads);
     for (ctx, from) in deferred {
       self.do_leader_read(now, log, ctx, from);
     }
@@ -48,7 +48,7 @@ where
     log: &L,
     stable: &S,
   ) {
-    if self.pending_reads.is_empty() {
+    if self.reads.pending_reads.is_empty() {
       return;
     }
     if !self.role.is_leader() {
@@ -286,7 +286,7 @@ where
   /// timing-invalid, or `ε_unc ≥ Δ` config must degrade to Safe, not serve). Gates the synchronized-wall
   /// stamp, the precise commit-anchor, AND the inherited-read serve.
   pub(crate) fn failover_tier_active(&self) -> bool {
-    self.config.failover_tier_valid(self.active_read_mode)
+    self.config.failover_tier_valid(self.reads.active_read_mode)
   }
 
   /// The FAILOVER inherited-read offer: while this freshly elected leader holds the post-election
@@ -338,7 +338,7 @@ where
     from: Option<I>,
   ) {
     let commit = self.commit;
-    match self.active_read_mode {
+    match self.reads.active_read_mode {
       crate::ReadOnlyOption::Safe => {
         self.do_safe_read(now, context, from);
       }
@@ -409,10 +409,11 @@ where
     // `context`): the token is unique per round, so a stale/duplicated HeartbeatResp echoing an
     // earlier round's token can never confirm this read — the linearizability hazard when a user
     // reuses a `context` after an earlier read with it completed.
-    let round = self.read_only.add_request(commit, context, from, me);
+    let round = self.reads.read_only.add_request(commit, context, from, me);
     // Single-node cluster fast-path: self-ack is already a quorum.
     let single_node_quorum = {
       let acks = self
+        .reads
         .read_only
         .acks_for(round.as_ref())
         .cloned()
@@ -427,7 +428,7 @@ where
       self.tracker.vote_result(&votes).is_won()
     };
     if single_node_quorum {
-      let confirmed = self.read_only.advance(round.as_ref());
+      let confirmed = self.reads.read_only.advance(round.as_ref());
       let (term, me2) = (self.term, me);
       for st in confirmed {
         let (context, req_from, index) = st.into_parts();
@@ -512,7 +513,7 @@ where
         // Current-term-commit gate.
         if !self.has_current_term_commit(log) {
           // Defer until the no-op commits.
-          self.pending_reads.push((context, None));
+          self.reads.pending_reads.push((context, None));
           return Ok(());
         }
         self.do_leader_read(now, log, context, None);
@@ -529,12 +530,12 @@ where
         // Follower-side duplicate-context guard (mirror of the leader's `read_context_in_flight`):
         // a context already forwarded and awaiting its `ReadIndexResp` owns the completion path;
         // reject the duplicate rather than forward it again (unbounded re-forward / silent coalesce).
-        if self.forwarded_reads.contains_context(&context) {
+        if self.reads.forwarded_reads.contains_context(&context) {
           return Err(crate::ReadIndexError::DuplicateContext);
         }
         // Back-pressure at capacity: reject the NEW read rather than evict an already-accepted one
         // (eviction would strand the evicted read and let a reused context complete the wrong one).
-        if self.forwarded_reads.is_full() {
+        if self.reads.forwarded_reads.is_full() {
           return Err(crate::ReadIndexError::TooManyInFlight);
         }
         // Record before forwarding and forward by the INTERNAL token, NOT the user context: the leader
@@ -542,7 +543,7 @@ where
         // means a stale/duplicated response from an earlier forward (even of the same user context)
         // cannot complete a later read. `read_index` already returned early if poisoned, so this never
         // desyncs from the suppressed `send` below.
-        let token = self.forwarded_reads.push(context);
+        let token = self.reads.forwarded_reads.push(context);
         let (term, me) = (self.term, self.config.id());
         self.send(
           leader,
@@ -566,17 +567,18 @@ where
   /// user-context dedup.
   pub(crate) fn read_context_in_flight(&self, context: &Bytes) -> bool {
     self
+      .reads
       .pending_reads
       .iter()
       .any(|(ctx, from)| from.is_none() && ctx == context)
-      || self.read_only.context_in_flight(context.as_ref())
+      || self.reads.read_only.context_in_flight(context.as_ref())
   }
 
   /// Whether the leader's combined in-flight read backlog (deferred `pending_reads` + confirming
   /// `read_only`) has reached [`MAX_LEADER_READS`]. A read is in one or the other, never both, so
   /// their sum is the live count.
   pub(crate) fn leader_reads_at_capacity(&self) -> bool {
-    self.pending_reads.len() + self.read_only.len() >= MAX_LEADER_READS
+    self.reads.pending_reads.len() + self.reads.read_only.len() >= MAX_LEADER_READS
   }
 
   /// Leader receives a forwarded `ReadIndex` from a follower.
@@ -622,7 +624,7 @@ where
     }
     // Current-term-commit gate (same as the local path).
     if !self.has_current_term_commit(log) {
-      self.pending_reads.push((context, Some(from)));
+      self.reads.pending_reads.push((context, Some(from)));
       return;
     }
     self.do_leader_read(now, log, context, Some(from));
@@ -671,7 +673,7 @@ where
     // outcomes — a rejecting response (leader at read back-pressure capacity) clears the strand exactly
     // like a confirming one, but must NOT emit a `ReadState` (its `index` is meaningless). Clearing
     // here lets the originator re-issue the same user context (it is no longer a duplicate).
-    let Some(context) = self.forwarded_reads.remove_by_token(token) else {
+    let Some(context) = self.reads.forwarded_reads.remove_by_token(token) else {
       return;
     };
     if resp.reject() {

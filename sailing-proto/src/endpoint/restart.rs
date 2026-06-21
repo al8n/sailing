@@ -351,14 +351,6 @@ where
     // construction stays infallible and identical across build profiles.
     let mut ep = Self {
       config,
-      // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later
-      // commit (the active mode is replicated state, not static config). See spec §6.
-      active_read_mode: read_only_opt,
-      // Read-mode provenance: a Some snapshot was written past a committed SetReadMode (migrated); a
-      // None/legacy snapshot is not. The committed-tail replay below (apply_committed) sets it true if a
-      // post-snapshot SetReadMode applies. A non-migrated node stays false, so its own future snapshots
-      // leave read_only absent (restart falls back to config, not the pinned active mode).
-      read_mode_migrated: snap_read_only.is_some(),
       fsm,
       role: Role::Follower,
       term: hs.term(),
@@ -441,15 +433,25 @@ where
       },
       // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
       pending_conf_index: Index::ZERO,
-      pending_read_mode_index: Index::ZERO,
       tracker,
       outputs: Outputs {
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
       },
-      read_only: ReadOnly::new(read_only_opt),
-      pending_reads: std::vec::Vec::new(),
-      forwarded_reads: ForwardedReads::new(boot_epoch),
+      reads: ReadState {
+        read_only: ReadOnly::new(read_only_opt),
+        // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later
+        // commit (the active mode is replicated state, not static config). See spec §6.
+        active_read_mode: read_only_opt,
+        // Read-mode provenance: a Some snapshot was written past a committed SetReadMode (migrated); a
+        // None/legacy snapshot is not. The committed-tail replay below (apply_committed) sets it true if a
+        // post-snapshot SetReadMode applies. A non-migrated node stays false, so its own future snapshots
+        // leave read_only absent (restart falls back to config, not the pinned active mode).
+        read_mode_migrated: snap_read_only.is_some(),
+        pending_reads: std::vec::Vec::new(),
+        forwarded_reads: ForwardedReads::new(boot_epoch),
+        pending_read_mode_index: Index::ZERO,
+      },
       check_quorum_lease: CheckQuorumLease {
         lease_round: 0,
         lease_round_start: now.mono(),

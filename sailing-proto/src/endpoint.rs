@@ -975,6 +975,45 @@ where
   }
 }
 
+/// The read machinery, grouped out of `Endpoint`.
+#[derive(Debug)]
+struct ReadState<I> {
+  /// ReadIndex tracking (pending reads, heartbeat-ack sets, confirmed read states).
+  read_only: ReadOnly<I>,
+  /// The ACTIVE read mode the serve dispatch + stamp helpers consult. Seeded from `config.read_only()`,
+  /// then overwritten apply-time when a committed `SetReadMode` entry applies (a mid-life migration);
+  /// recovered from replicated state (snapshot ⊔ tail-replay) on restart. `Config.read_only` stays the
+  /// immutable genesis default + knob source — only this active mode migrates. The fold floors stay
+  /// mode-INDEPENDENT, so a mid-flip / migrated-away node is strictly conservative on the commit-wait.
+  active_read_mode: crate::ReadOnlyOption,
+  /// Whether a committed `SetReadMode` has EVER applied on this node (read-mode provenance). Gates whether
+  /// `maybe_snapshot` carries an EXPLICIT `SnapshotMeta.read_only`: a migrated node records the mode (so
+  /// restart recovers it), a NON-migrated node leaves it absent (so restart falls back to the static
+  /// config rather than pinning the active mode across a config edit). Recovered at restart from the
+  /// snapshot's presence ⊔ the committed-tail replay; adopted from the snapshot's presence on install.
+  read_mode_migrated: bool,
+  /// Deferred read requests that arrived before the leader has committed an entry in its
+  /// current term.  Flushed once `maybe_advance_commit` advances `self.commit` to a
+  /// current-term entry.
+  ///
+  /// Each element is `(context, from)` matching `add_request`'s signature.
+  pending_reads: std::vec::Vec<(Bytes, Option<I>)>,
+  /// Read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
+  /// awaiting a `ReadIndexResp` for. The follower-side mirror of the leader's
+  /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
+  /// `DuplicateContext` instead of being silently coalesced (or unboundedly re-forwarded), so the
+  /// originator is never left waiting on a confirmation the first forward already owns. Removed on
+  /// the matching `ReadIndexResp`, FIFO-evicted at [`MAX_FORWARDED_READS`] (so dropped reads cannot
+  /// grow it without bound), and cleared wholesale on any term change or leader change (a read
+  /// forwarded to a now-stale leader must not block re-issuing it to the new one).
+  forwarded_reads: ForwardedReads,
+  /// The index of the last appended `SetReadMode` entry — the one-in-flight guard for read-mode
+  /// migrations (mirror [`pending_conf_index`](Endpoint::pending_conf_index)). `> applied` ⇒ a migration is
+  /// still in flight; recomputed to `last` at `become_leader` so an inherited uncommitted SetReadMode in a
+  /// fresh leader's tail blocks a new proposal until it commits-and-applies.
+  pending_read_mode_index: Index,
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -1034,40 +1073,9 @@ where
   /// the one-in-flight guard will be permissive (ZERO <= applied), but correctness is maintained
   /// because the entry will still be applied exactly once in `apply_committed`.
   pending_conf_index: Index,
-  /// The index of the last appended `SetReadMode` entry — the one-in-flight guard for read-mode
-  /// migrations (mirror [`pending_conf_index`](Self::pending_conf_index)). `> applied` ⇒ a migration is
-  /// still in flight; recomputed to `last` at `become_leader` so an inherited uncommitted SetReadMode in a
-  /// fresh leader's tail blocks a new proposal until it commits-and-applies.
-  pending_read_mode_index: Index,
-  /// ReadIndex tracking (pending reads, heartbeat-ack sets, confirmed read states).
-  read_only: ReadOnly<I>,
-  /// The ACTIVE read mode the serve dispatch + stamp helpers consult. Seeded from `config.read_only()`,
-  /// then overwritten apply-time when a committed `SetReadMode` entry applies (a mid-life migration);
-  /// recovered from replicated state (snapshot ⊔ tail-replay) on restart. `Config.read_only` stays the
-  /// immutable genesis default + knob source — only this active mode migrates. The fold floors stay
-  /// mode-INDEPENDENT, so a mid-flip / migrated-away node is strictly conservative on the commit-wait.
-  active_read_mode: crate::ReadOnlyOption,
-  /// Whether a committed `SetReadMode` has EVER applied on this node (read-mode provenance). Gates whether
-  /// `maybe_snapshot` carries an EXPLICIT `SnapshotMeta.read_only`: a migrated node records the mode (so
-  /// restart recovers it), a NON-migrated node leaves it absent (so restart falls back to the static
-  /// config rather than pinning the active mode across a config edit). Recovered at restart from the
-  /// snapshot's presence ⊔ the committed-tail replay; adopted from the snapshot's presence on install.
-  read_mode_migrated: bool,
-  /// Deferred read requests that arrived before the leader has committed an entry in its
-  /// current term.  Flushed once `maybe_advance_commit` advances `self.commit` to a
-  /// current-term entry.
-  ///
-  /// Each element is `(context, from)` matching `add_request`'s signature.
-  pending_reads: std::vec::Vec<(Bytes, Option<I>)>,
-  /// Read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
-  /// awaiting a `ReadIndexResp` for. The follower-side mirror of the leader's
-  /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
-  /// `DuplicateContext` instead of being silently coalesced (or unboundedly re-forwarded), so the
-  /// originator is never left waiting on a confirmation the first forward already owns. Removed on
-  /// the matching `ReadIndexResp`, FIFO-evicted at [`MAX_FORWARDED_READS`] (so dropped reads cannot
-  /// grow it without bound), and cleared wholesale on any term change or leader change (a read
-  /// forwarded to a now-stale leader must not block re-issuing it to the new one).
-  forwarded_reads: ForwardedReads,
+  /// The read machinery (active mode + migration provenance, the ReadIndex tracker, deferred and
+  /// forwarded reads, the SetReadMode one-in-flight guard).
+  reads: ReadState<I>,
   /// The leader's CheckQuorum read-lease (LeaseBased) round state.
   check_quorum_lease: CheckQuorumLease<I>,
   /// The leader-transfer state (forced-handoff flag + transferee target + abort deadline).
@@ -1142,9 +1150,6 @@ where
         read_since_anchor: false,
       },
       cold_read_defers: 0,
-      // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
-      active_read_mode: read_only_opt,
-      read_mode_migrated: false,
       outputs: Outputs {
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
@@ -1176,12 +1181,17 @@ where
         lease_vote_fence_until: None,
       },
       pending_conf_index: Index::ZERO,
-      pending_read_mode_index: Index::ZERO,
-      read_only: ReadOnly::new(read_only_opt),
-      pending_reads: std::vec::Vec::new(),
-      // Fresh node: boot epoch 0. A later restart provides a strictly-higher epoch, so this
-      // incarnation's forwarded-read tokens can never collide with a post-restart incarnation's.
-      forwarded_reads: ForwardedReads::new(0),
+      reads: ReadState {
+        read_only: ReadOnly::new(read_only_opt),
+        // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
+        active_read_mode: read_only_opt,
+        read_mode_migrated: false,
+        pending_reads: std::vec::Vec::new(),
+        // Fresh node: boot epoch 0. A later restart provides a strictly-higher epoch, so this
+        // incarnation's forwarded-read tokens can never collide with a post-restart incarnation's.
+        forwarded_reads: ForwardedReads::new(0),
+        pending_read_mode_index: Index::ZERO,
+      },
       check_quorum_lease: CheckQuorumLease {
         lease_round: 0,
         lease_round_start: now.mono(),
@@ -1233,7 +1243,7 @@ where
   /// measures the entry's age as `now − 0` (huge) and degrades to Safe — FAIL-CLOSED, never wrapping
   /// the truncated timestamp to a falsely-fresh value.
   pub(crate) fn lease_stamp(&self, now: Instant) -> u64 {
-    if self.active_read_mode == crate::ReadOnlyOption::LeaseGuard {
+    if self.reads.active_read_mode == crate::ReadOnlyOption::LeaseGuard {
       u64::try_from(now.since_origin().as_nanos()).unwrap_or(0)
     } else {
       0
@@ -1251,7 +1261,7 @@ where
     // stamping, the read gate, and validation never diverge. `0` when LeaseGuard is inactive/invalid.
     self
       .config
-      .leaseguard_commit_wait_ns(self.active_read_mode)
+      .leaseguard_commit_wait_ns(self.reads.active_read_mode)
       .unwrap_or(0)
   }
 
@@ -1272,7 +1282,7 @@ where
   /// (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never a falsely-fresh
   /// stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
   pub(crate) fn lease_wall_stamp(&self, now: crate::Now) -> u64 {
-    if self.config.failover_tier_valid(self.active_read_mode) {
+    if self.config.failover_tier_valid(self.reads.active_read_mode) {
       debug_assert!(
         !now.wall().is_absent(),
         "LeaseGuard failover tier is active but the caller supplied no synchronized wall (Now::monotonic)"
@@ -1298,7 +1308,7 @@ where
   pub(crate) fn leaseguard_timing(&self) -> Option<(core::time::Duration, core::time::Duration)> {
     self
       .config
-      .leaseguard_commit_wait_ns(self.active_read_mode)?;
+      .leaseguard_commit_wait_ns(self.reads.active_read_mode)?;
     Some((
       self.config.lease_duration()?,
       self.config.clock_drift_bound()?,
@@ -1309,12 +1319,12 @@ where
   /// none. The serve dispatch and the stamp helpers consult this, NOT the immutable `Config.read_only`.
   #[inline(always)]
   pub const fn active_read_mode(&self) -> crate::ReadOnlyOption {
-    self.active_read_mode
+    self.reads.active_read_mode
   }
 
   #[cfg(test)]
   pub(crate) fn set_active_read_mode_for_test(&mut self, mode: crate::ReadOnlyOption) {
-    self.active_read_mode = mode;
+    self.reads.active_read_mode = mode;
   }
 
   #[cfg(test)]
@@ -1331,13 +1341,14 @@ where
   pub(crate) fn inject_pending_read_for_test(&mut self, context: bytes::Bytes) {
     let leader = self.config.id();
     let _ = self
+      .reads
       .read_only
       .add_request(self.commit, context, None, leader);
   }
 
   #[cfg(test)]
   pub(crate) fn pending_read_count(&self) -> usize {
-    self.read_only.pending_len()
+    self.reads.read_only.pending_len()
   }
 
   /// The SINGLE leader-belief mutation point. Assigns the new belief and, exactly when the
@@ -1355,7 +1366,7 @@ where
       return;
     }
     self.leader = leader;
-    self.forwarded_reads.clear();
+    self.reads.forwarded_reads.clear();
     self
       .outputs
       .events
@@ -1762,8 +1773,8 @@ where
         // Drop all ReadIndex state too: a stale read confirmation must never leak across a term
         // change. Mirrors `step_down_to_follower` / `become_leader` (read confirmation is
         // leader-gated, so this is robustness, not a behavior change).
-        self.read_only.reset(self.active_read_mode);
-        self.pending_reads.clear();
+        self.reads.read_only.reset(self.reads.active_read_mode);
+        self.reads.pending_reads.clear();
         // (Reads forwarded under the old term/leader were cleared by `set_leader` above.)
         // Abort any in-progress leader transfer — leadership is changing.
         self.transfer.lead_transferee = None;
@@ -2123,18 +2134,18 @@ where
                 break;
               }
             };
-            self.active_read_mode = mode;
+            self.reads.active_read_mode = mode;
             // A committed SetReadMode has applied — record the read-mode provenance so a snapshot at/after
             // this boundary carries the mode EXPLICITLY. A node that NEVER migrated leaves it absent (None),
             // so a restart falls back to the static config rather than pinning the active mode across a
             // config edit (see `maybe_snapshot`).
-            self.read_mode_migrated = true;
+            self.reads.read_mode_migrated = true;
             // Update the read-mode option WITHOUT discarding in-flight accepted reads (`set_option`, NOT
             // `reset`): a read already accepted at its commit index stays valid and still confirms under the
             // mode-INDEPENDENT ReadIndex heartbeat quorum — clearing it (as a mid-term `reset` would) strands
             // the caller / a forwarding follower on a read `read_index` already accepted. Still revoke any
             // live LeaseBased lease (its granting quorum may not match the new mode) — mirror ConfChange.
-            self.read_only.set_option(mode);
+            self.reads.read_only.set_option(mode);
             self.check_quorum_lease.lease_valid_until = None;
             self.check_quorum_lease.lease_acks.clear();
             self.outputs.events.push_back(crate::Event::ReadModeChanged(
