@@ -277,7 +277,7 @@ fn lease_based_confirms_immediately() {
 /// lease. Otherwise an isolated old leader could keep serving stale lease reads on delayed/duplicated
 /// pre-partition traffic (unbounded under duplication), while a new leader commits newer state.
 ///
-/// MUTATION: drop the `resp.lease_round() == self.lease_round` guard in `on_heartbeat_resp` → the
+/// MUTATION: drop the `resp.lease_round() == self.check_quorum_lease.lease_round` guard in `on_heartbeat_resp` → the
 /// stale earlier-round response renews the lease (`lease_acks` gains the peer, `lease_valid_until`
 /// extends).
 #[test]
@@ -499,7 +499,7 @@ fn lease_not_renewed_by_non_enforcing_voter() {
 /// SHORTER election_timeout (heterogeneous config) caps the lease at its real election window — the
 /// leader cannot out-live the supporter that would time out first.
 ///
-/// MUTATION: renew with `self.config.election_timeout()` instead of `self.lease_min_support` → the
+/// MUTATION: renew with `self.config.election_timeout()` instead of `self.check_quorum_lease.lease_min_support` → the
 /// lease extends to the leader's 1000ms even though peer 2 only supports 300ms.
 #[test]
 fn lease_bounded_by_min_support() {
@@ -592,7 +592,7 @@ fn membership_change_revokes_lease() {
 /// until its floor is DURABLE, then its real election_timeout. So the leader can never float a lease on a
 /// promise a crash could erase.
 ///
-/// MUTATION: drop the `&& self.durable_lease_support >= Some(this_run)` gate in `on_heartbeat` (advertise
+/// MUTATION: drop the `&& self.durable.durable_lease_support >= Some(this_run)` gate in `on_heartbeat` (advertise
 /// `this_run` unconditionally) → the FIRST response carries 1000ms before the floor is durable.
 #[test]
 fn advertise_is_zero_until_lease_support_floor_durable_then_full() {
