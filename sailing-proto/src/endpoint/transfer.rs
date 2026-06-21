@@ -1,10 +1,11 @@
 use super::*;
 use crate::{TimeoutNow, TransferError};
 
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
   F::Command: crate::Data,
   F::Error: core::error::Error,
 {

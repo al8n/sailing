@@ -1025,7 +1025,7 @@ struct Reads<I> {
 /// need it. `F: StateMachine` is the documented "bounds that gate storage shape" exception
 /// (§8): the struct stores `Event<I, F::Response>`, which cannot be named without it.
 #[derive(Debug)]
-pub struct Endpoint<I, F>
+pub struct Endpoint<I, F, R = Prng>
 where
   F: StateMachine,
 {
@@ -1039,7 +1039,9 @@ where
   applied: Index,
   /// The deferred snapshot machinery (pending install + pending compaction + resend pacing).
   snapshot: SnapshotState<I, F>,
-  prng: Prng,
+  /// The election-timeout RNG. Defaults to the deterministic [`Prng`]; embedders may supply their
+  /// own via [`new_with_rng`](Self::new_with_rng) / the `restart_with_rng` constructors.
+  rng: R,
   /// Per-voter ballot: `true` = grant, `false` = reject. Absent IDs have not voted yet.
   /// Replaces the old `votes_granted: BTreeSet<I>` — the joint quorum needs the full
   /// ballot (grants *and* rejections), not just the grant set.
@@ -1087,16 +1089,37 @@ where
   transfer: Transfer<I>,
 }
 
-// ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
+// ─── Default-`Prng` seed constructors (the public, byte-identical-preserving entry points) ───────
 
-impl<I, F> Endpoint<I, F>
+impl<I, F> Endpoint<I, F, Prng>
 where
   I: NodeId,
   F: StateMachine,
 {
   /// Create a fresh node (status Follower, term 0, empty log view).
   /// Arms the election timer immediately.
+  ///
+  /// Uses the deterministic [`Prng`] seeded by `seed`; embedders who need their own RNG call
+  /// [`new_with_rng`](Self::new_with_rng) instead.
   pub fn new(config: Config<I>, now: impl Into<Now>, seed: u64, fsm: F) -> Self {
+    Self::new_with_rng(config, now, Prng::new(seed), fsm)
+  }
+}
+
+// ─── Pure-accessor / construction impl (no `F::Command` bound needed) ───────────────────────────
+
+impl<I, F, R> Endpoint<I, F, R>
+where
+  I: NodeId,
+  F: StateMachine,
+  R: rand::Rng,
+{
+  /// Create a fresh node (status Follower, term 0, empty log view) driven by a caller-supplied RNG.
+  /// Arms the election timer immediately.
+  ///
+  /// The byte-identical-preserving [`new`](Endpoint::new) wraps this with a seeded
+  /// [`Prng`].
+  pub fn new_with_rng(config: Config<I>, now: impl Into<Now>, rng: R, fsm: F) -> Self {
     let now: Now = now.into();
     // Bootstrap the Tracker from the static seed voter set. Read the needed config
     // values BEFORE moving `config` into the struct literal below.
@@ -1127,7 +1150,7 @@ where
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
       },
-      prng: Prng::new(seed),
+      rng,
       votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,
@@ -1683,10 +1706,11 @@ where
 
 // ─── Full replication impl (F::Command: Data required for apply_committed) ──────────────────────
 
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
   F::Command: Data,
   // The fatal apply/snapshot error must be inspectable so a poisoned node's cause can be
   // surfaced (design spec §6.3). `core::error::Error` is stable in core (no_std-OK).

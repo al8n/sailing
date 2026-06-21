@@ -16,7 +16,7 @@ extern crate std;
 compile_error!("sailing-proto requires at least one of the `std` or `alloc` features");
 
 mod prng;
-pub(crate) use prng::Prng;
+pub use prng::Prng;
 
 mod num;
 pub use num::{Index, Term};
