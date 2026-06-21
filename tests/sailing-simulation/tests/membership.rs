@@ -534,14 +534,14 @@ fn remove_leader_steps_down() {
 ///
 /// Before the `free_inflight_on_heartbeat` fix (etcd `FreeFirstOne`), a `Replicate` peer
 /// whose entire in-flight window was dropped during a partition would stay wedged: on each
-/// `HeartbeatResp` `is_paused()` returned `true` (full window) so `maybe_send_append` sent
+/// `HeartbeatResponse` `is_paused()` returned `true` (full window) so `maybe_send_append` sent
 /// nothing. The node only recovered when an unrelated client proposal happened to call
 /// `maybe_send_append`. This test asserts that a healed node catches up WITHOUT any
 /// post-heal `propose` call.
 ///
 /// We force `max_inflight_msgs = 1` so that even a single AppendEntries sent to the
 /// isolated learner (and then dropped) fills the window. Without the fix, after healing,
-/// every HeartbeatResp from the learner still sees `is_paused() == true` (full window,
+/// every HeartbeatResponse from the learner still sees `is_paused() == true` (full window,
 /// no acks ever arrived) and `maybe_send_append` sends nothing — the learner stalls forever.
 #[test]
 fn healed_follower_catchup_via_heartbeats() {
@@ -578,7 +578,7 @@ fn healed_follower_catchup_via_heartbeats() {
     "learner node 3 must join and catch up to >= 5 entries"
   );
 
-  // Isolate the learner so MsgApp/AppendResp traffic is dropped (fills its inflight window).
+  // Isolate the learner so MsgApp/AppendResponse traffic is dropped (fills its inflight window).
   c.isolate(3);
   wait_for_leader(&mut c, "leader must exist after isolating learner");
 

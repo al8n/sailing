@@ -60,13 +60,13 @@ fn install_snapshot_accessors() {
 }
 
 #[test]
-fn snapshot_resp_accessors() {
-  let resp = SnapshotResp::new(Term::new(4), 2u64, false, Index::new(10));
-  assert_eq!(resp.term(), Term::new(4));
-  assert_eq!(resp.from(), 2u64);
-  assert!(!resp.reject());
-  assert_eq!(resp.match_index(), Index::new(10));
+fn snapshot_response_accessors() {
+  let response = SnapshotResponse::new(Term::new(4), 2u64, false, Index::new(10));
+  assert_eq!(response.term(), Term::new(4));
+  assert_eq!(response.from(), 2u64);
+  assert!(!response.reject());
+  assert_eq!(response.match_index(), Index::new(10));
 
-  let m = Message::SnapshotResp(resp);
-  assert!(m.is_snapshot_resp());
+  let m = Message::SnapshotResponse(response);
+  assert!(m.is_snapshot_response());
 }

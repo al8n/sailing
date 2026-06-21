@@ -17,7 +17,7 @@ where
   ///
   /// `boot_epoch` MUST be strictly greater than the `boot_epoch` of every prior incarnation of THIS
   /// node, and the caller MUST persist it durably (e.g. a monotonic boot counter) BEFORE calling
-  /// `restart`. It namespaces this incarnation's forwarded-read tokens so that a `ReadIndexResp` sent
+  /// `restart`. It namespaces this incarnation's forwarded-read tokens so that a `ReadIndexResponse` sent
   /// to a previous incarnation — and redelivered after the restart by a transport that does not drop
   /// pre-crash messages — can never complete a post-restart read at a stale index. A fresh node
   /// ([`Endpoint::new`]) uses epoch 0, so the first `restart` must pass at least 1. Reusing or

@@ -76,7 +76,7 @@ impl<I: Copy> AppendEntries<I> {
 
 /// Response to AppendEntries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppendResp<I> {
+pub struct AppendResponse<I> {
   term: Term,
   from: I,
   reject: bool,
@@ -85,7 +85,7 @@ pub struct AppendResp<I> {
   match_index: Index,
 }
 
-impl<I: Copy> AppendResp<I> {
+impl<I: Copy> AppendResponse<I> {
   /// Construct.
   #[allow(clippy::too_many_arguments)]
   pub const fn new(
@@ -214,14 +214,14 @@ impl<I: Copy> RequestVote<I> {
 
 /// Response to RequestVote / PreVote.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VoteResp<I> {
+pub struct VoteResponse<I> {
   term: Term,
   from: I,
   pre_vote: bool,
   reject: bool,
 }
 
-impl<I: Copy> VoteResp<I> {
+impl<I: Copy> VoteResponse<I> {
   /// Construct.
   pub const fn new(term: Term, from: I, pre_vote: bool, reject: bool) -> Self {
     Self {
@@ -280,7 +280,7 @@ impl<I: Copy> Heartbeat<I> {
   }
 
   /// Set the per-round CheckQuorum lease token (builder). The follower echoes it in
-  /// [`HeartbeatResp`] so the leader confirms a quorum responded to THIS round, not a stale one.
+  /// [`HeartbeatResponse`] so the leader confirms a quorum responded to THIS round, not a stale one.
   #[inline(always)]
   pub fn with_lease_round(mut self, lease_round: u64) -> Self {
     self.lease_round = lease_round;
@@ -325,7 +325,7 @@ impl<I: Copy> Heartbeat<I> {
 
 /// Response to Heartbeat.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct HeartbeatResp<I> {
+pub struct HeartbeatResponse<I> {
   term: Term,
   from: I,
   context: Bytes,
@@ -333,7 +333,7 @@ pub struct HeartbeatResp<I> {
   lease_support: Duration,
 }
 
-impl<I: Copy> HeartbeatResp<I> {
+impl<I: Copy> HeartbeatResponse<I> {
   /// Construct. `lease_round` defaults to 0 and `lease_support` to ZERO; the follower echoes the
   /// heartbeat's round via [`Self::with_lease_round`] and advertises its lease support via
   /// [`Self::with_lease_support`].
@@ -583,14 +583,14 @@ impl<I: NodeId> InstallSnapshot<I> {
 
 /// Follower → leader: acknowledgement of an `InstallSnapshot`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SnapshotResp<I> {
+pub struct SnapshotResponse<I> {
   term: Term,
   from: I,
   reject: bool,
   match_index: Index,
 }
 
-impl<I: Copy> SnapshotResp<I> {
+impl<I: Copy> SnapshotResponse<I> {
   /// Construct.
   pub const fn new(term: Term, from: I, reject: bool, match_index: Index) -> Self {
     Self {
@@ -661,7 +661,7 @@ impl<I: Copy> TimeoutNow<I> {
 /// A follower that receives a read request from a client forwards it to the known leader
 /// using this message. The leader processes it (confirming its leadership via a heartbeat
 /// round for `ReadOnlySafe`, or via the lease for `ReadOnlyLeaseBased`) and replies with
-/// a [`ReadIndexResp`].
+/// a [`ReadIndexResponse`].
 ///
 /// `term` is set to the sender's current term so the message is not dropped by the leader's
 /// term pre-pass (which drops any message whose term is less than the leader's).
@@ -715,7 +715,7 @@ impl<I: Copy> ReadIndex<I> {
 /// `term` is set to the sender's (leader's) current term so the message is not dropped by
 /// the follower's term pre-pass.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReadIndexResp<I> {
+pub struct ReadIndexResponse<I> {
   term: Term,
   from: I,
   index: Index,
@@ -723,7 +723,7 @@ pub struct ReadIndexResp<I> {
   reject: bool,
 }
 
-impl<I: Copy> ReadIndexResp<I> {
+impl<I: Copy> ReadIndexResponse<I> {
   /// Construct.
   ///
   /// `reject` is `true` when the leader is at its read back-pressure capacity and is declining
@@ -790,25 +790,25 @@ pub enum Message<I> {
   /// Log replication / heartbeat-with-entries.
   AppendEntries(AppendEntries<I>),
   /// AppendEntries response.
-  AppendResp(AppendResp<I>),
+  AppendResponse(AppendResponse<I>),
   /// Vote / PreVote request.
   RequestVote(RequestVote<I>),
   /// Vote / PreVote response.
-  VoteResp(VoteResp<I>),
+  VoteResponse(VoteResponse<I>),
   /// Leader heartbeat.
   Heartbeat(Heartbeat<I>),
   /// Heartbeat response.
-  HeartbeatResp(HeartbeatResp<I>),
+  HeartbeatResponse(HeartbeatResponse<I>),
   /// Leader → follower: install a snapshot (follower is too far behind).
   InstallSnapshot(InstallSnapshot<I>),
   /// Follower → leader: acknowledgement of an `InstallSnapshot`.
-  SnapshotResp(SnapshotResp<I>),
+  SnapshotResponse(SnapshotResponse<I>),
   /// Leader → transfer target: campaign immediately (leader transfer).
   TimeoutNow(TimeoutNow<I>),
   /// Follower → leader: forward a linearizable read request.
   ReadIndex(ReadIndex<I>),
   /// Leader → follower: confirmed read index for a forwarded read request.
-  ReadIndexResp(ReadIndexResp<I>),
+  ReadIndexResponse(ReadIndexResponse<I>),
 }
 
 /// A typed message addressed to a peer. The driver frames + sends it; the sim moves it
@@ -848,23 +848,23 @@ impl<I: NodeId> Message<I> {
   /// The term carried by this message.
   ///
   /// Every variant carries a term field. For [`TimeoutNow`], [`ReadIndex`], and
-  /// [`ReadIndexResp`] the term is the sender's current term — it is included so that the
+  /// [`ReadIndexResponse`] the term is the sender's current term — it is included so that the
   /// receiver's term pre-pass (`msg.term() < self.term → drop`) does not accidentally drop
   /// these messages. Callers must set the term to the sender's current term when
   /// constructing these messages.
   pub fn term(&self) -> Term {
     match self {
       Self::AppendEntries(m) => m.term(),
-      Self::AppendResp(m) => m.term(),
+      Self::AppendResponse(m) => m.term(),
       Self::RequestVote(m) => m.term(),
-      Self::VoteResp(m) => m.term(),
+      Self::VoteResponse(m) => m.term(),
       Self::Heartbeat(m) => m.term(),
-      Self::HeartbeatResp(m) => m.term(),
+      Self::HeartbeatResponse(m) => m.term(),
       Self::InstallSnapshot(m) => m.term(),
-      Self::SnapshotResp(m) => m.term(),
+      Self::SnapshotResponse(m) => m.term(),
       Self::TimeoutNow(m) => m.term(),
       Self::ReadIndex(m) => m.term(),
-      Self::ReadIndexResp(m) => m.term(),
+      Self::ReadIndexResponse(m) => m.term(),
     }
   }
 
@@ -880,12 +880,12 @@ impl<I: NodeId> Message<I> {
       Self::InstallSnapshot(m) => m.leader(),
       Self::TimeoutNow(m) => m.leader(),
       // Responses and forwarded reads carry an explicit `from`.
-      Self::AppendResp(m) => m.from(),
-      Self::VoteResp(m) => m.from(),
-      Self::HeartbeatResp(m) => m.from(),
-      Self::SnapshotResp(m) => m.from(),
+      Self::AppendResponse(m) => m.from(),
+      Self::VoteResponse(m) => m.from(),
+      Self::HeartbeatResponse(m) => m.from(),
+      Self::SnapshotResponse(m) => m.from(),
       Self::ReadIndex(m) => m.from(),
-      Self::ReadIndexResp(m) => m.from(),
+      Self::ReadIndexResponse(m) => m.from(),
     }
   }
 }
@@ -937,8 +937,8 @@ mod term_test {
   }
 
   #[test]
-  fn read_index_resp_message_term() {
-    let rir = ReadIndexResp::new(
+  fn read_index_response_message_term() {
+    let rir = ReadIndexResponse::new(
       crate::Term::new(7),
       1u64,
       crate::Index::new(42),
@@ -950,13 +950,13 @@ mod term_test {
     assert_eq!(rir.index(), crate::Index::new(42));
     assert_eq!(rir.context(), b"ctx");
     assert!(!rir.reject());
-    let m = Message::ReadIndexResp(rir);
+    let m = Message::ReadIndexResponse(rir);
     assert_eq!(m.term(), crate::Term::new(7));
-    assert!(m.is_read_index_resp());
+    assert!(m.is_read_index_response());
 
     // A rejecting response carries the flag through the value (the wire form for these messages
     // is the struct itself; the bool round-trips by construction).
-    let rejected = ReadIndexResp::new(
+    let rejected = ReadIndexResponse::new(
       crate::Term::new(7),
       1u64,
       crate::Index::ZERO,
@@ -986,9 +986,9 @@ mod term_test {
   }
 
   #[test]
-  fn snapshot_resp_message_term() {
-    let resp = SnapshotResp::new(crate::Term::new(4), 2u64, false, crate::Index::new(10));
-    let m = Message::SnapshotResp(resp);
+  fn snapshot_response_message_term() {
+    let response = SnapshotResponse::new(crate::Term::new(4), 2u64, false, crate::Index::new(10));
+    let m = Message::SnapshotResponse(response);
     assert_eq!(m.term(), crate::Term::new(4));
   }
 }

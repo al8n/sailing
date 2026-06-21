@@ -1,7 +1,8 @@
 use super::*;
 use crate::{
-  AppendEntries, AppendResp, Heartbeat, HeartbeatResp, InstallSnapshot, ReadIndex, ReadIndexResp,
-  ReadOnlyOption, RequestVote, SnapshotResp, TimeoutNow, VoteResp, conf::ConfState,
+  AppendEntries, AppendResponse, Heartbeat, HeartbeatResponse, InstallSnapshot, ReadIndex,
+  ReadIndexResponse, ReadOnlyOption, RequestVote, SnapshotResponse, TimeoutNow, VoteResponse,
+  conf::ConfState,
 };
 
 fn rt(m: Message<u64>) {
@@ -43,7 +44,7 @@ fn round_trips_every_variant() {
     entries,
     Index::new(1),
   )));
-  rt(Message::AppendResp(AppendResp::new(
+  rt(Message::AppendResponse(AppendResponse::new(
     Term::new(3),
     2,
     true,
@@ -59,7 +60,7 @@ fn round_trips_every_variant() {
     true,
     false,
   )));
-  rt(Message::VoteResp(VoteResp::new(
+  rt(Message::VoteResponse(VoteResponse::new(
     Term::new(3),
     2,
     true,
@@ -68,8 +69,8 @@ fn round_trips_every_variant() {
   rt(Message::Heartbeat(
     Heartbeat::new(Term::new(3), 1, Index::new(4), Bytes::from_static(b"ctx")).with_lease_round(9),
   ));
-  rt(Message::HeartbeatResp(
-    HeartbeatResp::new(Term::new(3), 2, Bytes::from_static(b"ctx"))
+  rt(Message::HeartbeatResponse(
+    HeartbeatResponse::new(Term::new(3), 2, Bytes::from_static(b"ctx"))
       .with_lease_round(9)
       .with_lease_support(core::time::Duration::from_millis(150)),
   ));
@@ -84,7 +85,7 @@ fn round_trips_every_variant() {
     meta,
     Bytes::from_static(b"blob"),
   )));
-  rt(Message::SnapshotResp(SnapshotResp::new(
+  rt(Message::SnapshotResponse(SnapshotResponse::new(
     Term::new(3),
     2,
     false,
@@ -96,7 +97,7 @@ fn round_trips_every_variant() {
     2,
     Bytes::from_static(b"r"),
   )));
-  rt(Message::ReadIndexResp(ReadIndexResp::new(
+  rt(Message::ReadIndexResponse(ReadIndexResponse::new(
     Term::new(3),
     1,
     Index::new(7),
@@ -351,7 +352,7 @@ fn snapshot_meta_max_unwalled_lease_window_round_trips() {
 /// Zero-valued scalars (proto3 omits them) round-trip to the same values.
 #[test]
 fn round_trips_zero_defaults() {
-  rt(Message::VoteResp(VoteResp::new(
+  rt(Message::VoteResponse(VoteResponse::new(
     Term::ZERO,
     1,
     false,
@@ -445,7 +446,7 @@ fn conversion_rejections() {
   );
 
   // Empty id field.
-  let vr = pb::VoteResp {
+  let vr = pb::VoteResponse {
     term: 3,
     ..Default::default()
   };
@@ -455,7 +456,7 @@ fn conversion_rejections() {
   );
 
   // Oversized id field (> 1024 bytes).
-  let vr = pb::VoteResp {
+  let vr = pb::VoteResponse {
     from_id: Bytes::from(std::vec![0u8; 1025]),
     ..Default::default()
   };
@@ -465,7 +466,7 @@ fn conversion_rejections() {
   );
 
   // An id with trailing bytes (a u64 id is exactly 8 bytes).
-  let vr = pb::VoteResp {
+  let vr = pb::VoteResponse {
     from_id: Bytes::from(std::vec![1u8; 9]),
     ..Default::default()
   };
@@ -475,7 +476,7 @@ fn conversion_rejections() {
   );
 
   // Out-of-range lease nanos.
-  let hr = pb::HeartbeatResp {
+  let hr = pb::HeartbeatResponse {
     from_id: encode_id(&2u64),
     lease_support_nanos: 1_000_000_000,
     ..Default::default()
@@ -488,7 +489,7 @@ fn conversion_rejections() {
   // The uint32-truncation shape: 2^32 + k would truncate to an in-range k under a uint32
   // field (protobuf truncates oversized uint32 varints by spec); the uint64 schema field
   // sees the full value and the bound rejects it.
-  let hr = pb::HeartbeatResp {
+  let hr = pb::HeartbeatResponse {
     from_id: encode_id(&2u64),
     lease_support_nanos: (1u64 << 32) + 999_999_999,
     ..Default::default()
@@ -608,16 +609,16 @@ fn golden_byte_vectors() {
     buf
   }
 
-  let vote_resp = Message::VoteResp(VoteResp::new(Term::new(3), 2, true, false));
+  let vote_response = Message::VoteResponse(VoteResponse::new(Term::new(3), 2, true, false));
   assert_eq!(
-    enc(&vote_resp),
+    enc(&vote_response),
     std::vec![
-      0x22, 0x0E, // Message.vote_resp (field 4, length-delimited, 14 bytes)
+      0x22, 0x0E, // Message.vote_response (field 4, length-delimited, 14 bytes)
       0x08, 0x03, // term = 3
       0x12, 0x08, 0x02, 0, 0, 0, 0, 0, 0, 0, // from_id = the u64 id's 8-byte LE encoding
       0x18, 0x01, // pre_vote = true
     ],
-    "VoteResp golden encoding"
+    "VoteResponse golden encoding"
   );
 
   let timeout_now = Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1));

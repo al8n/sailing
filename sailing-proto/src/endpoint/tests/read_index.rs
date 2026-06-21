@@ -1,13 +1,13 @@
 use super::{super::*, *};
 use crate::{
-  Heartbeat, HeartbeatResp, ReadIndexError, ReadIndexResp, ReadState,
+  Heartbeat, HeartbeatResponse, ReadIndexError, ReadIndexResponse, ReadState,
   testkit::{CountSm, NoopStable, VecLog},
 };
 
 /// Test 1: Safe read confirmed only after a heartbeat quorum.
 ///
 /// A 3-node leader (with a current-term commit) calls `read_index(ctx)` →
-/// broadcasts heartbeats with ctx; NO `ReadState` until a quorum of `HeartbeatResp`
+/// broadcasts heartbeats with ctx; NO `ReadState` until a quorum of `HeartbeatResponse`
 /// arrive; after the quorum, exactly one `Event::ReadState` is emitted.
 #[test]
 fn safe_read_confirmed_after_heartbeat_quorum() {
@@ -18,7 +18,7 @@ fn safe_read_confirmed_after_heartbeat_quorum() {
     .expect("leader with a current-term commit must accept the read");
 
   // The leader broadcasts read heartbeats carrying the INTERNAL round token (NOT the user ctx).
-  // Capture the token to echo it back in the HeartbeatResp, exactly as a real follower would.
+  // Capture the token to echo it back in the HeartbeatResponse, exactly as a real follower would.
   let mut round = None;
   let mut ctx_hb_count = 0usize;
   while let Some(out) = ep.poll_message() {
@@ -41,13 +41,13 @@ fn safe_read_confirmed_after_heartbeat_quorum() {
     "ReadState must not be emitted before a quorum of heartbeat acks"
   );
 
-  // One HeartbeatResp echoing the round token from peer 2 → quorum reached (self + peer2 = 2/3).
+  // One HeartbeatResponse echoing the round token from peer 2 → quorum reached (self + peer2 = 2/3).
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
 
@@ -73,7 +73,7 @@ fn safe_read_confirmed_after_heartbeat_quorum() {
 
 /// Regression (the ReadIndex quorum proof keys on an INTERNAL round token, never the
 /// reusable user context): after a read with context X completes, the application may reuse X for a
-/// new read. A stale/duplicated `HeartbeatResp` from the FIRST read's round must NOT confirm the
+/// new read. A stale/duplicated `HeartbeatResponse` from the FIRST read's round must NOT confirm the
 /// SECOND read. Each read's heartbeat round carries a unique internal token, so the stale ack
 /// (echoing the first token) finds no pending entry for the second read and is ignored; only a fresh
 /// ack echoing the second round's token confirms it. Without this, a delayed duplicate could confirm
@@ -117,7 +117,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, token1.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, token1.clone())),
   );
   while ep.poll_message().is_some() {}
   assert_eq!(read_states(&mut ep).len(), 1, "read #1 must confirm");
@@ -131,13 +131,13 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     "the reused context must get a fresh internal round token"
   );
 
-  // ── The STALE HeartbeatResp from read #1's round arrives (delayed/duplicated). ──
+  // ── The STALE HeartbeatResponse from read #1's round arrives (delayed/duplicated). ──
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, token1.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, token1.clone())),
   );
   while ep.poll_message().is_some() {}
   assert!(
@@ -151,7 +151,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, token2.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, token2.clone())),
   );
   while ep.poll_message().is_some() {}
   let confirmed2 = read_states(&mut ep);
@@ -187,7 +187,7 @@ fn stale_leader_cannot_confirm_read() {
 /// Test 4: Follower-forwarded read.
 ///
 /// A follower calls `read_index(ctx)` → sends `ReadIndex` to the leader.
-/// The leader confirms (heartbeat quorum) and replies `ReadIndexResp`.
+/// The leader confirms (heartbeat quorum) and replies `ReadIndexResponse`.
 /// The follower emits `Event::ReadState`.
 #[test]
 fn follower_forwarded_read() {
@@ -243,13 +243,13 @@ fn follower_forwarded_read() {
     other => panic!("expected ReadIndex, got {other:?}"),
   };
 
-  // Now simulate the leader confirming and replying with ReadIndexResp echoing the token.
+  // Now simulate the leader confirming and replying with ReadIndexResponse echoing the token.
   follower.handle_message(
     Instant::ORIGIN,
     &mut follower_log,
     &mut follower_stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(5),
@@ -261,7 +261,7 @@ fn follower_forwarded_read() {
   // Follower must emit ReadState.
   let ev = follower
     .poll_event()
-    .expect("follower must emit ReadState on ReadIndexResp");
+    .expect("follower must emit ReadState on ReadIndexResponse");
   assert!(ev.is_read_state());
   let rs = ev.unwrap_read_state_ref();
   assert_eq!(rs.index(), Index::new(5));
@@ -270,7 +270,7 @@ fn follower_forwarded_read() {
 
 /// Regression (the FOLLOWER-FORWARDED read correlator must be an internal token, not the
 /// reusable user context): the follower-side mirror of the leader-side guard. After a forwarded read with context X
-/// completes, the app may reuse X. A delayed/duplicated `ReadIndexResp` from the FIRST forward must
+/// completes, the app may reuse X. A delayed/duplicated `ReadIndexResponse` from the FIRST forward must
 /// NOT complete the SECOND forwarded read. Each forward carries a unique internal token; the stale
 /// response echoes the first token, which `forwarded_reads.remove_by_token` no longer holds, so it is
 /// dropped. Only the fresh response for the second forward's token completes it (at the fresh index).
@@ -278,7 +278,7 @@ fn follower_forwarded_read() {
 /// MUTATION: freeze the follower's forward-token counter (`push` reuses token 0) → the stale response
 /// completes the reused read at the STALE index.
 #[test]
-fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
+fn reused_forwarded_read_context_is_not_completed_by_stale_response() {
   use core::time::Duration;
   let cfg = Config::try_new(
     2u64,
@@ -335,14 +335,14 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
       .collect()
   }
 
-  // ── Read #1: forward, capture token, complete via the leader's resp. ──
+  // ── Read #1: forward, capture token, complete via the leader's response. ──
   let token1 = forward(&mut ep, &log, &stable, ctx.clone());
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(5),
@@ -362,13 +362,13 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     "the reused forwarded context must get a fresh internal token"
   );
 
-  // ── A STALE duplicate ReadIndexResp echoing read #1's token arrives. ──
+  // ── A STALE duplicate ReadIndexResponse echoing read #1's token arrives. ──
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(5),
@@ -378,16 +378,16 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
   );
   assert!(
     read_states(&mut ep).is_empty(),
-    "a stale resp echoing read #1's token must NOT complete the reused read #2"
+    "a stale response echoing read #1's token must NOT complete the reused read #2"
   );
 
-  // ── The fresh resp for read #2's token completes it at the FRESH index. ──
+  // ── The fresh response for read #2's token completes it at the FRESH index. ──
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(8),
@@ -396,7 +396,11 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     )),
   );
   let s2 = read_states(&mut ep);
-  assert_eq!(s2.len(), 1, "read #2 completes only on its own fresh resp");
+  assert_eq!(
+    s2.len(),
+    1,
+    "read #2 completes only on its own fresh response"
+  );
   assert_eq!(
     s2[0].index(),
     Index::new(8),
@@ -407,7 +411,7 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
 
 /// Regression (forwarded-read tokens are unique ACROSS restarts via the durable boot epoch):
 /// a follower forwards a read (boot epoch E), crashes, and restarts with a strictly-higher boot epoch.
-/// A delayed pre-crash `ReadIndexResp` (carrying the epoch-E token) must NOT complete a post-restart
+/// A delayed pre-crash `ReadIndexResponse` (carrying the epoch-E token) must NOT complete a post-restart
 /// forwarded read (whose token carries the higher epoch), even at the same term — otherwise it would
 /// complete the new read at a stale index (a linearizability break under a transport that redelivers
 /// pre-crash messages across a restart).
@@ -416,7 +420,7 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
 /// incarnations' first tokens are identical and the pre-crash response completes the post-restart read.
 #[test]
 fn forwarded_read_token_is_unique_across_restart() {
-  use crate::{Config, Index, Instant, Message, ReadIndexResp, Term};
+  use crate::{Config, Index, Instant, Message, ReadIndexResponse, Term};
   use core::time::Duration;
   let cfg = Config::try_new(
     2u64,
@@ -488,13 +492,13 @@ fn forwarded_read_token_is_unique_across_restart() {
     "tokens from different boot epochs must differ"
   );
 
-  // The DELAYED pre-crash ReadIndexResp (epoch-1 token) must NOT complete B's post-restart read.
+  // The DELAYED pre-crash ReadIndexResponse (epoch-1 token) must NOT complete B's post-restart read.
   ep_b.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(5),
@@ -513,7 +517,7 @@ fn forwarded_read_token_is_unique_across_restart() {
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(8),
@@ -561,7 +565,11 @@ fn fifo_confirmation_and_index_correctness() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, last_round.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      last_round.clone(),
+    )),
   );
   while ep.poll_message().is_some() {}
 
@@ -626,7 +634,7 @@ fn no_current_term_commit_defers_read() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(crate::VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Do NOT drain storage or advance commit yet.
@@ -668,7 +676,7 @@ fn no_current_term_commit_defers_read() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
+    Message::AppendResponse(crate::AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -697,7 +705,7 @@ fn no_current_term_commit_defers_read() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
 
@@ -825,11 +833,11 @@ fn term_read_failure_at_committed_index_poisons_no_truncation() {
 
 /// A FOLLOWER forwarding a `ReadIndex` to its leader applies the same duplicate-context guard as
 /// the leader: a second `read_index` with an in-flight context returns `DuplicateContext`, and the
-/// matching `ReadIndexResp` clears it so the context can be re-issued. Regression (Class 2).
+/// matching `ReadIndexResponse` clears it so the context can be re-issued. Regression (Class 2).
 #[test]
 fn duplicate_follower_read_index_is_rejected_then_clears() {
   use crate::{
-    AppendEntries, Config, Index, Instant, Message, ReadIndexError, ReadIndexResp, Term,
+    AppendEntries, Config, Index, Instant, Message, ReadIndexError, ReadIndexResponse, Term,
   };
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -865,7 +873,7 @@ fn duplicate_follower_read_index_is_rejected_then_clears() {
   let ctx = bytes::Bytes::from_static(b"read-ctx");
 
   // First read forwards to the leader. The forward carries the follower's INTERNAL token (not the
-  // user ctx); capture it to echo back in the ReadIndexResp.
+  // user ctx); capture it to echo back in the ReadIndexResponse.
   assert_eq!(
     ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
     Ok(())
@@ -883,13 +891,13 @@ fn duplicate_follower_read_index_is_rejected_then_clears() {
   );
   assert!(ep.poll_message().is_none(), "no duplicate forward emitted");
 
-  // The matching ReadIndexResp (echoing the token) confirms the read and clears the in-flight context.
+  // The matching ReadIndexResponse (echoing the token) confirms the read and clears the in-flight context.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::ZERO,
@@ -904,12 +912,12 @@ fn duplicate_follower_read_index_is_rejected_then_clears() {
   assert_eq!(
     ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
     Ok(()),
-    "context is re-issuable after its ReadIndexResp"
+    "context is re-issuable after its ReadIndexResponse"
   );
 }
 
 /// When the leader is at `MAX_LEADER_READS`, a forwarded `ReadIndex` is DECLINED with a
-/// rejecting `ReadIndexResp` (not silently dropped), so the forwarding follower can clear its
+/// rejecting `ReadIndexResponse` (not silently dropped), so the forwarding follower can clear its
 /// `forwarded_reads` strand and re-issue the read.
 ///
 /// FAILS-ON-OLD: with the bare `return` at capacity the leader sends nothing; the follower never
@@ -918,7 +926,7 @@ fn duplicate_follower_read_index_is_rejected_then_clears() {
 fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
   use crate::{Index, ReadIndex, ReadIndexError};
 
-  // ── Leader half: at capacity, a forwarded ReadIndex yields a rejecting ReadIndexResp to ri.from.
+  // ── Leader half: at capacity, a forwarded ReadIndex yields a rejecting ReadIndexResponse to ri.from.
   let (mut leader, mut llog, mut lstable, lnow) = make_leader_with_current_term_commit();
   // Saturate the leader's read backlog so `leader_reads_at_capacity()` holds.
   for i in 0..MAX_LEADER_READS {
@@ -939,27 +947,28 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
     2u64,
     Message::ReadIndex(ReadIndex::new(leader_term, 2u64, fwd_ctx.clone())),
   );
-  // Exactly one rejecting ReadIndexResp addressed back to the forwarder (node 2).
-  let mut reject_resp = None;
+  // Exactly one rejecting ReadIndexResponse addressed back to the forwarder (node 2).
+  let mut reject_response = None;
   while let Some(out) = leader.poll_message() {
     if out.to() == 2u64
-      && let Message::ReadIndexResp(r) = out.message()
+      && let Message::ReadIndexResponse(r) = out.message()
     {
-      reject_resp = Some(r.clone());
+      reject_response = Some(r.clone());
     }
   }
-  let reject_resp = reject_resp.expect("leader at capacity must reply with a ReadIndexResp");
+  let reject_response =
+    reject_response.expect("leader at capacity must reply with a ReadIndexResponse");
   assert!(
-    reject_resp.reject(),
+    reject_response.reject(),
     "the at-capacity reply must carry reject=true"
   );
   assert_eq!(
-    reject_resp.context(),
+    reject_response.context(),
     fwd_ctx.as_ref(),
     "the rejecting reply echoes the forwarded context"
   );
 
-  // ── Follower half: receiving a rejecting ReadIndexResp clears the strand (no ReadState, and the
+  // ── Follower half: receiving a rejecting ReadIndexResponse clears the strand (no ReadState, and the
   // context becomes re-issuable rather than a stuck DuplicateContext).
   use crate::{AppendEntries, Config, Term};
   use core::time::Duration;
@@ -996,7 +1005,7 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
     Ok(()),
     "the read forwards and records a forwarded_reads strand"
   );
-  // Capture the follower's internal token from the forward to echo in the rejecting resp.
+  // Capture the follower's internal token from the forward to echo in the rejecting response.
   let strand_token = match follower.poll_message().map(|o| o.message().clone()) {
     Some(Message::ReadIndex(ri)) => bytes::Bytes::copy_from_slice(ri.context()),
     other => panic!("the read must forward as a ReadIndex, got {other:?}"),
@@ -1009,14 +1018,14 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
     "while the strand is held the context is a duplicate"
   );
 
-  // The rejecting ReadIndexResp from the leader (node 1), echoing the token, clears the strand and
+  // The rejecting ReadIndexResponse from the leader (node 1), echoing the token, clears the strand and
   // emits NO ReadState.
   follower.handle_message(
     Instant::ORIGIN,
     &mut flog,
     &mut fstable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::ZERO,
@@ -1026,13 +1035,13 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
   );
   assert!(
     !follower.poll_all_events_any_read_state(),
-    "a rejecting ReadIndexResp must NOT emit a ReadState"
+    "a rejecting ReadIndexResponse must NOT emit a ReadState"
   );
   // Strand cleared: the SAME context is now accepted again (forwards anew), not DuplicateContext.
   assert_eq!(
     follower.read_index(Instant::ORIGIN, &flog, &fstable, ctx.clone()),
     Ok(()),
-    "after a rejecting ReadIndexResp the context is re-issuable, not stranded"
+    "after a rejecting ReadIndexResponse the context is re-issuable, not stranded"
   );
 }
 
@@ -1061,15 +1070,15 @@ fn poisoned_read_index_reports_poisoned_not_ok() {
   );
 }
 
-/// A follower completes a forwarded read ONLY for a `ReadIndexResp` it actually awaits, from
-/// its CURRENT leader. An unsolicited / wrong-leader resp emits NO `ReadState`; the legitimate resp
+/// A follower completes a forwarded read ONLY for a `ReadIndexResponse` it actually awaits, from
+/// its CURRENT leader. An unsolicited / wrong-leader response emits NO `ReadState`; the legitimate response
 /// emits exactly one; a delayed duplicate (after the context cleared) emits nothing.
 ///
-/// FAILS-ON-OLD: `on_read_index_resp` removed-and-emitted unconditionally, so a spoofed or
-/// duplicate resp would surface a `ReadState` the application would treat as linearizable.
+/// FAILS-ON-OLD: `on_read_index_response` removed-and-emitted unconditionally, so a spoofed or
+/// duplicate response would surface a `ReadState` the application would treat as linearizable.
 #[test]
-fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
-  use crate::{AppendEntries, Config, Index, Instant, Message, ReadIndexResp, Term};
+fn read_index_response_validation_rejects_unsolicited_and_duplicate() {
+  use crate::{AppendEntries, Config, Index, Instant, Message, ReadIndexResponse, Term};
   use core::time::Duration;
   let cfg = Config::try_new(
     2u64,
@@ -1104,7 +1113,7 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
     ep.read_index(Instant::ORIGIN, &log, &stable, ctx.clone()),
     Ok(())
   );
-  // The forward carries the follower's INTERNAL token; capture it (the correlator the resp echoes).
+  // The forward carries the follower's INTERNAL token; capture it (the correlator the response echoes).
   let token = match ep.poll_message().map(|o| o.message().clone()) {
     Some(Message::ReadIndex(ri)) => bytes::Bytes::copy_from_slice(ri.context()),
     other => panic!("the read must forward as a ReadIndex, got {other:?}"),
@@ -1117,7 +1126,7 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(5),
@@ -1131,13 +1140,13 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
   );
 
   // (b) Right token but WRONG leader (from node 3, not our leader node 1): no ReadState, and the
-  // in-flight read must remain (so the legitimate resp can still complete it below).
+  // in-flight read must remain (so the legitimate response can still complete it below).
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     3u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       3u64,
       Index::new(5),
@@ -1147,16 +1156,16 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
   );
   assert!(
     !ep.poll_all_events_any_read_state(),
-    "a wrong-leader resp must not complete the read"
+    "a wrong-leader response must not complete the read"
   );
 
-  // (c) The legitimate resp from the current leader (echoing the token): exactly one ReadState.
+  // (c) The legitimate response from the current leader (echoing the token): exactly one ReadState.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(7),
@@ -1176,7 +1185,7 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
   assert_eq!(
     read_states.len(),
     1,
-    "the legitimate resp completes the read exactly once"
+    "the legitimate response completes the read exactly once"
   );
   assert_eq!(read_states[0].index(), Index::new(7));
 
@@ -1186,7 +1195,7 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
     &mut log,
     &mut stable,
     1u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       1u64,
       Index::new(7),
@@ -1196,7 +1205,7 @@ fn read_index_resp_validation_rejects_unsolicited_and_duplicate() {
   );
   assert!(
     !ep.poll_all_events_any_read_state(),
-    "a delayed duplicate resp must not re-complete the read"
+    "a delayed duplicate response must not re-complete the read"
   );
 }
 
@@ -1221,7 +1230,7 @@ fn forwarded_reads_is_bounded() {
   let mut stable = NoopStable::default();
 
   // Establish a stable leader (node 1) so every read FORWARDS (and is then "dropped" — we never
-  // deliver a ReadIndexResp).
+  // deliver a ReadIndexResponse).
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -1272,17 +1281,17 @@ fn forwarded_reads_is_bounded() {
   );
 }
 
-/// A forwarded read may be completed only by a `ReadIndexResp` whose ENVELOPE sender (the transport
+/// A forwarded read may be completed only by a `ReadIndexResponse` whose ENVELOPE sender (the transport
 /// peer `from` passed to `handle_message`) is the follower's current leader — not merely one whose
-/// PAYLOAD `from` claims to be the leader. A wrong peer can forge `resp.from()` to the leader's id;
+/// PAYLOAD `from` claims to be the leader. A wrong peer can forge `response.from()` to the leader's id;
 /// validating only the payload would let that spoofed response complete a read the application then
 /// treats as linearizable.
 ///
-/// FAILS-ON-OLD: if `on_read_index_resp` checks only `self.leader != Some(resp.from())` (ignoring
+/// FAILS-ON-OLD: if `on_read_index_response` checks only `self.leader != Some(response.from())` (ignoring
 /// the envelope `from`), the spoofed message at step (a) completes the read and a ReadState leaks.
 #[test]
-fn read_index_resp_requires_matching_envelope_sender() {
-  use crate::{AppendEntries, Config, Index, Instant, Message, ReadIndexResp, Term};
+fn read_index_response_requires_matching_envelope_sender() {
+  use crate::{AppendEntries, Config, Index, Instant, Message, ReadIndexResponse, Term};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -1340,7 +1349,7 @@ fn read_index_resp_requires_matching_envelope_sender() {
     &mut log,
     &mut stable,
     3u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       2u64,
       Index::new(9),
@@ -1350,7 +1359,7 @@ fn read_index_resp_requires_matching_envelope_sender() {
   );
   assert!(
     !ep.poll_all_events_any_read_state(),
-    "a resp whose ENVELOPE sender is not the leader must not complete the read, \
+    "a response whose ENVELOPE sender is not the leader must not complete the read, \
        even if its payload `from` is forged to the leader's id"
   );
 
@@ -1361,7 +1370,7 @@ fn read_index_resp_requires_matching_envelope_sender() {
     &mut log,
     &mut stable,
     2u64,
-    Message::ReadIndexResp(ReadIndexResp::new(
+    Message::ReadIndexResponse(ReadIndexResponse::new(
       Term::new(1),
       2u64,
       Index::new(9),
@@ -1381,7 +1390,7 @@ fn read_index_resp_requires_matching_envelope_sender() {
   assert_eq!(
     read_states.len(),
     1,
-    "the legitimately-addressed resp completes the read exactly once"
+    "the legitimately-addressed response completes the read exactly once"
   );
   assert_eq!(read_states[0].index(), Index::new(9));
 }
@@ -1398,7 +1407,7 @@ fn read_index_resp_requires_matching_envelope_sender() {
 /// `pending_reads` grows past `MAX_LEADER_READS`.
 #[test]
 fn leader_read_backlog_is_bounded() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -1421,7 +1430,7 @@ fn leader_read_backlog_is_bounded() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   while ep.poll_message().is_some() {}

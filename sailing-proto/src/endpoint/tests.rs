@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  AppendResp, Entry, Instant, VoteResp,
+  AppendResponse, Entry, Instant, VoteResponse,
   testkit::{AsyncStable, CountSm, NoopStable, VecLog},
 };
 use core::time::Duration;
@@ -138,7 +138,9 @@ fn make_leader_with_compacted_log(
   offset: u64,
   n_tail: usize,
 ) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
-  use crate::{Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, conf::ConfState};
+  use crate::{
+    Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse, conf::ConfState,
+  };
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -162,7 +164,7 @@ fn make_leader_with_compacted_log(
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   // Self-vote must become durable before become_leader fires (persist-before-ACT).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -236,7 +238,7 @@ fn wedged_snapshot_follower(
   (ep, log, stable, Index::new(offset))
 }
 
-// ---- InstallSnapshot receive + SnapshotResp ----
+// ---- InstallSnapshot receive + SnapshotResponse ----
 
 /// Encode a `u64` snapshot value into a `Bytes` blob (the wire format used by CountSm).
 fn encode_snapshot(v: u64) -> bytes::Bytes {
@@ -378,7 +380,7 @@ fn make_single_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Ins
 /// Helper: elect node 1 as leader of a 3-voter cluster {1, 2, 3}, drive the no-op to
 /// committed+applied, then return (ep, log, stable, d).
 fn make_three_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant) {
-  use crate::{Message, Term, VoteResp};
+  use crate::{Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -398,7 +400,7 @@ fn make_three_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Inst
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   // Self-vote must become durable before become_leader fires (persist-before-ACT).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -406,13 +408,13 @@ fn make_three_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Inst
   // Drain storage again: no-op LeaderAppend fires → self match → commit advances.
   ep.handle_storage(d, &mut log, &mut stable);
   // Need peer ack to commit the no-op in a 3-voter cluster (quorum=2).
-  use crate::{AppendResp, Index};
+  use crate::{AppendResponse, Index};
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -464,7 +466,7 @@ fn make_leader_with_current_term_commit() -> (Endpoint<u64, CountSm>, VecLog, No
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   // Self-vote must become durable before become_leader fires (persist-before-ACT).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -477,7 +479,7 @@ fn make_leader_with_current_term_commit() -> (Endpoint<u64, CountSm>, VecLog, No
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -516,7 +518,7 @@ fn leasebased_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable) {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(ep.role().is_leader());
@@ -526,7 +528,7 @@ fn leasebased_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable) {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -580,7 +582,7 @@ fn enforcing_follower(et: Duration) -> (Endpoint<u64, CountSm>, VecLog, AsyncSta
 }
 
 /// Deliver one Heartbeat (leader 1, term `t`, lease round `r`) and return the `lease_support` the
-/// follower advertised in its HeartbeatResp.
+/// follower advertised in its HeartbeatResponse.
 fn follower_advertised_support(
   ep: &mut Endpoint<u64, CountSm>,
   log: &mut VecLog,
@@ -602,11 +604,11 @@ fn follower_advertised_support(
   );
   let mut support = None;
   while let Some(out) = ep.poll_message() {
-    if let Message::HeartbeatResp(hr) = out.message() {
+    if let Message::HeartbeatResponse(hr) = out.message() {
       support = Some(hr.lease_support());
     }
   }
-  support.expect("the follower produced a HeartbeatResp")
+  support.expect("the follower produced a HeartbeatResponse")
 }
 
 // ─── leader transfer tests ────────────────────────────────────────────
@@ -634,7 +636,7 @@ fn setup_leader_with_peer2_caught_up() -> (Endpoint<u64, CountSm>, VecLog, NoopS
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   // Self-vote must become durable before become_leader fires (persist-before-ACT).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -647,7 +649,7 @@ fn setup_leader_with_peer2_caught_up() -> (Endpoint<u64, CountSm>, VecLog, NoopS
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,

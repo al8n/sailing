@@ -401,14 +401,14 @@ impl Cluster {
     let from = self.node_ids[i];
 
     // ── Structural assertion (a): append-before-ack ──────────────────────────────
-    // A success AppendResp must not outrun the node's readable log. (The proto's append-before-ack
+    // A success AppendResponse must not outrun the node's readable log. (The proto's append-before-ack
     // ordering — deferring a NEW suffix's ack to its durability via `on_log_appended` — is exercised
     // by the fsync-window integration test; this send-time tripwire is a coarse outran-the-log
     // guard. It uses the VISIBLE `last_index()` so it stays byte-identical to the original in sync mode and
     // does not flag the legitimate "duplicate AppendEntries, entries already present" ack path that
     // can fire for a visible-but-in-flight suffix. The per-entry quorum-durability of every COMMITTED
     // index is enforced separately by the `commit_is_quorum_durable` oracle on the durable snapshot.)
-    if let Message::AppendResp(a) = &message
+    if let Message::AppendResponse(a) = &message
       && !a.reject()
     {
       assert!(
@@ -423,10 +423,10 @@ impl Cluster {
       );
     }
     // ── Structural assertion (b): one-grant-per-(node,term) ──────────────────────
-    // A success VoteResp from `from` in term `T` to candidate `to` must not appear a second time
+    // A success VoteResponse from `from` in term `T` to candidate `to` must not appear a second time
     // for a different candidate — that would be a double-vote. Holds under reorder+dup: a duplicate
     // grant to the SAME candidate is fine; a grant to a DIFFERENT one in the same term is a bug.
-    if let Message::VoteResp(vr) = &message {
+    if let Message::VoteResponse(vr) = &message {
       // Only a REAL-vote grant binds (it persists `voted_for` for the term). A PRE-vote grant is
       // non-binding — "would I vote for you" — so a node may grant pre-votes to several candidates
       // in the same term without it being a double-vote; exclude them from the tripwire.

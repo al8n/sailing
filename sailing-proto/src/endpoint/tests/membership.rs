@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  ConfChangeSingle, ConfChangeV2, VoteResp,
+  ConfChangeSingle, ConfChangeV2, VoteResponse,
   testkit::{CountSm, NoopStable, VecLog},
 };
 
@@ -119,14 +119,14 @@ fn simple_remove_node_applies_at_commit() {
   ep.handle_timeout(d, &mut log, &mut stable); // become candidate
   ep.handle_storage(d, &mut log, &mut stable);
   // Self-vote is enough if quorum=1 among {1,2} with only self-vote — but actually 2-voter
-  // quorum=2. We need to hand-grant ourselves leadership via a VoteResp.
-  use crate::{Message, Term, VoteResp};
+  // quorum=2. We need to hand-grant ourselves leadership via a VoteResponse.
+  use crate::{Message, Term, VoteResponse};
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader(), "node 1 must be leader");
   ep.handle_storage(d, &mut log, &mut stable);
@@ -135,13 +135,13 @@ fn simple_remove_node_applies_at_commit() {
 
   // Also need to advance commit for the no-op entry. The 2-voter quorum requires peer ack.
   // Simulate peer 2 acking the no-op.
-  use crate::{AppendResp, Index};
+  use crate::{AppendResponse, Index};
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -179,7 +179,7 @@ fn simple_remove_node_applies_at_commit() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -248,7 +248,7 @@ fn non_leader_conf_change_is_refused() {
 fn inherited_uncommitted_conf_change_blocks_new_proposal() {
   use crate::{
     AppendEntries, ConfChange, ConfChangeType, Entry, EntryKind, Index, Message, ProposeError,
-    Term, VoteResp,
+    Term, VoteResponse,
   };
   use core::time::Duration;
 
@@ -329,7 +329,7 @@ fn inherited_uncommitted_conf_change_blocks_new_proposal() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(2), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(2), 3u64, false, false)),
   );
   assert!(ep.role().is_leader(), "node 2 must be leader after quorum");
 
@@ -429,7 +429,7 @@ fn changer_error_at_apply_poisons_node() {
 /// - is_voter(self) == false in the new Tracker
 #[test]
 fn leader_steps_down_on_self_removal() {
-  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Index, Message, Term};
 
   let (mut ep, mut log, mut stable, d) = make_three_node_leader();
   let self_id = ep.id();
@@ -454,7 +454,7 @@ fn leader_steps_down_on_self_removal() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -494,7 +494,7 @@ fn leader_steps_down_on_self_removal() {
 /// Test 2: A leader demoted to learner (AddLearnerNode(self)) also steps down.
 #[test]
 fn leader_steps_down_on_demotion_to_learner() {
-  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Index, Message, Term};
 
   let (mut ep, mut log, mut stable, d) = make_three_node_leader();
   let self_id = ep.id();
@@ -519,7 +519,7 @@ fn leader_steps_down_on_demotion_to_learner() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -623,7 +623,7 @@ fn promoted_learner_arms_election_timer() {
 /// the Leader role (the operator has opted out of the default behavior).
 #[test]
 fn step_down_disabled_leader_keeps_role_after_self_removal() {
-  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Index, Message, Term};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -647,7 +647,7 @@ fn step_down_disabled_leader_keeps_role_after_self_removal() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -656,7 +656,7 @@ fn step_down_disabled_leader_keeps_role_after_self_removal() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -679,7 +679,7 @@ fn step_down_disabled_leader_keeps_role_after_self_removal() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -704,7 +704,7 @@ fn step_down_disabled_leader_keeps_role_after_self_removal() {
 /// halves, so the leader remains a voter and must NOT step down.
 #[test]
 fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
-  use crate::{AppendResp, ConfChangeType, Index, Message, Term};
+  use crate::{AppendResponse, ConfChangeType, Index, Message, Term};
   use core::time::Duration;
 
   // 3-voter cluster {1, 2, 3}. We propose a joint change that replaces node 3 with node 4
@@ -729,7 +729,7 @@ fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -739,7 +739,7 @@ fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -772,7 +772,7 @@ fn joint_phase_leader_keeps_role_while_still_in_outgoing_half() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -832,7 +832,7 @@ fn propose_invalid_conf_change_is_rejected_not_poisoned() {
 /// the check-quorum step-down.
 #[test]
 fn self_removal_step_down_emits_leader_changed_none() {
-  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, Term};
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Index, Message, Term};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -855,7 +855,7 @@ fn self_removal_step_down_emits_leader_changed_none() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -864,7 +864,7 @@ fn self_removal_step_down_emits_leader_changed_none() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -887,7 +887,7 @@ fn self_removal_step_down_emits_leader_changed_none() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,

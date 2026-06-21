@@ -1,5 +1,5 @@
 use super::*;
-use crate::{FailoverReadWindow, ReadIndex, ReadIndexError, ReadIndexResp};
+use crate::{FailoverReadWindow, ReadIndex, ReadIndexError, ReadIndexResponse};
 
 impl<I, F> Endpoint<I, F>
 where
@@ -68,7 +68,7 @@ where
   ///   1. `check_quorum` is enabled — the lease invariant is only maintained under CheckQuorum (a leader
   ///      that loses quorum contact steps down within an election timeout).
   ///   2. a FRESH quorum lease is live (`lease_valid_until > now`). The lease is renewed in
-  ///      `on_heartbeat_resp` ONLY by a HeartbeatResp echoing the CURRENT `lease_round` and is
+  ///      `on_heartbeat_response` ONLY by a HeartbeatResponse echoing the CURRENT `lease_round` and is
   ///      bounded by the round's SEND time, not response receipt — so a stale/duplicated/delayed
   ///      response can neither keep an isolated leader's lease alive nor over-extend it. SELF-VALIDATING:
   ///      a contributing ack must ALSO advertise that it enforces the lease window
@@ -126,7 +126,7 @@ where
   }
 
   /// Confirm a read immediately at `index` (a lease fast-path — no heartbeat round): emit
-  /// `Event::ReadState` for a local read, or reply `ReadIndexResp` to the forwarding follower.
+  /// `Event::ReadState` for a local read, or reply `ReadIndexResponse` to the forwarding follower.
   /// Shared by the LeaseBased and LeaseGuard immediate-serve paths.
   fn emit_or_reply_read(&mut self, index: Index, context: Bytes, from: Option<I>) {
     match from {
@@ -135,7 +135,7 @@ where
         let (term, me) = (self.term, self.config.id());
         self.send(
           follower,
-          Message::ReadIndexResp(ReadIndexResp::new(term, me, index, context, false)),
+          Message::ReadIndexResponse(ReadIndexResponse::new(term, me, index, context, false)),
         );
       }
     }
@@ -404,7 +404,7 @@ where
     let me = self.config.id();
     let commit = self.commit;
     // Register the read and seed the heartbeat round with its INTERNAL token (not the user
-    // `context`): the token is unique per round, so a stale/duplicated HeartbeatResp echoing an
+    // `context`): the token is unique per round, so a stale/duplicated HeartbeatResponse echoing an
     // earlier round's token can never confirm this read — the linearizability hazard when a user
     // reuses a `context` after an earlier read with it completed.
     let round = self.reads.read_only.add_request(commit, context, from, me);
@@ -437,7 +437,7 @@ where
           Some(follower) => {
             self.send(
               follower,
-              Message::ReadIndexResp(ReadIndexResp::new(term, me2, index, context, false)),
+              Message::ReadIndexResponse(ReadIndexResponse::new(term, me2, index, context, false)),
             );
           }
         }
@@ -450,16 +450,16 @@ where
   /// Initiate a linearizable read.
   ///
   /// The `context` correlates this request with the eventual [`Event::ReadState`](crate::Event::ReadState)
-  /// (locally) or [`ReadIndexResp`](crate::ReadIndexResp) (when forwarded), so it should identify the
+  /// (locally) or [`ReadIndexResponse`](crate::ReadIndexResponse) (when forwarded), so it should identify the
   /// read uniquely AMONG IN-FLIGHT reads: reusing a `context` that is already in flight (including the
   /// **empty** context for two concurrent reads) returns [`crate::ReadIndexError::DuplicateContext`],
   /// since the prior read's single confirmation would otherwise be the only acknowledgement for both.
   /// Reuse AFTER a prior read with the same context has completed is safe: the leader's heartbeat-quorum
   /// proof keys on an internal, never-reused round token (not the `context`), so a stale or duplicated
-  /// `HeartbeatResp` from the earlier read can never confirm the later one.
+  /// `HeartbeatResponse` from the earlier read can never confirm the later one.
   ///
   /// `Ok(())` means the read was accepted onto a confirmation path; the caller should wait for
-  /// the matching `ReadState`/`ReadIndexResp`. An `Err` means **no** acknowledgement will ever
+  /// the matching `ReadState`/`ReadIndexResponse`. An `Err` means **no** acknowledgement will ever
   /// arrive for this call, so the caller must not block on one.
   ///
   /// - **Leader, `ReadOnlySafe`:** records the read at the current commit index and
@@ -526,7 +526,7 @@ where
           return Err(ReadIndexError::NoLeader);
         };
         // Follower-side duplicate-context guard (mirror of the leader's `read_context_in_flight`):
-        // a context already forwarded and awaiting its `ReadIndexResp` owns the completion path;
+        // a context already forwarded and awaiting its `ReadIndexResponse` owns the completion path;
         // reject the duplicate rather than forward it again (unbounded re-forward / silent coalesce).
         if self.reads.forwarded_reads.contains_context(&context) {
           return Err(ReadIndexError::DuplicateContext);
@@ -537,7 +537,7 @@ where
           return Err(ReadIndexError::TooManyInFlight);
         }
         // Record before forwarding and forward by the INTERNAL token, NOT the user context: the leader
-        // echoes whatever we send as the `ReadIndexResp` context, so correlating on a unique token
+        // echoes whatever we send as the `ReadIndexResponse` context, so correlating on a unique token
         // means a stale/duplicated response from an earlier forward (even of the same user context)
         // cannot complete a later read. `read_index` already returned early if poisoned, so this never
         // desyncs from the suppressed `send` below.
@@ -588,7 +588,7 @@ where
       return;
     }
     // `ri.context()` is the forwarding follower's per-read TOKEN (not a user context); the leader keeps
-    // it opaque and echoes it in the `ReadIndexResp` so the follower can correlate.
+    // it opaque and echoes it in the `ReadIndexResponse` so the follower can correlate.
     let context = Bytes::copy_from_slice(ri.context());
     let from = ri.from();
     // No leader-side duplicate-context guard on the forwarded path: the FORWARDING FOLLOWER owns the
@@ -596,7 +596,7 @@ where
     // keys on its OWN round token, so distinct forwards never collide even when followers reuse token
     // VALUES (each follower's token sequence starts at 0). A network-duplicated `ReadIndex` is harmless:
     // the leader confirms it again, but the follower's token-keyed `forwarded_reads` drops the redundant
-    // `ReadIndexResp`. Unbounded growth is bounded by the capacity check below, not by a dedup.
+    // `ReadIndexResponse`. Unbounded growth is bounded by the capacity check below, not by a dedup.
     // Leader-side read back-pressure (same bound as the local path): at capacity we decline the
     // forwarded read rather than grow the backlog without limit. We MUST tell the follower so it can
     // clear its `forwarded_reads` entry — a bare drop would strand that entry until an unrelated
@@ -607,7 +607,7 @@ where
       let (term, me) = (self.term, self.config.id());
       self.send(
         from,
-        Message::ReadIndexResp(ReadIndexResp::new(term, me, Index::ZERO, context, true)),
+        Message::ReadIndexResponse(ReadIndexResponse::new(term, me, Index::ZERO, context, true)),
       );
       return;
     }
@@ -623,7 +623,7 @@ where
   /// commit/applied view is no longer trustworthy, so confirming a linearizable read against it
   /// would hand the application a stale-or-wrong index. Every `Event::ReadState` push — the local
   /// leader read (Safe single-node and quorum-confirmed paths, LeaseBased) and the follower's
-  /// validated `ReadIndexResp` completion — routes through here so the poison check lives in one
+  /// validated `ReadIndexResponse` completion — routes through here so the poison check lives in one
   /// place. Mirrors `send`'s central emit-halt for the event channel.
   pub(crate) fn emit_read_state(&mut self, index: Index, context: Bytes) {
     if self.poison.poisoned {
@@ -637,24 +637,24 @@ where
       )));
   }
 
-  /// Follower receives a `ReadIndexResp` from the leader.
+  /// Follower receives a `ReadIndexResponse` from the leader.
   ///
   /// Only a FOLLOWER awaiting THIS forwarded read, from its CURRENT leader, may complete it: an
   /// unsolicited / stale / wrong-leader / already-completed response is rejected without emitting a
-  /// `ReadState`. Without the membership check, a spoofed or duplicate resp could complete a read the
+  /// `ReadState`. Without the membership check, a spoofed or duplicate response could complete a read the
   /// node never forwarded (or re-complete one it already did), surfacing a confirmation the
   /// application would treat as linearizable. The response's correlator is the follower's INTERNAL
   /// token (echoed by the leader), NOT the user context, so a stale/duplicated response from an
   /// earlier forward — even of a since-reused user context — finds no matching in-flight read and is
   /// dropped. `remove_by_token` doubles as the already-completed guard: `None` once consumed.
-  pub(crate) fn on_read_index_resp(&mut self, from: I, resp: ReadIndexResp<I>) {
-    let token = resp.context();
+  pub(crate) fn on_read_index_response(&mut self, from: I, response: ReadIndexResponse<I>) {
+    let token = response.context();
     // Only a follower awaiting a forward from its CURRENT leader may complete it, and the leader is
     // identified by the ENVELOPE sender `from` (the transport peer) — never the self-reported
-    // `resp.from()`, which a wrong peer could forge to the leader's id. Membership is
+    // `response.from()`, which a wrong peer could forge to the leader's id. Membership is
     // checked BEFORE consuming the token, so a spoofed / wrong-leader response never clears a real
     // in-flight slot.
-    if self.role != Role::Follower || self.leader != Some(from) || resp.from() != from {
+    if self.role != Role::Follower || self.leader != Some(from) || response.from() != from {
       return;
     }
     // `remove_by_token` is the authoritative clear of the in-flight slot AND the already-completed /
@@ -665,9 +665,9 @@ where
     let Some(context) = self.reads.forwarded_reads.remove_by_token(token) else {
       return;
     };
-    if resp.reject() {
+    if response.reject() {
       return;
     }
-    self.emit_read_state(resp.index(), context);
+    self.emit_read_state(response.index(), context);
   }
 }

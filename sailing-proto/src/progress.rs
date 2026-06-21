@@ -159,7 +159,7 @@ impl Progress {
     updated
   }
 
-  /// Clear the Probe pause flag without changing state — used by HeartbeatResp so a
+  /// Clear the Probe pause flag without changing state — used by HeartbeatResponse so a
   /// stalled Probe peer resumes on the next heartbeat round.
   pub fn clear_probe_pause(&mut self) {
     self.msg_app_flow_paused = false;
@@ -183,7 +183,7 @@ impl Progress {
   /// (because all acks were lost, e.g. during a partition), free the oldest in-flight slot so
   /// the leader can send one new `AppendEntries` per heartbeat round.
   ///
-  /// This is called on every `HeartbeatResp` so a healed/partitioned follower resumes
+  /// This is called on every `HeartbeatResponse` so a healed/partitioned follower resumes
   /// replication on its own via heartbeats instead of waiting for an unrelated client
   /// proposal to trigger a send.
   ///

@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  AppendResp, HeartbeatResp, VoteResp,
+  AppendResponse, HeartbeatResponse, VoteResponse,
   testkit::{AsyncStable, CountSm, NoopStable, VecLog},
 };
 
@@ -98,7 +98,7 @@ fn check_quorum_follower_lease_blocks_disruptive_vote() {
       bytes::Bytes::new(),
     )),
   );
-  // Drain the HeartbeatResp.
+  // Drain the HeartbeatResponse.
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
 
@@ -192,7 +192,7 @@ fn lease_based_confirms_immediately() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -201,7 +201,7 @@ fn lease_based_confirms_immediately() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -214,7 +214,7 @@ fn lease_based_confirms_immediately() {
   while ep.poll_message().is_some() {}
 
   // Establish a FRESH lease: tick a heartbeat round (bumps the lease round), then a quorum
-  // HeartbeatResp echoing the CURRENT lease round renews `lease_valid_until`. The lease is no longer
+  // HeartbeatResponse echoing the CURRENT lease round renews `lease_valid_until`. The lease is no longer
   // the spoofable `election_deadline`, so an immediate LeaseBased read requires this fresh confirmation.
   let lease_at = ep.poll_timeout().expect("heartbeat timer armed");
   ep.handle_timeout(lease_at, &mut log, &mut stable);
@@ -232,8 +232,8 @@ fn lease_based_confirms_immediately() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(
-      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
           .with_lease_round(lease_round)
           // advertise enforcement (the follower's own election_timeout) so the leader counts it.
           .with_lease_support(Duration::from_millis(1000)),
@@ -272,15 +272,15 @@ fn lease_based_confirms_immediately() {
 }
 
 /// Regression (the LeaseBased read lease is renewed ONLY by FRESH current-round responses):
-/// a stale or duplicated `HeartbeatResp` echoing an EARLIER CheckQuorum round must NOT renew the
+/// a stale or duplicated `HeartbeatResponse` echoing an EARLIER CheckQuorum round must NOT renew the
 /// lease. Otherwise an isolated old leader could keep serving stale lease reads on delayed/duplicated
 /// pre-partition traffic (unbounded under duplication), while a new leader commits newer state.
 ///
-/// MUTATION: drop the `resp.lease_round() == self.check_quorum_lease.lease_round` guard in `on_heartbeat_resp` → the
+/// MUTATION: drop the `response.lease_round() == self.check_quorum_lease.lease_round` guard in `on_heartbeat_response` → the
 /// stale earlier-round response renews the lease (`lease_acks` gains the peer, `lease_valid_until`
 /// extends).
 #[test]
-fn stale_round_heartbeat_resp_does_not_renew_lease() {
+fn stale_round_heartbeat_response_does_not_renew_lease() {
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -303,7 +303,7 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -325,9 +325,9 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
     }
     (at, lr.expect("heartbeat carried a lease round"))
   }
-  fn hb_resp(round: u64) -> Message<u64> {
-    Message::HeartbeatResp(
-      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
+  fn hb_response(round: u64) -> Message<u64> {
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
           .with_lease_round(round)
           // advertise enforcement (the follower's own election_timeout) so the leader counts it.
           .with_lease_support(Duration::from_millis(1000)),
@@ -336,7 +336,7 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
 
   // Round 1 (r1): a fresh quorum ack establishes the lease.
   let (t1, r1) = tick_round(&mut ep, &mut log, &mut stable);
-  ep.handle_message(t1, &mut log, &mut stable, 2u64, hb_resp(r1));
+  ep.handle_message(t1, &mut log, &mut stable, 2u64, hb_response(r1));
   assert!(
     ep.check_quorum_lease.lease_valid_until.is_some(),
     "a fresh current-round quorum ack establishes the lease"
@@ -351,8 +351,8 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
   );
   let lease_before = ep.check_quorum_lease.lease_valid_until;
 
-  // A STALE HeartbeatResp echoing the OLD round (r1) must be IGNORED for the lease.
-  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp(r1));
+  // A STALE HeartbeatResponse echoing the OLD round (r1) must be IGNORED for the lease.
+  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_response(r1));
   assert!(
     !ep.check_quorum_lease.lease_acks.contains(&2u64),
     "a stale (old-round) ack must not count toward the lease"
@@ -362,8 +362,8 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
     "a stale ack must not renew the lease"
   );
 
-  // A FRESH HeartbeatResp echoing the CURRENT round (r2) renews the lease.
-  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp(r2));
+  // A FRESH HeartbeatResponse echoing the CURRENT round (r2) renews the lease.
+  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_response(r2));
   assert!(
     ep.check_quorum_lease.lease_acks.contains(&2u64),
     "a fresh current-round ack counts toward the lease"
@@ -377,7 +377,7 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
 }
 
 /// Regression (the lease deadline is bounded by the round's SEND instant, not the response
-/// receipt time): a DELAYED current-round HeartbeatResp must renew the lease to
+/// receipt time): a DELAYED current-round HeartbeatResponse must renew the lease to
 /// `lease_round_start + election_timeout`, NOT `response_receipt + election_timeout`. Followers reset
 /// their election timers when they RECEIVED the round (≈ its send instant), so measuring from a
 /// delayed response would extend the lease past the quorum's election window and let an isolated
@@ -386,7 +386,7 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
 /// MUTATION: renew from `now` (response receipt) instead of `lease_round_start` → the lease extends
 /// by the response delay.
 #[test]
-fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
+fn delayed_heartbeat_response_does_not_extend_lease_past_send_window() {
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -408,7 +408,7 @@ fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -427,15 +427,15 @@ fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
     lr.expect("heartbeat carried a lease round")
   };
 
-  // The quorum's HeartbeatResp echoing this round arrives MUCH later (delayed in transit).
+  // The quorum's HeartbeatResponse echoing this round arrives MUCH later (delayed in transit).
   let t_late = t_send + Duration::from_millis(500);
   ep.handle_message(
     t_late,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(
-      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
           .with_lease_round(round)
           // advertise enforcement (the follower's own election_timeout) so the leader counts it.
           .with_lease_support(Duration::from_millis(1000)),
@@ -455,12 +455,12 @@ fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
   );
 }
 
-/// Self-validating lease: a voter that does NOT enforce the lease window (HeartbeatResp
+/// Self-validating lease: a voter that does NOT enforce the lease window (HeartbeatResponse
 /// `lease_support == 0`) must NOT renew the lease — even if it freshly acks the current round. This
 /// closes the heterogeneous/misconfigured-cluster cooperation hole: a Safe/CQ-disabled voter cannot
 /// keep a LeaseBased leader's lease alive.
 ///
-/// MUTATION: drop the `resp.lease_support() > 0` gate in `on_heartbeat_resp` → the non-enforcing ack
+/// MUTATION: drop the `response.lease_support() > 0` gate in `on_heartbeat_response` → the non-enforcing ack
 /// renews the lease.
 #[test]
 fn lease_not_renewed_by_non_enforcing_voter() {
@@ -473,8 +473,8 @@ fn lease_not_renewed_by_non_enforcing_voter() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(
-      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new()).with_lease_round(round),
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new()).with_lease_round(round),
     ),
   );
   assert!(
@@ -502,8 +502,8 @@ fn lease_bounded_by_min_support() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(
-      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
         .with_lease_round(round)
         .with_lease_support(Duration::from_millis(300)),
     ),
@@ -534,8 +534,8 @@ fn membership_change_revokes_lease() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(
-      HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
         .with_lease_round(round)
         .with_lease_support(Duration::from_millis(1000)),
     ),
@@ -560,7 +560,7 @@ fn membership_change_revokes_lease() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -822,7 +822,7 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -831,7 +831,7 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -866,13 +866,13 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
     "LeaseBased without check_quorum must fall back to Safe and broadcast a heartbeat round",
   );
 
-  // After a quorum of HeartbeatResp acks (echoing the round token), ReadState is emitted.
+  // After a quorum of HeartbeatResponse acks (echoing the round token), ReadState is emitted.
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
 
@@ -892,7 +892,7 @@ fn lease_based_without_check_quorum_degrades_to_safe() {
 /// unproven and confirming could serve a read a majority has moved past. Here the leader arms its
 /// lease at `d`, then `read_index` is called at `d + 2s` (past the `d + 1s` deadline) BEFORE any
 /// timeout — it must degrade to the Safe heartbeat round, not confirm immediately. A subsequent
-/// HeartbeatResp quorum then completes the read (liveness preserved).
+/// HeartbeatResponse quorum then completes the read (liveness preserved).
 ///
 /// MUTATION: drop the `election_deadline > now` conjunct so `use_lease` is `check_quorum()` alone →
 /// the leader confirms immediately and the "no immediate ReadState" assertion fails.
@@ -921,7 +921,7 @@ fn lease_based_expired_lease_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // The leader armed its quorum lease at `d`: election_deadline = d + election_timeout (1s).
@@ -931,7 +931,7 @@ fn lease_based_expired_lease_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -967,13 +967,13 @@ fn lease_based_expired_lease_degrades_to_safe() {
   let round =
     round.expect("expired LeaseBased lease must fall back to Safe and broadcast a heartbeat round");
 
-  // A HeartbeatResp quorum (echoing the round token) then completes the read (liveness preserved).
+  // A HeartbeatResponse quorum (echoing the round token) then completes the read (liveness preserved).
   ep.handle_message(
     expired,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, round.clone())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(Term::new(1), 2u64, round.clone())),
   );
   while ep.poll_message().is_some() {}
   let ev = ep

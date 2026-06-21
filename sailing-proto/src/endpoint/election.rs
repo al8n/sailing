@@ -1,5 +1,5 @@
 use super::*;
-use crate::{RequestVote, VoteResp};
+use crate::{RequestVote, VoteResponse};
 use core::error::Error;
 
 impl<I, F> Endpoint<I, F>
@@ -168,10 +168,10 @@ where
       // On grant: reply at the advertised term so the pre-candidate counts it for this
       // round; on reject: reply at self.term so the pre-candidate learns our (possibly
       // higher) term. Do NOT touch self.term, self.voted_for, or self.pending.
-      let resp_term = if grant { rv.term() } else { self.term };
+      let response_term = if grant { rv.term() } else { self.term };
       self.send(
         rv.candidate(),
-        Message::VoteResp(VoteResp::new(resp_term, me, true, !grant)),
+        Message::VoteResponse(VoteResponse::new(response_term, me, true, !grant)),
       );
       return;
     }
@@ -185,7 +185,7 @@ where
     if can_vote && log_ok && !self.lease_vote_fenced(now, rv.leader_transfer()) {
       self.voted_for = Some(rv.candidate());
       self.arm_election_timer(now);
-      // Persist (term, vote); the VoteResp(grant) is owed once the write is DURABLE.
+      // Persist (term, vote); the VoteResponse(grant) is owed once the write is DURABLE.
       // Stamp the current commit too: we read-modify `hard_state()` then override fields, so
       // without this the write would carry a possibly-stale `hard_state().commit` and could
       // REGRESS the durable commit below a value the handle_storage choke-point already wrote.
@@ -210,17 +210,17 @@ where
       let (term, me) = (self.term, self.config.id());
       self.send(
         rv.candidate(),
-        Message::VoteResp(VoteResp::new(term, me, false, true)),
+        Message::VoteResponse(VoteResponse::new(term, me, false, true)),
       );
     }
   }
 
-  pub(crate) fn on_vote_resp<L: LogStore, S: StableStore<NodeId = I>>(
+  pub(crate) fn on_vote_response<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Now,
     log: &mut L,
     stable: &mut S,
-    vr: VoteResp<I>,
+    vr: VoteResponse<I>,
   ) where
     F::Command: Data,
     // `become_candidate`/`become_leader` live in the `apply_committed` impl block, which is
@@ -527,7 +527,7 @@ where
     self.reads.pending_reads.clear();
     // a fresh leader holds NO read lease until a quorum freshly acks its first CheckQuorum
     // round. Reset the lease round/ack set and clear the deadline, so no LeaseBased read can be
-    // served until `on_heartbeat_resp` confirms a fresh current-round quorum.
+    // served until `on_heartbeat_response` confirms a fresh current-round quorum.
     self.check_quorum_lease.lease_round = 0;
     self.check_quorum_lease.lease_acks.clear();
     self.check_quorum_lease.lease_valid_until = None;

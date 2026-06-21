@@ -63,7 +63,7 @@ impl LeaseSupport {
 /// `None`); `lease_support` is a three-valued [`LeaseSupport`] (provenance + magnitude). Generic params
 /// carry no bounds (bounds live on methods).
 ///
-/// `lease_support` is the durable shadow of `HeartbeatResp.lease_support` — the lease window this node has
+/// `lease_support` is the durable shadow of `HeartbeatResponse.lease_support` — the lease window this node has
 /// advertised it will uphold — persisted so a restarted node keeps the promise its prior incarnation made
 /// to the network, sizing the post-restart vote fence by the PROMISE rather than by the (possibly weaker)
 /// post-restart config, with the provenance needed to handle a legacy upgrade safely. It is

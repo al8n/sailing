@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  Heartbeat, HeartbeatResp, VoteResp,
+  Heartbeat, HeartbeatResponse, VoteResponse,
   testkit::{AsyncStable, CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
 };
 use core::time::Duration;
@@ -136,7 +136,7 @@ fn follower_grants_then_rejects_second_candidate() {
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
   let mut log = NoopLog;
-  // Use AsyncStable so that the VoteResp(grant) is released on handle_storage.
+  // Use AsyncStable so that the VoteResponse(grant) is released on handle_storage.
   let mut stable = AsyncStable::default();
 
   // candidate 1 in term 1, empty log — grant is deferred behind durability
@@ -159,7 +159,7 @@ fn follower_grants_then_rejects_second_candidate() {
   // Drain storage → hard-state write completes → grant emitted.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   let vr = ep.poll_message().unwrap();
-  assert!(matches!(vr.message(), Message::VoteResp(v) if !v.reject() && v.from()==2));
+  assert!(matches!(vr.message(), Message::VoteResponse(v) if !v.reject() && v.from()==2));
   assert_eq!(ep.term(), Term::new(1));
 
   // candidate 3 in the SAME term — already voted for 1, reject sent immediately
@@ -178,7 +178,7 @@ fn follower_grants_then_rejects_second_candidate() {
     )),
   );
   let vr = ep.poll_message().unwrap();
-  assert!(matches!(vr.message(), Message::VoteResp(v) if v.reject()));
+  assert!(matches!(vr.message(), Message::VoteResponse(v) if v.reject()));
 }
 
 /// Regression (same-term leader step-down before a `LeaderAppend` completes): a leader
@@ -190,7 +190,7 @@ fn follower_grants_then_rejects_second_candidate() {
 /// completion hits `_`, `durable_index` stays at the pre-append value, and the assertion FAILS.
 #[test]
 fn durable_index_advances_after_same_term_leader_step_down() {
-  use crate::{AppendEntries, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendEntries, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -211,7 +211,7 @@ fn durable_index_advances_after_same_term_leader_step_down() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   // Self-vote durable → become_leader fires; the no-op append is now in-flight (LeaderAppend).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -302,7 +302,7 @@ fn vote_grant_waits_for_durable_hard_state() {
   // Drain storage → HardState write completes → grant emitted.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert!(
-    matches!(ep.poll_message().unwrap().message(), Message::VoteResp(v) if !v.reject()),
+    matches!(ep.poll_message().unwrap().message(), Message::VoteResponse(v) if !v.reject()),
     "grant must be emitted after handle_storage"
   );
 }
@@ -347,11 +347,11 @@ fn candidate_does_not_lead_until_self_vote_durable() {
 }
 
 /// Regression (election safety): even when a PEER's grant reaches quorum, the leader transition
-/// waits until the candidate's own self-vote write is durable (`on_vote_resp` gates on
+/// waits until the candidate's own self-vote write is durable (`on_vote_response` gates on
 /// `self_vote_durable`). Without the gate the peer grant elects the node on an un-durable self-vote.
 #[test]
 fn quorum_from_peer_vote_waits_for_durable_self_vote() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -376,7 +376,7 @@ fn quorum_from_peer_vote_waits_for_durable_self_vote() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(
     ep.role().is_candidate() && !ep.role().is_leader(),
@@ -458,10 +458,10 @@ fn deferred_vote_does_not_leak_across_term_bump() {
   // term-6 step-down write, plus op3 from term-6 grant, all complete here).
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
 
-  // Step 4: collect all VoteResp messages.
+  // Step 4: collect all VoteResponse messages.
   let mut grants: Vec<(u64, u64)> = Vec::new(); // (from, to/candidate)
   while let Some(out) = ep.poll_message() {
-    if let Message::VoteResp(vr) = out.message()
+    if let Message::VoteResponse(vr) = out.message()
       && !vr.reject()
     {
       // out.to() is the candidate we're replying to
@@ -545,14 +545,14 @@ fn non_voter_does_not_campaign_on_timeout() {
 
 /// Stepping down to Follower on a higher-term message must ARM a voter's election timer (mirrors
 /// etcd's `becomeFollower`). A leader with check_quorum disabled holds `election_deadline = None`; a
-/// higher-term RESPONSE (VoteResp / AppendResp — whose handler returns early without arming) would
+/// higher-term RESPONSE (VoteResponse / AppendResponse — whose handler returns early without arming) would
 /// otherwise leave it a voter Follower that can NEVER campaign, wedging the cluster leaderless.
 ///
 /// Before fix: the term pre-pass step-down never armed the timer, so a leader stepping down on a
-/// higher-term VoteResp kept `election_deadline = None`.
+/// higher-term VoteResponse kept `election_deadline = None`.
 #[test]
 fn step_down_on_higher_term_arms_voter_election_timer() {
-  use crate::{Message, Term, VoteResp};
+  use crate::{Message, Term, VoteResponse};
 
   let (mut ep, mut log, mut stable, d) = make_three_node_leader();
   assert!(ep.role().is_leader(), "precondition: node is the leader");
@@ -562,7 +562,7 @@ fn step_down_on_higher_term_arms_voter_election_timer() {
     "precondition: a leader without check_quorum has no election timer"
   );
 
-  // A higher-term VoteResp — a response whose handler returns early (we are no longer a candidate)
+  // A higher-term VoteResponse — a response whose handler returns early (we are no longer a candidate)
   // without arming — forces the step-down through the term pre-pass.
   let higher = Term::new(ep.term().get() + 5);
   ep.handle_message(
@@ -570,7 +570,7 @@ fn step_down_on_higher_term_arms_voter_election_timer() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(higher, 2u64, false, true)),
+    Message::VoteResponse(VoteResponse::new(higher, 2u64, false, true)),
   );
 
   assert!(
@@ -590,7 +590,7 @@ fn step_down_on_higher_term_arms_voter_election_timer() {
 /// → the node does NOT advance to Candidate, and self.term is UNCHANGED.
 #[test]
 fn pre_candidate_loses_stays_at_same_term() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -648,7 +648,7 @@ fn pre_candidate_loses_stays_at_same_term() {
       &mut log,
       &mut stable,
       peer,
-      Message::VoteResp(VoteResp::new(
+      Message::VoteResponse(VoteResponse::new(
         Term::ZERO,
         peer,
         true, /* pre_vote */
@@ -678,7 +678,7 @@ fn pre_candidate_loses_stays_at_same_term() {
 /// adopted until a quorum lands — the anti-disruption guarantee.)
 #[test]
 fn pre_vote_reject_at_higher_term_is_adopted() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -708,7 +708,7 @@ fn pre_vote_reject_at_higher_term_is_adopted() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(
+    Message::VoteResponse(VoteResponse::new(
       higher, 2u64, true, /* pre_vote */
       true, /* reject */
     )),
@@ -734,7 +734,7 @@ fn pre_vote_reject_at_higher_term_is_adopted() {
 /// a reject is).
 #[test]
 fn pre_vote_grant_at_higher_term_does_not_raise_term() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -761,7 +761,7 @@ fn pre_vote_grant_at_higher_term_does_not_raise_term() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(
+    Message::VoteResponse(VoteResponse::new(
       Term::new(1),
       2u64,
       true,  /* pre_vote */
@@ -814,7 +814,7 @@ fn pre_vote_request_does_not_raise_granter_term() {
       bytes::Bytes::new(),
     )),
   );
-  while ep.poll_message().is_some() {} // drain HeartbeatResp
+  while ep.poll_message().is_some() {} // drain HeartbeatResponse
   assert_eq!(
     ep.term(),
     Term::new(3),
@@ -846,9 +846,9 @@ fn pre_vote_request_does_not_raise_granter_term() {
   );
 
   // A response must have been sent (reject, since live leader + healthy election timer).
-  let resp = ep.poll_message().expect("must send a VoteResp");
-  match resp.message() {
-    Message::VoteResp(vr) => {
+  let response = ep.poll_message().expect("must send a VoteResponse");
+  match response.message() {
+    Message::VoteResponse(vr) => {
       assert!(vr.pre_vote(), "response must be a pre-vote response");
       assert!(
         vr.reject(),
@@ -861,7 +861,7 @@ fn pre_vote_request_does_not_raise_granter_term() {
         "reject response must carry self.term, not the advertised term"
       );
     }
-    other => panic!("expected VoteResp, got {other:?}"),
+    other => panic!("expected VoteResponse, got {other:?}"),
   }
 }
 
@@ -869,7 +869,7 @@ fn pre_vote_request_does_not_raise_granter_term() {
 /// and a real RequestVote{pre_vote:false} broadcast.
 #[test]
 fn successful_pre_vote_quorum_starts_real_campaign() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -899,7 +899,7 @@ fn successful_pre_vote_quorum_starts_real_campaign() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(
+    Message::VoteResponse(VoteResponse::new(
       Term::new(1),
       2u64,
       true,  /* pre_vote */
@@ -1012,16 +1012,16 @@ fn pre_vote_rejected_for_stale_log() {
     )),
   );
 
-  let resp = ep.poll_message().expect("must reply to pre-vote");
-  match resp.message() {
-    Message::VoteResp(vr) => {
+  let response = ep.poll_message().expect("must reply to pre-vote");
+  match response.message() {
+    Message::VoteResponse(vr) => {
       assert!(vr.pre_vote(), "must be a pre-vote response");
       assert!(
         vr.reject(),
         "must reject pre-vote from a stale-log candidate"
       );
     }
-    other => panic!("expected VoteResp, got {other:?}"),
+    other => panic!("expected VoteResponse, got {other:?}"),
   }
   // The receiver's term must be unchanged (pre-vote never changes term).
   assert_eq!(
@@ -1083,11 +1083,11 @@ fn term_pre_pass_exemption_for_pre_vote_request() {
   assert!(ep.voted_for.is_none(), "pre-vote must NOT set voted_for");
 
   // Response must be IMMEDIATE (no persist needed) — it is already in the outgoing queue.
-  let resp = ep
+  let response = ep
     .poll_message()
     .expect("response must be sent immediately, without waiting for storage");
-  match resp.message() {
-    Message::VoteResp(vr) => {
+  match response.message() {
+    Message::VoteResponse(vr) => {
       assert!(vr.pre_vote(), "must be a pre-vote response");
       // Grant: log_ok + term_ok + lease_open all pass.
       assert!(!vr.reject(), "must grant (log ok, term ok, lease open)");
@@ -1098,16 +1098,16 @@ fn term_pre_pass_exemption_for_pre_vote_request() {
         "grant reply must carry the advertised term rv.term()"
       );
     }
-    other => panic!("expected VoteResp, got {other:?}"),
+    other => panic!("expected VoteResponse, got {other:?}"),
   }
 
   // No storage write must have been submitted (pre-vote grants no-persist invariant).
   // Drain all pending storage → if a write was submitted, AsyncStable would yield it.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
-  // No additional messages should appear (a CastVote would have produced a VoteResp here).
+  // No additional messages should appear (a CastVote would have produced a VoteResponse here).
   assert!(
     ep.poll_message().is_none(),
-    "no additional VoteResp after handle_storage — pre-vote must not persist"
+    "no additional VoteResponse after handle_storage — pre-vote must not persist"
   );
 }
 
@@ -1117,7 +1117,7 @@ fn term_pre_pass_exemption_for_pre_vote_request() {
 /// pre-vote whose advertised term (3) is BELOW its own term.
 ///
 /// Expected (etcd semantics):
-/// - Reply: VoteResp{ pre_vote: true, reject: true, term: 5 } (granter's term in reject)
+/// - Reply: VoteResponse{ pre_vote: true, reject: true, term: 5 } (granter's term in reject)
 /// - self.term stays 5
 /// - voted_for stays None
 ///
@@ -1163,9 +1163,9 @@ fn stale_term_pre_vote_is_rejected() {
     )),
   );
 
-  let resp = ep.poll_message().expect("must reply to stale pre-vote");
-  match resp.message() {
-    Message::VoteResp(vr) => {
+  let response = ep.poll_message().expect("must reply to stale pre-vote");
+  match response.message() {
+    Message::VoteResponse(vr) => {
       assert!(vr.pre_vote(), "response must be a pre-vote response");
       assert!(
         vr.reject(),
@@ -1177,7 +1177,7 @@ fn stale_term_pre_vote_is_rejected() {
         "reject reply must carry self.term (5) so the pre-candidate learns it is behind"
       );
     }
-    other => panic!("expected VoteResp, got {other:?}"),
+    other => panic!("expected VoteResponse, got {other:?}"),
   }
   // No state mutation: term and voted_for are unchanged.
   assert_eq!(
@@ -1204,9 +1204,9 @@ fn stale_term_pre_vote_is_rejected() {
     )),
   );
 
-  let resp2 = ep.poll_message().expect("must reply to valid pre-vote");
-  match resp2.message() {
-    Message::VoteResp(vr) => {
+  let response2 = ep.poll_message().expect("must reply to valid pre-vote");
+  match response2.message() {
+    Message::VoteResponse(vr) => {
       assert!(vr.pre_vote(), "response must be a pre-vote response");
       assert!(
         !vr.reject(),
@@ -1218,7 +1218,7 @@ fn stale_term_pre_vote_is_rejected() {
         "grant reply must carry the advertised term (6)"
       );
     }
-    other => panic!("expected VoteResp, got {other:?}"),
+    other => panic!("expected VoteResponse, got {other:?}"),
   }
   // Still no state mutation after grant either.
   assert_eq!(
@@ -1255,7 +1255,7 @@ fn check_quorum_isolated_leader_steps_down() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(
     ep.role().is_leader(),
@@ -1320,7 +1320,7 @@ fn check_quorum_active_quorum_stays_leader() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   while ep.poll_message().is_some() {}
@@ -1330,7 +1330,7 @@ fn check_quorum_active_quorum_stays_leader() {
     .election_deadline
     .expect("CQ election_deadline must be armed");
 
-  // Simulate a HeartbeatResp from peer 2 (marks peer 2 active). Use a time before the
+  // Simulate a HeartbeatResponse from peer 2 (marks peer 2 active). Use a time before the
   // CheckQuorum deadline (base + election_timeout / 2 is safely before cq_deadline).
   let before_cq = Instant::ORIGIN + Duration::from_millis(1);
   ep.handle_message(
@@ -1338,7 +1338,11 @@ fn check_quorum_active_quorum_stays_leader() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
   );
   while ep.poll_message().is_some() {}
 
@@ -1376,7 +1380,7 @@ fn check_quorum_active_quorum_stays_leader() {
 
 /// Test CQ-3: `recent_active` is set when the leader receives a message from a peer.
 ///
-/// A leader receiving an AppendResp/HeartbeatResp from a peer marks that peer active.
+/// A leader receiving an AppendResponse/HeartbeatResponse from a peer marks that peer active.
 #[test]
 fn check_quorum_recent_active_set_on_inbound_message() {
   let cfg = cq_config(1, std::vec![1u64, 2, 3]);
@@ -1393,7 +1397,7 @@ fn check_quorum_recent_active_set_on_inbound_message() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Drain storage (noop write for leader).
@@ -1410,13 +1414,17 @@ fn check_quorum_recent_active_set_on_inbound_message() {
     "peer 2 must start inactive"
   );
 
-  // Receive a HeartbeatResp from peer 2.
+  // Receive a HeartbeatResponse from peer 2.
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
   );
 
   // Peer 2 must now be active.
@@ -1425,7 +1433,7 @@ fn check_quorum_recent_active_set_on_inbound_message() {
       .progress(&2u64)
       .map(|p| p.recent_active())
       .unwrap_or(false),
-    "peer 2 must be marked active after HeartbeatResp"
+    "peer 2 must be marked active after HeartbeatResponse"
   );
 }
 
@@ -1459,7 +1467,7 @@ fn check_quorum_disabled_preserves_m1_m6_behavior() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader(), "should be leader");
   // With check_quorum=false, election_deadline must NOT be armed (arm_heartbeat_timer clears it).
@@ -1660,7 +1668,8 @@ fn election_time_last_log_failure_poisons_without_self_vote() {
 #[test]
 fn find_conflict_by_term_poison_propagation_leader() {
   use crate::{
-    AppendResp, Config, Entry, EntryKind, Index, Instant, Message, ProgressState, Term, VoteResp,
+    AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, ProgressState, Term,
+    VoteResponse,
   };
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -1683,7 +1692,7 @@ fn find_conflict_by_term_poison_propagation_leader() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(leader.role().is_leader());
   leader.handle_storage(d, &mut log, &mut stable);
@@ -1722,7 +1731,7 @@ fn find_conflict_by_term_poison_propagation_leader() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1755,7 +1764,7 @@ fn find_conflict_by_term_poison_propagation_leader() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       true,
@@ -1788,7 +1797,7 @@ fn find_conflict_by_term_poison_propagation_leader() {
 /// Class B regression — sender-authenticity choke-point.
 ///
 /// `handle_message` rejects any message whose self-reported sender (`Message::from()`)
-/// disagrees with the transport peer it arrived from. A granting `VoteResp` whose PAYLOAD
+/// disagrees with the transport peer it arrived from. A granting `VoteResponse` whose PAYLOAD
 /// claims `from = 2` but which actually arrives over the transport from peer `3` must be
 /// dropped — so a single hostile peer cannot forge a second node's grant to push a candidate
 /// over quorum. The legitimate grant (payload from = 2, transport from = 2) then elects it.
@@ -1797,8 +1806,8 @@ fn find_conflict_by_term_poison_propagation_leader() {
 /// grant from peer 3 is tallied as node 2's vote, reaching quorum and electing the candidate
 /// before the legitimate grant ever arrives.
 #[test]
-fn spoofed_sender_vote_resp_is_rejected() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+fn spoofed_sender_vote_response_is_rejected() {
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -1830,7 +1839,7 @@ fn spoofed_sender_vote_resp_is_rejected() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(
     ep.role().is_candidate(),
@@ -1848,7 +1857,7 @@ fn spoofed_sender_vote_resp_is_rejected() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(
     ep.role().is_leader(),
@@ -1877,7 +1886,7 @@ fn check_quorum_step_down_emits_leader_changed_none() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   let leader_term = ep.term();
@@ -2003,7 +2012,7 @@ fn pre_vote_probe_emits_leader_changed_none_once() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(2), 2u64, true, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(2), 2u64, true, false)),
   );
   assert!(
     ep.role().is_candidate(),

@@ -19,11 +19,11 @@ stabilize
 > n2 recv RequestVote term=1 last=0/0 prevote=false
 > n3 recv RequestVote term=1 last=0/0 prevote=false
 > n2 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 > n3 ready
-  VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
 > n1 ready
   Heartbeat term=1 commit=0
   Heartbeat term=1 commit=0
@@ -35,17 +35,17 @@ stabilize
 > n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  HeartbeatResp term=1
-  AppendResp term=1 match=1
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
   n2 leader-changed term=1 lead=1
 > n3 ready
-  HeartbeatResp term=1
-  AppendResp term=1 match=1
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
   n3 leader-changed term=1 lead=1
-> n1 recv HeartbeatResp term=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv HeartbeatResp term=1
-> n1 recv AppendResp term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
 > n1 ready
   AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
   AppendEntries term=1 prev=1/1 commit=1 entries=[]
@@ -56,15 +56,15 @@ stabilize
 > n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
 > n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
 > n2 ready
-  AppendResp term=1 match=1
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
 > n3 ready
-  AppendResp term=1 match=1
-  AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
 
 isolate 3
 ----
@@ -93,14 +93,14 @@ stabilize
 > n2 recv AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
 > n2 recv AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
 > n2 ready
-  AppendResp term=1 match=2
-  AppendResp term=1 match=3
-  AppendResp term=1 match=4
-  AppendResp term=1 match=5
-> n1 recv AppendResp term=1 match=2
-> n1 recv AppendResp term=1 match=3
-> n1 recv AppendResp term=1 match=4
-> n1 recv AppendResp term=1 match=5
+  AppendResponse term=1 match=2
+  AppendResponse term=1 match=3
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=5
 > n1 ready
   AppendEntries term=1 prev=1/5 commit=2 entries=[]
   AppendEntries term=1 prev=1/5 commit=3 entries=[]
@@ -115,18 +115,18 @@ stabilize
 > n2 recv AppendEntries term=1 prev=1/5 commit=4 entries=[]
 > n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n2 ready
-  AppendResp term=1 match=5
-  AppendResp term=1 match=5
-  AppendResp term=1 match=5
-  AppendResp term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
   n2 applied index=2
   n2 applied index=3
   n2 applied index=4
   n2 applied index=5
-> n1 recv AppendResp term=1 match=5
-> n1 recv AppendResp term=1 match=5
-> n1 recv AppendResp term=1 match=5
-> n1 recv AppendResp term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
 
 recover 3
 ----
@@ -142,35 +142,35 @@ stabilize
 > n2 recv Heartbeat term=1 commit=5
 > n3 recv Heartbeat term=1 commit=1
 > n2 ready
-  HeartbeatResp term=1
+  HeartbeatResponse term=1
 > n3 ready
-  HeartbeatResp term=1
-> n1 recv HeartbeatResp term=1
-> n1 recv HeartbeatResp term=1
+  HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
 > n1 ready
   AppendEntries term=1 prev=1/5 commit=5 entries=[]
   AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n2 ready
-  AppendResp term=1 match=5
+  AppendResponse term=1 match=5
 > n3 ready
-  AppendResp term=1 reject hint=1/1
-> n1 recv AppendResp term=1 match=5
-> n1 recv AppendResp term=1 reject hint=1/1
+  AppendResponse term=1 reject hint=1/1
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 reject hint=1/1
 > n1 ready
   InstallSnapshot term=1 snap=1/5
 > n3 recv InstallSnapshot term=1 snap=1/5
 > n3 ready
-  SnapshotResp term=1 reject=false match=5
+  SnapshotResponse term=1 reject=false match=5
   n3 snapshot-installed snap=1/5
-> n1 recv SnapshotResp term=1 reject=false match=5
+> n1 recv SnapshotResponse term=1 reject=false match=5
 > n1 ready
   AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n3 ready
-  AppendResp term=1 match=5
-> n1 recv AppendResp term=1 match=5
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
 
 status 1
 ----
@@ -187,11 +187,11 @@ stabilize
 > n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 normal 0x010000000000000065]
 > n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 normal 0x010000000000000065]
 > n2 ready
-  AppendResp term=1 match=6
+  AppendResponse term=1 match=6
 > n3 ready
-  AppendResp term=1 match=6
-> n1 recv AppendResp term=1 match=6
-> n1 recv AppendResp term=1 match=6
+  AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
 > n1 ready
   AppendEntries term=1 prev=1/6 commit=6 entries=[]
   AppendEntries term=1 prev=1/6 commit=6 entries=[]
@@ -199,13 +199,13 @@ stabilize
 > n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
 > n3 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
 > n2 ready
-  AppendResp term=1 match=6
+  AppendResponse term=1 match=6
   n2 applied index=6
 > n3 ready
-  AppendResp term=1 match=6
+  AppendResponse term=1 match=6
   n3 applied index=6
-> n1 recv AppendResp term=1 match=6
-> n1 recv AppendResp term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
 
 status 1
 ----

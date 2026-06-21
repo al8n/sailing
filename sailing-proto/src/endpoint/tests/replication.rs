@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  HeartbeatResp,
+  HeartbeatResponse,
   endpoint::MAX_READ_BATCH_ENTRIES,
   testkit::{AsyncStable, CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
 };
@@ -73,13 +73,13 @@ fn append_entries_at_sentinel_index_poisons_not_imports() {
   );
   assert!(
     ep.poll_message().is_none(),
-    "a poisoned node sends no AppendResp"
+    "a poisoned node sends no AppendResponse"
   );
 }
 
 #[test]
 fn quorum_makes_a_leader_and_heartbeats_follow() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -104,7 +104,7 @@ fn quorum_makes_a_leader_and_heartbeats_follow() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // it should be broadcasting heartbeats to peers
@@ -123,7 +123,7 @@ fn quorum_makes_a_leader_and_heartbeats_follow() {
 
 #[test]
 fn become_leader_appends_noop_and_inits_progress() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -143,7 +143,7 @@ fn become_leader_appends_noop_and_inits_progress() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   assert_eq!(log.last_index(), Index::new(1)); // no-op at index 1
@@ -157,7 +157,7 @@ fn become_leader_appends_noop_and_inits_progress() {
 
 #[test]
 fn propose_appends_and_replicates() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -177,7 +177,7 @@ fn propose_appends_and_replicates() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   while ep.poll_message().is_some() {} // drain no-op AppendEntries
   while ep.poll_event().is_some() {} // drain LeaderChanged
@@ -242,7 +242,7 @@ fn follower_appends_and_rejects_gap() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   let r = ep.poll_message().unwrap();
   assert!(
-    matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index()==Index::new(1))
+    matches!(r.message(), Message::AppendResponse(a) if !a.reject() && a.match_index()==Index::new(1))
   );
   assert_eq!(log.last_index(), Index::new(1));
 
@@ -262,7 +262,7 @@ fn follower_appends_and_rejects_gap() {
     )),
   );
   let r = ep.poll_message().unwrap();
-  assert!(matches!(r.message(), Message::AppendResp(a) if a.reject()));
+  assert!(matches!(r.message(), Message::AppendResponse(a) if a.reject()));
 }
 
 /// Regression (AppendEntries entry contiguity): a follower MUST reject an AppendEntries
@@ -332,7 +332,7 @@ fn non_contiguous_append_poisons() {
 /// Regression (persist-before-ack on the immediate-ack path): a DUPLICATE `AppendEntries` for
 /// entries that exist only in the follower's visible-but-unflushed (in-flight) tail must NOT be
 /// acked as durable. `VecLog::submit_append` makes an entry visible immediately but releases its
-/// `LogDone::Appended` only on `handle_storage`; if the duplicate's immediate `AppendResp`
+/// `LogDone::Appended` only on `handle_storage`; if the duplicate's immediate `AppendResponse`
 /// reported the in-flight index, the leader could count a phantom replica and commit an entry a
 /// crash would lose (a non-quorum-durable commit). The immediate ack is clamped to
 /// `durable_index`, so the duplicate reports the prior durable watermark (here `0`); the deferred
@@ -434,9 +434,9 @@ fn duplicate_append_does_not_ack_in_flight_tail() {
   );
   let dup = ep
     .poll_message()
-    .expect("duplicate emits an immediate AppendResp");
+    .expect("duplicate emits an immediate AppendResponse");
   match dup.message() {
-    Message::AppendResp(a) => {
+    Message::AppendResponse(a) => {
       assert!(!a.reject(), "duplicate is a success ack, not a reject");
       assert_eq!(
         a.match_index(),
@@ -445,7 +445,7 @@ fn duplicate_append_does_not_ack_in_flight_tail() {
            not the in-flight index 1"
       );
     }
-    other => panic!("expected AppendResp, got {other:?}"),
+    other => panic!("expected AppendResponse, got {other:?}"),
   }
 
   // Now drain storage → the deferred FollowerAck for index 1 fires → the follower reports the
@@ -455,7 +455,7 @@ fn duplicate_append_does_not_ack_in_flight_tail() {
     .poll_message()
     .expect("the deferred FollowerAck fires after the append flushes");
   assert!(
-    matches!(acked.message(), Message::AppendResp(a) if !a.reject() && a.match_index() == Index::new(1)),
+    matches!(acked.message(), Message::AppendResponse(a) if !a.reject() && a.match_index() == Index::new(1)),
     "after flush the FollowerAck reports the full match (1)"
   );
 }
@@ -564,9 +564,9 @@ fn durable_index_advances_after_term_cleared_follower_ack() {
   );
   let dup = ep
     .poll_message()
-    .expect("duplicate emits an immediate AppendResp");
+    .expect("duplicate emits an immediate AppendResponse");
   match dup.message() {
-    Message::AppendResp(a) => {
+    Message::AppendResponse(a) => {
       assert!(!a.reject(), "duplicate is a success ack");
       assert_eq!(
         a.match_index(),
@@ -574,13 +574,13 @@ fn durable_index_advances_after_term_cleared_follower_ack() {
         "the immediate ack reports the now-durable index 1, not a stale-low 0"
       );
     }
-    other => panic!("expected AppendResp, got {other:?}"),
+    other => panic!("expected AppendResponse, got {other:?}"),
   }
 }
 
 #[test]
 fn quorum_ack_commits_and_applies() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -599,7 +599,7 @@ fn quorum_ack_commits_and_applies() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   // Drain storage so the no-op LeaderAppend fires (advances self match_index to 1).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -619,7 +619,7 @@ fn quorum_ack_commits_and_applies() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -696,7 +696,7 @@ fn stale_append_entries_does_not_erase_committed_entries() {
   // Must reply success with match_index=3.
   let r = ep.poll_message().unwrap();
   assert!(
-    matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index() == Index::new(3)),
+    matches!(r.message(), Message::AppendResponse(a) if !a.reject() && a.match_index() == Index::new(3)),
     "expected success match_index=3 after full append"
   );
   assert_eq!(log.last_index(), Index::new(3), "log must hold 3 entries");
@@ -726,7 +726,7 @@ fn stale_append_entries_does_not_erase_committed_entries() {
   // Must still reply success (last_new = prev(0) + len(1) = 1).
   let r2 = ep.poll_message().unwrap();
   assert!(
-    matches!(r2.message(), Message::AppendResp(a) if !a.reject()),
+    matches!(r2.message(), Message::AppendResponse(a) if !a.reject()),
     "stale duplicate must still be accepted"
   );
   // Entries 2 and 3 must still be in the log — the stale message must not have erased them.
@@ -859,7 +859,7 @@ fn replication_defers_on_cold_read_without_poisoning() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(crate::VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(ep.role().is_leader());
@@ -1045,7 +1045,7 @@ fn owned_zero_payload_backlog_reads_are_count_bounded() {
   );
 }
 
-/// A follower must not send AppendResp until the new log entries are durable.
+/// A follower must not send AppendResponse until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]
 fn follower_ack_waits_for_durable_append() {
@@ -1082,17 +1082,17 @@ fn follower_ack_waits_for_durable_append() {
       Index::ZERO,
     )),
   );
-  // append-before-ack: no AppendResp yet (the append isn't durable)
+  // append-before-ack: no AppendResponse yet (the append isn't durable)
   assert!(
     ep.poll_message().is_none(),
     "no ack before append is durable"
   );
-  // drain storage → the append completes → AppendResp(success) is emitted
+  // drain storage → the append completes → AppendResponse(success) is emitted
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   let r = ep.poll_message().unwrap();
   assert!(
-    matches!(r.message(), Message::AppendResp(a) if !a.reject() && a.match_index()==Index::new(1)),
-    "AppendResp(success, match=1) must be emitted after handle_storage"
+    matches!(r.message(), Message::AppendResponse(a) if !a.reject() && a.match_index()==Index::new(1)),
+    "AppendResponse(success, match=1) must be emitted after handle_storage"
   );
 }
 
@@ -1105,7 +1105,7 @@ fn follower_ack_waits_for_durable_append() {
 /// phantom one.
 #[test]
 fn heartbeat_commit_is_clamped_to_peer_match() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -1127,7 +1127,7 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable); // no-op (index 1) becomes durable
@@ -1149,7 +1149,7 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1198,7 +1198,7 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
 /// once both slots are occupied, and resume after an ack frees a slot.
 #[test]
 fn leader_paces_by_inflight_window() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   // window = 2, no byte cap, unbounded per-msg size
@@ -1226,7 +1226,7 @@ fn leader_paces_by_inflight_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Drain no-op append messages and storage.
@@ -1241,7 +1241,7 @@ fn leader_paces_by_inflight_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1289,7 +1289,7 @@ fn leader_paces_by_inflight_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1333,7 +1333,7 @@ fn leader_paces_by_inflight_window() {
 ///   at 4 — strictly less than the NEW path's 5, and a wasted re-send of an in-flight entry.
 #[test]
 fn single_ack_does_not_rewind_replicate_window() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   // window = 2, exactly one entry per AppendEntries (max_size_per_msg = 1 byte; each
@@ -1362,7 +1362,7 @@ fn single_ack_does_not_rewind_replicate_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -1376,7 +1376,7 @@ fn single_ack_does_not_rewind_replicate_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1416,7 +1416,7 @@ fn single_ack_does_not_rewind_replicate_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1521,7 +1521,8 @@ fn single_ack_does_not_rewind_replicate_window() {
 #[test]
 fn divergent_follower_resyncs_fast_via_term_skip() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -1588,12 +1589,12 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
   // find_conflict_by_term(follower_log, 4, ceiling=prev_log_term=2):
   //   term(4)=3 > 2 → 3; term(3)=3 > 2 → 2; term(2)=1 ≤ 2 → stop at 2
   // hint_index=2, hint_term=term(2)=1
-  let resp = follower
+  let response = follower
     .poll_message()
-    .expect("follower must send AppendResp(reject)");
-  let ar = match resp.message() {
-    Message::AppendResp(r) => *r,
-    other => panic!("expected AppendResp, got {other:?}"),
+    .expect("follower must send AppendResponse(reject)");
+  let ar = match response.message() {
+    Message::AppendResponse(r) => *r,
+    other => panic!("expected AppendResponse, got {other:?}"),
   };
   assert!(ar.reject(), "follower must reject the inconsistent append");
   // Etcd two-sided hint: walk from min(prev=4, last=4)=4 down while term > prev_log_term=2.
@@ -1634,7 +1635,7 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
     &mut leader_log,
     &mut leader_stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(leader.role().is_leader());
   leader.handle_storage(d, &mut leader_log, &mut leader_stable);
@@ -1678,7 +1679,7 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
     &mut leader_log,
     &mut leader_stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1701,7 +1702,7 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
     &mut leader_log,
     &mut leader_stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       true,          // reject
@@ -1739,7 +1740,7 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
 /// Before fix: a `(0,0)` hint took the `conflict == 0` branch and stepped `next_index` back by one.
 #[test]
 fn deeply_divergent_follower_jumps_to_one_not_decrement() {
-  use crate::{AppendResp, Entry, EntryKind, Index, Message, Term};
+  use crate::{AppendResponse, Entry, EntryKind, Index, Message, Term};
 
   let (mut leader, mut log, mut stable, d) = make_three_node_leader();
   // Give the leader a 5-entry log [1@1 .. 5@1] (index 1 is the elected no-op).
@@ -1783,7 +1784,7 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       true,        // reject
@@ -1812,10 +1813,10 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
 // ---- heartbeat response resumes a stalled probe ----
 
 /// A peer in Probe mode that has stalled (msg_app_flow_paused set because only a partial
-/// batch was sent due to the byte cap) must resume replication when a HeartbeatResp arrives.
+/// batch was sent due to the byte cap) must resume replication when a HeartbeatResponse arrives.
 #[test]
-fn heartbeat_resp_resumes_stalled_probe() {
-  use crate::{Config, Instant, Message, Term, VoteResp};
+fn heartbeat_response_resumes_stalled_probe() {
+  use crate::{Config, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   // max_size_per_msg=0 means exactly 1 entry per AppendEntries.
@@ -1842,7 +1843,7 @@ fn heartbeat_resp_resumes_stalled_probe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -1884,14 +1885,18 @@ fn heartbeat_resp_resumes_stalled_probe() {
     "while probe is paused, a new propose must NOT trigger an AppendEntries to peer 2"
   );
 
-  // A HeartbeatResp from peer 2 must clear msg_app_flow_paused and call
+  // A HeartbeatResponse from peer 2 must clear msg_app_flow_paused and call
   // maybe_send_append so the stalled probe resumes immediately.
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
   );
   let mut resumed = false;
   while let Some(out) = ep.poll_message() {
@@ -1903,7 +1908,7 @@ fn heartbeat_resp_resumes_stalled_probe() {
   }
   assert!(
     resumed,
-    "HeartbeatResp must clear the probe pause and trigger an AppendEntries to peer 2"
+    "HeartbeatResponse must clear the probe pause and trigger an AppendEntries to peer 2"
   );
 }
 
@@ -1917,7 +1922,7 @@ fn heartbeat_resp_resumes_stalled_probe() {
 /// MUTATION: revert `entry_size` to `e.data().len()` → the single send carries the whole zero-byte run.
 #[test]
 fn append_cap_bounds_zero_byte_entry_suffix() {
-  use crate::{Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp};
+  use crate::{Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -1940,7 +1945,7 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -1960,14 +1965,18 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
     .collect();
   log.force_append(&zero);
 
-  // A HeartbeatResp from the lagging peer 2 resumes replication → maybe_send_append packs from peer
+  // A HeartbeatResponse from the lagging peer 2 resumes replication → maybe_send_append packs from peer
   // 2's next index. The cap must bound the send to ONE zero-byte entry, not the whole 50-entry run.
   ep.handle_message(
     d,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
   );
   let mut sent = None;
   while let Some(out) = ep.poll_message() {
@@ -1986,16 +1995,16 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
 
 // ---- Fix 1 regression: empty appends must NOT consume the inflight window ----
 
-/// A caught-up Replicate peer triggers an empty AppendEntries on every HeartbeatResp.
+/// A caught-up Replicate peer triggers an empty AppendEntries on every HeartbeatResponse.
 /// Before the fix, each call to `sent_entries` added a zero-byte inflight slot that was
-/// never freed (no ack for empty sends), so after `max_inflight_msgs` heartbeat-resps
+/// never freed (no ack for empty sends), so after `max_inflight_msgs` heartbeat-responses
 /// the window filled and newly proposed entries were silently not delivered.
 ///
-/// This test uses a small window (4 slots), delivers many HeartbeatResps (more than 4),
+/// This test uses a small window (4 slots), delivers many HeartbeatResponses (more than 4),
 /// then proposes a new entry and asserts that an AppendEntries carrying it IS emitted.
 #[test]
 fn empty_appends_do_not_wedge_inflight_window() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -2022,7 +2031,7 @@ fn empty_appends_do_not_wedge_inflight_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -2035,7 +2044,7 @@ fn empty_appends_do_not_wedge_inflight_window() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -2046,15 +2055,19 @@ fn empty_appends_do_not_wedge_inflight_window() {
   );
   while ep.poll_message().is_some() {}
 
-  // Deliver 10 HeartbeatResps from peer 2 (each triggers an empty AppendEntries for a
-  // caught-up peer). With window=4 and the bug, only 4 resps suffice to wedge the window.
+  // Deliver 10 HeartbeatResponses from peer 2 (each triggers an empty AppendEntries for a
+  // caught-up peer). With window=4 and the bug, only 4 responses suffice to wedge the window.
   for _ in 0..10 {
     ep.handle_message(
       d,
       &mut log,
       &mut stable,
       2u64,
-      Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+      Message::HeartbeatResponse(HeartbeatResponse::new(
+        Term::new(1),
+        2u64,
+        bytes::Bytes::new(),
+      )),
     );
     while ep.poll_message().is_some() {}
   }
@@ -2076,7 +2089,7 @@ fn empty_appends_do_not_wedge_inflight_window() {
   }
   assert!(
     delivered,
-    "after 10 heartbeat-resps the inflight window must not be wedged; proposed entry must be delivered to peer 2"
+    "after 10 heartbeat-responses the inflight window must not be wedged; proposed entry must be delivered to peer 2"
   );
 }
 
@@ -2098,7 +2111,8 @@ fn empty_appends_do_not_wedge_inflight_window() {
 #[test]
 fn lagging_follower_hint_is_two_sided() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -2144,10 +2158,10 @@ fn lagging_follower_hint_is_two_sided() {
     )),
   );
 
-  let resp = follower.poll_message().expect("follower must reject");
-  let ar = match resp.message() {
-    Message::AppendResp(r) => *r,
-    other => panic!("expected AppendResp, got {other:?}"),
+  let response = follower.poll_message().expect("follower must reject");
+  let ar = match response.message() {
+    Message::AppendResponse(r) => *r,
+    other => panic!("expected AppendResponse, got {other:?}"),
   };
   assert!(ar.reject(), "follower must reject (prev=20 > last=2)");
   // Two-sided hint: hint_index_raw=min(20,2)=2; find_conflict_by_term(log, 2, ceiling=1):
@@ -2192,7 +2206,7 @@ fn lagging_follower_hint_is_two_sided() {
     &mut leader_log,
     &mut leader_stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(leader.role().is_leader());
   leader.handle_storage(d, &mut leader_log, &mut leader_stable);
@@ -2218,7 +2232,7 @@ fn lagging_follower_hint_is_two_sided() {
     &mut leader_log,
     &mut leader_stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -2239,7 +2253,7 @@ fn lagging_follower_hint_is_two_sided() {
     &mut leader_log,
     &mut leader_stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       true,          // reject
@@ -2326,7 +2340,7 @@ fn deferred_ack_does_not_over_ack_divergent_tail() {
   // Complete the term write → flush the deferred ack.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   let acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
-    .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
+    .filter(|o| matches!(o.message(), Message::AppendResponse(a) if !a.reject()))
     .collect();
   assert_eq!(
     acks.len(),
@@ -2334,7 +2348,7 @@ fn deferred_ack_does_not_over_ack_divergent_tail() {
     "the deferred ack is flushed once term 5 is durable"
   );
   let m = match acks[0].message() {
-    Message::AppendResp(a) => a.match_index(),
+    Message::AppendResponse(a) => a.match_index(),
     _ => unreachable!(),
   };
   assert_eq!(
@@ -2345,7 +2359,7 @@ fn deferred_ack_does_not_over_ack_divergent_tail() {
   );
 }
 
-/// Regression (AppendResp success match is bounded by the leader's log): a sender-authentic
+/// Regression (AppendResponse success match is bounded by the leader's log): a sender-authentic
 /// but malformed/version-skewed voter that reports a `match_index` ABOVE the leader's own
 /// `log.last_index()` must be ignored. Accepting it would corrupt the peer's `Progress`
 /// (`maybe_update` never lowers a match again) and push `maybe_advance_commit`'s quorum candidate
@@ -2353,11 +2367,11 @@ fn deferred_ack_does_not_over_ack_divergent_tail() {
 /// index 1; peer 2 reports match 1000. The over-ack is dropped: peer 2's match stays 0, commit stays
 /// 0, and the leader is not poisoned.
 ///
-/// MUTATION: delete the `match_within_log` guard in `on_append_resp`'s success branch → peer 2's
+/// MUTATION: delete the `match_within_log` guard in `on_append_response`'s success branch → peer 2's
 /// match jumps to 1000 and commit advances to 1 (a non-quorum-durable false commit).
 #[test]
-fn append_resp_over_ack_above_log_is_ignored() {
-  use crate::{Index, Instant, Message, Term, VoteResp};
+fn append_response_over_ack_above_log_is_ignored() {
+  use crate::{Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
   let cfg = crate::Config::try_new(
     1u64,
@@ -2378,7 +2392,7 @@ fn append_resp_over_ack_above_log_is_ignored() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable); // flush the no-op (index 1) durably
@@ -2391,7 +2405,7 @@ fn append_resp_over_ack_above_log_is_ignored() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
+    Message::AppendResponse(crate::AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -2414,7 +2428,7 @@ fn append_resp_over_ack_above_log_is_ignored() {
   );
 }
 
-/// Regression (AppendResp reject hint is clamped to the leader's log): a peer-supplied
+/// Regression (AppendResponse reject hint is clamped to the leader's log): a peer-supplied
 /// `reject_hint_index` is clamped to `log.last_index()` before the term-skip walk, so the walk only
 /// ever reads indexes the leader actually holds. The `FailTermLog` is armed to fail `term()` ONLY
 /// at the out-of-range hint (`u64::MAX`); with the clamp the walk starts at `min(hint, last=5)=5`
@@ -2426,8 +2440,10 @@ fn append_resp_over_ack_above_log_is_ignored() {
 /// MUTATION: drop the `min(_, log.last_index())` clamp → the walk reads `term(u64::MAX)`, the armed
 /// failure fires, and the leader poisons.
 #[test]
-fn append_resp_reject_hint_beyond_log_does_not_poison() {
-  use crate::{AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp};
+fn append_response_reject_hint_beyond_log_does_not_poison() {
+  use crate::{
+    AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse,
+  };
   use core::time::Duration;
   let cfg = Config::try_new(
     1u64,
@@ -2448,7 +2464,7 @@ fn append_resp_reject_hint_beyond_log_does_not_poison() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(leader.role().is_leader());
   leader.handle_storage(d, &mut log, &mut stable);
@@ -2488,7 +2504,7 @@ fn append_resp_reject_hint_beyond_log_does_not_poison() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       true,
@@ -2635,7 +2651,7 @@ fn commit_persist_is_fenced_by_durable_index() {
 
 /// CheckQuorum/PreVote step-down nudge: a node that ADVANCED its term during a partition (here to
 /// term 8) and then receives a STALE-term Heartbeat from a node still claiming leadership at a
-/// lower term (3) must reply with an AppendResp at ITS OWN higher term — the stale leader adopts
+/// lower term (3) must reply with an AppendResponse at ITS OWN higher term — the stale leader adopts
 /// it and steps down, breaking the wedge where it can neither replicate to us (our term is higher)
 /// nor be unseated by us (we are too far behind to win an election). Mirrors etcd's `m.Term <
 /// r.Term` MsgAppResp branch; only fires when CheckQuorum or PreVote is enabled (plain Raft relies
@@ -2674,7 +2690,7 @@ fn stale_term_heartbeat_forces_leader_step_down() {
     ))
   };
 
-  // pre_vote ON: the stale heartbeat must provoke an AppendResp at OUR term (8).
+  // pre_vote ON: the stale heartbeat must provoke an AppendResponse at OUR term (8).
   let mut ep = make(true);
   let mut log = NoopLog;
   let mut stable = NoopStable::default();
@@ -2685,21 +2701,21 @@ fn stale_term_heartbeat_forces_leader_step_down() {
     1u64,
     stale_heartbeat(),
   );
-  let resp = ep
+  let response = ep
     .poll_message()
     .expect("pre_vote on: must reply to a stale-term heartbeat to force the stale leader down");
   assert_eq!(
-    resp.to(),
+    response.to(),
     1u64,
     "the nudge must go back to the stale leader"
   );
-  match resp.message() {
-    Message::AppendResp(ar) => assert_eq!(
+  match response.message() {
+    Message::AppendResponse(ar) => assert_eq!(
       ar.term(),
       Term::new(8),
       "the nudge must carry OUR higher term so the stale leader adopts it and steps down"
     ),
-    other => panic!("expected AppendResp (step-down nudge), got {other:?}"),
+    other => panic!("expected AppendResponse (step-down nudge), got {other:?}"),
   }
   assert_eq!(
     ep.term(),
@@ -2819,7 +2835,7 @@ fn higher_term_malformed_append_poisons_without_persisting_term() {
 /// (1 MiB) per RTT while the 256-slot inflight window sits idle.
 #[test]
 fn ack_pumps_multiple_batches_to_a_lagging_follower() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -2840,7 +2856,7 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   while ep.poll_message().is_some() {}
@@ -2860,7 +2876,7 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       true,
@@ -2888,7 +2904,7 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,

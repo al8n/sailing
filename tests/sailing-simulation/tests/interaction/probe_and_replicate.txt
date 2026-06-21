@@ -21,11 +21,11 @@ stabilize
 > n2 recv RequestVote term=1 last=0/0 prevote=false
 > n3 recv RequestVote term=1 last=0/0 prevote=false
 > n2 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 > n3 ready
-  VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
 > n1 ready
   Heartbeat term=1 commit=0
   Heartbeat term=1 commit=0
@@ -37,17 +37,17 @@ stabilize
 > n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  HeartbeatResp term=1
-  AppendResp term=1 match=1
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
   n2 leader-changed term=1 lead=1
 > n3 ready
-  HeartbeatResp term=1
-  AppendResp term=1 match=1
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
   n3 leader-changed term=1 lead=1
-> n1 recv HeartbeatResp term=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv HeartbeatResp term=1
-> n1 recv AppendResp term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
 > n1 ready
   AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
   AppendEntries term=1 prev=1/1 commit=1 entries=[]
@@ -58,15 +58,15 @@ stabilize
 > n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
 > n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
 > n2 ready
-  AppendResp term=1 match=1
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
 > n3 ready
-  AppendResp term=1 match=1
-  AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
 
 propose 1 x
 ----
@@ -78,11 +78,11 @@ stabilize
 > n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
 > n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
 > n2 ready
-  AppendResp term=1 match=2
+  AppendResponse term=1 match=2
 > n3 ready
-  AppendResp term=1 match=2
-> n1 recv AppendResp term=1 match=2
-> n1 recv AppendResp term=1 match=2
+  AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
 > n1 ready
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
@@ -90,13 +90,13 @@ stabilize
 > n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
 > n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
 > n2 ready
-  AppendResp term=1 match=2
+  AppendResponse term=1 match=2
   n2 applied index=2
 > n3 ready
-  AppendResp term=1 match=2
+  AppendResponse term=1 match=2
   n3 applied index=2
-> n1 recv AppendResp term=1 match=2
-> n1 recv AppendResp term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
 
 isolate 1
 ----
@@ -116,9 +116,9 @@ stabilize
 ----
 > n3 recv RequestVote term=2 last=1/2 prevote=false
 > n3 ready
-  VoteResp term=2 prevote=false reject=false
+  VoteResponse term=2 prevote=false reject=false
   n3 leader-changed term=2 lead=none
-> n2 recv VoteResp term=2 prevote=false reject=false
+> n2 recv VoteResponse term=2 prevote=false reject=false
 > n2 ready
   Heartbeat term=2 commit=0
   AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
@@ -126,21 +126,21 @@ stabilize
 > n3 recv Heartbeat term=2 commit=0
 > n3 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
 > n3 ready
-  HeartbeatResp term=2
-  AppendResp term=2 match=3
+  HeartbeatResponse term=2
+  AppendResponse term=2 match=3
   n3 leader-changed term=2 lead=2
-> n2 recv HeartbeatResp term=2
-> n2 recv AppendResp term=2 match=3
+> n2 recv HeartbeatResponse term=2
+> n2 recv AppendResponse term=2 match=3
 > n2 ready
   AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
   AppendEntries term=2 prev=2/3 commit=3 entries=[]
 > n3 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
 > n3 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
 > n3 ready
-  AppendResp term=2 match=3
-  AppendResp term=2 match=3
-> n2 recv AppendResp term=2 match=3
-> n2 recv AppendResp term=2 match=3
+  AppendResponse term=2 match=3
+  AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
 
 raft-log 1
 ----
@@ -170,30 +170,30 @@ stabilize
 > n1 recv Heartbeat term=2 commit=0
 > n3 recv Heartbeat term=2 commit=3
 > n1 ready
-  HeartbeatResp term=2
+  HeartbeatResponse term=2
   n1 leader-changed term=2 lead=none
   n1 leader-changed term=2 lead=2
 > n3 ready
-  HeartbeatResp term=2
-> n2 recv HeartbeatResp term=2
-> n2 recv HeartbeatResp term=2
+  HeartbeatResponse term=2
+> n2 recv HeartbeatResponse term=2
+> n2 recv HeartbeatResponse term=2
 > n2 ready
   AppendEntries term=2 prev=1/2 commit=3 entries=[2/3 empty]
   AppendEntries term=2 prev=2/3 commit=3 entries=[]
 > n1 recv AppendEntries term=2 prev=1/2 commit=3 entries=[2/3 empty]
 > n3 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
 > n1 ready
-  AppendResp term=2 match=3
+  AppendResponse term=2 match=3
 > n3 ready
-  AppendResp term=2 match=3
-> n2 recv AppendResp term=2 match=3
-> n2 recv AppendResp term=2 match=3
+  AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
 > n2 ready
   AppendEntries term=2 prev=2/3 commit=3 entries=[]
 > n1 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
 > n1 ready
-  AppendResp term=2 match=3
-> n2 recv AppendResp term=2 match=3
+  AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
 
 raft-log 1
 ----

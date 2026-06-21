@@ -1562,11 +1562,11 @@ fn restarted_leasebased_node_fences_votes() {
   );
   match ep
     .poll_message()
-    .expect("a reject VoteResp is sent")
+    .expect("a reject VoteResponse is sent")
     .message()
   {
-    Message::VoteResp(v) => assert!(v.reject(), "a fenced node must REJECT the vote"),
-    _ => panic!("expected VoteResp"),
+    Message::VoteResponse(v) => assert!(v.reject(), "a fenced node must REJECT the vote"),
+    _ => panic!("expected VoteResponse"),
   }
   assert_eq!(ep.voted_for, None, "no vote granted within the fence");
   assert_eq!(ep.term(), Term::new(1), "but the higher term IS adopted");
@@ -2107,7 +2107,7 @@ fn restart_same_config_no_floor_write_and_no_advertise_stall() {
   let s1 = follower_advertised_support(&mut ep, &mut log, &mut stable, now, 5, 1);
   assert_eq!(
     s1, et,
-    "a same-config restart's first HeartbeatResp must advertise the real support (no stall)"
+    "a same-config restart's first HeartbeatResponse must advertise the real support (no stall)"
   );
 }
 
@@ -2215,14 +2215,14 @@ fn restart_migrating_honors_assumed_prior_lease_support() {
 
 /// Pin the leader-side round-token restart safety. The
 /// leader's ReadIndex round token also resets on restart, but it is safe BY CONSTRUCTION: a restarted
-/// node returns as a FOLLOWER, and `on_heartbeat_resp` only confirms reads while leader. To confirm
+/// node returns as a FOLLOWER, and `on_heartbeat_response` only confirms reads while leader. To confirm
 /// reads again it must win a NEW election (strictly higher term), and the term pre-pass drops any
-/// pre-crash HeartbeatResp (lower term). Here a restarted follower receives a HeartbeatResp at its
+/// pre-crash HeartbeatResponse (lower term). Here a restarted follower receives a HeartbeatResponse at its
 /// current term and emits NO ReadState (it is not leader), so a reset round token cannot complete a
 /// read from a stale ack.
 #[test]
-fn restarted_follower_ignores_heartbeat_resp_read_acks() {
-  use crate::{Config, HeartbeatResp, Index, Instant, Message, Term};
+fn restarted_follower_ignores_heartbeat_response_read_acks() {
+  use crate::{Config, HeartbeatResponse, Index, Instant, Message, Term};
   use core::time::Duration;
   let cfg = Config::try_new(
     2u64,
@@ -2244,14 +2244,14 @@ fn restarted_follower_ignores_heartbeat_resp_read_acks() {
     &mut stable,
   );
   assert!(ep.role().is_follower());
-  // A HeartbeatResp (the leader-side read ack) carrying any context must not complete a read on a
-  // follower — `on_heartbeat_resp` early-returns when `!is_leader`.
+  // A HeartbeatResponse (the leader-side read ack) carrying any context must not complete a read on a
+  // follower — `on_heartbeat_response` early-returns when `!is_leader`.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
     &mut stable,
     1u64,
-    Message::HeartbeatResp(HeartbeatResp::new(
+    Message::HeartbeatResponse(HeartbeatResponse::new(
       Term::new(1),
       1u64,
       bytes::Bytes::copy_from_slice(&[0u8; 8]),
@@ -2259,7 +2259,7 @@ fn restarted_follower_ignores_heartbeat_resp_read_acks() {
   );
   assert!(
     !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::ReadState(_))),
-    "a restarted follower must not complete a read from a HeartbeatResp"
+    "a restarted follower must not complete a read from a HeartbeatResponse"
   );
 }
 

@@ -413,7 +413,7 @@ pub fn agreement(view: &ClusterView) -> Result<(), Violation> {
 /// a node can only apply an entry it can read.
 ///
 /// **The real durability invariant is the send-time tripwire** in
-/// [`Cluster::schedule_send`](crate::Cluster): a follower sends a non-reject `AppendResp{match}`
+/// [`Cluster::schedule_send`](crate::Cluster): a follower sends a non-reject `AppendResponse{match}`
 /// only after its append is DURABLE (the proto defers the ack to `on_log_appended`, which fires on
 /// the flush completion), so `durable_last >= match` holds when the ack is sent. That is where
 /// "never ack an entry you have not durably stored" is enforced.

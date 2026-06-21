@@ -24,7 +24,7 @@ fn pause_semantics() {
   let mut p = Progress::new(Index::new(1), 2, 0); // next=1, inflight cap 2
   assert!(!p.is_paused()); // fresh probe can send
   p.sent_entries(Index::new(1), 10);
-  assert!(p.is_paused()); // probe sends one, then pauses until ack/heartbeat-resp
+  assert!(p.is_paused()); // probe sends one, then pauses until ack/heartbeat-response
   p.become_replicate();
   p.sent_entries(Index::new(2), 10);
   assert!(!p.is_paused()); // replicate: paused only when the window is full

@@ -89,7 +89,7 @@ impl FailoverReadWindow {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReadIndexStatus<I> {
   /// The opaque application context that identifies this read request (echoed back in
-  /// `ReadState` / `ReadIndexResp`).
+  /// `ReadState` / `ReadIndexResponse`).
   context: Bytes,
   /// The originator: `None` = local leader request, `Some(follower)` = forwarded.
   req_from: Option<I>,
@@ -117,7 +117,7 @@ impl<I: NodeId> ReadIndexStatus<I> {
   }
 
   /// Consume the confirmed read into the `(context, originator, index)` the leader needs to emit the
-  /// `ReadState` (local read) or `ReadIndexResp` (forwarded read). `originator` is `None` for a local
+  /// `ReadState` (local read) or `ReadIndexResponse` (forwarded read). `originator` is `None` for a local
   /// leader read and `Some(follower)` for a forwarded one.
   pub fn into_parts(self) -> (Bytes, Option<I>, Index) {
     (self.context, self.req_from, self.index)
@@ -131,7 +131,7 @@ impl<I: NodeId> ReadIndexStatus<I> {
 /// Pending reads are keyed by an INTERNAL, monotonically-unique **round token** (an 8-byte
 /// counter), NOT by the application's `context`.  This is what makes the heartbeat-quorum proof
 /// sound under message duplication/reordering AND application context reuse: each read's heartbeat
-/// round carries its own token, so a stale/duplicated `HeartbeatResp` echoing an earlier round's
+/// round carries its own token, so a stale/duplicated `HeartbeatResponse` echoing an earlier round's
 /// token can never be matched to a later read (even one that reuses the same user `context` after an
 /// earlier read with that context completed).  The user `context` rides along inside the status and
 /// is echoed back on confirmation.  When a heartbeat-response quorum acks a token, all reads up to
@@ -199,7 +199,7 @@ impl<I: NodeId> ReadOnly<I> {
   /// ack set immediately (the leader counts toward its own quorum).
   ///
   /// Returns the round token the caller must seed into the heartbeat round for this read.  The token
-  /// is NEVER reused, so the quorum proof is unambiguous: a stale/duplicated `HeartbeatResp` echoing
+  /// is NEVER reused, so the quorum proof is unambiguous: a stale/duplicated `HeartbeatResponse` echoing
   /// an earlier read's token cannot be credited to this one, even when the user `context` is reused
   /// after an earlier read with the same context completed.  The caller's own in-flight dedup
   /// ([`Self::context_in_flight`]) surfaces a concurrent same-`context` reuse as

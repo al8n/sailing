@@ -29,9 +29,9 @@ where
   ///
   /// A peer in `Snapshot` state is unconditionally paused, so `maybe_send_append`
   /// early-returns for it. It only leaves Snapshot state via `maybe_update(n >= pending)`,
-  /// which requires the snapshot to have been DELIVERED (a `SnapshotResp`/`AppendResp`). If
+  /// which requires the snapshot to have been DELIVERED (a `SnapshotResponse`/`AppendResponse`). If
   /// the single `InstallSnapshot` emitted by `maybe_send_append`'s compacted-hole branch is
-  /// lost, the leader would never retry and the follower would wedge forever. `on_heartbeat_resp`
+  /// lost, the leader would never retry and the follower would wedge forever. `on_heartbeat_response`
   /// calls this each heartbeat round for a peer still behind its pending snapshot index.
   ///
   /// Unlike the `maybe_send_append` branch this does NOT touch progress: the peer is already
@@ -197,7 +197,7 @@ where
     // meta.last_index() > self.commit: a genuinely-newer snapshot. DEFER the destructive install.
 
     // Duplicate-install guard: while this peer is in Snapshot state the leader resends the same (or an
-    // older) snapshot (`on_heartbeat_resp` resend / re-probe). If a deferred install at this boundary or
+    // older) snapshot (`on_heartbeat_response` resend / re-probe). If a deferred install at this boundary or
     // higher is already in flight, do NOT re-decode or mint a SECOND blob op (that would orphan the
     // first in-flight blob); the in-flight install will complete and ack. A strictly-NEWER snapshot
     // falls through and REPLACES it below (the stale opid's `SnapshotWritten` then finds no match — a
@@ -347,7 +347,7 @@ where
     // The log was replaced wholesale; any in-flight append records refer to discarded entries and must
     // not re-advance `durable_index` when their completions arrive.
     self.durable.inflight_append_upto.clear();
-    // Scrub any already-queued success `AppendResp`/`FollowerAck` for an index past the new boundary:
+    // Scrub any already-queued success `AppendResponse`/`FollowerAck` for an index past the new boundary:
     // reporting it would over-ack an entry this node no longer stores (symmetric with the §5.3 scrub).
     self.scrub_acks_above(meta.last_index());
 
@@ -387,14 +387,14 @@ where
     self.send_or_gate_snapshot_ack(leader, meta.last_index());
   }
 
-  /// Receive a `SnapshotResp` from a follower (leader path).
-  pub(crate) fn on_snapshot_resp<L, S>(
+  /// Receive a `SnapshotResponse` from a follower (leader path).
+  pub(crate) fn on_snapshot_response<L, S>(
     &mut self,
     now: Now,
     log: &mut L,
     stable: &S,
     from: I,
-    resp: crate::SnapshotResp<I>,
+    response: crate::SnapshotResponse<I>,
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
@@ -405,26 +405,26 @@ where
     let Some(pr) = self.tracker.progress_mut(&from) else {
       return;
     };
-    if resp.reject() {
+    if response.reject() {
       // The snapshot was refused (shouldn't happen in the current protocol, but handle
       // defensively): revert to Probe so maybe_send_append re-probes and, if the follower
       // is still below first_index, re-sends the snapshot.
       pr.become_probe();
       // Drop the mutable borrow of `pr` before calling maybe_send_append (which re-borrows
-      // self.tracker). The pattern mirrors on_append_resp's reject branch.
+      // self.tracker). The pattern mirrors on_append_response's reject branch.
       self.maybe_send_append(now, from, log, stable);
     } else {
-      // Boundary check (shared with `on_append_resp` via `match_within_log`): a successful snapshot
+      // Boundary check (shared with `on_append_response` via `match_within_log`): a successful snapshot
       // ack must not report a match above the leader's own log, for the same reason — an over-run
       // would corrupt `Progress` and could push the commit candidate off the log and poison the
       // leader. Ignore the malformed ack; the peer stays in Snapshot and is re-probed normally.
-      if !Self::match_within_log(resp.match_index(), log) {
+      if !Self::match_within_log(response.match_index(), log) {
         return;
       }
       // Success: maybe_update drives the Snapshot → Probe transition regardless of its return
       // value ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never
-      // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_resp).
-      pr.maybe_update(resp.match_index());
+      // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_response).
+      pr.maybe_update(response.match_index());
       // Re-borrow self for the resume sequence (pr is dropped above).
       self.maybe_advance_commit(now, log);
       self.apply_committed(log);

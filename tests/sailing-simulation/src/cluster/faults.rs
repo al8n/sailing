@@ -31,7 +31,7 @@ impl Cluster {
     self.stables[i].discard_inflight();
     let cfg = self.configs[i].clone();
     // Strictly-increasing per-restart boot epoch (the harness's durable boot counter): it namespaces
-    // the restarted node's forwarded-read tokens so a pre-crash ReadIndexResp cannot complete a
+    // the restarted node's forwarded-read tokens so a pre-crash ReadIndexResponse cannot complete a
     // post-restart read. `restarts[i]` counts PRIOR restarts, so +1 is unique per incarnation.
     let boot_epoch = self.restarts[i] + 1;
     // The node reboots on its OWN clock (rate persists — a crash does not change hardware clock rate;

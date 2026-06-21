@@ -115,7 +115,7 @@ message AppendEntries {
   uint64 leader_commit = 6;
 }
 
-message AppendResp {
+message AppendResponse {
   uint64 term = 1;
   bytes from_id = 2;
   bool reject = 3;
@@ -134,7 +134,7 @@ message RequestVote {
   bool leader_transfer = 6;
 }
 
-message VoteResp {
+message VoteResponse {
   uint64 term = 1;
   bytes from_id = 2;
   bool pre_vote = 3;
@@ -150,7 +150,7 @@ message Heartbeat {
   uint64 lease_round = 5;
 }
 
-message HeartbeatResp {
+message HeartbeatResponse {
   uint64 term = 1;
   bytes from_id = 2;
   bytes context = 3;
@@ -171,7 +171,7 @@ message InstallSnapshot {
   bytes data = 4;
 }
 
-message SnapshotResp {
+message SnapshotResponse {
   uint64 term = 1;
   bytes from_id = 2;
   bool reject = 3;
@@ -191,7 +191,7 @@ message ReadIndex {
   bytes context = 3;
 }
 
-message ReadIndexResp {
+message ReadIndexResponse {
   uint64 term = 1;
   bytes from_id = 2;
   uint64 index = 3;
@@ -238,15 +238,15 @@ enum ConfChangeTransition {
 message Message {
   oneof body {
     AppendEntries append_entries = 1;
-    AppendResp append_resp = 2;
+    AppendResponse append_response = 2;
     RequestVote request_vote = 3;
-    VoteResp vote_resp = 4;
+    VoteResponse vote_response = 4;
     Heartbeat heartbeat = 5;
-    HeartbeatResp heartbeat_resp = 6;
+    HeartbeatResponse heartbeat_response = 6;
     InstallSnapshot install_snapshot = 7;
-    SnapshotResp snapshot_resp = 8;
+    SnapshotResponse snapshot_response = 8;
     TimeoutNow timeout_now = 9;
     ReadIndex read_index = 10;
-    ReadIndexResp read_index_resp = 11;
+    ReadIndexResponse read_index_response = 11;
   }
 }

@@ -501,11 +501,11 @@ fn committed_membership_growth_raises_the_connection_cap() {
 /// FAILS-ON-OLD (FIX 2: `drain_bridge` must forward the full `Now` to `handle_message`): a
 /// network-driven election over QUIC, with EVERY coordinator hop driven by a SYNCHRONIZED `Now`,
 /// must preserve the synchronized wall onto the elected leader's term-current no-op (Empty) entry.
-/// The winning `VoteResp` rides a QUIC stream into `drain_bridge`, which decodes it and calls
+/// The winning `VoteResponse` rides a QUIC stream into `drain_bridge`, which decodes it and calls
 /// `endpoint.handle_message` → `become_leader` → `append_leader_noop`, stamping
 /// `lease_wall_stamp(now)`. Under the FAILOVER tier that stamp is `now.wall().as_nanos()`.
 ///
-/// MUTATION (revert FIX 2 — `drain_bridge(now.mono(), ..)`): the decoded `VoteResp` reaches
+/// MUTATION (revert FIX 2 — `drain_bridge(now.mono(), ..)`): the decoded `VoteResponse` reaches
 /// `handle_message` with the wall STRIPPED (`Now::monotonic`), so the failover tier's
 /// `lease_wall_stamp` debug-asserts the absent wall and PANICS the election (and, with the assert
 /// compiled out, the no-op would stamp `0`, also failing the `== W` assertion).
@@ -571,7 +571,7 @@ fn quic_election_preserves_synchronized_wall_on_leader_noop() {
   );
 
   // Drive timers (each node on its own randomized deadline) under a SYNCHRONIZED `Now` until a
-  // leader emerges — the winning VoteResp flows over QUIC into `drain_bridge` → `handle_message`.
+  // leader emerges — the winning VoteResponse flows over QUIC into `drain_bridge` → `handle_message`.
   for _ in 0..200 {
     let da = a.poll_timeout();
     let db = b.poll_timeout();
