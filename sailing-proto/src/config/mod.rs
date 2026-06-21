@@ -115,6 +115,34 @@ impl LeaseRefresh {
   }
 }
 
+/// Default [`Config::max_size_per_msg`]: 1 MiB of entries packed per `AppendEntries`.
+pub const DEFAULT_MAX_SIZE_PER_MSG: u64 = 1024 * 1024;
+/// Default [`Config::max_inflight_msgs`]: up to 256 un-acked `AppendEntries` per peer.
+pub const DEFAULT_MAX_INFLIGHT_MSGS: usize = 256;
+/// Default [`Config::max_inflight_bytes`]: `0` = the in-flight byte budget is uncapped.
+pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 0;
+/// Default [`Config::snapshot_threshold`]: etcd's `SnapshotCount` (committed entries between snapshots).
+pub const DEFAULT_SNAPSHOT_THRESHOLD: usize = 10_000;
+/// Default [`Config::step_down_on_removal`]: a leader removed/demoted by a committed `ConfChange`
+/// steps down immediately.
+pub const DEFAULT_STEP_DOWN_ON_REMOVAL: bool = true;
+/// Default [`Config::pre_vote`]: the PreVote extension is off.
+pub const DEFAULT_PRE_VOTE: bool = false;
+/// Default [`Config::check_quorum`]: CheckQuorum is off.
+pub const DEFAULT_CHECK_QUORUM: bool = false;
+/// Default [`Config::disable_proposal_forwarding`]: followers forward proposals to the leader.
+pub const DEFAULT_DISABLE_PROPOSAL_FORWARDING: bool = false;
+/// Default [`Config::read_only`]: the always-safe heartbeat-confirmed read mode.
+pub const DEFAULT_READ_ONLY: ReadOnlyOption = ReadOnlyOption::Safe;
+/// Default [`Config::lease_refresh`]: demand-driven only (byte-identical to pre-feature behavior).
+pub const DEFAULT_LEASE_REFRESH: LeaseRefresh = LeaseRefresh::Off;
+/// Default [`Config::lease_duration`]: no LeaseGuard lease window configured.
+pub const DEFAULT_LEASE_DURATION: Option<Duration> = None;
+/// Default [`Config::clock_drift_bound`]: no bounded clock-drift configured.
+pub const DEFAULT_CLOCK_DRIFT_BOUND: Option<Duration> = None;
+/// Default [`Config::bounded_clock_uncertainty`]: no bounded cross-node clock-uncertainty configured.
+pub const DEFAULT_BOUNDED_CLOCK_UNCERTAINTY: Option<Duration> = None;
+
 /// Static configuration for an [`crate::Endpoint`]. Holds the initial voter set (dynamic
 /// membership is via `ConfChange`). `Clone`, not `Copy` (it owns the voter list).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -205,19 +233,19 @@ impl<I: NodeId> Config<I> {
       voters,
       election_timeout,
       heartbeat_interval,
-      max_size_per_msg: 1024 * 1024, // 1 MiB default
-      max_inflight_msgs: 256,
-      max_inflight_bytes: 0,
-      snapshot_threshold: 10_000, // etcd default SnapshotCount
-      step_down_on_removal: true,
-      pre_vote: false,
-      check_quorum: false,
-      disable_proposal_forwarding: false,
-      read_only: ReadOnlyOption::Safe,
-      lease_refresh: LeaseRefresh::Off,
-      lease_duration: None,
-      clock_drift_bound: None,
-      bounded_clock_uncertainty: None,
+      max_size_per_msg: DEFAULT_MAX_SIZE_PER_MSG,
+      max_inflight_msgs: DEFAULT_MAX_INFLIGHT_MSGS,
+      max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+      snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
+      step_down_on_removal: DEFAULT_STEP_DOWN_ON_REMOVAL,
+      pre_vote: DEFAULT_PRE_VOTE,
+      check_quorum: DEFAULT_CHECK_QUORUM,
+      disable_proposal_forwarding: DEFAULT_DISABLE_PROPOSAL_FORWARDING,
+      read_only: DEFAULT_READ_ONLY,
+      lease_refresh: DEFAULT_LEASE_REFRESH,
+      lease_duration: DEFAULT_LEASE_DURATION,
+      clock_drift_bound: DEFAULT_CLOCK_DRIFT_BOUND,
+      bounded_clock_uncertainty: DEFAULT_BOUNDED_CLOCK_UNCERTAINTY,
     })
   }
 
@@ -250,19 +278,19 @@ impl<I: NodeId> Config<I> {
       voters: current_voters,
       election_timeout,
       heartbeat_interval,
-      max_size_per_msg: 1024 * 1024, // 1 MiB default
-      max_inflight_msgs: 256,
-      max_inflight_bytes: 0,
-      snapshot_threshold: 10_000, // etcd default SnapshotCount
-      step_down_on_removal: true,
-      pre_vote: false,
-      check_quorum: false,
-      disable_proposal_forwarding: false,
-      read_only: ReadOnlyOption::Safe,
-      lease_refresh: LeaseRefresh::Off,
-      lease_duration: None,
-      clock_drift_bound: None,
-      bounded_clock_uncertainty: None,
+      max_size_per_msg: DEFAULT_MAX_SIZE_PER_MSG,
+      max_inflight_msgs: DEFAULT_MAX_INFLIGHT_MSGS,
+      max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
+      snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
+      step_down_on_removal: DEFAULT_STEP_DOWN_ON_REMOVAL,
+      pre_vote: DEFAULT_PRE_VOTE,
+      check_quorum: DEFAULT_CHECK_QUORUM,
+      disable_proposal_forwarding: DEFAULT_DISABLE_PROPOSAL_FORWARDING,
+      read_only: DEFAULT_READ_ONLY,
+      lease_refresh: DEFAULT_LEASE_REFRESH,
+      lease_duration: DEFAULT_LEASE_DURATION,
+      clock_drift_bound: DEFAULT_CLOCK_DRIFT_BOUND,
+      bounded_clock_uncertainty: DEFAULT_BOUNDED_CLOCK_UNCERTAINTY,
     })
   }
 
@@ -274,8 +302,8 @@ impl<I: NodeId> Config<I> {
 
   /// The voter set.
   #[inline(always)]
-  pub fn voters(&self) -> &[I] {
-    &self.voters
+  pub const fn voters(&self) -> &[I] {
+    self.voters.as_slice()
   }
 
   /// Whether `id` is a voter.
@@ -290,7 +318,7 @@ impl<I: NodeId> Config<I> {
   /// voter set correctly. For an empty observer seed this returns a degenerate `1`; such a node cannot
   /// commit anything until it is reconfigured into a real voter set.
   #[inline(always)]
-  pub fn quorum(&self) -> usize {
+  pub const fn quorum(&self) -> usize {
     self.voters.len() / 2 + 1
   }
 
@@ -324,15 +352,37 @@ impl<I: NodeId> Config<I> {
     self.max_inflight_bytes
   }
 
-  /// Override the `max_size_per_msg` knob.
+  /// Override the `max_size_per_msg` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_max_size_per_msg(mut self, v: u64) -> Self {
+  pub const fn with_max_size_per_msg(mut self, v: u64) -> Self {
+    self.set_max_size_per_msg(v);
+    self
+  }
+
+  /// Override the `max_size_per_msg` knob in place.
+  #[inline(always)]
+  pub const fn set_max_size_per_msg(&mut self, v: u64) -> &mut Self {
     self.max_size_per_msg = v;
     self
   }
 
-  /// Override the `max_inflight_msgs` knob. Returns `Err(ConfigError::ZeroInflight)` if `v == 0`.
+  /// Override the `max_inflight_msgs` knob (consuming). Returns `Err(ConfigError::ZeroInflight)` if
+  /// `v == 0`.
+  ///
+  /// Not `const`: the fallible path would drop the owned-`Vec` `Config` in its error arm, and a
+  /// destructor cannot run in a `const fn`. The in-place [`Self::set_max_inflight_msgs`] (which only
+  /// borrows) is `const`.
+  #[inline(always)]
   pub fn with_max_inflight_msgs(mut self, v: usize) -> Result<Self, ConfigError> {
+    self.set_max_inflight_msgs(v)?;
+    Ok(self)
+  }
+
+  /// Override the `max_inflight_msgs` knob in place. Returns `Err(ConfigError::ZeroInflight)` if
+  /// `v == 0`.
+  #[inline(always)]
+  pub const fn set_max_inflight_msgs(&mut self, v: usize) -> Result<&mut Self, ConfigError> {
     if v == 0 {
       return Err(ConfigError::ZeroInflight);
     }
@@ -340,9 +390,17 @@ impl<I: NodeId> Config<I> {
     Ok(self)
   }
 
-  /// Override the `max_inflight_bytes` knob.
+  /// Override the `max_inflight_bytes` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_max_inflight_bytes(mut self, v: u64) -> Self {
+  pub const fn with_max_inflight_bytes(mut self, v: u64) -> Self {
+    self.set_max_inflight_bytes(v);
+    self
+  }
+
+  /// Override the `max_inflight_bytes` knob in place.
+  #[inline(always)]
+  pub const fn set_max_inflight_bytes(&mut self, v: u64) -> &mut Self {
     self.max_inflight_bytes = v;
     self
   }
@@ -353,9 +411,17 @@ impl<I: NodeId> Config<I> {
     self.snapshot_threshold
   }
 
-  /// Override the `snapshot_threshold` knob.
+  /// Override the `snapshot_threshold` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_snapshot_threshold(mut self, v: usize) -> Self {
+  pub const fn with_snapshot_threshold(mut self, v: usize) -> Self {
+    self.set_snapshot_threshold(v);
+    self
+  }
+
+  /// Override the `snapshot_threshold` knob in place.
+  #[inline(always)]
+  pub const fn set_snapshot_threshold(&mut self, v: usize) -> &mut Self {
     self.snapshot_threshold = v;
     self
   }
@@ -367,9 +433,17 @@ impl<I: NodeId> Config<I> {
     self.step_down_on_removal
   }
 
-  /// Override the `step_down_on_removal` knob.
+  /// Override the `step_down_on_removal` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_step_down_on_removal(mut self, v: bool) -> Self {
+  pub const fn with_step_down_on_removal(mut self, v: bool) -> Self {
+    self.set_step_down_on_removal(v);
+    self
+  }
+
+  /// Override the `step_down_on_removal` knob in place.
+  #[inline(always)]
+  pub const fn set_step_down_on_removal(&mut self, v: bool) -> &mut Self {
     self.step_down_on_removal = v;
     self
   }
@@ -383,9 +457,17 @@ impl<I: NodeId> Config<I> {
     self.pre_vote
   }
 
-  /// Override the `pre_vote` knob.
+  /// Override the `pre_vote` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_pre_vote(mut self, v: bool) -> Self {
+  pub const fn with_pre_vote(mut self, v: bool) -> Self {
+    self.set_pre_vote(v);
+    self
+  }
+
+  /// Override the `pre_vote` knob in place.
+  #[inline(always)]
+  pub const fn set_pre_vote(&mut self, v: bool) -> &mut Self {
     self.pre_vote = v;
     self
   }
@@ -399,9 +481,17 @@ impl<I: NodeId> Config<I> {
     self.check_quorum
   }
 
-  /// Override the `check_quorum` knob.
+  /// Override the `check_quorum` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_check_quorum(mut self, v: bool) -> Self {
+  pub const fn with_check_quorum(mut self, v: bool) -> Self {
+    self.set_check_quorum(v);
+    self
+  }
+
+  /// Override the `check_quorum` knob in place.
+  #[inline(always)]
+  pub const fn set_check_quorum(&mut self, v: bool) -> &mut Self {
     self.check_quorum = v;
     self
   }
@@ -415,9 +505,17 @@ impl<I: NodeId> Config<I> {
     self.disable_proposal_forwarding
   }
 
-  /// Override the `disable_proposal_forwarding` knob.
+  /// Override the `disable_proposal_forwarding` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_disable_proposal_forwarding(mut self, v: bool) -> Self {
+  pub const fn with_disable_proposal_forwarding(mut self, v: bool) -> Self {
+    self.set_disable_proposal_forwarding(v);
+    self
+  }
+
+  /// Override the `disable_proposal_forwarding` knob in place.
+  #[inline(always)]
+  pub const fn set_disable_proposal_forwarding(&mut self, v: bool) -> &mut Self {
     self.disable_proposal_forwarding = v;
     self
   }
@@ -429,9 +527,17 @@ impl<I: NodeId> Config<I> {
     self.read_only
   }
 
-  /// Override the `read_only` knob.
+  /// Override the `read_only` knob (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_read_only(mut self, v: ReadOnlyOption) -> Self {
+  pub const fn with_read_only(mut self, v: ReadOnlyOption) -> Self {
+    self.set_read_only(v);
+    self
+  }
+
+  /// Override the `read_only` knob in place.
+  #[inline(always)]
+  pub const fn set_read_only(&mut self, v: ReadOnlyOption) -> &mut Self {
     self.read_only = v;
     self
   }
@@ -443,10 +549,19 @@ impl<I: NodeId> Config<I> {
     self.lease_refresh
   }
 
-  /// Override the `lease_refresh` knob (only meaningful under [`ReadOnlyOption::LeaseGuard`];
+  /// Override the `lease_refresh` knob (consuming; only meaningful under [`ReadOnlyOption::LeaseGuard`];
   /// [`Self::validate`] rejects a proactive mode in any other read mode).
+  #[inline(always)]
   #[must_use]
-  pub fn with_lease_refresh(mut self, v: LeaseRefresh) -> Self {
+  pub const fn with_lease_refresh(mut self, v: LeaseRefresh) -> Self {
+    self.set_lease_refresh(v);
+    self
+  }
+
+  /// Override the `lease_refresh` knob in place (only meaningful under [`ReadOnlyOption::LeaseGuard`];
+  /// [`Self::validate`] rejects a proactive mode in any other read mode).
+  #[inline(always)]
+  pub const fn set_lease_refresh(&mut self, v: LeaseRefresh) -> &mut Self {
     self.lease_refresh = v;
     self
   }
@@ -457,9 +572,17 @@ impl<I: NodeId> Config<I> {
     self.lease_duration
   }
 
-  /// Set the LeaseGuard lease window Δ.
+  /// Set the LeaseGuard lease window Δ (consuming).
+  #[inline(always)]
   #[must_use]
-  pub fn with_lease_duration(mut self, v: Duration) -> Self {
+  pub const fn with_lease_duration(mut self, v: Duration) -> Self {
+    self.set_lease_duration(v);
+    self
+  }
+
+  /// Set the LeaseGuard lease window Δ in place.
+  #[inline(always)]
+  pub const fn set_lease_duration(&mut self, v: Duration) -> &mut Self {
     self.lease_duration = Some(v);
     self
   }
@@ -470,9 +593,17 @@ impl<I: NodeId> Config<I> {
     self.clock_drift_bound
   }
 
-  /// Set the bounded clock-drift ε (required for `LeaseGuard`).
+  /// Set the bounded clock-drift ε (consuming; required for `LeaseGuard`).
+  #[inline(always)]
   #[must_use]
-  pub fn with_clock_drift_bound(mut self, v: Duration) -> Self {
+  pub const fn with_clock_drift_bound(mut self, v: Duration) -> Self {
+    self.set_clock_drift_bound(v);
+    self
+  }
+
+  /// Set the bounded clock-drift ε in place (required for `LeaseGuard`).
+  #[inline(always)]
+  pub const fn set_clock_drift_bound(&mut self, v: Duration) -> &mut Self {
     self.clock_drift_bound = Some(v);
     self
   }
@@ -483,9 +614,17 @@ impl<I: NodeId> Config<I> {
     self.bounded_clock_uncertainty
   }
 
-  /// Set the bounded cross-node clock-uncertainty (enables LeaseGuard inherited-lease reads).
+  /// Set the bounded cross-node clock-uncertainty (consuming; enables LeaseGuard inherited-lease reads).
+  #[inline(always)]
   #[must_use]
-  pub fn with_bounded_clock_uncertainty(mut self, v: Duration) -> Self {
+  pub const fn with_bounded_clock_uncertainty(mut self, v: Duration) -> Self {
+    self.set_bounded_clock_uncertainty(v);
+    self
+  }
+
+  /// Set the bounded cross-node clock-uncertainty in place (enables LeaseGuard inherited-lease reads).
+  #[inline(always)]
+  pub const fn set_bounded_clock_uncertainty(&mut self, v: Duration) -> &mut Self {
     self.bounded_clock_uncertainty = Some(v);
     self
   }
