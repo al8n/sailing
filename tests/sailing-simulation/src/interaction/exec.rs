@@ -331,7 +331,7 @@ impl InteractionEnv {
       n.log.discard_inflight();
       n.stable.discard_inflight();
       // Bump the durable boot epoch so this incarnation's forwarded-read tokens are unique vs. any
-      // pre-crash ones (a pre-crash ReadIndexResp cannot complete a post-restart read).
+      // pre-crash ones (a pre-crash ReadIndexResponse cannot complete a post-restart read).
       n.boot_epoch += 1;
       n.ep = Endpoint::restart(
         n.config.clone(),

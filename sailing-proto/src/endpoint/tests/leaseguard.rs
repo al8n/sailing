@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  AppendResp, Entry, ProposeError, VoteResp,
+  AppendResponse, Entry, ProposeError, VoteResponse,
   testkit::{AsyncStable, CountSm, NoopStable, VecLog},
 };
 use core::time::Duration;
@@ -34,7 +34,7 @@ fn leaseguard_leader_stamps_appended_entries() {
       &mut log,
       &mut stable,
       2u64,
-      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+      Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
     );
     assert!(ep.role().is_leader());
     ep.handle_storage(now, &mut log, &mut stable);
@@ -96,7 +96,7 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(now, &mut log, &mut stable);
@@ -105,7 +105,7 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -145,7 +145,7 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -200,7 +200,7 @@ fn lease_near_expiry_fires_within_margin_of_delta() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(now, &mut log, &mut stable);
@@ -209,7 +209,7 @@ fn lease_near_expiry_fires_within_margin_of_delta() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -466,7 +466,7 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
       &mut log,
       &mut stable,
       2u64,
-      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+      Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
     );
     assert!(ep.role().is_leader());
     ep.handle_storage(now, &mut log, &mut stable);
@@ -513,7 +513,7 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
 /// [`leaseguard_commit_wait_covers_inherited_max_window`].)
 #[test]
 fn leaseguard_fresh_cluster_has_no_commit_wait() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   // Drive a fresh leader to the point where peer 2 has acked the no-op at index 1, returning
@@ -549,7 +549,7 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
       &mut log,
       &mut stable,
       2u64,
-      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+      Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
     );
     assert!(ep.role().is_leader());
     ep.handle_storage(d, &mut log, &mut stable);
@@ -561,7 +561,7 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
       &mut log,
       &mut stable,
       2u64,
-      Message::AppendResp(AppendResp::new(
+      Message::AppendResponse(AppendResponse::new(
         Term::new(1),
         2u64,
         false,
@@ -597,7 +597,8 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
 #[test]
 fn leaseguard_commit_wait_covers_inherited_max_window() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -658,7 +659,7 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -671,7 +672,7 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -716,8 +717,8 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
 #[test]
 fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -781,7 +782,7 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -795,7 +796,7 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -877,8 +878,8 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
 #[test]
 fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -947,7 +948,7 @@ fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -958,7 +959,7 @@ fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -1006,7 +1007,7 @@ fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
 /// (no immediate `ReadState` — it must await a quorum ack).
 #[test]
 fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -1032,7 +1033,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
@@ -1043,7 +1044,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1070,7 +1071,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1110,7 +1111,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
   );
 
   // STALE: a read at t1+400ms (anchor t1 + 300ms < t1+400ms) degrades to the safe heartbeat round —
-  // no immediate ReadState (it now awaits a quorum HeartbeatResp).
+  // no immediate ReadState (it now awaits a quorum HeartbeatResponse).
   let stale_now = t1 + Duration::from_millis(400);
   ep.read_index(stale_now, &log, &stable, bytes::Bytes::from_static(b"r2"))
     .unwrap();
@@ -1126,7 +1127,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
 /// safe heartbeat round — never an uncoverable lease fast-path or a missing-knob coerced to zero.
 #[test]
 fn leaseguard_invalid_config_degrades_to_safe() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   // LeaseGuard with lease_duration but NO clock_drift_bound: invalid (Config::validate would reject),
@@ -1151,7 +1152,7 @@ fn leaseguard_invalid_config_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
@@ -1163,7 +1164,7 @@ fn leaseguard_invalid_config_degrades_to_safe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1196,7 +1197,8 @@ fn leaseguard_invalid_config_degrades_to_safe() {
 #[test]
 fn leaseguard_inherited_window_defers_commit_even_for_a_safe_successor() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -1248,7 +1250,7 @@ fn leaseguard_inherited_window_defers_commit_even_for_a_safe_successor() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -1261,7 +1263,7 @@ fn leaseguard_inherited_window_defers_commit_even_for_a_safe_successor() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -1510,7 +1512,7 @@ fn leaseguard_duplicate_snapshot_folds_a_newly_visible_window() {
 /// wrap `now` to a small value and stay falsely live (which would let a deposed leader serve stale).
 #[test]
 fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -1536,7 +1538,7 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   ep.handle_message(
@@ -1544,7 +1546,7 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1568,7 +1570,7 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1702,7 +1704,7 @@ fn leaseguard_idle_leader_does_not_append_refresh_noops() {
 /// `propose`'s leader-transfer write freeze.
 #[test]
 fn leaseguard_no_refresh_during_leader_transfer() {
-  use crate::{AppendResp, Config, Index, Instant, Message, Term, VoteResp};
+  use crate::{AppendResponse, Config, Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   let cfg = Config::try_new(
@@ -1728,7 +1730,7 @@ fn leaseguard_no_refresh_during_leader_transfer() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -1739,7 +1741,7 @@ fn leaseguard_no_refresh_during_leader_transfer() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1784,7 +1786,7 @@ fn leaseguard_no_refresh_during_leader_transfer() {
 #[test]
 fn failover_read_window_offers_inherited_serve_while_lease_live() {
   use crate::{
-    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, Wall,
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -1859,7 +1861,7 @@ fn failover_read_window_offers_inherited_serve_while_lease_live() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -1923,7 +1925,7 @@ fn failover_read_window_offers_inherited_serve_while_lease_live() {
 #[test]
 fn failover_read_window_fail_closed_without_committed_anchor() {
   use crate::{
-    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, Wall,
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -1983,7 +1985,7 @@ fn failover_read_window_fail_closed_without_committed_anchor() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -2015,8 +2017,8 @@ fn failover_read_window_fail_closed_without_committed_anchor() {
 #[test]
 fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2092,7 +2094,7 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at_wall(0), &mut log, &mut stable);
@@ -2104,7 +2106,7 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -2162,8 +2164,8 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
 #[test]
 fn failover_future_stamp_floor_held_not_e_prime_undercut() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2229,7 +2231,7 @@ fn failover_future_stamp_floor_held_not_e_prime_undercut() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   assert!(
@@ -2245,7 +2247,7 @@ fn failover_future_stamp_floor_held_not_e_prime_undercut() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -2300,7 +2302,7 @@ fn failover_future_stamp_floor_held_not_e_prime_undercut() {
 #[test]
 fn failover_future_committed_anchor_refuses_serve() {
   use crate::{
-    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, Wall,
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2364,7 +2366,7 @@ fn failover_future_committed_anchor_refuses_serve() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   assert!(
@@ -2406,8 +2408,8 @@ fn failover_future_committed_anchor_refuses_serve() {
 #[test]
 fn failover_non_armed_successor_holds_commit_to_the_wall_floor() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2470,7 +2472,7 @@ fn failover_non_armed_successor_holds_commit_to_the_wall_floor() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -2506,7 +2508,7 @@ fn failover_non_armed_successor_holds_commit_to_the_wall_floor() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -2532,8 +2534,8 @@ fn failover_non_armed_successor_holds_commit_to_the_wall_floor() {
 #[test]
 fn failover_wall_veto_repoll_is_wedge_safe_and_releases() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2589,7 +2591,7 @@ fn failover_wall_veto_repoll_is_wedge_safe_and_releases() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -2600,7 +2602,7 @@ fn failover_wall_veto_repoll_is_wedge_safe_and_releases() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -2644,8 +2646,8 @@ fn failover_wall_veto_repoll_is_wedge_safe_and_releases() {
 #[test]
 fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2702,7 +2704,7 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -2713,7 +2715,7 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -2759,8 +2761,8 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
 #[test]
 fn failover_unprovable_floor_hold_is_counted() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2817,7 +2819,7 @@ fn failover_unprovable_floor_hold_is_counted() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -2828,7 +2830,7 @@ fn failover_unprovable_floor_hold_is_counted() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -2875,8 +2877,8 @@ fn failover_unprovable_floor_hold_is_counted() {
 #[test]
 fn failover_non_armed_successor_fails_closed_on_absent_wall() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -2939,7 +2941,7 @@ fn failover_non_armed_successor_fails_closed_on_absent_wall() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(mono(0), &mut log, &mut stable);
@@ -2972,7 +2974,7 @@ fn failover_non_armed_successor_fails_closed_on_absent_wall() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -3002,7 +3004,8 @@ fn failover_non_armed_successor_fails_closed_on_absent_wall() {
 #[test]
 fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -3064,7 +3067,7 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(mono(0), &mut log, &mut stable);
@@ -3075,7 +3078,7 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -3130,7 +3133,8 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
 #[test]
 fn failover_no_eps_unc_safe_successor_fails_closed() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -3187,7 +3191,7 @@ fn failover_no_eps_unc_safe_successor_fails_closed() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(mono(0), &mut log, &mut stable);
@@ -3198,7 +3202,7 @@ fn failover_no_eps_unc_safe_successor_fails_closed() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -3238,7 +3242,8 @@ fn failover_no_eps_unc_safe_successor_fails_closed() {
 #[test]
 fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -3299,7 +3304,7 @@ fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(mono(0), &mut log, &mut stable);
@@ -3310,7 +3315,7 @@ fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -3346,7 +3351,7 @@ fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
 #[test]
 fn failover_unrepresentable_commit_deadline_disarms_serve() {
   use crate::{
-    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, Wall,
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -3407,7 +3412,7 @@ fn failover_unrepresentable_commit_deadline_disarms_serve() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(now, &mut log, &mut stable);
@@ -3441,7 +3446,8 @@ fn failover_unrepresentable_commit_deadline_disarms_serve() {
 #[test]
 fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
   };
   use core::time::Duration;
 
@@ -3498,7 +3504,7 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   // The saturated bare commit-wait fail-stops: the node poisons.
   assert!(
@@ -3517,7 +3523,7 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -3546,8 +3552,8 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
 #[test]
 fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -3607,7 +3613,7 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   // The non-passable inherited wall horizon on a bare ε_unc successor fail-stops.
   assert!(
@@ -3625,7 +3631,7 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -3651,8 +3657,8 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
 #[test]
 fn inconsistent_lease_floor_snapshot_fails_stop() {
   use crate::{
-    AppendResp, Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, VoteResp,
-    conf::ConfState,
+    AppendResponse, Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    VoteResponse, conf::ConfState,
   };
   use core::time::Duration;
 
@@ -3702,7 +3708,7 @@ fn inconsistent_lease_floor_snapshot_fails_stop() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(2), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(2), 2u64, false, false)),
   );
   assert!(
     ep.is_poisoned(),
@@ -3721,7 +3727,7 @@ fn inconsistent_lease_floor_snapshot_fails_stop() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(2),
       2u64,
       false,
@@ -3747,8 +3753,8 @@ fn assert_inconsistent_unwalled_floor_fails_stop(
   max_lease_window: u64,
 ) {
   use crate::{
-    AppendResp, Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, VoteResp,
-    conf::ConfState,
+    AppendResponse, Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    VoteResponse, conf::ConfState,
   };
   use core::time::Duration;
 
@@ -3800,7 +3806,7 @@ fn assert_inconsistent_unwalled_floor_fails_stop(
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(2), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(2), 2u64, false, false)),
   );
   assert!(
     ep.is_poisoned(),
@@ -3819,7 +3825,7 @@ fn assert_inconsistent_unwalled_floor_fails_stop(
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(2),
       2u64,
       false,
@@ -3868,8 +3874,8 @@ fn assert_inconsistent_lease_floor_fails_stop(
   max_unwalled_lease_window: u64,
 ) {
   use crate::{
-    AppendResp, Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, VoteResp,
-    Wall, conf::ConfState,
+    AppendResponse, Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    VoteResponse, Wall, conf::ConfState,
   };
   use core::time::Duration;
 
@@ -3927,7 +3933,7 @@ fn assert_inconsistent_lease_floor_fails_stop(
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(2), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(2), 2u64, false, false)),
   );
   assert!(
     ep.is_poisoned(),
@@ -3946,7 +3952,7 @@ fn assert_inconsistent_lease_floor_fails_stop(
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(2),
       2u64,
       false,
@@ -4015,8 +4021,8 @@ fn failover_config_with_inflated_wait_over_election_is_still_valid() {
 #[test]
 fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -4082,7 +4088,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -4109,7 +4115,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,
@@ -4279,7 +4285,7 @@ fn failover_tier_active_requires_leaseguard_timing_and_bounded_uncertainty() {
 #[test]
 fn failover_serve_disarmed_when_inflation_overflows_u64() {
   use crate::{
-    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, Wall,
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -4340,7 +4346,7 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -4376,8 +4382,8 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
 #[test]
 fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
   use crate::{
-    AppendEntries, AppendResp, Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp,
-    Wall,
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
   };
   use core::time::Duration;
 
@@ -4442,7 +4448,7 @@ fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
     &mut log,
     &mut stable,
     3u64,
-    Message::VoteResp(VoteResp::new(Term::new(6), 3u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(at(0), &mut log, &mut stable);
@@ -4453,7 +4459,7 @@ fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(6),
       3u64,
       false,

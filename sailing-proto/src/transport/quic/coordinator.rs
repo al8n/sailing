@@ -529,7 +529,7 @@ where
   ///   already-decoded frames are delivered (deliver-before-close);
   /// - `lost` → reap the closed connection from routing (the entry drains to quinn's `Drained`).
   // Takes the full `Now` (not a bare `Instant`): a decoded consensus message dispatched below reaches
-  // `endpoint.handle_message`, and a network-driven election there (VoteResp → become_leader → no-op)
+  // `endpoint.handle_message`, and a network-driven election there (VoteResponse → become_leader → no-op)
   // must stamp the SYNCHRONIZED wall. Only the quinn/bridge timers use the monotonic `now.mono()`.
   fn drain_bridge<L, S>(&mut self, now: Now, log: &mut L, stable: &mut S)
   where

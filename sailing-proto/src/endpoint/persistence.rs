@@ -1,5 +1,5 @@
 use super::*;
-use crate::{AppendResp, HardState, LogDone, SnapshotResp, StableDone};
+use crate::{AppendResponse, HardState, LogDone, SnapshotResponse, StableDone};
 
 impl<I, F> Endpoint<I, F>
 where
@@ -106,12 +106,12 @@ where
   }
 
   /// Scrub state that references log entries ABOVE `boundary` — used wherever the log tail is discarded
-  /// (a §5.3 conflict truncation OR a snapshot install). A queued success `AppendResp` or a pending
+  /// (a §5.3 conflict truncation OR a snapshot install). A queued success `AppendResponse` or a pending
   /// `FollowerAck` for an index past `boundary` would otherwise over-ack an entry the node no longer
   /// stores, letting the leader count a phantom replica toward commit.
   pub(crate) fn scrub_acks_above(&mut self, boundary: Index) {
     self.outputs.outgoing.retain(|o| {
-      !matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() > boundary)
+      !matches!(o.message(), Message::AppendResponse(a) if !a.reject() && a.match_index() > boundary)
     });
     self.pending.retain(|_, p| match p {
       Pending::FollowerAck { match_index, .. } => *match_index <= boundary,
@@ -207,14 +207,14 @@ where
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::SnapshotResp(SnapshotResp::new(term, me, false, match_index)),
+        Message::SnapshotResponse(SnapshotResponse::new(term, me, false, match_index)),
       );
     }
     if let Some((to, _, proven)) = self.durable.term_gated_append_ack.take() {
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::AppendResp(AppendResp::new(
+        Message::AppendResponse(AppendResponse::new(
           term,
           me,
           false,
@@ -226,7 +226,7 @@ where
     }
   }
 
-  /// Emit a SUCCESS `AppendResp` if `self.term` is durable; otherwise DEFER it (persist-before-
+  /// Emit a SUCCESS `AppendResponse` if `self.term` is durable; otherwise DEFER it (persist-before-
   /// respond) until [`flush_term_gated_acks`] releases it. `proven` is the extent this AppendEntries
   /// actually matched on the follower (`last_new` / the deferred-append match) — NOT pre-clamped to
   /// durability. This fn applies `proven.min(ack_watermark())` both on the immediate send and (via the
@@ -239,7 +239,7 @@ where
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::AppendResp(AppendResp::new(
+        Message::AppendResponse(AppendResponse::new(
           term,
           me,
           false,
@@ -259,7 +259,7 @@ where
     }
   }
 
-  /// Emit a SUCCESS `SnapshotResp` if `self.term` is durable; otherwise DEFER it (persist-before-
+  /// Emit a SUCCESS `SnapshotResponse` if `self.term` is durable; otherwise DEFER it (persist-before-
   /// respond). `proven` (the snapshot boundary / committed match) is clamped to `ack_watermark()` on
   /// send and at flush — the snapshot analogue of [`send_or_gate_append_ack`].
   pub(crate) fn send_or_gate_snapshot_ack(&mut self, to: I, proven: Index) {
@@ -268,7 +268,7 @@ where
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::SnapshotResp(SnapshotResp::new(term, me, false, match_index)),
+        Message::SnapshotResponse(SnapshotResponse::new(term, me, false, match_index)),
       );
     } else {
       let proven = match self.durable.term_gated_snapshot_ack {
@@ -564,7 +564,7 @@ where
           let me = self.config.id();
           self.send(
             to,
-            Message::VoteResp(crate::VoteResp::new(term, me, false, false)),
+            Message::VoteResponse(crate::VoteResponse::new(term, me, false, false)),
           );
         }
       }

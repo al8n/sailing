@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  AppendEntries, AppendResp, Entry, Heartbeat, HeartbeatResp, MaybeOwned, ProgressState,
+  AppendEntries, AppendResponse, Entry, Heartbeat, HeartbeatResponse, MaybeOwned, ProgressState,
   ProposeError,
 };
 
@@ -18,7 +18,7 @@ where
 
   pub(crate) fn broadcast_heartbeat(&mut self, now: Now) {
     // Start a FRESH CheckQuorum lease round: bump the round, record its SEND instant, and clear the
-    // per-round ack set, so the read lease (`lease_valid_until`) is renewed only by HeartbeatResp
+    // per-round ack set, so the read lease (`lease_valid_until`) is renewed only by HeartbeatResponse
     // echoing THIS round and is bounded by this round's send time. A stale/duplicated
     // earlier-round response then cannot keep an isolated leader's lease alive, and a delayed
     // current-round response cannot extend it past the quorum's election window.
@@ -177,7 +177,7 @@ where
         }
         // Arm the resend-pacing deadline AT the send: the map entry means "an InstallSnapshot for
         // this peer's current install window went out at deadline − election_timeout". This (a)
-        // stops `on_heartbeat_resp` from re-sending the very blob this call just emitted (the
+        // stops `on_heartbeat_response` from re-sending the very blob this call just emitted (the
         // heartbeat pump can be what triggers the initial install, in the SAME response handling),
         // and (b) overwrites any stale deadline left over from a previous install window (the peer
         // may have exited Snapshot via `maybe_update` without a heartbeat observation to clean up).
@@ -280,7 +280,7 @@ where
     // For Replicate: only record non-empty sends — an empty AppendEntries (heartbeat probe
     // for a caught-up peer) must NOT consume an inflight slot. Empty sends carry no entries
     // so there is nothing for the peer to ack; the slot would never be freed, and after
-    // max_inflight_msgs heartbeat-resp cycles the window fills and newly proposed entries
+    // max_inflight_msgs heartbeat-response cycles the window fills and newly proposed entries
     // are silently not delivered. (etcd guards SentEntries on len(entries) > 0.)
     let is_empty = bytes_sent == 0 && entries_len == 0;
     if let Some(p) = self.tracker.progress_mut(&peer)
@@ -659,8 +659,8 @@ where
     };
     self.send(
       hb.leader(),
-      Message::HeartbeatResp(
-        HeartbeatResp::new(term, me, ctx)
+      Message::HeartbeatResponse(
+        HeartbeatResponse::new(term, me, ctx)
           .with_lease_round(hb.lease_round())
           .with_lease_support(lease_support),
       ),
@@ -715,7 +715,7 @@ where
       };
       self.send(
         ae.leader(),
-        Message::AppendResp(AppendResp::new(
+        Message::AppendResponse(AppendResponse::new(
           term,
           me,
           true,
@@ -875,27 +875,27 @@ where
     }
   }
 
-  /// Handle a `HeartbeatResp` from a peer.
+  /// Handle a `HeartbeatResponse` from a peer.
   ///
-  /// A HeartbeatResp from a peer:
+  /// A HeartbeatResponse from a peer:
   /// 1. Clears the peer's probe pause (so stalled replication resumes).
   /// 2. Frees one in-flight slot on a full Replicate window (etcd FreeFirstOne).
   /// 3. If the response carries a non-empty context, records the ack for the
   ///    corresponding pending read-index request and confirms any reads that have
   ///    reached a voter quorum.
-  pub(crate) fn on_heartbeat_resp<L: LogStore, S: StableStore<NodeId = I>>(
+  pub(crate) fn on_heartbeat_response<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Now,
     from: I,
     log: &L,
     stable: &S,
-    resp: HeartbeatResp<I>,
+    response: HeartbeatResponse<I>,
   ) {
     if !self.role.is_leader() {
       return;
     }
     // Renew the LeaseBased read lease ONLY from a FRESH response to the CURRENT CheckQuorum round.
-    // A HeartbeatResp echoing `self.check_quorum_lease.lease_round` proves `from` was reachable for THIS round — not via a
+    // A HeartbeatResponse echoing `self.check_quorum_lease.lease_round` proves `from` was reachable for THIS round — not via a
     // stale or duplicated earlier-round message (which carries a different round and is ignored here).
     // Bound the renewed lease by the round's SEND instant (`lease_round_start`), NOT this
     // response's receipt time: followers reset their election timers when they RECEIVED this round
@@ -912,14 +912,14 @@ where
     // The lease deadline is bounded by the MIN support across the contributing quorum (`lease_min_support`,
     // min'd here, seeded to the leader's own election_timeout each round), so a voter with a SHORTER
     // election_timeout caps the lease at its real election window — the leader never out-lives a supporter.
-    if resp.lease_round() == self.check_quorum_lease.lease_round
-      && resp.lease_support() > Duration::ZERO
+    if response.lease_round() == self.check_quorum_lease.lease_round
+      && response.lease_support() > Duration::ZERO
     {
       self.check_quorum_lease.lease_acks.insert(from);
       self.check_quorum_lease.lease_min_support = self
         .check_quorum_lease
         .lease_min_support
-        .min(resp.lease_support());
+        .min(response.lease_support());
       let me = self.config.id();
       if self
         .tracker
@@ -955,7 +955,7 @@ where
     // install. The per-peer countdown spaces resends roughly one election timeout apart: a
     // genuinely dropped blob is still retried within one election timeout (liveness preserved),
     // without the per-round egress amplification. (Read state/pending/match via an immutable
-    // borrow into locals, drop the borrow, then act — mirrors on_append_resp's re-borrow.)
+    // borrow into locals, drop the borrow, then act — mirrors on_append_response's re-borrow.)
     let resend = match self.tracker.progress(&from) {
       Some(pr) => match pr.state() {
         ProgressState::Snapshot(pending) => pr.match_index() < pending,
@@ -992,8 +992,8 @@ where
       self.snapshot.snapshot_resend_after.remove(&from);
     }
 
-    // ReadIndex Safe path: if the resp carries a context, record the ack and check quorum.
-    let ctx = resp.context();
+    // ReadIndex Safe path: if the response carries a context, record the ack and check quorum.
+    let ctx = response.context();
     if ctx.is_empty() {
       return;
     }
@@ -1021,10 +1021,12 @@ where
             self.emit_read_state(index, context);
           }
           Some(follower) => {
-            // Forwarded read — reply ReadIndexResp to the originating follower.
+            // Forwarded read — reply ReadIndexResponse to the originating follower.
             self.send(
               follower,
-              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, index, context, false)),
+              Message::ReadIndexResponse(crate::ReadIndexResponse::new(
+                term, me, index, context, false,
+              )),
             );
           }
         }
@@ -1060,7 +1062,7 @@ where
   /// The boundary check on a peer's reported `match_index` from a SUCCESSFUL response: it must not
   /// exceed the leader's own `log.last_index()`. The leader only ever sent entries it holds, so no
   /// honest peer can durably hold more; a higher value is malformed or version-skewed input. Both
-  /// `on_append_resp` and `on_snapshot_resp` gate their success path on this so the invariant lives
+  /// `on_append_response` and `on_snapshot_response` gate their success path on this so the invariant lives
   /// in ONE place. Accepting an over-run would (a) corrupt the peer's `Progress` (`maybe_update`
   /// trusts the value verbatim, never lowering it again) and (b) let `maybe_advance_commit`'s quorum
   /// candidate run past the log, where `log_term` reads an out-of-range index and POISONS the leader
@@ -1070,13 +1072,13 @@ where
     match_index <= log.last_index()
   }
 
-  pub(crate) fn on_append_resp<L: LogStore, S: StableStore<NodeId = I>>(
+  pub(crate) fn on_append_response<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Now,
     log: &mut L,
     stable: &S,
     from: I,
-    resp: AppendResp<I>,
+    response: AppendResponse<I>,
   ) {
     if !self.role.is_leader() {
       return;
@@ -1084,7 +1086,7 @@ where
     let Some(pr) = self.tracker.progress_mut(&from) else {
       return;
     };
-    if resp.reject() {
+    if response.reject() {
       // Use the term-skip hint to jump next_index forward in one step.
       // find_conflict_by_term walks the leader's log from reject_hint_index downward
       // until we find an entry whose term ≤ reject_hint_term (the follower's conflicting
@@ -1095,8 +1097,8 @@ where
       // `find_conflict_by_term` read a non-existent index — poisoning the leader via `log_term` — or,
       // at `u64::MAX`, overflow the `conflict + 1` jump below. Mirrors the follower-side hint clamp in
       // `on_append_entries` (`min(prev_log_index, last_index)`).
-      let hint_index = core::cmp::min(resp.reject_hint_index(), log.last_index());
-      let hint_term = resp.reject_hint_term();
+      let hint_index = core::cmp::min(response.reject_hint_index(), log.last_index());
+      let hint_term = response.reject_hint_term();
       let cur_next = pr.next_index();
       // Compute the conflict index before re-borrowing self.tracker.progress mutably. A fatal
       // term-read mid-walk poisons and returns `None`; short-circuit before mutating peer progress
@@ -1124,18 +1126,18 @@ where
       }
       self.maybe_send_append(now, from, log, stable);
     } else {
-      // Boundary check (shared with `on_snapshot_resp` via `match_within_log`): a successful ack must
+      // Boundary check (shared with `on_snapshot_response` via `match_within_log`): a successful ack must
       // not report a match above the leader's own log. An over-run is malformed/version-skewed input —
       // ignore the whole ack rather than corrupt this peer's `Progress` or let the commit candidate
       // run off the log and poison the leader.
-      if !Self::match_within_log(resp.match_index(), log) {
+      if !Self::match_within_log(response.match_index(), log) {
         return;
       }
       // Capture the state BEFORE maybe_update so we can guard the Probe -> Replicate
       // transition. etcd's MsgAppResp handler only switches Probe -> Replicate
       // on the first successful ack.
       let state_before = pr.state();
-      if pr.maybe_update(resp.match_index()) {
+      if pr.maybe_update(response.match_index()) {
         // etcd 3-way switch: only transition Probe -> Replicate here. For a peer ALREADY in
         // Replicate, maybe_update already advanced match/next and freed the acked inflight
         // slot via free_le; calling become_replicate() again would rewind next_index to

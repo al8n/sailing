@@ -85,7 +85,7 @@ async fn submit_anywhere(handles: &[Handle<u64, CountSm>], payload: &'static [u8
       "no commit within the deadline"
     );
     match handles[at].submit(Bytes::from_static(payload)).await {
-      Ok(resp) => return resp,
+      Ok(response) => return response,
       // Redirect: the hint names the leader; no hint yet means no leader yet — try the next
       // node after a beat.
       Err(DriverError::NotLeader { leader }) => {
@@ -109,12 +109,12 @@ async fn three_node_cluster_commits_and_queries() {
   let ca = TestCa::new();
   let handles = spawn_cluster(&ca, 42_000).await;
 
-  let resp = submit_anywhere(&handles, b"hello").await;
-  assert_eq!(resp, 1, "the first committed command counts to one");
+  let response = submit_anywhere(&handles, b"hello").await;
+  assert_eq!(response, 1, "the first committed command counts to one");
 
   // A second command through any node (the redirect loop finds the leader again).
-  let resp = submit_anywhere(&handles, b"world").await;
-  assert_eq!(resp, 2);
+  let response = submit_anywhere(&handles, b"world").await;
+  assert_eq!(response, 2);
 
   // A linearizable query: runs against the FSM on the driver thread at a confirmed read index.
   // Find the leader (the node whose submit succeeds is leader-adjacent; query needs the leader

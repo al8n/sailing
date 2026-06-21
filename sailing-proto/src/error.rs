@@ -73,7 +73,7 @@ pub enum TransferError<I> {
 /// A `read_index` that returns `Ok(())` has been accepted onto a confirmation path (the
 /// leader's heartbeat-quorum round, an immediate lease confirmation, or a forward to the
 /// known leader); the eventual [`Event::ReadState`](crate::Event::ReadState) (locally) or
-/// [`ReadIndexResp`](crate::ReadIndexResp) (when forwarded) is the only acknowledgement.
+/// [`ReadIndexResponse`](crate::ReadIndexResponse) (when forwarded) is the only acknowledgement.
 /// An `Err` means **no** such acknowledgement will ever arrive for this call, so the caller
 /// must not block waiting for one.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -88,12 +88,12 @@ pub enum ReadIndexError {
   #[error("proposal forwarding is disabled; cannot forward the read to the leader")]
   ForwardingDisabled,
   /// A read with this exact `context` is already in flight. The `context` is the sole
-  /// correlator between a request and its eventual `ReadState`/`ReadIndexResp`, so two
+  /// correlator between a request and its eventual `ReadState`/`ReadIndexResponse`, so two
   /// concurrent reads MUST use distinct contexts (including the empty context). Wait for the
   /// in-flight read to confirm, or reissue with a unique context.
   #[error("a read with this context is already in flight")]
   DuplicateContext,
-  /// This follower already has the maximum number of forwarded reads awaiting a `ReadIndexResp`
+  /// This follower already has the maximum number of forwarded reads awaiting a `ReadIndexResponse`
   /// (back-pressure). The read was NOT accepted; retry after some in-flight reads confirm, or once a
   /// leader/term change clears the backlog. Forwarded reads are never silently evicted, so an
   /// already-accepted read is never stranded.

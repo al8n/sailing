@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  HeartbeatResp, InstallSnapshot, ProgressState, SnapshotMeta, SnapshotResp,
+  HeartbeatResponse, InstallSnapshot, ProgressState, SnapshotMeta, SnapshotResponse,
   testkit::{AsyncStable, CountSm, FailTermLog, NoopStable, VecLog},
 };
 
@@ -171,9 +171,9 @@ fn snapshot_install_resets_durable_index_below_divergent_tail() {
   );
   let dup = ep
     .poll_message()
-    .expect("duplicate emits an immediate AppendResp");
+    .expect("duplicate emits an immediate AppendResponse");
   match dup.message() {
-    Message::AppendResp(a) => {
+    Message::AppendResponse(a) => {
       assert!(!a.reject(), "duplicate is a success ack");
       assert_eq!(
         a.match_index(),
@@ -182,7 +182,7 @@ fn snapshot_install_resets_durable_index_below_divergent_tail() {
            not the unflushed in-flight entry 3"
       );
     }
-    other => panic!("expected AppendResp, got {other:?}"),
+    other => panic!("expected AppendResponse, got {other:?}"),
   }
 }
 
@@ -650,10 +650,10 @@ fn normal_append_at_boundary_not_snapshot() {
   }
 }
 
-/// A HeartbeatResp from a peer still stuck in Snapshot state (its
+/// A HeartbeatResponse from a peer still stuck in Snapshot state (its
 /// InstallSnapshot was dropped) must RE-SEND the InstallSnapshot, carrying the same meta.
 ///
-/// FAILS-ON-OLD: without the resend hook the HeartbeatResp produces NO InstallSnapshot
+/// FAILS-ON-OLD: without the resend hook the HeartbeatResponse produces NO InstallSnapshot
 /// (maybe_send_append early-returns on the paused Snapshot peer), so the follower wedges.
 ///
 /// PACING (deadline armed AT each send): the initial install (sent at ORIGIN by the helper) arms
@@ -666,8 +666,13 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   let offset = 5u64;
   let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
   assert_eq!(pending, Index::new(offset));
-  let hb_resp =
-    || Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new()));
+  let hb_response = || {
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    ))
+  };
   let count_installs = |ep: &mut Endpoint<u64, CountSm>| {
     core::iter::from_fn(|| ep.poll_message())
       .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
@@ -678,7 +683,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   // snapshot. A response WITHIN one election timeout of the initial send (the helper sent it at
   // ORIGIN) must NOT re-send: the blob just went out, and the deadline armed at that send covers
   // it. (An immediate resend here is exactly the double-blob amplification the pacing prevents.)
-  ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, hb_resp());
+  ep.handle_message(Instant::ORIGIN, &mut log, &mut stable, 2u64, hb_response());
   assert_eq!(
     count_installs(&mut ep),
     0,
@@ -688,7 +693,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   // The first response at/after the deadline (one election timeout past the SEND) re-sends,
   // carrying the same meta.
   let later = Instant::ORIGIN + ep.config.election_timeout();
-  ep.handle_message(later, &mut log, &mut stable, 2u64, hb_resp());
+  ep.handle_message(later, &mut log, &mut stable, 2u64, hb_response());
   let msgs: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
   let snap_msgs: Vec<_> = msgs
     .iter()
@@ -697,7 +702,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   assert_eq!(
     snap_msgs.len(),
     1,
-    "the first HeartbeatResp at/after the deadline must RE-SEND exactly one InstallSnapshot"
+    "the first HeartbeatResponse at/after the deadline must RE-SEND exactly one InstallSnapshot"
   );
   let resent = match snap_msgs[0].message() {
     Message::InstallSnapshot(s) => s,
@@ -721,7 +726,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
 
   // BACKOFF: the resend re-armed the deadline, so another response at the SAME instant must not
   // re-send again — regardless of how many responses arrive (ReadIndex Safe rounds elicit extras).
-  ep.handle_message(later, &mut log, &mut stable, 2u64, hb_resp());
+  ep.handle_message(later, &mut log, &mut stable, 2u64, hb_response());
   assert_eq!(
     count_installs(&mut ep),
     0,
@@ -730,7 +735,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
 
   // TIME-based pacing repeats: one more election timeout later, the next response re-sends.
   let even_later = later + ep.config.election_timeout();
-  ep.handle_message(even_later, &mut log, &mut stable, 2u64, hb_resp());
+  ep.handle_message(even_later, &mut log, &mut stable, 2u64, hb_response());
   assert_eq!(
     count_installs(&mut ep),
     1,
@@ -762,7 +767,11 @@ fn heartbeat_pump_initial_install_is_not_double_sent() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
   );
   let installs = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
@@ -789,22 +798,27 @@ fn stale_resend_deadline_does_not_leak_across_install_windows() {
 
   let offset = 5u64;
   let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
-  let hb_resp =
-    || Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new()));
+  let hb_response = || {
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    ))
+  };
 
   // Window 1: a resend fires at the deadline, re-arming it (deadline now ORIGIN + 2·ET).
   let t1 = Instant::ORIGIN + ep.config.election_timeout();
-  ep.handle_message(t1, &mut log, &mut stable, 2u64, hb_resp());
+  ep.handle_message(t1, &mut log, &mut stable, 2u64, hb_response());
   while ep.poll_message().is_some() {}
 
-  // The follower acks at pending: it exits Snapshot via maybe_update (SnapshotResp path) —
+  // The follower acks at pending: it exits Snapshot via maybe_update (SnapshotResponse path) —
   // NO heartbeat-response observation cleans the pacing map here.
   ep.handle_message(
     t1,
     &mut log,
     &mut stable,
     2u64,
-    Message::SnapshotResp(SnapshotResp::new(Term::new(1), 2u64, false, pending)),
+    Message::SnapshotResponse(SnapshotResponse::new(Term::new(1), 2u64, false, pending)),
   );
   assert!(
     !ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
@@ -819,7 +833,7 @@ fn stale_resend_deadline_does_not_leak_across_install_windows() {
     p.set_next_index(Index::new(2));
   }
   let t2 = Instant::ORIGIN + ep.config.election_timeout() * 10;
-  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp());
+  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_response());
   let installs = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
     .count();
@@ -830,7 +844,7 @@ fn stale_resend_deadline_does_not_leak_across_install_windows() {
   );
 
   // And the very next response inside the new window's deadline stays quiet.
-  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp());
+  ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_response());
   let extra = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
     .count();
@@ -841,8 +855,8 @@ fn stale_resend_deadline_does_not_leak_across_install_windows() {
 }
 
 /// The resend STOPS once the follower acks past its pending snapshot index.
-/// After a SnapshotResp (match >= pending) the peer leaves Snapshot state (→ Probe), so a
-/// subsequent HeartbeatResp must NOT emit another InstallSnapshot (no infinite resend / spam).
+/// After a SnapshotResponse (match >= pending) the peer leaves Snapshot state (→ Probe), so a
+/// subsequent HeartbeatResponse must NOT emit another InstallSnapshot (no infinite resend / spam).
 #[test]
 fn no_snapshot_resend_after_follower_catches_up() {
   use crate::{Instant, Message, Term};
@@ -857,20 +871,24 @@ fn no_snapshot_resend_after_follower_catches_up() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
   );
   let resent = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
     .count();
   assert_eq!(resent, 1, "resend fires while the follower is still wedged");
 
-  // The follower finally receives a snapshot and acks at pending (SnapshotResp success).
+  // The follower finally receives a snapshot and acks at pending (SnapshotResponse success).
   ep.handle_message(
     t1,
     &mut log,
     &mut stable,
     2u64,
-    Message::SnapshotResp(SnapshotResp::new(Term::new(1), 2u64, false, pending)),
+    Message::SnapshotResponse(SnapshotResponse::new(Term::new(1), 2u64, false, pending)),
   );
   // It must have left Snapshot state (maybe_update(pending) → Probe).
   assert!(
@@ -879,14 +897,18 @@ fn no_snapshot_resend_after_follower_catches_up() {
   );
   while ep.poll_message().is_some() {} // drain anything the catch-up emitted
 
-  // A subsequent HeartbeatResp — even WAY past every armed deadline — must NOT emit another
+  // A subsequent HeartbeatResponse — even WAY past every armed deadline — must NOT emit another
   // InstallSnapshot (the resend is gated on Snapshot state, which the peer has left).
   ep.handle_message(
     Instant::ORIGIN + ep.config.election_timeout() * 10,
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
   );
   let after = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
@@ -922,7 +944,7 @@ fn install_snapshot_on_behind_follower() {
     1u64,
     Message::InstallSnapshot(is),
   );
-  // the install adopts term 1 (follower started at term 0), so the post-install SnapshotResp is
+  // the install adopts term 1 (follower started at term 0), so the post-install SnapshotResponse is
   // deferred until that term write is durable. Drain storage (as the driver does each iteration) to
   // complete the term write and release the ack.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
@@ -990,25 +1012,25 @@ fn install_snapshot_on_behind_follower() {
     Index::new(10)
   );
 
-  // Exactly one SnapshotResp must be sent to the leader (node 1) with reject=false,
+  // Exactly one SnapshotResponse must be sent to the leader (node 1) with reject=false,
   // match_index=10.
   let msgs: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
-  let snap_resps: Vec<_> = msgs
+  let snap_responses: Vec<_> = msgs
     .iter()
-    .filter(|o| o.to() == 1u64 && matches!(o.message(), Message::SnapshotResp(_)))
+    .filter(|o| o.to() == 1u64 && matches!(o.message(), Message::SnapshotResponse(_)))
     .collect();
   assert_eq!(
-    snap_resps.len(),
+    snap_responses.len(),
     1,
-    "exactly one SnapshotResp must be sent to the leader"
+    "exactly one SnapshotResponse must be sent to the leader"
   );
-  let sr = match snap_resps[0].message() {
-    Message::SnapshotResp(r) => r,
+  let sr = match snap_responses[0].message() {
+    Message::SnapshotResponse(r) => r,
     _ => unreachable!(),
   };
   assert!(
     !sr.reject(),
-    "SnapshotResp must not be a rejection on successful install"
+    "SnapshotResponse must not be a rejection on successful install"
   );
   assert_eq!(
     sr.match_index(),
@@ -1031,22 +1053,22 @@ fn install_snapshot_on_behind_follower() {
 
 /// A snapshot install must scrub stale outgoing success acks.
 ///
-/// A follower has a queued success `AppendResp(match_index = 3)` still in `outgoing` (it acked
+/// A follower has a queued success `AppendResponse(match_index = 3)` still in `outgoing` (it acked
 /// index 3, but the ack has not yet been polled). It then installs a snapshot at a LOWER boundary
 /// (`last_index = 2`). The truncated entry 3 no longer exists, so emitting that ack would over-ack
 /// an entry the follower no longer stores — letting the leader count a phantom replica toward
-/// commit. After the install, no success `AppendResp` with `match_index > 2` may be emitted.
+/// commit. After the install, no success `AppendResponse` with `match_index > 2` may be emitted.
 #[test]
 fn install_snapshot_scrubs_stale_outgoing_ack() {
   use crate::{Index, Instant, Message, Outgoing, Term, conf::ConfState};
 
   let (mut ep, mut log, mut stable) = make_follower();
 
-  // Queue a success AppendResp(match_index = 3) as if the follower had acked index 3 and the ack
+  // Queue a success AppendResponse(match_index = 3) as if the follower had acked index 3 and the ack
   // is still sitting in `outgoing` (not yet polled). This is the stale ack that must be scrubbed.
   ep.outputs.outgoing.push_back(Outgoing::new(
     1u64,
-    Message::AppendResp(crate::AppendResp::new(
+    Message::AppendResponse(crate::AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -1075,14 +1097,14 @@ fn install_snapshot_scrubs_stale_outgoing_ack() {
   // `install_snapshot_now`, which runs `scrub_acks_above(2)`.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
 
-  // Drain all outgoing messages: NONE may be a success AppendResp with match_index > 2.
+  // Drain all outgoing messages: NONE may be a success AppendResponse with match_index > 2.
   let msgs: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
   let over_ack = msgs.iter().any(|o| {
-      matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() > Index::new(2))
+      matches!(o.message(), Message::AppendResponse(a) if !a.reject() && a.match_index() > Index::new(2))
     });
   assert!(
     !over_ack,
-    "the stale success AppendResp(match_index = 3) must be scrubbed by the snapshot install"
+    "the stale success AppendResponse(match_index = 3) must be scrubbed by the snapshot install"
   );
 }
 
@@ -1132,7 +1154,7 @@ fn stale_snapshot_does_not_install() {
   );
   // the install adopts term 1 (the follower starts at term 0), so the stale-snapshot success ack
   // is deferred until that term write is durable. Drain storage (the driver does this every iteration)
-  // to complete the term write and release the deferred SnapshotResp.
+  // to complete the term write and release the deferred SnapshotResponse.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
 
   // SM must NOT have been restored.
@@ -1157,19 +1179,19 @@ fn stale_snapshot_does_not_install() {
     "no SnapshotInstalled event for a stale snapshot"
   );
 
-  // Must still send a SnapshotResp with reject=false and match_index = self.commit.
+  // Must still send a SnapshotResponse with reject=false and match_index = self.commit.
   let msgs: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
-  let snap_resps: Vec<_> = msgs
+  let snap_responses: Vec<_> = msgs
     .iter()
-    .filter(|o| o.to() == 1u64 && matches!(o.message(), Message::SnapshotResp(_)))
+    .filter(|o| o.to() == 1u64 && matches!(o.message(), Message::SnapshotResponse(_)))
     .collect();
   assert_eq!(
-    snap_resps.len(),
+    snap_responses.len(),
     1,
-    "stale snapshot must still send a SnapshotResp"
+    "stale snapshot must still send a SnapshotResponse"
   );
-  let sr = match snap_resps[0].message() {
-    Message::SnapshotResp(r) => r,
+  let sr = match snap_responses[0].message() {
+    Message::SnapshotResponse(r) => r,
     _ => unreachable!(),
   };
   assert!(!sr.reject(), "stale snapshot ack must have reject=false");
@@ -1249,10 +1271,10 @@ fn malformed_snapshot_data_poisons_node() {
   );
 }
 
-/// Test 4: leader processes a successful SnapshotResp — peer leaves Snapshot state.
+/// Test 4: leader processes a successful SnapshotResponse — peer leaves Snapshot state.
 #[test]
-fn leader_processes_snapshot_resp_success_and_reject() {
-  use crate::{Index, Instant, Message, Term, VoteResp};
+fn leader_processes_snapshot_response_success_and_reject() {
+  use crate::{Index, Instant, Message, Term, VoteResponse};
   use core::time::Duration;
 
   // Build a 3-voter leader (node 1).
@@ -1275,7 +1297,7 @@ fn leader_processes_snapshot_resp_success_and_reject() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Extend the leader's log to index 10 (no-op at 1 + 9 proposals) so a peer's snapshot ack at 10
@@ -1302,7 +1324,7 @@ fn leader_processes_snapshot_resp_success_and_reject() {
     &mut log,
     &mut stable,
     2u64,
-    Message::SnapshotResp(SnapshotResp::new(
+    Message::SnapshotResponse(SnapshotResponse::new(
       Term::new(1),
       2u64,
       true, // reject
@@ -1312,7 +1334,7 @@ fn leader_processes_snapshot_resp_success_and_reject() {
   // After reject the peer must have transitioned to Probe.
   assert!(
     ep.tracker.progress(&2u64).unwrap().state().is_probe(),
-    "reject SnapshotResp must transition peer to Probe"
+    "reject SnapshotResponse must transition peer to Probe"
   );
 
   // --- Success case: peer has been put back in Snapshot(10). ---
@@ -1327,7 +1349,7 @@ fn leader_processes_snapshot_resp_success_and_reject() {
     &mut log,
     &mut stable,
     2u64,
-    Message::SnapshotResp(SnapshotResp::new(
+    Message::SnapshotResponse(SnapshotResponse::new(
       Term::new(1),
       2u64,
       false, // success
@@ -1338,12 +1360,12 @@ fn leader_processes_snapshot_resp_success_and_reject() {
   let pr = ep.tracker.progress(&2u64).unwrap();
   assert!(
     pr.state().is_probe(),
-    "success SnapshotResp must transition peer out of Snapshot state"
+    "success SnapshotResponse must transition peer out of Snapshot state"
   );
   assert_eq!(
     pr.match_index(),
     Index::new(10),
-    "match_index must be 10 after successful SnapshotResp"
+    "match_index must be 10 after successful SnapshotResponse"
   );
 }
 
@@ -1611,17 +1633,17 @@ fn install_defers_commit_advance_until_blob_durable() {
 /// `self.commit`. An async follower can have `commit > durable_index` — commit advanced over a
 /// visible-but-not-yet-durable append — and replying raw commit would over-ack a tail this node
 /// cannot recover after a crash, letting the leader count a phantom replica (the same persist-before-
-/// ack hole the immediate `AppendResp` clamp closes on the AppendEntries path).
+/// ack hole the immediate `AppendResponse` clamp closes on the AppendEntries path).
 ///
 /// Setup: durable log [1..=3] (commit/durable 3); a second AppendEntries [4..=5] with leader_commit=5
 /// advances commit to 5 but `durable_index` stays 3 (the 4/5 `Appended` is NOT drained). A stale
 /// InstallSnapshot(last_index=5) then hits the guard; the reply must report 3 = min(commit 5,
 /// durable_index 3), not 5.
 ///
-/// MUTATION: revert the stale-guard ack to `self.commit` → the `SnapshotResp` reports 5, over-acking
+/// MUTATION: revert the stale-guard ack to `self.commit` → the `SnapshotResponse` reports 5, over-acking
 /// the non-durable tail [4..=5].
 #[test]
-fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
+fn stale_snapshot_response_is_clamped_to_durable_watermark() {
   use crate::{
     AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
     SnapshotMeta, Term, conf::ConfState,
@@ -1716,8 +1738,8 @@ fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
     Index::new(3),
     "but the 4/5 append is not yet durable"
   );
-  // Drain the outbox (the immediate AppendResp for the second append) so the next poll is the
-  // SnapshotResp under test.
+  // Drain the outbox (the immediate AppendResponse for the second append) so the next poll is the
+  // SnapshotResponse under test.
   while ep.poll_message().is_some() {}
 
   // A stale InstallSnapshot at index 3 (== durable_index, already within ack_watermark) hits the
@@ -1740,11 +1762,11 @@ fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
     )),
   );
 
-  let resp = ep
+  let response = ep
     .poll_message()
-    .expect("a stale InstallSnapshot emits a SnapshotResp");
-  match resp.message() {
-    Message::SnapshotResp(s) => {
+    .expect("a stale InstallSnapshot emits a SnapshotResponse");
+  match response.message() {
+    Message::SnapshotResponse(s) => {
       assert!(
         !s.reject(),
         "the follower is at/ahead → success ack, not a reject"
@@ -1756,7 +1778,7 @@ fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
            min(commit=5, durable_index=3)=3, not the raw in-memory commit 5"
       );
     }
-    other => panic!("expected SnapshotResp, got {other:?}"),
+    other => panic!("expected SnapshotResponse, got {other:?}"),
   }
   // The stale path installs nothing: commit must not regress and no deferred install is armed.
   assert_eq!(
@@ -1927,7 +1949,7 @@ fn vote_freshness_floored_at_pending_install_boundary() {
     )),
   );
   let granted_reject = core::iter::from_fn(|| ep.poll_message()).find_map(|o| match o.message() {
-    Message::VoteResp(v) => Some(v.reject()),
+    Message::VoteResponse(v) => Some(v.reject()),
     _ => None,
   });
   assert_eq!(
@@ -2205,7 +2227,7 @@ fn receipt_stale_above_watermark_records_durable_snapshot() {
 /// membership fold must prune the map to the new membership.
 #[test]
 fn conf_change_removal_prunes_snapshot_resend_deadline() {
-  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Instant, Message, Term};
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Index, Instant, Message, Term};
 
   let offset = 5u64;
   let (mut ep, mut log, mut stable, _pending) = wedged_snapshot_follower(offset, 2);
@@ -2233,7 +2255,7 @@ fn conf_change_removal_prunes_snapshot_resend_deadline() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       3u64,
       false,

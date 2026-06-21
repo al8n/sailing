@@ -468,7 +468,7 @@ const V_NEW: u64 = 200;
 ///
 /// We fault a FOLLOWER, never the leader: the leader reads its log on the SEND path (`maybe_send_append`)
 /// to replicate, so an always-on read fault would poison the leader BEFORE it could replicate/commit
-/// V_NEW. A follower's only faulting read is `apply_committed`; its append (a write) and its AppendResp
+/// V_NEW. A follower's only faulting read is `apply_committed`; its append (a write) and its AppendResponse
 /// ack (gated on the durable append, not on apply) are unaffected, so V_NEW commits on the quorum and
 /// the follower receives + logs it, then poisons solely on the apply read — the precise per-node gap the
 /// old applied-sourced `v_inv` masked.

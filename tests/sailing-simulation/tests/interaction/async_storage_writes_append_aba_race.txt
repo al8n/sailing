@@ -34,20 +34,20 @@ stabilize
 flush 1 2 3 4 5
 ----
 > n2 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 > n3 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 > n4 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 > n5 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 
 stabilize
 ----
-> n1 recv VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
 > n1 ready
   Heartbeat term=1 commit=0
   Heartbeat term=1 commit=0
@@ -67,21 +67,21 @@ stabilize
 > n4 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n5 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  HeartbeatResp term=1
+  HeartbeatResponse term=1
   n2 leader-changed term=1 lead=1
 > n3 ready
-  HeartbeatResp term=1
+  HeartbeatResponse term=1
   n3 leader-changed term=1 lead=1
 > n4 ready
-  HeartbeatResp term=1
+  HeartbeatResponse term=1
   n4 leader-changed term=1 lead=1
 > n5 ready
-  HeartbeatResp term=1
+  HeartbeatResponse term=1
   n5 leader-changed term=1 lead=1
-> n1 recv HeartbeatResp term=1
-> n1 recv HeartbeatResp term=1
-> n1 recv HeartbeatResp term=1
-> n1 recv HeartbeatResp term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
 > n1 ready
   AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
   AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
@@ -92,35 +92,35 @@ stabilize
 > n4 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n5 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  AppendResp term=1 match=0
+  AppendResponse term=1 match=0
 > n3 ready
-  AppendResp term=1 match=0
+  AppendResponse term=1 match=0
 > n4 ready
-  AppendResp term=1 match=0
+  AppendResponse term=1 match=0
 > n5 ready
-  AppendResp term=1 match=0
-> n1 recv AppendResp term=1 match=0
-> n1 recv AppendResp term=1 match=0
-> n1 recv AppendResp term=1 match=0
-> n1 recv AppendResp term=1 match=0
+  AppendResponse term=1 match=0
+> n1 recv AppendResponse term=1 match=0
+> n1 recv AppendResponse term=1 match=0
+> n1 recv AppendResponse term=1 match=0
+> n1 recv AppendResponse term=1 match=0
 
 flush 1 2 3 4 5
 ----
 > n2 ready
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
 > n3 ready
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
 > n4 ready
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
 > n5 ready
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
 
 stabilize
 ----
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
 > n1 ready
   AppendEntries term=1 prev=1/1 commit=0 entries=[]
   AppendEntries term=1 prev=1/1 commit=1 entries=[]
@@ -131,17 +131,17 @@ stabilize
 > n4 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
 > n5 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
 > n2 ready
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
 > n3 ready
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
 > n4 ready
-  AppendResp term=1 match=1
+  AppendResponse term=1 match=1
 > n5 ready
-  AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
-> n1 recv AppendResp term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
 
 isolate 3
 ----
@@ -216,14 +216,14 @@ stabilize
 flush 3 4 5
 ----
 > n4 ready
-  VoteResp term=2 prevote=false reject=false
+  VoteResponse term=2 prevote=false reject=false
 > n5 ready
-  VoteResp term=2 prevote=false reject=false
+  VoteResponse term=2 prevote=false reject=false
 
 stabilize
 ----
-> n3 recv VoteResp term=2 prevote=false reject=false
-> n3 recv VoteResp term=2 prevote=false reject=false
+> n3 recv VoteResponse term=2 prevote=false reject=false
+> n3 recv VoteResponse term=2 prevote=false reject=false
 > n3 ready
   Heartbeat term=2 commit=0
   Heartbeat term=2 commit=0
@@ -235,24 +235,24 @@ stabilize
 > n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n4 ready
-  HeartbeatResp term=2
+  HeartbeatResponse term=2
   n4 leader-changed term=2 lead=3
 > n5 ready
-  HeartbeatResp term=2
+  HeartbeatResponse term=2
   n5 leader-changed term=2 lead=3
-> n3 recv HeartbeatResp term=2
-> n3 recv HeartbeatResp term=2
+> n3 recv HeartbeatResponse term=2
+> n3 recv HeartbeatResponse term=2
 > n3 ready
   AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
   AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n4 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n4 ready
-  AppendResp term=2 match=1
+  AppendResponse term=2 match=1
 > n5 ready
-  AppendResp term=2 match=1
-> n3 recv AppendResp term=2 match=1
-> n3 recv AppendResp term=2 match=1
+  AppendResponse term=2 match=1
+> n3 recv AppendResponse term=2 match=1
+> n3 recv AppendResponse term=2 match=1
 > n3 ready
   AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
   AppendEntries term=2 prev=2/2 commit=1 entries=[]
@@ -263,38 +263,38 @@ stabilize
 > n5 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
 > n5 recv AppendEntries term=2 prev=2/2 commit=1 entries=[]
 > n4 ready
-  AppendResp term=2 match=1
-  AppendResp term=2 match=1
+  AppendResponse term=2 match=1
+  AppendResponse term=2 match=1
 > n5 ready
-  AppendResp term=2 match=1
-  AppendResp term=2 match=1
-> n3 recv AppendResp term=2 match=1
-> n3 recv AppendResp term=2 match=1
-> n3 recv AppendResp term=2 match=1
-> n3 recv AppendResp term=2 match=1
+  AppendResponse term=2 match=1
+  AppendResponse term=2 match=1
+> n3 recv AppendResponse term=2 match=1
+> n3 recv AppendResponse term=2 match=1
+> n3 recv AppendResponse term=2 match=1
+> n3 recv AppendResponse term=2 match=1
 
 flush 3 4 5
 ----
 > n4 ready
-  AppendResp term=2 match=2
+  AppendResponse term=2 match=2
 > n5 ready
-  AppendResp term=2 match=2
+  AppendResponse term=2 match=2
 
 stabilize
 ----
-> n3 recv AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
+> n3 recv AppendResponse term=2 match=2
+> n3 recv AppendResponse term=2 match=2
 > n3 ready
   AppendEntries term=2 prev=2/2 commit=1 entries=[]
   AppendEntries term=2 prev=2/2 commit=2 entries=[]
 > n4 recv AppendEntries term=2 prev=2/2 commit=1 entries=[]
 > n5 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
 > n4 ready
-  AppendResp term=2 match=2
+  AppendResponse term=2 match=2
 > n5 ready
-  AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
+  AppendResponse term=2 match=2
+> n3 recv AppendResponse term=2 match=2
+> n3 recv AppendResponse term=2 match=2
 
 propose 3 b
 ----
@@ -326,16 +326,16 @@ stabilize
 > n4 recv Heartbeat term=2 commit=2
 > n5 recv Heartbeat term=2 commit=2
 > n2 ready
-  HeartbeatResp term=2
+  HeartbeatResponse term=2
   n2 leader-changed term=2 lead=none
   n2 leader-changed term=2 lead=3
 > n4 ready
-  HeartbeatResp term=2
+  HeartbeatResponse term=2
 > n5 ready
-  HeartbeatResp term=2
-> n3 recv HeartbeatResp term=2
-> n3 recv HeartbeatResp term=2
-> n3 recv HeartbeatResp term=2
+  HeartbeatResponse term=2
+> n3 recv HeartbeatResponse term=2
+> n3 recv HeartbeatResponse term=2
+> n3 recv HeartbeatResponse term=2
 > n3 ready
   AppendEntries term=2 prev=1/1 commit=2 entries=[2/2 empty, 2/3 normal 0x010000000000000062]
   AppendEntries term=2 prev=2/3 commit=2 entries=[]
@@ -344,26 +344,26 @@ stabilize
 > n4 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
 > n5 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
 > n4 ready
-  AppendResp term=2 match=2
+  AppendResponse term=2 match=2
 > n5 ready
-  AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
-> n3 recv AppendResp term=2 match=2
+  AppendResponse term=2 match=2
+> n3 recv AppendResponse term=2 match=2
+> n3 recv AppendResponse term=2 match=2
 
 flush 2
 ----
 > n2 ready
-  AppendResp term=2 match=3
+  AppendResponse term=2 match=3
 
 stabilize
 ----
-> n3 recv AppendResp term=2 match=3
+> n3 recv AppendResponse term=2 match=3
 > n3 ready
   AppendEntries term=2 prev=2/3 commit=2 entries=[]
 > n2 recv AppendEntries term=2 prev=2/3 commit=2 entries=[]
 > n2 ready
-  AppendResp term=2 match=3
-> n3 recv AppendResp term=2 match=3
+  AppendResponse term=2 match=3
+> n3 recv AppendResponse term=2 match=3
 
 raft-log 2
 ----

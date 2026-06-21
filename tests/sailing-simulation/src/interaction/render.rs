@@ -23,17 +23,17 @@ pub(crate) fn render_msg(_from: u64, _to: u64, msg: &Message<u64>) -> String {
         .collect::<Vec<_>>()
         .join(", "),
     ),
-    Message::AppendResp(m) => {
+    Message::AppendResponse(m) => {
       if m.reject() {
         std::format!(
-          "AppendResp term={} reject hint={}/{}",
+          "AppendResponse term={} reject hint={}/{}",
           m.term().get(),
           m.reject_hint_term().get(),
           m.reject_hint_index().get(),
         )
       } else {
         std::format!(
-          "AppendResp term={} match={}",
+          "AppendResponse term={} match={}",
           m.term().get(),
           m.match_index().get()
         )
@@ -46,8 +46,8 @@ pub(crate) fn render_msg(_from: u64, _to: u64, msg: &Message<u64>) -> String {
       m.last_log_index().get(),
       m.pre_vote(),
     ),
-    Message::VoteResp(m) => std::format!(
-      "VoteResp term={} prevote={} reject={}",
+    Message::VoteResponse(m) => std::format!(
+      "VoteResponse term={} prevote={} reject={}",
       m.term().get(),
       m.pre_vote(),
       m.reject(),
@@ -59,24 +59,24 @@ pub(crate) fn render_msg(_from: u64, _to: u64, msg: &Message<u64>) -> String {
         m.commit().get()
       )
     }
-    Message::HeartbeatResp(m) => std::format!("HeartbeatResp term={}", m.term().get()),
+    Message::HeartbeatResponse(m) => std::format!("HeartbeatResponse term={}", m.term().get()),
     Message::InstallSnapshot(m) => std::format!(
       "InstallSnapshot term={} snap={}/{}",
       m.term().get(),
       m.snapshot().last_term().get(),
       m.snapshot().last_index().get(),
     ),
-    Message::SnapshotResp(m) => std::format!(
-      "SnapshotResp term={} reject={} match={}",
+    Message::SnapshotResponse(m) => std::format!(
+      "SnapshotResponse term={} reject={} match={}",
       m.term().get(),
       m.reject(),
       m.match_index().get(),
     ),
     Message::TimeoutNow(m) => std::format!("TimeoutNow term={}", m.term().get()),
     Message::ReadIndex(m) => std::format!("ReadIndex term={}", m.term().get()),
-    Message::ReadIndexResp(m) => {
+    Message::ReadIndexResponse(m) => {
       std::format!(
-        "ReadIndexResp term={} index={}",
+        "ReadIndexResponse term={} index={}",
         m.term().get(),
         m.index().get()
       )

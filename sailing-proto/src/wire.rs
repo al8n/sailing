@@ -318,7 +318,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       leader_commit: m.leader_commit().get(),
       ..Default::default()
     }),
-    Message::AppendResp(m) => Body::from(pb::AppendResp {
+    Message::AppendResponse(m) => Body::from(pb::AppendResponse {
       term: m.term().get(),
       from_id: encode_id(&m.from()),
       reject: m.reject(),
@@ -336,7 +336,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       leader_transfer: m.leader_transfer(),
       ..Default::default()
     }),
-    Message::VoteResp(m) => Body::from(pb::VoteResp {
+    Message::VoteResponse(m) => Body::from(pb::VoteResponse {
       term: m.term().get(),
       from_id: encode_id(&m.from()),
       pre_vote: m.pre_vote(),
@@ -351,7 +351,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       lease_round: m.lease_round(),
       ..Default::default()
     }),
-    Message::HeartbeatResp(m) => Body::from(pb::HeartbeatResp {
+    Message::HeartbeatResponse(m) => Body::from(pb::HeartbeatResponse {
       term: m.term().get(),
       from_id: encode_id(&m.from()),
       context: m.context_bytes(),
@@ -367,7 +367,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       data: m.data().clone(),
       ..Default::default()
     }),
-    Message::SnapshotResp(m) => Body::from(pb::SnapshotResp {
+    Message::SnapshotResponse(m) => Body::from(pb::SnapshotResponse {
       term: m.term().get(),
       from_id: encode_id(&m.from()),
       reject: m.reject(),
@@ -385,7 +385,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       context: m.context_bytes(),
       ..Default::default()
     }),
-    Message::ReadIndexResp(m) => Body::from(pb::ReadIndexResp {
+    Message::ReadIndexResponse(m) => Body::from(pb::ReadIndexResponse {
       term: m.term().get(),
       from_id: encode_id(&m.from()),
       index: m.index().get(),
@@ -415,7 +415,7 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
         .collect::<Result<Vec<_>, _>>()?,
       Index::new(m.leader_commit),
     )),
-    Body::AppendResp(m) => Message::AppendResp(crate::AppendResp::new(
+    Body::AppendResponse(m) => Message::AppendResponse(crate::AppendResponse::new(
       Term::new(m.term),
       decode_id(&m.from_id)?,
       m.reject,
@@ -431,7 +431,7 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
       m.pre_vote,
       m.leader_transfer,
     )),
-    Body::VoteResp(m) => Message::VoteResp(crate::VoteResp::new(
+    Body::VoteResponse(m) => Message::VoteResponse(crate::VoteResponse::new(
       Term::new(m.term),
       decode_id(&m.from_id)?,
       m.pre_vote,
@@ -446,15 +446,15 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
       )
       .with_lease_round(m.lease_round),
     ),
-    Body::HeartbeatResp(m) => {
+    Body::HeartbeatResponse(m) => {
       // Validate on the FULL u64 before narrowing: the schema deliberately carries nanos
       // as uint64 because protobuf uint32 decoding truncates oversized varints by spec,
       // which would let 2^32 + k slip past a post-truncation bound as k.
       if m.lease_support_nanos >= 1_000_000_000 {
         return Err(DecodeError::Invalid("lease_support nanos"));
       }
-      Message::HeartbeatResp(
-        crate::HeartbeatResp::new(Term::new(m.term), decode_id(&m.from_id)?, m.context)
+      Message::HeartbeatResponse(
+        crate::HeartbeatResponse::new(Term::new(m.term), decode_id(&m.from_id)?, m.context)
           .with_lease_round(m.lease_round)
           .with_lease_support(core::time::Duration::new(
             m.lease_support_secs,
@@ -474,7 +474,7 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
         m.data,
       ))
     }
-    Body::SnapshotResp(m) => Message::SnapshotResp(crate::SnapshotResp::new(
+    Body::SnapshotResponse(m) => Message::SnapshotResponse(crate::SnapshotResponse::new(
       Term::new(m.term),
       decode_id(&m.from_id)?,
       m.reject,
@@ -489,7 +489,7 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
       decode_id(&m.from_id)?,
       m.context,
     )),
-    Body::ReadIndexResp(m) => Message::ReadIndexResp(crate::ReadIndexResp::new(
+    Body::ReadIndexResponse(m) => Message::ReadIndexResponse(crate::ReadIndexResponse::new(
       Term::new(m.term),
       decode_id(&m.from_id)?,
       Index::new(m.index),

@@ -244,7 +244,7 @@ pub trait LogStore {
   /// **Completion discipline:** any in-flight `submit_append` completions for indices that
   /// are now below the new `first_index` MUST be dropped (not returned by future `poll`
   /// calls). Returning a stale `Appended` completion for a discarded index would cause the
-  /// core to emit a spurious `AppendResp`, potentially advancing the leader's commit past
+  /// core to emit a spurious `AppendResponse`, potentially advancing the leader's commit past
   /// what the follower has actually stored.
   ///
   /// **Durability ordering (NORMATIVE — disk-backed implementations):** `restore` re-baselines

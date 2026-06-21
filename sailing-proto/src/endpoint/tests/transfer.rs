@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  AppendEntries, AppendResp, ProposeError, TimeoutNow, TransferError, VoteResp,
+  AppendEntries, AppendResponse, ProposeError, TimeoutNow, TransferError, VoteResponse,
   testkit::{CountSm, NoopStable, VecLog},
 };
 
@@ -42,7 +42,7 @@ fn leader_transfer_revokes_leasebased_read_authority() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(ep.role().is_leader());
@@ -52,7 +52,7 @@ fn leader_transfer_revokes_leasebased_read_authority() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -128,7 +128,7 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(ep.role().is_leader());
@@ -138,7 +138,7 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -284,7 +284,7 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
 }
 
 /// Test 2: transfer_leader to a LAGGING follower does NOT send TimeoutNow yet.
-/// TimeoutNow is sent only when on_append_resp brings the target to last_index.
+/// TimeoutNow is sent only when on_append_response brings the target to last_index.
 #[test]
 fn transfer_to_lagging_follower_waits_for_catch_up() {
   use core::time::Duration;
@@ -308,7 +308,7 @@ fn transfer_to_lagging_follower_waits_for_catch_up() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Drain storage (no-op append).
@@ -344,7 +344,7 @@ fn transfer_to_lagging_follower_waits_for_catch_up() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       2u64,
       false,
@@ -593,7 +593,7 @@ fn timeout_now_bypasses_prevote_and_lease() {
   // follower3 must have granted the vote (not rejected it due to the lease).
   let mut granted = false;
   while let Some(out) = follower3.poll_message() {
-    if let Message::VoteResp(vr) = out.message()
+    if let Message::VoteResponse(vr) = out.message()
       && !vr.reject()
     {
       granted = true;
@@ -630,7 +630,7 @@ fn transfer_to_learner_rejected() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
 
@@ -676,7 +676,7 @@ fn transfer_to_learner_rejected() {
 ///   - a subsequent `propose` must SUCCEED (not `LeaderTransferInProgress`)
 #[test]
 fn transfer_aborted_when_transferee_removed_by_conf_change() {
-  use crate::{AppendResp, ConfChange, ConfChangeType, Index, Message, ProposeError, Term};
+  use crate::{AppendResponse, ConfChange, ConfChangeType, Index, Message, ProposeError, Term};
   use core::time::Duration;
 
   let (mut ep, mut log, mut stable, d) = make_three_node_leader();
@@ -759,7 +759,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
     &mut log,
     &mut stable,
     3u64,
-    Message::AppendResp(AppendResp::new(
+    Message::AppendResponse(AppendResponse::new(
       Term::new(1),
       3u64,
       false,

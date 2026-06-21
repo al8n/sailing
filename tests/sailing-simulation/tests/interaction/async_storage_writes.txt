@@ -2,7 +2,7 @@
 # explicit flush, so a node withholds its vote until the vote write is durable (persist-before-send).
 # Three async voters: node 1 campaigns but casts no self-vote yet (its vote is only staged); the
 # first flush makes node 1's vote durable and releases the RequestVotes; stabilize delivers them, and
-# each follower stages its own vote WITHOUT replying; only after flushing 2 and 3 are their VoteResps
+# each follower stages its own vote WITHOUT replying; only after flushing 2 and 3 are their VoteResponses
 # released, letting node 1 reach quorum and become leader. (Full async commit propagation of the
 # election no-op is exercised exhaustively by the VOPR; here we isolate the vote-durability gate.)
 add-nodes 3 voters=(1,2,3) async=true
@@ -29,14 +29,14 @@ stabilize
 flush 1 2 3
 ----
 > n2 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 > n3 ready
-  VoteResp term=1 prevote=false reject=false
+  VoteResponse term=1 prevote=false reject=false
 
 stabilize
 ----
-> n1 recv VoteResp term=1 prevote=false reject=false
-> n1 recv VoteResp term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
 > n1 ready
   Heartbeat term=1 commit=0
   Heartbeat term=1 commit=0
@@ -48,24 +48,24 @@ stabilize
 > n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  HeartbeatResp term=1
+  HeartbeatResponse term=1
   n2 leader-changed term=1 lead=1
 > n3 ready
-  HeartbeatResp term=1
+  HeartbeatResponse term=1
   n3 leader-changed term=1 lead=1
-> n1 recv HeartbeatResp term=1
-> n1 recv HeartbeatResp term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
 > n1 ready
   AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
   AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
 > n2 ready
-  AppendResp term=1 match=0
+  AppendResponse term=1 match=0
 > n3 ready
-  AppendResp term=1 match=0
-> n1 recv AppendResp term=1 match=0
-> n1 recv AppendResp term=1 match=0
+  AppendResponse term=1 match=0
+> n1 recv AppendResponse term=1 match=0
+> n1 recv AppendResponse term=1 match=0
 
 raft-state
 ----

@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  ProposeError, VoteResp,
+  ProposeError, VoteResponse,
   testkit::{CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
 };
 use core::time::Duration;
@@ -52,7 +52,7 @@ fn propose_at_max_index_is_refused_not_truncating() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -110,7 +110,7 @@ fn propose_reserves_sentinel_max_index() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -154,7 +154,7 @@ fn op_ids_are_minted_distinctly() {
   assert_eq!(b.get(), a.get() + 1);
 }
 
-/// Persist-before-RESPOND, core-enforced: a follower must not send a SUCCESS `AppendResp` under
+/// Persist-before-RESPOND, core-enforced: a follower must not send a SUCCESS `AppendResponse` under
 /// a term whose HardState write is not yet durable (Raft §5.1: persist `currentTerm` before responding
 /// to RPCs). A higher-term heartbeat (no entries) adopts the term in memory and submits the term write,
 /// but the success ack is DEFERRED until that write is durable — then released by `handle_storage`.
@@ -195,7 +195,7 @@ fn follower_defers_success_ack_until_term_durable() {
     "the success ack must be deferred while the term is not durable"
   );
   let early: Vec<_> = core::iter::from_fn(|| ep.poll_message())
-    .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
+    .filter(|o| matches!(o.message(), Message::AppendResponse(a) if !a.reject()))
     .collect();
   assert!(
     early.is_empty(),
@@ -214,7 +214,7 @@ fn follower_defers_success_ack_until_term_durable() {
     "the deferred ack was released"
   );
   let acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
-    .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
+    .filter(|o| matches!(o.message(), Message::AppendResponse(a) if !a.reject()))
     .collect();
   assert_eq!(
     acks.len(),
@@ -324,7 +324,7 @@ fn serviceable_now_mirrors_dispatch() {
     &mut log_cq,
     &mut stable_cq,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep_cq.role().is_leader());
   assert!(ep_cq.config.check_quorum());
@@ -446,7 +446,7 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
     &mut log_cq,
     &mut stable_cq,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep_cq.role().is_leader());
   let hb = ep_cq.heartbeat_deadline.expect("heartbeat armed");
@@ -611,7 +611,7 @@ fn handle_timeout_makes_progress_no_wedge() {
     &mut log_cq,
     &mut stable_cq,
     2u64,
-    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep_cq.role().is_leader());
   // Force both timers to now.
@@ -838,11 +838,11 @@ fn poison_reason_as_str_display_and_predicate() {
 }
 
 /// A node that POISONS mid-handler must emit NOTHING for the rest of that handler — no
-/// `HeartbeatResp` (the central `send` halt) and no `ReadState`. Here a `Heartbeat` advances commit
+/// `HeartbeatResponse` (the central `send` halt) and no `ReadState`. Here a `Heartbeat` advances commit
 /// over a durable-but-undecodable `Normal` entry; `apply_committed` poisons (`NormalEntryDecode`)
-/// and the handler would otherwise still queue a `HeartbeatResp` to the leader.
+/// and the handler would otherwise still queue a `HeartbeatResponse` to the leader.
 ///
-/// FAILS-ON-OLD: without the `send` guard the poisoned follower still replies a `HeartbeatResp`,
+/// FAILS-ON-OLD: without the `send` guard the poisoned follower still replies a `HeartbeatResponse`,
 /// acking a heartbeat it can no longer honor.
 #[test]
 fn poison_after_apply_emits_nothing() {
@@ -871,7 +871,7 @@ fn poison_after_apply_emits_nothing() {
   )]);
 
   // A heartbeat from leader 1 with commit=1 makes the follower advance commit to 1 and apply —
-  // the apply poisons. The handler then reaches its tail `send(HeartbeatResp)`, which must be
+  // the apply poisons. The handler then reaches its tail `send(HeartbeatResponse)`, which must be
   // suppressed by the central `send` poison-guard.
   ep.handle_message(
     Instant::ORIGIN,
@@ -891,10 +891,10 @@ fn poison_after_apply_emits_nothing() {
     "follower must be poisoned by the undecodable committed entry"
   );
   assert_eq!(ep.poison_reason(), Some(PoisonReason::NormalEntryDecode));
-  // No HeartbeatResp (nor any other message) may leak out of a poisoned node.
+  // No HeartbeatResponse (nor any other message) may leak out of a poisoned node.
   assert!(
     ep.poll_message().is_none(),
-    "a poisoned node must emit no message (no HeartbeatResp ack)"
+    "a poisoned node must emit no message (no HeartbeatResponse ack)"
   );
   // And no ReadState event slipped out either.
   assert!(
@@ -904,7 +904,7 @@ fn poison_after_apply_emits_nothing() {
 }
 
 /// Follower side: a fatal term-read inside `find_conflict_by_term` during an AppendEntries
-/// reject walk must short-circuit — the node poisons and sends NO reject `AppendResp`.
+/// reject walk must short-circuit — the node poisons and sends NO reject `AppendResponse`.
 ///
 /// On the follower path the no-send guarantee is enforced jointly by FIX 1 (propagate `None`) and
 /// the pre-existing `hint_term` guard (the index `find_conflict_by_term` fails on is the same index
@@ -976,7 +976,7 @@ fn find_conflict_by_term_poison_propagation_follower() {
   assert_eq!(ep.poison_reason(), Some(PoisonReason::LogTerm));
   assert!(
     ep.poll_message().is_none(),
-    "no reject AppendResp may be sent on a fabricated conflict index"
+    "no reject AppendResponse may be sent on a fabricated conflict index"
   );
 }
 

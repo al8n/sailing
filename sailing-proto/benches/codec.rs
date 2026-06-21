@@ -10,8 +10,8 @@
 use bytes::Bytes;
 use criterion::{Criterion, criterion_group, criterion_main};
 use sailing_proto::{
-  AppendEntries, Data, Entry, EntryKind, Heartbeat, HeartbeatResp, Index, InstallSnapshot, Message,
-  RequestVote, SnapshotMeta, Term, conf::ConfState, wire,
+  AppendEntries, Data, Entry, EntryKind, Heartbeat, HeartbeatResponse, Index, InstallSnapshot,
+  Message, RequestVote, SnapshotMeta, Term, conf::ConfState, wire,
 };
 use std::{collections::BTreeSet, hint::black_box, time::Duration};
 
@@ -66,9 +66,9 @@ fn corpus() -> Vec<(&'static str, Message<u64>)> {
       )),
     ),
     (
-      "heartbeat_resp_lease",
-      Message::HeartbeatResp(
-        HeartbeatResp::new(Term::new(7), 2, Bytes::from_static(b"ctx"))
+      "heartbeat_response_lease",
+      Message::HeartbeatResponse(
+        HeartbeatResponse::new(Term::new(7), 2, Bytes::from_static(b"ctx"))
           .with_lease_round(3)
           .with_lease_support(Duration::from_millis(150)),
       ),

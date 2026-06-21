@@ -11,8 +11,8 @@
 use bytes::Bytes;
 use criterion::{BatchSize, BenchmarkId, Criterion, criterion_group, criterion_main};
 use sailing_proto::{
-  AppendResp, Config, Endpoint, HeartbeatResp, Index, Instant, Message, ReadOnlyOption, Term,
-  VoteResp,
+  AppendResponse, Config, Endpoint, HeartbeatResponse, Index, Instant, Message, ReadOnlyOption,
+  Term, VoteResponse,
 };
 use sailing_simulation::{LogSm, MemLog, MemStable};
 use std::{hint::black_box, time::Duration};
@@ -27,8 +27,8 @@ type Ep = Endpoint<u64, LogSm>;
 type Harness = (Ep, MemLog, MemStable<u64>, Instant);
 
 /// Drive the leader to FULL quiescence: repeatedly drain its outbound messages and answer each
-/// (every `AppendEntries` with an `AppendResp` at the implied match, every `Heartbeat` with a
-/// lease-bearing `HeartbeatResp`), making each resulting commit durable, until the leader emits
+/// (every `AppendEntries` with an `AppendResponse` at the implied match, every `Heartbeat` with a
+/// lease-bearing `HeartbeatResponse`), making each resulting commit durable, until the leader emits
 /// nothing more. This brings EVERY follower (not just a quorum) to `match == last` / Replicate
 /// and drains all setup residue — the true steady state, so the benches time their claimed round
 /// and not leftover catch-up traffic.
@@ -63,7 +63,7 @@ fn settle(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, now: Insta
         log,
         stable,
         peer,
-        Message::AppendResp(AppendResp::new(
+        Message::AppendResponse(AppendResponse::new(
           term,
           peer,
           false,
@@ -79,8 +79,8 @@ fn settle(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, now: Insta
         log,
         stable,
         peer,
-        Message::HeartbeatResp(
-          HeartbeatResp::new(term, peer, ctx)
+        Message::HeartbeatResponse(
+          HeartbeatResponse::new(term, peer, ctx)
             .with_lease_round(lease)
             .with_lease_support(LEASE_SUPPORT),
         ),
@@ -119,7 +119,7 @@ fn elect_leader(n: usize) -> Harness {
       &mut log,
       &mut stable,
       from,
-      Message::VoteResp(VoteResp::new(term, from, false, false)),
+      Message::VoteResponse(VoteResponse::new(term, from, false, false)),
     );
   }
   ep.handle_storage(now, &mut log, &mut stable); // become_leader appends + stores the no-op
@@ -137,7 +137,7 @@ fn elect_leader(n: usize) -> Harness {
 
 /// One steady-state heartbeat round (no new entries ⇒ commit does not advance ⇒ repeatable):
 /// fire the leader's heartbeat timer, then answer every outgoing message — a `Heartbeat` with a
-/// lease-bearing `HeartbeatResp`, any stray `AppendEntries` with an `AppendResp` — so
+/// lease-bearing `HeartbeatResponse`, any stray `AppendEntries` with an `AppendResponse` — so
 /// `recent_active` and the lease quorum stay live (keeping check-quorum from stepping the leader
 /// down) and the `peers()`/broadcast/`vote_result`/lease work actually runs.
 fn heartbeat_round(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, now: &mut Instant) {
@@ -172,8 +172,8 @@ fn heartbeat_round(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, n
         log,
         stable,
         peer,
-        Message::HeartbeatResp(
-          HeartbeatResp::new(term, peer, ctx)
+        Message::HeartbeatResponse(
+          HeartbeatResponse::new(term, peer, ctx)
             .with_lease_round(lease)
             .with_lease_support(LEASE_SUPPORT),
         ),
@@ -183,7 +183,7 @@ fn heartbeat_round(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, n
         log,
         stable,
         peer,
-        Message::AppendResp(AppendResp::new(
+        Message::AppendResponse(AppendResponse::new(
           term,
           peer,
           false,
@@ -197,7 +197,7 @@ fn heartbeat_round(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, n
   ep.handle_storage(*now, log, stable);
 }
 
-/// Propose one entry and carry it to committed-and-applied via a quorum of `AppendResp`s.
+/// Propose one entry and carry it to committed-and-applied via a quorum of `AppendResponse`s.
 /// Exercises `committed_index` (the per-ack match-vector sort), `maybe_send_append`, and
 /// `apply_committed`. RETURNS the harness so criterion drops it OUTSIDE the timed interval
 /// (otherwise the teardown of the endpoint + stores pollutes a sub-µs measurement).
@@ -217,7 +217,7 @@ fn replicate_one(mut h: Harness, n: usize) -> Harness {
         log,
         stable,
         from,
-        Message::AppendResp(AppendResp::new(
+        Message::AppendResponse(AppendResponse::new(
           term,
           from,
           false,

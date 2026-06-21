@@ -458,17 +458,17 @@ fn reconcile_restart_log(
 /// What the core owes once a storage write completes.
 #[derive(Debug, Clone, Copy)]
 enum Pending<I> {
-  /// Emit `VoteResp(grant)` to `to` once the term+vote write is durable.
+  /// Emit `VoteResponse(grant)` to `to` once the term+vote write is durable.
   /// `term` records the term at which the vote was cast so stale completions can be
   /// detected and dropped if the term has since advanced.
   CastVote { to: I, term: Term },
-  /// Emit `AppendResp(success, match_index)` to `to` once the log append is durable.
+  /// Emit `AppendResponse(success, match_index)` to `to` once the log append is durable.
   FollowerAck { to: I, match_index: Index },
   /// Advance the leader's own `match_index` to `upto` (and re-check commit) once durable.
   LeaderAppend { upto: Index },
   /// The candidate's term+self-vote hard-state write is in flight. Until it is durable the self-vote
   /// must NOT be acted on: `become_leader` (single-node now, or once peer votes arrive) fires from
-  /// `on_stable_wrote`/`on_vote_resp` only after this completes. `term` guards a stale completion that
+  /// `on_stable_wrote`/`on_vote_response` only after this completes. `term` guards a stale completion that
   /// arrives after the term advanced. This makes the candidate's self-vote persist-before-act,
   /// symmetric with the follower's `CastVote` — otherwise a node could lead in a term on an un-durable
   /// self-vote, crash, restart with no recorded vote, and grant another candidate the same term.
@@ -477,7 +477,7 @@ enum Pending<I> {
 
 /// Cap on the number of distinct read contexts a follower may hold in-flight to its leader at once
 /// (the [`ForwardedReads`] set). A follower inserts a context before forwarding and removes it only
-/// on the matching `ReadIndexResp`; if the request or its response is dropped while the leader stays
+/// on the matching `ReadIndexResponse`; if the request or its response is dropped while the leader stays
 /// stable, distinct retry contexts would otherwise accumulate without bound. At the cap the oldest
 /// in-flight context is evicted FIFO. Kept independent of `max_inflight_msgs` (the leader's per-peer
 /// replication window) because the two limits are unrelated; 256 is the same generous default.
@@ -491,9 +491,9 @@ const MAX_FORWARDED_READS: usize = 256;
 const MAX_LEADER_READS: usize = 256;
 
 /// The reads this node (as a FOLLOWER) has forwarded to its current leader and is still awaiting a
-/// `ReadIndexResp` for. Each is keyed by an INTERNAL token (NOT the application context) — the
+/// `ReadIndexResponse` for. Each is keyed by an INTERNAL token (NOT the application context) — the
 /// follower-side mirror of the leader's round-token fix: the token is what travels in the forwarded
-/// `ReadIndex`/`ReadIndexResp`, so a stale or duplicated response echoing an earlier forward's token
+/// `ReadIndex`/`ReadIndexResponse`, so a stale or duplicated response echoing an earlier forward's token
 /// can never complete a LATER read that reused the same user context. The user context rides alongside
 /// for the `DuplicateContext` in-flight guard and for the emitted `ReadState`. Backed by a `VecDeque`
 /// (FIFO) and bounded at [`MAX_FORWARDED_READS`] via BACK-PRESSURE (a full set rejects the new read
@@ -503,7 +503,7 @@ const MAX_LEADER_READS: usize = 256;
 /// The token is `boot_epoch (8 bytes) || counter (8 bytes)`. `counter` is unique WITHIN an incarnation;
 /// `boot_epoch` (durable, app-provided via [`Endpoint::restart`], strictly increasing per restart) makes
 /// tokens unique ACROSS restarts. Without it a same-term restart resets `counter` to 0, and a delayed
-/// pre-crash `ReadIndexResp` could complete a post-restart read at a stale index — a linearizability
+/// pre-crash `ReadIndexResponse` could complete a post-restart read at a stale index — a linearizability
 /// break under a transport that redelivers pre-crash messages.
 #[derive(Debug, Default)]
 struct ForwardedReads {
@@ -539,7 +539,7 @@ impl ForwardedReads {
   }
 
   /// Record a NEW forwarded read for user `context` and return its fresh internal token (sent to the
-  /// leader as the `ReadIndex` context and echoed back in the `ReadIndexResp`). The caller has already
+  /// leader as the `ReadIndex` context and echoed back in the `ReadIndexResponse`). The caller has already
   /// verified `!contains_context(context)` (dedup) AND `!is_full()` (back-pressure).
   fn push(&mut self, context: Bytes) -> Bytes {
     let mut buf = [0u8; 16];
@@ -553,7 +553,7 @@ impl ForwardedReads {
 
   /// Remove the forwarded read identified by `token` (the echoed correlator), returning its user
   /// context if present. `None` means unsolicited / stale / already-completed — doubling as the
-  /// already-completed guard in `on_read_index_resp`.
+  /// already-completed guard in `on_read_index_response`.
   fn remove_by_token(&mut self, token: &[u8]) -> Option<Bytes> {
     let pos = self.order.iter().position(|(t, _)| t.as_ref() == token)?;
     self.order.remove(pos).map(|(_, ctx)| ctx)
@@ -618,7 +618,7 @@ struct Durability<I> {
   /// `restart` (so the choke-point doesn't immediately re-persist an unchanged value).
   committed_persisted: Index,
   /// Highest log index durably persisted (an append's LogDone::Appended fired). Every outbound
-  /// AppendResp match is clamped to this so a follower never reports an index only in its
+  /// AppendResponse match is clamped to this so a follower never reports an index only in its
   /// visible-but-unflushed tail (persist-before-ack on the immediate-ack path too).
   durable_index: Index,
   /// The highest DURABLE snapshot boundary this node holds — a SEPARATE durability watermark from
@@ -640,7 +640,7 @@ struct Durability<I> {
   /// `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init empty
   /// in `new` and `restart`.
   inflight_append_upto: BTreeMap<OpId, Index>,
-  /// A SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
+  /// A SUCCESS `AppendResponse` deferred until `self.term` is durable — `(leader, term, proven)`
   /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
   /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
   /// (Raft §5.1: persist `currentTerm` before responding to RPCs). Flushed in `on_stable_wrote` as
@@ -648,7 +648,7 @@ struct Durability<I> {
   /// but-divergent tail) and `ack_watermark()` caps to durability. A superseded-term tag
   /// is dropped; same-`(leader, term)` deferrals keep the MAX proven extent (acks are cumulative).
   term_gated_append_ack: Option<(I, Term, Index)>,
-  /// A SUCCESS `SnapshotResp` deferred until `self.term` is durable — the snapshot analogue of
+  /// A SUCCESS `SnapshotResponse` deferred until `self.term` is durable — the snapshot analogue of
   /// `term_gated_append_ack` (`proven` = the snapshot boundary / committed match).
   term_gated_snapshot_ack: Option<(I, Term, Index)>,
   /// Post-restart vote-suppression fence (LeaseBased crash-safety). A node that crashed may have
@@ -670,8 +670,8 @@ struct Durability<I> {
 #[derive(Debug)]
 struct CheckQuorumLease<I> {
   /// The leader's CURRENT CheckQuorum lease round (bumped on every heartbeat broadcast). Carried in
-  /// each `Heartbeat` and echoed in `HeartbeatResp`, it is what makes the LeaseBased read lease
-  /// FRESH: only a `HeartbeatResp` echoing this exact round counts toward renewing the lease, so a
+  /// each `Heartbeat` and echoed in `HeartbeatResponse`, it is what makes the LeaseBased read lease
+  /// FRESH: only a `HeartbeatResponse` echoing this exact round counts toward renewing the lease, so a
   /// stale or duplicated earlier-round response cannot keep an isolated leader's lease alive
   /// round response cannot keep an isolated leader's lease alive. Meaningful only while leader.
   lease_round: u64,
@@ -684,7 +684,7 @@ struct CheckQuorumLease<I> {
   /// Voters that ENFORCE the lease and have acked the CURRENT `lease_round` (the leader counts itself
   /// implicitly). Cleared on every heartbeat broadcast (each round must be freshly re-confirmed). When
   /// this set plus self forms a voter quorum, the read lease (`lease_valid_until`) is renewed. A
-  /// non-enforcing follower (HeartbeatResp `lease_support == 0`) is NOT inserted here, so it cannot keep
+  /// non-enforcing follower (HeartbeatResponse `lease_support == 0`) is NOT inserted here, so it cannot keep
   /// the lease alive.
   lease_acks: BTreeSet<I>,
   /// The MINIMUM lease-support duration advertised across the contributing quorum this round
@@ -1004,11 +1004,11 @@ struct Reads<I> {
   /// Each element is `(context, from)` matching `add_request`'s signature.
   pending_reads: Vec<(Bytes, Option<I>)>,
   /// Read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
-  /// awaiting a `ReadIndexResp` for. The follower-side mirror of the leader's
+  /// awaiting a `ReadIndexResponse` for. The follower-side mirror of the leader's
   /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
   /// `DuplicateContext` instead of being silently coalesced (or unboundedly re-forwarded), so the
   /// originator is never left waiting on a confirmation the first forward already owns. Removed on
-  /// the matching `ReadIndexResp`, FIFO-evicted at [`MAX_FORWARDED_READS`] (so dropped reads cannot
+  /// the matching `ReadIndexResponse`, FIFO-evicted at [`MAX_FORWARDED_READS`] (so dropped reads cannot
   /// grow it without bound), and cleared wholesale on any term change or leader change (a read
   /// forwarded to a now-stale leader must not block re-issuing it to the new one).
   forwarded_reads: ForwardedReads,
@@ -1614,10 +1614,10 @@ where
 
   /// The single outbound choke-point. A poisoned node emits NOTHING: a fatal fault can strike
   /// mid-handler (e.g. `apply_committed` poisons inside `on_heartbeat`/`on_append_entries`, after
-  /// which the handler would otherwise still queue a `HeartbeatResp`/`AppendResp`), and a poisoned
+  /// which the handler would otherwise still queue a `HeartbeatResponse`/`AppendResponse`), and a poisoned
   /// node that keeps replying to peers — acking entries it can no longer guarantee, granting reads it
   /// cannot confirm — is a safety hazard, not merely a dead node. Suppressing centrally here covers
-  /// every message kind (HeartbeatResp/AppendResp/AppendEntries/VoteResp/ReadIndex(Resp)/…) without a
+  /// every message kind (HeartbeatResponse/AppendResponse/AppendEntries/VoteResponse/ReadIndex(Response)/…) without a
   /// per-handler guard. `poison()` only sets a flag and emits no event, so this drops the message
   /// silently; the driver surfaces the fault via `poison_reason()`.
   fn send(&mut self, to: I, msg: Message<I>) {
@@ -1730,14 +1730,14 @@ where
       // *advertised* future term (it has only proposed it; it adopts only once a quorum grants) —
       // adopting it would let a partitioned node's pre-votes raise the cluster term, the very
       // disruption PreVote exists to prevent. But a REJECTED pre-vote response carries the
-      // responder's REAL current term (`on_request_vote`: `resp_term = if grant { rv.term() } else
+      // responder's REAL current term (`on_request_vote`: `response_term = if grant { rv.term() } else
       // { self.term }`), so a pre-candidate that is genuinely behind MUST adopt it. Otherwise, with
       // no third node to bump its term — a 2-voter cluster, or any pair where the peer self-voted at
       // a higher term — it stays a stale PreCandidate forever, re-proposing a term the peer keeps
       // rejecting: a livelock. (Matches etcd, which skips the term bump only for `MsgPreVote` and a
       // granted `MsgPreVoteResp`.)
       let advertised_prevote = matches!(&msg, Message::RequestVote(rv) if rv.pre_vote())
-        || matches!(&msg, Message::VoteResp(vr) if vr.pre_vote() && !vr.reject());
+        || matches!(&msg, Message::VoteResponse(vr) if vr.pre_vote() && !vr.reject());
       if advertised_prevote {
         // Fall through without adopting the term, stepping down, or persisting.
       } else {
@@ -1806,7 +1806,7 @@ where
         // means the sender BELIEVES it is the leader but is behind our term — we advanced (e.g.
         // campaigned) during a partition, then rejoined. It can never replicate to us (we reject
         // its lower-term entries), and we may be too far behind to win an election ourselves, so a
-        // silent drop wedges us BOTH forever. Reply with an AppendResp at OUR (higher) term: the
+        // silent drop wedges us BOTH forever. Reply with an AppendResponse at OUR (higher) term: the
         // stale leader sees the higher term and steps down, and the ensuing election lifts the
         // cluster to our term so the winner can finally replicate to us. Only when CheckQuorum or
         // PreVote is enabled (it is the mechanism those modes rely on; plain Raft has the disruptive
@@ -1820,7 +1820,7 @@ where
           let me = self.config.id();
           self.send(
             from,
-            Message::AppendResp(crate::AppendResp::new(
+            Message::AppendResponse(crate::AppendResponse::new(
               self.term,
               me,
               true,
@@ -1850,15 +1850,15 @@ where
     #[allow(unreachable_patterns)] // `_ => {}` is a forward-compat guard for future variants
     match msg {
       Message::RequestVote(rv) => self.on_request_vote(now, log, stable, rv),
-      Message::VoteResp(vr) => self.on_vote_resp(now, log, stable, vr),
+      Message::VoteResponse(vr) => self.on_vote_response(now, log, stable, vr),
       Message::Heartbeat(hb) => self.on_heartbeat(now, log, hb),
       Message::AppendEntries(ae) => self.on_append_entries(now, log, stable, ae),
-      Message::AppendResp(r) => self.on_append_resp(now, log, stable, from, r),
-      Message::HeartbeatResp(hr) => self.on_heartbeat_resp(now, from, log, stable, hr),
+      Message::AppendResponse(r) => self.on_append_response(now, log, stable, from, r),
+      Message::HeartbeatResponse(hr) => self.on_heartbeat_response(now, from, log, stable, hr),
       Message::ReadIndex(ri) => self.on_read_index(now, log, stable, ri),
-      Message::ReadIndexResp(r) => self.on_read_index_resp(from, r),
+      Message::ReadIndexResponse(r) => self.on_read_index_response(from, r),
       Message::InstallSnapshot(is) => self.on_install_snapshot(now, stable, is),
-      Message::SnapshotResp(r) => self.on_snapshot_resp(now, log, stable, from, r),
+      Message::SnapshotResponse(r) => self.on_snapshot_response(now, log, stable, from, r),
       Message::TimeoutNow(tn) => self.on_timeout_now(now, log, stable, tn),
       _ => {}
     }
@@ -2109,10 +2109,10 @@ where
               }
             };
             match self.fsm.apply(idx, cmd) {
-              Ok(resp) => self
+              Ok(response) => self
                 .outputs
                 .events
-                .push_back(Event::Applied(crate::Applied::new(idx, resp))),
+                .push_back(Event::Applied(crate::Applied::new(idx, response))),
               // An FSM apply error is fatal (the SM diverges from the committed log) → poison.
               Err(_) => {
                 self.poison(PoisonReason::Apply);

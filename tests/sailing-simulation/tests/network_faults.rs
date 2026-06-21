@@ -5,7 +5,7 @@
 //!
 //! This is exactly the scenario the M2 conflict-conditional-truncation fix and the M3/deferred-
 //! completion model protect against: a duplicate AppendEntries must not double-append, a reordered/
-//! duplicated VoteResp must not double-vote, and a dropped append must be re-replicated. The
+//! duplicated VoteResponse must not double-vote, and a dropped append must be re-replicated. The
 //! structural oracles (append-before-ack, one-grant-per-term) stay ENABLED in `Cluster::tick` and
 //! run on every SENT message — so if a reorder/dup tripped one, this test would PANIC with the
 //! seed, surfacing a real proto bug rather than a loosened oracle.

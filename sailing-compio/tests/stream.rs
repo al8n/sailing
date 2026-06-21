@@ -40,7 +40,7 @@ async fn submit_anywhere(handles: &[Handle<u64, CountSm>], payload: &'static [u8
       "no commit within the deadline"
     );
     match handles[at].submit(Bytes::from_static(payload)).await {
-      Ok(resp) => return resp,
+      Ok(response) => return response,
       Err(DriverError::NotLeader { leader }) => {
         at = leader
           .map(|l| (l - 1) as usize)
