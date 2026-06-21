@@ -1,5 +1,5 @@
 #![allow(missing_docs)]
-//! M8-U6 milestone gate: run every data-driven interaction scenario in `tests/interaction/*.txt`
+//! Run every data-driven interaction scenario in `tests/interaction/*.txt`
 //! against the proto via the harness, comparing each directive's rendered output against its
 //! recorded golden. Regenerate the goldens with `SAILING_REWRITE=1 cargo test -p sailing-simulation
 //! --test interaction`.

@@ -211,7 +211,7 @@ fn vopr_exercises_failover_precise_anchor_under_offset() {
 /// LIVENESS held (`committed > 0` — the gross clock violation did not starve the cluster).
 ///
 /// It does NOT try to CATCH a stale serve in-band (there is no record-caught suppression — a stale
-/// inherited serve always panics). A multi-expert audit proved a stale inherited serve is STRUCTURALLY
+/// inherited serve always panics). A stale inherited serve is STRUCTURALLY
 /// UNREACHABLE in a random run via a clock-offset injection: the inherited-serve window holder is ALWAYS a
 /// live Leader still inside its post-election commit-wait, and the serve gate (`now_wall + 2·ε_unc < s_c +
 /// W_c`) and the release gate (`now_wall > s_c + W_c + 2·ε_unc`) are exact DUALS on the same wall floor —
@@ -538,7 +538,7 @@ fn drive_committed_unapplied_gap(seed: u64) -> (Cluster, u64) {
   (c, follower)
 }
 
-/// REGRESSION (the Codex apply-lag finding): the per-key value oracle's invocation floor `v_inv` must
+/// REGRESSION (the apply-lag finding): the per-key value oracle's invocation floor `v_inv` must
 /// be sourced from the COMMITTED LOG frontier, not the APPLIED state machine. At a captured instant
 /// where `(GAP_KEY, V_NEW)` is committed on a node but not yet applied there, that node's
 /// committed-frontier value is V_NEW (the completed-write floor) while its applied-state value is still
@@ -765,7 +765,7 @@ fn drive_compacted_out_gap(seed: u64) -> (Cluster, u64, sailing_proto::Index) {
   (c, node, compact_index)
 }
 
-/// REGRESSION (the Codex compaction finding): the per-key value oracle's invocation floor `v_inv` must
+/// REGRESSION (the compaction finding): the per-key value oracle's invocation floor `v_inv` must
 /// fold the APPLIED state machine ALONGSIDE the live committed log — neither alone is complete. Once a
 /// key's latest committed write is COMPACTED into the snapshot, it leaves the live log, so
 /// `committed_entries_of` (which reads only `[first_index, commit]`) no longer sees it and a

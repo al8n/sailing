@@ -191,7 +191,7 @@ fn remove_voter_shrinks_quorum() {
     "cluster must stabilise after removing second follower",
   );
 
-  // Now remove the CURRENT leader. The leader must step down (U6), and a new leader
+  // Now remove the CURRENT leader. The leader must step down, and a new leader
   // must emerge among the remaining voters.
   let current_leader = wait_for_leader(&mut c, "a leader must exist before removing leader");
   // The current_leader's tracker was updated after the second removal: voters = {X, Y, current_leader}
@@ -470,7 +470,7 @@ fn learner_does_not_count_for_quorum() {
 }
 
 // ── Test 5 ──────────────────────────────────────────────────────────────────────────────────────
-/// The current leader is removed from the cluster. It must step down (U6), and a new
+/// The current leader is removed from the cluster. It must step down, and a new
 /// leader must emerge among the remaining voters.
 #[test]
 fn remove_leader_steps_down() {

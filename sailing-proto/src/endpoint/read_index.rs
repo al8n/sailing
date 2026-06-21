@@ -105,8 +105,8 @@ where
   /// `lease_valid_until` on a ConfChange so reads degrade to Safe until a fresh quorum re-confirms the
   /// lease under the new config — a config whose quorum is disjoint from the old one cannot inherit it.
   ///
-  /// RESIDUAL CAVEAT (IRREDUCIBLE for ALL lease reads — etcd's included — and PROVEN unremovable by a
-  /// multi-expert Raft panel: a lease infers a non-event from elapsed time, which no logical/epoch/HLC
+  /// RESIDUAL CAVEAT (IRREDUCIBLE for ALL lease reads — etcd's included — and unremovable in principle:
+  /// a lease infers a non-event from elapsed time, which no logical/epoch/HLC
   /// machinery can discharge): bounded clock-RATE drift, plus the non-Byzantine honesty of voters. The
   /// self-validating renewal (condition 2) closed the COOPERATION/heterogeneity vector by construction, and
   /// the durable lease-support floor closed the CONFIG-DRIFT-across-restart vector (a node restarting
