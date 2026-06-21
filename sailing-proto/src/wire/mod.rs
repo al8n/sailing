@@ -170,7 +170,7 @@ fn decode_set<I: NodeId>(elems: &[Bytes]) -> Result<BTreeSet<I>, DecodeError> {
 
 /// Encode a membership set: `BTreeSet` iteration is ascending by `Ord`, which IS the
 /// canonical wire order.
-fn encode_set<I: NodeId>(set: &BTreeSet<I>) -> Vec<Bytes> {
+fn encode_set<I: Data>(set: &BTreeSet<I>) -> Vec<Bytes> {
   set.iter().map(encode_id).collect()
 }
 
@@ -233,7 +233,7 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
   )
 }
 
-fn pb_conf_state<I: NodeId>(c: &ConfState<I>) -> pb::ConfState {
+fn pb_conf_state<I: Data>(c: &ConfState<I>) -> pb::ConfState {
   pb::ConfState {
     voters: encode_set(c.voters()),
     learners: encode_set(c.learners()),
@@ -254,7 +254,7 @@ fn conf_state_from<I: NodeId>(w: &pb::ConfState) -> Result<ConfState<I>, DecodeE
   ))
 }
 
-fn pb_snapshot_meta<I: NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
+fn pb_snapshot_meta<I: Data>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
   pb::SnapshotMeta {
     last_index: m.last_index().get(),
     last_term: m.last_term().get(),

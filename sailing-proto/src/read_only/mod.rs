@@ -2,7 +2,7 @@
 //! states.  Adapted from etcd's `readOnly`, but keyed by an INTERNAL per-round token rather than the
 //! application context (see [`ReadOnly`]) so the quorum proof is sound even when the application
 //! reuses a context across reads.
-use crate::{Index, NodeId, ReadOnlyOption};
+use crate::{Index, ReadOnlyOption};
 use bytes::Bytes;
 use std::{
   collections::{BTreeMap, BTreeSet},
@@ -96,7 +96,16 @@ pub struct ReadIndexStatus<I> {
   acks: BTreeSet<I>,
 }
 
-impl<I: NodeId> ReadIndexStatus<I> {
+impl<I> ReadIndexStatus<I> {
+  /// Consume the confirmed read into the `(context, originator, index)` the leader needs to emit the
+  /// `ReadState` (local read) or `ReadIndexResponse` (forwarded read). `originator` is `None` for a local
+  /// leader read and `Some(follower)` for a forwarded one.
+  pub fn into_parts(self) -> (Bytes, Option<I>, Index) {
+    (self.context, self.req_from, self.index)
+  }
+}
+
+impl<I: Ord> ReadIndexStatus<I> {
   /// Construct a new status.  `leader` is included in `acks` immediately (the
   /// leader counts itself toward quorum without waiting for a heartbeat reply).
   pub fn new(context: Bytes, req_from: Option<I>, index: Index, leader: I) -> Self {
@@ -108,13 +117,6 @@ impl<I: NodeId> ReadIndexStatus<I> {
       index,
       acks,
     }
-  }
-
-  /// Consume the confirmed read into the `(context, originator, index)` the leader needs to emit the
-  /// `ReadState` (local read) or `ReadIndexResponse` (forwarded read). `originator` is `None` for a local
-  /// leader read and `Some(follower)` for a forwarded one.
-  pub fn into_parts(self) -> (Bytes, Option<I>, Index) {
-    (self.context, self.req_from, self.index)
   }
 }
 
@@ -141,7 +143,7 @@ pub struct ReadOnly<I> {
   next_round: u64,
 }
 
-impl<I: NodeId> ReadOnly<I> {
+impl<I> ReadOnly<I> {
   /// Construct a new `ReadOnly` manager.
   pub fn new(option: ReadOnlyOption) -> Self {
     Self {
@@ -183,28 +185,6 @@ impl<I: NodeId> ReadOnly<I> {
     self.pending.len()
   }
 
-  /// Record a new pending read request and assign it a fresh, internally-unique **round token**.
-  ///
-  /// `index` is the leader's commit index at receipt.  `context` is the opaque application token
-  /// echoed back on confirmation.  `from` is `None` for local (leader-application) reads and
-  /// `Some(follower_id)` for forwarded reads.  `leader` is the current leader's id — included in the
-  /// ack set immediately (the leader counts toward its own quorum).
-  ///
-  /// Returns the round token the caller must seed into the heartbeat round for this read.  The token
-  /// is NEVER reused, so the quorum proof is unambiguous: a stale/duplicated `HeartbeatResponse` echoing
-  /// an earlier read's token cannot be credited to this one, even when the user `context` is reused
-  /// after an earlier read with the same context completed.  The caller's own in-flight dedup
-  /// ([`Self::context_in_flight`]) surfaces a concurrent same-`context` reuse as
-  /// [`crate::ReadIndexError::DuplicateContext`] before this is called.
-  pub fn add_request(&mut self, index: Index, context: Bytes, from: Option<I>, leader: I) -> Bytes {
-    let token = Bytes::copy_from_slice(&self.next_round.to_be_bytes());
-    self.next_round += 1;
-    let status = ReadIndexStatus::new(context, from, index, leader);
-    self.pending.insert(token.clone(), status);
-    self.queue.push(token.clone());
-    token
-  }
-
   /// Whether a LOCAL (leader-originated) pending read carries this user `context` — the in-flight
   /// dedup the leader's local read-index guard uses.  Reads are keyed by internal round token, so this
   /// scans the bounded pending set (`<= MAX_LEADER_READS`).  FORWARDED reads (`req_from = Some`) are
@@ -216,23 +196,6 @@ impl<I: NodeId> ReadOnly<I> {
       .pending
       .values()
       .any(|s| s.req_from.is_none() && s.context.as_ref() == context)
-  }
-
-  /// Record that `from` has acknowledged the heartbeat round identified by round `token`.
-  ///
-  /// Returns the **total number of acks** (including the self-ack seeded at
-  /// creation) for the identified pending request.  Returns `0` if no pending
-  /// request with that token exists (e.g. a stale ack echoing an already-confirmed,
-  /// hence removed, round — which is exactly why a reused user context is safe).
-  ///
-  /// Calling this multiple times with the same `from` is idempotent (`BTreeSet`
-  /// deduplicates).
-  pub fn recv_ack(&mut self, from: I, token: &[u8]) -> usize {
-    let Some(status) = self.pending.get_mut(token) else {
-      return 0;
-    };
-    status.acks.insert(from);
-    status.acks.len()
   }
 
   /// Confirm all pending reads up to and including the one identified by round `token`.
@@ -288,6 +251,47 @@ impl<I: NodeId> ReadOnly<I> {
   /// or `None` if no such request is pending.
   pub fn acks_for(&self, token: &[u8]) -> Option<&std::collections::BTreeSet<I>> {
     self.pending.get(token).map(|s| &s.acks)
+  }
+}
+
+impl<I: Ord> ReadOnly<I> {
+  /// Record a new pending read request and assign it a fresh, internally-unique **round token**.
+  ///
+  /// `index` is the leader's commit index at receipt.  `context` is the opaque application token
+  /// echoed back on confirmation.  `from` is `None` for local (leader-application) reads and
+  /// `Some(follower_id)` for forwarded reads.  `leader` is the current leader's id — included in the
+  /// ack set immediately (the leader counts toward its own quorum).
+  ///
+  /// Returns the round token the caller must seed into the heartbeat round for this read.  The token
+  /// is NEVER reused, so the quorum proof is unambiguous: a stale/duplicated `HeartbeatResponse` echoing
+  /// an earlier read's token cannot be credited to this one, even when the user `context` is reused
+  /// after an earlier read with the same context completed.  The caller's own in-flight dedup
+  /// ([`Self::context_in_flight`]) surfaces a concurrent same-`context` reuse as
+  /// [`crate::ReadIndexError::DuplicateContext`] before this is called.
+  pub fn add_request(&mut self, index: Index, context: Bytes, from: Option<I>, leader: I) -> Bytes {
+    let token = Bytes::copy_from_slice(&self.next_round.to_be_bytes());
+    self.next_round += 1;
+    let status = ReadIndexStatus::new(context, from, index, leader);
+    self.pending.insert(token.clone(), status);
+    self.queue.push(token.clone());
+    token
+  }
+
+  /// Record that `from` has acknowledged the heartbeat round identified by round `token`.
+  ///
+  /// Returns the **total number of acks** (including the self-ack seeded at
+  /// creation) for the identified pending request.  Returns `0` if no pending
+  /// request with that token exists (e.g. a stale ack echoing an already-confirmed,
+  /// hence removed, round — which is exactly why a reused user context is safe).
+  ///
+  /// Calling this multiple times with the same `from` is idempotent (`BTreeSet`
+  /// deduplicates).
+  pub fn recv_ack(&mut self, from: I, token: &[u8]) -> usize {
+    let Some(status) = self.pending.get_mut(token) else {
+      return 0;
+    };
+    status.acks.insert(from);
+    status.acks.len()
   }
 }
 

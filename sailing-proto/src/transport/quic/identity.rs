@@ -10,7 +10,7 @@ use std::vec::Vec;
 use rustls::pki_types::CertificateDer;
 
 use super::super::{ClusterId, labeled};
-use crate::NodeId;
+use crate::Data;
 
 /// A settled, authenticated peer identity — an UNTRUSTED candidate the coordinator re-checks.
 ///
@@ -189,7 +189,7 @@ impl Hello {
   }
 }
 
-impl<I: NodeId> IdentitySource<I> for Hello {
+impl<I: Data> IdentitySource<I> for Hello {
   fn write_control_preface(&self, me: &I, out: &mut Vec<u8>) {
     let mut id = Vec::new();
     me.encode(&mut id);
@@ -224,7 +224,6 @@ impl<I: NodeId> IdentitySource<I> for Hello {
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::Data as _;
 
   fn cluster(b: u8) -> ClusterId {
     ClusterId([b; 16])

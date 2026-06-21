@@ -1,6 +1,6 @@
 //! Endpoint configuration. Tuning is real `Duration` (not logical ticks); the election
 //! timeout is randomized per term from the seeded PRNG inside the `Endpoint`.
-use crate::{NodeId, error::ConfigError};
+use crate::{CheapClone, error::ConfigError};
 use core::time::Duration;
 use std::vec::Vec;
 
@@ -208,7 +208,7 @@ pub struct Config<I> {
   bounded_clock_uncertainty: Option<Duration>,
 }
 
-impl<I: NodeId> Config<I> {
+impl<I: PartialEq> Config<I> {
   /// Construct, validating timeouts and that `id` is among `voters`.
   pub fn try_new(
     id: I,
@@ -294,22 +294,26 @@ impl<I: NodeId> Config<I> {
     })
   }
 
+  /// Whether `id` is a voter.
+  #[inline(always)]
+  pub fn is_voter(&self, id: I) -> bool {
+    self.voters.contains(&id)
+  }
+}
+
+impl<I: CheapClone> Config<I> {
   /// This node's id.
   #[inline(always)]
   pub fn id(&self) -> I {
     self.id.cheap_clone()
   }
+}
 
+impl<I> Config<I> {
   /// The voter set.
   #[inline(always)]
   pub const fn voters(&self) -> &[I] {
     self.voters.as_slice()
-  }
-
-  /// Whether `id` is a voter.
-  #[inline(always)]
-  pub fn is_voter(&self, id: I) -> bool {
-    self.voters.contains(&id)
   }
 
   /// Majority size of the configured SEED voter set (`n/2 + 1`) — a convenience accessor, NOT the live

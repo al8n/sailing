@@ -9,7 +9,7 @@ use std::{
 use quinn_proto::{Connection, ConnectionHandle, StreamId};
 
 use super::super::frame::FrameDecoder;
-use crate::{CheapClone, NodeId};
+use crate::CheapClone;
 
 /// Per-connection lifecycle phase. Consensus-stream I/O is unreachable until [`Phase::Validated`].
 ///
@@ -178,7 +178,7 @@ pub(crate) struct ConnTable<I> {
   next_seq: u64,
 }
 
-impl<I: NodeId> ConnTable<I> {
+impl<I: Ord + CheapClone> ConnTable<I> {
   pub(crate) fn new() -> Self {
     Self {
       entries: BTreeMap::new(),
