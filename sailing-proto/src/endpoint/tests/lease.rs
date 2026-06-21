@@ -344,35 +344,40 @@ fn stale_round_heartbeat_resp_does_not_renew_lease() {
   let (t1, r1) = tick_round(&mut ep, &mut log, &mut stable);
   ep.handle_message(t1, &mut log, &mut stable, 2u64, hb_resp(r1));
   assert!(
-    ep.lease_valid_until.is_some(),
+    ep.check_quorum_lease.lease_valid_until.is_some(),
     "a fresh current-round quorum ack establishes the lease"
   );
 
   // Round 2 (r2): a new round opens — lease_acks is cleared and round 1 is now STALE.
   let (t2, r2) = tick_round(&mut ep, &mut log, &mut stable);
   assert_ne!(r1, r2, "a new heartbeat round bumps the lease round");
-  assert!(ep.lease_acks.is_empty(), "a new round clears the ack set");
-  let lease_before = ep.lease_valid_until;
+  assert!(
+    ep.check_quorum_lease.lease_acks.is_empty(),
+    "a new round clears the ack set"
+  );
+  let lease_before = ep.check_quorum_lease.lease_valid_until;
 
   // A STALE HeartbeatResp echoing the OLD round (r1) must be IGNORED for the lease.
   ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp(r1));
   assert!(
-    !ep.lease_acks.contains(&2u64),
+    !ep.check_quorum_lease.lease_acks.contains(&2u64),
     "a stale (old-round) ack must not count toward the lease"
   );
   assert_eq!(
-    ep.lease_valid_until, lease_before,
+    ep.check_quorum_lease.lease_valid_until, lease_before,
     "a stale ack must not renew the lease"
   );
 
   // A FRESH HeartbeatResp echoing the CURRENT round (r2) renews the lease.
   ep.handle_message(t2, &mut log, &mut stable, 2u64, hb_resp(r2));
   assert!(
-    ep.lease_acks.contains(&2u64),
+    ep.check_quorum_lease.lease_acks.contains(&2u64),
     "a fresh current-round ack counts toward the lease"
   );
   assert!(
-    ep.lease_valid_until.is_some_and(|d| d >= t2),
+    ep.check_quorum_lease
+      .lease_valid_until
+      .is_some_and(|d| d >= t2),
     "a fresh quorum ack renews the lease"
   );
 }
@@ -450,12 +455,12 @@ fn delayed_heartbeat_resp_does_not_extend_lease_past_send_window() {
 
   // The lease must be bounded by the SEND instant, NOT the (delayed) receipt instant.
   assert_eq!(
-    ep.lease_valid_until,
+    ep.check_quorum_lease.lease_valid_until,
     Some(t_send + Duration::from_millis(1000)),
     "lease must expire at round_start + election_timeout, not response_receipt + election_timeout"
   );
   assert_ne!(
-    ep.lease_valid_until,
+    ep.check_quorum_lease.lease_valid_until,
     Some(t_late + Duration::from_millis(1000)),
     "a delayed response must not extend the lease by the response delay"
   );
@@ -485,7 +490,7 @@ fn lease_not_renewed_by_non_enforcing_voter() {
     ),
   );
   assert!(
-    ep.lease_valid_until.is_none(),
+    ep.check_quorum_lease.lease_valid_until.is_none(),
     "a non-enforcing voter must NOT renew the lease (self-validating)"
   );
 }
@@ -502,7 +507,7 @@ fn lease_bounded_by_min_support() {
   use core::time::Duration;
   let (mut ep, mut log, mut stable) = leasebased_leader();
   let (at, round) = tick_lease_round(&mut ep, &mut log, &mut stable);
-  let lease_start = ep.lease_round_start;
+  let lease_start = ep.check_quorum_lease.lease_round_start;
   // Peer 2 enforces but with a SHORTER election_timeout (300ms < the leader's 1000ms).
   ep.handle_message(
     at,
@@ -516,7 +521,7 @@ fn lease_bounded_by_min_support() {
     ),
   );
   assert_eq!(
-    ep.lease_valid_until,
+    ep.check_quorum_lease.lease_valid_until,
     Some(lease_start + Duration::from_millis(300)),
     "the lease must be bounded by the quorum's MIN support (300ms), not the leader's 1000ms"
   );
@@ -547,7 +552,10 @@ fn membership_change_revokes_lease() {
         .with_lease_support(Duration::from_millis(1000)),
     ),
   );
-  assert!(ep.lease_valid_until.is_some(), "lease established");
+  assert!(
+    ep.check_quorum_lease.lease_valid_until.is_some(),
+    "lease established"
+  );
 
   // Propose + commit + apply a ConfChange (add a learner) → membership changes → lease revoked.
   ep.propose_conf_change(
@@ -575,7 +583,7 @@ fn membership_change_revokes_lease() {
   );
   ep.handle_storage(at, &mut log, &mut stable);
   assert!(
-    ep.lease_valid_until.is_none(),
+    ep.check_quorum_lease.lease_valid_until.is_none(),
     "a committed membership change must revoke the lease (quorum overlap no longer guaranteed)"
   );
 }

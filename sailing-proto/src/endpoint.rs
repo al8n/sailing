@@ -567,6 +567,42 @@ impl ForwardedReads {
   }
 }
 
+/// The leader's CheckQuorum read-lease (LeaseBased) round state, grouped out of `Endpoint`.
+#[derive(Debug)]
+struct CheckQuorumLease<I> {
+  /// The leader's CURRENT CheckQuorum lease round (bumped on every heartbeat broadcast). Carried in
+  /// each `Heartbeat` and echoed in `HeartbeatResp`, it is what makes the LeaseBased read lease
+  /// FRESH: only a `HeartbeatResp` echoing this exact round counts toward renewing the lease, so a
+  /// stale or duplicated earlier-round response cannot keep an isolated leader's lease alive
+  /// round response cannot keep an isolated leader's lease alive. Meaningful only while leader.
+  lease_round: u64,
+  /// The instant the CURRENT `lease_round`'s heartbeat was SENT (set in `broadcast_heartbeat` when the
+  /// round is bumped). The lease is renewed to `lease_round_start + election_timeout`, NOT
+  /// `response_receipt + election_timeout`: followers reset their election timers when they RECEIVED
+  /// this round (≈ its send time), so the lease must expire by then — measuring from a (possibly
+  /// delayed) response would over-extend the lease past the quorum's election window.
+  lease_round_start: Instant,
+  /// Voters that ENFORCE the lease and have acked the CURRENT `lease_round` (the leader counts itself
+  /// implicitly). Cleared on every heartbeat broadcast (each round must be freshly re-confirmed). When
+  /// this set plus self forms a voter quorum, the read lease (`lease_valid_until`) is renewed. A
+  /// non-enforcing follower (HeartbeatResp `lease_support == 0`) is NOT inserted here, so it cannot keep
+  /// the lease alive.
+  lease_acks: BTreeSet<I>,
+  /// The MINIMUM lease-support duration advertised across the contributing quorum this round
+  /// (reset to the leader's OWN `election_timeout` when the round is bumped in `broadcast_heartbeat`,
+  /// then min'd with each enforcing ack's `lease_support`). The lease is renewed to `lease_round_start +
+  /// lease_min_support`, so a voter with a SHORTER `election_timeout` (heterogeneous config) caps the
+  /// lease at its actual support — the leader never out-lives the quorum's real election window.
+  lease_min_support: core::time::Duration,
+  /// The read lease deadline for `ReadOnlyOption::LeaseBased`: the leader may serve a read from its
+  /// local commit WITHOUT a per-read round-trip while `now < lease_valid_until`. Renewed to
+  /// `lease_round_start + election_timeout` only when a quorum FRESHLY acks the current `lease_round` —
+  /// NOT from the (spoofable) `recent_active`/`election_deadline` CheckQuorum step-down signal, and NOT
+  /// from response-receipt time. `None` until the first fresh quorum confirmation. (The residual
+  /// clock-drift assumption common to all lease reads remains — see `do_leader_read`.)
+  lease_valid_until: Option<Instant>,
+}
+
 /// The LeaseGuard / failover commit-wait + inherited-read serve state, grouped out of `Endpoint`.
 #[derive(Debug, Default)]
 struct LeaseGuardState {
@@ -919,37 +955,8 @@ where
   /// grow it without bound), and cleared wholesale on any term change or leader change (a read
   /// forwarded to a now-stale leader must not block re-issuing it to the new one).
   forwarded_reads: ForwardedReads,
-  /// The leader's CURRENT CheckQuorum lease round (bumped on every heartbeat broadcast). Carried in
-  /// each `Heartbeat` and echoed in `HeartbeatResp`, it is what makes the LeaseBased read lease
-  /// FRESH: only a `HeartbeatResp` echoing this exact round counts toward renewing the lease, so a
-  /// stale or duplicated earlier-round response cannot keep an isolated leader's lease alive
-  /// round response cannot keep an isolated leader's lease alive. Meaningful only while leader.
-  lease_round: u64,
-  /// The instant the CURRENT `lease_round`'s heartbeat was SENT (set in `broadcast_heartbeat` when the
-  /// round is bumped). The lease is renewed to `lease_round_start + election_timeout`, NOT
-  /// `response_receipt + election_timeout`: followers reset their election timers when they RECEIVED
-  /// this round (≈ its send time), so the lease must expire by then — measuring from a (possibly
-  /// delayed) response would over-extend the lease past the quorum's election window.
-  lease_round_start: Instant,
-  /// Voters that ENFORCE the lease and have acked the CURRENT `lease_round` (the leader counts itself
-  /// implicitly). Cleared on every heartbeat broadcast (each round must be freshly re-confirmed). When
-  /// this set plus self forms a voter quorum, the read lease (`lease_valid_until`) is renewed. A
-  /// non-enforcing follower (HeartbeatResp `lease_support == 0`) is NOT inserted here, so it cannot keep
-  /// the lease alive.
-  lease_acks: BTreeSet<I>,
-  /// The MINIMUM lease-support duration advertised across the contributing quorum this round
-  /// (reset to the leader's OWN `election_timeout` when the round is bumped in `broadcast_heartbeat`,
-  /// then min'd with each enforcing ack's `lease_support`). The lease is renewed to `lease_round_start +
-  /// lease_min_support`, so a voter with a SHORTER `election_timeout` (heterogeneous config) caps the
-  /// lease at its actual support — the leader never out-lives the quorum's real election window.
-  lease_min_support: core::time::Duration,
-  /// The read lease deadline for `ReadOnlyOption::LeaseBased`: the leader may serve a read from its
-  /// local commit WITHOUT a per-read round-trip while `now < lease_valid_until`. Renewed to
-  /// `lease_round_start + election_timeout` only when a quorum FRESHLY acks the current `lease_round` —
-  /// NOT from the (spoofable) `recent_active`/`election_deadline` CheckQuorum step-down signal, and NOT
-  /// from response-receipt time. `None` until the first fresh quorum confirmation. (The residual
-  /// clock-drift assumption common to all lease reads remains — see `do_leader_read`.)
-  lease_valid_until: Option<Instant>,
+  /// The leader's CheckQuorum read-lease (LeaseBased) round state.
+  check_quorum_lease: CheckQuorumLease<I>,
   /// Post-restart vote-suppression fence (LeaseBased crash-safety). A node that crashed may have
   /// acked a leader's read-lease just before crashing; on restart that in-memory promise is gone, so
   /// without a fence it could grant a vote to a new candidate and elect a new leader WHILE the old
@@ -1085,11 +1092,13 @@ where
       // Fresh node: boot epoch 0. A later restart provides a strictly-higher epoch, so this
       // incarnation's forwarded-read tokens can never collide with a post-restart incarnation's.
       forwarded_reads: ForwardedReads::new(0),
-      lease_round: 0,
-      lease_round_start: now.mono(),
-      lease_acks: BTreeSet::new(),
-      lease_min_support: core::time::Duration::ZERO,
-      lease_valid_until: None,
+      check_quorum_lease: CheckQuorumLease {
+        lease_round: 0,
+        lease_round_start: now.mono(),
+        lease_acks: BTreeSet::new(),
+        lease_min_support: core::time::Duration::ZERO,
+        lease_valid_until: None,
+      },
       // A fresh node never acked any leader's read-lease, so no post-restart vote fence.
       lease_vote_fence_until: None,
       // No forced handoff authorized yet.
@@ -1220,12 +1229,12 @@ where
 
   #[cfg(test)]
   pub(crate) fn lease_valid_until_for_test(&self) -> Option<Instant> {
-    self.lease_valid_until
+    self.check_quorum_lease.lease_valid_until
   }
 
   #[cfg(test)]
   pub(crate) fn set_lease_valid_until_for_test(&mut self, until: Option<Instant>) {
-    self.lease_valid_until = until;
+    self.check_quorum_lease.lease_valid_until = until;
   }
 
   #[cfg(test)]
@@ -2030,8 +2039,8 @@ where
             // the caller / a forwarding follower on a read `read_index` already accepted. Still revoke any
             // live LeaseBased lease (its granting quorum may not match the new mode) — mirror ConfChange.
             self.read_only.set_option(mode);
-            self.lease_valid_until = None;
-            self.lease_acks.clear();
+            self.check_quorum_lease.lease_valid_until = None;
+            self.check_quorum_lease.lease_acks.clear();
             self
               .events
               .push_back(crate::Event::ReadModeChanged(crate::ReadModeChanged::new(
@@ -2078,8 +2087,8 @@ where
                 // committed membership change can produce a new config whose quorum is DISJOINT from the
                 // quorum that granted the live lease, so the lease no longer proves "no other leader". Revoke
                 // it; `do_leader_read` degrades to Safe until a fresh quorum re-confirms under the new config.
-                self.lease_valid_until = None;
-                self.lease_acks.clear();
+                self.check_quorum_lease.lease_valid_until = None;
+                self.check_quorum_lease.lease_acks.clear();
                 // Prune resend-pacing deadlines to the new membership. A peer this change REMOVED
                 // while still in Snapshot state can never be observed leaving it (its Progress is
                 // gone, and a dead peer sends no further responses), so its entry would linger for
