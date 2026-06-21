@@ -982,7 +982,7 @@ where
 
 /// The read machinery, grouped out of `Endpoint`.
 #[derive(Debug)]
-struct ReadState<I> {
+struct Reads<I> {
   /// ReadIndex tracking (pending reads, heartbeat-ack sets, confirmed read states).
   read_only: ReadOnly<I>,
   /// The ACTIVE read mode the serve dispatch + stamp helpers consult. Seeded from `config.read_only()`,
@@ -1080,7 +1080,7 @@ where
   pending_conf_index: Index,
   /// The read machinery (active mode + migration provenance, the ReadIndex tracker, deferred and
   /// forwarded reads, the SetReadMode one-in-flight guard).
-  reads: ReadState<I>,
+  reads: Reads<I>,
   /// The leader's CheckQuorum read-lease (LeaseBased) round state.
   check_quorum_lease: CheckQuorumLease<I>,
   /// The leader-transfer state (forced-handoff flag + transferee target + abort deadline).
@@ -1186,7 +1186,7 @@ where
         lease_vote_fence_until: None,
       },
       pending_conf_index: Index::ZERO,
-      reads: ReadState {
+      reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
         // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
         active_read_mode: read_only_opt,

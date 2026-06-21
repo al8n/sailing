@@ -1,6 +1,6 @@
 use super::{super::*, *};
 use crate::{
-  Heartbeat, HeartbeatResp, ReadIndexError, ReadIndexResp,
+  Heartbeat, HeartbeatResp, ReadIndexError, ReadIndexResp, ReadState,
   testkit::{CountSm, NoopStable, VecLog},
 };
 
@@ -99,7 +99,7 @@ fn reused_read_context_is_not_confirmed_by_stale_heartbeat_ack() {
     }
     token.expect("a read heartbeat round token")
   }
-  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<crate::ReadState> {
+  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<ReadState> {
     core::iter::from_fn(|| ep.poll_event())
       .filter_map(|e| match e {
         Event::ReadState(rs) => Some(rs),
@@ -326,7 +326,7 @@ fn reused_forwarded_read_context_is_not_completed_by_stale_resp() {
     }
     tok.expect("a forwarded ReadIndex")
   }
-  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<crate::ReadState> {
+  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<ReadState> {
     core::iter::from_fn(|| ep.poll_event())
       .filter_map(|e| match e {
         Event::ReadState(rs) => Some(rs),
@@ -469,7 +469,7 @@ fn forwarded_read_token_is_unique_across_restart() {
     }
     (ep, tok.expect("forwarded a ReadIndex"))
   }
-  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<crate::ReadState> {
+  fn read_states(ep: &mut Endpoint<u64, CountSm>) -> Vec<ReadState> {
     core::iter::from_fn(|| ep.poll_event())
       .filter_map(|e| match e {
         Event::ReadState(rs) => Some(rs),

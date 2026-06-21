@@ -438,7 +438,7 @@ where
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
       },
-      reads: ReadState {
+      reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
         // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later
         // commit (the active mode is replicated state, not static config). See spec §6.
