@@ -21,7 +21,7 @@ where
   /// Expose `pending_compact` for testing.
   #[cfg(test)]
   pub(crate) fn pending_compact(&self) -> Option<(crate::OpId, Index)> {
-    self.pending_compact
+    self.snapshot.pending_compact
   }
 
   /// Re-send the persisted snapshot to a peer that is stuck in `Snapshot` state.
@@ -66,7 +66,7 @@ where
     S: StableStore<NodeId = I>,
     F::Snapshot: crate::Data,
   {
-    if self.pending_compact.is_some() || self.pending_install.is_some() {
+    if self.snapshot.pending_compact.is_some() || self.snapshot.pending_install.is_some() {
       // A snapshot is already being persisted (our own compaction) OR a follower install is deferred
       // and about to re-baseline the log; don't start a leader-side snapshot over it.
       return;
@@ -111,7 +111,7 @@ where
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
-    self.pending_compact = Some((opid, self.applied));
+    self.snapshot.pending_compact = Some((opid, self.applied));
   }
 
   /// Receive an `InstallSnapshot` from the current leader (follower path). This only VALIDATES,
@@ -205,7 +205,7 @@ where
     // first in-flight blob); the in-flight install will complete and ack. A strictly-NEWER snapshot
     // falls through and REPLACES it below (the stale opid's `SnapshotWritten` then finds no match — a
     // harmless no-op).
-    if matches!(&self.pending_install, Some((_, pmeta, ..)) if pmeta.last_index() >= meta.last_index())
+    if matches!(&self.snapshot.pending_install, Some((_, pmeta, ..)) if pmeta.last_index() >= meta.last_index())
     {
       return;
     }
@@ -249,7 +249,7 @@ where
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta.clone(), is.data().clone());
     let leader = is.leader();
-    self.pending_install = Some((opid, meta.clone(), snap, leader));
+    self.snapshot.pending_install = Some((opid, meta.clone(), snap, leader));
   }
 
   /// Run the DEFERRED destructive snapshot-install body, once the blob is proven durable (the matching
@@ -320,7 +320,7 @@ where
     self
       .pending
       .retain(|_, p| matches!(p, Pending::CastVote { .. }));
-    self.pending_compact = None;
+    self.snapshot.pending_compact = None;
 
     // Step 3: advance commit + applied to the snapshot boundary.
     self.commit = meta.last_index();
