@@ -374,7 +374,11 @@ where
       // durable snapshot, so `durable_index` alone is the recoverable prefix; the gap this closes only
       // arises at RUNTIME from a dropped stale install.
       durable_snapshot_index: Index::ZERO,
-      pending_install: None,
+      snapshot: SnapshotState {
+        pending_install: None,
+        pending_compact: None,
+        snapshot_resend_after: BTreeMap::new(),
+      },
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -416,8 +420,6 @@ where
         poisoned,
         poison_reason,
       },
-      pending_compact: None,
-      snapshot_resend_after: BTreeMap::new(),
       durable: DurablePromises {
         // the recovered `hs.term()` came from durable HardState, so it IS durable. Seed both
         // `durable_term` and `last_submitted_term` to it so `term_is_durable()` is true immediately after

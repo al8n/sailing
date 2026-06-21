@@ -177,6 +177,7 @@ where
         // and (b) overwrites any stale deadline left over from a previous install window (the peer
         // may have exited Snapshot via `maybe_update` without a heartbeat observation to clean up).
         self
+          .snapshot
           .snapshot_resend_after
           .insert(peer, now.mono() + self.config.election_timeout());
       }
@@ -969,11 +970,13 @@ where
       // (liveness preserved). The `is_none_or` arm is a backstop for a Snapshot-state peer with no
       // armed deadline, which no current path produces.
       let due = self
+        .snapshot
         .snapshot_resend_after
         .get(&from)
         .is_none_or(|&after| now.mono() >= after);
       if due {
         self
+          .snapshot
           .snapshot_resend_after
           .insert(from, now.mono() + self.config.election_timeout());
         self.resend_snapshot(from, stable);
@@ -982,7 +985,7 @@ where
       // Observed out of Snapshot state: drop the pacing entry. (A peer that exits via
       // `maybe_update` keeps its entry until this observation — harmless, since the resend is
       // gated on Snapshot state above, and a NEW install window re-arms the deadline at send.)
-      self.snapshot_resend_after.remove(&from);
+      self.snapshot.snapshot_resend_after.remove(&from);
     }
 
     // ReadIndex Safe path: if the resp carries a context, record the ack and check quorum.

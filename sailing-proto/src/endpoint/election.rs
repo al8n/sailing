@@ -129,7 +129,7 @@ where
     // (a Leader-Completeness violation, strictly worse than the orphan the deferral closes). One local floor on
     // the comparison pair only; sound because the boundary is committed, so it never understates our
     // true committed freshness.
-    if let Some((_, meta, ..)) = &self.pending_install
+    if let Some((_, meta, ..)) = &self.snapshot.pending_install
       && (meta.last_term(), meta.last_index()) > (my_term, my_index)
     {
       my_index = meta.last_index();
@@ -527,7 +527,7 @@ where
     self.check_quorum_lease.lease_valid_until = None;
     // Fresh leadership starts fresh snapshot-resend pacing (the per-peer deadlines belong to the
     // previous leadership's transfer windows).
-    self.snapshot_resend_after.clear();
+    self.snapshot.snapshot_resend_after.clear();
     // Clear any in-progress leader transfer — becoming the leader means the transfer
     // target (us) has won; the previous leader's transfer state is irrelevant.
     self.transfer.lead_transferee = None;

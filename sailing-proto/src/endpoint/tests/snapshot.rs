@@ -1615,7 +1615,7 @@ fn install_defers_commit_advance_until_blob_durable() {
   // the install is DEFERRED — commit/applied/durable_index stay at their OLD values; only the blob
   // is submitted and `pending_install` is armed. A crash here loses just the in-flight blob.
   assert!(
-    ep.pending_install.is_some(),
+    ep.snapshot.pending_install.is_some(),
     "install deferred → pending_install armed"
   );
   assert_eq!(
@@ -1638,7 +1638,7 @@ fn install_defers_commit_advance_until_blob_durable() {
   // advance to the boundary together, with the blob already durable.
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
-    ep.pending_install.is_none(),
+    ep.snapshot.pending_install.is_none(),
     "blob durable → deferred install completed"
   );
   assert_eq!(
@@ -1814,7 +1814,7 @@ fn stale_snapshot_resp_is_clamped_to_durable_watermark() {
     "a stale snapshot must not regress commit"
   );
   assert!(
-    ep.pending_install.is_none(),
+    ep.snapshot.pending_install.is_none(),
     "the stale path submits no blob → no deferred install armed"
   );
 }
@@ -1838,7 +1838,7 @@ fn install_crash_in_window_does_not_orphan_log() {
   // NOT drive `handle_storage`, so `install_snapshot_now` never runs and `log.restore` is not called.
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
   assert!(
-    ep.pending_install.is_some(),
+    ep.snapshot.pending_install.is_some(),
     "install deferred → pending_install armed"
   );
   assert_eq!(
@@ -1892,13 +1892,13 @@ fn install_fallback_requires_durable_evidence_not_visible_blob() {
   // Torn fsync: the next snapshot blob is VISIBLE but NOT durable and enqueues no completion.
   stable.fail_next_snapshot_durability();
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
-  assert!(ep.pending_install.is_some());
+  assert!(ep.snapshot.pending_install.is_some());
 
   // Drain storage: NO SnapshotWritten arrives (torn); the fallback sees durable_snapshot()==None and
   // must NOT fire the destructive install.
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
-    ep.pending_install.is_some(),
+    ep.snapshot.pending_install.is_some(),
     "the fallback must NOT fire on a visible-but-not-durable blob"
   );
   assert_eq!(
@@ -1939,7 +1939,7 @@ fn install_completes_via_durable_fallback_on_missed_completion() {
   // The blob is fsync'd DURABLE but its SnapshotWritten completion is dropped (coalesced).
   stable.drop_next_snapshot_completion();
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
-  assert!(ep.pending_install.is_some());
+  assert!(ep.snapshot.pending_install.is_some());
   assert!(
     stable.durable_snapshot().is_some(),
     "blob durable despite the dropped completion"
@@ -1948,7 +1948,7 @@ fn install_completes_via_durable_fallback_on_missed_completion() {
   // Drain storage: no SnapshotWritten arrives, but the durable_snapshot() fallback completes the install.
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
-    ep.pending_install.is_none(),
+    ep.snapshot.pending_install.is_none(),
     "the durable-evidence fallback completed the install despite the missed completion"
   );
   assert_eq!(ep.commit, Index::new(10));
@@ -1972,7 +1972,7 @@ fn vote_freshness_floored_at_pending_install_boundary() {
   let d = Instant::ORIGIN;
   // Deferred install at boundary 10 (term 2) — pending_install armed, NOT yet completed.
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
-  assert!(ep.pending_install.is_some());
+  assert!(ep.snapshot.pending_install.is_some());
   while ep.poll_message().is_some() {}
 
   // A candidate at a HIGHER term (so the follower steps down → lease open) whose log (5/2) is BELOW the
@@ -2021,11 +2021,11 @@ fn duplicate_install_in_window_mints_no_second_blob() {
     ep.next_op_id, op_after_first,
     "a duplicate install must NOT mint a second blob op"
   );
-  assert!(ep.pending_install.is_some());
+  assert!(ep.snapshot.pending_install.is_some());
 
   // The original install still completes on SnapshotWritten.
   ep.handle_storage(d, &mut log, &mut stable);
-  assert!(ep.pending_install.is_none());
+  assert!(ep.snapshot.pending_install.is_none());
   assert_eq!(ep.commit, Index::new(10));
   assert_eq!(log.last_index(), Index::new(10));
 }
@@ -2042,7 +2042,7 @@ fn completion_time_staleness_drops_superseded_install() {
   let d = Instant::ORIGIN;
   // Deferred install at boundary 4.
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(4));
-  assert!(ep.pending_install.is_some());
+  assert!(ep.snapshot.pending_install.is_some());
 
   // In-window AppendEntries catch the follower up to commit=5 (PAST the boundary 4) before the blob is
   // durable — appended to the OLD log, which stays live throughout the deferral.
@@ -2078,7 +2078,7 @@ fn completion_time_staleness_drops_superseded_install() {
   // never regressing commit/log.
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
-    ep.pending_install.is_none(),
+    ep.snapshot.pending_install.is_none(),
     "the superseded install is dropped at completion"
   );
   assert_eq!(
@@ -2109,7 +2109,7 @@ fn stale_drop_acks_durable_snapshot_boundary() {
   let d = Instant::ORIGIN;
   // Deferred install at boundary 5 (blob in flight; commit still 3, so not stale at receipt).
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(5));
-  assert!(ep.pending_install.is_some());
+  assert!(ep.snapshot.pending_install.is_some());
 
   // In-window appends [4..=7] (leader_commit=7) advance commit to 7 — but the log HOLDS their `Appended`
   // completions (deferred fsync), so `durable_index` stays 3: a visible-but-unflushed tail.
@@ -2163,7 +2163,10 @@ fn stale_drop_acks_durable_snapshot_boundary() {
   // handle_storage drains SnapshotWritten(5) (the log loop drains nothing — appends are held) →
   // install_snapshot_now: 5 <= commit 7 → stale-drop, but it RECORDS the durable snapshot boundary.
   ep.handle_storage(d, &mut log, &mut stable);
-  assert!(ep.pending_install.is_none(), "stale install dropped");
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "stale install dropped"
+  );
   assert_eq!(
     ep.durable_index,
     Index::new(3),
@@ -2240,13 +2243,13 @@ fn receipt_stale_above_watermark_records_durable_snapshot() {
   // NOT be short-circuited — it falls through to the deferred install.
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
   assert!(
-    ep.pending_install.is_some(),
+    ep.snapshot.pending_install.is_some(),
     "a committed-but-not-yet-recoverable snapshot is deferred, not dropped"
   );
 
   // On SnapshotWritten the install stale-drops (10 <= commit 12) but RECORDS the durable boundary.
   ep.handle_storage(d, &mut log, &mut stable);
-  assert!(ep.pending_install.is_none());
+  assert!(ep.snapshot.pending_install.is_none());
   assert_eq!(ep.commit, Index::new(12), "commit did NOT regress");
   assert_eq!(
     ep.durable_index,
@@ -2272,7 +2275,7 @@ fn conf_change_removal_prunes_snapshot_resend_deadline() {
   let offset = 5u64;
   let (mut ep, mut log, mut stable, _pending) = wedged_snapshot_follower(offset, 2);
   assert!(
-    ep.snapshot_resend_after.contains_key(&2u64),
+    ep.snapshot.snapshot_resend_after.contains_key(&2u64),
     "the install send armed peer 2's pacing deadline"
   );
   while ep.poll_message().is_some() {}
@@ -2309,7 +2312,7 @@ fn conf_change_removal_prunes_snapshot_resend_deadline() {
     "RemoveNode(2) must have applied"
   );
   assert!(
-    !ep.snapshot_resend_after.contains_key(&2u64),
+    !ep.snapshot.snapshot_resend_after.contains_key(&2u64),
     "applying the removal must prune peer 2's resend-pacing deadline (no leak across membership)"
   );
 }

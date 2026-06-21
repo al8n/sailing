@@ -828,6 +828,72 @@ struct Transfer<I> {
   transfer_deadline: Option<Instant>,
 }
 
+/// The deferred snapshot machinery, grouped out of `Endpoint`.
+struct SnapshotState<I, F>
+where
+  F: StateMachine,
+{
+  /// `Some((blob_opid, meta, decoded_snap, leader))` while a FOLLOWER snapshot install is DEFERRED —
+  /// its blob has been submitted (`submit_snapshot`) but is not yet durable. The destructive
+  /// install body (SM restore, `commit`/`applied` advance, the `log.restore` re-baseline, membership
+  /// install, the success ack) is held here and run by `install_snapshot_now` ONLY once the blob is
+  /// durable — the matching `SnapshotWritten`, or `StableStore::durable_snapshot()` evidence covering
+  /// the boundary if that completion was missed. Until then the follower stays in its OLD consistent
+  /// state, so a crash in the window loses only the in-flight blob and restart re-syncs from the
+  /// UNCHANGED durable log (no orphaned re-baseline → no `OrphanedLog` poison). This is the snapshot
+  /// analogue of `pending_compact` deferring `log.compact` until the blob is durable — the core owns
+  /// the ordering rather than the storage layer (the audited golden fix). Holds the DECODED snapshot
+  /// (move-out-and-replace on supersede, never `Clone` — `F::Snapshot` has only a `Data` bound); a
+  /// separate field, so a higher-term step-down's `self.pending.clear()` does NOT drop it (a boundary
+  /// that is already quorum-committed stays valid across a pure term bump). `restart` resets it to `None`.
+  pending_install: Option<(crate::OpId, crate::SnapshotMeta<I>, F::Snapshot, I)>,
+  /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
+  /// is durable (crash-safe: we never compact before the snapshot write completes).
+  ///
+  /// Completion contract: the normal path clears this field when the matching `SnapshotWritten`
+  /// completion drains through `handle_storage`'s poll loop. If that completion is dropped or
+  /// coalesced by a store (so it never arrives), `handle_storage` instead RECONCILES this field
+  /// against the durable snapshot: once `StableStore::snapshot()` reports a persisted
+  /// snapshot whose `last_index >= up_to`, the blob is durable, the deferred compaction is
+  /// performed, and this field is cleared — so a missed completion can no longer wedge future
+  /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
+  /// this field to `None`.
+  pending_compact: Option<(crate::OpId, Index)>,
+  /// Per-peer deadline before which the full `InstallSnapshot` blob is NOT re-sent to a
+  /// `Snapshot`-state peer. A deferred install legitimately takes many heartbeat intervals (blob
+  /// fsync + apply), so resending on EVERY response would re-transmit a large snapshot tens of
+  /// times per install — and response COUNT is the wrong clock entirely (ReadIndex Safe rounds
+  /// elicit extra responses, accelerating a count-based pacer arbitrarily). The deadline is
+  /// time-based: at most one resend per election timeout, regardless of response rate; a genuinely
+  /// dropped blob is still retried within one election timeout of the next response (liveness).
+  /// Entries clear when the peer leaves `Snapshot` state and on leadership change.
+  snapshot_resend_after: BTreeMap<I, Instant>,
+}
+
+// Hand-written so the impl does not require `F::Snapshot: Debug` (its only bound is `Data`, which is
+// not `Debug`): the deferred-install blob is elided and its `Debug`-friendly metadata
+// (opid/meta/leader) shown instead. A `#[derive(Debug)]` would synthesise an `F::Snapshot: Debug`
+// bound that the embedding `Endpoint` derive cannot satisfy through this nested field.
+impl<I, F> core::fmt::Debug for SnapshotState<I, F>
+where
+  I: core::fmt::Debug,
+  F: StateMachine,
+{
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("SnapshotState")
+      .field(
+        "pending_install",
+        &self
+          .pending_install
+          .as_ref()
+          .map(|(opid, meta, _, leader)| (opid, meta, leader)),
+      )
+      .field("pending_compact", &self.pending_compact)
+      .field("snapshot_resend_after", &self.snapshot_resend_after)
+      .finish()
+  }
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -875,12 +941,8 @@ where
   /// the boundary if that completion was missed. Until then the follower stays in its OLD consistent
   /// state, so a crash in the window loses only the in-flight blob and restart re-syncs from the
   /// UNCHANGED durable log (no orphaned re-baseline → no `OrphanedLog` poison). This is the snapshot
-  /// analogue of `pending_compact` deferring `log.compact` until the blob is durable — the core owns
-  /// the ordering rather than the storage layer (the audited golden fix). Holds the DECODED snapshot
-  /// (move-out-and-replace on supersede, never `Clone` — `F::Snapshot` has only a `Data` bound); a
-  /// separate field, so a higher-term step-down's `self.pending.clear()` does NOT drop it (a boundary
-  /// that is already quorum-committed stays valid across a pure term bump). `restart` resets it to `None`.
-  pending_install: Option<(crate::OpId, crate::SnapshotMeta<I>, F::Snapshot, I)>,
+  /// The deferred snapshot machinery (pending install + pending compaction + resend pacing).
+  snapshot: SnapshotState<I, F>,
   prng: Prng,
   /// Per-voter ballot: `true` = grant, `false` = reject. Absent IDs have not voted yet.
   /// Replaces the old `votes_granted: BTreeSet<I>` — the joint quorum needs the full
@@ -918,27 +980,6 @@ where
   inflight_append_upto: BTreeMap<crate::OpId, Index>,
   /// The fail-stop state (poisoned flag + first-cause reason).
   poison: Poison,
-  /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
-  /// is durable (crash-safe: we never compact before the snapshot write completes).
-  ///
-  /// Completion contract: the normal path clears this field when the matching `SnapshotWritten`
-  /// completion drains through `handle_storage`'s poll loop. If that completion is dropped or
-  /// coalesced by a store (so it never arrives), `handle_storage` instead RECONCILES this field
-  /// against the durable snapshot: once `StableStore::snapshot()` reports a persisted
-  /// snapshot whose `last_index >= up_to`, the blob is durable, the deferred compaction is
-  /// performed, and this field is cleared — so a missed completion can no longer wedge future
-  /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
-  /// this field to `None`.
-  pending_compact: Option<(crate::OpId, Index)>,
-  /// Per-peer deadline before which the full `InstallSnapshot` blob is NOT re-sent to a
-  /// `Snapshot`-state peer. A deferred install legitimately takes many heartbeat intervals (blob
-  /// fsync + apply), so resending on EVERY response would re-transmit a large snapshot tens of
-  /// times per install — and response COUNT is the wrong clock entirely (ReadIndex Safe rounds
-  /// elicit extra responses, accelerating a count-based pacer arbitrarily). The deadline is
-  /// time-based: at most one resend per election timeout, regardless of response rate; a genuinely
-  /// dropped blob is still retried within one election timeout of the next response (liveness).
-  /// Entries clear when the peer leaves `Snapshot` state and on leadership change.
-  snapshot_resend_after: BTreeMap<I, Instant>,
   /// The term + lease-support durability watermarks (persist-before-respond / -advertise).
   durable: DurablePromises,
   /// A SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
@@ -1051,7 +1092,11 @@ where
       committed_persisted: Index::ZERO,
       durable_index: Index::ZERO,
       durable_snapshot_index: Index::ZERO,
-      pending_install: None,
+      snapshot: SnapshotState {
+        pending_install: None,
+        pending_compact: None,
+        snapshot_resend_after: BTreeMap::new(),
+      },
       prng: Prng::new(seed),
       votes: BTreeMap::new(),
       election_deadline: None,
@@ -1090,8 +1135,6 @@ where
       pending: BTreeMap::new(),
       inflight_append_upto: BTreeMap::new(),
       poison: Poison::default(),
-      pending_compact: None,
-      snapshot_resend_after: BTreeMap::new(),
       durable: DurablePromises {
         // fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
         // `term_is_durable()` is true and acks are never spuriously deferred at startup.
@@ -2126,6 +2169,7 @@ where
                 // pruning here bounds the map by the tracked peers by construction.
                 let tracker = &self.tracker;
                 self
+                  .snapshot
                   .snapshot_resend_after
                   .retain(|id, _| tracker.progress(id).is_some());
               }
