@@ -1,10 +1,11 @@
 use super::*;
 use crate::{ConfChangeV2, ProposeError};
 
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
 {
   /// The current committed-configuration membership ([`ConfState`](crate::ConfState)) derived from
   /// the runtime `Tracker`.
@@ -18,10 +19,11 @@ where
     self.tracker.conf_state()
   }
 }
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
   F::Command: crate::Data,
   F::Error: core::error::Error,
 {

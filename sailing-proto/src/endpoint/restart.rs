@@ -1,6 +1,6 @@
 use super::*;
 
-impl<I, F> Endpoint<I, F>
+impl<I, F> Endpoint<I, F, Prng>
 where
   I: NodeId,
   F: StateMachine,
@@ -14,6 +14,9 @@ where
   /// election timer armed.
   ///
   /// A corrupt durable snapshot poisons the node (no partial state is applied).
+  ///
+  /// Uses the deterministic [`Prng`] seeded by `seed`; embedders who need their own RNG call
+  /// [`restart_with_rng`](Endpoint::restart_with_rng) instead.
   ///
   /// `boot_epoch` MUST be strictly greater than the `boot_epoch` of every prior incarnation of THIS
   /// node, and the caller MUST persist it durably (e.g. a monotonic boot counter) BEFORE calling
@@ -38,8 +41,7 @@ where
     F::Snapshot: Data,
     I: Data,
   {
-    let now: Now = now.into();
-    Self::restart_inner(config, now, seed, fsm, boot_epoch, None, log, stable)
+    Self::restart_with_rng(config, now, Prng::new(seed), fsm, boot_epoch, log, stable)
   }
 
   /// Migration entry point: like [`restart`](Self::restart) but for a ONE-TIME upgrade from a binary
@@ -50,6 +52,9 @@ where
   /// subsequent plain `restart` is fully covered. Pass `None` (or just use `restart`) once any enforcing
   /// restart has recorded a real floor; a too-small value reopens the config-drift hole for exactly one
   /// restart, and `None` means "trust only the durable record".
+  ///
+  /// Uses the deterministic [`Prng`] seeded by `seed`; embedders who need their own RNG call
+  /// [`restart_migrating_with_rng`](Endpoint::restart_migrating_with_rng) instead.
   // Mirrors `restart`'s wide recovery API plus the one migration parameter; bundling into a struct would
   // obscure the parallel with `restart`/`new`.
   #[allow(clippy::too_many_arguments)]
@@ -69,11 +74,74 @@ where
     F::Snapshot: Data,
     I: Data,
   {
+    Self::restart_migrating_with_rng(
+      config,
+      now,
+      Prng::new(seed),
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      log,
+      stable,
+    )
+  }
+}
+
+impl<I, F, R> Endpoint<I, F, R>
+where
+  I: NodeId,
+  F: StateMachine,
+  R: rand::Rng,
+  F::Command: Data,
+  F::Error: core::error::Error,
+{
+  /// Rebuild a node from durable storage after a crash, driven by a caller-supplied RNG. The
+  /// byte-identical-preserving [`restart`](Endpoint::restart) wraps this with a seeded
+  /// [`Prng`]; see it for the recovery semantics and the `boot_epoch` contract.
+  pub fn restart_with_rng<L, S>(
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+    boot_epoch: u64,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Self
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: Data,
+    I: Data,
+  {
+    let now: Now = now.into();
+    Self::restart_inner(config, now, rng, fsm, boot_epoch, None, log, stable)
+  }
+
+  /// Migration entry point driven by a caller-supplied RNG. The byte-identical-preserving
+  /// [`restart_migrating`](Endpoint::restart_migrating) wraps this with a seeded
+  /// [`Prng`]; see it for the migration semantics.
+  #[allow(clippy::too_many_arguments)]
+  pub fn restart_migrating_with_rng<L, S>(
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<Duration>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Self
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: Data,
+    I: Data,
+  {
     let now: Now = now.into();
     Self::restart_inner(
       config,
       now,
-      seed,
+      rng,
       fsm,
       boot_epoch,
       assume_prior_lease_support,
@@ -86,7 +154,7 @@ where
   pub(crate) fn restart_inner<L, S>(
     config: Config<I>,
     now: Now,
-    seed: u64,
+    rng: R,
     fsm: F,
     boot_epoch: u64,
     assume_prior_lease_support: Option<Duration>,
@@ -363,7 +431,7 @@ where
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
       },
-      prng: Prng::new(seed),
+      rng,
       votes: BTreeMap::new(),
       election_deadline: None,
       heartbeat_deadline: None,

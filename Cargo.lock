@@ -1426,6 +1426,8 @@ dependencies = [
  "criterion",
  "derive_more",
  "quinn-proto",
+ "rand",
+ "rand_core",
  "rcgen",
  "rustls",
  "thiserror",

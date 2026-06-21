@@ -4,10 +4,11 @@ use crate::{
   ProposeError,
 };
 
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
 {
   pub(crate) fn arm_heartbeat_timer(&mut self, now: Now) {
     self.heartbeat_deadline = Some(now.mono() + self.config.heartbeat_interval());
@@ -543,10 +544,11 @@ where
     }
   }
 }
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
   F::Command: crate::Data,
   F::Error: core::error::Error,
 {

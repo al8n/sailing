@@ -1,10 +1,11 @@
 use super::*;
 use crate::{AppendResponse, HardState, LogDone, SnapshotResponse, StableDone};
 
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
 {
   /// The match-ack ceiling: the highest log index a follower may report as matched. EVERY outbound
   /// follower success-ack clamps to this single bound (persist-before-ack) — centralizing it is what
@@ -326,10 +327,11 @@ where
     self.durable.committed_persisted = self.durable_commit();
   }
 }
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
   F::Command: Data,
   F::Error: core::error::Error,
 {

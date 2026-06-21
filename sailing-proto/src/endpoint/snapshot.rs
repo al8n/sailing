@@ -1,10 +1,11 @@
 use super::*;
 use crate::{InstallSnapshot, SnapshotMeta};
 
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
 {
   pub(crate) fn submit_snapshot<S: StableStore<NodeId = I>>(
     &self,
@@ -48,10 +49,11 @@ where
     }
   }
 }
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
   F::Command: Data,
   F::Error: core::error::Error,
 {

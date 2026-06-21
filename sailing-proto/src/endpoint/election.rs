@@ -2,15 +2,16 @@ use super::*;
 use crate::{RequestVote, VoteResponse};
 use core::error::Error;
 
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
 {
   // --- PRIVATE HELPERS (no Data bound) ---
 
   pub(crate) fn arm_election_timer(&mut self, now: Now) {
-    let t = self.prng.election_timeout(self.config.election_timeout());
+    let t = crate::prng::election_timeout(&mut self.rng, self.config.election_timeout());
     self.election_deadline = Some(now.mono() + t);
     self.heartbeat_deadline = None;
   }
@@ -258,10 +259,11 @@ where
     // Lost or Pending: stay candidate; the election timeout retries (preserves election liveness).
   }
 }
-impl<I, F> Endpoint<I, F>
+impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
+  R: rand::Rng,
   F::Command: Data,
   F::Error: Error,
 {
