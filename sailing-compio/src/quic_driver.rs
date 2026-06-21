@@ -576,7 +576,7 @@ where
       }
       // A refused dial (cap, config) is just retried on the schedule; the typed error matters
       // to interactive callers, not to the background reconciler.
-      let _ = self.coord.connect(now, addr, peer);
+      let _ = self.coord.connect(now, addr, peer.cheap_clone());
       let backoff = self
         .redial
         .get(&peer)

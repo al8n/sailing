@@ -588,7 +588,7 @@ where
         .map_or(self.redial_base, |r| r.backoff);
       let at = std_now + jittered(delay);
       self.redial.insert(
-        peer,
+        peer.cheap_clone(),
         Redial {
           at,
           backoff: (delay * 2).min(self.redial_cap),

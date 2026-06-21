@@ -162,7 +162,7 @@ fn decode_set<I: NodeId>(elems: &[Bytes]) -> Result<BTreeSet<I>, DecodeError> {
     {
       return Err(DecodeError::Invalid("set order"));
     }
-    prev = Some(id);
+    prev = Some(id.cheap_clone());
     out.insert(id);
   }
   Ok(out)

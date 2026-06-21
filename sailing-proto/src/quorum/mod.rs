@@ -4,7 +4,7 @@
 //! These are the building blocks for commit-index advancement and vote tallying under both
 //! simple and joint-consensus configurations. Correctness is critical: the committed index
 //! and vote result ride directly on the safety of replication and leader election.
-use crate::{Index, NodeId};
+use crate::{CheapClone, Index, NodeId};
 use std::collections::BTreeSet;
 
 /// The outcome of a quorum vote.
@@ -103,13 +103,14 @@ impl<I: NodeId> MajorityConfig<I> {
     if n <= STACK_CAP {
       let mut buf = [Index::ZERO; STACK_CAP];
       for (slot, id) in buf[..n].iter_mut().zip(self.ids.iter()) {
-        *slot = acked(*id);
+        *slot = acked(id.cheap_clone());
       }
       let s = &mut buf[..n];
       s.select_nth_unstable(pos);
       s[pos]
     } else {
-      let mut srt: std::vec::Vec<Index> = self.ids.iter().map(|id| acked(*id)).collect();
+      let mut srt: std::vec::Vec<Index> =
+        self.ids.iter().map(|id| acked(id.cheap_clone())).collect();
       srt.select_nth_unstable(pos);
       srt[pos]
     }
@@ -130,8 +131,8 @@ impl<I: NodeId> MajorityConfig<I> {
     }
     let mut grants = 0usize;
     let mut missing = 0usize;
-    for &id in &self.ids {
-      match votes(id) {
+    for id in &self.ids {
+      match votes(id.cheap_clone()) {
         Some(true) => grants += 1,
         Some(false) => {}
         None => missing += 1,
@@ -196,7 +197,7 @@ impl<I: NodeId> JointConfig<I> {
       .ids
       .iter()
       .chain(self.outgoing.ids.iter())
-      .copied()
+      .map(CheapClone::cheap_clone)
       .collect()
   }
 

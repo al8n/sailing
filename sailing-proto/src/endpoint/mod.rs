@@ -1,9 +1,9 @@
 //! The Sans-I/O Raft core. It owns the consensus state and exposes the
 //! `handle_*`/`poll_*` surface; leader election and log replication run through it.
 use crate::{
-  ConfChangeTransition, Config, Data, EntriesRead, EntryKind, Event, Index, Instant, LeaseRefresh,
-  LeaseSupport, LogStore, Message, NodeId, Now, OpId, Outgoing, Prng, ReadOnly, ReadOnlyOption,
-  StableStore, StateMachine, Term, Tracker,
+  CheapClone, ConfChangeTransition, Config, Data, EntriesRead, EntryKind, Event, Index, Instant,
+  LeaseRefresh, LeaseSupport, LogStore, Message, NodeId, Now, OpId, Outgoing, Prng, ReadOnly,
+  ReadOnlyOption, StableStore, StateMachine, Term, Tracker,
 };
 use bytes::Bytes;
 use core::{fmt, time::Duration};
@@ -1089,8 +1089,6 @@ where
   transfer: Transfer<I>,
 }
 
-// Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
-
 impl<I, F> Endpoint<I, F, Prng>
 where
   I: NodeId,
@@ -1105,8 +1103,6 @@ where
     Self::new_with_rng(config, now, Prng::new(seed), fsm)
   }
 }
-
-// The only entry that draws the election RNG, hence the `R: rand::Rng` bound.
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -1123,7 +1119,7 @@ where
     let now: Now = now.into();
     // Bootstrap the Tracker from the static seed voter set. Read the needed config
     // values BEFORE moving `config` into the struct literal below.
-    let cs = crate::ConfState::from_voters(config.voters().iter().copied());
+    let cs = crate::ConfState::from_voters(config.voters().iter().map(CheapClone::cheap_clone));
     let tracker = Tracker::from_conf_state(
       &cs,
       Index::ZERO,
@@ -1239,8 +1235,6 @@ where
   }
 }
 
-// No `R` bound: none of these draw the election RNG.
-
 impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
@@ -1248,7 +1242,7 @@ where
 {
   /// This node's id.
   #[inline(always)]
-  pub const fn id(&self) -> I {
+  pub fn id(&self) -> I {
     self.config.id()
   }
 
@@ -1266,8 +1260,8 @@ where
 
   /// The believed leader, if any.
   #[inline(always)]
-  pub const fn leader(&self) -> Option<I> {
-    self.leader
+  pub fn leader(&self) -> Option<I> {
+    self.leader.cheap_clone()
   }
 
   /// The LeaseGuard append-timestamp to stamp on a new leader entry: the leader's clock (nanos
@@ -1401,7 +1395,7 @@ where
     if self.leader == leader {
       return;
     }
-    self.leader = leader;
+    self.leader = leader.cheap_clone();
     self.reads.forwarded_reads.clear();
     self
       .outputs
@@ -1663,7 +1657,7 @@ where
     // Iterate all tracked IDs (voters both halves ∪ learners ∪ learners_next), excluding self.
     // The leader replicates to learners too; quorum is still computed over voters only
     // (tracker.quorum_committed / tracker.vote_result read only the voter halves).
-    self.tracker.ids().into_iter().filter(move |&p| p != me)
+    self.tracker.ids().into_iter().filter(move |p| *p != me)
   }
 
   /// The single term-read choke-point. `LogStore::term` returning `Err` is a FATAL storage failure
@@ -1711,8 +1705,6 @@ where
     })
   }
 }
-
-// `F::Command: Data`, required by `apply_committed`.
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -2284,7 +2276,8 @@ where
             if self
               .transfer
               .lead_transferee
-              .is_some_and(|t| !self.tracker.is_voter(&t))
+              .as_ref()
+              .is_some_and(|t| !self.tracker.is_voter(t))
             {
               self.transfer.lead_transferee = None;
               self.transfer.transfer_deadline = None;

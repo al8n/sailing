@@ -164,8 +164,8 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     conn.poll_decoded(&mut msgs)?;
     let peer = conn.peer();
     for m in msgs {
-      if let Some(p) = peer {
-        out.push((p, m));
+      if let Some(p) = &peer {
+        out.push((p.cheap_clone(), m));
       }
     }
     Ok(())

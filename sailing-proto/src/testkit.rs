@@ -471,7 +471,7 @@ impl<I: NodeId> StableStore for NoopStable<I> {
   type Error = Infallible;
 
   fn hard_state(&self) -> HardState<I> {
-    self.hard_state
+    self.hard_state.clone()
   }
 
   fn submit_write(&mut self, id: OpId, hard_state: HardState<I>) {

@@ -36,7 +36,7 @@ where
     }
     if !self.role.is_leader() {
       return Err(TransferError::NotLeader {
-        leader: self.leader,
+        leader: self.leader.cheap_clone(),
       });
     }
     if to == self.config.id() {
@@ -46,11 +46,11 @@ where
       return Err(TransferError::NotAVoter);
     }
     // Already targeting this node — idempotent, just return Ok.
-    if self.transfer.lead_transferee == Some(to) {
+    if self.transfer.lead_transferee.as_ref() == Some(&to) {
       return Ok(());
     }
     // Arm the transfer: stop accepting proposals, start the deadline window.
-    self.transfer.lead_transferee = Some(to);
+    self.transfer.lead_transferee = Some(to.cheap_clone());
     self.transfer.transfer_deadline = Some(now.mono() + self.config.election_timeout());
     // revoke the LeaseBased read authority for the duration of the transfer. Authorizing a transfer
     // lets the transferee become leader (forced campaign, bypassing the post-restart fence), so this leader must

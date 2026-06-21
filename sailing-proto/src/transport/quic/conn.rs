@@ -9,7 +9,7 @@ use std::{
 use quinn_proto::{Connection, ConnectionHandle, StreamId};
 
 use super::super::frame::FrameDecoder;
-use crate::NodeId;
+use crate::{CheapClone, NodeId};
 
 /// Per-connection lifecycle phase. Consensus-stream I/O is unreachable until [`Phase::Validated`].
 ///
@@ -225,7 +225,7 @@ impl<I: NodeId> ConnTable<I> {
   /// Clear `h`'s routing slot (its peer becomes unrouteable through `h`); the entry itself is
   /// KEPT so the service pump can drive the quinn connection to `Drained`.
   pub(crate) fn unbind(&mut self, h: ConnectionHandle) {
-    let peer = self.entries.get(&h).and_then(|e| e.peer);
+    let peer = self.entries.get(&h).and_then(|e| e.peer.cheap_clone());
     if let Some(p) = peer
       && self.by_peer.get(&p) == Some(&h)
     {
@@ -250,9 +250,9 @@ impl<I: NodeId> ConnTable<I> {
     limit: usize,
   ) -> Vec<ConnectionHandle> {
     if let Some(e) = self.entries.get_mut(&h) {
-      e.peer = Some(*peer);
+      e.peer = Some(peer.cheap_clone());
     }
-    self.by_peer.insert(*peer, h);
+    self.by_peer.insert(peer.cheap_clone(), h);
     // Live same-peer connections, excluding `h`, newest first; everything past the `limit - 1`
     // newest "others" is stale excess (`h` itself occupies the final slot of the bound).
     let mut others: Vec<(u64, ConnectionHandle)> = self
@@ -284,7 +284,7 @@ impl<I: NodeId> ConnTable<I> {
       .max_by_key(|(_, e)| e.seq)
       .map(|(hh, _)| *hh);
     if let Some(hh) = newest {
-      self.by_peer.insert(*peer, hh);
+      self.by_peer.insert(peer.cheap_clone(), hh);
     }
   }
 

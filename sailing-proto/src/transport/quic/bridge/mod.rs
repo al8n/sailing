@@ -45,7 +45,7 @@ use super::{
   conn::{ConnEntry, ConnTable, Phase},
   crypto::QuicOptions,
 };
-use crate::{Message, NodeId, TransportError};
+use crate::{CheapClone, Message, NodeId, TransportError};
 
 /// Maximum number of LIVE connections the bridge keeps for any ONE peer. On validation the bridge
 /// closes the OLDEST same-peer connections beyond this bound, so a flapping or crash-looping
@@ -644,7 +644,7 @@ impl<I: NodeId> Bridge<I> {
 
   /// The peer bound to connection `h`, if it has validated.
   pub(crate) fn bound_peer_of(&mut self, h: ConnectionHandle) -> Option<I> {
-    self.table.entry(h).and_then(|e| e.peer)
+    self.table.entry(h).and_then(|e| e.peer.cheap_clone())
   }
 
   /// Whether `h` is in the `Authenticating` window (preface exchange).
@@ -659,7 +659,10 @@ impl<I: NodeId> Bridge<I> {
 
   /// The peer `h` was dialed to reach (`None` for an accepted connection).
   pub(crate) fn dialed_expectation_of(&mut self, h: ConnectionHandle) -> Option<I> {
-    self.table.entry(h).and_then(|e| e.dialed_expectation)
+    self
+      .table
+      .entry(h)
+      .and_then(|e| e.dialed_expectation.cheap_clone())
   }
 
   /// The peer's TLS certificate chain for `h`, as validated by the handshake (empty when none —
@@ -784,7 +787,7 @@ impl<I: NodeId> Bridge<I> {
   /// is KEPT for the drain — only the routing slot clears), and a peer holding a still-validated
   /// mutual-dial sibling keeps an outbound route across the loss.
   fn mark_closed_unbind_push(&mut self, h: ConnectionHandle) {
-    let peer = self.table.entry(h).and_then(|e| e.peer);
+    let peer = self.table.entry(h).and_then(|e| e.peer.cheap_clone());
     if let Some(e) = self.table.entry(h) {
       e.phase = Phase::Closed;
       e.auth_deadline = None;

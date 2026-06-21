@@ -932,6 +932,8 @@ impl crate::Data for OverwideId {
   }
 }
 
+impl crate::CheapClone for OverwideId {}
+
 /// A conf change whose target id encodes OUTSIDE the wire bound must be REJECTED AT
 /// PROPOSE (`InvalidConfChange`, nothing appended): appended-and-committed, the apply
 /// path's envelope decode would reject the id and poison EVERY node applying the entry.

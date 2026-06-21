@@ -16,7 +16,7 @@ pub struct AppendEntries<I> {
   leader_commit: Index,
 }
 
-impl<I: Copy> AppendEntries<I> {
+impl<I: NodeId> AppendEntries<I> {
   /// Construct.
   #[allow(clippy::too_many_arguments)]
   pub fn new(
@@ -45,8 +45,8 @@ impl<I: Copy> AppendEntries<I> {
 
   /// The leader node id.
   #[inline(always)]
-  pub const fn leader(&self) -> I {
-    self.leader
+  pub fn leader(&self) -> I {
+    self.leader.cheap_clone()
   }
 
   /// The index immediately preceding the new entries.
@@ -85,7 +85,7 @@ pub struct AppendResponse<I> {
   match_index: Index,
 }
 
-impl<I: Copy> AppendResponse<I> {
+impl<I: NodeId> AppendResponse<I> {
   /// Construct.
   #[allow(clippy::too_many_arguments)]
   pub const fn new(
@@ -114,8 +114,8 @@ impl<I: Copy> AppendResponse<I> {
 
   /// The sender's node id.
   #[inline(always)]
-  pub const fn from(&self) -> I {
-    self.from
+  pub fn from(&self) -> I {
+    self.from.cheap_clone()
   }
 
   /// Whether the append was rejected.
@@ -154,7 +154,7 @@ pub struct RequestVote<I> {
   leader_transfer: bool,
 }
 
-impl<I: Copy> RequestVote<I> {
+impl<I: NodeId> RequestVote<I> {
   /// Construct.
   #[allow(clippy::too_many_arguments)]
   pub const fn new(
@@ -183,8 +183,8 @@ impl<I: Copy> RequestVote<I> {
 
   /// The candidate's node id.
   #[inline(always)]
-  pub const fn candidate(&self) -> I {
-    self.candidate
+  pub fn candidate(&self) -> I {
+    self.candidate.cheap_clone()
   }
 
   /// The candidate's last log index.
@@ -221,7 +221,7 @@ pub struct VoteResponse<I> {
   reject: bool,
 }
 
-impl<I: Copy> VoteResponse<I> {
+impl<I: NodeId> VoteResponse<I> {
   /// Construct.
   pub const fn new(term: Term, from: I, pre_vote: bool, reject: bool) -> Self {
     Self {
@@ -240,8 +240,8 @@ impl<I: Copy> VoteResponse<I> {
 
   /// The sender's node id.
   #[inline(always)]
-  pub const fn from(&self) -> I {
-    self.from
+  pub fn from(&self) -> I {
+    self.from.cheap_clone()
   }
 
   /// Whether this is a PreVote response.
@@ -267,7 +267,7 @@ pub struct Heartbeat<I> {
   lease_round: u64,
 }
 
-impl<I: Copy> Heartbeat<I> {
+impl<I: NodeId> Heartbeat<I> {
   /// Construct. `lease_round` defaults to 0; the leader sets it via [`Self::with_lease_round`].
   pub fn new(term: Term, leader: I, commit: Index, context: Bytes) -> Self {
     Self {
@@ -295,8 +295,8 @@ impl<I: Copy> Heartbeat<I> {
 
   /// The leader's node id.
   #[inline(always)]
-  pub const fn leader(&self) -> I {
-    self.leader
+  pub fn leader(&self) -> I {
+    self.leader.cheap_clone()
   }
 
   /// The leader's committed index.
@@ -333,7 +333,7 @@ pub struct HeartbeatResponse<I> {
   lease_support: Duration,
 }
 
-impl<I: Copy> HeartbeatResponse<I> {
+impl<I: NodeId> HeartbeatResponse<I> {
   /// Construct. `lease_round` defaults to 0 and `lease_support` to ZERO; the follower echoes the
   /// heartbeat's round via [`Self::with_lease_round`] and advertises its lease support via
   /// [`Self::with_lease_support`].
@@ -374,8 +374,8 @@ impl<I: Copy> HeartbeatResponse<I> {
 
   /// The sender's node id.
   #[inline(always)]
-  pub const fn from(&self) -> I {
-    self.from
+  pub fn from(&self) -> I {
+    self.from.cheap_clone()
   }
 
   /// Opaque context bytes echoed from the heartbeat (empty when not used).
@@ -561,11 +561,8 @@ impl<I: NodeId> InstallSnapshot<I> {
 
   /// The leader's node id.
   #[inline(always)]
-  pub fn leader(&self) -> I
-  where
-    I: Copy,
-  {
-    self.leader
+  pub fn leader(&self) -> I {
+    self.leader.cheap_clone()
   }
 
   /// Snapshot metadata (last covered index/term + conf).
@@ -590,7 +587,7 @@ pub struct SnapshotResponse<I> {
   match_index: Index,
 }
 
-impl<I: Copy> SnapshotResponse<I> {
+impl<I: NodeId> SnapshotResponse<I> {
   /// Construct.
   pub const fn new(term: Term, from: I, reject: bool, match_index: Index) -> Self {
     Self {
@@ -609,8 +606,8 @@ impl<I: Copy> SnapshotResponse<I> {
 
   /// The sender's node id.
   #[inline(always)]
-  pub const fn from(&self) -> I {
-    self.from
+  pub fn from(&self) -> I {
+    self.from.cheap_clone()
   }
 
   /// Whether the snapshot was rejected (stale or follower is already ahead).
@@ -637,7 +634,7 @@ pub struct TimeoutNow<I> {
   leader: I,
 }
 
-impl<I: Copy> TimeoutNow<I> {
+impl<I: NodeId> TimeoutNow<I> {
   /// Construct.
   pub const fn new(term: Term, leader: I) -> Self {
     Self { term, leader }
@@ -651,8 +648,8 @@ impl<I: Copy> TimeoutNow<I> {
 
   /// The sending leader's node id.
   #[inline(always)]
-  pub const fn leader(&self) -> I {
-    self.leader
+  pub fn leader(&self) -> I {
+    self.leader.cheap_clone()
   }
 }
 
@@ -672,7 +669,7 @@ pub struct ReadIndex<I> {
   context: Bytes,
 }
 
-impl<I: Copy> ReadIndex<I> {
+impl<I: NodeId> ReadIndex<I> {
   /// Construct.
   pub fn new(term: Term, from: I, context: Bytes) -> Self {
     Self {
@@ -690,8 +687,8 @@ impl<I: Copy> ReadIndex<I> {
 
   /// The sender's node id.
   #[inline(always)]
-  pub const fn from(&self) -> I {
-    self.from
+  pub fn from(&self) -> I {
+    self.from.cheap_clone()
   }
 
   /// Opaque application context identifying this read request.
@@ -723,7 +720,7 @@ pub struct ReadIndexResponse<I> {
   reject: bool,
 }
 
-impl<I: Copy> ReadIndexResponse<I> {
+impl<I: NodeId> ReadIndexResponse<I> {
   /// Construct.
   ///
   /// `reject` is `true` when the leader is at its read back-pressure capacity and is declining
@@ -748,8 +745,8 @@ impl<I: Copy> ReadIndexResponse<I> {
 
   /// The sender's node id.
   #[inline(always)]
-  pub const fn from(&self) -> I {
-    self.from
+  pub fn from(&self) -> I {
+    self.from.cheap_clone()
   }
 
   /// The confirmed committed index the follower must wait for before serving the read.
@@ -819,7 +816,7 @@ pub struct Outgoing<I> {
   message: Message<I>,
 }
 
-impl<I: Copy> Outgoing<I> {
+impl<I: NodeId> Outgoing<I> {
   /// Construct.
   pub const fn new(to: I, message: Message<I>) -> Self {
     Self { to, message }
@@ -827,8 +824,8 @@ impl<I: Copy> Outgoing<I> {
 
   /// The recipient.
   #[inline(always)]
-  pub const fn to(&self) -> I {
-    self.to
+  pub fn to(&self) -> I {
+    self.to.cheap_clone()
   }
 
   /// The message.
