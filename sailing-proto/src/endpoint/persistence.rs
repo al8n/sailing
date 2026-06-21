@@ -106,7 +106,7 @@ where
   /// `FollowerAck` for an index past `boundary` would otherwise over-ack an entry the node no longer
   /// stores, letting the leader count a phantom replica toward commit.
   pub(crate) fn scrub_acks_above(&mut self, boundary: Index) {
-    self.outgoing.retain(|o| {
+    self.outputs.outgoing.retain(|o| {
       !matches!(o.message(), Message::AppendResp(a) if !a.reject() && a.match_index() > boundary)
     });
     self.pending.retain(|_, p| match p {

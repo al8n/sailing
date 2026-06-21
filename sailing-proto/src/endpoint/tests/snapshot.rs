@@ -1093,7 +1093,7 @@ fn install_snapshot_scrubs_stale_outgoing_ack() {
 
   // Queue a success AppendResp(match_index = 3) as if the follower had acked index 3 and the ack
   // is still sitting in `outgoing` (not yet polled). This is the stale ack that must be scrubbed.
-  ep.outgoing.push_back(Outgoing::new(
+  ep.outputs.outgoing.push_back(Outgoing::new(
     1u64,
     Message::AppendResp(crate::AppendResp::new(
       Term::new(1),

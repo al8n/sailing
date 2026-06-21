@@ -894,6 +894,32 @@ where
   }
 }
 
+/// The pending output queues, grouped out of `Endpoint`.
+struct Outputs<I, F>
+where
+  F: StateMachine,
+{
+  outgoing: VecDeque<Outgoing<I>>,
+  events: VecDeque<Event<I, F::Response>>,
+}
+
+// Hand-written so the impl does not require `F::Response: Debug` (an `Event` carries the application
+// response, which is not constrained to `Debug`): the event queue is shown by its length only. A
+// `#[derive(Debug)]` would synthesise an `F::Response: Debug` bound that the embedding `Endpoint`
+// derive cannot satisfy through this nested field.
+impl<I, F> core::fmt::Debug for Outputs<I, F>
+where
+  I: core::fmt::Debug,
+  F: StateMachine,
+{
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.debug_struct("Outputs")
+      .field("outgoing", &self.outgoing)
+      .field("events", &format_args!("[{} pending]", self.events.len()))
+      .finish()
+  }
+}
+
 /// The Sans-I/O Raft state machine for one node.
 ///
 /// `I` is unbounded on the struct; `I: NodeId` belongs only on the `impl` blocks that
@@ -959,8 +985,8 @@ where
   /// broken). Pure in-memory metric — never persisted, never on the wire, reset to `0` on construction and
   /// restart, read only via [`cold_read_defers`](Self::cold_read_defers). Not a poison.
   cold_read_defers: u64,
-  outgoing: VecDeque<Outgoing<I>>,
-  events: VecDeque<Event<I, F::Response>>,
+  /// The pending output queues (outbound messages + application events).
+  outputs: Outputs<I, F>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
   /// Replaces the old `progress: BTreeMap<I, crate::Progress>` and static-voter quorum.
   tracker: crate::Tracker<I>,
@@ -1128,8 +1154,10 @@ where
       // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
       active_read_mode: read_only_opt,
       read_mode_migrated: false,
-      outgoing: VecDeque::new(),
-      events: VecDeque::new(),
+      outputs: Outputs {
+        outgoing: VecDeque::new(),
+        events: VecDeque::new(),
+      },
       tracker,
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
@@ -1335,6 +1363,7 @@ where
     self.leader = leader;
     self.forwarded_reads.clear();
     self
+      .outputs
       .events
       .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
         self.term, leader,
@@ -1421,7 +1450,7 @@ where
     if self.poison.poisoned {
       return None;
     }
-    self.outgoing.pop_front()
+    self.outputs.outgoing.pop_front()
   }
 
   /// Next application event, if any.
@@ -1432,7 +1461,7 @@ where
     if self.poison.poisoned {
       return None;
     }
-    self.events.pop_front()
+    self.outputs.events.pop_front()
   }
 
   /// Debug-only tripwire for the driver's drain obligation (see [`poll_message`](Self::poll_message)):
@@ -1445,15 +1474,15 @@ where
   fn debug_assert_queues_drained(&self) {
     const TRIPWIRE: usize = 1 << 20;
     debug_assert!(
-      self.outgoing.len() < TRIPWIRE
-        && self.events.len() < TRIPWIRE
+      self.outputs.outgoing.len() < TRIPWIRE
+        && self.outputs.events.len() < TRIPWIRE
         && self.pending.len() < TRIPWIRE
         && self.inflight_append_upto.len() < TRIPWIRE,
       "endpoint work queues exceeded the drain tripwire (outgoing={}, events={}, pending={}, \
        inflight={}) — a driver MUST drain poll_message/poll_event and call handle_storage between \
        dispatches (see poll_message)",
-      self.outgoing.len(),
-      self.events.len(),
+      self.outputs.outgoing.len(),
+      self.outputs.events.len(),
       self.pending.len(),
       self.inflight_append_upto.len(),
     );
@@ -1585,7 +1614,7 @@ where
     if self.poison.poisoned {
       return;
     }
-    self.outgoing.push_back(Outgoing::new(to, msg));
+    self.outputs.outgoing.push_back(Outgoing::new(to, msg));
   }
 
   fn peers(&self) -> impl Iterator<Item = I> {
@@ -2071,6 +2100,7 @@ where
             };
             match self.fsm.apply(idx, cmd) {
               Ok(resp) => self
+                .outputs
                 .events
                 .push_back(crate::Event::Applied(crate::Applied::new(idx, resp))),
               // An FSM apply error is fatal (the SM diverges from the committed log) → poison.
@@ -2113,11 +2143,9 @@ where
             self.read_only.set_option(mode);
             self.check_quorum_lease.lease_valid_until = None;
             self.check_quorum_lease.lease_acks.clear();
-            self
-              .events
-              .push_back(crate::Event::ReadModeChanged(crate::ReadModeChanged::new(
-                idx, mode,
-              )));
+            self.outputs.events.push_back(crate::Event::ReadModeChanged(
+              crate::ReadModeChanged::new(idx, mode),
+            ));
           }
           crate::EntryKind::ConfChange => {
             // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
@@ -2183,6 +2211,7 @@ where
             }
             let conf = self.tracker.conf_state();
             self
+              .outputs
               .events
               .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
                 idx, conf,

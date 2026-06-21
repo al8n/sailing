@@ -639,6 +639,7 @@ where
       return;
     }
     self
+      .outputs
       .events
       .push_back(crate::Event::ReadState(crate::ReadState::new(
         index, context,
