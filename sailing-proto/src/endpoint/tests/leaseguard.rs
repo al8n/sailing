@@ -494,7 +494,7 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
     0,
     "without the failover tier the wall stamp stays 0 (absent on the wire)"
   );
-  // R10: ε_unc ≥ Δ (here ε_unc = Δ = 300ms) is REJECTED by `Config::validate` and reports
+  // ε_unc ≥ Δ (here ε_unc = Δ = 300ms) is REJECTED by `Config::validate` and reports
   // `failover_tier_active() == false`. The wall stamp is gated on the SAME centralized predicate, so it
   // must stay 0 — otherwise a VALID successor would fold a validation-rejected config's `wall_timestamp`
   // into its `max_wall_plus_window` and trust it as an inherited-read / release horizon (a rejected
@@ -1999,7 +1999,7 @@ fn failover_read_window_fail_closed_without_committed_anchor() {
   );
 }
 
-/// FAILOVER R2 REGRESSION (E′, in its post-Option-B role) — the conservative MONO commit-wait is INFLATED
+/// FAILOVER REGRESSION (E′, in its post-Option-B role) — the conservative MONO commit-wait is INFLATED
 /// on the failover tier so it can NOT fire before a walled inherited entry's wall window `s_c + W_c`
 /// (which the inherited-read serve duals). The bare `become_leader_mono + max_lease_window` covers only
 /// the deposed leader's read-LEASE (`< W_c` in real time under drift); a fast successor could reach it in
@@ -2007,7 +2007,7 @@ fn failover_read_window_fail_closed_without_committed_anchor() {
 /// `(Δ+ε_drift)/Δ` so the mono timer lands no earlier than the wall window.
 ///
 /// Since Option B (the conservative mono clear is WALL-GATED for the walled class when a wall is present),
-/// E′'s job narrowed; R19 narrowed it further: the inflated wait may only SKIP the veto when a synchronized
+/// E′'s job narrowed; a later refinement narrowed it further: the inflated wait may only SKIP the veto when a synchronized
 /// wall AT ELECTION proves it reaches the floor (`wall_proves_floor`: now_wall + max_lease_window ≥
 /// max_wall_plus_window + 2·ε_unc). Here max_wall_plus_window = S + W and max_lease_window = W, so the proof
 /// needs the election wall ≥ S + 2·ε_unc — i.e. this election is 2·ε_unc AFTER the inherited stamp S (a
@@ -2025,7 +2025,7 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
   const S: u64 = 1_700_000_000_000_000_000; // the inherited COMMITTED entry's wall stamp
   // Use a NON-DIVISIBLE inflation: 100ms · (350/300) = 116_666_666.67ns, so the deadline must CEIL to
   // 116_666_667 — a truncating `/` would round to 116_666_666 and (the serve gate being strict and
-  // nanosecond-grained) re-open the R2 boundary by 1ns.
+  // nanosecond-grained) re-open the mono-undercut boundary by 1ns.
   const W: u64 = 100_000_000; // lease_window = max_lease_window = 100ms
   const TRUNC: u64 = 116_666_666; // floor(100ms · 350/300) — the WRONG (truncated) deadline
   const INFLATED: u64 = 116_666_667; // ceil(100ms · 350/300) — the correct E′ deadline
@@ -2133,7 +2133,7 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
 
   // CEIL boundary: at the TRUNCATED deadline (floor(W · 350/300) = d + 116_666_666ns) the timer must
   // STILL NOT fire — a truncating `/` would have released here, 1ns short of the wall window, re-opening
-  // R2. The ceil holds it one nanosecond longer.
+  // the mono-undercut. The ceil holds it one nanosecond longer.
   ep.handle_timeout(at(TRUNC), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
@@ -2152,13 +2152,13 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
   );
 }
 
-/// FAILOVER R19 regression (the core finding — E′ must NOT under-cover a FUTURE-stamped walled floor): an
+/// FAILOVER regression (the core finding — E′ must NOT under-cover a FUTURE-stamped walled floor): an
 /// ε_unc successor with valid lease timing inherits a walled committed entry whose wall stamp `s_c` is in
 /// the FUTURE relative to this election (crafted/corrupt — `max_wall_plus_window = s_c + W_c` is a SUM a
-/// future `s_c` inflates while `max_lease_window = W_c` stays small). Before R19 the node, being E′-eligible,
+/// future `s_c` inflates while `max_lease_window = W_c` stays small). Previously the node, being E′-eligible,
 /// would set `commit_wait_inflated`, SKIP the wall veto, and clear at the small E′ mono deadline
 /// (~W_c·(1+ρ) ≈ 117ms) — committing past `c` ~half a second before the future floor `s_c + W_c`,
-/// undercutting a peer's inherited serve on it. R19 gates the veto-skip on `wall_proves_floor` (now_wall +
+/// undercutting a peer's inherited serve on it. The fix gates the veto-skip on `wall_proves_floor` (now_wall +
 /// max_lease_window ≥ max_wall_plus_window + 2·ε_unc), which a future `s_c` fails — so the node is NOT
 /// inflated, and the wall-gate veto HOLDS the commit-wait until the wall actually passes `s_c + W_c + 2·ε_unc`.
 #[test]
@@ -2259,8 +2259,8 @@ fn failover_future_stamp_floor_held_not_e_prime_undercut() {
   assert_eq!(ep.commit_index(), Index::new(1));
 
   // Past the SMALL E′ deadline (~117ms) but with the wall ≪ the 640ms floor: the commit must NOT clear. The
-  // node is NOT inflated (`wall_proves_floor` fails for a future floor), so the wall-gate veto holds. Before
-  // R19 the E′ skip would have cleared here — the undercut.
+  // node is NOT inflated (`wall_proves_floor` fails for a future floor), so the wall-gate veto holds. Without
+  // that gate the E′ skip would have cleared here — the undercut.
   ep.handle_timeout(at(PAST_E_PRIME), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
@@ -2289,11 +2289,11 @@ fn failover_future_stamp_floor_held_not_e_prime_undercut() {
   );
 }
 
-/// FAILOVER R19 SERVE-SIDE regression (Gap-G2 — a FUTURE committed anchor must not over-serve): the serve
+/// FAILOVER SERVE-SIDE regression (Gap-G2 — a FUTURE committed anchor must not over-serve): the serve
 /// gate reads the committed anchor `(s_c, W_c)` VERBATIM from `log[commit]` and offers while `now_wall +
 /// 2·ε_unc < s_c + W_c`. A crafted/corrupt entry with a FUTURE `s_c` (the serve-side mirror of the release
 /// hole) would keep the offer open until the wall reaches the future `s_c + W_c` — long past the real lease.
-/// R19 bounds the anchor at election: trusted only when `s_c ≤ now_wall + ε_unc` (not stamped in this
+/// The fix bounds the anchor at election: trusted only when `s_c ≤ now_wall + ε_unc` (not stamped in this
 /// election's future) AND `s_c + W_c ≤ max_wall_plus_window`; otherwise it is dropped to `(0, 0)` and the
 /// serve REFUSES (the read degrades to Safe; the release side still holds commit via the veto). Here `s_c`
 /// is 500ms in the election's future, so the offer that the otherwise-identical live-lease test grants is
@@ -2382,8 +2382,8 @@ fn failover_future_committed_anchor_refuses_serve() {
     "commit held during the wait — the serve is ARMED this term"
   );
 
-  // The committed anchor was stamped in this election's future (s_c = T + 500ms ≫ now_wall + ε_unc), so R19
-  // DROPPED it to (0, 0): the serve REFUSES. Without the drop `now_wall + 2·ε_unc < s_c + W_c` would hold
+  // The committed anchor was stamped in this election's future (s_c = T + 500ms ≫ now_wall + ε_unc), so the
+  // election-time bound DROPPED it to (0, 0): the serve REFUSES. Without the drop `now_wall + 2·ε_unc < s_c + W_c` would hold
   // (the live-lease test grants exactly this for a non-future stamp), opening a stale over-serve.
   assert!(
     ep.failover_read_window(at(0)).is_none(),
@@ -2635,7 +2635,7 @@ fn failover_wall_veto_repoll_is_wedge_safe_and_releases() {
   );
 }
 
-/// FAILOVER totality regression (R23 — the wall-veto RE-ARM must not saturate near `Instant::MAX`): the
+/// FAILOVER totality regression (the wall-veto RE-ARM must not saturate near `Instant::MAX`): the
 /// re-poll re-arms `now.mono() + heartbeat`, and `Instant::add` SATURATES. A node whose monotonic clock is
 /// within one heartbeat of `Instant::MAX`, still vetoing a walled inherited lease, would re-arm to a CLAMPED
 /// `Instant::MAX` — a deadline DUE forever (the §8 serviceable-timer tripwire trips in debug, and a release
@@ -2751,10 +2751,10 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
   );
 }
 
-/// FAILOVER observability regression (the silent-wedge counter the architecture review surfaced): a failover
+/// FAILOVER observability regression (the silent-wedge counter): a failover
 /// (ε_unc) node arms its commit-wait under a wall, then is driven with a WALL-ABSENT `Now` on the release
 /// path — a driver that armed the tier but did not supply a wall to `handle_timeout`. The veto holds the
-/// commit-wait FAIL-CLOSED (R11) — safe (it never undercuts the walled lease) but otherwise SILENT and, for
+/// commit-wait FAIL-CLOSED — safe (it never undercuts the walled lease) but otherwise SILENT and, for
 /// a persistently wall-absent driver, permanent. `unprovable_floor_holds` counts each such hold so the wedge
 /// is observable (and so the VOPR can assert the failover commit-wait does not silently wedge). A
 /// wall-PRESENT, not-yet-released hold is NORMAL and is NOT counted.
@@ -2847,7 +2847,7 @@ fn failover_unprovable_floor_hold_is_counted() {
   );
 
   // The driver now drops the wall on the release path: drive WALL-ABSENT due ticks. Each holds fail-closed
-  // (R11) and is COUNTED; commit stays pinned (the walled lease is never undercut).
+  // and is COUNTED; commit stays pinned (the walled lease is never undercut).
   let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   for k in 1..=3u64 {
     ep.handle_timeout(mono(W + (k - 1) * HB), &mut log, &mut stable);
@@ -2865,12 +2865,12 @@ fn failover_unprovable_floor_hold_is_counted() {
   }
 }
 
-/// FAILOVER R11 regression (the absent-wall fail-OPEN): a NON-armed Safe+ε_unc successor driven with a
+/// FAILOVER regression (the absent-wall fail-OPEN): a NON-armed Safe+ε_unc successor driven with a
 /// MONOTONIC-only `Now` (no synchronized wall) at its bare deadline must FAIL CLOSED — hold the
 /// commit-wait — NOT clear via the bare mono path. Without the wall-absent veto, `walled_lease_vetoes_
 /// conservative` returned false on an absent wall, so this node would clear at the bare `max_lease_window`
 /// (un-inflated, under drift) and commit past `c` while an ARMED peer serves an inherited read at `c` — a
-/// stale read (R11). The fix: with ε_unc set, a walled inherited lease, and a passable horizon, an absent
+/// stale read. The fix: with ε_unc set, a walled inherited lease, and a passable horizon, an absent
 /// wall vetoes for a NON-armed node (no E′ to make the bare mono safe). It releases only once a
 /// synchronized wall proves the floor expired. (An armed node keeps its E′ mono fallback — tested
 /// separately — so this is non-armed-specific.)
@@ -2991,10 +2991,10 @@ fn failover_non_armed_successor_fails_closed_on_absent_wall() {
   );
 }
 
-/// FAILOVER R19 regression (no-ε_unc LeaseGuard successor — the R12 revert): a LeaseGuard successor that
+/// FAILOVER regression (no-ε_unc LeaseGuard successor — a reverted earlier relaxation): a LeaseGuard successor that
 /// LACKS `bounded_clock_uncertainty` (so it has no synchronized wall to read) but has valid lease timing
-/// (Δ, ε_drift) inherits a WALL-stamped committed entry. R12 let it ride the E′-inflated mono wait, claiming
-/// E′ covers the wall floor `s_c + W_c` WITHOUT a wall. R19 refuted that: E′ is a window-ONLY mono duration,
+/// (Δ, ε_drift) inherits a WALL-stamped committed entry. An earlier relaxation let it ride the E′-inflated mono wait, claiming
+/// E′ covers the wall floor `s_c + W_c` WITHOUT a wall. That was refuted: E′ is a window-ONLY mono duration,
 /// blind to the wall offset `s_c`, so a crafted/corrupt FUTURE `s_c` outruns it (`max_wall_plus_window` is a
 /// `wall + window` SUM). A node with no wall therefore cannot PROVE the floor (`wall_proves_floor` requires
 /// ε_unc AND a present wall) and must FAIL CLOSED — it HOLDS the commit-wait indefinitely rather than clear
@@ -3099,7 +3099,7 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
     "a no-ε_unc successor cannot prove the floor — it must HOLD, not clear at the bare deadline"
   );
   // It must STILL hold past the (now-defunct) E′ deadline: E′ alone cannot bound an absolute wall floor
-  // against a crafted future stamp (R19), and there is no wall to ever release it. The R12 "release at E′
+  // against a crafted future stamp, and there is no wall to ever release it. The earlier "release at E′
   // without a wall" behavior is RETRACTED — fail-closed is the only sound outcome.
   ep.handle_timeout(mono(E_PRIME), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
@@ -3124,7 +3124,7 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
   );
 }
 
-/// FAILOVER R12 regression (no-ε_unc successor, the Safe case): a Safe/LeaseBased successor that inherited
+/// FAILOVER regression (no-ε_unc successor, the Safe case): a Safe/LeaseBased successor that inherited
 /// a WALLED failover entry but has NEITHER `bounded_clock_uncertainty` (cannot wall-gate) NOR lease timing
 /// (cannot E′-inflate — no Δ) genuinely cannot bound the inherited lease in real time. It must FAIL CLOSED
 /// — hold its commit-wait rather than clear via the bare mono wait and undercut an armed peer's serve.
@@ -3231,7 +3231,7 @@ fn failover_no_eps_unc_safe_successor_fails_closed() {
   }
 }
 
-/// FAILOVER R13 regression (E′ totality — timing-invalid successor): a TIMING-INVALID LeaseGuard config
+/// FAILOVER regression (E′ totality — timing-invalid successor): a TIMING-INVALID LeaseGuard config
 /// (Δ so large the window `Δ·(Δ+ε)/(Δ−ε)` overflows `u64`, so `leaseguard_timing()` is `None`) must NOT
 /// produce a usable E′ wait. The prior E′ helper read the RAW `lease_duration`/`clock_drift_bound` and
 /// used SATURATING arithmetic, so a stale/huge Δ with a large inherited `max_lease_window` clamped the
@@ -3340,11 +3340,11 @@ fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
   }
 }
 
-/// FAILOVER R14/R15 regression (deadline-scheduling totality): `Instant::add` SATURATES, so a
+/// FAILOVER regression (deadline-scheduling totality): `Instant::add` SATURATES, so a
 /// `become_leader` at a monotonic instant within `commit_wait_window` of `Instant::MAX` would store a
 /// `commit_wait_until` clamped at the max — a real wait SHORTER than the window, which would clear the
-/// commit-wait early and commit before a deposed leader's lease elapsed. The R14 flag gate
-/// (`deadline_exact`) disarms the serve; the R15 fix additionally FAIL-STOPS the whole commit-wait
+/// commit-wait early and commit before a deposed leader's lease elapsed. The flag gate
+/// (`deadline_exact`) disarms the serve; a further fix additionally FAIL-STOPS the whole commit-wait
 /// (poison `CommitWaitUnrepresentable`) since even the BARE wait would clear early. Here the election
 /// instant is `Instant::MAX − 50ms` and the E′ wait is 116.67ms, so the deadline saturates: the node
 /// poisons (and its serve is consequently withheld). Unreachable by any real monotonic clock.
@@ -3436,7 +3436,7 @@ fn failover_unrepresentable_commit_deadline_disarms_serve() {
   );
 }
 
-/// R15 regression (BASIC-LeaseGuard saturated commit-wait): the saturated-deadline fail-stop is NOT
+/// Regression (BASIC-LeaseGuard saturated commit-wait): the saturated-deadline fail-stop is NOT
 /// failover-specific — a basic LeaseGuard successor with a WALL-ABSENT inherited window (so
 /// `inherited_release_deadline == 0` and there is no walled veto) elected near `Instant::MAX` would, with
 /// the saturating `now + max_lease_window`, store a deadline at `Instant::MAX` (a wait shorter than the
@@ -3539,7 +3539,7 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
   );
 }
 
-/// FAILOVER R16 regression (non-passable wall horizon, the cross-node fail-open): a BARE-wait ε_unc
+/// FAILOVER regression (non-passable wall horizon, the cross-node fail-open): a BARE-wait ε_unc
 /// successor (Safe + ε_unc — no E′ inflation) that inherited a WALLED entry whose horizon
 /// `wall_timestamp + lease_window + 2·ε_unc` is NON-PASSABLE (a near-`u64::MAX` wall stamp) must FAIL-STOP.
 /// The prior code SKIPPED the wall veto for a non-passable LOCAL max, reasoning "the serve is disarmed for
@@ -3647,7 +3647,7 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
   );
 }
 
-/// R17 regression (inconsistent recovered lease floors): a crafted/corrupt `SnapshotMeta` can carry a
+/// Regression (inconsistent recovered lease floors): a crafted/corrupt `SnapshotMeta` can carry a
 /// walled release floor (`max_wall_plus_window != 0`) with NO lease-window bound (`max_lease_window == 0`)
 /// — live folds can never separate them (a walled entry's window goes to BOTH). With `max_lease_window ==
 /// 0`, `failover_inflated_commit_wait` returns `Some(0)`, which (before the fix) marked the node
@@ -3743,11 +3743,11 @@ fn inconsistent_lease_floor_snapshot_fails_stop() {
   );
 }
 
-/// Shared body for the R18 unwalled-floor regressions: install a snapshot whose carried floors violate the
+/// Shared body for the unwalled-floor regressions: install a snapshot whose carried floors violate the
 /// `max_unwalled_lease_window <= max_lease_window` invariant, campaign to leader, and assert `become_leader`
 /// FAIL-STOPS with `InconsistentLeaseFloor` before any commit can advance. (No `bounded_clock_uncertainty`
 /// and a representable `max_lease_window`-sized deadline, so `InconsistentLeaseFloor` is the only poison
-/// that can fire — the same minimal LeaseGuard config the R17 walled-floor regression uses.)
+/// that can fire — the same minimal LeaseGuard config the walled-floor regression uses.)
 fn assert_inconsistent_unwalled_floor_fails_stop(
   max_unwalled_lease_window: u64,
   max_lease_window: u64,
@@ -3841,17 +3841,17 @@ fn assert_inconsistent_unwalled_floor_fails_stop(
   );
 }
 
-/// R18 regression (unwalled fallback floor exceeds the window bound — zero-window shape): a crafted
+/// Regression (unwalled fallback floor exceeds the window bound — zero-window shape): a crafted
 /// `SnapshotMeta` carries `max_unwalled_lease_window > 0` with `max_lease_window == 0`. The conservative
 /// path schedules NO commit-wait from the zero window (`commit_wait_until == None`), so the first commit
 /// would pass IMMEDIATELY while the larger unwalled fallback was only ever placed in
-/// `unwalled_commit_wait_until` — the same floor-without-window class as R17, through the unwalled field.
+/// `unwalled_commit_wait_until` — the same floor-without-window class as the walled-floor regression, through the unwalled field.
 #[test]
 fn inconsistent_unwalled_floor_zero_window_fails_stop() {
   assert_inconsistent_unwalled_floor_fails_stop(350_000_000, 0);
 }
 
-/// R18 regression (unwalled fallback floor exceeds the window bound — early-commit shape): a crafted
+/// Regression (unwalled fallback floor exceeds the window bound — early-commit shape): a crafted
 /// `SnapshotMeta` carries `max_unwalled_lease_window > max_lease_window > 0`. The conservative path
 /// schedules the SMALLER `max_lease_window` wait and clears it before the precise fallback can force the
 /// larger unwalled deadline, so the first commit passes EARLY. In a consistent fold the unwalled max is a
@@ -3979,7 +3979,7 @@ fn inconsistent_lease_floor_no_classified_floor_fails_stop() {
   assert_inconsistent_lease_floor_fails_stop(350_000_000, 0, 0);
 }
 
-/// FAILOVER R4 config-behavior change: a LeaseGuard config whose BASE window fits below the election
+/// FAILOVER config-behavior change: a LeaseGuard config whose BASE window fits below the election
 /// timeout is VALID even when its E′-INFLATED failover wait (`window · (Δ+ε_drift)/Δ`) would exceed it.
 /// The runtime inflation keys on `max_lease_window` — the MAX window INHERITED, possibly stamped by
 /// ANOTHER node's larger config — which config-time validation cannot bound (there is no cluster-wide
@@ -4012,7 +4012,7 @@ fn failover_config_with_inflated_wait_over_election_is_still_valid() {
   );
 }
 
-/// FAILOVER R4 finding 1 (heterogeneous-window runtime guard): when this node INHERITS a lease window so
+/// FAILOVER finding (heterogeneous-window runtime guard): when this node INHERITS a lease window so
 /// large that the E′-inflated conservative wait would NOT fit below the election timeout, the inherited
 /// serve is DISARMED (`failover_read_window` returns `None` even though the committed anchor's lease is
 /// live), and the commit-wait falls back to the BARE `max_lease_window` (the shipped conservative anchor)
@@ -4150,7 +4150,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
   );
 }
 
-/// FAILOVER R4 finding 2 (tier gating): `failover_tier_active` — which gates the wall stamp, the precise
+/// FAILOVER finding (tier gating): `failover_tier_active` — which gates the wall stamp, the precise
 /// commit-anchor, AND the inherited-read serve — is true ONLY for a VALID, ACTIVE LeaseGuard failover
 /// tier: LeaseGuard mode with valid timing (a computable lease window) AND a bounded clock-uncertainty.
 /// `Endpoint::new` does NOT call `Config::validate`, so a Safe/LeaseBased config (or a timing-invalid
@@ -4260,7 +4260,7 @@ fn failover_tier_active_requires_leaseguard_timing_and_bounded_uncertainty() {
   // CONSISTENCY: the runtime tier-active predicate agrees with `Config::validate` across these configs —
   // a config that validates as a failover tier is active; one validate rejects (for the failover reason)
   // is inactive. (The valid base config (1) is active and validates; the ε_unc ≥ Δ config is both
-  // rejected and inactive.) This is the single-source-of-truth invariant that ends the R4/R9 class.
+  // rejected and inactive.) This is the single-source-of-truth invariant that ends this class.
   let valid_failover = base()
     .with_read_only(ReadOnlyOption::LeaseGuard)
     .with_lease_duration(Duration::from_millis(300))
@@ -4270,12 +4270,12 @@ fn failover_tier_active_requires_leaseguard_timing_and_bounded_uncertainty() {
   assert!(endpoint(valid_failover).failover_tier_active());
 }
 
-/// FAILOVER R5 regression (arming totality): the E′-inflated conservative wait is computed in `u128`. When
+/// FAILOVER regression (arming totality): the E′-inflated conservative wait is computed in `u128`. When
 /// the EXACT ceil inflation exceeds `u64::MAX` it is NOT representable as the `Duration::from_nanos` wait
 /// `become_leader` schedules — so the serve must FAIL CLOSED. The prior `unwrap_or(u64::MAX)` CLAMP let
 /// the arming check compare a too-small value against the election timeout: with an election timeout above
 /// `u64::MAX` nanos and an inherited window forcing the exact inflation above `u64::MAX`, the clamp armed
-/// the serve while scheduling a wait SHORTER than the E′ bound, re-opening the R2 mono-undercut. The fix
+/// the serve while scheduling a wait SHORTER than the E′ bound, re-opening the mono-undercut. The fix
 /// returns `None` on overflow → the serve is disarmed and the bare wait is used.
 ///
 /// The magnitudes are deliberately at the `u64` boundary (this is a totality guard, not a realistic
@@ -4368,14 +4368,14 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
   );
 }
 
-/// FAILOVER R19 + R16 regression (a non-passable wall horizon FAILS STOP, even with valid lease timing): an
+/// FAILOVER regression (a non-passable wall horizon FAILS STOP, even with valid lease timing): an
 /// inherited walled entry stamps the wall release threshold `max_wall_plus_window + 2·ε_unc` to EXACTLY
 /// `u64::MAX` (`wall = u64::MAX − W − 2·ε_unc`). No `u64` wall can ever exceed that (strict `>`), so the
-/// floor is UNPROVABLE by a wall. This node HAS valid lease timing (Δ, ε_drift), so BEFORE R19 it rode the
-/// E′-inflated wait to avoid a wedge. R19 gates the E′ veto-skip on a wall-PROOF (`now_wall +
+/// floor is UNPROVABLE by a wall. This node HAS valid lease timing (Δ, ε_drift), so previously it rode the
+/// E′-inflated wait to avoid a wedge. The fix gates the E′ veto-skip on a wall-PROOF (`now_wall +
 /// max_lease_window ≥ max_wall_plus_window + 2·ε_unc`) that a near-`u64::MAX` floor can NEVER satisfy
 /// (`now_wall ≈ S ≪ u64::MAX`), so the node is NOT inflated — the `commit_wait_inflated`-exempt path no
-/// longer hides a non-passable floor (Expert-panel finding A8). `become_leader` then FAIL-STOPS via
+/// longer hides a non-passable floor. `become_leader` then FAIL-STOPS via
 /// `WallHorizonUnrepresentable`: a floor provable by NEITHER a wall NOR E′ must poison — not wedge, and not
 /// clear on an unsound E′ release. The serve is refused too (a poisoned node serves nothing). Unreachable
 /// under synchronized clocks (~now ≪ u64::MAX); a pure totality guard.
@@ -4473,7 +4473,7 @@ fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
   // The non-passable horizon is provable by NEITHER a wall (no u64 exceeds u64::MAX) NOR E′ (the wall-proof
   // `now_wall + max_lease_window ≥ floor + 2·ε_unc` fails: now_wall ≈ S ≪ u64::MAX). So this node — despite
   // valid lease timing — is NOT E′-inflated, and `become_leader` FAIL-STOPS via WallHorizonUnrepresentable.
-  // The inflated-exemption can no longer hide a non-passable floor (panel finding A8).
+  // The inflated-exemption can no longer hide a non-passable floor.
   assert!(
     ep.is_poisoned(),
     "a non-passable wall horizon must FAIL-STOP — not wedge, not clear on an unsound E′ release"
@@ -4810,7 +4810,7 @@ fn pending_read_mode_recomputed_at_become_leader() {
   );
 }
 
-/// REGRESSION (codex R1 [high]): a YOUNG leader (now.since_origin() < Δ) into-LeaseGuard must NOT serve
+/// REGRESSION: a YOUNG leader (now.since_origin() < Δ) into-LeaseGuard must NOT serve
 /// off the unstamped migration anchor. The Safe→LeaseGuard SetReadMode is stamped ts=0/window=0 under the
 /// OLD Safe mode; the age gate alone (now − 0 < Δ) would serve it, but the window check degrades to Safe
 /// until a stamped current-term anchor commits. (The earlier warm-up test only covered now > Δ, missing
@@ -4851,7 +4851,7 @@ fn young_leader_into_leaseguard_degrades_off_unstamped_anchor() {
   );
 }
 
-/// REGRESSION (codex R1 [medium]): applying a SetReadMode must NOT discard in-flight accepted reads
+/// REGRESSION: applying a SetReadMode must NOT discard in-flight accepted reads
 /// (`set_option`, not `reset`). A read accepted before the flip stays pending and confirms under the
 /// mode-INDEPENDENT ReadIndex quorum, instead of stranding the caller / a forwarding follower.
 #[test]

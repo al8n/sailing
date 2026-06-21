@@ -116,7 +116,7 @@ where
   /// iteration always delegates (no pre-guard): when the peer is "caught up" by `next_index` but
   /// its `match` is stale (acks lost in transit), `maybe_send_append` sends the EMPTY append whose
   /// success ack refreshes `match` and unclamps the heartbeat commit — suppressing that send wedges
-  /// a healed follower's commit forever (caught by the VOPR quiesce oracle, seed 3).
+  /// a healed follower's commit forever (caught by the VOPR quiesce oracle).
   pub(crate) fn pump_appends<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     now: Now,
@@ -472,7 +472,7 @@ where
           self.lease_guard.precise_releases += 1;
         }
       } else if walled_vetoes {
-        // OBSERVABILITY (the silent-wedge class the architecture review surfaced): the veto holds a still-
+        // OBSERVABILITY (the silent-wedge class): the veto holds a still-
         // live walled lease. Count the hold when the floor is UNPROVABLE this tick — NO synchronized wall on
         // this release path (a driver that armed the failover tier but withheld the wall here), or NO ε_unc
         // to wall-gate (a node outside the synchronized-clock contract that inherited walled entries).

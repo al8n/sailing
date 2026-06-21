@@ -1,9 +1,10 @@
-//! M8-U1 integration: a crash INSIDE the fsync window (an in-flight append staged but not yet
+//! Integration: a crash INSIDE the fsync window (an in-flight append staged but not yet
 //! flushed) loses that in-flight tail, and the node recovers the durable committed prefix
-//! (commit persistence, review C1) and re-syncs the lost tail from the leader to agreement.
+//! (commit persistence, the C1 durable-prefix oracle) and re-syncs the lost tail from the leader
+//! to agreement.
 //!
 //! This is the test that makes append-before-ack / C1 MEANINGFUL under crash: with synchronous
-//! stores the window does not exist, so M0–M7 proved those rules only against a degenerate
+//! stores the window does not exist, so earlier work proved those rules only against a degenerate
 //! commit-on-submit store. Here the window is real — the test would FAIL if the proto acted on
 //! un-flushed data (it would ack/commit an entry the follower never durably stored) or if
 //! `restart` lost the durably-committed prefix.

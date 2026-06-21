@@ -1,5 +1,5 @@
-//! M8-U3 integration: the per-tick safety-oracle suite ([`sailing_simulation::checker`]) runs on
-//! EVERY `Cluster::tick` and must stay GREEN across the full span of M1–M7 + M8-U1/U2 scenarios —
+//! Integration: the per-tick safety-oracle suite ([`sailing_simulation::checker`]) runs on
+//! EVERY `Cluster::tick` and must stay GREEN across the full span of scenarios —
 //! proving it has NO false positives on correct runs. (Reaching quiescence in any of these without
 //! a panic already proves the per-tick suite passed at every step; these tests ALSO call
 //! `check_oracles()` explicitly at the end so a green result is asserted, not merely the absence of
@@ -22,7 +22,7 @@ fn assert_green(c: &mut Cluster, ctx: &str) {
 }
 
 /// Basic replication: a 3-node cluster commits a batch; the suite stays green throughout and at the
-/// end. (M1/M2 path — the implicit per-tick run is the real assertion; the explicit check is a
+/// end. (The implicit per-tick run is the real assertion; the explicit check is a
 /// belt-and-suspenders green.)
 #[test]
 fn suite_green_across_basic_replication() {
@@ -41,7 +41,7 @@ fn suite_green_across_basic_replication() {
   assert!(leader_commit >= 12, "leader must have committed the batch");
 }
 
-/// Crash + restart (M3/persistence + M8-U1 C1 path): a follower crashes and recovers; the
+/// Crash + restart (the C1 durable-prefix path): a follower crashes and recovers; the
 /// durable-prefix and monotonic-commit oracles must NOT false-positive on the legitimate recovery
 /// (commit is persisted, so it does not regress and the recovered commit covers the durable prefix).
 #[test]
@@ -75,7 +75,7 @@ fn suite_green_across_crash_restart() {
   );
 }
 
-/// Async fsync-window crash (M8-U1): a follower crashes mid-fsync-window (a staged, un-flushed
+/// Async fsync-window crash: a follower crashes mid-fsync-window (a staged, un-flushed
 /// append is lost). The suite must stay green — the lost tail is re-synced, and the recovered
 /// commit covers the durable committed prefix (the C1 durability invariant the oracle enforces).
 #[test]
@@ -105,7 +105,7 @@ fn suite_green_across_async_fsync_window_crash() {
   assert_green(&mut c, "after async fsync-window crash + reconverge");
 }
 
-/// Snapshot + compaction (M7): a low snapshot threshold forces compaction. The
+/// Snapshot + compaction: a low snapshot threshold forces compaction. The
 /// commit-is-quorum-durable and append-before-ack oracles account for compacted entries (covered by
 /// the snapshot boundary), and boundedness checks the in-memory log shrank — none may false-positive.
 #[test]
@@ -132,7 +132,7 @@ fn suite_green_across_snapshot_and_compaction() {
   assert_green(&mut c, "after snapshot + compaction");
 }
 
-/// Membership change with a removed node (M6): removing a node leaves its applied log frozen while
+/// Membership change with a removed node: removing a node leaves its applied log frozen while
 /// the cluster advances. The agreement / no-committed-rewrite oracles must SKIP the removed node
 /// (no false positive on its stale tail), which is exactly what `removed` in the view encodes.
 #[test]
@@ -164,7 +164,7 @@ fn suite_green_across_remove_node() {
   assert_green(&mut c, "after removing a voter and advancing");
 }
 
-/// A freshly added learner lags behind before it catches up (M6): a learner is NOT a voter, so it
+/// A freshly added learner lags behind before it catches up: a learner is NOT a voter, so it
 /// must not affect the quorum-durability oracle, and while it lags its applied log is a short prefix
 /// (agreement's prefix form accepts that). No false positive during catch-up.
 #[test]
@@ -186,7 +186,7 @@ fn suite_green_across_add_learner_catchup() {
   assert_green(&mut c, "after a learner catches up");
 }
 
-/// Lossy/duplicating/reordering bus (M8-U2): a healthy majority still agrees; the per-tick suite
+/// Lossy/duplicating/reordering bus: a healthy majority still agrees; the per-tick suite
 /// must stay green under the adversarial schedule (a dropped/duplicated/reordered message must never
 /// produce a committed-history rewrite, a double-commit, or a commit that is not quorum-durable).
 #[test]

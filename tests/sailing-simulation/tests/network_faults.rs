@@ -1,9 +1,9 @@
-//! M8-U2 integration: the seeded network fault model on the typed-message bus — per-message
+//! Integration: the seeded network fault model on the typed-message bus — per-message
 //! latency/jitter/drop/duplicate/reorder. With a lossy, duplicating, reordering bus a healthy
 //! majority must STILL reach agreement and make progress (commit the batch), and the run must be
 //! deterministic (same seed ⇒ identical applied logs).
 //!
-//! This is exactly the scenario the M2 conflict-conditional-truncation fix and the M3/deferred-
+//! This is exactly the scenario the conflict-conditional-truncation fix and the deferred-
 //! completion model protect against: a duplicate AppendEntries must not double-append, a reordered/
 //! duplicated VoteResponse must not double-vote, and a dropped append must be re-replicated. The
 //! structural oracles (append-before-ack, one-grant-per-term) stay ENABLED in `Cluster::tick` and
