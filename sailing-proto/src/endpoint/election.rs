@@ -1,4 +1,6 @@
 use super::*;
+use crate::{RequestVote, VoteResp};
+use core::error::Error;
 
 impl<I, F> Endpoint<I, F>
 where
@@ -7,7 +9,7 @@ where
 {
   // --- PRIVATE HELPERS (no Data bound) ---
 
-  pub(crate) fn arm_election_timer(&mut self, now: crate::Now) {
+  pub(crate) fn arm_election_timer(&mut self, now: Now) {
     let t = self.prng.election_timeout(self.config.election_timeout());
     self.election_deadline = Some(now.mono() + t);
     self.heartbeat_deadline = None;
@@ -37,7 +39,7 @@ where
   /// Mirrors the guarantee etcd gets for free from its always-incrementing `electionElapsed` counter
   /// (every node ticks, so a voter always eventually campaigns); we reconstruct it for the
   /// deadline-based model without giving up the event-driven clock skip for non-voters.
-  pub(crate) fn reconcile_election_timer(&mut self, now: crate::Now) {
+  pub(crate) fn reconcile_election_timer(&mut self, now: Now) {
     if !self.role.is_leader()
       && self.election_deadline.is_none()
       && self.tracker.is_voter(&self.config.id())
@@ -53,7 +55,7 @@ where
   ///
   /// Sets `role = Follower`, clears `leader` and `heartbeat_deadline`, and arms the election
   /// timer so the node will eventually campaign again (with PreVote, non-disruptively).
-  pub(crate) fn step_down_to_follower(&mut self, now: crate::Now) {
+  pub(crate) fn step_down_to_follower(&mut self, now: Now) {
     self.role = Role::Follower;
     self.set_leader(None);
     self.heartbeat_deadline = None;
@@ -91,7 +93,7 @@ where
   /// leader is voluntarily handing off (relinquishing its lease), so granting cannot strand a live lease
   /// — mirrors the `in_lease` bypass. Only ever armed under `ReadOnlyOption::LeaseBased` (see `restart`).
   #[inline]
-  pub(crate) fn lease_vote_fenced(&self, now: crate::Now, force: bool) -> bool {
+  pub(crate) fn lease_vote_fenced(&self, now: Now, force: bool) -> bool {
     !force
       && self
         .durable
@@ -101,10 +103,10 @@ where
 
   pub(crate) fn on_request_vote<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &mut S,
-    rv: crate::RequestVote<I>,
+    rv: RequestVote<I>,
   ) {
     // INTENTIONAL (do NOT add a `tracker.is_voter(rv.candidate())` gate here): vote granting is
     // membership-AGNOSTIC, matching etcd's `Step`. Election safety comes from one-vote-per-term
@@ -169,7 +171,7 @@ where
       let resp_term = if grant { rv.term() } else { self.term };
       self.send(
         rv.candidate(),
-        Message::VoteResp(crate::VoteResp::new(resp_term, me, true, !grant)),
+        Message::VoteResp(VoteResp::new(resp_term, me, true, !grant)),
       );
       return;
     }
@@ -208,22 +210,22 @@ where
       let (term, me) = (self.term, self.config.id());
       self.send(
         rv.candidate(),
-        Message::VoteResp(crate::VoteResp::new(term, me, false, true)),
+        Message::VoteResp(VoteResp::new(term, me, false, true)),
       );
     }
   }
 
   pub(crate) fn on_vote_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &mut S,
-    vr: crate::VoteResp<I>,
+    vr: VoteResp<I>,
   ) where
-    F::Command: crate::Data,
+    F::Command: Data,
     // `become_candidate`/`become_leader` live in the `apply_committed` impl block, which is
     // gated on this bound (the fatal apply error must be inspectable, design spec §6.3).
-    F::Error: core::error::Error,
+    F::Error: Error,
   {
     if vr.pre_vote() {
       // Pre-vote response: only count if we are still a PreCandidate.
@@ -260,8 +262,8 @@ impl<I, F> Endpoint<I, F>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
-  F::Error: core::error::Error,
+  F::Command: Data,
+  F::Error: Error,
 {
   /// Start a real election campaign.
   ///
@@ -271,7 +273,7 @@ where
   /// (election-timeout path, pre-vote quorum reached) pass `transfer = false`.
   pub(crate) fn become_candidate<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &mut S,
     transfer: bool,
@@ -334,11 +336,11 @@ where
     // Send RequestVote only to VOTER peers (not learners). Learners don't participate in
     // elections; sending them a RequestVote wastes bandwidth and may confuse their state.
     // Replication still goes to all peers (learners get AppendEntries from become_leader).
-    let voter_peers: std::vec::Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
+    let voter_peers: Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
     for peer in voter_peers {
       self.send(
         peer,
-        Message::RequestVote(crate::RequestVote::new(
+        Message::RequestVote(RequestVote::new(
           term, me, last_index, last_term, false, transfer,
         )),
       );
@@ -356,7 +358,7 @@ where
   ///
   /// Returns `true` if the pre-vote quorum is already satisfied (single-node fast path), so
   /// the caller can immediately proceed to `become_candidate`.
-  pub(crate) fn become_pre_candidate<L: LogStore>(&mut self, now: crate::Now, log: &L) -> bool {
+  pub(crate) fn become_pre_candidate<L: LogStore>(&mut self, now: Now, log: &L) -> bool {
     // Non-voter guard (mirrors become_candidate for defense-in-depth).
     if !self.tracker.is_voter(&self.config.id()) {
       return false;
@@ -381,11 +383,11 @@ where
       return false;
     };
     let me = self.config.id();
-    let voter_peers: std::vec::Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
+    let voter_peers: Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
     for peer in voter_peers {
       self.send(
         peer,
-        Message::RequestVote(crate::RequestVote::new(
+        Message::RequestVote(RequestVote::new(
           advertised_term,
           me,
           last_index,
@@ -409,10 +411,10 @@ where
   /// non-aliased index — a corrupt/terminal node).
   pub(crate) fn append_leader_noop<L: LogStore>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
-    last: crate::Index,
-  ) -> Option<crate::Index> {
+    last: Index,
+  ) -> Option<Index> {
     let Some(noop_index) = Self::next_log_index(last) else {
       self.poison(PoisonReason::LogExhausted);
       return None;
@@ -449,12 +451,12 @@ where
       return (0, 0);
     }
     match log.entries(self.commit..self.commit.next(), u64::MAX) {
-      Ok(crate::EntriesRead::Ready(s)) => s
+      Ok(EntriesRead::Ready(s)) => s
         .first()
         .map(|e| (e.wall_timestamp(), e.lease_window()))
         .unwrap_or((0, 0)),
       // Cold anchor: fail closed (the serve gate refuses, degrades to Safe), same as the absent case.
-      Ok(crate::EntriesRead::Pending) => (0, 0),
+      Ok(EntriesRead::Pending) => (0, 0),
       Err(_) => {
         self.poison(PoisonReason::LogRead);
         (0, 0)
@@ -513,7 +515,7 @@ where
 
   pub(crate) fn become_leader<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &mut S,
   ) {
@@ -686,7 +688,7 @@ where
     let deadline_exact = now
       .mono()
       .since_origin()
-      .checked_add(core::time::Duration::from_nanos(commit_wait_window))
+      .checked_add(Duration::from_nanos(commit_wait_window))
       .is_some();
     self.lease_guard.commit_wait_inflated = inflated_candidate && deadline_exact;
     // The SERVE additionally requires a valid active failover tier (ε_unc) and a passable horizon.
@@ -698,7 +700,7 @@ where
     // so FAIL-STOP: poison. A poisoned node's `handle_message`/`handle_timeout` return early, so it never
     // advances commit — it holds rather than under-wait. Unreachable by any real monotonic clock.
     if self.lease_guard.max_lease_window > 0 && !deadline_exact {
-      self.poison(crate::PoisonReason::CommitWaitUnrepresentable);
+      self.poison(PoisonReason::CommitWaitUnrepresentable);
     }
     // A BARE-wait ε_unc successor (no E′ inflation) relies SOLELY on the wall-gate to bound an inherited
     // WALLED lease. If that lease's horizon is NON-PASSABLE (`max_wall_plus_window + 2·ε_unc > u64::MAX`),
@@ -713,7 +715,7 @@ where
       && self.lease_guard.max_wall_plus_window != 0
       && !horizon_passable
     {
-      self.poison(crate::PoisonReason::WallHorizonUnrepresentable);
+      self.poison(PoisonReason::WallHorizonUnrepresentable);
     }
     // INHERITED-LEASE FLOOR fold-consistency — cheap DEFENSE-IN-DEPTH against a BUG in OUR OWN fold (the
     // `submit_append` / restart-scan / snapshot-install folds emitting internally-inconsistent floors), NOT a
@@ -738,10 +740,10 @@ where
         && self.lease_guard.max_wall_plus_window == 0
         && self.lease_guard.max_unwalled_lease_window == 0)
     {
-      self.poison(crate::PoisonReason::InconsistentLeaseFloor);
+      self.poison(PoisonReason::InconsistentLeaseFloor);
     }
     self.lease_guard.commit_wait_until = (self.lease_guard.max_lease_window > 0)
-      .then(|| now.mono() + core::time::Duration::from_nanos(commit_wait_window));
+      .then(|| now.mono() + Duration::from_nanos(commit_wait_window));
     // FAILOVER-tier PRECISE commit-anchor (consumed by `maybe_advance_commit`'s precise early-release).
     // Pin, immutable for this term: the WALL-frame release floor = `max_wall_plus_window` (max over
     // WALLED inherited entries of `wall_timestamp + lease_window`), and the MONO-frame fallback deadline
@@ -750,9 +752,7 @@ where
     // conservative anchor above governs unchanged.
     self.lease_guard.inherited_release_deadline = self.lease_guard.max_wall_plus_window;
     self.lease_guard.unwalled_commit_wait_until = (self.lease_guard.max_unwalled_lease_window > 0)
-      .then(|| {
-        now.mono() + core::time::Duration::from_nanos(self.lease_guard.max_unwalled_lease_window)
-      });
+      .then(|| now.mono() + Duration::from_nanos(self.lease_guard.max_unwalled_lease_window));
     // FAILOVER-tier INHERITED-READ serve anchors (consumed by `failover_read_window`). Pinned ONCE here,
     // immutable for the term — `log.last_index()` and `commit` both drift during the term, so neither
     // may stand in later (§4). `limbo_upper` = the election tail (captured BEFORE the no-op below, which
@@ -801,7 +801,7 @@ where
 
     // Broadcast heartbeats and kick off replication to peers.
     self.broadcast_heartbeat(now);
-    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+    for peer in self.peers().collect::<Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
     }
   }

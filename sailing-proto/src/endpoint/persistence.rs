@@ -1,4 +1,5 @@
 use super::*;
+use crate::{AppendResp, HardState, LogDone, SnapshotResp, StableDone};
 
 impl<I, F> Endpoint<I, F>
 where
@@ -52,7 +53,7 @@ where
   pub(crate) fn submit_append<L: LogStore>(
     &mut self,
     log: &mut L,
-    id: crate::OpId,
+    id: OpId,
     entries: &[crate::Entry],
   ) {
     if self.poison.poisoned {
@@ -140,15 +141,15 @@ where
   /// here (NOT a re-read value) makes the durable floor monotone by construction (`raise` never lowers it,
   /// and also upgrades a legacy `Unrecorded` record to `Recorded` — the self-heal). A future monotone field
   /// `F` adds exactly ONE line here: `.with_f(hs.f().max(self.f_floor))`.
-  pub(crate) fn stamp_floors(&self, hs: crate::HardState<I>) -> crate::HardState<I> {
+  pub(crate) fn stamp_floors(&self, hs: HardState<I>) -> HardState<I> {
     hs.with_lease_support(hs.lease_support().raise(self.durable.lease_support_floor))
   }
 
   pub(crate) fn submit_write<S: StableStore<NodeId = I>>(
     &mut self,
     stable: &mut S,
-    id: crate::OpId,
-    hard_state: crate::HardState<I>,
+    id: OpId,
+    hard_state: HardState<I>,
   ) {
     if self.poison.poisoned {
       return;
@@ -206,14 +207,14 @@ where
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
+        Message::SnapshotResp(SnapshotResp::new(term, me, false, match_index)),
       );
     }
     if let Some((to, _, proven)) = self.durable.term_gated_append_ack.take() {
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::AppendResp(crate::AppendResp::new(
+        Message::AppendResp(AppendResp::new(
           term,
           me,
           false,
@@ -238,7 +239,7 @@ where
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::AppendResp(crate::AppendResp::new(
+        Message::AppendResp(AppendResp::new(
           term,
           me,
           false,
@@ -267,7 +268,7 @@ where
       let match_index = proven.min(self.ack_watermark());
       self.send(
         to,
-        Message::SnapshotResp(crate::SnapshotResp::new(term, me, false, match_index)),
+        Message::SnapshotResp(SnapshotResp::new(term, me, false, match_index)),
       );
     } else {
       let proven = match self.durable.term_gated_snapshot_ack {
@@ -329,7 +330,7 @@ impl<I, F> Endpoint<I, F>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
+  F::Command: Data,
   F::Error: core::error::Error,
 {
   /// Drain storage completions (append-before-ack / persist-vote).
@@ -337,17 +338,17 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    F::Snapshot: crate::Data,
+    F::Snapshot: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     if self.poison.poisoned {
       return;
     }
     self.debug_assert_queues_drained();
     while let Some(done) = log.poll() {
       match done {
-        Ok(crate::LogDone::Appended(opid)) => self.on_log_appended(now, log, stable, opid),
-        Ok(crate::LogDone::Compacted(_)) => {}
+        Ok(LogDone::Appended(opid)) => self.on_log_appended(now, log, stable, opid),
+        Ok(LogDone::Compacted(_)) => {}
         Err(_) => {
           self.poison(PoisonReason::LogPoll);
           return;
@@ -356,8 +357,8 @@ where
     }
     while let Some(done) = stable.poll() {
       match done {
-        Ok(crate::StableDone::Wrote(opid)) => self.on_stable_wrote(now, log, stable, opid),
-        Ok(crate::StableDone::SnapshotWritten(opid)) => {
+        Ok(StableDone::Wrote(opid)) => self.on_stable_wrote(now, log, stable, opid),
+        Ok(StableDone::SnapshotWritten(opid)) => {
           // Deferred compaction: fire only after the snapshot is durable.
           // This mirrors append-before-ack: the log is never compacted before the
           // snapshot backing it is safely on stable storage.
@@ -482,10 +483,10 @@ where
 
   pub(crate) fn on_log_appended<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &S,
-    opid: crate::OpId,
+    opid: OpId,
   ) {
     // Advance the persist-before-ack watermark for EVERY completed append, regardless of role,
     // term, or whether a `pending` action survived. `pending` is cleared on term changes, and a
@@ -531,10 +532,10 @@ where
 
   pub(crate) fn on_stable_wrote<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &mut S,
-    opid: crate::OpId,
+    opid: OpId,
   ) {
     // a completion at or past the current term's write makes that term durable (stable completions
     // are ordered). Advance `durable_term`, which may now release a term-gated success ack below.

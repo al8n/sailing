@@ -1,18 +1,22 @@
 use super::*;
+use crate::{
+  AppendEntries, AppendResp, Entry, Heartbeat, HeartbeatResp, MaybeOwned, ProgressState,
+  ProposeError,
+};
 
 impl<I, F> Endpoint<I, F>
 where
   I: NodeId,
   F: StateMachine,
 {
-  pub(crate) fn arm_heartbeat_timer(&mut self, now: crate::Now) {
+  pub(crate) fn arm_heartbeat_timer(&mut self, now: Now) {
     self.heartbeat_deadline = Some(now.mono() + self.config.heartbeat_interval());
     // Callers that need to clear election_deadline (e.g. become_leader when check_quorum is
     // false) do so explicitly; we do NOT touch election_deadline here so the CQ timer
     // (set by become_leader when check_quorum is true) is not clobbered on each heartbeat.
   }
 
-  pub(crate) fn broadcast_heartbeat(&mut self, now: crate::Now) {
+  pub(crate) fn broadcast_heartbeat(&mut self, now: Now) {
     // Start a FRESH CheckQuorum lease round: bump the round, record its SEND instant, and clear the
     // per-round ack set, so the read lease (`lease_valid_until`) is renewed only by HeartbeatResp
     // echoing THIS round and is bounded by this round's send time. A stale/duplicated
@@ -38,7 +42,7 @@ where
       .last_pending_request_ctx()
       .cloned()
       .unwrap_or_default();
-    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+    for peer in self.peers().collect::<Vec<_>>() {
       // Clamp the advertised commit to this peer's known match index. A heartbeat carries
       // no prev-log check, so the follower can only safely commit up to the prefix it has
       // proven (via a consistency-checked AppendEntries) matches ours. Telling a peer to
@@ -53,7 +57,7 @@ where
       self.send(
         peer,
         Message::Heartbeat(
-          crate::Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
+          Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
         ),
       );
     }
@@ -63,7 +67,7 @@ where
   ///
   /// Used by the ReadIndex Safe path to kick off a dedicated heartbeat round that
   /// proves the leader is still reachable by a quorum.
-  pub(crate) fn broadcast_heartbeat_with_ctx(&mut self, _now: crate::Now, ctx: Bytes) {
+  pub(crate) fn broadcast_heartbeat_with_ctx(&mut self, _now: Now, ctx: Bytes) {
     // Carry the CURRENT lease round (do NOT bump — only the periodic `broadcast_heartbeat` opens a new
     // round) so responses to this read-path heartbeat also count toward the lease.
     let (term, me, lease_round) = (
@@ -71,7 +75,7 @@ where
       self.config.id(),
       self.check_quorum_lease.lease_round,
     );
-    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+    for peer in self.peers().collect::<Vec<_>>() {
       let peer_commit = self
         .tracker
         .progress(&peer)
@@ -80,7 +84,7 @@ where
       self.send(
         peer,
         Message::Heartbeat(
-          crate::Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
+          Heartbeat::new(term, me, peer_commit, ctx.clone()).with_lease_round(lease_round),
         ),
       );
     }
@@ -94,7 +98,7 @@ where
   /// one message regardless of the cap — a flow-control bypass / OOM risk. Mirrors etcd's
   /// `limitSize`, which charges each entry's full encoded `Size()` (never zero).
   #[inline(always)]
-  pub(crate) fn entry_size(e: &crate::Entry) -> u64 {
+  pub(crate) fn entry_size(e: &Entry) -> u64 {
     const ENTRY_METADATA_SIZE: u64 = 17;
     ENTRY_METADATA_SIZE + e.data().len() as u64
   }
@@ -114,7 +118,7 @@ where
   /// a healed follower's commit forever (caught by the VOPR quiesce oracle, seed 3).
   pub(crate) fn pump_appends<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     peer: I,
     log: &L,
     stable: &S,
@@ -139,7 +143,7 @@ where
 
   pub(crate) fn maybe_send_append<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     peer: I,
     log: &L,
     stable: &S,
@@ -209,22 +213,22 @@ where
       next.get().saturating_add(MAX_READ_BATCH_ENTRIES),
     ));
     // Bind the MaybeOwned to a local so a cold-fetch store's OWNED buffer outlives the `slice` borrow.
-    let read: crate::MaybeOwned<'_, [crate::Entry]> = if next < end {
+    let read: MaybeOwned<'_, [Entry]> = if next < end {
       match log.entries(next..read_end, max_bytes) {
-        Ok(crate::EntriesRead::Ready(e)) => e,
+        Ok(EntriesRead::Ready(e)) => e,
         // Cold: the range isn't resident. Defer the whole send — no Progress mutation, no inflight
         // slot consumed — and retry on the next pump. A cold read is NOT a fault, so never poison
         // (unlike an Err, which IS fatal, same policy as `apply_committed`'s LogRead).
-        Ok(crate::EntriesRead::Pending) => return,
+        Ok(EntriesRead::Pending) => return,
         Err(_) => {
           self.poison(PoisonReason::LogRead);
           return;
         }
       }
     } else {
-      crate::MaybeOwned::Borrowed(&[])
+      MaybeOwned::Borrowed(&[])
     };
-    let slice: &[crate::Entry] = &read;
+    let slice: &[Entry] = &read;
 
     // Cap at max_size_per_msg bytes, but always send at least one entry.
     let entries = if slice.is_empty() || max_bytes == u64::MAX {
@@ -265,7 +269,7 @@ where
     let (term, me, commit) = (self.term, self.config.id(), self.commit);
     self.send(
       peer,
-      Message::AppendEntries(crate::AppendEntries::new(
+      Message::AppendEntries(AppendEntries::new(
         term, me, prev_index, prev_term, entries, commit,
       )),
     );
@@ -327,7 +331,7 @@ where
   /// i.e. `now_wall > inherited_release_deadline + 2·ε_unc`) and any WALL-ABSENT (fail-closed) entries
   /// by the conservative mono-frame fallback `unwalled_commit_wait_until`. Returns `false` off-tier or
   /// when this leader holds no synchronized wall, so the shipped conservative anchor governs unchanged.
-  pub(crate) fn precise_release_ready(&self, now: crate::Now) -> bool {
+  pub(crate) fn precise_release_ready(&self, now: Now) -> bool {
     let Some(eps) = self.config.bounded_clock_uncertainty() else {
       return false;
     };
@@ -396,7 +400,7 @@ where
   /// Keys on `inherited_release_deadline` (folded ENTRY-property-gated, so present on EVERY holder
   /// regardless of read mode) — NOT `failover_tier_active`. The fail-closed branches hold a misconfigured
   /// node rather than serve a stale read (safety over the liveness of a node outside the clock contract).
-  fn walled_lease_vetoes_conservative(&self, now: crate::Now) -> bool {
+  fn walled_lease_vetoes_conservative(&self, now: Now) -> bool {
     if self.lease_guard.inherited_release_deadline == 0 {
       return false; // no walled inherited lease to honor
     }
@@ -432,7 +436,7 @@ where
     )
   }
 
-  pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: crate::Now, log: &L) {
+  pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: Now, log: &L) {
     // LeaseGuard commit-wait: once the post-election deferred-commit window elapses, lift the gate
     // FOR GOOD — clearing here (not only when a commit actually advances) keeps poll_timeout and
     // handle_timeout consistent: a fired CommitWait timer must leave no serviceable-and-due deadline
@@ -554,34 +558,34 @@ where
     log: &mut L,
     stable: &S,
     cmd: &F::Command,
-  ) -> Result<Index, crate::ProposeError<I>>
+  ) -> Result<Index, ProposeError<I>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     if self.poison.poisoned {
-      return Err(crate::ProposeError::Poisoned);
+      return Err(ProposeError::Poisoned);
     }
     if !self.role.is_leader() {
-      return Err(crate::ProposeError::NotLeader {
+      return Err(ProposeError::NotLeader {
         leader: self.leader,
       });
     }
     // A leader transfer is in progress: stop accepting new entries so the target can
     // catch up to a fixed last_index and receive TimeoutNow.
     if self.transfer.lead_transferee.is_some() {
-      return Err(crate::ProposeError::LeaderTransferInProgress);
+      return Err(ProposeError::LeaderTransferInProgress);
     }
     // Allocate a fresh, usable log index (see `next_log_index`): refuse rather than alias-and-truncate
     // at the saturated ceiling or allocate the unreadable sentinel `u64::MAX`.
     let Some(index) = Self::next_log_index(log.last_index()) else {
-      return Err(crate::ProposeError::LogIndexExhausted);
+      return Err(ProposeError::LogIndexExhausted);
     };
     use crate::Data as _;
-    let mut buf = std::vec::Vec::new();
+    let mut buf = Vec::new();
     cmd.encode(&mut buf);
-    let entry = crate::Entry::new(
+    let entry = Entry::new(
       self.term,
       index,
       crate::EntryKind::Normal,
@@ -596,18 +600,13 @@ where
     self
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
-    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+    for peer in self.peers().collect::<Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
     }
     Ok(index)
   }
 
-  pub(crate) fn on_heartbeat<L: LogStore>(
-    &mut self,
-    now: crate::Now,
-    log: &mut L,
-    hb: crate::Heartbeat<I>,
-  ) {
+  pub(crate) fn on_heartbeat<L: LogStore>(&mut self, now: Now, log: &mut L, hb: Heartbeat<I>) {
     self.role = Role::Follower;
     self.set_leader(Some(hb.leader()));
     self.arm_election_timer(now);
@@ -653,15 +652,15 @@ where
       if self.durable.durable_lease_support >= Some(this_run) {
         this_run
       } else {
-        core::time::Duration::ZERO
+        Duration::ZERO
       }
     } else {
-      core::time::Duration::ZERO
+      Duration::ZERO
     };
     self.send(
       hb.leader(),
       Message::HeartbeatResp(
-        crate::HeartbeatResp::new(term, me, ctx)
+        HeartbeatResp::new(term, me, ctx)
           .with_lease_round(hb.lease_round())
           .with_lease_support(lease_support),
       ),
@@ -670,10 +669,10 @@ where
 
   pub(crate) fn on_append_entries<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &mut S,
-    ae: crate::AppendEntries<I>,
+    ae: AppendEntries<I>,
   ) {
     self.role = Role::Follower;
     self.set_leader(Some(ae.leader()));
@@ -716,7 +715,7 @@ where
       };
       self.send(
         ae.leader(),
-        Message::AppendResp(crate::AppendResp::new(
+        Message::AppendResp(AppendResp::new(
           term,
           me,
           true,
@@ -886,11 +885,11 @@ where
   ///    reached a voter quorum.
   pub(crate) fn on_heartbeat_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     from: I,
     log: &L,
     stable: &S,
-    resp: crate::HeartbeatResp<I>,
+    resp: HeartbeatResp<I>,
   ) {
     if !self.role.is_leader() {
       return;
@@ -914,7 +913,7 @@ where
     // min'd here, seeded to the leader's own election_timeout each round), so a voter with a SHORTER
     // election_timeout caps the lease at its real election window — the leader never out-lives a supporter.
     if resp.lease_round() == self.check_quorum_lease.lease_round
-      && resp.lease_support() > core::time::Duration::ZERO
+      && resp.lease_support() > Duration::ZERO
     {
       self.check_quorum_lease.lease_acks.insert(from);
       self.check_quorum_lease.lease_min_support = self
@@ -959,7 +958,7 @@ where
     // borrow into locals, drop the borrow, then act — mirrors on_append_resp's re-borrow.)
     let resend = match self.tracker.progress(&from) {
       Some(pr) => match pr.state() {
-        crate::ProgressState::Snapshot(pending) => pr.match_index() < pending,
+        ProgressState::Snapshot(pending) => pr.match_index() < pending,
         _ => false,
       },
       None => false,
@@ -1073,11 +1072,11 @@ where
 
   pub(crate) fn on_append_resp<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &S,
     from: I,
-    resp: crate::AppendResp<I>,
+    resp: AppendResp<I>,
   ) {
     if !self.role.is_leader() {
       return;
@@ -1145,14 +1144,14 @@ where
         // performed the Snapshot -> Probe transition when the peer caught up past pending, so
         // there is nothing to do here either.
         match state_before {
-          crate::ProgressState::Probe => {
+          ProgressState::Probe => {
             // Re-acquire progress (prior `pr` borrow ended at maybe_update above), mirroring
             // the reject-branch re-borrow idiom.
             if let Some(p) = self.tracker.progress_mut(&from) {
               p.become_replicate();
             }
           }
-          crate::ProgressState::Replicate | crate::ProgressState::Snapshot(_) => {}
+          ProgressState::Replicate | ProgressState::Snapshot(_) => {}
         }
         self.maybe_advance_commit(now, log);
         self.apply_committed(log);

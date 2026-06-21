@@ -1,4 +1,5 @@
 use super::*;
+use crate::{ConfChangeV2, ProposeError};
 
 impl<I, F> Endpoint<I, F>
 where
@@ -35,10 +36,10 @@ where
   /// Requires `I: crate::Data` because the ConfChangeV2 encodes node ids.
   pub(crate) fn append_conf_change<L, S>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &S,
-    cc: crate::ConfChangeV2<I>,
+    cc: ConfChangeV2<I>,
   ) -> Option<Index>
   where
     L: LogStore,
@@ -47,7 +48,7 @@ where
     // Allocate a fresh, usable index (see `next_log_index`): refuse at the ceiling rather than
     // alias-and-truncate or allocate the unreadable sentinel `u64::MAX`.
     let index = Self::next_log_index(log.last_index())?;
-    let mut buf = std::vec::Vec::new();
+    let mut buf = Vec::new();
     crate::wire::encode_conf_change_v2(&cc, &mut buf);
     let entry = crate::Entry::new(
       self.term,
@@ -68,7 +69,7 @@ where
     // here. The configuration changes only when the entry is committed-and-applied (apply_committed) —
     // so `conf_state()`/`quorum_committed()` always reflect the COMMITTED voter set, never an
     // uncommitted log tail. At append the leader records only `pending_conf_index` (one in flight).
-    for peer in self.peers().collect::<std::vec::Vec<_>>() {
+    for peer in self.peers().collect::<Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
     }
     Some(index)
@@ -88,12 +89,12 @@ where
     log: &mut L,
     stable: &S,
     cc: crate::ConfChange<I>,
-  ) -> Result<Index, crate::ProposeError<I>>
+  ) -> Result<Index, ProposeError<I>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     self.propose_conf_change_v2(now, log, stable, cc.into_v2())
   }
 
@@ -109,28 +110,28 @@ where
     now: impl Into<Now>,
     log: &mut L,
     stable: &S,
-    cc: crate::ConfChangeV2<I>,
-  ) -> Result<Index, crate::ProposeError<I>>
+    cc: ConfChangeV2<I>,
+  ) -> Result<Index, ProposeError<I>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     if self.poison.poisoned {
-      return Err(crate::ProposeError::Poisoned);
+      return Err(ProposeError::Poisoned);
     }
     if !self.role.is_leader() {
-      return Err(crate::ProposeError::NotLeader {
+      return Err(ProposeError::NotLeader {
         leader: self.leader,
       });
     }
     // A leader transfer is in progress: no membership changes mid-transfer either.
     if self.transfer.lead_transferee.is_some() {
-      return Err(crate::ProposeError::LeaderTransferInProgress);
+      return Err(ProposeError::LeaderTransferInProgress);
     }
     // One change in flight at a time: refuse if a ConfChange entry is not yet applied.
     if self.pending_conf_index > self.applied {
-      return Err(crate::ProposeError::ConfChangeInFlight);
+      return Err(ProposeError::ConfChangeInFlight);
     }
     // Every id entering the LOG must satisfy the wire bound (1..=1024-byte encoding):
     // the apply path decodes committed conf changes through the envelope, whose id
@@ -143,7 +144,7 @@ where
       .iter()
       .all(|c| crate::wire::id_within_wire_bound(&c.node()))
     {
-      return Err(crate::ProposeError::InvalidConfChange);
+      return Err(ProposeError::InvalidConfChange);
     }
     // Pre-validate against the CURRENT tracker using the SAME Changer dispatch `apply_committed`
     // uses (apply-time membership, spec §9). An invalid change (e.g. `leave_joint` while not in a
@@ -156,22 +157,21 @@ where
         self.config.max_inflight_msgs(),
         self.config.max_inflight_bytes(),
       );
-      let result =
-        if cc.changes().is_empty() && cc.transition() == crate::ConfChangeTransition::Auto {
-          changer.leave_joint(&self.tracker)
-        } else if cc.transition() != crate::ConfChangeTransition::Auto || cc.changes().len() > 1 {
-          let auto_leave = cc.transition() != crate::ConfChangeTransition::Explicit;
-          changer.enter_joint(&self.tracker, auto_leave, cc.changes())
-        } else {
-          changer.simple(&self.tracker, cc.changes())
-        };
+      let result = if cc.changes().is_empty() && cc.transition() == ConfChangeTransition::Auto {
+        changer.leave_joint(&self.tracker)
+      } else if cc.transition() != ConfChangeTransition::Auto || cc.changes().len() > 1 {
+        let auto_leave = cc.transition() != ConfChangeTransition::Explicit;
+        changer.enter_joint(&self.tracker, auto_leave, cc.changes())
+      } else {
+        changer.simple(&self.tracker, cc.changes())
+      };
       if result.is_err() {
-        return Err(crate::ProposeError::InvalidConfChange);
+        return Err(ProposeError::InvalidConfChange);
       }
     }
     match self.append_conf_change(now, log, stable, cc) {
       Some(index) => Ok(index),
-      None => Err(crate::ProposeError::LogIndexExhausted),
+      None => Err(ProposeError::LogIndexExhausted),
     }
   }
 }

@@ -1,4 +1,5 @@
 use super::*;
+use crate::{TimeoutNow, TransferError};
 
 impl<I, F> Endpoint<I, F>
 where
@@ -25,25 +26,25 @@ where
     log: &L,
     stable: &S,
     to: I,
-  ) -> Result<(), crate::TransferError<I>>
+  ) -> Result<(), TransferError<I>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     if self.poison.poisoned {
-      return Err(crate::TransferError::Poisoned);
+      return Err(TransferError::Poisoned);
     }
     if !self.role.is_leader() {
-      return Err(crate::TransferError::NotLeader {
+      return Err(TransferError::NotLeader {
         leader: self.leader,
       });
     }
     if to == self.config.id() {
-      return Err(crate::TransferError::AlreadyLeader);
+      return Err(TransferError::AlreadyLeader);
     }
     if !self.tracker.is_voter(&to) {
-      return Err(crate::TransferError::NotAVoter);
+      return Err(TransferError::NotAVoter);
     }
     // Already targeting this node — idempotent, just return Ok.
     if self.transfer.lead_transferee == Some(to) {
@@ -69,7 +70,7 @@ where
       .unwrap_or(crate::Index::ZERO);
     if target_match == log.last_index() {
       let (term, me) = (self.term, self.config.id());
-      self.send(to, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
+      self.send(to, Message::TimeoutNow(TimeoutNow::new(term, me)));
       // a forced campaign is now authorized for this term — disable LeaseBased reads for the rest
       // of it (the forced campaign can elect a new leader at any later point, even after this transfer
       // aborts on the deadline).
@@ -89,10 +90,10 @@ where
   /// voter it ignores the message (etcd: removed/learner nodes silently drop TimeoutNow).
   pub(crate) fn on_timeout_now<L, S>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &mut S,
-    tn: crate::TimeoutNow<I>,
+    tn: TimeoutNow<I>,
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
