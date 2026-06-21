@@ -216,7 +216,7 @@ fn durable_index_advances_after_same_term_leader_step_down() {
   while ep.poll_event().is_some() {}
   // The leader's current-term no-op is pending as a LeaderAppend; durable_index has NOT yet
   // captured it (the completion is still queued in the log).
-  let upto_before = ep.durable_index;
+  let upto_before = ep.durable.durable_index;
   assert!(
     !ep.pending.is_empty(),
     "the leader's no-op append is pending as a LeaderAppend"
@@ -255,7 +255,7 @@ fn durable_index_advances_after_same_term_leader_step_down() {
   ep.handle_storage(d, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
-    ep.durable_index, noop_index,
+    ep.durable.durable_index, noop_index,
     "the no-op became durable; durable_index advanced despite the same-term step-down (hit `_`)"
   );
 }

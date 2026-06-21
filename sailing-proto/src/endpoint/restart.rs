@@ -366,14 +366,6 @@ where
       leader: None,
       commit,
       applied,
-      // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
-      // the handle_storage choke-point doesn't immediately re-persist an unchanged value.
-      committed_persisted: commit,
-      durable_index: log.last_index(),
-      // volatile — after restart the reconciled durable log (Restore/Compact) already covers any
-      // durable snapshot, so `durable_index` alone is the recoverable prefix; the gap this closes only
-      // arises at RUNTIME from a dropped stale install.
-      durable_snapshot_index: Index::ZERO,
       snapshot: SnapshotState {
         pending_install: None,
         pending_compact: None,
@@ -415,12 +407,11 @@ where
       // and every `>=` watermark check). The same boot_epoch namespaces forwarded-read tokens below.
       next_op_id: crate::OpId::first_of_epoch(boot_epoch),
       pending: BTreeMap::new(),
-      inflight_append_upto: BTreeMap::new(),
       poison: Poison {
         poisoned,
         poison_reason,
       },
-      durable: DurablePromises {
+      durable: Durability {
         // the recovered `hs.term()` came from durable HardState, so it IS durable. Seed both
         // `durable_term` and `last_submitted_term` to it so `term_is_durable()` is true immediately after
         // restart and follower acks are not spuriously deferred.
@@ -435,9 +426,19 @@ where
         last_submitted_lease_support: recovered_floor,
         durable_lease_support: recovered_floor,
         lease_support_persist_opid: crate::OpId::ZERO,
+        // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
+        // the handle_storage choke-point doesn't immediately re-persist an unchanged value.
+        committed_persisted: commit,
+        durable_index: log.last_index(),
+        // volatile — after restart the reconciled durable log (Restore/Compact) already covers any
+        // durable snapshot, so `durable_index` alone is the recoverable prefix; the gap this closes only
+        // arises at RUNTIME from a dropped stale install.
+        durable_snapshot_index: Index::ZERO,
+        inflight_append_upto: BTreeMap::new(),
+        term_gated_append_ack: None,
+        term_gated_snapshot_ack: None,
+        lease_vote_fence_until,
       },
-      term_gated_append_ack: None,
-      term_gated_snapshot_ack: None,
       // On restart, ZERO is acceptable — see the field-level comment on pending_conf_index.
       pending_conf_index: Index::ZERO,
       pending_read_mode_index: Index::ZERO,
@@ -456,7 +457,6 @@ where
         lease_min_support: core::time::Duration::ZERO,
         lease_valid_until: None,
       },
-      lease_vote_fence_until,
       transfer: Transfer {
         // A restarted node is not leader (recovers as Follower) and has authorized no handoff.
         forced_handoff_this_term: false,

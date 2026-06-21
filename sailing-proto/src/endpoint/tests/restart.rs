@@ -1546,7 +1546,7 @@ fn restarted_leasebased_node_fences_votes() {
     &mut stable,
   );
   assert!(
-    ep.lease_vote_fence_until.is_some(),
+    ep.durable.lease_vote_fence_until.is_some(),
     "a LeaseBased restart arms the post-restart vote fence"
   );
 
@@ -1729,7 +1729,7 @@ fn restart_arms_vote_fence_on_enforcement_capability_not_read_mode() {
     &mut stable,
   );
   assert!(
-    ep.lease_vote_fence_until.is_some(),
+    ep.durable.lease_vote_fence_until.is_some(),
     "a Safe-reads BUT check_quorum node must fence post-restart (it can uphold a leader's lease)"
   );
   // Neither check_quorum nor pre_vote → enforces nothing → no fence needed.
@@ -1746,7 +1746,7 @@ fn restart_arms_vote_fence_on_enforcement_capability_not_read_mode() {
     &mut stable2,
   );
   assert!(
-    ep2.lease_vote_fence_until.is_none(),
+    ep2.durable.lease_vote_fence_until.is_none(),
     "a node that enforces neither check_quorum nor pre_vote needs no post-restart fence"
   );
 }
@@ -1787,7 +1787,7 @@ fn restart_fence_honors_persisted_floor_under_enforcement_disabled() {
     &mut stable,
   );
   assert_eq!(
-    ep.lease_vote_fence_until,
+    ep.durable.lease_vote_fence_until,
     Some(now + Duration::from_millis(1000)),
     "the durable pre-crash promise must arm the fence even when the post-restart config enforces nothing"
   );
@@ -1827,7 +1827,7 @@ fn restart_fence_honors_persisted_floor_over_shrunk_election_timeout() {
     &mut stable,
   );
   assert_eq!(
-    ep.lease_vote_fence_until,
+    ep.durable.lease_vote_fence_until,
     Some(now + Duration::from_millis(1000)),
     "the fence must honor the durable 1000ms promise, not the shrunk 100ms election_timeout"
   );
@@ -1909,7 +1909,7 @@ fn legacy_unrecorded_plain_restart_poisons_migrating_recovers() {
     "restart_migrating with a bound must recover, not poison"
   );
   assert_eq!(
-    ep.lease_vote_fence_until,
+    ep.durable.lease_vote_fence_until,
     Some(now + Duration::from_millis(2000)),
     "restart_migrating fences by the operator's known prior window, not the shrunk config"
   );
@@ -2013,7 +2013,7 @@ fn native_recorded_none_is_not_overfenced() {
     &mut stable,
   );
   assert_eq!(
-    ep.lease_vote_fence_until, None,
+    ep.durable.lease_vote_fence_until, None,
     "a native Recorded(None) must ignore assume_prior (authoritative no-promise), not over-fence"
   );
   // Contrast: the SAME huge assume_prior on a legacy Unrecorded record IS honored.
@@ -2031,7 +2031,7 @@ fn native_recorded_none_is_not_overfenced() {
     &mut stable2,
   );
   assert_eq!(
-    ep2.lease_vote_fence_until,
+    ep2.durable.lease_vote_fence_until,
     Some(now + Duration::from_secs(999)),
     "a legacy Unrecorded record DOES honor the operator's assume_prior"
   );
@@ -2197,7 +2197,7 @@ fn poisoned_restart_still_computes_fence_from_floor() {
   );
   assert!(ep.is_poisoned(), "the orphaned-log restart must poison");
   assert_eq!(
-    ep.lease_vote_fence_until,
+    ep.durable.lease_vote_fence_until,
     Some(now + Duration::from_millis(1000)),
     "the fence must still be armed from the durable floor on a poisoned restart"
   );
@@ -2259,7 +2259,7 @@ fn restart_migrating_honors_assumed_prior_lease_support() {
     &mut stable,
   );
   assert_eq!(
-    ep.lease_vote_fence_until,
+    ep.durable.lease_vote_fence_until,
     Some(now + Duration::from_millis(1000)),
     "restart_migrating must honor the assumed prior promise (1000ms), not the weaker post-restart config"
   );

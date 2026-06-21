@@ -567,10 +567,10 @@ impl ForwardedReads {
   }
 }
 
-/// The term + lease-support durability watermarks (persist-before-respond / -advertise), grouped out
+/// The durability watermarks and gated acks (persist-before-respond / -advertise / -ack), grouped out
 /// of `Endpoint`.
-#[derive(Debug, Default)]
-struct DurablePromises {
+#[derive(Debug)]
+struct Durability<I> {
   /// Term-before-respond durability. The highest `Term` whose HardState write has reached stable
   /// storage — `term_is_durable()` is simply `durable_term >= self.term`. Seeded to the initial/recovered
   /// term (trivially durable: it came from durable HardState or is the bootstrap term), then advanced in
@@ -604,6 +604,61 @@ struct DurablePromises {
   /// completion with `opid >= lease_support_persist_opid` arrives, that floor is durable (advanced in
   /// [`on_stable_wrote`], releasing the persist-before-advertise gate in `on_heartbeat`).
   lease_support_persist_opid: crate::OpId,
+  /// The last `commit` value durably written to `HardState`. The commit watermark is
+  /// persisted (batched) by the `handle_storage` choke-point whenever `self.commit` exceeds
+  /// this, and stamped into every term/vote write so a stale read-back can never regress the
+  /// durable commit. Without persisting it, a crash with no snapshot loses the commit
+  /// watermark and `restart` rebuilds an empty/snapshot-only state machine despite a durable
+  /// committed log. Init `Index::ZERO` in `new`; init to the recovered commit in
+  /// `restart` (so the choke-point doesn't immediately re-persist an unchanged value).
+  committed_persisted: Index,
+  /// Highest log index durably persisted (an append's LogDone::Appended fired). Every outbound
+  /// AppendResp match is clamped to this so a follower never reports an index only in its
+  /// visible-but-unflushed tail (persist-before-ack on the immediate-ack path too).
+  durable_index: Index,
+  /// The highest DURABLE snapshot boundary this node holds — a SEPARATE durability watermark from
+  /// the durable log tip (`durable_index`). It matters only when a deferred install is DROPPED as stale
+  /// (in-window appends advanced `commit` past the boundary over a not-yet-flushed tail): the blob is
+  /// durable but the log was NOT re-baselined, so `durable_index` stays below the boundary even though a
+  /// crash would `reconcile_restart_log::Restore` to this snapshot. `ack_watermark()` takes the MAX of
+  /// the two, so the follower honestly acks its true recoverable prefix and the leader is not pinned in
+  /// `ProgressState::Snapshot`. Monotone (a durable snapshot sits at a committed, hence permanent, index);
+  /// volatile (init ZERO — after restart the reconciled log already covers any durable snapshot).
+  durable_snapshot_index: Index,
+  /// Per-append last-index, keyed by the submission's `OpId`, for EVERY in-flight log append —
+  /// independent of `pending`. `durable_index` must advance on every `LogDone::Appended`, but
+  /// `pending` is cleared on term changes and a same-term step-down routes a `LeaderAppend`
+  /// completion to the `_` arm; in both cases the entry still became durable. Keeping the upto
+  /// here lets `on_log_appended` advance the watermark unconditionally (role/term-independent),
+  /// so a follower never under-acks its durable suffix on a later duplicate/empty AppendEntries.
+  /// Entry is recorded in `submit_append`, removed (consumed into the watermark) in
+  /// `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init empty
+  /// in `new` and `restart`.
+  inflight_append_upto: BTreeMap<crate::OpId, Index>,
+  /// A SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
+  /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
+  /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
+  /// (Raft §5.1: persist `currentTerm` before responding to RPCs). Flushed in `on_stable_wrote` as
+  /// `proven.min(ack_watermark())` — `proven` caps to what the leader matched (never over-ack a durable-
+  /// but-divergent tail) and `ack_watermark()` caps to durability. A superseded-term tag
+  /// is dropped; same-`(leader, term)` deferrals keep the MAX proven extent (acks are cumulative).
+  term_gated_append_ack: Option<(I, crate::Term, Index)>,
+  /// A SUCCESS `SnapshotResp` deferred until `self.term` is durable — the snapshot analogue of
+  /// `term_gated_append_ack` (`proven` = the snapshot boundary / committed match).
+  term_gated_snapshot_ack: Option<(I, crate::Term, Index)>,
+  /// Post-restart vote-suppression fence (LeaseBased crash-safety). A node that crashed may have
+  /// acked a leader's read-lease just before crashing; on restart that in-memory promise is gone, so
+  /// without a fence it could grant a vote to a new candidate and elect a new leader WHILE the old
+  /// leader is still inside its (unexpired) lease window — letting the old leader serve a stale
+  /// LeaseBased read. While `now < lease_vote_fence_until` a restarted node REFUSES to grant votes
+  /// (real and pre), UNLESS the request is a forced leader-transfer (mirrors the `in_lease` bypass).
+  /// `restart` sizes it as `now + the DURABLE lease-support floor` (`HardState.lease_support`,
+  /// monotone-max'd with this run's own support), so it honors the PRE-CRASH promise regardless of the
+  /// post-restart config — closing config drift (a restart with a shorter `election_timeout` or
+  /// enforcement disabled) by construction. `None` only when no enforcing promise is on record and this
+  /// run enforces nothing. Safety rests on `now >= the pre-crash ack instants` (follower clock
+  /// monotonicity across restart) — the irreducible clock residual common to all lease reads.
+  lease_vote_fence_until: Option<Instant>,
 }
 
 /// The leader's CheckQuorum read-lease (LeaseBased) round state, grouped out of `Endpoint`.
@@ -938,35 +993,6 @@ where
   leader: Option<I>,
   commit: Index,
   applied: Index,
-  /// The last `commit` value durably written to `HardState`. The commit watermark is
-  /// persisted (batched) by the `handle_storage` choke-point whenever `self.commit` exceeds
-  /// this, and stamped into every term/vote write so a stale read-back can never regress the
-  /// durable commit. Without persisting it, a crash with no snapshot loses the commit
-  /// watermark and `restart` rebuilds an empty/snapshot-only state machine despite a durable
-  /// committed log. Init `Index::ZERO` in `new`; init to the recovered commit in
-  /// `restart` (so the choke-point doesn't immediately re-persist an unchanged value).
-  committed_persisted: Index,
-  /// Highest log index durably persisted (an append's LogDone::Appended fired). Every outbound
-  /// AppendResp match is clamped to this so a follower never reports an index only in its
-  /// visible-but-unflushed tail (persist-before-ack on the immediate-ack path too).
-  durable_index: Index,
-  /// The highest DURABLE snapshot boundary this node holds — a SEPARATE durability watermark from
-  /// the durable log tip (`durable_index`). It matters only when a deferred install is DROPPED as stale
-  /// (in-window appends advanced `commit` past the boundary over a not-yet-flushed tail): the blob is
-  /// durable but the log was NOT re-baselined, so `durable_index` stays below the boundary even though a
-  /// crash would `reconcile_restart_log::Restore` to this snapshot. `ack_watermark()` takes the MAX of
-  /// the two, so the follower honestly acks its true recoverable prefix and the leader is not pinned in
-  /// `ProgressState::Snapshot`. Monotone (a durable snapshot sits at a committed, hence permanent, index);
-  /// volatile (init ZERO — after restart the reconciled log already covers any durable snapshot).
-  durable_snapshot_index: Index,
-  /// `Some((blob_opid, meta, decoded_snap, leader))` while a FOLLOWER snapshot install is DEFERRED —
-  /// its blob has been submitted (`submit_snapshot`) but is not yet durable. The destructive
-  /// install body (SM restore, `commit`/`applied` advance, the `log.restore` re-baseline, membership
-  /// install, the success ack) is held here and run by `install_snapshot_now` ONLY once the blob is
-  /// durable — the matching `SnapshotWritten`, or `StableStore::durable_snapshot()` evidence covering
-  /// the boundary if that completion was missed. Until then the follower stays in its OLD consistent
-  /// state, so a crash in the window loses only the in-flight blob and restart re-syncs from the
-  /// UNCHANGED durable log (no orphaned re-baseline → no `OrphanedLog` poison). This is the snapshot
   /// The deferred snapshot machinery (pending install + pending compaction + resend pacing).
   snapshot: SnapshotState<I, F>,
   prng: Prng,
@@ -994,31 +1020,12 @@ where
   next_op_id: crate::OpId,
   /// Outstanding write → deferred action.
   pending: BTreeMap<crate::OpId, Pending<I>>,
-  /// Per-append last-index, keyed by the submission's `OpId`, for EVERY in-flight log append —
-  /// independent of `pending`. `durable_index` must advance on every `LogDone::Appended`, but
-  /// `pending` is cleared on term changes and a same-term step-down routes a `LeaderAppend`
-  /// completion to the `_` arm; in both cases the entry still became durable. Keeping the upto
-  /// here lets `on_log_appended` advance the watermark unconditionally (role/term-independent),
-  /// so a follower never under-acks its durable suffix on a later duplicate/empty AppendEntries.
-  /// Entry is recorded in `submit_append`, removed (consumed into the watermark) in
-  /// `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init empty
-  /// in `new` and `restart`.
-  inflight_append_upto: BTreeMap<crate::OpId, Index>,
   /// The fail-stop state (poisoned flag + first-cause reason).
   poison: Poison,
-  /// The term + lease-support durability watermarks (persist-before-respond / -advertise).
-  durable: DurablePromises,
-  /// A SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
-  /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
-  /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
-  /// (Raft §5.1: persist `currentTerm` before responding to RPCs). Flushed in `on_stable_wrote` as
-  /// `proven.min(ack_watermark())` — `proven` caps to what the leader matched (never over-ack a durable-
-  /// but-divergent tail) and `ack_watermark()` caps to durability. A superseded-term tag
-  /// is dropped; same-`(leader, term)` deferrals keep the MAX proven extent (acks are cumulative).
-  term_gated_append_ack: Option<(I, crate::Term, Index)>,
-  /// A SUCCESS `SnapshotResp` deferred until `self.term` is durable — the snapshot analogue of
-  /// `term_gated_append_ack` (`proven` = the snapshot boundary / committed match).
-  term_gated_snapshot_ack: Option<(I, crate::Term, Index)>,
+  /// The durability watermarks and gated acks (persist-before-respond / -advertise / -ack): the term +
+  /// lease-support floors, the commit/log/snapshot watermarks, the in-flight append uptos, the
+  /// term-gated append/snapshot acks, and the post-restart lease vote fence.
+  durable: Durability<I>,
   /// Log index of the most recently appended (not-yet-applied) `ConfChange` entry.
   ///
   /// Initialized to `Index::ZERO` in both `new` and `restart`. On restart, ZERO is acceptable
@@ -1063,19 +1070,6 @@ where
   forwarded_reads: ForwardedReads,
   /// The leader's CheckQuorum read-lease (LeaseBased) round state.
   check_quorum_lease: CheckQuorumLease<I>,
-  /// Post-restart vote-suppression fence (LeaseBased crash-safety). A node that crashed may have
-  /// acked a leader's read-lease just before crashing; on restart that in-memory promise is gone, so
-  /// without a fence it could grant a vote to a new candidate and elect a new leader WHILE the old
-  /// leader is still inside its (unexpired) lease window — letting the old leader serve a stale
-  /// LeaseBased read. While `now < lease_vote_fence_until` a restarted node REFUSES to grant votes
-  /// (real and pre), UNLESS the request is a forced leader-transfer (mirrors the `in_lease` bypass).
-  /// `restart` sizes it as `now + the DURABLE lease-support floor` (`HardState.lease_support`,
-  /// monotone-max'd with this run's own support), so it honors the PRE-CRASH promise regardless of the
-  /// post-restart config — closing config drift (a restart with a shorter `election_timeout` or
-  /// enforcement disabled) by construction. `None` only when no enforcing promise is on record and this
-  /// run enforces nothing. Safety rests on `now >= the pre-crash ack instants` (follower clock
-  /// monotonicity across restart) — the irreducible clock residual common to all lease reads.
-  lease_vote_fence_until: Option<Instant>,
   /// The leader-transfer state (forced-handoff flag + transferee target + abort deadline).
   transfer: Transfer<I>,
 }
@@ -1115,9 +1109,6 @@ where
       leader: None,
       commit: Index::ZERO,
       applied: Index::ZERO,
-      committed_persisted: Index::ZERO,
-      durable_index: Index::ZERO,
-      durable_snapshot_index: Index::ZERO,
       snapshot: SnapshotState {
         pending_install: None,
         pending_compact: None,
@@ -1161,9 +1152,8 @@ where
       tracker,
       next_op_id: crate::OpId::ZERO,
       pending: BTreeMap::new(),
-      inflight_append_upto: BTreeMap::new(),
       poison: Poison::default(),
-      durable: DurablePromises {
+      durable: Durability {
         // fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
         // `term_is_durable()` is true and acks are never spuriously deferred at startup.
         durable_term: Term::ZERO,
@@ -1176,9 +1166,15 @@ where
         last_submitted_lease_support: None,
         durable_lease_support: None,
         lease_support_persist_opid: crate::OpId::ZERO,
+        committed_persisted: Index::ZERO,
+        durable_index: Index::ZERO,
+        durable_snapshot_index: Index::ZERO,
+        inflight_append_upto: BTreeMap::new(),
+        term_gated_append_ack: None,
+        term_gated_snapshot_ack: None,
+        // A fresh node never acked any leader's read-lease, so no post-restart vote fence.
+        lease_vote_fence_until: None,
       },
-      term_gated_append_ack: None,
-      term_gated_snapshot_ack: None,
       pending_conf_index: Index::ZERO,
       pending_read_mode_index: Index::ZERO,
       read_only: ReadOnly::new(read_only_opt),
@@ -1193,8 +1189,6 @@ where
         lease_min_support: core::time::Duration::ZERO,
         lease_valid_until: None,
       },
-      // A fresh node never acked any leader's read-lease, so no post-restart vote fence.
-      lease_vote_fence_until: None,
       transfer: Transfer {
         // No forced handoff authorized yet.
         forced_handoff_this_term: false,
@@ -1477,14 +1471,14 @@ where
       self.outputs.outgoing.len() < TRIPWIRE
         && self.outputs.events.len() < TRIPWIRE
         && self.pending.len() < TRIPWIRE
-        && self.inflight_append_upto.len() < TRIPWIRE,
+        && self.durable.inflight_append_upto.len() < TRIPWIRE,
       "endpoint work queues exceeded the drain tripwire (outgoing={}, events={}, pending={}, \
        inflight={}) — a driver MUST drain poll_message/poll_event and call handle_storage between \
        dispatches (see poll_message)",
       self.outputs.outgoing.len(),
       self.outputs.events.len(),
       self.pending.len(),
-      self.inflight_append_upto.len(),
+      self.durable.inflight_append_upto.len(),
     );
   }
 

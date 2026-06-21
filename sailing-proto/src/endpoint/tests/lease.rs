@@ -657,7 +657,7 @@ fn persist_before_advertise_survives_crash_in_fsync_window() {
     &mut stable,
   );
   assert_eq!(
-    ep2.lease_vote_fence_until, None,
+    ep2.durable.lease_vote_fence_until, None,
     "no durable promise → no fence (safe: only ZERO was ever advertised)"
   );
 }
@@ -726,7 +726,7 @@ fn grow_then_crash_then_shrink_does_not_underfence() {
     &mut stable,
   );
   assert_eq!(
-    ep_c.lease_vote_fence_until,
+    ep_c.durable.lease_vote_fence_until,
     Some(now_c + Duration::from_millis(1000)),
     "fence must honor run A's durable 1000ms, not the lost 2000 grow nor the 100ms shrink"
   );
@@ -764,7 +764,7 @@ fn genuine_zero_floor_does_not_force_fence() {
     &mut stable,
   );
   assert_eq!(
-    ep.lease_vote_fence_until, None,
+    ep.durable.lease_vote_fence_until, None,
     "a recorded genuine-ZERO floor promised nothing → no fence (must not arm now+0)"
   );
 }

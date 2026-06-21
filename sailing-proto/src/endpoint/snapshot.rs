@@ -275,7 +275,8 @@ where
     // reflects the boundary even when this install is dropped as stale: otherwise a follower whose
     // in-window appends advanced `commit` over a not-yet-flushed tail (so `durable_index < boundary`)
     // under-acks `durable_index` and pins the leader in `ProgressState::Snapshot` until the tail flushes.
-    self.durable_snapshot_index = core::cmp::max(self.durable_snapshot_index, meta.last_index());
+    self.durable.durable_snapshot_index =
+      core::cmp::max(self.durable.durable_snapshot_index, meta.last_index());
     // Raise the self-describing LeaseGuard bound over the snapshot's carried max — BEFORE the
     // stale-drop, like `durable_snapshot_index`, so even a dropped-stale install contributes its
     // bound (the sender held entries this follower may not have all of). Monotonic, so the redundant
@@ -345,10 +346,10 @@ where
     // `restore` DISCARDS the prior tail, so the durable boundary IS exactly the snapshot's last index — a
     // hard RESET. `durable_index` and the re-baseline advance together, after the blob is durable, so the
     // boundary is recoverable (no stale-HIGH watermark, no orphan).
-    self.durable_index = meta.last_index();
+    self.durable.durable_index = meta.last_index();
     // The log was replaced wholesale; any in-flight append records refer to discarded entries and must
     // not re-advance `durable_index` when their completions arrive.
-    self.inflight_append_upto.clear();
+    self.durable.inflight_append_upto.clear();
     // Scrub any already-queued success `AppendResp`/`FollowerAck` for an index past the new boundary:
     // reporting it would over-ack an entry this node no longer stores (symmetric with the §5.3 scrub).
     self.scrub_acks_above(meta.last_index());

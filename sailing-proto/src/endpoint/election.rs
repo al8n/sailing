@@ -92,7 +92,11 @@ where
   /// — mirrors the `in_lease` bypass. Only ever armed under `ReadOnlyOption::LeaseBased` (see `restart`).
   #[inline]
   pub(crate) fn lease_vote_fenced(&self, now: crate::Now, force: bool) -> bool {
-    !force && self.lease_vote_fence_until.is_some_and(|d| now.mono() < d)
+    !force
+      && self
+        .durable
+        .lease_vote_fence_until
+        .is_some_and(|d| now.mono() < d)
   }
 
   pub(crate) fn on_request_vote<L: LogStore, S: StableStore<NodeId = I>>(
@@ -191,7 +195,7 @@ where
         .with_vote(self.voted_for)
         .with_commit(self.durable_commit());
       self.submit_write(stable, opid, hs);
-      self.committed_persisted = self.durable_commit();
+      self.durable.committed_persisted = self.durable_commit();
       self.pending.insert(
         opid,
         Pending::CastVote {
@@ -317,7 +321,7 @@ where
       .with_vote(self.voted_for)
       .with_commit(self.durable_commit());
     self.submit_write(stable, opid, hs);
-    self.committed_persisted = self.durable_commit();
+    self.durable.committed_persisted = self.durable_commit();
     // Defer acting on the self-vote until it is DURABLE (persist-before-act, symmetric with the
     // follower `CastVote` path): `become_leader` fires from `on_stable_wrote` (single-node now, or
     // once peer votes arrive) only after this write's `StableDone::Wrote`.
