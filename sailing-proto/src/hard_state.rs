@@ -176,15 +176,13 @@ mod tests {
       .with_term(Term::new(3))
       .with_vote(Some(7))
       .with_commit(Index::new(2))
-      .with_lease_support(LeaseSupport::Recorded(Some(
-        core::time::Duration::from_millis(500),
-      )));
+      .with_lease_support(LeaseSupport::Recorded(Some(Duration::from_millis(500))));
     assert_eq!(hs.term(), Term::new(3));
     assert_eq!(hs.vote(), Some(7));
     assert_eq!(hs.commit(), Index::new(2));
     assert_eq!(
       hs.promised_lease_support(),
-      Some(core::time::Duration::from_millis(500))
+      Some(Duration::from_millis(500))
     );
     // `Unrecorded` (a legacy decode) is DISTINCT from `Recorded(None)` and reports no magnitude.
     let legacy = hs.with_lease_support(LeaseSupport::Unrecorded);

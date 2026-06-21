@@ -1,11 +1,11 @@
 use super::*;
 use crate::{
   AppendEntries, AppendResp, Heartbeat, HeartbeatResp, InstallSnapshot, ReadIndex, ReadIndexResp,
-  RequestVote, SnapshotResp, TimeoutNow, VoteResp, conf::ConfState,
+  ReadOnlyOption, RequestVote, SnapshotResp, TimeoutNow, VoteResp, conf::ConfState,
 };
 
 fn rt(m: Message<u64>) {
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   let back = decode_message::<u64>(Bytes::from(buf)).expect("decode");
   assert_eq!(back, m, "round-trips: {m:?}");
@@ -124,7 +124,7 @@ fn entry_timestamp_round_trips() {
     std::vec![stamped.clone()],
     Index::ZERO,
   ));
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   let Message::AppendEntries(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
   else {
@@ -141,8 +141,8 @@ fn entry_timestamp_round_trips() {
     EntryKind::Normal,
     Bytes::from_static(b"x"),
   );
-  let mut a = std::vec::Vec::new();
-  let mut b = std::vec::Vec::new();
+  let mut a = Vec::new();
+  let mut b = Vec::new();
   encode_message(
     &Message::AppendEntries(AppendEntries::new(
       Term::new(2),
@@ -187,7 +187,7 @@ fn entry_wall_timestamp_round_trips() {
     std::vec![stamped.clone()],
     Index::ZERO,
   ));
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   let Message::AppendEntries(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
   else {
@@ -206,8 +206,8 @@ fn entry_wall_timestamp_round_trips() {
     EntryKind::Normal,
     Bytes::from_static(b"x"),
   );
-  let mut a = std::vec::Vec::new();
-  let mut b = std::vec::Vec::new();
+  let mut a = Vec::new();
+  let mut b = Vec::new();
   encode_message(
     &Message::AppendEntries(AppendEntries::new(
       Term::new(2),
@@ -252,7 +252,7 @@ fn snapshot_meta_max_wall_plus_window_round_trips() {
     meta,
     Bytes::from_static(b"blob"),
   ));
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
   else {
@@ -265,8 +265,8 @@ fn snapshot_meta_max_wall_plus_window_round_trips() {
 
   // A zero max_wall_plus_window is omitted on the wire: byte-identical to a snapshot that never set it.
   let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
-  let mut a = std::vec::Vec::new();
-  let mut b = std::vec::Vec::new();
+  let mut a = Vec::new();
+  let mut b = Vec::new();
   encode_message(
     &Message::InstallSnapshot(InstallSnapshot::new(
       Term::new(4),
@@ -311,7 +311,7 @@ fn snapshot_meta_max_unwalled_lease_window_round_trips() {
     meta,
     Bytes::from_static(b"blob"),
   ));
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
   else {
@@ -322,8 +322,8 @@ fn snapshot_meta_max_unwalled_lease_window_round_trips() {
   // A zero max_unwalled_lease_window is omitted on the wire (the codec's absent-when-zero rule; a real
   // LeaseGuard snapshot's value is non-zero under the entry-property fold).
   let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
-  let mut a = std::vec::Vec::new();
-  let mut b = std::vec::Vec::new();
+  let mut a = Vec::new();
+  let mut b = Vec::new();
   encode_message(
     &Message::InstallSnapshot(InstallSnapshot::new(
       Term::new(4),
@@ -402,7 +402,7 @@ fn truncation_never_panics_and_never_misdecodes() {
     )],
     Index::new(1),
   ));
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   for cut in 0..buf.len() {
     let r = decode_message::<u64>(Bytes::copy_from_slice(&buf[..cut]));
@@ -427,7 +427,7 @@ fn conversion_rejections() {
   use buffa::Message as _;
 
   fn enc(msg: &pb::Message) -> Bytes {
-    let mut buf = std::vec::Vec::new();
+    let mut buf = Vec::new();
     msg.encode(&mut buf);
     Bytes::from(buf)
   }
@@ -530,7 +530,7 @@ fn conversion_rejections() {
 fn set_order_discipline() {
   use buffa::Message as _;
 
-  fn snapshot_with_voters(voters: std::vec::Vec<u64>) -> Bytes {
+  fn snapshot_with_voters(voters: Vec<u64>) -> Bytes {
     let cs = pb::ConfState {
       voters: voters.iter().map(encode_id).collect(),
       ..Default::default()
@@ -548,7 +548,7 @@ fn set_order_discipline() {
       body: Some(pb::message::Body::from(is)),
       ..Default::default()
     };
-    let mut buf = std::vec::Vec::new();
+    let mut buf = Vec::new();
     msg.encode(&mut buf);
     Bytes::from(buf)
   }
@@ -582,7 +582,7 @@ fn conf_change_v2_payload_round_trip_and_rejects() {
     ],
     Bytes::from_static(b"ctx"),
   );
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_conf_change_v2(&cc, &mut buf);
   let back = decode_conf_change_v2::<u64>(Bytes::from(buf)).expect("decodes");
   assert_eq!(back, cc);
@@ -592,7 +592,7 @@ fn conf_change_v2_payload_round_trip_and_rejects() {
     transition: EnumValue::Unknown(77),
     ..Default::default()
   };
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   w.encode(&mut buf);
   assert!(decode_conf_change_v2::<u64>(Bytes::from(buf)).is_err());
 }
@@ -602,8 +602,8 @@ fn conf_change_v2_payload_round_trip_and_rejects() {
 /// emitting the same fields in field order produces these bytes.
 #[test]
 fn golden_byte_vectors() {
-  fn enc(m: &Message<u64>) -> std::vec::Vec<u8> {
-    let mut buf = std::vec::Vec::new();
+  fn enc(m: &Message<u64>) -> Vec<u8> {
+    let mut buf = Vec::new();
     encode_message(m, &mut buf);
     buf
   }
@@ -650,7 +650,7 @@ fn decode_aliases_the_frame_allocation() {
     )],
     Index::ZERO,
   ));
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   let frame = Bytes::from(buf);
   let frame_range = frame.as_ptr() as usize..frame.as_ptr() as usize + frame.len();
@@ -679,14 +679,14 @@ fn snapshot_meta_read_only_round_trips() {
     false,
   );
   let meta = SnapshotMeta::new(Index::new(10), Term::new(4), conf.clone())
-    .with_read_only(crate::ReadOnlyOption::LeaseGuard);
+    .with_read_only(ReadOnlyOption::LeaseGuard);
   let m = Message::InstallSnapshot(InstallSnapshot::new(
     Term::new(4),
     1,
     meta,
     Bytes::from_static(b"blob"),
   ));
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   encode_message(&m, &mut buf);
   let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
   else {
@@ -694,15 +694,15 @@ fn snapshot_meta_read_only_round_trips() {
   };
   assert_eq!(
     back.snapshot().read_only(),
-    Some(crate::ReadOnlyOption::LeaseGuard)
+    Some(ReadOnlyOption::LeaseGuard)
   );
 
   // A snapshot that NEVER set the mode (a pre-migration / legacy snapshot) is ABSENT on the wire and
   // decodes as None; an EXPLICIT Safe is PRESENT (discriminant + 1), so the two are NOT byte-identical —
   // a migrate-to-Safe stays distinguishable from legacy, and recovery falls back to config (not Safe).
   let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
-  let mut a = std::vec::Vec::new();
-  let mut b = std::vec::Vec::new();
+  let mut a = Vec::new();
+  let mut b = Vec::new();
   encode_message(
     &Message::InstallSnapshot(InstallSnapshot::new(
       Term::new(4),
@@ -716,7 +716,7 @@ fn snapshot_meta_read_only_round_trips() {
     &Message::InstallSnapshot(InstallSnapshot::new(
       Term::new(4),
       1,
-      plain.with_read_only(crate::ReadOnlyOption::Safe),
+      plain.with_read_only(ReadOnlyOption::Safe),
       Bytes::from_static(b"blob"),
     )),
     &mut b,
@@ -741,7 +741,7 @@ fn snapshot_meta_read_only_round_trips() {
   };
   assert_eq!(
     back_safe.snapshot().read_only(),
-    Some(crate::ReadOnlyOption::Safe),
+    Some(ReadOnlyOption::Safe),
     "an explicit Safe round-trips as Some(Safe)"
   );
 }

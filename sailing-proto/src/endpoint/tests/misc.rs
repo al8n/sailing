@@ -1,9 +1,13 @@
 use super::{super::*, *};
+use crate::{
+  ProposeError, VoteResp,
+  testkit::{CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
+};
 use core::time::Duration;
 
 #[test]
 fn endpoint_constructs_and_polls_empty() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64],
     Duration::from_millis(1000),
@@ -36,9 +40,9 @@ fn propose_at_max_index_is_refused_not_truncating() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   // Elect node 1 leader (small log).
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -48,7 +52,7 @@ fn propose_at_max_index_is_refused_not_truncating() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -95,9 +99,9 @@ fn propose_reserves_sentinel_max_index() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_storage(d, &mut log, &mut stable);
@@ -106,7 +110,7 @@ fn propose_reserves_sentinel_max_index() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(d, &mut log, &mut stable);
@@ -136,14 +140,14 @@ fn propose_reserves_sentinel_max_index() {
 
 #[test]
 fn op_ids_are_minted_distinctly() {
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    core::time::Duration::from_millis(1000),
-    core::time::Duration::from_millis(100),
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
   let a = ep.mint_op_id_for_test();
   let b = ep.mint_op_id_for_test();
   assert_ne!(a, b);
@@ -190,7 +194,7 @@ fn follower_defers_success_ack_until_term_durable() {
     ep.durable.term_gated_append_ack.is_some(),
     "the success ack must be deferred while the term is not durable"
   );
-  let early: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())
+  let early: Vec<_> = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
     .collect();
   assert!(
@@ -209,7 +213,7 @@ fn follower_defers_success_ack_until_term_durable() {
     ep.durable.term_gated_append_ack.is_none(),
     "the deferred ack was released"
   );
-  let acks: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())
+  let acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
     .collect();
   assert_eq!(
@@ -234,7 +238,7 @@ fn serviceable_now_mirrors_dispatch() {
   use core::time::Duration;
 
   // --- Follower (voter) ---
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -259,7 +263,7 @@ fn serviceable_now_mirrors_dispatch() {
   // --- Follower (non-voter / observer) ---
   // Use try_new_observer: node 99 joins an existing cluster {1,2,3} as an observer.
   // Its id is not in the voter seed so is_voter(99) = false in its Tracker.
-  let cfg_nv = crate::Config::try_new_observer(
+  let cfg_nv = Config::try_new_observer(
     99u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -301,7 +305,7 @@ fn serviceable_now_mirrors_dispatch() {
   );
 
   // --- Leader (check_quorum=true, no transfer) ---
-  let cfg_cq = crate::Config::try_new(
+  let cfg_cq = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -309,14 +313,9 @@ fn serviceable_now_mirrors_dispatch() {
   )
   .unwrap()
   .with_check_quorum(true);
-  let mut ep_cq = Endpoint::new(
-    cfg_cq,
-    Instant::ORIGIN,
-    1,
-    crate::testkit::CountSm::default(),
-  );
-  let mut log_cq = crate::testkit::VecLog::default();
-  let mut stable_cq = crate::testkit::NoopStable::default();
+  let mut ep_cq = Endpoint::new(cfg_cq, Instant::ORIGIN, 1, CountSm::default());
+  let mut log_cq = VecLog::default();
+  let mut stable_cq = NoopStable::default();
   let d_cq = ep_cq.poll_timeout().unwrap();
   ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
   ep_cq.handle_storage(d_cq, &mut log_cq, &mut stable_cq);
@@ -325,12 +324,7 @@ fn serviceable_now_mirrors_dispatch() {
     &mut log_cq,
     &mut stable_cq,
     2u64,
-    crate::Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep_cq.role().is_leader());
   assert!(ep_cq.config.check_quorum());
@@ -376,7 +370,7 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
   let heartbeat_interval = Duration::from_millis(100);
 
   // --- Follower: stale heartbeat_deadline set, should NOT appear in poll_timeout ---
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     election_timeout,
@@ -401,7 +395,7 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
   );
 
   // --- Non-voter: election_deadline armed but not serviceable → poll_timeout returns None ---
-  let cfg_nv = crate::Config::try_new_observer(
+  let cfg_nv = Config::try_new_observer(
     99u64,
     std::vec![1u64, 2u64, 3u64], // 99 is not in the voter set
     election_timeout,
@@ -433,7 +427,7 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
   );
 
   // --- Leader (CQ): poll_timeout returns min(heartbeat, election) ---
-  let cfg_cq = crate::Config::try_new(
+  let cfg_cq = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     election_timeout,
@@ -441,14 +435,9 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
   )
   .unwrap()
   .with_check_quorum(true);
-  let mut ep_cq = Endpoint::new(
-    cfg_cq,
-    Instant::ORIGIN,
-    1,
-    crate::testkit::CountSm::default(),
-  );
-  let mut log_cq = crate::testkit::VecLog::default();
-  let mut stable_cq = crate::testkit::NoopStable::default();
+  let mut ep_cq = Endpoint::new(cfg_cq, Instant::ORIGIN, 1, CountSm::default());
+  let mut log_cq = VecLog::default();
+  let mut stable_cq = NoopStable::default();
   let d_cq = ep_cq.poll_timeout().unwrap();
   ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
   ep_cq.handle_storage(d_cq, &mut log_cq, &mut stable_cq);
@@ -457,12 +446,7 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
     &mut log_cq,
     &mut stable_cq,
     2u64,
-    crate::Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep_cq.role().is_leader());
   let hb = ep_cq.heartbeat_deadline.expect("heartbeat armed");
@@ -509,7 +493,7 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
 fn poisoned_node_surfaces_no_timer() {
   use core::time::Duration;
 
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -546,7 +530,7 @@ fn handle_timeout_makes_progress_no_wedge() {
   let now = Instant::ORIGIN + Duration::from_millis(5000);
 
   // --- Follower voter: election timer fires → campaign → election re-armed to future ---
-  let cfg_f = crate::Config::try_new(
+  let cfg_f = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -556,8 +540,8 @@ fn handle_timeout_makes_progress_no_wedge() {
   let mut ep_f = Endpoint::new(cfg_f, now, 42, Noop);
   // Force the election deadline to exactly `now` (due).
   ep_f.election_deadline = Some(now);
-  let mut log_f = crate::testkit::NoopLog;
-  let mut stable_f = crate::testkit::NoopStable::default();
+  let mut log_f = NoopLog;
+  let mut stable_f = NoopStable::default();
   ep_f.handle_timeout(now, &mut log_f, &mut stable_f);
   ep_f.handle_storage(now, &mut log_f, &mut stable_f);
   // After: either poll_timeout is None (single-node immediate leader) or > now.
@@ -569,7 +553,7 @@ fn handle_timeout_makes_progress_no_wedge() {
   }
 
   // --- Non-voter follower: election timer fires silently → poll_timeout becomes None ---
-  let cfg_nv = crate::Config::try_new_observer(
+  let cfg_nv = Config::try_new_observer(
     99u64,
     std::vec![1u64, 2u64, 3u64], // 99 is not in the voter set
     Duration::from_millis(1000),
@@ -578,8 +562,8 @@ fn handle_timeout_makes_progress_no_wedge() {
   .unwrap();
   let mut ep_nv = Endpoint::new(cfg_nv, now, 7, Noop);
   ep_nv.election_deadline = Some(now);
-  let mut log_nv = crate::testkit::NoopLog;
-  let mut stable_nv = crate::testkit::NoopStable::default();
+  let mut log_nv = NoopLog;
+  let mut stable_nv = NoopStable::default();
   ep_nv.handle_timeout(now, &mut log_nv, &mut stable_nv);
   ep_nv.handle_storage(now, &mut log_nv, &mut stable_nv);
   assert!(
@@ -608,7 +592,7 @@ fn handle_timeout_makes_progress_no_wedge() {
   );
 
   // --- Leader (CQ): both heartbeat and election fire, both re-armed ---
-  let cfg_cq = crate::Config::try_new(
+  let cfg_cq = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -616,14 +600,9 @@ fn handle_timeout_makes_progress_no_wedge() {
   )
   .unwrap()
   .with_check_quorum(true);
-  let mut ep_cq = Endpoint::new(
-    cfg_cq,
-    Instant::ORIGIN,
-    1,
-    crate::testkit::CountSm::default(),
-  );
-  let mut log_cq = crate::testkit::VecLog::default();
-  let mut stable_cq = crate::testkit::NoopStable::default();
+  let mut ep_cq = Endpoint::new(cfg_cq, Instant::ORIGIN, 1, CountSm::default());
+  let mut log_cq = VecLog::default();
+  let mut stable_cq = NoopStable::default();
   let d_cq = ep_cq.poll_timeout().unwrap();
   ep_cq.handle_timeout(d_cq, &mut log_cq, &mut stable_cq);
   ep_cq.handle_storage(d_cq, &mut log_cq, &mut stable_cq);
@@ -632,12 +611,7 @@ fn handle_timeout_makes_progress_no_wedge() {
     &mut log_cq,
     &mut stable_cq,
     2u64,
-    crate::Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep_cq.role().is_leader());
   // Force both timers to now.
@@ -701,7 +675,7 @@ fn failing_fsm_apply_poisons_node() {
   use core::time::Duration;
 
   // Node 2 is a follower in a 3-voter cluster {1, 2, 3}.
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -709,8 +683,8 @@ fn failing_fsm_apply_poisons_node() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, FailSm);
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Leader 1 (term 1) sends one Normal entry carrying the 0xFF sentinel; leader_commit = 1
   // forces the follower to commit and apply it. FailSm::apply will return Err.
@@ -739,7 +713,7 @@ fn failing_fsm_apply_poisons_node() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::Apply),
+    Some(PoisonReason::Apply),
     "poison_reason must record the apply failure"
   );
   // applied is stuck at the pre-apply watermark (the failing entry was never applied).
@@ -778,7 +752,7 @@ fn failing_fsm_apply_poisons_node() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::Apply),
+    Some(PoisonReason::Apply),
     "poison_reason is first-cause-wins and must not change"
   );
 }
@@ -793,16 +767,16 @@ fn corrupt_normal_entry_poisons_node() {
   use crate::{AppendEntries, Index, Message, Term};
   use core::time::Duration;
 
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // A Normal entry whose data is a single byte. `<Bytes as Data>::decode` needs an 8-byte
   // u64 length prefix, so this decodes as UnexpectedEof → corrupt-log decode error.
@@ -834,7 +808,7 @@ fn corrupt_normal_entry_poisons_node() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::NormalEntryDecode),
+    Some(PoisonReason::NormalEntryDecode),
     "poison_reason must record the decode failure"
   );
   assert_eq!(
@@ -875,16 +849,16 @@ fn poison_after_apply_emits_nothing() {
   use crate::{Entry, EntryKind, Heartbeat, Index, Message, PoisonReason, Term};
   use core::time::Duration;
 
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // A durable Normal entry at index 1 whose data is a single byte: `<Bytes as Data>::decode`
   // needs an 8-byte length prefix, so applying it fails → poison. Seed it directly (already
@@ -948,11 +922,11 @@ fn find_conflict_by_term_poison_propagation_follower() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut stable = NoopStable::default();
 
   // Three durable (uncommitted) entries at term 5 (indices 1..=3).
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(5),
@@ -999,7 +973,7 @@ fn find_conflict_by_term_poison_propagation_follower() {
     ep.is_poisoned(),
     "fatal term-read in the reject walk must poison"
   );
-  assert_eq!(ep.poison_reason(), Some(crate::PoisonReason::LogTerm));
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::LogTerm));
   assert!(
     ep.poll_message().is_none(),
     "no reject AppendResp may be sent on a fabricated conflict index"
@@ -1029,11 +1003,11 @@ fn queued_message_is_suppressed_after_later_dispatch_poisons() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut stable = NoopStable::default();
 
   // Two durable entries at indices 1 and 2 (both term 1).
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(1),
@@ -1134,13 +1108,13 @@ fn poisoned_node_rejects_work_and_persists_nothing() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut stable = NoopStable::default();
 
   // Poison via the same FATAL term-read path as
   // `term_read_failure_at_committed_index_poisons_no_truncation`: two durable committed entries,
   // then a conflicting AppendEntries whose conflict scan reads an armed-to-fail term(2) → poison.
-  let mut log = crate::testkit::FailTermLog::default();
+  let mut log = FailTermLog::default();
   log.force_append(&[
     Entry::new(
       Term::new(1),
@@ -1204,7 +1178,7 @@ fn poisoned_node_rejects_work_and_persists_nothing() {
   let cmd = bytes::Bytes::from_static(b"x");
   assert_eq!(
     ep.propose(Instant::ORIGIN, &mut log, &stable, &cmd),
-    Err(crate::ProposeError::Poisoned),
+    Err(ProposeError::Poisoned),
     "a poisoned node must reject propose with Poisoned"
   );
   // propose_conf_change_v2 → Poisoned.
@@ -1215,7 +1189,7 @@ fn poisoned_node_rejects_work_and_persists_nothing() {
   );
   assert_eq!(
     ep.propose_conf_change_v2(Instant::ORIGIN, &mut log, &stable, cc),
-    Err(crate::ProposeError::Poisoned),
+    Err(ProposeError::Poisoned),
     "a poisoned node must reject propose_conf_change_v2 with Poisoned"
   );
   // transfer_leader → Poisoned.

@@ -73,15 +73,15 @@ mod tests {
   fn full_by_count_and_bytes() {
     let mut f = Inflights::new(2, 0); // max 2 msgs, no byte cap
     assert!(!f.full());
-    f.add(crate::Index::new(1), 10);
-    f.add(crate::Index::new(2), 10);
+    f.add(Index::new(1), 10);
+    f.add(Index::new(2), 10);
     assert!(f.full());
-    f.free_le(crate::Index::new(1)); // ack of 1 frees one slot
+    f.free_le(Index::new(1)); // ack of 1 frees one slot
     assert!(!f.full());
     let mut b = Inflights::new(10, 15); // byte cap 15
-    b.add(crate::Index::new(1), 10);
+    b.add(Index::new(1), 10);
     assert!(!b.full());
-    b.add(crate::Index::new(2), 10); // 20 bytes > 15
+    b.add(Index::new(2), 10); // 20 bytes > 15
     assert!(b.full());
   }
 
@@ -89,8 +89,8 @@ mod tests {
   fn free_first_one_unblocks_full_window() {
     // Fill to capacity (count cap = 2).
     let mut f = Inflights::new(2, 0);
-    f.add(crate::Index::new(1), 7);
-    f.add(crate::Index::new(2), 11);
+    f.add(Index::new(1), 7);
+    f.add(Index::new(2), 11);
     assert!(f.full(), "window must be full after two adds");
     let bytes_before = f.bytes;
 

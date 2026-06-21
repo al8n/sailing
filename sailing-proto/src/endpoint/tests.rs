@@ -1,16 +1,19 @@
 use super::*;
-use crate::Instant;
+use crate::{
+  AppendResp, Entry, Instant, VoteResp,
+  testkit::{AsyncStable, CountSm, NoopStable, VecLog},
+};
 use core::time::Duration;
 
 struct Noop;
 
-impl crate::StateMachine for Noop {
+impl StateMachine for Noop {
   type Command = bytes::Bytes;
   type Response = ();
   type Snapshot = ();
   type Error = core::convert::Infallible;
 
-  fn apply(&mut self, _: crate::Index, _: bytes::Bytes) -> Result<(), Self::Error> {
+  fn apply(&mut self, _: Index, _: bytes::Bytes) -> Result<(), Self::Error> {
     Ok(())
   }
 
@@ -28,7 +31,7 @@ impl crate::StateMachine for Noop {
 /// Encode a Bytes command through the Data codec (as propose does internally).
 fn encode_cmd(b: &[u8]) -> bytes::Bytes {
   use crate::Data;
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   bytes::Bytes::copy_from_slice(b).encode(&mut buf);
   bytes::Bytes::from(buf)
 }
@@ -40,11 +43,7 @@ fn encode_cmd(b: &[u8]) -> bytes::Bytes {
 fn make_single_node_leader_with_entries(
   n: usize,
   threshold: usize,
-) -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::AsyncStable,
-) {
+) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
   use crate::{Config, Instant};
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -56,9 +55,9 @@ fn make_single_node_leader_with_entries(
   .unwrap()
   .with_snapshot_threshold(threshold);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // campaign
@@ -89,11 +88,7 @@ fn make_single_node_leader_with_entries(
 fn make_single_node_leader_dropping_snapshot_completion(
   n: usize,
   threshold: usize,
-) -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::AsyncStable,
-) {
+) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
   use crate::{Config, Instant};
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -105,9 +100,9 @@ fn make_single_node_leader_dropping_snapshot_completion(
   .unwrap()
   .with_snapshot_threshold(threshold);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   // The threshold is crossed exactly once during the drive, so the only `submit_snapshot` is
   // the one whose completion we want dropped — arming at the start is sufficient and precise.
   stable.drop_next_snapshot_completion();
@@ -142,11 +137,7 @@ fn make_single_node_leader_dropping_snapshot_completion(
 fn make_leader_with_compacted_log(
   offset: u64,
   n_tail: usize,
-) -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::AsyncStable,
-) {
+) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
   use crate::{Config, Entry, EntryKind, Index, Instant, Message, Term, VoteResp, conf::ConfState};
   use core::time::Duration;
 
@@ -159,9 +150,9 @@ fn make_leader_with_compacted_log(
   .unwrap()
   .with_max_size_per_msg(u64::MAX);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   // Elect node 1 as leader.
   let d = ep.poll_timeout().unwrap();
@@ -184,7 +175,7 @@ fn make_leader_with_compacted_log(
   // Compact the log up to `offset`: seed boundary entries then compact.
   if offset > 0 {
     // Force the log to have entries 1..=offset+n_tail to give compact() something to drop.
-    let all: std::vec::Vec<Entry> = (1u64..=offset + n_tail as u64)
+    let all: Vec<Entry> = (1u64..=offset + n_tail as u64)
       .map(|i| {
         Entry::new(
           Term::new(1),
@@ -221,12 +212,7 @@ fn make_leader_with_compacted_log(
 fn wedged_snapshot_follower(
   offset: u64,
   n_tail: usize,
-) -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::AsyncStable,
-  crate::Index,
-) {
+) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, Index) {
   use crate::Index;
 
   let (mut ep, log, stable) = make_leader_with_compacted_log(offset, n_tail);
@@ -238,12 +224,7 @@ fn wedged_snapshot_follower(
   }
 
   // First send: emits the InstallSnapshot and moves peer 2 into Snapshot(offset).
-  ep.maybe_send_append(
-    crate::Now::monotonic(crate::Instant::ORIGIN),
-    2u64,
-    &log,
-    &stable,
-  );
+  ep.maybe_send_append(crate::Now::monotonic(Instant::ORIGIN), 2u64, &log, &stable);
   assert!(
     ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
     "peer 2 must be in Snapshot state after the first send"
@@ -260,17 +241,13 @@ fn wedged_snapshot_follower(
 /// Encode a `u64` snapshot value into a `Bytes` blob (the wire format used by CountSm).
 fn encode_snapshot(v: u64) -> bytes::Bytes {
   use crate::Data as _;
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   v.encode(&mut buf);
   bytes::Bytes::from(buf)
 }
 
 /// Build a follower endpoint (node 2 in a 3-voter cluster, term 1) with an empty log.
-fn make_follower() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::AsyncStable,
-) {
+fn make_follower() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
   use crate::{Config, Instant};
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -280,9 +257,9 @@ fn make_follower() -> (
     Duration::from_millis(100),
   )
   .unwrap();
-  let ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let log = crate::testkit::VecLog::default();
-  let stable = crate::testkit::AsyncStable::default();
+  let ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let log = VecLog::default();
+  let stable = AsyncStable::default();
   (ep, log, stable)
 }
 
@@ -291,7 +268,7 @@ fn make_follower() -> (
 /// Build a `CountSm` snapshot blob for the given count value.
 fn encode_count_snapshot(count: u64) -> bytes::Bytes {
   use crate::Data as _;
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   count.encode(&mut buf);
   bytes::Bytes::from(buf)
 }
@@ -300,12 +277,7 @@ fn encode_count_snapshot(count: u64) -> bytes::Bytes {
 
 /// A 3-voter follower (node 2) at term 2 with a durable, committed log `[1..=3]` (commit=3), ready to
 /// receive a snapshot install. Returns `(ep, log, stable, cfg)` — `cfg` for a later `restart`.
-fn follower_committed_to_3() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::AsyncStable,
-  crate::Config<u64>,
-) {
+fn follower_committed_to_3() -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, Config<u64>) {
   use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -315,14 +287,9 @@ fn follower_committed_to_3() -> (
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(
-    cfg.clone(),
-    Instant::ORIGIN,
-    1,
-    crate::testkit::CountSm::default(),
-  );
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg.clone(), Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
   let d = Instant::ORIGIN;
   ep.handle_message(
     d,
@@ -362,7 +329,7 @@ fn follower_committed_to_3() -> (
   (ep, log, stable, cfg)
 }
 
-fn install_at(boundary: u64) -> crate::Message<u64> {
+fn install_at(boundary: u64) -> Message<u64> {
   use crate::{Index, InstallSnapshot, Message, SnapshotMeta, Term, conf::ConfState};
   let meta = SnapshotMeta::new(
     Index::new(boundary),
@@ -381,23 +348,18 @@ fn install_at(boundary: u64) -> crate::Message<u64> {
 
 /// Helper: build a single-node leader (node 1) with a VecLog + NoopStable, and drain storage
 /// so the no-op entry at index 1 is committed and applied. Returns (ep, log, stable, d).
-fn make_single_node_leader() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::NoopStable,
-  crate::Instant,
-) {
+fn make_single_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant) {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // campaign (quorum=1)
@@ -415,24 +377,19 @@ fn make_single_node_leader() -> (
 
 /// Helper: elect node 1 as leader of a 3-voter cluster {1, 2, 3}, drive the no-op to
 /// committed+applied, then return (ep, log, stable, d).
-fn make_three_node_leader() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::NoopStable,
-  crate::Instant,
-) {
+fn make_three_node_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant) {
   use crate::{Message, Term, VoteResp};
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // candidate
@@ -460,7 +417,7 @@ fn make_three_node_leader() -> (
       2u64,
       false,
       Index::ZERO,
-      crate::Term::ZERO,
+      Term::ZERO,
       Index::new(1),
     )),
   );
@@ -472,8 +429,8 @@ fn make_three_node_leader() -> (
 // ─── CheckQuorum tests ────────────────────────────────────────────────────────────────
 
 /// Helper: build a Config with check_quorum=true for a cluster of `voters` with 1s/100ms.
-fn cq_config(id: u64, voters: std::vec::Vec<u64>) -> crate::Config<u64> {
-  crate::Config::try_new(
+fn cq_config(id: u64, voters: Vec<u64>) -> Config<u64> {
+  Config::try_new(
     id,
     voters,
     Duration::from_millis(1000),
@@ -487,23 +444,18 @@ fn cq_config(id: u64, voters: std::vec::Vec<u64>) -> crate::Config<u64> {
 
 /// Helper: elect node 1 leader in a 3-voter cluster, drain the no-op so the leader has
 /// a committed current-term entry.  Returns (ep, log, stable, now).
-fn make_leader_with_current_term_commit() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::NoopStable,
-  crate::Instant,
-) {
+fn make_leader_with_current_term_commit() -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant) {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // candidate
@@ -512,12 +464,7 @@ fn make_leader_with_current_term_commit() -> (
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   // Self-vote must become durable before become_leader fires (persist-before-ACT).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -530,13 +477,13 @@ fn make_leader_with_current_term_commit() -> (
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {}
@@ -547,11 +494,7 @@ fn make_leader_with_current_term_commit() -> (
 // ---- self-validating lease regressions ----
 
 /// Build a `LeaseBased + check_quorum` leader at term 1 with a current-term commit (no lease yet).
-fn leasebased_leader() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::NoopStable,
-) {
+fn leasebased_leader() -> (Endpoint<u64, CountSm>, VecLog, NoopStable) {
   use crate::{Config, Instant, Message, Term};
   use core::time::Duration;
   let cfg = Config::try_new(
@@ -562,10 +505,10 @@ fn leasebased_leader() -> (
   )
   .unwrap()
   .with_check_quorum(true)
-  .with_read_only(crate::ReadOnlyOption::LeaseBased);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  .with_read_only(ReadOnlyOption::LeaseBased);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_message(
@@ -573,7 +516,7 @@ fn leasebased_leader() -> (
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(ep.role().is_leader());
@@ -583,13 +526,13 @@ fn leasebased_leader() -> (
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
+    Message::AppendResp(AppendResp::new(
       Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {}
@@ -599,15 +542,15 @@ fn leasebased_leader() -> (
 
 /// Fire one CheckQuorum heartbeat round; return (now, the round's lease token).
 fn tick_lease_round(
-  ep: &mut Endpoint<u64, crate::testkit::CountSm>,
-  log: &mut crate::testkit::VecLog,
-  stable: &mut crate::testkit::NoopStable,
-) -> (crate::Instant, u64) {
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut NoopStable,
+) -> (Instant, u64) {
   let at = ep.poll_timeout().expect("a timer is armed");
   ep.handle_timeout(at, log, stable);
   let mut lr = None;
   while let Some(out) = ep.poll_message() {
-    if let crate::Message::Heartbeat(hb) = out.message() {
+    if let Message::Heartbeat(hb) = out.message() {
       lr = Some(hb.lease_round());
     }
   }
@@ -618,40 +561,34 @@ fn tick_lease_round(
 
 /// Build a fresh enforcing follower (node 2 in {1,2,3}, check_quorum on, LeaseBased) at term 0 on an
 /// async store. Drive it with `follower_advertised_support` to exercise the persist-before-advertise gate.
-fn enforcing_follower(
-  et: core::time::Duration,
-) -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::AsyncStable,
-) {
+fn enforcing_follower(et: Duration) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
   use crate::{Config, Instant};
   let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     et,
-    core::time::Duration::from_millis(50),
+    Duration::from_millis(50),
   )
   .unwrap()
   .with_check_quorum(true)
-  .with_read_only(crate::ReadOnlyOption::LeaseBased);
+  .with_read_only(ReadOnlyOption::LeaseBased);
   (
-    Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default()),
-    crate::testkit::VecLog::default(),
-    crate::testkit::AsyncStable::default(),
+    Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default()),
+    VecLog::default(),
+    AsyncStable::default(),
   )
 }
 
 /// Deliver one Heartbeat (leader 1, term `t`, lease round `r`) and return the `lease_support` the
 /// follower advertised in its HeartbeatResp.
 fn follower_advertised_support(
-  ep: &mut Endpoint<u64, crate::testkit::CountSm>,
-  log: &mut crate::testkit::VecLog,
-  stable: &mut crate::testkit::AsyncStable,
-  now: crate::Instant,
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  now: Instant,
   t: u64,
   r: u64,
-) -> core::time::Duration {
+) -> Duration {
   use crate::Message;
   ep.handle_message(
     now,
@@ -659,13 +596,8 @@ fn follower_advertised_support(
     stable,
     1u64,
     Message::Heartbeat(
-      crate::Heartbeat::new(
-        crate::Term::new(t),
-        1u64,
-        crate::Index::ZERO,
-        bytes::Bytes::new(),
-      )
-      .with_lease_round(r),
+      crate::Heartbeat::new(Term::new(t), 1u64, Index::ZERO, bytes::Bytes::new())
+        .with_lease_round(r),
     ),
   );
   let mut support = None;
@@ -681,22 +613,18 @@ fn follower_advertised_support(
 
 /// Elect node 1 as leader and return (ep, log, stable) ready for transfer tests.
 /// The log has the no-op at index 1 committed; peer 2's match_index is caught up.
-fn setup_leader_with_peer2_caught_up() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::NoopStable,
-) {
+fn setup_leader_with_peer2_caught_up() -> (Endpoint<u64, CountSm>, VecLog, NoopStable) {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1.
   let d = ep.poll_timeout().unwrap();
@@ -706,12 +634,7 @@ fn setup_leader_with_peer2_caught_up() -> (
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   // Self-vote must become durable before become_leader fires (persist-before-ACT).
   ep.handle_storage(d, &mut log, &mut stable);
@@ -724,13 +647,13 @@ fn setup_leader_with_peer2_caught_up() -> (
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_message().is_some() {}
@@ -759,7 +682,7 @@ impl core::fmt::Display for FailSmError {
 
 impl core::error::Error for FailSmError {}
 
-impl crate::StateMachine for FailSm {
+impl StateMachine for FailSm {
   type Command = Bytes;
   type Response = usize;
   type Snapshot = u64;
@@ -784,11 +707,11 @@ impl crate::StateMachine for FailSm {
 
 /// Encode `payload` as a `Normal` entry's `data` using the `Bytes` codec (length-prefixed),
 /// so `<F::Command as Data>::decode` reads it back as the SM command.
-fn normal_entry(term: u64, index: u64, payload: &[u8]) -> crate::Entry {
+fn normal_entry(term: u64, index: u64, payload: &[u8]) -> Entry {
   use crate::Data as _;
-  let mut buf = std::vec::Vec::new();
+  let mut buf = Vec::new();
   bytes::Bytes::copy_from_slice(payload).encode(&mut buf);
-  crate::Entry::new(
+  Entry::new(
     Term::new(term),
     Index::new(index),
     crate::EntryKind::Normal,

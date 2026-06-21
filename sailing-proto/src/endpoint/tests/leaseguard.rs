@@ -1,11 +1,15 @@
 use super::{super::*, *};
+use crate::{
+  AppendResp, Entry, ProposeError, VoteResp,
+  testkit::{AsyncStable, CountSm, NoopStable, VecLog},
+};
 use core::time::Duration;
 
 /// A LeaseGuard leader stamps every entry it appends with its append-time clock; a
 /// non-LeaseGuard leader leaves the timestamp at 0 (so the field is absent on the wire).
 #[test]
 fn leaseguard_leader_stamps_appended_entries() {
-  fn proposed_timestamp(read_only: crate::ReadOnlyOption) -> (u64, u64) {
+  fn proposed_timestamp(read_only: ReadOnlyOption) -> (u64, u64) {
     let mut cfg = Config::try_new(
       1u64,
       std::vec![1u64, 2, 3],
@@ -14,12 +18,12 @@ fn leaseguard_leader_stamps_appended_entries() {
     )
     .unwrap()
     .with_read_only(read_only);
-    if read_only == crate::ReadOnlyOption::LeaseGuard {
+    if read_only == ReadOnlyOption::LeaseGuard {
       cfg = cfg.with_lease_duration(Duration::from_millis(300));
     }
-    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-    let mut log = crate::testkit::VecLog::default();
-    let mut stable = crate::testkit::NoopStable::default();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = NoopStable::default();
 
     // Elect (at the non-zero election deadline) so a stamp is distinguishable from 0.
     let now = ep.poll_timeout().unwrap();
@@ -30,12 +34,7 @@ fn leaseguard_leader_stamps_appended_entries() {
       &mut log,
       &mut stable,
       2u64,
-      Message::VoteResp(crate::VoteResp::new(
-        crate::Term::new(1),
-        2u64,
-        false,
-        false,
-      )),
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
     );
     assert!(ep.role().is_leader());
     ep.handle_storage(now, &mut log, &mut stable);
@@ -54,14 +53,14 @@ fn leaseguard_leader_stamps_appended_entries() {
     panic!("the proposed entry was not broadcast");
   }
 
-  let (lg_ts, expected) = proposed_timestamp(crate::ReadOnlyOption::LeaseGuard);
+  let (lg_ts, expected) = proposed_timestamp(ReadOnlyOption::LeaseGuard);
   assert!(expected > 0, "the election deadline must be non-zero");
   assert_eq!(
     lg_ts, expected,
     "a LeaseGuard leader stamps the entry with its append-time clock"
   );
 
-  let (safe_ts, _) = proposed_timestamp(crate::ReadOnlyOption::Safe);
+  let (safe_ts, _) = proposed_timestamp(ReadOnlyOption::Safe);
   assert_eq!(
     safe_ts, 0,
     "a non-LeaseGuard leader leaves the timestamp at 0"
@@ -80,12 +79,12 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect, then commit the election no-op so a current-term anchor exists (a fresh cluster has no
   // commit-wait, so the no-op commits on the first quorum ack).
@@ -97,12 +96,7 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(now, &mut log, &mut stable);
@@ -111,13 +105,13 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {}
@@ -139,7 +133,7 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
   // COMMITS, not when it is appended (clearing at append would let a read in the append->commit window
   // survive into the new anchor; see read_in_refresh_inflight_window_does_not_cause_extra_refresh).
   let last = log.last_index();
-  ep.append_leader_noop(crate::Now::monotonic(now), &mut log, last);
+  ep.append_leader_noop(Now::monotonic(now), &mut log, last);
   assert!(
     ep.read_since_anchor(),
     "an un-committed append must NOT clear read_since_anchor"
@@ -151,13 +145,13 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(2),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
     )),
   );
   while ep.poll_event().is_some() {}
@@ -171,7 +165,7 @@ fn read_since_anchor_set_on_read_cleared_on_commit_and_stepdown() {
   ep.read_index(now, &log, &stable, ctx)
     .expect("leader accepts the read");
   assert!(ep.read_since_anchor());
-  ep.step_down_to_follower(crate::Now::monotonic(now));
+  ep.step_down_to_follower(Now::monotonic(now));
   assert!(
     !ep.read_since_anchor(),
     "step-down clears read_since_anchor"
@@ -190,12 +184,12 @@ fn lease_near_expiry_fires_within_margin_of_delta() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect + commit the election no-op, stamped at `now` (the anchor `lease_near_expiry` reads).
   let now = ep.poll_timeout().unwrap();
@@ -206,12 +200,7 @@ fn lease_near_expiry_fires_within_margin_of_delta() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   ep.handle_storage(now, &mut log, &mut stable);
@@ -220,19 +209,19 @@ fn lease_near_expiry_fires_within_margin_of_delta() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(1),
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
     )),
   );
   while ep.poll_event().is_some() {}
   while ep.poll_message().is_some() {}
 
-  let at = |ms: u64| crate::Now::monotonic(now + Duration::from_millis(ms));
+  let at = |ms: u64| Now::monotonic(now + Duration::from_millis(ms));
   // Age below the 100ms threshold: not near expiry.
   assert!(!ep.lease_near_expiry(at(0), &log));
   assert!(!ep.lease_near_expiry(at(50), &log));
@@ -256,13 +245,13 @@ fn continuous_refresh_drains_when_reads_stop() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
-  .with_lease_refresh(crate::LeaseRefresh::Continuous);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  .with_lease_refresh(LeaseRefresh::Continuous);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Self-elect (single voter = self-quorum) and commit the election no-op.
   let t0 = ep.poll_timeout().unwrap();
@@ -317,13 +306,13 @@ fn continuous_refresh_is_heartbeat_paced() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
-  .with_lease_refresh(crate::LeaseRefresh::Continuous);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  .with_lease_refresh(LeaseRefresh::Continuous);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Self-elect (single voter) and commit the election no-op; the heartbeat deadline is now t0 + 100ms.
   let t0 = ep.poll_timeout().unwrap();
@@ -378,13 +367,13 @@ fn read_in_refresh_inflight_window_does_not_cause_extra_refresh() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
-  .with_lease_refresh(crate::LeaseRefresh::Continuous);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  .with_lease_refresh(LeaseRefresh::Continuous);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Self-elect (single voter) and commit the election no-op.
   let t0 = ep.poll_timeout().unwrap();
@@ -457,19 +446,19 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
       Duration::from_millis(100),
     )
     .unwrap()
-    .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+    .with_read_only(ReadOnlyOption::LeaseGuard)
     .with_lease_duration(Duration::from_millis(300))
     .with_clock_drift_bound(Duration::from_millis(50));
     if let Some(u) = uncertainty {
       cfg = cfg.with_bounded_clock_uncertainty(u);
     }
-    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-    let mut log = crate::testkit::VecLog::default();
-    let mut stable = crate::testkit::NoopStable::default();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = NoopStable::default();
 
     // Supply the synchronized wall on EVERY call (the failover tier debug_asserts a present wall).
     let mono = ep.poll_timeout().unwrap();
-    let now = crate::Now::synchronized(mono, crate::Wall::from_nanos(1_700_000_000_000_000_000));
+    let now = Now::synchronized(mono, crate::Wall::from_nanos(1_700_000_000_000_000_000));
     ep.handle_timeout(now, &mut log, &mut stable);
     ep.handle_storage(now, &mut log, &mut stable);
     ep.handle_message(
@@ -477,12 +466,7 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
       &mut log,
       &mut stable,
       2u64,
-      Message::VoteResp(crate::VoteResp::new(
-        crate::Term::new(1),
-        2u64,
-        false,
-        false,
-      )),
+      Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
     );
     assert!(ep.role().is_leader());
     ep.handle_storage(now, &mut log, &mut stable);
@@ -536,13 +520,8 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
   // `(endpoint, election_instant)`. `read_only` selects the mode; LeaseGuard also sets Δ=300ms,
   // ε_drift=50ms (the exact window 300·350/250 = 420ms < the 1000ms election timeout, so valid).
   fn elected_with_quorum_ack(
-    read_only: crate::ReadOnlyOption,
-  ) -> (
-    Endpoint<u64, crate::testkit::CountSm>,
-    crate::testkit::VecLog,
-    crate::testkit::NoopStable,
-    Instant,
-  ) {
+    read_only: ReadOnlyOption,
+  ) -> (Endpoint<u64, CountSm>, VecLog, NoopStable, Instant) {
     let mut cfg = Config::try_new(
       1u64,
       std::vec![1u64, 2, 3],
@@ -551,14 +530,14 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
     )
     .unwrap()
     .with_read_only(read_only);
-    if read_only == crate::ReadOnlyOption::LeaseGuard {
+    if read_only == ReadOnlyOption::LeaseGuard {
       cfg = cfg
         .with_lease_duration(Duration::from_millis(300))
         .with_clock_drift_bound(Duration::from_millis(50));
     }
-    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-    let mut log = crate::testkit::VecLog::default();
-    let mut stable = crate::testkit::NoopStable::default();
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = NoopStable::default();
     let d = ep.poll_timeout().unwrap();
     ep.handle_timeout(d, &mut log, &mut stable);
     // Self-vote durable first (gates the leader transition), then the peer vote yields a quorum and
@@ -596,13 +575,13 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
 
   // Both Safe AND a fresh LeaseGuard leader commit immediately: a fresh node inherited no windowed
   // entries, so max_lease_window = 0 and there is no deposed lease to wait out.
-  let (safe, ..) = elected_with_quorum_ack(crate::ReadOnlyOption::Safe);
+  let (safe, ..) = elected_with_quorum_ack(ReadOnlyOption::Safe);
   assert_eq!(
     safe.commit_index(),
     Index::new(1),
     "a Safe leader commits its no-op as soon as a quorum acks"
   );
-  let (lg, ..) = elected_with_quorum_ack(crate::ReadOnlyOption::LeaseGuard);
+  let (lg, ..) = elected_with_quorum_ack(ReadOnlyOption::LeaseGuard);
   assert_eq!(
     lg.commit_index(),
     Index::new(1),
@@ -629,12 +608,12 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // A deposed leader (node 2, term 5) replicated two entries to node 1. The LARGER window (350ms) is
   // on the EARLIER index, so the test pins "wait the MAX", not "wait the last entry's window".
@@ -756,13 +735,13 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // A deposed FAILOVER leader (node 2, term 5) replicated ONE wall-stamped entry to node 1.
   ep.handle_message(
@@ -794,8 +773,7 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
   // node 1 campaigns (term 6) under a SYNCHRONIZED wall. `at(off)` = the synchronized clock at
   // `d + off`: mono `d + off`, wall `W_E + off` (the wall advances with mono).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(W_E + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(W_E + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -834,7 +812,7 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
   // Absent-wall fallback: with NO synchronized wall the precise anchor never fires, even far past the
   // deadline — the shipped conservative anchor governs.
   assert!(
-    !ep.precise_release_ready(crate::Now::monotonic(d + Duration::from_secs(10))),
+    !ep.precise_release_ready(Now::monotonic(d + Duration::from_secs(10))),
     "an absent wall must not lift the commit-wait early"
   );
 
@@ -917,13 +895,13 @@ fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit TWO entries from a deposed failover leader: a WALL-STAMPED one (short window) and a
   // fail-closed WALL-ABSENT one (longer window, wall_timestamp == 0).
@@ -961,8 +939,7 @@ fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
   while ep.poll_message().is_some() {}
 
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(W_E + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(W_E + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -1039,12 +1016,12 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect at the election deadline `d`; no-op lands at index 1.
   let d = ep.poll_timeout().unwrap();
@@ -1108,11 +1085,11 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
   // LIVE: a read at t1 (anchor t1 + Δ=300ms > t1) serves immediately — a ReadState with no round.
   ep.read_index(t1, &log, &stable, bytes::Bytes::from_static(b"r1"))
     .unwrap();
-  let live: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let live: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
     live
       .iter()
-      .any(|e| matches!(e, crate::Event::ReadState(rs) if rs.index() == idx2)),
+      .any(|e| matches!(e, Event::ReadState(rs) if rs.index() == idx2)),
     "a live LeaseGuard lease serves the read immediately from the local commit"
   );
 
@@ -1126,11 +1103,9 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
     bytes::Bytes::from_static(b"rb"),
   )
   .unwrap();
-  let at_boundary: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let at_boundary: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
-    !at_boundary
-      .iter()
-      .any(|e| matches!(e, crate::Event::ReadState(_))),
+    !at_boundary.iter().any(|e| matches!(e, Event::ReadState(_))),
     "the lease is DEAD at exactly ts + lease_duration (strict gate), so the read degrades to Safe"
   );
 
@@ -1139,11 +1114,9 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
   let stale_now = t1 + Duration::from_millis(400);
   ep.read_index(stale_now, &log, &stable, bytes::Bytes::from_static(b"r2"))
     .unwrap();
-  let stale: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let stale: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
-    !stale
-      .iter()
-      .any(|e| matches!(e, crate::Event::ReadState(_))),
+    !stale.iter().any(|e| matches!(e, Event::ReadState(_))),
     "a stale LeaseGuard lease degrades to the safe round (no immediate ReadState)"
   );
 }
@@ -1165,11 +1138,11 @@ fn leaseguard_invalid_config_degrades_to_safe() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_storage(d, &mut log, &mut stable);
@@ -1209,9 +1182,9 @@ fn leaseguard_invalid_config_degrades_to_safe() {
   while ep.poll_event().is_some() {}
   ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r"))
     .unwrap();
-  let evs: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let evs: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
-    !evs.iter().any(|e| matches!(e, crate::Event::ReadState(_))),
+    !evs.iter().any(|e| matches!(e, Event::ReadState(_))),
     "an invalid LeaseGuard config serves reads via the safe round, not a lease fast-path"
   );
 }
@@ -1236,10 +1209,10 @@ fn leaseguard_inherited_window_defers_commit_even_for_a_safe_successor() {
     Duration::from_millis(100),
   )
   .unwrap();
-  assert_eq!(cfg.read_only(), crate::ReadOnlyOption::Safe);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  assert_eq!(cfg.read_only(), ReadOnlyOption::Safe);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
@@ -1329,11 +1302,11 @@ fn leaseguard_restart_scan_read_fault_poisons() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
 
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut stable = AsyncStable::default();
   stable.force_state(Term::new(2), None, Index::new(1));
   let mut log = crate::testkit::FailTermLog::default();
   log.force_append(&[Entry::new(
@@ -1350,7 +1323,7 @@ fn leaseguard_restart_scan_read_fault_poisons() {
     cfg,
     Instant::ORIGIN,
     42,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -1380,12 +1353,12 @@ fn leaseguard_pending_snapshot_folds_window_at_receipt() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   let meta = SnapshotMeta::new(
     Index::new(5),
@@ -1429,12 +1402,12 @@ fn leaseguard_duplicate_append_folds_a_newly_visible_window() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let ae = |window: u64| {
     Message::AppendEntries(AppendEntries::new(
@@ -1492,12 +1465,12 @@ fn leaseguard_duplicate_snapshot_folds_a_newly_visible_window() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   let is = |window: u64| {
     Message::InstallSnapshot(InstallSnapshot::new(
@@ -1547,12 +1520,12 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect at the (small) election deadline; the no-op commits immediately (fresh cluster, no wait).
   let d = ep.poll_timeout().unwrap();
@@ -1610,9 +1583,9 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
   // LIVE at t_huge (age 0 < Δ).
   ep.read_index(t_huge, &log, &stable, bytes::Bytes::from_static(b"r1"))
     .unwrap();
-  let live: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let live: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
-    live.iter().any(|e| matches!(e, crate::Event::ReadState(_))),
+    live.iter().any(|e| matches!(e, Event::ReadState(_))),
     "a fresh near-u64::MAX-stamped lease serves immediately"
   );
 
@@ -1621,11 +1594,9 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
   let t_past = t_huge + Duration::from_secs(1);
   ep.read_index(t_past, &log, &stable, bytes::Bytes::from_static(b"r2"))
     .unwrap();
-  let stale: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let stale: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
-    !stale
-      .iter()
-      .any(|e| matches!(e, crate::Event::ReadState(_))),
+    !stale.iter().any(|e| matches!(e, Event::ReadState(_))),
     "past the u64::MAX boundary the lease is STALE (no wrap to falsely-live), so the read degrades"
   );
 }
@@ -1633,12 +1604,7 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
 /// Build a single-voter LeaseGuard leader (Δ=300ms, ε=50ms) whose become-leader no-op is committed, and
 /// return `(endpoint, log, stable, election_instant)`. A 1-voter cluster self-quorums, so the no-op
 /// commits without peer acks and the lease is fresh as of the election instant.
-fn elected_leaseguard_single_voter() -> (
-  Endpoint<u64, crate::testkit::CountSm>,
-  crate::testkit::VecLog,
-  crate::testkit::NoopStable<u64>,
-  Instant,
-) {
+fn elected_leaseguard_single_voter() -> (Endpoint<u64, CountSm>, VecLog, NoopStable<u64>, Instant) {
   let cfg = Config::try_new(
     1u64,
     std::vec![1u64],
@@ -1646,12 +1612,12 @@ fn elected_leaseguard_single_voter() -> (
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
@@ -1746,12 +1712,12 @@ fn leaseguard_no_refresh_during_leader_transfer() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect and commit the become-leader no-op with peer 2 caught up (so a transfer to 2 is immediate).
   let d = ep.poll_timeout().unwrap();
@@ -1838,19 +1804,19 @@ fn failover_read_window_offers_inherited_serve_while_lease_live() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_nanos(DELTA))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // The COMMITTED entry is applied, so its payload must be a valid `F::Command` encoding (`Bytes` is
   // length-prefixed) — a raw byte string would poison with NormalEntryDecode on apply.
   let cmd = {
-    let mut buf = std::vec::Vec::new();
-    <bytes::Bytes as crate::Data>::encode(&bytes::Bytes::from_static(b"a"), &mut buf);
+    let mut buf = Vec::new();
+    <bytes::Bytes as Data>::encode(&bytes::Bytes::from_static(b"a"), &mut buf);
     bytes::Bytes::from(buf)
   };
 
@@ -1885,8 +1851,7 @@ fn failover_read_window_offers_inherited_serve_while_lease_live() {
   // node 1 campaigns (term 6) under a SYNCHRONIZED wall whose election instant is S (the lease just
   // started — fully alive). `at(off)` = mono `d + off`, wall `S + off`.
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -1938,13 +1903,13 @@ fn failover_read_window_offers_inherited_serve_while_lease_live() {
 
   // Fail closed with NO synchronized wall (a monotonic-only reading): the offer is withdrawn.
   assert!(
-    ep.failover_read_window(crate::Now::monotonic(d)).is_none(),
+    ep.failover_read_window(Now::monotonic(d)).is_none(),
     "an absent synchronized wall must withdraw the inherited-read offer"
   );
 
   // Fail closed once this node is POISONED (it has declared itself untrustworthy): no serve window even
   // while the role, commit-wait, and anchors are all still intact and the lease is live.
-  ep.poison(crate::PoisonReason::LogRead);
+  ep.poison(PoisonReason::LogRead);
   assert!(
     ep.failover_read_window(at(0)).is_none(),
     "a poisoned node must never advertise an inherited-read serve window"
@@ -1973,13 +1938,13 @@ fn failover_read_window_fail_closed_without_committed_anchor() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a wall-stamped entry but leave it UNCOMMITTED (leader_commit = 0).
   ep.handle_message(
@@ -2010,8 +1975,7 @@ fn failover_read_window_fail_closed_without_committed_anchor() {
   assert_eq!(ep.commit_index(), Index::ZERO);
 
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2072,13 +2036,13 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300)) // Δ
   .with_clock_drift_bound(Duration::from_millis(50)) // ε_drift → inflation (300+50)/300 = 7/6
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a wall-stamped entry and COMMIT it (leader_commit = 1).
   ep.handle_message(
@@ -2115,12 +2079,12 @@ fn failover_conservative_commit_wait_is_inflated_against_the_mono_undercut() {
   // the node would fail closed via the veto, never release on E′ alone — see the no-ε_unc regression.)
   let d = ep.poll_timeout().unwrap();
   let at_wall = |off: u64| {
-    crate::Now::synchronized(
+    Now::synchronized(
       d + Duration::from_nanos(off),
       Wall::from_nanos(S + 2 * EPS + off),
     )
   };
-  let at = |off: u64| crate::Now::monotonic(d + Duration::from_nanos(off));
+  let at = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   ep.handle_timeout(at_wall(0), &mut log, &mut stable);
   ep.handle_storage(at_wall(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2220,13 +2184,13 @@ fn failover_future_stamp_floor_held_not_e_prime_undercut() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit + commit a walled entry whose wall stamp is in the election's FUTURE.
   ep.handle_message(
@@ -2257,8 +2221,7 @@ fn failover_future_stamp_floor_held_not_e_prime_undercut() {
 
   // node 1 wins term 6 under election wall T (so s_c = T + X is 500ms in the future).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(T + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(T + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2354,18 +2317,18 @@ fn failover_future_committed_anchor_refuses_serve() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // The committed entry is applied, so its payload must be a valid length-prefixed `Bytes` encoding.
   let cmd = {
-    let mut buf = std::vec::Vec::new();
-    <bytes::Bytes as crate::Data>::encode(&bytes::Bytes::from_static(b"a"), &mut buf);
+    let mut buf = Vec::new();
+    <bytes::Bytes as Data>::encode(&bytes::Bytes::from_static(b"a"), &mut buf);
     bytes::Bytes::from(buf)
   };
   // Inherit + commit a walled entry whose wall stamp is in the election's FUTURE.
@@ -2393,8 +2356,7 @@ fn failover_future_committed_anchor_refuses_serve() {
 
   // node 1 wins term 6 under election wall T (so s_c = T + X is 500ms in the future).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(T + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(T + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2465,10 +2427,10 @@ fn failover_non_armed_successor_holds_commit_to_the_wall_floor() {
   )
   .unwrap()
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  assert_eq!(cfg.read_only(), crate::ReadOnlyOption::Safe);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  assert_eq!(cfg.read_only(), ReadOnlyOption::Safe);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a WALL-stamped committed entry (leader_commit = 1) from a deposed failover leader.
   ep.handle_message(
@@ -2500,8 +2462,7 @@ fn failover_non_armed_successor_holds_commit_to_the_wall_floor() {
   // node 1 wins term 6 under a synchronized wall tracking real time from S (`at(off)` = mono d+off,
   // wall S+off).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2589,9 +2550,9 @@ fn failover_wall_veto_repoll_is_wedge_safe_and_releases() {
   )
   .unwrap()
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
@@ -2620,8 +2581,7 @@ fn failover_wall_veto_repoll_is_wedge_safe_and_releases() {
   while ep.poll_message().is_some() {}
 
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2702,9 +2662,9 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
   )
   .unwrap()
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
@@ -2734,8 +2694,7 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
 
   // Elect under a live wall (lease just started at S, so the node is NOT inflated → the veto governs).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2769,7 +2728,7 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
   // STILL below the floor (S < S + 140ms) so the walled lease vetoes the clear. The re-arm `now.mono() + HB`
   // would saturate to `Instant::MAX` (`MAX − 50ms + 100ms`); the fix FAIL-STOPS instead. `handle_timeout`
   // must NOT panic (no saturated, perpetually-due CommitWait timer left behind).
-  let near_max = crate::Now::synchronized(
+  let near_max = Now::synchronized(
     Instant::from_origin(Duration::MAX - Duration::from_millis(50)),
     Wall::from_nanos(S),
   );
@@ -2781,7 +2740,7 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::CommitWaitUnrepresentable)
+    Some(PoisonReason::CommitWaitUnrepresentable)
   );
   assert_eq!(
     ep.commit_index(),
@@ -2818,9 +2777,9 @@ fn failover_unprovable_floor_hold_is_counted() {
   )
   .unwrap()
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
@@ -2850,8 +2809,7 @@ fn failover_unprovable_floor_hold_is_counted() {
 
   // Elect under a synchronized wall (the no-op stamps; the node is NOT inflated → the veto governs).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -2888,7 +2846,7 @@ fn failover_unprovable_floor_hold_is_counted() {
 
   // The driver now drops the wall on the release path: drive WALL-ABSENT due ticks. Each holds fail-closed
   // (R11) and is COUNTED; commit stays pinned (the walled lease is never undercut).
-  let mono = |off: u64| crate::Now::monotonic(d + Duration::from_nanos(off));
+  let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   for k in 1..=3u64 {
     ep.handle_timeout(mono(W + (k - 1) * HB), &mut log, &mut stable);
     while ep.poll_message().is_some() {}
@@ -2937,10 +2895,10 @@ fn failover_non_armed_successor_fails_closed_on_absent_wall() {
   )
   .unwrap()
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  assert_eq!(cfg.read_only(), crate::ReadOnlyOption::Safe);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  assert_eq!(cfg.read_only(), ReadOnlyOption::Safe);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a WALL-stamped committed entry (leader_commit = 1) from a deposed failover leader.
   ep.handle_message(
@@ -2973,7 +2931,7 @@ fn failover_non_armed_successor_fails_closed_on_absent_wall() {
   // fail-closed assert). peer 3 has NOT yet acked index 2, so the later ack ADVANCES and re-enters
   // maybe_advance_commit.
   let d = ep.poll_timeout().unwrap();
-  let mono = |off: u64| crate::Now::monotonic(d + Duration::from_nanos(off));
+  let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   ep.handle_timeout(mono(0), &mut log, &mut stable);
   ep.handle_storage(mono(0), &mut log, &mut stable);
   ep.handle_message(
@@ -3007,7 +2965,7 @@ fn failover_non_armed_successor_fails_closed_on_absent_wall() {
   // Once a SYNCHRONIZED wall past the floor (S + 140ms) is supplied, peer 3's first ack advances index 2
   // and the precise path (wall past floor) releases — the lease is honored, then the commit lands.
   ep.handle_message(
-    crate::Now::synchronized(
+    Now::synchronized(
       d + Duration::from_nanos(W + 2 * EPS + 1),
       Wall::from_nanos(S + W + 2 * EPS + 1),
     ),
@@ -3061,13 +3019,13 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
   assert!(cfg.bounded_clock_uncertainty().is_none());
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a WALL-stamped committed entry from a deposed failover leader (this node didn't stamp it).
   ep.handle_message(
@@ -3098,7 +3056,7 @@ fn failover_no_eps_unc_leaseguard_successor_fails_closed() {
 
   // Drive MONOTONIC — this node has no ε_unc and stamps no wall, so a monotonic clock is its normal input.
   let d = ep.poll_timeout().unwrap();
-  let mono = |off: u64| crate::Now::monotonic(d + Duration::from_nanos(off));
+  let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   ep.handle_timeout(mono(0), &mut log, &mut stable);
   ep.handle_storage(mono(0), &mut log, &mut stable);
   ep.handle_message(
@@ -3187,11 +3145,11 @@ fn failover_no_eps_unc_safe_successor_fails_closed() {
     Duration::from_millis(100),
   )
   .unwrap();
-  assert_eq!(cfg.read_only(), crate::ReadOnlyOption::Safe);
+  assert_eq!(cfg.read_only(), ReadOnlyOption::Safe);
   assert!(cfg.bounded_clock_uncertainty().is_none());
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a WALL-stamped committed entry from a deposed failover leader.
   ep.handle_message(
@@ -3221,7 +3179,7 @@ fn failover_no_eps_unc_safe_successor_fails_closed() {
   while ep.poll_message().is_some() {}
 
   let d = ep.poll_timeout().unwrap();
-  let mono = |off: u64| crate::Now::monotonic(d + Duration::from_nanos(off));
+  let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   ep.handle_timeout(mono(0), &mut log, &mut stable);
   ep.handle_storage(mono(0), &mut log, &mut stable);
   ep.handle_message(
@@ -3298,12 +3256,12 @@ fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
     Duration::from_secs(1),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_nanos(u64::MAX)) // window overflows u64 ⇒ timing-invalid
   .with_clock_drift_bound(Duration::from_nanos(1));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a SMALL wall-stamped committed entry (window 100ms) from a deposed failover leader.
   ep.handle_message(
@@ -3333,7 +3291,7 @@ fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
   while ep.poll_message().is_some() {}
 
   let d = ep.poll_timeout().unwrap();
-  let mono = |off: u64| crate::Now::monotonic(d + Duration::from_nanos(off));
+  let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   ep.handle_timeout(mono(0), &mut log, &mut stable);
   ep.handle_storage(mono(0), &mut log, &mut stable);
   ep.handle_message(
@@ -3404,13 +3362,13 @@ fn failover_unrepresentable_commit_deadline_disarms_serve() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_millis(20));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   ep.handle_message(
     Instant::ORIGIN,
@@ -3441,7 +3399,7 @@ fn failover_unrepresentable_commit_deadline_disarms_serve() {
   // Elect at a monotonic instant 50ms below Instant::MAX, under a live wall (lease just started at S). The
   // election deadline (from ORIGIN) is far in the past relative to this instant, so the campaign fires.
   let near_max = Instant::from_origin(Duration::MAX - Duration::from_millis(50));
-  let now = crate::Now::synchronized(near_max, Wall::from_nanos(S));
+  let now = Now::synchronized(near_max, Wall::from_nanos(S));
   ep.handle_timeout(now, &mut log, &mut stable);
   ep.handle_storage(now, &mut log, &mut stable);
   ep.handle_message(
@@ -3465,7 +3423,7 @@ fn failover_unrepresentable_commit_deadline_disarms_serve() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::CommitWaitUnrepresentable)
+    Some(PoisonReason::CommitWaitUnrepresentable)
   );
   assert!(
     ep.failover_read_window(now).is_none(),
@@ -3495,12 +3453,12 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a WALL-ABSENT windowed entry (lease_window = 100ms, wall_timestamp = 0) — a basic LeaseGuard
   // commit-wait obligation, NO walled lease (inherited_release_deadline stays 0, so no Option B veto).
@@ -3532,7 +3490,7 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
   // Elect near Instant::MAX (monotonic — basic LeaseGuard stamps no wall). The bare commit-wait
   // `near_max + 100ms` saturates.
   let near_max = Instant::from_origin(Duration::MAX - Duration::from_millis(50));
-  let now = crate::Now::monotonic(near_max);
+  let now = Now::monotonic(near_max);
   ep.handle_timeout(now, &mut log, &mut stable);
   ep.handle_storage(now, &mut log, &mut stable);
   ep.handle_message(
@@ -3549,7 +3507,7 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::CommitWaitUnrepresentable)
+    Some(PoisonReason::CommitWaitUnrepresentable)
   );
 
   // A quorum ack at the same (near-MAX) instant must NOT advance the commit past the inherited index —
@@ -3608,10 +3566,10 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
   )
   .unwrap()
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  assert_eq!(cfg.read_only(), crate::ReadOnlyOption::Safe);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  assert_eq!(cfg.read_only(), ReadOnlyOption::Safe);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a WALL-stamped committed entry with a near-ceiling wall stamp (the non-passable horizon).
   ep.handle_message(
@@ -3641,8 +3599,7 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
   while ep.poll_message().is_some() {}
 
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -3659,7 +3616,7 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::WallHorizonUnrepresentable)
+    Some(PoisonReason::WallHorizonUnrepresentable)
   );
 
   // A quorum ack must NOT advance the commit — the poisoned node never undercuts a peer's serve at c.
@@ -3706,12 +3663,12 @@ fn inconsistent_lease_floor_snapshot_fails_stop() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   // Install a snapshot whose carried floors are INCONSISTENT: a walled release floor but NO window bound.
   let meta = SnapshotMeta::new(
@@ -3753,7 +3710,7 @@ fn inconsistent_lease_floor_snapshot_fails_stop() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::InconsistentLeaseFloor)
+    Some(PoisonReason::InconsistentLeaseFloor)
   );
 
   // A quorum ack must NOT advance commit past the snapshot index — the poisoned node never commits with no
@@ -3802,12 +3759,12 @@ fn assert_inconsistent_unwalled_floor_fails_stop(
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   // Install a snapshot whose floors violate `max_unwalled_lease_window <= max_lease_window`. A consistent
   // fold can never produce this (the unwalled max is taken over a SUBSET of the same windows); only a
@@ -3852,7 +3809,7 @@ fn assert_inconsistent_unwalled_floor_fails_stop(
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::InconsistentLeaseFloor)
+    Some(PoisonReason::InconsistentLeaseFloor)
   );
 
   // A quorum ack must NOT advance commit — the poisoned node never schedules the larger unwalled deadline.
@@ -3923,13 +3880,13 @@ fn assert_inconsistent_lease_floor_fails_stop(
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_millis(20));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   let meta = SnapshotMeta::new(
     Index::new(5),
@@ -3958,7 +3915,7 @@ fn assert_inconsistent_lease_floor_fails_stop(
   // must FAIL-STOP on the inconsistent floors before the vacuous/early release can fire.
   let d = ep.poll_timeout().unwrap();
   let at = |off: u64| {
-    crate::Now::synchronized(
+    Now::synchronized(
       d + Duration::from_nanos(off),
       Wall::from_nanos(1_700_000_000_000_000_000 + off),
     )
@@ -3978,7 +3935,7 @@ fn assert_inconsistent_lease_floor_fails_stop(
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::InconsistentLeaseFloor)
+    Some(PoisonReason::InconsistentLeaseFloor)
   );
 
   // A quorum ack must NOT advance commit — without the fix the commit-wait would clear (vacuously, or on the
@@ -4077,13 +4034,13 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a wall-stamped entry with the OVERSIZED 900ms window and COMMIT it (leader_commit = 1).
   ep.handle_message(
@@ -4117,8 +4074,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
   // (bare) wait is wall-GOVERNED (held below the wall floor S + 940ms, released past it), proving the
   // wait is the bare 900ms and not the inflated 1050ms (which would still be held at d + 1000ms).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -4208,8 +4164,7 @@ fn failover_tier_active_requires_leaseguard_timing_and_bounded_uncertainty() {
     )
     .unwrap()
   };
-  let endpoint =
-    |cfg: Config<u64>| Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let endpoint = |cfg: Config<u64>| Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
 
   // (1) LeaseGuard + valid timing + bounded uncertainty → ACTIVE.
   let active = endpoint(
@@ -4338,13 +4293,13 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
     Duration::from_secs(1),              // heartbeat (must be < election_timeout)
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_nanos(2)) // Δ = 2ns
   .with_clock_drift_bound(Duration::from_nanos(1)) // ε_drift = 1ns → inflation factor 3/2
   .with_bounded_clock_uncertainty(Duration::from_nanos(1));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a wall-stamped entry whose window is u64::MAX (exact inflation ceil(u64::MAX · 3/2) overflows
   // u64) and COMMIT it.
@@ -4377,8 +4332,7 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
   // node 1 wins term 6 under a synchronized wall at S (the lease would be live: now_wall + 2·ε_unc ≪
   // S + u64::MAX).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -4443,13 +4397,13 @@ fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50))
   .with_bounded_clock_uncertainty(Duration::from_nanos(EPS));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Inherit a wall-stamped committed entry whose wall stamp is near the u64 ceiling.
   ep.handle_message(
@@ -4480,8 +4434,7 @@ fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
 
   // node 1 wins term 6 under its OWN normal synchronized wall (it stamps its no-op fine).
   let d = ep.poll_timeout().unwrap();
-  let at =
-    |off: u64| crate::Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
+  let at = |off: u64| Now::synchronized(d + Duration::from_nanos(off), Wall::from_nanos(S + off));
   ep.handle_timeout(at(0), &mut log, &mut stable);
   ep.handle_storage(at(0), &mut log, &mut stable);
   ep.handle_message(
@@ -4521,7 +4474,7 @@ fn failover_unrepresentable_wall_horizon_fails_stop_with_valid_timing() {
   );
   assert_eq!(
     ep.poison_reason(),
-    Some(crate::PoisonReason::WallHorizonUnrepresentable)
+    Some(PoisonReason::WallHorizonUnrepresentable)
   );
   // The serve is refused — a poisoned node serves no inherited read.
   assert!(
@@ -4554,13 +4507,13 @@ fn active_read_mode_drives_serve_and_stamp_not_config() {
     Duration::from_millis(100),
   )
   .unwrap()
-  .with_read_only(crate::ReadOnlyOption::LeaseGuard)
+  .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
 
   // Active mode seeded from the config (LeaseGuard): serve gate live, stamp carries the exact window.
-  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert_eq!(ep.active_read_mode(), ReadOnlyOption::LeaseGuard);
   assert!(
     ep.leaseguard_timing().is_some(),
     "LeaseGuard: serve gate live"
@@ -4571,7 +4524,7 @@ fn active_read_mode_drives_serve_and_stamp_not_config() {
   );
 
   // Override the RUNTIME mode to Safe; the static config stays LeaseGuard.
-  ep.set_active_read_mode_for_test(crate::ReadOnlyOption::Safe);
+  ep.set_active_read_mode_for_test(ReadOnlyOption::Safe);
   // Serve + stamp degrade TOGETHER off the runtime mode.
   assert!(
     ep.leaseguard_timing().is_none(),
@@ -4596,9 +4549,9 @@ fn read_mode_flips_at_apply_not_append() {
   .unwrap()
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
@@ -4607,30 +4560,30 @@ fn read_mode_flips_at_apply_not_append() {
   while ep.poll_event().is_some() {}
   while ep.poll_message().is_some() {}
 
-  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::Safe);
-  let now = crate::Now::monotonic(t0);
+  assert_eq!(ep.active_read_mode(), ReadOnlyOption::Safe);
+  let now = Now::monotonic(t0);
   let idx = ep
-    .propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+    .propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard)
     .expect("proposed");
   assert_eq!(
     ep.active_read_mode(),
-    crate::ReadOnlyOption::Safe,
+    ReadOnlyOption::Safe,
     "not flipped before the entry commits + applies"
   );
   ep.handle_storage(t0, &mut log, &mut stable);
   assert_eq!(
     ep.active_read_mode(),
-    crate::ReadOnlyOption::LeaseGuard,
+    ReadOnlyOption::LeaseGuard,
     "flipped at apply"
   );
   let mut rmc = None;
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::ReadModeChanged(r) = ev {
+    if let Event::ReadModeChanged(r) = ev {
       rmc = Some(r);
     }
   }
   let rmc = rmc.expect("ReadModeChanged emitted");
-  assert_eq!(rmc.mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert_eq!(rmc.mode(), ReadOnlyOption::LeaseGuard);
   assert_eq!(rmc.index(), idx);
 }
 
@@ -4647,9 +4600,9 @@ fn into_leaseguard_warms_up_to_safe() {
   .unwrap()
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
@@ -4658,11 +4611,11 @@ fn into_leaseguard_warms_up_to_safe() {
   while ep.poll_event().is_some() {}
   while ep.poll_message().is_some() {}
 
-  let now = crate::Now::monotonic(t0);
-  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+  let now = Now::monotonic(t0);
+  ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard)
     .expect("proposed");
   ep.handle_storage(t0, &mut log, &mut stable);
-  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert_eq!(ep.active_read_mode(), ReadOnlyOption::LeaseGuard);
   // The committed anchor is the SetReadMode entry, stamped ts=0 under Safe → no live lease yet.
   assert!(
     !ep.lease_guard_read_live(now, &log),
@@ -4691,9 +4644,9 @@ fn flip_revokes_leasebased_lease() {
   .unwrap()
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
@@ -4705,8 +4658,8 @@ fn flip_revokes_leasebased_lease() {
   // Simulate a live LeaseBased lease, then flip the mode.
   ep.set_lease_valid_until_for_test(Some(t0 + Duration::from_secs(10)));
   assert!(ep.lease_valid_until_for_test().is_some());
-  let now = crate::Now::monotonic(t0);
-  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+  let now = Now::monotonic(t0);
+  ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard)
     .expect("proposed");
   ep.handle_storage(t0, &mut log, &mut stable);
   assert_eq!(
@@ -4727,9 +4680,9 @@ fn propose_rejects_unconfigured_target() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
@@ -4738,19 +4691,19 @@ fn propose_rejects_unconfigured_target() {
   while ep.poll_event().is_some() {}
   while ep.poll_message().is_some() {}
 
-  let now = crate::Now::monotonic(t0);
+  let now = Now::monotonic(t0);
   assert_eq!(
-    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard),
-    Err(crate::ProposeError::InvalidReadMode),
+    ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard),
+    Err(ProposeError::InvalidReadMode),
     "into-LeaseGuard without a configured lease window is rejected"
   );
   assert_eq!(
-    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseBased),
-    Err(crate::ProposeError::InvalidReadMode),
+    ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseBased),
+    Err(ProposeError::InvalidReadMode),
     "into-LeaseBased without check_quorum is rejected"
   );
   assert!(
-    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::Safe)
+    ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::Safe)
       .is_ok(),
     "into-Safe always validates"
   );
@@ -4768,9 +4721,9 @@ fn one_read_mode_change_in_flight() {
   .unwrap()
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
@@ -4779,20 +4732,20 @@ fn one_read_mode_change_in_flight() {
   while ep.poll_event().is_some() {}
   while ep.poll_message().is_some() {}
 
-  let now = crate::Now::monotonic(t0);
+  let now = Now::monotonic(t0);
   assert!(
-    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+    ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard)
       .is_ok(),
     "the first migration is accepted"
   );
   assert_eq!(
-    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::Safe),
-    Err(crate::ProposeError::ReadModeChangeInFlight),
+    ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::Safe),
+    Err(ProposeError::ReadModeChangeInFlight),
     "a second migration before the first applies is rejected"
   );
   ep.handle_storage(t0, &mut log, &mut stable);
   assert!(
-    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::Safe)
+    ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::Safe)
       .is_ok(),
     "a new migration is accepted once the prior one applies"
   );
@@ -4811,29 +4764,29 @@ fn pending_read_mode_recomputed_at_become_leader() {
   .unwrap()
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   // Durable log: a committed Empty at 1, an UNCOMMITTED SetReadMode at 2 (commit = 1).
   log.force_append(&[
-    crate::Entry::new(
-      crate::Term::new(1),
-      crate::Index::new(1),
-      crate::EntryKind::Empty,
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
       bytes::Bytes::new(),
     ),
-    crate::Entry::new(
-      crate::Term::new(1),
-      crate::Index::new(2),
-      crate::EntryKind::SetReadMode,
-      bytes::Bytes::copy_from_slice(&[crate::ReadOnlyOption::Safe.as_u8()]),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::SetReadMode,
+      bytes::Bytes::copy_from_slice(&[ReadOnlyOption::Safe.as_u8()]),
     ),
   ]);
-  stable.force_state(crate::Term::new(1), Some(1u64), crate::Index::new(1));
+  stable.force_state(Term::new(1), Some(1u64), Index::new(1));
   let mut ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -4843,10 +4796,10 @@ fn pending_read_mode_recomputed_at_become_leader() {
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
   assert!(ep.role().is_leader());
-  let now = crate::Now::monotonic(t0);
+  let now = Now::monotonic(t0);
   assert_eq!(
-    ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard),
-    Err(crate::ProposeError::ReadModeChangeInFlight),
+    ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard),
+    Err(ProposeError::ReadModeChangeInFlight),
     "the inherited uncommitted SetReadMode blocks a new migration until it applies"
   );
 }
@@ -4867,9 +4820,9 @@ fn young_leader_into_leaseguard_degrades_off_unstamped_anchor() {
   .unwrap()
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
@@ -4878,14 +4831,14 @@ fn young_leader_into_leaseguard_degrades_off_unstamped_anchor() {
   while ep.poll_event().is_some() {}
   while ep.poll_message().is_some() {}
 
-  let now = crate::Now::monotonic(t0);
-  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+  let now = Now::monotonic(t0);
+  ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard)
     .expect("proposed");
   ep.handle_storage(t0, &mut log, &mut stable);
-  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert_eq!(ep.active_read_mode(), ReadOnlyOption::LeaseGuard);
   // The committed anchor is the unstamped SetReadMode entry (window=0). At a YOUNG now (since_origin < Δ),
   // where the age gate alone would serve, the read MUST still degrade — the anchor is not LeaseGuard-stamped.
-  let young = crate::Now::monotonic(Instant::ORIGIN + Duration::from_millis(5));
+  let young = Now::monotonic(Instant::ORIGIN + Duration::from_millis(5));
   assert!(
     !ep.lease_guard_read_live(young, &log),
     "a young leader must NOT serve off the unstamped migration anchor (window=0)"
@@ -4906,9 +4859,9 @@ fn mode_flip_preserves_inflight_accepted_read() {
   .unwrap()
   .with_lease_duration(Duration::from_millis(300))
   .with_clock_drift_bound(Duration::from_millis(50));
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let t0 = ep.poll_timeout().unwrap();
   ep.handle_timeout(t0, &mut log, &mut stable);
   ep.handle_storage(t0, &mut log, &mut stable);
@@ -4925,11 +4878,11 @@ fn mode_flip_preserves_inflight_accepted_read() {
     "the read is accepted and pending"
   );
   // Flip the mode; the apply must NOT discard the accepted read.
-  let now = crate::Now::monotonic(t0);
-  ep.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseGuard)
+  let now = Now::monotonic(t0);
+  ep.propose_read_mode_change(now, &mut log, &stable, ReadOnlyOption::LeaseGuard)
     .expect("proposed");
   ep.handle_storage(t0, &mut log, &mut stable);
-  assert_eq!(ep.active_read_mode(), crate::ReadOnlyOption::LeaseGuard);
+  assert_eq!(ep.active_read_mode(), ReadOnlyOption::LeaseGuard);
   assert_eq!(
     ep.pending_read_count(),
     1,

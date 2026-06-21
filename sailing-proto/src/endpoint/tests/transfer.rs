@@ -1,4 +1,8 @@
 use super::{super::*, *};
+use crate::{
+  AppendEntries, AppendResp, ProposeError, TimeoutNow, TransferError, VoteResp,
+  testkit::{CountSm, NoopStable, VecLog},
+};
 
 /// A leader transfer revokes LeaseBased read authority: the forced-transfer vote-fence bypass
 /// is only safe if the transferring leader actually relinquishes its lease. A leader that arms a
@@ -24,10 +28,10 @@ fn leader_transfer_revokes_leasebased_read_authority() {
   )
   .unwrap()
   .with_check_quorum(true)
-  .with_read_only(crate::ReadOnlyOption::LeaseBased);
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  .with_read_only(ReadOnlyOption::LeaseBased);
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
 
   // Become leader at term 1 with a current-term commit (campaign → self-vote durable → peer vote →
   // commit the no-op), mirroring `make_leader_with_current_term_commit` but under LeaseBased.
@@ -38,7 +42,7 @@ fn leader_transfer_revokes_leasebased_read_authority() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(ep.role().is_leader());
@@ -48,7 +52,7 @@ fn leader_transfer_revokes_leasebased_read_authority() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
+    Message::AppendResp(AppendResp::new(
       Term::new(1),
       2u64,
       false,
@@ -111,10 +115,10 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
   )
   .unwrap()
   .with_check_quorum(true)
-  .with_read_only(crate::ReadOnlyOption::LeaseBased);
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
+  .with_read_only(ReadOnlyOption::LeaseBased);
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
 
   // Become leader at term 1 with a current-term commit (node 2 acks the no-op → match=1).
   let d = ep.poll_timeout().unwrap();
@@ -124,7 +128,7 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(Term::new(1), 2u64, false, false)),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(ep.role().is_leader());
@@ -134,7 +138,7 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
+    Message::AppendResp(AppendResp::new(
       Term::new(1),
       2u64,
       false,
@@ -208,7 +212,7 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
 
   // Now simulate peer 2 receiving TimeoutNow (with pre_vote=true config, should still
   // do a REAL campaign bypassing PreVote).
-  let cfg2 = crate::Config::try_new(
+  let cfg2 = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -216,9 +220,9 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
   )
   .unwrap()
   .with_pre_vote(true);
-  let mut follower = Endpoint::new(cfg2, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut flog = crate::testkit::VecLog::default();
-  let mut fstable = crate::testkit::NoopStable::default();
+  let mut follower = Endpoint::new(cfg2, Instant::ORIGIN, 7, CountSm::default());
+  let mut flog = VecLog::default();
+  let mut fstable = NoopStable::default();
   // The transfer target must already be a follower of node 1 AT THE LEADER'S TERM for the
   // TimeoutNow to be honored (a TimeoutNow is now authenticated against the current known leader,
   // and a real transfer target is caught up under that leader at its term). Establish leader=1,
@@ -229,13 +233,13 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
     &mut flog,
     &mut fstable,
     1u64,
-    Message::AppendEntries(crate::AppendEntries::new(
-      crate::Term::new(1),
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
       1u64,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
+      Index::ZERO,
+      Term::ZERO,
       std::vec![],
-      crate::Index::ZERO,
+      Index::ZERO,
     )),
   );
   assert_eq!(follower.leader(), Some(1u64));
@@ -247,7 +251,7 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
     &mut flog,
     &mut fstable,
     1u64,
-    Message::TimeoutNow(crate::TimeoutNow::new(crate::Term::new(1), 1u64)),
+    Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64)),
   );
 
   // Peer 2 must be a REAL Candidate (not PreCandidate) at term 2.
@@ -257,7 +261,7 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
   );
   assert_eq!(
     follower.term(),
-    crate::Term::new(2),
+    Term::new(2),
     "candidate term must be bumped to 2"
   );
 
@@ -284,16 +288,16 @@ fn transfer_to_caught_up_follower_sends_timeout_now_immediately() {
 #[test]
 fn transfer_to_lagging_follower_waits_for_catch_up() {
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1.
   let d = ep.poll_timeout().unwrap();
@@ -304,12 +308,7 @@ fn transfer_to_lagging_follower_waits_for_catch_up() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
   // Drain storage (no-op append).
@@ -345,13 +344,13 @@ fn transfer_to_lagging_follower_waits_for_catch_up() {
     &mut log,
     &mut stable,
     2u64,
-    Message::AppendResp(crate::AppendResp::new(
-      crate::Term::new(1),
+    Message::AppendResp(AppendResp::new(
+      Term::new(1),
       2u64,
       false,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
-      crate::Index::new(2), // caught up to last_index=2
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2), // caught up to last_index=2
     )),
   );
 
@@ -390,7 +389,7 @@ fn proposals_refused_during_transfer_allowed_after_abort() {
     )
     .unwrap_err();
   assert!(
-    matches!(err, crate::ProposeError::LeaderTransferInProgress),
+    matches!(err, ProposeError::LeaderTransferInProgress),
     "propose must fail with LeaderTransferInProgress during transfer"
   );
 
@@ -404,7 +403,7 @@ fn proposals_refused_during_transfer_allowed_after_abort() {
     )
     .unwrap_err();
   assert!(
-    matches!(cc_err, crate::ProposeError::LeaderTransferInProgress),
+    matches!(cc_err, ProposeError::LeaderTransferInProgress),
     "propose_conf_change must fail with LeaderTransferInProgress during transfer"
   );
 
@@ -481,7 +480,7 @@ fn timeout_now_bypasses_prevote_and_lease() {
   use core::time::Duration;
 
   // Node 2 is the transfer target: pre_vote=true, check_quorum=true.
-  let cfg2 = crate::Config::try_new(
+  let cfg2 = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -490,9 +489,9 @@ fn timeout_now_bypasses_prevote_and_lease() {
   .unwrap()
   .with_pre_vote(true)
   .with_check_quorum(true);
-  let mut target = Endpoint::new(cfg2, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut tlog = crate::testkit::VecLog::default();
-  let mut tstable = crate::testkit::NoopStable::default();
+  let mut target = Endpoint::new(cfg2, Instant::ORIGIN, 7, CountSm::default());
+  let mut tlog = VecLog::default();
+  let mut tstable = NoopStable::default();
 
   // A live leader-1 heartbeat at term 1: this both sets the known leader (so the lease would
   // normally block a vote) AND advances the target to the leader's term, so the equal-term
@@ -503,17 +502,17 @@ fn timeout_now_bypasses_prevote_and_lease() {
     &mut tlog,
     &mut tstable,
     1u64,
-    Message::AppendEntries(crate::AppendEntries::new(
-      crate::Term::new(1),
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
       1u64,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
+      Index::ZERO,
+      Term::ZERO,
       std::vec![],
-      crate::Index::ZERO,
+      Index::ZERO,
     )),
   );
   assert_eq!(target.leader(), Some(1u64));
-  assert_eq!(target.term(), crate::Term::new(1));
+  assert_eq!(target.term(), Term::new(1));
   while target.poll_message().is_some() {}
 
   // Deliver TimeoutNow.
@@ -522,7 +521,7 @@ fn timeout_now_bypasses_prevote_and_lease() {
     &mut tlog,
     &mut tstable,
     1u64,
-    Message::TimeoutNow(crate::TimeoutNow::new(crate::Term::new(1), 1u64)),
+    Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64)),
   );
 
   // Must be a REAL Candidate (not PreCandidate) despite pre_vote=true.
@@ -530,11 +529,7 @@ fn timeout_now_bypasses_prevote_and_lease() {
     target.role().is_candidate(),
     "TimeoutNow must produce Candidate, not PreCandidate"
   );
-  assert_eq!(
-    target.term(),
-    crate::Term::new(2),
-    "term must be bumped to 2"
-  );
+  assert_eq!(target.term(), Term::new(2), "term must be bumped to 2");
 
   // All RequestVote messages must have leader_transfer=true and pre_vote=false.
   let mut rv_count = 0;
@@ -555,7 +550,7 @@ fn timeout_now_bypasses_prevote_and_lease() {
 
   // Node 3 (a follower with a live leader and healthy election timer) receives the
   // RequestVote{leader_transfer:true}: the lease must NOT block it — it should grant.
-  let cfg3 = crate::Config::try_new(
+  let cfg3 = Config::try_new(
     3u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -564,13 +559,8 @@ fn timeout_now_bypasses_prevote_and_lease() {
   .unwrap()
   .with_pre_vote(true)
   .with_check_quorum(true);
-  let mut follower3 = Endpoint::new(
-    cfg3,
-    Instant::ORIGIN,
-    42,
-    crate::testkit::CountSm::default(),
-  );
-  let mut fl3 = crate::testkit::VecLog::default();
+  let mut follower3 = Endpoint::new(cfg3, Instant::ORIGIN, 42, CountSm::default());
+  let mut fl3 = VecLog::default();
   let mut fs3 = crate::testkit::AsyncStable::default();
 
   // Give follower3 a live leader + healthy election timer (same-term as the RequestVote).
@@ -589,10 +579,10 @@ fn timeout_now_bypasses_prevote_and_lease() {
     &mut fs3,
     2u64,
     Message::RequestVote(crate::RequestVote::new(
-      crate::Term::new(2), // higher term
+      Term::new(2), // higher term
       2u64,
-      crate::Index::ZERO,
-      crate::Term::ZERO,
+      Index::ZERO,
+      Term::ZERO,
       false, // real vote
       true,  // leader_transfer — must bypass lease
     )),
@@ -620,16 +610,16 @@ fn timeout_now_bypasses_prevote_and_lease() {
 fn transfer_to_learner_rejected() {
   use core::time::Duration;
   // Create a cluster where node 4 is a learner (not a voter).
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 as leader.
   let d = ep.poll_timeout().unwrap();
@@ -640,48 +630,38 @@ fn transfer_to_learner_rejected() {
     &mut log,
     &mut stable,
     2u64,
-    Message::VoteResp(crate::VoteResp::new(
-      crate::Term::new(1),
-      2u64,
-      false,
-      false,
-    )),
+    Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
 
   // Node 4 is not in the voter set — transfer must fail with NotAVoter.
   let err = ep.transfer_leader(d, &log, &stable, 4u64).unwrap_err();
   assert!(
-    matches!(err, crate::TransferError::NotAVoter),
+    matches!(err, TransferError::NotAVoter),
     "transfer to non-voter must fail with NotAVoter; got {err:?}"
   );
 
   // Transferring to self must fail with AlreadyLeader.
   let err2 = ep.transfer_leader(d, &log, &stable, 1u64).unwrap_err();
   assert!(
-    matches!(err2, crate::TransferError::AlreadyLeader),
+    matches!(err2, TransferError::AlreadyLeader),
     "transfer to self must fail with AlreadyLeader; got {err2:?}"
   );
 
   // Non-leader can't initiate transfer at all.
-  let cfg_follower = crate::Config::try_new(
+  let cfg_follower = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut follower = Endpoint::new(
-    cfg_follower,
-    Instant::ORIGIN,
-    5,
-    crate::testkit::CountSm::default(),
-  );
+  let mut follower = Endpoint::new(cfg_follower, Instant::ORIGIN, 5, CountSm::default());
   let err3 = follower
     .transfer_leader(d, &log, &stable, 3u64)
     .unwrap_err();
   assert!(
-    matches!(err3, crate::TransferError::NotLeader { .. }),
+    matches!(err3, TransferError::NotLeader { .. }),
     "non-leader transfer_leader must fail with NotLeader; got {err3:?}"
   );
 }
@@ -825,7 +805,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
 fn timeout_now_is_authenticated_against_current_leader() {
   use crate::{AppendEntries, Index, Term};
   use core::time::Duration;
-  let cfg = crate::Config::try_new(
+  let cfg = Config::try_new(
     2u64,
     std::vec![1u64, 2u64, 3u64],
     Duration::from_millis(1000),
@@ -834,9 +814,9 @@ fn timeout_now_is_authenticated_against_current_leader() {
   .unwrap()
   .with_pre_vote(true)
   .with_check_quorum(true);
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Establish leader node 1 at term 1 via a heartbeat-shaped AppendEntries (so the node is a real
   // follower at term 1, not a fresh term-0 node — then an equal-term TimeoutNow triggers no term
@@ -867,7 +847,7 @@ fn timeout_now_is_authenticated_against_current_leader() {
     &mut log,
     &mut stable,
     3u64,
-    Message::TimeoutNow(crate::TimeoutNow::new(Term::new(1), 3u64)),
+    Message::TimeoutNow(TimeoutNow::new(Term::new(1), 3u64)),
   );
   assert_eq!(
     ep.role(),
@@ -891,7 +871,7 @@ fn timeout_now_is_authenticated_against_current_leader() {
     &mut log,
     &mut stable,
     1u64,
-    Message::TimeoutNow(crate::TimeoutNow::new(Term::new(1), 1u64)),
+    Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64)),
   );
   assert!(
     ep.role().is_candidate(),
@@ -899,7 +879,7 @@ fn timeout_now_is_authenticated_against_current_leader() {
   );
   assert_eq!(
     ep.term(),
-    crate::Term::new(2),
+    Term::new(2),
     "the forced campaign bumps the term"
   );
   let mut saw_transfer_vote = false;

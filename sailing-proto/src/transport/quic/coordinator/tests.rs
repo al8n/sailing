@@ -1,10 +1,13 @@
-use std::{net::SocketAddr, time::Duration};
+use std::{net::SocketAddr, string::String, time::Duration, vec::Vec};
 
 use super::QuicCoordinator;
 use crate::{
-  Config, Instant,
+  ConfState, Config, Data, Endpoint, Instant,
   testkit::{CountSm, NoopStable, VecLog},
-  transport::{ClusterId, quic::crypto::tests::TestClusterCa},
+  transport::{
+    ClusterId,
+    quic::{QuicTuning, crypto::tests::TestClusterCa},
+  },
 };
 
 type Coord = QuicCoordinator<u64, CountSm>;
@@ -22,11 +25,11 @@ fn cluster(b: u8) -> ClusterId {
 
 /// The SAN the coordinator's `sni_for` derives for node `id` in `cluster` — certs are minted with
 /// it so the stock WebPki verifier matches the dial.
-fn san(id: u64, c: &ClusterId) -> std::string::String {
+fn san(id: u64, c: &ClusterId) -> String {
   use core::fmt::Write as _;
-  let mut s = std::string::String::from("node-");
-  let mut enc = std::vec::Vec::new();
-  crate::Data::encode(&id, &mut enc);
+  let mut s = String::from("node-");
+  let mut enc = Vec::new();
+  Data::encode(&id, &mut enc);
   for b in &enc {
     let _ = write!(s, "{b:02x}");
   }
@@ -50,7 +53,7 @@ fn coord(ca: &TestClusterCa, id: u64, c: ClusterId) -> Coord {
 fn coord_with_cap(ca: &TestClusterCa, id: u64, c: ClusterId, cap: Option<usize>) -> Coord {
   use crate::transport::quic::QuicTuning;
   let cfg = Config::try_new(id, std::vec![1u64, 2u64], ELECTION, HEARTBEAT).unwrap();
-  let endpoint = crate::Endpoint::new(cfg, Instant::ORIGIN, id, CountSm::default());
+  let endpoint = Endpoint::new(cfg, Instant::ORIGIN, id, CountSm::default());
   let mut opts = ca
     .cluster_tls(&san(id, &c))
     .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
@@ -76,7 +79,7 @@ fn coord_failover(ca: &TestClusterCa, id: u64, c: ClusterId) -> Coord {
     .with_lease_duration(Duration::from_millis(30))
     .with_clock_drift_bound(Duration::from_millis(5))
     .with_bounded_clock_uncertainty(Duration::from_millis(20));
-  let endpoint = crate::Endpoint::new(cfg, Instant::ORIGIN, id, CountSm::default());
+  let endpoint = Endpoint::new(cfg, Instant::ORIGIN, id, CountSm::default());
   let opts = ca
     .cluster_tls(&san(id, &c))
     .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
@@ -149,11 +152,11 @@ impl World {
     for _ in 0..400 {
       self.a.handle_storage(self.now, &mut self.la, &mut self.sa);
       self.b.handle_storage(self.now, &mut self.lb, &mut self.sb);
-      let mut from_a = std::vec::Vec::new();
+      let mut from_a = Vec::new();
       while let Some(t) = self.a.poll_transmit() {
         from_a.push(t);
       }
-      let mut from_b = std::vec::Vec::new();
+      let mut from_b = Vec::new();
       while let Some(t) = self.b.poll_transmit() {
         from_b.push(t);
       }
@@ -309,7 +312,7 @@ fn wrong_cluster_hello_never_binds() {
   let c7 = cluster(7);
   let c9 = cluster(9);
   let mut a = coord(&ca, 1, c7);
-  let b_endpoint = crate::Endpoint::new(
+  let b_endpoint = Endpoint::new(
     Config::try_new(2u64, std::vec![1u64, 2u64], ELECTION, HEARTBEAT).unwrap(),
     Instant::ORIGIN,
     2,
@@ -317,7 +320,7 @@ fn wrong_cluster_hello_never_binds() {
   );
   let b_opts = ca
     .cluster_tls(&san(2, &c7))
-    .tuning(crate::transport::quic::QuicTuning::new().with_keep_alive_interval_millis(0))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
     .build();
   let mut b: Coord = QuicCoordinator::with_identity(b_endpoint, b_opts, Some([2; 32]), c9);
 
@@ -366,8 +369,8 @@ fn oversized_node_id_encoding_fails_the_dial_with_a_typed_error() {
     }
   }
 
-  impl crate::Data for WideId {
-    fn encode(&self, buf: &mut std::vec::Vec<u8>) {
+  impl Data for WideId {
+    fn encode(&self, buf: &mut Vec<u8>) {
       buf.extend_from_slice(&self.0);
     }
     fn decode(cur: &mut crate::ByteCursor) -> Result<Self, crate::DecodeError> {
@@ -383,10 +386,10 @@ fn oversized_node_id_encoding_fails_the_dial_with_a_typed_error() {
     HEARTBEAT,
   )
   .unwrap();
-  let endpoint = crate::Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let endpoint = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
   let opts = ca
     .cluster_tls("node-wide.test.sailing")
-    .tuning(crate::transport::quic::QuicTuning::new().with_keep_alive_interval_millis(0))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
     .build();
   let mut c: QuicCoordinator<WideId, CountSm> =
     QuicCoordinator::with_identity(endpoint, opts, Some([9; 32]), cluster(7));
@@ -413,7 +416,7 @@ fn oversized_node_id_encoding_fails_the_dial_with_a_typed_error() {
 /// them, so the transport must admit a mesh edge to each.
 #[test]
 fn tracked_peer_count_spans_joint_config_and_learners() {
-  let simple = crate::ConfState::from_voters(std::vec![1u64, 2, 3]);
+  let simple = ConfState::from_voters(std::vec![1u64, 2, 3]);
   assert_eq!(
     super::tracked_peer_count(&simple, &1u64),
     2,
@@ -426,7 +429,7 @@ fn tracked_peer_count_spans_joint_config_and_learners() {
   // learner 6. From node 1 the mesh is {2,3,4,5,6} — the union minus self, every one of which
   // the endpoint replicates to. Counting only incoming voters would size for {2,4} and refuse
   // the rest under a low cap.
-  let joint = crate::ConfState::new(
+  let joint = ConfState::new(
     std::vec![1u64, 2, 4],
     std::vec![5u64],
     std::vec![1u64, 2, 3],
@@ -537,11 +540,11 @@ fn quic_election_preserves_synchronized_wall_on_leader_noop() {
     for _ in 0..400 {
       a.handle_storage(synced(now), la, sa);
       b.handle_storage(synced(now), lb, sb);
-      let mut from_a = std::vec::Vec::new();
+      let mut from_a = Vec::new();
       while let Some(t) = a.poll_transmit() {
         from_a.push(t);
       }
-      let mut from_b = std::vec::Vec::new();
+      let mut from_b = Vec::new();
       while let Some(t) = b.poll_transmit() {
         from_b.push(t);
       }

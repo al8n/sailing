@@ -1,5 +1,5 @@
 use super::{super::passthrough::Passthrough, *};
-use crate::{Data, Instant};
+use crate::{Data, Instant, transport::TransportError};
 use std::vec::Vec;
 
 fn enc(id: u64) -> Vec<u8> {
@@ -288,12 +288,12 @@ fn out_of_bounds_local_id_is_rejected_at_construction() {
   for bad in [&empty, &oversized] {
     assert_eq!(
       Labeled::dialer(Passthrough::default(), bad).err(),
-      Some(crate::transport::TransportError::InvalidLocalId),
+      Some(TransportError::InvalidLocalId),
       "dialer must reject an out-of-bounds local id"
     );
     assert_eq!(
       Labeled::acceptor(Passthrough::default(), bad).err(),
-      Some(crate::transport::TransportError::InvalidLocalId),
+      Some(TransportError::InvalidLocalId),
       "acceptor must reject an out-of-bounds local id"
     );
   }

@@ -38,11 +38,7 @@ fn hb(from: u64) -> Message<u64> {
 }
 
 /// Shuttle bytes between a router's connection `id` and a standalone peer Conn until quiescent.
-fn pump(
-  router: &mut R,
-  id: ConnId,
-  peer: &mut crate::transport::conn::Conn<u64, Labeled<Passthrough>>,
-) {
+fn pump(router: &mut R, id: ConnId, peer: &mut Conn<u64, Labeled<Passthrough>>) {
   for _ in 0..8 {
     let moved = router.poll_transmit();
     let mut any = false;
@@ -72,7 +68,7 @@ fn binds_peer_on_validation_and_routes() {
   let mut router = R::new();
   let id = ConnId(1);
   router.register(id, acceptor(10), Instant::ORIGIN); // local node 10 accepts
-  let mut peer = crate::transport::conn::Conn::new(dialer(7)); // remote node 7 dials
+  let mut peer = Conn::new(dialer(7)); // remote node 7 dials
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id), "peer 7 is bound to its conn");
 
@@ -89,7 +85,7 @@ fn decodes_inbound_messages_with_their_peer() {
   let mut router = R::new();
   let id = ConnId(1);
   router.register(id, acceptor(10), Instant::ORIGIN);
-  let mut peer = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
 
   peer.send_message(&hb(7));
@@ -118,7 +114,7 @@ fn eof_clears_the_peer_route() {
   let mut router = R::new();
   let id = ConnId(1);
   router.register(id, acceptor(10), Instant::ORIGIN);
-  let mut peer = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id));
 
@@ -140,12 +136,12 @@ fn newer_connection_wins_duplicate_peer() {
   // Two connections both validate as peer 7; the second registered wins.
   let (id1, id2) = (ConnId(1), ConnId(2));
   router.register(id1, acceptor(10), Instant::ORIGIN);
-  let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer1 = Conn::new(dialer(7));
   pump(&mut router, id1, &mut peer1);
   assert_eq!(router.conn_of(&7), Some(id1));
 
   router.register(id2, acceptor(10), Instant::ORIGIN);
-  let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer2 = Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
   assert_eq!(router.conn_of(&7), Some(id2), "newer conn wins");
   assert!(router.route(7, &hb(10)));
@@ -158,8 +154,8 @@ fn older_connection_validating_late_does_not_evict_newer() {
   // Both registered up front; the NEWER one (id2) completes its handshake first and binds.
   router.register(id1, acceptor(10), Instant::ORIGIN);
   router.register(id2, acceptor(10), Instant::ORIGIN);
-  let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
-  let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer1 = Conn::new(dialer(7));
+  let mut peer2 = Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
   assert_eq!(router.conn_of(&7), Some(id2), "newer conn bound first");
 
@@ -195,12 +191,12 @@ fn duplicate_eviction_surfaces_via_poll_conn_closed() {
   let mut router = R::new();
   let (id1, id2) = (ConnId(1), ConnId(2));
   router.register(id1, acceptor(10), Instant::ORIGIN);
-  let mut peer1 = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer1 = Conn::new(dialer(7));
   pump(&mut router, id1, &mut peer1);
   assert_eq!(router.conn_of(&7), Some(id1));
 
   router.register(id2, acceptor(10), Instant::ORIGIN);
-  let mut peer2 = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer2 = Conn::new(dialer(7));
   pump(&mut router, id2, &mut peer2);
   assert_eq!(router.conn_of(&7), Some(id2));
   // The evicted older connection is reported (clean — no fault) so the driver can close its socket.
@@ -231,7 +227,7 @@ fn duplicate_conn_id_registration_is_rejected_not_replaced() {
   let mut router = R::new();
   let id = ConnId(1);
   router.register(id, acceptor(10), Instant::ORIGIN);
-  let mut peer = crate::transport::conn::Conn::new(dialer(7));
+  let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
   assert_eq!(router.conn_of(&7), Some(id), "original conn validated");
 

@@ -1,4 +1,9 @@
 use super::*;
+use crate::{
+  HeartbeatResp,
+  endpoint::MAX_READ_BATCH_ENTRIES,
+  testkit::{AsyncStable, CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
+};
 
 /// Regression (the follower must also reject IMPORTING the reserved sentinel index): the
 /// leader reserves u64::MAX, but a malformed/version-skewed AppendEntries with prev_log_index
@@ -22,9 +27,9 @@ fn append_entries_at_sentinel_index_poisons_not_imports() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = Instant::ORIGIN;
   // Follower's log re-baselined to the ceiling: last_index == u64::MAX - 1, boundary term 1.
   log.restore(Index::new(u64::MAX - 1), Term::new(1));
@@ -84,8 +89,8 @@ fn quorum_makes_a_leader_and_heartbeats_follow() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // become candidate, term 1, self-vote
@@ -111,10 +116,7 @@ fn quorum_makes_a_leader_and_heartbeats_follow() {
   }
   assert_eq!(hb, 2);
   // leader event surfaced
-  assert!(matches!(
-    ep.poll_event(),
-    Some(crate::Event::LeaderChanged(_))
-  ));
+  assert!(matches!(ep.poll_event(), Some(Event::LeaderChanged(_))));
 }
 
 // --- log-replication tests ---
@@ -130,9 +132,9 @@ fn become_leader_appends_noop_and_inits_progress() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // candidate
   ep.handle_storage(d, &mut log, &mut stable);
@@ -144,10 +146,9 @@ fn become_leader_appends_noop_and_inits_progress() {
     Message::VoteResp(VoteResp::new(Term::new(1), 2u64, false, false)),
   );
   assert!(ep.role().is_leader());
-  assert_eq!(log.last_index(), crate::Index::new(1)); // no-op at index 1
-  let crate::EntriesRead::Ready(entries) = log
-    .entries(crate::Index::new(1)..crate::Index::new(2), u64::MAX)
-    .unwrap()
+  assert_eq!(log.last_index(), Index::new(1)); // no-op at index 1
+  let crate::EntriesRead::Ready(entries) =
+    log.entries(Index::new(1)..Index::new(2), u64::MAX).unwrap()
   else {
     panic!("a resident store never returns Pending");
   };
@@ -165,9 +166,9 @@ fn propose_appends_and_replicates() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_storage(d, &mut log, &mut stable);
@@ -184,7 +185,7 @@ fn propose_appends_and_replicates() {
   let idx = ep
     .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
     .unwrap();
-  assert_eq!(idx, crate::Index::new(2)); // after the no-op at 1
+  assert_eq!(idx, Index::new(2)); // after the no-op at 1
   let mut appends = 0;
   while let Some(o) = ep.poll_message() {
     if let Message::AppendEntries(ae) = o.message()
@@ -207,9 +208,9 @@ fn follower_appends_and_rejects_gap() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // matching append at index 1 (prev=0) — fresh entry, ack deferred until durable
   let e1 = Entry::new(
@@ -287,9 +288,9 @@ fn non_contiguous_append_poisons() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // prev_log_index=0 is consistent against the empty log, but the single entry's embedded index
   // is 2 — a gap at index 1. Positional `last_new` would be 1; the embedded index is 2.
@@ -350,9 +351,9 @@ fn duplicate_append_does_not_ack_in_flight_tail() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   let e1 = Entry::new(
     Term::new(1),
@@ -483,9 +484,9 @@ fn durable_index_advances_after_term_cleared_follower_ack() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::AsyncStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
 
   let e1 = Entry::new(
     Term::new(1),
@@ -588,9 +589,9 @@ fn quorum_ack_commits_and_applies() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_message(
@@ -628,11 +629,11 @@ fn quorum_ack_commits_and_applies() {
     )),
   );
   // Applied event for the Normal entry at idx 2 (the no-op at 1 is an Empty entry, not Applied)
-  let applied: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let applied: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
     applied
       .iter()
-      .any(|e| matches!(e, crate::Event::Applied(a) if a.index()==idx))
+      .any(|e| matches!(e, Event::Applied(a) if a.index()==idx))
   );
 }
 
@@ -650,9 +651,9 @@ fn stale_append_entries_does_not_erase_committed_entries() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Feed 3 entries from leader 1, leader_commit=3 → follower appends and commits all three.
   // Payloads are Data-encoded (`encode_cmd`) so the committed entries decode as the SM's
@@ -750,9 +751,9 @@ fn single_node_leader_commits_after_storage_drain() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable); // self-elects (quorum=1)
@@ -770,9 +771,9 @@ fn single_node_leader_commits_after_storage_drain() {
   ep.handle_storage(d, &mut log, &mut stable);
 
   // Applied event for the Normal entry must have been emitted.
-  let events: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event()).collect();
   assert!(
-    events.iter().any(|e| matches!(e, crate::Event::Applied(_))),
+    events.iter().any(|e| matches!(e, Event::Applied(_))),
     "a single-node leader must commit after handle_storage drains"
   );
 }
@@ -792,9 +793,9 @@ fn apply_defers_on_cold_read_without_poisoning() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::FailTermLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
 
   // Self-elect (quorum == 1), drain so the no-op commits and applies.
   let d = ep.poll_timeout().unwrap();
@@ -826,7 +827,7 @@ fn apply_defers_on_cold_read_without_poisoning() {
     "the apply cold-read defer must bump the wedge counter"
   );
   assert!(
-    !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, Event::Applied(_))),
     "the proposed entry must NOT apply while the read is cold (deferred)"
   );
 }
@@ -846,9 +847,9 @@ fn replication_defers_on_cold_read_without_poisoning() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::FailTermLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 leader (peer 2 votes) so it appends a no-op at index 1.
   let d = ep.poll_timeout().unwrap();
@@ -900,9 +901,9 @@ fn cold_apply_is_redriven_by_handle_storage_without_a_completion() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::FailTermLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
 
   // Become leader, commit + apply the no-op (applied catches up).
   let d = ep.poll_timeout().unwrap();
@@ -920,7 +921,7 @@ fn cold_apply_is_redriven_by_handle_storage_without_a_completion() {
     .unwrap();
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
-    !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, Event::Applied(_))),
     "the entry must NOT apply while the read is cold"
   );
 
@@ -933,7 +934,7 @@ fn cold_apply_is_redriven_by_handle_storage_without_a_completion() {
     "the re-drive must apply cleanly, never poison"
   );
   assert!(
-    core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, Event::Applied(_))),
     "handle_storage with no LogDone must re-pump the deferred apply once the cold read resolves"
   );
 }
@@ -952,9 +953,9 @@ fn apply_reads_are_byte_capped_and_handle_owned_entries() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::FailTermLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
   log.return_owned_on_read(); // every read materialises OWNED — the cold/disk store shape
 
   // Become leader, propose, and drive apply over the OWNED read path.
@@ -973,7 +974,7 @@ fn apply_reads_are_byte_capped_and_handle_owned_entries() {
     "apply over an OWNED cold read must not poison"
   );
   assert!(
-    core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, crate::Event::Applied(_))),
+    core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, Event::Applied(_))),
     "the entry must apply via the owned cold-read path"
   );
   assert_eq!(
@@ -1001,10 +1002,10 @@ fn owned_zero_payload_backlog_reads_are_count_bounded() {
   )
   .unwrap();
   // A committed backlog LARGER than the cap, every entry zero-payload (the byte cap charges 0 bytes).
-  let n = crate::endpoint::MAX_READ_BATCH_ENTRIES + 200;
-  let mut log = crate::testkit::FailTermLog::default();
+  let n = MAX_READ_BATCH_ENTRIES + 200;
+  let mut log = FailTermLog::default();
   log.return_owned_on_read(); // materialise OWNED — the cold/disk store shape
-  let entries: std::vec::Vec<Entry> = (1..=n)
+  let entries: Vec<Entry> = (1..=n)
     .map(|i| {
       Entry::new(
         Term::new(1),
@@ -1015,13 +1016,13 @@ fn owned_zero_payload_backlog_reads_are_count_bounded() {
     })
     .collect();
   log.force_append(&entries);
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut stable = NoopStable::default();
   stable.force_state(Term::new(1), Some(1u64), Index::new(n)); // commit = n
   let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     1,
-    crate::testkit::CountSm::default(),
+    CountSm::default(),
     1,
     &mut log,
     &mut stable,
@@ -1032,14 +1033,14 @@ fn owned_zero_payload_backlog_reads_are_count_bounded() {
     "restart + apply over a large owned zero-payload backlog must succeed"
   );
   assert!(
-    log.observed_max_range_width() <= crate::endpoint::MAX_READ_BATCH_ENTRIES,
+    log.observed_max_range_width() <= MAX_READ_BATCH_ENTRIES,
     "every committed-range read must request at most MAX_READ_BATCH_ENTRIES indices ({} requested) — else \
      an owned store could materialise the whole zero-payload backlog in one read",
     log.observed_max_range_width()
   );
   assert_eq!(
     log.observed_max_range_width(),
-    crate::endpoint::MAX_READ_BATCH_ENTRIES,
+    MAX_READ_BATCH_ENTRIES,
     "the entry-count cap must actually FIRE for a backlog larger than it (non-vacuous coverage)"
   );
 }
@@ -1057,9 +1058,9 @@ fn follower_ack_waits_for_durable_append() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let e1 = Entry::new(
     Term::new(1),
@@ -1113,9 +1114,9 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 leader (term 1) and let its no-op append become durable (commit→1).
   let d = ep.poll_timeout().unwrap();
@@ -1158,8 +1159,8 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
     )),
   );
   // Commit must have advanced to 3: the two Normal entries (idx 2, 3) are now applied.
-  let applied: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_event())
-    .filter(|e| matches!(e, crate::Event::Applied(_)))
+  let applied: Vec<_> = core::iter::from_fn(|| ep.poll_event())
+    .filter(|e| matches!(e, Event::Applied(_)))
     .collect();
   assert_eq!(
     applied.len(),
@@ -1212,9 +1213,9 @@ fn leader_paces_by_inflight_window() {
   .unwrap()
   .with_max_size_per_msg(u64::MAX);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 as leader.
   let d = ep.poll_timeout().unwrap();
@@ -1348,9 +1349,9 @@ fn single_ack_does_not_rewind_replicate_window() {
   .unwrap()
   .with_max_size_per_msg(1);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 as leader.
   let d = ep.poll_timeout().unwrap();
@@ -1533,14 +1534,9 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut follower = Endpoint::new(
-    follower_cfg,
-    Instant::ORIGIN,
-    7,
-    crate::testkit::CountSm::default(),
-  );
-  let mut follower_log = crate::testkit::VecLog::default();
-  let mut follower_stable = crate::testkit::NoopStable::default();
+  let mut follower = Endpoint::new(follower_cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut follower_log = VecLog::default();
+  let mut follower_stable = NoopStable::default();
 
   // Seed follower log with [1@1, 2@1, 3@3, 4@3].
   follower_log.force_append(&[
@@ -1625,14 +1621,9 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut leader = Endpoint::new(
-    leader_cfg,
-    Instant::ORIGIN,
-    1,
-    crate::testkit::CountSm::default(),
-  );
-  let mut leader_log = crate::testkit::VecLog::default();
-  let mut leader_stable = crate::testkit::NoopStable::default();
+  let mut leader = Endpoint::new(leader_cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut leader_log = VecLog::default();
+  let mut leader_stable = NoopStable::default();
 
   // Elect node 1 as leader (term=1, noop at index 1).
   let d = leader.poll_timeout().unwrap();
@@ -1838,9 +1829,9 @@ fn heartbeat_resp_resumes_stalled_probe() {
   .unwrap()
   .with_max_size_per_msg(0); // 0 = one entry per message
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 as leader.
   let d = ep.poll_timeout().unwrap();
@@ -1900,11 +1891,7 @@ fn heartbeat_resp_resumes_stalled_probe() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      Term::new(1),
-      2u64,
-      bytes::Bytes::new(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
   );
   let mut resumed = false;
   while let Some(out) = ep.poll_message() {
@@ -1940,9 +1927,9 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
   )
   .unwrap()
   .with_max_size_per_msg(0); // 0 = at most one entry per AppendEntries
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 leader (no-op@1).
   let d = ep.poll_timeout().unwrap();
@@ -1961,7 +1948,7 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
   while ep.poll_event().is_some() {}
 
   // Append a long run of ZERO-BYTE (Empty / no-op) entries: indices 2..=51, term 1.
-  let zero: std::vec::Vec<_> = (2u64..=51)
+  let zero: Vec<_> = (2u64..=51)
     .map(|i| {
       Entry::new(
         Term::new(1),
@@ -1980,11 +1967,7 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
     &mut log,
     &mut stable,
     2u64,
-    Message::HeartbeatResp(crate::HeartbeatResp::new(
-      Term::new(1),
-      2u64,
-      bytes::Bytes::new(),
-    )),
+    Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
   );
   let mut sent = None;
   while let Some(out) = ep.poll_message() {
@@ -2026,9 +2009,9 @@ fn empty_appends_do_not_wedge_inflight_window() {
   .unwrap()
   .with_max_size_per_msg(u64::MAX);
 
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   // Elect node 1 as leader.
   let d = ep.poll_timeout().unwrap();
@@ -2071,11 +2054,7 @@ fn empty_appends_do_not_wedge_inflight_window() {
       &mut log,
       &mut stable,
       2u64,
-      Message::HeartbeatResp(crate::HeartbeatResp::new(
-        Term::new(1),
-        2u64,
-        bytes::Bytes::new(),
-      )),
+      Message::HeartbeatResp(HeartbeatResp::new(Term::new(1), 2u64, bytes::Bytes::new())),
     );
     while ep.poll_message().is_some() {}
   }
@@ -2132,14 +2111,9 @@ fn lagging_follower_hint_is_two_sided() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut follower = Endpoint::new(
-    follower_cfg,
-    Instant::ORIGIN,
-    7,
-    crate::testkit::CountSm::default(),
-  );
-  let mut follower_log = crate::testkit::VecLog::default();
-  let mut follower_stable = crate::testkit::NoopStable::default();
+  let mut follower = Endpoint::new(follower_cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut follower_log = VecLog::default();
+  let mut follower_stable = NoopStable::default();
   follower_log.force_append(&[
     Entry::new(
       Term::new(1),
@@ -2206,14 +2180,9 @@ fn lagging_follower_hint_is_two_sided() {
   )
   .unwrap()
   .with_max_size_per_msg(u64::MAX);
-  let mut leader = Endpoint::new(
-    leader_cfg,
-    Instant::ORIGIN,
-    1,
-    crate::testkit::CountSm::default(),
-  );
-  let mut leader_log = crate::testkit::VecLog::default();
-  let mut leader_stable = crate::testkit::NoopStable::default();
+  let mut leader = Endpoint::new(leader_cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut leader_log = VecLog::default();
+  let mut leader_stable = NoopStable::default();
 
   let d = leader.poll_timeout().unwrap();
   leader.handle_timeout(d, &mut leader_log, &mut leader_stable);
@@ -2231,7 +2200,7 @@ fn lagging_follower_hint_is_two_sided() {
   while leader.poll_event().is_some() {}
 
   // Force-seed indices 2..=20 so leader has [1..20]@term1.
-  let extra: std::vec::Vec<_> = (2u64..=20)
+  let extra: Vec<_> = (2u64..=20)
     .map(|i| {
       Entry::new(
         Term::new(1),
@@ -2315,7 +2284,7 @@ fn deferred_ack_does_not_over_ack_divergent_tail() {
 
   // Durable divergent tail: entries 1..=10 at term 1, durable through 10. (`force_append` writes the
   // VecLog directly; mirror `durable_index` so the follower's durable state is self-consistent.)
-  let entries: std::vec::Vec<_> = (1u64..=10)
+  let entries: Vec<_> = (1u64..=10)
     .map(|i| {
       Entry::new(
         Term::new(1),
@@ -2356,7 +2325,7 @@ fn deferred_ack_does_not_over_ack_divergent_tail() {
 
   // Complete the term write → flush the deferred ack.
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
-  let acks: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message())
+  let acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| matches!(o.message(), Message::AppendResp(a) if !a.reject()))
     .collect();
   assert_eq!(
@@ -2397,9 +2366,9 @@ fn append_resp_over_ack_above_log_is_ignored() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
 
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
@@ -2467,9 +2436,9 @@ fn append_resp_reject_hint_beyond_log_does_not_poison() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut leader = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::FailTermLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut leader = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
 
   let d = leader.poll_timeout().unwrap();
   leader.handle_timeout(d, &mut log, &mut stable);
@@ -2563,13 +2532,13 @@ fn commit_persist_is_fenced_by_durable_index() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = Instant::ORIGIN;
 
   // Become a follower at term 2 with a durable log [1..=5], commit=5.
-  let mut e = std::vec::Vec::new();
+  let mut e = Vec::new();
   for i in 1u64..=5 {
     e.push(Entry::new(
       Term::new(2),
@@ -2707,8 +2676,8 @@ fn stale_term_heartbeat_forces_leader_step_down() {
 
   // pre_vote ON: the stale heartbeat must provoke an AppendResp at OUR term (8).
   let mut ep = make(true);
-  let mut log = crate::testkit::NoopLog;
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = NoopLog;
+  let mut stable = NoopStable::default();
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -2801,9 +2770,9 @@ fn higher_term_malformed_append_poisons_without_persisting_term() {
     Duration::from_millis(100),
   )
   .unwrap();
-  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, crate::testkit::CountSm::default());
-  let mut stable = crate::testkit::NoopStable::default();
-  let mut log = crate::testkit::VecLog::default();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut stable = NoopStable::default();
+  let mut log = VecLog::default();
   assert_eq!(
     stable.hard_state().term(),
     Term::ZERO,
@@ -2861,8 +2830,8 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
   )
   .unwrap();
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, Noop);
-  let mut log = crate::testkit::VecLog::default();
-  let mut stable = crate::testkit::NoopStable::default();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
   let d = ep.poll_timeout().unwrap();
   ep.handle_timeout(d, &mut log, &mut stable);
   ep.handle_storage(d, &mut log, &mut stable);
@@ -2901,8 +2870,8 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
     )),
   );
   // The probe sends exactly ONE byte-capped batch; note where it ends.
-  let probe: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
-  let probe_batches: std::vec::Vec<_> = probe
+  let probe: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  let probe_batches: Vec<_> = probe
     .iter()
     .filter_map(|o| match o.message() {
       Message::AppendEntries(ae) if o.to() == 2u64 => Some(ae),
@@ -2928,8 +2897,8 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
       probe_end,
     )),
   );
-  let pumped: std::vec::Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
-  let batches: std::vec::Vec<_> = pumped
+  let pumped: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  let batches: Vec<_> = pumped
     .iter()
     .filter_map(|o| match o.message() {
       Message::AppendEntries(ae) if o.to() == 2u64 => Some(ae),
