@@ -4,7 +4,7 @@ impl<I, F> Endpoint<I, F>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
+  F::Command: Data,
   F::Error: core::error::Error,
 {
   /// Rebuild a node from durable storage after a crash. If a durable snapshot exists,
@@ -35,10 +35,10 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    F::Snapshot: crate::Data,
-    I: crate::Data,
+    F::Snapshot: Data,
+    I: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     Self::restart_inner(config, now, seed, fsm, boot_epoch, None, log, stable)
   }
 
@@ -59,17 +59,17 @@ where
     seed: u64,
     fsm: F,
     boot_epoch: u64,
-    assume_prior_lease_support: Option<core::time::Duration>,
+    assume_prior_lease_support: Option<Duration>,
     log: &mut L,
     stable: &mut S,
   ) -> Self
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    F::Snapshot: crate::Data,
-    I: crate::Data,
+    F::Snapshot: Data,
+    I: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     Self::restart_inner(
       config,
       now,
@@ -85,19 +85,19 @@ where
   #[allow(clippy::too_many_arguments)]
   pub(crate) fn restart_inner<L, S>(
     config: Config<I>,
-    now: crate::Now,
+    now: Now,
     seed: u64,
     fsm: F,
     boot_epoch: u64,
-    assume_prior_lease_support: Option<core::time::Duration>,
+    assume_prior_lease_support: Option<Duration>,
     log: &mut L,
     stable: &mut S,
   ) -> Self
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    F::Snapshot: crate::Data,
-    I: crate::Data, // decode ConfChangeV2 entries when replaying the log's membership (Raft §4.1)
+    F::Snapshot: Data,
+    I: Data, // decode ConfChangeV2 entries when replaying the log's membership (Raft §4.1)
   {
     let hs = stable.hard_state();
     let mut fsm = fsm;
@@ -107,7 +107,7 @@ where
     // Bootstrap tracker from the static seed first; may be overridden below if a
     // durable snapshot carries a more recent ConfState.
     let seed_cs = crate::ConfState::from_voters(config.voters().iter().copied());
-    let mut tracker = crate::Tracker::from_conf_state(
+    let mut tracker = Tracker::from_conf_state(
       &seed_cs,
       Index::ZERO,
       config.max_inflight_msgs(),
@@ -169,7 +169,7 @@ where
         poisoned = true;
         poison_reason = Some(PoisonReason::InvalidConfState);
       } else {
-        match <F::Snapshot as crate::Data>::decode_exact(data) {
+        match <F::Snapshot as Data>::decode_exact(data) {
           Ok(snap) => {
             if fsm.restore(snap).is_err() {
               poisoned = true;
@@ -179,7 +179,7 @@ where
               // Install the durable membership from the snapshot's ConfState.
               // This supersedes the bootstrap seed from Config.voters.
               // (Replaying ConfChange log entries to further refine membership is handled separately.)
-              tracker = crate::Tracker::from_conf_state(
+              tracker = Tracker::from_conf_state(
                 &meta.conf().clone(),
                 meta.last_index(),
                 config.max_inflight_msgs(),
@@ -397,7 +397,7 @@ where
       // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup
       // and every `>=` watermark check). The same boot_epoch namespaces forwarded-read tokens below.
-      next_op_id: crate::OpId::first_of_epoch(boot_epoch),
+      next_op_id: OpId::first_of_epoch(boot_epoch),
       pending: BTreeMap::new(),
       poison: Poison {
         poisoned,
@@ -409,7 +409,7 @@ where
         // restart and follower acks are not spuriously deferred.
         durable_term: hs.term(),
         last_submitted_term: hs.term(),
-        term_persist_opid: crate::OpId::ZERO,
+        term_persist_opid: OpId::ZERO,
         // `recovered_floor` (= hs.lease_support()) is what is durable NOW; `lease_support_floor` may be
         // larger (a config grow this incarnation), in which case the post-construction step below persists it
         // and the advertise gate holds at ZERO until that write drains. On a same/shrunk-config restart the
@@ -417,7 +417,7 @@ where
         lease_support_floor,
         last_submitted_lease_support: recovered_floor,
         durable_lease_support: recovered_floor,
-        lease_support_persist_opid: crate::OpId::ZERO,
+        lease_support_persist_opid: OpId::ZERO,
         // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
         // the handle_storage choke-point doesn't immediately re-persist an unchanged value.
         committed_persisted: commit,
@@ -456,7 +456,7 @@ where
         lease_round: 0,
         lease_round_start: now.mono(),
         lease_acks: BTreeSet::new(),
-        lease_min_support: core::time::Duration::ZERO,
+        lease_min_support: Duration::ZERO,
         lease_valid_until: None,
       },
       transfer: Transfer {
@@ -511,7 +511,7 @@ where
       let chunk = match log.entries(idx..read_end, 1 << 20) {
         // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
         // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
-        Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
+        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
         _ => return Err(PoisonReason::LogRead),
       };
       for e in chunk.iter() {
@@ -546,7 +546,7 @@ where
       let chunk = match log.entries(idx..read_end, 1 << 20) {
         // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
         // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
-        Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
+        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
         _ => return Err(PoisonReason::LogRead),
       };
       for e in chunk.iter() {
@@ -589,7 +589,7 @@ where
       let chunk = match log.entries(idx..read_end, 1 << 20) {
         // Restart is resident-only: a cold (Pending), empty, or faulted in-range read during the
         // synchronous lease-floor scan cannot be retried and would under-size the floor → fail-stop.
-        Ok(crate::EntriesRead::Ready(c)) if !c.is_empty() => c,
+        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
         _ => return Err(PoisonReason::LogRead),
       };
       for e in chunk.iter() {

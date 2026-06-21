@@ -1,11 +1,16 @@
 //! The Sans-I/O Raft core. It owns the consensus state and exposes the
 //! `handle_*`/`poll_*` surface; leader election and log replication run through it.
 use crate::{
-  Config, Event, Index, Instant, LogStore, Message, NodeId, Now, Outgoing, Prng, ReadOnly,
-  StableStore, StateMachine, Term,
+  ConfChangeTransition, Config, Data, EntriesRead, EntryKind, Event, Index, Instant, LeaseRefresh,
+  LeaseSupport, LogStore, Message, NodeId, Now, OpId, Outgoing, Prng, ReadOnly, ReadOnlyOption,
+  StableStore, StateMachine, Term, Tracker,
 };
 use bytes::Bytes;
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use core::{fmt, time::Duration};
+use std::{
+  collections::{BTreeMap, BTreeSet, VecDeque},
+  vec::Vec,
+};
 
 // The `impl Endpoint` surface is split across these submodules by concern; each holds
 // `impl` blocks that operate on the `Endpoint` defined here.
@@ -278,9 +283,9 @@ pub(crate) fn restore_rebaselined<L: LogStore>(log: &L, n: Index, term: Term) ->
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct DerivedLeaseSafety {
   /// The in-memory `lease_support_floor` to seed (the max lease window this incarnation will back).
-  lease_support_floor: Option<core::time::Duration>,
+  lease_support_floor: Option<Duration>,
   /// The vote-fence WINDOW (`None` = no fence); the caller arms `now + window`.
-  fence_window: Option<core::time::Duration>,
+  fence_window: Option<Duration>,
 }
 
 /// The outcome of [`reconcile_durable`]: either a safe derived state, or a fail-stop for a legacy record
@@ -314,10 +319,10 @@ enum LeaseReconcile {
 /// A genuine-ZERO floor (`Some(0)`) is filtered out of the fence window (a recorded no-op promise).
 /// `this_run` = the lease window THIS incarnation will advertise = `election_timeout` iff it enforces.
 fn reconcile_durable(
-  recovered: crate::LeaseSupport,
+  recovered: LeaseSupport,
   enforcing: bool,
-  election_timeout: core::time::Duration,
-  assume_prior: Option<core::time::Duration>,
+  election_timeout: Duration,
+  assume_prior: Option<Duration>,
 ) -> LeaseReconcile {
   let this_run = if enforcing {
     Some(election_timeout)
@@ -325,10 +330,10 @@ fn reconcile_durable(
     None
   };
   let lease_support_floor = match recovered {
-    crate::LeaseSupport::Recorded(d) => d.max(this_run),
+    LeaseSupport::Recorded(d) => d.max(this_run),
     // Legacy record with a known operator bound: safe. Without one: unbounded → fail-stop.
-    crate::LeaseSupport::Unrecorded if assume_prior.is_some() => this_run.max(assume_prior),
-    crate::LeaseSupport::Unrecorded => return LeaseReconcile::Poison,
+    LeaseSupport::Unrecorded if assume_prior.is_some() => this_run.max(assume_prior),
+    LeaseSupport::Unrecorded => return LeaseReconcile::Poison,
   };
   let fence_window = lease_support_floor.filter(|d| !d.is_zero());
   LeaseReconcile::Ok(DerivedLeaseSafety {
@@ -456,7 +461,7 @@ enum Pending<I> {
   /// Emit `VoteResp(grant)` to `to` once the term+vote write is durable.
   /// `term` records the term at which the vote was cast so stale completions can be
   /// detected and dropped if the term has since advanced.
-  CastVote { to: I, term: crate::Term },
+  CastVote { to: I, term: Term },
   /// Emit `AppendResp(success, match_index)` to `to` once the log append is durable.
   FollowerAck { to: I, match_index: Index },
   /// Advance the leader's own `match_index` to `upto` (and re-check commit) once durable.
@@ -467,7 +472,7 @@ enum Pending<I> {
   /// arrives after the term advanced. This makes the candidate's self-vote persist-before-act,
   /// symmetric with the follower's `CastVote` — otherwise a node could lead in a term on an un-durable
   /// self-vote, crash, restart with no recorded vote, and grant another candidate the same term.
-  Campaign { term: crate::Term },
+  Campaign { term: Term },
 }
 
 /// Cap on the number of distinct read contexts a follower may hold in-flight to its leader at once
@@ -577,33 +582,33 @@ struct Durability<I> {
   /// [`on_stable_wrote`] when an adopted term's write completes. The core observes the stable seam's
   /// completions, so it enforces currentTerm-before-respond itself rather than delegating the ordering to
   /// the storage layer.
-  durable_term: crate::Term,
+  durable_term: Term,
   /// The highest `Term` ever submitted to the `StableStore` (via `submit_write`). Paired with
   /// `term_persist_opid` so [`on_stable_wrote`] can recognise when the current term's write completes and
   /// advance `durable_term` (a freshly-adopted term is set in memory before its write is even submitted).
-  last_submitted_term: crate::Term,
+  last_submitted_term: Term,
   /// The `OpId` of the FIRST HardState write that carried `last_submitted_term`. When a `Wrote` completion
   /// with `opid >= term_persist_opid` arrives (stable completions are ordered), that term is durable.
-  term_persist_opid: crate::OpId,
+  term_persist_opid: OpId,
   /// Persist-before-ADVERTISE for the lease promise; exact mirror of the term machinery above.
   /// The in-memory lease-support floor: the max lease window this node will uphold this incarnation =
   /// `max(recovered durable floor, this run's own election_timeout if it enforces)`. Bumped at most ONCE
   /// per incarnation (election_timeout is process-constant); persisted to `HardState.lease_support` so the
   /// restart vote fence honors the PRE-CRASH promise regardless of post-restart config. `None` = no
   /// enforcing promise (fresh / legacy / never-enforced); `Some(d)` = a real promise of `d`.
-  lease_support_floor: Option<core::time::Duration>,
+  lease_support_floor: Option<Duration>,
   /// The highest lease-support floor ever submitted to the `StableStore` (paired with
   /// `lease_support_persist_opid`, exactly like `last_submitted_term`/`term_persist_opid`).
-  last_submitted_lease_support: Option<core::time::Duration>,
+  last_submitted_lease_support: Option<Duration>,
   /// The highest lease-support floor whose HardState write has reached stable storage. A follower must NOT
   /// advertise its real `lease_support` until `durable_lease_support >= Some(this_run)` — otherwise a crash
   /// in the fsync window erases a promise the leader already counted toward a live lease (persist-before-
   /// advertise, the lease sibling of the term-before-respond gate). Seeded to the recovered durable floor.
-  durable_lease_support: Option<core::time::Duration>,
+  durable_lease_support: Option<Duration>,
   /// The `OpId` of the FIRST HardState write that carried `last_submitted_lease_support`. When a `Wrote`
   /// completion with `opid >= lease_support_persist_opid` arrives, that floor is durable (advanced in
   /// [`on_stable_wrote`], releasing the persist-before-advertise gate in `on_heartbeat`).
-  lease_support_persist_opid: crate::OpId,
+  lease_support_persist_opid: OpId,
   /// The last `commit` value durably written to `HardState`. The commit watermark is
   /// persisted (batched) by the `handle_storage` choke-point whenever `self.commit` exceeds
   /// this, and stamped into every term/vote write so a stale read-back can never regress the
@@ -634,7 +639,7 @@ struct Durability<I> {
   /// Entry is recorded in `submit_append`, removed (consumed into the watermark) in
   /// `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init empty
   /// in `new` and `restart`.
-  inflight_append_upto: BTreeMap<crate::OpId, Index>,
+  inflight_append_upto: BTreeMap<OpId, Index>,
   /// A SUCCESS `AppendResp` deferred until `self.term` is durable — `(leader, term, proven)`
   /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
   /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
@@ -642,10 +647,10 @@ struct Durability<I> {
   /// `proven.min(ack_watermark())` — `proven` caps to what the leader matched (never over-ack a durable-
   /// but-divergent tail) and `ack_watermark()` caps to durability. A superseded-term tag
   /// is dropped; same-`(leader, term)` deferrals keep the MAX proven extent (acks are cumulative).
-  term_gated_append_ack: Option<(I, crate::Term, Index)>,
+  term_gated_append_ack: Option<(I, Term, Index)>,
   /// A SUCCESS `SnapshotResp` deferred until `self.term` is durable — the snapshot analogue of
   /// `term_gated_append_ack` (`proven` = the snapshot boundary / committed match).
-  term_gated_snapshot_ack: Option<(I, crate::Term, Index)>,
+  term_gated_snapshot_ack: Option<(I, Term, Index)>,
   /// Post-restart vote-suppression fence (LeaseBased crash-safety). A node that crashed may have
   /// acked a leader's read-lease just before crashing; on restart that in-memory promise is gone, so
   /// without a fence it could grant a vote to a new candidate and elect a new leader WHILE the old
@@ -687,7 +692,7 @@ struct CheckQuorumLease<I> {
   /// then min'd with each enforcing ack's `lease_support`). The lease is renewed to `lease_round_start +
   /// lease_min_support`, so a voter with a SHORTER `election_timeout` (heterogeneous config) caps the
   /// lease at its actual support — the leader never out-lives the quorum's real election window.
-  lease_min_support: core::time::Duration,
+  lease_min_support: Duration,
   /// The read lease deadline for `ReadOnlyOption::LeaseBased`: the leader may serve a read from its
   /// local commit WITHOUT a per-read round-trip while `now < lease_valid_until`. Renewed to
   /// `lease_round_start + election_timeout` only when a quorum FRESHLY acks the current `lease_round` —
@@ -901,7 +906,7 @@ where
   /// (move-out-and-replace on supersede, never `Clone` — `F::Snapshot` has only a `Data` bound); a
   /// separate field, so a higher-term step-down's `self.pending.clear()` does NOT drop it (a boundary
   /// that is already quorum-committed stays valid across a pure term bump). `restart` resets it to `None`.
-  pending_install: Option<(crate::OpId, crate::SnapshotMeta<I>, F::Snapshot, I)>,
+  pending_install: Option<(OpId, crate::SnapshotMeta<I>, F::Snapshot, I)>,
   /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
   /// is durable (crash-safe: we never compact before the snapshot write completes).
   ///
@@ -913,7 +918,7 @@ where
   /// performed, and this field is cleared — so a missed completion can no longer wedge future
   /// snapshots. A store error still poisons the node via `handle_storage`, and `restart` resets
   /// this field to `None`.
-  pending_compact: Option<(crate::OpId, Index)>,
+  pending_compact: Option<(OpId, Index)>,
   /// Per-peer deadline before which the full `InstallSnapshot` blob is NOT re-sent to a
   /// `Snapshot`-state peer. A deferred install legitimately takes many heartbeat intervals (blob
   /// fsync + apply), so resending on EVERY response would re-transmit a large snapshot tens of
@@ -929,12 +934,12 @@ where
 // not `Debug`): the deferred-install blob is elided and its `Debug`-friendly metadata
 // (opid/meta/leader) shown instead. A `#[derive(Debug)]` would synthesise an `F::Snapshot: Debug`
 // bound that the embedding `Endpoint` derive cannot satisfy through this nested field.
-impl<I, F> core::fmt::Debug for SnapshotState<I, F>
+impl<I, F> fmt::Debug for SnapshotState<I, F>
 where
-  I: core::fmt::Debug,
+  I: fmt::Debug,
   F: StateMachine,
 {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("SnapshotState")
       .field(
         "pending_install",
@@ -962,12 +967,12 @@ where
 // response, which is not constrained to `Debug`): the event queue is shown by its length only. A
 // `#[derive(Debug)]` would synthesise an `F::Response: Debug` bound that the embedding `Endpoint`
 // derive cannot satisfy through this nested field.
-impl<I, F> core::fmt::Debug for Outputs<I, F>
+impl<I, F> fmt::Debug for Outputs<I, F>
 where
-  I: core::fmt::Debug,
+  I: fmt::Debug,
   F: StateMachine,
 {
-  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
     f.debug_struct("Outputs")
       .field("outgoing", &self.outgoing)
       .field("events", &format_args!("[{} pending]", self.events.len()))
@@ -985,7 +990,7 @@ struct ReadState<I> {
   /// recovered from replicated state (snapshot ⊔ tail-replay) on restart. `Config.read_only` stays the
   /// immutable genesis default + knob source — only this active mode migrates. The fold floors stay
   /// mode-INDEPENDENT, so a mid-flip / migrated-away node is strictly conservative on the commit-wait.
-  active_read_mode: crate::ReadOnlyOption,
+  active_read_mode: ReadOnlyOption,
   /// Whether a committed `SetReadMode` has EVER applied on this node (read-mode provenance). Gates whether
   /// `maybe_snapshot` carries an EXPLICIT `SnapshotMeta.read_only`: a migrated node records the mode (so
   /// restart recovers it), a NON-migrated node leaves it absent (so restart falls back to the static
@@ -997,7 +1002,7 @@ struct ReadState<I> {
   /// current-term entry.
   ///
   /// Each element is `(context, from)` matching `add_request`'s signature.
-  pending_reads: std::vec::Vec<(Bytes, Option<I>)>,
+  pending_reads: Vec<(Bytes, Option<I>)>,
   /// Read contexts this node (as a FOLLOWER) has forwarded to its current leader and is still
   /// awaiting a `ReadIndexResp` for. The follower-side mirror of the leader's
   /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
@@ -1054,11 +1059,11 @@ where
   outputs: Outputs<I, F>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
   /// Replaces the old `progress: BTreeMap<I, crate::Progress>` and static-voter quorum.
-  tracker: crate::Tracker<I>,
+  tracker: Tracker<I>,
   /// Monotonically minted id for every storage submission.
-  next_op_id: crate::OpId,
+  next_op_id: OpId,
   /// Outstanding write → deferred action.
-  pending: BTreeMap<crate::OpId, Pending<I>>,
+  pending: BTreeMap<OpId, Pending<I>>,
   /// The fail-stop state (poisoned flag + first-cause reason).
   poison: Poison,
   /// The durability watermarks and gated acks (persist-before-respond / -advertise / -ack): the term +
@@ -1092,11 +1097,11 @@ where
   /// Create a fresh node (status Follower, term 0, empty log view).
   /// Arms the election timer immediately.
   pub fn new(config: Config<I>, now: impl Into<Now>, seed: u64, fsm: F) -> Self {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     // Bootstrap the Tracker from the static seed voter set. Read the needed config
     // values BEFORE moving `config` into the struct literal below.
     let cs = crate::ConfState::from_voters(config.voters().iter().copied());
-    let tracker = crate::Tracker::from_conf_state(
+    let tracker = Tracker::from_conf_state(
       &cs,
       Index::ZERO,
       config.max_inflight_msgs(),
@@ -1155,7 +1160,7 @@ where
         events: VecDeque::new(),
       },
       tracker,
-      next_op_id: crate::OpId::ZERO,
+      next_op_id: OpId::ZERO,
       pending: BTreeMap::new(),
       poison: Poison::default(),
       durable: Durability {
@@ -1163,14 +1168,14 @@ where
         // `term_is_durable()` is true and acks are never spuriously deferred at startup.
         durable_term: Term::ZERO,
         last_submitted_term: Term::ZERO,
-        term_persist_opid: crate::OpId::ZERO,
+        term_persist_opid: OpId::ZERO,
         // a fresh node has made no lease promise. `new()` has no StableStore, so the floor is recorded
         // lazily on the first enforcing heartbeat (bumped in `on_heartbeat`, persisted by the post-dispatch
         // `ensure_term_durable`); until then `durable_lease_support` is None and the advertise gate emits ZERO.
         lease_support_floor: None,
         last_submitted_lease_support: None,
         durable_lease_support: None,
-        lease_support_persist_opid: crate::OpId::ZERO,
+        lease_support_persist_opid: OpId::ZERO,
         committed_persisted: Index::ZERO,
         durable_index: Index::ZERO,
         durable_snapshot_index: Index::ZERO,
@@ -1186,7 +1191,7 @@ where
         // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.
         active_read_mode: read_only_opt,
         read_mode_migrated: false,
-        pending_reads: std::vec::Vec::new(),
+        pending_reads: Vec::new(),
         // Fresh node: boot epoch 0. A later restart provides a strictly-higher epoch, so this
         // incarnation's forwarded-read tokens can never collide with a post-restart incarnation's.
         forwarded_reads: ForwardedReads::new(0),
@@ -1196,7 +1201,7 @@ where
         lease_round: 0,
         lease_round_start: now.mono(),
         lease_acks: BTreeSet::new(),
-        lease_min_support: core::time::Duration::ZERO,
+        lease_min_support: Duration::ZERO,
         lease_valid_until: None,
       },
       transfer: Transfer {
@@ -1243,7 +1248,7 @@ where
   /// measures the entry's age as `now − 0` (huge) and degrades to Safe — FAIL-CLOSED, never wrapping
   /// the truncated timestamp to a falsely-fresh value.
   pub(crate) fn lease_stamp(&self, now: Instant) -> u64 {
-    if self.reads.active_read_mode == crate::ReadOnlyOption::LeaseGuard {
+    if self.reads.active_read_mode == ReadOnlyOption::LeaseGuard {
       u64::try_from(now.since_origin().as_nanos()).unwrap_or(0)
     } else {
       0
@@ -1281,7 +1286,7 @@ where
   /// the failover tier. FAIL-CLOSED: if the tier is active but the caller supplied no wall
   /// (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never a falsely-fresh
   /// stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
-  pub(crate) fn lease_wall_stamp(&self, now: crate::Now) -> u64 {
+  pub(crate) fn lease_wall_stamp(&self, now: Now) -> u64 {
     if self.config.failover_tier_valid(self.reads.active_read_mode) {
       debug_assert!(
         !now.wall().is_absent(),
@@ -1305,7 +1310,7 @@ where
   /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX), needing no assumption
   /// about any other node's config. Gated HERE, not only in the optional `Config::validate`, so an
   /// unvalidated config degrades to Safe. Returns `(Δ, ε)` for the read gate's same-leader check.
-  pub(crate) fn leaseguard_timing(&self) -> Option<(core::time::Duration, core::time::Duration)> {
+  pub(crate) fn leaseguard_timing(&self) -> Option<(Duration, Duration)> {
     self
       .config
       .leaseguard_commit_wait_ns(self.reads.active_read_mode)?;
@@ -1318,12 +1323,12 @@ where
   /// The read mode CURRENTLY IN EFFECT — the last applied `SetReadMode` mode, or the `Config` default if
   /// none. The serve dispatch and the stamp helpers consult this, NOT the immutable `Config.read_only`.
   #[inline(always)]
-  pub const fn active_read_mode(&self) -> crate::ReadOnlyOption {
+  pub const fn active_read_mode(&self) -> ReadOnlyOption {
     self.reads.active_read_mode
   }
 
   #[cfg(test)]
-  pub(crate) fn set_active_read_mode_for_test(&mut self, mode: crate::ReadOnlyOption) {
+  pub(crate) fn set_active_read_mode_for_test(&mut self, mode: ReadOnlyOption) {
     self.reads.active_read_mode = mode;
   }
 
@@ -1370,7 +1375,7 @@ where
     self
       .outputs
       .events
-      .push_back(crate::Event::LeaderChanged(crate::LeaderChanged::new(
+      .push_back(Event::LeaderChanged(crate::LeaderChanged::new(
         self.term, leader,
       )));
   }
@@ -1527,7 +1532,7 @@ where
   }
 
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
-  fn mint_op_id(&mut self) -> crate::OpId {
+  fn mint_op_id(&mut self) -> OpId {
     let id = self.next_op_id;
     self.next_op_id = self.next_op_id.next();
     id
@@ -1682,13 +1687,13 @@ impl<I, F> Endpoint<I, F>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
+  F::Command: Data,
   // The fatal apply/snapshot error must be inspectable so a poisoned node's cause can be
   // surfaced (design spec §6.3). `core::error::Error` is stable in core (no_std-OK).
   F::Error: core::error::Error,
 {
   #[cfg(test)]
-  pub(crate) fn mint_op_id_for_test(&mut self) -> crate::OpId {
+  pub(crate) fn mint_op_id_for_test(&mut self) -> OpId {
     self.mint_op_id()
   }
 
@@ -1703,9 +1708,9 @@ where
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    F::Snapshot: crate::Data,
+    F::Snapshot: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     if self.poison.poisoned {
       return;
     }
@@ -1878,7 +1883,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     if self.poison.poisoned {
       return;
     }
@@ -1925,16 +1930,16 @@ where
         // block above (if it appended, `last != commit` here, so we never stack two).
         let mode = self.config.lease_refresh();
         if heartbeat_due
-          && mode != crate::LeaseRefresh::Off
+          && mode != LeaseRefresh::Off
           && self.lease_guard.read_since_anchor
           && self.leaseguard_timing().is_some()
           && self.transfer.lead_transferee.is_none()
           && log.last_index() == self.commit
         {
           let fire = match mode {
-            crate::LeaseRefresh::Continuous => true,
-            crate::LeaseRefresh::OnExpiry => self.lease_near_expiry(now, log),
-            crate::LeaseRefresh::Off => false, // unreachable — gated by `mode != Off` above
+            LeaseRefresh::Continuous => true,
+            LeaseRefresh::OnExpiry => self.lease_near_expiry(now, log),
+            LeaseRefresh::Off => false, // unreachable — gated by `mode != Off` above
           };
           if fire {
             self.append_leader_noop(now, log, self.commit);
@@ -2067,11 +2072,11 @@ where
           .saturating_add(MAX_READ_BATCH_ENTRIES + 1),
       ));
       let batch = match log.entries(self.applied.next()..read_end, APPLY_READ_MAX_BYTES) {
-        Ok(crate::EntriesRead::Ready(e)) if e.is_empty() => break,
-        Ok(crate::EntriesRead::Ready(e)) => e,
+        Ok(EntriesRead::Ready(e)) if e.is_empty() => break,
+        Ok(EntriesRead::Ready(e)) => e,
         // Present but cold: stop applying this pass and retry on the next pump (the store signals
         // storage-ready when the range lands). A cold defer is not a fault — never poison.
-        Ok(crate::EntriesRead::Pending) => {
+        Ok(EntriesRead::Pending) => {
           self.cold_read_defers = self.cold_read_defers.saturating_add(1);
           break;
         }
@@ -2093,9 +2098,9 @@ where
           break;
         }
         match entry.kind() {
-          crate::EntryKind::Normal => {
+          EntryKind::Normal => {
             // Zero-copy: the command decodes from a shared slice of the entry's payload.
-            let cmd = match <F::Command as crate::Data>::decode_exact(entry.data_bytes()) {
+            let cmd = match <F::Command as Data>::decode_exact(entry.data_bytes()) {
               Ok(c) => c,
               // A committed entry whose payload won't decode is corrupt/unrecoverable → poison.
               Err(_) => {
@@ -2107,7 +2112,7 @@ where
               Ok(resp) => self
                 .outputs
                 .events
-                .push_back(crate::Event::Applied(crate::Applied::new(idx, resp))),
+                .push_back(Event::Applied(crate::Applied::new(idx, resp))),
               // An FSM apply error is fatal (the SM diverges from the committed log) → poison.
               Err(_) => {
                 self.poison(PoisonReason::Apply);
@@ -2115,8 +2120,8 @@ where
               }
             }
           }
-          crate::EntryKind::Empty => {} // no-op: just advance applied
-          crate::EntryKind::SetReadMode => {
+          EntryKind::Empty => {} // no-op: just advance applied
+          EntryKind::SetReadMode => {
             // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison
             // (mirror ConfChange's exact decode). An empty, trailing-junk, or out-of-range payload is a
             // non-canonical committed entry → fail-stop, never a silent partial decode. This is the
@@ -2126,7 +2131,7 @@ where
             let data = entry.data();
             let mode = match (data.len() == 1)
               .then(|| data[0])
-              .and_then(crate::ReadOnlyOption::from_u8)
+              .and_then(ReadOnlyOption::from_u8)
             {
               Some(m) => m,
               None => {
@@ -2148,11 +2153,14 @@ where
             self.reads.read_only.set_option(mode);
             self.check_quorum_lease.lease_valid_until = None;
             self.check_quorum_lease.lease_acks.clear();
-            self.outputs.events.push_back(crate::Event::ReadModeChanged(
-              crate::ReadModeChanged::new(idx, mode),
-            ));
+            self
+              .outputs
+              .events
+              .push_back(Event::ReadModeChanged(crate::ReadModeChanged::new(
+                idx, mode,
+              )));
           }
-          crate::EntryKind::ConfChange => {
+          EntryKind::ConfChange => {
             // Decode the ConfChangeV2 payload. On failure: unrecoverable → poison (mirror Normal).
             let cc = match crate::wire::decode_conf_change_v2::<I>(entry.data_bytes()) {
               Ok(c) => c,
@@ -2172,13 +2180,11 @@ where
               self.config.max_inflight_msgs(),
               self.config.max_inflight_bytes(),
             );
-            let result = if cc.changes().is_empty()
-              && cc.transition() == crate::ConfChangeTransition::Auto
+            let result = if cc.changes().is_empty() && cc.transition() == ConfChangeTransition::Auto
             {
               changer.leave_joint(&self.tracker)
-            } else if cc.transition() != crate::ConfChangeTransition::Auto || cc.changes().len() > 1
-            {
-              let auto_leave = cc.transition() != crate::ConfChangeTransition::Explicit;
+            } else if cc.transition() != ConfChangeTransition::Auto || cc.changes().len() > 1 {
+              let auto_leave = cc.transition() != ConfChangeTransition::Explicit;
               changer.enter_joint(&self.tracker, auto_leave, cc.changes())
             } else {
               changer.simple(&self.tracker, cc.changes())
@@ -2218,9 +2224,7 @@ where
             self
               .outputs
               .events
-              .push_back(crate::Event::ConfChanged(crate::ConfChanged::new(
-                idx, conf,
-              )));
+              .push_back(Event::ConfChanged(crate::ConfChanged::new(idx, conf)));
             // A leader that this change removed (or demoted to learner) is no longer a voter in the
             // new configuration and must stop acting as leader. `is_voter()` checks BOTH joint halves,
             // so during a joint phase where we are still in the outgoing config we keep leading (we must

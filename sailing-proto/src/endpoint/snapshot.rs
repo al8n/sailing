@@ -1,4 +1,5 @@
 use super::*;
+use crate::{InstallSnapshot, SnapshotMeta};
 
 impl<I, F> Endpoint<I, F>
 where
@@ -8,8 +9,8 @@ where
   pub(crate) fn submit_snapshot<S: StableStore<NodeId = I>>(
     &self,
     stable: &mut S,
-    id: crate::OpId,
-    meta: crate::SnapshotMeta<I>,
+    id: OpId,
+    meta: SnapshotMeta<I>,
     data: Bytes,
   ) {
     if self.poison.poisoned {
@@ -20,7 +21,7 @@ where
 
   /// Expose `pending_compact` for testing.
   #[cfg(test)]
-  pub(crate) fn pending_compact(&self) -> Option<(crate::OpId, Index)> {
+  pub(crate) fn pending_compact(&self) -> Option<(OpId, Index)> {
     self.snapshot.pending_compact
   }
 
@@ -42,7 +43,7 @@ where
       let (term, me) = (self.term, self.config.id());
       self.send(
         peer,
-        Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, data)),
+        Message::InstallSnapshot(InstallSnapshot::new(term, me, meta, data)),
       );
     }
   }
@@ -51,7 +52,7 @@ impl<I, F> Endpoint<I, F>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
+  F::Command: Data,
   F::Error: core::error::Error,
 {
   /// Trigger a snapshot if `applied - first_index >= snapshot_threshold`.
@@ -64,7 +65,7 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    F::Snapshot: crate::Data,
+    F::Snapshot: Data,
   {
     if self.snapshot.pending_compact.is_some() || self.snapshot.pending_install.is_some() {
       // A snapshot is already being persisted (our own compaction) OR a follower install is deferred
@@ -87,7 +88,7 @@ where
         return;
       }
     };
-    use crate::Data as _;
+    use Data as _;
     let mut data = std::vec::Vec::new();
     snap.encode(&mut data);
     let Some(last_term) = self.log_term(log, self.applied) else {
@@ -98,7 +99,7 @@ where
     // `max_lease_window` (a conservative over-bound — the global max ≥ the compacted prefix's max).
     // A successor that compacts past — or installs — these entries then still covers any deposed
     // leader's lease on a now-unavailable entry.
-    let mut meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
+    let mut meta = SnapshotMeta::new(self.applied, last_term, self.conf_state())
       .with_max_lease_window(self.lease_guard.max_lease_window)
       .with_max_wall_plus_window(self.lease_guard.max_wall_plus_window)
       .with_max_unwalled_lease_window(self.lease_guard.max_unwalled_lease_window);
@@ -117,14 +118,10 @@ where
   /// Receive an `InstallSnapshot` from the current leader (follower path). This only VALIDATES,
   /// persists the term, and submits the blob — it DEFERS the destructive install body (which touches the
   /// log) to `install_snapshot_now` once the blob is durable, so it needs no `LogStore`.
-  pub(crate) fn on_install_snapshot<S>(
-    &mut self,
-    now: crate::Now,
-    stable: &mut S,
-    is: crate::InstallSnapshot<I>,
-  ) where
+  pub(crate) fn on_install_snapshot<S>(&mut self, now: Now, stable: &mut S, is: InstallSnapshot<I>)
+  where
     S: StableStore<NodeId = I>,
-    F::Snapshot: crate::Data,
+    F::Snapshot: Data,
   {
     // Preamble: mirror on_append_entries — reset to Follower, track leader, re-arm election timer.
     self.role = Role::Follower;
@@ -223,7 +220,7 @@ where
     // Step 1: decode the SM snapshot (fail-fast; leave NO partial state). The decoded snapshot is HELD
     // in `pending_install` and applied to the SM only once the blob is durable (`install_snapshot_now`)
     // — NOT here, so a crash before the blob lands leaves the SM and log untouched and recoverable.
-    let snap = match <F::Snapshot as crate::Data>::decode_exact(is.data().clone()) {
+    let snap = match <F::Snapshot as Data>::decode_exact(is.data().clone()) {
       Ok(s) => s,
       Err(_) => {
         self.poison(PoisonReason::SnapshotDecode);
@@ -262,7 +259,7 @@ where
   pub(crate) fn install_snapshot_now<L: LogStore>(
     &mut self,
     log: &mut L,
-    meta: crate::SnapshotMeta<I>,
+    meta: SnapshotMeta<I>,
     snap: F::Snapshot,
     leader: I,
   ) {
@@ -393,7 +390,7 @@ where
   /// Receive a `SnapshotResp` from a follower (leader path).
   pub(crate) fn on_snapshot_resp<L, S>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &mut L,
     stable: &S,
     from: I,

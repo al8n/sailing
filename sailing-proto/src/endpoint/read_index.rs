@@ -1,4 +1,5 @@
 use super::*;
+use crate::{FailoverReadWindow, ReadIndex, ReadIndexError, ReadIndexResp};
 
 impl<I, F> Endpoint<I, F>
 where
@@ -27,7 +28,7 @@ where
   /// Called once the leader first commits an entry in its current term.
   pub(crate) fn flush_deferred_reads<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &L,
     _stable: &S,
   ) {
@@ -44,7 +45,7 @@ where
   /// leader has committed its first current-term entry.
   pub(crate) fn maybe_flush_deferred_reads<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &L,
     stable: &S,
   ) {
@@ -114,7 +115,7 @@ where
   /// Deployments that cannot bound clock drift MUST use `ReadOnlyOption::Safe` (the default), whose
   /// per-read heartbeat round needs no timing assumption.
   #[inline]
-  pub(crate) fn lease_read_available(&self, now: crate::Now) -> bool {
+  pub(crate) fn lease_read_available(&self, now: Now) -> bool {
     self.config.check_quorum()
       && self.transfer.lead_transferee.is_none()
       && !self.transfer.forced_handoff_this_term
@@ -134,7 +135,7 @@ where
         let (term, me) = (self.term, self.config.id());
         self.send(
           follower,
-          Message::ReadIndexResp(crate::ReadIndexResp::new(term, me, index, context, false)),
+          Message::ReadIndexResp(ReadIndexResp::new(term, me, index, context, false)),
         );
       }
     }
@@ -144,7 +145,7 @@ where
   /// entry is still within the lease window Δ on the leader's OWN monotonic clock. Fails CLOSED —
   /// degrade to the safe heartbeat round — on an inactive/invalid config (see
   /// [`leaseguard_timing`](Self::leaseguard_timing)) or an unreadable/absent anchor.
-  pub(crate) fn lease_guard_read_live<L: LogStore>(&mut self, now: crate::Now, log: &L) -> bool {
+  pub(crate) fn lease_guard_read_live<L: LogStore>(&mut self, now: Now, log: &L) -> bool {
     let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
     };
@@ -154,12 +155,12 @@ where
     // LOCAL here rather than relying solely on the caller's `has_current_term_commit` gate. A storage
     // read failure poisons and fails closed (an absent index answers `Ok` empty, not `Err`).
     let (term, ts, window) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
-      Ok(crate::EntriesRead::Ready(s)) => match s.first() {
+      Ok(EntriesRead::Ready(s)) => match s.first() {
         Some(e) => (e.term(), e.timestamp(), e.lease_window()),
         None => return false,
       },
       // Cold anchor: fail closed (degrade to the Safe round / no refresh), same as an absent anchor.
-      Ok(crate::EntriesRead::Pending) => return false,
+      Ok(EntriesRead::Pending) => return false,
       Err(_) => {
         self.poison(PoisonReason::LogRead);
         return false;
@@ -187,7 +188,7 @@ where
     now
       .mono()
       .since_origin()
-      .saturating_sub(core::time::Duration::from_nanos(ts))
+      .saturating_sub(Duration::from_nanos(ts))
       < delta
   }
 
@@ -202,17 +203,17 @@ where
   /// INTERVAL while reads flow is `Δ − margin`: it stays near `Δ` only when `Δ ≫ margin`, and shrinks
   /// toward the heartbeat cadence (`OnExpiry` → `Continuous`) as `Δ` approaches `margin` (and fires every
   /// heartbeat once `margin >= Δ`).
-  pub(crate) fn lease_near_expiry<L: LogStore>(&mut self, now: crate::Now, log: &L) -> bool {
+  pub(crate) fn lease_near_expiry<L: LogStore>(&mut self, now: Now, log: &L) -> bool {
     let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
     };
     let (term, ts, window) = match log.entries(self.commit..self.commit.next(), u64::MAX) {
-      Ok(crate::EntriesRead::Ready(s)) => match s.first() {
+      Ok(EntriesRead::Ready(s)) => match s.first() {
         Some(e) => (e.term(), e.timestamp(), e.lease_window()),
         None => return false,
       },
       // Cold anchor: fail closed (degrade to the Safe round / no refresh), same as an absent anchor.
-      Ok(crate::EntriesRead::Pending) => return false,
+      Ok(EntriesRead::Pending) => return false,
       Err(_) => {
         self.poison(PoisonReason::LogRead);
         return false;
@@ -232,7 +233,7 @@ where
     now
       .mono()
       .since_origin()
-      .saturating_sub(core::time::Duration::from_nanos(ts))
+      .saturating_sub(Duration::from_nanos(ts))
       .saturating_add(margin)
       >= delta
   }
@@ -259,7 +260,7 @@ where
   /// `≥ s_c + W_c`). Fails CLOSED: no synchronized wall this tick, no captured anchor (`s_c = 0`), the
   /// anchor is not lease-bearing (`W_c = 0`), or the failover tier is inactive. STRICT `<`. `u128`
   /// (wall + window nanos exceed `u64`), never a lossy cast.
-  fn inherited_lease_live(&self, now: crate::Now) -> bool {
+  fn inherited_lease_live(&self, now: Now) -> bool {
     if !self.failover_tier_active()
       || now.wall().is_absent()
       || self.lease_guard.committed_anchor_wall == 0
@@ -303,10 +304,7 @@ where
   /// election timeout — see `become_leader`), when the anchor lease has expired,
   /// or when this node is POISONED — in every such case the application must fall back to a normal read.
   /// Pure read-only observer (`&self`, no log): the anchors were captured at `become_leader`.
-  pub fn failover_read_window(
-    &self,
-    now: impl Into<crate::Now>,
-  ) -> Option<crate::FailoverReadWindow> {
+  pub fn failover_read_window(&self, now: impl Into<Now>) -> Option<FailoverReadWindow> {
     // A poisoned node has declared itself untrustworthy (it suppresses all messages/events and rejects
     // the normal read/propose paths); it must never advertise a serve window either. `poison` leaves
     // `role`/`commit_wait_until`/the anchors intact, so this guard is load-bearing, not redundant.
@@ -323,7 +321,7 @@ where
     if !self.inherited_lease_live(now.into()) {
       return None;
     }
-    Some(crate::FailoverReadWindow::new(
+    Some(FailoverReadWindow::new(
       self.commit,
       self.lease_guard.limbo_upper,
     ))
@@ -332,17 +330,17 @@ where
   /// Core leader read logic: register the read and broadcast / confirm.
   pub(crate) fn do_leader_read<L: LogStore>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &L,
     context: Bytes,
     from: Option<I>,
   ) {
     let commit = self.commit;
     match self.reads.active_read_mode {
-      crate::ReadOnlyOption::Safe => {
+      ReadOnlyOption::Safe => {
         self.do_safe_read(now, context, from);
       }
-      crate::ReadOnlyOption::LeaseBased => {
+      ReadOnlyOption::LeaseBased => {
         // Serve from the local commit WITHOUT a round-trip iff the full lease-read invariant holds (see
         // `lease_read_available` — the single source of truth for LeaseBased safety). Otherwise degrade
         // to the Safe heartbeat round, which re-confirms a quorum before emitting; degrading is silent
@@ -358,7 +356,7 @@ where
           self.do_safe_read(now, context, from);
         }
       }
-      crate::ReadOnlyOption::LeaseGuard => {
+      ReadOnlyOption::LeaseGuard => {
         // Record read activity since the current anchor — the gate for the proactive `LeaseRefresh`
         // modes (a served read AND a degraded one both count; an idle leader with no reads never
         // proactively refreshes, so an idle cluster keeps its no-write-amplification guarantee).
@@ -402,7 +400,7 @@ where
   /// Shared by the `Safe` read-only config AND the `LeaseBased` degradation fallback so single-node
   /// completion holds for both: the lease-unavailable fallback MUST run the self-quorum fast-path,
   /// not merely register-and-broadcast, or a one-voter leader's read would never emit `ReadState`.
-  pub(crate) fn do_safe_read(&mut self, now: crate::Now, context: Bytes, from: Option<I>) {
+  pub(crate) fn do_safe_read(&mut self, now: Now, context: Bytes, from: Option<I>) {
     let me = self.config.id();
     let commit = self.commit;
     // Register the read and seed the heartbeat round with its INTERNAL token (not the user
@@ -439,7 +437,7 @@ where
           Some(follower) => {
             self.send(
               follower,
-              Message::ReadIndexResp(crate::ReadIndexResp::new(term, me2, index, context, false)),
+              Message::ReadIndexResp(ReadIndexResp::new(term, me2, index, context, false)),
             );
           }
         }
@@ -484,31 +482,31 @@ where
     log: &L,
     _stable: &S,
     context: Bytes,
-  ) -> Result<(), crate::ReadIndexError>
+  ) -> Result<(), ReadIndexError>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     // A poisoned node suppresses `poll_event`, so no `ReadState` can ever be emitted. Returning
     // `Ok(())` here would violate the `read_index` contract ("accepted onto a confirmation path"):
     // the promised acknowledgement never arrives and the caller blocks forever. Reject up front,
     // before any state change, so the caller learns no confirmation is coming.
     if self.poison.poisoned {
-      return Err(crate::ReadIndexError::Poisoned);
+      return Err(ReadIndexError::Poisoned);
     }
     match self.role {
       Role::Leader => {
         // Reject a context that is already in flight (deferred or registered) so the caller
         // is not left waiting forever for a confirmation that the prior read already owns.
         if self.read_context_in_flight(&context) {
-          return Err(crate::ReadIndexError::DuplicateContext);
+          return Err(ReadIndexError::DuplicateContext);
         }
         // Leader-side read back-pressure: a partitioned leader (no current-term commit, or no
         // heartbeat-ack quorum) must not accumulate reads without bound. Cap the combined in-flight
         // backlog — deferred (`pending_reads`) plus confirming (`read_only`) — and reject beyond it.
         if self.leader_reads_at_capacity() {
-          return Err(crate::ReadIndexError::TooManyInFlight);
+          return Err(ReadIndexError::TooManyInFlight);
         }
         // Current-term-commit gate.
         if !self.has_current_term_commit(log) {
@@ -522,21 +520,21 @@ where
       Role::Follower => {
         // Forward to the leader if known and forwarding is not disabled.
         if self.config.disable_proposal_forwarding() {
-          return Err(crate::ReadIndexError::ForwardingDisabled);
+          return Err(ReadIndexError::ForwardingDisabled);
         }
         let Some(leader) = self.leader else {
-          return Err(crate::ReadIndexError::NoLeader);
+          return Err(ReadIndexError::NoLeader);
         };
         // Follower-side duplicate-context guard (mirror of the leader's `read_context_in_flight`):
         // a context already forwarded and awaiting its `ReadIndexResp` owns the completion path;
         // reject the duplicate rather than forward it again (unbounded re-forward / silent coalesce).
         if self.reads.forwarded_reads.contains_context(&context) {
-          return Err(crate::ReadIndexError::DuplicateContext);
+          return Err(ReadIndexError::DuplicateContext);
         }
         // Back-pressure at capacity: reject the NEW read rather than evict an already-accepted one
         // (eviction would strand the evicted read and let a reused context complete the wrong one).
         if self.reads.forwarded_reads.is_full() {
-          return Err(crate::ReadIndexError::TooManyInFlight);
+          return Err(ReadIndexError::TooManyInFlight);
         }
         // Record before forwarding and forward by the INTERNAL token, NOT the user context: the leader
         // echoes whatever we send as the `ReadIndexResp` context, so correlating on a unique token
@@ -545,15 +543,12 @@ where
         // desyncs from the suppressed `send` below.
         let token = self.reads.forwarded_reads.push(context);
         let (term, me) = (self.term, self.config.id());
-        self.send(
-          leader,
-          Message::ReadIndex(crate::ReadIndex::new(term, me, token)),
-        );
+        self.send(leader, Message::ReadIndex(ReadIndex::new(term, me, token)));
         Ok(())
       }
       Role::Candidate | Role::PreCandidate => {
         // No leader to confirm reads.
-        Err(crate::ReadIndexError::NoLeader)
+        Err(ReadIndexError::NoLeader)
       }
     }
   }
@@ -584,10 +579,10 @@ where
   /// Leader receives a forwarded `ReadIndex` from a follower.
   pub(crate) fn on_read_index<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
-    now: crate::Now,
+    now: Now,
     log: &L,
     _stable: &S,
-    ri: crate::ReadIndex<I>,
+    ri: ReadIndex<I>,
   ) {
     if !self.role.is_leader() {
       return;
@@ -612,13 +607,7 @@ where
       let (term, me) = (self.term, self.config.id());
       self.send(
         from,
-        Message::ReadIndexResp(crate::ReadIndexResp::new(
-          term,
-          me,
-          Index::ZERO,
-          context,
-          true,
-        )),
+        Message::ReadIndexResp(ReadIndexResp::new(term, me, Index::ZERO, context, true)),
       );
       return;
     }
@@ -658,7 +647,7 @@ where
   /// token (echoed by the leader), NOT the user context, so a stale/duplicated response from an
   /// earlier forward — even of a since-reused user context — finds no matching in-flight read and is
   /// dropped. `remove_by_token` doubles as the already-completed guard: `None` once consumed.
-  pub(crate) fn on_read_index_resp(&mut self, from: I, resp: crate::ReadIndexResp<I>) {
+  pub(crate) fn on_read_index_resp(&mut self, from: I, resp: ReadIndexResp<I>) {
     let token = resp.context();
     // Only a follower awaiting a forward from its CURRENT leader may complete it, and the leader is
     // identified by the ENVELOPE sender `from` (the transport peer) — never the self-reported

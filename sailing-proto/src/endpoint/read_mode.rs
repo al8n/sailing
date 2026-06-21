@@ -1,4 +1,5 @@
 use super::*;
+use crate::ProposeError;
 
 impl<I, F> Endpoint<I, F>
 where
@@ -26,38 +27,38 @@ where
     log: &mut L,
     stable: &S,
     mode: crate::ReadOnlyOption,
-  ) -> Result<Index, crate::ProposeError<I>>
+  ) -> Result<Index, ProposeError<I>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
     let now: crate::Now = now.into();
     if self.poison.poisoned {
-      return Err(crate::ProposeError::Poisoned);
+      return Err(ProposeError::Poisoned);
     }
     if !self.role.is_leader() {
-      return Err(crate::ProposeError::NotLeader {
+      return Err(ProposeError::NotLeader {
         leader: self.leader,
       });
     }
     // A leader transfer is in progress: no new proposals until it completes or times out.
     if self.transfer.lead_transferee.is_some() {
-      return Err(crate::ProposeError::LeaderTransferInProgress);
+      return Err(ProposeError::LeaderTransferInProgress);
     }
     // One migration in flight at a time: refuse if a SetReadMode entry is not yet applied (mirror
     // `pending_conf_index`). Two stacked flips would otherwise race their apply-time effects.
     if self.reads.pending_read_mode_index > self.applied {
-      return Err(crate::ProposeError::ReadModeChangeInFlight);
+      return Err(ProposeError::ReadModeChangeInFlight);
     }
     // Reject-at-propose if THIS leader lacks the target mode's required knobs (into-LeaseGuard ⇒ a valid
     // commit-wait window; into-LeaseBased ⇒ check_quorum). A straggler that lacks them safely
     // Safe-degrades after the flip applies, so only the PROPOSER must be checked (spec §7).
     if !self.config.read_mode_change_valid(mode) {
-      return Err(crate::ProposeError::InvalidReadMode);
+      return Err(ProposeError::InvalidReadMode);
     }
     // Allocate a fresh, usable index (see `next_log_index`): refuse at the ceiling rather than alias.
     let Some(index) = Self::next_log_index(log.last_index()) else {
-      return Err(crate::ProposeError::LogIndexExhausted);
+      return Err(ProposeError::LogIndexExhausted);
     };
     // The migration entry is stamped under the CURRENT active mode, so a Safe→LeaseGuard entry is ts=0
     // (the into-LeaseGuard warm-up: it is not a usable anchor until a fresh stamped entry commits). It
