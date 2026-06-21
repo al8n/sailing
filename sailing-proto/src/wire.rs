@@ -35,12 +35,12 @@
 
 use crate::{
   ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-  EntryKind, Index, Message, SnapshotMeta, Term,
+  EntryKind, Index, Message, NodeId, SnapshotMeta, Term,
   data::{Data, DecodeError},
 };
 use buffa::{EnumValue, Message as _};
 use bytes::Bytes;
-use std::vec::Vec;
+use std::{collections::BTreeSet, vec::Vec};
 
 mod generated {
   // The view accessors for the protocol's `from_id` fields generate `fn from_id(&self)`,
@@ -71,20 +71,20 @@ pub(crate) fn id_within_wire_bound<I: Data>(id: &I) -> bool {
 /// Encode one consensus message into `buf` as the protobuf envelope — the payload of one
 /// transport frame. The public seam for custom transports (the built-in stream/QUIC
 /// transports and the simulation harness all route through here).
-pub fn encode_message<I: crate::NodeId>(msg: &Message<I>, buf: &mut Vec<u8>) {
+pub fn encode_message<I: NodeId>(msg: &Message<I>, buf: &mut Vec<u8>) {
   pb_message(msg).encode(buf);
 }
 
 /// Decode one frame (the COMPLETE payload of a transport frame) into a consensus
 /// message. The frame's `Bytes` is the backing allocation: decoded payloads alias it
 /// (O(1) refcount slices — the frame stays alive as long as any decoded field does).
-pub fn decode_message<I: crate::NodeId>(mut frame: Bytes) -> Result<Message<I>, DecodeError> {
+pub fn decode_message<I: NodeId>(mut frame: Bytes) -> Result<Message<I>, DecodeError> {
   let wire = pb::Message::decode(&mut frame).map_err(map_err)?;
   message_from(wire)
 }
 
 /// Encode a v2 conf change as an entry payload.
-pub(crate) fn encode_conf_change_v2<I: crate::NodeId>(cc: &ConfChangeV2<I>, buf: &mut Vec<u8>) {
+pub(crate) fn encode_conf_change_v2<I: NodeId>(cc: &ConfChangeV2<I>, buf: &mut Vec<u8>) {
   pb::ConfChangeV2 {
     transition: EnumValue::Known(pb_transition(cc.transition())),
     changes: cc
@@ -103,7 +103,7 @@ pub(crate) fn encode_conf_change_v2<I: crate::NodeId>(cc: &ConfChangeV2<I>, buf:
 }
 
 /// Decode a v2 conf change from an entry payload.
-pub(crate) fn decode_conf_change_v2<I: crate::NodeId>(
+pub(crate) fn decode_conf_change_v2<I: NodeId>(
   mut data: Bytes,
 ) -> Result<ConfChangeV2<I>, DecodeError> {
   let w = pb::ConfChangeV2::decode(&mut data).map_err(map_err)?;
@@ -156,10 +156,8 @@ fn decode_id<I: Data>(b: &Bytes) -> Result<I, DecodeError> {
 
 /// Decode a membership set: each element an id, the sequence STRICTLY ASCENDING by
 /// decoded value. Duplicates and disorder reject — one set, one accepted encoding.
-fn decode_set<I: crate::NodeId>(
-  elems: &[Bytes],
-) -> Result<std::collections::BTreeSet<I>, DecodeError> {
-  let mut out = std::collections::BTreeSet::new();
+fn decode_set<I: NodeId>(elems: &[Bytes]) -> Result<BTreeSet<I>, DecodeError> {
+  let mut out = BTreeSet::new();
   let mut prev: Option<I> = None;
   for b in elems {
     let id = decode_id::<I>(b)?;
@@ -176,7 +174,7 @@ fn decode_set<I: crate::NodeId>(
 
 /// Encode a membership set: `BTreeSet` iteration is ascending by `Ord`, which IS the
 /// canonical wire order.
-fn encode_set<I: crate::NodeId>(set: &std::collections::BTreeSet<I>) -> Vec<Bytes> {
+fn encode_set<I: NodeId>(set: &BTreeSet<I>) -> Vec<Bytes> {
   set.iter().map(encode_id).collect()
 }
 
@@ -241,7 +239,7 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
   )
 }
 
-fn pb_conf_state<I: crate::NodeId>(c: &ConfState<I>) -> pb::ConfState {
+fn pb_conf_state<I: NodeId>(c: &ConfState<I>) -> pb::ConfState {
   pb::ConfState {
     voters: encode_set(c.voters()),
     learners: encode_set(c.learners()),
@@ -252,7 +250,7 @@ fn pb_conf_state<I: crate::NodeId>(c: &ConfState<I>) -> pb::ConfState {
   }
 }
 
-fn conf_state_from<I: crate::NodeId>(w: &pb::ConfState) -> Result<ConfState<I>, DecodeError> {
+fn conf_state_from<I: NodeId>(w: &pb::ConfState) -> Result<ConfState<I>, DecodeError> {
   Ok(ConfState::new(
     decode_set::<I>(&w.voters)?,
     decode_set::<I>(&w.learners)?,
@@ -262,7 +260,7 @@ fn conf_state_from<I: crate::NodeId>(w: &pb::ConfState) -> Result<ConfState<I>, 
   ))
 }
 
-fn pb_snapshot_meta<I: crate::NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
+fn pb_snapshot_meta<I: NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
   pb::SnapshotMeta {
     last_index: m.last_index().get(),
     last_term: m.last_term().get(),
@@ -275,9 +273,7 @@ fn pb_snapshot_meta<I: crate::NodeId>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
   }
 }
 
-fn snapshot_meta_from<I: crate::NodeId>(
-  w: &pb::SnapshotMeta,
-) -> Result<SnapshotMeta<I>, DecodeError> {
+fn snapshot_meta_from<I: NodeId>(w: &pb::SnapshotMeta) -> Result<SnapshotMeta<I>, DecodeError> {
   let conf = w
     .conf
     .as_option()
@@ -310,7 +306,7 @@ fn snapshot_meta_from<I: crate::NodeId>(
 
 // ─── Message ───────────────────────────────────────────────────────────────────────
 
-fn pb_message<I: crate::NodeId>(msg: &Message<I>) -> pb::Message {
+fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
   use pb::message::Body;
   let body = match msg {
     Message::AppendEntries(m) => Body::from(pb::AppendEntries {
@@ -404,7 +400,7 @@ fn pb_message<I: crate::NodeId>(msg: &Message<I>) -> pb::Message {
   }
 }
 
-fn message_from<I: crate::NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError> {
+fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError> {
   use pb::message::Body;
   let body = wire.body.ok_or(DecodeError::Invalid("Message.body"))?;
   Ok(match body {

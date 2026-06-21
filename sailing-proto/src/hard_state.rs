@@ -1,5 +1,6 @@
 //! The durable Raft metadata: `(term, vote, commit, lease_support)`, persisted before acting.
 use crate::{Index, Term};
+use core::time::Duration;
 
 /// The durable provenance + magnitude of this node's LeaseBased read-lease promise.
 ///
@@ -19,7 +20,7 @@ pub enum LeaseSupport {
   /// A current-format node recorded its enforcing promise. `None` = it promised nothing (a fresh,
   /// non-enforcing, or never-yet-enforcing node); `Some(d)` = it will uphold a `d` lease window across a
   /// restart and the fence must cover it.
-  Recorded(Option<core::time::Duration>),
+  Recorded(Option<Duration>),
 }
 
 impl Default for LeaseSupport {
@@ -35,7 +36,7 @@ impl LeaseSupport {
   /// The promised lease-window MAGNITUDE: `Some(d)` for a recorded promise, `None` for a recorded
   /// no-promise OR a legacy record (callers that need to DISTINGUISH legacy use [`is_unrecorded`](Self::is_unrecorded)).
   #[inline(always)]
-  pub const fn promised(self) -> Option<core::time::Duration> {
+  pub const fn promised(self) -> Option<Duration> {
     match self {
       Self::Recorded(d) => d,
       Self::Unrecorded => None,
@@ -53,7 +54,7 @@ impl LeaseSupport {
   /// provenance, so a legacy record self-heals on the first write this incarnation makes. Never lowers a
   /// recorded magnitude (`max`).
   #[inline]
-  pub fn raise(self, floor: Option<core::time::Duration>) -> Self {
+  pub fn raise(self, floor: Option<Duration>) -> Self {
     Self::Recorded(self.promised().max(floor))
   }
 }
@@ -128,7 +129,7 @@ impl<I> HardState<I> {
   /// read sites want (fence math input, durability watermark comparison). Use [`lease_support`](Self::lease_support)
   /// when the legacy/native PROVENANCE matters.
   #[inline(always)]
-  pub const fn promised_lease_support(&self) -> Option<core::time::Duration> {
+  pub const fn promised_lease_support(&self) -> Option<Duration> {
     self.lease_support.promised()
   }
 

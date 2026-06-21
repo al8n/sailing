@@ -6,7 +6,7 @@
 //! deterministic and Sans-I/O.
 use super::{ConnId, router::PeerRouter, stream::RecordIo};
 use crate::{
-  Config, Endpoint, Event, Index, Instant, LogStore, NodeId, Now, ProposeError, StableStore,
+  Config, Data, Endpoint, Event, Index, Instant, LogStore, NodeId, Now, ProposeError, StableStore,
   StateMachine, TransferError,
 };
 use bytes::Bytes;
@@ -30,14 +30,14 @@ impl<I, F, R> StreamCoordinator<I, F, R>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
-  F::Snapshot: crate::Data,
+  F::Command: Data,
+  F::Snapshot: Data,
   F::Error: core::error::Error,
   R: RecordIo,
 {
   /// Create a coordinator wrapping a fresh [`Endpoint`] and an empty connection table.
   pub fn new(config: Config<I>, now: impl Into<Now>, seed: u64, fsm: F) -> Self {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     Self::from_endpoint(Endpoint::new(config, now, seed, fsm))
   }
 
@@ -56,9 +56,9 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    I: crate::Data,
+    I: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     Self::from_endpoint(Endpoint::restart(
       config, now, seed, fsm, boot_epoch, log, stable,
     ))
@@ -80,9 +80,9 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
-    I: crate::Data,
+    I: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     Self::from_endpoint(Endpoint::restart_migrating(
       config,
       now,
@@ -155,7 +155,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let mut decoded = Vec::new();
     // The router removes a faulted/closed connection itself and queues the close (with its reason)
     // for poll_conn_closed; the error needs no extra handling here.
@@ -186,7 +186,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.propose(now, log, stable, cmd);
     self.flush();
     r
@@ -204,7 +204,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.read_index(now, log, stable, context);
     self.flush();
     r
@@ -222,7 +222,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.transfer_leader(now, log, stable, to);
     self.flush();
     r
@@ -235,7 +235,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     self.router.reap_handshakes(now.mono());
     self.endpoint.handle_timeout(now, log, stable);
     self.flush();
@@ -253,7 +253,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.propose_conf_change(now, log, stable, cc);
     self.flush();
     r
@@ -272,7 +272,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.propose_conf_change_v2(now, log, stable, cc);
     self.flush();
     r
@@ -290,7 +290,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self
       .endpoint
       .propose_read_mode_change(now, log, stable, mode);
@@ -304,7 +304,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     self.endpoint.handle_storage(now, log, stable);
     self.flush();
   }

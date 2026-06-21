@@ -18,6 +18,8 @@ use crate::{
   Config, Data, Endpoint, Event, Index, Instant, LogStore, NodeId, Now, ProposeError, StableStore,
   StateMachine, TransferError, transport::ClusterId,
 };
+use core::error::Error;
+use std::collections::BTreeSet;
 
 /// Derive the SNI server-name a dial presents for `peer` in `cluster`, matching the per-node cert
 /// SAN minted by a [`ClusterTls`](super::ClusterTls) deployment:
@@ -56,7 +58,7 @@ fn sni_for<I: NodeId>(peer: &I, cluster: &ClusterId) -> String {
 /// sized from this — not from the incoming voter set alone, which would undercount learners and
 /// joint transitions (and a node that is itself a learner).
 fn tracked_peer_count<I: NodeId>(conf: &crate::ConfState<I>, me: &I) -> usize {
-  let mut peers: std::collections::BTreeSet<&I> = std::collections::BTreeSet::new();
+  let mut peers: BTreeSet<&I> = BTreeSet::new();
   peers.extend(conf.voters().iter());
   peers.extend(conf.voters_outgoing().iter());
   peers.extend(conf.learners().iter());
@@ -117,9 +119,9 @@ impl<I, F> QuicCoordinator<I, F, Hello>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
-  F::Snapshot: crate::Data,
-  F::Error: core::error::Error,
+  F::Command: Data,
+  F::Snapshot: Data,
+  F::Error: Error,
 {
   /// Create a coordinator wrapping a fresh [`Endpoint`], authenticating peers with the provided
   /// [`Hello`] preface scheme.
@@ -139,7 +141,7 @@ where
     opts: QuicOptions,
     cluster: ClusterId,
   ) -> Self {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     Self::with_identity(Endpoint::new(config, now, seed, fsm), opts, None, cluster)
   }
 
@@ -173,9 +175,9 @@ impl<I, F, ID> QuicCoordinator<I, F, ID>
 where
   I: NodeId,
   F: StateMachine,
-  F::Command: crate::Data,
-  F::Snapshot: crate::Data,
-  F::Error: core::error::Error,
+  F::Command: Data,
+  F::Snapshot: Data,
+  F::Error: Error,
   ID: IdentitySource<I>,
 {
   /// Wrap a consensus endpoint with a CALLER-SUPPLIED [`IdentitySource`].
@@ -318,7 +320,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let std_now = self.quinn_now(now.mono());
     self.bridge.handle_datagram(std_now, remote, ecn, data);
     self.drain_bridge(now, log, stable);
@@ -331,7 +333,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let std_now = self.quinn_now(now.mono());
     self.bridge.handle_timeout(std_now);
     self.endpoint.handle_timeout(now, log, stable);
@@ -345,7 +347,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     self.endpoint.handle_storage(now, log, stable);
     self.drain_bridge(now, log, stable);
     self.pump(now.mono());
@@ -415,7 +417,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.propose(now, log, stable, cmd);
     self.pump(now.mono());
     r
@@ -434,7 +436,7 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.propose_conf_change(now, log, stable, cc);
     self.pump(now.mono());
     r
@@ -453,7 +455,7 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.propose_conf_change_v2(now, log, stable, cc);
     self.pump(now.mono());
     r
@@ -472,7 +474,7 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self
       .endpoint
       .propose_read_mode_change(now, log, stable, mode);
@@ -492,7 +494,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.read_index(now, log, stable, context);
     self.pump(now.mono());
     r
@@ -510,7 +512,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let now: crate::Now = now.into();
+    let now: Now = now.into();
     let r = self.endpoint.transfer_leader(now, log, stable, to);
     self.pump(now.mono());
     r
@@ -529,7 +531,7 @@ where
   // Takes the full `Now` (not a bare `Instant`): a decoded consensus message dispatched below reaches
   // `endpoint.handle_message`, and a network-driven election there (VoteResp → become_leader → no-op)
   // must stamp the SYNCHRONIZED wall. Only the quinn/bridge timers use the monotonic `now.mono()`.
-  fn drain_bridge<L, S>(&mut self, now: crate::Now, log: &mut L, stable: &mut S)
+  fn drain_bridge<L, S>(&mut self, now: Now, log: &mut L, stable: &mut S)
   where
     L: LogStore,
     S: StableStore<NodeId = I>,

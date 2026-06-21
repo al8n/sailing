@@ -93,19 +93,18 @@ pub(crate) use tracker::Tracker;
 #[cfg(feature = "fuzzing")]
 #[doc(hidden)]
 pub mod fuzz_internals {
+  use crate::ConfChangeV2;
   use bytes::Bytes;
   use std::vec::Vec;
 
   /// [`wire::decode_conf_change_v2`](crate::wire) over a `u64` id — the entry-payload decode
   /// path (the apply-poison surface).
-  pub fn decode_conf_change_v2(
-    data: Bytes,
-  ) -> Result<crate::ConfChangeV2<u64>, crate::DecodeError> {
+  pub fn decode_conf_change_v2(data: Bytes) -> Result<ConfChangeV2<u64>, crate::DecodeError> {
     crate::wire::decode_conf_change_v2::<u64>(data)
   }
 
   /// [`wire::encode_conf_change_v2`](crate::wire) over a `u64` id.
-  pub fn encode_conf_change_v2(cc: &crate::ConfChangeV2<u64>, buf: &mut Vec<u8>) {
+  pub fn encode_conf_change_v2(cc: &ConfChangeV2<u64>, buf: &mut Vec<u8>) {
     crate::wire::encode_conf_change_v2::<u64>(cc, buf)
   }
 

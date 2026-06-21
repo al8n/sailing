@@ -1,4 +1,5 @@
 //! Public error types for the core.
+use core::time::Duration;
 
 /// Why a proposal was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -114,9 +115,9 @@ pub enum ConfigError {
   #[error("election timeout ({election:?}) must exceed heartbeat interval ({heartbeat:?})")]
   ElectionNotGreaterThanHeartbeat {
     /// The rejected election timeout.
-    election: core::time::Duration,
+    election: Duration,
     /// The heartbeat interval it must exceed.
-    heartbeat: core::time::Duration,
+    heartbeat: Duration,
   },
   /// `heartbeat_interval` was zero.
   #[error("heartbeat interval must be non-zero")]
@@ -139,11 +140,11 @@ pub enum ConfigError {
   )]
   LeaseTimingTooLong {
     /// The configured lease window.
-    lease: core::time::Duration,
+    lease: Duration,
     /// The configured clock-drift bound.
-    drift: core::time::Duration,
+    drift: Duration,
     /// The election timeout it must stay under.
-    election: core::time::Duration,
+    election: Duration,
   },
   /// `max_inflight_msgs` was zero.
   #[error("max_inflight_msgs must be greater than zero")]
@@ -159,9 +160,9 @@ pub enum ConfigError {
   )]
   BoundedUncertaintyInvalid {
     /// The configured bounded clock uncertainty (the failover skew bound).
-    uncertainty: core::time::Duration,
+    uncertainty: Duration,
     /// The configured lease duration it must be under (`None` if unset).
-    lease: Option<core::time::Duration>,
+    lease: Option<Duration>,
   },
   /// `lease_refresh` was set to a proactive mode (`OnExpiry` / `Continuous`) without
   /// `read_only = LeaseGuard`. Safe and LeaseBased reads have no per-entry timestamp anchor to refresh,

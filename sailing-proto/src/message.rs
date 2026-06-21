@@ -1,7 +1,8 @@
 //! Raft RPC messages. Payloads are named structs; `Message<I>` wraps them as newtype
 //! variants (no multi-field enum variants). Types only — behavior lives elsewhere.
-use crate::{Entry, Index, Term, conf::ConfState};
+use crate::{Entry, Index, NodeId, ReadOnlyOption, Term, conf::ConfState};
 use bytes::Bytes;
+use core::time::Duration;
 use std::vec::Vec;
 
 /// AppendEntries / heartbeat-with-entries (log replication).
@@ -329,7 +330,7 @@ pub struct HeartbeatResp<I> {
   from: I,
   context: Bytes,
   lease_round: u64,
-  lease_support: core::time::Duration,
+  lease_support: Duration,
 }
 
 impl<I: Copy> HeartbeatResp<I> {
@@ -342,7 +343,7 @@ impl<I: Copy> HeartbeatResp<I> {
       from,
       context,
       lease_round: 0,
-      lease_support: core::time::Duration::ZERO,
+      lease_support: Duration::ZERO,
     }
   }
 
@@ -360,7 +361,7 @@ impl<I: Copy> HeartbeatResp<I> {
   /// the follower's own `election_timeout`, letting the leader bound the lease by the quorum's actual
   /// support even under heterogeneous `election_timeout`.
   #[inline(always)]
-  pub fn with_lease_support(mut self, lease_support: core::time::Duration) -> Self {
+  pub fn with_lease_support(mut self, lease_support: Duration) -> Self {
     self.lease_support = lease_support;
     self
   }
@@ -397,7 +398,7 @@ impl<I: Copy> HeartbeatResp<I> {
   /// How long this follower will uphold the leader's read-lease window (ZERO if it does not enforce the
   /// lease, so the leader must NOT count it toward the lease quorum). See [`Self::with_lease_support`].
   #[inline(always)]
-  pub const fn lease_support(&self) -> core::time::Duration {
+  pub const fn lease_support(&self) -> Duration {
     self.lease_support
   }
 }
@@ -430,10 +431,10 @@ pub struct SnapshotMeta<I> {
   /// construction config — while `None` falls back to the static config, so a pre-migration snapshot is
   /// NOT misread as an explicit migrate-to-Safe. `None` ⇒ absent on the wire (byte-identical to a
   /// pre-migration peer); an explicit mode is PRESENT (the discriminant + 1), so Safe stays distinguishable.
-  read_only: Option<crate::ReadOnlyOption>,
+  read_only: Option<ReadOnlyOption>,
 }
 
-impl<I: crate::NodeId> SnapshotMeta<I> {
+impl<I: NodeId> SnapshotMeta<I> {
   /// Construct (`max_lease_window` defaults to `0`; set it with
   /// [`with_max_lease_window`](Self::with_max_lease_window) in LeaseGuard mode).
   pub fn new(last_index: Index, last_term: Term, conf: ConfState<I>) -> Self {
@@ -482,7 +483,7 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   /// non-migrated / pre-migration snapshot, which falls back to the static config on recovery.
   #[inline(always)]
   #[must_use]
-  pub const fn with_read_only(mut self, read_only: crate::ReadOnlyOption) -> Self {
+  pub const fn with_read_only(mut self, read_only: ReadOnlyOption) -> Self {
     self.read_only = Some(read_only);
     self
   }
@@ -514,7 +515,7 @@ impl<I: crate::NodeId> SnapshotMeta<I> {
   /// The active read mode at the snapshot boundary, or `None` for a legacy/pre-migration snapshot (or one
   /// that never set it) — recovery then falls back to the static config rather than forcing Safe.
   #[inline(always)]
-  pub const fn read_only(&self) -> Option<crate::ReadOnlyOption> {
+  pub const fn read_only(&self) -> Option<ReadOnlyOption> {
     self.read_only
   }
 
@@ -541,7 +542,7 @@ pub struct InstallSnapshot<I> {
   data: Bytes,
 }
 
-impl<I: crate::NodeId> InstallSnapshot<I> {
+impl<I: NodeId> InstallSnapshot<I> {
   /// Construct.
   pub fn new(term: Term, leader: I, snapshot: SnapshotMeta<I>, data: Bytes) -> Self {
     Self {
@@ -843,7 +844,7 @@ impl<I: Copy> Outgoing<I> {
   }
 }
 
-impl<I: crate::NodeId> Message<I> {
+impl<I: NodeId> Message<I> {
   /// The term carried by this message.
   ///
   /// Every variant carries a term field. For [`TimeoutNow`], [`ReadIndex`], and
@@ -851,7 +852,7 @@ impl<I: crate::NodeId> Message<I> {
   /// receiver's term pre-pass (`msg.term() < self.term → drop`) does not accidentally drop
   /// these messages. Callers must set the term to the sender's current term when
   /// constructing these messages.
-  pub fn term(&self) -> crate::Term {
+  pub fn term(&self) -> Term {
     match self {
       Self::AppendEntries(m) => m.term(),
       Self::AppendResp(m) => m.term(),

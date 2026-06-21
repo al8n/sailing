@@ -1,5 +1,5 @@
 //! Application-facing outputs drained via `Endpoint::poll_event`.
-use crate::{ConfState, Index, ReadState, SnapshotMeta, Term};
+use crate::{ConfState, Index, ReadOnlyOption, ReadState, SnapshotMeta, Term};
 
 /// A committed `Normal` entry was applied; `response` is the `StateMachine::Response`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -101,12 +101,12 @@ pub struct ReadModeChanged {
   /// The log index of the applied `SetReadMode` entry.
   index: Index,
   /// The new active read mode.
-  mode: crate::ReadOnlyOption,
+  mode: ReadOnlyOption,
 }
 
 impl ReadModeChanged {
   /// Construct.
-  pub fn new(index: Index, mode: crate::ReadOnlyOption) -> Self {
+  pub fn new(index: Index, mode: ReadOnlyOption) -> Self {
     Self { index, mode }
   }
 
@@ -118,7 +118,7 @@ impl ReadModeChanged {
 
   /// The new active read mode after applying the change.
   #[inline(always)]
-  pub fn mode(&self) -> crate::ReadOnlyOption {
+  pub fn mode(&self) -> ReadOnlyOption {
     self.mode
   }
 }
