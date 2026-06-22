@@ -85,7 +85,7 @@ where
   /// Byte cap on the failover inherited-read limbo scan (see
   /// [`DriverConfig::max_failover_limbo_bytes`]).
   max_failover_limbo_bytes: usize,
-  commands: futures_channel::mpsc::Receiver<Command<I, F>>,
+  commands: flume::Receiver<Command<I, F>>,
   routing: Routing<I, F::Response, F>,
   storage_ready: flume::Receiver<()>,
   /// Keeps a `None`-seam storage channel parked forever (a sender-less receiver would resolve
@@ -182,9 +182,9 @@ where
     driver_cfg: DriverConfig,
   ) -> Result<(Self, Handle<I, F>), BindError> {
     // Reject an out-of-range programmatic `DriverConfig` UP FRONT (before the socket binds). The
-    // serde/clap parse paths validate, but a programmatic config bypasses that; without this an
-    // over-ceiling `max_inflight` would panic the `futures_channel` sizing below. `validate` now
-    // guarantees `max_inflight < MAX_CHANNEL_CAPACITY`, so the `saturating_add(1)` is belt-and-braces.
+    // serde/clap parse paths validate, but a programmatic config bypasses that; this keeps the
+    // channel-sizing knobs (`events_cap`/`recv_cap`) under the capacity ceiling before any
+    // channel is built.
     driver_cfg.validate()?;
     // Validate + capture ε_unc (the sole copy of the wall-gate threshold) BEFORE the socket binds,
     // rejecting an invalid Config and the silent failover wedge (a failover tier with a non-supplying
@@ -195,12 +195,10 @@ where
     let endpoint = sailing_proto::Endpoint::new(config, clock.now(), seed, fsm);
     let coord = QuicCoordinator::with_identity(endpoint, opts, None, cluster);
 
-    // The command channel's buffer is sized to the submit budget plus one: the budget — not the
-    // channel — is the binding bound on in-flight operations (see the memory model). The parsed
-    // config funnel rejects `max_inflight == usize::MAX`, but a programmatic config bypasses that, so
-    // `saturating_add` keeps even that extreme value from overflowing `usize` (it caps at the budget).
-    let (cmd_tx, cmd_rx) =
-      futures_channel::mpsc::channel(driver_cfg.max_inflight.saturating_add(1));
+    // Unbounded: the submit BUDGET — not the channel — is the binding bound on in-flight
+    // operations (see the memory model), and an unbounded queue keeps shutdown from ever blocking
+    // on a full channel.
+    let (cmd_tx, cmd_rx) = flume::unbounded();
     let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
     let budget = InflightBudget::new(driver_cfg.max_inflight, driver_cfg.max_pending_bytes);
     let handle = Handle::new(cmd_tx, event_rx, budget);
@@ -291,10 +289,10 @@ where
             }
           }
           Err(e) => {
-            // Closed = every Handle clone dropped AND the buffer drained: the command stream
-            // has ENDED for good — exit (a continuously-readable socket would otherwise keep
-            // the task and the socket alive forever). Empty just falls through to the select.
-            if e.is_closed() {
+            // Disconnected = every Handle clone dropped AND the buffer drained: the command
+            // stream has ENDED for good — exit (a continuously-readable socket would otherwise
+            // keep the task and the socket alive forever). Empty just falls through to the select.
+            if matches!(e, flume::TryRecvError::Disconnected) {
               exit = true;
             }
             break;
@@ -351,8 +349,8 @@ where
           }
         }
         .fuse();
-        futures_util::pin_mut!(recv_fut, timer_fut, storage_fut);
-        let mut cmd_next = futures_util::StreamExt::next(&mut self.commands).fuse();
+        let cmd_fut = self.commands.recv_async().fuse();
+        futures_util::pin_mut!(recv_fut, timer_fut, storage_fut, cmd_fut);
 
         let mut inbound: Option<(Vec<u8>, SocketAddr)> = None;
         let mut fire_timeout = false;
@@ -367,8 +365,10 @@ where
             if let Ok(datagram) = got { inbound = Some(datagram); }
           }
           _ = timer_fut => { fire_timeout = true; }
-          cmd = cmd_next => {
-            match cmd { Some(c) => command = Some(c), None => ended = true }
+          // flume `recv_async` yields `Ok` while any sender lives and `Err` once every `Handle`
+          // clone has dropped (the buffer already drained) — the end-of-stream signal.
+          cmd = cmd_fut => {
+            match cmd { Ok(c) => command = Some(c), Err(_) => ended = true }
           }
           got = storage_fut => {
             if got.is_err() { storage_disconnected = true; }
@@ -422,10 +422,13 @@ where
     self.routing.fail_all(&DriverError::ShuttingDown);
     drop(recv_task);
     drop(recv_rx);
-    self.commands.close();
+    // Drain everything already buffered, then DROP the receiver: a racing `try_send` then sees a
+    // disconnected channel WITH its command (the handle's own rollback runs) — no command, queued
+    // or in flight, survives the ack.
     while let Ok(cmd) = self.commands.try_recv() {
       drop(cmd);
     }
+    drop(self.commands);
     // The fd-release barrier: close() parks until every other reference to the socket's fd —
     // the recv task's clone and its cancelled-but-unprocessed op — has dropped, then closes the
     // fd with a real close op. Once this await returns the bound address is free, which is what

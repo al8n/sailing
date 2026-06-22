@@ -54,10 +54,10 @@ async fn submit_anywhere(handles: &[Handle<u64, CountSm>], payload: &'static [u8
 }
 
 /// `bind` must REJECT an out-of-range programmatic `DriverConfig` (whose serde/clap parse path would
-/// have caught it) rather than panic deep in the channel sizing. An over-ceiling `max_inflight`
-/// trips `futures_channel`'s `MAX_BUFFER` assert at `mpsc::channel(max_inflight + 1)`; a zero redial
-/// base hot-loops. Both must surface as `BindError::DriverConfig`. The validation runs before the
-/// socket binds, so the bogus address is never touched.
+/// have caught it) rather than build a driver with a pathological submit budget. An over-ceiling
+/// `max_inflight` exceeds the submit-budget ceiling; a zero redial base hot-loops. Both must surface
+/// as `BindError::DriverConfig`. The validation runs before the socket binds, so the bogus address
+/// is never touched.
 #[compio::test]
 async fn bind_rejects_out_of_range_driver_config() {
   use sailing_compio::{BindError, MAX_CHANNEL_CAPACITY};
@@ -86,8 +86,7 @@ async fn bind_rejects_out_of_range_driver_config() {
     .map_err(std::io::Error::other)
   });
 
-  // `max_inflight` whose `+ 1` clears the `usize::MAX` overflow check yet exceeds `MAX_BUFFER` — the
-  // exact value that panicked `bind` before the up-front `validate`.
+  // `max_inflight` at the channel-capacity ceiling — above the submit-budget cap `validate` enforces.
   let over_inflight = DriverConfig {
     max_inflight: MAX_CHANNEL_CAPACITY,
     ..DriverConfig::default()

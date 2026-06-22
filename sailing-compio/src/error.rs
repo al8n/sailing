@@ -55,10 +55,10 @@ pub enum BindError {
   /// silent fall back to Safe.
   #[error("invalid raft config: {0}")]
   Config(#[from] sailing_proto::ConfigError),
-  /// The [`DriverConfig`](crate::DriverConfig) is invalid (e.g. a `max_inflight` whose `+ 1`
-  /// command-channel sizing would trip `futures_channel`'s `MAX_BUFFER` assert, an over-bound redial).
-  /// A programmatic `DriverConfig` is not validated at construction, so `bind` validates it UP FRONT —
-  /// a loud startup error rather than a panic deeper in the channel/queue arithmetic.
+  /// The [`DriverConfig`](crate::DriverConfig) is invalid (e.g. a `max_inflight` above the
+  /// submit-budget ceiling, an over-bound redial). A programmatic `DriverConfig` is not validated at
+  /// construction, so `bind` validates it UP FRONT — a loud startup error rather than a panic deeper
+  /// in the budget/queue arithmetic.
   #[error("invalid driver config: {0}")]
   DriverConfig(#[from] crate::DriverConfigError),
   /// The `Config` is a valid LeaseGuard FAILOVER tier (`bounded_clock_uncertainty` set) but the
@@ -89,21 +89,15 @@ pub enum DriverConfigError {
   /// [`DriverError::Busy`] — the driver can never make progress.
   #[error("max_inflight must be non-zero")]
   ZeroMaxInflight,
-  /// `max_inflight` is `usize::MAX`. The command channel is sized at `max_inflight + 1`, which would
-  /// overflow `usize`; the cap is rejected so the addition can never wrap.
-  #[error(
-    "max_inflight must be less than usize::MAX (the command channel is sized at max_inflight + 1)"
-  )]
+  /// `max_inflight` is `usize::MAX`. It sizes the submit budget against the shared channel ceiling;
+  /// `usize::MAX` is rejected so the ceiling comparison can never wrap.
+  #[error("max_inflight must be less than usize::MAX")]
   MaxInflightOverflow,
-  /// `max_inflight` is at or above the channel-capacity ceiling. Both drivers size the command
-  /// channel at `max_inflight + 1` via `futures_channel::mpsc::channel`, which ASSERTS the buffer is
-  /// strictly below its `MAX_BUFFER` (≈ `usize::MAX / 4`) — rejecting `usize::MAX` alone is not enough,
-  /// because a value like `usize::MAX / 2` clears that check yet still trips the channel's assert and
-  /// panics `bind`. Capped at [`MAX_CHANNEL_CAPACITY`](crate::MAX_CHANNEL_CAPACITY) − 1 so the `+ 1`
-  /// stays under the ceiling.
-  #[error(
-    "max_inflight + 1 must be at most the channel-capacity ceiling (futures_channel's MAX_BUFFER)"
-  )]
+  /// `max_inflight` is at or above the channel-capacity ceiling. The command channel is
+  /// `flume::unbounded`, so this bounds the submit BUDGET rather than a channel buffer; capping it at
+  /// [`MAX_CHANNEL_CAPACITY`](crate::MAX_CHANNEL_CAPACITY) − 1 keeps a pathological budget from
+  /// admitting an astronomical pending count.
+  #[error("max_inflight must be at most the channel-capacity ceiling")]
   MaxInflightAboveChannelCeiling,
   /// `events_cap` is at or above the channel-capacity ceiling. The events tail is sized via a bounded
   /// channel; a capacity at/above the ceiling would trip the channel implementation's limit.
