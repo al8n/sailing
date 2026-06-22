@@ -1,5 +1,10 @@
 //! The cross-thread submission surface: [`Handle`] and the [`Command`]s it sends the driver.
 
+use std::sync::{
+  Arc,
+  atomic::{AtomicBool, Ordering},
+};
+
 use sailing_proto::{ConfChange, ConfChangeV2, Data, Entry, Event, FailoverReadWindow, Index};
 
 use crate::{
@@ -87,9 +92,12 @@ where
 /// **The bound, precisely**: the command channel is `flume::unbounded`, so the channel itself is
 /// NOT the bound. The BUDGET is: every operation except `shutdown` reserves against it before
 /// enqueueing (a transfer reserves a zero-byte slot), so no number of clones can park more than
-/// `max_inflight` budgeted commands. `shutdown` is deliberately exempt — a driver must be
-/// stoppable under full load — and is bounded by being terminal (the first one drained exits the
-/// loop).
+/// `max_inflight` budgeted commands. `shutdown` is deliberately exempt from the budget — a driver
+/// must be stoppable under full load — but is COALESCED instead: a shared atomic flag (cloned across
+/// every handle) lets only the FIRST `shutdown` enqueue a `Command::Shutdown`; every later call (and
+/// every concurrent racer that lost the swap) returns early without enqueueing. So at most ONE
+/// `Shutdown` is ever queued, regardless of clone count or a stalled driver — the unbounded channel
+/// cannot be stormed by repeated `shutdown`s.
 pub struct Handle<I, F>
 where
   F: sailing_proto::StateMachine,
@@ -99,6 +107,10 @@ where
   commands: flume::Sender<Command<I, F>>,
   events: flume::Receiver<Event<I, F::Response>>,
   budget: InflightBudget,
+  /// Shared across every clone: set once by the first `shutdown` to COALESCE all later (and
+  /// concurrent) shutdown requests to a single enqueued `Command::Shutdown`, so the unbounded
+  /// command channel can never be flooded with `Shutdown`s under a slow/stalled driver.
+  shutdown: Arc<AtomicBool>,
 }
 
 impl<I, F> Clone for Handle<I, F>
@@ -107,11 +119,13 @@ where
 {
   fn clone(&self) -> Self {
     // The shared submit BUDGET is the binding bound on in-flight operations; the cloned
-    // (unbounded) command sender adds no slack of its own.
+    // (unbounded) command sender adds no slack of its own. The shutdown flag is shared (Arc clone)
+    // so a `shutdown` on ANY clone coalesces with one on any other.
     Self {
       commands: self.commands.clone(),
       events: self.events.clone(),
       budget: self.budget.clone(),
+      shutdown: self.shutdown.clone(),
     }
   }
 }
@@ -132,6 +146,7 @@ where
       commands,
       events,
       budget,
+      shutdown: Arc::new(AtomicBool::new(false)),
     }
   }
 
@@ -273,9 +288,191 @@ where
 
   /// Ask the driver to stop and await the teardown ack. When the ack arrives the run loop has
   /// exited and the socket fd is fully released — the bound address is immediately rebindable.
+  ///
+  /// IDEMPOTENT and COALESCED. The shared shutdown flag is swapped once: only the FIRST caller
+  /// (across every clone, and across a concurrent race) enqueues a single `Command::Shutdown` and
+  /// awaits its teardown ack; every subsequent caller returns `Ok(())` immediately without enqueueing
+  /// — so the unbounded command channel can never be flooded with `Shutdown`s. A first-caller enqueue
+  /// that finds the channel already disconnected likewise returns `Ok(())`: the driver is already gone,
+  /// which is exactly what shutdown wants.
   pub async fn shutdown(&self) -> Result<(), DriverError<I>> {
+    // Coalesce: only the caller that flips the flag false→true is responsible for the single enqueue;
+    // everyone else (already-shutting-down, or a concurrent racer that lost the swap) is done. The flag
+    // stays set on every path, so a later call never re-enqueues.
+    if self.shutdown.swap(true, Ordering::AcqRel) {
+      return Ok(());
+    }
     let (tx, rx) = futures_channel::oneshot::channel();
-    self.send(Command::Shutdown { ack: tx })?;
+    // A disconnected channel means the driver already exited — shutdown is satisfied, so map it to
+    // `Ok(())` rather than `ShuttingDown`. (`Full` cannot occur on an unbounded channel.)
+    if let Err(e) = self.commands.try_send(Command::Shutdown { ack: tx }) {
+      return match e {
+        flume::TrySendError::Disconnected(_) => Ok(()),
+        flume::TrySendError::Full(_) => Err(DriverError::Busy),
+      };
+    }
+    // Only the enqueuer awaits the teardown ack (unchanged behavior): a dropped ack sender (driver
+    // gone without signalling) surfaces as `ShuttingDown`.
     rx.await.map_err(|_| DriverError::ShuttingDown)
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  use crate::shared::InflightBudget;
+
+  /// A do-nothing state machine, just enough to parametrize a `Handle`/`Command` for the
+  /// channel-coalescing tests. No command ever applies — the tests only exercise `shutdown`.
+  struct NoopSm;
+
+  impl sailing_proto::StateMachine for NoopSm {
+    type Command = ();
+    type Response = ();
+    type Snapshot = ();
+    type Error = std::convert::Infallible;
+
+    fn apply(
+      &mut self,
+      _index: sailing_proto::Index,
+      _cmd: (),
+    ) -> Result<(), std::convert::Infallible> {
+      Ok(())
+    }
+    fn snapshot(&self) -> Result<(), std::convert::Infallible> {
+      Ok(())
+    }
+    fn restore(&mut self, _snapshot: ()) -> Result<(), std::convert::Infallible> {
+      Ok(())
+    }
+  }
+
+  type TestHandle = Handle<u64, NoopSm>;
+  type CmdRx = flume::Receiver<Command<u64, NoopSm>>;
+  type EventTx = flume::Sender<Event<u64, ()>>;
+
+  /// The shutdown-coalescing flag is an `Arc<AtomicBool>` (`Send + Sync`), so the cross-thread
+  /// `Handle` stays `Send + Sync` as documented. A regression here is a compile error.
+  const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<TestHandle>();
+  };
+
+  /// The handle under test, the command RECEIVER (the stub driver's end), and the held event SENDER
+  /// (kept alive only so the handle's event receiver is not pre-disconnected — these tests never use
+  /// the event tail).
+  fn test_handle() -> (TestHandle, CmdRx, EventTx) {
+    let (cmd_tx, cmd_rx) = flume::unbounded();
+    let (event_tx, event_rx) = flume::bounded(1);
+    let budget = InflightBudget::new(8, 64);
+    let handle = Handle::new(cmd_tx, event_rx, budget);
+    (handle, cmd_rx, event_tx)
+  }
+
+  fn count_shutdowns(rx: &CmdRx) -> usize {
+    let mut n = 0;
+    while let Ok(cmd) = rx.try_recv() {
+      if matches!(cmd, Command::Shutdown { .. }) {
+        n += 1;
+      }
+    }
+    n
+  }
+
+  #[test]
+  fn shutdown_coalesces_to_a_single_command_across_clones() {
+    futures_executor::block_on(async {
+      let (handle, cmd_rx, _event_tx) = test_handle();
+      let clones: Vec<TestHandle> = (0..8).map(|_| handle.clone()).collect();
+
+      // A stub driver: drain the (single) coalesced `Shutdown`, count it, and ack it so the one
+      // awaiting caller resolves; the channel then stays empty for the rest of the join.
+      let count = std::cell::Cell::new(0usize);
+      let driver = async {
+        while let Ok(cmd) = cmd_rx.recv_async().await {
+          if let Command::Shutdown { ack } = cmd {
+            count.set(count.get() + 1);
+            let _ = ack.send(());
+          }
+        }
+      };
+
+      // Every handle (original + clones) calls `shutdown`; all must resolve `Ok`. Only the FIRST to
+      // win the atomic swap enqueues + awaits the ack (the stub driver, running in the same join,
+      // supplies it); the rest return `Ok` immediately without touching the channel — so ordering of
+      // the calls does not matter to the coalescing, which the single-channel assertion below proves.
+      let callers = async {
+        assert!(handle.shutdown().await.is_ok(), "first shutdown must be Ok");
+        for c in &clones {
+          assert!(
+            c.shutdown().await.is_ok(),
+            "every later shutdown caller must return Ok"
+          );
+        }
+        // All callers done: drop every sender so the stub driver's recv disconnects and the join
+        // completes.
+        drop(handle);
+        drop(clones);
+      };
+
+      futures_util::future::join(driver, callers).await;
+
+      // Exactly ONE `Shutdown` was ever enqueued, regardless of the 9 concurrent callers.
+      assert_eq!(
+        count.get(),
+        1,
+        "the unbounded channel must carry at most one coalesced Shutdown"
+      );
+      // And nothing is left queued.
+      assert_eq!(count_shutdowns(&cmd_rx), 0);
+    });
+  }
+
+  #[test]
+  fn shutdown_is_idempotent_after_completion() {
+    futures_executor::block_on(async {
+      let (handle, cmd_rx, _event_tx) = test_handle();
+
+      // First shutdown: enqueues one `Shutdown`; a stub driver acks it.
+      let first = async {
+        let count = std::cell::Cell::new(0usize);
+        let driver = async {
+          while let Ok(cmd) = cmd_rx.recv_async().await {
+            if let Command::Shutdown { ack } = cmd {
+              count.set(count.get() + 1);
+              let _ = ack.send(());
+              break;
+            }
+          }
+        };
+        let call = async { handle.shutdown().await.unwrap() };
+        futures_util::future::join(driver, call).await;
+        count.get()
+      }
+      .await;
+      assert_eq!(first, 1, "the first shutdown enqueues exactly one Shutdown");
+
+      // A SUBSEQUENT shutdown on the same handle returns Ok WITHOUT enqueueing anything.
+      handle.shutdown().await.unwrap();
+      assert_eq!(
+        count_shutdowns(&cmd_rx),
+        0,
+        "a second shutdown must not enqueue another Shutdown"
+      );
+    });
+  }
+
+  #[test]
+  fn shutdown_on_disconnected_channel_is_ok() {
+    futures_executor::block_on(async {
+      let (handle, cmd_rx, _event_tx) = test_handle();
+      // Driver already gone: the command receiver is dropped, so the first enqueue sees Disconnected.
+      drop(cmd_rx);
+      // Shutdown still resolves Ok (the driver is already stopped — exactly what shutdown wants).
+      handle.shutdown().await.unwrap();
+      // And a second call is still Ok (flag set, early return).
+      handle.shutdown().await.unwrap();
+    });
   }
 }
