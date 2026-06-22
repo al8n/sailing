@@ -181,6 +181,11 @@ where
     wall: W,
     driver_cfg: DriverConfig,
   ) -> Result<(Self, Handle<I, F>), BindError> {
+    // Reject an out-of-range programmatic `DriverConfig` UP FRONT (before the socket binds). The
+    // serde/clap parse paths validate, but a programmatic config bypasses that; without this an
+    // over-ceiling `max_inflight` would panic the `futures_channel` sizing below. `validate` now
+    // guarantees `max_inflight < MAX_CHANNEL_CAPACITY`, so the `saturating_add(1)` is belt-and-braces.
+    driver_cfg.validate()?;
     // Validate + capture ε_unc (the sole copy of the wall-gate threshold) BEFORE the socket binds,
     // rejecting an invalid Config and the silent failover wedge (a failover tier with a non-supplying
     // source).
@@ -191,8 +196,11 @@ where
     let coord = QuicCoordinator::with_identity(endpoint, opts, None, cluster);
 
     // The command channel's buffer is sized to the submit budget plus one: the budget — not the
-    // channel — is the binding bound on in-flight operations (see the memory model).
-    let (cmd_tx, cmd_rx) = futures_channel::mpsc::channel(driver_cfg.max_inflight + 1);
+    // channel — is the binding bound on in-flight operations (see the memory model). The parsed
+    // config funnel rejects `max_inflight == usize::MAX`, but a programmatic config bypasses that, so
+    // `saturating_add` keeps even that extreme value from overflowing `usize` (it caps at the budget).
+    let (cmd_tx, cmd_rx) =
+      futures_channel::mpsc::channel(driver_cfg.max_inflight.saturating_add(1));
     let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
     let budget = InflightBudget::new(driver_cfg.max_inflight, driver_cfg.max_pending_bytes);
     let handle = Handle::new(cmd_tx, event_rx, budget);

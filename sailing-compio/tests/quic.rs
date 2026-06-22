@@ -101,6 +101,40 @@ async fn submit_anywhere(handles: &[Handle<u64, CountSm>], payload: &'static [u8
   }
 }
 
+/// `bind` must REJECT an out-of-range programmatic `DriverConfig` rather than panic in the channel
+/// sizing — the QUIC counterpart of the stream driver's identical guard. An over-ceiling
+/// `max_inflight` trips `futures_channel`'s `MAX_BUFFER` assert at `mpsc::channel(max_inflight + 1)`.
+/// The `validate` runs before the UDP socket binds, so the bogus address is never touched.
+#[compio::test]
+async fn bind_rejects_out_of_range_driver_config() {
+  use sailing_compio::{BindError, MAX_CHANNEL_CAPACITY};
+
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let over_inflight = DriverConfig {
+    max_inflight: MAX_CHANNEL_CAPACITY,
+    ..DriverConfig::default()
+  };
+  let res = CompioQuicDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    vec![],
+    MemLog::new(),
+    MemStable::new(),
+    over_inflight,
+  )
+  .await;
+  assert!(
+    matches!(res, Err(BindError::DriverConfig(_))),
+    "an over-ceiling max_inflight must be rejected at bind, not panic"
+  );
+}
+
 /// The gate: a real 3-node cluster over mandatory-mTLS QUIC on loopback elects, commits a
 /// command submitted with NotLeader redirects, answers through the submitting handle, and
 /// serves a linearizable query against the leader's state machine.
