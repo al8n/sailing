@@ -1,7 +1,5 @@
 //! The cross-thread submission surface: [`Handle`] and the [`Command`]s it sends the driver.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
-
 use sailing_proto::{ConfChange, ConfChangeV2, Data, Entry, Event, FailoverReadWindow, Index};
 
 use crate::{
@@ -86,22 +84,19 @@ where
 /// Cloning is O(1) (a channel handle plus `Arc` clones). All clones share one submit budget —
 /// the in-flight count/byte caps apply across all clones, not per clone.
 ///
-/// **The bound, precisely**: the command channel's true capacity is its buffer
-/// (`max_inflight + 1`) plus one in-flight slot per live sender clone — a property of the
-/// bounded mpsc, so the channel alone is NOT the bound. The BUDGET is: every operation except
-/// `shutdown` reserves against it before enqueueing (a transfer reserves a zero-byte slot), so
-/// no number of clones can park more than `max_inflight` budgeted commands. `shutdown` is
-/// deliberately exempt — a driver must be stoppable under full load — and is bounded by being
-/// terminal (the first one drained exits the loop).
+/// **The bound, precisely**: the command channel is `flume::unbounded`, so the channel itself is
+/// NOT the bound. The BUDGET is: every operation except `shutdown` reserves against it before
+/// enqueueing (a transfer reserves a zero-byte slot), so no number of clones can park more than
+/// `max_inflight` budgeted commands. `shutdown` is deliberately exempt — a driver must be
+/// stoppable under full load — and is bounded by being terminal (the first one drained exits the
+/// loop).
 pub struct Handle<I, F>
 where
   F: sailing_proto::StateMachine,
 {
-  /// The command sender, `Mutex`-wrapped because `futures_channel::mpsc::Sender::try_send`
-  /// takes `&mut self` (the sender tracks its own parked state) while the methods here take
-  /// `&self`. The lock is held only across a non-blocking `try_send`/`clone` — never across an
-  /// await — so callers sharing one clone by reference serialize only the enqueue itself.
-  commands: Mutex<futures_channel::mpsc::Sender<Command<I, F>>>,
+  /// The command sender. `flume::Sender::try_send` takes `&self` and is internally synchronized,
+  /// so the public `&self` methods enqueue without a wrapping `Mutex`.
+  commands: flume::Sender<Command<I, F>>,
   events: flume::Receiver<Event<I, F::Response>>,
   budget: InflightBudget,
 }
@@ -111,17 +106,10 @@ where
   F: sailing_proto::StateMachine,
 {
   fn clone(&self) -> Self {
-    // A cloned sender starts fresh (unparked) and carries its own guaranteed channel slot: the
-    // command channel admits its buffer plus one in-flight command per live sender, so each
-    // clone widens the queue's slack by one. The shared submit BUDGET is the binding bound on
-    // in-flight operations, not that slack.
-    let sender = self
-      .commands
-      .lock()
-      .unwrap_or_else(PoisonError::into_inner)
-      .clone();
+    // The shared submit BUDGET is the binding bound on in-flight operations; the cloned
+    // (unbounded) command sender adds no slack of its own.
     Self {
-      commands: Mutex::new(sender),
+      commands: self.commands.clone(),
       events: self.events.clone(),
       budget: self.budget.clone(),
     }
@@ -136,35 +124,26 @@ where
   F::Response: Send,
 {
   pub(crate) fn new(
-    commands: futures_channel::mpsc::Sender<Command<I, F>>,
+    commands: flume::Sender<Command<I, F>>,
     events: flume::Receiver<Event<I, F::Response>>,
     budget: InflightBudget,
   ) -> Self {
     Self {
-      commands: Mutex::new(commands),
+      commands,
       events,
       budget,
     }
   }
 
-  /// Lock the command sender. A poisoned lock only means another thread panicked while holding
-  /// it; the sender is a plain channel handle whose state cannot be torn by an unwind
-  /// mid-`try_send`, so the inner value is taken either way rather than cascading the panic
-  /// into every clone.
-  fn commands(&self) -> MutexGuard<'_, futures_channel::mpsc::Sender<Command<I, F>>> {
-    self.commands.lock().unwrap_or_else(PoisonError::into_inner)
-  }
-
-  /// Enqueue one command, mapping a full/closed channel to the right error. The budget
+  /// Enqueue one command, mapping a closed channel to [`DriverError::ShuttingDown`]. The budget
   /// reservation rides INSIDE `cmd`, so a rejected enqueue drops it here and nothing leaks.
   fn send(&self, cmd: Command<I, F>) -> Result<(), DriverError<I>> {
-    self.commands().try_send(cmd).map_err(|e| {
-      if e.is_disconnected() {
+    self.commands.try_send(cmd).map_err(|e| {
+      if matches!(e, flume::TrySendError::Disconnected(_)) {
         DriverError::ShuttingDown
       } else {
-        // The channel buffer is sized to the submit budget, so a full channel without a
-        // disconnected driver means commands are racing ahead of the drain — the same
-        // backpressure signal as budget exhaustion.
+        // Unbounded: `Full` cannot occur, so this arm is defensively dead. The submit BUDGET is
+        // the real backpressure signal (exhaustion fails fast as `Busy` before enqueue).
         DriverError::Busy
       }
     })

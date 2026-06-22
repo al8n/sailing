@@ -101,10 +101,10 @@ async fn submit_anywhere(handles: &[Handle<u64, CountSm>], payload: &'static [u8
   }
 }
 
-/// `bind` must REJECT an out-of-range programmatic `DriverConfig` rather than panic in the channel
-/// sizing — the QUIC counterpart of the stream driver's identical guard. An over-ceiling
-/// `max_inflight` trips `futures_channel`'s `MAX_BUFFER` assert at `mpsc::channel(max_inflight + 1)`.
-/// The `validate` runs before the UDP socket binds, so the bogus address is never touched.
+/// `bind` must REJECT an out-of-range programmatic `DriverConfig` rather than build a driver with a
+/// pathological submit budget — the QUIC counterpart of the stream driver's identical guard. An
+/// over-ceiling `max_inflight` exceeds the submit-budget ceiling and is rejected. The `validate`
+/// runs before the UDP socket binds, so the bogus address is never touched.
 #[compio::test]
 async fn bind_rejects_out_of_range_driver_config() {
   use sailing_compio::{BindError, MAX_CHANNEL_CAPACITY};

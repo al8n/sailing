@@ -34,19 +34,17 @@ pub(crate) const DEFAULT_REDIAL_CAP: Duration = Duration::from_secs(5);
 /// Inclusive ceiling for every CHANNEL-sizing knob (`max_inflight`, `events_cap`, `recv_cap`,
 /// `inbound_cap`, `accept_cap`).
 ///
-/// `max_inflight` sizes the command channel via `futures_channel::mpsc::channel(max_inflight + 1)`,
-/// and that constructor `assert!`s the buffer is STRICTLY below its `MAX_BUFFER` — which on a 64-bit
-/// target is `usize::MAX >> 2` (≈ `usize::MAX / 4`), so a value merely below `usize::MAX` (e.g.
-/// `usize::MAX / 2`) clears the old overflow check yet still trips the assert and panics `bind`. The
-/// flume-sized caps (`events_cap`/`recv_cap`/`inbound_cap`/`accept_cap`) grow their `VecDeque` lazily
-/// — no eager allocation of `cap` slots — so their only hard limit is the `cap == usize::MAX` `+ 1`
-/// overflow in flume's pending-pull; one shared ceiling well under both limits covers every channel.
+/// The command channel itself is now `flume::unbounded` and carries no cap — but `max_inflight`
+/// still SIZES the submit budget, so the same ceiling keeps a pathological budget from admitting an
+/// astronomical pending count. The bounded channels (`events_cap` via flume; `recv_cap`/`inbound_cap`/
+/// `accept_cap` via the lochan rings) only allocate as they fill, so their hard limit is just the
+/// `cap == usize::MAX` `+ 1` overflow in the ring's pending arithmetic; one shared ceiling well below
+/// that covers every channel.
 ///
-/// The value is `(usize::MAX >> 2) − 1`: strictly below `futures_channel`'s `MAX_BUFFER` even after
-/// the command channel's `+ 1`, derived from `usize::MAX` so it is correct on any target width
-/// (≈ 4.6×10¹⁸ on 64-bit, ≈ 1.07×10⁹ on 32-bit), and astronomically above any realistic channel depth
-/// (the defaults are in the hundreds to low thousands). It is the ceiling, not a policy cap on the
-/// operator's memory budget.
+/// The value is `(usize::MAX >> 2) − 1`, derived from `usize::MAX` so it is correct on any target
+/// width (≈ 4.6×10¹⁸ on 64-bit, ≈ 1.07×10⁹ on 32-bit) and astronomically above any realistic channel
+/// depth (the defaults are in the hundreds to low thousands). It is the ceiling, not a policy cap on
+/// the operator's memory budget.
 pub const MAX_CHANNEL_CAPACITY: usize = (usize::MAX >> 2) - 1;
 
 /// `Instant`-safe ceiling for the redial backoff durations (`redial_base`, `redial_cap`).
@@ -140,7 +138,7 @@ const fn default_max_failover_limbo_bytes() -> usize {
 ///
 /// | Knob | Runtime sink | Bound |
 /// |------|--------------|-------|
-/// | `max_inflight` | `futures_channel::mpsc::channel(max_inflight + 1)` (both drivers) | `1 ..= MAX_CHANNEL_CAPACITY − 1` (`+ 1` < channel ceiling) |
+/// | `max_inflight` | the submit budget (`flume::unbounded` command channel; budget is the bound) | `1 ..= MAX_CHANNEL_CAPACITY − 1` |
 /// | `events_cap` | `flume::bounded(events_cap)` (both drivers) | `1 ..= MAX_CHANNEL_CAPACITY` |
 /// | `recv_cap` | `flume::bounded(recv_cap)` (QUIC datagram channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
 /// | `inbound_cap` | `flume::bounded(inbound_cap)` (stream inbound channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
@@ -229,11 +227,11 @@ impl DriverConfig {
   /// The checks cover the CONCRETE hazards — a parsed value reaching a runtime primitive with a hard
   /// limit (a channel-capacity ceiling, a `Duration`/`Instant` overflow) — not arbitrary policy caps:
   ///
-  /// - `max_inflight` must be non-zero (a zero budget admits no submit ⇒ no progress) AND its `+ 1`
-  ///   command-channel size must stay below the channel ceiling: it is rejected at `usize::MAX` (the
-  ///   `+ 1` would wrap `usize`) and, more tightly, above [`MAX_CHANNEL_CAPACITY`] − 1, because
-  ///   `futures_channel::mpsc::channel` asserts the buffer is below its `MAX_BUFFER` (≈ `usize::MAX/4`)
-  ///   — a value like `usize::MAX/2` clears the wrap check yet still panics that assert at `bind`;
+  /// - `max_inflight` must be non-zero (a zero budget admits no submit ⇒ no progress) AND must stay
+  ///   below the channel ceiling: the command channel is `flume::unbounded`, so this bounds the
+  ///   submit BUDGET rather than a channel buffer, rejecting `usize::MAX` and, more tightly, any
+  ///   value above [`MAX_CHANNEL_CAPACITY`] − 1 so a pathological budget can never admit an
+  ///   astronomical pending count;
   /// - `cmd_budget` must be non-zero (a zero per-iteration drain budget stalls every submit);
   /// - `events_cap` / `recv_cap` / `inbound_cap` / `accept_cap` must each be non-zero (a
   ///   zero-capacity bounded channel can never hold its item ⇒ the producing task is wedged) AND at
@@ -256,8 +254,8 @@ impl DriverConfig {
     if self.max_inflight == usize::MAX {
       return Err(DriverConfigError::MaxInflightOverflow);
     }
-    // The command channel is sized at `max_inflight + 1`; that buffer must stay below the channel
-    // ceiling, so `max_inflight` itself is capped one below it (`futures_channel` asserts strict `<`).
+    // The command channel is `flume::unbounded`, so this caps the submit BUDGET (one below the
+    // shared ceiling), keeping a pathological budget from admitting an astronomical pending count.
     if self.max_inflight > MAX_CHANNEL_CAPACITY - 1 {
       return Err(DriverConfigError::MaxInflightAboveChannelCeiling);
     }
@@ -756,12 +754,12 @@ mod tests {
   #[cfg(feature = "serde")]
   #[test]
   fn serde_rejects_max_inflight_above_channel_ceiling() {
-    // `usize::MAX / 2` clears the `usize::MAX` overflow check yet, as `max_inflight + 1`, exceeds
-    // `futures_channel`'s `MAX_BUFFER` and would panic `bind`; the funnel rejects it at parse time.
+    // `usize::MAX / 2` clears the `usize::MAX` overflow check yet exceeds the submit-budget ceiling;
+    // the funnel rejects it at parse time.
     // (Falsify: drop the `> MAX_CHANNEL_CAPACITY - 1` check in `validate` and this parse succeeds.)
     let json = format!(r#"{{ "max_inflight": {} }}"#, usize::MAX / 2);
     assert!(serde_json::from_str::<DriverConfig>(&json).is_err());
-    // The ceiling itself is the largest accepted value (`+ 1` is still < MAX_BUFFER).
+    // One below the ceiling is the largest accepted value.
     let json = format!(r#"{{ "max_inflight": {} }}"#, MAX_CHANNEL_CAPACITY - 1);
     assert!(serde_json::from_str::<DriverConfig>(&json).is_ok());
     let json = format!(r#"{{ "max_inflight": {} }}"#, MAX_CHANNEL_CAPACITY);
@@ -952,10 +950,10 @@ mod tests {
       driver: DriverConfig,
     }
 
-    // `max_inflight` whose `+ 1` would clear `usize::MAX` yet exceed `futures_channel`'s `MAX_BUFFER`.
+    // `max_inflight` that clears the `usize::MAX` overflow check yet exceeds the submit-budget ceiling.
     let half = format!("{}", usize::MAX / 2);
     assert!(Cli::try_parse_from(["prog", "--max-inflight", &half]).is_err());
-    // Each flume-sized cap above the ceiling is likewise rejected through clap's error path.
+    // Each bounded-channel cap above the ceiling is likewise rejected through clap's error path.
     let over = format!("{}", MAX_CHANNEL_CAPACITY + 1);
     for flag in [
       "--events-cap",
