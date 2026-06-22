@@ -3254,16 +3254,19 @@ fn failover_timing_invalid_successor_no_e_prime_fails_closed() {
   // `leaseguard_commit_wait_ns` / `leaseguard_timing` is None (TIMING-INVALID). A huge election timeout
   // means the PRIOR clamped E′ (~half u64::MAX) would have compared BELOW it and (buggily) set
   // commit_wait_inflated. No ε_unc — so once E′ is correctly unavailable, the node fails closed.
-  let cfg = Config::try_new(
+  let mut cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    Duration::from_secs(10_000_000_000), // election ≫ any clamped E′
-    Duration::from_secs(1),
+    Duration::from_secs(1), // a within-bound placeholder; overwritten below
+    Duration::from_millis(100),
   )
   .unwrap()
   .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_nanos(u64::MAX)) // window overflows u64 ⇒ timing-invalid
   .with_clock_drift_bound(Duration::from_nanos(1));
+  // election ≫ any clamped E′ — an out-of-bound value the public constructors reject, injected here
+  // only to reach the runtime E′ comparison (`MAX_ELECTION_TIMEOUT` is far below a clamped E′).
+  cfg.set_election_timeout_for_test(Duration::from_secs(10_000_000_000));
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
   let mut log = VecLog::default();
   let mut stable = NoopStable::default();
@@ -4292,17 +4295,20 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
   const S: u64 = 1_700_000_000_000_000_000; // the inherited COMMITTED entry's wall stamp
   // Election timeout ~1268 years: its `as_nanos()` (≈ 4·10^19) exceeds u64::MAX (≈ 1.84·10^19), so the
   // CLAMPED u64::MAX would have compared BELOW it and (buggily) armed.
-  let cfg = Config::try_new(
+  let mut cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2, 3],
-    Duration::from_secs(40_000_000_000), // election_timeout ≫ u64::MAX nanos
-    Duration::from_secs(1),              // heartbeat (must be < election_timeout)
+    Duration::from_secs(1), // a within-bound placeholder; overwritten below
+    Duration::from_millis(100),
   )
   .unwrap()
   .with_read_only(ReadOnlyOption::LeaseGuard)
   .with_lease_duration(Duration::from_nanos(2)) // Δ = 2ns
   .with_clock_drift_bound(Duration::from_nanos(1)) // ε_drift = 1ns → inflation factor 3/2
   .with_bounded_clock_uncertainty(Duration::from_nanos(1));
+  // election_timeout ≫ u64::MAX nanos — an out-of-bound value the public constructors reject, injected
+  // here only so the CLAMPED u64::MAX inflation compares BELOW it (the buggy-arm scenario under test).
+  cfg.set_election_timeout_for_test(Duration::from_secs(40_000_000_000));
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
   let mut log = VecLog::default();
   let mut stable = NoopStable::default();

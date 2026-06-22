@@ -18,6 +18,10 @@ use std::vec::Vec;
 #[derive(
   Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "clap", value(rename_all = "snake_case"))]
 pub enum ReadOnlyOption {
   /// Confirm leadership via a heartbeat quorum before serving each read (default, always safe).
   #[default]
@@ -86,6 +90,10 @@ impl ReadOnlyOption {
 #[derive(
   Debug, Clone, Copy, PartialEq, Eq, Default, derive_more::Display, derive_more::IsVariant,
 )]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
+#[cfg_attr(feature = "clap", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "clap", value(rename_all = "snake_case"))]
 pub enum LeaseRefresh {
   /// Demand-driven only (DEFAULT): a stale read triggers one no-op at the next heartbeat. The first read
   /// after the lease ages pays one Safe round. Byte-identical to pre-feature behavior.
@@ -142,14 +150,119 @@ pub const DEFAULT_LEASE_DURATION: Option<Duration> = None;
 pub const DEFAULT_CLOCK_DRIFT_BOUND: Option<Duration> = None;
 /// Default [`Config::bounded_clock_uncertainty`]: no bounded cross-node clock-uncertainty configured.
 pub const DEFAULT_BOUNDED_CLOCK_UNCERTAINTY: Option<Duration> = None;
+/// Default [`Config::election_timeout`]: 1s (10× the heartbeat — etcd's standard ratio). Exceeds
+/// [`DEFAULT_HEARTBEAT_INTERVAL`], so the parsed-path `election_timeout > heartbeat_interval`
+/// invariant holds for a config that defaults both.
+pub const DEFAULT_ELECTION_TIMEOUT: Duration = Duration::from_secs(1);
+/// Default [`Config::heartbeat_interval`]: 100ms (etcd's standard heartbeat tick).
+pub const DEFAULT_HEARTBEAT_INTERVAL: Duration = Duration::from_millis(100);
+
+/// `Instant`-safe ceiling for [`Config::election_timeout`].
+///
+/// The per-term randomized election timeout is drawn as `election_timeout +
+/// Duration::from_millis(rng % election_timeout_ms)` — a RAW `core::time::Duration` add (its `Add`
+/// `expect`s on overflow, unlike the crate's saturating [`Instant`](crate::Instant) add), so the draw
+/// can reach just under `2 · election_timeout`. A value near `Duration::MAX` parsed from a serde/clap
+/// config therefore overflows that add and PANICS the node on its first election. Bounding
+/// `election_timeout` to this ceiling keeps `2 · election_timeout` (the draw's supremum) far below
+/// `Duration::MAX`. Because [`Config::validate`] also requires `election_timeout > heartbeat_interval`,
+/// this transitively bounds `heartbeat_interval` too.
+///
+/// Mirrors the QUIC transport's `MAX_TIMER_MILLIS` (`u32::MAX` ms ≈ 49.7 days): comfortably below any
+/// `Instant`/`Duration` overflow threshold yet far above any realistic election timeout (the default is
+/// 1 s). It is the `Instant`-safety bound, not a policy cap.
+pub const MAX_ELECTION_TIMEOUT: Duration = Duration::from_millis(u32::MAX as u64);
+
+// The default election timeout must itself satisfy the new upper bound, or a config that defaults it
+// would be rejected by `validate`.
+const _: () = assert!(DEFAULT_ELECTION_TIMEOUT.as_nanos() <= MAX_ELECTION_TIMEOUT.as_nanos());
+
+// The two defaulted timeouts must, on their own, satisfy `validate`'s
+// `election_timeout > heartbeat_interval`, so a serde/clap config that supplies neither is valid. This
+// compile-time check pins that relationship to the consts (and, the consts not being publicly
+// re-exported, keeps them referenced in the always-built path — every other `DEFAULT_*` is kept alive
+// by the constructors, but the timeouts arrive there as parameters, not as these consts).
+const _: () = assert!(DEFAULT_ELECTION_TIMEOUT.as_nanos() > DEFAULT_HEARTBEAT_INTERVAL.as_nanos());
+
+// `serde(default = "…")` needs a function PATH, not a const, so each non-`Option` value knob's
+// default is wrapped to return the single-source-of-truth `DEFAULT_*` const. The `Option<Duration>`
+// knobs use the bare `serde(default)` (`None`) instead, and the enum knobs use `serde(default)`
+// (their `#[default]` variant), so neither needs a wrapper. The clap mirror reuses the consts
+// directly via `default_value_t`. Gated on `serde` so the default build stays warning-free.
+#[cfg(feature = "serde")]
+const fn default_max_size_per_msg() -> u64 {
+  DEFAULT_MAX_SIZE_PER_MSG
+}
+#[cfg(feature = "serde")]
+const fn default_max_inflight_msgs() -> usize {
+  DEFAULT_MAX_INFLIGHT_MSGS
+}
+#[cfg(feature = "serde")]
+const fn default_max_inflight_bytes() -> u64 {
+  DEFAULT_MAX_INFLIGHT_BYTES
+}
+#[cfg(feature = "serde")]
+const fn default_snapshot_threshold() -> usize {
+  DEFAULT_SNAPSHOT_THRESHOLD
+}
+#[cfg(feature = "serde")]
+const fn default_step_down_on_removal() -> bool {
+  DEFAULT_STEP_DOWN_ON_REMOVAL
+}
+#[cfg(feature = "serde")]
+const fn default_pre_vote() -> bool {
+  DEFAULT_PRE_VOTE
+}
+#[cfg(feature = "serde")]
+const fn default_check_quorum() -> bool {
+  DEFAULT_CHECK_QUORUM
+}
+#[cfg(feature = "serde")]
+const fn default_disable_proposal_forwarding() -> bool {
+  DEFAULT_DISABLE_PROPOSAL_FORWARDING
+}
+#[cfg(feature = "serde")]
+const fn default_election_timeout() -> Duration {
+  DEFAULT_ELECTION_TIMEOUT
+}
+#[cfg(feature = "serde")]
+const fn default_heartbeat_interval() -> Duration {
+  DEFAULT_HEARTBEAT_INTERVAL
+}
 
 /// Static configuration for an [`crate::Endpoint`]. Holds the initial voter set (dynamic
 /// membership is via `ConfChange`). `Clone`, not `Copy` (it owns the voter list).
+///
+/// A config parsed from serde or clap is VALIDATED at parse time, so it can never carry a value the
+/// programmatic constructors reject (see [`Self::validate`]). A parsed config is a VOTER when
+/// `id ∈ voters` and an OBSERVER otherwise; both are accepted (the `id ∈ voters` rule is
+/// voter-only — see [`Self::validate`]). The two parse paths use separate `serde` / `clap` mirrors,
+/// so a custom `NodeId` that is `Deserialize` but not `FromStr` deserializes fine.
+///
+/// `serde` (re)serializes every knob — `id` / `voters` directly, the two `Duration` timeouts as
+/// humantime strings via `humantime-serde`, and every tuning knob — so a partial config file carrying
+/// only the required `id` / `voters` deserializes with the timeouts AND every knob at their
+/// single-source-of-truth `DEFAULT_*` values. `clap` exposes the same knobs as CLI flags + `SAILING_*`
+/// env vars.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+// The explicit `bound(deserialize = …)` is required: without it serde infers only `I: Deserialize`,
+// leaving `Config<I>: TryFrom<ConfigSerde<I>>` (which the `try_from` below needs) unsatisfied.
+// `Serialize` is a direct derive (it needs only `I: Serialize`); `Deserialize` routes through the
+// `ConfigSerde<I>` mirror so its impl carries only that mirror's parse bounds.
+#[cfg_attr(
+  feature = "serde",
+  serde(
+    try_from = "ConfigSerde<I>",
+    bound(deserialize = "I: serde::Deserialize<'de> + Clone + PartialEq")
+  )
+)]
 pub struct Config<I> {
   id: I,
   voters: Vec<I>,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   election_timeout: Duration,
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   heartbeat_interval: Duration,
   /// Maximum byte size of entries in a single `AppendEntries`. `u64::MAX` = unbounded;
   /// `0` = one entry per message.
@@ -187,6 +300,7 @@ pub struct Config<I> {
   /// The LeaseGuard lease window Δ: a leader serves a `LeaseGuard` read while its last committed
   /// entry is younger than this. Required when `read_only = LeaseGuard`; ignored otherwise.
   /// Default: `None`.
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   lease_duration: Option<Duration>,
   /// The bounded one-sided clock drift ε — the most a SINGLE node's clock may gain OR lose (in real
   /// time) while measuring a `lease_duration` interval; equivalently the rate drift is `ρ = ε/Δ`
@@ -197,6 +311,7 @@ pub struct Config<I> {
   /// wait finishes at real time `window/(1+ρ)`), so the successor commits only after the deposed
   /// leader's read-lease has expired. Needs only local clocks with bounded drift, no cross-node sync.
   /// Default: `None`.
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   clock_drift_bound: Option<Duration>,
   /// The bounded cross-node clock-UNCERTAINTY (skew). OPTIONAL: `Some(ε)` enables LeaseGuard's
   /// FAILOVER tier — the precise commit-anchor (and, later, inherited-lease reads) compares in-log
@@ -205,6 +320,7 @@ pub struct Config<I> {
   /// deposed leader's stamp lags real time by ≤ ε, and a successor's evaluation leads it by ≤ ε.
   /// `None` = the new leader simply waits out the prior lease on local clocks (safe, less available).
   /// Default: `None`.
+  #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   bounded_clock_uncertainty: Option<Duration>,
 }
 
@@ -223,6 +339,16 @@ impl<I: PartialEq> Config<I> {
       return Err(ConfigError::ElectionNotGreaterThanHeartbeat {
         election: election_timeout,
         heartbeat: heartbeat_interval,
+      });
+    }
+    // The per-term randomized timeout is a raw `Duration` add (`election_timeout + jitter`, jitter
+    // `< election_timeout`); a value near `Duration::MAX` overflows it and panics the first election.
+    // `Endpoint::new` does NOT call `validate`, so the bound must also live here, at the construction
+    // boundary, to keep `2 · election_timeout` `Instant`-safe.
+    if election_timeout > MAX_ELECTION_TIMEOUT {
+      return Err(ConfigError::ElectionTimeoutTooLarge {
+        election: election_timeout,
+        max: MAX_ELECTION_TIMEOUT,
       });
     }
     if !voters.contains(&id) {
@@ -269,6 +395,15 @@ impl<I: PartialEq> Config<I> {
       return Err(ConfigError::ElectionNotGreaterThanHeartbeat {
         election: election_timeout,
         heartbeat: heartbeat_interval,
+      });
+    }
+    // Same `Instant`-safe bound as `try_new` (see there): the per-term randomized timeout's raw
+    // `Duration` add would overflow for an `election_timeout` near `Duration::MAX`, and `Endpoint::new`
+    // never calls `validate`.
+    if election_timeout > MAX_ELECTION_TIMEOUT {
+      return Err(ConfigError::ElectionTimeoutTooLarge {
+        election: election_timeout,
+        max: MAX_ELECTION_TIMEOUT,
       });
     }
     // Intentionally do NOT check `current_voters.contains(&id)` — the joining node
@@ -330,6 +465,17 @@ impl<I> Config<I> {
   #[inline(always)]
   pub const fn election_timeout(&self) -> Duration {
     self.election_timeout
+  }
+
+  /// Test-only: overwrite `election_timeout` BYPASSING the [`MAX_ELECTION_TIMEOUT`] bound the public
+  /// constructors enforce. Some FAILOVER tests must reach a RUNTIME comparison that keys on a value
+  /// `election_timeout` can never legally hold (e.g. an inherited E′ inflation vs an election timeout
+  /// above `u64::MAX` nanos) — a deliberately unconstructible config used only to exercise that branch.
+  /// Production code never sets the field except through the bounded constructors.
+  #[cfg(test)]
+  pub(crate) fn set_election_timeout_for_test(&mut self, v: Duration) -> &mut Self {
+    self.election_timeout = v;
+    self
   }
 
   /// The leader heartbeat interval.
@@ -633,16 +779,106 @@ impl<I> Config<I> {
     self
   }
 
-  /// Validate cross-field invariants that cannot be checked at construction time.
+  /// The SINGLE validating builder both parse mirrors funnel through: direct-construct the private
+  /// fields from the already-parsed parts, then run [`Self::validate`]. Keeping the construction +
+  /// validation in one place is what stops the two mirrors (serde's `ConfigSerde`, clap's `ConfigCli`)
+  /// from drifting into duplicated — and divergent — validation logic; each one's `TryFrom` is just a
+  /// field-by-field forward to here. Returns the specific [`ConfigError`] for an invalid combination.
+  #[cfg(any(feature = "serde", feature = "clap"))]
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn from_parts_validated(
+    id: I,
+    voters: Vec<I>,
+    election_timeout: Duration,
+    heartbeat_interval: Duration,
+    max_size_per_msg: u64,
+    max_inflight_msgs: usize,
+    max_inflight_bytes: u64,
+    snapshot_threshold: usize,
+    step_down_on_removal: bool,
+    pre_vote: bool,
+    check_quorum: bool,
+    disable_proposal_forwarding: bool,
+    read_only: ReadOnlyOption,
+    lease_refresh: LeaseRefresh,
+    lease_duration: Option<Duration>,
+    clock_drift_bound: Option<Duration>,
+    bounded_clock_uncertainty: Option<Duration>,
+  ) -> Result<Self, ConfigError> {
+    let cfg = Self {
+      id,
+      voters,
+      election_timeout,
+      heartbeat_interval,
+      max_size_per_msg,
+      max_inflight_msgs,
+      max_inflight_bytes,
+      snapshot_threshold,
+      step_down_on_removal,
+      pre_vote,
+      check_quorum,
+      disable_proposal_forwarding,
+      read_only,
+      lease_refresh,
+      lease_duration,
+      clock_drift_bound,
+      bounded_clock_uncertainty,
+    };
+    cfg.validate()?;
+    Ok(cfg)
+  }
+
+  /// Validate the COMPLETE set of UNIVERSAL config invariants — the checks that must hold for ANY
+  /// config, voter or observer alike. This is the single, authoritative invariant set that the
+  /// parsed-config paths (serde `Deserialize` and clap `FromArgMatches`) route through, so a
+  /// config produced by a file/CLI/env CANNOT carry a value the engine would choke on (a `0`
+  /// `max_inflight_msgs` stalling replication, a zero `heartbeat_interval`, an `election_timeout`
+  /// that does not exceed it, or an empty voter set).
   ///
-  /// Currently enforces: `ReadOnlyOption::LeaseBased` requires `check_quorum = true`.
-  /// (Lease-based reads are only safe when CheckQuorum guarantees the election-timeout
-  /// lease is fresh; without it a stale leader could serve a read after losing quorum.)
+  /// Enforces, in order:
+  /// - non-zero `heartbeat_interval` ([`ConfigError::ZeroHeartbeat`]);
+  /// - `election_timeout > heartbeat_interval` ([`ConfigError::ElectionNotGreaterThanHeartbeat`]);
+  /// - non-zero `max_inflight_msgs` ([`ConfigError::ZeroInflight`]);
+  /// - non-empty `voters` ([`ConfigError::EmptyVoters`]);
+  /// - `ReadOnlyOption::LeaseBased` requires `check_quorum = true`
+  ///   ([`ConfigError::LeaseRequiresCheckQuorum`]) — lease-based reads are only safe when
+  ///   CheckQuorum keeps the election-timeout lease fresh; without it a stale leader could serve a
+  ///   read after losing quorum;
+  /// - the LeaseGuard timing + failover-tier invariants (the per-entry commit-wait window and the
+  ///   `bounded_clock_uncertainty` bound).
   ///
-  /// Call this after building a `Config` via the builder chain; `try_new` and
-  /// `try_new_observer` do **not** call it automatically so that callers have a chance to
-  /// set all knobs first.
+  /// This deliberately does NOT require `id ∈ voters`: that is voter-role-specific (an OBSERVER's
+  /// `id` is `∉ voters` by design — see [`Self::try_new_observer`]). A parsed config is a VOTER
+  /// when `id ∈ voters` and an OBSERVER otherwise; both must satisfy the universal invariants
+  /// above, so the `id ∈ voters` check stays in [`Self::try_new`] (the voter constructor), not here.
+  ///
+  /// `try_new` / `try_new_observer` do **not** call this automatically (so a builder chain can set
+  /// every knob first); the parsed paths DO, rejecting an invalid config at parse/deserialize time.
   pub fn validate(&self) -> Result<(), ConfigError> {
+    if self.heartbeat_interval.is_zero() {
+      return Err(ConfigError::ZeroHeartbeat);
+    }
+    if self.election_timeout <= self.heartbeat_interval {
+      return Err(ConfigError::ElectionNotGreaterThanHeartbeat {
+        election: self.election_timeout,
+        heartbeat: self.heartbeat_interval,
+      });
+    }
+    // The per-term randomized timeout is a raw `Duration` add (`election_timeout + jitter`, jitter
+    // `< election_timeout`); a value near `Duration::MAX` would overflow it and panic the first
+    // election. Bound it `Instant`-safe so `2 · election_timeout` can never overflow.
+    if self.election_timeout > MAX_ELECTION_TIMEOUT {
+      return Err(ConfigError::ElectionTimeoutTooLarge {
+        election: self.election_timeout,
+        max: MAX_ELECTION_TIMEOUT,
+      });
+    }
+    if self.max_inflight_msgs == 0 {
+      return Err(ConfigError::ZeroInflight);
+    }
+    if self.voters.is_empty() {
+      return Err(ConfigError::EmptyVoters);
+    }
     if self.read_only == ReadOnlyOption::LeaseBased && !self.check_quorum {
       return Err(ConfigError::LeaseRequiresCheckQuorum);
     }
@@ -767,5 +1003,386 @@ impl<I> Config<I> {
   }
 }
 
+// The two optional layers each get their OWN private parse mirror, because their bound requirements
+// differ and a shared mirror over-constrains one of them:
+//
+//  * `ConfigSerde<I>` (serde only) carries the serde field attrs (`default = "fn"` / `humantime_serde`
+//    / `deny_unknown_fields`) and is bounded ONLY `I: Clone + PartialEq` (+ what the `Deserialize`
+//    derive itself needs). It deserializes `id` / `voters` directly, so it needs no `FromStr`.
+//  * `ConfigCli<I>` (clap only) carries the `#[arg(...)]` attrs and is bounded
+//    `I: FromStr + Clone + Send + Sync + 'static` — the value-parser bounds clap's `derive(Args)`
+//    needs (clap parses every arg from a string, so the `id` type must be `FromStr`); `clap::Args`
+//    cannot derive on `Config<I>` itself because `value_parser!` cannot resolve a parser for an
+//    unbounded generic, and putting `I: FromStr` on `Config` would cascade that bound onto the whole
+//    engine.
+//
+// Splitting them is what keeps the serde path from inheriting clap's `FromStr` requirement — a custom
+// `NodeId` that is `Deserialize` but NOT `FromStr` deserializes fine. Both mirrors funnel through the
+// shared validating builder [`Config::from_parts_validated`] via their respective `TryFrom`.
+
+/// Serde-only parse mirror for [`Config`]. NOT part of the public API — it exists only to carry the
+/// serde per-knob deserialize defaults / humantime adapters and is always converted to a validated
+/// [`Config`] via [`TryFrom`]. Bounded only `I: Clone + PartialEq` (it deserializes `id` / `voters`
+/// directly — no `FromStr`), so a custom `NodeId` that impls `Deserialize` but not `FromStr` works.
+#[cfg(feature = "serde")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields, bound(deserialize = "I: serde::Deserialize<'de>"))]
+struct ConfigSerde<I>
+where
+  I: Clone + PartialEq,
+{
+  id: I,
+  voters: Vec<I>,
+  #[serde(default = "default_election_timeout", with = "humantime_serde")]
+  election_timeout: Duration,
+  #[serde(default = "default_heartbeat_interval", with = "humantime_serde")]
+  heartbeat_interval: Duration,
+  #[serde(default = "default_max_size_per_msg")]
+  max_size_per_msg: u64,
+  #[serde(default = "default_max_inflight_msgs")]
+  max_inflight_msgs: usize,
+  #[serde(default = "default_max_inflight_bytes")]
+  max_inflight_bytes: u64,
+  #[serde(default = "default_snapshot_threshold")]
+  snapshot_threshold: usize,
+  #[serde(default = "default_step_down_on_removal")]
+  step_down_on_removal: bool,
+  #[serde(default = "default_pre_vote")]
+  pre_vote: bool,
+  #[serde(default = "default_check_quorum")]
+  check_quorum: bool,
+  #[serde(default = "default_disable_proposal_forwarding")]
+  disable_proposal_forwarding: bool,
+  #[serde(default)]
+  read_only: ReadOnlyOption,
+  #[serde(default)]
+  lease_refresh: LeaseRefresh,
+  #[serde(default, with = "humantime_serde")]
+  lease_duration: Option<Duration>,
+  #[serde(default, with = "humantime_serde")]
+  clock_drift_bound: Option<Duration>,
+  #[serde(default, with = "humantime_serde")]
+  bounded_clock_uncertainty: Option<Duration>,
+}
+
+#[cfg(feature = "serde")]
+impl<I> TryFrom<ConfigSerde<I>> for Config<I>
+where
+  I: Clone + PartialEq,
+{
+  type Error = ConfigError;
+
+  fn try_from(c: ConfigSerde<I>) -> Result<Self, Self::Error> {
+    Self::from_parts_validated(
+      c.id,
+      c.voters,
+      c.election_timeout,
+      c.heartbeat_interval,
+      c.max_size_per_msg,
+      c.max_inflight_msgs,
+      c.max_inflight_bytes,
+      c.snapshot_threshold,
+      c.step_down_on_removal,
+      c.pre_vote,
+      c.check_quorum,
+      c.disable_proposal_forwarding,
+      c.read_only,
+      c.lease_refresh,
+      c.lease_duration,
+      c.clock_drift_bound,
+      c.bounded_clock_uncertainty,
+    )
+  }
+}
+
+/// Clap-only parse mirror for [`Config`]. NOT part of the public API — it exists only to carry the clap
+/// `Args` derive (which needs the `I: FromStr` value-parser bounds `Config` must not impose) and the
+/// per-knob `#[arg(...)]` attributes, and is always converted to a validated [`Config`] via [`TryFrom`].
+#[cfg(feature = "clap")]
+use core::str::FromStr;
+
+#[cfg(feature = "clap")]
+#[derive(clap::Args)]
+struct ConfigCli<I>
+where
+  I: FromStr + Clone + Send + Sync + 'static,
+  <I as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+{
+  #[arg(id = "config-id", long = "id", env = "SAILING_ID")]
+  id: I,
+  #[arg(
+    id = "config-voters",
+    long = "voter",
+    env = "SAILING_VOTERS",
+    value_delimiter = ','
+  )]
+  voters: Vec<I>,
+  #[arg(
+    id = "config-election-timeout",
+    long = "election-timeout",
+    env = "SAILING_ELECTION_TIMEOUT",
+    value_parser = humantime::parse_duration,
+    default_value = "1s"
+  )]
+  election_timeout: Duration,
+  #[arg(
+    id = "config-heartbeat-interval",
+    long = "heartbeat-interval",
+    env = "SAILING_HEARTBEAT_INTERVAL",
+    value_parser = humantime::parse_duration,
+    default_value = "100ms"
+  )]
+  heartbeat_interval: Duration,
+  #[arg(
+    id = "config-max-size-per-msg",
+    long = "max-size-per-msg",
+    env = "SAILING_MAX_SIZE_PER_MSG",
+    default_value_t = DEFAULT_MAX_SIZE_PER_MSG
+  )]
+  max_size_per_msg: u64,
+  #[arg(
+    id = "config-max-inflight-msgs",
+    long = "max-inflight-msgs",
+    env = "SAILING_MAX_INFLIGHT_MSGS",
+    default_value_t = DEFAULT_MAX_INFLIGHT_MSGS
+  )]
+  max_inflight_msgs: usize,
+  #[arg(
+    id = "config-max-inflight-bytes",
+    long = "max-inflight-bytes",
+    env = "SAILING_MAX_INFLIGHT_BYTES",
+    default_value_t = DEFAULT_MAX_INFLIGHT_BYTES
+  )]
+  max_inflight_bytes: u64,
+  #[arg(
+    id = "config-snapshot-threshold",
+    long = "snapshot-threshold",
+    env = "SAILING_SNAPSHOT_THRESHOLD",
+    default_value_t = DEFAULT_SNAPSHOT_THRESHOLD
+  )]
+  snapshot_threshold: usize,
+  // The bool knobs take an explicit `true` / `false` VALUE (`ArgAction::Set`) rather than the
+  // derive's default flag (`SetTrue`) action: `step_down_on_removal` DEFAULTS to `true`, which a
+  // presence-only flag could never turn off. `Set` keeps every bool settable both ways from its
+  // `DEFAULT_*` (the one deviation sailing's true-defaulting bool forces over the memberlist mirror,
+  // whose bools all default `false`).
+  #[arg(
+    id = "config-step-down-on-removal",
+    long = "step-down-on-removal",
+    env = "SAILING_STEP_DOWN_ON_REMOVAL",
+    action = clap::ArgAction::Set,
+    default_value_t = DEFAULT_STEP_DOWN_ON_REMOVAL
+  )]
+  step_down_on_removal: bool,
+  #[arg(
+    id = "config-pre-vote",
+    long = "pre-vote",
+    env = "SAILING_PRE_VOTE",
+    action = clap::ArgAction::Set,
+    default_value_t = DEFAULT_PRE_VOTE
+  )]
+  pre_vote: bool,
+  #[arg(
+    id = "config-check-quorum",
+    long = "check-quorum",
+    env = "SAILING_CHECK_QUORUM",
+    action = clap::ArgAction::Set,
+    default_value_t = DEFAULT_CHECK_QUORUM
+  )]
+  check_quorum: bool,
+  #[arg(
+    id = "config-disable-proposal-forwarding",
+    long = "disable-proposal-forwarding",
+    env = "SAILING_DISABLE_PROPOSAL_FORWARDING",
+    action = clap::ArgAction::Set,
+    default_value_t = DEFAULT_DISABLE_PROPOSAL_FORWARDING
+  )]
+  disable_proposal_forwarding: bool,
+  // The enum knobs render their default as the `ValueEnum`'s snake_case possible-value (matching
+  // `as_str()` / serde) — a literal `default_value`, not `default_value_t`, so the default does not
+  // depend on the enums' `Display` (which yields the CamelCase variant name, not the wire spelling).
+  #[arg(
+    id = "config-read-only",
+    long = "read-only",
+    env = "SAILING_READ_ONLY",
+    default_value = "safe",
+    value_enum
+  )]
+  read_only: ReadOnlyOption,
+  #[arg(
+    id = "config-lease-refresh",
+    long = "lease-refresh",
+    env = "SAILING_LEASE_REFRESH",
+    default_value = "off",
+    value_enum
+  )]
+  lease_refresh: LeaseRefresh,
+  #[arg(
+    id = "config-lease-duration",
+    long = "lease-duration",
+    env = "SAILING_LEASE_DURATION",
+    value_parser = humantime::parse_duration
+  )]
+  lease_duration: Option<Duration>,
+  #[arg(
+    id = "config-clock-drift-bound",
+    long = "clock-drift-bound",
+    env = "SAILING_CLOCK_DRIFT_BOUND",
+    value_parser = humantime::parse_duration
+  )]
+  clock_drift_bound: Option<Duration>,
+  #[arg(
+    id = "config-bounded-clock-uncertainty",
+    long = "bounded-clock-uncertainty",
+    env = "SAILING_BOUNDED_CLOCK_UNCERTAINTY",
+    value_parser = humantime::parse_duration
+  )]
+  bounded_clock_uncertainty: Option<Duration>,
+}
+
+#[cfg(feature = "clap")]
+impl<I> TryFrom<ConfigCli<I>> for Config<I>
+where
+  I: FromStr + Clone + Send + Sync + 'static + PartialEq,
+  <I as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+{
+  type Error = ConfigError;
+
+  fn try_from(c: ConfigCli<I>) -> Result<Self, Self::Error> {
+    Self::from_parts_validated(
+      c.id,
+      c.voters,
+      c.election_timeout,
+      c.heartbeat_interval,
+      c.max_size_per_msg,
+      c.max_inflight_msgs,
+      c.max_inflight_bytes,
+      c.snapshot_threshold,
+      c.step_down_on_removal,
+      c.pre_vote,
+      c.check_quorum,
+      c.disable_proposal_forwarding,
+      c.read_only,
+      c.lease_refresh,
+      c.lease_duration,
+      c.clock_drift_bound,
+      c.bounded_clock_uncertainty,
+    )
+  }
+}
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+const _: () = {
+  use clap::{ArgMatches, Args, Command, Error, FromArgMatches, parser::ValueSource};
+
+  // Map a parse-time [`ConfigError`] to a clap value-validation error so an invalid CLI/env config
+  // surfaces through clap's own error path (exit code, formatted message) rather than building an
+  // unrunnable node.
+  fn config_err(e: ConfigError) -> Error {
+    Error::raw(clap::error::ErrorKind::ValueValidation, e)
+  }
+
+  impl<I> Args for Config<I>
+  where
+    I: FromStr + Clone + Send + Sync + 'static + PartialEq,
+    <I as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+  {
+    fn augment_args(cmd: Command) -> Command {
+      ConfigCli::<I>::augment_args(cmd)
+    }
+
+    fn augment_args_for_update(cmd: Command) -> Command {
+      ConfigCli::<I>::augment_args_for_update(cmd)
+    }
+  }
+
+  impl<I> FromArgMatches for Config<I>
+  where
+    I: FromStr + Clone + Send + Sync + 'static + PartialEq,
+    <I as FromStr>::Err: std::error::Error + Send + Sync + 'static,
+  {
+    fn from_arg_matches(m: &ArgMatches) -> Result<Self, Error> {
+      // Parse the mirror, then route through the VALIDATING `TryFrom` so an invalid CLI/env config
+      // is rejected at parse time, not silently built.
+      let cli = ConfigCli::<I>::from_arg_matches(m)?;
+      Config::try_from(cli).map_err(config_err)
+    }
+
+    fn update_from_arg_matches(&mut self, m: &ArgMatches) -> Result<(), Error> {
+      // TRANSACTIONAL update: apply every override to a `candidate` CLONE, validate the candidate,
+      // and commit it back to `self` only on success. A rejected update (e.g. `--max-inflight-msgs 0`
+      // or `--heartbeat-interval 0s`) leaves `self` byte-for-byte unchanged, so a caller that catches
+      // the clap error and keeps its config can never end up holding a half-applied invalid `Config`.
+      let mut candidate = self.clone();
+      // Apply ONLY operator-supplied overrides — args whose value came from the command line or an
+      // env var, not a clap default. A bare derived update treats every `default_value` arg as
+      // present and would reset unset fields back to their clap defaults.
+      macro_rules! take {
+        ($id:literal, $field:ident, $ty:ty) => {
+          if matches!(
+            m.value_source($id),
+            Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
+          ) {
+            if let Some(v) = m.get_one::<$ty>($id) {
+              candidate.$field = v.clone();
+            }
+          }
+        };
+      }
+      macro_rules! take_opt {
+        ($id:literal, $field:ident, $ty:ty) => {
+          if matches!(
+            m.value_source($id),
+            Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
+          ) {
+            candidate.$field = m.get_one::<$ty>($id).cloned();
+          }
+        };
+      }
+      macro_rules! take_vec {
+        ($id:literal, $field:ident, $ty:ty) => {
+          if matches!(
+            m.value_source($id),
+            Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
+          ) {
+            if let Some(vs) = m.get_many::<$ty>($id) {
+              candidate.$field = vs.cloned().collect();
+            }
+          }
+        };
+      }
+      take!("config-id", id, I);
+      take_vec!("config-voters", voters, I);
+      take!("config-election-timeout", election_timeout, Duration);
+      take!("config-heartbeat-interval", heartbeat_interval, Duration);
+      take!("config-max-size-per-msg", max_size_per_msg, u64);
+      take!("config-max-inflight-msgs", max_inflight_msgs, usize);
+      take!("config-max-inflight-bytes", max_inflight_bytes, u64);
+      take!("config-snapshot-threshold", snapshot_threshold, usize);
+      take!("config-step-down-on-removal", step_down_on_removal, bool);
+      take!("config-pre-vote", pre_vote, bool);
+      take!("config-check-quorum", check_quorum, bool);
+      take!(
+        "config-disable-proposal-forwarding",
+        disable_proposal_forwarding,
+        bool
+      );
+      take!("config-read-only", read_only, ReadOnlyOption);
+      take!("config-lease-refresh", lease_refresh, LeaseRefresh);
+      take_opt!("config-lease-duration", lease_duration, Duration);
+      take_opt!("config-clock-drift-bound", clock_drift_bound, Duration);
+      take_opt!(
+        "config-bounded-clock-uncertainty",
+        bounded_clock_uncertainty,
+        Duration
+      );
+      // Validate before committing, so a rejected update leaves `self` untouched (see above).
+      candidate.validate().map_err(config_err)?;
+      *self = candidate;
+      Ok(())
+    }
+  }
+};
 #[cfg(test)]
 mod tests;
