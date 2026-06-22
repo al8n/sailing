@@ -90,14 +90,32 @@ const CONNECTION_RECEIVE_WINDOW: u64 = 16 * 1024 * 1024;
 /// cannot pin the entire connection window at once.
 const STREAM_RECEIVE_WINDOW: u64 = 8 * 1024 * 1024;
 
-/// The largest value a QUIC `VarInt` can carry (`2^62 - 1`). The tuning setters clamp to this so an
-/// embedder-supplied window/timeout can never make the `VarInt` conversions in
+/// The largest value a QUIC `VarInt` can carry (`2^62 - 1`). The byte-WINDOW tuning setters clamp to
+/// this so an embedder-supplied window can never make the `VarInt` conversions in
 /// [`QuicOptions::build_transport`] fail at construction time.
 const MAX_VARINT_U64: u64 = (1 << 62) - 1;
 
-/// Clamp an embedder-supplied tuning value into `1..=MAX_VARINT_U64`: never zero (a zero timeout or
-/// window is a wedge, not a tuning), never past the QUIC `VarInt` range.
-const fn clamp_tuning(v: u64) -> u64 {
+/// Upper bound for the TIMER tuning knobs (idle timeout, initial RTT, keep-alive), chosen so the
+/// resolved `Duration` is `std::time::Instant`-safe. The byte-window knobs are NOT durations and
+/// stay at the `VarInt` clamp; only the timers reach an `Instant`.
+///
+/// quinn turns each timer into a `Duration` it later ADDS to a `std::time::Instant` (the keep-alive,
+/// idle, and PTO deadlines), and `Instant + Duration` PANICS on overflow. `VarInt`'s `2^62-1`-ms
+/// ceiling (~1.5×10^17 ms ≈ 1.5×10^23 ns) is FAR past the `u64`-nanosecond `Instant` overflow
+/// threshold (~584 years ≈ 1.8×10^19 ns), so a parsed `u64::MAX` that clears the `VarInt` clamp
+/// would still panic quinn at runtime — an operator config typo taking the node down after a clean
+/// startup. `u32::MAX` ms (~49.7 days ≈ 4.29×10^15 ns) is the bound here: comfortably below the
+/// `Instant` overflow threshold (so `Instant + Duration` of this bound cannot overflow), yet far
+/// above any realistic QUIC idle / keep-alive / RTT for any deployment.
+const MAX_TIMER_MILLIS: u64 = u32::MAX as u64;
+
+// The timer bound is strictly tighter than the `VarInt` window ceiling, so an idle timeout clamped
+// to it always converts to a quinn `IdleTimeout` (a `VarInt`) AND is `Instant`-safe.
+const _: () = assert!(MAX_TIMER_MILLIS < MAX_VARINT_U64);
+
+/// Clamp an embedder-supplied WINDOW value into `1..=MAX_VARINT_U64`: never zero (a zero window is a
+/// wedge, not a tuning), never past the QUIC `VarInt` range.
+const fn clamp_window(v: u64) -> u64 {
   if v == 0 {
     1
   } else if v > MAX_VARINT_U64 {
@@ -105,6 +123,52 @@ const fn clamp_tuning(v: u64) -> u64 {
   } else {
     v
   }
+}
+
+/// Clamp an embedder-supplied TIMER value into `1..=MAX_TIMER_MILLIS`: never zero (a zero timeout is
+/// a wedge, not a tuning), never past the `Instant`-safe timer bound (see `MAX_TIMER_MILLIS` for
+/// why the bound is well below the `VarInt` ceiling).
+const fn clamp_timer(v: u64) -> u64 {
+  if v == 0 {
+    1
+  } else if v > MAX_TIMER_MILLIS {
+    MAX_TIMER_MILLIS
+  } else {
+    v
+  }
+}
+
+/// Clamp an embedder-supplied keep-alive override into `0..=MAX_TIMER_MILLIS`: `0` keeps its
+/// "keep-alive off" meaning, any positive value is clamped to the `Instant`-safe timer bound. Unlike
+/// the other timers this admits `0` (it is the documented disable, not a wedge).
+const fn clamp_keep_alive(v: u64) -> u64 {
+  if v > MAX_TIMER_MILLIS {
+    MAX_TIMER_MILLIS
+  } else {
+    v
+  }
+}
+
+// `serde(default = "…")` needs a function PATH (the pinned consts above are private, so they cannot
+// be named in an `#[arg(default_value_t = …)]` from another module either — but they ARE in scope
+// here, which is all the clap mirror needs). Each value knob's serde default is wrapped to return
+// its single-source-of-truth const; the `Option<u64>` keep-alive uses bare `serde(default)` (`None`)
+// and has no clap default. Gated on `serde` so the default build stays warning-free.
+#[cfg(feature = "serde")]
+const fn default_idle_timeout_millis() -> u64 {
+  IDLE_TIMEOUT_MILLIS
+}
+#[cfg(feature = "serde")]
+const fn default_initial_rtt_millis() -> u64 {
+  INITIAL_RTT_MILLIS
+}
+#[cfg(feature = "serde")]
+const fn default_connection_receive_window() -> u64 {
+  CONNECTION_RECEIVE_WINDOW
+}
+#[cfg(feature = "serde")]
+const fn default_stream_receive_window() -> u64 {
+  STREAM_RECEIVE_WINDOW
 }
 
 /// Embedder-tunable timer and flow-control values for the QUIC `TransportConfig`, with `Default` =
@@ -116,9 +180,22 @@ const fn clamp_tuning(v: u64) -> u64 {
 /// sizes. The security-relevant construction (cluster-private roots, mandatory mTLS, TLS 1.3,
 /// ALPN) lives exclusively inside [`ClusterTls::build`] and no tuning value can reach it.
 ///
-/// Setters clamp to `1..=2^62-1` (the QUIC `VarInt` range) so no embedder value can wedge the
-/// transport with a zero timeout/window or fail the `VarInt` conversions at construction.
+/// Setters clamp every value so no embedder input can wedge or crash the transport. The byte WINDOW
+/// knobs clamp to `1..=2^62-1` (the QUIC `VarInt` range), so the `VarInt` conversions at
+/// construction cannot fail. The TIMER knobs (idle timeout, initial RTT, keep-alive) clamp instead
+/// to the tighter `Instant`-safe `MAX_TIMER_MILLIS` bound: quinn adds each as a `Duration` to a
+/// `std::time::Instant`, and a value merely within `VarInt` range (e.g. a parsed `u64::MAX`) would
+/// overflow that addition and PANIC quinn at runtime. A zero timeout/window clamps up to the `1`-ms
+/// minimum (an explicit `0` keep-alive keeps its "off" meaning).
+///
+/// `serde`/`clap` (optional) parse this through the SAME clamping setters: `Deserialize` and the
+/// CLI/env path both route a raw value map through a private mirror and into
+/// [`QuicTuning::new`]`.with_*(…)`, so an out-of-range deserialized/parsed value is CLAMPED exactly
+/// as a programmatic builder would — never accepted raw. `Serialize` emits the RESOLVED fields
+/// (`keep_alive_interval_millis` is the override `Option`, not the derived idle/3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(from = "QuicTuningParts"))]
 pub struct QuicTuning {
   /// `max_idle_timeout`, milliseconds. Default [`IDLE_TIMEOUT_MILLIS`].
   idle_timeout_millis: u64,
@@ -182,49 +259,51 @@ impl QuicTuning {
     self.stream_receive_window
   }
 
-  /// Override the idle timeout (milliseconds; clamped to `1..=2^62-1`). Must stay ABOVE the
-  /// election timeout, or healthy links idle out between elections; with the default (derived)
-  /// keep-alive the idle/3 ping interval scales along with it.
+  /// Override the idle timeout (milliseconds; clamped to `1..=MAX_TIMER_MILLIS`, the
+  /// `Instant`-safe timer bound). Must stay ABOVE the election timeout, or healthy links idle out
+  /// between elections; with the default (derived) keep-alive the idle/3 ping interval scales
+  /// along with it.
   #[must_use]
   pub const fn with_idle_timeout_millis(mut self, millis: u64) -> Self {
-    self.idle_timeout_millis = clamp_tuning(millis);
+    self.idle_timeout_millis = clamp_timer(millis);
     self
   }
 
-  /// Override the keep-alive interval (milliseconds; `0` disables keep-alive). Without an override
-  /// the interval is derived as idle/3. Disabling keep-alive on a production mesh is a liveness
-  /// hazard: the zero-traffic follower↔follower edges then idle out between elections (see
+  /// Override the keep-alive interval (milliseconds; `0` disables keep-alive, any positive value is
+  /// clamped to `MAX_TIMER_MILLIS`, the `Instant`-safe timer bound). Without an override the
+  /// interval is derived as idle/3. Disabling keep-alive on a production mesh is a liveness hazard:
+  /// the zero-traffic follower↔follower edges then idle out between elections (see
   /// `IDLE_TIMEOUT_MILLIS`).
   #[must_use]
   pub const fn with_keep_alive_interval_millis(mut self, millis: u64) -> Self {
-    self.keep_alive_interval_millis = Some(millis);
+    self.keep_alive_interval_millis = Some(clamp_keep_alive(millis));
     self
   }
 
-  /// Override the initial RTT estimate (milliseconds; clamped to `1..=2^62-1`). Keep it at or
-  /// above the real inter-node RTT: an estimate far below it provokes spurious handshake
-  /// retransmits, while the election timeout must in turn stay above the resulting ~3×RTT initial
-  /// probe timeout.
+  /// Override the initial RTT estimate (milliseconds; clamped to `1..=MAX_TIMER_MILLIS`, the
+  /// `Instant`-safe timer bound). Keep it at or above the real inter-node RTT: an estimate far
+  /// below it provokes spurious handshake retransmits, while the election timeout must in turn stay
+  /// above the resulting ~3×RTT initial probe timeout.
   #[must_use]
   pub const fn with_initial_rtt_millis(mut self, millis: u64) -> Self {
-    self.initial_rtt_millis = clamp_tuning(millis);
+    self.initial_rtt_millis = clamp_timer(millis);
     self
   }
 
-  /// Override the connection-level receive window (bytes; clamped to `1..=2^62-1`). A window below
-  /// the 64 MiB max frame only throttles a snapshot install (credit regrants as the reader
-  /// drains); it cannot deadlock it.
+  /// Override the connection-level receive window (bytes; clamped to `1..=2^62-1`, the QUIC
+  /// `VarInt` range). A window below the 64 MiB max frame only throttles a snapshot install (credit
+  /// regrants as the reader drains); it cannot deadlock it.
   #[must_use]
   pub const fn with_connection_receive_window(mut self, bytes: u64) -> Self {
-    self.connection_receive_window = clamp_tuning(bytes);
+    self.connection_receive_window = clamp_window(bytes);
     self
   }
 
-  /// Override the per-stream receive window (bytes; clamped to `1..=2^62-1`). Keep it at or below
-  /// the connection window.
+  /// Override the per-stream receive window (bytes; clamped to `1..=2^62-1`, the QUIC `VarInt`
+  /// range). Keep it at or below the connection window.
   #[must_use]
   pub const fn with_stream_receive_window(mut self, bytes: u64) -> Self {
-    self.stream_receive_window = clamp_tuning(bytes);
+    self.stream_receive_window = clamp_window(bytes);
     self
   }
 }
@@ -235,13 +314,188 @@ impl Default for QuicTuning {
   }
 }
 
+/// Raw parse mirror for [`QuicTuning`]. NOT part of the public API — it carries the serde per-knob
+/// deserialize defaults and the clap `#[arg(...)]` attributes, and is ALWAYS converted to a
+/// [`QuicTuning`] via the clamping [`From`] (see below). Because `QuicTuning` is non-generic, ONE
+/// shared mirror serves both serde and clap (no `FromStr` split — that was only forced by `Config`'s
+/// generic `I`). The fields are the raw wire values; clamping happens in the conversion, so the
+/// mirror itself holds whatever was supplied.
+#[cfg(any(feature = "serde", feature = "clap"))]
+#[cfg_attr(feature = "serde", derive(serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+#[cfg_attr(feature = "clap", derive(clap::Args))]
+struct QuicTuningParts {
+  #[cfg_attr(feature = "serde", serde(default = "default_idle_timeout_millis"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      id = "quic-idle-timeout-millis",
+      long = "quic-idle-timeout-millis",
+      env = "SAILING_QUIC_IDLE_TIMEOUT_MILLIS",
+      default_value_t = IDLE_TIMEOUT_MILLIS
+    )
+  )]
+  idle_timeout_millis: u64,
+  // `None` (the default) derives idle/3; an explicit value (incl. `0` = off) overrides it. Bare
+  // `serde(default)` → `None`; no clap default, so an unset flag leaves the derivation in place.
+  #[cfg_attr(feature = "serde", serde(default))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      id = "quic-keep-alive-interval-millis",
+      long = "quic-keep-alive-interval-millis",
+      env = "SAILING_QUIC_KEEP_ALIVE_INTERVAL_MILLIS"
+    )
+  )]
+  keep_alive_interval_millis: Option<u64>,
+  #[cfg_attr(feature = "serde", serde(default = "default_initial_rtt_millis"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      id = "quic-initial-rtt-millis",
+      long = "quic-initial-rtt-millis",
+      env = "SAILING_QUIC_INITIAL_RTT_MILLIS",
+      default_value_t = INITIAL_RTT_MILLIS
+    )
+  )]
+  initial_rtt_millis: u64,
+  #[cfg_attr(
+    feature = "serde",
+    serde(default = "default_connection_receive_window")
+  )]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      id = "quic-connection-receive-window",
+      long = "quic-connection-receive-window",
+      env = "SAILING_QUIC_CONNECTION_RECEIVE_WINDOW",
+      default_value_t = CONNECTION_RECEIVE_WINDOW
+    )
+  )]
+  connection_receive_window: u64,
+  #[cfg_attr(feature = "serde", serde(default = "default_stream_receive_window"))]
+  #[cfg_attr(
+    feature = "clap",
+    arg(
+      id = "quic-stream-receive-window",
+      long = "quic-stream-receive-window",
+      env = "SAILING_QUIC_STREAM_RECEIVE_WINDOW",
+      default_value_t = STREAM_RECEIVE_WINDOW
+    )
+  )]
+  stream_receive_window: u64,
+}
+
+// The CLAMPING conversion both parse paths funnel through: rebuild from `QuicTuning::new()` and run
+// every raw value back through the `with_*` setters, so a deserialized/parsed value is clamped
+// EXACTLY as a programmatic builder would — windows to the `VarInt` range, timers to the
+// `Instant`-safe `MAX_TIMER_MILLIS` bound. This is what makes the conversion INFALLIBLE — the
+// setters never reject — so `QuicTuning` needs only `From`, not a validating `TryFrom`.
+#[cfg(any(feature = "serde", feature = "clap"))]
+impl From<QuicTuningParts> for QuicTuning {
+  fn from(p: QuicTuningParts) -> Self {
+    let mut t = Self::new()
+      .with_idle_timeout_millis(p.idle_timeout_millis)
+      .with_initial_rtt_millis(p.initial_rtt_millis)
+      .with_connection_receive_window(p.connection_receive_window)
+      .with_stream_receive_window(p.stream_receive_window);
+    // The keep-alive is an `Option` override: a present value (incl. `0` = off) replaces the idle/3
+    // derivation, an absent one leaves it. The setter clamps a positive override to the timer bound.
+    if let Some(ms) = p.keep_alive_interval_millis {
+      t = t.with_keep_alive_interval_millis(ms);
+    }
+    t
+  }
+}
+
+// Apply a clap UPDATE to a [`QuicTuning`] preserving every un-flagged field. Seed a parts mirror
+// from the CURRENT resolved fields and overwrite a field ONLY when its arg's value came from the
+// command line or an env var — NOT from a clap default. A bare derived `QuicTuningParts` update
+// treats every `default_value_t` arg as present and would reset the un-flagged knobs back to their
+// pinned defaults (silently shrinking a WAN/large-window tuning on a partial reload); the
+// `value_source` gate is exactly what stops that. The seeded parts then go through the clamping
+// `From` so an operator-supplied out-of-range value is clamped just as a programmatic builder would.
+// Shared with [`QuicConfigOptions`]'s hand-written update, which flattens this type.
+#[cfg(feature = "clap")]
+pub(super) fn update_quic_tuning(tuning: &mut QuicTuning, m: &clap::ArgMatches) {
+  use clap::parser::ValueSource;
+
+  let mut parts = QuicTuningParts {
+    idle_timeout_millis: tuning.idle_timeout_millis,
+    keep_alive_interval_millis: tuning.keep_alive_interval_millis,
+    initial_rtt_millis: tuning.initial_rtt_millis,
+    connection_receive_window: tuning.connection_receive_window,
+    stream_receive_window: tuning.stream_receive_window,
+  };
+  macro_rules! take {
+    ($id:literal, $field:ident, $ty:ty) => {
+      if matches!(
+        m.value_source($id),
+        Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
+      ) {
+        if let Some(v) = m.get_one::<$ty>($id) {
+          parts.$field = v.clone();
+        }
+      }
+    };
+  }
+  take!("quic-idle-timeout-millis", idle_timeout_millis, u64);
+  take!("quic-initial-rtt-millis", initial_rtt_millis, u64);
+  take!(
+    "quic-connection-receive-window",
+    connection_receive_window,
+    u64
+  );
+  take!("quic-stream-receive-window", stream_receive_window, u64);
+  // `keep_alive_interval_millis` is an `Option<u64>` override (a present value, incl. `0`, replaces
+  // the idle/3 derivation; absent leaves it). An operator-supplied flag sets the `Some`; otherwise
+  // the seeded value (the current override state) is preserved.
+  if matches!(
+    m.value_source("quic-keep-alive-interval-millis"),
+    Some(ValueSource::CommandLine) | Some(ValueSource::EnvVariable)
+  ) {
+    parts.keep_alive_interval_millis = m.get_one::<u64>("quic-keep-alive-interval-millis").copied();
+  }
+  *tuning = parts.into();
+}
+
+#[cfg(feature = "clap")]
+#[cfg_attr(docsrs, doc(cfg(feature = "clap")))]
+const _: () = {
+  use clap::{ArgMatches, Args, Command, Error, FromArgMatches};
+
+  // `clap::Args`/`FromArgMatches` delegate to the `QuicTuningParts` mirror, then run the parsed
+  // parts through the clamping `From` — mirroring `Config`'s mirror delegation. There is no
+  // validating step (the clamp is infallible), so unlike `Config` the conversion cannot error.
+  impl Args for QuicTuning {
+    fn augment_args(cmd: Command) -> Command {
+      QuicTuningParts::augment_args(cmd)
+    }
+
+    fn augment_args_for_update(cmd: Command) -> Command {
+      QuicTuningParts::augment_args_for_update(cmd)
+    }
+  }
+
+  impl FromArgMatches for QuicTuning {
+    fn from_arg_matches(m: &ArgMatches) -> Result<Self, Error> {
+      QuicTuningParts::from_arg_matches(m).map(Into::into)
+    }
+
+    fn update_from_arg_matches(&mut self, m: &ArgMatches) -> Result<(), Error> {
+      update_quic_tuning(self, m);
+      Ok(())
+    }
+  }
+};
+
 /// Default cap on the number of LIVE connections the bridge holds at once (dialed + accepted). The
 /// network is untrusted: an inbound flood of foreign-CA / no-cert Initials would otherwise each
 /// allocate a `Connection` before identity validation could reject it. At the cap the bridge
 /// statelessly refuses further inbound attempts instead of allocating. The coordinator RAISES the
 /// effective cap to [`mesh_connection_floor`] of the tracked peer count at construction, so a
 /// default-cap node on a large cluster still admits its whole steady-state mesh.
-const DEFAULT_MAX_CONNECTIONS: usize = 64;
+pub(crate) const DEFAULT_MAX_CONNECTIONS: usize = 64;
 
 /// A small constant floor on the connection cap, so even a 1- or 2-node cluster (whose mutual-dial
 /// mesh is tiny) keeps a little accept/reconnect headroom.
@@ -369,7 +623,7 @@ impl QuicOptions {
   fn build_transport(tuning: &QuicTuning) -> Arc<TransportConfig> {
     let mut tc = TransportConfig::default();
     let idle = IdleTimeout::try_from(Duration::from_millis(tuning.idle_timeout_millis()))
-      .expect("idle timeout within VarInt range (clamped by the tuning setter)");
+      .expect("idle timeout within the Instant-safe timer bound (clamped by the tuning setter)");
     tc.max_idle_timeout(Some(idle));
     // Keep-alive pings hold the zero-traffic follower↔follower mesh edges under the idle timeout
     // (see `keep_alive_interval_millis`); a resolved 0 means keep-alive off.
@@ -462,9 +716,29 @@ impl ClusterTls {
   /// # Panics
   ///
   /// Panics if the supplied roots/chain/key are not a valid cluster-CA bundle (an empty root
-  /// store, a key that does not match the leaf, TLS 1.3 unsupported by the linked provider) —
-  /// construction-time configuration errors, not runtime conditions.
+  /// store, a key that does not match the leaf, TLS 1.3 unsupported by the linked provider). This
+  /// is the back-compat panic-on-misconfig surface; [`Self::try_build`] returns those same
+  /// failures as a recoverable [`ClusterTlsError`] instead (preferred for any path that parses the
+  /// bundle from operator-supplied files, where a mismatched cert/key is an ordinary
+  /// cert-rotation mistake, not a programming error).
   pub fn build(self) -> QuicOptions {
+    self
+      .try_build()
+      .expect("ClusterTls::build: invalid cluster CA bundle")
+  }
+
+  /// Consume the builder and produce a [`QuicOptions`] with both a server config (mandatory client
+  /// auth) and a client config (mTLS), returning a typed [`ClusterTlsError`] instead of panicking
+  /// when the bundle is invalid.
+  ///
+  /// Every fallible assembly step is mapped to a recoverable error: building the cluster-CA
+  /// certificate verifiers ([`ClusterTlsError::Verifier`]), the rustls config assembly — selecting
+  /// TLS 1.3 and accepting the leaf cert/key pair, where a **mismatched cert and key** surfaces
+  /// ([`ClusterTlsError::Rustls`]), and the quinn TLS-config conversion, which fails when the
+  /// provider offers no TLS 1.3 cipher suite ([`ClusterTlsError::Quic`]). A mismatched cert/key, an
+  /// invalid leaf, or a no-TLS-1.3 provider are ordinary cert-rotation / configuration mistakes,
+  /// so they are recoverable here rather than a process panic.
+  pub fn try_build(self) -> Result<QuicOptions, ClusterTlsError> {
     use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
     use rustls::{client::WebPkiServerVerifier, server::WebPkiClientVerifier};
 
@@ -473,44 +747,61 @@ impl ClusterTls {
 
     // Server: mandatory client-cert auth via the cluster CA.
     let client_verifier =
-      WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone())
-        .build()
-        .expect("WebPkiClientVerifier with valid cluster roots");
+      WebPkiClientVerifier::builder_with_provider(roots.clone(), provider.clone()).build()?;
     let mut rustls_server = rustls::ServerConfig::builder_with_provider(provider.clone())
-      .with_protocol_versions(&[&rustls::version::TLS13])
-      .expect("TLS 1.3 is supported by the active provider")
+      .with_protocol_versions(&[&rustls::version::TLS13])?
       .with_client_cert_verifier(client_verifier)
-      .with_single_cert(self.chain.clone(), self.key.clone_key())
-      .expect("valid cluster cert and key");
+      .with_single_cert(self.chain.clone(), self.key.clone_key())?;
     rustls_server.alpn_protocols = vec![ALPN.to_vec()];
-    let qsc = QuicServerConfig::try_from(Arc::new(rustls_server))
-      .expect("QuicServerConfig from cluster-CA rustls ServerConfig");
+    let qsc = QuicServerConfig::try_from(Arc::new(rustls_server))?;
     let server = ServerConfig::with_crypto(Arc::new(qsc));
 
     // Client: verify the server against the cluster CA; present this node's cert.
-    let server_verifier = WebPkiServerVerifier::builder_with_provider(roots, provider.clone())
-      .build()
-      .expect("WebPkiServerVerifier with valid cluster roots");
+    let server_verifier =
+      WebPkiServerVerifier::builder_with_provider(roots, provider.clone()).build()?;
     let mut rustls_client = rustls::ClientConfig::builder_with_provider(provider)
-      .with_protocol_versions(&[&rustls::version::TLS13])
-      .expect("TLS 1.3 is supported by the active provider")
+      .with_protocol_versions(&[&rustls::version::TLS13])?
       .dangerous()
       .with_custom_certificate_verifier(server_verifier)
-      .with_client_auth_cert(self.chain, self.key)
-      .expect("valid cluster cert and key for client auth");
+      .with_client_auth_cert(self.chain, self.key)?;
     rustls_client.alpn_protocols = vec![ALPN.to_vec()];
-    let qcc = QuicClientConfig::try_from(Arc::new(rustls_client))
-      .expect("QuicClientConfig from cluster-CA rustls ClientConfig");
+    let qcc = QuicClientConfig::try_from(Arc::new(rustls_client))?;
     let client = ClientConfig::new(Arc::new(qcc));
 
-    QuicOptions::new_inner(
+    Ok(QuicOptions::new_inner(
       EndpointConfig::default(),
       Some(client),
       Some(server),
       self.tuning,
       true,
-    )
+    ))
   }
+}
+
+/// A failure assembling the mandatory-mTLS [`QuicOptions`] in [`ClusterTls::try_build`] from an
+/// invalid cluster-CA bundle.
+///
+/// These are construction-time configuration mistakes — a mismatched cert/key, an invalid leaf, an
+/// empty root store, a provider without TLS 1.3 — that [`ClusterTls::build`] turns into a panic but
+/// [`ClusterTls::try_build`] surfaces here so a caller parsing the bundle from operator-supplied
+/// files can recover instead of crashing the process.
+#[non_exhaustive]
+#[derive(Debug, thiserror::Error)]
+pub enum ClusterTlsError {
+  /// Building a cluster-CA certificate verifier failed (e.g. an empty root store — no trust
+  /// anchors). Covers both the server-side client verifier and the client-side server verifier
+  /// (rustls uses one `VerifierBuilderError` type for both).
+  #[error("failed to build the cluster-CA certificate verifier: {0}")]
+  Verifier(#[from] rustls::server::VerifierBuilderError),
+  /// Assembling the rustls TLS 1.3 config failed: the provider offers no TLS 1.3 usable cipher
+  /// suite, or — the common cert-rotation mistake — the supplied leaf certificate and private key
+  /// do not match (a bad/mismatched cert/key pair).
+  #[error("invalid cluster TLS configuration (cert/key mismatch or TLS 1.3 unsupported): {0}")]
+  Rustls(#[from] rustls::Error),
+  /// Converting the assembled rustls config into a quinn QUIC crypto config failed because the
+  /// negotiated TLS configuration exposes no initial (TLS 1.3) cipher suite for QUIC.
+  #[error("cluster TLS configuration is not usable for QUIC (no TLS 1.3 cipher suite): {0}")]
+  Quic(#[from] quinn_proto::crypto::rustls::NoInitialCipherSuite),
 }
 
 #[cfg(test)]
@@ -543,6 +834,11 @@ pub(crate) mod tests {
         key,
       );
       Self { ca_cert, issuer }
+    }
+
+    /// The CA certificate in PEM form (for the from-files config layer's tests).
+    pub(crate) fn ca_cert_pem(&self) -> std::string::String {
+      self.ca_cert.pem()
     }
 
     /// Build a `RootCertStore` containing the CA certificate.
@@ -599,6 +895,56 @@ pub(crate) mod tests {
   }
 
   #[test]
+  fn try_build_succeeds_on_a_valid_bundle() {
+    let ca = TestClusterCa::generate();
+    let opts = ca
+      .cluster_tls("node-01.00000000000000000000000000000000.sailing")
+      .try_build()
+      .expect("a valid cluster bundle builds without error");
+    assert!(opts.requires_client_auth());
+    assert!(opts.client_config().is_some());
+    assert!(opts.server_config().is_some());
+  }
+
+  #[test]
+  fn try_build_rejects_a_mismatched_cert_and_key() {
+    // Pair leaf A's certificate with leaf B's private key: a valid-PEM-but-mismatched bundle.
+    // `try_build` must return the typed error (`Rustls`, from rustls' cert/key acceptance), not
+    // panic the way `build` does.
+    let ca = TestClusterCa::generate();
+    let leaf_a = ca.issue_node("node-0a.00000000000000000000000000000000.sailing");
+    let leaf_b = ca.issue_node("node-0b.00000000000000000000000000000000.sailing");
+    let cluster = ClusterTls::new(
+      ca.roots(),
+      std::vec![CertificateDer::from(leaf_a.cert.der().to_vec())],
+      PrivateKeyDer::try_from(leaf_b.key.serialize_der()).expect("leaf B key DER"),
+    );
+    match cluster.try_build() {
+      Err(ClusterTlsError::Rustls(_)) => {}
+      Err(e) => panic!("a mismatched cert/key must be ClusterTlsError::Rustls, got {e:?}"),
+      Ok(_) => panic!("a mismatched cert/key must not build successfully"),
+    }
+  }
+
+  #[test]
+  fn try_build_rejects_an_empty_root_store() {
+    // An empty `RootCertStore` has no trust anchors, so the verifier builder fails — surfaced as
+    // the typed `Verifier` error rather than a panic.
+    let ca = TestClusterCa::generate();
+    let leaf = ca.issue_node("node-01.00000000000000000000000000000000.sailing");
+    let cluster = ClusterTls::new(
+      rustls::RootCertStore::empty(),
+      std::vec![CertificateDer::from(leaf.cert.der().to_vec())],
+      PrivateKeyDer::try_from(leaf.key.serialize_der()).expect("leaf key DER"),
+    );
+    match cluster.try_build() {
+      Err(ClusterTlsError::Verifier(_)) => {}
+      Err(e) => panic!("an empty root store must be ClusterTlsError::Verifier, got {e:?}"),
+      Ok(_) => panic!("an empty root store must not build successfully"),
+    }
+  }
+
+  #[test]
   fn tuning_clamps_and_derives() {
     let t = QuicTuning::new();
     assert_eq!(t.idle_timeout_millis(), IDLE_TIMEOUT_MILLIS);
@@ -620,9 +966,27 @@ pub(crate) mod tests {
     assert_eq!(t.connection_receive_window(), 1);
     assert_eq!(t.stream_receive_window(), 1);
 
-    // Past the VarInt range clamps to 2^62-1 so build_transport's conversions cannot fail.
+    // A byte WINDOW past the VarInt range clamps to 2^62-1 so build_transport's conversions cannot
+    // fail.
     let t = QuicTuning::new().with_connection_receive_window(u64::MAX);
     assert_eq!(t.connection_receive_window(), MAX_VARINT_U64);
+
+    // A TIMER past the Instant-safe bound clamps to MAX_TIMER_MILLIS (NOT the larger VarInt ceiling)
+    // so quinn never adds an overflowing `Duration` to a `std::time::Instant`. A raw `u64::MAX` from
+    // a config typo is the case that would otherwise panic quinn at runtime.
+    let t = QuicTuning::new()
+      .with_idle_timeout_millis(u64::MAX)
+      .with_initial_rtt_millis(u64::MAX)
+      .with_keep_alive_interval_millis(u64::MAX);
+    assert_eq!(t.idle_timeout_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(t.initial_rtt_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(
+      t.keep_alive_interval_millis(),
+      MAX_TIMER_MILLIS,
+      "a positive keep-alive override clamps to the timer bound, not u64::MAX"
+    );
+    // The clamped timers are FINITE durations build_transport can hand quinn without overflow.
+    let _ = QuicOptions::build_transport(&t);
 
     // An explicit keep-alive override replaces the derivation; 0 = off.
     let t = QuicTuning::new().with_keep_alive_interval_millis(0);
@@ -633,6 +997,37 @@ pub(crate) mod tests {
     // The raised idle timeout scales the derived keep-alive with it.
     let t = QuicTuning::new().with_idle_timeout_millis(9_000);
     assert_eq!(t.keep_alive_interval_millis(), 3_000);
+  }
+
+  #[test]
+  fn timer_clamp_keeps_build_transport_instant_safe() {
+    // The whole point of the timer clamp: a `u64::MAX` config typo for EVERY timer knob (which
+    // clears the VarInt window clamp but would overflow `Instant + Duration` inside quinn) is
+    // clamped to MAX_TIMER_MILLIS, and build_transport then succeeds with finite durations rather
+    // than handing quinn a panic-inducing `Duration`.
+    let t = QuicTuning::new()
+      .with_idle_timeout_millis(u64::MAX)
+      .with_initial_rtt_millis(u64::MAX)
+      .with_keep_alive_interval_millis(u64::MAX);
+    assert_eq!(t.idle_timeout_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(t.initial_rtt_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(t.keep_alive_interval_millis(), MAX_TIMER_MILLIS);
+    // Every resolved timer fits in a `Duration` quinn can add to a `std::time::Instant` without
+    // overflowing — assert that directly on the resolved millis (mirrors what build_transport feeds
+    // quinn), then drive build_transport itself.
+    for ms in [
+      t.idle_timeout_millis(),
+      t.initial_rtt_millis(),
+      t.keep_alive_interval_millis(),
+    ] {
+      assert!(
+        std::time::Instant::now()
+          .checked_add(Duration::from_millis(ms))
+          .is_some(),
+        "the clamped timer {ms} ms must be Instant-addable"
+      );
+    }
+    let _ = QuicOptions::build_transport(&t);
   }
 
   #[test]
@@ -653,5 +1048,198 @@ pub(crate) mod tests {
       .build()
       .with_max_connections(0);
     assert_eq!(opts.max_connections(), 1, "0 clamps to 1");
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn tuning_serde_round_trips_and_fills_defaults() {
+    // Full round-trip: every resolved field survives Serialize → Deserialize.
+    let full = QuicTuning::new()
+      .with_idle_timeout_millis(9_000)
+      .with_initial_rtt_millis(120)
+      .with_connection_receive_window(32 * 1024 * 1024)
+      .with_stream_receive_window(16 * 1024 * 1024)
+      .with_keep_alive_interval_millis(250);
+    let json = serde_json::to_string(&full).unwrap();
+    assert_eq!(serde_json::from_str::<QuicTuning>(&json).unwrap(), full);
+
+    // A PARTIAL `{}` is the full default (every per-field `serde(default)` fires; keep-alive → None,
+    // so the resolved interval is the idle/3 derivation).
+    let partial: QuicTuning = serde_json::from_str("{}").unwrap();
+    assert_eq!(partial, QuicTuning::new());
+    assert_eq!(
+      partial.keep_alive_interval_millis(),
+      IDLE_TIMEOUT_MILLIS / 3
+    );
+
+    // A partial config carrying only one knob fills the rest from the consts.
+    let one: QuicTuning = serde_json::from_str(r#"{"idle_timeout_millis": 9000}"#).unwrap();
+    assert_eq!(one.idle_timeout_millis(), 9_000);
+    assert_eq!(one.initial_rtt_millis(), INITIAL_RTT_MILLIS);
+    assert_eq!(one.connection_receive_window(), CONNECTION_RECEIVE_WINDOW);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn tuning_deserialize_goes_through_the_clamp() {
+    // The KEY safety check: an out-of-range deserialized value is CLAMPED by the `From`, not
+    // accepted raw. A `0` idle timeout (a wedge) becomes the `1`-ms minimum, and a byte window past
+    // the VarInt range saturates to `2^62-1` — exactly the programmatic-builder clamp.
+    let clamped: QuicTuning = serde_json::from_str(
+      r#"{"idle_timeout_millis": 0, "connection_receive_window": 18446744073709551615}"#,
+    )
+    .unwrap();
+    assert_eq!(clamped.idle_timeout_millis(), 1, "0 clamps to the min");
+    assert_eq!(
+      clamped.connection_receive_window(),
+      MAX_VARINT_U64,
+      "past-range clamps to the VarInt ceiling"
+    );
+
+    // A deserialized `u64::MAX` for each TIMER knob clamps to the Instant-safe MAX_TIMER_MILLIS (NOT
+    // the larger VarInt ceiling), and build_transport then succeeds with finite durations — the
+    // config-typo case that would otherwise panic quinn after a clean startup.
+    let clamped: QuicTuning = serde_json::from_str(
+      r#"{"idle_timeout_millis": 18446744073709551615, "initial_rtt_millis": 18446744073709551615, "keep_alive_interval_millis": 18446744073709551615}"#,
+    )
+    .unwrap();
+    assert_eq!(clamped.idle_timeout_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(clamped.initial_rtt_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(
+      clamped.keep_alive_interval_millis(),
+      MAX_TIMER_MILLIS,
+      "the keep-alive override resolves to the timer bound, not u64::MAX"
+    );
+    let _ = QuicOptions::build_transport(&clamped);
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn tuning_serde_rejects_unknown_field() {
+    assert!(
+      serde_json::from_str::<QuicTuning>(r#"{"nonsense": 1}"#).is_err(),
+      "deny_unknown_fields rejects an unrecognized knob"
+    );
+  }
+
+  #[cfg(feature = "clap")]
+  #[test]
+  fn tuning_clap_parses_defaults_and_clamps() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+      #[command(flatten)]
+      tuning: QuicTuning,
+    }
+
+    // No flags → every default, byte-identical to `new()`.
+    let cli = Cli::try_parse_from(["app"]).unwrap();
+    assert_eq!(cli.tuning, QuicTuning::new());
+
+    // A supplied flag is parsed; an out-of-range value goes through the SAME clamp as serde.
+    let cli = Cli::try_parse_from(["app", "--quic-idle-timeout-millis", "0"]).unwrap();
+    assert_eq!(cli.tuning.idle_timeout_millis(), 1, "0 clamps to the min");
+
+    let cli = Cli::try_parse_from([
+      "app",
+      "--quic-keep-alive-interval-millis",
+      "250",
+      "--quic-stream-receive-window",
+      "12345",
+    ])
+    .unwrap();
+    assert_eq!(cli.tuning.keep_alive_interval_millis(), 250);
+    assert_eq!(cli.tuning.stream_receive_window(), 12345);
+    // The unset idle timeout stays at its default.
+    assert_eq!(cli.tuning.idle_timeout_millis(), IDLE_TIMEOUT_MILLIS);
+
+    // A `u64::MAX` parsed for each TIMER knob clamps to the Instant-safe MAX_TIMER_MILLIS through
+    // the clap path too, and build_transport then succeeds with finite durations.
+    let cli = Cli::try_parse_from([
+      "app",
+      "--quic-idle-timeout-millis",
+      "18446744073709551615",
+      "--quic-initial-rtt-millis",
+      "18446744073709551615",
+      "--quic-keep-alive-interval-millis",
+      "18446744073709551615",
+    ])
+    .unwrap();
+    assert_eq!(cli.tuning.idle_timeout_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(cli.tuning.initial_rtt_millis(), MAX_TIMER_MILLIS);
+    assert_eq!(
+      cli.tuning.keep_alive_interval_millis(),
+      MAX_TIMER_MILLIS,
+      "the keep-alive override clamps to the timer bound on the clap path, not u64::MAX"
+    );
+    let _ = QuicOptions::build_transport(&cli.tuning);
+  }
+
+  #[cfg(feature = "clap")]
+  #[test]
+  fn tuning_clap_env_is_wired() {
+    use clap::CommandFactory;
+    #[derive(clap::Parser)]
+    struct Cli {
+      #[command(flatten)]
+      tuning: QuicTuning,
+    }
+    let cmd = Cli::command();
+    let arg = cmd
+      .get_arguments()
+      .find(|a| a.get_id().as_str() == "quic-idle-timeout-millis")
+      .unwrap();
+    assert_eq!(
+      arg.get_env().and_then(|e| e.to_str()),
+      Some("SAILING_QUIC_IDLE_TIMEOUT_MILLIS")
+    );
+  }
+
+  #[cfg(feature = "clap")]
+  #[test]
+  fn tuning_clap_update_preserves_omitted_non_default_fields() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+      #[command(flatten)]
+      tuning: QuicTuning,
+    }
+
+    // A base carrying NON-default values across every knob (a WAN/large-window tuning).
+    let base = QuicTuning::new()
+      .with_idle_timeout_millis(9_000)
+      .with_initial_rtt_millis(120)
+      .with_connection_receive_window(32 * 1024 * 1024)
+      .with_stream_receive_window(16 * 1024 * 1024)
+      .with_keep_alive_interval_millis(250);
+
+    let mut cli = Cli { tuning: base };
+    // Supply EXACTLY ONE flag. A bare derived update would treat every other `default_value_t` arg
+    // as present and reset it to its pinned default; the `value_source` gate must leave them alone.
+    cli
+      .try_update_from(["app", "--quic-initial-rtt-millis", "200"])
+      .unwrap();
+
+    // The one flagged field changed...
+    assert_eq!(cli.tuning.initial_rtt_millis(), 200);
+    // ...and EVERY other non-default field is PRESERVED (this is the falsifying assertion: it fails
+    // if the value_source gate is removed and the derived reset shrinks them to the defaults).
+    assert_eq!(cli.tuning.idle_timeout_millis(), 9_000);
+    assert_eq!(cli.tuning.connection_receive_window(), 32 * 1024 * 1024);
+    assert_eq!(cli.tuning.stream_receive_window(), 16 * 1024 * 1024);
+    assert_eq!(cli.tuning.keep_alive_interval_millis(), 250);
+
+    // A supplied value still routes through the clamp on update (0 → the 1-ms minimum).
+    let mut cli = Cli { tuning: base };
+    cli
+      .try_update_from(["app", "--quic-idle-timeout-millis", "0"])
+      .unwrap();
+    assert_eq!(
+      cli.tuning.idle_timeout_millis(),
+      1,
+      "0 clamps on update too"
+    );
+    // The other non-default fields are still preserved across the clamped update.
+    assert_eq!(cli.tuning.initial_rtt_millis(), 120);
   }
 }
