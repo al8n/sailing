@@ -39,9 +39,9 @@ pub(crate) enum BridgeInbound {
 }
 
 /// The run loop → ONE connection's writer task (a per-conn FIFO so queued bytes flush before a
-/// close). A graceful close is signalled by DROPPING the sender: the writer's `recv_async`
-/// resolves `Err` only after draining the bytes queued ahead of it. One frame type keeps the
-/// queue's byte accounting unambiguous.
+/// close). A graceful close is signalled by DROPPING the sender: the writer's `recv` resolves
+/// `None` only after draining the bytes queued ahead of it. One frame type keeps the queue's byte
+/// accounting unambiguous.
 pub(crate) struct BridgeOut(pub(crate) Bytes);
 
 /// A dial completion handed back to the run loop. The connection was REGISTERED with the
@@ -54,8 +54,9 @@ pub(crate) struct DialReady {
   /// The connected socket, or the dial failure (the run loop closes + schedules the redial).
   pub(crate) result: std::io::Result<TcpStream>,
   /// The outbound receiver the writer drains (moved into the connect task at dial time, shipped
-  /// back on completion).
-  pub(crate) out_rx: flume::Receiver<BridgeOut>,
+  /// back on completion). A `!Send` lochan receiver, carried on-thread through the flume
+  /// `DialReady` channel.
+  pub(crate) out_rx: lochan::mpsc::Receiver<BridgeOut>,
   /// The same byte counter the run loop's `Conn` holds: the run loop adds on enqueue, the writer
   /// subtracts as it writes.
   pub(crate) queued_bytes: Arc<AtomicUsize>,
@@ -64,12 +65,12 @@ pub(crate) struct DialReady {
 /// Read one socket half until EOF/error, tagging every chunk onto the shared inbound channel.
 /// Runs on its own task so a concurrent large write cannot stop this half from reading. One
 /// buffer for the task's lifetime (each completed read hands it back in the `BufResult`). A full
-/// inbound channel parks `send_async`, which stops reading — kernel TCP backpressure on exactly
-/// the flooding peer.
+/// inbound channel parks `send`, which stops reading — kernel TCP backpressure on exactly the
+/// flooding peer.
 pub(crate) async fn bridge_read(
   mut half: impl AsyncRead,
   id: ConnId,
-  inbound: flume::Sender<BridgeInbound>,
+  inbound: lochan::mpsc::Sender<BridgeInbound>,
 ) {
   let mut buf = vec![0u8; RECV_BUF_LEN];
   loop {
@@ -77,12 +78,12 @@ pub(crate) async fn bridge_read(
     buf = returned;
     match res {
       Ok(0) => {
-        let _ = inbound.send_async(BridgeInbound::Eof { id }).await;
+        let _ = inbound.send(BridgeInbound::Eof { id }).await;
         return;
       }
       Ok(n) => {
         if inbound
-          .send_async(BridgeInbound::Bytes {
+          .send(BridgeInbound::Bytes {
             id,
             bytes: buf[..n].to_vec(),
           })
@@ -93,7 +94,7 @@ pub(crate) async fn bridge_read(
         }
       }
       Err(_) => {
-        let _ = inbound.send_async(BridgeInbound::Error { id }).await;
+        let _ = inbound.send(BridgeInbound::Error { id }).await;
         return;
       }
     }
@@ -110,16 +111,16 @@ pub(crate) async fn bridge_read(
 pub(crate) async fn bridge_write(
   mut half: impl AsyncWrite,
   id: ConnId,
-  out: flume::Receiver<BridgeOut>,
+  mut out: lochan::mpsc::Receiver<BridgeOut>,
   queued_bytes: Arc<AtomicUsize>,
-  inbound: flume::Sender<BridgeInbound>,
+  inbound: lochan::mpsc::Sender<BridgeInbound>,
 ) {
-  while let Ok(BridgeOut(bytes)) = out.recv_async().await {
+  while let Some(BridgeOut(bytes)) = out.recv().await {
     let len = bytes.len();
     let BufResult(res, _) = half.write_all(bytes).await;
     queued_bytes.fetch_sub(len, Ordering::AcqRel);
     if res.is_err() {
-      let _ = inbound.send_async(BridgeInbound::Error { id }).await;
+      let _ = inbound.send(BridgeInbound::Error { id }).await;
       return;
     }
   }

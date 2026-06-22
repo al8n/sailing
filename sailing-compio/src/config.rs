@@ -140,9 +140,9 @@ const fn default_max_failover_limbo_bytes() -> usize {
 /// |------|--------------|-------|
 /// | `max_inflight` | the submit budget (`flume::unbounded` command channel; budget is the bound) | `1 ..= MAX_CHANNEL_CAPACITY − 1` |
 /// | `events_cap` | `flume::bounded(events_cap)` (both drivers) | `1 ..= MAX_CHANNEL_CAPACITY` |
-/// | `recv_cap` | `flume::bounded(recv_cap)` (QUIC datagram channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
-/// | `inbound_cap` | `flume::bounded(inbound_cap)` (stream inbound channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
-/// | `accept_cap` | `flume::bounded(accept_cap)` (accept channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
+/// | `recv_cap` | `lochan::mpsc::bounded(recv_cap)` (QUIC datagram channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
+/// | `inbound_cap` | `lochan::mpsc::bounded(inbound_cap)` (stream inbound channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
+/// | `accept_cap` | `lochan::mpsc::bounded(accept_cap)` (accept channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
 /// | `redial_base` | doubled + jittered + added to `std::time::Instant` (redial schedule) | `(0, MAX_REDIAL_BACKOFF]`, `≤ redial_cap` |
 /// | `redial_cap` | the doubling ceiling — the largest value the jitter + `Instant` math sees | `(0, MAX_REDIAL_BACKOFF]` |
 /// | `cmd_budget` | per-iteration loop counter (`for _ in 0..cmd_budget`) — no panic sink | non-zero only |
@@ -768,8 +768,8 @@ mod tests {
 
   #[cfg(feature = "serde")]
   #[test]
-  fn serde_rejects_flume_caps_above_channel_ceiling() {
-    // Every flume-sized cap is bounded to the same channel ceiling; one above it is rejected, the
+  fn serde_rejects_channel_caps_above_ceiling() {
+    // Every bounded-channel cap is bounded to the same ceiling; one above it is rejected, the
     // ceiling itself accepted. (Falsify: drop any `> MAX_CHANNEL_CAPACITY` check and its case passes.)
     for field in ["events_cap", "recv_cap", "inbound_cap", "accept_cap"] {
       let over = format!(r#"{{ "{field}": {} }}"#, MAX_CHANNEL_CAPACITY + 1);

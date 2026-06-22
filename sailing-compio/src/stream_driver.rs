@@ -42,11 +42,14 @@ pub type AcceptorFactory<R> = Rc<dyn Fn() -> std::io::Result<R>>;
 /// queue in (then overflow) the kernel listen backlog, which is exactly TCP accept backpressure.
 /// An accept error is transient (a refused/reset in-flight connection); the loop keeps accepting
 /// after a paced backoff.
-async fn accept_conns(listener: TcpListener, accepted: flume::Sender<(TcpStream, SocketAddr)>) {
+async fn accept_conns(
+  listener: TcpListener,
+  accepted: lochan::mpsc::Sender<(TcpStream, SocketAddr)>,
+) {
   loop {
     match listener.accept().await {
       Ok((socket, from)) => {
-        if accepted.send_async((socket, from)).await.is_err() {
+        if accepted.send((socket, from)).await.is_err() {
           return; // the run loop dropped its receiver: teardown
         }
       }
@@ -94,7 +97,7 @@ struct Redial {
 struct Conn<I> {
   tasks: ConnTask,
   /// Outbound wire bytes to the writer (the per-conn FIFO).
-  out_tx: flume::Sender<BridgeOut>,
+  out_tx: lochan::mpsc::Sender<BridgeOut>,
   /// Bytes enqueued toward the socket and not yet written — the per-conn memory bound.
   queued_bytes: Arc<AtomicUsize>,
   /// `Some(peer)` for a dialed conn — the reconciler's dial-in-flight marker — and `None` for
@@ -136,8 +139,8 @@ where
   peers: Vec<(I, SocketAddr)>,
   dialer: DialerFactory<I, R>,
   acceptor: AcceptorFactory<R>,
-  inbound_tx: flume::Sender<BridgeInbound>,
-  inbound_rx: flume::Receiver<BridgeInbound>,
+  inbound_tx: lochan::mpsc::Sender<BridgeInbound>,
+  inbound_rx: lochan::mpsc::Receiver<BridgeInbound>,
   dial_ready_tx: flume::Sender<DialReady>,
   dial_ready_rx: flume::Receiver<DialReady>,
   cmd_budget: usize,
@@ -250,7 +253,7 @@ where
         (rx, Some(tx))
       }
     };
-    let (inbound_tx, inbound_rx) = flume::bounded(driver_cfg.inbound_cap);
+    let (inbound_tx, inbound_rx) = lochan::mpsc::bounded(driver_cfg.inbound_cap);
     // Bounded by construction at the live dial count (one task, one completion each), itself
     // bounded by the peer book + the reconciler's in-flight dedup; `unbounded` here means
     // "never parks a dial task".
@@ -321,7 +324,8 @@ where
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
-    let (accept_tx, accept_rx) = flume::bounded::<(TcpStream, SocketAddr)>(self.accept_cap);
+    let (accept_tx, mut accept_rx) =
+      lochan::mpsc::bounded::<(TcpStream, SocketAddr)>(self.accept_cap);
     let accept_task = compio::runtime::spawn(accept_conns(self.listener.clone(), accept_tx));
 
     // The first reconciler pass dials the full configured mesh (nothing is bound yet).
@@ -390,8 +394,8 @@ where
         StorageClosed,
       }
       let wake = {
-        let inbound_fut = self.inbound_rx.recv_async().fuse();
-        let accept_fut = accept_rx.recv_async().fuse();
+        // `accept_rx` is a run-loop local, so its lochan `recv` (`&mut self`) is pre-pinnable.
+        let accept_fut = accept_rx.recv();
         let dial_fut = self.dial_ready_rx.recv_async().fuse();
         let timer_fut = compio::time::sleep_until(deadline).fuse();
         // Parked once every notifier sender has dropped (the `storage_closed` latch): a dead
@@ -408,17 +412,17 @@ where
         }
         .fuse();
         let cmd_fut = self.commands.recv_async().fuse();
-        futures_util::pin_mut!(
-          inbound_fut,
-          accept_fut,
-          dial_fut,
-          timer_fut,
-          storage_fut,
-          cmd_fut
-        );
+        // `inbound_rx` is a lochan receiver (`&mut self` recv), so it is recv'd INLINE in its arm
+        // below — never pre-pinned — so the `&mut self.inbound_rx` borrow ends the instant the
+        // select resolves. (`accept_fut`/`dial_fut`/`storage_fut`/`cmd_fut` borrow disjoint fields
+        // or locals, so they stay pre-created.) lochan `recv` is `Unpin + FusedFuture`; pinning it
+        // via `pin_mut!` gives `select_biased!` the `&mut` place it polls (no `.fuse()` needed).
+        futures_util::pin_mut!(accept_fut, dial_fut, timer_fut, storage_fut, cmd_fut);
 
         select_biased! {
-          got = inbound_fut => Wake::Inbound(got.expect("inbound_tx outlives the loop")),
+          // lochan `recv` yields `Some` while the producing tasks live; `None` (every bridge
+          // dropped its sender) is unreachable while the loop is alive — the senders outlive it.
+          got = self.inbound_rx.recv() => Wake::Inbound(got.expect("inbound_tx outlives the loop")),
           got = accept_fut => {
             let (s, _from) = got.expect("accept task outlives the loop");
             Wake::Accepted(s)
@@ -516,7 +520,7 @@ where
       Err(_) => return, // a mis-built record layer cannot serve this socket
     };
     let id = self.coord.on_conn_open(record, now);
-    let (out_tx, out_rx) = flume::unbounded();
+    let (out_tx, out_rx) = lochan::mpsc::unbounded();
     let queued = Arc::new(AtomicUsize::new(0));
     let (read_half, write_half) = socket.into_split();
     let read = compio::runtime::spawn(bridge_read(read_half, id, self.inbound_tx.clone()));
@@ -632,7 +636,7 @@ where
       Err(_) => return,
     };
     let id = self.coord.on_conn_open(record, now);
-    let (out_tx, out_rx) = flume::unbounded();
+    let (out_tx, out_rx) = lochan::mpsc::unbounded();
     let queued = Arc::new(AtomicUsize::new(0));
     let dial_ready = self.dial_ready_tx.clone();
     let task = compio::runtime::spawn({
@@ -897,7 +901,9 @@ where
         continue;
       }
       conn.queued_bytes.fetch_add(bytes.len(), Ordering::AcqRel);
-      let _ = conn.out_tx.send(BridgeOut(Bytes::from(bytes)));
+      // lochan unbounded `try_send` never returns `Full`; only `Closed` (the writer task already
+      // exited), and a stale enqueue onto a dying conn is benign (consensus retransmits).
+      let _ = conn.out_tx.try_send(BridgeOut(Bytes::from(bytes)));
     }
     // Coordinator-initiated closes (handshake reap, duplicate tie-break, faults): tear down
     // the bridge side; the link reconciler repairs whatever ends up unbound.
