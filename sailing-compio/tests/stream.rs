@@ -53,6 +53,87 @@ async fn submit_anywhere(handles: &[Handle<u64, CountSm>], payload: &'static [u8
   }
 }
 
+/// `bind` must REJECT an out-of-range programmatic `DriverConfig` (whose serde/clap parse path would
+/// have caught it) rather than panic deep in the channel sizing. An over-ceiling `max_inflight`
+/// trips `futures_channel`'s `MAX_BUFFER` assert at `mpsc::channel(max_inflight + 1)`; a zero redial
+/// base hot-loops. Both must surface as `BindError::DriverConfig`. The validation runs before the
+/// socket binds, so the bogus address is never touched.
+#[compio::test]
+async fn bind_rejects_out_of_range_driver_config() {
+  use sailing_compio::{BindError, MAX_CHANNEL_CAPACITY};
+
+  let addr: SocketAddr = "127.0.0.1:1".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let dialer: sailing_compio::DialerFactory<u64, Labeled<Passthrough>> =
+    Rc::new(move |_peer: &u64| {
+      Labeled::dialer(
+        Passthrough::new(),
+        &LabelOptions {
+          cluster: cluster(),
+          local_id: encoded(1),
+        },
+      )
+      .map_err(std::io::Error::other)
+    });
+  let acceptor: sailing_compio::AcceptorFactory<Labeled<Passthrough>> = Rc::new(move || {
+    Labeled::acceptor(
+      Passthrough::new(),
+      &LabelOptions {
+        cluster: cluster(),
+        local_id: encoded(1),
+      },
+    )
+    .map_err(std::io::Error::other)
+  });
+
+  // `max_inflight` whose `+ 1` clears the `usize::MAX` overflow check yet exceeds `MAX_BUFFER` — the
+  // exact value that panicked `bind` before the up-front `validate`.
+  let over_inflight = DriverConfig {
+    max_inflight: MAX_CHANNEL_CAPACITY,
+    ..DriverConfig::default()
+  };
+  let res = CompioStreamDriver::bind(
+    addr,
+    config.clone(),
+    1,
+    CountSm::default(),
+    vec![],
+    dialer.clone(),
+    acceptor.clone(),
+    MemLog::new(),
+    MemStable::new(),
+    over_inflight,
+  )
+  .await;
+  assert!(
+    matches!(res, Err(BindError::DriverConfig(_))),
+    "an over-ceiling max_inflight must be rejected at bind, not panic"
+  );
+
+  // A zero redial base (a hot retry loop) is likewise a startup rejection, not a silent build.
+  let zero_redial = DriverConfig {
+    redial_base: Duration::ZERO,
+    ..DriverConfig::default()
+  };
+  let res = CompioStreamDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    vec![],
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    zero_redial,
+  )
+  .await;
+  assert!(
+    matches!(res, Err(BindError::DriverConfig(_))),
+    "a zero redial base must be rejected at bind"
+  );
+}
+
 /// Three plaintext-TCP nodes elect, commit through redirects, and serve a linearizable query —
 /// the full stream-driver stack over real sockets.
 #[compio::test]
