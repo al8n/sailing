@@ -112,6 +112,12 @@ where
   /// second, event-independent witness that parked completions (and their budget) can never
   /// be stranded by an event path regression.
   was_leader: bool,
+  /// The teardown-completion signal: fired (or dropped) AFTER the socket's `close().await`
+  /// fd-release barrier on every run-loop exit, fanning to every `Handle` via the shared receiver
+  /// so each `shutdown().await` resolves only once the bound address is rebindable. `Option` so the
+  /// fire is an explicit, ordered `take().send(())` right after `close()` — never an implicit field
+  /// drop whose ordering against the socket close is not guaranteed.
+  teardown_tx: Option<futures_channel::oneshot::Sender<()>>,
 }
 
 impl<I, F, L, S> CompioQuicDriver<I, F, L, S, Monotonic>
@@ -202,7 +208,11 @@ where
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
     let budget = InflightBudget::new(driver_cfg.max_inflight, driver_cfg.max_pending_bytes);
-    let handle = Handle::new(cmd_tx, event_rx, budget);
+    // The teardown-completion oneshot: the driver keeps the sender and fires it after the socket's
+    // fd-release barrier; every `Handle` clone awaits the shared receiver, so a coalesced shutdown
+    // caller that does not itself enqueue still observes real teardown.
+    let (teardown_tx, teardown_rx) = futures_channel::oneshot::channel();
+    let handle = Handle::new(cmd_tx, event_rx, budget, teardown_rx);
 
     let (storage_ready, keepalive) = match driver_cfg.storage_ready {
       Some(rx) => (rx, None),
@@ -235,6 +245,7 @@ where
         redial_cap: driver_cfg.redial_cap,
         storage_closed: false,
         was_leader: false,
+        teardown_tx: Some(teardown_tx),
       },
       handle,
     ))
@@ -274,7 +285,6 @@ where
     self.reconcile_peer_links(now.mono());
     let mut poisoned = self.pump().await;
 
-    let mut shutdown_ack: Option<futures_channel::oneshot::Sender<()>> = None;
     while !poisoned {
       let now = self.clock.now();
 
@@ -284,7 +294,7 @@ where
       for _ in 0..self.cmd_budget {
         match self.commands.try_recv() {
           Ok(cmd) => {
-            if self.handle_command(now, cmd, &mut shutdown_ack) {
+            if self.handle_command(now, cmd) {
               exit = true;
               break;
             }
@@ -404,7 +414,7 @@ where
         .coord
         .handle_storage(now, &mut self.log, &mut self.stable);
       if let Some(cmd) = command
-        && self.handle_command(now, cmd, &mut shutdown_ack)
+        && self.handle_command(now, cmd)
       {
         break;
       }
@@ -414,7 +424,7 @@ where
     // Teardown. Fail everything parked (each entry's reservation releases on drop), cancel the
     // recv task, then make the command queue airtight: close-then-drain refuses a racing
     // try_send WITH its command (the handle's own rollback runs) while everything already
-    // buffered is drained and dropped here — no command, queued or in flight, survives the ack.
+    // buffered is drained and dropped here — no command, queued or in flight, survives teardown.
     // Classify the fail-stop FIRST: an exit that raced a poison (a Shutdown command winning
     // the select after the poisoning storage drain) must still fail parked work with the typed
     // verdict; the ShuttingDown sweep below is then a no-op on the emptied maps.
@@ -426,28 +436,29 @@ where
     drop(recv_rx);
     // Drain everything already buffered, then DROP the receiver: a racing `try_send` then sees a
     // disconnected channel WITH its command (the handle's own rollback runs) — no command, queued
-    // or in flight, survives the ack.
+    // or in flight, survives teardown.
     while let Ok(cmd) = self.commands.try_recv() {
       drop(cmd);
     }
     drop(self.commands);
     // The fd-release barrier: close() parks until every other reference to the socket's fd —
     // the recv task's clone and its cancelled-but-unprocessed op — has dropped, then closes the
-    // fd with a real close op. Once this await returns the bound address is free, which is what
-    // makes the ack an immediate-rebind contract.
+    // fd with a real close op. Once this await returns the bound address is free.
     let _ = self.socket.close().await;
-    if let Some(ack) = shutdown_ack {
-      let _ = ack.send(());
+    // The socket fd is now released — fire teardown so every parked `shutdown().await` (winner,
+    // swap-loser, disconnected path) resolves and an immediate rebind is safe. Explicit AFTER
+    // `close()` rather than a field drop, whose ordering against the close await is not guaranteed.
+    // Dropping the sender instead of sending would also satisfy the awaiters (`Canceled`), but the
+    // explicit send keeps the success path observable.
+    if let Some(tx) = self.teardown_tx.take() {
+      let _ = tx.send(());
     }
   }
 
-  /// Handle one command; returns `true` when the loop should exit (a `Shutdown`).
-  fn handle_command(
-    &mut self,
-    now: Now,
-    cmd: Command<I, F>,
-    shutdown_ack: &mut Option<futures_channel::oneshot::Sender<()>>,
-  ) -> bool {
+  /// Handle one command; returns `true` when the loop should exit (a `Shutdown`). Teardown
+  /// completion is signalled by the run loop after `close().await`, not here, so this carries no
+  /// ack.
+  fn handle_command(&mut self, now: Now, cmd: Command<I, F>) -> bool {
     match cmd {
       Command::Submit {
         cmd,
@@ -566,10 +577,7 @@ where
         // A transfer parks nothing (the verdict is immediate); release with the reply.
         drop(reservation);
       }
-      Command::Shutdown { ack } => {
-        *shutdown_ack = Some(ack);
-        return true;
-      }
+      Command::Shutdown => return true,
     }
     false
   }

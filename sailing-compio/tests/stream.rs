@@ -331,9 +331,11 @@ async fn three_node_tls_cluster_commits() {
   assert_eq!(submit_anywhere(&handles, b"tls-op").await, 1);
 }
 
-/// The stream shutdown ack carries the same immediate-rebind contract as the QUIC driver's.
+/// The stream shutdown carries the same immediate-rebind contract as the QUIC driver's, for every
+/// coalesced caller: two `Handle` clones shut down concurrently and BOTH must resolve before the
+/// listener address is rebindable — a swap-loser awaits real teardown, never an early `Ok`.
 #[compio::test]
-async fn stream_shutdown_ack_means_immediate_rebind() {
+async fn stream_shutdown_means_immediate_rebind_for_every_coalesced_caller() {
   let addr: SocketAddr = "127.0.0.1:43200".parse().unwrap();
   let config = Config::try_new(1u64, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap();
   let local = encoded(1);
@@ -372,11 +374,16 @@ async fn stream_shutdown_ack_means_immediate_rebind() {
   )
   .await
   .expect("binds");
+  let clone = handle.clone();
   let task = compio::runtime::spawn(driver.run());
-  handle.shutdown().await.expect("acks");
+  // Two coalesced callers JOINED: both must resolve before the rebind, proving the swap-loser awaits
+  // the driver's listener `close().await` rather than returning early.
+  let (a, b) = futures_util::future::join(handle.shutdown(), clone.shutdown()).await;
+  a.expect("the winner resolves after teardown");
+  b.expect("the loser resolves after teardown");
   let rebound = compio::net::TcpListener::bind(addr)
     .await
-    .expect("immediately rebindable");
+    .expect("immediately rebindable once every shutdown caller has resolved");
   drop(rebound);
   let _ = task.await;
 }
