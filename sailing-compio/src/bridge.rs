@@ -1,10 +1,7 @@
 //! Per-connection plumbing for the stream driver: the split-half socket tasks and the channel
 //! frames they exchange with the run loop.
 
-use std::sync::{
-  Arc,
-  atomic::{AtomicUsize, Ordering},
-};
+use std::{cell::Cell, rc::Rc};
 
 use bytes::Bytes;
 use compio::{
@@ -59,7 +56,7 @@ pub(crate) struct DialReady {
   pub(crate) out_rx: lochan::mpsc::Receiver<BridgeOut>,
   /// The same byte counter the run loop's `Conn` holds: the run loop adds on enqueue, the writer
   /// subtracts as it writes.
-  pub(crate) queued_bytes: Arc<AtomicUsize>,
+  pub(crate) queued_bytes: Rc<Cell<usize>>,
 }
 
 /// Read one socket half until EOF/error, tagging every chunk onto the shared inbound channel.
@@ -112,13 +109,13 @@ pub(crate) async fn bridge_write(
   mut half: impl AsyncWrite,
   id: ConnId,
   mut out: lochan::mpsc::Receiver<BridgeOut>,
-  queued_bytes: Arc<AtomicUsize>,
+  queued_bytes: Rc<Cell<usize>>,
   inbound: lochan::mpsc::Sender<BridgeInbound>,
 ) {
   while let Some(BridgeOut(bytes)) = out.recv().await {
     let len = bytes.len();
     let BufResult(res, _) = half.write_all(bytes).await;
-    queued_bytes.fetch_sub(len, Ordering::AcqRel);
+    queued_bytes.set(queued_bytes.get() - len);
     if res.is_err() {
       let _ = inbound.send(BridgeInbound::Error { id }).await;
       return;

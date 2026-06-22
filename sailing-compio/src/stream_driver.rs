@@ -2,16 +2,7 @@
 //! TCP listener, driving consensus over framed reliable streams (plain TCP or TLS, by the record
 //! layer the factories build).
 
-use std::{
-  collections::BTreeMap,
-  net::SocketAddr,
-  rc::Rc,
-  sync::{
-    Arc,
-    atomic::{AtomicUsize, Ordering},
-  },
-  time::Duration,
-};
+use std::{cell::Cell, collections::BTreeMap, net::SocketAddr, rc::Rc, time::Duration};
 
 use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
@@ -99,7 +90,7 @@ struct Conn<I> {
   /// Outbound wire bytes to the writer (the per-conn FIFO).
   out_tx: lochan::mpsc::Sender<BridgeOut>,
   /// Bytes enqueued toward the socket and not yet written — the per-conn memory bound.
-  queued_bytes: Arc<AtomicUsize>,
+  queued_bytes: Rc<Cell<usize>>,
   /// `Some(peer)` for a dialed conn — the reconciler's dial-in-flight marker — and `None` for
   /// an accepted one. Repair scheduling itself lives in the reconciler, never on the conn.
   dialed_to: Option<I>,
@@ -537,7 +528,7 @@ where
     };
     let id = self.coord.on_conn_open(record, now);
     let (out_tx, out_rx) = lochan::mpsc::unbounded();
-    let queued = Arc::new(AtomicUsize::new(0));
+    let queued = Rc::new(Cell::new(0usize));
     let (read_half, write_half) = socket.into_split();
     let read = compio::runtime::spawn(bridge_read(read_half, id, self.inbound_tx.clone()));
     let write = compio::runtime::spawn(bridge_write(
@@ -653,7 +644,7 @@ where
     };
     let id = self.coord.on_conn_open(record, now);
     let (out_tx, out_rx) = lochan::mpsc::unbounded();
-    let queued = Arc::new(AtomicUsize::new(0));
+    let queued = Rc::new(Cell::new(0usize));
     let dial_ready = self.dial_ready_tx.clone();
     let task = compio::runtime::spawn({
       let queued = queued.clone();
@@ -904,13 +895,13 @@ where
       let Some(conn) = self.conns.get(&id) else {
         continue; // already closed; the coordinator's stale bytes die with it
       };
-      let projected = conn.queued_bytes.load(Ordering::Acquire) + bytes.len();
+      let projected = conn.queued_bytes.get() + bytes.len();
       if projected > self.max_outbound_backlog {
         // The peer has stopped consuming: close (consensus retransmission re-drives).
         self.close_conn(id);
         continue;
       }
-      conn.queued_bytes.fetch_add(bytes.len(), Ordering::AcqRel);
+      conn.queued_bytes.set(conn.queued_bytes.get() + bytes.len());
       // lochan unbounded `try_send` never returns `Full`; only `Closed` (the writer task already
       // exited), and a stale enqueue onto a dying conn is benign (consensus retransmits).
       let _ = conn.out_tx.try_send(BridgeOut(Bytes::from(bytes)));
