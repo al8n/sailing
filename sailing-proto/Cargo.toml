@@ -21,7 +21,16 @@ fuzzing = []
 tls = ["tcp", "std", "dep:rustls", "tls-ring"]
 tls-ring = ["rustls?/ring"]
 tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
-quic = ["tcp", "std", "dep:rustls", "dep:quinn-proto", "tls-ring"]
+quic = ["tcp", "std", "dep:rustls", "dep:quinn-proto", "dep:rustls-pemfile", "tls-ring"]
+
+# Optional config layering on `Config` and the read-mode enums. `serde` adds gated
+# Serialize/Deserialize (config files, round-trip; the `Duration` knobs render as humantime
+# strings via `humantime-serde`); `clap` adds a gated `clap::Args` mirror (CLI flags + env vars).
+# Both leave the default build byte-identical (everything gated) and both pull `std`: `clap` is
+# std-only, and `serde` uses `humantime-serde` for the `Duration` fields (a no_std `humantime`
+# does not yet exist — until then the config serde layer is std-only).
+serde = ["std", "dep:serde", "serde/std", "dep:humantime-serde"]
+clap = ["std", "dep:clap", "dep:humantime"]
 
 [dependencies]
 buffa = { version = "0.7", default-features = false }
@@ -32,7 +41,12 @@ derive_more.workspace = true
 rand = { version = "0.9", default-features = false }
 rand_core = { version = "0.9", default-features = false }
 rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
 quinn-proto = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+humantime-serde = { workspace = true, optional = true }
+humantime = { workspace = true, optional = true }
+clap = { workspace = true, optional = true }
 
 [build-dependencies]
 # Generates the wire envelope types from proto/sailing/v1/messages.proto (requires protoc).
@@ -43,6 +57,8 @@ buffa-build = "0.7"
 rcgen = { workspace = true }
 # Bench-only: criterion without plotters/rayon (lean dep tree; `cargo bench` + CI compile-check).
 criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+# Test-only: JSON round-trip of the `serde`-gated `Config`.
+serde_json = { workspace = true }
 
 [[bench]]
 name = "codec"

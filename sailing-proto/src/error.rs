@@ -149,6 +149,11 @@ pub enum ConfigError {
   /// `max_inflight_msgs` was zero.
   #[error("max_inflight_msgs must be greater than zero")]
   ZeroInflight,
+  /// The voter set was empty. A config with no voters has no consensus group to bootstrap; the
+  /// programmatic constructors reach this only via [`crate::Config::try_new`]'s `id ∈ voters`
+  /// rejection, but a parsed (serde / clap) config could otherwise carry an empty `voters`.
+  #[error("the voter set must not be empty")]
+  EmptyVoters,
   /// `ReadOnlyOption::LeaseBased` requires `check_quorum = true` (the lease safety depends on
   /// the leader knowing it still holds a quorum; without CheckQuorum that guarantee is absent).
   #[error("ReadOnlyOption::LeaseBased requires check_quorum to be enabled")]
@@ -169,4 +174,16 @@ pub enum ConfigError {
   /// so the knob is meaningless there.
   #[error("a proactive lease_refresh requires read_only = LeaseGuard")]
   LeaseRefreshRequiresLeaseGuard,
+  /// `election_timeout` exceeds the `Instant`-safe bound. The per-term randomized timeout is
+  /// `election_timeout + Duration::from_millis(rng % election_timeout_ms)` (a raw `Duration` add that
+  /// PANICS on overflow), so a value near `Duration::MAX` parsed from a config would take the node down
+  /// on its first election. Rejected above [`crate::Config`]'s `Instant`-safe election bound so the
+  /// randomized draw (`< 2 · election_timeout`) can never overflow.
+  #[error("election_timeout ({election:?}) must be at most the Instant-safe bound ({max:?})")]
+  ElectionTimeoutTooLarge {
+    /// The rejected election timeout.
+    election: Duration,
+    /// The `Instant`-safe maximum it must not exceed.
+    max: Duration,
+  },
 }
