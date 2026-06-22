@@ -50,6 +50,7 @@ pub(crate) fn shrink_excess(buf: &mut std::vec::Vec<u8>) {
 
 /// A 16-byte cluster identity; peers reject handshakes from other clusters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClusterId(
   /// The raw 16 cluster-identity bytes.
   pub [u8; 16],

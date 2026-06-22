@@ -30,6 +30,16 @@ pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 pub(super) const MAX_PEER_ID_LEN: usize = 1024;
 
 /// Construction parameters for a [`Labeled`] layer.
+///
+/// `serde` (optional) derives `Serialize`/`Deserialize` directly: both fields are cluster/peer
+/// IDENTITY, so neither is defaulted — a missing field is correctly a deserialize error (an
+/// identity-less hello layer is not a sensible default). `clap` is intentionally NOT applied: both
+/// fields are opaque bytes (`ClusterId` is a raw `[u8; 16]`, `local_id` an already-encoded
+/// `NodeId`/`Data` blob), neither of which has a natural CLI/string surface, so forcing a hex
+/// `value_parser` would only add an ugly, error-prone flag form. Construct it programmatically or
+/// from a config file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct LabelOptions {
   /// The cluster this node belongs to; a peer advertising a different cluster is rejected.
   pub cluster: ClusterId,
