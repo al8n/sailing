@@ -1168,6 +1168,23 @@ fn read_round_dump(c: &Cluster) -> String {
   per_node.join(" ")
 }
 
+/// Tick `c` until it has a single leader, reconciling membership each step. Unlike a plain
+/// `run_until(..., leader_count() == 1)`, this drops a stale ex-leader the instant the authoritative
+/// (highest-term) leader emerges: a node removed from the committed config but still advertising
+/// `role = Leader` at an old term would otherwise keep `leader_count()` above 1 and strand the wait,
+/// because the isolating reconcile would run only AFTER a plain wait returned.
+fn run_until_single_leader(c: &mut Cluster, st: &mut VoprState, max_steps: usize) -> bool {
+  for _ in 0..max_steps {
+    reconcile_membership(c, st);
+    if c.leader_count() == 1 {
+      return true;
+    }
+    c.tick();
+  }
+  reconcile_membership(c, st);
+  c.leader_count() == 1
+}
+
 /// Open a CALM WINDOW: back the adversary off entirely (heal every partition, clear all faults) and
 /// assert the cluster makes fresh PROGRESS — it must elect a leader and commit+apply new client load
 /// within a generous bound. Failure to progress is a LIVELOCK and panics with `seed`+`tick`.
@@ -1205,7 +1222,7 @@ fn calm_window(
   restart_poisoned(c, st, report);
 
   // Let the cluster settle to a single leader (generous bound — a healthy majority MUST converge).
-  if !c.run_until(4_000, |c| c.leader_count() == 1) {
+  if !run_until_single_leader(c, st, 4_000) {
     // Last-resort phantom-gone recovery for a LEADERLESS deadlock: a divergent-config election cannot
     // resolve when a `gone` node a current voter still lists as a member never answers (e.g. a gone
     // node is still in voter n1's config, so neither candidate can assemble a quorum that
@@ -1224,7 +1241,7 @@ fn calm_window(
       c.reinstate(g);
       st.gone.remove(&g);
     }
-    if !reinstated_any || !c.run_until(4_000, |c| c.leader_count() == 1) {
+    if !reinstated_any || !run_until_single_leader(c, st, 4_000) {
       let tick = c.view().tick;
       let per_node: Vec<_> = st
         .voters
@@ -1412,7 +1429,10 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
   // accurate without a separate fixup.
   let mut converged = false;
   for _ in 0..10_000 {
-    if c.leader_count() == 1 {
+    // Reconcile whenever ANY leader exists, not only at `leader_count() == 1`: a stale ex-leader that
+    // never applied its own removal inflates the count to 2, so gating on `== 1` would skip the very
+    // reconcile that isolates it and strand this drain.
+    if c.leader().is_some() {
       reconcile_membership(c, st);
       // A node reconcile RESURRECTS (a `gone` node the committed config still lists) was skipped by the
       // one-time fault clear at quiesce setup, so it would rejoin with its OLD storage faults still
