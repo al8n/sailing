@@ -1021,6 +1021,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76dda8459b10a8960dfae91c1c77316fc15e7caf94f9f18794126512a8dc77e5"
 
 [[package]]
+name = "lochan"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81385e62081e32f98505f3ef5c9799837398b666c268e44290a7bdaf4984038c"
+dependencies = [
+ "futures-core",
+]
+
+[[package]]
 name = "lock_api"
 version = "0.4.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1574,6 +1583,7 @@ dependencies = [
  "humantime",
  "humantime-serde",
  "libc",
+ "lochan",
  "rcgen",
  "rustls",
  "sailing-proto",

@@ -27,6 +27,7 @@ bytes = { workspace = true }
 thiserror = { workspace = true }
 compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io-uring", "polling"] }
 flume = { workspace = true }
+lochan = { workspace = true }
 futures-channel = { workspace = true }
 futures-util = { workspace = true }
 serde = { workspace = true, optional = true }

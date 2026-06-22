@@ -29,6 +29,7 @@ rcgen = { version = "0.14" }
 compio = { version = "0.19", default-features = false }
 libc = { version = "0.2" }
 flume = { version = "0.11", default-features = false, features = ["async"] }
+lochan = "0.1"
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
 

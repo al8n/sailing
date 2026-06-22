@@ -40,7 +40,7 @@ const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
 /// loss recovery's to repair), so the loop keeps receiving after a paced backoff. The task exits
 /// when the driver drops the channel receiver; the driver also OWNS the task's `JoinHandle`,
 /// whose drop cancels the task on every run-loop exit path.
-async fn recv_datagrams(socket: UdpSocket, inbound: flume::Sender<(Vec<u8>, SocketAddr)>) {
+async fn recv_datagrams(socket: UdpSocket, inbound: lochan::mpsc::Sender<(Vec<u8>, SocketAddr)>) {
   let mut buf = vec![0u8; RECV_BUF_LEN];
   loop {
     let compio::buf::BufResult(res, returned) = socket.recv_from(buf).await;
@@ -50,7 +50,7 @@ async fn recv_datagrams(socket: UdpSocket, inbound: flume::Sender<(Vec<u8>, Sock
         // Exact-sized copy so the long-lived receive buffer is immediately re-lent; a full
         // channel parks here, leaving NO receive in flight — arrivals then queue in (and
         // overflow) the kernel socket buffer, which is exactly UDP backpressure.
-        if inbound.send_async((buf[..n].to_vec(), from)).await.is_err() {
+        if inbound.send((buf[..n].to_vec(), from)).await.is_err() {
           return; // the driver dropped its receiver: tear down
         }
       }
@@ -262,7 +262,7 @@ where
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
-    let (recv_tx, recv_rx) = flume::bounded(self.recv_cap);
+    let (recv_tx, mut recv_rx) = lochan::mpsc::bounded(self.recv_cap);
     // The recv task's JoinHandle is OWNED by this scope — never detached — so every exit path
     // drops it, cancelling the task with its in-flight recv and its socket clone. The cancel is
     // mark-and-schedule, not synchronous teardown: the orderly exits below follow it with the
@@ -333,7 +333,8 @@ where
       // and the pump — so a losing arm never cancels an in-flight socket op. The pinned futures
       // are confined to this scope; each arm only writes a captured local.
       let (inbound, fire_timeout, command, ended) = {
-        let recv_fut = recv_rx.recv_async().fuse();
+        // `recv_rx` is a run-loop local, so its lochan `recv` (`&mut self`) is pre-pinnable.
+        let recv_fut = recv_rx.recv();
         let timer_fut = compio::time::sleep_until(deadline).fuse();
         // Once every notifier sender has dropped, the channel is dead (recv resolves Err
         // immediately, forever) and would win the select every iteration — when latched, this
@@ -359,10 +360,10 @@ where
         let mut storage_disconnected = false;
 
         select_biased! {
-          // Err (a closed channel) is unreachable while this scope holds recv_task: the task
+          // `None` (a closed channel) is unreachable while this scope holds recv_task: the task
           // only exits when the receiver it sends to drops.
           got = recv_fut => {
-            if let Ok(datagram) = got { inbound = Some(datagram); }
+            if let Some(datagram) = got { inbound = Some(datagram); }
           }
           _ = timer_fut => { fire_timeout = true; }
           // flume `recv_async` yields `Ok` while any sender lives and `Err` once every `Handle`
