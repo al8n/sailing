@@ -307,3 +307,35 @@ fn out_of_bounds_local_id_is_rejected_at_construction() {
   };
   assert!(Labeled::acceptor(Passthrough::default(), &one).is_ok());
 }
+
+#[cfg(feature = "serde")]
+#[test]
+fn label_options_serde_round_trips() {
+  let opts = LabelOptions {
+    cluster: ClusterId([0xAB; 16]),
+    local_id: std::vec![1, 2, 3, 4, 5],
+  };
+  let json = serde_json::to_string(&opts).unwrap();
+  let back: LabelOptions = serde_json::from_str(&json).unwrap();
+  assert_eq!(back, opts);
+}
+
+#[cfg(feature = "serde")]
+#[test]
+fn label_options_serde_requires_both_identity_fields() {
+  // Identity is REQUIRED — neither field is defaulted, so a missing one is an error (not a silent
+  // empty identity). The cluster id is a 16-byte array; a wrong length is likewise rejected.
+  assert!(
+    serde_json::from_str::<LabelOptions>(r#"{"cluster": [0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0]}"#)
+      .is_err(),
+    "a missing local_id is an error"
+  );
+  assert!(
+    serde_json::from_str::<LabelOptions>(r#"{"local_id": [1, 2, 3]}"#).is_err(),
+    "a missing cluster is an error"
+  );
+  assert!(
+    serde_json::from_str::<LabelOptions>(r#"{"cluster": [1, 2, 3], "local_id": []}"#).is_err(),
+    "a wrong-length cluster array is an error"
+  );
+}
