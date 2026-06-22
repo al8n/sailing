@@ -183,8 +183,9 @@ where
   ) -> Result<(Self, Handle<I, F>), BindError> {
     // Reject an out-of-range programmatic `DriverConfig` UP FRONT (before the socket binds). The
     // serde/clap parse paths validate, but a programmatic config bypasses that; this keeps the
-    // channel-sizing knobs (`events_cap`/`recv_cap`) under the capacity ceiling before any
-    // channel is built.
+    // channel-sizing knobs under their ceilings before any channel is built — in particular the
+    // eager-ring `recv_cap` (a `lochan::mpsc::bounded` ring is allocated in full at `cap` slots) under
+    // `MAX_BOUNDED_QUEUE_DEPTH`, so an astronomical value cannot OOM at bind.
     driver_cfg.validate()?;
     // Validate + capture ε_unc (the sole copy of the wall-gate threshold) BEFORE the socket binds,
     // rejecting an invalid Config and the silent failover wedge (a failover tier with a non-supplying

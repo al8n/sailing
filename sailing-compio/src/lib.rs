@@ -101,7 +101,7 @@ mod stream_driver;
 mod wall_clock;
 
 pub use clock::Clock;
-pub use config::{DriverConfig, MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF};
+pub use config::{DriverConfig, MAX_BOUNDED_QUEUE_DEPTH, MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF};
 pub use error::{BindError, DriverConfigError, DriverError};
 pub use handle::Handle;
 pub use quic_driver::CompioQuicDriver;

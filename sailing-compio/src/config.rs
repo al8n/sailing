@@ -31,21 +31,41 @@ pub(crate) const DEFAULT_REDIAL_BASE: Duration = Duration::from_millis(100);
 /// Default redial backoff ceiling.
 pub(crate) const DEFAULT_REDIAL_CAP: Duration = Duration::from_secs(5);
 
-/// Inclusive ceiling for every CHANNEL-sizing knob (`max_inflight`, `events_cap`, `recv_cap`,
-/// `inbound_cap`, `accept_cap`).
+/// Inclusive ceiling for the LAZILY-allocated channel-sizing knobs (`max_inflight`, `events_cap`).
 ///
 /// The command channel itself is now `flume::unbounded` and carries no cap — but `max_inflight`
-/// still SIZES the submit budget, so the same ceiling keeps a pathological budget from admitting an
-/// astronomical pending count. The bounded channels (`events_cap` via flume; `recv_cap`/`inbound_cap`/
-/// `accept_cap` via the lochan rings) only allocate as they fill, so their hard limit is just the
-/// `cap == usize::MAX` `+ 1` overflow in the ring's pending arithmetic; one shared ceiling well below
-/// that covers every channel.
+/// still SIZES the submit budget, so this ceiling keeps a pathological budget from admitting an
+/// astronomical pending count. `events_cap` sizes a `flume::bounded` channel whose `VecDeque` grows
+/// only as it fills, so its hard limit is just the `cap == usize::MAX` `+ 1` overflow in the channel's
+/// pending arithmetic; one shared ceiling well below that covers both.
+///
+/// The three LOCHAN-backed caps (`recv_cap`, `inbound_cap`, `accept_cap`) do NOT use this ceiling:
+/// `lochan::mpsc::bounded(cap)` EAGER-allocates a `cap`-slot ring up front (see
+/// [`MAX_BOUNDED_QUEUE_DEPTH`]), so a `(usize::MAX >> 2)`-scale value would OOM at bind, not lazily.
+/// They get the far tighter [`MAX_BOUNDED_QUEUE_DEPTH`] instead.
 ///
 /// The value is `(usize::MAX >> 2) − 1`, derived from `usize::MAX` so it is correct on any target
 /// width (≈ 4.6×10¹⁸ on 64-bit, ≈ 1.07×10⁹ on 32-bit) and astronomically above any realistic channel
 /// depth (the defaults are in the hundreds to low thousands). It is the ceiling, not a policy cap on
 /// the operator's memory budget.
 pub const MAX_CHANNEL_CAPACITY: usize = (usize::MAX >> 2) - 1;
+
+/// Inclusive ceiling for the three EAGER-RING channel caps (`recv_cap`, `inbound_cap`, `accept_cap`).
+///
+/// Unlike `events_cap`'s `flume::bounded` (a lazily-growing `VecDeque`), `lochan::mpsc::bounded(cap)`
+/// allocates a FIXED ring of exactly `cap` `MaybeUninit` slots in ONE allocation up front — so `cap` is
+/// an immediate memory commitment at bind, not a lazy fill bound. A `cap` near [`MAX_CHANNEL_CAPACITY`]
+/// (≈ `usize::MAX / 4`) would therefore try to allocate ~`usize::MAX / 4` elements and OOM / abort at
+/// bind, so these three caps need a realistic eager-allocation ceiling rather than the lazy one.
+///
+/// `1 << 19` (524 288) is chosen WELL ABOVE the defaults — `recv_cap` / `inbound_cap` default to 256
+/// and `accept_cap` to 16, so this leaves > 2000× headroom and normal tuning is unaffected — yet bounds
+/// each ring to a sane up-front size. The slot element is the largest of `(Vec<u8>, SocketAddr)`
+/// (`recv_cap`), `BridgeInbound` (`inbound_cap`), and `(TcpStream, SocketAddr)` (`accept_cap`), each on
+/// the order of tens of bytes, so a full `1 << 19`-slot ring is roughly 524 288 × ~56 B ≈ 30 MB at the
+/// very top — a low-tens-of-MB per-queue commitment, not an OOM. It is the eager-allocation safety
+/// ceiling, not a policy cap on the operator's memory budget.
+pub const MAX_BOUNDED_QUEUE_DEPTH: usize = 1 << 19;
 
 /// `Instant`-safe ceiling for the redial backoff durations (`redial_base`, `redial_cap`).
 ///
@@ -139,10 +159,10 @@ const fn default_max_failover_limbo_bytes() -> usize {
 /// | Knob | Runtime sink | Bound |
 /// |------|--------------|-------|
 /// | `max_inflight` | the submit budget (`flume::unbounded` command channel; budget is the bound) | `1 ..= MAX_CHANNEL_CAPACITY − 1` |
-/// | `events_cap` | `flume::bounded(events_cap)` (both drivers) | `1 ..= MAX_CHANNEL_CAPACITY` |
-/// | `recv_cap` | `lochan::mpsc::bounded(recv_cap)` (QUIC datagram channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
-/// | `inbound_cap` | `lochan::mpsc::bounded(inbound_cap)` (stream inbound channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
-/// | `accept_cap` | `lochan::mpsc::bounded(accept_cap)` (accept channel) | `1 ..= MAX_CHANNEL_CAPACITY` |
+/// | `events_cap` | `flume::bounded(events_cap)` (both drivers; lazy `VecDeque`) | `1 ..= MAX_CHANNEL_CAPACITY` |
+/// | `recv_cap` | `lochan::mpsc::bounded(recv_cap)` (QUIC datagram channel; EAGER ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
+/// | `inbound_cap` | `lochan::mpsc::bounded(inbound_cap)` (stream inbound channel; EAGER ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
+/// | `accept_cap` | `lochan::mpsc::bounded(accept_cap)` (accept channel; EAGER ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
 /// | `redial_base` | doubled + jittered + added to `std::time::Instant` (redial schedule) | `(0, MAX_REDIAL_BACKOFF]`, `≤ redial_cap` |
 /// | `redial_cap` | the doubling ceiling — the largest value the jitter + `Instant` math sees | `(0, MAX_REDIAL_BACKOFF]` |
 /// | `cmd_budget` | per-iteration loop counter (`for _ in 0..cmd_budget`) — no panic sink | non-zero only |
@@ -233,9 +253,13 @@ impl DriverConfig {
   ///   value above [`MAX_CHANNEL_CAPACITY`] − 1 so a pathological budget can never admit an
   ///   astronomical pending count;
   /// - `cmd_budget` must be non-zero (a zero per-iteration drain budget stalls every submit);
-  /// - `events_cap` / `recv_cap` / `inbound_cap` / `accept_cap` must each be non-zero (a
-  ///   zero-capacity bounded channel can never hold its item ⇒ the producing task is wedged) AND at
-  ///   most [`MAX_CHANNEL_CAPACITY`] (the same channel-capacity ceiling);
+  /// - `events_cap` must be non-zero (a zero-capacity bounded channel can never hold its item ⇒ the
+  ///   producing task is wedged) AND at most [`MAX_CHANNEL_CAPACITY`] (it sizes a lazily-growing
+  ///   `flume::bounded`, so the ceiling only guards the channel's pending arithmetic);
+  /// - `recv_cap` / `inbound_cap` / `accept_cap` must each be non-zero (same wedge) AND at most
+  ///   [`MAX_BOUNDED_QUEUE_DEPTH`] (the far tighter EAGER-allocation ceiling: each sizes a
+  ///   `lochan::mpsc::bounded` ring that allocates all `cap` slots UP FRONT, so an astronomical value
+  ///   would OOM at bind rather than fill lazily);
   /// - `max_pending_bytes` / `max_outbound_backlog` / `max_conns` / `max_failover_limbo_bytes` must
   ///   each be non-zero (a zero turns the corresponding budget/cap into a reject-everything gate);
   /// - `redial_base` and `redial_cap` must each be non-zero (a zero backoff is a hot retry loop),
@@ -271,20 +295,22 @@ impl DriverConfig {
     if self.recv_cap == 0 {
       return Err(DriverConfigError::ZeroRecvCap);
     }
-    if self.recv_cap > MAX_CHANNEL_CAPACITY {
-      return Err(DriverConfigError::RecvCapAboveChannelCeiling);
+    // The lochan ring eager-allocates `recv_cap` slots at bind, so it is bounded by the far tighter
+    // eager-allocation ceiling, not the lazy channel one.
+    if self.recv_cap > MAX_BOUNDED_QUEUE_DEPTH {
+      return Err(DriverConfigError::RecvCapAboveQueueCeiling);
     }
     if self.inbound_cap == 0 {
       return Err(DriverConfigError::ZeroInboundCap);
     }
-    if self.inbound_cap > MAX_CHANNEL_CAPACITY {
-      return Err(DriverConfigError::InboundCapAboveChannelCeiling);
+    if self.inbound_cap > MAX_BOUNDED_QUEUE_DEPTH {
+      return Err(DriverConfigError::InboundCapAboveQueueCeiling);
     }
     if self.accept_cap == 0 {
       return Err(DriverConfigError::ZeroAcceptCap);
     }
-    if self.accept_cap > MAX_CHANNEL_CAPACITY {
-      return Err(DriverConfigError::AcceptCapAboveChannelCeiling);
+    if self.accept_cap > MAX_BOUNDED_QUEUE_DEPTH {
+      return Err(DriverConfigError::AcceptCapAboveQueueCeiling);
     }
     if self.max_pending_bytes == 0 {
       return Err(DriverConfigError::ZeroMaxPendingBytes);
@@ -768,19 +794,46 @@ mod tests {
 
   #[cfg(feature = "serde")]
   #[test]
-  fn serde_rejects_channel_caps_above_ceiling() {
-    // Every bounded-channel cap is bounded to the same ceiling; one above it is rejected, the
-    // ceiling itself accepted. (Falsify: drop any `> MAX_CHANNEL_CAPACITY` check and its case passes.)
-    for field in ["events_cap", "recv_cap", "inbound_cap", "accept_cap"] {
-      let over = format!(r#"{{ "{field}": {} }}"#, MAX_CHANNEL_CAPACITY + 1);
+  fn serde_rejects_events_cap_above_ceiling() {
+    // The lazily-growing `flume::bounded` events tail is bounded to the lazy channel ceiling; one
+    // above it is rejected, the ceiling itself accepted. (Falsify: drop the `events_cap >
+    // MAX_CHANNEL_CAPACITY` check and the over case parses.)
+    let over = format!(r#"{{ "events_cap": {} }}"#, MAX_CHANNEL_CAPACITY + 1);
+    assert!(
+      serde_json::from_str::<DriverConfig>(&over).is_err(),
+      "events_cap above the channel ceiling must be rejected"
+    );
+    let at = format!(r#"{{ "events_cap": {MAX_CHANNEL_CAPACITY} }}"#);
+    assert!(
+      serde_json::from_str::<DriverConfig>(&at).is_ok(),
+      "events_cap == the channel ceiling must be accepted"
+    );
+  }
+
+  #[cfg(feature = "serde")]
+  #[test]
+  fn serde_rejects_eager_ring_caps_above_queue_ceiling() {
+    // The three lochan eager-ring caps allocate all `cap` slots at bind, so they are bounded by the
+    // far tighter `MAX_BOUNDED_QUEUE_DEPTH`: one above it is rejected (it would OOM at bind), the
+    // ceiling itself accepted, and a `MAX_CHANNEL_CAPACITY`-scale value (fine for the lazy channels) is
+    // now rejected for these. (Falsify: drop any `> MAX_BOUNDED_QUEUE_DEPTH` check and its over case
+    // parses.)
+    for field in ["recv_cap", "inbound_cap", "accept_cap"] {
+      let over = format!(r#"{{ "{field}": {} }}"#, MAX_BOUNDED_QUEUE_DEPTH + 1);
       assert!(
         serde_json::from_str::<DriverConfig>(&over).is_err(),
-        "{field} above the channel ceiling must be rejected"
+        "{field} above the eager-ring ceiling must be rejected"
       );
-      let at = format!(r#"{{ "{field}": {MAX_CHANNEL_CAPACITY} }}"#);
+      let at = format!(r#"{{ "{field}": {MAX_BOUNDED_QUEUE_DEPTH} }}"#);
       assert!(
         serde_json::from_str::<DriverConfig>(&at).is_ok(),
-        "{field} == the channel ceiling must be accepted"
+        "{field} == the eager-ring ceiling must be accepted"
+      );
+      // A value that the lazy channel ceiling would still permit is rejected for an eager ring.
+      let lazy_scale = format!(r#"{{ "{field}": {MAX_CHANNEL_CAPACITY} }}"#);
+      assert!(
+        serde_json::from_str::<DriverConfig>(&lazy_scale).is_err(),
+        "{field} at the lazy channel ceiling must be rejected by the tighter eager-ring ceiling"
       );
     }
   }
@@ -953,17 +1006,24 @@ mod tests {
     // `max_inflight` that clears the `usize::MAX` overflow check yet exceeds the submit-budget ceiling.
     let half = format!("{}", usize::MAX / 2);
     assert!(Cli::try_parse_from(["prog", "--max-inflight", &half]).is_err());
-    // Each bounded-channel cap above the ceiling is likewise rejected through clap's error path.
-    let over = format!("{}", MAX_CHANNEL_CAPACITY + 1);
-    for flag in [
-      "--events-cap",
-      "--recv-cap",
-      "--inbound-cap",
-      "--accept-cap",
-    ] {
+    // The lazy `events_cap` above the lazy channel ceiling is rejected through clap's error path.
+    let over_lazy = format!("{}", MAX_CHANNEL_CAPACITY + 1);
+    assert!(
+      Cli::try_parse_from(["prog", "--events-cap", &over_lazy]).is_err(),
+      "--events-cap above the channel ceiling must be rejected"
+    );
+    // Each eager-ring cap above the tighter eager-ring ceiling is likewise rejected — including a
+    // `MAX_CHANNEL_CAPACITY`-scale value that the lazy ceiling would have allowed.
+    let over_eager = format!("{}", MAX_BOUNDED_QUEUE_DEPTH + 1);
+    let lazy_scale = format!("{}", MAX_CHANNEL_CAPACITY);
+    for flag in ["--recv-cap", "--inbound-cap", "--accept-cap"] {
       assert!(
-        Cli::try_parse_from(["prog", flag, &over]).is_err(),
-        "{flag} above the channel ceiling must be rejected"
+        Cli::try_parse_from(["prog", flag, &over_eager]).is_err(),
+        "{flag} above the eager-ring ceiling must be rejected"
+      );
+      assert!(
+        Cli::try_parse_from(["prog", flag, &lazy_scale]).is_err(),
+        "{flag} at the lazy channel ceiling must be rejected by the tighter eager-ring ceiling"
       );
     }
   }
@@ -1005,6 +1065,43 @@ mod tests {
       over_events.validate(),
       Err(DriverConfigError::EventsCapAboveChannelCeiling)
     ));
+    // The three eager-ring caps are bounded by the tighter `MAX_BOUNDED_QUEUE_DEPTH`: a value above it
+    // (and, a fortiori, a `MAX_CHANNEL_CAPACITY`-scale value the lazy ceiling would permit) is rejected
+    // with the per-cap eager-ring variant.
+    let over_recv = DriverConfig {
+      recv_cap: MAX_BOUNDED_QUEUE_DEPTH + 1,
+      ..DriverConfig::default()
+    };
+    assert!(matches!(
+      over_recv.validate(),
+      Err(DriverConfigError::RecvCapAboveQueueCeiling)
+    ));
+    let over_inbound = DriverConfig {
+      inbound_cap: MAX_BOUNDED_QUEUE_DEPTH + 1,
+      ..DriverConfig::default()
+    };
+    assert!(matches!(
+      over_inbound.validate(),
+      Err(DriverConfigError::InboundCapAboveQueueCeiling)
+    ));
+    let over_accept = DriverConfig {
+      accept_cap: MAX_BOUNDED_QUEUE_DEPTH + 1,
+      ..DriverConfig::default()
+    };
+    assert!(matches!(
+      over_accept.validate(),
+      Err(DriverConfigError::AcceptCapAboveQueueCeiling)
+    ));
+    // A `MAX_CHANNEL_CAPACITY`-scale value (fine for the lazy `events_cap`) is rejected for an eager
+    // ring — this is the OOM-at-bind hazard the tighter ceiling closes.
+    let lazy_scale_recv = DriverConfig {
+      recv_cap: MAX_CHANNEL_CAPACITY,
+      ..DriverConfig::default()
+    };
+    assert!(matches!(
+      lazy_scale_recv.validate(),
+      Err(DriverConfigError::RecvCapAboveQueueCeiling)
+    ));
     let over_cap = DriverConfig {
       redial_cap: MAX_REDIAL_BACKOFF + Duration::from_secs(1),
       ..DriverConfig::default()
@@ -1023,12 +1120,14 @@ mod tests {
       Err(DriverConfigError::RedialBaseTooLarge)
     ));
     // The bounds themselves validate (boundary is inclusive for the caps, `- 1` for max_inflight).
+    // The lazy `events_cap` sits at `MAX_CHANNEL_CAPACITY`; the three eager-ring caps at the tighter
+    // `MAX_BOUNDED_QUEUE_DEPTH`.
     let at_bounds = DriverConfig {
       max_inflight: MAX_CHANNEL_CAPACITY - 1,
       events_cap: MAX_CHANNEL_CAPACITY,
-      recv_cap: MAX_CHANNEL_CAPACITY,
-      inbound_cap: MAX_CHANNEL_CAPACITY,
-      accept_cap: MAX_CHANNEL_CAPACITY,
+      recv_cap: MAX_BOUNDED_QUEUE_DEPTH,
+      inbound_cap: MAX_BOUNDED_QUEUE_DEPTH,
+      accept_cap: MAX_BOUNDED_QUEUE_DEPTH,
       redial_base: MAX_REDIAL_BACKOFF,
       redial_cap: MAX_REDIAL_BACKOFF,
       ..DriverConfig::default()
