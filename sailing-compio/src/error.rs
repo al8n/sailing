@@ -103,19 +103,24 @@ pub enum DriverConfigError {
   /// channel; a capacity at/above the ceiling would trip the channel implementation's limit.
   #[error("events_cap must be at most the channel-capacity ceiling")]
   EventsCapAboveChannelCeiling,
-  /// `recv_cap` is at or above the channel-capacity ceiling. The QUIC datagram channel is sized from
-  /// it; a capacity at/above the ceiling would trip the channel implementation's limit.
-  #[error("recv_cap must be at most the channel-capacity ceiling")]
-  RecvCapAboveChannelCeiling,
-  /// `inbound_cap` is at or above the channel-capacity ceiling. The stream drivers' shared inbound
-  /// channel is sized from it; a capacity at/above the ceiling would trip the channel implementation's
-  /// limit.
-  #[error("inbound_cap must be at most the channel-capacity ceiling")]
-  InboundCapAboveChannelCeiling,
-  /// `accept_cap` is at or above the channel-capacity ceiling. The accept channel is sized from it; a
-  /// capacity at/above the ceiling would trip the channel implementation's limit.
-  #[error("accept_cap must be at most the channel-capacity ceiling")]
-  AcceptCapAboveChannelCeiling,
+  /// `recv_cap` exceeds the eager-ring ceiling. The QUIC datagram channel is a `lochan::mpsc::bounded`
+  /// ring that allocates all `recv_cap` slots UP FRONT, so a value above
+  /// [`MAX_BOUNDED_QUEUE_DEPTH`](crate::MAX_BOUNDED_QUEUE_DEPTH) would OOM / abort at bind rather than
+  /// fill lazily.
+  #[error("recv_cap must be at most the eager-ring queue ceiling")]
+  RecvCapAboveQueueCeiling,
+  /// `inbound_cap` exceeds the eager-ring ceiling. The stream drivers' shared inbound channel is a
+  /// `lochan::mpsc::bounded` ring that allocates all `inbound_cap` slots UP FRONT, so a value above
+  /// [`MAX_BOUNDED_QUEUE_DEPTH`](crate::MAX_BOUNDED_QUEUE_DEPTH) would OOM / abort at bind rather than
+  /// fill lazily.
+  #[error("inbound_cap must be at most the eager-ring queue ceiling")]
+  InboundCapAboveQueueCeiling,
+  /// `accept_cap` exceeds the eager-ring ceiling. The accept channel is a `lochan::mpsc::bounded` ring
+  /// that allocates all `accept_cap` slots UP FRONT, so a value above
+  /// [`MAX_BOUNDED_QUEUE_DEPTH`](crate::MAX_BOUNDED_QUEUE_DEPTH) would OOM / abort at bind rather than
+  /// fill lazily.
+  #[error("accept_cap must be at most the eager-ring queue ceiling")]
+  AcceptCapAboveQueueCeiling,
   /// `cmd_budget` is zero. The per-iteration command-drain budget would drain nothing, stalling
   /// every submit behind the run loop.
   #[error("cmd_budget must be non-zero")]
