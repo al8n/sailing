@@ -146,6 +146,24 @@ impl Cluster {
       .count()
   }
 
+  /// The maximum term among nodes that currently believe themselves leader, over the SAME live
+  /// (non-removed) population as [`leader_count`](Self::leader_count) and
+  /// [`committed_voters`](Self::committed_voters); `None` if no live node is a leader.
+  ///
+  /// `mark_removed` freezes a node's `role`/`term` rather than clearing them, so a removed ex-leader
+  /// stranded at a stale high term is excluded here. Including it would inflate the live max and let a
+  /// caller gating on "the live max leader term" miss a genuine same-term split among live leaders.
+  pub fn max_leader_term(&self) -> Option<sailing_proto::Term> {
+    self
+      .node_ids
+      .iter()
+      .enumerate()
+      .filter(|(_, id)| !self.removed.contains(id))
+      .filter(|(i, _)| self.nodes[*i].role().is_leader())
+      .map(|(i, _)| self.nodes[i].term())
+      .max()
+  }
+
   /// The term of node `id`.
   pub fn term_of(&self, id: u64) -> sailing_proto::Term {
     let i = self.node_idx[&id];

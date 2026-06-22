@@ -20,6 +20,11 @@ pub(crate) fn reconcile_membership(c: &mut Cluster, st: &mut VoprState) {
   if c.leader().is_some() {
     let voters = c.committed_voters();
     let learners = c.committed_learners();
+    // Snapshot the live max leader term HERE, from the same pre-mutation state as `committed_voters`
+    // above and BEFORE the `reinstate`/committed-removal below change the live population. Since
+    // `committed_voters` took its config from the highest-term leader, that leader's term IS this max,
+    // and capturing it now keeps the split guard below and `committed_voters` on one consistent snapshot.
+    let max_leader_term = c.max_leader_term();
     // Regression recovery: a `gone` node the CURRENT leader's committed view STILL lists must rejoin the
     // network. The leader needs that node's vote/ack to make progress, but the harness had isolated it
     // because the leader is a post-restart/partition laggard whose APPLIED config regressed (rebuilt
@@ -52,8 +57,39 @@ pub(crate) fn reconcile_membership(c: &mut Cluster, st: &mut VoprState) {
       st.removing.remove(&v);
       st.down.remove(&v);
     }
+    // Snapshot the tracked set BEFORE the recompute overwrites it, so the orphan filter below can spot
+    // a node that just departed the membership.
+    let prev_tracked: BTreeSet<u64> = st
+      .voters
+      .iter()
+      .chain(st.learners.iter())
+      .copied()
+      .collect();
     st.voters = voters.difference(&st.gone).copied().collect();
     st.learners = learners.difference(&st.gone).copied().collect();
+    // Drop any still-tracked node (a voter/learner, or one resurrected above) that the authoritative
+    // committed config no longer lists — it left the membership OUTSIDE the in-flight-removal path,
+    // e.g. resurrected on one leader's regressed view but absent from the now-authoritative leader's.
+    // Left alone such a node stays un-isolated and un-`removed`, so a stale ex-leader counts toward
+    // `leader_count()` forever and falsely trips the calm-window liveness oracle. `mark_removed` (which
+    // also isolates) restores the invariant that every non-member is excluded from the oracles. This is
+    // symmetric to AND disjoint from the resurrect above (which re-admits nodes the leader LISTS; this
+    // drops nodes it does NOT), so the two cannot fight within a pass.
+    let orphaned: Vec<u64> = prev_tracked
+      .into_iter()
+      .filter(|id| !voters.contains(id) && !learners.contains(id) && !st.gone.contains(id))
+      // NEVER erase a node that is itself a leader at the max leader term. Two leaders sharing the max
+      // term on DIVERGENT configs is a genuine same-term split-brain that `committed_voters` resolves
+      // arbitrarily (no higher term distinguishes authority); dropping the OTHER leader here would HIDE
+      // that split from the single-leader oracle instead of failing on it. A strictly-lower-term leader
+      // (the stale phantom) or a non-leader cannot mask a split, so both stay eligible.
+      .filter(|id| !(c.role_of(*id).is_leader() && Some(c.term_of(*id)) == max_leader_term))
+      .collect();
+    for id in orphaned {
+      c.mark_removed(id);
+      st.gone.insert(id);
+      st.down.remove(&id);
+    }
   }
   // A VOPR-isolated node that is no longer a voter (e.g. its RemoveNode committed) should leave
   // `down` so it stops being counted — `voters_down` already filters by `voters`, but pruning keeps

@@ -670,6 +670,31 @@ mod tests {
     assert!(found, "a leader should emerge within 100 ticks");
   }
 
+  #[test]
+  fn max_leader_term_excludes_removed_leaders() {
+    // A removed ex-leader keeps a frozen Leader role at its stale term, so `max_leader_term` must read
+    // the live (non-removed) population — a naive max over all node ids would still report that frozen
+    // term, disabling the VOPR's split-masking guard (which protects every leader at the live max term).
+    let mut c = Cluster::new(3);
+    assert!(c.run_until(300, |c| c.leader_count() == 1));
+    let leader = c.leader().expect("a leader was elected");
+    let t = c.term_of(leader);
+    assert_eq!(c.max_leader_term(), Some(t), "the live leader's term");
+    // With the only leader removed and no other yet elected, the live max-leader-term is None even
+    // though the removed node's frozen role still reads Leader at `t`.
+    c.mark_removed(leader);
+    assert_eq!(
+      c.leader_count(),
+      0,
+      "the removed leader is no longer counted"
+    );
+    assert_eq!(
+      c.max_leader_term(),
+      None,
+      "max_leader_term must exclude the removed (frozen-Leader) node"
+    );
+  }
+
   /// Drive a cluster to agreement on a batch and return each node's applied (index, command) log.
   fn drive_and_capture(c: &mut Cluster, batch: u32) -> Vec<AppliedLog> {
     assert!(c.run_until(300, |c| c.leader_count() == 1));
