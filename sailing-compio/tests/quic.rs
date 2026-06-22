@@ -207,20 +207,28 @@ async fn submit_budget_exhaustion_is_busy() {
   }
 }
 
-/// The shutdown ack is an immediate-rebind contract: when it arrives the socket fd is fully
-/// released, so binding the SAME address again succeeds at once.
+/// A completed `shutdown().await` is an immediate-rebind contract: it resolves only after the socket
+/// fd is fully released, so binding the SAME address again succeeds at once. Crucially this holds for
+/// EVERY coalesced caller — here two `Handle` clones shut down concurrently and BOTH must resolve
+/// before the rebind, proving a swap-loser awaits real teardown rather than returning an early `Ok`.
 #[compio::test]
-async fn shutdown_ack_means_immediate_rebind() {
+async fn shutdown_means_immediate_rebind_for_every_coalesced_caller() {
   let ca = TestCa::new();
   let addr: SocketAddr = "127.0.0.1:42200".parse().unwrap();
 
   let (driver, handle) = build_node(&ca, 1, addr, Vec::new(), DriverConfig::default()).await;
+  let clone = handle.clone();
   let task = compio::runtime::spawn(driver.run());
-  handle.shutdown().await.expect("shutdown acks");
-  // The ack means the fd is RELEASED — not merely that teardown was scheduled.
+  // Two coalesced callers (only one wins the enqueue swap); JOIN them so BOTH resolve before the
+  // rebind. If a loser returned `Ok` before the driver's `close().await`, the rebind below would
+  // race the still-open fd and could fail with `AddrInUse`.
+  let (a, b) = futures_util::future::join(handle.shutdown(), clone.shutdown()).await;
+  a.expect("the winner resolves after teardown");
+  b.expect("the loser resolves after teardown");
+  // Both resolved ⇒ the fd is RELEASED — not merely that teardown was scheduled.
   let rebound = compio::net::UdpSocket::bind(addr)
     .await
-    .expect("the address is immediately rebindable after the ack");
+    .expect("the address is immediately rebindable once every shutdown caller has resolved");
   drop(rebound);
   let _ = task.await;
 

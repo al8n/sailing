@@ -29,7 +29,10 @@ compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io
 flume = { workspace = true }
 lochan = { workspace = true }
 futures-channel = { workspace = true }
-futures-util = { workspace = true }
+# `std` (over the workspace default's macro-only set) brings in `FutureExt::shared` + `Shared`,
+# which the coalesced shutdown uses to fan ONE teardown-completion oneshot out to every Handle
+# clone. sailing-compio is std, so this adds nothing the crate did not already require.
+futures-util = { workspace = true, features = ["std"] }
 serde = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }
 humantime = { workspace = true, optional = true }
