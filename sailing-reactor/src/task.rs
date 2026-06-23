@@ -23,6 +23,13 @@ impl<R: RuntimeLite> AbortOnDrop<R> {
   pub(crate) fn new(handle: <R::Spawner as AsyncSpawner>::JoinHandle<()>) -> Self {
     Self(Some(handle))
   }
+
+  /// Take the join handle, DEFUSING the abort-on-drop. For a teardown that drives the task to a clean
+  /// stop (a shutdown signal) and then AWAITS the returned handle, so the task's owned resources are
+  /// released before the caller proceeds rather than merely scheduled for cancellation.
+  pub(crate) fn into_handle(mut self) -> Option<<R::Spawner as AsyncSpawner>::JoinHandle<()>> {
+    self.0.take()
+  }
 }
 
 impl<R: RuntimeLite> Drop for AbortOnDrop<R> {

@@ -14,7 +14,7 @@ mod bridge;
 mod driver;
 mod task;
 
-pub use driver::{AcceptorFactory, DialerFactory, ReactorStreamDriver};
+pub use driver::{AcceptorFactory, DialerFactory, ReactorQuicDriver, ReactorStreamDriver};
 
 #[cfg(feature = "unverified-wall-clock")]
 pub use sailing_driver::UnverifiedSystemClock;
