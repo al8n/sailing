@@ -10,11 +10,14 @@
 mod clock;
 mod config;
 mod error;
+mod handle;
+pub mod shared;
 mod wall_clock;
 
 pub use clock::{Clock, jittered, validate_and_capture_eps};
 pub use config::{DriverConfig, MAX_BOUNDED_QUEUE_DEPTH, MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF};
 pub use error::{BindError, DriverConfigError, DriverError};
+pub use handle::{Command, Handle};
 #[cfg(feature = "unverified-wall-clock")]
 pub use wall_clock::UnverifiedSystemClock;
 pub use wall_clock::{Monotonic, NtpDisciplinedClock, WallClock, WallReading};
