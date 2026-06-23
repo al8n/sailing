@@ -45,6 +45,10 @@ impl LogStore for NoopLog {
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
     None
   }
+
+  fn has_pending(&self) -> bool {
+    false
+  }
 }
 
 /// A mutating in-memory log for proto unit tests. Mirrors `sailing_simulation::MemLog`.
@@ -180,6 +184,9 @@ impl LogStore for VecLog {
     self.entries.drain(0..drain_count);
     self.offset = up_to;
     self.compacted_term = boundary_term;
+    // Enqueue the `Compacted` completion the trait's completion discipline requires (every sibling
+    // in-memory store does), so a `poll()` reports the compaction and `has_pending()` is faithful.
+    self.completions.push_back(LogDone::Compacted(up_to));
   }
 
   fn restore(&mut self, last_index: Index, last_term: Term) {
@@ -196,6 +203,12 @@ impl LogStore for VecLog {
 
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
+  }
+
+  fn has_pending(&self) -> bool {
+    // Ready-to-poll only: the `held` deque is un-flushed (no completion enqueued yet), so it is
+    // excluded — counting it would make the driver hot-spin on a deferred-fsync tail.
+    !self.completions.is_empty()
   }
 }
 
@@ -399,6 +412,10 @@ impl LogStore for FailTermLog {
       .poll()
       .map(|r| Ok(r.expect("VecLog::poll is Infallible")))
   }
+
+  fn has_pending(&self) -> bool {
+    self.inner.has_pending()
+  }
 }
 
 /// A counting state machine: `Command = Bytes`, `Response = usize`. Counts applied commands.
@@ -493,6 +510,10 @@ impl<I: NodeId> StableStore for NoopStable<I> {
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
+  }
+
+  fn has_pending(&self) -> bool {
+    !self.completions.is_empty()
   }
 }
 
@@ -668,5 +689,11 @@ impl StableStore for AsyncStable {
       _ => {}
     }
     done.map(Ok)
+  }
+
+  fn has_pending(&self) -> bool {
+    // Only ENQUEUED completions are ready to poll. A `submit_*` whose durability is deferred (no
+    // completion yet — the `fail_next_snapshot_durability` torn-fsync slot) is correctly excluded.
+    !self.completions.is_empty()
   }
 }

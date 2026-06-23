@@ -636,6 +636,9 @@ mod tests {
       fn poll(&mut self) -> Option<Result<LogDone, ()>> {
         unreachable!()
       }
+      fn has_pending(&self) -> bool {
+        false
+      }
     }
     // A non-empty limbo region forces the log read: the fatal error MUST surface as `Err` (the driver
     // fail-stops `Poisoned`), NOT collapse to `Ok(None)` — which would hide a corrupt committed-range
@@ -683,6 +686,9 @@ mod tests {
       }
       fn poll(&mut self) -> Option<Result<LogDone, ()>> {
         unreachable!()
+      }
+      fn has_pending(&self) -> bool {
+        false
       }
     }
     // Budget 640 / LIMBO_ENTRY_OVERHEAD (64) = 10 entries max; a ~1000-index limbo region far exceeds it,

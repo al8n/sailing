@@ -110,6 +110,17 @@ pub enum StableDone {
   SnapshotWritten(OpId),
 }
 
+/// Whether a bounded `handle_storage` call left more storage completions queued.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::IsVariant)]
+pub enum StorageProgress {
+  /// Both completion queues drained within the per-call budget — the driver may sleep.
+  Drained,
+  /// The per-call budget was hit with completions still queued — the driver must re-drive
+  /// without sleeping so no single call monopolizes the run loop. The un-processed completions
+  /// stay queued (poll() is a stateful FIFO) and are processed next call — never dropped/reordered.
+  MorePending,
+}
+
 /// The result of a [`LogStore::entries`] range read: resident entries (owned or borrowed) or a
 /// cold-read deferral.
 ///
@@ -267,6 +278,19 @@ pub trait LogStore {
 
   /// Drain the next completion, if any.
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>>;
+
+  /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion
+  /// is queued and ready to drain RIGHT NOW.
+  ///
+  /// NORMATIVE: reports the READY-TO-POLL queue depth, NOT un-durable work. `poll()` is a FIFO, so
+  /// this is exactly "`poll()` would yield `Some`": an async store that accepted a `submit_*` but has
+  /// not yet made it durable (no completion enqueued) MUST return `false` here until its fsync lands
+  /// and the completion is queued — else the driver hot-spins (never sleeps). The core checks this at
+  /// the END of `handle_storage`, so any enqueue from any site this call (a submission whose
+  /// completion lands after its drain phase, a post-drain `compact`, a coordinator bridge-dispatched
+  /// submit) is caught by construction. MUST be cheap (no I/O) and side-effect-free. No default — a
+  /// store must answer for its own queue (`false`-default would silently stall, `true` would hot-spin).
+  fn has_pending(&self) -> bool;
 }
 
 /// The durable-metadata store (term/vote/commit + snapshot blobs).
@@ -327,6 +351,19 @@ pub trait StableStore {
 
   /// Drain the next completion, if any.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;
+
+  /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion
+  /// is queued and ready to drain RIGHT NOW.
+  ///
+  /// NORMATIVE: reports the READY-TO-POLL queue depth, NOT un-durable work. `poll()` is a FIFO, so
+  /// this is exactly "`poll()` would yield `Some`": an async store that accepted a `submit_*` but has
+  /// not yet made it durable (no completion enqueued) MUST return `false` here until its fsync lands
+  /// and the completion is queued — else the driver hot-spins (never sleeps). The core checks this at
+  /// the END of `handle_storage`, so any enqueue from any site this call (a submission whose
+  /// completion lands after its drain phase, a post-drain `compact`, a coordinator bridge-dispatched
+  /// submit) is caught by construction. MUST be cheap (no I/O) and side-effect-free. No default — a
+  /// store must answer for its own queue (`false`-default would silently stall, `true` would hot-spin).
+  fn has_pending(&self) -> bool;
 }
 
 #[cfg(test)]
@@ -380,5 +417,85 @@ mod tests {
     assert_eq!(rmeta.last_index(), meta.last_index());
     assert_eq!(rmeta.last_term(), meta.last_term());
     assert_eq!(rdata, data);
+  }
+
+  /// `has_pending` reports READY-TO-POLL, never un-durable work: a `submit_append` accepted but not
+  /// yet flushed (its `Appended` completion HELD, modelling a deferred fsync) must read `false`, and
+  /// only once the fsync lands and the completion is enqueued does it read `true`. This is the
+  /// anti-hot-spin contract — were `has_pending` to count an un-flushed submit, the driver would
+  /// never sleep on a store whose fsync is still in flight.
+  #[test]
+  fn has_pending_excludes_unflushed_submits() {
+    use crate::{Entry, EntryKind, testkit::VecLog};
+    let mut log = VecLog::default();
+    // No completion is queued, and the (visible-but-)held submit below enqueues none either.
+    assert!(!log.has_pending(), "an empty queue has nothing to poll");
+
+    log.hold_appends(true);
+    log.submit_append(
+      OpId::new(1),
+      &[Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )],
+    );
+    assert!(
+      !log.has_pending(),
+      "a submitted-but-unflushed append has enqueued no completion: nothing to poll yet"
+    );
+
+    // The deferred fsync lands: the completion is enqueued and is now ready to drain.
+    log.flush_held_appends();
+    assert!(
+      log.has_pending(),
+      "once the fsync completion is enqueued, poll() would yield Some"
+    );
+    assert!(log.poll().is_some());
+    assert!(
+      !log.has_pending(),
+      "draining the sole completion empties the queue again"
+    );
+  }
+
+  /// The stable-store companion to [`has_pending_excludes_unflushed_submits`]: `has_pending` tracks the
+  /// stable completion queue — true EXACTLY when `poll()` would yield `Some`. AsyncStable enqueues the
+  /// completion at `submit_write` (an instant-completion store), so it reads `true` until drained; a
+  /// torn-fsync `submit_snapshot` enqueues NO completion, so it correctly stays `false`.
+  #[test]
+  fn has_pending_tracks_the_stable_completion_queue() {
+    use crate::{ConfState, testkit::AsyncStable};
+    let mut stable = AsyncStable::default();
+    assert!(
+      !stable.has_pending(),
+      "an empty stable queue has nothing to poll"
+    );
+
+    // A normal submit_write enqueues its `Wrote` completion (durability is observed when poll drains it).
+    let hs = stable.hard_state().with_term(Term::new(1));
+    stable.submit_write(OpId::new(1), hs);
+    assert!(
+      stable.has_pending(),
+      "a submit_write's enqueued completion is ready to poll"
+    );
+    assert!(stable.poll().is_some());
+    assert!(
+      !stable.has_pending(),
+      "draining the completion empties the queue"
+    );
+
+    // A torn fsync makes the blob submit-visible but enqueues NO completion: nothing to poll.
+    stable.fail_next_snapshot_durability();
+    let meta = SnapshotMeta::new(
+      Index::new(1),
+      Term::new(1),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    stable.submit_snapshot(OpId::new(2), meta, bytes::Bytes::new());
+    assert!(
+      !stable.has_pending(),
+      "a torn-fsync submit_snapshot enqueues no completion: nothing to poll"
+    );
   }
 }

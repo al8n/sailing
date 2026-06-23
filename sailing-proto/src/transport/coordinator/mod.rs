@@ -7,7 +7,7 @@
 use super::{ConnId, router::PeerRouter, stream::RecordIo};
 use crate::{
   Config, Data, Endpoint, Event, Index, Instant, LogStore, NodeId, Now, ProposeError, StableStore,
-  StateMachine, TransferError,
+  StateMachine, StorageProgress, TransferError,
 };
 use bytes::Bytes;
 use std::vec::Vec;
@@ -298,15 +298,23 @@ where
     r
   }
 
-  /// Drain storage completions into the endpoint, then flush.
-  pub fn handle_storage<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
+  /// Drain storage completions into the endpoint, then flush. Forwards the endpoint's
+  /// [`StorageProgress`] so the driver re-drives without sleeping while the per-call budget left more
+  /// completions queued.
+  pub fn handle_storage<L, S>(
+    &mut self,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> StorageProgress
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
     let now: Now = now.into();
-    self.endpoint.handle_storage(now, log, stable);
+    let progress = self.endpoint.handle_storage(now, log, stable);
     self.flush();
+    progress
   }
 
   /// Drain queued outbound wire bytes as `(conn, bytes)` pairs for the driver to write.

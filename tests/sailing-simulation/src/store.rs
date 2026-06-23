@@ -647,6 +647,12 @@ impl LogStore for MemLog {
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
   }
+
+  fn has_pending(&self) -> bool {
+    // Ready-to-poll only: the async `in_flight` set is submitted-but-unflushed (no completion
+    // enqueued until `flush`), so it is excluded — counting it would make the driver hot-spin.
+    !self.completions.is_empty()
+  }
 }
 
 /// In-memory durable metadata store.
@@ -861,6 +867,12 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
+  }
+
+  fn has_pending(&self) -> bool {
+    // Ready-to-poll only: the async `in_flight` set is submitted-but-unflushed (no completion
+    // enqueued until `flush`), so it is excluded — counting it would make the driver hot-spin.
+    !self.completions.is_empty()
   }
 }
 
