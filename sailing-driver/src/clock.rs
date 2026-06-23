@@ -75,7 +75,7 @@ impl<W: WallClock> Clock<W> {
 /// `Some(0)` tier is NOT flattened into failover-off. Rejects a failover tier paired with a wall source
 /// `W` that cannot supply a wall — the loud [`BindError::MissingWallSource`], since the tier would
 /// otherwise silently never fire. Run at `bind`, BEFORE the socket binds.
-pub(crate) fn validate_and_capture_eps<I, W>(config: &Config<I>) -> Result<Option<u64>, BindError>
+pub fn validate_and_capture_eps<I, W>(config: &Config<I>) -> Result<Option<u64>, BindError>
 where
   I: NodeId,
   W: WallClock,
@@ -94,9 +94,7 @@ where
 /// schedule — no RNG dependency needed. Monotone in `base` with jitter at most `base / 4`, so a
 /// doubled base always schedules strictly later than the previous jittered delay (the strict
 /// spacing an exponential redial schedule needs).
-// Consumed by the drivers' redial schedules; the allow is removed when the first driver lands.
-#[allow(dead_code)]
-pub(crate) fn jittered(base: Duration) -> Duration {
+pub fn jittered(base: Duration) -> Duration {
   let nanos = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |d| d.subsec_nanos());

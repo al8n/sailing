@@ -1574,22 +1574,17 @@ name = "sailing-compio"
 version = "0.1.0"
 dependencies = [
  "bytes",
- "clap",
  "compio",
  "flume 0.11.1",
  "futures-channel",
  "futures-executor",
  "futures-util",
- "humantime",
- "humantime-serde",
  "libc",
  "lochan",
  "rcgen",
  "rustls",
  "sailing-driver",
  "sailing-proto",
- "serde",
- "serde_json",
  "thiserror",
 ]
 

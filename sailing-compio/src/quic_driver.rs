@@ -10,10 +10,10 @@ use sailing_proto::{
   quic::{QuicCoordinator, QuicOptions},
 };
 
+use sailing_driver::{jittered, validate_and_capture_eps};
+
 use crate::{
-  BindError, DriverError, Monotonic, WallClock,
-  clock::{Clock, jittered},
-  config::DriverConfig,
+  BindError, Clock, DriverConfig, DriverError, Monotonic, WallClock,
   handle::{Command, Handle},
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
 };
@@ -196,7 +196,7 @@ where
     // Validate + capture ε_unc (the sole copy of the wall-gate threshold) BEFORE the socket binds,
     // rejecting an invalid Config and the silent failover wedge (a failover tier with a non-supplying
     // source).
-    let eps_unc_ns = crate::clock::validate_and_capture_eps::<I, W>(&config)?;
+    let eps_unc_ns = validate_and_capture_eps::<I, W>(&config)?;
     let socket = UdpSocket::bind(addr).await?;
     let mut clock = Clock::new(eps_unc_ns, wall);
     let endpoint = sailing_proto::Endpoint::new(config, clock.now(), seed, fsm);

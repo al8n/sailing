@@ -11,11 +11,11 @@ use sailing_proto::{
   StreamCoordinator,
 };
 
+use sailing_driver::{jittered, validate_and_capture_eps};
+
 use crate::{
-  BindError, DriverError, Monotonic, WallClock,
+  BindError, Clock, DriverConfig, DriverError, Monotonic, WallClock,
   bridge::{BridgeInbound, BridgeOut, DialReady, bridge_read, bridge_write},
-  clock::{Clock, jittered},
-  config::DriverConfig,
   handle::{Command, Handle},
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
 };
@@ -232,7 +232,7 @@ where
     // Validate + capture ε_unc (the sole copy of the wall-gate threshold) BEFORE the socket binds,
     // rejecting an invalid Config and the silent failover wedge (a failover tier with a non-supplying
     // source).
-    let eps_unc_ns = crate::clock::validate_and_capture_eps::<I, W>(&config)?;
+    let eps_unc_ns = validate_and_capture_eps::<I, W>(&config)?;
     let listener = TcpListener::bind(addr).await?;
     let mut clock = Clock::new(eps_unc_ns, wall);
     let coord = StreamCoordinator::new(config, clock.now(), seed, fsm);
