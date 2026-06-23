@@ -14,12 +14,11 @@ repository.workspace = true
 # failover deployment by accident. For tests / tightly-disciplined single-region only.
 unverified-wall-clock = ["sailing-driver/unverified-wall-clock"]
 
-# Optional config layering on `DriverConfig`. `serde` adds gated Serialize/Deserialize (config files,
-# round-trip; the `Duration` knobs render as humantime strings via `humantime-serde`); `clap` adds a
-# gated `clap::Args` derive (CLI flags + `SAILING_DRIVER_*` env vars). Both leave the default build
-# byte-identical (everything gated). sailing-compio is std, so neither pulls a tier feature.
-serde = ["dep:serde", "dep:humantime-serde"]
-clap = ["dep:clap", "dep:humantime"]
+# Forward the optional `DriverConfig` config-layering to sailing-driver (where `DriverConfig` lives):
+# `serde` enables its gated Serialize/Deserialize, `clap` its gated `clap::Args` derive. Both leave the
+# default build byte-identical (everything gated).
+serde = ["sailing-driver/serde"]
+clap = ["sailing-driver/clap"]
 
 [dependencies]
 sailing-proto = { workspace = true, features = ["tls", "quic"] }
@@ -34,10 +33,6 @@ futures-channel = { workspace = true }
 # which the coalesced shutdown uses to fan ONE teardown-completion oneshot out to every Handle
 # clone. sailing-compio is std, so this adds nothing the crate did not already require.
 futures-util = { workspace = true, features = ["std"] }
-serde = { workspace = true, optional = true }
-humantime-serde = { workspace = true, optional = true }
-humantime = { workspace = true, optional = true }
-clap = { workspace = true, optional = true }
 
 # Linux-only: the disciplined wall clock reads the kernel's NTP sync state via adjtimex.
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -47,8 +42,6 @@ libc = { workspace = true }
 rcgen = { workspace = true }
 rustls = { workspace = true }
 futures-executor = { version = "0.3", default-features = false, features = ["std"] }
-# Test-only: JSON round-trip of the `serde`-gated `DriverConfig`.
-serde_json = { workspace = true }
 
 [lints]
 workspace = true
