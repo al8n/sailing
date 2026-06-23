@@ -178,4 +178,10 @@ pub enum DriverConfigError {
   /// `Duration::MAX` overflows and panics. Capped at [`MAX_REDIAL_BACKOFF`](crate::MAX_REDIAL_BACKOFF).
   #[error("redial_cap must be at most the Instant-safe redial bound")]
   RedialCapTooLarge,
+  /// `storage_ready` must be a COALESCING channel — `flume::bounded(1)` written with `try_send` — not an
+  /// unbounded one. The signal carries no data (it only nudges the driver to re-poll the store), so the
+  /// run loop coalesces it; an unbounded channel a noisy notifier fills faster than the loop drains would
+  /// grow without bound (the bounded drain that stops the livelock cannot also bound an unbounded queue).
+  #[error("storage_ready must be a coalescing flume::bounded(1) channel, not unbounded")]
+  StorageReadyNotCoalescing,
 }

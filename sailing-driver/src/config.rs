@@ -344,6 +344,13 @@ impl DriverConfig {
     if self.redial_base > self.redial_cap {
       return Err(DriverConfigError::RedialBaseAboveCap);
     }
+    // Require a coalescing `flume::bounded(1)` storage-ready channel (see
+    // `DriverConfigError::StorageReadyNotCoalescing`).
+    if let Some(rx) = &self.storage_ready
+      && rx.capacity() != Some(1)
+    {
+      return Err(DriverConfigError::StorageReadyNotCoalescing);
+    }
     Ok(())
   }
 }
@@ -1136,5 +1143,41 @@ mod tests {
       ..DriverConfig::default()
     };
     assert!(at_bounds.validate().is_ok());
+  }
+
+  #[test]
+  fn validate_requires_a_coalescing_storage_ready() {
+    // None (no async-store seam) is fine.
+    assert!(DriverConfig::default().validate().is_ok());
+    // The contract: a coalescing `flume::bounded(1)` channel.
+    let (_tx, rx) = flume::bounded(1);
+    assert!(
+      DriverConfig {
+        storage_ready: Some(rx),
+        ..DriverConfig::default()
+      }
+      .validate()
+      .is_ok()
+    );
+    // An UNBOUNDED channel is rejected — a noisy notifier would grow it without bound.
+    let (_tx, rx) = flume::unbounded();
+    assert!(matches!(
+      DriverConfig {
+        storage_ready: Some(rx),
+        ..DriverConfig::default()
+      }
+      .validate(),
+      Err(DriverConfigError::StorageReadyNotCoalescing)
+    ));
+    // A bounded channel wider than one slot is also rejected (not coalescing).
+    let (_tx, rx) = flume::bounded(8);
+    assert!(matches!(
+      DriverConfig {
+        storage_ready: Some(rx),
+        ..DriverConfig::default()
+      }
+      .validate(),
+      Err(DriverConfigError::StorageReadyNotCoalescing)
+    ));
   }
 }
