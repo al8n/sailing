@@ -387,3 +387,126 @@ async fn stream_shutdown_means_immediate_rebind_for_every_coalesced_caller() {
   drop(rebound);
   let _ = task.await;
 }
+
+/// A log whose `poll()` emits a huge burst of `Compacted` completions AHEAD of its real ones before
+/// draining: an UNBOUNDED `handle_storage` would process the whole burst in one call and trap the
+/// driver's run loop, starving commands/timers. The per-call budget bounds each call instead (the
+/// remainder stays queued — `poll()` is a stateful FIFO, nothing dropped), so the loop keeps cycling.
+/// `Compacted` is a no-op arm, so flooding it never corrupts log state. Finite (not endless) because
+/// the submit's own append completion sits BEHIND the burst in the log FIFO — the per-queue budget
+/// drains the burst over several windows before that real append surfaces to commit. (The election is
+/// never delayed: the stable queue has its OWN budget, so the durable self-vote can't be starved by a
+/// log flood.) The burst is sized to drain well within the timeout.
+struct CompactedFloodLog {
+  inner: MemLog,
+  filler: usize,
+}
+
+impl CompactedFloodLog {
+  fn new(filler: usize) -> Self {
+    Self {
+      inner: MemLog::new(),
+      filler,
+    }
+  }
+}
+
+impl sailing_proto::LogStore for CompactedFloodLog {
+  type Error = std::convert::Infallible;
+
+  fn first_index(&self) -> sailing_proto::Index {
+    self.inner.first_index()
+  }
+  fn last_index(&self) -> sailing_proto::Index {
+    self.inner.last_index()
+  }
+  fn term(&self, index: sailing_proto::Index) -> Result<sailing_proto::Term, Self::Error> {
+    self.inner.term(index)
+  }
+  fn entries(
+    &self,
+    range: std::ops::Range<sailing_proto::Index>,
+    max_bytes: u64,
+  ) -> Result<sailing_proto::EntriesRead<'_>, Self::Error> {
+    self.inner.entries(range, max_bytes)
+  }
+  fn submit_append(&mut self, id: sailing_proto::OpId, entries: &[sailing_proto::Entry]) {
+    self.inner.submit_append(id, entries);
+  }
+  fn compact(&mut self, up_to: sailing_proto::Index) {
+    self.inner.compact(up_to);
+  }
+  fn restore(&mut self, last_index: sailing_proto::Index, last_term: sailing_proto::Term) {
+    self.inner.restore(last_index, last_term);
+  }
+
+  fn poll(&mut self) -> Option<Result<sailing_proto::LogDone, Self::Error>> {
+    if self.filler > 0 {
+      self.filler -= 1;
+      return Some(Ok(sailing_proto::LogDone::Compacted(
+        sailing_proto::Index::ZERO,
+      )));
+    }
+    self.inner.poll()
+  }
+
+  fn has_pending(&self) -> bool {
+    self.filler > 0 || self.inner.has_pending()
+  }
+}
+
+/// The per-call storage-drain budget keeps a degraded LOG store's flood of `Compacted` completions
+/// from trapping the run loop: a lone-voter leader still elects and commits a submit despite the log
+/// handing back a huge `Compacted` burst on every drain.
+#[compio::test]
+async fn storage_log_flood_does_not_trap_the_run_loop() {
+  let addr: SocketAddr = "127.0.0.1:43201".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let local = encoded(1);
+  let dial_local = local.clone();
+  let dialer: sailing_compio::DialerFactory<u64, Labeled<Passthrough>> = Rc::new(move |_: &u64| {
+    Labeled::dialer(
+      Passthrough::new(),
+      &LabelOptions {
+        cluster: cluster(),
+        local_id: dial_local.clone(),
+      },
+    )
+    .map_err(std::io::Error::other)
+  });
+  let acceptor: sailing_compio::AcceptorFactory<Labeled<Passthrough>> = Rc::new(move || {
+    Labeled::acceptor(
+      Passthrough::new(),
+      &LabelOptions {
+        cluster: cluster(),
+        local_id: local.clone(),
+      },
+    )
+    .map_err(std::io::Error::other)
+  });
+  // 64 budget windows' worth of `Compacted` completions ahead of any real work.
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    CompactedFloodLog::new(64 * 256),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+  // Despite the log flood, the lone leader elects and commits the submit within the timeout — the
+  // budget bounds each `handle_storage` call so the run loop is never trapped.
+  let committed = compio::time::timeout(
+    Duration::from_secs(10),
+    submit_anywhere(std::slice::from_ref(&handle), b"under-log-flood"),
+  )
+  .await
+  .expect("no livelock: the submit must commit despite the Compacted log flood");
+  assert_eq!(committed, 1);
+}

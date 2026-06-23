@@ -154,6 +154,10 @@ impl LogStore for MemLog {
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
   }
+
+  fn has_pending(&self) -> bool {
+    !self.completions.is_empty()
+  }
 }
 
 /// A synchronous in-memory stable store (every write durable immediately, so the visible and
@@ -228,6 +232,10 @@ impl StableStore for MemStable {
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
     self.completions.pop_front().map(Ok)
   }
+
+  fn has_pending(&self) -> bool {
+    !self.completions.is_empty()
+  }
 }
 
 /// A log whose appends can be made to FAIL on demand — the poison trigger. A completion error
@@ -299,6 +307,11 @@ impl LogStore for PoisonableLog {
       return Some(Err(e));
     }
     self.inner.poll().map(|r| r.map_err(|_| unreachable!()))
+  }
+
+  fn has_pending(&self) -> bool {
+    // `poll()` yields the injected-error queue first, then the inner store's completions.
+    !self.failed.is_empty() || self.inner.has_pending()
   }
 }
 
