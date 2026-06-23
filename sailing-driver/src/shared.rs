@@ -281,7 +281,7 @@ pub struct ParkedQuery<I, F> {
   pub _reservation: ReservationGuard,
 }
 
-/// The shared routing state both drivers thread through [`route_event`].
+/// The shared routing state both drivers thread through [`Self::route_event`].
 pub struct Routing<I, R, F> {
   /// Submit/conf completions keyed by their log index. Sound ONLY together with the
   /// sweep-on-every-`LeaderChanged` rule below: within one unbroken leadership the index is

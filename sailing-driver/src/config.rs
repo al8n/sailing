@@ -39,10 +39,11 @@ pub(crate) const DEFAULT_REDIAL_CAP: Duration = Duration::from_secs(5);
 /// only as it fills, so its hard limit is just the `cap == usize::MAX` `+ 1` overflow in the channel's
 /// pending arithmetic; one shared ceiling well below that covers both.
 ///
-/// The three LOCHAN-backed caps (`recv_cap`, `inbound_cap`, `accept_cap`) do NOT use this ceiling:
-/// `lochan::mpsc::bounded(cap)` EAGER-allocates a `cap`-slot ring up front (see
-/// [`MAX_BOUNDED_QUEUE_DEPTH`]), so a `(usize::MAX >> 2)`-scale value would OOM at bind, not lazily.
-/// They get the far tighter [`MAX_BOUNDED_QUEUE_DEPTH`] instead.
+/// The three transport-channel caps (`recv_cap`, `inbound_cap`, `accept_cap`) do NOT use this ceiling:
+/// a driver whose bounded transport channel EAGER-allocates its `cap` slots up front (the compio driver's
+/// lochan ring; see [`MAX_BOUNDED_QUEUE_DEPTH`]) would OOM at bind on a `(usize::MAX >> 2)`-scale value,
+/// so they get the far tighter [`MAX_BOUNDED_QUEUE_DEPTH`] — which a driver with lazily-growing channels
+/// (the reactor's flume) inherits as a conservative depth bound.
 ///
 /// The value is `(usize::MAX >> 2) − 1`, derived from `usize::MAX` so it is correct on any target
 /// width (≈ 4.6×10¹⁸ on 64-bit, ≈ 1.07×10⁹ on 32-bit) and astronomically above any realistic channel
@@ -50,13 +51,15 @@ pub(crate) const DEFAULT_REDIAL_CAP: Duration = Duration::from_secs(5);
 /// the operator's memory budget.
 pub const MAX_CHANNEL_CAPACITY: usize = (usize::MAX >> 2) - 1;
 
-/// Inclusive ceiling for the three EAGER-RING channel caps (`recv_cap`, `inbound_cap`, `accept_cap`).
+/// Inclusive ceiling for the three transport-channel caps (`recv_cap`, `inbound_cap`, `accept_cap`).
 ///
-/// Unlike `events_cap`'s `flume::bounded` (a lazily-growing `VecDeque`), `lochan::mpsc::bounded(cap)`
-/// allocates a FIXED ring of exactly `cap` `MaybeUninit` slots in ONE allocation up front — so `cap` is
-/// an immediate memory commitment at bind, not a lazy fill bound. A `cap` near [`MAX_CHANNEL_CAPACITY`]
-/// (≈ `usize::MAX / 4`) would therefore try to allocate ~`usize::MAX / 4` elements and OOM / abort at
-/// bind, so these three caps need a realistic eager-allocation ceiling rather than the lazy one.
+/// A driver whose bounded transport channel EAGER-allocates — the compio driver's `lochan::mpsc::bounded(cap)`
+/// allocates a FIXED ring of exactly `cap` `MaybeUninit` slots in ONE allocation up front, unlike
+/// `events_cap`'s lazily-growing `flume::bounded` — makes `cap` an immediate memory commitment at bind, not
+/// a lazy fill bound. A `cap` near [`MAX_CHANNEL_CAPACITY`] (≈ `usize::MAX / 4`) would therefore try to
+/// allocate ~`usize::MAX / 4` elements and OOM / abort at bind, so these three caps need a realistic
+/// eager-allocation ceiling rather than the lazy one (a driver with lazy transport channels — the
+/// reactor's flume — inherits the same tight ceiling conservatively).
 ///
 /// `1 << 19` (524 288) is chosen WELL ABOVE the defaults — `recv_cap` / `inbound_cap` default to 256
 /// and `accept_cap` to 16, so this leaves > 2000× headroom and normal tuning is unaffected — yet bounds
@@ -135,8 +138,8 @@ const fn default_max_failover_limbo_bytes() -> usize {
   DEFAULT_MAX_FAILOVER_LIMBO_BYTES
 }
 
-/// Tuning for a [`CompioQuicDriver`](crate::CompioQuicDriver) /
-/// `CompioStreamDriver`. `Default` is sized for a small LAN cluster; every knob
+/// Tuning shared by the stream and QUIC drivers (compio and reactor). `Default` is sized for a small
+/// LAN cluster; every knob
 /// adjusts the SIZE of a documented bound, never removes it.
 ///
 /// The optional `serde` / `clap` layers (re)serialize / expose every TUNING knob — the two
@@ -160,9 +163,9 @@ const fn default_max_failover_limbo_bytes() -> usize {
 /// |------|--------------|-------|
 /// | `max_inflight` | the submit budget (`flume::unbounded` command channel; budget is the bound) | `1 ..= MAX_CHANNEL_CAPACITY − 1` |
 /// | `events_cap` | `flume::bounded(events_cap)` (both drivers; lazy `VecDeque`) | `1 ..= MAX_CHANNEL_CAPACITY` |
-/// | `recv_cap` | `lochan::mpsc::bounded(recv_cap)` (QUIC datagram channel; EAGER ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
-/// | `inbound_cap` | `lochan::mpsc::bounded(inbound_cap)` (stream inbound channel; EAGER ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
-/// | `accept_cap` | `lochan::mpsc::bounded(accept_cap)` (accept channel; EAGER ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
+/// | `recv_cap` | the QUIC datagram channel (compio: an eager lochan ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
+/// | `inbound_cap` | the stream inbound channel (compio: an eager lochan ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
+/// | `accept_cap` | the accept channel (compio: an eager lochan ring) | `1 ..= MAX_BOUNDED_QUEUE_DEPTH` |
 /// | `redial_base` | doubled + jittered + added to `std::time::Instant` (redial schedule) | `(0, MAX_REDIAL_BACKOFF]`, `≤ redial_cap` |
 /// | `redial_cap` | the doubling ceiling — the largest value the jitter + `Instant` math sees | `(0, MAX_REDIAL_BACKOFF]` |
 /// | `cmd_budget` | per-iteration loop counter (`for _ in 0..cmd_budget`) — no panic sink | non-zero only |
@@ -257,9 +260,9 @@ impl DriverConfig {
   ///   producing task is wedged) AND at most [`MAX_CHANNEL_CAPACITY`] (it sizes a lazily-growing
   ///   `flume::bounded`, so the ceiling only guards the channel's pending arithmetic);
   /// - `recv_cap` / `inbound_cap` / `accept_cap` must each be non-zero (same wedge) AND at most
-  ///   [`MAX_BOUNDED_QUEUE_DEPTH`] (the far tighter EAGER-allocation ceiling: each sizes a
-  ///   `lochan::mpsc::bounded` ring that allocates all `cap` slots UP FRONT, so an astronomical value
-  ///   would OOM at bind rather than fill lazily);
+  ///   [`MAX_BOUNDED_QUEUE_DEPTH`] (the far tighter EAGER-allocation ceiling: on an eager-ring driver
+  ///   (the compio driver's lochan ring) each allocates all `cap` slots UP FRONT, so an astronomical
+  ///   value would OOM at bind rather than fill lazily);
   /// - `max_pending_bytes` / `max_outbound_backlog` / `max_conns` / `max_failover_limbo_bytes` must
   ///   each be non-zero (a zero turns the corresponding budget/cap into a reject-everything gate);
   /// - `redial_base` and `redial_cap` must each be non-zero (a zero backoff is a hot retry loop),
@@ -295,8 +298,8 @@ impl DriverConfig {
     if self.recv_cap == 0 {
       return Err(DriverConfigError::ZeroRecvCap);
     }
-    // The lochan ring eager-allocates `recv_cap` slots at bind, so it is bounded by the far tighter
-    // eager-allocation ceiling, not the lazy channel one.
+    // An eager-ring transport channel (the compio driver's lochan ring) allocates `recv_cap` slots at
+    // bind, so it is bounded by the far tighter eager-allocation ceiling, not the lazy channel one.
     if self.recv_cap > MAX_BOUNDED_QUEUE_DEPTH {
       return Err(DriverConfigError::RecvCapAboveQueueCeiling);
     }
@@ -813,7 +816,7 @@ mod tests {
   #[cfg(feature = "serde")]
   #[test]
   fn serde_rejects_eager_ring_caps_above_queue_ceiling() {
-    // The three lochan eager-ring caps allocate all `cap` slots at bind, so they are bounded by the
+    // The three eager-ring transport caps (compio's lochan) allocate all `cap` slots at bind, bounded by the
     // far tighter `MAX_BOUNDED_QUEUE_DEPTH`: one above it is rejected (it would OOM at bind), the
     // ceiling itself accepted, and a `MAX_CHANNEL_CAPACITY`-scale value (fine for the lazy channels) is
     // now rejected for these. (Falsify: drop any `> MAX_BOUNDED_QUEUE_DEPTH` check and its over case
