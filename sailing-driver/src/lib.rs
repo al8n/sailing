@@ -6,3 +6,11 @@
 //! [`WallClock`] time seam, the inflight budget and event/reply routing, and the driver error
 //! types. The I/O-specific halves — the socket bridges, the run loops, and the per-runtime entry
 //! points — live in the driver crates that depend on this one.
+
+mod error;
+mod wall_clock;
+
+pub use error::{BindError, DriverConfigError, DriverError};
+#[cfg(feature = "unverified-wall-clock")]
+pub use wall_clock::UnverifiedSystemClock;
+pub use wall_clock::{Monotonic, NtpDisciplinedClock, WallClock, WallReading};
