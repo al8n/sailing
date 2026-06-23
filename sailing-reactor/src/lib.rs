@@ -10,7 +10,11 @@
 //! the inflight budget, and the routing — lives in `sailing-driver` and is shared with sailing-compio;
 //! this crate provides only the readiness I/O half (the socket bridges and the run loop).
 
+mod bridge;
+mod driver;
 mod task;
+
+pub use driver::{AcceptorFactory, DialerFactory, ReactorStreamDriver};
 
 #[cfg(feature = "unverified-wall-clock")]
 pub use sailing_driver::UnverifiedSystemClock;
