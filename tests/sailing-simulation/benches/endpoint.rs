@@ -86,7 +86,7 @@ fn settle(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, now: Insta
         ),
       );
     }
-    ep.handle_storage(now, log, stable); // commit advances; apply_committed runs
+    let _ = ep.handle_storage(now, log, stable); // commit advances; apply_committed runs
   }
   panic!("the harness leader failed to quiesce within 64 settle rounds");
 }
@@ -110,7 +110,7 @@ fn elect_leader(n: usize) -> Harness {
     .poll_timeout()
     .expect("a fresh voter arms an election timer");
   ep.handle_timeout(now, &mut log, &mut stable); // → Candidate, campaigns
-  ep.handle_storage(now, &mut log, &mut stable); // self-vote durable
+  let _ = ep.handle_storage(now, &mut log, &mut stable); // self-vote durable
   let term = ep.term();
   // A strict majority is the self-vote plus floor(n/2) peers.
   for from in 1..=(n / 2) as u64 {
@@ -122,7 +122,7 @@ fn elect_leader(n: usize) -> Harness {
       Message::VoteResponse(VoteResponse::new(term, from, false, false)),
     );
   }
-  ep.handle_storage(now, &mut log, &mut stable); // become_leader appends + stores the no-op
+  let _ = ep.handle_storage(now, &mut log, &mut stable); // become_leader appends + stores the no-op
   settle(&mut ep, &mut log, &mut stable, now); // commit + apply it; every follower → Replicate
   assert!(
     ep.role().is_leader(),
@@ -194,7 +194,7 @@ fn heartbeat_round(ep: &mut Ep, log: &mut MemLog, stable: &mut MemStable<u64>, n
       ),
     }
   }
-  ep.handle_storage(*now, log, stable);
+  let _ = ep.handle_storage(*now, log, stable);
 }
 
 /// Propose one entry and carry it to committed-and-applied via a quorum of `AppendResponse`s.
@@ -208,7 +208,7 @@ fn replicate_one(mut h: Harness, n: usize) -> Harness {
     let idx = ep
       .propose(now, log, &*stable, &cmd)
       .expect("leader accepts the proposal");
-    ep.handle_storage(now, log, stable);
+    let _ = ep.handle_storage(now, log, stable);
     let term = ep.term();
     while ep.poll_message().is_some() {} // we synthesize the acks directly
     for from in 1..=(n / 2) as u64 {
@@ -227,7 +227,7 @@ fn replicate_one(mut h: Harness, n: usize) -> Harness {
         )),
       );
     }
-    ep.handle_storage(now, log, stable); // commit advances; apply_committed runs
+    let _ = ep.handle_storage(now, log, stable); // commit advances; apply_committed runs
     black_box(idx);
   }
   h

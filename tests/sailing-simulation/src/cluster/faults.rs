@@ -302,6 +302,7 @@ impl Cluster {
   /// [`open_fsync_window`](Self::open_fsync_window) so it can mirror `tick`'s storage step while
   /// holding one node out of the flush. Isolated nodes' messages are discarded (as in `tick`).
   pub(crate) fn flush_drain_collect_except(&mut self, keep: u64) -> bool {
+    let mut produced = false;
     for i in 0..self.nodes.len() {
       if self.node_ids[i] == keep {
         continue;
@@ -310,9 +311,12 @@ impl Cluster {
       self.stables[i].flush();
       let now_i = self.now_now(i);
       let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-      self.nodes[i].handle_storage(now_i, log, stable);
+      // A budget-bounded call may leave completions queued (`MorePending`); count that as progress so
+      // the settle loop keeps draining until every node returns `Drained`.
+      produced |= self.nodes[i]
+        .handle_storage(now_i, log, stable)
+        .is_more_pending();
     }
-    let mut produced = false;
     for i in 0..self.nodes.len() {
       let from = self.node_ids[i];
       if from == keep {

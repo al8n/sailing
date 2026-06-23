@@ -358,7 +358,11 @@ impl Cluster {
     for i in 0..self.nodes.len() {
       let now_i = self.now_now(i);
       let (log, stable) = (&mut self.logs[i], &mut self.stables[i]);
-      self.nodes[i].handle_storage(now_i, log, stable);
+      // A budget-bounded call may leave completions queued (`MorePending`); count that as progress so
+      // the settle-until-quiescent loop keeps draining until every node returns `Drained`.
+      any_new |= self.nodes[i]
+        .handle_storage(now_i, log, stable)
+        .is_more_pending();
     }
     // Collect outgoing messages produced by completion handlers (e.g. deferred acks once a staged
     // append flushes). Same path as the `tick` outgoing-drain: the structural oracles + seeded
