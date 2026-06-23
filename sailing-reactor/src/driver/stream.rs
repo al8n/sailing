@@ -406,6 +406,13 @@ where
       // on a timerless node (see HOUSEKEEPING_INTERVAL).
       let housekeeping =
         (!self.conns.is_empty()).then(|| std::time::Instant::now() + HOUSEKEEPING_INTERVAL);
+      // An already-due instant when EITHER store still has a completion queued — derived from the
+      // stores' LIVE state here, so it catches storage queued by a command (the loop-top fairness
+      // drain OR the selected command) as well as a budget cutoff, not just the prior
+      // `handle_storage`. So the timer fires immediately and the loop re-drives `handle_storage`
+      // next pass WITHOUT sleeping.
+      let storage_redrive =
+        (self.log.has_pending() || self.stable.has_pending()).then(std::time::Instant::now);
       let deadline = self
         .coord
         .poll_timeout()
@@ -414,6 +421,7 @@ where
         .chain(self.redial_wake)
         .chain(self.accept_backoff_until)
         .chain(housekeeping)
+        .chain(storage_redrive)
         .min()
         .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
 

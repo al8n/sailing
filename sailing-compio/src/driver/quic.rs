@@ -335,11 +335,21 @@ where
         break;
       }
 
+      // An already-due instant when EITHER store still has a completion queued — derived from the
+      // stores' LIVE state here, so it catches storage queued by a command (the loop-top fairness
+      // drain OR the selected command) as well as a budget cutoff, not just the prior
+      // `handle_storage`. So the timer fires immediately and the loop re-drives `handle_storage`
+      // next pass WITHOUT sleeping.
+      let storage_redrive =
+        (self.log.has_pending() || self.stable.has_pending()).then(std::time::Instant::now);
       // Recomputed AFTER the iter-top fire so it reflects the NEXT deadline.
       let deadline = self
         .coord
         .poll_timeout()
         .map(|d| self.clock.to_std(d))
+        .into_iter()
+        .chain(storage_redrive)
+        .min()
         .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
 
       // The select arms are plain channel/timer waits — the socket I/O lives in the recv task
@@ -410,16 +420,19 @@ where
           .coord
           .handle_timeout(now, &mut self.log, &mut self.stable);
       }
-      // ALWAYS drain storage completions: synchronous stores complete inline with the calls
-      // above, async ones signalled the arm we just coalesced.
-      self
-        .coord
-        .handle_storage(now, &mut self.log, &mut self.stable);
       if let Some(cmd) = command
         && self.handle_command(now, cmd)
       {
         break;
       }
+      // ALWAYS drain storage completions, AFTER the wake's command: a `Submit` proposes inline and a
+      // synchronous store enqueues its completion with no fresh storage-ready signal, so draining here
+      // is what surfaces that completion to the stores' queues; the deadline's `has_pending` check
+      // then re-drives without waiting for a timer. The other three drivers all drain storage after
+      // the wake's command; this matches them.
+      self
+        .coord
+        .handle_storage(now, &mut self.log, &mut self.stable);
       poisoned = self.pump().await;
     }
 
