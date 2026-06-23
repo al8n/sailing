@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sailing-proto", "sailing-driver", "sailing-compio", "tests/sailing-simulation"]
+members = ["sailing-proto", "sailing-driver", "sailing-compio", "sailing-reactor", "tests/sailing-simulation"]
 # The cargo-fuzz crate is nightly + libfuzzer with its own target dir; it is its own workspace.
 exclude = ["sailing-proto/fuzz"]
 
@@ -33,6 +33,10 @@ flume = { version = "0.11", default-features = false, features = ["async"] }
 lochan = "0.1"
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
+# Reactor driver (sailing-reactor): the agnostic runtime abstraction (tokio/smol) + socket tuning.
+agnostic = { version = "0.9", default-features = false }
+agnostic-lite = { version = "0.6", default-features = false }
+socket2 = { version = "0.6", features = ["all"] }
 
 [workspace.lints.rust]
 missing_docs = "warn"
