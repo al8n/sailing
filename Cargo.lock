@@ -1576,9 +1576,9 @@ checksum = "76dda8459b10a8960dfae91c1c77316fc15e7caf94f9f18794126512a8dc77e5"
 
 [[package]]
 name = "lochan"
-version = "0.1.2"
+version = "0.1.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "81385e62081e32f98505f3ef5c9799837398b666c268e44290a7bdaf4984038c"
+checksum = "b25993a15fcf640caae7558dfed8e4fd006e8fade9117ba729c77cd90ec7450e"
 dependencies = [
  "futures-core",
 ]
