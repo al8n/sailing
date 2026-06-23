@@ -41,5 +41,9 @@ tokio = { version = "1", default-features = false, features = ["rt-multi-thread"
 name = "stream_loopback"
 required-features = ["tokio"]
 
+[[test]]
+name = "quic_loopback"
+required-features = ["tokio"]
+
 [lints]
 workspace = true
