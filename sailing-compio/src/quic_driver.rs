@@ -10,13 +10,13 @@ use sailing_proto::{
   quic::{QuicCoordinator, QuicOptions},
 };
 
-use sailing_driver::{jittered, validate_and_capture_eps};
-
-use crate::{
-  BindError, Clock, DriverConfig, DriverError, Monotonic, WallClock,
-  handle::{Command, Handle},
+use sailing_driver::{
+  Command, Handle, jittered,
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  validate_and_capture_eps,
 };
+
+use crate::{BindError, Clock, DriverConfig, DriverError, Monotonic, WallClock};
 
 /// IP-layer maximum UDP payload — the persistent receive buffer's size.
 const RECV_BUF_LEN: usize = 65_507;
@@ -633,13 +633,17 @@ where
         }
       }
       Some(window) if self.routing.applied >= window.index() => {
-        match crate::shared::read_limbo(&self.log, &window, self.max_failover_limbo_bytes as u64) {
+        match sailing_driver::shared::read_limbo(
+          &self.log,
+          &window,
+          self.max_failover_limbo_bytes as u64,
+        ) {
           Ok(Some(limbo)) => {
             let parked = std::mem::take(&mut self.routing.failovers);
             let fsm = self.coord.state_machine();
             // Re-check the lease with a FRESH wall before EACH completion — the scan and each closure
             // burn wall time, so the window can expire mid-batch.
-            crate::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+            sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
               self
                 .coord
                 .endpoint()

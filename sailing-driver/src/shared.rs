@@ -39,7 +39,7 @@ use crate::DriverError;
 /// The shared in-flight submit budget (count AND payload bytes), cloned into every
 /// [`Handle`](crate::Handle) — the caps apply across all clones, not per clone.
 #[derive(Clone)]
-pub(crate) struct InflightBudget {
+pub struct InflightBudget {
   count: Arc<AtomicUsize>,
   bytes: Arc<AtomicUsize>,
   max_count: usize,
@@ -47,7 +47,8 @@ pub(crate) struct InflightBudget {
 }
 
 impl InflightBudget {
-  pub(crate) fn new(max_count: usize, max_bytes: usize) -> Self {
+  /// A budget admitting `max_count` in-flight slots and `max_bytes` of in-flight submit payload.
+  pub fn new(max_count: usize, max_bytes: usize) -> Self {
     Self {
       count: Arc::new(AtomicUsize::new(0)),
       bytes: Arc::new(AtomicUsize::new(0)),
@@ -61,7 +62,7 @@ impl InflightBudget {
   /// the reservation: it releases on `Drop` wherever the carrying command finally dies — moved
   /// into the pending entry on drain, completed with the reply, or dropped still-queued by a
   /// teardown — so no path can leak budget.
-  pub(crate) fn try_reserve<I>(&self, len: usize) -> Result<ReservationGuard, DriverError<I>> {
+  pub fn try_reserve<I>(&self, len: usize) -> Result<ReservationGuard, DriverError<I>> {
     // Optimistic add + rollback on overshoot: both counters are independent saturating gates,
     // and a failed reservation must leave them exactly as found.
     let prev_count = self.count.fetch_add(1, Ordering::AcqRel);
@@ -91,7 +92,7 @@ impl InflightBudget {
 }
 
 /// The owning side of one budget reservation (see [`InflightBudget::try_reserve`]).
-pub(crate) struct ReservationGuard {
+pub struct ReservationGuard {
   budget: InflightBudget,
   len: usize,
 }
@@ -104,7 +105,7 @@ impl Drop for ReservationGuard {
 }
 
 /// What a parked operation is waiting for, keyed by log index.
-pub(crate) enum Pending<I, R> {
+pub enum Pending<I, R> {
   /// A `submit`: completed with the apply response by `Applied` at this index.
   Submit {
     /// Answered with the committed response (or the supersede error).
@@ -124,27 +125,27 @@ pub(crate) enum Pending<I, R> {
 /// The type-erased completion of a linearizable query: called with `Ok(&F)` ON the driver
 /// thread to run the query (the result ships through the captured channel), or with the error
 /// that voided it — one closure, so the caller keeps full error fidelity across the erasure.
-pub(crate) type QueryComplete<I, F> = Box<dyn FnOnce(Result<&F, DriverError<I>>) + Send>;
+pub type QueryComplete<I, F> = Box<dyn FnOnce(Result<&F, DriverError<I>>) + Send>;
 
 /// The argument a [`FailoverComplete`] receives: the served `(FSM, limbo entries, window)` triple to
 /// run the read against, `None` when no serve window is available (the caller falls back to a normal
 /// read), or the error that voided the query.
-pub(crate) type FailoverOutcome<'a, I, F> =
+pub type FailoverOutcome<'a, I, F> =
   Result<Option<(&'a F, &'a [Entry], FailoverReadWindow)>, DriverError<I>>;
 
 /// The type-erased completion of a failover inherited-read query. Called ON the driver thread with the
 /// [`FailoverOutcome`] — the served triple, `Ok(None)`, or the error that voided it — one closure, so
 /// the caller keeps full error fidelity across the erasure.
-pub(crate) type FailoverComplete<I, F> = Box<dyn FnOnce(FailoverOutcome<'_, I, F>) + Send>;
+pub type FailoverComplete<I, F> = Box<dyn FnOnce(FailoverOutcome<'_, I, F>) + Send>;
 
 /// A parked failover inherited-read query: held until the committed prefix applies AND the serve
 /// window is (re-)confirmed live, then run against the state machine with the limbo region. The
 /// completion is type-erased and carries its own reply channel.
-pub(crate) struct ParkedFailover<I, F> {
+pub struct ParkedFailover<I, F> {
   /// The SINGLE completion (see [`FailoverComplete`]).
-  pub(crate) complete: FailoverComplete<I, F>,
+  pub complete: FailoverComplete<I, F>,
   /// The budget reservation (a failover query reserves one zero-byte slot).
-  pub(crate) _reservation: ReservationGuard,
+  pub _reservation: ReservationGuard,
 }
 
 /// The limbo region `(window.index(), window.limbo_upper()]` filtered to NORMAL entries — the
@@ -160,7 +161,7 @@ pub(crate) struct ParkedFailover<I, F> {
 /// arbitrarily large inherited tail and a failover read reserves a zero-byte budget slot, so an
 /// unbounded scan would let one read OOM/stall the driver. The region is contiguous and above the
 /// commit (never compacted), so a COMPLETE read's last entry reaches `limbo_upper`.
-pub(crate) fn read_limbo<L: LogStore>(
+pub fn read_limbo<L: LogStore>(
   log: &L,
   window: &FailoverReadWindow,
   max_bytes: u64,
@@ -251,7 +252,7 @@ fn contiguous_normal_entries(
 /// window live when the batch started can expire mid-batch — a completion past expiry must fall back
 /// (`Ok(None)`) rather than serve a stale inherited read. Shared by both drivers so the freshness rule
 /// cannot drift.
-pub(crate) fn serve_failover_batch<I, F>(
+pub fn serve_failover_batch<I, F>(
   parked: Vec<ParkedFailover<I, F>>,
   fsm: &F,
   limbo: &[Entry],
@@ -270,39 +271,40 @@ pub(crate) fn serve_failover_batch<I, F>(
 /// A linearizable query's lifecycle: confirmed by `ReadState` (which fixes `ready_at`), then run
 /// against the state machine once `applied >= ready_at`. The completion is type-erased and
 /// carries its own reply channel; `F` is the driver's state-machine type.
-pub(crate) struct ParkedQuery<I, F> {
+pub struct ParkedQuery<I, F> {
   /// `None` until the matching `ReadState` arrives; then the index the apply watermark must
   /// reach before the closure may run.
-  pub(crate) ready_at: Option<Index>,
+  pub ready_at: Option<Index>,
   /// The SINGLE completion (see [`QueryComplete`]).
-  pub(crate) complete: QueryComplete<I, F>,
+  pub complete: QueryComplete<I, F>,
   /// The budget reservation (a query reserves one zero-byte slot).
-  pub(crate) _reservation: ReservationGuard,
+  pub _reservation: ReservationGuard,
 }
 
 /// The shared routing state both drivers thread through [`route_event`].
-pub(crate) struct Routing<I, R, F> {
+pub struct Routing<I, R, F> {
   /// Submit/conf completions keyed by their log index. Sound ONLY together with the
   /// sweep-on-every-`LeaderChanged` rule below: within one unbroken leadership the index is
   /// unambiguous; across a change, swept entries can never be completed by a recycled index.
-  pub(crate) pending: BTreeMap<Index, Pending<I, R>>,
+  pub pending: BTreeMap<Index, Pending<I, R>>,
   /// Linearizable queries keyed by the read context this driver minted (a monotone counter's
   /// big-endian bytes — never reused within a driver's lifetime).
-  pub(crate) queries: BTreeMap<u64, ParkedQuery<I, F>>,
+  pub queries: BTreeMap<u64, ParkedQuery<I, F>>,
   /// The next read-context value.
-  pub(crate) next_query_ctx: u64,
+  pub next_query_ctx: u64,
   /// Parked failover inherited-read queries: served as a batch each pass once the serve window is
   /// confirmed live and the committed prefix has applied (see the drivers' `run_failover_serve`), and
   /// swept by [`Self::fail_all`] on every leadership change, exactly like the parked queries.
-  pub(crate) failovers: Vec<ParkedFailover<I, F>>,
+  pub failovers: Vec<ParkedFailover<I, F>>,
   /// The apply watermark (highest `Applied`/`ConfChanged` index seen): gates query execution.
-  pub(crate) applied: Index,
+  pub applied: Index,
   /// The best-effort events tail (dropped-on-full; never blocks the driver).
-  pub(crate) events: flume::Sender<Event<I, R>>,
+  pub events: flume::Sender<Event<I, R>>,
 }
 
 impl<I, R, F> Routing<I, R, F> {
-  pub(crate) fn new(events: flume::Sender<Event<I, R>>) -> Self {
+  /// Empty routing forwarding committed events to the best-effort `events` tail.
+  pub fn new(events: flume::Sender<Event<I, R>>) -> Self {
     Self {
       pending: BTreeMap::new(),
       queries: BTreeMap::new(),
@@ -314,7 +316,7 @@ impl<I, R, F> Routing<I, R, F> {
   }
 
   /// Mint a fresh, never-reused read context for a query.
-  pub(crate) fn mint_query_ctx(&mut self) -> u64 {
+  pub fn mint_query_ctx(&mut self) -> u64 {
     let ctx = self.next_query_ctx;
     self.next_query_ctx += 1;
     ctx
@@ -322,7 +324,7 @@ impl<I, R, F> Routing<I, R, F> {
 
   /// Queries whose confirmed read index the apply watermark has reached — popped for execution
   /// against the state machine (the DRIVER runs them; this module only books them).
-  pub(crate) fn take_runnable_queries(&mut self) -> Vec<ParkedQuery<I, F>> {
+  pub fn take_runnable_queries(&mut self) -> Vec<ParkedQuery<I, F>> {
     let applied = self.applied;
     let ready: Vec<u64> = self
       .queries
@@ -346,7 +348,7 @@ impl<I, R, F> Routing<I, R, F> {
   /// swept too: their read confirmation belongs to the old leadership's quorum reasoning.
   ///
   /// With [`DriverError::ShuttingDown`]: the teardown sweep.
-  pub(crate) fn fail_all(&mut self, err: &DriverError<I>)
+  pub fn fail_all(&mut self, err: &DriverError<I>)
   where
     I: Clone,
   {
@@ -374,7 +376,7 @@ impl<I: sailing_proto::NodeId, R: Clone, F> Routing<I, R, F> {
   /// watermark, mark confirmed queries ready, sweep on leadership changes — and forward a copy
   /// to the best-effort events tail. Returns `true` if the apply watermark advanced (the driver
   /// then runs [`Self::take_runnable_queries`] against the state machine).
-  pub(crate) fn route_event(&mut self, event: Event<I, R>) -> bool {
+  pub fn route_event(&mut self, event: Event<I, R>) -> bool {
     let mut advanced = false;
     match &event {
       Event::Applied(applied) => {

@@ -11,13 +11,15 @@ use sailing_proto::{
   StreamCoordinator,
 };
 
-use sailing_driver::{jittered, validate_and_capture_eps};
+use sailing_driver::{
+  Command, Handle, jittered,
+  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  validate_and_capture_eps,
+};
 
 use crate::{
   BindError, Clock, DriverConfig, DriverError, Monotonic, WallClock,
   bridge::{BridgeInbound, BridgeOut, DialReady, bridge_read, bridge_write},
-  handle::{Command, Handle},
-  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
 };
 
 /// Builds the record layer for an OUTBOUND connection to the given peer (the peer parameter
@@ -855,13 +857,17 @@ where
         }
       }
       Some(window) if self.routing.applied >= window.index() => {
-        match crate::shared::read_limbo(&self.log, &window, self.max_failover_limbo_bytes as u64) {
+        match sailing_driver::shared::read_limbo(
+          &self.log,
+          &window,
+          self.max_failover_limbo_bytes as u64,
+        ) {
           Ok(Some(limbo)) => {
             let parked = std::mem::take(&mut self.routing.failovers);
             let fsm = self.coord.state_machine();
             // Re-check the lease with a FRESH wall before EACH completion — the scan and each closure
             // burn wall time, so the window can expire mid-batch.
-            crate::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+            sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
               self
                 .coord
                 .endpoint()

@@ -91,17 +91,14 @@
 //! (an unsynchronized clock, a missing source), the intended backstop rather than a wiring fault.
 
 mod bridge;
-mod handle;
 mod quic_driver;
-mod shared;
 mod stream_driver;
 
-pub use handle::Handle;
 pub use quic_driver::CompioQuicDriver;
 #[cfg(feature = "unverified-wall-clock")]
 pub use sailing_driver::UnverifiedSystemClock;
 pub use sailing_driver::{
-  BindError, Clock, DriverConfig, DriverConfigError, DriverError, MAX_BOUNDED_QUEUE_DEPTH,
+  BindError, Clock, DriverConfig, DriverConfigError, DriverError, Handle, MAX_BOUNDED_QUEUE_DEPTH,
   MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic, NtpDisciplinedClock, WallClock, WallReading,
 };
 pub use stream_driver::{AcceptorFactory, CompioStreamDriver, DialerFactory};

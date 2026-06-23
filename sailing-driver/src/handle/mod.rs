@@ -18,7 +18,7 @@ use crate::{
 ///
 /// Generic over the node id `I`, the state machine `F` (whose `Command`/`Response` types ride
 /// the variants), so the typed payloads cross the thread boundary without serialization.
-pub(crate) enum Command<I, F>
+pub enum Command<I, F>
 where
   F: sailing_proto::StateMachine,
 {
@@ -151,7 +151,7 @@ where
   /// Build a handle. `teardown` is the receiver half of the driver's teardown-completion oneshot
   /// (the driver keeps the sender and fires it after its fd-release barrier); it is stored as a
   /// `Shared` so every clone awaits the one signal.
-  pub(crate) fn new(
+  pub fn new(
     commands: flume::Sender<Command<I, F>>,
     events: flume::Receiver<Event<I, F::Response>>,
     budget: InflightBudget,
