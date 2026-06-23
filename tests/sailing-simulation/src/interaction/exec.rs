@@ -708,7 +708,13 @@ impl InteractionEnv {
     loop {
       guard += 1;
       assert!(guard < 10_000, "drain_node storage livelock");
-      n.ep.handle_storage(now, &mut n.log, &mut n.stable);
+      // Fully drain the budget-bounded call so a single step processes every queued completion (the
+      // testkit stores enqueue a finite count, so `MorePending` clears in a bounded number of calls).
+      while n
+        .ep
+        .handle_storage(now, &mut n.log, &mut n.stable)
+        .is_more_pending()
+      {}
       // Drain outgoing → bus.
       let mut any = false;
       while let Some(o) = n.ep.poll_message() {
