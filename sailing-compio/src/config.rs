@@ -3,7 +3,7 @@
 
 use std::time::Duration;
 
-use crate::error::DriverConfigError;
+use crate::DriverConfigError;
 
 /// How many in-flight submits the budget admits by default.
 pub(crate) const DEFAULT_MAX_INFLIGHT: usize = 1_024;

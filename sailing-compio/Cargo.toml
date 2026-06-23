@@ -12,7 +12,7 @@ repository.workspace = true
 [features]
 # The raw-SystemTime wall source (UnverifiedSystemClock) — off by default so it cannot be selected in a
 # failover deployment by accident. For tests / tightly-disciplined single-region only.
-unverified-wall-clock = []
+unverified-wall-clock = ["sailing-driver/unverified-wall-clock"]
 
 # Optional config layering on `DriverConfig`. `serde` adds gated Serialize/Deserialize (config files,
 # round-trip; the `Duration` knobs render as humantime strings via `humantime-serde`); `clap` adds a

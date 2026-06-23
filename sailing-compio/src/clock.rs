@@ -4,10 +4,7 @@ use std::time::{Duration, Instant as StdInstant};
 
 use sailing_proto::{Config, Instant, NodeId, Now, Wall};
 
-use crate::{
-  BindError,
-  wall_clock::{Monotonic, WallClock},
-};
+use crate::{BindError, Monotonic, WallClock};
 
 /// Anchors the proto's monotonic [`Instant`] to an epoch captured at startup, owns the [`WallClock`]
 /// source `W` (default [`Monotonic`]), and holds the cluster `ε_unc` captured from the proto `Config`
@@ -142,7 +139,7 @@ mod tests {
 
   #[test]
   fn the_eps_gate_passes_within_bound_and_fails_over_bound() {
-    use crate::wall_clock::{WallClock, WallReading};
+    use crate::{WallClock, WallReading};
     // A fixture source that reports a fixed error so we can exercise the gate deterministically.
     struct Fixed(u64);
     impl WallClock for Fixed {
@@ -184,7 +181,7 @@ mod tests {
 
   #[test]
   fn validate_and_capture_eps_rejects_failover_without_wall_source() {
-    use crate::wall_clock::{NtpDisciplinedClock, WallClock, WallReading};
+    use crate::{NtpDisciplinedClock, WallClock, WallReading};
     use sailing_proto::ReadOnlyOption;
     // An always-supplying source so the Ok-with-ε case is platform-independent.
     struct AlwaysSupplies;

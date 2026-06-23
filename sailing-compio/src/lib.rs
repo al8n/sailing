@@ -93,19 +93,18 @@
 mod bridge;
 mod clock;
 mod config;
-mod error;
 mod handle;
 mod quic_driver;
 mod shared;
 mod stream_driver;
-mod wall_clock;
 
 pub use clock::Clock;
 pub use config::{DriverConfig, MAX_BOUNDED_QUEUE_DEPTH, MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF};
-pub use error::{BindError, DriverConfigError, DriverError};
 pub use handle::Handle;
 pub use quic_driver::CompioQuicDriver;
-pub use stream_driver::{AcceptorFactory, CompioStreamDriver, DialerFactory};
 #[cfg(feature = "unverified-wall-clock")]
-pub use wall_clock::UnverifiedSystemClock;
-pub use wall_clock::{Monotonic, NtpDisciplinedClock, WallClock, WallReading};
+pub use sailing_driver::UnverifiedSystemClock;
+pub use sailing_driver::{
+  BindError, DriverConfigError, DriverError, Monotonic, NtpDisciplinedClock, WallClock, WallReading,
+};
+pub use stream_driver::{AcceptorFactory, CompioStreamDriver, DialerFactory};
