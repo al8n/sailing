@@ -6,7 +6,7 @@ use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 use bytes::Bytes;
 use compio::net::UdpSocket;
 use sailing_proto::{
-  ClusterId, Config, Instant, LogStore, Now, ProposeError, StableStore, StateMachine,
+  ClusterId, Config, Instant, LogStore, Now, StableStore, StateMachine,
   quic::{QuicCoordinator, QuicOptions},
 };
 
@@ -17,6 +17,8 @@ use sailing_driver::{
 };
 
 use crate::{BindError, Clock, DriverConfig, DriverError, Monotonic, WallClock};
+
+use super::{map_propose_err, map_read_err, map_transfer_err};
 
 /// IP-layer maximum UDP payload — the persistent receive buffer's size.
 const RECV_BUF_LEN: usize = 65_507;
@@ -724,39 +726,5 @@ where
       return true;
     }
     false
-  }
-}
-
-/// Map the proto's propose-time error to the driver's typed surface.
-fn map_propose_err<I: core::fmt::Debug>(e: ProposeError<I>) -> DriverError<I> {
-  match e {
-    ProposeError::NotLeader { leader } => DriverError::NotLeader { leader },
-    ProposeError::Poisoned => DriverError::Poisoned,
-    other => DriverError::Rejected {
-      reason: format!("{other:?}"),
-    },
-  }
-}
-
-/// Map the proto's transfer-time error, preserving the redirect hint.
-fn map_transfer_err<I: core::fmt::Debug>(e: sailing_proto::TransferError<I>) -> DriverError<I> {
-  match e {
-    sailing_proto::TransferError::NotLeader { leader } => DriverError::NotLeader { leader },
-    sailing_proto::TransferError::Poisoned => DriverError::Poisoned,
-    other => DriverError::Rejected {
-      reason: format!("{other:?}"),
-    },
-  }
-}
-
-/// Map the proto's read-index error: a missing leader is the same redirect signal as a propose
-/// rejection (retry once a leader is known), the rest carry their reason.
-fn map_read_err<I>(e: sailing_proto::ReadIndexError) -> DriverError<I> {
-  match e {
-    sailing_proto::ReadIndexError::NoLeader => DriverError::NotLeader { leader: None },
-    sailing_proto::ReadIndexError::Poisoned => DriverError::Poisoned,
-    other => DriverError::Rejected {
-      reason: other.to_string(),
-    },
   }
 }
