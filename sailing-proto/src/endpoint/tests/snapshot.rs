@@ -237,6 +237,33 @@ fn deferred_compact_fires_on_snapshot_written() {
   );
 }
 
+/// Regression (storage-drain progress): the deferred compaction that fires when the
+/// `SnapshotWritten` completion drains calls `log.compact` AFTER the log drain phase. `compact`
+/// mints no op id, so a budget/op-id-only progress check would miss the `LogDone::Compacted` (or a
+/// compaction error) it can enqueue and report `Drained` with that completion still queued. This
+/// call runs no submission and exhausts no budget, so the compaction is the SOLE progress signal —
+/// `handle_storage` must report `MorePending` (this fails against the budget/op-id-only return).
+#[test]
+fn handle_storage_reports_more_pending_when_a_deferred_compaction_fires() {
+  let (mut ep, mut log, mut stable) = make_single_node_leader_with_entries(3, 3);
+  assert!(
+    ep.pending_compact().is_some(),
+    "snapshot write in flight, compaction deferred"
+  );
+
+  // The SnapshotWritten completion drains → the deferred `log.compact` fires.
+  let progress = ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    log.first_index() > Index::new(1),
+    "the deferred compaction ran (first_index advanced past 1)"
+  );
+  assert_eq!(
+    progress,
+    crate::StorageProgress::MorePending,
+    "a post-drain compaction must report MorePending, not Drained"
+  );
+}
+
 /// While `pending_compact` is set, `maybe_snapshot` must not fire again (idempotence guard).
 #[test]
 fn maybe_snapshot_does_not_refire_while_pending() {

@@ -16,7 +16,7 @@ use super::{
 };
 use crate::{
   Config, Data, Endpoint, Event, Index, Instant, LogStore, NodeId, Now, ProposeError, StableStore,
-  StateMachine, TransferError, transport::ClusterId,
+  StateMachine, StorageProgress, TransferError, transport::ClusterId,
 };
 use core::error::Error;
 use std::collections::BTreeSet;
@@ -341,16 +341,31 @@ where
     self.pump(now.mono());
   }
 
-  /// Drain storage completions into the consensus endpoint, then drain the bridge and pump.
-  pub fn handle_storage<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
+  /// Drain storage completions into the consensus endpoint, then drain the bridge and pump. The
+  /// [`StorageProgress`] is RE-DERIVED from the stores AFTER the bridge dispatch, so the driver
+  /// re-drives without sleeping while a completion is queued — including one a bridge-dispatched
+  /// inbound handler submitted, which the endpoint's own (pre-bridge) verdict could not see.
+  pub fn handle_storage<L, S>(
+    &mut self,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> StorageProgress
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
     let now: Now = now.into();
-    self.endpoint.handle_storage(now, log, stable);
-    self.drain_bridge(now, log, stable);
+    let _ = self.endpoint.handle_storage(now, log, stable);
+    self.drain_bridge(now, log, stable); // inbound handlers may submit storage after the drain above
     self.pump(now.mono());
+    // Re-derive from the stores AFTER the bridge dispatch — catches a bridge-submitted append / vote
+    // persist the endpoint's own (pre-bridge) verdict could not see.
+    if log.has_pending() || stable.has_pending() {
+      StorageProgress::MorePending
+    } else {
+      StorageProgress::Drained
+    }
   }
 
   /// Pop one outbound datagram (destination + owned bytes), or `None` when the queue is empty.

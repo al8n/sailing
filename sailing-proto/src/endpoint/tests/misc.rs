@@ -1,9 +1,136 @@
 use super::{super::*, *};
 use crate::{
-  ProposeError, VoteResponse,
+  ProposeError, StorageProgress, VoteResponse,
   testkit::{CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
 };
 use core::time::Duration;
+
+/// A log whose `poll()` yields a fixed run of `Compacted` completions before draining to `None`,
+/// counting every `poll()` call. `Compacted` is a no-op arm in `handle_storage`, so no valid log
+/// state is needed — the store only needs degenerate-empty domain answers (like `NoopLog`) plus the
+/// counting completion stream. Models a degraded store whose endless completion queue would trap an
+/// UNBOUNDED drain inside one `handle_storage` call.
+struct CompactedFloodLog {
+  /// Remaining `Compacted` completions to emit.
+  remaining: core::cell::Cell<usize>,
+  /// Total `poll()` calls (to bound the per-call work against the drain budget).
+  polls: core::cell::Cell<usize>,
+  /// Total completions actually handed out (to prove nothing is lost across calls).
+  emitted: core::cell::Cell<usize>,
+}
+
+impl CompactedFloodLog {
+  fn new(n: usize) -> Self {
+    Self {
+      remaining: core::cell::Cell::new(n),
+      polls: core::cell::Cell::new(0),
+      emitted: core::cell::Cell::new(0),
+    }
+  }
+}
+
+impl LogStore for CompactedFloodLog {
+  type Error = core::convert::Infallible;
+
+  fn first_index(&self) -> Index {
+    Index::new(1)
+  }
+  fn last_index(&self) -> Index {
+    Index::ZERO
+  }
+  fn term(&self, _index: Index) -> Result<Term, Self::Error> {
+    Ok(Term::ZERO)
+  }
+  fn entries(
+    &self,
+    _range: core::ops::Range<Index>,
+    _max_bytes: u64,
+  ) -> Result<crate::EntriesRead<'_>, Self::Error> {
+    Ok(crate::EntriesRead::Ready(crate::MaybeOwned::Borrowed(&[])))
+  }
+  fn submit_append(&mut self, _id: crate::OpId, _entries: &[Entry]) {}
+  fn compact(&mut self, _up_to: Index) {}
+  fn restore(&mut self, _last_index: Index, _last_term: Term) {}
+
+  fn poll(&mut self) -> Option<Result<crate::LogDone, Self::Error>> {
+    self.polls.set(self.polls.get() + 1);
+    let left = self.remaining.get();
+    if left == 0 {
+      return None;
+    }
+    self.remaining.set(left - 1);
+    self.emitted.set(self.emitted.get() + 1);
+    Some(Ok(crate::LogDone::Compacted(Index::ZERO)))
+  }
+
+  fn has_pending(&self) -> bool {
+    self.remaining.get() > 0
+  }
+}
+
+/// `handle_storage` is BOUNDED: a degraded store's endless completion stream can never trap the
+/// driver inside one call. With more than `STORAGE_DRAIN_BUDGET` completions queued, the FIRST call
+/// processes at most the budget (plus the one terminating `poll`), returns `MorePending`, and the
+/// remainder stays queued (`poll()` is a stateful FIFO — nothing dropped/reordered). Repeated calls
+/// eventually return `Drained`, and the total processed equals the enqueued count.
+///
+/// MUTATION: revert the `while budget > 0` guard to the old unbounded `while let Some(..)` → the
+/// first call drains all `3 * BUDGET` completions, so it never returns `MorePending` and `poll()` is
+/// called far more than `BUDGET + 1` times in one call (the run loop is trapped).
+#[test]
+fn handle_storage_is_budget_bounded_and_loses_nothing() {
+  const BUDGET: usize = Endpoint::<u64, CountSm>::STORAGE_DRAIN_BUDGET;
+  let enqueued = 3 * BUDGET;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  // A fresh, un-elected single voter: commit == applied == 0, so the fixed tail of `handle_storage`
+  // (apply, snapshot, commit-persist) is inert and the `Compacted` no-op arm is all that runs.
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = CompactedFloodLog::new(enqueued);
+  let mut stable = NoopStable::default();
+
+  // The first call is bounded: it hits the budget with completions still queued.
+  let polls_before = log.polls.get();
+  let first = ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(
+    first,
+    StorageProgress::MorePending,
+    "the first call must report MorePending while completions remain queued"
+  );
+  let polls_in_first = log.polls.get() - polls_before;
+  assert!(
+    polls_in_first <= BUDGET + 2,
+    "one call must poll at most the budget plus a small constant, not the whole stream \
+     (polled {polls_in_first})"
+  );
+
+  // Repeated calls drain the FIFO and eventually report Drained — never trapped, never lost.
+  let mut calls = 1usize;
+  loop {
+    assert!(
+      calls < 100,
+      "the bounded drain must converge well within this guard"
+    );
+    if ep
+      .handle_storage(Instant::ORIGIN, &mut log, &mut stable)
+      .is_drained()
+    {
+      break;
+    }
+    calls += 1;
+  }
+  assert_eq!(
+    log.emitted.get(),
+    enqueued,
+    "every enqueued completion is processed across calls — the per-call budget drops nothing"
+  );
+}
 
 #[test]
 fn endpoint_constructs_and_polls_empty() {

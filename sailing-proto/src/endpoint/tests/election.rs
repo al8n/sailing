@@ -346,6 +346,57 @@ fn candidate_does_not_lead_until_self_vote_durable() {
   );
 }
 
+/// Regression (storage-drain progress): a single-node campaign whose self-vote `Wrote` completion
+/// makes the node `become_leader` appends the leader no-op INTO the log queue — a queue the log
+/// drain phase already passed this call. `handle_storage` must report `MorePending`, not `Drained`,
+/// while that log completion is queued, or the driver could sleep without re-driving and the no-op
+/// (and the commit it unblocks) would stall. The op-id counter advancing on the no-op submission is
+/// the exact signal a budget-only check would miss.
+#[test]
+fn handle_storage_reports_more_pending_when_a_drain_resubmits() {
+  use crate::{Config, Instant, StorageProgress};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+
+  // Campaign at term 1; the self-vote hard-state write is in flight.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  assert!(ep.role().is_candidate() && !ep.role().is_leader());
+
+  // The self-vote `Wrote` drains → `become_leader` appends the leader no-op to the log, AFTER the
+  // log drain phase ran. The call must report `MorePending` so the driver re-drives.
+  let progress = ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.role().is_leader(),
+    "leads once the self-vote write is durable"
+  );
+  assert_eq!(
+    progress,
+    StorageProgress::MorePending,
+    "the just-appended leader no-op is queued: handle_storage must not report Drained"
+  );
+
+  // And it converges: re-driving drains the no-op (and the commit-watermark it unblocks) to
+  // `Drained` within a bounded number of calls, never spinning.
+  let mut calls = 0;
+  while ep.handle_storage(d, &mut log, &mut stable) == StorageProgress::MorePending {
+    calls += 1;
+    assert!(
+      calls < 16,
+      "handle_storage must converge to Drained, not spin"
+    );
+  }
+}
+
 /// Regression (election safety): even when a PEER's grant reaches quorum, the leader transition
 /// waits until the candidate's own self-vote write is durable (`on_vote_response` gates on
 /// `self_vote_durable`). Without the gate the peer grant elects the node on an un-durable self-vote.

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{AppendResponse, HardState, LogDone, SnapshotResponse, StableDone};
+use crate::{AppendResponse, HardState, LogDone, SnapshotResponse, StableDone, StorageProgress};
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -343,8 +343,31 @@ where
   F::Command: Data,
   F::Error: core::error::Error,
 {
+  /// Max storage completions processed per `handle_storage` call before yielding to the driver's run
+  /// loop: an unbounded drain lets a degraded store's endless completion stream trap the driver inside
+  /// one call, starving commands/timers/accept/peer-I/O. The budget is PER-QUEUE — the log and stable
+  /// completion streams each get their own, so a flood of one cannot starve the other's durable
+  /// progress (e.g. a log flood must not block the vote/leadership completions). The un-processed
+  /// remainder stays queued (`poll()` is a stateful FIFO — nothing is dropped or reordered) and is
+  /// re-driven next call. Mirrors the reactor `IO_BUDGET` /
+  /// `APPLY_READ_MAX_BYTES` precedent. `pub(crate)` only so the bounded-drain test can assert the
+  /// per-call poll count against it.
+  pub(crate) const STORAGE_DRAIN_BUDGET: usize = 256;
+
   /// Drain storage completions (append-before-ack / persist-vote).
-  pub fn handle_storage<L, S>(&mut self, now: impl Into<Now>, log: &mut L, stable: &mut S)
+  ///
+  /// Returns [`StorageProgress::MorePending`] when a completion is still queued at either store after
+  /// this call — a per-queue budget cut its drain short, or the fixed tail submitted / compacted into a
+  /// queue whose drain already exited — so the driver re-drives without sleeping (no single call
+  /// monopolizes the run loop). The verdict is derived from the stores' actual queued state via
+  /// [`LogStore::has_pending`] / [`StableStore::has_pending`], so every post-drain enqueue is caught
+  /// uniformly.
+  pub fn handle_storage<L, S>(
+    &mut self,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> StorageProgress
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
@@ -352,23 +375,32 @@ where
   {
     let now: Now = now.into();
     if self.poison.poisoned {
-      return;
+      return StorageProgress::Drained;
     }
     self.debug_assert_queues_drained();
-    while let Some(done) = log.poll() {
-      match done {
-        Ok(LogDone::Appended(opid)) => self.on_log_appended(now, log, stable, opid),
-        Ok(LogDone::Compacted(_)) => {}
-        Err(_) => {
-          self.poison(PoisonReason::LogPoll);
-          return;
+    let mut log_budget = Self::STORAGE_DRAIN_BUDGET;
+    while log_budget > 0 {
+      match log.poll() {
+        Some(Ok(LogDone::Appended(opid))) => {
+          self.on_log_appended(now, log, stable, opid);
+          log_budget -= 1;
         }
+        Some(Ok(LogDone::Compacted(_))) => log_budget -= 1,
+        Some(Err(_)) => {
+          self.poison(PoisonReason::LogPoll);
+          return StorageProgress::Drained;
+        }
+        None => break,
       }
     }
-    while let Some(done) = stable.poll() {
-      match done {
-        Ok(StableDone::Wrote(opid)) => self.on_stable_wrote(now, log, stable, opid),
-        Ok(StableDone::SnapshotWritten(opid)) => {
+    let mut stable_budget = Self::STORAGE_DRAIN_BUDGET;
+    while stable_budget > 0 {
+      match stable.poll() {
+        Some(Ok(StableDone::Wrote(opid))) => {
+          self.on_stable_wrote(now, log, stable, opid);
+          stable_budget -= 1;
+        }
+        Some(Ok(StableDone::SnapshotWritten(opid))) => {
           // Deferred compaction: fire only after the snapshot is durable.
           // This mirrors append-before-ack: the log is never compacted before the
           // snapshot backing it is safely on stable storage.
@@ -391,11 +423,13 @@ where
               .expect("checked Some above");
             self.install_snapshot_now(log, meta, snap, leader);
           }
+          stable_budget -= 1;
         }
-        Err(_) => {
+        Some(Err(_)) => {
           self.poison(PoisonReason::StablePoll);
-          return;
+          return StorageProgress::Drained;
         }
+        None => break,
       }
     }
 
@@ -489,6 +523,18 @@ where
     // Invariant restore: a learner promoted to voter by an applied conf-change above may have been
     // left without an election timer; ensure a voter non-leader can always campaign.
     self.reconcile_election_timer(now);
+
+    // Storage-derived progress: MorePending iff a completion is queued for the next poll() at EITHER
+    // store, checked AFTER every drain and the whole fixed tail (which can submit / compact into a
+    // queue whose drain already exited). Exact by construction — catches every post-drain enqueue
+    // uniformly (a budget cut leaves the remainder queued; a post-drain submit's completion; a
+    // compact's `LogDone::Compacted`) with no per-site detector. poll() is a FIFO; the remainder
+    // re-drives next call.
+    if log.has_pending() || stable.has_pending() {
+      StorageProgress::MorePending
+    } else {
+      StorageProgress::Drained
+    }
   }
 
   pub(crate) fn on_log_appended<L: LogStore, S: StableStore<NodeId = I>>(
