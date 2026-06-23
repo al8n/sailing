@@ -1,11 +1,9 @@
 [package]
-name = "sailing-compio"
+name = "sailing-driver"
 version = "0.1.0"
-description = "Proactor (compio) reference driver for sailing-proto"
+description = "Runtime-agnostic driver core for sailing-proto, shared by the sailing-compio and sailing-reactor drivers"
 edition.workspace = true
-# compio's tree floors this well above the workspace's 1.85 (cfg_select in
-# compio-executor needs 1.95); the no_std protocol crate keeps the lower MSRV.
-rust-version = "1.95"
+rust-version = "1.91"
 license.workspace = true
 repository.workspace = true
 
@@ -17,22 +15,18 @@ unverified-wall-clock = []
 # Optional config layering on `DriverConfig`. `serde` adds gated Serialize/Deserialize (config files,
 # round-trip; the `Duration` knobs render as humantime strings via `humantime-serde`); `clap` adds a
 # gated `clap::Args` derive (CLI flags + `SAILING_DRIVER_*` env vars). Both leave the default build
-# byte-identical (everything gated). sailing-compio is std, so neither pulls a tier feature.
+# byte-identical (everything gated).
 serde = ["dep:serde", "dep:humantime-serde"]
 clap = ["dep:clap", "dep:humantime"]
 
 [dependencies]
-sailing-proto = { workspace = true, features = ["tls", "quic"] }
-sailing-driver = { workspace = true }
+sailing-proto = { workspace = true }
 bytes = { workspace = true }
 thiserror = { workspace = true }
-compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io-uring", "polling"] }
 flume = { workspace = true }
-lochan = { workspace = true }
 futures-channel = { workspace = true }
-# `std` (over the workspace default's macro-only set) brings in `FutureExt::shared` + `Shared`,
-# which the coalesced shutdown uses to fan ONE teardown-completion oneshot out to every Handle
-# clone. sailing-compio is std, so this adds nothing the crate did not already require.
+# `std` (over the workspace default's macro-only set) brings in `FutureExt::shared` + `Shared`, which
+# the coalesced shutdown uses to fan ONE teardown-completion oneshot out to every Handle clone.
 futures-util = { workspace = true, features = ["std"] }
 serde = { workspace = true, optional = true }
 humantime-serde = { workspace = true, optional = true }
@@ -44,8 +38,6 @@ clap = { workspace = true, optional = true }
 libc = { workspace = true }
 
 [dev-dependencies]
-rcgen = { workspace = true }
-rustls = { workspace = true }
 futures-executor = { version = "0.3", default-features = false, features = ["std"] }
 # Test-only: JSON round-trip of the `serde`-gated `DriverConfig`.
 serde_json = { workspace = true }

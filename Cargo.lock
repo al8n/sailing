@@ -1586,6 +1586,26 @@ dependencies = [
  "lochan",
  "rcgen",
  "rustls",
+ "sailing-driver",
+ "sailing-proto",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
+name = "sailing-driver"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "clap",
+ "flume 0.11.1",
+ "futures-channel",
+ "futures-executor",
+ "futures-util",
+ "humantime",
+ "humantime-serde",
+ "libc",
  "sailing-proto",
  "serde",
  "serde_json",
