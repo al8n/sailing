@@ -12,7 +12,7 @@ default = ["std"]
 # `std` and `alloc` are INDEPENDENT (never `std = ["alloc"]`): `std` layers each dependency's std
 # feature; `alloc` is the no_std heap tier (the deps use `alloc` automatically under
 # `default-features = false`, so there is nothing to layer). The crate requires at least one.
-std = ["bytes/std", "thiserror/std", "derive_more/std", "buffa/std", "rand/std", "rand_core/std", "cheap-clone/default"]
+std = ["bytes/std", "thiserror/std", "derive_more/std", "buffa/std", "rand/std", "cheap-clone/default"]
 alloc = ["cheap-clone/alloc"]
 tcp = []                                   # no_std + alloc OK (no crypto)
 # Exposes pub(crate) decode entry points to the `fuzz/` cargo-fuzz crate via a doc-hidden
@@ -38,8 +38,8 @@ cheap-clone = { version = "0.3", default-features = false }
 bytes.workspace = true
 thiserror.workspace = true
 derive_more.workspace = true
-rand = { version = "0.9", default-features = false }
-rand_core = { version = "0.9", default-features = false }
+rand = { version = "0.10", default-features = false }
+rand_core = { version = "0.10", default-features = false }
 rustls = { workspace = true, optional = true }
 rustls-pemfile = { workspace = true, optional = true }
 quinn-proto = { workspace = true, optional = true }

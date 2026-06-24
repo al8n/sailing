@@ -14,33 +14,39 @@ impl Prng {
   }
 }
 
-impl rand_core::RngCore for Prng {
+// rand_core 0.10 renamed `RngCore` to the infallible `Rng`, which is a blanket impl over
+// `TryRng<Error = Infallible>` — so the generator implements `TryRng` and gets `Rng` (with the
+// `next_u64`/`fill_bytes` methods the consumers call) for free.
+impl rand_core::TryRng for Prng {
+  type Error = core::convert::Infallible;
+
   /// Next pseudo-random `u64`.
   #[inline]
-  fn next_u64(&mut self) -> u64 {
+  fn try_next_u64(&mut self) -> Result<u64, Self::Error> {
     self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
     let mut z = self.0;
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-    z ^ (z >> 31)
+    Ok(z ^ (z >> 31))
   }
 
   #[inline]
-  fn next_u32(&mut self) -> u32 {
-    self.next_u64() as u32
+  fn try_next_u32(&mut self) -> Result<u32, Self::Error> {
+    Ok(self.try_next_u64()? as u32)
   }
 
   #[inline]
-  fn fill_bytes(&mut self, dst: &mut [u8]) {
+  fn try_fill_bytes(&mut self, dst: &mut [u8]) -> Result<(), Self::Error> {
     let mut chunks = dst.chunks_exact_mut(8);
     for chunk in &mut chunks {
-      chunk.copy_from_slice(&self.next_u64().to_le_bytes());
+      chunk.copy_from_slice(&self.try_next_u64()?.to_le_bytes());
     }
     let rem = chunks.into_remainder();
     if !rem.is_empty() {
-      let bytes = self.next_u64().to_le_bytes();
+      let bytes = self.try_next_u64()?.to_le_bytes();
       rem.copy_from_slice(&bytes[..rem.len()]);
     }
+    Ok(())
   }
 }
 
@@ -63,7 +69,7 @@ pub(crate) fn election_timeout<R: rand::Rng>(rng: &mut R, base: Duration) -> Dur
 mod tests {
   use super::*;
   use core::time::Duration;
-  use rand_core::RngCore;
+  use rand_core::Rng;
 
   #[test]
   fn deterministic_and_in_range() {
