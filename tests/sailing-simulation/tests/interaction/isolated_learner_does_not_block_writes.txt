@@ -1,0 +1,89 @@
+# openraft port — append_entries/t30_replication_1_voter_to_isolated_learner: an isolated LEARNER must
+# not block client writes. The learner is not part of the voter quorum, so a single-voter leader keeps
+# committing on its own while the learner is unreachable; once replication is restored the learner
+# catches up. Bring up n1 (sole voter) + n2 (learner), isolate n2, write under isolation (commits at
+# n1), then recover n2 and confirm it receives the writes.
+add-nodes 1 voters=(1)
+----
+n1: created voters={1} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+n1 leader-changed term=1 lead=1
+
+stabilize
+----
+ok
+
+propose-conf-change 1 addlearner 2
+----
+n1 proposed conf-change addlearner n2 at index 2
+n1 conf-changed index=2 voters={1} learners={2}
+
+stabilize
+----
+ok
+
+isolate 2
+----
+n2 isolated
+
+propose 1 x
+----
+n1 applied index=3
+
+stabilize
+----
+ok
+
+raft-log 1
+----
+n1: commit=3 applied=3 last=3
+  1/1 empty
+  1/2 conf-change 0x120c080212080200000000000000
+  1/3 normal 0x010000000000000078
+
+recover 2
+----
+n2 recovered
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=0
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=0
+> n2 ready
+  HeartbeatResponse term=1
+  n2 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/1 commit=3 entries=[1/2 conf-change 0x120c080212080200000000000000, 1/3 normal 0x010000000000000078]
+> n2 recv AppendEntries term=1 prev=1/1 commit=3 entries=[1/2 conf-change 0x120c080212080200000000000000, 1/3 normal 0x010000000000000078]
+> n2 ready
+  AppendResponse term=1 reject hint=0/0
+> n1 recv AppendResponse term=1 reject hint=0/0
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120c080212080200000000000000, 1/3 normal 0x010000000000000078]
+> n2 recv AppendEntries term=1 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120c080212080200000000000000, 1/3 normal 0x010000000000000078]
+> n2 ready
+  AppendResponse term=1 match=3
+  n2 conf-changed index=2 voters={1} learners={2}
+  n2 applied index=3
+> n1 recv AppendResponse term=1 match=3
+> n1 ready
+  AppendEntries term=1 prev=1/3 commit=3 entries=[]
+> n2 recv AppendEntries term=1 prev=1/3 commit=3 entries=[]
+> n2 ready
+  AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=3
+
+raft-log 2
+----
+n2: commit=3 applied=3 last=3
+  1/1 empty
+  1/2 conf-change 0x120c080212080200000000000000
+  1/3 normal 0x010000000000000078
+
