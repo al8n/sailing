@@ -55,6 +55,7 @@ impl InteractionEnv {
     let async_store = d.flag("async");
     let inflight: usize = d.value("inflight").unwrap_or(256);
     let snap: usize = d.value("snap").unwrap_or(10_000);
+    let chunk: u64 = d.value("chunk").unwrap_or(1 << 20);
 
     let mut out = String::new();
     for &id in &voters {
@@ -64,7 +65,8 @@ impl InteractionEnv {
         .with_check_quorum(check_quorum)
         .with_max_inflight_msgs(inflight)
         .expect("valid inflight window")
-        .with_snapshot_threshold(snap);
+        .with_snapshot_threshold(snap)
+        .with_snapshot_chunk_bytes(chunk);
       let ep = Endpoint::new(cfg.clone(), Instant::ORIGIN, id, LogSm::new());
       // Async stores re-open the fsync-in-flight window: a submitted write is visible but not durable
       // until an explicit `flush`, so acks/votes stay deferred until then (persist-before-send).

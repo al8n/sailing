@@ -230,6 +230,20 @@ fn snapshot_threshold_default_and_override() {
 }
 
 #[test]
+fn snapshot_chunk_bytes_default_and_override() {
+  let c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  assert_eq!(c.snapshot_chunk_bytes(), 1 << 20, "default should be 1 MiB");
+  let c2 = c.with_snapshot_chunk_bytes(4);
+  assert_eq!(c2.snapshot_chunk_bytes(), 4);
+}
+
+#[test]
 fn flow_control_defaults_and_validation() {
   let c = Config::try_new(
     1u64,

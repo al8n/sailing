@@ -131,6 +131,9 @@ pub const DEFAULT_MAX_INFLIGHT_MSGS: usize = 256;
 pub const DEFAULT_MAX_INFLIGHT_BYTES: u64 = 0;
 /// Default [`Config::snapshot_threshold`]: etcd's `SnapshotCount` (committed entries between snapshots).
 pub const DEFAULT_SNAPSHOT_THRESHOLD: usize = 10_000;
+/// Default [`Config::snapshot_chunk_bytes`]: 1 MiB per `InstallSnapshot` chunk (well under the
+/// 64 MiB max frame).
+pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: u64 = 1 << 20;
 /// Default [`Config::step_down_on_removal`]: a leader removed/demoted by a committed `ConfChange`
 /// steps down immediately.
 pub const DEFAULT_STEP_DOWN_ON_REMOVAL: bool = true;
@@ -206,6 +209,10 @@ const fn default_snapshot_threshold() -> usize {
   DEFAULT_SNAPSHOT_THRESHOLD
 }
 #[cfg(feature = "serde")]
+const fn default_snapshot_chunk_bytes() -> u64 {
+  DEFAULT_SNAPSHOT_CHUNK_BYTES
+}
+#[cfg(feature = "serde")]
 const fn default_step_down_on_removal() -> bool {
   DEFAULT_STEP_DOWN_ON_REMOVAL
 }
@@ -273,6 +280,8 @@ pub struct Config<I> {
   max_inflight_bytes: u64,
   /// Number of committed entries between automatic snapshots (etcd's SnapshotCount default).
   snapshot_threshold: usize,
+  /// Max bytes per `InstallSnapshot` chunk on the wire (must stay well under the 64 MiB max frame).
+  snapshot_chunk_bytes: u64,
   /// When `true` (default), a leader that is removed or demoted to learner by a committed
   /// `ConfChange` steps down immediately (role → Follower, timers disarmed). Set to `false`
   /// only if the operator explicitly wants the removed leader to keep acting until it hears
@@ -363,6 +372,7 @@ impl<I: PartialEq> Config<I> {
       max_inflight_msgs: DEFAULT_MAX_INFLIGHT_MSGS,
       max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
       snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
+      snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
       step_down_on_removal: DEFAULT_STEP_DOWN_ON_REMOVAL,
       pre_vote: DEFAULT_PRE_VOTE,
       check_quorum: DEFAULT_CHECK_QUORUM,
@@ -417,6 +427,7 @@ impl<I: PartialEq> Config<I> {
       max_inflight_msgs: DEFAULT_MAX_INFLIGHT_MSGS,
       max_inflight_bytes: DEFAULT_MAX_INFLIGHT_BYTES,
       snapshot_threshold: DEFAULT_SNAPSHOT_THRESHOLD,
+      snapshot_chunk_bytes: DEFAULT_SNAPSHOT_CHUNK_BYTES,
       step_down_on_removal: DEFAULT_STEP_DOWN_ON_REMOVAL,
       pre_vote: DEFAULT_PRE_VOTE,
       check_quorum: DEFAULT_CHECK_QUORUM,
@@ -573,6 +584,27 @@ impl<I> Config<I> {
   #[inline(always)]
   pub const fn set_snapshot_threshold(&mut self, v: usize) -> &mut Self {
     self.snapshot_threshold = v;
+    self
+  }
+
+  /// Max bytes per `InstallSnapshot` chunk on the wire.
+  #[inline(always)]
+  pub const fn snapshot_chunk_bytes(&self) -> u64 {
+    self.snapshot_chunk_bytes
+  }
+
+  /// Override the `snapshot_chunk_bytes` knob (consuming).
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_snapshot_chunk_bytes(mut self, v: u64) -> Self {
+    self.set_snapshot_chunk_bytes(v);
+    self
+  }
+
+  /// Override the `snapshot_chunk_bytes` knob in place.
+  #[inline(always)]
+  pub const fn set_snapshot_chunk_bytes(&mut self, v: u64) -> &mut Self {
+    self.snapshot_chunk_bytes = v;
     self
   }
 
@@ -795,6 +827,7 @@ impl<I> Config<I> {
     max_inflight_msgs: usize,
     max_inflight_bytes: u64,
     snapshot_threshold: usize,
+    snapshot_chunk_bytes: u64,
     step_down_on_removal: bool,
     pre_vote: bool,
     check_quorum: bool,
@@ -814,6 +847,7 @@ impl<I> Config<I> {
       max_inflight_msgs,
       max_inflight_bytes,
       snapshot_threshold,
+      snapshot_chunk_bytes,
       step_down_on_removal,
       pre_vote,
       check_quorum,
@@ -1045,6 +1079,8 @@ where
   max_inflight_bytes: u64,
   #[serde(default = "default_snapshot_threshold")]
   snapshot_threshold: usize,
+  #[serde(default = "default_snapshot_chunk_bytes")]
+  snapshot_chunk_bytes: u64,
   #[serde(default = "default_step_down_on_removal")]
   step_down_on_removal: bool,
   #[serde(default = "default_pre_vote")]
@@ -1082,6 +1118,7 @@ where
       c.max_inflight_msgs,
       c.max_inflight_bytes,
       c.snapshot_threshold,
+      c.snapshot_chunk_bytes,
       c.step_down_on_removal,
       c.pre_vote,
       c.check_quorum,
@@ -1161,6 +1198,13 @@ where
     default_value_t = DEFAULT_SNAPSHOT_THRESHOLD
   )]
   snapshot_threshold: usize,
+  #[arg(
+    id = "config-snapshot-chunk-bytes",
+    long = "snapshot-chunk-bytes",
+    env = "SAILING_SNAPSHOT_CHUNK_BYTES",
+    default_value_t = DEFAULT_SNAPSHOT_CHUNK_BYTES
+  )]
+  snapshot_chunk_bytes: u64,
   // The bool knobs take an explicit `true` / `false` VALUE (`ArgAction::Set`) rather than the
   // derive's default flag (`SetTrue`) action: `step_down_on_removal` DEFAULTS to `true`, which a
   // presence-only flag could never turn off. `Set` keeps every bool settable both ways from its
@@ -1258,6 +1302,7 @@ where
       c.max_inflight_msgs,
       c.max_inflight_bytes,
       c.snapshot_threshold,
+      c.snapshot_chunk_bytes,
       c.step_down_on_removal,
       c.pre_vote,
       c.check_quorum,
@@ -1360,6 +1405,7 @@ const _: () = {
       take!("config-max-inflight-msgs", max_inflight_msgs, usize);
       take!("config-max-inflight-bytes", max_inflight_bytes, u64);
       take!("config-snapshot-threshold", snapshot_threshold, usize);
+      take!("config-snapshot-chunk-bytes", snapshot_chunk_bytes, u64);
       take!("config-step-down-on-removal", step_down_on_removal, bool);
       take!("config-pre-vote", pre_vote, bool);
       take!("config-check-quorum", check_quorum, bool);
