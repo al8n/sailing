@@ -11,6 +11,11 @@ name: VOPR Deep Sweep
 # no RNG, and no hash-iteration-order dependence — so it is reproducible across platforms and opt
 # levels. A failure prints `seed=<S>` (and the tick budget); reproduce it ANYWHERE with
 # `run_vopr(<S>, <ticks>)`, which is exactly what a developer runs locally to debug.
+#
+# Schedule ROTATION: a scheduled run shifts its band by `run_number * total_seeds`, so successive runs
+# sweep an ever-advancing window ([0,N), [N,2N), [2N,3N), …) — continuous coverage of NEW seeds instead
+# of re-running the same low band forever. A manual dispatch keeps the [0, total_seeds) band, a
+# reproducible regression sweep. (The per-commit `ci.yml` covers the low `0..24` band on every push.)
 
 on:
   workflow_dispatch:
@@ -66,18 +71,30 @@ jobs:
           TICKS: ${{ github.event.inputs.ticks || '2000' }}
           SHARDS: "16"
           SHARD: ${{ matrix.shard }}
+          EVENT: ${{ github.event_name }}
+          RUN_NUMBER: ${{ github.run_number }}
         run: |
           set -euo pipefail
-          # Ceil division so 16 shards always cover [0, TOTAL); the tail shard takes the remainder.
+          # SCHEDULE band ROTATION: a scheduled run advances the seed frontier by a fresh TOTAL each run
+          # (run_number * TOTAL), so successive runs sweep [0,TOTAL), [TOTAL,2·TOTAL), … rather than the same
+          # low band forever. Every other event (manual dispatch) keeps the [0, TOTAL) regression band. The
+          # 16 shards then split THIS run's band [BASE, BASE+TOTAL).
+          if [ "$EVENT" = "schedule" ]; then
+            BASE=$(( RUN_NUMBER * TOTAL ))
+          else
+            BASE=0
+          fi
+          BAND_END=$(( BASE + TOTAL ))
+          # Ceil division so 16 shards always cover the band; the tail shard takes the remainder.
           PER=$(( (TOTAL + SHARDS - 1) / SHARDS ))
-          START=$(( SHARD * PER ))
+          START=$(( BASE + SHARD * PER ))
           END=$(( START + PER ))
-          [ "$END" -gt "$TOTAL" ] && END=$TOTAL || true
+          [ "$END" -gt "$BAND_END" ] && END=$BAND_END || true
           if [ "$START" -ge "$END" ]; then
-            echo "::notice title=shard ${SHARD}::empty slice (START=${START} >= TOTAL=${TOTAL}) — skipping"
+            echo "::notice title=shard ${SHARD}::empty slice (START=${START} >= band end ${BAND_END}) — skipping"
             exit 0
           fi
-          echo "::notice title=shard ${SHARD}::sweeping seeds [${START}, ${END}) @ ${TICKS} ticks"
+          echo "::notice title=shard ${SHARD}::sweeping seeds [${START}, ${END}) @ ${TICKS} ticks (band base ${BASE})"
           # Release build: the sweep is compute-bound; release is ~5-10x faster and finds the SAME
           # bugs (the proto logic is opt-level independent). Each shard is one disjoint seed slice.
           # `--features wire` routes EVERY delivered message through the real wire codec
