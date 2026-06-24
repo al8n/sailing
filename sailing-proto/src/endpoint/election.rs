@@ -140,6 +140,17 @@ where
       my_index = meta.last_index();
       my_term = meta.last_term();
     }
+    // The SAME floor for an in-progress CHUNKED receive: chunks accepted into `snapshot_recv` advance our
+    // accepted boundary for a committed snapshot LONG before the whole blob completes into `pending_install`.
+    // Without this floor, the multi-chunk receive window advertises stale-LOW freshness (the old short log)
+    // and could help elect a candidate behind the committed snapshot boundary we have already accepted from
+    // the leader — the exact stale-low class the `pending_install` floor closes, reopened by chunking.
+    if let Some(r) = &self.snapshot.snapshot_recv
+      && (r.meta.last_term(), r.meta.last_index()) > (my_term, my_index)
+    {
+      my_index = r.meta.last_index();
+      my_term = r.meta.last_term();
+    }
     let log_ok = (rv.last_log_term(), rv.last_log_index()) >= (my_term, my_index);
 
     // Pre-vote path: a completely separate branch — NO durable state is changed.

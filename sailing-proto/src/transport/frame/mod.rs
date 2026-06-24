@@ -4,11 +4,10 @@ use bytes::{Bytes, BytesMut};
 use std::vec::Vec;
 
 /// The largest single frame payload accepted (64 MiB). A length prefix above this is rejected
-/// rather than buffered, bounding a connection's decode memory.
-///
-/// NOTE: an `InstallSnapshot` blob larger than this cannot ride a single frame; chunked snapshot
-/// transfer is out of scope for this transport layer (see the design spec).
-pub(crate) const MAX_FRAME_LEN: usize = 64 * 1024 * 1024;
+/// rather than buffered, bounding a connection's decode memory. Derives from the single source of
+/// truth in [`crate::wire::MAX_FRAME_BYTES`], which the core's snapshot-chunk sizer also reads so each
+/// chunked `InstallSnapshot` (metadata + chunk) is bounded below this limit.
+pub(crate) const MAX_FRAME_LEN: usize = crate::wire::MAX_FRAME_BYTES;
 
 /// Append a length-prefixed frame (`[u32 BE len][payload]`) to `out`.
 pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {

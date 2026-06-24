@@ -457,8 +457,12 @@ where
     // Durable evidence ONLY (`durable_snapshot()`): firing on the visible (pre-fsync) `snapshot()` slot
     // would re-baseline the log ahead of a non-durable blob — the exact orphan this fix prevents.
     if let Some((_pid, meta, ..)) = &self.snapshot.pending_install {
-      let boundary = meta.last_index();
-      if matches!(stable.durable_snapshot(), Some(m) if m.last_index() >= boundary) {
+      // IDENTITY-aware, not merely boundary `>=`: a same-boundary supersede can leave a SUPERSEDED
+      // snapshot's blob durable while the replacement is still in flight; firing on that evidence would
+      // install the replacement decoded snapshot on a blob that is NOT its own (ack/rebaseline on a
+      // non-durable blob, and a crash recovers the superseded identity). Require the durable slot to be
+      // THIS pending install's own snapshot.
+      if matches!(stable.durable_snapshot(), Some(m) if m.identity_eq(meta)) {
         let (_pid, meta, snap, leader) = self
           .snapshot
           .pending_install
@@ -467,6 +471,11 @@ where
         self.install_snapshot_now(log, meta, snap, leader);
       }
     }
+
+    // Reclaim an abandoned chunked receive whose boundary the now-advanced recoverable prefix has passed
+    // (a snapshot/AppendEntries race where the log caught up first), freeing its staging buffer rather than
+    // pinning it until a future supersede or restart.
+    self.reclaim_stale_snapshot_recv(stable);
 
     // Re-drive a deferred apply. A cold (`EntriesRead::Pending`) committed-range read leaves
     // `applied < commit` with NO `LogDone` to re-trigger apply through `on_log_appended`, so the store's

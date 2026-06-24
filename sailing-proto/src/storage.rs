@@ -353,14 +353,19 @@ pub trait StableStore {
   /// Stage one snapshot chunk under the key `meta.last_index()`, writing `data` at byte `offset`.
   /// `Ok` is the highest CONTIGUOUS byte offset now staged (drives `SnapshotResponse.acked_through`).
   ///
-  /// Idempotent on a re-delivered `offset`; a STRICTLY-NEWER key (a higher `meta.last_index()`)
-  /// supersedes and discards an older partial. The store bounds its OWN staging (a disk store by disk,
-  /// an in-RAM store by RAM) and returns `Err` on capacity exhaustion — the core treats that as fatal
-  /// (a node crash → CFT failover), NOT a protocol-level cap. A store MAY persist staging durably; if it
-  /// does, the returned offset is the DURABLE contiguous offset, which makes the transfer resumable
-  /// across a crash (the leader re-sends from the reported offset, not from `0`). Staging is SEPARATE
-  /// from the durable snapshot slot — a crash mid-transfer loses only staging (unless persisted), never
-  /// the durable log. [`SnapshotStaging`] is the reference accumulator a store can embed.
+  /// Idempotent on a re-delivered `offset`; a STRICTLY-NEWER key (a higher `meta.last_index()`, or the same
+  /// boundary with a different `total_len`) supersedes and discards an older partial. The core ALSO discards
+  /// explicitly via [`discard_snapshot_staging`](Self::discard_snapshot_staging) when a transfer is replaced
+  /// (e.g. a new leader's LOWER snapshot) or becomes redundant. The store bounds its OWN staging (a disk
+  /// store by disk, an in-RAM store by RAM) and returns `Err` on capacity exhaustion — the core treats that
+  /// as fatal (a node crash → CFT failover), NOT a protocol-level cap.
+  ///
+  /// The returned contiguous offset drives IN-SESSION resume — a lost chunk re-sends from it, not from `0`.
+  /// Staging is VOLATILE across RESTART, however: a store MAY persist it internally, but the core does NOT
+  /// resume a partial across a crash (no recovery API restores the transfer identity) — it calls
+  /// `discard_snapshot_staging` on restart, which MUST remove any persisted partial. Staging is SEPARATE
+  /// from the durable snapshot slot — a crash mid-transfer loses only staging, never the durable log.
+  /// [`SnapshotStaging`] is the reference accumulator a store can embed.
   fn accept_snapshot_chunk(
     &mut self,
     meta: &SnapshotMeta<Self::NodeId>,
@@ -369,16 +374,24 @@ pub trait StableStore {
     data: &Bytes,
   ) -> Result<u64, Self::Error>;
 
-  /// Read back the fully-staged blob keyed at `meta.last_index()` once its contiguous-staged length
-  /// reaches `total_len` — the bytes the core decodes and re-submits via [`submit_snapshot`]. `None`
-  /// if no COMPLETE staged blob is keyed there. [`MaybeOwned`](crate::MaybeOwned) so a store can return
-  /// its staging buffer without a copy.
+  /// CONSUME the fully-staged blob keyed at `meta.last_index()` once its contiguous-staged length
+  /// reaches `total_len` — the bytes the core decodes and re-submits via [`submit_snapshot`]. Returns
+  /// `None` (leaving any partial staging in place) if no COMPLETE staged blob is keyed there. On `Some`
+  /// the store MUST drop its staging accumulator and hand back ownership, so the chunked install never
+  /// retains a second full-snapshot buffer past completion.
   ///
   /// [`submit_snapshot`]: Self::submit_snapshot
-  fn staged_snapshot(
-    &self,
-    meta: &SnapshotMeta<Self::NodeId>,
-  ) -> Option<crate::MaybeOwned<'_, [u8]>>;
+  fn take_staged_snapshot(&mut self, meta: &SnapshotMeta<Self::NodeId>) -> Option<Bytes>;
+
+  /// DISCARD any in-progress chunked-snapshot staging, freeing the `SnapshotStaging` buffer. The core calls
+  /// this when an in-flight transfer becomes REDUNDANT (the recoverable prefix caught up past its boundary),
+  /// when a DIFFERENT transfer supersedes it, and on RESTART. A no-op if nothing is staged.
+  ///
+  /// Chunk staging is VOLATILE: it need NOT survive a process restart. A store MAY persist it, but the core
+  /// does not RESUME a durable partial across restart (there is no recovery API to restore the transfer
+  /// identity) — it calls this on restart to discard any orphan, so a persisted partial cannot outlive the
+  /// `snapshot_recv` that tracks it and block a fresh post-restart transfer.
+  fn discard_snapshot_staging(&mut self);
 
   /// Drain the next completion, if any.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;
@@ -399,7 +412,7 @@ pub trait StableStore {
 
 /// A reusable accumulator for chunked snapshot staging — the reference implementation a [`StableStore`]
 /// embeds to satisfy [`accept_snapshot_chunk`](StableStore::accept_snapshot_chunk) /
-/// [`staged_snapshot`](StableStore::staged_snapshot). It tracks written byte runs and reports the
+/// [`take_staged_snapshot`](StableStore::take_staged_snapshot). It tracks written byte runs and reports the
 /// highest CONTIGUOUS offset; the embedding store keys ONE of these per in-flight transfer and discards
 /// it when a strictly-newer boundary supersedes it.
 #[derive(Debug)]
@@ -411,14 +424,21 @@ pub struct SnapshotStaging {
 }
 
 impl SnapshotStaging {
-  /// Begin staging a `total_len`-byte blob covered by snapshot boundary `boundary`.
+  /// Begin staging a `total_len`-byte blob covered by snapshot boundary `boundary`, bounded by
+  /// `max_bytes`. Returns `None` — WITHOUT allocating — if `total_len` overflows `usize` or exceeds
+  /// `max_bytes`, so a malformed/forged length POISONS (the embedding store maps `None` to its fatal
+  /// error) rather than panicking or aborting on a huge allocation.
   #[must_use]
-  pub fn new(boundary: Index, total_len: u64) -> Self {
-    Self {
-      boundary,
-      buf: std::vec![0u8; total_len as usize],
-      runs: Vec::new(),
+  pub fn new(boundary: Index, total_len: u64, max_bytes: usize) -> Option<Self> {
+    let len = usize::try_from(total_len).ok()?;
+    if len > max_bytes {
+      return None;
     }
+    Some(Self {
+      boundary,
+      buf: std::vec![0u8; len],
+      runs: Vec::new(),
+    })
   }
 
   /// The snapshot boundary (`meta.last_index()`) this staging is keyed on.
@@ -427,10 +447,21 @@ impl SnapshotStaging {
     self.boundary
   }
 
+  /// The full blob length this staging is accumulating (the `total_len` it was created with) — part of
+  /// the transfer identity, so a store can detect a same-boundary different-length supersede.
+  #[inline]
+  pub fn total_len(&self) -> u64 {
+    self.buf.len() as u64
+  }
+
   /// Write `data` at byte `offset` (clamped to the buffer) and return the highest CONTIGUOUS staged
   /// offset. Idempotent on a re-delivered range.
   pub fn accept(&mut self, offset: u64, data: &[u8]) -> u64 {
-    let start = (offset as usize).min(self.buf.len());
+    // Clamp in u64 BEFORE narrowing: `offset as usize` would WRAP a > usize::MAX offset to a low value on
+    // 32-bit, overwriting the wrong bytes; `usize::try_from` saturates past-the-end (a no-op) instead.
+    let start = usize::try_from(offset)
+      .unwrap_or(usize::MAX)
+      .min(self.buf.len());
     let end = start.saturating_add(data.len()).min(self.buf.len());
     self.buf[start..end].copy_from_slice(&data[..end - start]);
     self.insert_run(start as u64, end as u64);
@@ -456,6 +487,15 @@ impl SnapshotStaging {
   #[inline]
   pub fn bytes(&self) -> &[u8] {
     &self.buf
+  }
+
+  /// CONSUME the staging, returning the full blob buffer (meaningful once [`is_complete`] holds) — used
+  /// by a store's `take_staged_snapshot` to hand ownership to the core without a copy.
+  ///
+  /// [`is_complete`]: Self::is_complete
+  #[must_use]
+  pub fn into_vec(self) -> Vec<u8> {
+    self.buf
   }
 
   fn insert_run(&mut self, start: u64, end: u64) {
@@ -486,7 +526,7 @@ mod tests {
 
   #[test]
   fn snapshot_staging_tracks_contiguous_runs() {
-    let mut s = SnapshotStaging::new(Index::new(10), 6);
+    let mut s = SnapshotStaging::new(Index::new(10), 6, 1024).unwrap();
     assert_eq!(s.accept(0, b"ab"), 2);
     assert_eq!(
       s.accept(4, b"ef"),
@@ -497,6 +537,34 @@ mod tests {
     assert_eq!(s.accept(2, b"cd"), 6, "filling the gap completes the run");
     assert!(s.is_complete());
     assert_eq!(s.bytes(), b"abcdef");
+  }
+
+  #[test]
+  fn snapshot_staging_handles_overlap_and_clamp() {
+    let mut s = SnapshotStaging::new(Index::new(7), 5, 1024).unwrap();
+    assert_eq!(s.accept(0, b"abc"), 3);
+    // An OVERLAPPING range coalesces to the union end (no double-count).
+    assert_eq!(s.accept(2, b"XYZ"), 5, "[0,3) + [2,5) coalesces to 5");
+    assert!(s.is_complete());
+    // An idempotent re-delivery does not regress the watermark.
+    assert_eq!(s.accept(0, b"a"), 5);
+    // An offset+len past the buffer CLAMPS (no panic, no growth).
+    assert_eq!(s.accept(4, b"OVERLONG"), 5);
+    // A write entirely past the end is a no-op.
+    assert_eq!(s.accept(99, b"z"), 5);
+    // A huge offset saturates to past-the-end (no wrap to a low offset, no wrong-byte write) — the
+    // 32-bit `offset as usize` truncation guard.
+    assert_eq!(s.accept(u64::MAX, b"x"), 5);
+    assert_eq!(s.into_vec().len(), 5);
+  }
+
+  #[test]
+  fn snapshot_staging_new_rejects_oversize() {
+    assert!(SnapshotStaging::new(Index::new(1), 8, 16).is_some());
+    assert!(
+      SnapshotStaging::new(Index::new(1), 17, 16).is_none(),
+      "a total_len beyond the cap must be rejected WITHOUT allocating (no OOM on a forged length)"
+    );
   }
 
   #[test]

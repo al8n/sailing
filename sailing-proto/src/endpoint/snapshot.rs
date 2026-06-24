@@ -52,6 +52,11 @@ where
   /// Send the snapshot chunk beginning at `from_offset`, bounded by `config.snapshot_chunk_bytes()`.
   /// The chunk always carries the blob's real `total_len`, so the receiver stages it; a snapshot that
   /// fits one chunk is simply `offset 0 .. total` with `is_last() == true`.
+  ///
+  /// `from_offset` is RECONCILED against the current snapshot boundary: if the local snapshot has
+  /// advanced past the peer's in-flight boundary (the leader compacted a newer snapshot mid-transfer),
+  /// the supplied cursor belongs to a superseded blob, so the peer is reset to the new boundary and the
+  /// stream restarts at offset 0.
   pub(crate) fn send_snapshot_chunk<S: StableStore<NodeId = I>>(
     &mut self,
     peer: I,
@@ -61,22 +66,64 @@ where
     let Some((meta, blob)) = stable.snapshot() else {
       return;
     };
+    let boundary = meta.last_index();
+    // A peer whose `pending` no longer matches the local snapshot is mid-transfer on a now-superseded
+    // blob: its monotone `acked_through` would otherwise keep re-sending the NEW blob at the OLD offset
+    // (the follower supersedes its staging to the new boundary and acks `acked_through = 0`, which the
+    // monotone cursor ignores), wedging it. Reset to the new boundary and restart at 0.
+    let from = if matches!(
+      self.tracker.progress(&peer).map(|p| p.state()),
+      Some(ProgressState::Snapshot { pending, .. }) if pending == boundary
+    ) {
+      from_offset
+    } else {
+      if let Some(p) = self.tracker.progress_mut(&peer) {
+        p.become_snapshot(boundary);
+      }
+      0
+    };
     let total = blob.len() as u64;
-    let start = from_offset.min(total);
-    let end = from_offset
-      .saturating_add(self.config.snapshot_chunk_bytes())
-      .min(total);
-    let data = blob.slice(start as usize..end as usize);
     let (term, me) = (self.term, self.config.id());
+    // `start` clamps `from` to the blob. A STALE resume cursor — a reordered ack from a LARGER superseded
+    // snapshot, SET onto a peer whose CURRENT blob is smaller — would otherwise encode `offset > total`,
+    // which the receiver's range check rejects as a decode poison of a CORRECT follower. The transmitted
+    // offset is therefore `start`, NOT the raw `from`: it always matches the sliced data's position and
+    // never exceeds `total` (an over-cursor degenerates to the benign empty tail at `start == total`, which
+    // the follower's true-watermark ack then self-corrects). `start` is independent of the chunk size, so
+    // it is fixed before the frame budget below.
+    let start = from.min(total);
+    // Bound the chunk by the ENCODED FRAME size, not just the blob slice. The wire frame also carries the
+    // `SnapshotMeta` (its `ConfState` voter set can be large yet legal) plus envelope overhead, and a frame
+    // over `MAX_FRAME_BYTES` is REFUSED by the transport — the follower would wedge in catch-up. Size the
+    // non-data overhead in closed form (no clone of the potentially huge meta) for THIS exact meta and the
+    // chosen offset, reserving the data field's own tag + length-prefix at the largest possible chunk, then
+    // size `data` to stay under the limit. A `0` or oversized config value is already rejected at
+    // construction; the lower clamp keeps a non-empty chunk (no livelock).
+    let overhead = crate::wire::install_snapshot_encoded_len(term, &me, &meta, start, total, 0);
+    let data_field_max_self_cost =
+      1 + buffa::encoding::varint_len(crate::config::MAX_SNAPSHOT_CHUNK_BYTES);
+    // If the metadata alone (a pathologically large but VALID ConfState — `is_valid` checks membership
+    // invariants, NOT encoded size) leaves no room for even one data byte under the frame limit, the
+    // snapshot is UNSENDABLE on this transport. Do NOT enqueue an oversized frame (the stream transport
+    // would close the connection / QUIC would drop it): return without sending. The peer stays in Snapshot
+    // — this is a misconfiguration (a membership too large to snapshot), not a transient condition a
+    // re-send resolves.
+    let frame_budget =
+      crate::wire::MAX_FRAME_BYTES.saturating_sub(overhead + data_field_max_self_cost) as u64;
+    if frame_budget == 0 {
+      return;
+    }
+    let chunk = self
+      .config
+      .snapshot_chunk_bytes()
+      .clamp(1, crate::config::MAX_SNAPSHOT_CHUNK_BYTES)
+      .min(frame_budget);
+    let end = from.saturating_add(chunk).min(total);
+    let data = blob.slice(start as usize..end as usize);
     self.send(
       peer,
       Message::InstallSnapshot(InstallSnapshot::new_chunk(
-        term,
-        me,
-        meta,
-        data,
-        from_offset,
-        total,
+        term, me, meta, data, start, total,
       )),
     );
   }
@@ -149,6 +196,20 @@ where
     self.snapshot.pending_compact = Some((opid, self.applied));
   }
 
+  /// Reclaim an ABANDONED chunked receive: if the recoverable prefix (`min(commit, ack_watermark())`) has
+  /// caught up to or past an in-progress transfer's boundary, the partial is now redundant — free
+  /// `snapshot_recv` AND the store's `SnapshotStaging` buffer (a full `total_len` allocation) rather than
+  /// pinning it until a future supersede or restart. A no-op when no transfer is in progress or it is still
+  /// ahead of the recoverable prefix.
+  pub(crate) fn reclaim_stale_snapshot_recv<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
+    if let Some(r) = &self.snapshot.snapshot_recv
+      && r.meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark())
+    {
+      self.snapshot.snapshot_recv = None;
+      stable.discard_snapshot_staging();
+    }
+  }
+
   /// Receive an `InstallSnapshot` from the current leader (follower path). This only VALIDATES,
   /// persists the term, and submits the blob — it DEFERS the destructive install body (which touches the
   /// log) to `install_snapshot_now` once the blob is durable, so it needs no `LogStore`.
@@ -173,6 +234,11 @@ where
       self.poison(PoisonReason::LogExhausted);
       return;
     }
+
+    // Reclaim an abandoned in-progress receive whose boundary the recoverable prefix has already passed:
+    // a delayed chunk for it would otherwise short-circuit at the staleness guard below WITHOUT freeing the
+    // staging buffer (the leak that pins a full `total_len` allocation).
+    self.reclaim_stale_snapshot_recv(stable);
 
     // Fold this snapshot's carried LeaseGuard bound into `max_lease_window` HERE — before EVERY early
     // return below (redundant short-circuit, duplicate-install guard) and before the destructive
@@ -230,18 +296,39 @@ where
 
     // meta.last_index() > self.commit: a genuinely-newer snapshot.
 
-    // Duplicate-install guard: a deferred install already at this boundary or higher is completing — do
-    // NOT re-stage or re-decode (that would orphan the in-flight blob). A strictly-NEWER snapshot falls
-    // through and SUPERSEDES the partial below (the stale opid's `SnapshotWritten` then finds no match).
-    if matches!(&self.snapshot.pending_install, Some((_, pmeta, ..)) if pmeta.last_index() >= meta.last_index())
-    {
+    // Duplicate-install guard: a deferred install for the SAME snapshot identity (or one at a
+    // strictly-NEWER boundary) is completing — do NOT re-stage or re-decode (that would orphan the
+    // in-flight blob, or stage a now-stale older snapshot). A DIFFERENT snapshot at the same-or-lower
+    // boundary (a different term/conf — a re-snapshot during the fsync window) falls through and
+    // SUPERSEDES the partial below; the stale opid's `SnapshotWritten` then finds no match.
+    if matches!(
+      &self.snapshot.pending_install,
+      Some((_, pmeta, ..)) if pmeta.last_index() > meta.last_index() || pmeta.identity_eq(meta)
+    ) {
       return;
     }
 
     let total_len = is.total_len();
     if total_len == 0 {
       // LEGACY single-shot: `data` IS the whole blob — decode + submit directly (the pre-chunking path,
-      // byte-identical, no staging). A genuine pre-chunking peer is otherwise fenced by the handshake.
+      // byte-identical, no staging; also reached by a 0-byte snapshot from the chunked sender). A genuine
+      // pre-chunking peer is otherwise fenced by the handshake.
+      //
+      // A complete single-shot SUPERSEDES any in-progress chunked receive — apply the SAME leader-aware
+      // cleanup as the chunked branch: drop a same-leader LOWER-boundary reorder, else discard the
+      // abandoned partial (`snapshot_recv` + store staging) before installing. Without it, a stale
+      // `snapshot_recv` would pin its `total_len` staging buffer AND skew the vote-freshness floor.
+      if matches!(
+        &self.snapshot.snapshot_recv,
+        Some(r) if r.sender_term == is.term() && r.meta.last_index() > meta.last_index()
+      ) {
+        return;
+      }
+      // Discard any prior store staging UNCONDITIONALLY (not gated on `snapshot_recv.is_some()`): a store
+      // that persisted staging across a restart holds it WITHOUT a `snapshot_recv` to track, so a gate would
+      // miss the orphan and this install would race a stale higher staging key.
+      self.snapshot.snapshot_recv = None;
+      stable.discard_snapshot_staging();
       if !meta.conf().is_valid() {
         self.poison(PoisonReason::InvalidConfState);
         return;
@@ -265,30 +352,58 @@ where
     // install until the WHOLE blob is contiguous-staged. The proto holds NO bytes — `snapshot_recv` is
     // coordination only.
     let boundary = meta.last_index();
-    let first_chunk =
-      !matches!(&self.snapshot.snapshot_recv, Some(r) if r.meta.last_index() == boundary);
-    if first_chunk {
-      // Validate the snapshot's membership BEFORE any durable op — a malformed ConfState would install an
-      // impossible configuration. Once per boundary (the meta is identical on every chunk). A strictly-
-      // newer boundary supersedes an older `snapshot_recv` partial (the store's staging supersedes by key).
+    // Identify the in-progress transfer by its FULL identity — (sender_term, last_index, last_term, conf,
+    // total_len) — NOT just the boundary index. The SENDER TERM is load-bearing: a NEWER leader sending a
+    // snapshot with the SAME (last_index, last_term, conf) and length is a DISTINCT capture, not a
+    // continuation — appending its chunks into the old leader's staging would MIX bytes from two
+    // independently-captured snapshots (the StateMachine contract does not promise byte-identical encodings
+    // across leaders for the same applied state). A mismatch routes to the supersede/replace path below.
+    // (The LeaseGuard / read-mode bounds are folded ungated above and may legitimately differ between
+    // same-boundary snapshots, so they are NOT part of the identity.)
+    let continues = matches!(
+      &self.snapshot.snapshot_recv,
+      Some(r) if r.sender_term == is.term() && r.meta.identity_eq(meta) && r.total_len == total_len
+    );
+    if !continues {
+      // A chunk that does NOT continue the current partial. Drop ONLY a stale reorder — a delayed
+      // LOWER-boundary chunk from the SAME leader term (a now-superseded transfer). A chunk from a NEWER
+      // leader term REPLACES the partial at ANY boundary: the new leader is authoritative and may
+      // legitimately send a LOWER snapshot (`snapshot(K)+log` for a follower below its first index), which
+      // boundary ordering ALONE would wrongly drop — wedging the follower. Otherwise BEGIN a new transfer.
+      if matches!(
+        &self.snapshot.snapshot_recv,
+        Some(r) if r.sender_term == is.term() && r.meta.last_index() > boundary
+      ) {
+        return;
+      }
+      // Validate the new snapshot's membership BEFORE any durable op (once per transfer identity).
       if !meta.conf().is_valid() {
         self.poison(PoisonReason::InvalidConfState);
         return;
       }
+      // Free any prior store staging so this fresh transfer stages from scratch — the store keys staging by
+      // boundary/identity and would otherwise drop a lower chunk against a higher stale buffer. Done
+      // UNCONDITIONALLY (not gated on `snapshot_recv.is_some()`): a store that persisted staging across a
+      // restart has orphaned it WITHOUT a `snapshot_recv` to track, so a gate would miss it.
+      stable.discard_snapshot_staging();
       self.snapshot.snapshot_recv = Some(SnapshotRecv {
         meta: meta.clone(),
         total_len,
         contiguous_staged: 0,
+        sender_term: is.term(),
       });
-    } else if self
-      .snapshot
-      .snapshot_recv
-      .as_ref()
-      .is_some_and(|r| r.total_len != total_len)
-    {
-      // total_len consistency: every chunk of a transfer must agree (a buggy/forged length).
-      self.poison(PoisonReason::SnapshotDecode);
-      return;
+    }
+
+    // Validate the chunk byte-range BEFORE staging — a chunk past `total_len` would be silently CLAMPED by
+    // the staging accumulator, completing the buffer from a malformed stream and decoding a TRUNCATED
+    // prefix instead of fail-stopping. (`offset == total_len` with empty data is the benign stale-cursor
+    // self-correction — its `end == total_len` passes.) Checked arithmetic: a `u64` overflow is out of range.
+    match is.offset().checked_add(is.data().len() as u64) {
+      Some(end) if end <= total_len => {}
+      _ => {
+        self.poison(PoisonReason::SnapshotDecode);
+        return;
+      }
     }
 
     // Stage this chunk. A store staging-capacity error poisons (CFT resource exhaustion → failover).
@@ -311,12 +426,10 @@ where
       return;
     }
 
-    // Whole blob staged: read it back, decode once (fail-fast; leave NO partial state), persist the term
-    // (term-before-blob), submit, and DEFER the UNCHANGED destructive install until the blob is durable.
-    let Some(blob) = stable
-      .staged_snapshot(meta)
-      .map(|b| Bytes::from(b.into_vec()))
-    else {
+    // Whole blob staged: CONSUME it (clearing the store's staging buffer), decode once (fail-fast;
+    // leave NO partial state), persist the term (term-before-blob), submit, and DEFER the UNCHANGED
+    // destructive install until the blob is durable.
+    let Some(blob) = stable.take_staged_snapshot(meta) else {
       self.poison(PoisonReason::SnapshotDecode);
       return;
     };
@@ -336,17 +449,19 @@ where
   }
 
   /// Send a mid-transfer PROGRESS ack for a chunked snapshot: carries the contiguous-staged byte offset
-  /// (`acked_through`) so the leader sends the next chunk, with `match_index = commit` — below the
-  /// snapshot boundary, so the leader's `maybe_update` does NOT lift the peer out of Snapshot state.
-  /// UNGATED (unlike the final install ack): it makes no new durable commitment — `commit` is already
-  /// durable and `acked_through` is a transfer-progress hint — so a crash that loses it merely restarts
-  /// the transfer (from the store's durable staging, or 0), never an unsafe over-ack.
+  /// (`acked_through`) so the leader sends the next chunk, with `match_index = min(commit, ack_watermark)`
+  /// — the persist-before-ack-safe RECOVERABLE watermark, which past the staleness guard is strictly
+  /// below the snapshot boundary, so the leader's `maybe_update` does NOT lift the peer out of Snapshot
+  /// state (counting a phantom replica before the blob is durably installed). UNGATED (unlike the final
+  /// install ack): it makes no NEW durable commitment — the watermark is already durable and
+  /// `acked_through` is a transfer-progress hint — so a crash that loses it merely restarts the transfer.
   fn send_snapshot_progress_ack(&mut self, to: I, acked_through: u64) {
     let (term, me) = (self.term, self.config.id());
+    let match_index = self.commit.min(self.ack_watermark());
     self.send(
       to,
       Message::SnapshotResponse(
-        crate::SnapshotResponse::new(term, me, false, self.commit)
+        crate::SnapshotResponse::new(term, me, false, match_index)
           .with_acked_through(acked_through),
       ),
     );

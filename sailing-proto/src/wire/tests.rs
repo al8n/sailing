@@ -843,3 +843,97 @@ fn snapshot_response_acked_through_round_trips() {
   );
   assert_eq!(c, d, "a zero acked_through must be absent on the wire");
 }
+
+/// The closed-form `install_snapshot_encoded_len` must equal — to the byte — the length the real
+/// encoder produces for the matching `InstallSnapshot::new_chunk` frame, across the full field
+/// space (empty/joint/learner ConfStates, present/absent lease-and-read scalars, present/absent
+/// term/offset/total_len, and several data lengths). This agreement is the guarantee the formula
+/// stays in lockstep with the encoder.
+#[test]
+fn install_snapshot_encoded_len_agrees_with_encoder() {
+  let metas: std::vec::Vec<(&str, SnapshotMeta<u64>)> = std::vec![
+    (
+      "3-voter, no extras",
+      SnapshotMeta::new(
+        Index::new(7),
+        Term::new(3),
+        ConfState::from_voters([1u64, 2, 3])
+      ),
+    ),
+    (
+      "empty conf",
+      SnapshotMeta::new(Index::new(0), Term::new(0), ConfState::default()),
+    ),
+    (
+      "joint + learners + outgoing + auto_leave",
+      SnapshotMeta::new(
+        Index::new(1_000_000),
+        Term::new(42),
+        ConfState::new(
+          [1u64, 2, 300],
+          [4u64, 5],
+          [6u64, 7, 8],
+          [9u64, 128, 16_384],
+          true,
+        ),
+      ),
+    ),
+    (
+      "all lease/read scalars set (Safe)",
+      SnapshotMeta::new(
+        Index::new(9),
+        Term::new(4),
+        ConfState::from_voters([10u64, 20])
+      )
+      .with_max_lease_window(1_234_567)
+      .with_max_wall_plus_window(2_000_000_000)
+      .with_max_unwalled_lease_window(50_000)
+      .with_read_only(ReadOnlyOption::Safe),
+    ),
+    (
+      "lease scalars set (LeaseGuard read mode)",
+      SnapshotMeta::new(
+        Index::new(u32::MAX as u64),
+        Term::new(u16::MAX as u64),
+        ConfState::from_voters([u64::MAX, u64::MAX - 1]),
+      )
+      .with_max_lease_window(u64::MAX)
+      .with_max_wall_plus_window(u64::MAX)
+      .with_max_unwalled_lease_window(u64::MAX)
+      .with_read_only(ReadOnlyOption::LeaseGuard),
+    ),
+  ];
+
+  for (term_raw, leader, offset, total) in [
+    (0u64, 1u64, 0u64, 0u64),
+    (5, 7, 0, 0),
+    (5, 7, 4096, 60 << 20),
+    (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+  ] {
+    let term = Term::new(term_raw);
+    for (label, meta) in &metas {
+      for data_len in [0u64, 1, 100, 65536] {
+        let want = {
+          let mut v = Vec::new();
+          encode_message(
+            &Message::InstallSnapshot(InstallSnapshot::new_chunk(
+              term,
+              leader,
+              meta.clone(),
+              Bytes::from(std::vec![0u8; data_len as usize]),
+              offset,
+              total,
+            )),
+            &mut v,
+          );
+          v.len()
+        };
+        let got = install_snapshot_encoded_len(term, &leader, meta, offset, total, data_len);
+        assert_eq!(
+          got, want,
+          "meta={label}, term={term_raw}, leader={leader}, offset={offset}, total={total}, data_len={data_len}"
+        );
+      }
+    }
+  }
+}

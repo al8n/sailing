@@ -154,7 +154,7 @@ Each `Message` rides one frame:
 One-time, before any application frame, in each direction:
 
 ```text
-[ magic 0xCA ][ version 0x04 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
+[ magic 0xCA ][ version 0x05 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
 ```
 
 The ENCODING is shared by both transports — one format, one parser family, one version byte

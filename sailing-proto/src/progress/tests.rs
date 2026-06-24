@@ -76,7 +76,7 @@ fn become_snapshot_records_pending_index() {
 }
 
 #[test]
-fn snapshot_acked_advances_the_cursor_monotonically() {
+fn snapshot_acked_tracks_the_followers_watermark() {
   let mut p = Progress::new(Index::new(1), 256, 0);
   p.become_snapshot(Index::new(10));
   let ProgressState::Snapshot {
@@ -89,11 +89,14 @@ fn snapshot_acked_advances_the_cursor_monotonically() {
   assert_eq!(pending, Index::new(10));
   assert_eq!(acked_through, 0, "become_snapshot seeds acked_through = 0");
   p.snapshot_acked(64);
-  p.snapshot_acked(32); // a stale/lower ack must NOT lower the cursor
+  // SET (not max): the cursor tracks the follower's reported contiguous watermark, so a later LOWER
+  // value (a stale old-boundary ack after a supersede reset) sets it lower — self-correcting, never
+  // inflating the cursor and wedging the transfer.
+  p.snapshot_acked(32);
   let ProgressState::Snapshot { acked_through, .. } = p.state() else {
     panic!("expected Snapshot state");
   };
-  assert_eq!(acked_through, 64);
+  assert_eq!(acked_through, 32);
 }
 
 #[test]

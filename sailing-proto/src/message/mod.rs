@@ -506,6 +506,21 @@ impl<I> SnapshotMeta<I> {
     &self.conf
   }
 
+  /// Whether two snapshots share the same TRANSFER IDENTITY — equal `(last_index, last_term, conf)`. The
+  /// LeaseGuard / read-mode bounds are EXCLUDED: a later snapshot at the same boundary may carry a higher
+  /// monotone bound yet is the same underlying snapshot, so it must CONTINUE an in-flight transfer, not
+  /// restart it. Used by the receiver and the store staging to key a chunked transfer by its real identity
+  /// rather than the boundary index alone (so a different snapshot at the same `last_index` cannot reuse a
+  /// prior transfer's staged bytes).
+  pub fn identity_eq(&self, other: &Self) -> bool
+  where
+    I: PartialEq,
+  {
+    self.last_index == other.last_index
+      && self.last_term == other.last_term
+      && self.conf == other.conf
+  }
+
   /// The max LeaseGuard commit-wait window (nanos) over the subsumed entries, or `0` if unset.
   #[inline(always)]
   pub const fn max_lease_window(&self) -> u64 {
