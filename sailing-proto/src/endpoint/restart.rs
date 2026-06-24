@@ -428,6 +428,7 @@ where
       commit,
       applied,
       snapshot: SnapshotState {
+        snapshot_recv: None,
         pending_install: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
