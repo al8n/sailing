@@ -215,6 +215,9 @@ impl StorageFaults {
 pub enum MemStoreError {
   /// A seeded transient read fault fired: the read failed but a retry may succeed.
   TransientRead,
+  /// A snapshot chunk could not be staged: the configured staging cap was exceeded — a node-fatal
+  /// resource exhaustion modeling an in-RAM store that runs out of room.
+  StagingFull,
 }
 
 impl MemStoreError {
@@ -222,6 +225,7 @@ impl MemStoreError {
   pub const fn as_str(&self) -> &'static str {
     match self {
       Self::TransientRead => "transient_read",
+      Self::StagingFull => "staging_full",
     }
   }
 }
@@ -686,6 +690,11 @@ pub struct MemStable<I> {
   faults: StorageFaults,
   /// Write-side fault PRNG (drives `torn_write` at `flush`). Deterministic given the seed.
   prng: FaultPrng,
+  /// Chunked-snapshot staging accumulator (one in-flight transfer at a time).
+  snapshot_staging: Option<sailing_proto::SnapshotStaging>,
+  /// Optional staging-capacity cap (bytes); a `total_len` beyond it fails `accept_snapshot_chunk`,
+  /// modeling an in-RAM store that runs out of room.
+  staging_cap: Option<usize>,
 }
 
 /// Which completion an in-flight (async, not-yet-flushed) stable-store write owes at `flush`.
@@ -710,6 +719,8 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
       in_flight: Vec::new(),
       faults: StorageFaults::none(),
       prng: FaultPrng::default(),
+      snapshot_staging: None,
+      staging_cap: None,
     }
   }
 
@@ -722,6 +733,14 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
       prng: FaultPrng::new(seed),
       ..Self::new()
     }
+  }
+
+  /// Cap the chunked-snapshot staging buffer (bytes); a `total_len` beyond `cap` fails
+  /// `accept_snapshot_chunk` with [`MemStoreError::StagingFull`] (a node-fatal resource error).
+  #[must_use]
+  pub fn with_staging_cap(mut self, cap: usize) -> Self {
+    self.staging_cap = Some(cap);
+    self
   }
 
   /// Set the write mode. Switching to `Sync` requires no in-flight writes (debug-asserted).
@@ -790,6 +809,8 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     self.hard_state = self.durable_hard_state.clone();
     self.snapshot.clone_from(&self.durable_snapshot);
     self.in_flight.clear();
+    // An in-RAM store loses chunk staging on a crash — the transfer restarts from offset 0.
+    self.snapshot_staging = None;
   }
 
   /// Whether there is a submitted-but-not-yet-flushed write in the fsync window. Always `false` in
@@ -862,6 +883,39 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
       self.durable_snapshot.as_ref().map(|(m, _)| m.clone())
     } else {
       self.snapshot.as_ref().map(|(m, _)| m.clone())
+    }
+  }
+
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &SnapshotMeta<I>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, Self::Error> {
+    let boundary = meta.last_index();
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() > boundary => return Ok(0),
+      Some(s) if s.boundary() < boundary => self.snapshot_staging = None,
+      _ => {}
+    }
+    if let Some(cap) = self.staging_cap
+      && total_len as usize > cap
+    {
+      return Err(MemStoreError::StagingFull);
+    }
+    let s = self
+      .snapshot_staging
+      .get_or_insert_with(|| sailing_proto::SnapshotStaging::new(boundary, total_len));
+    Ok(s.accept(offset, data))
+  }
+
+  fn staged_snapshot(&self, meta: &SnapshotMeta<I>) -> Option<sailing_proto::MaybeOwned<'_, [u8]>> {
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() == meta.last_index() && s.is_complete() => {
+        Some(sailing_proto::MaybeOwned::Borrowed(s.bytes()))
+      }
+      _ => None,
     }
   }
 

@@ -462,6 +462,7 @@ impl crate::StateMachine for CountSm {
 pub(crate) struct NoopStable<I = u64> {
   hard_state: HardState<I>,
   completions: VecDeque<StableDone>,
+  snapshot_staging: Option<crate::SnapshotStaging>,
 }
 
 impl<I> Default for NoopStable<I> {
@@ -469,6 +470,7 @@ impl<I> Default for NoopStable<I> {
     Self {
       hard_state: HardState::initial(),
       completions: VecDeque::new(),
+      snapshot_staging: None,
     }
   }
 }
@@ -506,6 +508,34 @@ impl<I: NodeId> StableStore for NoopStable<I> {
 
   fn durable_snapshot(&self) -> Option<SnapshotMeta<I>> {
     None
+  }
+
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &SnapshotMeta<I>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, Self::Error> {
+    let boundary = meta.last_index();
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() > boundary => return Ok(0),
+      Some(s) if s.boundary() < boundary => self.snapshot_staging = None,
+      _ => {}
+    }
+    let s = self
+      .snapshot_staging
+      .get_or_insert_with(|| crate::SnapshotStaging::new(boundary, total_len));
+    Ok(s.accept(offset, data))
+  }
+
+  fn staged_snapshot(&self, meta: &SnapshotMeta<I>) -> Option<crate::MaybeOwned<'_, [u8]>> {
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() == meta.last_index() && s.is_complete() => {
+        Some(crate::MaybeOwned::Borrowed(s.bytes()))
+      }
+      _ => None,
+    }
   }
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
@@ -550,6 +580,7 @@ pub(crate) struct AsyncStable {
   /// The `lease_support` of every HardState actually handed to `submit_write` (post choke-point
   /// stamp). Lets a test assert the durable floor is monotone non-decreasing across all writes.
   submitted_lease: Vec<Option<Duration>>,
+  snapshot_staging: Option<crate::SnapshotStaging>,
 }
 
 impl Default for AsyncStable {
@@ -564,6 +595,7 @@ impl Default for AsyncStable {
       fail_next_snapshot_durability: false,
       last_durable_reads: false,
       submitted_lease: Vec::new(),
+      snapshot_staging: None,
     }
   }
 }
@@ -594,6 +626,8 @@ impl AsyncStable {
     self.hard_state = self.durable_hard_state;
     self.snapshot.clone_from(&self.durable_snapshot);
     self.completions.clear();
+    // An in-RAM store loses chunk staging on a crash — the transfer restarts from offset 0.
+    self.snapshot_staging = None;
   }
 
   /// Make `hard_state()` return the LAST-DURABLE value (strict `StableStore` contract) instead of the
@@ -677,6 +711,34 @@ impl StableStore for AsyncStable {
 
   fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
     self.durable_snapshot.as_ref().map(|(m, _)| m.clone())
+  }
+
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &SnapshotMeta<u64>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, Self::Error> {
+    let boundary = meta.last_index();
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() > boundary => return Ok(0),
+      Some(s) if s.boundary() < boundary => self.snapshot_staging = None,
+      _ => {}
+    }
+    let s = self
+      .snapshot_staging
+      .get_or_insert_with(|| crate::SnapshotStaging::new(boundary, total_len));
+    Ok(s.accept(offset, data))
+  }
+
+  fn staged_snapshot(&self, meta: &SnapshotMeta<u64>) -> Option<crate::MaybeOwned<'_, [u8]>> {
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() == meta.last_index() && s.is_complete() => {
+        Some(crate::MaybeOwned::Borrowed(s.bytes()))
+      }
+      _ => None,
+    }
   }
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {

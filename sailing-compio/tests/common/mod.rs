@@ -169,6 +169,8 @@ pub struct MemStable {
   /// Optional async-store signal: cloned from `DriverConfig::storage_ready`'s sender so the
   /// storage-ready seam can be exercised (signalled on every completion enqueue).
   ready: Option<flume::Sender<()>>,
+  /// Chunked-snapshot staging accumulator (one in-flight transfer at a time).
+  snapshot_staging: Option<sailing_proto::SnapshotStaging>,
 }
 
 impl MemStable {
@@ -178,6 +180,7 @@ impl MemStable {
       snap: None,
       completions: VecDeque::new(),
       ready: None,
+      snapshot_staging: None,
     }
   }
 
@@ -227,6 +230,37 @@ impl StableStore for MemStable {
   fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
     // Synchronous store: submitted == durable.
     self.snap.as_ref().map(|(m, _)| m.clone())
+  }
+
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &SnapshotMeta<u64>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, Self::Error> {
+    let boundary = meta.last_index();
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() > boundary => return Ok(0),
+      Some(s) if s.boundary() < boundary => self.snapshot_staging = None,
+      _ => {}
+    }
+    let s = self
+      .snapshot_staging
+      .get_or_insert_with(|| sailing_proto::SnapshotStaging::new(boundary, total_len));
+    Ok(s.accept(offset, data))
+  }
+
+  fn staged_snapshot(
+    &self,
+    meta: &SnapshotMeta<u64>,
+  ) -> Option<sailing_proto::MaybeOwned<'_, [u8]>> {
+    match &self.snapshot_staging {
+      Some(s) if s.boundary() == meta.last_index() && s.is_complete() => {
+        Some(sailing_proto::MaybeOwned::Borrowed(s.bytes()))
+      }
+      _ => None,
+    }
   }
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
