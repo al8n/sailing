@@ -194,6 +194,8 @@ jobs:
   test:
     name: test
     strategy:
+      # Report every platform's result; a disk or timeout flake on one OS must not cancel the others.
+      fail-fast: false
       matrix:
         os:
           - ubuntu-latest
@@ -202,6 +204,13 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
     - uses: actions/checkout@v6
+    - name: Free disk space
+      if: runner.os == 'Linux'
+      # Reclaim the large preinstalled toolchains the Rust build never touches; the test build is
+      # otherwise close enough to the runner's disk ceiling that a transient peak can fail a compile.
+      run: |
+        sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost /opt/hostedtoolcache/CodeQL 2>/dev/null || true
+        df -h /
     - name: Install protoc
       uses: arduino/setup-protoc@v3
       with:
@@ -221,8 +230,24 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
-    - name: Run test
-      run: cargo hack test --feature-powerset --exclude-features fuzzing --at-least-one-of std,alloc
+    - name: Per-feature test the core library
+      # sailing-proto owns the feature gating (std/alloc/tcp/tls/quic/serde/clap). The full --feature-powerset
+      # is 530 combos — 408 of them rebuilding rustls/quinn for a tls/quic variant — which overran the runner's
+      # disk and wall-clock. --each-feature instead checks every feature in isolation; the crate requires one of
+      # std/alloc, so it runs once per tier with that tier as the --features base (--at-least-one-of is
+      # powerset-only). Each feature thus compiles and tests on both the std and the no_std/alloc tier.
+      run: |
+        cargo hack test -p sailing-proto --each-feature --features std --exclude-features fuzzing
+        cargo hack test -p sailing-proto --each-feature --features alloc --exclude-features fuzzing
+    - name: Integration, driver, and simulation tests
+      # The downstream crates carry no test-relevant feature combinatorics, so each runs ONCE with all
+      # features (the reactor loopback needs the agnostic runtime, the simulator's VOPR exercises the wire
+      # codec) rather than per powerset combo.
+      run: |
+        cargo test -p sailing-driver --all-features
+        cargo test -p sailing-simulation --all-features
+        cargo test -p sailing-compio --all-features
+        cargo test -p sailing-reactor --all-features
 
   coverage:
     name: coverage
