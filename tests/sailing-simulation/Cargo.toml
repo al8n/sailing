@@ -21,7 +21,7 @@ derive_more.workspace = true
 
 [dev-dependencies]
 # Bench-only: criterion without plotters/rayon (lean dep tree; `cargo bench` + CI compile-check).
-criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "endpoint"
