@@ -228,59 +228,128 @@ where
       return;
     }
 
-    // meta.last_index() > self.commit: a genuinely-newer snapshot. DEFER the destructive install.
+    // meta.last_index() > self.commit: a genuinely-newer snapshot.
 
-    // Duplicate-install guard: while this peer is in Snapshot state the leader resends the same (or an
-    // older) snapshot (`on_heartbeat_response` resend / re-probe). If a deferred install at this boundary or
-    // higher is already in flight, do NOT re-decode or mint a SECOND blob op (that would orphan the
-    // first in-flight blob); the in-flight install will complete and ack. A strictly-NEWER snapshot
-    // falls through and REPLACES it below (the stale opid's `SnapshotWritten` then finds no match — a
-    // harmless no-op).
+    // Duplicate-install guard: a deferred install already at this boundary or higher is completing — do
+    // NOT re-stage or re-decode (that would orphan the in-flight blob). A strictly-NEWER snapshot falls
+    // through and SUPERSEDES the partial below (the stale opid's `SnapshotWritten` then finds no match).
     if matches!(&self.snapshot.pending_install, Some((_, pmeta, ..)) if pmeta.last_index() >= meta.last_index())
     {
       return;
     }
 
-    // Step 0: validate the snapshot's membership BEFORE any durable op / state mutation.
-    // `Tracker::from_conf_state` (in `install_snapshot_now`) copies the ConfState sets verbatim, so a
-    // malformed `meta.conf()` — empty voters, learner/voter overlap, bad `learners_next`, non-joint
-    // `auto_leave` — would install an impossible configuration (no quorum, vacuous votes). A correct
-    // leader never sends one; treat it as fatal corruption and poison here, before any durable write.
-    if !meta.conf().is_valid() {
-      self.poison(PoisonReason::InvalidConfState);
+    let total_len = is.total_len();
+    if total_len == 0 {
+      // LEGACY single-shot: `data` IS the whole blob — decode + submit directly (the pre-chunking path,
+      // byte-identical, no staging). A genuine pre-chunking peer is otherwise fenced by the handshake.
+      if !meta.conf().is_valid() {
+        self.poison(PoisonReason::InvalidConfState);
+        return;
+      }
+      let snap = match <F::Snapshot as Data>::decode_exact(is.data().clone()) {
+        Ok(s) => s,
+        Err(_) => {
+          self.poison(PoisonReason::SnapshotDecode);
+          return;
+        }
+      };
+      self.ensure_term_durable(stable);
+      let opid = self.mint_op_id();
+      self.submit_snapshot(stable, opid, meta.clone(), is.data().clone());
+      let leader = is.leader();
+      self.snapshot.pending_install = Some((opid, meta.clone(), snap, leader));
       return;
     }
 
-    // Step 1: decode the SM snapshot (fail-fast; leave NO partial state). The decoded snapshot is HELD
-    // in `pending_install` and applied to the SM only once the blob is durable (`install_snapshot_now`)
-    // — NOT here, so a crash before the blob lands leaves the SM and log untouched and recoverable.
-    let snap = match <F::Snapshot as Data>::decode_exact(is.data().clone()) {
+    // CHUNKED transfer (total_len != 0): stage this chunk into the store; DEFER decode + the destructive
+    // install until the WHOLE blob is contiguous-staged. The proto holds NO bytes — `snapshot_recv` is
+    // coordination only.
+    let boundary = meta.last_index();
+    let first_chunk =
+      !matches!(&self.snapshot.snapshot_recv, Some(r) if r.meta.last_index() == boundary);
+    if first_chunk {
+      // Validate the snapshot's membership BEFORE any durable op — a malformed ConfState would install an
+      // impossible configuration. Once per boundary (the meta is identical on every chunk). A strictly-
+      // newer boundary supersedes an older `snapshot_recv` partial (the store's staging supersedes by key).
+      if !meta.conf().is_valid() {
+        self.poison(PoisonReason::InvalidConfState);
+        return;
+      }
+      self.snapshot.snapshot_recv = Some(SnapshotRecv {
+        meta: meta.clone(),
+        total_len,
+        contiguous_staged: 0,
+      });
+    } else if self
+      .snapshot
+      .snapshot_recv
+      .as_ref()
+      .is_some_and(|r| r.total_len != total_len)
+    {
+      // total_len consistency: every chunk of a transfer must agree (a buggy/forged length).
+      self.poison(PoisonReason::SnapshotDecode);
+      return;
+    }
+
+    // Stage this chunk. A store staging-capacity error poisons (CFT resource exhaustion → failover).
+    let staged = match stable.accept_snapshot_chunk(meta, total_len, is.offset(), is.data()) {
+      Ok(s) => s,
+      Err(_) => {
+        self.poison(PoisonReason::StablePoll);
+        return;
+      }
+    };
+    if let Some(r) = &mut self.snapshot.snapshot_recv {
+      r.contiguous_staged = staged;
+    }
+
+    if staged < total_len {
+      // Mid-transfer: a PROGRESS ack carrying the contiguous-staged offset — drives the leader's next
+      // chunk but does NOT advance `match_index` (the peer stays in Snapshot state).
+      let leader = is.leader();
+      self.send_snapshot_progress_ack(leader, staged);
+      return;
+    }
+
+    // Whole blob staged: read it back, decode once (fail-fast; leave NO partial state), persist the term
+    // (term-before-blob), submit, and DEFER the UNCHANGED destructive install until the blob is durable.
+    let Some(blob) = stable
+      .staged_snapshot(meta)
+      .map(|b| Bytes::from(b.into_vec()))
+    else {
+      self.poison(PoisonReason::SnapshotDecode);
+      return;
+    };
+    let snap = match <F::Snapshot as Data>::decode_exact(blob.clone()) {
       Ok(s) => s,
       Err(_) => {
         self.poison(PoisonReason::SnapshotDecode);
         return;
       }
     };
-
-    // Persist the (possibly just-adopted) term now — AFTER the read-only validation (sentinel, conf,
-    // decode) and BEFORE the snapshot blob: term-before-snapshot, the snapshot analogue of
-    // term-before-entries (see `ensure_term_durable`). A fail-stop in any check above persisted no term
-    // write. Idempotent (a same-term install skips). The term write is independently recoverable, so it
-    // is correct to make durable now even though the destructive install body is deferred.
     self.ensure_term_durable(stable);
-
-    // Submit the snapshot blob and DEFER the destructive install body (SM restore, commit/applied
-    // advance, the `log.restore` re-baseline, membership install, ack) until the blob is durable:
-    // the core owns the snapshot-vs-rebaseline ordering, exactly mirroring how `pending_compact` defers
-    // `log.compact`. Until `SnapshotWritten` (or `durable_snapshot()` evidence) fires `install_snapshot_now`,
-    // this follower stays in its OLD consistent state — so a crash in the window loses only the in-flight
-    // blob and restart re-syncs from the UNCHANGED durable log (`reconcile_restart_log` sees the
-    // pre-install shape, never the `OrphanedLog` poison). The decoded `snap` and the `leader` ride in
-    // `pending_install`; the blob bytes are handed to the store (a refcount bump on `Bytes`).
     let opid = self.mint_op_id();
-    self.submit_snapshot(stable, opid, meta.clone(), is.data().clone());
+    self.submit_snapshot(stable, opid, meta.clone(), blob);
     let leader = is.leader();
     self.snapshot.pending_install = Some((opid, meta.clone(), snap, leader));
+    self.snapshot.snapshot_recv = None;
+  }
+
+  /// Send a mid-transfer PROGRESS ack for a chunked snapshot: carries the contiguous-staged byte offset
+  /// (`acked_through`) so the leader sends the next chunk, with `match_index = commit` — below the
+  /// snapshot boundary, so the leader's `maybe_update` does NOT lift the peer out of Snapshot state.
+  /// UNGATED (unlike the final install ack): it makes no new durable commitment — `commit` is already
+  /// durable and `acked_through` is a transfer-progress hint — so a crash that loses it merely restarts
+  /// the transfer (from the store's durable staging, or 0), never an unsafe over-ack.
+  fn send_snapshot_progress_ack(&mut self, to: I, acked_through: u64) {
+    let (term, me) = (self.term, self.config.id());
+    self.send(
+      to,
+      Message::SnapshotResponse(
+        crate::SnapshotResponse::new(term, me, false, self.commit)
+          .with_acked_through(acked_through),
+      ),
+    );
   }
 
   /// Run the DEFERRED destructive snapshot-install body, once the blob is proven durable (the matching

@@ -888,11 +888,26 @@ struct Transfer<I> {
   transfer_deadline: Option<Instant>,
 }
 
+/// Coordination state for a chunked snapshot being RECEIVED (Phase 1 of the two-phase install). Holds
+/// NO bytes — the chunks are staged in the `StableStore` via `accept_snapshot_chunk`; this tracks only
+/// the boundary (`meta`), the agreed `total_len`, and the contiguous-staged watermark. Becomes a
+/// `pending_install` (Phase 2) once the contiguous-staged length reaches `total_len`.
+#[derive(Debug)]
+struct SnapshotRecv<I> {
+  meta: crate::SnapshotMeta<I>,
+  total_len: u64,
+  contiguous_staged: u64,
+}
+
 /// The deferred snapshot machinery, grouped out of `Endpoint`.
 struct SnapshotState<I, F>
 where
   F: StateMachine,
 {
+  /// Phase-1 chunk staging coordination (NO bytes — the store holds the staged chunks): `Some` while a
+  /// chunked snapshot is being RECEIVED, before the whole blob is staged. Becomes `pending_install`
+  /// (Phase 2) once contiguous-staged == `total_len`. `restart` resets it to `None`.
+  snapshot_recv: Option<SnapshotRecv<I>>,
   /// `Some((blob_opid, meta, decoded_snap, leader))` while a FOLLOWER snapshot install is DEFERRED —
   /// its blob has been submitted (`submit_snapshot`) but is not yet durable. The destructive
   /// install body (SM restore, `commit`/`applied` advance, the `log.restore` re-baseline, membership
@@ -948,6 +963,7 @@ where
           .as_ref()
           .map(|(opid, meta, _, leader)| (opid, meta, leader)),
       )
+      .field("snapshot_recv", &self.snapshot_recv)
       .field("pending_compact", &self.pending_compact)
       .field("snapshot_resend_after", &self.snapshot_resend_after)
       .finish()
@@ -1144,6 +1160,7 @@ where
       commit: Index::ZERO,
       applied: Index::ZERO,
       snapshot: SnapshotState {
+        snapshot_recv: None,
         pending_install: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
