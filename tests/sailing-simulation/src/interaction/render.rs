@@ -59,16 +59,20 @@ pub(crate) fn render_msg(_from: u64, _to: u64, msg: &Message<u64>) -> String {
     }
     Message::HeartbeatResponse(m) => std::format!("HeartbeatResponse term={}", m.term().get()),
     Message::InstallSnapshot(m) => std::format!(
-      "InstallSnapshot term={} snap={}/{}",
+      "InstallSnapshot term={} snap={}/{} offset={} len={} last={}",
       m.term().get(),
       m.snapshot().last_term().get(),
       m.snapshot().last_index().get(),
+      m.offset(),
+      m.data().len(),
+      m.is_last(),
     ),
     Message::SnapshotResponse(m) => std::format!(
-      "SnapshotResponse term={} reject={} match={}",
+      "SnapshotResponse term={} reject={} match={} acked={}",
       m.term().get(),
       m.reject(),
       m.match_index().get(),
+      m.acked_through(),
     ),
     Message::TimeoutNow(m) => std::format!("TimeoutNow term={}", m.term().get()),
     Message::ReadIndex(m) => std::format!("ReadIndex term={}", m.term().get()),
