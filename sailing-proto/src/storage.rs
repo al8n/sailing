@@ -4,6 +4,7 @@
 use crate::{Entry, HardState, Index, NodeId, SnapshotMeta, Term};
 use bytes::Bytes;
 use core::ops::Range;
+use std::vec::Vec;
 
 /// A storage-submission correlation id, echoed back on completion.
 ///
@@ -349,6 +350,36 @@ pub trait StableStore {
   /// the boundary, and the blob was already handed to the SM at `submit_snapshot`).
   fn durable_snapshot(&self) -> Option<SnapshotMeta<Self::NodeId>>;
 
+  /// Stage one snapshot chunk under the key `meta.last_index()`, writing `data` at byte `offset`.
+  /// `Ok` is the highest CONTIGUOUS byte offset now staged (drives `SnapshotResponse.acked_through`).
+  ///
+  /// Idempotent on a re-delivered `offset`; a STRICTLY-NEWER key (a higher `meta.last_index()`)
+  /// supersedes and discards an older partial. The store bounds its OWN staging (a disk store by disk,
+  /// an in-RAM store by RAM) and returns `Err` on capacity exhaustion — the core treats that as fatal
+  /// (a node crash → CFT failover), NOT a protocol-level cap. A store MAY persist staging durably; if it
+  /// does, the returned offset is the DURABLE contiguous offset, which makes the transfer resumable
+  /// across a crash (the leader re-sends from the reported offset, not from `0`). Staging is SEPARATE
+  /// from the durable snapshot slot — a crash mid-transfer loses only staging (unless persisted), never
+  /// the durable log. [`SnapshotStaging`] is the reference accumulator a store can embed.
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &SnapshotMeta<Self::NodeId>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, Self::Error>;
+
+  /// Read back the fully-staged blob keyed at `meta.last_index()` once its contiguous-staged length
+  /// reaches `total_len` — the bytes the core decodes and re-submits via [`submit_snapshot`]. `None`
+  /// if no COMPLETE staged blob is keyed there. [`MaybeOwned`](crate::MaybeOwned) so a store can return
+  /// its staging buffer without a copy.
+  ///
+  /// [`submit_snapshot`]: Self::submit_snapshot
+  fn staged_snapshot(
+    &self,
+    meta: &SnapshotMeta<Self::NodeId>,
+  ) -> Option<crate::MaybeOwned<'_, [u8]>>;
+
   /// Drain the next completion, if any.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;
 
@@ -366,6 +397,84 @@ pub trait StableStore {
   fn has_pending(&self) -> bool;
 }
 
+/// A reusable accumulator for chunked snapshot staging — the reference implementation a [`StableStore`]
+/// embeds to satisfy [`accept_snapshot_chunk`](StableStore::accept_snapshot_chunk) /
+/// [`staged_snapshot`](StableStore::staged_snapshot). It tracks written byte runs and reports the
+/// highest CONTIGUOUS offset; the embedding store keys ONE of these per in-flight transfer and discards
+/// it when a strictly-newer boundary supersedes it.
+#[derive(Debug)]
+pub struct SnapshotStaging {
+  boundary: Index,
+  buf: Vec<u8>,
+  /// Sorted, non-overlapping written byte ranges `[start, end)`.
+  runs: Vec<(u64, u64)>,
+}
+
+impl SnapshotStaging {
+  /// Begin staging a `total_len`-byte blob covered by snapshot boundary `boundary`.
+  #[must_use]
+  pub fn new(boundary: Index, total_len: u64) -> Self {
+    Self {
+      boundary,
+      buf: std::vec![0u8; total_len as usize],
+      runs: Vec::new(),
+    }
+  }
+
+  /// The snapshot boundary (`meta.last_index()`) this staging is keyed on.
+  #[inline]
+  pub const fn boundary(&self) -> Index {
+    self.boundary
+  }
+
+  /// Write `data` at byte `offset` (clamped to the buffer) and return the highest CONTIGUOUS staged
+  /// offset. Idempotent on a re-delivered range.
+  pub fn accept(&mut self, offset: u64, data: &[u8]) -> u64 {
+    let start = (offset as usize).min(self.buf.len());
+    let end = start.saturating_add(data.len()).min(self.buf.len());
+    self.buf[start..end].copy_from_slice(&data[..end - start]);
+    self.insert_run(start as u64, end as u64);
+    self.contiguous()
+  }
+
+  /// The highest contiguous staged offset (the end of the run starting at `0`, else `0`).
+  #[inline]
+  pub fn contiguous(&self) -> u64 {
+    match self.runs.first() {
+      Some(&(0, end)) => end,
+      _ => 0,
+    }
+  }
+
+  /// Whether the whole blob is staged (`contiguous() == total_len`).
+  #[inline]
+  pub fn is_complete(&self) -> bool {
+    self.contiguous() == self.buf.len() as u64
+  }
+
+  /// The staged bytes (meaningful once [`is_complete`](Self::is_complete) holds).
+  #[inline]
+  pub fn bytes(&self) -> &[u8] {
+    &self.buf
+  }
+
+  fn insert_run(&mut self, start: u64, end: u64) {
+    if start >= end {
+      return;
+    }
+    self.runs.push((start, end));
+    self.runs.sort_unstable_by_key(|&(s, _)| s);
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(self.runs.len());
+    for &(s, e) in &self.runs {
+      match merged.last_mut() {
+        Some(last) if s <= last.1 => last.1 = last.1.max(e),
+        _ => merged.push((s, e)),
+      }
+    }
+    self.runs = merged;
+  }
+}
+
 #[cfg(test)]
 mod tests {
   use super::*;
@@ -374,6 +483,21 @@ mod tests {
   fn assert_log<L: LogStore>() {}
   #[allow(dead_code)]
   fn assert_stable<S: StableStore>() {}
+
+  #[test]
+  fn snapshot_staging_tracks_contiguous_runs() {
+    let mut s = SnapshotStaging::new(Index::new(10), 6);
+    assert_eq!(s.accept(0, b"ab"), 2);
+    assert_eq!(
+      s.accept(4, b"ef"),
+      2,
+      "a gap at [2,4) holds the contiguous watermark"
+    );
+    assert!(!s.is_complete());
+    assert_eq!(s.accept(2, b"cd"), 6, "filling the gap completes the run");
+    assert!(s.is_complete());
+    assert_eq!(s.bytes(), b"abcdef");
+  }
 
   #[test]
   fn opid_increments() {
