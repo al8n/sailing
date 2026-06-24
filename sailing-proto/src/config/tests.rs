@@ -244,6 +244,36 @@ fn snapshot_chunk_bytes_default_and_override() {
 }
 
 #[test]
+fn snapshot_chunk_bytes_bounds_are_validated() {
+  let base = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  // 0 would livelock on empty chunks; an oversized value would produce an unsendable frame — both
+  // rejected by validate() (the parsed serde/clap paths route through it).
+  assert!(matches!(
+    base.clone().with_snapshot_chunk_bytes(0).validate(),
+    Err(ConfigError::SnapshotChunkBytesOutOfRange { value: 0, .. })
+  ));
+  assert!(matches!(
+    base
+      .clone()
+      .with_snapshot_chunk_bytes(MAX_SNAPSHOT_CHUNK_BYTES + 1)
+      .validate(),
+    Err(ConfigError::SnapshotChunkBytesOutOfRange { .. })
+  ));
+  assert!(
+    base
+      .with_snapshot_chunk_bytes(MAX_SNAPSHOT_CHUNK_BYTES)
+      .validate()
+      .is_ok()
+  );
+}
+
+#[test]
 fn flow_control_defaults_and_validation() {
   let c = Config::try_new(
     1u64,

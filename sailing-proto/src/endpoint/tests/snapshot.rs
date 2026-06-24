@@ -1984,6 +1984,606 @@ fn vote_freshness_floored_at_pending_install_boundary() {
   );
 }
 
+/// The SAME freshness floor must apply during an in-progress CHUNKED receive — BEFORE the blob completes
+/// into `pending_install`. Without it, the multi-chunk receive window would advertise stale-LOW freshness
+/// and could help elect a candidate behind the committed snapshot boundary already accepted.
+///
+/// MUTATION: drop the `snapshot_recv` floor in `on_request_vote` → the below-boundary candidate is granted
+/// (assert fails).
+#[test]
+fn vote_freshness_floored_at_chunked_receive_boundary() {
+  use crate::{
+    Index, InstallSnapshot, Instant, Message, RequestVote, SnapshotMeta, Term, conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  // Accept only the FIRST chunk of a higher-boundary (10/2) snapshot: `snapshot_recv` is armed, but the
+  // blob is incomplete (3 of 100 bytes), so `pending_install` is NOT yet armed.
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  let first_chunk = InstallSnapshot::new_chunk(
+    Term::new(2),
+    1u64,
+    meta,
+    bytes::Bytes::from_static(b"abc"),
+    0,
+    100,
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(first_chunk),
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the first chunk arms snapshot_recv"
+  );
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the blob is incomplete — pending_install is NOT yet armed"
+  );
+  while ep.poll_message().is_some() {}
+
+  // A candidate at a HIGHER term whose log (5/2) is BELOW the committed snapshot boundary (10/2).
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::RequestVote(RequestVote::new(
+      Term::new(3),
+      3u64,
+      Index::new(5),
+      Term::new(2),
+      false,
+      false,
+    )),
+  );
+  let granted_reject = core::iter::from_fn(|| ep.poll_message()).find_map(|o| match o.message() {
+    Message::VoteResponse(v) => Some(v.reject()),
+    _ => None,
+  });
+  assert_eq!(
+    granted_reject,
+    Some(true),
+    "the freshness floor at the in-progress chunked-receive boundary must REJECT a candidate below it"
+  );
+}
+
+/// An abandoned chunked receive must be reclaimed once the recoverable prefix catches up past its
+/// boundary (a snapshot/AppendEntries race where the live log wins) — freeing `snapshot_recv` AND the
+/// store staging, not pinning a full `total_len` buffer until a supersede/restart.
+///
+/// MUTATION: drop the `reclaim_stale_snapshot_recv` call in `handle_storage` → `snapshot_recv` stays armed
+/// after the catch-up (assert fails).
+#[test]
+fn abandoned_chunked_receive_is_reclaimed_when_log_catches_up() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  ep.handle_storage(d, &mut log, &mut stable); // make the committed prefix durable (ack_watermark = 3)
+  while ep.poll_message().is_some() {}
+
+  // A partial first chunk of a boundary-5 snapshot arms snapshot_recv (5 is above the recoverable prefix 3).
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta,
+      bytes::Bytes::from_static(b"abc"),
+      0,
+      100,
+    )),
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the partial chunk arms snapshot_recv"
+  );
+  while ep.poll_message().is_some() {}
+
+  // A snapshot/AppendEntries RACE: the live log catches up to (and commits) boundary 5 before the rest of
+  // the snapshot arrives.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(3),
+      Term::new(2),
+      std::vec![
+        Entry::new(
+          Term::new(2),
+          Index::new(4),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        ),
+        Entry::new(
+          Term::new(2),
+          Index::new(5),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        ),
+      ],
+      Index::new(5),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable); // entries 4,5 durable → ack_watermark = 5, reclaim fires
+
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "an abandoned chunked receive must be reclaimed once the recoverable prefix covers its boundary"
+  );
+}
+
+/// A new leader must be able to replace an abandoned HIGHER partial from an old leader with a LOWER
+/// snapshot — a leader change can legitimately leave the follower below a new leader's first index, which
+/// then sends `snapshot(K)+log`. Dropping the lower snapshot by boundary ordering would wedge the follower.
+///
+/// MUTATION: revert the supersession rule to boundary-only (drop when the partial boundary exceeds the
+/// incoming) → the new leader's lower snapshot is dropped and snapshot_recv stays at the old boundary.
+#[test]
+fn new_leader_lower_snapshot_replaces_abandoned_higher_partial() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  // Old leader (term 2) leaves a HIGH partial at boundary 100 (3 of 200 bytes).
+  let hi = SnapshotMeta::new(
+    Index::new(100),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      hi,
+      bytes::Bytes::from_static(b"abc"),
+      0,
+      200,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| r.meta.last_index()),
+    Some(Index::new(100)),
+    "the old leader's high partial is armed"
+  );
+  while ep.poll_message().is_some() {}
+
+  // A NEW leader (term 3) catches the follower up via a LOWER snapshot(50). The follower must REPLACE the
+  // abandoned 100 partial, not drop the 50 by boundary ordering (which would wedge it).
+  let lo = SnapshotMeta::new(
+    Index::new(50),
+    Term::new(3),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(3),
+      2u64,
+      lo,
+      bytes::Bytes::from_static(b"de"),
+      0,
+      80,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| r.meta.last_index()),
+    Some(Index::new(50)),
+    "the new leader's lower snapshot REPLACES the abandoned higher partial (not dropped → no wedge)"
+  );
+}
+
+/// A newer leader's chunk for the SAME snapshot identity (same meta + length) is a DISTINCT capture, not a
+/// continuation — the receiver must DISCARD the old leader's partial staging and start fresh, never mix two
+/// leaders' bytes into one blob (the StateMachine contract does not promise byte-identical cross-leader
+/// encodings of the same applied state).
+///
+/// MUTATION: drop `r.sender_term == is.term()` from the `continues` check → the newer chunk continues the
+/// old partial, leaving contiguous_staged = 6 (a mixed blob) instead of 0 (assert fails).
+#[test]
+fn newer_leader_same_identity_chunk_discards_old_partial_not_mixes() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+  // Old leader (term 2) stages [0,3) of a boundary-10 snapshot (total_len 6).
+  let m = SnapshotMeta::new(Index::new(10), Term::new(2), conf);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      m.clone(),
+      bytes::Bytes::from_static(b"AAA"),
+      0,
+      6,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| r.contiguous_staged),
+    Some(3),
+    "the old leader staged [0,3)"
+  );
+  while ep.poll_message().is_some() {}
+
+  // A NEWER leader (term 3) sends the REMAINING chunk [3,6) for the SAME identity but a different capture.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(3),
+      2u64,
+      m,
+      bytes::Bytes::from_static(b"BBB"),
+      3,
+      6,
+    )),
+  );
+  let recv = ep
+    .snapshot
+    .snapshot_recv
+    .as_ref()
+    .expect("a transfer is in progress");
+  assert_eq!(
+    recv.sender_term,
+    Term::new(3),
+    "the newer leader's transfer REPLACED the old partial"
+  );
+  assert_eq!(
+    recv.contiguous_staged, 0,
+    "the old [0,3) was discarded — the new [3,6) leaves a gap, NOT a mixed [0,6) blob"
+  );
+}
+
+/// A complete single-shot (legacy / 0-byte) snapshot must supersede an abandoned chunked partial —
+/// clearing `snapshot_recv` and discarding the store staging — not install alongside a lingering stale
+/// receive that would pin the staging buffer and skew the vote-freshness floor.
+///
+/// MUTATION: drop the snapshot_recv cleanup from the `total_len == 0` branch → the chunked partial survives
+/// the single-shot install (snapshot_recv stays Some, assert fails).
+#[test]
+fn legacy_single_shot_supersedes_abandoned_chunked_partial() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  // Old leader (term 2) leaves a HIGH chunked partial at boundary 100.
+  let hi = SnapshotMeta::new(
+    Index::new(100),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      hi,
+      bytes::Bytes::from_static(b"abc"),
+      0,
+      200,
+    )),
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the chunked partial is armed"
+  );
+  while ep.poll_message().is_some() {}
+
+  // A NEW leader (term 3) catches the follower up via a LOWER single-shot snapshot(50) — it must SUPERSEDE
+  // the abandoned chunked partial, clearing snapshot_recv and discarding staging.
+  let lo = SnapshotMeta::new(
+    Index::new(50),
+    Term::new(3),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(3),
+      2u64,
+      lo,
+      encode_count_snapshot(50),
+    )),
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "the legacy single-shot cleared the abandoned chunked partial"
+  );
+  assert!(
+    matches!(&ep.snapshot.pending_install, Some((_, m, ..)) if m.last_index() == Index::new(50)),
+    "the legacy single-shot installed at boundary 50"
+  );
+}
+
+/// Chunk staging is VOLATILE across restart: if a store persisted a higher partial, restart must discard it
+/// (snapshot_recv is reset to None, and there is no recovery API), so a post-restart LOWER snapshot from a
+/// new leader can stage instead of being blocked forever by the orphaned higher staging key.
+///
+/// MUTATION: drop the `discard_snapshot_staging` call in `restart_inner` → the orphaned 100 staging survives
+/// and the store rejects the lower 50 chunk (contiguous stays 0, assert fails).
+#[test]
+fn restart_discards_orphaned_durable_staging_so_a_lower_snapshot_stages() {
+  use crate::{
+    Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, StableStore, Term,
+    conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+
+  // Simulate a pre-crash DURABLE partial: stage the first chunk of a boundary-100 snapshot directly in the
+  // store, with NO surviving snapshot_recv (the proto is about to restart).
+  let hi = SnapshotMeta::new(
+    Index::new(100),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  stable
+    .accept_snapshot_chunk(&hi, 200, 0, &bytes::Bytes::from_static(b"abc"))
+    .unwrap();
+
+  // RESTART: the proto must discard the orphaned durable staging.
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  let d = Instant::ORIGIN;
+
+  // A new leader (term 3) sends a LOWER snapshot(50): it must STAGE (the old 100 staging is gone), not be
+  // rejected by a surviving higher staging key.
+  let lo = SnapshotMeta::new(
+    Index::new(50),
+    Term::new(3),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(3),
+      2u64,
+      lo,
+      bytes::Bytes::from_static(b"de"),
+      0,
+      80,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| (r.meta.last_index(), r.contiguous_staged)),
+    Some((Index::new(50), 2)),
+    "after the restart discard, the lower snapshot stages fresh — not blocked by the orphaned 100 staging"
+  );
+}
+
+/// A chunk whose byte range exceeds `total_len` must FAIL-STOP, not be silently clamped by the staging
+/// accumulator into a completed-but-TRUNCATED buffer that decodes a valid-looking prefix.
+///
+/// MUTATION: drop the range check before `accept_snapshot_chunk` → the overlong chunk clamps to [0,6),
+/// completes the buffer, and decodes a 6-byte prefix instead of poisoning (assert fails).
+#[test]
+fn overlong_chunk_is_rejected_not_truncated() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  // offset 0 + 10 bytes of data, but total_len is only 6 — out of range.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta,
+      bytes::Bytes::from_static(b"abcdefghij"),
+      0,
+      6,
+    )),
+  );
+  assert!(
+    ep.is_poisoned(),
+    "an overlong chunk (offset + len > total_len) must fail-stop, not truncate-install"
+  );
+  assert_eq!(
+    ep.poison_reason().map(|r| r.as_str()),
+    Some("snapshot_decode")
+  );
+}
+
+/// A STALE resume cursor (a reordered ack from a LARGER superseded snapshot, SET onto a peer whose current
+/// blob is smaller) must NOT make the leader encode `offset > total_len` — which the follower's range check
+/// would reject as a decode poison of a CORRECT follower. The transmitted offset is the CLAMPED `start`.
+///
+/// MUTATION: encode the raw `from` instead of `start` in `send_snapshot_chunk` → the emitted offset is
+/// 1_000_000 > total_len (assert fails).
+#[test]
+fn stale_resume_cursor_emits_clamped_offset() {
+  use crate::{Instant, Message, Term};
+  let (mut ep, mut log, mut stable, _pending) = wedged_snapshot_follower(5u64, 2);
+  // Simulate a stale cursor far beyond the current blob (the SET cursor accepts any reported watermark).
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.snapshot_acked(1_000_000);
+  }
+  // A HeartbeatResponse at/after the resend deadline re-sends from the cursor.
+  let later = Instant::ORIGIN + ep.config.election_timeout();
+  ep.handle_message(
+    later,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
+  );
+  let resent = core::iter::from_fn(|| ep.poll_message())
+    .find_map(|o| match o.message() {
+      Message::InstallSnapshot(s) if o.to() == 2u64 => Some(s.clone()),
+      _ => None,
+    })
+    .expect("a resend InstallSnapshot");
+  assert!(
+    resent.offset() <= resent.total_len(),
+    "a stale cursor must encode a CLAMPED offset ({}) ≤ total_len ({}), never offset > total",
+    resent.offset(),
+    resent.total_len(),
+  );
+}
+
+/// The chunk cap bounds the ENCODED FRAME, not just the blob slice: a large but legal `ConfState` plus a
+/// full `MAX_SNAPSHOT_CHUNK_BYTES` chunk must still encode below `MAX_FRAME_BYTES`, else the transport
+/// refuses the frame and the follower wedges in catch-up.
+///
+/// MUTATION: drop the frame-budget `.min(frame_budget.max(1))` in `send_snapshot_chunk` → the emitted frame
+/// exceeds `MAX_FRAME_BYTES` (assert fails). `#[ignore]` — allocates ~64 MiB; run with `-- --ignored`.
+#[test]
+#[ignore = "near the 64 MiB frame limit — allocates ~64 MiB; run with cargo test -- --ignored"]
+fn chunked_install_frame_stays_under_limit_with_large_metadata() {
+  use crate::{
+    Config, Index, Instant, Message, OpId, SnapshotMeta, StableStore, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_chunk_bytes(crate::config::MAX_SNAPSHOT_CHUNK_BYTES);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut stable = AsyncStable::default();
+  // A LARGE but legal ConfState (a huge voter set, ~5 MiB encoded) + a ~60 MiB blob. Without frame-aware
+  // chunk sizing, the encoded InstallSnapshot (metadata + a full MAX_SNAPSHOT_CHUNK_BYTES chunk) would
+  // exceed MAX_FRAME_BYTES and the stream/QUIC transport would refuse it.
+  let voters: std::vec::Vec<u64> = (0..600_000u64).collect();
+  let meta = SnapshotMeta::new(Index::new(10), Term::new(1), ConfState::from_voters(voters));
+  let blob = bytes::Bytes::from(std::vec![0u8; 60 * 1024 * 1024]);
+  stable.submit_snapshot(OpId::new(1), meta, blob);
+  if let Some(p) = ep.tracker.progress_mut(&1u64) {
+    p.become_snapshot(Index::new(10));
+  }
+  ep.send_snapshot_chunk(1u64, &stable, 0);
+  let out = core::iter::from_fn(|| ep.poll_message())
+    .find(|o| matches!(o.message(), Message::InstallSnapshot(_)))
+    .expect("an InstallSnapshot chunk");
+  let mut buf = std::vec::Vec::new();
+  crate::wire::encode_message(out.message(), &mut buf);
+  assert!(
+    buf.len() <= crate::wire::MAX_FRAME_BYTES,
+    "the chunked InstallSnapshot frame ({} bytes) must stay within MAX_FRAME_BYTES ({}) even with large metadata",
+    buf.len(),
+    crate::wire::MAX_FRAME_BYTES,
+  );
+}
+
+/// When the snapshot METADATA alone exceeds the frame limit (no room for even a 1-byte chunk), the snapshot
+/// is UNSENDABLE — `send_snapshot_chunk` must emit NOTHING, never an oversized frame the transport refuses.
+///
+/// MUTATION: revert the unsendable guard to `frame_budget.max(1)` → a 1-byte chunk is enqueued in an
+/// oversized frame (poll_message returns Some, assert fails). `#[ignore]` — allocates a >64 MiB ConfState.
+#[test]
+#[ignore = "metadata alone over the 64 MiB frame limit — allocates a ~7.5M-voter ConfState; run with -- --ignored"]
+fn unsendable_oversized_metadata_emits_no_chunk() {
+  use crate::{Config, Index, Instant, OpId, SnapshotMeta, StableStore, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_chunk_bytes(crate::config::MAX_SNAPSHOT_CHUNK_BYTES);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut stable = AsyncStable::default();
+  // A ConfState whose ENCODED size alone exceeds MAX_FRAME_BYTES (~8M voters ≈ 72 MiB). The snapshot can
+  // never ride a single frame — the metadata-only InstallSnapshot is already oversized.
+  let voters: std::vec::Vec<u64> = (0..8_000_000u64).collect();
+  let meta = SnapshotMeta::new(Index::new(10), Term::new(1), ConfState::from_voters(voters));
+  let blob = bytes::Bytes::from(std::vec![0u8; 1024]); // the BLOB is tiny — the METADATA is what's oversized
+  stable.submit_snapshot(OpId::new(1), meta, blob);
+  if let Some(p) = ep.tracker.progress_mut(&1u64) {
+    p.become_snapshot(Index::new(10));
+  }
+  ep.send_snapshot_chunk(1u64, &stable, 0);
+  assert!(
+    ep.poll_message().is_none(),
+    "an InstallSnapshot whose metadata alone exceeds MAX_FRAME_BYTES must NOT be enqueued (no oversized frame)"
+  );
+}
+
 /// Duplicate-install guard: a resent (same-boundary) InstallSnapshot while one is already deferred must
 /// be a no-op — NOT mint a second blob op (which would orphan the first in-flight blob).
 ///

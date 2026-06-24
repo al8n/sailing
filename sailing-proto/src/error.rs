@@ -149,6 +149,15 @@ pub enum ConfigError {
   /// `max_inflight_msgs` was zero.
   #[error("max_inflight_msgs must be greater than zero")]
   ZeroInflight,
+  /// `snapshot_chunk_bytes` was zero (which would livelock on empty chunks) or exceeded the frame-safe
+  /// maximum (which would produce an unsendable wire frame).
+  #[error("snapshot_chunk_bytes must be in 1..={max} (got {value})")]
+  SnapshotChunkBytesOutOfRange {
+    /// The configured chunk size.
+    value: u64,
+    /// The frame-safe maximum (the configured `snapshot_chunk_bytes` upper bound).
+    max: u64,
+  },
   /// The voter set was empty. A config with no voters has no consensus group to bootstrap; the
   /// programmatic constructors reach this only via [`crate::Config::try_new`]'s `id ∈ voters`
   /// rejection, but a parsed (serde / clap) config could otherwise carry an empty `voters`.

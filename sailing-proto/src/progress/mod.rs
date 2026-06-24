@@ -125,11 +125,16 @@ impl Progress {
     self.msg_app_flow_paused = false;
   }
 
-  /// Raise the per-chunk resume cursor for a peer in `Snapshot` state (monotonic — a stale/lower
-  /// `acked_through` from a reordered response is ignored). A no-op if the peer is not in `Snapshot`.
+  /// Set the per-chunk resume cursor for a peer in `Snapshot` state to the follower's reported
+  /// contiguous-staged watermark. NOT monotone: a `max` would let a STALE old-boundary `acked_through`
+  /// (a reordered ack arriving after a boundary supersede reset the peer to a new boundary) inflate the
+  /// new boundary's cursor and wedge the transfer. Tracking the follower's ACTUAL watermark instead
+  /// self-corrects — the follower always reports its TRUE contiguous length, so the next ack drives the
+  /// cursor to the right place (any out-of-order chunk is retained by the store's staging). No-op if the
+  /// peer is not in `Snapshot`.
   pub fn snapshot_acked(&mut self, offset: u64) {
     if let ProgressState::Snapshot { acked_through, .. } = &mut self.state {
-      *acked_through = (*acked_through).max(offset);
+      *acked_through = offset;
     }
   }
 

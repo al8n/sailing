@@ -41,6 +41,35 @@ fn snapshot_meta_accessors() {
 }
 
 #[test]
+fn snapshot_meta_identity_eq() {
+  use crate::conf::ConfState;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+  let base = SnapshotMeta::new(Index::new(42), Term::new(5), conf.clone());
+
+  // Same (last_index, last_term, conf) is the SAME identity even with a DIFFERENT monotone lease bound:
+  // a later same-boundary re-snapshot may carry a higher bound yet CONTINUES the same transfer.
+  let higher_bound =
+    SnapshotMeta::new(Index::new(42), Term::new(5), conf.clone()).with_max_lease_window(999);
+  assert!(base.identity_eq(&higher_bound));
+  assert!(higher_bound.identity_eq(&base));
+
+  // A different last_term, conf, or boundary at the same index is a DISTINCT snapshot — NOT the same
+  // transfer, so a same-boundary snapshot with different committed metadata cannot reuse a prior
+  // transfer's staged bytes.
+  assert!(!base.identity_eq(&SnapshotMeta::new(
+    Index::new(42),
+    Term::new(6),
+    conf.clone()
+  )));
+  assert!(!base.identity_eq(&SnapshotMeta::new(
+    Index::new(42),
+    Term::new(5),
+    ConfState::from_voters(std::vec![1u64, 2u64]),
+  )));
+  assert!(!base.identity_eq(&SnapshotMeta::new(Index::new(43), Term::new(5), conf)));
+}
+
+#[test]
 fn install_snapshot_accessors() {
   use crate::conf::ConfState;
   let meta = SnapshotMeta::new(

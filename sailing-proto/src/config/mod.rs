@@ -134,6 +134,11 @@ pub const DEFAULT_SNAPSHOT_THRESHOLD: usize = 10_000;
 /// Default [`Config::snapshot_chunk_bytes`]: 1 MiB per `InstallSnapshot` chunk (well under the
 /// 64 MiB max frame).
 pub const DEFAULT_SNAPSHOT_CHUNK_BYTES: u64 = 1 << 20;
+/// Upper bound for [`Config::snapshot_chunk_bytes`]: 60 MiB — well under the 64 MiB max wire frame,
+/// leaving room for the `SnapshotMeta` + envelope. A larger chunk would produce a frame the transport
+/// refuses to emit; a `0` chunk would livelock on empty messages. Validated construction enforces
+/// `1 ..= MAX_SNAPSHOT_CHUNK_BYTES`.
+pub const MAX_SNAPSHOT_CHUNK_BYTES: u64 = 60 << 20;
 /// Default [`Config::step_down_on_removal`]: a leader removed/demoted by a committed `ConfChange`
 /// steps down immediately.
 pub const DEFAULT_STEP_DOWN_ON_REMOVAL: bool = true;
@@ -912,6 +917,12 @@ impl<I> Config<I> {
     }
     if self.voters.is_empty() {
       return Err(ConfigError::EmptyVoters);
+    }
+    if self.snapshot_chunk_bytes == 0 || self.snapshot_chunk_bytes > MAX_SNAPSHOT_CHUNK_BYTES {
+      return Err(ConfigError::SnapshotChunkBytesOutOfRange {
+        value: self.snapshot_chunk_bytes,
+        max: MAX_SNAPSHOT_CHUNK_BYTES,
+      });
     }
     if self.read_only == ReadOnlyOption::LeaseBased && !self.check_quorum {
       return Err(ConfigError::LeaseRequiresCheckQuorum);

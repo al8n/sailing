@@ -170,7 +170,7 @@ pub struct MemStable {
   /// storage-ready seam can be exercised (signalled on every completion enqueue).
   ready: Option<flume::Sender<()>>,
   /// Chunked-snapshot staging accumulator (one in-flight transfer at a time).
-  snapshot_staging: Option<sailing_proto::SnapshotStaging>,
+  snapshot_staging: Option<(SnapshotMeta<u64>, sailing_proto::SnapshotStaging)>,
 }
 
 impl MemStable {
@@ -241,26 +241,46 @@ impl StableStore for MemStable {
   ) -> Result<u64, Self::Error> {
     let boundary = meta.last_index();
     match &self.snapshot_staging {
-      Some(s) if s.boundary() > boundary => return Ok(0),
-      Some(s) if s.boundary() < boundary => self.snapshot_staging = None,
+      Some((m, _)) if m.last_index() > boundary => return Ok(0),
+      Some((m, s)) if !m.identity_eq(meta) || s.total_len() != total_len => {
+        self.snapshot_staging = None
+      }
       _ => {}
     }
-    let s = self
-      .snapshot_staging
-      .get_or_insert_with(|| sailing_proto::SnapshotStaging::new(boundary, total_len));
-    Ok(s.accept(offset, data))
+    if self.snapshot_staging.is_none() {
+      // A generous cap bounds a forged length without OOM; these test stores see only small snapshots,
+      // so an over-cap None is unreachable — treat it as a no-op stage rather than panic.
+      match sailing_proto::SnapshotStaging::new(boundary, total_len, 1 << 30) {
+        Some(s) => self.snapshot_staging = Some((meta.clone(), s)),
+        None => return Ok(0),
+      }
+    }
+    Ok(
+      self
+        .snapshot_staging
+        .as_mut()
+        .expect("staging set above")
+        .1
+        .accept(offset, data),
+    )
   }
 
-  fn staged_snapshot(
-    &self,
-    meta: &SnapshotMeta<u64>,
-  ) -> Option<sailing_proto::MaybeOwned<'_, [u8]>> {
-    match &self.snapshot_staging {
-      Some(s) if s.boundary() == meta.last_index() && s.is_complete() => {
-        Some(sailing_proto::MaybeOwned::Borrowed(s.bytes()))
-      }
-      _ => None,
-    }
+  fn take_staged_snapshot(&mut self, meta: &SnapshotMeta<u64>) -> Option<Bytes> {
+    let complete = matches!(
+      &self.snapshot_staging,
+      Some((m, s)) if m.identity_eq(meta) && s.is_complete()
+    );
+    complete.then(|| {
+      let (_, s) = self
+        .snapshot_staging
+        .take()
+        .expect("checked complete above");
+      Bytes::from(s.into_vec())
+    })
+  }
+
+  fn discard_snapshot_staging(&mut self) {
+    self.snapshot_staging = None;
   }
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {

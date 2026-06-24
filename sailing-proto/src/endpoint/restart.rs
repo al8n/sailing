@@ -168,6 +168,11 @@ where
     I: Data, // decode ConfChangeV2 entries when replaying the log's membership (Raft §4.1)
   {
     let hs = stable.hard_state();
+    // Chunk-snapshot staging is VOLATILE across restart: `snapshot_recv` is reset to `None` below and there
+    // is no Phase-1 recovery API to restore an in-flight transfer's identity from durable staging, so any
+    // staging a store happened to persist is now ORPHANED — discard it, else a post-restart lower snapshot
+    // from a new leader would be blocked forever by the stale higher staging key.
+    stable.discard_snapshot_staging();
     let mut fsm = fsm;
     let mut applied = Index::ZERO;
     let mut poisoned = false;

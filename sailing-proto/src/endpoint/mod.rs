@@ -890,13 +890,18 @@ struct Transfer<I> {
 
 /// Coordination state for a chunked snapshot being RECEIVED (Phase 1 of the two-phase install). Holds
 /// NO bytes — the chunks are staged in the `StableStore` via `accept_snapshot_chunk`; this tracks only
-/// the boundary (`meta`), the agreed `total_len`, and the contiguous-staged watermark. Becomes a
-/// `pending_install` (Phase 2) once the contiguous-staged length reaches `total_len`.
+/// the boundary (`meta`), the agreed `total_len`, the contiguous-staged watermark, and the SENDER's term
+/// (`sender_term`). The sender term makes supersession LEADER-aware: a transfer from a newer-term leader
+/// REPLACES an abandoned partial at ANY boundary (a new leader may legitimately send a LOWER snapshot —
+/// `snapshot(K)+log` for a follower below its first index), while a delayed LOWER chunk from the SAME
+/// leader is a stale reorder and is dropped. Becomes a `pending_install` (Phase 2) once the
+/// contiguous-staged length reaches `total_len`.
 #[derive(Debug)]
 struct SnapshotRecv<I> {
   meta: crate::SnapshotMeta<I>,
   total_len: u64,
   contiguous_staged: u64,
+  sender_term: crate::Term,
 }
 
 /// The deferred snapshot machinery, grouped out of `Endpoint`.

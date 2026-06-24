@@ -56,6 +56,103 @@ use generated::sailing::v1 as pb;
 /// 1..=1024 bytes everywhere it appears on the wire.
 const MAX_ID_LEN: usize = 1024;
 
+/// The maximum encoded length of one consensus message — the payload of a single transport frame. The
+/// built-in stream/QUIC transports REFUSE a larger frame, so the snapshot-chunk sizer caps each
+/// `InstallSnapshot` (metadata + chunk) below this. The single source of truth: the transport's frame
+/// layer derives its own limit from this const.
+pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
+
+/// The encoded byte length of the `InstallSnapshot` frame this would produce:
+///
+/// ```ignore
+/// let mut v = Vec::new();
+/// encode_message(
+///   &Message::InstallSnapshot(InstallSnapshot::new_chunk(
+///     term, leader.clone(), meta.clone(), <Bytes of length data_len>, offset, total_len,
+///   )),
+///   &mut v,
+/// );
+/// v.len()
+/// ```
+///
+/// computed WITHOUT building any pb type, cloning the `ConfState`, or allocating an encode
+/// buffer — the snapshot-chunk frame sizer must not materialize a potentially huge metadata
+/// clone on every resend. Mirrors buffa's protobuf field-size arithmetic over the BORROWED
+/// `SnapshotMeta`/`ConfState`: a present scalar costs its 1-byte tag (every field number here is
+/// 1..=15) plus its varint/bytes/bool body, a proto3-default scalar is absent, and a nested
+/// message costs `tag + varint_len(inner) + inner`. The `tests` module pins this in lockstep
+/// with the encoder for every field combination.
+pub(crate) fn install_snapshot_encoded_len<I: NodeId>(
+  term: Term,
+  leader: &I,
+  meta: &SnapshotMeta<I>,
+  offset: u64,
+  total_len: u64,
+  data_len: u64,
+) -> usize {
+  // One REUSED scratch buffer to size each id's `bytes` field — O(largest single id), never
+  // O(membership): `encode` into it, size that one slice, then clear for the next id.
+  let mut scratch = Vec::new();
+  let mut id_bytes_field = |id: &I| {
+    id.encode(&mut scratch);
+    let n = 1 + buffa::types::bytes_encoded_len(&scratch);
+    scratch.clear();
+    n
+  };
+
+  // ConfState (a present sub-message): each set element is a `bytes` field — tag + length-prefix +
+  // the id bytes; `auto_leave` rides only when true.
+  let conf = meta.conf();
+  let mut conf_size = 0usize;
+  for set in [
+    conf.voters(),
+    conf.learners(),
+    conf.voters_outgoing(),
+    conf.learners_next(),
+  ] {
+    for id in set {
+      conf_size += id_bytes_field(id);
+    }
+  }
+  if conf.auto_leave() {
+    conf_size += 1 + buffa::types::BOOL_ENCODED_LEN;
+  }
+
+  // SnapshotMeta: the present scalars (proto3-default 0 is absent) plus the nested ConfState.
+  let mut meta_size = 1 + buffa::encoding::varint_len(conf_size as u64) + conf_size;
+  meta_size += present_uint64(meta.last_index().get());
+  meta_size += present_uint64(meta.last_term().get());
+  meta_size += present_uint64(meta.max_lease_window());
+  meta_size += present_uint64(meta.max_wall_plus_window());
+  meta_size += present_uint64(meta.max_unwalled_lease_window());
+  meta_size += present_uint64(meta.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1));
+
+  // InstallSnapshot: term/offset/total_len ride only when non-zero; the leader id is always present
+  // (1..=1024 bytes); the snapshot sub-message is always set; the data field rides only when non-empty.
+  let mut is_size = present_uint64(term.get());
+  is_size += id_bytes_field(leader);
+  is_size += 1 + buffa::encoding::varint_len(meta_size as u64) + meta_size;
+  if data_len != 0 {
+    is_size += 1 + buffa::encoding::varint_len(data_len) + data_len as usize;
+  }
+  is_size += present_uint64(offset);
+  is_size += present_uint64(total_len);
+
+  // The Message envelope: the InstallSnapshot oneof arm (field 7) is `tag + varint_len(inner) + inner`.
+  1 + buffa::encoding::varint_len(is_size as u64) + is_size
+}
+
+/// The encoded cost of a present `uint64` field with a 1-byte tag (every such field here is
+/// field-number 1..=15), or `0` when the value is the proto3 default and so absent on the wire.
+#[inline]
+fn present_uint64(value: u64) -> usize {
+  if value == 0 {
+    0
+  } else {
+    1 + buffa::types::uint64_encoded_len(value)
+  }
+}
+
 /// Whether `id`'s `Data` encoding satisfies the wire bound (1..=1024 bytes). The
 /// propose-side gate for ids that enter the LOG: a conf-change id outside the bound
 /// would append and replicate fine, then `decode_id` would reject it at APPLY on every

@@ -691,7 +691,7 @@ pub struct MemStable<I> {
   /// Write-side fault PRNG (drives `torn_write` at `flush`). Deterministic given the seed.
   prng: FaultPrng,
   /// Chunked-snapshot staging accumulator (one in-flight transfer at a time).
-  snapshot_staging: Option<sailing_proto::SnapshotStaging>,
+  snapshot_staging: Option<(SnapshotMeta<I>, sailing_proto::SnapshotStaging)>,
   /// Optional staging-capacity cap (bytes); a `total_len` beyond it fails `accept_snapshot_chunk`,
   /// modeling an in-RAM store that runs out of room.
   staging_cap: Option<usize>,
@@ -895,28 +895,45 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
   ) -> Result<u64, Self::Error> {
     let boundary = meta.last_index();
     match &self.snapshot_staging {
-      Some(s) if s.boundary() > boundary => return Ok(0),
-      Some(s) if s.boundary() < boundary => self.snapshot_staging = None,
+      Some((m, _)) if m.last_index() > boundary => return Ok(0),
+      Some((m, s)) if !m.identity_eq(meta) || s.total_len() != total_len => {
+        self.snapshot_staging = None
+      }
       _ => {}
     }
-    if let Some(cap) = self.staging_cap
-      && total_len as usize > cap
-    {
-      return Err(MemStoreError::StagingFull);
+    if self.snapshot_staging.is_none() {
+      let cap = self.staging_cap.unwrap_or(1 << 30);
+      match sailing_proto::SnapshotStaging::new(boundary, total_len, cap) {
+        Some(s) => self.snapshot_staging = Some((meta.clone(), s)),
+        None => return Err(MemStoreError::StagingFull),
+      }
     }
-    let s = self
-      .snapshot_staging
-      .get_or_insert_with(|| sailing_proto::SnapshotStaging::new(boundary, total_len));
-    Ok(s.accept(offset, data))
+    Ok(
+      self
+        .snapshot_staging
+        .as_mut()
+        .expect("staging set above")
+        .1
+        .accept(offset, data),
+    )
   }
 
-  fn staged_snapshot(&self, meta: &SnapshotMeta<I>) -> Option<sailing_proto::MaybeOwned<'_, [u8]>> {
-    match &self.snapshot_staging {
-      Some(s) if s.boundary() == meta.last_index() && s.is_complete() => {
-        Some(sailing_proto::MaybeOwned::Borrowed(s.bytes()))
-      }
-      _ => None,
-    }
+  fn take_staged_snapshot(&mut self, meta: &SnapshotMeta<I>) -> Option<Bytes> {
+    let complete = matches!(
+      &self.snapshot_staging,
+      Some((m, s)) if m.identity_eq(meta) && s.is_complete()
+    );
+    complete.then(|| {
+      let (_, s) = self
+        .snapshot_staging
+        .take()
+        .expect("checked complete above");
+      Bytes::from(s.into_vec())
+    })
+  }
+
+  fn discard_snapshot_staging(&mut self) {
+    self.snapshot_staging = None;
   }
 
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
