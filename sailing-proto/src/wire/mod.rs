@@ -357,6 +357,8 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       leader_id: encode_id(&m.leader()),
       snapshot: buffa::MessageField::some(pb_snapshot_meta(m.snapshot())),
       data: m.data().clone(),
+      offset: m.offset(),
+      total_len: m.total_len(),
       ..Default::default()
     }),
     Message::SnapshotResponse(m) => Body::from(pb::SnapshotResponse {
@@ -364,6 +366,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       from_id: encode_id(&m.from()),
       reject: m.reject(),
       match_index: m.match_index().get(),
+      acked_through: m.acked_through(),
       ..Default::default()
     }),
     Message::TimeoutNow(m) => Body::from(pb::TimeoutNow {
@@ -459,19 +462,24 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
         .snapshot
         .as_option()
         .ok_or(DecodeError::Invalid("InstallSnapshot.snapshot"))?;
-      Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Message::InstallSnapshot(crate::InstallSnapshot::new_chunk(
         Term::new(m.term),
         decode_id(&m.leader_id)?,
         snapshot_meta_from(meta)?,
         m.data,
+        m.offset,
+        m.total_len,
       ))
     }
-    Body::SnapshotResponse(m) => Message::SnapshotResponse(crate::SnapshotResponse::new(
-      Term::new(m.term),
-      decode_id(&m.from_id)?,
-      m.reject,
-      Index::new(m.match_index),
-    )),
+    Body::SnapshotResponse(m) => Message::SnapshotResponse(
+      crate::SnapshotResponse::new(
+        Term::new(m.term),
+        decode_id(&m.from_id)?,
+        m.reject,
+        Index::new(m.match_index),
+      )
+      .with_acked_through(m.acked_through),
+    ),
     Body::TimeoutNow(m) => Message::TimeoutNow(crate::TimeoutNow::new(
       Term::new(m.term),
       decode_id(&m.leader_id)?,

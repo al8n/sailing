@@ -540,16 +540,33 @@ pub struct InstallSnapshot<I> {
   leader: I,
   snapshot: SnapshotMeta<I>,
   data: Bytes,
+  offset: u64,
+  total_len: u64,
 }
 
 impl<I: CheapClone> InstallSnapshot<I> {
-  /// Construct.
+  /// Construct a LEGACY single-shot install: `data` is the WHOLE blob (`offset == 0`, `total_len == 0`).
   pub fn new(term: Term, leader: I, snapshot: SnapshotMeta<I>, data: Bytes) -> Self {
+    Self::new_chunk(term, leader, snapshot, data, 0, 0)
+  }
+
+  /// Construct one CHUNK of a chunked install: `data` is the bytes at `offset` within a blob of
+  /// `total_len` bytes. `total_len == 0` is the legacy single-shot encoding (`data` is the whole blob).
+  pub fn new_chunk(
+    term: Term,
+    leader: I,
+    snapshot: SnapshotMeta<I>,
+    data: Bytes,
+    offset: u64,
+    total_len: u64,
+  ) -> Self {
     Self {
       term,
       leader,
       snapshot,
       data,
+      offset,
+      total_len,
     }
   }
 
@@ -571,10 +588,28 @@ impl<I: CheapClone> InstallSnapshot<I> {
     &self.snapshot
   }
 
-  /// The raw snapshot blob.
+  /// This chunk's snapshot bytes.
   #[inline(always)]
   pub fn data(&self) -> &Bytes {
     &self.data
+  }
+
+  /// The byte offset of `data` within the full blob.
+  #[inline(always)]
+  pub const fn offset(&self) -> u64 {
+    self.offset
+  }
+
+  /// The full blob length; `0` ⇒ legacy single-shot (`data` is the whole blob).
+  #[inline(always)]
+  pub const fn total_len(&self) -> u64 {
+    self.total_len
+  }
+
+  /// Whether this chunk completes the blob: `total_len != 0 && offset + data.len() == total_len`.
+  #[inline(always)]
+  pub fn is_last(&self) -> bool {
+    self.total_len != 0 && self.offset.saturating_add(self.data.len() as u64) == self.total_len
   }
 }
 
@@ -585,17 +620,29 @@ pub struct SnapshotResponse<I> {
   from: I,
   reject: bool,
   match_index: Index,
+  acked_through: u64,
 }
 
 impl<I: CheapClone> SnapshotResponse<I> {
-  /// Construct.
+  /// Construct (with `acked_through == 0` — a legacy/final ack). Use [`with_acked_through`] for a
+  /// mid-transfer progress ack.
+  ///
+  /// [`with_acked_through`]: Self::with_acked_through
   pub const fn new(term: Term, from: I, reject: bool, match_index: Index) -> Self {
     Self {
       term,
       from,
       reject,
       match_index,
+      acked_through: 0,
     }
+  }
+
+  /// Set the highest CONTIGUOUS staged byte offset (drives the leader's chunk pacing + resume).
+  #[must_use]
+  pub const fn with_acked_through(mut self, acked_through: u64) -> Self {
+    self.acked_through = acked_through;
+    self
   }
 
   /// The respondent's current term.
@@ -620,6 +667,12 @@ impl<I: CheapClone> SnapshotResponse<I> {
   #[inline(always)]
   pub const fn match_index(&self) -> Index {
     self.match_index
+  }
+
+  /// The follower's highest CONTIGUOUS staged byte offset (`0` on a legacy/final ack).
+  #[inline(always)]
+  pub const fn acked_through(&self) -> u64 {
+    self.acked_through
   }
 }
 

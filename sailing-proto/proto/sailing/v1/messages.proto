@@ -169,6 +169,8 @@ message InstallSnapshot {
   bytes leader_id = 2;
   SnapshotMeta snapshot = 3;
   bytes data = 4;
+  uint64 offset = 5;
+  uint64 total_len = 6;
 }
 
 message SnapshotResponse {
@@ -176,6 +178,7 @@ message SnapshotResponse {
   bytes from_id = 2;
   bool reject = 3;
   uint64 match_index = 4;
+  uint64 acked_through = 5;
 }
 
 // Leader -> transfer target: campaign NOW (bypasses the pre-vote lease).

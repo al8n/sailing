@@ -631,6 +631,21 @@ fn golden_byte_vectors() {
     ],
     "TimeoutNow golden encoding"
   );
+
+  let snapshot_response = Message::SnapshotResponse(
+    SnapshotResponse::new(Term::new(3), 2, false, Index::new(9)).with_acked_through(1),
+  );
+  assert_eq!(
+    enc(&snapshot_response),
+    std::vec![
+      0x42, 0x10, // Message.snapshot_response (field 8, length-delimited, 16 bytes)
+      0x08, 0x03, // term = 3
+      0x12, 0x08, 0x02, 0, 0, 0, 0, 0, 0, 0, // from_id = the u64 id's 8-byte LE encoding
+      0x20, 0x09, // match_index = 9 (field 4)
+      0x28, 0x01, // acked_through = 1 (field 5)
+    ],
+    "SnapshotResponse golden encoding (reject=false is absent on the wire)"
+  );
 }
 
 /// The decoded message's Bytes fields alias the frame allocation (zero-copy): the
@@ -745,4 +760,86 @@ fn snapshot_meta_read_only_round_trips() {
     Some(ReadOnlyOption::Safe),
     "an explicit Safe round-trips as Some(Safe)"
   );
+}
+
+#[test]
+fn install_snapshot_chunk_fields_round_trip() {
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64]);
+  let meta = SnapshotMeta::new(Index::new(10), Term::new(3), conf);
+  let m = Message::InstallSnapshot(InstallSnapshot::new_chunk(
+    Term::new(3),
+    1,
+    meta,
+    Bytes::from_static(b"chunk"),
+    64,
+    4096,
+  ));
+  let mut buf = Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(back.offset(), 64);
+  assert_eq!(back.total_len(), 4096);
+  assert!(!back.is_last());
+}
+
+#[test]
+fn install_snapshot_legacy_is_byte_identical() {
+  let conf = ConfState::from_voters(std::vec![1u64]);
+  let meta = SnapshotMeta::new(Index::new(5), Term::new(1), conf);
+  let mut a = Vec::new();
+  let mut b = Vec::new();
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1,
+      meta.clone(),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut a,
+  );
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(1),
+      1,
+      meta,
+      Bytes::from_static(b"blob"),
+      0,
+      0,
+    )),
+    &mut b,
+  );
+  assert_eq!(
+    a, b,
+    "offset=0,total_len=0 must be byte-identical to the legacy new()"
+  );
+}
+
+#[test]
+fn snapshot_response_acked_through_round_trips() {
+  let m = Message::SnapshotResponse(
+    SnapshotResponse::new(Term::new(2), 7, false, Index::new(0)).with_acked_through(2048),
+  );
+  let mut buf = Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::SnapshotResponse(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(back.acked_through(), 2048);
+  let mut c = Vec::new();
+  let mut d = Vec::new();
+  encode_message(
+    &Message::SnapshotResponse(SnapshotResponse::new(Term::new(2), 7, false, Index::new(9))),
+    &mut c,
+  );
+  encode_message(
+    &Message::SnapshotResponse(
+      SnapshotResponse::new(Term::new(2), 7, false, Index::new(9)).with_acked_through(0),
+    ),
+    &mut d,
+  );
+  assert_eq!(c, d, "a zero acked_through must be absent on the wire");
 }

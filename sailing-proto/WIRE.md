@@ -94,6 +94,13 @@ reference — this section pins the SEMANTICS:
   mode across the cluster — so `LABEL_VERSION` is now 4:** the handshake fences a pre-migration peer. (A
   node restarting from its OWN pre-migration durable log never sees a `SetReadMode`, so there is no
   divergence to fence — the same residual as the floors above.)
+- `InstallSnapshot.offset` (5) and `total_len` (6), and `SnapshotResponse.acked_through` (5), carry
+  CHUNKED snapshot transfer. `total_len == 0` is the legacy single-shot encoding (`data` is the whole
+  blob — byte-identical to a pre-chunking message); `total_len != 0` means `data` is the chunk at
+  `offset` within a `total_len`-byte blob, and `acked_through` is the receiver's highest contiguous
+  staged offset (driving the leader's per-chunk pacing + resume). A `0` for any of the three is absent
+  on the wire. **A node predating chunking would mis-stage a partial chunk as a whole blob (a decode
+  failure or corrupt install), so `LABEL_VERSION` is now 5:** the handshake fences a pre-chunking peer.
 - An enum field must carry a KNOWN value; the `Message.body` oneof must be present. Either
   failure rejects the message (parity with the old codec's unknown-tag reject).
 - A rejected message closes the connection (transport) — the endpoint is never poisoned by
