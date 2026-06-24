@@ -62,7 +62,10 @@ impl Cluster {
         Duration::from_millis(1000),
         Duration::from_millis(100),
       )
-      .expect("valid config");
+      .expect("valid config")
+      // Small chunks so snapshot transfers are MULTI-chunk — exercising the chunk staging /
+      // progress-ack / resume / supersede paths under the VOPR's drop/reorder/crash/partition faults.
+      .with_snapshot_chunk_bytes(16);
       let cfg = node_configure(base);
       nodes.push(Endpoint::new(
         cfg.clone(),
@@ -100,6 +103,7 @@ impl Cluster {
       removed: BTreeSet::new(),
       grants: BTreeMap::new(),
       snapshot_installs,
+      multi_chunk_deliveries: 0,
       restarts,
       node_configure,
       conf_changed,

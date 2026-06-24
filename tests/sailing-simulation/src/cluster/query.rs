@@ -259,6 +259,12 @@ impl Cluster {
     self.snapshot_installs[i]
   }
 
+  /// Count of delivered MULTI-chunk `InstallSnapshot` chunks (offset > 0) — the non-vacuity witness
+  /// that snapshot transfers were genuinely MULTI-chunk, not vacuously single-chunk.
+  pub fn multi_chunk_deliveries(&self) -> u64 {
+    self.multi_chunk_deliveries
+  }
+
   /// Total `Event::SnapshotInstalled` events across ALL nodes.
   pub fn total_snapshot_installs(&self) -> u64 {
     self.snapshot_installs.iter().sum()
