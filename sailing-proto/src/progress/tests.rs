@@ -34,8 +34,21 @@ fn pause_semantics() {
 
 #[test]
 fn snapshot_state_as_str_and_predicate() {
-  assert_eq!(ProgressState::Snapshot(Index::new(10)).as_str(), "snapshot");
-  assert!(ProgressState::Snapshot(Index::new(10)).is_snapshot());
+  assert_eq!(
+    ProgressState::Snapshot {
+      pending: Index::new(10),
+      acked_through: 0
+    }
+    .as_str(),
+    "snapshot"
+  );
+  assert!(
+    ProgressState::Snapshot {
+      pending: Index::new(10),
+      acked_through: 0
+    }
+    .is_snapshot()
+  );
   assert!(!ProgressState::Probe.is_snapshot());
   assert!(!ProgressState::Replicate.is_snapshot());
 }
@@ -55,11 +68,32 @@ fn become_snapshot_records_pending_index() {
   assert!(p.state().is_snapshot());
   assert!(p.is_paused());
   // pending_snapshot index is stored in the variant
-  if let ProgressState::Snapshot(pending) = p.state() {
+  if let ProgressState::Snapshot { pending, .. } = p.state() {
     assert_eq!(pending, Index::new(20));
   } else {
     panic!("expected Snapshot state");
   }
+}
+
+#[test]
+fn snapshot_acked_advances_the_cursor_monotonically() {
+  let mut p = Progress::new(Index::new(1), 256, 0);
+  p.become_snapshot(Index::new(10));
+  let ProgressState::Snapshot {
+    pending,
+    acked_through,
+  } = p.state()
+  else {
+    panic!("expected Snapshot state");
+  };
+  assert_eq!(pending, Index::new(10));
+  assert_eq!(acked_through, 0, "become_snapshot seeds acked_through = 0");
+  p.snapshot_acked(64);
+  p.snapshot_acked(32); // a stale/lower ack must NOT lower the cursor
+  let ProgressState::Snapshot { acked_through, .. } = p.state() else {
+    panic!("expected Snapshot state");
+  };
+  assert_eq!(acked_through, 64);
 }
 
 #[test]
@@ -85,7 +119,13 @@ fn maybe_update_below_pending_snapshot_stays_in_snapshot() {
 #[test]
 fn snapshot_state_display() {
   assert_eq!(
-    std::format!("{}", ProgressState::Snapshot(Index::new(0))),
+    std::format!(
+      "{}",
+      ProgressState::Snapshot {
+        pending: Index::new(0),
+        acked_through: 0
+      }
+    ),
     "snapshot"
   );
 }

@@ -5,9 +5,10 @@ use crate::{Index, Inflights};
 
 /// How the leader is currently replicating to a peer.
 ///
-/// `Snapshot(pending_snapshot)` carries the last log index covered by the snapshot being
-/// sent; the peer stays paused until it acks at or past that index, then transitions back
-/// to `Probe`.
+/// `Snapshot { pending, acked_through }` carries the last log index covered by the snapshot being
+/// sent (`pending`) and the highest contiguous byte offset the follower has staged (`acked_through`,
+/// the chunk resume cursor); the peer stays paused until it acks at or past `pending`, then
+/// transitions back to `Probe`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 pub enum ProgressState {
@@ -15,8 +16,13 @@ pub enum ProgressState {
   Probe,
   /// Steady-state: optimistically advance `next_index` as acks arrive.
   Replicate,
-  /// An `InstallSnapshot` is in flight; `pending_snapshot` is its `last_index`.
-  Snapshot(Index),
+  /// An `InstallSnapshot` is in flight.
+  Snapshot {
+    /// The snapshot's `last_index` — the peer stays paused until it acks at or past this.
+    pending: Index,
+    /// The highest contiguous byte offset the follower has staged (the chunk resume cursor).
+    acked_through: u64,
+  },
 }
 
 impl ProgressState {
@@ -25,7 +31,7 @@ impl ProgressState {
     match self {
       Self::Probe => "probe",
       Self::Replicate => "replicate",
-      Self::Snapshot(_) => "snapshot",
+      Self::Snapshot { .. } => "snapshot",
     }
   }
 }
@@ -87,7 +93,7 @@ impl Progress {
     match self.state {
       ProgressState::Probe => self.msg_app_flow_paused,
       ProgressState::Replicate => self.inflight.full(),
-      ProgressState::Snapshot(_) => true,
+      ProgressState::Snapshot { .. } => true,
     }
   }
 
@@ -102,7 +108,7 @@ impl Progress {
           self.next_index = last.next();
         }
       }
-      ProgressState::Snapshot(_) => {
+      ProgressState::Snapshot { .. } => {
         // In Snapshot state no entries are sent; this is a no-op.
       }
     }
@@ -111,9 +117,20 @@ impl Progress {
   /// Enter snapshot-delivery state. The peer stays paused until it acks at or past
   /// `pending_snapshot`, then `maybe_update` transitions it back to `Probe`.
   pub fn become_snapshot(&mut self, pending_snapshot: Index) {
-    self.state = ProgressState::Snapshot(pending_snapshot);
+    self.state = ProgressState::Snapshot {
+      pending: pending_snapshot,
+      acked_through: 0,
+    };
     self.inflight.reset();
     self.msg_app_flow_paused = false;
+  }
+
+  /// Raise the per-chunk resume cursor for a peer in `Snapshot` state (monotonic — a stale/lower
+  /// `acked_through` from a reordered response is ignored). A no-op if the peer is not in `Snapshot`.
+  pub fn snapshot_acked(&mut self, offset: u64) {
+    if let ProgressState::Snapshot { acked_through, .. } = &mut self.state {
+      *acked_through = (*acked_through).max(offset);
+    }
   }
 
   /// Enter steady-state replication.
@@ -151,7 +168,7 @@ impl Progress {
     self.inflight.free_le(n);
     self.msg_app_flow_paused = false;
     // If we were waiting for a snapshot ack and the peer is now caught up, resume.
-    if let ProgressState::Snapshot(pending) = self.state
+    if let ProgressState::Snapshot { pending, .. } = self.state
       && n >= pending
     {
       self.become_probe();
