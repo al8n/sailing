@@ -168,13 +168,10 @@ where
     // At next_index == first_index the normal path still works: prev_index == offset
     // whose boundary term is retained.
     if next.get() < log.first_index().get() {
-      if let Some((meta, data)) = stable.snapshot() {
-        let (term, me) = (self.term, self.config.id());
+      if let Some((meta, _)) = stable.snapshot() {
         let pending = meta.last_index();
-        self.send(
-          peer.cheap_clone(),
-          Message::InstallSnapshot(crate::InstallSnapshot::new(term, me, meta, data)),
-        );
+        // Send the FIRST chunk (offset 0); the per-ack pump in `on_snapshot_response` streams the rest.
+        self.send_snapshot_chunk(peer.cheap_clone(), stable, 0);
         if let Some(p) = self.tracker.progress_mut(&peer) {
           p.become_snapshot(pending);
         }

@@ -1,5 +1,5 @@
 use super::*;
-use crate::{InstallSnapshot, SnapshotMeta};
+use crate::{InstallSnapshot, ProgressState, SnapshotMeta};
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -40,13 +40,45 @@ where
   /// idempotent for the follower's install (`on_install_snapshot` is staleness-guarded). If no
   /// snapshot is persisted yet (shouldn't happen once compaction ran) this is a no-op.
   pub(crate) fn resend_snapshot<S: StableStore<NodeId = I>>(&mut self, peer: I, stable: &S) {
-    if let Some((meta, data)) = stable.snapshot() {
-      let (term, me) = (self.term, self.config.id());
-      self.send(
-        peer,
-        Message::InstallSnapshot(InstallSnapshot::new(term, me, meta, data)),
-      );
-    }
+    // Resume from the peer's contiguous-staged cursor, not from 0: a lost middle chunk re-sends only
+    // the tail. A peer with no cursor (shouldn't happen in Snapshot state) restarts from 0.
+    let from = match self.tracker.progress(&peer).map(|p| p.state()) {
+      Some(ProgressState::Snapshot { acked_through, .. }) => acked_through,
+      _ => 0,
+    };
+    self.send_snapshot_chunk(peer, stable, from);
+  }
+
+  /// Send the snapshot chunk beginning at `from_offset`, bounded by `config.snapshot_chunk_bytes()`.
+  /// The chunk always carries the blob's real `total_len`, so the receiver stages it; a snapshot that
+  /// fits one chunk is simply `offset 0 .. total` with `is_last() == true`.
+  pub(crate) fn send_snapshot_chunk<S: StableStore<NodeId = I>>(
+    &mut self,
+    peer: I,
+    stable: &S,
+    from_offset: u64,
+  ) {
+    let Some((meta, blob)) = stable.snapshot() else {
+      return;
+    };
+    let total = blob.len() as u64;
+    let start = from_offset.min(total);
+    let end = from_offset
+      .saturating_add(self.config.snapshot_chunk_bytes())
+      .min(total);
+    let data = blob.slice(start as usize..end as usize);
+    let (term, me) = (self.term, self.config.id());
+    self.send(
+      peer,
+      Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        term,
+        me,
+        meta,
+        data,
+        from_offset,
+        total,
+      )),
+    );
   }
 }
 impl<I, F, R> Endpoint<I, F, R>
@@ -427,6 +459,21 @@ where
       // value ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never
       // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_response).
       pr.maybe_update(response.match_index());
+      // Advance the resume cursor from the follower's contiguous watermark, then — if the peer is STILL
+      // mid-transfer (a progress ack did not lift it out of Snapshot via maybe_update above) — send the
+      // next chunk. A single-chunk snapshot's FINAL ack lifts the peer out of Snapshot, so this no-ops.
+      if let Some(pr) = self.tracker.progress_mut(&from) {
+        pr.snapshot_acked(response.acked_through());
+      }
+      if let Some(ProgressState::Snapshot { acked_through, .. }) =
+        self.tracker.progress(&from).map(|p| p.state())
+      {
+        self.send_snapshot_chunk(from.cheap_clone(), stable, acked_through);
+        self.snapshot.snapshot_resend_after.insert(
+          from.cheap_clone(),
+          now.mono() + self.config.election_timeout(),
+        );
+      }
       // Re-borrow self for the resume sequence (pr is dropped above).
       self.maybe_advance_commit(now, log);
       self.apply_committed(log);
