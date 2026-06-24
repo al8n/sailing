@@ -114,6 +114,16 @@ fn lagging_follower_catches_up_via_snapshot() {
     c.snapshot_install_count(isolated)
   );
 
+  // Non-vacuity: with the cluster's small `snapshot_chunk_bytes` the catch-up transfer is MULTI-chunk —
+  // a delivered InstallSnapshot with offset > 0 is the witness (a single-chunk transfer delivers only
+  // offset 0). Guards against the chunked send path silently collapsing back to single-shot.
+  assert!(
+    c.multi_chunk_deliveries() >= 1,
+    "the snapshot catch-up must be MULTI-chunk (a delivered InstallSnapshot with offset > 0); \
+     multi_chunk_deliveries={}",
+    c.multi_chunk_deliveries()
+  );
+
   assert!(
     c.agreement_holds(),
     "agreement must hold after snapshot catch-up"

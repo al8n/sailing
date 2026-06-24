@@ -253,6 +253,9 @@ pub struct VoprReport {
   /// Total COLD (`EntriesRead::Pending`) reads returned across node logs — the cold-fetch coverage
   /// non-vacuity witness. `0` outside `run_vopr_cold` (cold-fetch is off in every other entry).
   pub cold_reads: u64,
+  /// Count of delivered MULTI-chunk `InstallSnapshot` chunks (offset > 0) — the chunking-coverage
+  /// non-vacuity witness (a single-chunk transfer only ever delivers offset 0).
+  pub multi_chunk_snapshots: u64,
 }
 
 /// The weighted action menu. Client load dominates; faults are frequent but not constant; structural
@@ -1574,6 +1577,7 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
 
   report.committed = committed_count;
   report.cold_reads = c.total_cold_reads();
+  report.multi_chunk_snapshots = c.multi_chunk_deliveries();
   // One final oracle sweep at the fully-quiesced state (belt-and-suspenders; tick already ran it).
   c.run_oracles();
 }

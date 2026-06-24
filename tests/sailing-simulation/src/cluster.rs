@@ -81,6 +81,9 @@ pub struct Cluster {
   /// Config for each node, kept so `crash` can rebuild from durable stores.
   configs: Vec<Config<u64>>,
   bus: VecDeque<InFlight>,
+  /// Count of delivered `InstallSnapshot` chunks with `offset > 0` — the MULTI-chunk-transfer
+  /// non-vacuity witness (a single-chunk transfer only ever delivers `offset == 0`).
+  multi_chunk_deliveries: u64,
   now: Instant,
   /// Node ids that are fully partitioned: their outgoing messages are dropped and
   /// inbound messages to/from them are dropped. Init empty.
@@ -515,8 +518,11 @@ impl Cluster {
         } else if let Some(&to_idx) = self.node_idx.get(&m.to) {
           delivered = true;
           let now_to = self.now_now(to_idx);
-          let (log, stable) = (&mut self.logs[to_idx], &mut self.stables[to_idx]);
           let message = wire_roundtrip(m.message);
+          if matches!(&message, Message::InstallSnapshot(is) if is.offset() > 0) {
+            self.multi_chunk_deliveries += 1;
+          }
+          let (log, stable) = (&mut self.logs[to_idx], &mut self.stables[to_idx]);
           self.nodes[to_idx].handle_message(now_to, log, stable, m.from, message);
         }
         // else: message to an unknown id (shouldn't happen, but drop safely)
