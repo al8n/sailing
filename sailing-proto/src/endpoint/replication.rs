@@ -965,7 +965,7 @@ where
     // borrow into locals, drop the borrow, then act — mirrors on_append_response's re-borrow.)
     let resend = match self.tracker.progress(&from) {
       Some(pr) => match pr.state() {
-        ProgressState::Snapshot(pending) => pr.match_index() < pending,
+        ProgressState::Snapshot { pending, .. } => pr.match_index() < pending,
         _ => false,
       },
       None => false,
@@ -1164,7 +1164,7 @@ where
               p.become_replicate();
             }
           }
-          ProgressState::Replicate | ProgressState::Snapshot(_) => {}
+          ProgressState::Replicate | ProgressState::Snapshot { .. } => {}
         }
         self.maybe_advance_commit(now, log);
         self.apply_committed(log);

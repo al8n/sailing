@@ -557,7 +557,7 @@ fn sends_install_snapshot_on_compacted_hole() {
     pr.state().is_snapshot(),
     "peer 2 must be in Snapshot state after sending InstallSnapshot"
   );
-  if let ProgressState::Snapshot(pending) = pr.state() {
+  if let ProgressState::Snapshot { pending, .. } = pr.state() {
     assert_eq!(
       pending,
       Index::new(offset),
@@ -744,7 +744,7 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   // Peer 2 remains in Snapshot(pending) — the resend does not change progress state.
   let pr = ep.tracker.progress(&2u64).unwrap();
   assert!(pr.state().is_snapshot(), "peer 2 stays in Snapshot state");
-  if let ProgressState::Snapshot(p) = pr.state() {
+  if let ProgressState::Snapshot { pending: p, .. } = pr.state() {
     assert_eq!(
       p, pending,
       "pending snapshot index is unchanged by the resend"
