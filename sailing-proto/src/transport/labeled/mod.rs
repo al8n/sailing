@@ -20,8 +20,10 @@ const LABEL_MAGIC: u8 = 0xCA;
 /// floors would feed a successor an under-sized release bound (a stale read), so it must be rejected at
 /// the handshake, not tolerated as a forward-compatible additive field. Version 4 adds the `SetReadMode`
 /// entry kind (mid-life read-mode migration): a pre-version-4 peer would reject it as an unknown
-/// `EntryKind` and close the connection, so the handshake must fence such a peer instead.
-const LABEL_VERSION: u8 = 4;
+/// `EntryKind` and close the connection, so the handshake must fence such a peer instead. Version 5
+/// adds chunked `InstallSnapshot` (`offset`/`total_len`) and `SnapshotResponse.acked_through`: a
+/// pre-version-5 peer would mis-stage a partial chunk as a whole blob, so it must be fenced.
+const LABEL_VERSION: u8 = 5;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 /// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes
