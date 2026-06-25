@@ -39,14 +39,19 @@ where
   /// `Snapshot(pending)` with the correct pending index, and re-sending the same blob is
   /// idempotent for the follower's install (`on_install_snapshot` is staleness-guarded). If no
   /// snapshot is persisted yet (shouldn't happen once compaction ran) this is a no-op.
-  pub(crate) fn resend_snapshot<S: StableStore<NodeId = I>>(&mut self, peer: I, stable: &S) {
+  pub(crate) fn resend_snapshot<S: StableStore<NodeId = I>>(
+    &mut self,
+    peer: I,
+    stable: &S,
+  ) -> bool {
     // Resume from the peer's contiguous-staged cursor, not from 0: a lost middle chunk re-sends only
-    // the tail. A peer with no cursor (shouldn't happen in Snapshot state) restarts from 0.
+    // the tail. A peer with no cursor (shouldn't happen in Snapshot state) restarts from 0. Returns
+    // whether a chunk was actually sent, so the caller arms resend-pacing ONLY on a real send.
     let from = match self.tracker.progress(&peer).map(|p| p.state()) {
       Some(ProgressState::Snapshot { acked_through, .. }) => acked_through,
       _ => 0,
     };
-    self.send_snapshot_chunk(peer, stable, from);
+    self.send_snapshot_chunk(peer, stable, from)
   }
 
   /// Send the snapshot chunk beginning at `from_offset`, bounded by `config.snapshot_chunk_bytes()`.
@@ -62,20 +67,23 @@ where
     peer: I,
     stable: &S,
     from_offset: u64,
-  ) {
+  ) -> bool {
     // Read THIS chunk from the store (bounded — one chunk, never the whole blob resident). The read also
     // hands back the meta + total_len, so we reconcile the boundary and size the frame from it. A cold
     // store returns `Pending` (we defer and re-drive on storage-ready); an `Err` is a fatal store fault.
+    // Returns whether an `InstallSnapshot` was actually EMITTED: the caller arms the resend-pacing deadline
+    // ONLY on a real send, so a deferred (`Pending`) or unsendable chunk stays due for the next
+    // heartbeat / storage-ready re-drive instead of being suppressed for a full election timeout.
     let config_chunk = self
       .config
       .snapshot_chunk_bytes()
       .clamp(1, crate::config::MAX_SNAPSHOT_CHUNK_BYTES);
     let (meta, total, chunk_at_from) = match stable.snapshot_chunk(from_offset, config_chunk) {
-      None => return,
+      None => return false,
       Some(Ok(read)) => read,
       Some(Err(_)) => {
         self.poison(PoisonReason::SnapshotRead);
-        return;
+        return false;
       }
     };
     let boundary = meta.last_index();
@@ -122,7 +130,7 @@ where
     let frame_budget =
       crate::wire::MAX_FRAME_BYTES.saturating_sub(overhead + data_field_max_self_cost) as u64;
     if frame_budget == 0 {
-      return;
+      return false;
     }
     let chunk_len = config_chunk.min(frame_budget);
     // Reuse the chunk already read at `from_offset` when the reconciled offset is unchanged (the common
@@ -132,11 +140,11 @@ where
       chunk_at_from
     } else {
       match stable.snapshot_chunk(start, chunk_len) {
-        None => return,
+        None => return false,
         Some(Ok((_, _, read))) => read,
         Some(Err(_)) => {
           self.poison(PoisonReason::SnapshotRead);
-          return;
+          return false;
         }
       }
     };
@@ -149,7 +157,7 @@ where
       }
       // Cold: the bytes aren't resident and the store began fetching. Defer — no progress mutation — and
       // re-drive on the storage-ready seam (the heartbeat `resend_snapshot` also re-drives).
-      SnapshotChunkRead::Pending => return,
+      SnapshotChunkRead::Pending => return false,
     };
     self.send(
       peer,
@@ -157,6 +165,7 @@ where
         term, me, meta, data, start, total,
       )),
     );
+    true
   }
 }
 impl<I, F, R> Endpoint<I, F, R>
