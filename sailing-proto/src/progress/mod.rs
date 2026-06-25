@@ -117,6 +117,18 @@ impl Progress {
   /// Enter snapshot-delivery state. The peer stays paused until it acks at or past
   /// `pending_snapshot`, then `maybe_update` transitions it back to `Probe`.
   pub fn become_snapshot(&mut self, pending_snapshot: Index) {
+    // A peer whose `match_index` already covers the snapshot boundary has those entries durably — it does
+    // NOT need the snapshot. Entering Snapshot state here would WEDGE it permanently: it is already
+    // `>= pending`, so `resend_snapshot` (which only re-sends to a peer BEHIND `pending`) never fires, and
+    // the paused state makes `maybe_send_append` early-return — so no `SnapshotResponse`/`AppendResponse`
+    // ever arrives to drive `maybe_update` back out of Snapshot. A caught-up voter stalls forever and the
+    // cluster cannot commit. Re-probe from `match_index + 1` instead (resume ordinary append replication).
+    // This guards the case where `next_index` has backtracked below `match_index` (a reject hint) and so
+    // dipped under `first_index`, making the caller mistake a caught-up peer for one needing a snapshot.
+    if self.match_index >= pending_snapshot {
+      self.become_probe();
+      return;
+    }
     self.state = ProgressState::Snapshot {
       pending: pending_snapshot,
       acked_through: 0,
