@@ -132,6 +132,8 @@ impl TimerKind {
 pub enum PoisonReason {
   /// A committed-range log read (`LogStore::entries`) failed during apply.
   LogRead,
+  /// A snapshot chunk read (`StableStore::snapshot_chunk`) failed while streaming to a follower.
+  SnapshotRead,
   /// `LogStore::poll` yielded a storage error.
   LogPoll,
   /// `StableStore::poll` yielded a storage error.
@@ -231,6 +233,7 @@ impl PoisonReason {
   pub const fn as_str(&self) -> &'static str {
     match self {
       Self::LogRead => "log_read",
+      Self::SnapshotRead => "snapshot_read",
       Self::LogPoll => "log_poll",
       Self::StablePoll => "stable_poll",
       Self::LogTerm => "log_term",
