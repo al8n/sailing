@@ -294,6 +294,23 @@ pub trait LogStore {
   fn has_pending(&self) -> bool;
 }
 
+/// The result of a [`StableStore::snapshot_chunk`] read: resident chunk bytes or a cold-read deferral.
+///
+/// Like [`EntriesRead`], deliberately NOT `#[non_exhaustive]`: `Ready` and `Pending` demand distinct
+/// handling at the send site (stream the chunk vs defer), so a future variant SHOULD break the match
+/// rather than fall silently into a catch-all.
+pub enum SnapshotChunkRead {
+  /// A contiguous run of the snapshot blob beginning at the requested `offset`, capped at roughly the
+  /// requested length. The blob IS `Bytes`, so a resident store returns an O(1) refcount slice and a cold
+  /// store returns the materialised bytes; either moves into the outgoing `InstallSnapshot` without a copy.
+  /// EMPTY iff `offset >= total_len` (the benign tail an over-cursor degenerates to).
+  Ready(Bytes),
+  /// The requested run is in-domain but NOT resident; the store has begun fetching it. A BENIGN, retryable
+  /// answer (NOT an error): the leader sends nothing now and re-drives on the storage-ready seam. A
+  /// fully-resident store NEVER returns this.
+  Pending,
+}
+
 /// The durable-metadata store (term/vote/commit + snapshot blobs).
 ///
 /// Borrow strength on the command surface follows what each method actually needs:
@@ -349,6 +366,54 @@ pub trait StableStore {
   /// exact ordering hole this method closes. Returns owned metadata (no `Bytes` — the install needs only
   /// the boundary, and the blob was already handed to the SM at `submit_snapshot`).
   fn durable_snapshot(&self) -> Option<SnapshotMeta<Self::NodeId>>;
+
+  /// Read up to `len` bytes of the latest SUBMITTED snapshot starting at byte `offset`, with its
+  /// metadata and total length — the bounded-read counterpart of [`snapshot`](Self::snapshot) for
+  /// streaming a snapshot to a lagging follower one chunk at a time.
+  ///
+  /// Returns `None` if no snapshot exists (like [`snapshot`](Self::snapshot)). Otherwise the tuple is
+  /// `(meta, total_len, chunk)`: `total_len` is the full blob length and `chunk` is the requested run.
+  ///
+  /// **Range-read contract (NORMATIVE)** — mirrors [`LogStore::entries`]:
+  /// - **Contiguous, offset-aligned:** a non-empty [`Ready`](SnapshotChunkRead::Ready) holds exactly the
+  ///   bytes at `[offset, offset + n)` for some `n <= len` — a PREFIX, never a suffix, never with a gap.
+  ///   The caller resumes at `offset + n`, driven by the follower's `acked_through`.
+  /// - **May be a prefix (cap):** capped at roughly `len`; a non-empty in-range request returns at least
+  ///   one byte. `Ready(empty)` iff `offset >= total_len` (the benign tail).
+  /// - **Three `Ok` outcomes:** `Ready(non-empty)` streams; `Ready(empty)` means `offset >= total_len`;
+  ///   [`Pending`](SnapshotChunkRead::Pending) means the run EXISTS but is not resident and the store began
+  ///   fetching it — benign and retryable, but DISTINCT from empty. A store MUST NOT report a cold run as
+  ///   `Ready(empty)`. `Err` is a genuine store fault and is FATAL: the core poisons
+  ///   (`PoisonReason::SnapshotRead`).
+  /// - **Cold-read obligation:** a store that returns `Pending` MUST eventually return `Ready` (or `Err`)
+  ///   for that run and signal the storage-ready seam so the core re-pumps; a never-resolving `Pending`
+  ///   wedges the transfer. A fully-resident store NEVER returns `Pending`.
+  ///
+  /// **Default:** reads the whole resident blob via [`snapshot`](Self::snapshot) and slices it — the
+  /// correct RESIDENT-store behavior (the leader holds an O(1) `Bytes` slice, never a copy of the blob).
+  /// A store whose snapshot is NOT fully resident (disk/mmap) SHOULD OVERRIDE to page in one chunk
+  /// (returning `Pending` while cold), so its per-peer send footprint is one chunk, not the whole blob —
+  /// the bounded-send guarantee of chunked transfer.
+  // The `(meta, total_len, chunk-read)` tuple inside `Option<Result<..>>` is the deliberate read
+  // contract documented above (snapshot present?, total length, and the resident/cold chunk); naming a
+  // type alias for it would obscure rather than clarify the three returned facts.
+  #[allow(clippy::type_complexity)]
+  fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<Self::NodeId>, u64, SnapshotChunkRead), Self::Error>> {
+    self.snapshot().map(|(meta, blob)| {
+      let total = blob.len() as u64;
+      let start = offset.min(total) as usize;
+      let end = offset.saturating_add(len).min(total) as usize;
+      Ok((
+        meta,
+        total,
+        SnapshotChunkRead::Ready(blob.slice(start..end)),
+      ))
+    })
+  }
 
   /// Stage one snapshot chunk under the key `meta.last_index()`, writing `data` at byte `offset`.
   /// `Ok` is the highest CONTIGUOUS byte offset now staged (drives `SnapshotResponse.acked_through`).

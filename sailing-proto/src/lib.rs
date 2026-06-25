@@ -61,7 +61,8 @@ pub use state_machine::StateMachine;
 
 mod storage;
 pub use storage::{
-  EntriesRead, LogDone, LogStore, OpId, SnapshotStaging, StableDone, StableStore, StorageProgress,
+  EntriesRead, LogDone, LogStore, OpId, SnapshotChunkRead, SnapshotStaging, StableDone,
+  StableStore, StorageProgress,
 };
 
 mod error;
