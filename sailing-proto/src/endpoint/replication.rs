@@ -171,20 +171,23 @@ where
       if let Some((meta, _)) = stable.snapshot() {
         let pending = meta.last_index();
         // Send the FIRST chunk (offset 0); the per-ack pump in `on_snapshot_response` streams the rest.
-        self.send_snapshot_chunk(peer.cheap_clone(), stable, 0);
+        let sent = self.send_snapshot_chunk(peer.cheap_clone(), stable, 0);
         if let Some(p) = self.tracker.progress_mut(&peer) {
           p.become_snapshot(pending);
         }
-        // Arm the resend-pacing deadline AT the send: the map entry means "an InstallSnapshot for
-        // this peer's current install window went out at deadline − election_timeout". This (a)
-        // stops `on_heartbeat_response` from re-sending the very blob this call just emitted (the
-        // heartbeat pump can be what triggers the initial install, in the SAME response handling),
-        // and (b) overwrites any stale deadline left over from a previous install window (the peer
-        // may have exited Snapshot via `maybe_update` without a heartbeat observation to clean up).
-        self
-          .snapshot
-          .snapshot_resend_after
-          .insert(peer, now.mono() + self.config.election_timeout());
+        // Arm the resend-pacing deadline ONLY on a real send: the map entry means "an InstallSnapshot for
+        // this peer's current install window went out at deadline − election_timeout". This (a) stops
+        // `on_heartbeat_response` from re-sending the very blob this call just emitted (the heartbeat pump
+        // can be what triggers the initial install, in the SAME response handling), and (b) overwrites any
+        // stale deadline left from a previous install window. If the first chunk DEFERRED (a cold store
+        // returned `Pending`), leave the deadline unset so the next heartbeat retries immediately rather
+        // than waiting a full election timeout for the cold blob to warm.
+        if sent {
+          self
+            .snapshot
+            .snapshot_resend_after
+            .insert(peer, now.mono() + self.config.election_timeout());
+        }
       }
       // No snapshot persisted yet → nothing to send; retry later.
       return;
@@ -983,11 +986,16 @@ where
         .get(&from)
         .is_none_or(|&after| now.mono() >= after);
       if due {
-        self.snapshot.snapshot_resend_after.insert(
-          from.cheap_clone(),
-          now.mono() + self.config.election_timeout(),
-        );
-        self.resend_snapshot(from.cheap_clone(), stable);
+        // Arm the resend-pacing deadline ONLY on a real send. If the resend DEFERRED (a cold store
+        // returned `Pending`), leave the deadline due so the NEXT heartbeat retries immediately, instead
+        // of suppressing retries for a full election timeout per cold chunk (which would stall catch-up
+        // and risk leaving a voter in Snapshot long enough to threaten quorum).
+        if self.resend_snapshot(from.cheap_clone(), stable) {
+          self.snapshot.snapshot_resend_after.insert(
+            from.cheap_clone(),
+            now.mono() + self.config.election_timeout(),
+          );
+        }
       }
     } else {
       // Observed out of Snapshot state: drop the pacing entry. (A peer that exits via
