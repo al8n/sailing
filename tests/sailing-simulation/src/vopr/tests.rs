@@ -1000,3 +1000,43 @@ fn vopr_exercises_cold_reads() {
     "no cold run committed — liveness failed under the cold-read deferrals (apply/replication wedged)"
   );
 }
+
+/// The cold SNAPSHOT-read path, end-to-end across a band of seeds. `run_vopr_cold_compacting` lowers the
+/// snapshot threshold so the cluster compacts and streams a snapshot to a lagging node mid-run, while the
+/// cold fault makes a fraction of `snapshot_chunk` reads return `SnapshotChunkRead::Pending` — the leader's
+/// chunked send DEFERS (emits nothing, mutates no progress) and the heartbeat `resend_snapshot` re-drives
+/// it, so a transient-cold store still completes the transfer. Every run completes WITHOUT a
+/// read-linearizability / safety-oracle / liveness panic (`run_vopr_cold_compacting` panics on a
+/// violation), proving the deferred snapshot read does not wedge the transfer and stays linearizable.
+///
+/// The aggregate confirms BOTH the snapshot path actually streamed across a lagging gap (multi-chunk
+/// deliveries fired) AND the cold fault landed on a snapshot-chunk read (cold snapshot reads fired) — a `0`
+/// in either means the broad sweep would cover the chunked snapshot-read path VACUOUSLY (the default
+/// threshold never compacts in a bounded run, so without this the sweep never exercises it at all).
+#[test]
+fn vopr_exercises_cold_snapshot_reads() {
+  let mut total_cold_snapshot_reads = 0u64;
+  let mut total_multi_chunk_snapshots = 0u64;
+  for seed in 0u64..64 {
+    let r = run_vopr_cold_compacting(seed, 2_000);
+    total_cold_snapshot_reads += r.cold_snapshot_reads;
+    total_multi_chunk_snapshots += r.multi_chunk_snapshots;
+  }
+  std::eprintln!(
+    "vopr cold-snapshot-read coverage (seeds 0..64, 2000 ticks): \
+     cold_snapshot_reads={total_cold_snapshot_reads} \
+     multi_chunk_snapshots={total_multi_chunk_snapshots}"
+  );
+  assert!(
+    total_multi_chunk_snapshots > 0,
+    "no multi-chunk snapshot was delivered across seeds 0..64 — no snapshot streamed to a lagging node, \
+     so the chunked snapshot-read path went uncovered (snapshot coverage is vacuous); lower the threshold \
+     or raise the tick budget"
+  );
+  assert!(
+    total_cold_snapshot_reads > 0,
+    "no cold (Pending) snapshot-chunk read fired across seeds 0..64 — a snapshot streamed but the cold \
+     fault never landed on a snapshot_chunk read, so the cold snapshot-read path went uncovered (its \
+     coverage is vacuous); raise the tick budget so more transfers overlap the fault"
+  );
+}

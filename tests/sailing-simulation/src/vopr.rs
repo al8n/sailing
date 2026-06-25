@@ -725,7 +725,7 @@ impl ReadLedger {
 /// progress within a generous bound), or a quiesce failure (a fully-healed cluster failed to
 /// converge / apply the committed history).
 pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, false, false)
+  run_vopr_inner(seed, ticks, false, false, false, None)
 }
 
 /// Like [`run_vopr`] but additionally draws the proactive [`sailing_proto::LeaseRefresh`] sub-coin on
@@ -736,7 +736,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 /// that coverage. Only the dedicated lease-refresh coverage opts into the volume.
 #[cfg(test)]
 pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, true, false, false)
+  run_vopr_inner(seed, ticks, true, false, false, None)
 }
 
 /// Like [`run_vopr`] but additionally opts into mid-run READ-MODE migrations: the leader occasionally
@@ -747,7 +747,7 @@ pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
 /// migration coverage opts in; the read-linearizability oracle judges reads across each migration.
 #[cfg(test)]
 pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, true, false)
+  run_vopr_inner(seed, ticks, false, true, false, None)
 }
 
 /// Like [`run_vopr`] but arms the seeded COLD-read fault on every node: a fraction of committed-range
@@ -758,7 +758,26 @@ pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
 /// only the per-store read PRNG, so the master action/topology stream is unchanged.
 #[cfg(test)]
 pub(crate) fn run_vopr_cold(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, false, true)
+  run_vopr_inner(seed, ticks, false, false, true, None)
+}
+
+/// Like [`run_vopr_cold`] but additionally lowers `snapshot_threshold` to a MODERATE seed-derived value
+/// so the cluster compacts within a few hundred ticks and streams a snapshot to a lagging node — putting
+/// the cold fault on the chunked snapshot-READ path (a `SnapshotChunkRead::Pending` deferring a chunked
+/// transfer), which the demand-driven default (`10_000`) never reaches in a bounded run. A SEPARATE entry
+/// so every other entry stays on the default threshold (no compaction): the broad sweeps + the
+/// drift/failover/offset/asymmetric non-vacuity pins are unaffected. The threshold is drawn from a
+/// DEDICATED sub-stream, so the master action/topology stream is byte-identical to `run_vopr_cold` and the
+/// run stays read-linearizable across the snapshot transfer (its completing IS the safety assertion).
+#[cfg(test)]
+pub(crate) fn run_vopr_cold_compacting(seed: u64, ticks: usize) -> VoprReport {
+  // A moderate threshold in 256..512: small enough to compact and stream a snapshot within a few hundred
+  // ticks, but well clear of the pathological ~100 (which would snapshot so aggressively the cluster
+  // spends its budget on transfers rather than the fault). Seed-derived for per-seed variety, from a
+  // sub-PRNG distinct from every master/sub stream so it draws nothing the master run observes.
+  let mut p = FaultPrng::new(seed.rotate_left(32) ^ 0x534E_4150_5448_5231); // "SNAPTHR1"
+  let threshold = 256 + (p.next_u64() % 256) as usize; // 256..=511
+  run_vopr_inner(seed, ticks, false, false, true, Some(threshold))
 }
 
 fn run_vopr_inner(
@@ -767,6 +786,7 @@ fn run_vopr_inner(
   draw_refresh: bool,
   migrate: bool,
   cold: bool,
+  snapshot_threshold: Option<usize>,
 ) -> VoprReport {
   // The single master PRNG. Every draw in the run comes from here (deterministic from `seed`).
   let mut prng = FaultPrng::new(seed ^ 0x564F_5052_5F5F_5631); // "VOPR__V1"
@@ -838,6 +858,13 @@ fn run_vopr_inner(
   };
   let mut c = Cluster::new_async_with(size, seed, move |cfg| {
     let cfg = cfg.with_pre_vote(true);
+    // A moderate snapshot threshold (only the compacting cold entry sets one) makes the cluster compact
+    // and stream a snapshot mid-run, so the cold fault reaches the chunked snapshot-read path. `None`
+    // leaves the demand-driven default untouched, so every other entry is byte-identical.
+    let cfg = match snapshot_threshold {
+      Some(t) => cfg.with_snapshot_threshold(t),
+      None => cfg,
+    };
     match read_mode {
       0 => cfg,
       1 => cfg.with_check_quorum(true),
