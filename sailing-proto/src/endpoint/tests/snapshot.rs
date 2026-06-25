@@ -3344,10 +3344,22 @@ fn redundant_install_caught_up_mid_transfer_dropped_at_completion() {
   // instead reclaimed earlier when the durable prefix advanced, completion would be a no-op — but the
   // SAFETY outcome below is identical regardless of which guard fired.)
   ep.handle_storage(d, &mut log, &mut stable);
-  while ep.poll_message().is_some() {}
+  // A redundant install dropped at completion must ack a position at/above the boundary (mirror the
+  // receipt-time short-circuit) so the leader leaves `ProgressState::Snapshot` without waiting for a resend.
+  let mut snapshot_ack = None;
+  while let Some(m) = ep.poll_message() {
+    if let Message::SnapshotResponse(r) = m.message() {
+      snapshot_ack = Some(r.match_index());
+    }
+  }
   assert!(
     ep.snapshot.pending_install.is_none(),
     "the install completed (or was reclaimed) and is no longer pending"
+  );
+  assert_eq!(
+    snapshot_ack,
+    Some(Index::new(5)),
+    "the completion-time drop acks max(commit, boundary) = 5 so the leader leaves Snapshot without a resend"
   );
 
   // SAFETY (non-negotiable): the durable tail [5..=9] survives — the log is NOT truncated to the boundary.

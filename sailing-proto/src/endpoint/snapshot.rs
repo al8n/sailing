@@ -565,16 +565,21 @@ where
     //       prefix entry-for-entry, so installing would ONLY destroy durably-acked entries above it (the
     //       non-quorum-durable-commit hole: re-baselining over a longer, consistent, already-acked tail).
     // A DIFFERENT term at the boundary (or a boundary above the durable tip) ⇒ a divergent / short durable
-    // tail ⇒ NOT redundant ⇒ fall through and re-baseline. `durable_snapshot_index` was raised to the
-    // boundary above, so a dropped install is still acked via `ack_watermark()` (the follower reports its
-    // TRUE durable tip, never this lower boundary). The restart path enforces the identical invariant in
-    // `reconcile_restart_log`; this brings the runtime install path to parity. A fatal `term` read fails
-    // the equality (installs) — the safe direction, since re-baselining onto a quorum-committed boundary
-    // never loses data, only dropping a NEEDED install would.
+    // tail ⇒ NOT redundant ⇒ fall through and re-baseline. The restart path enforces the identical
+    // invariant in `reconcile_restart_log`; this brings the runtime install path to parity. A fatal `term`
+    // read fails the equality (installs) — the safe direction, since re-baselining onto a quorum-committed
+    // boundary never loses data, only dropping a NEEDED install would.
     let redundant = meta.last_index() <= self.commit
       || (meta.last_index() <= self.durable.durable_index
         && log.term(meta.last_index()).ok() == Some(meta.last_term()));
     if redundant {
+      // Release the leader from `ProgressState::Snapshot` NOW, without waiting for a heartbeat resend: a
+      // follower that caught up while the blob was fsyncing must ack a position at/above the boundary
+      // immediately (mirror the receipt-time short-circuit). `durable_snapshot_index` was raised to the
+      // boundary above, so `ack_watermark()` already covers it; ack `max(commit, boundary)` (clamped to
+      // `ack_watermark()` inside `send_or_gate_snapshot_ack`) so the leader's `match` advances past
+      // `pending`. Persist-before-RESPOND: a non-durable term defers the ack via the term-gated queue.
+      self.send_or_gate_snapshot_ack(leader, core::cmp::max(self.commit, meta.last_index()));
       return;
     }
 
