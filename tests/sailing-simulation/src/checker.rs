@@ -452,8 +452,10 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
 ///
 /// Catches a node that advanced commit without the entry being durably replicated to a quorum (the
 /// heartbeat class) — one tick BEFORE [`agreement`] would catch the resulting divergence.
-/// Compaction is accounted for: a snapshotted entry counts as durable-present at the snapshot
-/// boundary term (see [`NodeView::durable_covers`] / [`NodeView::durable_term`]).
+/// Compaction is accounted for: an index a voter has snapshotted past counts as a durable witness
+/// (the snapshot subsumes its already-applied content), regardless of the snapshot boundary term —
+/// a boundary-term match would be wrong, since the boundary outranks the subsumed entry's own term
+/// (see [`NodeView::durable_covers`]).
 ///
 /// The committing voter's own durable term at its commit index is the witness term `t`; the oracle
 /// then counts how many VOTERS durably hold `(commit, t)`. Fewer than a majority of the EFFECTIVE
@@ -532,7 +534,24 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
     let quorum = effective / 2 + 1;
     let copies = view
       .voters()
-      .filter(|m| m.durable_covers(c) && m.durable_term(c) == Some(witness_term))
+      .filter(|m| {
+        // A voter witnesses the committed entry at `c` if it durably holds that entry's content.
+        // LIVE (`c` in the retained log): the term must EQUAL the witness term — the teeth that catch a
+        // stale-tail / heartbeat commit one tick before `agreement` would. COMPACTED (`c` below the
+        // retained log, subsumed by the voter's snapshot): the voter APPLIED `c` before compacting it
+        // away (compaction follows apply), so it durably holds the committed content regardless of the
+        // snapshot's BOUNDARY term — which is necessarily >= the entry's term and is NOT the entry's own
+        // term, so a boundary-term match is the WRONG test. The applied content of a compacted entry is
+        // already validated by `agreement`, so a subsumed index counts as a durable witness here.
+        // Without this, a committed entry that an ahead voter has snapshotted past is mis-scored as a
+        // term-divergent branch and the count drops below quorum (a false positive under frequent
+        // compaction, where the snapshot boundary outranks a still-live-elsewhere earlier committed entry).
+        if c >= m.durable_first {
+          m.durable_term(c) == Some(witness_term)
+        } else {
+          m.durable_covers(c)
+        }
+      })
       .count();
     if copies < quorum {
       let per_voter: std::vec::Vec<_> = view
