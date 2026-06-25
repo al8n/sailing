@@ -1,7 +1,7 @@
 //! Throwaway store impls for proto-level unit tests. Not compiled outside `#[cfg(test)]`.
 use crate::{
-  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, NodeId, OpId, SnapshotMeta,
-  StableDone, StableStore, Term,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, NodeId, OpId,
+  SnapshotChunkRead, SnapshotMeta, StableDone, StableStore, Term,
 };
 use bytes::Bytes;
 use core::{cell::Cell, convert::Infallible, ops::Range, time::Duration};
@@ -604,6 +604,11 @@ pub(crate) struct AsyncStable {
   /// stamp). Lets a test assert the durable floor is monotone non-decreasing across all writes.
   submitted_lease: Vec<Option<Duration>>,
   snapshot_staging: Option<(SnapshotMeta<u64>, crate::SnapshotStaging)>,
+  /// When true, `snapshot_chunk` reports the resident blob as COLD — it returns the meta and real
+  /// `total_len` but `SnapshotChunkRead::Pending`, modelling a disk/mmap store whose blob is not paged
+  /// in. The sender must then defer (emit nothing, mutate no progress). When false the default resident
+  /// slice is served, so the store behaves byte-identically to a fully-resident one.
+  pub cold_snapshot: bool,
 }
 
 impl Default for AsyncStable {
@@ -619,6 +624,7 @@ impl Default for AsyncStable {
       last_durable_reads: false,
       submitted_lease: Vec::new(),
       snapshot_staging: None,
+      cold_snapshot: false,
     }
   }
 }
@@ -730,6 +736,26 @@ impl StableStore for AsyncStable {
 
   fn snapshot(&self) -> Option<(SnapshotMeta<u64>, Bytes)> {
     self.snapshot.clone()
+  }
+
+  fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<u64>, u64, SnapshotChunkRead), Self::Error>> {
+    self.snapshot.as_ref().map(|(meta, blob)| {
+      let total = blob.len() as u64;
+      let read = if self.cold_snapshot {
+        // The blob is resident in this in-RAM store, but report it as COLD so the sender must defer —
+        // exactly what a disk/mmap store does when the requested run has not been paged in.
+        SnapshotChunkRead::Pending
+      } else {
+        let start = offset.min(total) as usize;
+        let end = offset.saturating_add(len).min(total) as usize;
+        SnapshotChunkRead::Ready(blob.slice(start..end))
+      };
+      Ok((meta.clone(), total, read))
+    })
   }
 
   fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
