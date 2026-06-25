@@ -241,11 +241,19 @@ where
     }
   }
 
-  /// Receive an `InstallSnapshot` from the current leader (follower path). This only VALIDATES,
-  /// persists the term, and submits the blob — it DEFERS the destructive install body (which touches the
-  /// log) to `install_snapshot_now` once the blob is durable, so it needs no `LogStore`.
-  pub(crate) fn on_install_snapshot<S>(&mut self, now: Now, stable: &mut S, is: InstallSnapshot<I>)
-  where
+  /// Receive an `InstallSnapshot` from the current leader (follower path). This VALIDATES, persists the
+  /// term, and submits the blob — it DEFERS the destructive install body (which touches the log) to
+  /// `install_snapshot_now` once the blob is durable. It reads the `LogStore` only to recognize a snapshot
+  /// already covered by this follower's durable log (the Log-Matching short-circuit below), so a follower
+  /// whose durable log outran `commit` does not waste a full transfer on a snapshot it already holds.
+  pub(crate) fn on_install_snapshot<L, S>(
+    &mut self,
+    now: Now,
+    log: &L,
+    stable: &mut S,
+    is: InstallSnapshot<I>,
+  ) where
+    L: LogStore,
     S: StableStore<NodeId = I>,
     F::Snapshot: Data,
   {
@@ -297,31 +305,33 @@ where
       .max_unwalled_lease_window
       .max(meta.max_unwalled_lease_window());
 
-    // Staleness guard: short-circuit ONLY when the snapshot is ALREADY part of this follower's durable
-    // RECOVERABLE prefix — `ack_watermark()` = max(durable log tip, durable snapshot boundary). Such a
-    // snapshot is redundant; ack `ack_watermark()` (which already covers it) so the leader can leave
-    // Snapshot state. `send_or_gate_snapshot_ack` applies the `commit.min(ack_watermark())` persist-before-
-    // ack clamp itself (an async follower can have `commit > durable_index`; replying raw `commit` would
-    // over-ack an unrecoverable tail). Persist-before-RESPOND: if `self.term` is not yet durable the
-    // ack defers (this path runs no install, so the term write is the post-dispatch catch-all in
-    // `handle_message`) and `flush_term_gated_acks` releases it.
-    //
-    // The snapshot is redundant — and short-circuits — ONLY when its boundary is already covered by BOTH
-    // the committed prefix AND the recoverable prefix: `boundary <= min(commit, ack_watermark())`. Both
-    // bounds are load-bearing:
-    //  - a committed snapshot (`<= commit`) ABOVE `ack_watermark()` is NOT redundant (commit ran
-    //    ahead of the durable log over an unflushed tail, no durable snapshot covers the gap). It must
-    //    fall through to the DEFERRED install, which makes the boundary durable and RECORDS
-    //    `durable_snapshot_index` (`install_snapshot_now`), raising `ack_watermark()` so the leader is not
-    //    pinned in `ProgressState::Snapshot`; the completion-time stale re-check there drops the
-    //    destructive body since `boundary <= commit`, so commit/applied/log never regress.
-    //  - A snapshot ABOVE `commit` (`ack_watermark()` can exceed `commit` when a DIVERGENT uncommitted
-    //    durable tail sits above it) is also NOT redundant: it extends/corrects the committed prefix and
-    //    must install (re-baselining over the divergent tail). Only `boundary <= commit` is committed
-    //    history, which is never divergent — so short-circuiting there cannot skip a needed correction.
-    if meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark()) {
+    // Redundancy short-circuit: skip the staging+install entirely when this follower ALREADY holds the
+    // snapshot's prefix durably, and ack a position at/above the boundary so the leader advances `match`
+    // and leaves `ProgressState::Snapshot`. Redundant two ways:
+    //  - `boundary <= min(commit, ack_watermark())` — covered by BOTH the committed prefix AND the durable
+    //    RECOVERABLE prefix (`ack_watermark()` = max(durable log tip, durable snapshot boundary)). A
+    //    committed snapshot ABOVE `ack_watermark()` is NOT here (commit ran ahead of the durable log over
+    //    an unflushed tail); it falls through to the deferred install, which records `durable_snapshot_index`
+    //    and whose completion-time re-check drops the destructive body since `boundary <= commit`.
+    //  - `boundary <= durable_index` AND the durable log entry at `boundary` carries the snapshot's term —
+    //    Log Matching (§5.3): our durable `[first..=boundary]` IS the snapshot's prefix entry-for-entry, so
+    //    the snapshot is redundant even though `boundary > commit`. This is the case the committed-only bound
+    //    misses: an async follower whose durable log outran `commit` would otherwise STAGE and slowly transfer
+    //    a snapshot it already holds (its leader-side `match` is stale-low, so the leader keeps re-sending) —
+    //    wasting a whole transfer and pinning the peer in Snapshot. A DIFFERENT term at the boundary is a
+    //    DIVERGENT durable tail → NOT redundant → fall through and install (re-baseline over the tail).
+    // Ack `max(commit, boundary)` (clamped to `ack_watermark()` inside `send_or_gate_snapshot_ack`, which an
+    // async follower needs since it can have `commit > durable_index`): for the committed case that is
+    // `commit`; for the Log-Matching case the boundary is durable + consistent and exceeds `commit`, so
+    // acking it lifts the leader's `match` past `pending`. Persist-before-RESPOND: a non-durable term defers
+    // the ack (this path runs no install; the term write is the post-dispatch catch-all in `handle_message`)
+    // and `flush_term_gated_acks` releases it.
+    let redundant = meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark())
+      || (meta.last_index() <= self.durable.durable_index
+        && log.term(meta.last_index()).ok() == Some(meta.last_term()));
+    if redundant {
       let leader = is.leader();
-      self.send_or_gate_snapshot_ack(leader, self.commit);
+      self.send_or_gate_snapshot_ack(leader, core::cmp::max(self.commit, meta.last_index()));
       return;
     }
 
