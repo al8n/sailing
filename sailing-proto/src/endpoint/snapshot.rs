@@ -1,5 +1,5 @@
 use super::*;
-use crate::{InstallSnapshot, ProgressState, SnapshotMeta};
+use crate::{InstallSnapshot, ProgressState, SnapshotChunkRead, SnapshotMeta};
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -63,8 +63,20 @@ where
     stable: &S,
     from_offset: u64,
   ) {
-    let Some((meta, blob)) = stable.snapshot() else {
-      return;
+    // Read THIS chunk from the store (bounded — one chunk, never the whole blob resident). The read also
+    // hands back the meta + total_len, so we reconcile the boundary and size the frame from it. A cold
+    // store returns `Pending` (we defer and re-drive on storage-ready); an `Err` is a fatal store fault.
+    let config_chunk = self
+      .config
+      .snapshot_chunk_bytes()
+      .clamp(1, crate::config::MAX_SNAPSHOT_CHUNK_BYTES);
+    let (meta, total, chunk_at_from) = match stable.snapshot_chunk(from_offset, config_chunk) {
+      None => return,
+      Some(Ok(read)) => read,
+      Some(Err(_)) => {
+        self.poison(PoisonReason::SnapshotRead);
+        return;
+      }
     };
     let boundary = meta.last_index();
     // A peer whose `pending` no longer matches the local snapshot is mid-transfer on a now-superseded
@@ -82,7 +94,6 @@ where
       }
       0
     };
-    let total = blob.len() as u64;
     let (term, me) = (self.term, self.config.id());
     // `start` clamps `from` to the blob. A STALE resume cursor — a reordered ack from a LARGER superseded
     // snapshot, SET onto a peer whose CURRENT blob is smaller — would otherwise encode `offset > total`,
@@ -113,13 +124,33 @@ where
     if frame_budget == 0 {
       return;
     }
-    let chunk = self
-      .config
-      .snapshot_chunk_bytes()
-      .clamp(1, crate::config::MAX_SNAPSHOT_CHUNK_BYTES)
-      .min(frame_budget);
-    let end = from.saturating_add(chunk).min(total);
-    let data = blob.slice(start as usize..end as usize);
+    let chunk_len = config_chunk.min(frame_budget);
+    // Reuse the chunk already read at `from_offset` when the reconciled offset is unchanged (the common
+    // path — ONE store read). A boundary RESET (`start == 0`) or an over-cursor clamp (`start == total`)
+    // moved the offset, so re-read at `start`.
+    let chunk_read = if start == from_offset {
+      chunk_at_from
+    } else {
+      match stable.snapshot_chunk(start, chunk_len) {
+        None => return,
+        Some(Ok((_, _, read))) => read,
+        Some(Err(_)) => {
+          self.poison(PoisonReason::SnapshotRead);
+          return;
+        }
+      }
+    };
+    let data = match chunk_read {
+      // Trim to the frame budget — normally a no-op (`chunk_len >= bytes.len()`); it fires only when a
+      // huge meta shrank the budget below the bytes the store returned.
+      SnapshotChunkRead::Ready(bytes) => {
+        let n = (bytes.len() as u64).min(chunk_len) as usize;
+        bytes.slice(0..n)
+      }
+      // Cold: the bytes aren't resident and the store began fetching. Defer — no progress mutation — and
+      // re-drive on the storage-ready seam (the heartbeat `resend_snapshot` also re-drives).
+      SnapshotChunkRead::Pending => return,
+    };
     self.send(
       peer,
       Message::InstallSnapshot(InstallSnapshot::new_chunk(

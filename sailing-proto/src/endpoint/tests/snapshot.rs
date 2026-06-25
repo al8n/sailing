@@ -2501,6 +2501,69 @@ fn stale_resume_cursor_emits_clamped_offset() {
   );
 }
 
+/// A COLD snapshot read (the store reports the blob NOT resident — `SnapshotChunkRead::Pending`) makes
+/// the sender DEFER: it emits no `InstallSnapshot` and mutates no `Progress`, relying on a later re-drive
+/// (the storage-ready seam / the heartbeat `resend_snapshot`). Once the read warms (`Ready`), the very
+/// same send proceeds, carrying the blob's real `total_len` and the requested `offset`.
+///
+/// MUTATION: drop the `SnapshotChunkRead::Pending => return` arm in `send_snapshot_chunk` (e.g. fall
+/// through to an empty `data`) → the cold call enqueues an InstallSnapshot and/or advances progress
+/// (the cold-defer asserts fail).
+#[test]
+fn cold_snapshot_chunk_read_defers_the_send() {
+  use crate::{Index, Message};
+
+  let offset = 5u64;
+  let (mut ep, _log, mut stable) = make_leader_with_compacted_log(offset, 2);
+  // Drive peer 2 into Snapshot state for the persisted boundary, then drop anything emitted in setup so
+  // the next poll observes only what THIS send produces.
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_snapshot(Index::new(offset));
+  }
+  while ep.poll_message().is_some() {}
+  let progress_before = ep.tracker.progress(&2u64).unwrap().state();
+
+  // COLD: the store reports the resident blob as not-yet-paged-in. The send must defer.
+  stable.cold_snapshot = true;
+  ep.send_snapshot_chunk(2u64, &stable, 0);
+  assert!(
+    ep.poll_message().is_none(),
+    "a cold snapshot_chunk read (Pending) must emit NO InstallSnapshot — the send defers"
+  );
+  assert_eq!(
+    ep.tracker.progress(&2u64).unwrap().state(),
+    progress_before,
+    "a deferred (cold) send must NOT mutate the peer's Snapshot progress"
+  );
+
+  // WARM: the read resolves. The deferred send now proceeds — exactly one InstallSnapshot, carrying the
+  // blob's real total_len (b"snap-data" = 9 bytes) and the requested offset 0.
+  stable.cold_snapshot = false;
+  ep.send_snapshot_chunk(2u64, &stable, 0);
+  let installs: Vec<_> = core::iter::from_fn(|| ep.poll_message())
+    .filter_map(|o| match o.message() {
+      Message::InstallSnapshot(s) if o.to() == 2u64 => Some(s.clone()),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    installs.len(),
+    1,
+    "once the cold read warms, the send proceeds — exactly one InstallSnapshot"
+  );
+  assert_eq!(
+    installs[0].total_len(),
+    9,
+    "the warm send carries the blob's real total_len (b\"snap-data\")"
+  );
+  assert_eq!(installs[0].offset(), 0, "the warm send begins at offset 0");
+  assert_eq!(
+    installs[0].snapshot().last_index(),
+    Index::new(offset),
+    "the warm send carries the persisted snapshot boundary"
+  );
+}
+
 /// The chunk cap bounds the ENCODED FRAME, not just the blob slice: a large but legal `ConfState` plus a
 /// full `MAX_SNAPSHOT_CHUNK_BYTES` chunk must still encode below `MAX_FRAME_BYTES`, else the transport
 /// refuses the frame and the follower wedges in catch-up.
