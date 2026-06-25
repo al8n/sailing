@@ -490,18 +490,24 @@ pub struct SnapshotStaging {
 
 impl SnapshotStaging {
   /// Begin staging a `total_len`-byte blob covered by snapshot boundary `boundary`, bounded by
-  /// `max_bytes`. Returns `None` — WITHOUT allocating — if `total_len` overflows `usize` or exceeds
-  /// `max_bytes`, so a malformed/forged length POISONS (the embedding store maps `None` to its fatal
-  /// error) rather than panicking or aborting on a huge allocation.
+  /// `max_bytes`. Returns `None` if `total_len` overflows `usize`, exceeds `max_bytes` (WITHOUT
+  /// allocating), or the receiver buffer cannot be allocated — so a malformed/forged length OR genuine
+  /// memory pressure POISONS (the embedding store maps `None` to its fatal error) rather than panicking or
+  /// ABORTING the process. The buffer allocation is FALLIBLE (`try_reserve_exact`): a `len` at or under
+  /// `max_bytes` can still exceed available memory, and an infallible `vec![0u8; len]` would abort on OOM,
+  /// bypassing the fail-stop path.
   #[must_use]
   pub fn new(boundary: Index, total_len: u64, max_bytes: usize) -> Option<Self> {
     let len = usize::try_from(total_len).ok()?;
     if len > max_bytes {
       return None;
     }
+    let mut buf = Vec::new();
+    buf.try_reserve_exact(len).ok()?;
+    buf.resize(len, 0u8);
     Some(Self {
       boundary,
-      buf: std::vec![0u8; len],
+      buf,
       runs: Vec::new(),
     })
   }
@@ -629,6 +635,17 @@ mod tests {
     assert!(
       SnapshotStaging::new(Index::new(1), 17, 16).is_none(),
       "a total_len beyond the cap must be rejected WITHOUT allocating (no OOM on a forged length)"
+    );
+  }
+
+  #[test]
+  fn snapshot_staging_new_returns_none_on_unallocatable_len() {
+    // A `total_len` AT OR UNDER `max_bytes` but beyond addressable memory must fail-stop (return None via
+    // the fallible `try_reserve_exact`), NOT abort the process on an infallible allocation.
+    let huge = 1usize << 60; // ~1 EiB — unallocatable, yet <= usize::MAX so it clears the cap check
+    assert!(
+      SnapshotStaging::new(Index::new(1), huge as u64, usize::MAX).is_none(),
+      "an unallocatable (but under-cap) length must return None, not abort"
     );
   }
 
