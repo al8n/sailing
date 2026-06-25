@@ -3120,3 +3120,206 @@ fn install_with_stale_suffix_after_restore_poisons() {
     "a restore that keeps a stale suffix above the boundary must fail-stop the install"
   );
 }
+
+/// Completion-time Log-Matching redundancy: an async follower whose DURABLE log tip outran its
+/// in-memory `commit` (it persisted+acked entries before learning they were committed) receives a
+/// committed snapshot at a boundary BETWEEN `commit` and `durable_index` whose boundary term MATCHES
+/// the durable entry there. Boundary `> commit`, so the receipt-time guard stages a deferred install;
+/// at completion `install_snapshot_now` must DROP it via the §5.3 redundancy arm (`boundary <=
+/// durable_index` AND `term(boundary) == last_term`): the durable `[first..=boundary]` already IS the
+/// snapshot's prefix entry-for-entry, so re-baselining would only DESTROY durably-acked entries above
+/// the boundary — making a leader's quorum-committed entry non-durable on this replica.
+///
+/// MUTATION: revert the redundancy test to `if meta.last_index() <= self.commit { return; }`. Boundary
+/// 5 > commit 2, so the install is no longer redundant: `log.restore(5)` truncates the durable tail,
+/// `log.last_index()` drops 9 → 5, and the first assertion FAILS.
+#[test]
+fn redundant_install_below_durable_tip_keeps_the_log() {
+  use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Durable log tip ABOVE `commit`: entries [1..=9] at the leader's term 2 (consistent with the
+  // leader — same terms), but `leader_commit = 2`, so the follower commits only up to 2 while it
+  // makes the whole tail durable. (An async follower acks entries before learning they committed.)
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  // Flush so the tail becomes durable: durable_index == 9 while commit stays at 2.
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(9),
+    "tail flushed → durable=9"
+  );
+  assert_eq!(ep.commit, Index::new(2), "leader_commit held commit at 2");
+  assert_eq!(ep.applied, Index::new(2), "applied tracks commit");
+  assert_eq!(
+    log.term(Index::new(5)).unwrap(),
+    Term::new(2),
+    "the durable entry at the boundary carries the leader's term 2"
+  );
+
+  // Deferred install at boundary 5 (commit 2 < 5 < durable 9), carrying last_term == 2 — the SAME term
+  // as the follower's durable entry at 5. At receipt `5 > commit 2`, so it is STAGED (not short-circuited)
+  // and reaches `install_snapshot_now`.
+  ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(5));
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "a committed snapshot above `commit` stages a deferred install"
+  );
+
+  // SnapshotWritten fires → completion-time redundancy test: 5 <= durable 9 AND term(5)==2==last_term →
+  // DROP the install (keep the durable log), never destroying the acked tail above the boundary.
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the redundant install is dropped at completion"
+  );
+
+  // (a) The log is NOT truncated — the durable tail [6..=9] is preserved.
+  assert_eq!(
+    log.last_index(),
+    Index::new(9),
+    "the durable tail above the boundary must survive (no re-baseline)"
+  );
+  assert_eq!(
+    log.first_index(),
+    Index::new(1),
+    "the log was not re-baselined onto the snapshot boundary"
+  );
+  // (b) commit/applied are UNCHANGED — the install was dropped, not applied.
+  assert_eq!(
+    ep.commit,
+    Index::new(2),
+    "a dropped install must not move commit"
+  );
+  assert_eq!(
+    ep.applied,
+    Index::new(2),
+    "a dropped install must not move applied"
+  );
+  // (c) The follower still acks its TRUE durable tip (9), never the lower boundary (5): the dropped
+  // install raised `durable_snapshot_index` to 5, but `ack_watermark()` = max(durable_index 9, 5) = 9.
+  assert_eq!(
+    ep.ack_watermark(),
+    Index::new(9),
+    "the follower acks its durable tip, not the lower (subsumed) snapshot boundary"
+  );
+}
+
+/// Over-suppression guard for the redundancy arm (the must-STILL-install direction): same shape —
+/// durable tip above `commit`, boundary BETWEEN them — but the follower's durable entry at the boundary
+/// carries a DIFFERENT term than the snapshot's `last_term` (a divergent tail). Log Matching does NOT
+/// hold, so the install must PROCEED and re-baseline onto the boundary. (`snapshot_install_resets_durable_
+/// index_below_divergent_tail` exercises the same divergent-tail re-baseline from the commit==0 angle and
+/// focuses on the `durable_index` RESET + the later ack-clamp; this one isolates the commit/applied/
+/// first_index/last_index advance for a boundary strictly above a non-zero `commit`.)
+///
+/// MUTATION: this direction is unaffected by the redundancy test — both forms install — so it stays GREEN
+/// under the reverted guard; it fences the redundancy test against over-suppressing a divergent install.
+#[test]
+fn divergent_install_below_durable_tip_still_rebaselines() {
+  use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Durable tip above `commit`, but the tail is at term 1 — DIVERGENT from the term-2 snapshot below.
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(9),
+    "tail flushed → durable=9"
+  );
+  assert_eq!(ep.commit, Index::new(2), "leader_commit held commit at 2");
+  assert_eq!(
+    log.term(Index::new(5)).unwrap(),
+    Term::new(1),
+    "the durable entry at the boundary carries term 1 (divergent from the term-2 snapshot)"
+  );
+
+  // Deferred install at boundary 5 carrying last_term == 2 (DIFFERENT from the durable entry's term 1).
+  ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(5));
+  assert!(ep.snapshot.pending_install.is_some());
+
+  // SnapshotWritten fires → redundancy test: 5 <= durable 9 but term(5)==1 != 2 == last_term → NOT
+  // redundant → fall through and re-baseline onto the boundary.
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the divergent install completes (it is not redundant)"
+  );
+
+  // The log IS re-baselined to the boundary — first_index == last_index + 1 == 6, last_index == 5 —
+  // and commit/applied advance to the boundary.
+  assert_eq!(
+    log.last_index(),
+    Index::new(5),
+    "re-baselined to the snapshot boundary"
+  );
+  assert_eq!(
+    log.first_index(),
+    Index::new(6),
+    "first_index == boundary + 1 after restore"
+  );
+  assert_eq!(ep.commit, Index::new(5), "commit advances to the boundary");
+  assert_eq!(
+    ep.applied,
+    Index::new(5),
+    "applied advances to the boundary"
+  );
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(5),
+    "durable_index RESET to the boundary (the divergent tail was discarded)"
+  );
+}
