@@ -1052,6 +1052,25 @@ fn run_vopr_inner(
         "calm-window",
       );
       report.calm_windows += 1;
+      // The calm window cleared all storage faults to assert fault-free progress. For the snapshot-coverage
+      // variant, RE-ARM the cold-read fault for the next chaos phase: snapshots stream only after enough
+      // compaction (well past the first calm window), so without re-arming, the cold path never fires on a
+      // snapshot read and the coverage is vacuous. The cold fault only DELAYS reads (re-driven each
+      // heartbeat round), so it cannot wedge a later calm window's progress. Draws NOTHING from the master
+      // prng (fixed rate, deterministic re-seed), and is gated on the threshold so `run_vopr`/`run_vopr_cold`
+      // stay byte-identical.
+      if cold && snapshot_threshold.is_some() {
+        for id in 0..size as u64 {
+          c.set_node_faults(
+            id,
+            StorageFaults {
+              cold_fetch_per_mille: 80,
+              ..StorageFaults::none()
+            },
+            seed.wrapping_add(id).rotate_left(11),
+          );
+        }
+      }
       let jitter = (prng.next_u64() % 60) as usize;
       next_calm = iter + 1 + calm_period + jitter;
     }
