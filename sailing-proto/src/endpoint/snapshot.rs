@@ -232,10 +232,34 @@ where
   /// `snapshot_recv` AND the store's `SnapshotStaging` buffer (a full `total_len` allocation) rather than
   /// pinning it until a future supersede or restart. A no-op when no transfer is in progress or it is still
   /// ahead of the recoverable prefix.
-  pub(crate) fn reclaim_stale_snapshot_recv<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
-    if let Some(r) = &self.snapshot.snapshot_recv
-      && r.meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark())
-    {
+  pub(crate) fn reclaim_stale_snapshot_recv<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    log: &L,
+    stable: &mut S,
+  ) {
+    let Some((boundary, last_term)) = self
+      .snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| (r.meta.last_index(), r.meta.last_term()))
+    else {
+      return;
+    };
+    // Free the staging buffer whenever the staged snapshot is redundant by the SAME proof the ack-path
+    // short-circuit uses: committed-and-recoverable, OR the durable log matches through the boundary (Log
+    // Matching). The committed-only `min(commit, ack_watermark())` bound missed the case where in-window
+    // appends made the durable log match through `boundary` while `commit` stayed lower — a later duplicate
+    // chunk would then ack the leader out of Snapshot but strand the full `total_len` allocation. A fatal
+    // `term` Err poisons via `log_term`.
+    let committed_recoverable = core::cmp::min(self.commit, self.ack_watermark());
+    let durable_index = self.durable.durable_index;
+    let redundant = boundary <= committed_recoverable
+      || (boundary <= durable_index
+        && match self.log_term(log, boundary) {
+          Some(t) => t == last_term,
+          None => return,
+        });
+    if redundant {
       self.snapshot.snapshot_recv = None;
       stable.discard_snapshot_staging();
     }
@@ -277,7 +301,7 @@ where
     // Reclaim an abandoned in-progress receive whose boundary the recoverable prefix has already passed:
     // a delayed chunk for it would otherwise short-circuit at the staleness guard below WITHOUT freeing the
     // staging buffer (the leak that pins a full `total_len` allocation).
-    self.reclaim_stale_snapshot_recv(stable);
+    self.reclaim_stale_snapshot_recv(log, stable);
 
     // Fold this snapshot's carried LeaseGuard bound into `max_lease_window` HERE — before EVERY early
     // return below (redundant short-circuit, duplicate-install guard) and before the destructive

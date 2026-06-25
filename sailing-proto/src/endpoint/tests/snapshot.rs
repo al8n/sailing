@@ -3626,3 +3626,105 @@ fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
     "a fatal boundary term-read at completion poisons, never falls through to the destructive restore"
   );
 }
+
+// A partial chunked receive stages a full `total_len` buffer. If in-window appends make the durable log
+// match THROUGH the boundary while `commit` stays below it, the staged receive is redundant — and must be
+// reclaimed (its buffer freed), not stranded until restart/supersede. Reclaim uses the same Log-Matching
+// proof as the ack-path short-circuit, so it fires even though `boundary > commit`.
+#[test]
+fn redundant_staged_chunk_reclaimed_when_durable_log_catches_up() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Durable [1..=4] term 2, commit 2: durable_index=4 < boundary 5 at receipt, so a partial chunk STAGES.
+  let head: Vec<Entry> = (1u64..=4)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      head,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // A PARTIAL chunk at boundary 5 (offset 0, half the blob, total_len = full) stages `snapshot_recv`.
+  let blob = encode_count_snapshot(5);
+  let half = blob.len() / 2;
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta,
+      blob.slice(0..half),
+      0,
+      blob.len() as u64,
+    )),
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "a partial chunk below the durable tip stages a receive"
+  );
+
+  // In-window appends extend the durable log THROUGH the boundary at term 2; commit stays at 2.
+  let tail: Vec<Entry> = (5u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(4),
+      Term::new(2),
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(ep.durable.durable_index, Index::new(9));
+  assert_eq!(ep.commit, Index::new(2), "commit stays below the boundary");
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "the staged receive is reclaimed once the durable log matches through the boundary (commit < boundary)"
+  );
+}
