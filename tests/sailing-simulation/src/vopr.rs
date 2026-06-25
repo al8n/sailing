@@ -253,6 +253,14 @@ pub struct VoprReport {
   /// Total COLD (`EntriesRead::Pending`) reads returned across node logs — the cold-fetch coverage
   /// non-vacuity witness. `0` outside `run_vopr_cold` (cold-fetch is off in every other entry).
   pub cold_reads: u64,
+  /// Total COLD (`SnapshotChunkRead::Pending`) snapshot-chunk reads returned across node stable stores. A
+  /// cold snapshot read makes the leader's chunked send DEFER (emit nothing, mutate no progress); the
+  /// heartbeat `resend_snapshot` re-drives it, so a transient-cold store still completes the transfer. `0`
+  /// outside `run_vopr_cold`, and `0` even there unless a snapshot is actually streamed — the default
+  /// snapshot threshold rarely compacts in a bounded run. The dedicated coverage of this counter (the cold
+  /// snapshot read delaying a multi-chunk transfer WITHOUT wedging it) lives in the snapshot integration
+  /// suite, which drives a controlled multi-chunk catch-up under the fault.
+  pub cold_snapshot_reads: u64,
   /// Count of delivered MULTI-chunk `InstallSnapshot` chunks (offset > 0) — the chunking-coverage
   /// non-vacuity witness (a single-chunk transfer only ever delivers offset 0).
   pub multi_chunk_snapshots: u64,
@@ -1577,6 +1585,7 @@ fn quiesce(c: &mut Cluster, st: &mut VoprState, report: &mut VoprReport, seed: u
 
   report.committed = committed_count;
   report.cold_reads = c.total_cold_reads();
+  report.cold_snapshot_reads = c.total_cold_snapshot_reads();
   report.multi_chunk_snapshots = c.multi_chunk_deliveries();
   // One final oracle sweep at the fully-quiesced state (belt-and-suspenders; tick already ran it).
   c.run_oracles();

@@ -973,6 +973,11 @@ fn vopr_exercises_read_mode_migrations() {
 /// cold run still committed (liveness held despite the deferrals). The per-site dispositions are
 /// unit-tested in `sailing-proto` (`restart_scan_poisons_on_cold_read`,
 /// `apply_defers_on_cold_read_without_poisoning`, `replication_defers_on_cold_read_without_poisoning`).
+///
+/// The cold SNAPSHOT read (a `Pending` from `snapshot_chunk` deferring a chunked transfer) is exercised
+/// separately, in the snapshot integration suite: the default snapshot threshold rarely compacts in a
+/// bounded run, so a controlled multi-chunk catch-up under the fault is the reliable, non-vacuous home
+/// for that coverage.
 #[test]
 fn vopr_exercises_cold_reads() {
   let mut total_cold_reads = 0u64;
