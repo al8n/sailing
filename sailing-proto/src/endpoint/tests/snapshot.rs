@@ -3121,18 +3121,21 @@ fn install_with_stale_suffix_after_restore_poisons() {
   );
 }
 
-/// Completion-time Log-Matching redundancy: an async follower whose DURABLE log tip outran its
-/// in-memory `commit` (it persisted+acked entries before learning they were committed) receives a
-/// committed snapshot at a boundary BETWEEN `commit` and `durable_index` whose boundary term MATCHES
-/// the durable entry there. Boundary `> commit`, so the receipt-time guard stages a deferred install;
-/// at completion `install_snapshot_now` must DROP it via the §5.3 redundancy arm (`boundary <=
-/// durable_index` AND `term(boundary) == last_term`): the durable `[first..=boundary]` already IS the
-/// snapshot's prefix entry-for-entry, so re-baselining would only DESTROY durably-acked entries above
-/// the boundary — making a leader's quorum-committed entry non-durable on this replica.
+/// Receipt-time Log-Matching redundancy: an async follower whose DURABLE log tip outran its in-memory
+/// `commit` (it persisted+acked entries before learning they were committed) receives a committed
+/// snapshot at a boundary BETWEEN `commit` and `durable_index` whose boundary term MATCHES the durable
+/// entry there. `on_install_snapshot` reads the `LogStore` and short-circuits AT RECEIPT via the §5.3
+/// redundancy arm (`boundary <= durable_index` AND `term(boundary) == last_term`): the durable
+/// `[first..=boundary]` already IS the snapshot's prefix entry-for-entry, so the snapshot is never
+/// staged (no transfer, no deferred install) and re-baselining — which would only DESTROY durably-acked
+/// entries above the boundary, making a leader's quorum-committed entry non-durable on this replica — is
+/// avoided. The follower acks `max(commit, boundary)` so the leader lifts `match` past `pending` and the
+/// peer leaves `ProgressState::Snapshot`.
 ///
-/// MUTATION: revert the redundancy test to `if meta.last_index() <= self.commit { return; }`. Boundary
-/// 5 > commit 2, so the install is no longer redundant: `log.restore(5)` truncates the durable tail,
-/// `log.last_index()` drops 9 → 5, and the first assertion FAILS.
+/// MUTATION: drop the receipt guard's Log-Matching clause so `redundant` is just `boundary <=
+/// min(commit, ack_watermark())`. Boundary 5 > commit 2, so the snapshot is no longer short-circuited at
+/// receipt: it STAGES a deferred install (`pending_install.is_some()`) and the receipt ack at 5 is never
+/// sent — both assertions FAIL.
 #[test]
 fn redundant_install_below_durable_tip_keeps_the_log() {
   use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};
@@ -3166,7 +3169,8 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
       Index::new(2),
     )),
   );
-  // Flush so the tail becomes durable: durable_index == 9 while commit stays at 2.
+  // Flush so the tail becomes durable: durable_index == 9 while commit stays at 2. (This also makes
+  // term 2 durable, so the receipt ack below is sent immediately, not term-gated.)
   ep.handle_storage(d, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
@@ -3182,25 +3186,37 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
     "the durable entry at the boundary carries the leader's term 2"
   );
 
-  // Deferred install at boundary 5 (commit 2 < 5 < durable 9), carrying last_term == 2 — the SAME term
-  // as the follower's durable entry at 5. At receipt `5 > commit 2`, so it is STAGED (not short-circuited)
-  // and reaches `install_snapshot_now`.
+  // Install at boundary 5 (commit 2 < 5 <= durable 9), carrying last_term == 2 — the SAME term as the
+  // follower's durable entry at 5. At receipt `5 <= durable_index 9` AND `term(5) == 2 == last_term`, so
+  // it is SHORT-CIRCUITED: never staged, never reaching `install_snapshot_now`.
   ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(5));
   assert!(
-    ep.snapshot.pending_install.is_some(),
-    "a committed snapshot above `commit` stages a deferred install"
-  );
-
-  // SnapshotWritten fires → completion-time redundancy test: 5 <= durable 9 AND term(5)==2==last_term →
-  // DROP the install (keep the durable log), never destroying the acked tail above the boundary.
-  ep.handle_storage(d, &mut log, &mut stable);
-  while ep.poll_message().is_some() {}
-  assert!(
     ep.snapshot.pending_install.is_none(),
-    "the redundant install is dropped at completion"
+    "a snapshot already covered by the durable log is short-circuited at receipt (never staged)"
   );
 
-  // (a) The log is NOT truncated — the durable tail [6..=9] is preserved.
+  // The follower acks `max(commit 2, boundary 5) = 5` — above `pending`, so the leader lifts `match`
+  // and the peer leaves Snapshot state. Capture the last SnapshotResponse from the drain.
+  let mut acked: Option<crate::SnapshotResponse<u64>> = None;
+  while let Some(out) = ep.poll_message() {
+    if out.to() == 1u64
+      && let Message::SnapshotResponse(sr) = out.message()
+    {
+      acked = Some(*sr);
+    }
+  }
+  let sr = acked.expect("the short-circuit emits a SnapshotResponse to the leader");
+  assert!(
+    !sr.reject(),
+    "the receipt short-circuit acks, never rejects"
+  );
+  assert_eq!(
+    sr.match_index(),
+    Index::new(5),
+    "the follower acks max(commit, boundary) = 5 so the leader advances past `pending`"
+  );
+
+  // (a) The log is preserved — the durable tail [6..=9] survives (it was never staged or re-baselined).
   assert_eq!(
     log.last_index(),
     Index::new(9),
@@ -3211,7 +3227,141 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
     Index::new(1),
     "the log was not re-baselined onto the snapshot boundary"
   );
-  // (b) commit/applied are UNCHANGED — the install was dropped, not applied.
+  // (b) commit/applied are UNCHANGED — the snapshot was short-circuited, not applied.
+  assert_eq!(
+    ep.commit,
+    Index::new(2),
+    "a short-circuited snapshot must not move commit"
+  );
+  assert_eq!(
+    ep.applied,
+    Index::new(2),
+    "a short-circuited snapshot must not move applied"
+  );
+  // (c) The follower's `ack_watermark()` is still the durable tip 9: nothing raised
+  // `durable_snapshot_index` (no install ran), so the recoverable prefix is the durable log tail.
+  assert_eq!(
+    ep.ack_watermark(),
+    Index::new(9),
+    "no install ran, so the watermark stays at the durable tip"
+  );
+}
+
+/// Completion-time Log-Matching redundancy (the IN-WINDOW catch-up case the receipt guard cannot see):
+/// the snapshot's boundary is ABOVE the follower's durable tip AT RECEIPT, so the receipt short-circuit
+/// does NOT fire and the install is STAGED. Then in-window AppendEntries make the matching prefix durable
+/// PAST the boundary while the blob is in flight. `install_snapshot_now` re-checks at completion and DROPS
+/// the install via the §5.3 arm (`boundary <= durable_index` AND `term(boundary) == last_term`): the
+/// durable `[first..=boundary]` now IS the snapshot's prefix entry-for-entry, so re-baselining would only
+/// DESTROY durably-acked entries above the boundary. This is the last line of defense — the receipt guard
+/// covers the already-covered case, completion covers the caught-up-mid-transfer case.
+///
+/// MUTATION: revert BOTH the completion guard (back to `boundary <= self.commit`) AND the receipt
+/// Log-Matching clause. The install is staged at receipt (boundary 5 > durable 4) and, since boundary 5 >
+/// commit 2 at completion too, `log.restore(5)` truncates the durable tail — `log.last_index()` drops
+/// 9 → 5, losing committed-prefix-consistent durably-acked entries — so the safety assertion FAILS.
+#[test]
+fn redundant_install_caught_up_mid_transfer_dropped_at_completion() {
+  use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Durable prefix [1..=4] at the leader's term 2, with `leader_commit = 2`: the follower commits only
+  // up to 2 while making [1..=4] durable. Crucially the durable tip (4) is BELOW the incoming boundary
+  // (5), so the receipt-time guard cannot short-circuit — the install must stage.
+  let head: Vec<Entry> = (1u64..=4)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      head,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(4),
+    "head flushed → durable=4 (BELOW the incoming boundary 5)"
+  );
+  assert_eq!(ep.commit, Index::new(2), "leader_commit held commit at 2");
+
+  // Install at boundary 5: `5 > durable 4` at receipt, so the receipt guard does NOT fire — the install
+  // is STAGED as a deferred install. The blob is submitted but NOT yet drained (no `handle_storage` here).
+  ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(5));
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "a snapshot above the durable tip is staged at receipt (the receipt guard cannot see it as covered)"
+  );
+
+  // In-window AppendEntries extend the durable log to [5..=9] at term 2 — making the snapshot's matching
+  // prefix durable PAST the boundary while the blob is still in flight. (prev = (4, term 2) so the
+  // consistency check passes; the deferral window keeps the OLD log live and its appends valid.)
+  let tail: Vec<Entry> = (5u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(4),
+      Term::new(2),
+      tail,
+      Index::new(2),
+    )),
+  );
+  // ONE drain: `handle_storage` drains the LOG queue first (the [5..=9] appends raise `durable_index` to
+  // 9), THEN the STABLE queue (the snapshot's `SnapshotWritten` fires `install_snapshot_now`). So at the
+  // moment the install completes, `durable_index == 9 >= boundary 5` and `term(5) == 2 == last_term` →
+  // the install is DROPPED, never re-baselining over the durably-acked tail. (If the staged receive were
+  // instead reclaimed earlier when the durable prefix advanced, completion would be a no-op — but the
+  // SAFETY outcome below is identical regardless of which guard fired.)
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the install completed (or was reclaimed) and is no longer pending"
+  );
+
+  // SAFETY (non-negotiable): the durable tail [5..=9] survives — the log is NOT truncated to the boundary.
+  assert_eq!(
+    log.last_index(),
+    Index::new(9),
+    "the durable tail above the boundary must survive (no re-baseline, no committed-data loss)"
+  );
+  assert_eq!(
+    log.first_index(),
+    Index::new(1),
+    "the log was not re-baselined onto the snapshot boundary"
+  );
+  // commit/applied are UNCHANGED — the install was dropped, not applied.
   assert_eq!(
     ep.commit,
     Index::new(2),
@@ -3221,13 +3371,6 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
     ep.applied,
     Index::new(2),
     "a dropped install must not move applied"
-  );
-  // (c) The follower still acks its TRUE durable tip (9), never the lower boundary (5): the dropped
-  // install raised `durable_snapshot_index` to 5, but `ack_watermark()` = max(durable_index 9, 5) = 9.
-  assert_eq!(
-    ep.ack_watermark(),
-    Index::new(9),
-    "the follower acks its durable tip, not the lower (subsumed) snapshot boundary"
   );
 }
 

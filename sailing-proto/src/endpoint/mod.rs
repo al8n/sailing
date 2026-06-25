@@ -1917,7 +1917,7 @@ where
       Message::HeartbeatResponse(hr) => self.on_heartbeat_response(now, from, log, stable, hr),
       Message::ReadIndex(ri) => self.on_read_index(now, log, stable, ri),
       Message::ReadIndexResponse(r) => self.on_read_index_response(from, r),
-      Message::InstallSnapshot(is) => self.on_install_snapshot(now, stable, is),
+      Message::InstallSnapshot(is) => self.on_install_snapshot(now, log, stable, is),
       Message::SnapshotResponse(r) => self.on_snapshot_response(now, log, stable, from, r),
       Message::TimeoutNow(tn) => self.on_timeout_now(now, log, stable, tn),
       _ => {}
