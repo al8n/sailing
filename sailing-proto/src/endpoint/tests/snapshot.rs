@@ -3832,3 +3832,111 @@ fn redundant_lower_snapshot_from_newer_leader_supersedes_older_staged_receive() 
     "the newer leader is acked out of Snapshot at the redundant boundary"
   );
 }
+
+// A chunked replacement transfer must retire a superseded `pending_install` immediately. Otherwise the old
+// install's `SnapshotWritten` — delivered while the replacement is still partial — would run
+// `install_snapshot_now` for the STALE snapshot, restoring/acking superseded metadata.
+#[test]
+fn chunked_replacement_retires_the_superseded_pending_install() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Committed log [1..=5] term 2, commit 5.
+  let entries: Vec<Entry> = (1u64..=5)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(5),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  let applied_before = ep.applied;
+
+  // A single-shot install at boundary 8 (> commit) stages a DEFERRED pending install (NOT yet drained).
+  let meta1 = SnapshotMeta::new(
+    Index::new(8),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      meta1,
+      encode_count_snapshot(8),
+    )),
+  );
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "the single-shot install stages a deferred pending install"
+  );
+
+  // The FIRST chunk of a DIFFERENT, higher-boundary chunked transfer (boundary 10) supersedes it → the
+  // pending install is retired NOW, before this replacement completes.
+  let blob = encode_count_snapshot(10);
+  let meta2 = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta2,
+      blob.slice(0..blob.len() / 2),
+      0,
+      blob.len() as u64,
+    )),
+  );
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the chunked replacement retires the superseded pending install"
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the replacement transfer is staged"
+  );
+
+  // The OLD install's SnapshotWritten fires but finds no matching pending install → the stale snapshot at
+  // 8 is NOT installed (applied unchanged; the replacement transfer survives).
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    ep.applied, applied_before,
+    "the superseded install at 8 did not run (no stale restore)"
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the replacement transfer survives the stale completion"
+  );
+}
