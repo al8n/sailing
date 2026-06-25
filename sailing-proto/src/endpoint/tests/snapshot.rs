@@ -3728,3 +3728,107 @@ fn redundant_staged_chunk_reclaimed_when_durable_log_catches_up() {
     "the staged receive is reclaimed once the durable log matches through the boundary (commit < boundary)"
   );
 }
+
+// A redundant LOWER-boundary snapshot from a NEWER leader must both ack that leader out of Snapshot AND
+// discard an abandoned HIGHER-boundary partial staged by an OLDER leader — not strand its `total_len`
+// allocation. (Reclaim alone misses it: the staged boundary is not recoverable; the supersede cleanup is.)
+#[test]
+fn redundant_lower_snapshot_from_newer_leader_supersedes_older_staged_receive() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Durable [1..=9] term 2, commit 2: durable_index=9, so a boundary-5 snapshot is covered (redundant).
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(ep.durable.durable_index, Index::new(9));
+
+  // Stage a PARTIAL HIGHER-boundary receive from an OLDER leader term (3, boundary 20).
+  let blob_hi = encode_count_snapshot(20);
+  let meta_hi = SnapshotMeta::new(
+    Index::new(20),
+    Term::new(3),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(3),
+      1u64,
+      meta_hi,
+      blob_hi.slice(0..blob_hi.len() / 2),
+      0,
+      blob_hi.len() as u64,
+    )),
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "a higher-boundary partial from the older leader stages"
+  );
+
+  // A REDUNDANT LOWER-boundary install from a NEWER leader term (4, boundary 5, last_term 2 = durable term).
+  let blob_lo = encode_count_snapshot(5);
+  let meta_lo = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(Term::new(4), 1u64, meta_lo, blob_lo)),
+  );
+
+  // The stale higher-boundary staging is discarded IMMEDIATELY, not stranded until a later catch-up to 20
+  // / supersede / restart.
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "the abandoned older higher-boundary staging is discarded, not stranded"
+  );
+  // The newer leader is acked out of Snapshot at the boundary. The ack is term-gated (the newer leader's
+  // term is not yet durable), so flush to release it, then observe it.
+  ep.handle_storage(d, &mut log, &mut stable);
+  let mut snapshot_ack = None;
+  while let Some(m) = ep.poll_message() {
+    if let Message::SnapshotResponse(r) = m.message() {
+      snapshot_ack = Some(r.match_index());
+    }
+  }
+  assert_eq!(
+    snapshot_ack,
+    Some(Index::new(5)),
+    "the newer leader is acked out of Snapshot at the redundant boundary"
+  );
+}

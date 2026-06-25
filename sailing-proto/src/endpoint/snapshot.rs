@@ -364,6 +364,23 @@ where
       false
     };
     if redundant {
+      // Apply the SAME leader-aware staged-receive cleanup as the supersede path BEFORE acking, so the ack
+      // never lifts the leader out of Snapshot while an abandoned partial stays staged (the `reclaim` above
+      // only frees a staged receive whose OWN boundary is recoverable — NOT a higher-boundary one a newer
+      // leader's redundant lower snapshot supersedes). A same-leader HIGHER-boundary staged receive means
+      // this redundant snapshot is a stale LOWER-boundary reorder of an in-flight authoritative transfer:
+      // keep it and don't ack a regressive boundary over it.
+      if matches!(
+        &self.snapshot.snapshot_recv,
+        Some(r) if r.sender_term == is.term() && r.meta.last_index() > meta.last_index()
+      ) {
+        return;
+      }
+      // Otherwise the staged receive (if any) is moot or superseded → discard its buffer. Unconditional
+      // (not gated on `snapshot_recv.is_some()`): a store that persisted staging across a restart holds it
+      // WITHOUT a `snapshot_recv` to track.
+      self.snapshot.snapshot_recv = None;
+      stable.discard_snapshot_staging();
       let leader = is.leader();
       self.send_or_gate_snapshot_ack(leader, core::cmp::max(self.commit, meta.last_index()));
       return;
