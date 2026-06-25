@@ -3478,3 +3478,151 @@ fn divergent_install_below_durable_tip_still_rebaselines() {
     "durable_index RESET to the boundary (the divergent tail was discarded)"
   );
 }
+
+// A fatal `term(boundary)` read during the redundancy proof is a STORAGE failure, not a mismatch — it
+// must poison (`PoisonReason::LogTerm`), never silently fall through (which at receipt would stage a
+// redundant transfer, and at completion would drive the destructive `log.restore` on unreadable state).
+#[test]
+fn snapshot_redundancy_term_read_failure_poisons_at_receipt() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, PoisonReason, Term,
+    testkit::{AsyncStable, CountSm, FailTermLog},
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  // Durable [1..=9] term 2, commit 2: durable_index=9 >= the incoming boundary 5, so the Log-Matching
+  // clause is reached. Append + flush BEFORE arming the fault (the append path reads only its prev term).
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(ep.durable.durable_index, Index::new(9));
+
+  // Arm the fatal boundary term-read, then deliver the install: the receipt redundancy proof read fails.
+  log.fail_term_at(Some(Index::new(5)));
+  ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(5));
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::LogTerm),
+    "a fatal boundary term-read at receipt poisons, never silently 'not redundant'"
+  );
+}
+
+#[test]
+fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, PoisonReason, Term,
+    testkit::{AsyncStable, CountSm, FailTermLog},
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  // Durable [1..=4], commit 2: durable_index=4 < boundary 5 at receipt, so the install STAGES.
+  let head: Vec<Entry> = (1u64..=4)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      head,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(5));
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "below the boundary at receipt → stages"
+  );
+
+  // In-window appends extend the durable log past the boundary; arm the fault before the completion drains.
+  let tail: Vec<Entry> = (5u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(4),
+      Term::new(2),
+      tail,
+      Index::new(2),
+    )),
+  );
+  log.fail_term_at(Some(Index::new(5)));
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::LogTerm),
+    "a fatal boundary term-read at completion poisons, never falls through to the destructive restore"
+  );
+}
