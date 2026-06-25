@@ -478,6 +478,14 @@ where
       // UNCONDITIONALLY (not gated on `snapshot_recv.is_some()`): a store that persisted staging across a
       // restart has orphaned it WITHOUT a `snapshot_recv` to track, so a gate would miss it.
       stable.discard_snapshot_staging();
+      // Retire a superseded COMPLETED install NOW, before staging the replacement. This fresh transfer
+      // passed the duplicate-install guard, so any `pending_install` is at a same-or-lower boundary AND a
+      // DIFFERENT identity — this snapshot supersedes it. Left live, its in-flight `SnapshotWritten` would
+      // complete `install_snapshot_now` for the STALE snapshot while THIS replacement is still partial,
+      // restoring/acking superseded metadata. The single-shot path retires it by overwriting in the same
+      // dispatch; a chunked replacement (which defers its own install) must clear it explicitly. The
+      // orphaned durable blob is harmless — a later `maybe_compact`/restart reconciles it.
+      self.snapshot.pending_install = None;
       self.snapshot.snapshot_recv = Some(SnapshotRecv {
         meta: meta.clone(),
         total_len,
