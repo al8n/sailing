@@ -543,11 +543,28 @@ where
       .lease_guard
       .max_unwalled_lease_window
       .max(meta.max_unwalled_lease_window());
-    // Completion-time staleness re-check (mirror the receipt-time guard): in-window AppendEntries can
-    // have caught this follower up to/past the boundary while the blob was in flight. Installing now
-    // would REGRESS committed/applied state, so DROP the deferred install (the durable blob is harmless;
-    // a later `maybe_compact`/restart reconciles it). `pending_install` was already taken by the caller.
-    if meta.last_index() <= self.commit {
+    // Completion-time redundancy re-check (the LAST line of defense before the destructive `log.restore`).
+    // In-window AppendEntries can have caught this follower up to/PAST the boundary while the blob was in
+    // flight — and the durable log tip can outrun the in-memory `commit` (an async follower makes entries
+    // durable, and acks them, before it learns they are committed). DROP the deferred install (keep the
+    // durable log) when the follower's durable log ALREADY holds the snapshot's committed prefix, proven
+    // two ways:
+    //   (a) `boundary <= commit` — committed history is never divergent, so the durable log holds it; OR
+    //   (b) `boundary <= durable_index` AND the durable entry at `boundary` carries the snapshot's term —
+    //       Log Matching (§5.3): same index+term ⇒ our durable `[first..=boundary]` IS the snapshot's
+    //       prefix entry-for-entry, so installing would ONLY destroy durably-acked entries above it (the
+    //       non-quorum-durable-commit hole: re-baselining over a longer, consistent, already-acked tail).
+    // A DIFFERENT term at the boundary (or a boundary above the durable tip) ⇒ a divergent / short durable
+    // tail ⇒ NOT redundant ⇒ fall through and re-baseline. `durable_snapshot_index` was raised to the
+    // boundary above, so a dropped install is still acked via `ack_watermark()` (the follower reports its
+    // TRUE durable tip, never this lower boundary). The restart path enforces the identical invariant in
+    // `reconcile_restart_log`; this brings the runtime install path to parity. A fatal `term` read fails
+    // the equality (installs) — the safe direction, since re-baselining onto a quorum-committed boundary
+    // never loses data, only dropping a NEEDED install would.
+    let redundant = meta.last_index() <= self.commit
+      || (meta.last_index() <= self.durable.durable_index
+        && log.term(meta.last_index()).ok() == Some(meta.last_term()));
+    if redundant {
       return;
     }
 
