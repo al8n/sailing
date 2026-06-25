@@ -76,6 +76,27 @@ fn become_snapshot_records_pending_index() {
 }
 
 #[test]
+fn become_snapshot_at_or_below_match_reprobes_instead_of_wedging() {
+  // A peer whose `match_index` already covers the snapshot boundary must NOT enter Snapshot state.
+  // Once in Snapshot with `match >= pending` it would wedge forever: `resend_snapshot` only re-sends to
+  // a peer BEHIND `pending`, and a paused peer receives no append, so no ack ever arrives to drive
+  // `maybe_update` out of Snapshot. Re-probe from `match + 1` and resume append replication instead.
+  let mut p = Progress::new(Index::new(5), 256, 0);
+  p.maybe_update(Index::new(615)); // confirmed replicated through 615
+  p.become_snapshot(Index::new(583)); // boundary 583 is already covered by match 615
+  assert!(
+    p.state().is_probe(),
+    "a peer whose match is past the boundary must re-probe, not wedge in Snapshot"
+  );
+  assert!(!p.is_paused());
+  // The boundary-equal case is equally redundant and must also re-probe.
+  let mut q = Progress::new(Index::new(5), 256, 0);
+  q.maybe_update(Index::new(583));
+  q.become_snapshot(Index::new(583));
+  assert!(q.state().is_probe());
+}
+
+#[test]
 fn snapshot_acked_tracks_the_followers_watermark() {
   let mut p = Progress::new(Index::new(1), 256, 0);
   p.become_snapshot(Index::new(10));
