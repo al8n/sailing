@@ -1,6 +1,6 @@
 #![allow(missing_docs)]
 use sailing_proto::Index;
-use sailing_simulation::Cluster;
+use sailing_simulation::{Cluster, StorageFaults};
 
 /// Low snapshot threshold for simulation tests: triggers compaction after a modest
 /// number of proposals so tests run fast without hundreds of entries.
@@ -189,5 +189,109 @@ fn restart_after_snapshot_preserves_state() {
   assert!(
     c.agreement_holds(),
     "agreement must hold after restart-from-snapshot"
+  );
+}
+
+/// A COLD snapshot read (the store reports the resident blob as NOT paged in —
+/// `SnapshotChunkRead::Pending`) must only DELAY a chunked `InstallSnapshot` transfer, NEVER wedge it:
+/// the leader's send DEFERS (emits nothing, mutates no progress) and the heartbeat `resend_snapshot`
+/// re-drives it on a later round, so a transient-cold store still completes the transfer.
+///
+/// This drives the EXACT chunked-snapshot catch-up of `lagging_follower_catches_up_via_snapshot` but
+/// with `cold_fetch_per_mille > 0` on every node's stable store, so a fraction of `snapshot_chunk`
+/// reads return `Pending` MID-TRANSFER. The far-behind follower must STILL install the snapshot and
+/// catch up, the transfer must be MULTI-chunk (small `snapshot_chunk_bytes`), and a cold snapshot read
+/// must actually have FIRED (non-vacuity). The per-tick safety-oracle suite (agreement, quorum-durable
+/// commit, durable-prefix, …) runs inside every `tick` and panics on any violation, so reaching
+/// convergence without a panic proves the deferral preserved safety throughout. A clean single-leader
+/// catch-up (one isolated follower, no election churn) keeps the cluster on one quorum the whole time.
+#[test]
+fn cold_snapshot_read_delays_but_does_not_wedge_catch_up() {
+  // ~25% of `snapshot_chunk` reads return Pending — high enough that a multi-chunk transfer hits at
+  // least one cold read mid-flight, low enough that the per-heartbeat re-drive completes it briskly.
+  const COLD_PER_MILLE: u16 = 250;
+  let mut c = Cluster::new_async_with(
+    3,
+    /* seed */ 0xC01D,
+    |cfg| cfg.with_snapshot_threshold(SNAP_THRESHOLD),
+  );
+  // Arm the cold-snapshot fault on every node (it is rolled on the `&self` `snapshot_chunk` read).
+  for id in 0..3u64 {
+    let faults = StorageFaults {
+      cold_fetch_per_mille: COLD_PER_MILLE,
+      ..StorageFaults::none()
+    };
+    c.set_node_faults(id, faults, 0xC01D ^ id);
+  }
+
+  assert!(
+    c.run_until(2_000, |c| c.leader_count() == 1),
+    "a leader must emerge"
+  );
+  let leader = c.leader().unwrap();
+  let isolated = (0..3u64).find(|&n| n != leader).unwrap();
+
+  // Isolate one follower, then commit far enough that the leader compacts PAST its next index, so the
+  // follower can only catch up via a (multi-chunk) InstallSnapshot once healed.
+  c.isolate(isolated);
+  for i in 0u32..20 {
+    let payload = i.to_le_bytes();
+    assert!(c.propose(&payload).is_some(), "propose {i} must succeed");
+    c.run_until(30, |_| false);
+  }
+  c.run_until(300, |_| false);
+  assert!(
+    c.first_index_of(leader) > Index::new(1),
+    "leader log must be compacted before healing (first_index={:?})",
+    c.first_index_of(leader)
+  );
+
+  // Heal and converge. The budget is generous BECAUSE cold reads defer chunks (each re-driven on the
+  // next heartbeat) — a cold read may only DELAY the transfer. If the follower never catches up here,
+  // the transfer WEDGED (the deferred send was not re-driven) — a real bug, surfaced as this failure.
+  c.heal(isolated);
+  assert!(
+    c.run_until(8_000, |c| c.agreement_holds() && c.min_applied_len() >= 15),
+    "the lagging follower must catch up via a cold (deferred) snapshot transfer and the cluster must \
+     agree on >= 15 entries — a cold read must DELAY, never WEDGE (snapshot_install_count={}, \
+     multi_chunk_deliveries={}, cold_snapshot_reads={})",
+    c.snapshot_install_count(isolated),
+    c.multi_chunk_deliveries(),
+    c.total_cold_snapshot_reads(),
+  );
+
+  // The catch-up went through InstallSnapshot, and was MULTI-chunk (small snapshot_chunk_bytes).
+  assert!(
+    c.snapshot_install_count(isolated) >= 1,
+    "the lagging follower (node {isolated}) must have installed at least one snapshot \
+     (snapshot_install_count={})",
+    c.snapshot_install_count(isolated)
+  );
+  assert!(
+    c.multi_chunk_deliveries() >= 1,
+    "the snapshot catch-up must be MULTI-chunk (a delivered InstallSnapshot with offset > 0); \
+     multi_chunk_deliveries={}",
+    c.multi_chunk_deliveries()
+  );
+
+  // NON-VACUITY: a cold snapshot read must actually have fired during the transfer — otherwise the
+  // "delays but does not wedge" claim is vacuous (the cold path was never on the critical path).
+  assert!(
+    c.total_cold_snapshot_reads() > 0,
+    "no cold (Pending) snapshot-chunk read fired during the transfer — the cold-snapshot fault never \
+     armed on `snapshot_chunk`, so the no-wedge proof is vacuous (cold_snapshot_reads={})",
+    c.total_cold_snapshot_reads()
+  );
+
+  assert!(
+    c.agreement_holds(),
+    "agreement must hold after the cold (deferred) snapshot catch-up"
+  );
+
+  std::eprintln!(
+    "cold-snapshot catch-up: cold_snapshot_reads={} multi_chunk_deliveries={} snapshot_installs={}",
+    c.total_cold_snapshot_reads(),
+    c.multi_chunk_deliveries(),
+    c.snapshot_install_count(isolated),
   );
 }

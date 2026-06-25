@@ -32,8 +32,8 @@
 //! stays deterministic without changing the trait signature.
 use bytes::Bytes;
 use sailing_proto::{
-  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotMeta,
-  StableDone, StableStore, Term,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotChunkRead,
+  SnapshotMeta, StableDone, StableStore, Term,
 };
 use std::{cell::Cell, collections::VecDeque, vec::Vec};
 
@@ -690,6 +690,14 @@ pub struct MemStable<I> {
   faults: StorageFaults,
   /// Write-side fault PRNG (drives `torn_write` at `flush`). Deterministic given the seed.
   prng: FaultPrng,
+  /// Read-side fault PRNG (drives `cold_fetch` on the `&self` `snapshot_chunk` read). Deterministic
+  /// given the seed; a distinct stream from the `MemLog` read PRNG so a node's log-read and
+  /// snapshot-read fault schedules do not alias.
+  read_prng: ReadFaultPrng,
+  /// Count of COLD (`SnapshotChunkRead::Pending`) snapshot-chunk reads returned — interior-mutable (the
+  /// read is `&self`) so the cold-snapshot coverage can assert non-vacuity. `0` unless
+  /// `cold_fetch_per_mille > 0`.
+  cold_snapshot_reads: Cell<u64>,
   /// Chunked-snapshot staging accumulator (one in-flight transfer at a time).
   snapshot_staging: Option<(SnapshotMeta<I>, sailing_proto::SnapshotStaging)>,
   /// Optional staging-capacity cap (bytes); a `total_len` beyond it fails `accept_snapshot_chunk`,
@@ -719,6 +727,8 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
       in_flight: Vec::new(),
       faults: StorageFaults::none(),
       prng: FaultPrng::default(),
+      read_prng: ReadFaultPrng::default(),
+      cold_snapshot_reads: Cell::new(0),
       snapshot_staging: None,
       staging_cap: None,
     }
@@ -731,6 +741,7 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     Self {
       mode: StoreMode::Async,
       prng: FaultPrng::new(seed),
+      read_prng: ReadFaultPrng::new(seed ^ 0xA5A5_A5A5_A5A5_A5A5),
       ..Self::new()
     }
   }
@@ -757,10 +768,18 @@ impl<I: sailing_proto::NodeId> MemStable<I> {
     self.mode
   }
 
-  /// Install a seeded fault config (defaults are all-off). Re-seeds the write-side fault PRNG.
+  /// Install a seeded fault config (defaults are all-off). Re-seeds both the write-side and the
+  /// snapshot-read-side fault PRNGs so the fault schedule is reproducible from `seed`.
   pub fn set_faults(&mut self, faults: StorageFaults, seed: u64) {
     self.faults = faults;
     self.prng = FaultPrng::new(seed);
+    self.read_prng.reseed(seed ^ 0xA5A5_A5A5_A5A5_A5A5);
+  }
+
+  /// Total COLD (`SnapshotChunkRead::Pending`) snapshot-chunk reads returned so far — the
+  /// cold-snapshot coverage non-vacuity signal. `0` unless `cold_fetch_per_mille > 0`.
+  pub fn cold_snapshot_reads(&self) -> u64 {
+    self.cold_snapshot_reads.get()
   }
 
   /// Async mode: make the in-flight (already-visible) writes DURABLE by snapshotting the visible
@@ -873,6 +892,36 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
 
   fn snapshot(&self) -> Option<(SnapshotMeta<I>, Bytes)> {
     self.snapshot.clone()
+  }
+
+  fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<I>, u64, SnapshotChunkRead), Self::Error>> {
+    // Read the VISIBLE snapshot slot (matching `snapshot()` — the slot the sender streams from). The
+    // resident blob IS in RAM, but a seeded COLD-read fault (off by default) reports the requested run as
+    // NOT resident, exactly as a disk/mmap store does when the run has not been paged in: return
+    // `Pending`, mutating no progress, so the sender defers and re-drives on the heartbeat `resend_snapshot`.
+    // The SAME `cold_fetch_per_mille` rate and the SAME `&self`-safe read-PRNG mechanism the committed-range
+    // `LogStore::entries` cold path uses (a distinct stream so the two schedules do not alias). A cold read
+    // must only DELAY a transfer, never wedge it — the deferral is re-driven each heartbeat round.
+    self.snapshot.as_ref().map(|(meta, blob)| {
+      let total = blob.len() as u64;
+      if self.read_prng.fires(self.faults.cold_fetch_per_mille) {
+        self
+          .cold_snapshot_reads
+          .set(self.cold_snapshot_reads.get().wrapping_add(1));
+        return Ok((meta.clone(), total, SnapshotChunkRead::Pending));
+      }
+      let start = offset.min(total) as usize;
+      let end = offset.saturating_add(len).min(total) as usize;
+      Ok((
+        meta.clone(),
+        total,
+        SnapshotChunkRead::Ready(blob.slice(start..end)),
+      ))
+    })
   }
 
   fn durable_snapshot(&self) -> Option<SnapshotMeta<I>> {

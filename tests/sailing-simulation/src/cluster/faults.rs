@@ -78,6 +78,12 @@ impl Cluster {
     self.logs.iter().map(|l| l.cold_reads()).sum()
   }
 
+  /// Total COLD (`SnapshotChunkRead::Pending`) snapshot-chunk reads returned across all node stable
+  /// stores — the cold-snapshot coverage non-vacuity signal (summed at run end into the report).
+  pub fn total_cold_snapshot_reads(&self) -> u64 {
+    self.stables.iter().map(|s| s.cold_snapshot_reads()).sum()
+  }
+
   /// Install a seeded [`NetworkFaults`] config on the typed-message bus: per-message
   /// latency/jitter/drop/duplicate/reorder applied at the bus-push point in [`tick`](Self::tick),
   /// AFTER the structural oracles run. Faults are deterministic given the cluster seed (the network
