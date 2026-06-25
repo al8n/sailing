@@ -908,6 +908,16 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
     // must only DELAY a transfer, never wedge it — the deferral is re-driven each heartbeat round.
     self.snapshot.as_ref().map(|(meta, blob)| {
       let total = blob.len() as u64;
+      // EOF / over-cursor is the transfer's completion signal (`Ready(empty)`), not a fetchable run, so a
+      // cold fault must NEVER delay it: a stale cursor at/past the end under an always-cold fault would
+      // otherwise return `Pending` forever — the sender never delivers the empty tail and the peer wedges.
+      if offset >= total || len == 0 {
+        return Ok((
+          meta.clone(),
+          total,
+          SnapshotChunkRead::Ready(bytes::Bytes::new()),
+        ));
+      }
       if self.read_prng.fires(self.faults.cold_fetch_per_mille) {
         self
           .cold_snapshot_reads
@@ -998,3 +1008,45 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod snapshot_chunk_eof_tests {
+  use super::*;
+  use sailing_proto::{ConfState, Index, OpId, SnapshotMeta, StableStore, Term};
+
+  // A stale over-cursor (offset at/past `total`) must get the empty-tail EOF even under an ALWAYS-cold
+  // fault. The cold fault may only DELAY a fetchable run; delaying EOF would mean the sender never
+  // delivers the empty tail, the follower never reports its true watermark, and the peer wedges in Snapshot.
+  #[test]
+  fn cold_snapshot_chunk_returns_eof_before_a_cold_fault() {
+    let mut s: MemStable<u64> = MemStable::new();
+    let meta = SnapshotMeta::new(
+      Index::new(8),
+      Term::new(1),
+      ConfState::from_voters(std::vec![1u64, 2, 3]),
+    );
+    let blob = Bytes::from_static(b"snapshot-bytes");
+    let total = blob.len() as u64;
+    s.submit_snapshot(OpId::new(1), meta, blob);
+    while s.poll().is_some() {}
+    s.set_faults(
+      StorageFaults {
+        cold_fetch_per_mille: 1000,
+        ..StorageFaults::none()
+      },
+      0,
+    );
+    // Over-cursor under always-cold: EOF (`Ready(empty)`), NOT `Pending`.
+    let (_, _, read) = s.snapshot_chunk(total + 16, 16).unwrap().unwrap();
+    assert!(
+      matches!(read, SnapshotChunkRead::Ready(ref b) if b.is_empty()),
+      "an over-cursor must return the empty-tail EOF even when the cold fault is armed"
+    );
+    // A genuine in-range read under always-cold still DEFERS — the fault applies below EOF.
+    let (_, _, read2) = s.snapshot_chunk(0, 4).unwrap().unwrap();
+    assert!(
+      matches!(read2, SnapshotChunkRead::Pending),
+      "an in-range read under an always-cold fault must still defer"
+    );
+  }
+}

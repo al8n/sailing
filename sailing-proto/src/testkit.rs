@@ -745,7 +745,11 @@ impl StableStore for AsyncStable {
   ) -> Option<Result<(SnapshotMeta<u64>, u64, SnapshotChunkRead), Self::Error>> {
     self.snapshot.as_ref().map(|(meta, blob)| {
       let total = blob.len() as u64;
-      let read = if self.cold_snapshot {
+      let read = if offset >= total || len == 0 {
+        // EOF / over-cursor is the transfer's completion signal (`Ready(empty)`), not a fetchable run — a
+        // cold report must NEVER delay it, or a stale over-cursor would defer forever and wedge the peer.
+        SnapshotChunkRead::Ready(bytes::Bytes::new())
+      } else if self.cold_snapshot {
         // The blob is resident in this in-RAM store, but report it as COLD so the sender must defer —
         // exactly what a disk/mmap store does when the requested run has not been paged in.
         SnapshotChunkRead::Pending
