@@ -524,11 +524,21 @@ where
         }
         // Current-term-commit gate.
         if !self.has_current_term_commit(log) {
+          // A fatal term read in the gate poisons (it funnels LogStore::term through log_term): a poisoned
+          // node suppresses events, so no ReadState could ever be emitted. Reject rather than defer-and-Ok,
+          // which would promise an acknowledgement that never arrives.
+          if self.poison.poisoned {
+            return Err(ReadIndexError::Poisoned);
+          }
           // Defer until the no-op commits.
           self.reads.pending_reads.push((context, None));
           return Ok(());
         }
         self.do_leader_read(now, log, context, None);
+        // do_leader_read can poison on a fatal log/apply read → reject rather than report Ok.
+        if self.poison.poisoned {
+          return Err(ReadIndexError::Poisoned);
+        }
         Ok(())
       }
       Role::Follower => {
@@ -627,6 +637,11 @@ where
     }
     // Current-term-commit gate (same as the local path).
     if !self.has_current_term_commit(log) {
+      // A fatal term read in the gate poisons; a poisoned node never emits a ReadState, so don't defer the
+      // read (mutating read state on a dead node) — just stop.
+      if self.poison.poisoned {
+        return;
+      }
       self.reads.pending_reads.push((context, Some(from)));
       return;
     }
