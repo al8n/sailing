@@ -1341,7 +1341,7 @@ fn leader_processes_snapshot_response_success_and_reject() {
 
   // Manually put peer 2 into Snapshot(10) state.
   if let Some(p) = ep.tracker.progress_mut(&2u64) {
-    p.become_snapshot(Index::new(10));
+    p.become_snapshot(Index::new(10), 9);
   }
   assert!(ep.tracker.progress(&2u64).unwrap().state().is_snapshot());
 
@@ -1364,7 +1364,7 @@ fn leader_processes_snapshot_response_success_and_reject() {
   );
 
   if let Some(p) = ep.tracker.progress_mut(&2u64) {
-    p.become_snapshot(Index::new(10));
+    p.become_snapshot(Index::new(10), 9);
   }
   // Drain any messages from the probe that was triggered by the reject.
   while ep.poll_message().is_some() {}
@@ -2518,7 +2518,7 @@ fn cold_snapshot_chunk_read_defers_the_send() {
   // Drive peer 2 into Snapshot state for the persisted boundary, then drop anything emitted in setup so
   // the next poll observes only what THIS send produces.
   if let Some(p) = ep.tracker.progress_mut(&2u64) {
-    p.become_snapshot(Index::new(offset));
+    p.become_snapshot(Index::new(offset), 9);
   }
   while ep.poll_message().is_some() {}
   let progress_before = ep.tracker.progress(&2u64).unwrap().state();
@@ -2605,7 +2605,7 @@ fn chunked_install_frame_stays_under_limit_with_large_metadata() {
   let blob = bytes::Bytes::from(std::vec![0u8; 60 * 1024 * 1024]);
   stable.submit_snapshot(OpId::new(1), meta, blob);
   if let Some(p) = ep.tracker.progress_mut(&1u64) {
-    p.become_snapshot(Index::new(10));
+    p.become_snapshot(Index::new(10), 60 * 1024 * 1024);
   }
   let _ = ep.send_snapshot_chunk(1u64, &stable, 0);
   let out = core::iter::from_fn(|| ep.poll_message())
@@ -2648,7 +2648,7 @@ fn unsendable_oversized_metadata_emits_no_chunk() {
   let blob = bytes::Bytes::from(std::vec![0u8; 1024]); // the BLOB is tiny — the METADATA is what's oversized
   stable.submit_snapshot(OpId::new(1), meta, blob);
   if let Some(p) = ep.tracker.progress_mut(&1u64) {
-    p.become_snapshot(Index::new(10));
+    p.become_snapshot(Index::new(10), 1024);
   }
   let _ = ep.send_snapshot_chunk(1u64, &stable, 0);
   assert!(
@@ -4165,7 +4165,7 @@ fn send_snapshot_chunk_validates_malformed_store_ready() {
   {
     let (mut ep, _log, mut stable) = make_leader_with_compacted_log(offset, 2);
     if let Some(p) = ep.tracker.progress_mut(&2u64) {
-      p.become_snapshot(Index::new(offset));
+      p.become_snapshot(Index::new(offset), 9);
     }
     while ep.poll_message().is_some() {}
     stable.malformed_in_range_empty = true;
@@ -4180,7 +4180,7 @@ fn send_snapshot_chunk_validates_malformed_store_ready() {
   {
     let (mut ep, _log, mut stable) = make_leader_with_compacted_log(offset, 2);
     if let Some(p) = ep.tracker.progress_mut(&2u64) {
-      p.become_snapshot(Index::new(offset));
+      p.become_snapshot(Index::new(offset), 9);
     }
     while ep.poll_message().is_some() {}
     stable.malformed_overlong = true;
@@ -4256,7 +4256,8 @@ fn receiver_handles_eof_empty_chunk_without_pinning_staging() {
     )
   };
 
-  // A FRESH EOF-empty chunk starts no transfer and pins no staging — it is dropped.
+  // A FRESH EOF-empty chunk starts no transfer and pins no staging, but re-acks the TRUE watermark (0) so the
+  // leader re-syncs and restarts at offset 0 rather than resending the same empty tail forever.
   {
     let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
     ep.handle_message(
@@ -4282,9 +4283,14 @@ fn receiver_handles_eof_empty_chunk_without_pinning_staging() {
       ep.snapshot.snapshot_recv.is_none(),
       "a fresh EOF-empty starts no transfer — no staging pinned"
     );
-    assert!(
-      ep.poll_message().is_none(),
-      "no ack for a fresh EOF-empty (nothing to re-sync)"
+    let acked = core::iter::from_fn(|| ep.poll_message()).find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(r.acked_through()),
+      _ => None,
+    });
+    assert_eq!(
+      acked,
+      Some(0),
+      "a fresh EOF-empty re-acks the true watermark 0 (restart, not a stranding drop)"
     );
   }
 
