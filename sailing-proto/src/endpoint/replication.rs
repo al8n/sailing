@@ -1,4 +1,4 @@
-use super::*;
+use super::{snapshot::ChunkSend, *};
 use crate::{
   AppendEntries, AppendResponse, Entry, Heartbeat, HeartbeatResponse, MaybeOwned, ProgressState,
   ProposeError,
@@ -171,7 +171,11 @@ where
       if let Some((meta, _)) = stable.snapshot() {
         let pending = meta.last_index();
         // Send the FIRST chunk (offset 0); the per-ack pump in `on_snapshot_response` streams the rest.
-        let sent = self.send_snapshot_chunk(peer.cheap_clone(), stable, 0);
+        let send = self.send_snapshot_chunk(peer.cheap_clone(), stable, 0);
+        // A FATAL store read poisons the node → bail before mutating progress or pacing on a dead node.
+        if matches!(send, ChunkSend::Poisoned) {
+          return;
+        }
         if let Some(p) = self.tracker.progress_mut(&peer) {
           p.become_snapshot(pending);
         }
@@ -180,16 +184,14 @@ where
         // `on_heartbeat_response` from re-sending the very blob this call just emitted (the heartbeat pump
         // can be what triggers the initial install, in the SAME response handling), and (b) overwrites any
         // stale deadline left from a previous install window. If the first chunk DEFERRED (a cold store
-        // returned `Pending`), leave the deadline unset so the next heartbeat retries immediately rather
+        // returned `Pending`), CLEAR any stale deadline so the next heartbeat retries immediately rather
         // than waiting a full election timeout for the cold blob to warm.
-        if sent {
+        if matches!(send, ChunkSend::Sent) {
           self
             .snapshot
             .snapshot_resend_after
             .insert(peer, now.mono() + self.config.election_timeout());
         } else {
-          // Deferred (cold) first chunk: clear any stale deadline left from a previous install window so
-          // the next heartbeat retries immediately rather than honoring a lingering future deadline.
           self.snapshot.snapshot_resend_after.remove(&peer);
         }
       }
@@ -990,15 +992,20 @@ where
         .get(&from)
         .is_none_or(|&after| now.mono() >= after);
       if due {
-        // Arm the resend-pacing deadline ONLY on a real send. If the resend DEFERRED (a cold store
-        // returned `Pending`), leave the deadline due so the NEXT heartbeat retries immediately, instead
-        // of suppressing retries for a full election timeout per cold chunk (which would stall catch-up
-        // and risk leaving a voter in Snapshot long enough to threaten quorum).
-        if self.resend_snapshot(from.cheap_clone(), stable) {
-          self.snapshot.snapshot_resend_after.insert(
-            from.cheap_clone(),
-            now.mono() + self.config.election_timeout(),
-          );
+        // Arm the resend-pacing deadline ONLY on a real send. A benign DEFER (cold `Pending`) leaves the
+        // already-due deadline so the NEXT heartbeat retries immediately, instead of suppressing retries
+        // for a full election timeout per cold chunk (which would stall catch-up and risk leaving a voter
+        // in Snapshot long enough to threaten quorum). A fatal store read POISONS → bail before the
+        // ReadIndex path below records acks / sends on a dead node.
+        match self.resend_snapshot(from.cheap_clone(), stable) {
+          ChunkSend::Sent => {
+            self.snapshot.snapshot_resend_after.insert(
+              from.cheap_clone(),
+              now.mono() + self.config.election_timeout(),
+            );
+          }
+          ChunkSend::Deferred => {}
+          ChunkSend::Poisoned => return,
         }
       }
     } else {
