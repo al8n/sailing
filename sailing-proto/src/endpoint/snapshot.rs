@@ -545,9 +545,15 @@ where
     // snapshot with the SAME (last_index, last_term, conf) and length is a DISTINCT capture, not a
     // continuation — appending its chunks into the old leader's staging would MIX bytes from two
     // independently-captured snapshots (the StateMachine contract does not promise byte-identical encodings
-    // across leaders for the same applied state). A mismatch routes to the supersede/replace path below.
-    // (The LeaseGuard / read-mode bounds are folded ungated above and may legitimately differ between
-    // same-boundary snapshots, so they are NOT part of the identity.)
+    // across leaders for the same applied state). A SAME-term recapture at the same boundary is impossible by
+    // construction — a leader snapshots only its own monotone `applied`, `maybe_snapshot` is single-flight,
+    // and compaction advances `first_index` PAST the boundary — so `sender_term` discriminates EXACTLY the
+    // cross-leader recapture, the only way the (boundary, total_len) resume identity can collide. This term
+    // key, checked HERE in the core BEFORE staging, is what bounds byte-mixing — NOT the store's staging key,
+    // which omits the term (`discard_snapshot_staging` runs before the first accept of any differing term).
+    // A mismatch routes to the supersede/replace path below. (The LeaseGuard / read-mode bounds are folded
+    // ungated above and may legitimately differ between same-boundary snapshots, so they are NOT part of the
+    // identity.)
     let continues = matches!(
       &self.snapshot.snapshot_recv,
       Some(r) if r.sender_term == is.term() && r.meta.identity_eq(meta) && r.total_len == total_len

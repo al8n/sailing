@@ -437,6 +437,16 @@ pub trait StableStore {
   /// store by disk, an in-RAM store by RAM) and returns `Err` on capacity exhaustion — the core treats that
   /// as fatal (a node crash → CFT failover), NOT a protocol-level cap.
   ///
+  /// The staging key is `(meta.last_index(), total_len)` and DELIBERATELY EXCLUDES the sender's term — the
+  /// store cannot see it. Two leaders may capture the SAME `(last_index, total_len)` at DIFFERENT terms with
+  /// byte-DIFFERENT blobs (the `StateMachine` does not promise byte-identical encodings across leaders), so a
+  /// store MUST NOT treat a same-key sequence spanning a leadership change as one transfer. The CORE
+  /// guarantees that can never reach the store: its receiver transfer identity DOES include `sender_term`,
+  /// and it calls [`discard_snapshot_staging`](Self::discard_snapshot_staging) BEFORE the first
+  /// `accept_snapshot_chunk` of any differing-term capture — so one staging buffer only ever holds a single
+  /// term's bytes. A store relies on that ordering for cross-term separation; do NOT key staging on content
+  /// to compensate.
+  ///
   /// The returned contiguous offset drives IN-SESSION resume — a lost chunk re-sends from it, not from `0`.
   /// Staging is VOLATILE across RESTART, however: a store MAY persist it internally, but the core does NOT
   /// resume a partial across a crash (no recovery API restores the transfer identity) — it calls
