@@ -158,7 +158,16 @@ where
     } else {
       match stable.snapshot_chunk(start, chunk_len) {
         None => return ChunkSend::Deferred,
-        Some(Ok((_, _, read))) => read,
+        // The re-read MUST be the same snapshot: a store that swapped the blob between the two reads would
+        // otherwise pair the FIRST read's meta/total with the SECOND read's bytes. Reject the inconsistency
+        // rather than send a frame whose meta and data disagree.
+        Some(Ok((meta2, total2, read))) => {
+          if total2 != total || !meta2.identity_eq(&meta) {
+            self.poison(PoisonReason::SnapshotRead);
+            return ChunkSend::Poisoned;
+          }
+          read
+        }
         Some(Err(_)) => {
           self.poison(PoisonReason::SnapshotRead);
           return ChunkSend::Poisoned;
@@ -166,10 +175,23 @@ where
       }
     };
     let data = match chunk_read {
-      // Trim to the frame budget — normally a no-op (`chunk_len >= bytes.len()`); it fires only when a
-      // huge meta shrank the budget below the bytes the store returned.
       SnapshotChunkRead::Ready(bytes) => {
-        let n = (bytes.len() as u64).min(chunk_len) as usize;
+        // `start <= total` (clamped above), so this never underflows.
+        let remaining = total - start;
+        // Validate the store's chunk against the `snapshot_chunk` contract — the sender now TRUSTS this API
+        // (it no longer locally slices a resident blob). `Ready(empty)` is EOF-ONLY (`start == total`): an
+        // in-range empty chunk would have the leader emit an empty NON-final InstallSnapshot, which the
+        // follower stages as nothing and re-acks the same cursor — an infinite-resend wedge. A
+        // store-contract violation is fatal.
+        if remaining > 0 && bytes.is_empty() {
+          self.poison(PoisonReason::SnapshotRead);
+          return ChunkSend::Poisoned;
+        }
+        // Trim to BOTH the frame budget AND the remaining blob length. The frame-budget clamp is normally a
+        // no-op (it fires only when a huge meta shrank the budget below the bytes the store returned); the
+        // `remaining` clamp rejects a store that returned bytes PAST `total_len`, which would otherwise
+        // forward an out-of-range chunk the follower's range check decode-poisons as a CORRECT follower.
+        let n = bytes.len().min(chunk_len as usize).min(remaining as usize);
         bytes.slice(0..n)
       }
       // Cold: the bytes aren't resident and the store began fetching. Defer — no progress mutation — and

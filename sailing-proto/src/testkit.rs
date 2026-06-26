@@ -620,6 +620,12 @@ pub(crate) struct AsyncStable {
   /// in. The sender must then defer (emit nothing, mutate no progress). When false the default resident
   /// slice is served, so the store behaves byte-identically to a fully-resident one.
   pub cold_snapshot: bool,
+  /// CONTRACT-VIOLATION modes for testing the sender's chunk validation: when set, `snapshot_chunk`
+  /// returns a MALFORMED `Ready` for an in-range offset — an empty run (`in_range_empty`, which a correct
+  /// store returns only at EOF) or more bytes than remain past the offset (`overlong`). The sender must
+  /// reject the empty run and clamp the overlong one.
+  pub malformed_in_range_empty: bool,
+  pub malformed_overlong: bool,
 }
 
 impl Default for AsyncStable {
@@ -636,6 +642,8 @@ impl Default for AsyncStable {
       submitted_lease: Vec::new(),
       snapshot_staging: None,
       cold_snapshot: false,
+      malformed_in_range_empty: false,
+      malformed_overlong: false,
     }
   }
 }
@@ -764,6 +772,12 @@ impl StableStore for AsyncStable {
         // The blob is resident in this in-RAM store, but report it as COLD so the sender must defer —
         // exactly what a disk/mmap store does when the requested run has not been paged in.
         SnapshotChunkRead::Pending
+      } else if self.malformed_in_range_empty {
+        // Contract violation: an in-range empty run (a correct store returns Ready(empty) ONLY at EOF).
+        SnapshotChunkRead::Ready(bytes::Bytes::new())
+      } else if self.malformed_overlong {
+        // Contract violation: more bytes than remain past `offset` (here offset < total).
+        SnapshotChunkRead::Ready(bytes::BytesMut::zeroed((total - offset + 8) as usize).freeze())
       } else {
         let start = offset.min(total) as usize;
         let end = offset.saturating_add(len).min(total) as usize;
