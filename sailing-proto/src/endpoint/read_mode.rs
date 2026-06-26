@@ -85,11 +85,10 @@ where
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
     }
-    // A fatal store fault in the broadcast above poisons the node — report it rather than an Ok index the
-    // dead node will never drive to commit.
-    if self.poison.poisoned {
-      return Err(ProposeError::Poisoned);
-    }
+    // The SetReadMode entry was ALREADY appended (durable-pending) above, before the broadcast — report
+    // Ok(index) even if the broadcast self-poisoned. It is a real proposal that WILL commit via the durable
+    // log; returning Err would make the caller treat a committed entry as never-proposed. The poison does no
+    // further work (every op entry-guards) and surfaces on the next public-API call.
     Ok(index)
   }
 }
