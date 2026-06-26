@@ -191,7 +191,11 @@ where
         // no-op (it fires only when a huge meta shrank the budget below the bytes the store returned); the
         // `remaining` clamp rejects a store that returned bytes PAST `total_len`, which would otherwise
         // forward an out-of-range chunk the follower's range check decode-poisons as a CORRECT follower.
-        let n = bytes.len().min(chunk_len as usize).min(remaining as usize);
+        // Compute the min in u64, THEN narrow: `remaining`/`chunk_len` can exceed `usize` on a 32-bit target
+        // (a bounded streaming store with a > 4 GiB blob), so a lossy `as usize` could truncate the bound
+        // BELOW the returned non-empty `bytes` — yielding n == 0 and recreating the in-range-empty wedge.
+        // The min is <= bytes.len() (a real usize), so the final cast is lossless.
+        let n = (bytes.len() as u64).min(chunk_len).min(remaining) as usize;
         bytes.slice(0..n)
       }
       // Cold: the bytes aren't resident and the store began fetching. Defer — no progress mutation — and
