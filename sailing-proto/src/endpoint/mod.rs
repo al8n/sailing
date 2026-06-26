@@ -1979,6 +1979,12 @@ where
             self.append_leader_noop(now, log, last);
           }
         }
+        // The demand-refresh anchor read (`lease_guard_read_live`) can poison on a fatal log read →
+        // fail-stop before the proactive refresh and the later timer branches (commit-wait, transfer
+        // abort, CheckQuorum step-down) run on a dead node.
+        if self.poison.poisoned {
+          return;
+        }
         // LeaseGuard PROACTIVE refresh (`LeaseRefresh::OnExpiry` / `Continuous`): re-anchor the lease
         // BEFORE it expires so reads never pay a Safe round — but ONLY when a read has occurred since the
         // current anchor (`read_since_anchor`), so an idle leader refreshes nothing (no write amp). The
@@ -2004,6 +2010,11 @@ where
           if fire {
             self.append_leader_noop(now, log, self.commit);
           }
+        }
+        // The proactive-refresh anchor read (`lease_near_expiry`) can poison on a fatal log read →
+        // fail-stop before the commit-wait, transfer-abort, and CheckQuorum branches run on a dead node.
+        if self.poison.poisoned {
+          return;
         }
         // LeaseGuard commit-wait: the post-election deferred-commit window has elapsed. Retry the
         // commit (and apply + flush deferred reads) now, so the new leader's first commit lands as
