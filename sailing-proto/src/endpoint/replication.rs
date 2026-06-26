@@ -138,6 +138,12 @@ where
       }
       let before = pr.next_index();
       self.maybe_send_append(now, peer.cheap_clone(), log, stable);
+      // maybe_send_append can self-poison (a fatal log read in the append path). Stop the pump rather than
+      // loop again — the next iteration would no-op against the entry guard anyway, but fail-stopping here
+      // keeps "no work after poison" explicit and bounds the pump to one iteration on a dead node.
+      if self.poison.poisoned {
+        return;
+      }
       let Some(pr) = self.tracker.progress(&peer) else {
         return;
       };
