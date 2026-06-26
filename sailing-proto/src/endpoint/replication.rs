@@ -168,34 +168,29 @@ where
     // At next_index == first_index the normal path still works: prev_index == offset
     // whose boundary term is retained.
     if next.get() < log.first_index().get() {
-      if let Some((meta, _)) = stable.snapshot() {
-        let pending = meta.last_index();
-        // Send the FIRST chunk (offset 0); the per-ack pump in `on_snapshot_response` streams the rest.
-        let send = self.send_snapshot_chunk(peer.cheap_clone(), stable, 0);
-        // A FATAL store read poisons the node → bail before mutating progress or pacing on a dead node.
-        if matches!(send, ChunkSend::Poisoned) {
-          return;
-        }
-        if let Some(p) = self.tracker.progress_mut(&peer) {
-          p.become_snapshot(pending);
-        }
-        // Arm the resend-pacing deadline ONLY on a real send: the map entry means "an InstallSnapshot for
-        // this peer's current install window went out at deadline − election_timeout". This (a) stops
-        // `on_heartbeat_response` from re-sending the very blob this call just emitted (the heartbeat pump
-        // can be what triggers the initial install, in the SAME response handling), and (b) overwrites any
-        // stale deadline left from a previous install window. If the first chunk DEFERRED (a cold store
-        // returned `Pending`), CLEAR any stale deadline so the next heartbeat retries immediately rather
-        // than waiting a full election timeout for the cold blob to warm.
-        if matches!(send, ChunkSend::Sent) {
+      // Compacted hole: the peer needs a snapshot. `send_snapshot_chunk` reads the boundary via the store's
+      // BOUNDED chunk API (no whole-blob `stable.snapshot()` materialization on the send path), transitions
+      // the peer to Snapshot(boundary) itself, and emits the first chunk — so the INITIAL handoff is bounded
+      // too. A None read (nothing persisted yet) returns Deferred without transitioning the peer.
+      match self.send_snapshot_chunk(peer.cheap_clone(), stable, 0) {
+        // A real send: arm the resend-pacing deadline. The map entry means "an InstallSnapshot for this
+        // peer's current install window went out at deadline − election_timeout", which (a) stops
+        // `on_heartbeat_response` re-sending the very blob just emitted, and (b) overwrites any stale
+        // deadline from a previous install window.
+        ChunkSend::Sent => {
           self
             .snapshot
             .snapshot_resend_after
             .insert(peer, now.mono() + self.config.election_timeout());
-        } else {
+        }
+        // Nothing went out (no snapshot persisted yet, or a cold/unsendable read) → CLEAR any stale deadline
+        // so the next heartbeat retries immediately rather than honoring a lingering future deadline.
+        ChunkSend::Deferred => {
           self.snapshot.snapshot_resend_after.remove(&peer);
         }
+        // Fatal store read → the node is poisoned; fall through to the bail below.
+        ChunkSend::Poisoned => {}
       }
-      // No snapshot persisted yet → nothing to send; retry later.
       return;
     }
 
