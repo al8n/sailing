@@ -475,6 +475,14 @@ pub trait StableStore {
   fn has_pending(&self) -> bool;
 }
 
+/// Cap on the number of DISJOINT staged byte-ranges a single transfer may hold. A sane chunked transfer
+/// keeps very few runs (sailing sends one chunk per ack and resumes from the contiguous cursor, so the
+/// runs collapse as the prefix grows); an adversarial leader flooding tiny out-of-order chunks would
+/// otherwise grow the interval metadata to many times the (already bounded) byte buffer and OOM. Past this
+/// cap [`SnapshotStaging::accept`] returns `None`, so the embedding store returns an error and the core
+/// fail-stops rather than the process aborting.
+pub(crate) const MAX_STAGING_RUNS: usize = 1024;
+
 /// A reusable accumulator for chunked snapshot staging — the reference implementation a [`StableStore`]
 /// embeds to satisfy [`accept_snapshot_chunk`](StableStore::accept_snapshot_chunk) /
 /// [`take_staged_snapshot`](StableStore::take_staged_snapshot). It tracks written byte runs and reports the
@@ -526,8 +534,11 @@ impl SnapshotStaging {
   }
 
   /// Write `data` at byte `offset` (clamped to the buffer) and return the highest CONTIGUOUS staged
-  /// offset. Idempotent on a re-delivered range.
-  pub fn accept(&mut self, offset: u64, data: &[u8]) -> u64 {
+  /// offset. Idempotent on a re-delivered range. Returns `None` if tracking this range would exceed
+  /// [`MAX_STAGING_RUNS`] disjoint runs (an adversarially fragmented transfer): the caller maps that to a
+  /// store error so the core fail-stops, rather than the interval metadata growing many times the buffer.
+  #[must_use]
+  pub fn accept(&mut self, offset: u64, data: &[u8]) -> Option<u64> {
     // Clamp in u64 BEFORE narrowing: `offset as usize` would WRAP a > usize::MAX offset to a low value on
     // 32-bit, overwriting the wrong bytes; `usize::try_from` saturates past-the-end (a no-op) instead.
     let start = usize::try_from(offset)
@@ -535,8 +546,8 @@ impl SnapshotStaging {
       .min(self.buf.len());
     let end = start.saturating_add(data.len()).min(self.buf.len());
     self.buf[start..end].copy_from_slice(&data[..end - start]);
-    self.insert_run(start as u64, end as u64);
-    self.contiguous()
+    self.insert_run(start as u64, end as u64)?;
+    Some(self.contiguous())
   }
 
   /// The highest contiguous staged offset (the end of the run starting at `0`, else `0`).
@@ -569,9 +580,9 @@ impl SnapshotStaging {
     self.buf
   }
 
-  fn insert_run(&mut self, start: u64, end: u64) {
+  fn insert_run(&mut self, start: u64, end: u64) -> Option<()> {
     if start >= end {
-      return;
+      return Some(());
     }
     self.runs.push((start, end));
     self.runs.sort_unstable_by_key(|&(s, _)| s);
@@ -582,7 +593,14 @@ impl SnapshotStaging {
         _ => merged.push((s, e)),
       }
     }
+    // Reject a transfer that stays this fragmented: a sane chunked transfer collapses to a few runs, so
+    // exceeding the cap signals an adversarial flood of disjoint chunks. Return None (the caller maps it to
+    // a store error → the core fail-stops) rather than letting the interval metadata grow unbounded.
+    if merged.len() > MAX_STAGING_RUNS {
+      return None;
+    }
     self.runs = merged;
+    Some(())
   }
 }
 
@@ -598,14 +616,18 @@ mod tests {
   #[test]
   fn snapshot_staging_tracks_contiguous_runs() {
     let mut s = SnapshotStaging::new(Index::new(10), 6, 1024).unwrap();
-    assert_eq!(s.accept(0, b"ab"), 2);
+    assert_eq!(s.accept(0, b"ab"), Some(2));
     assert_eq!(
       s.accept(4, b"ef"),
-      2,
+      Some(2),
       "a gap at [2,4) holds the contiguous watermark"
     );
     assert!(!s.is_complete());
-    assert_eq!(s.accept(2, b"cd"), 6, "filling the gap completes the run");
+    assert_eq!(
+      s.accept(2, b"cd"),
+      Some(6),
+      "filling the gap completes the run"
+    );
     assert!(s.is_complete());
     assert_eq!(s.bytes(), b"abcdef");
   }
@@ -613,20 +635,42 @@ mod tests {
   #[test]
   fn snapshot_staging_handles_overlap_and_clamp() {
     let mut s = SnapshotStaging::new(Index::new(7), 5, 1024).unwrap();
-    assert_eq!(s.accept(0, b"abc"), 3);
+    assert_eq!(s.accept(0, b"abc"), Some(3));
     // An OVERLAPPING range coalesces to the union end (no double-count).
-    assert_eq!(s.accept(2, b"XYZ"), 5, "[0,3) + [2,5) coalesces to 5");
+    assert_eq!(s.accept(2, b"XYZ"), Some(5), "[0,3) + [2,5) coalesces to 5");
     assert!(s.is_complete());
     // An idempotent re-delivery does not regress the watermark.
-    assert_eq!(s.accept(0, b"a"), 5);
+    assert_eq!(s.accept(0, b"a"), Some(5));
     // An offset+len past the buffer CLAMPS (no panic, no growth).
-    assert_eq!(s.accept(4, b"OVERLONG"), 5);
+    assert_eq!(s.accept(4, b"OVERLONG"), Some(5));
     // A write entirely past the end is a no-op.
-    assert_eq!(s.accept(99, b"z"), 5);
+    assert_eq!(s.accept(99, b"z"), Some(5));
     // A huge offset saturates to past-the-end (no wrap to a low offset, no wrong-byte write) — the
     // 32-bit `offset as usize` truncation guard.
-    assert_eq!(s.accept(u64::MAX, b"x"), 5);
+    assert_eq!(s.accept(u64::MAX, b"x"), Some(5));
     assert_eq!(s.into_vec().len(), 5);
+  }
+
+  #[test]
+  fn snapshot_staging_caps_fragmentation() {
+    // An adversarially fragmented transfer (many tiny DISJOINT chunks, each separated by a 1-byte gap) is
+    // rejected once it would exceed MAX_STAGING_RUNS disjoint runs, so the interval metadata stays bounded
+    // and the store returns an error instead of the process OOM-aborting.
+    let total = (MAX_STAGING_RUNS as u64 + 1) * 2;
+    let mut s = SnapshotStaging::new(Index::new(1), total, total as usize).unwrap();
+    // A 1-byte write at every even offset is disjoint from the last (odd-byte gaps), so each adds a run.
+    for i in 0..MAX_STAGING_RUNS as u64 {
+      assert!(
+        s.accept(i * 2, b"x").is_some(),
+        "a run within the cap must be accepted"
+      );
+    }
+    // One more disjoint run would exceed the cap → None (the caller maps this to a fatal store error).
+    assert_eq!(
+      s.accept(MAX_STAGING_RUNS as u64 * 2, b"y"),
+      None,
+      "exceeding MAX_STAGING_RUNS disjoint runs is rejected, not grown unbounded"
+    );
   }
 
   #[test]
