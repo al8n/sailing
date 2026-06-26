@@ -1,0 +1,236 @@
+# Invariant: a pre-candidate whose PreVote is REJECTED with a strictly higher term ADOPTS the term
+# CARRIED BY that response (stepping down to follower at it) instead of livelocking at its stale term.
+# A rejected PreVote response carries the responder's REAL current term (a granted one only echoes the
+# pre-candidate's advertised term), so propagating it is the only way a partitioned-and-behind node
+# can discover the cluster has moved on. Mirrors openraft's "adopt higher vote from a rejected
+# Pre-Vote" (without it a behind cohort re-proposes a term the peers keep rejecting, forever).
+#
+# This is sailing's third cross-validation of this class: its own VOPR first surfaced the 2-voter
+# PreVote livelock and the fix (adopt the term from a rejected PreVote, etcd-match) is already shipped;
+# this deterministic scenario pins the behavior.
+#
+# The rejecter's term is driven STRICTLY ABOVE node 1's advertised PreVote term so the golden proves
+# node 1 adopts the term the rejection CARRIES — not merely its own current+1: node 1 (stranded at
+# term 1) advertises PreVote term 2, the leader rejects with term 3, and node 1 must land at term 3.
+# A build that ignored the response's term and just bumped a rejected pre-candidate to current+1 would
+# stop at term 2 and FAIL this golden, while still livelocking against a peer more than one term ahead.
+#
+# Construction: node 1 leads term 1, is isolated and steps down (CheckQuorum) to a follower still at
+# term 1. The reachable side {2,3} advances TWO terms — node 2 wins term 2, then a forced transfer
+# hands leadership to node 3 at term 3 — so the rejecter sits two terms ahead of node 1's stale term.
+add-nodes 3 voters=(1,2,3) prevote=true checkquorum=true
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 pre-candidate term=0
+RequestVote term=1 last=0/0 prevote=true
+RequestVote term=1 last=0/0 prevote=true
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=true
+> n3 recv RequestVote term=1 last=0/0 prevote=true
+> n2 ready
+  VoteResponse term=1 prevote=true reject=false
+> n3 ready
+  VoteResponse term=1 prevote=true reject=false
+> n1 recv VoteResponse term=1 prevote=true reject=false
+> n1 recv VoteResponse term=1 prevote=true reject=false
+> n1 ready
+  RequestVote term=1 last=0/0 prevote=false
+  RequestVote term=1 last=0/0 prevote=false
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+isolate 1
+----
+n1 isolated
+
+tick-election 1
+----
+ok
+
+tick-election 1
+----
+n1 leader-changed term=1 lead=none
+
+# With node 1 isolated and stepped down, {2,3} elect node 2 at term 2.
+campaign 2
+----
+n2 pre-candidate term=1
+RequestVote term=2 last=1/1 prevote=true
+n2 leader-changed term=1 lead=none
+
+stabilize
+----
+> n3 recv RequestVote term=2 last=1/1 prevote=true
+> n3 ready
+  VoteResponse term=2 prevote=true reject=false
+> n2 recv VoteResponse term=2 prevote=true reject=false
+> n2 ready
+  RequestVote term=2 last=1/1 prevote=false
+> n3 recv RequestVote term=2 last=1/1 prevote=false
+> n3 ready
+  VoteResponse term=2 prevote=false reject=false
+  n3 leader-changed term=2 lead=none
+> n2 recv VoteResponse term=2 prevote=false reject=false
+> n2 ready
+  Heartbeat term=2 commit=0
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  n2 leader-changed term=2 lead=2
+> n3 recv Heartbeat term=2 commit=0
+> n3 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n3 ready
+  HeartbeatResponse term=2
+  AppendResponse term=2 match=2
+  n3 leader-changed term=2 lead=2
+> n2 recv HeartbeatResponse term=2
+> n2 recv AppendResponse term=2 match=2
+> n2 ready
+  AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+  AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n3 recv AppendEntries term=2 prev=1/1 commit=1 entries=[2/2 empty]
+> n3 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
+> n3 ready
+  AppendResponse term=2 match=2
+  AppendResponse term=2 match=2
+> n2 recv AppendResponse term=2 match=2
+> n2 recv AppendResponse term=2 match=2
+
+# A forced transfer hands leadership 2 -> 3, bumping the reachable side to term 3 (deterministic, no
+# election-timeout race). Node 3 now leads at term 3 while node 1 is still stranded at term 1.
+transfer-leadership from=2 to=3
+----
+TimeoutNow term=2
+
+stabilize
+----
+> n3 recv TimeoutNow term=2
+> n3 ready
+  RequestVote term=3 last=2/2 prevote=false
+  n3 leader-changed term=3 lead=none
+> n2 recv RequestVote term=3 last=2/2 prevote=false
+> n2 ready
+  VoteResponse term=3 prevote=false reject=false
+  n2 leader-changed term=3 lead=none
+> n3 recv VoteResponse term=3 prevote=false reject=false
+> n3 ready
+  Heartbeat term=3 commit=0
+  AppendEntries term=3 prev=2/2 commit=2 entries=[3/3 empty]
+  n3 leader-changed term=3 lead=3
+> n2 recv Heartbeat term=3 commit=0
+> n2 recv AppendEntries term=3 prev=2/2 commit=2 entries=[3/3 empty]
+> n2 ready
+  HeartbeatResponse term=3
+  AppendResponse term=3 match=3
+  n2 leader-changed term=3 lead=3
+> n3 recv HeartbeatResponse term=3
+> n3 recv AppendResponse term=3 match=3
+> n3 ready
+  AppendEntries term=3 prev=2/2 commit=2 entries=[3/3 empty]
+  AppendEntries term=3 prev=3/3 commit=3 entries=[]
+> n2 recv AppendEntries term=3 prev=2/2 commit=2 entries=[3/3 empty]
+> n2 recv AppendEntries term=3 prev=3/3 commit=3 entries=[]
+> n2 ready
+  AppendResponse term=3 match=3
+  AppendResponse term=3 match=3
+> n3 recv AppendResponse term=3 match=3
+> n3 recv AppendResponse term=3 match=3
+
+# Node 1 is a follower stranded at term 1; the reachable cluster is two terms ahead at term 3.
+raft-state
+----
+n1: follower term=1 lead=none
+n2: follower term=3 lead=3
+n3: leader term=3 lead=3
+
+recover 1
+----
+n1 recovered
+
+# Node 1 pre-votes, advertising term 2 with its stale 1/1 log (no term bump yet — PreVote is a query).
+campaign 1
+----
+n1 pre-candidate term=1
+RequestVote term=2 last=1/1 prevote=true
+RequestVote term=2 last=1/1 prevote=true
+
+# Deliver node 1's PreVote only to leader node 3: its log is fresher, so it REJECTS, and the rejection
+# carries node 3's real term (3) — strictly above node 1's advertised PreVote term (2).
+deliver-msgs from=1 to=3
+----
+n1->n3 RequestVote term=2 last=1/1 prevote=true
+
+process-ready 3
+----
+VoteResponse term=3 prevote=true reject=true
+
+# Node 1 receives the rejected PreVote carrying term 3 and ADOPTS it: it becomes a follower at term 3.
+deliver-msgs from=3 to=1
+----
+n3->n1 VoteResponse term=3 prevote=true reject=true
+
+# Node 1 is now a follower at TERM 3 — the term the rejection carried — NOT term 2 (current+1) and NOT
+# a stale pre-candidate at term 1. This is the load-bearing assertion of the adoption.
+raft-state
+----
+n1: follower term=3 lead=none
+n2: follower term=3 lead=3
+n3: leader term=3 lead=3
+
+# Drop node 1's leftover PreVote to node 2 (already superseded).
+drop-msgs from=1
+----
+dropped n1->n2 RequestVote term=2 last=1/1 prevote=true
+
