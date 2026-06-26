@@ -1,0 +1,295 @@
+# A multi-chunk InstallSnapshot transfer assembles correctly regardless of HOW its chunks interleave
+# with other in-flight traffic and WHEN each is processed: the receiver stages every chunk by its
+# byte offset into a gap-tracking buffer and only advances its contiguous watermark over the filled
+# prefix, so the order in which chunks are taken off the wire — and any unrelated heartbeat/append
+# traffic delivered in between — never corrupts the assembled blob. The invariant: snapshot assembly
+# is delivery-order independent; staging is keyed by offset, not by arrival sequence.
+#
+# Sailing's snapshot SENDER is strictly stop-and-wait (one chunk per follower ack) and always resumes
+# from the follower's contiguous cursor, so the wire itself only ever carries chunks in ascending
+# offset order — a chunk is delayed and interleaved with other messages here, then released, and the
+# by-offset staging absorbs it cleanly. (Pure forward offset-reorder is exercised at the staging-unit
+# level; on the wire it cannot arise by construction.)
+#
+# Setup: 3 voters, threshold 3, chunk=40 over an ~84-byte blob (3 chunks). Node 3 is isolated, the
+# leader compacts past it, then on recovery node 3 is caught up via InstallSnapshot while a second
+# command stream and heartbeats to node 2 run concurrently.
+add-nodes 3 voters=(1,2,3) snap=3 chunk=40
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+isolate 3
+----
+n3 isolated
+
+propose 1 a
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+propose 1 b
+----
+AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+
+propose 1 c
+----
+AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+
+propose 1 d
+----
+AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+> n2 recv AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+> n2 recv AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+> n2 recv AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+> n2 ready
+  AppendResponse term=1 match=2
+  AppendResponse term=1 match=3
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=5
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=2 entries=[]
+  AppendEntries term=1 prev=1/5 commit=3 entries=[]
+  AppendEntries term=1 prev=1/5 commit=4 entries=[]
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  n1 applied index=2
+  n1 applied index=3
+  n1 applied index=4
+  n1 applied index=5
+> n2 recv AppendEntries term=1 prev=1/5 commit=2 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=3 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=4 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  n2 applied index=2
+  n2 applied index=3
+  n2 applied index=4
+  n2 applied index=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+
+recover 3
+----
+n3 recovered
+
+# Drive the heartbeat/probe handshake by hand until the leader is in snapshot mode and the first chunk
+# (offset 0) has been emitted.
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+deliver-msgs from=1 to=3
+----
+n1->n3 Heartbeat term=1 commit=1
+
+process-ready 3
+----
+HeartbeatResponse term=1
+
+deliver-msgs from=3 to=1
+----
+n3->n1 HeartbeatResponse term=1
+
+process-ready 1
+----
+AppendEntries term=1 prev=1/5 commit=5 entries=[]
+
+deliver-msgs from=1 to=3
+----
+n1->n3 AppendEntries term=1 prev=1/5 commit=5 entries=[]
+
+process-ready 3
+----
+AppendResponse term=1 reject hint=1/1
+
+deliver-msgs from=3 to=1
+----
+n3->n1 AppendResponse term=1 reject hint=1/1
+
+process-ready 1
+----
+InstallSnapshot term=1 snap=1/5 offset=0 len=40 last=false
+
+# Chunk 0 (offset 0) is now on the bus toward node 3. Deliver it; node 3 stages [0,40) and acks
+# acked=40.
+deliver-msgs from=1 to=3
+----
+n1->n3 InstallSnapshot term=1 snap=1/5 offset=0 len=40 last=false
+
+process-ready 3
+----
+SnapshotResponse term=1 reject=false match=1 acked=40
+
+deliver-msgs from=3 to=1
+----
+n3->n1 SnapshotResponse term=1 reject=false match=1 acked=40
+
+process-ready 1
+----
+InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+
+# The leader has emitted chunk 1 (offset 40). Before delivering it, run an UNRELATED round of traffic:
+# a fresh client write that the leader replicates to node 2 and commits, plus heartbeats. This puts
+# non-snapshot messages on the bus interleaved with the held middle chunk.
+propose 1 e
+----
+AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 normal 0x010000000000000065]
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+# Deliver EVERYTHING on the bus in one shot: the held offset-40 chunk, the new AppendEntries to node 2,
+# and the heartbeats all flush together, interleaved. Node 3 still stages offset 40 by offset into its
+# buffer (contiguous -> 80) no matter what else is delivered around it.
+deliver-msgs
+----
+n1->n2 Heartbeat term=1 commit=5
+n1->n3 InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+n1->n2 AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 normal 0x010000000000000065]
+n1->n2 Heartbeat term=1 commit=5
+n1->n3 Heartbeat term=1 commit=1
+
+stabilize
+----
+> n2 ready
+  HeartbeatResponse term=1
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=6
+> n3 ready
+  SnapshotResponse term=1 reject=false match=1 acked=80
+  HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=6
+> n1 recv SnapshotResponse term=1 reject=false match=1 acked=80
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/6 commit=5 entries=[]
+  AppendEntries term=1 prev=1/6 commit=5 entries=[]
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+  InstallSnapshot term=1 snap=1/5 offset=80 len=4 last=true
+  n1 applied index=6
+> n2 recv AppendEntries term=1 prev=1/6 commit=5 entries=[]
+> n2 recv AppendEntries term=1 prev=1/6 commit=5 entries=[]
+> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n3 recv InstallSnapshot term=1 snap=1/5 offset=80 len=4 last=true
+> n2 ready
+  AppendResponse term=1 match=6
+  AppendResponse term=1 match=6
+  AppendResponse term=1 match=6
+  n2 applied index=6
+> n3 ready
+  SnapshotResponse term=1 reject=false match=5 acked=0
+  n3 snapshot-installed snap=1/5
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv SnapshotResponse term=1 reject=false match=5 acked=0
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=6 entries=[1/6 normal 0x010000000000000065]
+> n3 recv AppendEntries term=1 prev=1/5 commit=6 entries=[1/6 normal 0x010000000000000065]
+> n3 ready
+  AppendResponse term=1 match=6
+  n3 applied index=6
+> n1 recv AppendResponse term=1 match=6
+> n1 ready
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n3 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n3 ready
+  AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+
+# Node 3 received the final chunk and installed; the blob assembled correctly despite the interleaving
+# and the delayed middle chunk. It is re-based to the snapshot boundary and caught up to the new tip.
+raft-log 3
+----
+n3: commit=6 applied=6 last=6
+  (snapshot covers <= index 5)
+  1/6 normal 0x010000000000000065
+
+raft-log 1
+----
+n1: commit=6 applied=6 last=6
+  (snapshot covers <= index 5)
+  1/6 normal 0x010000000000000065
+
+status 1
+----
+n2: match=6 next=7 replicate
+n3: match=6 next=7 replicate
+
