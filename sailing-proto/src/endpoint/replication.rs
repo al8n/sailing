@@ -187,6 +187,10 @@ where
             .snapshot
             .snapshot_resend_after
             .insert(peer, now.mono() + self.config.election_timeout());
+        } else {
+          // Deferred (cold) first chunk: clear any stale deadline left from a previous install window so
+          // the next heartbeat retries immediately rather than honoring a lingering future deadline.
+          self.snapshot.snapshot_resend_after.remove(&peer);
         }
       }
       // No snapshot persisted yet → nothing to send; retry later.
