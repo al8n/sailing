@@ -373,6 +373,13 @@ where
         if self.lease_guard_read_live(now, log) {
           self.emit_or_reply_read(commit, context, from);
         } else {
+          // A fatal `entries` read inside `lease_guard_read_live` poisons the node → fail-stop BEFORE
+          // mutating refresh/read state on a dead node. `read_index` reports the poison to its caller and
+          // the forwarded `on_read_index` path simply stops; without this a poisoned LeaseGuard read would
+          // set `lease_refresh_wanted` and register a Safe read that can never complete.
+          if self.poison.poisoned {
+            return;
+          }
           // Stale lease: degrade THIS read to the always-safe heartbeat round, and (only under an
           // active LeaseGuard config) record a refresh demand. The leader's next heartbeat tick appends
           // ONE stamped no-op to re-commit and re-stamp the lease, so subsequent reads serve fast again
