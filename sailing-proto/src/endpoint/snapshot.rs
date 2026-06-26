@@ -509,6 +509,34 @@ where
     // CHUNKED transfer (total_len != 0): stage this chunk into the store; DEFER decode + the destructive
     // install until the WHOLE blob is contiguous-staged. The proto holds NO bytes — `snapshot_recv` is
     // coordination only.
+
+    // An empty chunk delivers no bytes, so it must NEVER begin, replace, or extend a staging buffer — it can
+    // only be a stale-cursor artifact. Handle it BEFORE the continuation/supersede/stage logic so a malformed
+    // or version-skewed leader cannot pin a `total_len` staging allocation or replace the active
+    // `snapshot_recv` with a no-progress one. A correct sender emits empty data ONLY at EOF
+    // (`offset == total_len`); any other offset is malformed and fail-stops. An EOF-empty re-acks the CURRENT
+    // contiguous cursor of the matching in-progress transfer (the benign stale-cursor self-correction that
+    // re-syncs a leader whose acked cursor ran ahead), or is dropped when none matches — either way it
+    // allocates nothing and starts nothing.
+    if is.data().is_empty() {
+      if is.offset() != total_len {
+        self.poison(PoisonReason::SnapshotDecode);
+        return;
+      }
+      let cursor = match &self.snapshot.snapshot_recv {
+        Some(r)
+          if r.sender_term == is.term() && r.meta.identity_eq(meta) && r.total_len == total_len =>
+        {
+          Some(r.contiguous_staged)
+        }
+        _ => None,
+      };
+      if let Some(staged) = cursor {
+        self.send_snapshot_progress_ack(is.leader(), staged);
+      }
+      return;
+    }
+
     let boundary = meta.last_index();
     // Identify the in-progress transfer by its FULL identity — (sender_term, last_index, last_term, conf,
     // total_len) — NOT just the boundary index. The SENDER TERM is load-bearing: a NEWER leader sending a
@@ -560,26 +588,16 @@ where
       });
     }
 
-    // Validate the chunk byte-range BEFORE staging — a chunk past `total_len` would be silently CLAMPED by
-    // the staging accumulator, completing the buffer from a malformed stream and decoding a TRUNCATED
-    // prefix instead of fail-stopping. (`offset == total_len` with empty data is the benign stale-cursor
-    // self-correction — its `end == total_len` passes.) Checked arithmetic: a `u64` overflow is out of range.
+    // Validate the NON-EMPTY chunk's byte-range BEFORE staging — a chunk past `total_len` would be silently
+    // CLAMPED by the staging accumulator, completing the buffer from a malformed stream and decoding a
+    // TRUNCATED prefix instead of fail-stopping. (Empty chunks are fully handled above, so `data.len() >= 1`
+    // here.) Checked arithmetic: a `u64` overflow is out of range.
     match is.offset().checked_add(is.data().len() as u64) {
       Some(end) if end <= total_len => {}
       _ => {
         self.poison(PoisonReason::SnapshotDecode);
         return;
       }
-    }
-    // An IN-RANGE empty chunk (`offset < total_len` with no data) is malformed: a correct sender emits empty
-    // data ONLY at EOF (`offset == total_len`, the benign stale-cursor self-correction, which passes the
-    // range check above). Staging an in-range empty run is a no-op that re-acks the SAME contiguous cursor,
-    // so a malformed or version-skewed leader could pin this follower in the transfer forever (its full
-    // `total_len` staging buffer stays allocated). Fail-stop instead of looping — the dual of the sender's
-    // own in-range-empty guard.
-    if is.offset() < total_len && is.data().is_empty() {
-      self.poison(PoisonReason::SnapshotDecode);
-      return;
     }
 
     // Stage this chunk. A store staging-capacity error poisons (CFT resource exhaustion → failover).

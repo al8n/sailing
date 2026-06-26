@@ -4239,3 +4239,104 @@ fn receiver_rejects_in_range_empty_snapshot_chunk() {
     "no same-cursor progress ack for the malformed chunk (no resend loop)"
   );
 }
+
+// EOF-empty chunks (offset == total_len, no data) are stale-cursor artifacts, NOT bytes. The structural
+// empty-chunk guard handles them BEFORE any staging: a fresh one starts nothing (no buffer to pin), and one
+// matching an in-progress transfer re-acks the current cursor to re-sync a leader whose acked offset ran
+// ahead — neither allocates or replaces staging.
+#[test]
+fn receiver_handles_eof_empty_chunk_without_pinning_staging() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let d = Instant::ORIGIN;
+  let meta = || {
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+  };
+
+  // A FRESH EOF-empty chunk starts no transfer and pins no staging — it is dropped.
+  {
+    let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(2),
+        1u64,
+        meta(),
+        bytes::Bytes::new(),
+        100,
+        100,
+      )),
+    );
+    assert_eq!(
+      ep.poison_reason(),
+      None,
+      "an EOF-empty chunk is benign, not malformed"
+    );
+    assert!(
+      ep.snapshot.snapshot_recv.is_none(),
+      "a fresh EOF-empty starts no transfer — no staging pinned"
+    );
+    assert!(
+      ep.poll_message().is_none(),
+      "no ack for a fresh EOF-empty (nothing to re-sync)"
+    );
+  }
+
+  // An EOF-empty matching an IN-PROGRESS transfer re-acks the current cursor without tearing it down.
+  {
+    let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(2),
+        1u64,
+        meta(),
+        bytes::Bytes::from_static(b"abc"),
+        0,
+        100,
+      )),
+    );
+    assert!(
+      ep.snapshot.snapshot_recv.is_some(),
+      "the data chunk armed the transfer"
+    );
+    while ep.poll_message().is_some() {}
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(2),
+        1u64,
+        meta(),
+        bytes::Bytes::new(),
+        100,
+        100,
+      )),
+    );
+    assert_eq!(ep.poison_reason(), None);
+    assert!(
+      ep.snapshot.snapshot_recv.is_some(),
+      "the EOF-empty did not tear down the in-progress transfer"
+    );
+    let acked = core::iter::from_fn(|| ep.poll_message()).find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(r.acked_through()),
+      _ => None,
+    });
+    assert_eq!(
+      acked,
+      Some(3),
+      "the EOF-empty re-acked the current contiguous cursor (3 bytes)"
+    );
+  }
+}
