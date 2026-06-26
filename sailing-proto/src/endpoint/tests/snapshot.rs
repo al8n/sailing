@@ -4152,3 +4152,48 @@ fn reclaim_term_read_failure_fail_stops_handle_storage() {
     "a fatal term-read in reclaim fail-stops the storage handler"
   );
 }
+
+// The sender now TRUSTS the snapshot_chunk API (it no longer locally slices a resident blob), so it must
+// validate the store's Ready chunk: an in-range Ready(empty) is a contract violation (empty is EOF-only)
+// that would wedge on infinite empty resends → poison; overlong bytes (past total_len) are clamped so a
+// correct follower never decode-poisons on an out-of-range chunk.
+#[test]
+fn send_snapshot_chunk_validates_malformed_store_ready() {
+  use crate::{Index, Message, PoisonReason};
+  let offset = 5u64;
+  // In-range Ready(empty) → fatal store-contract violation → Poisoned.
+  {
+    let (mut ep, _log, mut stable) = make_leader_with_compacted_log(offset, 2);
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
+      p.become_snapshot(Index::new(offset));
+    }
+    while ep.poll_message().is_some() {}
+    stable.malformed_in_range_empty = true;
+    assert_eq!(
+      ep.send_snapshot_chunk(2u64, &stable, 0),
+      ChunkSend::Poisoned,
+      "an in-range Ready(empty) is a contract violation (empty is EOF-only) and must poison"
+    );
+    assert_eq!(ep.poison_reason(), Some(PoisonReason::SnapshotRead));
+  }
+  // Overlong Ready (more bytes than remain) → clamped to within total_len, still Sent.
+  {
+    let (mut ep, _log, mut stable) = make_leader_with_compacted_log(offset, 2);
+    if let Some(p) = ep.tracker.progress_mut(&2u64) {
+      p.become_snapshot(Index::new(offset));
+    }
+    while ep.poll_message().is_some() {}
+    stable.malformed_overlong = true;
+    assert_eq!(ep.send_snapshot_chunk(2u64, &stable, 0), ChunkSend::Sent);
+    let install = core::iter::from_fn(|| ep.poll_message())
+      .find_map(|o| match o.message() {
+        Message::InstallSnapshot(s) if o.to() == 2u64 => Some(s.clone()),
+        _ => None,
+      })
+      .expect("an InstallSnapshot was sent");
+    assert!(
+      install.offset() + install.data().len() as u64 <= install.total_len(),
+      "the overlong chunk was clamped to within total_len — no out-of-range chunk reaches the follower"
+    );
+  }
+}
