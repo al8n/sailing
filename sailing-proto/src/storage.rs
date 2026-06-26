@@ -556,8 +556,8 @@ impl SnapshotStaging {
   }
 
   /// Write `data` at byte `offset` (clamped to the buffer) and return the highest CONTIGUOUS staged
-  /// offset. Idempotent on a re-delivered range. Returns `None` if tracking this range would exceed
-  /// [`MAX_STAGING_RUNS`] disjoint runs (an adversarially fragmented transfer): the caller maps that to a
+  /// offset. Idempotent on a re-delivered range. Returns `None` if tracking this range would exceed the
+  /// `MAX_STAGING_RUNS` disjoint-run cap (an adversarially fragmented transfer): the caller maps that to a
   /// store error so the core fail-stops, rather than the interval metadata growing many times the buffer.
   #[must_use]
   pub fn accept(&mut self, offset: u64, data: &[u8]) -> Option<u64> {
