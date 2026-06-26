@@ -389,16 +389,28 @@ pub trait StableStore {
   ///   for that run and signal the storage-ready seam so the core re-pumps; a never-resolving `Pending`
   ///   wedges the transfer. A fully-resident store NEVER returns `Pending`.
   ///
-  /// **Default:** reads the whole resident blob via [`snapshot`](Self::snapshot) and slices it — the
-  /// correct RESIDENT-store behavior (the leader holds an O(1) `Bytes` slice, never a copy of the blob).
-  /// A store whose snapshot is NOT fully resident (disk/mmap) SHOULD OVERRIDE to page in one chunk
-  /// (returning `Pending` while cold), so its per-peer send footprint is one chunk, not the whole blob —
-  /// the bounded-send guarantee of chunked transfer.
+  /// **No default:** every store MUST implement this, so a non-resident (disk/mmap) store cannot SILENTLY
+  /// inherit a whole-blob send — which would defeat the bounded-send guarantee at the first send. A
+  /// fully-resident store delegates to [`resident_snapshot_chunk`](Self::resident_snapshot_chunk) (an O(1)
+  /// `Bytes` slice, never a copy); a non-resident store pages in ONE chunk (returning `Pending` while
+  /// cold), so its per-peer send footprint is one chunk, not the whole blob.
   // The `(meta, total_len, chunk-read)` tuple inside `Option<Result<..>>` is the deliberate read
   // contract documented above (snapshot present?, total length, and the resident/cold chunk); naming a
   // type alias for it would obscure rather than clarify the three returned facts.
   #[allow(clippy::type_complexity)]
   fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<Self::NodeId>, u64, SnapshotChunkRead), Self::Error>>;
+
+  /// RESIDENT-store helper for [`snapshot_chunk`](Self::snapshot_chunk): reads the whole resident blob via
+  /// [`snapshot`](Self::snapshot) and slices it (an O(1) `Bytes` slice, never a copy). A fully-resident
+  /// store implements `snapshot_chunk` as `self.resident_snapshot_chunk(offset, len)`. A store whose
+  /// snapshot is NOT fully resident MUST NOT use this — it would materialize the whole blob and defeat the
+  /// bounded-send guarantee — and should page in one chunk instead.
+  #[allow(clippy::type_complexity)]
+  fn resident_snapshot_chunk(
     &self,
     offset: u64,
     len: u64,
