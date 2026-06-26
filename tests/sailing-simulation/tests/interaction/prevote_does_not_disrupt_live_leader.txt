@@ -1,0 +1,152 @@
+# Invariant: a follower that times out and runs a PreVote round does NOT inflate the cluster term, so
+# it cannot disrupt a live leader; when it next hears the leader it stands down to follower. n3 times
+# out and pre-votes (advertising term 2) but its pre-votes are lost on the wire (drop-msgs renders the
+# loss explicitly) so it gets no quorum. Because PreVote never bumps the term until a real quorum
+# grants, n3 stays a pre-candidate at term=1 across REPEATED rounds — it never reaches term 2. The
+# leader n1 is never deposed (still leader term=1). On n1's next heartbeat n3 reverts to follower with
+# lead=1. Mirrors hashicorp/raft's PreVote anti-disruption (a stale pre-voter must not unseat a live
+# leader): a non-PreVote candidate would instead climb to term 2, 3, ... and force the leader to step
+# down on rejoin.
+add-nodes 3 voters=(1,2,3) prevote=true
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 pre-candidate term=0
+RequestVote term=1 last=0/0 prevote=true
+RequestVote term=1 last=0/0 prevote=true
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=true
+> n3 recv RequestVote term=1 last=0/0 prevote=true
+> n2 ready
+  VoteResponse term=1 prevote=true reject=false
+> n3 ready
+  VoteResponse term=1 prevote=true reject=false
+> n1 recv VoteResponse term=1 prevote=true reject=false
+> n1 recv VoteResponse term=1 prevote=true reject=false
+> n1 ready
+  RequestVote term=1 last=0/0 prevote=false
+  RequestVote term=1 last=0/0 prevote=false
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+campaign 3
+----
+n3 pre-candidate term=1
+RequestVote term=2 last=1/1 prevote=true
+RequestVote term=2 last=1/1 prevote=true
+n3 leader-changed term=1 lead=none
+
+drop-msgs from=3
+----
+dropped n3->n1 RequestVote term=2 last=1/1 prevote=true
+dropped n3->n2 RequestVote term=2 last=1/1 prevote=true
+
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: pre-candidate term=1 lead=none
+
+campaign 3
+----
+RequestVote term=2 last=1/1 prevote=true
+RequestVote term=2 last=1/1 prevote=true
+
+drop-msgs from=3
+----
+dropped n3->n1 RequestVote term=2 last=1/1 prevote=true
+dropped n3->n2 RequestVote term=2 last=1/1 prevote=true
+
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: pre-candidate term=1 lead=none
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=1
+Heartbeat term=1 commit=1
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=1
+> n3 recv Heartbeat term=1 commit=1
+> n2 ready
+  HeartbeatResponse term=1
+> n3 ready
+  HeartbeatResponse term=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: follower term=1 lead=1
+
