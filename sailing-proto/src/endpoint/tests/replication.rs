@@ -2927,3 +2927,80 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
     "the pump fills the window to the end of the backlog"
   );
 }
+
+// on_heartbeat fail-stops if apply_committed self-poisons: it must NOT raise the durable lease-support
+// floor (or otherwise act) after a fatal committed-range read on a dead node. (Egress is poison-suppressed,
+// so the lease-support floor is the observable discriminator.)
+#[test]
+fn on_heartbeat_fail_stops_when_apply_committed_poisons() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Heartbeat, Index, Instant, Message, PoisonReason, Term,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_check_quorum(true);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
+  let d = Instant::ORIGIN;
+  let entries: Vec<Entry> = (1u64..=3)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(3),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  // Force applied behind commit so the next on_heartbeat re-applies the committed range.
+  ep.applied = Index::ZERO;
+  assert!(ep.poison_reason().is_none());
+  let floor_before = ep.durable.lease_support_floor;
+
+  // Arm the fatal committed-range read; apply_committed reads entries(1..) and poisons (LogRead).
+  log.fail_entries_at(Some(Index::new(1)));
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::Heartbeat(Heartbeat::new(
+      Term::new(1),
+      1u64,
+      Index::new(3),
+      bytes::Bytes::new(),
+    )),
+  );
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::LogRead));
+  assert_eq!(
+    ep.durable.lease_support_floor, floor_before,
+    "on_heartbeat must not raise the lease-support floor after apply_committed poisons"
+  );
+  assert!(
+    ep.poll_message().is_none(),
+    "no HeartbeatResponse on a dead node"
+  );
+}
