@@ -2030,6 +2030,12 @@ where
           self.apply_committed(log);
           self.maybe_flush_deferred_reads(now, log, stable);
         }
+        // The commit-wait retry above (maybe_advance_commit / apply_committed) can self-poison on a fatal
+        // read / decode / FSM apply → fail-stop before the transfer-abort and CheckQuorum (step-down)
+        // branches mutate transfer state or step the node down on a dead node.
+        if self.poison.poisoned {
+          return;
+        }
         // Leader transfer abort: if the transfer deadline has passed without the target
         // taking over, abort the transfer and resume accepting proposals.
         if self.transfer.lead_transferee.is_some()

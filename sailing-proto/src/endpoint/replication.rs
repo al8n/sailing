@@ -645,6 +645,11 @@ where
     if self.applied < self.commit {
       self.apply_committed(log);
     }
+    // apply_committed can self-poison on a fatal committed-range read / decode / FSM apply → fail-stop
+    // before the lease-support response path below raises the durable lease floor and replies on a dead node.
+    if self.poison.poisoned {
+      return;
+    }
     let (term, me) = (self.term, self.config.id());
     // Echo the heartbeat's context back to the leader (lets the leader count this follower's ack
     // toward a pending safe read; empty context is a normal heartbeat) AND echo the lease round so the
@@ -866,6 +871,11 @@ where
     // wedged. Idempotent when already caught up.
     if self.applied < self.commit {
       self.apply_committed(log);
+    }
+    // apply_committed can self-poison on a fatal committed-range read / decode / FSM apply → fail-stop
+    // before enqueuing or sending a follower ack on a dead node.
+    if self.poison.poisoned {
+      return;
     }
 
     if let Some(opid) = appended_opid {
@@ -1203,6 +1213,11 @@ where
         }
         self.maybe_advance_commit(now, log);
         self.apply_committed(log);
+        // maybe_advance_commit / apply_committed can self-poison on a fatal read / decode / FSM apply →
+        // fail-stop before the deferred-read flush, the append pump, and the leader-transfer tail below.
+        if self.poison.poisoned {
+          return;
+        }
         self.maybe_flush_deferred_reads(now, log, stable);
         self.pump_appends(now, from.cheap_clone(), log, stable); // fill the peer's inflight window if still behind
         // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
