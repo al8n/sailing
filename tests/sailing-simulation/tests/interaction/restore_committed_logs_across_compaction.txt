@@ -1,0 +1,292 @@
+# Invariant: a crash+restart restores the WHOLE committed prefix, including entries that survive ONLY
+# in the snapshot after compaction. A node compacts its log (snapshot boundary K), commits more
+# entries past K (K < commit <= last), then crashes — its durable state is exactly {snapshot@K, log
+# entries (K,last], hardstate commit}. On restart it rebuilds the FSM from the snapshot and RE-APPLIES
+# the committed tail, so commit/applied/last and the snapshot boundary all survive (snap.Index <=
+# commitIdx <= lastIdx) and it resumes as a follower. The `applied-state` assertions observe the FSM
+# DATA (the actual a..e commands), not just the watermarks: the commands a,b,c at indices <=4 survive
+# ONLY inside the snapshot (their log entries are compacted away), so their presence after the crash
+# proves the compacted prefix was genuinely restored — byte-identical before and after. Mirrors
+# hashicorp/raft's RestoreCommittedLogs: a strictly stronger crash-recovery than crash_restart.txt
+# (which never compacts before the crash).
+add-nodes 3 voters=(1,2,3) snap=3
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+propose 1 a
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+propose 1 b
+----
+AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+
+propose 1 c
+----
+AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+> n2 recv AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+> n3 recv AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+> n2 recv AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+> n3 recv AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+> n2 ready
+  AppendResponse term=1 match=2
+  AppendResponse term=1 match=3
+  AppendResponse term=1 match=4
+> n3 ready
+  AppendResponse term=1 match=2
+  AppendResponse term=1 match=3
+  AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=4
+> n1 ready
+  AppendEntries term=1 prev=1/4 commit=2 entries=[]
+  AppendEntries term=1 prev=1/4 commit=3 entries=[]
+  AppendEntries term=1 prev=1/4 commit=4 entries=[]
+  AppendEntries term=1 prev=1/4 commit=4 entries=[]
+  AppendEntries term=1 prev=1/4 commit=4 entries=[]
+  AppendEntries term=1 prev=1/4 commit=4 entries=[]
+  n1 applied index=2
+  n1 applied index=3
+  n1 applied index=4
+> n2 recv AppendEntries term=1 prev=1/4 commit=2 entries=[]
+> n2 recv AppendEntries term=1 prev=1/4 commit=3 entries=[]
+> n2 recv AppendEntries term=1 prev=1/4 commit=4 entries=[]
+> n3 recv AppendEntries term=1 prev=1/4 commit=4 entries=[]
+> n3 recv AppendEntries term=1 prev=1/4 commit=4 entries=[]
+> n3 recv AppendEntries term=1 prev=1/4 commit=4 entries=[]
+> n2 ready
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=4
+  n2 applied index=2
+  n2 applied index=3
+  n2 applied index=4
+> n3 ready
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=4
+  n3 applied index=2
+  n3 applied index=3
+  n3 applied index=4
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=4
+
+raft-log 2
+----
+n2: commit=4 applied=4 last=4
+  (snapshot covers <= index 4)
+
+propose 1 d
+----
+AppendEntries term=1 prev=1/4 commit=4 entries=[1/5 normal 0x010000000000000064]
+AppendEntries term=1 prev=1/4 commit=4 entries=[1/5 normal 0x010000000000000064]
+
+propose 1 e
+----
+AppendEntries term=1 prev=1/5 commit=4 entries=[1/6 normal 0x010000000000000065]
+AppendEntries term=1 prev=1/5 commit=4 entries=[1/6 normal 0x010000000000000065]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/4 commit=4 entries=[1/5 normal 0x010000000000000064]
+> n3 recv AppendEntries term=1 prev=1/4 commit=4 entries=[1/5 normal 0x010000000000000064]
+> n2 recv AppendEntries term=1 prev=1/5 commit=4 entries=[1/6 normal 0x010000000000000065]
+> n3 recv AppendEntries term=1 prev=1/5 commit=4 entries=[1/6 normal 0x010000000000000065]
+> n2 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=6
+> n3 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=6
+> n1 ready
+  AppendEntries term=1 prev=1/6 commit=5 entries=[]
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+  n1 applied index=5
+  n1 applied index=6
+> n2 recv AppendEntries term=1 prev=1/6 commit=5 entries=[]
+> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n3 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n3 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n2 ready
+  AppendResponse term=1 match=6
+  AppendResponse term=1 match=6
+  n2 applied index=5
+  n2 applied index=6
+> n3 ready
+  AppendResponse term=1 match=6
+  AppendResponse term=1 match=6
+  n3 applied index=5
+  n3 applied index=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+
+raft-log 2
+----
+n2: commit=6 applied=6 last=6
+  (snapshot covers <= index 4)
+  1/5 normal 0x010000000000000064
+  1/6 normal 0x010000000000000065
+
+applied-state 2
+----
+n2: applied=5
+  2: "a"
+  3: "b"
+  4: "c"
+  5: "d"
+  6: "e"
+
+crash 2
+----
+n2 crashed and restarted
+
+raft-log 2
+----
+n2: commit=6 applied=6 last=6
+  (snapshot covers <= index 4)
+  1/5 normal 0x010000000000000064
+  1/6 normal 0x010000000000000065
+
+applied-state 2
+----
+n2: applied=5
+  2: "a"
+  3: "b"
+  4: "c"
+  5: "d"
+  6: "e"
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=6
+Heartbeat term=1 commit=6
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=6
+> n3 recv Heartbeat term=1 commit=6
+> n2 ready
+  HeartbeatResponse term=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n3 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n2 ready
+  AppendResponse term=1 match=6
+> n3 ready
+  AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: follower term=1 lead=1
+
+raft-log 2
+----
+n2: commit=6 applied=6 last=6
+  (snapshot covers <= index 4)
+  1/5 normal 0x010000000000000064
+  1/6 normal 0x010000000000000065
+
+applied-state 2
+----
+n2: applied=5
+  2: "a"
+  3: "b"
+  4: "c"
+  5: "d"
+  6: "e"
+
