@@ -625,11 +625,11 @@ where
     for peer in self.peers().collect::<Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
     }
-    // A fatal store fault in the broadcast above poisons the node — report it rather than an Ok index the
-    // dead node will never drive to commit.
-    if self.poison.poisoned {
-      return Err(ProposeError::Poisoned);
-    }
+    // The entry was ALREADY appended (durable-pending) ABOVE, before the broadcast — so report Ok(index)
+    // even if the broadcast then self-poisoned. The entry is a real proposal that WILL commit via the
+    // durable log (a restart or a new leader drives it); returning Err here would make the caller treat a
+    // committed entry as never-proposed (the VOPR's "conjured command" failure). The poison does no further
+    // work — every op entry-guards — and surfaces on the caller's NEXT public-API call.
     Ok(index)
   }
 

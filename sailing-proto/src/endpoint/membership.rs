@@ -173,13 +173,12 @@ where
         return Err(ProposeError::InvalidConfChange);
       }
     }
-    let appended = self.append_conf_change(now, log, stable, cc);
-    // A fatal store fault while appending or broadcasting poisons the node — report it rather than an Ok
-    // index (or a misleading LogIndexExhausted) the dead node will never drive to commit.
-    if self.poison.poisoned {
-      return Err(ProposeError::Poisoned);
-    }
-    match appended {
+    // append_conf_change appends the entry (durable-pending) BEFORE its broadcast, so a broadcast self-poison
+    // does not un-append it — report Ok(index). It returns None ONLY for a genuine LogIndexExhausted (the
+    // already-poisoned entry case is caught by this method's own entry guard above, so it can't reach here),
+    // which maps to that error. Returning Err on a broadcast poison would make the caller treat a committed
+    // conf-change as never-proposed; the poison surfaces on the next public-API call instead.
+    match self.append_conf_change(now, log, stable, cc) {
       Some(index) => Ok(index),
       None => Err(ProposeError::LogIndexExhausted),
     }
