@@ -1,0 +1,227 @@
+# Invariant: a non-voter (learner) carrying a strictly HIGHER term than the cluster's leader cannot win
+# or keep the cluster wedged — a learner never campaigns, so a VOTER must end up leading, and the
+# cluster term advances to at least the disruptor's. Construction (mirrors hashicorp/raft's
+# ClusterCanRegainStability_WhenNonVoterWithHigherTermJoin): elect n1 in {1,2,3}; isolate n3 and let it
+# campaign so it climbs to term 2 (above the leader's term 1) while its votes are lost; demote n3 to a
+# learner on the {1,2} side (n3, isolated, does not learn this yet); reconnect. n3's higher term nudges
+# the stale-term leader n1 to step down (CheckQuorum), and a voter (n2) re-elects. n3 — still a
+# candidate in its own pre-demotion view — is superseded the moment it hears the new leader, applies
+# its own demotion, and settles as a quiet learner. It is NEVER leader at any point.
+add-nodes 3 voters=(1,2,3) checkquorum=true
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+isolate 3
+----
+n3 isolated
+
+campaign 3
+----
+n3 candidate term=2
+n3 leader-changed term=2 lead=none
+
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: candidate term=2 lead=none
+
+propose-conf-change 1 addlearner 3
+----
+n1 proposed conf-change addlearner n3 at index 2
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080212080300000000000000]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080212080300000000000000]
+> n2 ready
+  AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  n1 conf-changed index=2 voters={1,2} learners={3}
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResponse term=1 match=2
+  n2 conf-changed index=2 voters={1,2} learners={3}
+> n1 recv AppendResponse term=1 match=2
+
+conf-state 1
+----
+n1: voters={1,2} learners={3}
+
+recover 3
+----
+n3 recovered
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=2
+Heartbeat term=1 commit=1
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=2
+> n3 recv Heartbeat term=1 commit=1
+> n2 ready
+  HeartbeatResponse term=1
+> n3 ready
+  AppendResponse term=2 reject hint=0/0
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=2 reject hint=0/0
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  n1 leader-changed term=2 lead=none
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+
+raft-state
+----
+n1: follower term=2 lead=none
+n2: follower term=1 lead=1
+n3: candidate term=2 lead=none
+
+campaign 2
+----
+n2 candidate term=2
+RequestVote term=2 last=1/2 prevote=false
+n2 leader-changed term=2 lead=none
+
+stabilize
+----
+> n1 recv RequestVote term=2 last=1/2 prevote=false
+> n1 ready
+  VoteResponse term=2 prevote=false reject=false
+> n2 recv VoteResponse term=2 prevote=false reject=false
+> n2 ready
+  Heartbeat term=2 commit=0
+  Heartbeat term=2 commit=0
+  AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+  AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+  n2 leader-changed term=2 lead=2
+> n1 recv Heartbeat term=2 commit=0
+> n3 recv Heartbeat term=2 commit=0
+> n1 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+> n3 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+> n1 ready
+  HeartbeatResponse term=2
+  AppendResponse term=2 match=3
+  n1 leader-changed term=2 lead=2
+> n3 ready
+  HeartbeatResponse term=2
+  AppendResponse term=2 reject hint=1/1
+  n3 leader-changed term=2 lead=2
+> n2 recv HeartbeatResponse term=2
+> n2 recv AppendResponse term=2 match=3
+> n2 recv HeartbeatResponse term=2
+> n2 recv AppendResponse term=2 reject hint=1/1
+> n2 ready
+  AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+  AppendEntries term=2 prev=2/3 commit=3 entries=[]
+  AppendEntries term=2 prev=1/2 commit=3 entries=[2/3 empty]
+  AppendEntries term=2 prev=1/1 commit=3 entries=[1/2 conf-change 0x120c080212080300000000000000, 2/3 empty]
+> n1 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+> n1 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
+> n3 recv AppendEntries term=2 prev=1/2 commit=3 entries=[2/3 empty]
+> n3 recv AppendEntries term=2 prev=1/1 commit=3 entries=[1/2 conf-change 0x120c080212080300000000000000, 2/3 empty]
+> n1 ready
+  AppendResponse term=2 match=3
+  AppendResponse term=2 match=3
+> n3 ready
+  AppendResponse term=2 reject hint=1/1
+  AppendResponse term=2 match=3
+  n3 conf-changed index=2 voters={1,2} learners={3}
+> n2 recv AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 reject hint=1/1
+> n2 recv AppendResponse term=2 match=3
+> n2 ready
+  AppendEntries term=2 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120c080212080300000000000000, 2/3 empty]
+  AppendEntries term=2 prev=2/3 commit=3 entries=[]
+> n3 recv AppendEntries term=2 prev=0/0 commit=3 entries=[1/1 empty, 1/2 conf-change 0x120c080212080300000000000000, 2/3 empty]
+> n3 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
+> n3 ready
+  AppendResponse term=2 match=3
+  AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
+
+raft-state
+----
+n1: follower term=2 lead=2
+n2: leader term=2 lead=2
+n3: follower term=2 lead=2
+
+conf-state 3
+----
+n3: voters={1,2} learners={3}
+
+raft-log 3
+----
+n3: commit=3 applied=3 last=3
+  1/1 empty
+  1/2 conf-change 0x120c080212080300000000000000
+  2/3 empty
+
