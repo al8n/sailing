@@ -2104,6 +2104,9 @@ where
   /// A bare `break` is used ONLY for the benign "committed entry not yet readable" case (the
   /// log slice is empty), which is transient and retried on the next `handle_*`.
   fn apply_committed<L: LogStore>(&mut self, log: &L) {
+    if self.poison.poisoned {
+      return;
+    }
     // Bound BOTH the per-pass payload bytes AND the entry COUNT so a COLD/disk store returning
     // `Ready(Owned(..))` materializes a bounded amount per call instead of the whole unapplied backlog (a
     // panic-OOM for a node catching up). The byte cap alone is INSUFFICIENT: it charges PAYLOAD bytes, so a

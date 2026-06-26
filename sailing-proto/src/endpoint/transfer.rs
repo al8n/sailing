@@ -79,6 +79,11 @@ where
       // TimeoutNow will be sent from on_append_response once match_index == last_index.
       self.maybe_send_append(now, to, log, stable);
     }
+    // A fatal store fault in the lagging-target replication kick poisons the node — report it rather than
+    // an Ok the dead node will never honor.
+    if self.poison.poisoned {
+      return Err(TransferError::Poisoned);
+    }
     Ok(())
   }
 

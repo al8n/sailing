@@ -205,6 +205,9 @@ where
     S: StableStore<NodeId = I>,
     F::Snapshot: Data,
   {
+    if self.poison.poisoned {
+      return;
+    }
     if self.snapshot.pending_compact.is_some() || self.snapshot.pending_install.is_some() {
       // A snapshot is already being persisted (our own compaction) OR a follower install is deferred
       // and about to re-baseline the log; don't start a leader-side snapshot over it.
@@ -312,6 +315,9 @@ where
     S: StableStore<NodeId = I>,
     F::Snapshot: Data,
   {
+    if self.poison.poisoned {
+      return;
+    }
     // Preamble: mirror on_append_entries — reset to Follower, track leader, re-arm election timer.
     self.role = Role::Follower;
     self.set_leader(Some(is.leader()));
@@ -782,6 +788,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if self.poison.poisoned {
+      return;
+    }
     if !self.role.is_leader() {
       return;
     }

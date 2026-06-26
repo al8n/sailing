@@ -46,6 +46,9 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if self.poison.poisoned {
+      return None;
+    }
     // Allocate a fresh, usable index (see `next_log_index`): refuse at the ceiling rather than
     // alias-and-truncate or allocate the unreadable sentinel `u64::MAX`.
     let index = Self::next_log_index(log.last_index())?;
@@ -170,7 +173,13 @@ where
         return Err(ProposeError::InvalidConfChange);
       }
     }
-    match self.append_conf_change(now, log, stable, cc) {
+    let appended = self.append_conf_change(now, log, stable, cc);
+    // A fatal store fault while appending or broadcasting poisons the node — report it rather than an Ok
+    // index (or a misleading LogIndexExhausted) the dead node will never drive to commit.
+    if self.poison.poisoned {
+      return Err(ProposeError::Poisoned);
+    }
+    match appended {
       Some(index) => Ok(index),
       None => Err(ProposeError::LogIndexExhausted),
     }
