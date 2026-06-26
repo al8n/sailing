@@ -1,4 +1,4 @@
-use super::*;
+use super::{super::snapshot::ChunkSend, *};
 use crate::{
   HeartbeatResponse, InstallSnapshot, ProgressState, SnapshotMeta, SnapshotResponse,
   testkit::{AsyncStable, CountSm, FailTermLog, NoopStable, VecLog},
@@ -2523,9 +2523,15 @@ fn cold_snapshot_chunk_read_defers_the_send() {
   while ep.poll_message().is_some() {}
   let progress_before = ep.tracker.progress(&2u64).unwrap().state();
 
-  // COLD: the store reports the resident blob as not-yet-paged-in. The send must defer.
+  // COLD: the store reports the resident blob as not-yet-paged-in. The send must defer AND report NOT sent
+  // — so the caller leaves the resend-pacing deadline DUE (the next heartbeat retries immediately) rather
+  // than arming it and suppressing retries for a full election timeout per cold chunk.
   stable.cold_snapshot = true;
-  ep.send_snapshot_chunk(2u64, &stable, 0);
+  assert_eq!(
+    ep.send_snapshot_chunk(2u64, &stable, 0),
+    ChunkSend::Deferred,
+    "a cold (Pending) chunk read reports Deferred so the caller does not arm resend-pacing"
+  );
   assert!(
     ep.poll_message().is_none(),
     "a cold snapshot_chunk read (Pending) must emit NO InstallSnapshot — the send defers"
@@ -2537,9 +2543,13 @@ fn cold_snapshot_chunk_read_defers_the_send() {
   );
 
   // WARM: the read resolves. The deferred send now proceeds — exactly one InstallSnapshot, carrying the
-  // blob's real total_len (b"snap-data" = 9 bytes) and the requested offset 0.
+  // blob's real total_len (b"snap-data" = 9 bytes) and the requested offset 0. The send reports SENT.
   stable.cold_snapshot = false;
-  ep.send_snapshot_chunk(2u64, &stable, 0);
+  assert_eq!(
+    ep.send_snapshot_chunk(2u64, &stable, 0),
+    ChunkSend::Sent,
+    "a warm send that emits an InstallSnapshot reports Sent"
+  );
   let installs: Vec<_> = core::iter::from_fn(|| ep.poll_message())
     .filter_map(|o| match o.message() {
       Message::InstallSnapshot(s) if o.to() == 2u64 => Some(s.clone()),
@@ -2597,7 +2607,7 @@ fn chunked_install_frame_stays_under_limit_with_large_metadata() {
   if let Some(p) = ep.tracker.progress_mut(&1u64) {
     p.become_snapshot(Index::new(10));
   }
-  ep.send_snapshot_chunk(1u64, &stable, 0);
+  let _ = ep.send_snapshot_chunk(1u64, &stable, 0);
   let out = core::iter::from_fn(|| ep.poll_message())
     .find(|o| matches!(o.message(), Message::InstallSnapshot(_)))
     .expect("an InstallSnapshot chunk");
@@ -2640,7 +2650,7 @@ fn unsendable_oversized_metadata_emits_no_chunk() {
   if let Some(p) = ep.tracker.progress_mut(&1u64) {
     p.become_snapshot(Index::new(10));
   }
-  ep.send_snapshot_chunk(1u64, &stable, 0);
+  let _ = ep.send_snapshot_chunk(1u64, &stable, 0);
   assert!(
     ep.poll_message().is_none(),
     "an InstallSnapshot whose metadata alone exceeds MAX_FRAME_BYTES must NOT be enqueued (no oversized frame)"
@@ -3544,7 +3554,8 @@ fn snapshot_redundancy_term_read_failure_poisons_at_receipt() {
 #[test]
 fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
   use crate::{
-    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, PoisonReason, Term,
+    AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, OpId, PoisonReason,
+    StorageProgress, Term,
     testkit::{AsyncStable, CountSm, FailTermLog},
   };
   use core::time::Duration;
@@ -3619,11 +3630,27 @@ fn snapshot_redundancy_term_read_failure_poisons_at_completion() {
     )),
   );
   log.fail_term_at(Some(Index::new(5)));
-  ep.handle_storage(d, &mut log, &mut stable);
+  // A deferred compaction is pending when the install completes. The install poison must FAIL-STOP the
+  // storage handler BEFORE its compaction fallback runs — a poisoned node must do no destructive
+  // `log.compact`. (op 99 != the install's op, so the in-loop compaction at the completion does not match;
+  // only the post-loop fallback could fire, and with the durable snapshot covering up_to it WOULD — so the
+  // surviving entry proves the bail skipped it.)
+  ep.snapshot.pending_compact = Some((OpId::new(99), Index::new(2)));
+  let progress = ep.handle_storage(d, &mut log, &mut stable);
   assert_eq!(
     ep.poison_reason(),
     Some(PoisonReason::LogTerm),
     "a fatal boundary term-read at completion poisons, never falls through to the destructive restore"
+  );
+  assert_eq!(
+    progress,
+    StorageProgress::Drained,
+    "the completion-time install poison fail-stops handle_storage"
+  );
+  assert_eq!(
+    ep.pending_compact(),
+    Some((OpId::new(99), Index::new(2))),
+    "the fail-stop skips the compaction fallback — no destructive log.compact after a poison"
   );
 }
 
@@ -3938,5 +3965,190 @@ fn chunked_replacement_retires_the_superseded_pending_install() {
   assert!(
     ep.snapshot.snapshot_recv.is_some(),
     "the replacement transfer survives the stale completion"
+  );
+}
+
+// A DEFERRED (cold) snapshot send must not arm the resend-pacing deadline: arming it would let the
+// heartbeat suppress retries for a full election timeout, stalling a cold transfer one timeout per chunk.
+// The peer still enters Snapshot (it needs the blob), but the deadline stays unset so the next heartbeat
+// retries immediately. (The warm-send-arms case is covered by `conf_change_removal_prunes_snapshot_resend_deadline`.)
+#[test]
+fn cold_snapshot_send_does_not_arm_resend_pacing() {
+  use crate::{Index, Instant, Now};
+  let offset = 5u64;
+  let (mut ep, log, mut stable) = make_leader_with_compacted_log(offset, 2);
+  // Peer 2 far behind: next_index < first_index = offset + 1, so maybe_send_append takes the snapshot path.
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_probe();
+    p.set_next_index(Index::new(2));
+  }
+  while ep.poll_message().is_some() {}
+
+  // COLD store: the first snapshot chunk read defers (Pending).
+  stable.cold_snapshot = true;
+  ep.maybe_send_append(Now::monotonic(Instant::ORIGIN), 2u64, &log, &stable);
+  assert!(
+    ep.poll_message().is_none(),
+    "a cold first chunk emits no InstallSnapshot"
+  );
+  assert!(
+    ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+    "the peer still enters Snapshot state — it needs the blob"
+  );
+  assert!(
+    !ep.snapshot.snapshot_resend_after.contains_key(&2u64),
+    "a deferred (cold) snapshot send must NOT arm resend-pacing — the chunk was not sent"
+  );
+}
+
+// A cold per-ack PUMP (progress ack → the next chunk read defers) must CLEAR the resend-pacing deadline,
+// not leave the prior (future) one armed — otherwise the next heartbeat is suppressed for up to a full
+// election timeout even though no chunk went out and the peer will send no further progress ack.
+#[test]
+fn progress_ack_cold_pump_clears_resend_pacing_so_retry_is_immediate() {
+  use crate::{Index, Instant, Message, SnapshotResponse, Term};
+  let offset = 5u64;
+  let (mut ep, mut log, mut stable, _pending) = wedged_snapshot_follower(offset, 2);
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.snapshot.snapshot_resend_after.contains_key(&2u64),
+    "the wedged setup armed peer 2's (future) resend deadline"
+  );
+
+  stable.cold_snapshot = true;
+  // Mid-transfer progress ack: match_index 0 < pending keeps the peer in Snapshot; acked_through advances
+  // the cursor so the per-ack pump tries the NEXT chunk (which defers, cold).
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(
+      SnapshotResponse::new(Term::new(1), 2u64, false, Index::ZERO).with_acked_through(1),
+    ),
+  );
+  assert!(
+    ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+    "a progress ack keeps the peer in Snapshot"
+  );
+  assert!(
+    !core::iter::from_fn(|| ep.poll_message())
+      .any(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_))),
+    "the cold per-ack pump emits no InstallSnapshot"
+  );
+  assert!(
+    !ep.snapshot.snapshot_resend_after.contains_key(&2u64),
+    "a cold per-ack pump CLEARS the resend deadline so the next heartbeat retries immediately"
+  );
+}
+
+// A fatal `term` read during `reclaim_stale_snapshot_recv`'s Log-Matching proof must FAIL-STOP the whole
+// storage handler — `reclaim` poisons (PoisonReason::LogTerm) and returns false, and `handle_storage` bails
+// rather than continuing handler work on a poisoned node.
+#[test]
+fn reclaim_term_read_failure_fail_stops_handle_storage() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, PoisonReason,
+    SnapshotMeta, Term,
+    testkit::{AsyncStable, CountSm, FailTermLog},
+  };
+  let cfg = crate::Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  let d = Instant::ORIGIN;
+
+  // Durable [1..=4] term 2, commit 2: durable_index=4 < boundary 5 at receipt, so a partial chunk STAGES.
+  let head: Vec<Entry> = (1u64..=4)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      head,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // Stage a partial chunk at boundary 5 (offset 0, total_len > the partial).
+  let blob = encode_count_snapshot(5);
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    crate::conf::ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta,
+      blob.slice(0..blob.len() / 2),
+      0,
+      blob.len() as u64,
+    )),
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the partial chunk staged"
+  );
+
+  // In-window appends extend the durable log THROUGH the boundary; arm the fatal boundary term-read so the
+  // reclaim Log-Matching proof (boundary 5 <= durable 9) hits it.
+  let tail: Vec<Entry> = (5u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(4),
+      Term::new(2),
+      tail,
+      Index::new(2),
+    )),
+  );
+  log.fail_term_at(Some(Index::new(5)));
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::LogTerm),
+    "a fatal term-read in reclaim fail-stops the storage handler"
   );
 }

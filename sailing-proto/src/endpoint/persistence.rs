@@ -422,6 +422,11 @@ where
               .take()
               .expect("checked Some above");
             self.install_snapshot_now(log, meta, snap, leader);
+            // Completion-time install can poison (log_term, SnapshotRestore, the log re-baseline) →
+            // fail-stop the storage handler before any further drain / compaction / reclaim on a dead node.
+            if self.poison.poisoned {
+              return StorageProgress::Drained;
+            }
           }
           stable_budget -= 1;
         }
@@ -469,6 +474,10 @@ where
           .take()
           .expect("checked Some above");
         self.install_snapshot_now(log, meta, snap, leader);
+        // The deferred (missed-completion) install can poison the same ways → fail-stop before reclaim.
+        if self.poison.poisoned {
+          return StorageProgress::Drained;
+        }
       }
     }
 

@@ -1,6 +1,22 @@
 use super::*;
 use crate::{InstallSnapshot, ProgressState, SnapshotChunkRead, SnapshotMeta};
 
+/// The outcome of a snapshot-chunk send attempt. A FATAL store error and a benign cold deferral are
+/// DISTINCT outcomes — both emit no `InstallSnapshot`, but conflating them let a poisoned node keep
+/// mutating state (advance commit, compact) in the same dispatch. Callers match exhaustively, so the
+/// poison case can never be silently treated as a retryable defer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use = "a ChunkSend::Poisoned must fail-stop the caller; Sent/Deferred drive resend-pacing"]
+pub(crate) enum ChunkSend {
+  /// An `InstallSnapshot` was emitted — arm the resend-pacing deadline.
+  Sent,
+  /// No chunk went out for a BENIGN reason (cold `Pending`, nothing persisted, or an unsendable frame) —
+  /// clear the deadline so the next heartbeat retries immediately.
+  Deferred,
+  /// A FATAL store error poisoned the node — the caller MUST bail (no further work this dispatch).
+  Poisoned,
+}
+
 impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
@@ -43,10 +59,11 @@ where
     &mut self,
     peer: I,
     stable: &S,
-  ) -> bool {
+  ) -> ChunkSend {
     // Resume from the peer's contiguous-staged cursor, not from 0: a lost middle chunk re-sends only
-    // the tail. A peer with no cursor (shouldn't happen in Snapshot state) restarts from 0. Returns
-    // whether a chunk was actually sent, so the caller arms resend-pacing ONLY on a real send.
+    // the tail. A peer with no cursor (shouldn't happen in Snapshot state) restarts from 0. Propagates
+    // the `ChunkSend` outcome so the caller arms resend-pacing on `Sent`, clears it on `Deferred`, and
+    // bails on `Poisoned`.
     let from = match self.tracker.progress(&peer).map(|p| p.state()) {
       Some(ProgressState::Snapshot { acked_through, .. }) => acked_through,
       _ => 0,
@@ -67,23 +84,23 @@ where
     peer: I,
     stable: &S,
     from_offset: u64,
-  ) -> bool {
+  ) -> ChunkSend {
     // Read THIS chunk from the store (bounded — one chunk, never the whole blob resident). The read also
     // hands back the meta + total_len, so we reconcile the boundary and size the frame from it. A cold
     // store returns `Pending` (we defer and re-drive on storage-ready); an `Err` is a fatal store fault.
-    // Returns whether an `InstallSnapshot` was actually EMITTED: the caller arms the resend-pacing deadline
-    // ONLY on a real send, so a deferred (`Pending`) or unsendable chunk stays due for the next
-    // heartbeat / storage-ready re-drive instead of being suppressed for a full election timeout.
+    // Returns a `ChunkSend`: `Sent` when an `InstallSnapshot` was EMITTED (caller arms resend-pacing),
+    // `Deferred` for a benign no-send (cold `Pending`, nothing persisted, unsendable frame — caller clears
+    // pacing so the next heartbeat retries), or `Poisoned` on a FATAL store error (caller MUST bail).
     let config_chunk = self
       .config
       .snapshot_chunk_bytes()
       .clamp(1, crate::config::MAX_SNAPSHOT_CHUNK_BYTES);
     let (meta, total, chunk_at_from) = match stable.snapshot_chunk(from_offset, config_chunk) {
-      None => return false,
+      None => return ChunkSend::Deferred,
       Some(Ok(read)) => read,
       Some(Err(_)) => {
         self.poison(PoisonReason::SnapshotRead);
-        return false;
+        return ChunkSend::Poisoned;
       }
     };
     let boundary = meta.last_index();
@@ -130,7 +147,7 @@ where
     let frame_budget =
       crate::wire::MAX_FRAME_BYTES.saturating_sub(overhead + data_field_max_self_cost) as u64;
     if frame_budget == 0 {
-      return false;
+      return ChunkSend::Deferred;
     }
     let chunk_len = config_chunk.min(frame_budget);
     // Reuse the chunk already read at `from_offset` when the reconciled offset is unchanged (the common
@@ -140,11 +157,11 @@ where
       chunk_at_from
     } else {
       match stable.snapshot_chunk(start, chunk_len) {
-        None => return false,
+        None => return ChunkSend::Deferred,
         Some(Ok((_, _, read))) => read,
         Some(Err(_)) => {
           self.poison(PoisonReason::SnapshotRead);
-          return false;
+          return ChunkSend::Poisoned;
         }
       }
     };
@@ -157,7 +174,7 @@ where
       }
       // Cold: the bytes aren't resident and the store began fetching. Defer — no progress mutation — and
       // re-drive on the storage-ready seam (the heartbeat `resend_snapshot` also re-drives).
-      SnapshotChunkRead::Pending => return false,
+      SnapshotChunkRead::Pending => return ChunkSend::Deferred,
     };
     self.send(
       peer,
@@ -165,7 +182,7 @@ where
         term, me, meta, data, start, total,
       )),
     );
-    true
+    ChunkSend::Sent
   }
 }
 impl<I, F, R> Endpoint<I, F, R>
@@ -800,18 +817,22 @@ where
       if let Some(ProgressState::Snapshot { acked_through, .. }) =
         self.tracker.progress(&from).map(|p| p.state())
       {
-        // Pump the NEXT chunk; arm resend-pacing ONLY on a real send. A cold/deferred chunk
-        // (`SnapshotChunkRead::Pending`) emits nothing and returns false — CLEAR the deadline so the next
-        // heartbeat retries immediately. Merely not re-arming is insufficient HERE: the prior pump left a
-        // FUTURE deadline, and the peer (no new chunk to ack) will send no further progress ack to re-drive
-        // it, so a lingering future deadline would suppress the retry for up to a full election timeout.
-        if self.send_snapshot_chunk(from.cheap_clone(), stable, acked_through) {
-          self.snapshot.snapshot_resend_after.insert(
-            from.cheap_clone(),
-            now.mono() + self.config.election_timeout(),
-          );
-        } else {
-          self.snapshot.snapshot_resend_after.remove(&from);
+        // Pump the NEXT chunk. Arm resend-pacing on a real send; CLEAR it on a benign defer so the next
+        // heartbeat retries immediately (merely not re-arming is insufficient HERE — the prior pump left a
+        // FUTURE deadline, and the peer, with no new chunk to ack, sends no further progress ack to re-drive
+        // it, so a lingering future deadline would suppress the retry for up to a full election timeout); and
+        // BAIL on a fatal store error — a poisoned node must not fall through to commit/apply below.
+        match self.send_snapshot_chunk(from.cheap_clone(), stable, acked_through) {
+          ChunkSend::Sent => {
+            self.snapshot.snapshot_resend_after.insert(
+              from.cheap_clone(),
+              now.mono() + self.config.election_timeout(),
+            );
+          }
+          ChunkSend::Deferred => {
+            self.snapshot.snapshot_resend_after.remove(&from);
+          }
+          ChunkSend::Poisoned => return,
         }
       }
       // Re-borrow self for the resume sequence (pr is dropped above).
