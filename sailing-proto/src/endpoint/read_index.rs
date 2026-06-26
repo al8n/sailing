@@ -37,6 +37,11 @@ where
     let deferred = core::mem::take(&mut self.reads.pending_reads);
     for (ctx, from) in deferred {
       self.do_leader_read(now, log, ctx, from);
+      // A read that poisons the node (a fatal LeaseGuard anchor read) fail-stops the flush: the remaining
+      // deferred reads can never complete on a dead node, so stop rather than re-enter do_leader_read.
+      if self.poison.poisoned {
+        return;
+      }
     }
   }
 
@@ -337,6 +342,12 @@ where
     context: Bytes,
     from: Option<I>,
   ) {
+    // A poisoned node serves no reads; guard at entry so a re-entry (e.g. the deferred-read flush loop after
+    // an earlier read poisoned) mutates no read state — not even the LeaseGuard read_since_anchor flag set
+    // before the per-mode lease check below.
+    if self.poison.poisoned {
+      return;
+    }
     let commit = self.commit;
     match self.reads.active_read_mode {
       ReadOnlyOption::Safe => {
