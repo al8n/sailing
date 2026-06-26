@@ -506,6 +506,16 @@ impl<I: NodeId> StableStore for NoopStable<I> {
     None
   }
 
+  #[allow(clippy::type_complexity)]
+  fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<I>, u64, SnapshotChunkRead), Self::Error>> {
+    // No snapshot is ever resident, so this resolves to None; delegating documents the resident contract.
+    self.resident_snapshot_chunk(offset, len)
+  }
+
   fn durable_snapshot(&self) -> Option<SnapshotMeta<I>> {
     None
   }
