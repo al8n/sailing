@@ -500,9 +500,19 @@ where
       self.apply_committed(log);
       self.maybe_flush_deferred_reads(now, log, stable);
     }
+    // apply_committed / the deferred-read flush can poison on a fatal log or state read → fail-stop before
+    // the snapshot, auto-leave, and commit-persist tail runs on a dead node.
+    if self.poison.poisoned {
+      return StorageProgress::Drained;
+    }
 
     // After all completions are drained, check whether a new snapshot is warranted.
     self.maybe_snapshot(log, stable);
+    // maybe_snapshot can poison on snapshot capture or its log_term(applied) read → fail-stop before the
+    // auto-leave / commit-persist tail mutates leader state on a dead node.
+    if self.poison.poisoned {
+      return StorageProgress::Drained;
+    }
 
     // Auto-leave joint consensus: once the joint config is applied and no conf change is in
     // flight, the leader appends an empty leave-joint entry to transition back to a simple
@@ -520,6 +530,11 @@ where
         // at u64::MAX is in a corrupt/terminal state — fail-stop.
         self.poison(PoisonReason::LogExhausted);
       }
+    }
+    // The auto-leave append can poison (log index space exhausted) → fail-stop before the commit-persist
+    // and election-timer tail runs on a dead node.
+    if self.poison.poisoned {
+      return StorageProgress::Drained;
     }
 
     // Persist the advanced commit watermark so a restart recovers it (without this, restart
