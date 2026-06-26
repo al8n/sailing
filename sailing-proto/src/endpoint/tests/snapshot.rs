@@ -4346,3 +4346,173 @@ fn receiver_handles_eof_empty_chunk_without_pinning_staging() {
     );
   }
 }
+
+// A snapshot chunk that arrives OUT of byte-offset order (a higher offset before the lower one) is staged
+// by its offset; the contiguous watermark only advances over the FILLED prefix, so the receiver acks its
+// true contiguous length regardless of arrival order. Sailing's stop-and-wait sender never produces this
+// order on the wire (so the interaction corpus cannot), but the receiver tolerates it by construction —
+// this exercises that tolerance directly, with a REAL snapshot blob so the reassembled bytes must decode
+// at the correct offsets and drive a genuine install (not merely advance a watermark over zero-fill).
+#[test]
+fn receiver_stages_out_of_order_chunks_by_offset() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+
+  // A REAL CountSm snapshot blob (the LE u64 the install path decodes), restoring the SM to this value.
+  // DISTINCT NON-ZERO bytes in every position (little-endian 0x01..0x08) so a staging bug that misplaces the
+  // out-of-order range changes the decoded value or the persisted bytes — a wrong placement cannot alias the
+  // correct one through shared zero padding.
+  let snap_value = 0x0807_0605_0403_0201u64;
+  let blob = encode_count_snapshot(snap_value);
+  let total = blob.len() as u64;
+  let meta = || {
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+  };
+  // Three byte-ranges covering the whole blob: a low [0..3), a middle [3..6), and the final [6..total).
+  let lo = blob.slice(0..3);
+  let mid = blob.slice(3..6);
+  let last = blob.slice(6..total as usize);
+  // Count the non-reject progress acks a single delivery produced (each chunk emits exactly one).
+  let take_acks = |ep: &mut Endpoint<u64, CountSm>| -> Vec<u64> {
+    core::iter::from_fn(|| ep.poll_message())
+      .filter_map(|o| match o.message() {
+        Message::SnapshotResponse(r) if !r.reject() => Some(r.acked_through()),
+        _ => None,
+      })
+      .collect()
+  };
+
+  // The MIDDLE range [3..6) arrives FIRST (a higher offset before the lower one): staged by offset, but
+  // the contiguous prefix is empty — the gap at [0..3) pins the watermark at 0.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta(),
+      mid,
+      3,
+      total,
+    )),
+  );
+  assert_eq!(
+    take_acks(&mut ep),
+    std::vec![0],
+    "a gap before the staged middle range leaves the contiguous watermark at 0 (one progress ack)"
+  );
+
+  // The LOW range [0..3) fills the gap: the contiguous prefix jumps over the now-adjacent [0..6).
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta(),
+      lo,
+      0,
+      total,
+    )),
+  );
+  assert_eq!(
+    take_acks(&mut ep),
+    std::vec![6],
+    "filling the [0..3) gap advances the watermark over the now-contiguous [0..6) (one progress ack)"
+  );
+
+  // The FINAL range [6..total) completes the blob. The whole blob is now contiguous-staged, so the receiver
+  // DEFERS the destructive install (no immediate ack yet) until the blob is proven durable.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta(),
+      last,
+      6,
+      total,
+    )),
+  );
+  assert!(
+    take_acks(&mut ep).is_empty(),
+    "the final chunk defers the install (the ack waits for the blob to be durable)"
+  );
+
+  // Drive storage (as the driver does each iteration): the SnapshotWritten completion fires
+  // `install_snapshot_now`, which decodes the reassembled blob and runs the destructive re-baseline.
+  ep.handle_storage(d, &mut log, &mut stable);
+
+  // The reassembled bytes decoded at the correct offsets: the SM is restored to the snapshot value. Compare
+  // as `usize` (CountSm restores into a usize): on a 32-bit target both sides truncate identically, so the
+  // decode check stays portable; the exact persisted-blob equality below is the byte-placement guard on ALL
+  // targets (it compares the full 8-byte blob, so a misplaced high range still fails where usize is 32-bit).
+  assert_eq!(
+    ep.state_machine().count(),
+    snap_value as usize,
+    "the out-of-order ranges reassembled into the real blob and restored the SM to the snapshot value"
+  );
+  // commit/applied and the log re-baseline jump to the snapshot boundary (a genuine install).
+  assert_eq!(
+    ep.commit,
+    Index::new(10),
+    "commit advanced to the snapshot boundary"
+  );
+  assert_eq!(
+    ep.applied,
+    Index::new(10),
+    "applied advanced to the snapshot boundary"
+  );
+  assert_eq!(
+    log.first_index(),
+    Index::new(11),
+    "the log was re-baselined to last_index + 1"
+  );
+  // The persisted blob is EXACTLY the original — proving the out-of-order ranges were placed at their true
+  // byte offsets, not merely that some snapshot was stored.
+  assert_eq!(
+    stable
+      .snapshot()
+      .expect("the install persisted a snapshot")
+      .1,
+    blob,
+    "the persisted snapshot bytes equal the original reassembled blob"
+  );
+
+  // Exactly one SnapshotInstalled event for the boundary, and the final install ack reports the boundary.
+  let events: Vec<_> = core::iter::from_fn(|| ep.poll_event())
+    .filter(|e| e.is_snapshot_installed())
+    .collect();
+  assert_eq!(
+    events.len(),
+    1,
+    "exactly one SnapshotInstalled event for the completed install"
+  );
+  assert_eq!(
+    events[0].unwrap_snapshot_installed_ref().last_index(),
+    Index::new(10)
+  );
+  let install_acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
+    .filter_map(|o| match o.message() {
+      Message::SnapshotResponse(r) if !r.reject() => Some(r.match_index()),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    install_acks,
+    std::vec![Index::new(10)],
+    "the completed install sends exactly one success ack at the snapshot boundary"
+  );
+}
