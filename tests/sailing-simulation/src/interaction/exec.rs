@@ -18,6 +18,7 @@ impl InteractionEnv {
       "campaign" => self.campaign(d),
       "stabilize" => self.stabilize(),
       "deliver-msgs" => self.deliver_msgs(d),
+      "drop-msgs" => self.drop_msgs(d),
       "process-ready" => self.process_ready(d),
       "propose" => self.propose(d),
       "propose-conf-change" => self.propose_conf_change(d),
@@ -611,6 +612,34 @@ impl InteractionEnv {
         n.ep
           .handle_message(now, &mut n.log, &mut n.stable, from, msg);
       }
+    }
+    self.bus = kept;
+    if out.is_empty() {
+      out.push_str("no messages\n");
+    }
+    out
+  }
+
+  /// `drop-msgs [from=..] [to=..]` — DROP the in-flight messages matching the filter (all if none)
+  /// WITHOUT delivering them, modelling a lossy link. Renders each dropped message (same form as
+  /// `deliver-msgs`) so the golden records exactly what was emitted-then-lost rather than the loss
+  /// being invisible.
+  pub(crate) fn drop_msgs(&mut self, d: &Directive) -> String {
+    let from_filter: Option<u64> = d.value("from");
+    let to_filter: Option<u64> = d.value("to");
+    let mut out = String::new();
+    let mut kept = VecDeque::new();
+    let pending: Vec<(u64, u64, Message<u64>)> = self.bus.drain(..).collect();
+    for (from, to, msg) in pending {
+      let matches = from_filter.is_none_or(|f| f == from) && to_filter.is_none_or(|t| t == to);
+      if !matches {
+        kept.push_back((from, to, msg));
+        continue;
+      }
+      out.push_str(&std::format!(
+        "dropped n{from}->n{to} {}\n",
+        render_msg(from, to, &msg)
+      ));
     }
     self.bus = kept;
     if out.is_empty() {
