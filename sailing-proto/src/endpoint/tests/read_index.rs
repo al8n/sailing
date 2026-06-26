@@ -1469,3 +1469,240 @@ fn leader_read_backlog_is_bounded() {
     "the rejected read must not be added: the backlog stays at the cap"
   );
 }
+
+// A fatal LogStore::term read in read_index's current-term-commit gate must REJECT with Poisoned — not
+// collapse the fatal error into the ordinary "no current-term commit yet" deferral, which would push a
+// pending read that can never complete (a poisoned node emits no events) and report Ok.
+#[test]
+fn read_index_rejects_when_current_term_gate_term_read_poisons() {
+  use crate::{
+    AppendResponse, Config, Index, Instant, Message, PoisonReason, Term, VoteResponse,
+    testkit::FailTermLog,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
+  // Elect + commit the election no-op so a current-term anchor exists (term reads succeed: fault unarmed).
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.poison_reason().is_none(),
+    "not poisoned before the fault"
+  );
+
+  // Arm the fatal term read at the commit index — has_current_term_commit reads log_term(commit).
+  log.fail_term_at(Some(ep.commit_index()));
+  let r = ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r"));
+  assert_eq!(
+    r,
+    Err(ReadIndexError::Poisoned),
+    "a fatal term read in the current-term gate rejects the read, not defer-and-Ok"
+  );
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::LogTerm));
+  assert!(
+    ep.reads.pending_reads.is_empty(),
+    "no read deferred after the poison"
+  );
+  assert!(
+    ep.poll_event().is_none(),
+    "no ReadState event emitted after the poison"
+  );
+}
+
+// A LeaseGuard read whose anchor `entries` read fails (fatal) poisons the node inside do_leader_read.
+// The fail-stop must happen BEFORE the stale-lease branch sets lease_refresh_wanted or registers a Safe
+// read — no read/refresh state mutated on a dead node (the egress is already guarded, so the discriminator
+// is the internal state). Covers both the local read_index and the shared do_leader_read forwarded path.
+#[test]
+fn leaseguard_read_fail_stops_before_mutating_state_when_entries_poisons() {
+  use crate::{
+    AppendResponse, Config, Index, Instant, Message, PoisonReason, ReadOnlyOption, Term,
+    VoteResponse, testkit::FailTermLog,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
+  // Elect + commit the election no-op (a current-term LeaseGuard anchor); term/entries reads succeed here.
+  let now = ep.poll_timeout().unwrap();
+  ep.handle_timeout(now, &mut log, &mut stable);
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  ep.handle_storage(now, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  assert!(
+    ep.poison_reason().is_none(),
+    "not poisoned before the fault"
+  );
+
+  // Arm the fatal anchor `entries` read; lease_guard_read_live reads entries(commit) and poisons (LogRead).
+  log.fail_entries_at(Some(ep.commit_index()));
+  let r = ep.read_index(now, &log, &stable, bytes::Bytes::from_static(b"r"));
+  assert_eq!(
+    r,
+    Err(ReadIndexError::Poisoned),
+    "a fatal entries read in the LeaseGuard lease check rejects the read"
+  );
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::LogRead));
+  assert!(
+    !ep.lease_guard.lease_refresh_wanted,
+    "do_leader_read must fail-stop BEFORE recording a refresh demand on a dead node"
+  );
+  assert!(
+    ep.poll_event().is_none(),
+    "no ReadState event after the poison"
+  );
+}
+
+// do_leader_read entry-guards: once the node is poisoned it mutates NO read state — not even the LeaseGuard
+// read_since_anchor flag set before the per-mode lease check. So the deferred-read flush loop re-entering
+// do_leader_read after an earlier read poisoned is a no-op (the flush loop fail-stop relies on this guard).
+#[test]
+fn do_leader_read_entry_guards_on_a_poisoned_node() {
+  use crate::{
+    AppendResponse, Config, Index, Instant, Message, ReadOnlyOption, Term, VoteResponse,
+    testkit::FailTermLog,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
+  let now = ep.poll_timeout().unwrap();
+  ep.handle_timeout(now, &mut log, &mut stable);
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(now, &mut log, &mut stable);
+  ep.handle_message(
+    now,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  ep.handle_storage(now, &mut log, &mut stable);
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+  // A fresh anchor: no read has occurred yet.
+  assert!(!ep.lease_guard.read_since_anchor);
+
+  // Poison the node via read_index's gate (fail the term read): it returns Err(Poisoned) WITHOUT reaching
+  // do_leader_read, so read_since_anchor stays unset.
+  log.fail_term_at(Some(ep.commit_index()));
+  assert_eq!(
+    ep.read_index(now, &log, &stable, bytes::Bytes::from_static(b"r1")),
+    Err(ReadIndexError::Poisoned)
+  );
+  assert!(ep.poison_reason().is_some());
+  assert!(
+    !ep.lease_guard.read_since_anchor,
+    "the gate poison did not reach do_leader_read"
+  );
+
+  // Re-enter do_leader_read on the poisoned node (as the deferred-read flush loop would): the entry guard
+  // must no-op — no read_since_anchor mutation, no event.
+  ep.do_leader_read(
+    crate::Now::monotonic(now),
+    &log,
+    bytes::Bytes::from_static(b"r2"),
+    None,
+  );
+  assert!(
+    !ep.lease_guard.read_since_anchor,
+    "do_leader_read must mutate no read state on a poisoned node"
+  );
+  assert!(
+    ep.poll_event().is_none(),
+    "no ReadState event on a poisoned node"
+  );
+}
