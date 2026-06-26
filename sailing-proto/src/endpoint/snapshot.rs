@@ -104,18 +104,20 @@ where
       }
     };
     let boundary = meta.last_index();
-    // A peer whose `pending` no longer matches the local snapshot is mid-transfer on a now-superseded
-    // blob: its monotone `acked_through` would otherwise keep re-sending the NEW blob at the OLD offset
-    // (the follower supersedes its staging to the new boundary and acks `acked_through = 0`, which the
-    // monotone cursor ignores), wedging it. Reset to the new boundary and restart at 0.
+    // A peer whose snapshot IDENTITY (boundary + total) no longer matches the local snapshot is mid-transfer
+    // on a now-superseded blob: keeping its resume cursor would re-send the NEW blob at the OLD offset (or,
+    // for a SMALLER new blob, clamp the cursor past the end and emit a stale empty tail). Reset to the new
+    // identity — `become_snapshot` clears the cursor to 0 and records the new `total` — and restart at 0.
+    // Matching the TOTAL (not just the boundary) is load-bearing: a newer same-boundary capture is a distinct
+    // blob whose byte stream differs, so the old cursor is meaningless against it.
     let from = if matches!(
       self.tracker.progress(&peer).map(|p| p.state()),
-      Some(ProgressState::Snapshot { pending, .. }) if pending == boundary
+      Some(ProgressState::Snapshot { pending, total: t, .. }) if pending == boundary && t == total
     ) {
       from_offset
     } else {
       if let Some(p) = self.tracker.progress_mut(&peer) {
-        p.become_snapshot(boundary);
+        p.become_snapshot(boundary, total);
       }
       0
     };
@@ -514,26 +516,26 @@ where
     // only be a stale-cursor artifact. Handle it BEFORE the continuation/supersede/stage logic so a malformed
     // or version-skewed leader cannot pin a `total_len` staging allocation or replace the active
     // `snapshot_recv` with a no-progress one. A correct sender emits empty data ONLY at EOF
-    // (`offset == total_len`); any other offset is malformed and fail-stops. An EOF-empty re-acks the CURRENT
-    // contiguous cursor of the matching in-progress transfer (the benign stale-cursor self-correction that
-    // re-syncs a leader whose acked cursor ran ahead), or is dropped when none matches — either way it
-    // allocates nothing and starts nothing.
+    // (`offset == total_len`); any other offset is malformed and fail-stops.
     if is.data().is_empty() {
       if is.offset() != total_len {
         self.poison(PoisonReason::SnapshotDecode);
         return;
       }
-      let cursor = match &self.snapshot.snapshot_recv {
+      // EOF: re-ack the follower's TRUE contiguous watermark — the matching transfer's staged length, or 0
+      // when no transfer matches (a not-yet-started or superseded identity has staged nothing for this blob).
+      // NEVER drop: the leader sets its resume cursor from this ack (`snapshot_acked` is not monotone), so a
+      // true-watermark ack re-syncs a leader whose cursor ran ahead and RESTARTS a stranded transfer at 0
+      // rather than letting it resend the same empty tail forever. Allocates nothing and starts nothing.
+      let staged = match &self.snapshot.snapshot_recv {
         Some(r)
           if r.sender_term == is.term() && r.meta.identity_eq(meta) && r.total_len == total_len =>
         {
-          Some(r.contiguous_staged)
+          r.contiguous_staged
         }
-        _ => None,
+        _ => 0,
       };
-      if let Some(staged) = cursor {
-        self.send_snapshot_progress_ack(is.leader(), staged);
-      }
+      self.send_snapshot_progress_ack(is.leader(), staged);
       return;
     }
 

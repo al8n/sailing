@@ -5,10 +5,13 @@ use crate::{Index, Inflights};
 
 /// How the leader is currently replicating to a peer.
 ///
-/// `Snapshot { pending, acked_through }` carries the last log index covered by the snapshot being
-/// sent (`pending`) and the highest contiguous byte offset the follower has staged (`acked_through`,
-/// the chunk resume cursor); the peer stays paused until it acks at or past `pending`, then
-/// transitions back to `Probe`.
+/// `Snapshot { pending, acked_through, total }` carries the last log index covered by the snapshot being
+/// sent (`pending`), the highest contiguous byte offset the follower has staged (`acked_through`, the chunk
+/// resume cursor), and the blob's `total` length. `total` IDENTITY-SCOPES the cursor: a delayed ack from a
+/// SUPERSEDED same-boundary capture (a different, often larger, blob) reports a watermark past the CURRENT
+/// blob, which `snapshot_acked` rejects rather than letting it inflate the cursor past `total` and make the
+/// sender emit a stale empty tail. The peer stays paused until it acks at or past `pending`, then transitions
+/// back to `Probe`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
 pub enum ProgressState {
@@ -22,6 +25,9 @@ pub enum ProgressState {
     pending: Index,
     /// The highest contiguous byte offset the follower has staged (the chunk resume cursor).
     acked_through: u64,
+    /// The blob's total length — identity-scopes the cursor so a stale cross-capture ack cannot inflate
+    /// `acked_through` past the CURRENT blob.
+    total: u64,
   },
 }
 
@@ -116,7 +122,7 @@ impl Progress {
 
   /// Enter snapshot-delivery state. The peer stays paused until it acks at or past
   /// `pending_snapshot`, then `maybe_update` transitions it back to `Probe`.
-  pub fn become_snapshot(&mut self, pending_snapshot: Index) {
+  pub fn become_snapshot(&mut self, pending_snapshot: Index, total: u64) {
     // A peer whose `match_index` already covers the snapshot boundary has those entries durably — it does
     // NOT need the snapshot. Entering Snapshot state here would WEDGE it permanently: it is already
     // `>= pending`, so `resend_snapshot` (which only re-sends to a peer BEHIND `pending`) never fires, and
@@ -132,20 +138,30 @@ impl Progress {
     self.state = ProgressState::Snapshot {
       pending: pending_snapshot,
       acked_through: 0,
+      total,
     };
     self.inflight.reset();
     self.msg_app_flow_paused = false;
   }
 
   /// Set the per-chunk resume cursor for a peer in `Snapshot` state to the follower's reported
-  /// contiguous-staged watermark. NOT monotone: a `max` would let a STALE old-boundary `acked_through`
-  /// (a reordered ack arriving after a boundary supersede reset the peer to a new boundary) inflate the
-  /// new boundary's cursor and wedge the transfer. Tracking the follower's ACTUAL watermark instead
-  /// self-corrects — the follower always reports its TRUE contiguous length, so the next ack drives the
-  /// cursor to the right place (any out-of-order chunk is retained by the store's staging). No-op if the
-  /// peer is not in `Snapshot`.
+  /// contiguous-staged watermark, REJECTING a watermark past the current blob's `total`. NOT monotone: a
+  /// `max` would let a STALE old-boundary `acked_through` (a reordered ack arriving after a boundary supersede
+  /// reset the peer to a new boundary) inflate the cursor and wedge the transfer. Tracking the follower's
+  /// ACTUAL watermark self-corrects — the follower always reports its TRUE contiguous length, so the next ack
+  /// drives the cursor to the right place (any out-of-order chunk is retained by the store's staging). But a
+  /// stale ack from a SAME-boundary, DIFFERENT-capture blob (a larger superseded snapshot) reports a watermark
+  /// past THIS blob, which is NOT self-correcting — it makes the sender clamp to the end and emit a stale
+  /// empty tail — so it is rejected against `total`. A watermark for THIS blob is always `<= total`, so a
+  /// valid ack is never dropped. No-op if the peer is not in `Snapshot`.
   pub fn snapshot_acked(&mut self, offset: u64) {
-    if let ProgressState::Snapshot { acked_through, .. } = &mut self.state {
+    if let ProgressState::Snapshot {
+      acked_through,
+      total,
+      ..
+    } = &mut self.state
+      && offset <= *total
+    {
       *acked_through = offset;
     }
   }

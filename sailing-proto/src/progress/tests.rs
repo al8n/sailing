@@ -37,7 +37,8 @@ fn snapshot_state_as_str_and_predicate() {
   assert_eq!(
     ProgressState::Snapshot {
       pending: Index::new(10),
-      acked_through: 0
+      acked_through: 0,
+      total: 256,
     }
     .as_str(),
     "snapshot"
@@ -45,7 +46,8 @@ fn snapshot_state_as_str_and_predicate() {
   assert!(
     ProgressState::Snapshot {
       pending: Index::new(10),
-      acked_through: 0
+      acked_through: 0,
+      total: 256,
     }
     .is_snapshot()
   );
@@ -56,7 +58,7 @@ fn snapshot_state_as_str_and_predicate() {
 #[test]
 fn snapshot_state_is_always_paused() {
   let mut p = Progress::new(Index::new(5), 256, 0);
-  p.become_snapshot(Index::new(10));
+  p.become_snapshot(Index::new(10), 256);
   assert!(p.is_paused());
   assert!(p.state().is_snapshot());
 }
@@ -64,7 +66,7 @@ fn snapshot_state_is_always_paused() {
 #[test]
 fn become_snapshot_records_pending_index() {
   let mut p = Progress::new(Index::new(5), 256, 0);
-  p.become_snapshot(Index::new(20));
+  p.become_snapshot(Index::new(20), 256);
   assert!(p.state().is_snapshot());
   assert!(p.is_paused());
   // pending_snapshot index is stored in the variant
@@ -83,7 +85,7 @@ fn become_snapshot_at_or_below_match_reprobes_instead_of_wedging() {
   // `maybe_update` out of Snapshot. Re-probe from `match + 1` and resume append replication instead.
   let mut p = Progress::new(Index::new(5), 256, 0);
   p.maybe_update(Index::new(615)); // confirmed replicated through 615
-  p.become_snapshot(Index::new(583)); // boundary 583 is already covered by match 615
+  p.become_snapshot(Index::new(583), 256); // boundary 583 is already covered by match 615
   assert!(
     p.state().is_probe(),
     "a peer whose match is past the boundary must re-probe, not wedge in Snapshot"
@@ -92,17 +94,18 @@ fn become_snapshot_at_or_below_match_reprobes_instead_of_wedging() {
   // The boundary-equal case is equally redundant and must also re-probe.
   let mut q = Progress::new(Index::new(5), 256, 0);
   q.maybe_update(Index::new(583));
-  q.become_snapshot(Index::new(583));
+  q.become_snapshot(Index::new(583), 256);
   assert!(q.state().is_probe());
 }
 
 #[test]
 fn snapshot_acked_tracks_the_followers_watermark() {
   let mut p = Progress::new(Index::new(1), 256, 0);
-  p.become_snapshot(Index::new(10));
+  p.become_snapshot(Index::new(10), 256);
   let ProgressState::Snapshot {
     pending,
     acked_through,
+    ..
   } = p.state()
   else {
     panic!("expected Snapshot state");
@@ -123,7 +126,7 @@ fn snapshot_acked_tracks_the_followers_watermark() {
 #[test]
 fn maybe_update_past_pending_snapshot_becomes_probe() {
   let mut p = Progress::new(Index::new(5), 256, 0);
-  p.become_snapshot(Index::new(10));
+  p.become_snapshot(Index::new(10), 256);
   // ack at exactly pending_snapshot → transition to Probe
   p.maybe_update(Index::new(10));
   assert!(p.state().is_probe());
@@ -133,7 +136,7 @@ fn maybe_update_past_pending_snapshot_becomes_probe() {
 #[test]
 fn maybe_update_below_pending_snapshot_stays_in_snapshot() {
   let mut p = Progress::new(Index::new(5), 256, 0);
-  p.become_snapshot(Index::new(10));
+  p.become_snapshot(Index::new(10), 256);
   // ack below pending_snapshot → stays Snapshot
   p.maybe_update(Index::new(9));
   assert!(p.state().is_snapshot());
@@ -147,7 +150,8 @@ fn snapshot_state_display() {
       "{}",
       ProgressState::Snapshot {
         pending: Index::new(0),
-        acked_through: 0
+        acked_through: 0,
+        total: 0
       }
     ),
     "snapshot"
@@ -190,7 +194,7 @@ fn free_inflight_on_heartbeat_probe_noop() {
 fn free_inflight_on_heartbeat_snapshot_noop() {
   // Snapshot state: always paused; free_inflight_on_heartbeat must be a no-op.
   let mut p = Progress::new(Index::new(1), 2, 0);
-  p.become_snapshot(Index::new(10));
+  p.become_snapshot(Index::new(10), 256);
   assert!(p.is_paused());
   p.free_inflight_on_heartbeat(); // no-op for Snapshot
   assert!(
@@ -217,4 +221,26 @@ fn become_probe_resets_next_to_match_plus_one() {
     "become_probe must re-probe from match+1, not retain the stale-high next"
   );
   assert_eq!(p.match_index(), Index::new(5));
+}
+
+#[test]
+fn snapshot_acked_rejects_a_watermark_past_total() {
+  // A delayed ack from a superseded, LARGER same-boundary capture reports a watermark past the CURRENT
+  // blob's total. Accepting it would inflate the cursor past `total`, so the next send clamps to the end and
+  // emits a stale empty tail that can strand the transfer — it must be rejected.
+  let mut p = Progress::new(Index::new(1), 256, 0);
+  p.become_snapshot(Index::new(10), 50);
+  p.snapshot_acked(40);
+  let ProgressState::Snapshot { acked_through, .. } = p.state() else {
+    panic!("expected Snapshot state");
+  };
+  assert_eq!(acked_through, 40, "an in-range watermark is accepted");
+  p.snapshot_acked(80); // 80 > total 50 — a stale cross-capture over-ack
+  let ProgressState::Snapshot { acked_through, .. } = p.state() else {
+    panic!("expected Snapshot state");
+  };
+  assert_eq!(
+    acked_through, 40,
+    "a watermark past total is rejected, leaving the cursor unchanged"
+  );
 }
