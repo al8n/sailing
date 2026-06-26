@@ -1,0 +1,198 @@
+# Invariant: a leadership-transfer target that is a voter in the LEADER's committed configuration but
+# still a learner in its OWN view — because it has replicated, but not yet applied, the entry that
+# promotes it — must IGNORE the forced-campaign order. It must not become a candidate, bump its term,
+# or broadcast a RequestVote. Mirrors openraft's stale-transfer-target rejection (the target's
+# candidacy path must not act on a vote from a node outside its own quorum set).
+#
+# Construction: cluster {1,2} with a caught-up learner 3. Promote 3 to voter; deliver the promotion
+# entry to 1,2,3 (so the leader counts 3 as caught up: match==last) but withhold the commit-advancing
+# broadcast from 3, so 3 appends the promotion at index 3 yet keeps applied=2 — a learner in its own
+# view. The leader, having applied the promotion, sends 3 a TimeoutNow; 3 must drop it.
+add-nodes 2 voters=(1,2)
+----
+n1: created voters={1,2} term=0 commit=0 last=0
+n2: created voters={1,2} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+propose-conf-change 1 addlearner 3
+----
+n1 proposed conf-change addlearner n3 at index 2
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080212080300000000000000]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 conf-change 0x120c080212080300000000000000]
+> n2 ready
+  AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  n1 conf-changed index=2 voters={1,2} learners={3}
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResponse term=1 match=2
+  n2 conf-changed index=2 voters={1,2} learners={3}
+> n1 recv AppendResponse term=1 match=2
+
+# Catch the new learner up: one heartbeat round replicates the existing log to node 3 so it applies
+# through index 2 and settles as a learner (voters={1,2} learners={3}, applied=2).
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=2
+Heartbeat term=1 commit=0
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=2
+> n3 recv Heartbeat term=1 commit=0
+> n2 ready
+  HeartbeatResponse term=1
+> n3 ready
+  HeartbeatResponse term=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120c080212080300000000000000]
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n3 recv AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120c080212080300000000000000]
+> n2 ready
+  AppendResponse term=1 match=2
+> n3 ready
+  AppendResponse term=1 reject hint=0/0
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 reject hint=0/0
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=2 entries=[1/1 empty, 1/2 conf-change 0x120c080212080300000000000000]
+> n3 recv AppendEntries term=1 prev=0/0 commit=2 entries=[1/1 empty, 1/2 conf-change 0x120c080212080300000000000000]
+> n3 ready
+  AppendResponse term=1 match=2
+  n3 conf-changed index=2 voters={1,2} learners={3}
+> n1 recv AppendResponse term=1 match=2
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n3 ready
+  AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+
+# Promote learner 3 to voter. The leader appends the AddNode entry at index 3 and replicates it.
+propose-conf-change 1 add 3
+----
+n1 proposed conf-change add n3 at index 3
+AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120a12080300000000000000]
+AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120a12080300000000000000]
+
+# Nodes 2 and 3 replicate the promotion entry (append at index 3) but DO NOT apply it yet: the
+# AppendEntries carries leader_commit=2, so their commit stays at 2.
+deliver-msgs to=2
+----
+n1->n2 AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120a12080300000000000000]
+
+deliver-msgs to=3
+----
+n1->n3 AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120a12080300000000000000]
+
+process-ready 2
+----
+AppendResponse term=1 match=3
+
+process-ready 3
+----
+AppendResponse term=1 match=3
+
+# The leader learns node 3's match=3 (== its last index) and commits the promotion on the {1,2}
+# voter quorum, then applies it — so the leader now counts node 3 as a voter.
+deliver-msgs to=1
+----
+n2->n1 AppendResponse term=1 match=3
+n3->n1 AppendResponse term=1 match=3
+
+process-ready 1
+----
+AppendEntries term=1 prev=1/3 commit=3 entries=[]
+AppendEntries term=1 prev=1/3 commit=3 entries=[]
+n1 conf-changed index=3 voters={1,2,3}
+
+# Drop the commit-advancing broadcast so node 3 never learns the promotion is committed: it stays at
+# applied=2, a learner in its OWN configuration, while the leader sees it as a caught-up voter.
+drop-msgs from=1
+----
+dropped n1->n2 AppendEntries term=1 prev=1/3 commit=3 entries=[]
+dropped n1->n3 AppendEntries term=1 prev=1/3 commit=3 entries=[]
+
+# The leader sees node 3 as a caught-up voter, so it sends the TimeoutNow immediately.
+transfer-leadership from=1 to=3
+----
+TimeoutNow term=1
+
+# Node 3 receives the forced-campaign order while still a learner in its own view: it IGNORES it.
+deliver-msgs to=3
+----
+n1->n3 TimeoutNow term=1
+
+# Node 3 is still a follower at the leader's term — it never became a candidate, never bumped term.
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: follower term=1 lead=1
+
+# The leader's committed configuration already counts node 3 as a voter...
+conf-state 1
+----
+n1: voters={1,2,3}
+
+# ...but node 3's own view is still a learner: it has the promotion entry at index 3 in its log but
+# has not applied it (applied=2).
+conf-state 3
+----
+n3: voters={1,2} learners={3}
+
+raft-log 3
+----
+n3: commit=2 applied=2 last=3
+  1/1 empty
+  1/2 conf-change 0x120c080212080300000000000000
+  1/3 conf-change 0x120a12080300000000000000
+
+# Re-draining node 3 confirms it queued NOTHING in response to the TimeoutNow — no RequestVote, no
+# candidacy. A buggy target that campaigned would surface RequestVote messages here.
+process-ready 3
+----
+ok
+
