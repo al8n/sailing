@@ -1220,6 +1220,12 @@ where
         }
         self.maybe_flush_deferred_reads(now, log, stable);
         self.pump_appends(now, from.cheap_clone(), log, stable); // fill the peer's inflight window if still behind
+        // maybe_flush_deferred_reads (has_current_term_commit / a LeaseGuard anchor read) and pump_appends
+        // (maybe_send_append) can ALSO self-poison → fail-stop before the leader-transfer tail mutates
+        // forced_handoff_this_term or attempts TimeoutNow on a dead node.
+        if self.poison.poisoned {
+          return;
+        }
         // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
         if self.transfer.lead_transferee.as_ref() == Some(&from) {
           let peer_match = self
