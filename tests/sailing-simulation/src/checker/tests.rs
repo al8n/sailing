@@ -324,6 +324,138 @@ fn boundedness_detects_staged_leak() {
 }
 
 #[test]
+fn snapshot_boundary_coherent_accepts_matching_boundary() {
+  // Node 0 installed a snapshot at boundary (index 3, term 1); nodes 1 and 2 still RETAIN index 3 as a
+  // durable log entry with term 1 (the `healthy_node` log is `(i, term=1)`). The witnessed committed
+  // term matches the boundary term, so this must pass.
+  let mut n0 = healthy_node(0, 5, 5);
+  n0.snapshot_last_index = 3;
+  n0.snapshot_last_term = 1; // matches the term every node's log records at index 3
+  let view = cv(
+    1,
+    1,
+    std::vec![n0, healthy_node(1, 5, 5), healthy_node(2, 5, 5)],
+  );
+  assert_eq!(snapshot_boundary_coherent(&view), Ok(()));
+}
+
+#[test]
+fn snapshot_boundary_coherent_detects_term_mismatch() {
+  // Node 0 installed a snapshot claiming boundary term 9 at index 3, but the committed log (nodes 1
+  // and 2 still retain index 3 at term 1) says the committed term there is 1 — a corrupt/mis-keyed
+  // snapshot boundary that must be caught.
+  let mut n0 = healthy_node(0, 5, 5);
+  n0.snapshot_last_index = 3;
+  n0.snapshot_last_term = 9; // disagrees with the committed term (1) at index 3
+  let view = cv(
+    2,
+    7,
+    std::vec![n0, healthy_node(1, 5, 5), healthy_node(2, 5, 5)],
+  );
+  let v = snapshot_boundary_coherent(&view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_boundary_coherent");
+  assert!(
+    v.detail.contains("boundary (last_index=3, last_term=9)")
+      && v.detail.contains("records term 1"),
+    "{}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_boundary_coherent_skips_unwitnessable_boundary() {
+  // EVERY node has compacted past index 3 (their durable logs start at 4), so no live node retains the
+  // committed term at index 3. The boundary is then UNWITNESSABLE: even a boundary term that no log can
+  // corroborate must be SKIPPED, never flagged — the soundness rule that keeps the oracle free of false
+  // positives under frequent compaction.
+  let mut nodes = Vec::new();
+  for id in 0..3u64 {
+    let mut n = healthy_node(id, 6, 8);
+    n.snapshot_last_index = 3;
+    n.snapshot_last_term = 9; // a term no retained log can witness — must NOT fire (unwitnessable)
+    n.durable_first = 4;
+    n.durable_entries.retain(|e| e.index >= 4);
+    nodes.push(n);
+  }
+  let view = cv(3, 11, nodes);
+  assert_eq!(
+    snapshot_boundary_coherent(&view),
+    Ok(()),
+    "an index no live node retains in its durable log is unwitnessable and must be skipped, not flagged"
+  );
+}
+
+#[test]
+fn snapshot_boundary_coherent_ignores_uncommitted_tail_witness() {
+  // The supersession-race regression: a snapshot boundary (index 4, term 2) is CORRECT — the committed
+  // entry at index 4 was elected at term 2. A lagging node still durably holds a STALE UNCOMMITTED entry
+  // at index 4 from the pre-supersede term 1 (its commit watermark is only 3, below index 4), which was
+  // overwritten by the term-2 committed entry but not yet truncated. That node's durable term at 4 is 1,
+  // one below the boundary's 2 — the exact term-off-by-one a superseding snapshot produces. The oracle
+  // MUST NOT witness against that uncommitted tail (it is not the committed term); a node that has
+  // actually COMMITTED index 4 (n2, commit=5) attests the true committed term 2, so the boundary passes.
+  let mut n0 = healthy_node(0, 5, 5); // up-to-date: committed index 4 at term 2 ...
+  for e in n0.durable_entries.iter_mut() {
+    if e.index >= 4 {
+      e.term = 2; // ... the committed term at index 4 is 2
+    }
+  }
+  n0.snapshot_last_index = 4;
+  n0.snapshot_last_term = 2; // a CORRECT boundary
+
+  // A laggard durably holding the STALE term-1 entry at index 4, but with commit only 3 (uncommitted).
+  let mut laggard = healthy_node(1, 3, 5); // commit=3 < 4; durable still has the old term-1 entry at 4
+  laggard.snapshot_last_index = 0;
+
+  // A node that HAS committed index 4 at the true term 2 — the sound witness.
+  let mut n2 = healthy_node(2, 5, 5);
+  for e in n2.durable_entries.iter_mut() {
+    if e.index >= 4 {
+      e.term = 2;
+    }
+  }
+
+  let view = cv(14, 4151, std::vec![n0, laggard, n2]);
+  assert_eq!(
+    snapshot_boundary_coherent(&view),
+    Ok(()),
+    "a correct boundary must not be flagged against a laggard's UNCOMMITTED stale tail; only a committed \
+     witness attests the committed term"
+  );
+
+  // And if NO node has committed index 4 (only the laggard's uncommitted term-1 tail retains it), the
+  // index is unwitnessable-as-committed and is SKIPPED — never flagged against the uncommitted term.
+  let mut snap_only = healthy_node(0, 3, 5); // commit=3 < 4, carries the boundary, no committed witness
+  snap_only.snapshot_last_index = 4;
+  snap_only.snapshot_last_term = 2;
+  let mut lag2 = healthy_node(1, 3, 5); // commit=3 < 4, durable term-1 tail at 4
+  lag2.snapshot_last_index = 0;
+  let view2 = cv(14, 4152, std::vec![snap_only, lag2]);
+  assert_eq!(
+    snapshot_boundary_coherent(&view2),
+    Ok(()),
+    "with no committed witness for the index, an uncommitted tail must not be used as the reference"
+  );
+}
+
+#[test]
+fn snapshot_boundary_coherent_witnesses_against_own_retained_log() {
+  // A node whose snapshot boundary index is still inside its OWN retained durable window is checked
+  // against its own log entry at that index — a correctly-built snapshot's boundary term equals exactly
+  // that entry's term, so it passes; a corrupted one (term bumped) trips even with a single node.
+  let mut ok = healthy_node(0, 5, 5);
+  ok.snapshot_last_index = 4;
+  ok.snapshot_last_term = 1; // index 4 is retained at term 1 → coherent
+  assert_eq!(snapshot_boundary_coherent(&cv(1, 1, std::vec![ok])), Ok(()));
+
+  let mut bad = healthy_node(0, 5, 5);
+  bad.snapshot_last_index = 4;
+  bad.snapshot_last_term = 7; // its own retained log says term 1 at index 4 → incoherent
+  let v = snapshot_boundary_coherent(&cv(1, 1, std::vec![bad])).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_boundary_coherent");
+}
+
+#[test]
 fn durable_prefix_detects_c1_lost_commit_on_restart() {
   // Scenario: a node had durably committed a prefix of length 5 — its durable HardState.commit is
   // 5 and its durable log holds entries 1..=5. It then crashed and RESTARTED. The bug is that

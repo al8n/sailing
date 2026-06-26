@@ -28,6 +28,7 @@
 //! | [`term_monotonic`] | a node's term going backward across ticks |
 //! | [`durable_prefix`] | a restarted node silently forgetting the committed prefix it durably stored (the headline durability bug) |
 //! | [`boundedness`] | per-node bookkeeping growing unboundedly under compaction (a GC/compaction failure) |
+//! | [`snapshot_boundary_coherent`] | an installed snapshot whose boundary term disagrees with the committed log at that index (a corrupt/mis-keyed snapshot transfer) |
 //!
 //! The suite is a **pure observer**: it never draws from a PRNG and never mutates the simulated
 //! nodes/stores, so the run is byte-identical with or without it (determinism preserved).
@@ -177,6 +178,30 @@ impl NodeView {
     // does the same via `term(offset)`).
     if index <= self.snapshot_last_index {
       return Some(self.snapshot_last_term);
+    }
+    None
+  }
+
+  /// The COMMITTED term this node attests at `index`, read STRICTLY from a retained durable log entry
+  /// the node has ALSO committed (`index <= self.commit`) — never from a snapshot boundary, and never
+  /// from an uncommitted tail. `None` if `index` is outside the retained window
+  /// (`durable_first..=durable_last`) or above this node's commit watermark.
+  ///
+  /// This is the sound, non-circular term witness for [`snapshot_boundary_coherent`]:
+  /// - NOT a snapshot boundary, because that boundary's own `last_term` is the value under test (a
+  ///   circular witness could rubber-stamp a divergence).
+  /// - NOT an uncommitted durable tail, because a node can durably hold an uncommitted entry at an index
+  ///   (a stale tail later overwritten by the committed entry at a HIGHER term) — its term is NOT the
+  ///   committed term and would false-positive against a correct boundary. Only an entry the node has
+  ///   committed carries the one true committed term (a committed index has a unique term, so two
+  ///   committed witnesses can never disagree).
+  fn committed_log_term(&self, index: u64) -> Option<u64> {
+    if index <= self.commit && index >= self.durable_first && index <= self.durable_last {
+      return self
+        .durable_entries
+        .iter()
+        .find(|e| e.index == index)
+        .map(|e| e.term);
     }
     None
   }
@@ -346,6 +371,7 @@ impl Checker {
     commit_is_quorum_durable(view, self.commit_floor)?;
     durable_prefix(view)?;
     boundedness(view)?;
+    snapshot_boundary_coherent(view)?;
     // History oracles (read-then-fold).
     no_committed_rewrite(self, view)?;
     monotonic_commit(self, view)?;
@@ -677,6 +703,80 @@ pub fn boundedness(view: &ClusterView) -> Result<(), Violation> {
           n.id,
           n.inflight_staged,
           STAGED_SLACK,
+        ),
+      ));
+    }
+  }
+  Ok(())
+}
+
+/// **snapshot-boundary-coherent**: for every node carrying an installed durable snapshot with
+/// boundary `(last_index, last_term)`, the `last_term` must EQUAL the term the committed log actually
+/// recorded at `last_index`. A node can never install a snapshot whose boundary term disagrees with
+/// the committed log — that would mean a snapshot transfer delivered a boundary for a different
+/// (conflicting) entry than the one committed at that index, corrupting the receiver's compacted
+/// prefix below the reach of [`agreement`] (whose applied logs no longer hold the compacted entries).
+///
+/// # Reference term (the committed log's term at `last_index`)
+///
+/// A snapshot's boundary entry was a COMMITTED entry on the node that built it (compaction follows
+/// apply, apply follows commit), and the chunked-transfer receiver installs that same boundary. The
+/// committed term at an index is unique — two nodes that have both COMMITTED `last_index` can never
+/// disagree on its term (State Machine Safety) — so the reference is read from any node that still
+/// retains `last_index` as a durable LOG entry it has ALSO committed
+/// ([`NodeView::committed_log_term`]). The witness is deliberately neither (a) a snapshot boundary
+/// (the boundary term is the value under test — circular) nor (b) an UNCOMMITTED durable tail.
+///
+/// # Why it never false-positives (soundness)
+///
+/// - The reference comes only from a COMMITTED retained log entry, which carries the one true committed
+///   term at that index; if it equals the boundary, the boundary is coherent.
+/// - An UNCOMMITTED durable tail is excluded: a lagging node can durably hold a stale entry at
+///   `last_index` whose term is LOWER than the committed one (it was overwritten by the higher-term
+///   committed entry but not yet truncated). That term is not the committed term — counting it would
+///   false-positive against a perfectly correct boundary (the exact term-off-by-one a superseding
+///   snapshot race produces: a node still holding the pre-supersede uncommitted tail).
+/// - An index NO node retains-and-has-committed is UNWITNESSABLE: there is no sound reference, so the
+///   snapshot is SKIPPED, never flagged. Its coherence is still protected at install time (the receiver
+///   validates a snapshot's boundary term against its own committed log before installing) and
+///   transitively by the monotonic-commit / durable-prefix oracles; this oracle adds teeth for the
+///   witnessable case.
+///
+/// Read-only: draws no PRNG and mutates nothing, so the run stays byte-identical (determinism preserved).
+pub fn snapshot_boundary_coherent(view: &ClusterView) -> Result<(), Violation> {
+  for n in view.nodes.iter() {
+    // No installed snapshot ⇒ no boundary to check (`snapshot_last_index == 0` is the "none" sentinel,
+    // matching `Cluster::view`'s capture of an absent durable snapshot).
+    if n.snapshot_last_index == 0 {
+      continue;
+    }
+    let last_index = n.snapshot_last_index;
+    // The reference committed term at `last_index`, witnessed by any node (incl. this one) that retains
+    // it as a durable LOG entry it has ALSO committed. Never a snapshot boundary (circular) nor an
+    // uncommitted tail (a stale lower-term entry not yet truncated). The first such witness suffices:
+    // a committed index has a unique term, so any committed witness gives the same answer.
+    let Some(reference_term) = view
+      .nodes
+      .iter()
+      .find_map(|w| w.committed_log_term(last_index))
+    else {
+      // Unwitnessable: no node retains-and-has-committed `last_index`, so there is no sound reference.
+      // Skip — flagging here would false-positive on a perfectly valid boundary whose committed entry
+      // every up-to-date node has compacted away while the laggards have not yet committed it.
+      continue;
+    };
+    if n.snapshot_last_term != reference_term {
+      return Err(Violation::new(
+        "snapshot_boundary_coherent",
+        std::format!(
+          "node {} installed a snapshot with boundary (last_index={}, last_term={}) but the committed \
+           log records term {} at index {} — a snapshot boundary's term must match the committed entry \
+           it subsumes",
+          n.id,
+          last_index,
+          n.snapshot_last_term,
+          reference_term,
+          last_index,
         ),
       ));
     }
