@@ -33,6 +33,7 @@ impl InteractionEnv {
       "read-index" => self.read_index(d),
       "raft-state" => self.raft_state(),
       "raft-log" => self.raft_log(d),
+      "applied-state" => self.applied_state(d),
       "conf-state" => self.conf_state_cmd(d),
       "status" => self.status(d),
       other => std::format!("unknown command: {other}\n"),
@@ -720,6 +721,29 @@ impl InteractionEnv {
           fmt_data(e.data()),
         ));
       }
+    }
+    out
+  }
+
+  /// `applied-state <id>` — the ordered `(index, command)` pairs node `id`'s state machine has
+  /// applied. Where `raft-log` renders the durable LOG (whose compacted prefix is replaced by a bare
+  /// `snapshot covers <= index K` boundary), this renders the FSM DATA itself — including commands
+  /// that survive ONLY inside an installed/restored snapshot after their log entries were compacted
+  /// away. It lets a scenario prove the compacted prefix was genuinely preserved across a restart or
+  /// snapshot install (the actual a/b/c commands), not merely that the boundary metadata matched.
+  pub(crate) fn applied_state(&mut self, d: &Directive) -> String {
+    let id: u64 = match d.positional(0).and_then(|s| s.parse().ok()) {
+      Some(id) => id,
+      None => return "applied-state: missing node id\n".to_string(),
+    };
+    let n = match self.nodes.get(&id) {
+      Some(n) => n,
+      None => return std::format!("n{id}: no such node\n"),
+    };
+    let applied = n.ep.state_machine().applied();
+    let mut out = std::format!("n{id}: applied={}\n", applied.len());
+    for (idx, data) in applied {
+      out.push_str(&std::format!("  {}:{}\n", idx.get(), fmt_data(data)));
     }
     out
   }
