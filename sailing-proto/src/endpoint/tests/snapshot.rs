@@ -4197,3 +4197,45 @@ fn send_snapshot_chunk_validates_malformed_store_ready() {
     );
   }
 }
+
+// Receive-side dual of the in-range-empty wedge: a malformed/version-skewed leader could send an
+// InstallSnapshot chunk with offset < total_len but EMPTY data. Staging it is a no-op that re-acks the same
+// cursor, pinning the follower in the transfer forever with its total_len staging allocated. The receiver
+// must fail-stop (decode poison) and NOT send a same-cursor progress ack.
+#[test]
+fn receiver_rejects_in_range_empty_snapshot_chunk() {
+  use crate::{
+    Index, InstallSnapshot, Instant, Message, PoisonReason, SnapshotMeta, Term, conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  // offset 0 < total_len 9, but no data — empty is EOF-only, so this is malformed.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta,
+      bytes::Bytes::new(),
+      0,
+      9,
+    )),
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::SnapshotDecode),
+    "an in-range empty chunk is malformed and must fail-stop"
+  );
+  assert!(
+    ep.poll_message().is_none(),
+    "no same-cursor progress ack for the malformed chunk (no resend loop)"
+  );
+}

@@ -571,6 +571,16 @@ where
         return;
       }
     }
+    // An IN-RANGE empty chunk (`offset < total_len` with no data) is malformed: a correct sender emits empty
+    // data ONLY at EOF (`offset == total_len`, the benign stale-cursor self-correction, which passes the
+    // range check above). Staging an in-range empty run is a no-op that re-acks the SAME contiguous cursor,
+    // so a malformed or version-skewed leader could pin this follower in the transfer forever (its full
+    // `total_len` staging buffer stays allocated). Fail-stop instead of looping — the dual of the sender's
+    // own in-range-empty guard.
+    if is.offset() < total_len && is.data().is_empty() {
+      self.poison(PoisonReason::SnapshotDecode);
+      return;
+    }
 
     // Stage this chunk. A store staging-capacity error poisons (CFT resource exhaustion → failover).
     let staged = match stable.accept_snapshot_chunk(meta, total_len, is.offset(), is.data()) {
