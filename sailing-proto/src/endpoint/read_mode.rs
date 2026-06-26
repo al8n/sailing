@@ -85,6 +85,11 @@ where
     for peer in self.peers().collect::<std::vec::Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
     }
+    // A fatal store fault in the broadcast above poisons the node — report it rather than an Ok index the
+    // dead node will never drive to commit.
+    if self.poison.poisoned {
+      return Err(ProposeError::Poisoned);
+    }
     Ok(index)
   }
 }

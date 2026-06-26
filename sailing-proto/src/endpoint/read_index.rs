@@ -48,6 +48,9 @@ where
     log: &L,
     stable: &S,
   ) {
+    if self.poison.poisoned {
+      return;
+    }
     if self.reads.pending_reads.is_empty() {
       return;
     }

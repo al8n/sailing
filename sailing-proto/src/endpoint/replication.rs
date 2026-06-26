@@ -126,6 +126,9 @@ where
     log: &L,
     stable: &S,
   ) {
+    if self.poison.poisoned {
+      return;
+    }
     loop {
       let Some(pr) = self.tracker.progress(&peer) else {
         return;
@@ -151,6 +154,11 @@ where
     log: &L,
     stable: &S,
   ) {
+    // A poisoned node performs no work; every poison-capable op no-ops at entry so a mid-dispatch poison
+    // cannot drive further sends, commits, or state mutation before the public entry point returns.
+    if self.poison.poisoned {
+      return;
+    }
     // Read only the two scalars the send decision needs — avoid cloning the whole Progress (and its
     // Inflights VecDeque) on every call; the post-send mutations re-fetch via progress_mut below.
     let (paused, next) = match self.tracker.progress(&peer) {
@@ -441,6 +449,9 @@ where
   }
 
   pub(crate) fn maybe_advance_commit<L: LogStore>(&mut self, now: Now, log: &L) {
+    if self.poison.poisoned {
+      return;
+    }
     // LeaseGuard commit-wait: once the post-election deferred-commit window elapses, lift the gate
     // FOR GOOD — clearing here (not only when a commit actually advances) keeps poll_timeout and
     // handle_timeout consistent: a fired CommitWait timer must leave no serviceable-and-due deadline
@@ -607,6 +618,11 @@ where
       .insert(opid, Pending::LeaderAppend { upto: index });
     for peer in self.peers().collect::<Vec<_>>() {
       self.maybe_send_append(now, peer, log, stable);
+    }
+    // A fatal store fault in the broadcast above poisons the node — report it rather than an Ok index the
+    // dead node will never drive to commit.
+    if self.poison.poisoned {
+      return Err(ProposeError::Poisoned);
     }
     Ok(index)
   }
@@ -949,6 +965,11 @@ where
       pr.free_inflight_on_heartbeat();
     }
     self.pump_appends(now, from.cheap_clone(), log, stable);
+    // pump_appends can poison (a log read in the append path) → fail-stop before the snapshot-resend and
+    // the ReadIndex path below confirm reads / send on a dead node.
+    if self.poison.poisoned {
+      return;
+    }
 
     // Liveness fix: if this peer is still in Snapshot state and has NOT yet
     // caught up to its pending snapshot index, RE-SEND the snapshot. The single
@@ -1102,6 +1123,9 @@ where
     from: I,
     response: AppendResponse<I>,
   ) {
+    if self.poison.poisoned {
+      return;
+    }
     if !self.role.is_leader() {
       return;
     }

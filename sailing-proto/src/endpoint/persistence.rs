@@ -383,6 +383,11 @@ where
       match log.poll() {
         Some(Ok(LogDone::Appended(opid))) => {
           self.on_log_appended(now, log, stable, opid);
+          // The completion callback can poison (commit-advance, apply, deferred-read flush) → fail-stop the
+          // whole storage handler before draining further completions or running any tail work.
+          if self.poison.poisoned {
+            return StorageProgress::Drained;
+          }
           log_budget -= 1;
         }
         Some(Ok(LogDone::Compacted(_))) => log_budget -= 1,
@@ -398,6 +403,11 @@ where
       match stable.poll() {
         Some(Ok(StableDone::Wrote(opid))) => {
           self.on_stable_wrote(now, log, stable, opid);
+          // The completion callback can poison (e.g. a freshly-promoted leader's no-op append) → fail-stop
+          // before draining further completions (including a SnapshotWritten compaction) or tail work.
+          if self.poison.poisoned {
+            return StorageProgress::Drained;
+          }
           stable_budget -= 1;
         }
         Some(Ok(StableDone::SnapshotWritten(opid))) => {

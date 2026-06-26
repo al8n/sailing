@@ -431,6 +431,9 @@ where
     log: &mut L,
     last: Index,
   ) -> Option<Index> {
+    if self.poison.poisoned {
+      return None;
+    }
     let Some(noop_index) = Self::next_log_index(last) else {
       self.poison(PoisonReason::LogExhausted);
       return None;
