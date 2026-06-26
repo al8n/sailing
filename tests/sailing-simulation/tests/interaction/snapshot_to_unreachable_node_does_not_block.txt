@@ -1,0 +1,291 @@
+# An in-flight snapshot transfer to a peer that becomes unreachable must NOT block the leader from
+# making progress. The leader's log is compacted PAST node 3's match index, so node 3 can only be
+# caught up via InstallSnapshot. We first PROVE the leader has actually entered snapshot transfer to
+# node 3 (node 3 rejects behind the compacted log, the leader switches to InstallSnapshot, and its
+# progress for node 3 enters `snapshot`), THEN make node 3 unreachable so the snapshot send is
+# dropped — the leader is genuinely mid-snapshot to a peer it cannot reach. A membership change that
+# REMOVES node 3 still commits on the surviving {1,2} quorum, and a later proposal commits and applies
+# too. The invariant: a stuck snapshot transfer to an unreachable peer never gates quorum-backed
+# commits — neither the conf-change nor later proposals wait on it.
+add-nodes 3 voters=(1,2,3) snap=3 chunk=40
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+isolate 3
+----
+n3 isolated
+
+propose 1 a
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+propose 1 b
+----
+AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+
+propose 1 c
+----
+AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+
+propose 1 d
+----
+AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+> n2 recv AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+> n2 recv AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+> n2 recv AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+> n2 ready
+  AppendResponse term=1 match=2
+  AppendResponse term=1 match=3
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=5
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=2 entries=[]
+  AppendEntries term=1 prev=1/5 commit=3 entries=[]
+  AppendEntries term=1 prev=1/5 commit=4 entries=[]
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  n1 applied index=2
+  n1 applied index=3
+  n1 applied index=4
+  n1 applied index=5
+> n2 recv AppendEntries term=1 prev=1/5 commit=2 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=3 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=4 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  n2 applied index=2
+  n2 applied index=3
+  n2 applied index=4
+  n2 applied index=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+
+raft-log 1
+----
+n1: commit=5 applied=5 last=5
+  (snapshot covers <= index 5)
+
+# Briefly recover node 3 and drive a heartbeat probe so the leader discovers node 3 is behind the
+# compacted log: node 3 rejects (its entries are gone from the leader), and the leader switches from
+# AppendEntries to InstallSnapshot. Drive the handshake by hand up to the snapshot going out.
+recover 3
+----
+n3 recovered
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+deliver-msgs from=1 to=3
+----
+n1->n3 Heartbeat term=1 commit=1
+
+process-ready 3
+----
+HeartbeatResponse term=1
+
+deliver-msgs from=3 to=1
+----
+n3->n1 HeartbeatResponse term=1
+
+process-ready 1
+----
+AppendEntries term=1 prev=1/5 commit=5 entries=[]
+
+deliver-msgs from=1 to=3
+----
+n1->n3 AppendEntries term=1 prev=1/5 commit=5 entries=[]
+
+process-ready 3
+----
+AppendResponse term=1 reject hint=1/1
+
+deliver-msgs from=3 to=1
+----
+n3->n1 AppendResponse term=1 reject hint=1/1
+
+# The leader has the reject; it switches node 3 to InstallSnapshot and emits the FIRST chunk (offset 0).
+# This PROVES the leader is in snapshot transfer to node 3 (not merely dropping AppendEntries).
+process-ready 1
+----
+InstallSnapshot term=1 snap=1/5 offset=0 len=40 last=false
+
+# Deliver chunk 0; node 3 stages it and acks its contiguous watermark (acked=40) but does NOT yet
+# install (match stays 1), so the leader keeps node 3 in snapshot transfer.
+deliver-msgs from=1 to=3
+----
+n1->n3 InstallSnapshot term=1 snap=1/5 offset=0 len=40 last=false
+
+process-ready 3
+----
+SnapshotResponse term=1 reject=false match=1 acked=40
+
+deliver-msgs from=3 to=1
+----
+n3->n1 SnapshotResponse term=1 reject=false match=1 acked=40
+
+# The leader's progress for node 3 is now `snapshot` (paused mid-transfer at the acked watermark). This
+# is the proof the unreachable peer below is one the leader is genuinely mid-snapshot to.
+status 1
+----
+n2: match=5 next=6 replicate
+n3: match=1 next=2 snapshot paused
+
+# The leader processes node 3's ack and emits the NEXT chunk (offset 40); the link then DROPS it before it
+# reaches node 3 (`drop-msgs` renders the discarded chunk), so the in-flight snapshot send is genuinely
+# LOST. Re-isolate node 3 so it stays unreachable for the remainder — the leader is now stuck mid-snapshot
+# to an unreachable peer.
+process-ready 1
+----
+InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+
+drop-msgs from=1 to=3
+----
+dropped n1->n3 InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+
+isolate 3
+----
+n3 isolated
+
+# Node 3 never finished installing: it is still at its pre-isolation log, behind the compacted leader.
+raft-log 3
+----
+n3: commit=1 applied=1 last=1
+  1/1 empty
+
+# With node 3 stuck mid-snapshot AND unreachable, removing it still commits on the {1,2} quorum.
+propose-conf-change 1 remove 3
+----
+n1 proposed conf-change remove n3 at index 6
+AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 conf-change 0x120c080112080300000000000000]
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=5
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 conf-change 0x120c080112080300000000000000]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=6
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=6
+> n1 ready
+  AppendEntries term=1 prev=1/6 commit=5 entries=[]
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+  n1 conf-changed index=6 voters={1,2}
+> n2 recv AppendEntries term=1 prev=1/6 commit=5 entries=[]
+> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n2 ready
+  AppendResponse term=1 match=6
+  AppendResponse term=1 match=6
+  n2 conf-changed index=6 voters={1,2}
+> n1 recv AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+
+conf-state 1
+----
+n1: voters={1,2}
+
+propose 1 e
+----
+AppendEntries term=1 prev=1/6 commit=6 entries=[1/7 normal 0x010000000000000065]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[1/7 normal 0x010000000000000065]
+> n2 ready
+  AppendResponse term=1 match=7
+> n1 recv AppendResponse term=1 match=7
+> n1 ready
+  AppendEntries term=1 prev=1/7 commit=7 entries=[]
+  n1 applied index=7
+> n2 recv AppendEntries term=1 prev=1/7 commit=7 entries=[]
+> n2 ready
+  AppendResponse term=1 match=7
+  n2 applied index=7
+> n1 recv AppendResponse term=1 match=7
+
+raft-log 1
+----
+n1: commit=7 applied=7 last=7
+  (snapshot covers <= index 5)
+  1/6 conf-change 0x120c080112080300000000000000
+  1/7 normal 0x010000000000000065
+
+status 1
+----
+n2: match=7 next=8 replicate
+

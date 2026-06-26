@@ -1,0 +1,314 @@
+# A multi-chunk InstallSnapshot transfer survives the loss of a MIDDLE chunk: the follower only ever
+# acks its CONTIGUOUS, by-offset watermark, so when a chunk in the middle of the stream is dropped the
+# leader resumes the transfer from exactly that watermark (it re-sends the lost chunk and everything
+# after) rather than restarting from offset 0 or wedging. The invariant: chunked snapshot transfer is
+# resumable from the last acked offset; a lost middle chunk costs only a re-send, and the install still
+# completes and re-bases the follower.
+#
+# Setup mirrors the chunked-catch-up case: 3 voters, threshold 3, chunk=40 over an ~84-byte blob so the
+# stream is 3 chunks. Node 3 is isolated, the leader compacts past it, then on recovery the leader can
+# only catch node 3 up via InstallSnapshot.
+add-nodes 3 voters=(1,2,3) snap=3 chunk=40
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+isolate 3
+----
+n3 isolated
+
+propose 1 a
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+propose 1 b
+----
+AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+
+propose 1 c
+----
+AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+
+propose 1 d
+----
+AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+> n2 recv AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+> n2 recv AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+> n2 recv AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+> n2 ready
+  AppendResponse term=1 match=2
+  AppendResponse term=1 match=3
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=5
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=2 entries=[]
+  AppendEntries term=1 prev=1/5 commit=3 entries=[]
+  AppendEntries term=1 prev=1/5 commit=4 entries=[]
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  n1 applied index=2
+  n1 applied index=3
+  n1 applied index=4
+  n1 applied index=5
+> n2 recv AppendEntries term=1 prev=1/5 commit=2 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=3 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=4 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  n2 applied index=2
+  n2 applied index=3
+  n2 applied index=4
+  n2 applied index=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+
+recover 3
+----
+n3 recovered
+
+# Heartbeat probe re-establishes contact; node 3 (behind the compacted log) replies, the leader
+# re-probes with an empty append, node 3 rejects (its log is gone from the leader), and the leader
+# switches to InstallSnapshot. Drive the handshake by hand up to the first chunk going out.
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+deliver-msgs from=1 to=3
+----
+n1->n3 Heartbeat term=1 commit=1
+
+process-ready 3
+----
+HeartbeatResponse term=1
+
+deliver-msgs from=3 to=1
+----
+n3->n1 HeartbeatResponse term=1
+
+process-ready 1
+----
+AppendEntries term=1 prev=1/5 commit=5 entries=[]
+
+deliver-msgs from=1 to=3
+----
+n1->n3 AppendEntries term=1 prev=1/5 commit=5 entries=[]
+
+process-ready 3
+----
+AppendResponse term=1 reject hint=1/1
+
+# The leader now has the reject; it emits the FIRST snapshot chunk (offset 0).
+deliver-msgs from=3 to=1
+----
+n3->n1 AppendResponse term=1 reject hint=1/1
+
+process-ready 1
+----
+InstallSnapshot term=1 snap=1/5 offset=0 len=40 last=false
+
+# Deliver chunk 0; node 3 stages it and acks its contiguous watermark (acked=40).
+deliver-msgs from=1 to=3
+----
+n1->n3 InstallSnapshot term=1 snap=1/5 offset=0 len=40 last=false
+
+process-ready 3
+----
+SnapshotResponse term=1 reject=false match=1 acked=40
+
+# The leader receives acked=40, so it now emits the MIDDLE chunk (offset 40) onto the wire.
+deliver-msgs from=3 to=1
+----
+n3->n1 SnapshotResponse term=1 reject=false match=1 acked=40
+
+# The leader emits the middle chunk normally: process-ready renders the offset=40 InstallSnapshot, proving
+# it was actually SENT (not merely never produced).
+process-ready 1
+----
+InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+
+# ...but the link drops it: drop-msgs removes the in-flight offset=40 chunk WITHOUT delivering it, and
+# renders the drop. The golden now UNAMBIGUOUSLY shows the chunk was emitted THEN lost — a genuine
+# middle-chunk loss, not a chunk that was never sent.
+drop-msgs from=1 to=3
+----
+dropped n1->n3 InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+
+# Node 3 never received the middle chunk; it stays at its contiguous watermark (acked=40, commit=1).
+raft-log 3
+----
+n3: commit=1 applied=1 last=1
+  1/1 empty
+
+# BEFORE the resend deadline passes: a heartbeat round re-establishes contact but does NOT re-drive the
+# stalled transfer. The exchange is heartbeats only — NO InstallSnapshot — proving the resend is paced
+# at one per election timeout (an unpaced impl would re-send the lost chunk on this first heartbeat).
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=5
+> n2 recv Heartbeat term=1 commit=5
+> n3 recv Heartbeat term=1 commit=1
+> n2 ready
+  HeartbeatResponse term=1
+  HeartbeatResponse term=1
+> n3 ready
+  HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+
+# Advance the leader's clock past the resend deadline; the next heartbeat round then RESUMES the transfer
+# from offset 40 — re-sending the lost middle chunk and the final chunk — and the install completes,
+# re-basing node 3 to the snapshot boundary.
+tick-election 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=5
+Heartbeat term=1 commit=1
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=5
+> n3 recv Heartbeat term=1 commit=1
+> n2 recv Heartbeat term=1 commit=5
+> n3 recv Heartbeat term=1 commit=1
+> n2 ready
+  HeartbeatResponse term=1
+  HeartbeatResponse term=1
+> n3 ready
+  HeartbeatResponse term=1
+  HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n3 recv InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
+> n2 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+> n3 ready
+  SnapshotResponse term=1 reject=false match=1 acked=80
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv SnapshotResponse term=1 reject=false match=1 acked=80
+> n1 ready
+  InstallSnapshot term=1 snap=1/5 offset=80 len=4 last=true
+> n3 recv InstallSnapshot term=1 snap=1/5 offset=80 len=4 last=true
+> n3 ready
+  SnapshotResponse term=1 reject=false match=5 acked=0
+  n3 snapshot-installed snap=1/5
+> n1 recv SnapshotResponse term=1 reject=false match=5 acked=0
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n3 ready
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+
+raft-log 3
+----
+n3: commit=5 applied=5 last=5
+  (snapshot covers <= index 5)
+
+status 1
+----
+n2: match=5 next=6 replicate
+n3: match=5 next=6 probe
+

@@ -1,0 +1,261 @@
+# A node learns its cluster membership from the SNAPSHOT, which overrides the membership it had before.
+# Mirrors the snapshot-overrides-membership case: a learner is added to the cluster AFTER the leader has
+# compacted, and the conf-change that adds it is itself compacted INTO a later snapshot. The joining
+# node therefore never applies the membership log entry — its only catch-up path is the snapshot, whose
+# carried ConfState includes the learner. Installing the snapshot rebuilds the node's configuration from
+# that ConfState, correcting the stale bootstrap membership it started with. The invariant: membership
+# travels inside the snapshot; a node caught up by InstallSnapshot adopts the snapshot's committed
+# configuration, even for a change it has no log entry for.
+#
+# Because membership in this design is apply-time and committed history never diverges, the prior
+# membership being overridden is the node's stale BOOTSTRAP view, not a conflicting committed one (which
+# cannot arise) — the override path (rebuild the config from the snapshot's ConfState) is the same.
+add-nodes 2 voters=(1,2) snap=3
+----
+n1: created voters={1,2} term=0 commit=0 last=0
+n2: created voters={1,2} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+# Fill and compact the leader's log so a late-joining node can only be caught up via a snapshot.
+propose 1 a
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+
+propose 1 b
+----
+AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+
+propose 1 c
+----
+AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+
+propose 1 d
+----
+AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000061]
+> n2 recv AppendEntries term=1 prev=1/2 commit=1 entries=[1/3 normal 0x010000000000000062]
+> n2 recv AppendEntries term=1 prev=1/3 commit=1 entries=[1/4 normal 0x010000000000000063]
+> n2 recv AppendEntries term=1 prev=1/4 commit=1 entries=[1/5 normal 0x010000000000000064]
+> n2 ready
+  AppendResponse term=1 match=2
+  AppendResponse term=1 match=3
+  AppendResponse term=1 match=4
+  AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=3
+> n1 recv AppendResponse term=1 match=4
+> n1 recv AppendResponse term=1 match=5
+> n1 ready
+  AppendEntries term=1 prev=1/5 commit=2 entries=[]
+  AppendEntries term=1 prev=1/5 commit=3 entries=[]
+  AppendEntries term=1 prev=1/5 commit=4 entries=[]
+  AppendEntries term=1 prev=1/5 commit=5 entries=[]
+  n1 applied index=2
+  n1 applied index=3
+  n1 applied index=4
+  n1 applied index=5
+> n2 recv AppendEntries term=1 prev=1/5 commit=2 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=3 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=4 entries=[]
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
+> n2 ready
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  AppendResponse term=1 match=5
+  n2 applied index=2
+  n2 applied index=3
+  n2 applied index=4
+  n2 applied index=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+> n1 recv AppendResponse term=1 match=5
+
+raft-log 1
+----
+n1: commit=5 applied=5 last=5
+  (snapshot covers <= index 5)
+
+# Add node 3 as a learner. It is wired as a fresh observer whose bootstrap view is just {1,2} — it does
+# NOT yet know it is a learner. Isolate it immediately so it cannot receive the conf-change entry by
+# replication; its membership can only be corrected later, by a snapshot.
+isolate 3
+----
+n3 isolated
+
+propose-conf-change 1 addlearner 3
+----
+n1 proposed conf-change addlearner n3 at index 6
+AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 conf-change 0x120c080212080300000000000000]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[1/6 conf-change 0x120c080212080300000000000000]
+> n2 ready
+  AppendResponse term=1 match=6
+> n1 recv AppendResponse term=1 match=6
+> n1 ready
+  AppendEntries term=1 prev=1/6 commit=6 entries=[]
+  n1 conf-changed index=6 voters={1,2} learners={3}
+> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
+> n2 ready
+  AppendResponse term=1 match=6
+  n2 conf-changed index=6 voters={1,2} learners={3}
+> n1 recv AppendResponse term=1 match=6
+
+# The conf-change is committed on {1,2}; node 3 still holds only its stale bootstrap membership.
+conf-state 1
+----
+n1: voters={1,2} learners={3}
+
+conf-state 3
+----
+n3: voters={1,2}
+
+# Write more commands and compact again — now PAST the conf-change index — so the learner membership is
+# captured INSIDE the snapshot's ConfState.
+propose 1 e
+----
+AppendEntries term=1 prev=1/6 commit=6 entries=[1/7 normal 0x010000000000000065]
+
+propose 1 f
+----
+AppendEntries term=1 prev=1/7 commit=6 entries=[1/8 normal 0x010000000000000066]
+
+propose 1 g
+----
+AppendEntries term=1 prev=1/8 commit=6 entries=[1/9 normal 0x010000000000000067]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[1/7 normal 0x010000000000000065]
+> n2 recv AppendEntries term=1 prev=1/7 commit=6 entries=[1/8 normal 0x010000000000000066]
+> n2 recv AppendEntries term=1 prev=1/8 commit=6 entries=[1/9 normal 0x010000000000000067]
+> n2 ready
+  AppendResponse term=1 match=7
+  AppendResponse term=1 match=8
+  AppendResponse term=1 match=9
+> n1 recv AppendResponse term=1 match=7
+> n1 recv AppendResponse term=1 match=8
+> n1 recv AppendResponse term=1 match=9
+> n1 ready
+  AppendEntries term=1 prev=1/9 commit=7 entries=[]
+  AppendEntries term=1 prev=1/9 commit=8 entries=[]
+  AppendEntries term=1 prev=1/9 commit=9 entries=[]
+  n1 applied index=7
+  n1 applied index=8
+  n1 applied index=9
+> n2 recv AppendEntries term=1 prev=1/9 commit=7 entries=[]
+> n2 recv AppendEntries term=1 prev=1/9 commit=8 entries=[]
+> n2 recv AppendEntries term=1 prev=1/9 commit=9 entries=[]
+> n2 ready
+  AppendResponse term=1 match=9
+  AppendResponse term=1 match=9
+  AppendResponse term=1 match=9
+  n2 applied index=7
+  n2 applied index=8
+  n2 applied index=9
+> n1 recv AppendResponse term=1 match=9
+> n1 recv AppendResponse term=1 match=9
+> n1 recv AppendResponse term=1 match=9
+
+raft-log 1
+----
+n1: commit=9 applied=9 last=9
+  (snapshot covers <= index 9)
+
+# Recover node 3 and catch it up. It is behind the compaction, so the leader sends an InstallSnapshot
+# whose ConfState includes learners={3}. Installing it rebuilds node 3's configuration from the snapshot.
+recover 3
+----
+n3 recovered
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=9
+Heartbeat term=1 commit=0
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=9
+> n3 recv Heartbeat term=1 commit=0
+> n2 ready
+  HeartbeatResponse term=1
+> n3 ready
+  HeartbeatResponse term=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/9 commit=9 entries=[]
+  InstallSnapshot term=1 snap=1/9 offset=0 len=135 last=true
+> n2 recv AppendEntries term=1 prev=1/9 commit=9 entries=[]
+> n3 recv InstallSnapshot term=1 snap=1/9 offset=0 len=135 last=true
+> n2 ready
+  AppendResponse term=1 match=9
+> n3 ready
+  SnapshotResponse term=1 reject=false match=9 acked=0
+  n3 snapshot-installed snap=1/9
+> n1 recv AppendResponse term=1 match=9
+> n1 recv SnapshotResponse term=1 reject=false match=9 acked=0
+> n1 ready
+  AppendEntries term=1 prev=1/9 commit=9 entries=[]
+> n3 recv AppendEntries term=1 prev=1/9 commit=9 entries=[]
+> n3 ready
+  AppendResponse term=1 match=9
+> n1 recv AppendResponse term=1 match=9
+
+# Node 3's configuration is now the snapshot's: voters={1,2} learners={3}. It adopted the learner role
+# from the snapshot's ConfState despite never applying the conf-change log entry (it was compacted away).
+conf-state 3
+----
+n3: voters={1,2} learners={3}
+
+raft-log 3
+----
+n3: commit=9 applied=9 last=9
+  (snapshot covers <= index 9)
+
+raft-state
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: follower term=1 lead=1
+

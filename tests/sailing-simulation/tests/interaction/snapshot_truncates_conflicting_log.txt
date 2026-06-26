@@ -1,0 +1,283 @@
+# Installing a snapshot on a follower whose log CONFLICTS with the snapshot boundary deletes the
+# conflicting tail and re-bases the log onto the snapshot. Mirrors the snapshot-delete-conflicting-logs
+# case: a stale ex-leader accumulates an uncommitted, divergent tail (entries at indices that the rest
+# of the cluster later fills with DIFFERENT, higher-term entries), then a new leader compacts PAST the
+# divergence point. When the stale node rejoins, its conflicting entries are gone from the leader's log
+# so they cannot be overwritten entry-by-entry — the leader sends an InstallSnapshot, and installing it
+# discards the divergent tail wholesale and re-bases the node to the snapshot's last index/term. The
+# invariant: a snapshot install is a hard reset of the log to the snapshot boundary; a conflicting
+# (divergent, never-committed) suffix is truncated, not merged.
+#
+# Build the divergence exactly as the probe-and-overwrite case does, but with a low snapshot threshold
+# and extra writes so the new leader compacts over the conflict before the stale node returns.
+add-nodes 3 voters=(1,2,3) snap=3
+----
+n1: created voters={1,2,3} term=0 commit=0 last=0
+n2: created voters={1,2,3} term=0 commit=0 last=0
+n3: created voters={1,2,3} term=0 commit=0 last=0
+
+campaign 1
+----
+n1 candidate term=1
+RequestVote term=1 last=0/0 prevote=false
+RequestVote term=1 last=0/0 prevote=false
+
+stabilize
+----
+> n2 recv RequestVote term=1 last=0/0 prevote=false
+> n3 recv RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 recv VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  Heartbeat term=1 commit=0
+  Heartbeat term=1 commit=0
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  n1 leader-changed term=1 lead=1
+> n2 recv Heartbeat term=1 commit=0
+> n3 recv Heartbeat term=1 commit=0
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n2 leader-changed term=1 lead=1
+> n3 ready
+  HeartbeatResponse term=1
+  AppendResponse term=1 match=1
+  n3 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv AppendResponse term=1 match=1
+> n1 ready
+  AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n3 ready
+  AppendResponse term=1 match=1
+  AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+> n1 recv AppendResponse term=1 match=1
+
+# Commit one normal entry under n1 (term 1) so all three share a common prefix [1/1 empty, 1/2 x].
+propose 1 x
+----
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+
+stabilize
+----
+> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+> n2 ready
+  AppendResponse term=1 match=2
+> n3 ready
+  AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  n1 applied index=2
+> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResponse term=1 match=2
+  n2 applied index=2
+> n3 ready
+  AppendResponse term=1 match=2
+  n3 applied index=2
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+
+# Isolate the leader n1, then let it append an uncommitted entry "a" at index 3 (term 1). With no
+# quorum it never commits, but it sits in n1's log — the seed of the divergence.
+isolate 1
+----
+n1 isolated
+
+propose 1 a
+----
+ok
+
+raft-log 1
+----
+n1: commit=2 applied=2 last=3
+  1/1 empty
+  1/2 normal 0x010000000000000078
+  1/3 normal 0x010000000000000061
+
+# {2,3} elect n2 at term 2. Its election no-op lands at index 3 with term 2, so index 3 now DIVERGES:
+# n1 holds 1/3 (normal "a"), the majority holds 2/3 (empty no-op).
+campaign 2
+----
+n2 candidate term=2
+RequestVote term=2 last=1/2 prevote=false
+n2 leader-changed term=2 lead=none
+
+stabilize
+----
+> n3 recv RequestVote term=2 last=1/2 prevote=false
+> n3 ready
+  VoteResponse term=2 prevote=false reject=false
+  n3 leader-changed term=2 lead=none
+> n2 recv VoteResponse term=2 prevote=false reject=false
+> n2 ready
+  Heartbeat term=2 commit=0
+  AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+  n2 leader-changed term=2 lead=2
+> n3 recv Heartbeat term=2 commit=0
+> n3 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+> n3 ready
+  HeartbeatResponse term=2
+  AppendResponse term=2 match=3
+  n3 leader-changed term=2 lead=2
+> n2 recv HeartbeatResponse term=2
+> n2 recv AppendResponse term=2 match=3
+> n2 ready
+  AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+  AppendEntries term=2 prev=2/3 commit=3 entries=[]
+> n3 recv AppendEntries term=2 prev=1/2 commit=2 entries=[2/3 empty]
+> n3 recv AppendEntries term=2 prev=2/3 commit=3 entries=[]
+> n3 ready
+  AppendResponse term=2 match=3
+  AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
+> n2 recv AppendResponse term=2 match=3
+
+# n2 (new leader) writes more commands and, with threshold 3, compacts its log PAST index 3 — the
+# divergence point — while n1 is still isolated.
+propose 2 c
+----
+AppendEntries term=2 prev=2/3 commit=3 entries=[2/4 normal 0x010000000000000063]
+
+propose 2 d
+----
+AppendEntries term=2 prev=2/4 commit=3 entries=[2/5 normal 0x010000000000000064]
+
+propose 2 e
+----
+AppendEntries term=2 prev=2/5 commit=3 entries=[2/6 normal 0x010000000000000065]
+
+stabilize
+----
+> n3 recv AppendEntries term=2 prev=2/3 commit=3 entries=[2/4 normal 0x010000000000000063]
+> n3 recv AppendEntries term=2 prev=2/4 commit=3 entries=[2/5 normal 0x010000000000000064]
+> n3 recv AppendEntries term=2 prev=2/5 commit=3 entries=[2/6 normal 0x010000000000000065]
+> n3 ready
+  AppendResponse term=2 match=4
+  AppendResponse term=2 match=5
+  AppendResponse term=2 match=6
+> n2 recv AppendResponse term=2 match=4
+> n2 recv AppendResponse term=2 match=5
+> n2 recv AppendResponse term=2 match=6
+> n2 ready
+  AppendEntries term=2 prev=2/6 commit=4 entries=[]
+  AppendEntries term=2 prev=2/6 commit=5 entries=[]
+  AppendEntries term=2 prev=2/6 commit=6 entries=[]
+  n2 applied index=4
+  n2 applied index=5
+  n2 applied index=6
+> n3 recv AppendEntries term=2 prev=2/6 commit=4 entries=[]
+> n3 recv AppendEntries term=2 prev=2/6 commit=5 entries=[]
+> n3 recv AppendEntries term=2 prev=2/6 commit=6 entries=[]
+> n3 ready
+  AppendResponse term=2 match=6
+  AppendResponse term=2 match=6
+  AppendResponse term=2 match=6
+  n3 applied index=4
+  n3 applied index=5
+  n3 applied index=6
+> n2 recv AppendResponse term=2 match=6
+> n2 recv AppendResponse term=2 match=6
+> n2 recv AppendResponse term=2 match=6
+
+# The leader's log is now compacted past the conflict; it can no longer send n1 the individual entries
+# around index 3.
+raft-log 2
+----
+n2: commit=6 applied=6 last=6
+  (snapshot covers <= index 6)
+
+raft-log 1
+----
+n1: commit=2 applied=2 last=3
+  1/1 empty
+  1/2 normal 0x010000000000000078
+  1/3 normal 0x010000000000000061
+
+# Recover n1 and let the cluster settle. n1 adopts term 2, rejects the append (its log is gone from the
+# leader), and the leader installs a snapshot — which truncates n1's divergent 1/3 tail and re-bases it.
+recover 1
+----
+n1 recovered
+
+tick-heartbeat 2
+----
+Heartbeat term=2 commit=0
+Heartbeat term=2 commit=6
+
+stabilize
+----
+> n1 recv Heartbeat term=2 commit=0
+> n3 recv Heartbeat term=2 commit=6
+> n1 ready
+  HeartbeatResponse term=2
+  n1 leader-changed term=2 lead=none
+  n1 leader-changed term=2 lead=2
+> n3 ready
+  HeartbeatResponse term=2
+> n2 recv HeartbeatResponse term=2
+> n2 recv HeartbeatResponse term=2
+> n2 ready
+  InstallSnapshot term=2 snap=2/6 offset=0 len=84 last=true
+  AppendEntries term=2 prev=2/6 commit=6 entries=[]
+> n1 recv InstallSnapshot term=2 snap=2/6 offset=0 len=84 last=true
+> n3 recv AppendEntries term=2 prev=2/6 commit=6 entries=[]
+> n1 ready
+  SnapshotResponse term=2 reject=false match=6 acked=0
+  n1 snapshot-installed snap=2/6
+> n3 ready
+  AppendResponse term=2 match=6
+> n2 recv SnapshotResponse term=2 reject=false match=6 acked=0
+> n2 recv AppendResponse term=2 match=6
+> n2 ready
+  AppendEntries term=2 prev=2/6 commit=6 entries=[]
+> n1 recv AppendEntries term=2 prev=2/6 commit=6 entries=[]
+> n1 ready
+  AppendResponse term=2 match=6
+> n2 recv AppendResponse term=2 match=6
+
+# n1's conflicting entry is gone: its log is re-based to the snapshot boundary and it agrees with the
+# leader's committed history (the term-2 entries), NOT its old term-1 "a".
+raft-log 1
+----
+n1: commit=6 applied=6 last=6
+  (snapshot covers <= index 6)
+
+raft-log 2
+----
+n2: commit=6 applied=6 last=6
+  (snapshot covers <= index 6)
+
+raft-state
+----
+n1: follower term=2 lead=2
+n2: leader term=2 lead=2
+n3: follower term=2 lead=2
+
