@@ -967,14 +967,15 @@ impl<I: sailing_proto::NodeId> StableStore for MemStable<I> {
         None => return Err(MemStoreError::StagingFull),
       }
     }
-    Ok(
-      self
-        .snapshot_staging
-        .as_mut()
-        .expect("staging set above")
-        .1
-        .accept(offset, data),
-    )
+    // An adversarially fragmented transfer (too many disjoint runs) returns None → a fatal store error so
+    // the core fail-stops, rather than the interval metadata growing unbounded.
+    self
+      .snapshot_staging
+      .as_mut()
+      .expect("staging set above")
+      .1
+      .accept(offset, data)
+      .ok_or(MemStoreError::StagingFull)
   }
 
   fn take_staged_snapshot(&mut self, meta: &SnapshotMeta<I>) -> Option<Bytes> {

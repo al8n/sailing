@@ -539,7 +539,8 @@ impl<I: NodeId> StableStore for NoopStable<I> {
         .as_mut()
         .expect("staging set above")
         .1
-        .accept(offset, data),
+        .accept(offset, data)
+        .expect("test store: small snapshots stay within MAX_STAGING_RUNS"),
     )
   }
 
@@ -795,7 +796,8 @@ impl StableStore for AsyncStable {
         .as_mut()
         .expect("staging set above")
         .1
-        .accept(offset, data),
+        .accept(offset, data)
+        .expect("test store: small snapshots stay within MAX_STAGING_RUNS"),
     )
   }
 
