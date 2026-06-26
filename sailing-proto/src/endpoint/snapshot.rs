@@ -241,18 +241,22 @@ where
   /// `snapshot_recv` AND the store's `SnapshotStaging` buffer (a full `total_len` allocation) rather than
   /// pinning it until a future supersede or restart. A no-op when no transfer is in progress or it is still
   /// ahead of the recoverable prefix.
+  ///
+  /// Returns `false` if the Log-Matching proof read hit a FATAL `term` error (the node is now poisoned via
+  /// `log_term`): the caller MUST bail immediately rather than continue handler work on a poisoned node.
+  #[must_use]
   pub(crate) fn reclaim_stale_snapshot_recv<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     log: &L,
     stable: &mut S,
-  ) {
+  ) -> bool {
     let Some((boundary, last_term)) = self
       .snapshot
       .snapshot_recv
       .as_ref()
       .map(|r| (r.meta.last_index(), r.meta.last_term()))
     else {
-      return;
+      return true;
     };
     // Free the staging buffer whenever the staged snapshot is redundant by the SAME proof the ack-path
     // short-circuit uses: committed-and-recoverable, OR the durable log matches through the boundary (Log
@@ -266,12 +270,13 @@ where
       || (boundary <= durable_index
         && match self.log_term(log, boundary) {
           Some(t) => t == last_term,
-          None => return,
+          None => return false,
         });
     if redundant {
       self.snapshot.snapshot_recv = None;
       stable.discard_snapshot_staging();
     }
+    true
   }
 
   /// Receive an `InstallSnapshot` from the current leader (follower path). This VALIDATES, persists the
@@ -309,8 +314,11 @@ where
 
     // Reclaim an abandoned in-progress receive whose boundary the recoverable prefix has already passed:
     // a delayed chunk for it would otherwise short-circuit at the staleness guard below WITHOUT freeing the
-    // staging buffer (the leak that pins a full `total_len` allocation).
-    self.reclaim_stale_snapshot_recv(log, stable);
+    // staging buffer (the leak that pins a full `total_len` allocation). A fatal term-read in the proof
+    // poisons the node → bail before any further handler work.
+    if !self.reclaim_stale_snapshot_recv(log, stable) {
+      return;
+    }
 
     // Fold this snapshot's carried LeaseGuard bound into `max_lease_window` HERE — before EVERY early
     // return below (redundant short-circuit, duplicate-install guard) and before the destructive
@@ -792,11 +800,19 @@ where
       if let Some(ProgressState::Snapshot { acked_through, .. }) =
         self.tracker.progress(&from).map(|p| p.state())
       {
-        self.send_snapshot_chunk(from.cheap_clone(), stable, acked_through);
-        self.snapshot.snapshot_resend_after.insert(
-          from.cheap_clone(),
-          now.mono() + self.config.election_timeout(),
-        );
+        // Pump the NEXT chunk; arm resend-pacing ONLY on a real send. A cold/deferred chunk
+        // (`SnapshotChunkRead::Pending`) emits nothing and returns false — CLEAR the deadline so the next
+        // heartbeat retries immediately. Merely not re-arming is insufficient HERE: the prior pump left a
+        // FUTURE deadline, and the peer (no new chunk to ack) will send no further progress ack to re-drive
+        // it, so a lingering future deadline would suppress the retry for up to a full election timeout.
+        if self.send_snapshot_chunk(from.cheap_clone(), stable, acked_through) {
+          self.snapshot.snapshot_resend_after.insert(
+            from.cheap_clone(),
+            now.mono() + self.config.election_timeout(),
+          );
+        } else {
+          self.snapshot.snapshot_resend_after.remove(&from);
+        }
       }
       // Re-borrow self for the resume sequence (pr is dropped above).
       self.maybe_advance_commit(now, log);

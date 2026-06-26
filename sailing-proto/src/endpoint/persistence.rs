@@ -474,8 +474,11 @@ where
 
     // Reclaim an abandoned chunked receive whose boundary the now-advanced recoverable prefix has passed
     // (a snapshot/AppendEntries race where the log caught up first), freeing its staging buffer rather than
-    // pinning it until a future supersede or restart.
-    self.reclaim_stale_snapshot_recv(log, stable);
+    // pinning it until a future supersede or restart. A fatal term-read in the Log-Matching proof poisons
+    // the node → fail-stop the storage handler immediately (mirrors the poisoned-entry guard at the top).
+    if !self.reclaim_stale_snapshot_recv(log, stable) {
+      return StorageProgress::Drained;
+    }
 
     // Re-drive a deferred apply. A cold (`EntriesRead::Pending`) committed-range read leaves
     // `applied < commit` with NO `LogDone` to re-trigger apply through `on_log_appended`, so the store's
