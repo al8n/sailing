@@ -847,6 +847,12 @@ where
       // Re-borrow self for the resume sequence (pr is dropped above).
       self.maybe_advance_commit(now, log);
       self.apply_committed(log);
+      // maybe_advance_commit / apply_committed can self-poison → fail-stop before the deferred-read flush
+      // and the append pump (both no-op on a poisoned node, but the explicit bail keeps "no work after
+      // poison" airtight rather than relying on those downstream entry guards).
+      if self.poison.poisoned {
+        return;
+      }
       self.maybe_flush_deferred_reads(now, log, stable);
       self.maybe_send_append(now, from, log, stable);
     }
