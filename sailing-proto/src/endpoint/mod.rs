@@ -633,16 +633,23 @@ struct Durability<I> {
   /// `ProgressState::Snapshot`. Monotone (a durable snapshot sits at a committed, hence permanent, index);
   /// volatile (init ZERO — after restart the reconciled log already covers any durable snapshot).
   durable_snapshot_index: Index,
-  /// Per-append last-index, keyed by the submission's `OpId`, for EVERY in-flight log append —
-  /// independent of `pending`. `durable_index` must advance on every `LogDone::Appended`, but
-  /// `pending` is cleared on term changes and a same-term step-down routes a `LeaderAppend`
-  /// completion to the `_` arm; in both cases the entry still became durable. Keeping the upto
-  /// here lets `on_log_appended` advance the watermark unconditionally (role/term-independent),
-  /// so a follower never under-acks its durable suffix on a later duplicate/empty AppendEntries.
-  /// Entry is recorded in `submit_append`, removed (consumed into the watermark) in
-  /// `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init empty
-  /// in `new` and `restart`.
-  inflight_append_upto: BTreeMap<OpId, Index>,
+  /// Per-append last-index for EVERY in-flight log append, in submit order — independent of
+  /// `pending`. `durable_index` must advance on every `LogDone::Appended`, but `pending` is cleared
+  /// on term changes and a same-term step-down routes a `LeaderAppend` completion to the `_` arm; in
+  /// both cases the entry still became durable. Keeping the upto here lets `on_log_appended` advance
+  /// the watermark unconditionally (role/term-independent), so a follower never under-acks its durable
+  /// suffix on a later duplicate/empty AppendEntries. Recorded (`push_back`) in `submit_append`,
+  /// consumed in `on_log_appended`, pruned on §5.3 truncation, and cleared on snapshot restore. Init
+  /// empty in `new` and `restart`.
+  ///
+  /// A `VecDeque`, not a map: appends are submitted in strictly increasing index order, so the
+  /// `(OpId, Index)` pairs are pushed back with non-decreasing `Index` and the records drain to empty
+  /// between bursts (no B-tree node churn). `submit_append` durability is prefix-ordered and the
+  /// completing op is the FRONT in the common case (an O(1) `pop_front`); the `LogStore` contract
+  /// nonetheless permits completions in ANY order, so `on_log_appended` falls back to a search-remove
+  /// when the front does not match. Truncation pops the back while `Index >= truncate_from` (the
+  /// superseded suffix, by the non-decreasing invariant).
+  inflight_append_upto: VecDeque<(OpId, Index)>,
   /// A SUCCESS `AppendResponse` deferred until `self.term` is durable — `(leader, term, proven)`
   /// where `proven` is the highest log index the leader's RPC(s) actually MATCHED on this follower. A
   /// follower must not RESPOND to an AppendEntries under a term whose HardState write is not yet durable
@@ -1246,7 +1253,7 @@ where
         committed_persisted: Index::ZERO,
         durable_index: Index::ZERO,
         durable_snapshot_index: Index::ZERO,
-        inflight_append_upto: BTreeMap::new(),
+        inflight_append_upto: VecDeque::new(),
         term_gated_append_ack: None,
         term_gated_snapshot_ack: None,
         // A fresh node never acked any leader's read-lease, so no post-restart vote fence.

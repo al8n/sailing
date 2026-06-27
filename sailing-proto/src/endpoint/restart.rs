@@ -502,7 +502,7 @@ where
         // durable snapshot, so `durable_index` alone is the recoverable prefix; the gap this closes only
         // arises at RUNTIME from a dropped stale install.
         durable_snapshot_index: Index::ZERO,
-        inflight_append_upto: BTreeMap::new(),
+        inflight_append_upto: VecDeque::new(),
         term_gated_append_ack: None,
         term_gated_snapshot_ack: None,
         lease_vote_fence_until,

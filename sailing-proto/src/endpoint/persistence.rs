@@ -102,7 +102,10 @@ where
     // Track this append's last index independently of `pending` so `on_log_appended` can advance
     // `durable_index` unconditionally when the completion fires (see the field comment).
     if let Some(last) = entries.last() {
-      self.durable.inflight_append_upto.insert(id, last.index());
+      self
+        .durable
+        .inflight_append_upto
+        .push_back((id, last.index()));
     }
   }
 
@@ -602,7 +605,32 @@ where
     // through `upto` is durable, so this watermark is a true durable-PREFIX bound no matter what
     // order completions arrive in — a later append cannot complete ahead of an earlier index that is
     // still crash-losable.
-    if let Some(upto) = self.durable.inflight_append_upto.remove(&opid) {
+    // The completing op is the FRONT in the common case (prefix-ordered durability + in-order store
+    // completions), an O(1) pop. The `LogStore` contract permits completions in ANY order, so on a
+    // front mismatch fall back to a search-remove; an opid not present (its record was pruned by a
+    // truncation or snapshot restore, or it was never an append) is ignored — exactly as the old
+    // remove-by-key returned `None`.
+    let upto = if self
+      .durable
+      .inflight_append_upto
+      .front()
+      .is_some_and(|(front, _)| front == &opid)
+    {
+      self
+        .durable
+        .inflight_append_upto
+        .pop_front()
+        .map(|(_, upto)| upto)
+    } else {
+      self
+        .durable
+        .inflight_append_upto
+        .iter()
+        .position(|(id, _)| id == &opid)
+        .and_then(|i| self.durable.inflight_append_upto.remove(i))
+        .map(|(_, upto)| upto)
+    };
+    if let Some(upto) = upto {
       self.durable.durable_index = self.durable.durable_index.max(upto);
     }
     match self.pending.remove(&opid) {
