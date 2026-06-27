@@ -1081,6 +1081,15 @@ where
   /// broken). Pure in-memory metric — never persisted, never on the wire, reset to `0` on construction and
   /// restart, read only via [`cold_read_defers`](Self::cold_read_defers). Not a poison.
   cold_read_defers: u64,
+  /// Proactive lease-refresh observability counter (sibling of [`cold_read_defers`](Self::cold_read_defers)).
+  /// Bumped each time a [`LeaseRefresh::OnExpiry`](crate::LeaseRefresh) / `Continuous` leader appends a
+  /// proactive re-anchoring no-op (re-stamping the LeaseGuard lease before it expires so reads never pay a
+  /// Safe round). `0` for the demand-driven [`LeaseRefresh::Off`](crate::LeaseRefresh) default and for every
+  /// non-LeaseGuard / idle leader (the proactive gate never fires without a read since the anchor). Pure
+  /// in-memory metric — never persisted, never on the wire, reset to `0` on construction and restart, read
+  /// only via [`lease_refreshes`](Self::lease_refreshes). A positive value proves the proactive path actually
+  /// re-anchored, so a configured refresh mode cannot pass a test vacuously.
+  lease_refreshes: u64,
   /// The pending output queues (outbound messages + application events).
   outputs: Outputs<I, F>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -1201,6 +1210,7 @@ where
         read_since_anchor: false,
       },
       cold_read_defers: 0,
+      lease_refreshes: 0,
       outputs: Outputs {
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
@@ -1364,6 +1374,16 @@ where
   #[inline(always)]
   pub const fn cold_read_defers(&self) -> u64 {
     self.cold_read_defers
+  }
+
+  /// Proactive lease-refresh counter: how many proactive re-anchoring no-ops this node has appended under
+  /// [`LeaseRefresh::OnExpiry`](crate::LeaseRefresh) / `Continuous`. `0` for the demand-driven `Off` default
+  /// and for an idle or non-LeaseGuard leader. Diagnostic only (see [`cold_read_defers`](Self::cold_read_defers));
+  /// a positive value proves the proactive refresh path actually fired, so a configured refresh mode cannot be
+  /// asserted vacuously.
+  #[inline(always)]
+  pub const fn lease_refreshes(&self) -> u64 {
+    self.lease_refreshes
   }
 
   /// The current applied index — the highest log index this node has applied to its
@@ -2009,6 +2029,7 @@ where
           };
           if fire {
             self.append_leader_noop(now, log, self.commit);
+            self.lease_refreshes = self.lease_refreshes.saturating_add(1);
           }
         }
         // The proactive-refresh anchor read (`lease_near_expiry`) can poison on a fatal log read →

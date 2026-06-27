@@ -29,6 +29,7 @@
 //! | [`durable_prefix`] | a restarted node silently forgetting the committed prefix it durably stored (the headline durability bug) |
 //! | [`boundedness`] | per-node bookkeeping growing unboundedly under compaction (a GC/compaction failure) |
 //! | [`snapshot_boundary_coherent`] | an installed snapshot whose boundary term disagrees with the committed log at that index (a corrupt/mis-keyed snapshot transfer) |
+//! | [`finalize_membership`] | a snapshot-installed node whose installed membership disagrees with the committed-config history at its snapshot boundary (a phantom voter / missing joiner from a corrupt snapshot `ConfState`) |
 //!
 //! The suite is a **pure observer**: it never draws from a PRNG and never mutates the simulated
 //! nodes/stores, so the run is byte-identical with or without it (determinism preserved).
@@ -81,6 +82,12 @@ pub struct DurableEntry {
   pub term: u64,
   /// The entry's payload bytes.
   pub data: Vec<u8>,
+  /// Whether this entry is a `ConfChange`. The authoritative kind the committed-config history's tombstone
+  /// needs: a recorded ConfChange transition at an index is valid only if the FINAL committed entry there is
+  /// itself a ConfChange. A higher-term NON-ConfChange (Normal/Empty/SetReadMode) that truncated and superseded
+  /// an in-memory-applied ConfChange emits NO `ConfChanged` event, so the event-sourced history would otherwise
+  /// keep the stale transition (see `finalize_membership`).
+  pub is_conf_change: bool,
 }
 
 /// A read-only snapshot of one node's observable state at a tick boundary.
@@ -141,6 +148,39 @@ pub struct NodeView {
   pub snapshot_last_index: u64,
   /// The boundary term of the node's durable snapshot (or `0` if none).
   pub snapshot_last_term: u64,
+  /// Whether this node's active membership is SNAPSHOT-DERIVED — it installed a TRANSFERRED snapshot, so
+  /// its config came (at least up to the snapshot boundary) from a wire `ConfState` rather than purely by
+  /// applying the committed log. STICKY across crash (sourced from `Cluster`'s durable lineage flag, not the
+  /// resettable install counter): a restarted node recovers its membership from the durable snapshot, so the
+  /// provenance survives. The membership-coherence oracle treats such a node as the one UNDER TEST and
+  /// NEVER as the sound (log-built) reference — using a snapshot-derived node as the witness would be
+  /// circular and could mask a corrupt snapshot. A locally-COMPACTED node (durable snapshot present but
+  /// never transfer-installed) has `false` here — its config is log-built, so it is a valid witness.
+  pub installed_snapshot: bool,
+  /// The node's ACTIVE incoming voter set (`Endpoint::conf_state().voters()`) — the current-config (or
+  /// joint incoming) half. Folded from every membership change the node has applied (a snapshot install
+  /// adopts the snapshot's `ConfState` verbatim), so it is the membership the node actually serves with.
+  pub conf_voters: BTreeSet<u64>,
+  /// The node's ACTIVE outgoing voter set (`conf_state().voters_outgoing()`) — non-empty only mid joint
+  /// transition. Compared so a corrupt snapshot can't smuggle a divergent joint half.
+  pub conf_voters_outgoing: BTreeSet<u64>,
+  /// The node's ACTIVE learner set (`conf_state().learners()`). Compared alongside the voter halves so a
+  /// mis-keyed snapshot `ConfState` that drops/adds a learner is also caught.
+  pub conf_learners: BTreeSet<u64>,
+  /// The node's ACTIVE `learners_next` set (`conf_state().learners_next()`) — the outgoing-only voters
+  /// staged for demotion to learner when a joint config LEAVES. Part of the full `ConfState`, so it is
+  /// compared too: a snapshot that corrupts the staged demotions while the other halves match would
+  /// otherwise slip past.
+  pub conf_learners_next: BTreeSet<u64>,
+  /// The node's ACTIVE `auto_leave` flag (`conf_state().auto_leave()`) — whether the leader will
+  /// auto-append the leave-joint entry. Part of the full `ConfState`, so it is compared too: a snapshot
+  /// that flips `auto_leave` while every membership set matches would otherwise slip past.
+  pub conf_auto_leave: bool,
+  /// The count of `Event::ConfChanged` this node has applied (`Cluster::conf_changed_count`). For a
+  /// LOG-BUILT node this exactly counts the applied conf-changes; the committed-config history uses it to
+  /// detect a conf-change-free applied delta (the config is then constant across the whole delta, so the
+  /// history can be filled for every committed index the node skipped over in one batched apply).
+  pub conf_changed: u64,
   /// The node's durable `HardState.commit` — the durably-persisted commit watermark. The
   /// durability invariant relates the recovered in-memory `commit` to this.
   pub hardstate_commit: u64,
@@ -153,7 +193,47 @@ pub struct NodeView {
   pub incarnation: u64,
 }
 
+/// A full cluster configuration snapshot — the five [`ConfState`](sailing_proto::ConfState) fields. The
+/// committed-config history records one per committed CONF-CHANGE index (the exact index the new config took
+/// effect, taken from the `Event::ConfChanged` of a log-built node); an install record stores the membership a
+/// snapshot embedded (from its `SnapshotMeta`); and [`finalize_membership`] compares the install's
+/// against the config in effect at the snapshot boundary. Comparing the WHOLE snapshot (not just the voter
+/// halves) is what catches a corrupt `learners_next` / `auto_leave`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ConfSnapshot {
+  voters: BTreeSet<u64>,
+  voters_outgoing: BTreeSet<u64>,
+  learners: BTreeSet<u64>,
+  learners_next: BTreeSet<u64>,
+  auto_leave: bool,
+}
+
+impl ConfSnapshot {
+  /// Capture a [`ConfState`](sailing_proto::ConfState)'s five fields. Used by the cluster to record a
+  /// committed conf-change (from an `Event::ConfChanged`) into the committed-config history.
+  pub(crate) fn from_conf_state(cs: &sailing_proto::ConfState<u64>) -> Self {
+    Self {
+      voters: cs.voters().clone(),
+      voters_outgoing: cs.voters_outgoing().clone(),
+      learners: cs.learners().clone(),
+      learners_next: cs.learners_next().clone(),
+      auto_leave: cs.auto_leave(),
+    }
+  }
+}
+
 impl NodeView {
+  /// This node's active configuration as a [`ConfSnapshot`] (all five `ConfState` fields).
+  fn conf_snapshot(&self) -> ConfSnapshot {
+    ConfSnapshot {
+      voters: self.conf_voters.clone(),
+      voters_outgoing: self.conf_voters_outgoing.clone(),
+      learners: self.conf_learners.clone(),
+      learners_next: self.conf_learners_next.clone(),
+      auto_leave: self.conf_auto_leave,
+    }
+  }
+
   /// Whether this node's durable state (in-memory entries OR snapshot) covers `index` — i.e. the
   /// node has durably stored the committed entry at `index`. Used by the quorum-durability and
   /// committed-rewrite oracles to account for compaction.
@@ -226,6 +306,18 @@ pub struct ClusterView {
   /// then falls back to the per-node `is_voter & !removed` population. Direct-constructed synthetic
   /// views (the oracle teeth tests) leave this `None` and rely on that fallback.
   pub committed_voters: Option<BTreeSet<u64>>,
+  /// This tick's NEW committed conf-changes observed on LOG-BUILT nodes, as `(conf-change index, node term at
+  /// apply, resulting ConfState)` taken from `Event::ConfChanged`. The membership oracle folds these into its
+  /// persistent committed-config history (a step function keyed by conf-change index). Only log-built nodes
+  /// contribute (a snapshot-derived node's config could be wire-corrupt). The term resolves a same-index
+  /// conflict: a higher-term observation supersedes a lower-term in-memory apply that was later truncated.
+  /// Empty on most ticks and for synthetic views that do not seed the history. Crate-internal.
+  pub(crate) committed_transitions: Vec<(u64, u64, ConfSnapshot)>,
+  /// This tick's NEW transfer-snapshot installs, as `(node id, snapshot boundary index, install-time
+  /// ConfState)` from each `SnapshotInstalled` event's `SnapshotMeta`. The membership oracle accumulates these
+  /// into its persistent OBSERVED-install map and compares each STORED install-time ConfState (never the
+  /// node's current, drifting one) against the committed-config reference at the boundary. Crate-internal.
+  pub(crate) new_installs: Vec<(u64, u64, ConfSnapshot)>,
   /// One [`NodeView`] per node, in node-position order.
   pub nodes: Vec<NodeView>,
 }
@@ -272,6 +364,21 @@ impl ClusterView {
   }
 }
 
+/// The kind of the committed entry observed at a log index, for the membership oracle's authoritative
+/// committed-log record. A given `(index, term)` is a unique committed entry, so all committed-durable
+/// observations of it must agree; observing BOTH kinds at the same term means one is a transient/buggy artifact
+/// and NEITHER can be trusted, so the record becomes [`Conflicted`](CommittedKind::Conflicted) (order-independent)
+/// and [`finalize_membership`] declines there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommittedKind {
+  /// The committed entry at the index's recorded term is a `ConfChange`.
+  ConfChange,
+  /// The committed entry at the index's recorded term is NOT a `ConfChange` (Normal / Empty / SetReadMode).
+  NonConfChange,
+  /// Two different kinds were observed at the SAME term — an impossible-in-correct-Raft conflict; trust nothing.
+  Conflicted,
+}
+
 /// The per-tick safety-oracle suite, holding the cross-tick history the monotonicity / committed-
 /// history oracles need.
 ///
@@ -305,12 +412,99 @@ pub struct Checker {
   /// changes (it crashed and recovered), its commit/term monotonicity baseline is reset, so a
   /// legitimate watermark drop across the restart boundary is not flagged as a backward step.
   last_incarnation: BTreeMap<u64, u64>,
+  /// The INDEPENDENT, PERSISTENT committed-config reference for [`finalize_membership`], as a STEP
+  /// FUNCTION keyed by committed conf-change index: `index -> (term, the ConfState that took effect AT that
+  /// index)`, folded from LOG-BUILT nodes' `Event::ConfChanged` (carried in
+  /// [`ClusterView::committed_transitions`]). The config in effect at any index `i` is the ConfState of the
+  /// GREATEST key `<= i` (or [`genesis_conf`] below the first conf-change). It never resets and never shrinks,
+  /// so the reference cannot exhaust even when every currently-live node has become snapshot-derived (the
+  /// exhaustion the live-peer witness suffered). Each entry is `(term, ConfState, ambiguous)`:
+  /// - HIGHEST-TERM-WINS resolves a same-index conflict: a strictly-higher-term observation overwrites (a
+  ///   later term truncated and re-applied that entry — the committed truth) AND clears `ambiguous`.
+  /// - Two DIFFERENT folds at the SAME `(index, term)` mark the entry `ambiguous`: the ConfChanged ConfState
+  ///   is the node's apply-time fold, which an async in-memory apply can transiently diverge, so NEITHER fold
+  ///   can be trusted. First-writer-win there would POISON the reference (the install-vs-reference check would
+  ///   then compare against the poisoned value and pass a corrupt install), so an ambiguous index is NEVER
+  ///   used — an install resolving to it is SKIPPED (counted unwitnessed) until a strictly-higher-term
+  ///   transition disambiguates it.
+  committed_config_history: BTreeMap<u64, (u64, ConfSnapshot, bool)>,
+  /// The FINAL committed-log kind per index, the AUTHORITATIVE source that [`committed_config_history`] (sourced
+  /// from transient apply-time `ConfChanged` events) is reconciled against: `index -> (highest committed term,
+  /// [`CommittedKind`])`, folded from every node's COMMITTED (`index <= commit`) durable entry. A strictly-higher
+  /// term OVERWRITES (resetting the kind); a SAME-term observation whose kind DIFFERS marks the entry
+  /// [`Conflicted`](CommittedKind::Conflicted) regardless of arrival order (the committed entry at a given
+  /// `(index, term)` is unique, so a same-term kind conflict means one observation is a transient/buggy artifact
+  /// — trust neither). An in-memory-applied ConfChange at `(I, t)` can be truncated and superseded by a
+  /// strictly-higher-term NON-ConfChange committed at the same index (which emits no `ConfChanged` event, so the
+  /// event-sourced history keeps the stale transition); [`finalize_membership`] TOMBSTONES that. Committed entries
+  /// are final, so highest-term-wins converges to the committed truth.
+  committed_log_kind: BTreeMap<u64, (u64, CommittedKind)>,
+  /// EVERY install ever OBSERVED, keyed by identity `(node id, transfer-snapshot boundary)` and storing the
+  /// INSTALL-TIME `ConfState` (the exact membership the snapshot installed, captured from the event's
+  /// `SnapshotMeta` — carried in [`ClusterView::new_installs`]). The check compares THIS fixed value against
+  /// the committed-config reference at the boundary, NEVER the node's CURRENT config (which drifts as the node
+  /// applies later entries — a corrupt install could otherwise be "repaired" by a later ConfChange and pass
+  /// unexamined). Persistent: an earlier boundary stays even after a later boundary on the same node is
+  /// compared, so `observed − compared` never lets a skipped-then-superseded install vanish.
+  observed_installs: BTreeMap<(u64, u64), ConfSnapshot>,
+  /// The genesis (pre-first-conf-change) configuration, captured ONCE from a log-built node that has applied
+  /// no conf-change (`conf_changed == 0` ⇒ its config is the founding membership). The step-function
+  /// reference for indices below the first recorded conf-change.
+  genesis_conf: Option<ConfSnapshot>,
+  /// The highest applied index any LOG-BUILT node has reached — the watermark up to which the step-function
+  /// history is COMPLETE (a log-built node at applied `A` has emitted `ConfChanged` for every conf-change
+  /// `<= A`, so none is missing). Monotone. An install at applied `> complete_up_to` has no certified
+  /// reference (the frontier was only ever reached via snapshot transfer) and is counted as unwitnessed.
+  complete_up_to: u64,
+  /// How many observed installs the run-end final pass ([`finalize_membership`]) actually COMPARED
+  /// against the FINAL committed-config history. Set by `finalize_membership` (0 until it runs). A sweep asserts
+  /// this is `> 0` so the oracle is proven non-vacuous.
+  membership_comparisons: u64,
+  /// How many observed installs the run-end final pass ([`finalize_membership`]) could NOT compare because the
+  /// committed-config HISTORY is incomplete at the boundary (`boundary > complete_up_to`, an unresolved
+  /// same-term divergence, a higher-term ConfChange of unknown conf, or a resolved index that is neither
+  /// committed-final nor genesis). Set by `finalize_membership` (0 until it runs). A sweep asserts this is `0`: a
+  /// converged run leaves every boundary's reference complete + non-ambiguous. Distinct from
+  /// [`membership_kind_unobservable`](Self::membership_kind_unobservable).
+  membership_skipped: u64,
+  /// How many observed installs the run-end final pass SOUNDLY declined because the resolved conf-change index is
+  /// committed-FINAL (`<= complete_up_to`) but the committed log gives no EXACT-term ConfChange proof for it — its
+  /// kind was compacted before any tick observed it as a standalone entry, or only a stale lower-term / unknown
+  /// higher-term record exists — so whether the recorded ConfChange is the committed entry cannot be PROVEN. The
+  /// net DECLINES to judge (never trust-stale) rather than risk a false verdict; a bounded coverage limitation of
+  /// compaction, NOT a soundness hole and NOT a history-completeness gap.
+  membership_kind_unobservable: u64,
 }
 
 impl Checker {
   /// A fresh checker with empty history.
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// The number of membership-coherence comparisons the run-end final pass performed (see
+  /// `finalize_membership`); `0` until it runs. A sweep asserts this is `> 0` so the oracle is proven
+  /// non-vacuous — it genuinely compared a snapshot-installed node against the committed-config history.
+  pub fn membership_comparisons(&self) -> u64 {
+    self.membership_comparisons
+  }
+
+  /// The number of observed installs the run-end final pass could NOT witness due to an incomplete committed
+  /// -config HISTORY (boundary beyond the completeness watermark, an unresolved divergence, or a resolved index
+  /// that is neither committed-final nor genesis); `0` until `finalize_membership` runs. A sweep asserts this is
+  /// `0` at run end: after convergence every boundary's reference is complete + non-ambiguous. A compacted
+  /// committed-log KIND is NOT counted here — see [`kind_unobservable_installs`](Self::kind_unobservable_installs).
+  pub fn skipped_unwitnessed_installs(&self) -> u64 {
+    self.membership_skipped
+  }
+
+  /// The number of observed installs the run-end final pass SOUNDLY declined because the resolved conf-change
+  /// index is committed-FINAL (covered by a durable snapshot) but its committed-log KIND was compacted before any
+  /// tick observed it. The net never trusts a possibly-stale ConfChange, so it declines rather than risk a false
+  /// verdict — a bounded coverage limitation of compaction, not a soundness hole. `0` until `finalize_membership`
+  /// runs.
+  pub fn kind_unobservable_installs(&self) -> u64 {
+    self.membership_kind_unobservable
   }
 
   /// Run the ENTIRE oracle suite against `view`, updating cross-tick history.
@@ -372,6 +566,8 @@ impl Checker {
     durable_prefix(view)?;
     boundedness(view)?;
     snapshot_boundary_coherent(view)?;
+    // Record-only: fold this tick's membership observations; the verdict is the run-end `finalize_membership`.
+    record_membership_observation(self, view);
     // History oracles (read-then-fold).
     no_committed_rewrite(self, view)?;
     monotonic_commit(self, view)?;
@@ -781,6 +977,305 @@ pub fn snapshot_boundary_coherent(view: &ClusterView) -> Result<(), Violation> {
       ));
     }
   }
+  Ok(())
+}
+
+/// **snapshot-membership-coherent (RECORD step)**: fold this tick's observations — every `SnapshotInstalled`
+/// (as an install-time ConfState) and every committed conf-change (into the persistent step-function history) —
+/// so the run-end [`finalize_membership`] can render the verdict against the FINAL stable history.
+///
+/// The PROPERTY (verified by `finalize_membership`): the [`ConfState`](sailing_proto::ConfState) a transferred
+/// snapshot INSTALLED (captured at install time — every field, not just the obvious sets) must equal the
+/// committed configuration in effect at the snapshot's BOUNDARY, so a snapshot transfer can never adopt a
+/// membership with a PHANTOM voter (one the committed membership has removed) or a MISSING joiner (one it has
+/// added), nor a corrupted joint / learner-promotion state. The verdict is against the INSTALL-TIME ConfState —
+/// NOT the node's CURRENT config, which drifts as it applies later entries (a corrupt install could otherwise
+/// be silently "repaired" by a later ConfChange and never examined).
+///
+/// # The reference is an INDEPENDENT, PERSISTENT step-function history (it cannot exhaust)
+///
+/// A node's active config is the fold of every membership change it has applied, in committed-log (total)
+/// order, so the committed config is a STEP FUNCTION of index, changing only at conf-change indices. Rather
+/// than depend on a currently-live log-built peer (which can VANISH once every node has become
+/// snapshot-derived, since the lineage flag is sticky forever), this oracle folds each committed conf-change
+/// — at its EXACT index, from a LOG-BUILT node's `ConfChanged` event — into a PERSISTENT
+/// [`committed_config_history`](Checker::committed_config_history), plus the [`genesis_conf`](Checker::genesis_conf)
+/// below the first change. The config in effect at index `i` is the value of the greatest key `<= i`. The
+/// history never resets and never shrinks, so the reference survives even when no log-built node is currently
+/// live. Keying by EXACT conf-change index (not per-applied-index) makes it gap-free regardless of how large a
+/// batch an apply advances.
+///
+/// # Same-index conflicts: highest-term-wins, else AMBIGUOUS (never poisoned)
+///
+/// A ConfChanged's ConfState is the node's apply-time FOLD, and in async mode an in-memory apply can run ahead
+/// of durability and be truncated + superseded by a higher-term entry, so two log-built nodes can report
+/// DIFFERENT folds at the same conf-change index. A strictly-higher-term observation is the committed truth
+/// (it overwrites); a same-`(index, term)` divergence marks the index AMBIGUOUS — first-writer-win there would
+/// POISON the reference, so an ambiguous index is never used until a higher-term transition disambiguates it.
+/// Because these resolutions MUTATE the history as the run proceeds, the verdict is deferred to run end (see
+/// [`finalize_membership`]) — comparing against an entry before the history stabilises could freeze a verdict
+/// against a value a later overwrite or ambiguation supersedes.
+///
+/// This is a pure observer: it draws no PRNG and never mutates the simulated nodes, so the run stays
+/// byte-identical (determinism preserved).
+pub fn record_membership_observation(checker: &mut Checker, view: &ClusterView) {
+  // RECORD installs: every `SnapshotInstalled` this tick is an OBSERVED install, keyed by (id, transfer
+  // boundary) and storing the INSTALL-TIME ConfState (the exact membership the snapshot installed). A repeated
+  // observation of the same install keeps the first (same conf).
+  for (id, boundary, install_conf) in view.new_installs.iter() {
+    checker
+      .observed_installs
+      .entry((*id, *boundary))
+      .or_insert_with(|| install_conf.clone());
+  }
+
+  // RECORD transitions: fold this tick's committed conf-changes (from log-built nodes' ConfChanged events)
+  // into the step-function history at their EXACT indices.
+  //
+  // The ConfState in a ConfChanged event is the node's APPLY-TIME FOLD of every conf-change it has applied,
+  // and in async mode an in-memory apply can run ahead of durability and later be TRUNCATED + superseded by a
+  // higher-term entry at the same log index — so two log-built nodes can legitimately report DIFFERENT folded
+  // ConfStates at the same conf-change index. Resolution:
+  //   • a STRICTLY-HIGHER term overwrites and clears ambiguity (the later term re-applied the entry — truth);
+  //   • a same-`(index, term)` DIVERGENT fold marks the index AMBIGUOUS (neither fold can be trusted —
+  //     first-writer-win would poison the reference and let a corrupt install pass the check below);
+  //   • a same-`(index, term)` matching fold, or a stale lower term, changes nothing.
+  for (idx, term, conf) in view.committed_transitions.iter() {
+    if let Some((et, ec, amb)) = checker.committed_config_history.get_mut(idx) {
+      if *term > *et {
+        *et = *term;
+        *ec = conf.clone();
+        *amb = false;
+      } else if *term == *et && &*ec != conf {
+        *amb = true;
+      }
+    } else {
+      checker
+        .committed_config_history
+        .insert(*idx, (*term, conf.clone(), false));
+    }
+  }
+  for n in view.nodes.iter() {
+    if n.removed || n.installed_snapshot {
+      continue;
+    }
+    // Genesis: a log-built node that has applied NO conf-change is serving the founding membership.
+    if n.conf_changed == 0 && checker.genesis_conf.is_none() {
+      checker.genesis_conf = Some(n.conf_snapshot());
+    }
+    // A log-built node at applied `A` has emitted ConfChanged for every conf-change `<= A`, so the history is
+    // complete up to `A`. Raise the completeness watermark (monotone).
+    checker.complete_up_to = checker.complete_up_to.max(n.applied);
+  }
+
+  // Record the FINAL committed-log kind per index from the AUTHORITATIVE source — the committed DURABLE log, not
+  // the transient apply-time events. For each COMMITTED (`index <= commit`) DURABLE entry of EVERY node, every
+  // tick: a strictly-higher term OVERWRITES (resetting the kind to that entry's); a SAME-term observation whose
+  // kind DIFFERS marks the index CONFLICTED (order-independent — the committed entry at a given `(index, term)`
+  // is unique, so a same-term kind conflict means one observation is a transient/buggy artifact, trust neither);
+  // a same-term same-kind or a lower-term observation changes nothing. A durable committed entry is FINAL
+  // (committed entries are persisted-before-ack — the durability oracles verify this), unlike a committed-but-
+  // unflushed entry an async higher term can still supersede. PERSISTENT (never cleared/compacted), so a captured
+  // index is kept FOREVER — capturing across each tick's commit growth observes an entry while still retained,
+  // BEFORE compaction removes it.
+  for n in view.nodes.iter() {
+    for e in n.durable_entries.iter() {
+      if e.index > n.commit {
+        continue;
+      }
+      let kind = if e.is_conf_change {
+        CommittedKind::ConfChange
+      } else {
+        CommittedKind::NonConfChange
+      };
+      match checker.committed_log_kind.get_mut(&e.index) {
+        Some((t, k)) if e.term > *t => {
+          *t = e.term;
+          *k = kind; // strictly-higher term: the superseding committed entry's kind (clears any conflict)
+        }
+        Some((t, k)) if e.term == *t && *k != kind => {
+          *k = CommittedKind::Conflicted; // same term, differing kind: an impossible-in-correct-Raft conflict
+        }
+        Some(_) => {} // same-term same-kind (incl. already conflicted), or a stale lower-term observation
+        None => {
+          checker.committed_log_kind.insert(e.index, (e.term, kind));
+        }
+      }
+    }
+  }
+}
+
+/// **snapshot-membership-coherent (VERDICT step)**: the run-end final pass. Compare EVERY observed install's
+/// INSTALL-TIME ConfState against the FINAL committed config in effect at its boundary, exactly once. Run once
+/// after the last tick (see [`record_membership_observation`] for the per-tick recording it consumes).
+///
+/// # Why a run-end pass, not a per-tick verdict
+///
+/// [`committed_config_history`](Checker::committed_config_history) is MUTABLE while a run proceeds: a
+/// strictly-higher-term observation OVERWRITES an entry (the later term re-applied it — the committed truth),
+/// and a same-`(index, term)` divergent fold AMBIGUATES it. A per-tick verdict that blessed an install the
+/// first time its reference resolved would freeze that judgement against a NON-FINAL reference — a later
+/// overwrite or ambiguation of that index would never re-judge the install, so a corrupt install could pass
+/// against a value the history later supersedes (the install-vs-stale-reference false-negative class). Deferring
+/// to one pass over the now-stable history compares every install against the FINAL committed truth exactly
+/// once and removes that whole class.
+///
+/// # Authoritative source: tombstone superseded ConfChanges
+///
+/// The history is sourced from transient apply-time `ConfChanged` EVENTS, but the AUTHORITATIVE truth is the
+/// committed LOG. An in-memory-applied ConfChange at `(I, t)` can be truncated and superseded by a
+/// strictly-higher-term NON-ConfChange (Normal/Empty/SetReadMode) committed at the same index `I` — which emits
+/// NO `ConfChanged` event, so the stale ConfChange transition would linger. So the config-in-effect resolution
+/// consults [`committed_log_kind`](Checker::committed_log_kind) (the final committed entry per index) and
+/// TOMBSTONES a recorded transition at `I` whose final committed entry is a higher-term non-ConfChange: the
+/// config does NOT change at `I`, so the resolution walks past it to the prior surviving conf-change index.
+///
+/// STRICT trust: `committed_log_kind` is the only proof source, and a recorded ConfChange transition is the
+/// reference ONLY when the committed-log kind is an EXACT-term ConfChange at that index — which (committed
+/// entries being immutable) IS the recorded entry. A known non-ConfChange at exact-or-higher term tombstones
+/// (config unchanged there); anything weaker — a kind compacted unobserved, a stale lower-term record, or a
+/// higher-term ConfChange of unknown conf — is NEVER trusted (no fall-through to the transient apply-time
+/// ConfChange). (An independently-witnessed snapshot boundary would also prove the entry, but a witnessed
+/// boundary's committed entry is retained, so its kind is already in `committed_log_kind` — the exact-term check
+/// subsumes it; an UN-witnessed boundary is no proof, so there is no separate boundary path.)
+///
+/// # Verdict
+///
+/// For each observed install `(node, boundary) -> install-time ConfState`:
+/// - boundary beyond [`complete_up_to`](Checker::complete_up_to) (no log-built node certified the history that
+///   far), an AMBIGUOUS effective index, or an absent genesis ⇒ a history-completeness gap (SKIPPED — a converged
+///   run drives this to `0`);
+/// - a consulted index whose committed-log kind is not an exact-term ConfChange proof (compacted unobserved, a
+///   stale lower-term record, or a higher-term ConfChange of unknown conf) ⇒ a sound KIND-UNOBSERVABLE decline:
+///   the index is committed-final (`<= complete_up_to`) but the oracle cannot prove the recorded ConfChange is
+///   the committed entry, so it declines rather than risk a stale verdict;
+/// - otherwise resolve the FINAL reference = the conf of the greatest SURVIVING (non-tombstoned) conf-change
+///   index `<= boundary`, else [`genesis_conf`](Checker::genesis_conf), and COMPARE the stored install-time
+///   ConfState against it: a mismatch is a Violation (a phantom voter, a missing joiner, or a corrupted joint /
+///   learner state); a match counts as a comparison.
+///
+/// Sets [`membership_comparisons`](Checker::membership_comparisons) (installs compared, a sweep asserts `> 0`),
+/// [`skipped_unwitnessed_installs`](Checker::skipped_unwitnessed_installs) (history-completeness gaps, a sweep
+/// asserts `0` on a converged run), and [`kind_unobservable_installs`](Checker::kind_unobservable_installs)
+/// (sound declines for committed-final indices whose kind was compacted — a bounded compaction limitation, not a
+/// soundness hole). Idempotent: recomputes from the current history each call. A pure observer — no PRNG, no
+/// node mutation.
+pub fn finalize_membership(checker: &mut Checker) -> Result<(), Violation> {
+  // Snapshot the observed installs so the loop can write the checker's counters without holding a borrow of
+  // `observed_installs`. Sorted by (node, boundary) ⇒ a deterministic first-violation choice.
+  let observed: Vec<((u64, u64), ConfSnapshot)> = checker
+    .observed_installs
+    .iter()
+    .map(|(id, conf)| (*id, conf.clone()))
+    .collect();
+  let mut comparisons = 0u64;
+  let mut kind_unobservable = 0u64;
+  for ((node_id, boundary), install_conf) in observed.iter() {
+    // The history is certified complete only up to `complete_up_to` (the highest index a LOG-BUILT node has
+    // APPLIED, hence emitted every conf-change for). Beyond it the reference is not final — count it unwitnessed.
+    if *boundary > checker.complete_up_to {
+      continue;
+    }
+    // The FINAL committed config in effect at the BOUNDARY = the conf of the greatest SURVIVING conf-change
+    // index `<= boundary`. STRICT trust against the AUTHORITATIVE committed log (`committed_log_kind`): a recorded
+    // ConfChange transition is used as the reference ONLY on SOLID PROOF — an EXACT-term ConfChange record at the
+    // index. Walk the recorded transitions descending:
+    //   • `committed_log_kind[idx] == (term_cc, ConfChange)` — the committed entry at idx IS the recorded
+    //     ConfChange (committed entries are immutable, so a sampled committed entry at the transition's term is
+    //     that entry) ⇒ TRUST (resolve to its conf), unless its fold is AMBIGUOUS;
+    //   • a KNOWN non-ConfChange at exact-or-higher term `(>= term_cc, non-ConfChange)` — a same-term or
+    //     higher-term non-ConfChange is the committed entry, so the config does NOT change here ⇒ TOMBSTONE:
+    //     walk past to the prior surviving index;
+    //   • anything else — kind MISSING (compacted unobserved), a STALE lower-term record, or a higher-term
+    //     ConfChange of unknown conf — is NOT solid proof ⇒ DECLINE. A declined index is committed-FINAL (it is
+    //     `<= complete_up_to`, so a log-built node applied it), so this is a sound KIND-UNOBSERVABLE decline,
+    //     NEVER a fall-through to the transient apply-time ConfChange.
+    // Below the first surviving conf-change the genesis config applies (a history gap if never captured).
+    let mut resolved: Option<ConfSnapshot> = None;
+    let mut unwitnessable = false;
+    let mut decline_kind = false;
+    for (idx, (term_cc, conf, amb)) in checker.committed_config_history.range(..=*boundary).rev() {
+      match checker.committed_log_kind.get(idx) {
+        // PROVEN: an exact-term committed ConfChange at idx is the recorded transition's entry.
+        Some((term_log, CommittedKind::ConfChange)) if *term_log == *term_cc => {}
+        // TOMBSTONE: a known non-ConfChange at exact-or-higher term is the committed entry — config unchanged here.
+        Some((term_log, CommittedKind::NonConfChange)) if *term_log >= *term_cc => continue,
+        // No solid proof — a CONFLICTED same-term record (two kinds observed, trust neither), a missing kind, a
+        // stale lower-term record, or a higher-term ConfChange of unknown conf: committed-final but unprovable ⇒
+        // a sound kind-unobservable decline, never trust-stale.
+        _ => {
+          decline_kind = true;
+          break;
+        }
+      }
+      if *amb {
+        unwitnessable = true; // a proven ConfChange whose apply-time fold is an unresolved same-term divergence
+        break;
+      }
+      resolved = Some(conf.clone());
+      break;
+    }
+    if decline_kind {
+      kind_unobservable += 1;
+      continue;
+    }
+    if unwitnessable {
+      continue;
+    }
+    let reference = match resolved {
+      Some(conf) => conf,
+      None => match checker.genesis_conf.clone() {
+        Some(genesis) => genesis,
+        None => continue,
+      },
+    };
+    comparisons += 1;
+    if install_conf == &reference {
+      continue;
+    }
+    let phantom: BTreeSet<u64> = install_conf
+      .voters
+      .difference(&reference.voters)
+      .copied()
+      .collect();
+    let missing: BTreeSet<u64> = reference
+      .voters
+      .difference(&install_conf.voters)
+      .copied()
+      .collect();
+    checker.membership_comparisons = comparisons;
+    return Err(Violation::new(
+      "snapshot_membership_coherent",
+      std::format!(
+        "the snapshot installed at node {} boundary {} adopted membership (voters={:?} outgoing={:?} \
+         learners={:?} learners_next={:?} auto_leave={}) but the committed config at that boundary is \
+         (voters={:?} outgoing={:?} learners={:?} learners_next={:?} auto_leave={}) — phantom voters {:?} \
+         (committed-removed yet present), missing joiners {:?} (committed-added yet absent): the installed \
+         snapshot's ConfState is inconsistent with the committed membership",
+        node_id,
+        boundary,
+        install_conf.voters,
+        install_conf.voters_outgoing,
+        install_conf.learners,
+        install_conf.learners_next,
+        install_conf.auto_leave,
+        reference.voters,
+        reference.voters_outgoing,
+        reference.learners,
+        reference.learners_next,
+        reference.auto_leave,
+        phantom,
+        missing,
+      ),
+    ));
+  }
+  checker.membership_comparisons = comparisons;
+  checker.membership_kind_unobservable = kind_unobservable;
+  // Skipped = observed installs that were neither compared nor a sound kind-unobservable decline — i.e. genuine
+  // committed-config-history completeness gaps (which a converged run drives to 0).
+  checker.membership_skipped = (observed.len() as u64)
+    .saturating_sub(comparisons)
+    .saturating_sub(kind_unobservable);
   Ok(())
 }
 

@@ -890,20 +890,34 @@ fn vopr_exercises_lease_refresh_modes() {
   use sailing_proto::LeaseRefresh::{Continuous, Off, OnExpiry};
   let (mut saw_off, mut saw_on_expiry, mut saw_continuous) = (false, false, false);
   let mut progressed_under_proactive = false;
+  // Non-vacuity for the proactive path itself: a configured OnExpiry/Continuous mode must ACTUALLY fire a
+  // re-anchoring no-op somewhere (counted by the proto's `lease_refreshes` observability counter), not merely
+  // be drawn. An Off run must never fire one (the demand-driven default appends no proactive no-op).
+  let mut proactive_refreshes = 0u64;
+  let mut off_refreshes = 0u64;
   for seed in 0..256u64 {
     let r = run_vopr_refresh(seed, 500);
     match r.lease_refresh {
-      Off => saw_off = true,
+      Off => {
+        saw_off = true;
+        off_refreshes += r.lease_refreshes_fired;
+      }
       OnExpiry => {
         saw_on_expiry = true;
         progressed_under_proactive |= r.committed > 0;
+        proactive_refreshes += r.lease_refreshes_fired;
       }
       Continuous => {
         saw_continuous = true;
         progressed_under_proactive |= r.committed > 0;
+        proactive_refreshes += r.lease_refreshes_fired;
       }
     }
   }
+  std::eprintln!(
+    "vopr lease-refresh coverage (seeds 0..256, 500 ticks): proactive_refreshes_fired={proactive_refreshes} \
+     off_refreshes={off_refreshes}"
+  );
   assert!(
     saw_off,
     "no seed in 0..256 stayed LeaseRefresh::Off (the bit-identical default)"
@@ -919,6 +933,15 @@ fn vopr_exercises_lease_refresh_modes() {
   assert!(
     progressed_under_proactive,
     "a proactive-refresh run must still commit (liveness held under the extra no-ops)"
+  );
+  assert!(
+    proactive_refreshes > 0,
+    "no OnExpiry/Continuous run actually re-anchored the lease across seeds 0..256 — the proactive refresh \
+     never fired, so the configured mode passed vacuously (the refresh gate or the no-op path regressed)"
+  );
+  assert_eq!(
+    off_refreshes, 0,
+    "a LeaseRefresh::Off run fired a proactive refresh no-op — the demand-driven default must append none"
   );
 }
 
@@ -1038,5 +1061,371 @@ fn vopr_exercises_cold_snapshot_reads() {
     "no cold (Pending) snapshot-chunk read fired across seeds 0..64 — a snapshot streamed but the cold \
      fault never landed on a snapshot_chunk read, so the cold snapshot-read path went uncovered (its \
      coverage is vacuous); raise the tick budget so more transfers overlap the fault"
+  );
+}
+
+/// Joint-membership × snapshot, end-to-end across a band of seeds. `run_vopr_joint_snapshot` lowers the
+/// snapshot threshold (so the cluster compacts and streams a snapshot to a lagging node) AND submits every
+/// conf-change as a `ConfChangeV2(Implicit)` — routing each single add/remove through a REAL joint
+/// configuration the proto auto-leaves — while the partition action also strands LEARNERS. A lagging node
+/// (voter or learner) therefore snapshot-installs a configuration whose `ConfState` was produced through a
+/// joint transition. Every run completes WITHOUT a panic, which is the safety assertion: the per-tick
+/// `snapshot_membership_coherent` oracle proves each installed node's active membership matches a log-built
+/// peer at the same applied index (no phantom voter, no missing joiner), and the calm-window / quiesce
+/// liveness oracles prove a lagging learner never deadlocks progress.
+///
+/// The aggregate confirms the scenario was actually exercised (non-vacuity): conf-changes were proposed, a
+/// snapshot streamed multi-chunk to a lagging node, a learner was partitioned, and at least one snapshot
+/// installed into a joint-produced membership lineage — a `0` in any would mean the coverage is vacuous.
+#[test]
+fn vopr_exercises_joint_snapshot_membership() {
+  let mut total_conf_changes = 0u64;
+  let mut total_joint_installs = 0u64;
+  let mut total_learner_partitions = 0u64;
+  let mut total_multi_chunk = 0u64;
+  let mut total_oracle_comparisons = 0u64;
+  let mut total_skipped_unwitnessed = 0u64;
+  let mut total_kind_unobservable = 0u64;
+  for seed in 0u64..64 {
+    let r = run_vopr_joint_snapshot(seed, 700);
+    total_conf_changes += r.conf_changes;
+    total_joint_installs += r.joint_snapshot_installs;
+    total_learner_partitions += r.learner_partitions;
+    total_multi_chunk += r.multi_chunk_snapshots;
+    total_oracle_comparisons += r.membership_oracle_comparisons;
+    total_skipped_unwitnessed += r.skipped_unwitnessed_installs;
+    total_kind_unobservable += r.kind_unobservable_installs;
+  }
+  std::eprintln!(
+    "vopr joint-snapshot coverage (seeds 0..64, 700 ticks): conf_changes={total_conf_changes} \
+     joint_snapshot_installs={total_joint_installs} learner_partitions={total_learner_partitions} \
+     multi_chunk_snapshots={total_multi_chunk} membership_oracle_comparisons={total_oracle_comparisons} \
+     skipped_unwitnessed_installs={total_skipped_unwitnessed} kind_unobservable_installs={total_kind_unobservable}"
+  );
+  // Determinism: the dedicated sub-PRNG / `joint` flag must replay bit-identically.
+  assert_eq!(
+    run_vopr_joint_snapshot(7, 700),
+    run_vopr_joint_snapshot(7, 700),
+    "run_vopr_joint_snapshot must be deterministic for a fixed (seed, ticks)"
+  );
+  assert!(
+    total_conf_changes > 0,
+    "no joint conf-change was proposed across seeds 0..64 — the membership churn never fired (the action \
+     draw moved, or the v2-implicit proposal path regressed)"
+  );
+  assert!(
+    total_multi_chunk > 0,
+    "no multi-chunk snapshot streamed to a lagging node across seeds 0..64 — no node lagged far enough to \
+     snapshot-install (lower the threshold or raise the tick budget)"
+  );
+  assert!(
+    total_joint_installs > 0,
+    "no snapshot installed into a joint-produced membership lineage across seeds 0..64 — the lagging node \
+     never snapshot-installed a configuration after a joint conf-change committed (the membership-oracle \
+     coverage is vacuous)"
+  );
+  assert!(
+    total_learner_partitions > 0,
+    "no learner was ever partitioned across seeds 0..64 — the lagging-learner path went unexercised, so the \
+     'a lagging learner never deadlocks progress' coverage is vacuous (no learner was added, or the learner \
+     partition draw regressed)"
+  );
+  assert!(
+    total_oracle_comparisons > 0,
+    "the snapshot-membership oracle never COMPARED a snapshot-installed node against the committed-config \
+     history across seeds 0..64 — so a corrupt snapshot ConfState could slip through this green sweep (the \
+     oracle ran but judged nothing)"
+  );
+  assert_eq!(
+    total_skipped_unwitnessed, 0,
+    "the snapshot-membership oracle hit a committed-config HISTORY completeness gap across seeds 0..64 (a \
+     boundary beyond the watermark or an unresolved divergence that did not converge) — the history must cover \
+     every committed index an install lands on"
+  );
+  // Some installs resolve to a conf-change whose committed-log entry was compacted before any tick observed it
+  // (committed and snapshot-compacted within a single catch-up tick), so the oracle has no EXACT-term ConfChange
+  // proof for it. Under STRICT trust it DECLINES these (it will not trust a possibly-stale ConfChange) rather
+  // than risk a false verdict — a bounded compaction limitation, NOT a soundness hole. Assert the oracle still
+  // COMPARED the directly-observed exact-term ConfChanges in bulk (it does not collapse to near-zero coverage):
+  // declines stay a minority of comparisons.
+  assert!(
+    total_kind_unobservable * 2 < total_oracle_comparisons,
+    "the membership oracle's coverage collapsed: kind-unobservable declines ({total_kind_unobservable}) are not \
+     a minority of comparisons ({total_oracle_comparisons}) — the exact-term committed-log-kind witness regressed"
+  );
+}
+
+/// Failover-clock × snapshot, end-to-end across a band of seeds. `run_vopr_failover_compacting` forces the
+/// LeaseGuard FAILOVER tier (a synchronized wall carrying a per-node bounded, re-syncing offset) AND lowers
+/// the snapshot threshold, so a chunked snapshot transfer + install RACES a backward wall-offset resync and
+/// the precise commit-anchor's release path. Every run completes WITHOUT a read-linearizability / safety /
+/// liveness panic — the assertion that the failover commit-wait + inherited-serve machinery stays correct
+/// across a snapshot install (the snapshot carries the failover lease bounds past compaction).
+///
+/// The aggregate confirms BOTH halves actually co-occurred (non-vacuity): every run drew the failover tier,
+/// a snapshot streamed multi-chunk to a lagging node, and the precise commit-anchor early-released — a `0` in
+/// the latter two would mean the race went uncovered.
+#[test]
+fn vopr_exercises_failover_compacting() {
+  let mut total_precise_releases = 0u64;
+  let mut total_multi_chunk = 0u64;
+  let mut total_resyncs = 0u64;
+  let mut all_failover = true;
+  for seed in 0u64..64 {
+    let r = run_vopr_failover_compacting(seed, 1_000);
+    all_failover &= r.failover;
+    total_precise_releases += r.precise_releases;
+    total_multi_chunk += r.multi_chunk_snapshots;
+    total_resyncs += r.offset_resyncs;
+  }
+  std::eprintln!(
+    "vopr failover-compacting coverage (seeds 0..64, 1000 ticks): precise_releases={total_precise_releases} \
+     multi_chunk_snapshots={total_multi_chunk} offset_resyncs={total_resyncs}"
+  );
+  // Determinism: the forced failover tier + dedicated threshold sub-PRNG must replay bit-identically.
+  assert_eq!(
+    run_vopr_failover_compacting(5, 1_000),
+    run_vopr_failover_compacting(5, 1_000),
+    "run_vopr_failover_compacting must be deterministic for a fixed (seed, ticks)"
+  );
+  assert!(
+    all_failover,
+    "a run_vopr_failover_compacting seed did NOT draw the failover tier — the force_failover override regressed"
+  );
+  assert!(
+    total_multi_chunk > 0,
+    "no multi-chunk snapshot streamed to a lagging node across seeds 0..64 — the snapshot never raced the \
+     failover clock (lower the threshold or raise the tick budget)"
+  );
+  assert!(
+    total_precise_releases > 0,
+    "the precise commit-anchor never early-released across seeds 0..64 — the failover wall-offset path went \
+     unexercised under compaction (the coverage is vacuous)"
+  );
+}
+
+/// Set up a 3-node async cluster with one follower frozen PAST the leader's compaction boundary, then
+/// HEALED — so the only way to catch the laggard up is a TRANSFERRED snapshot, which the leader will send on
+/// its next replication round. Returns `(cluster, laggard_id, frozen_last)` right after the heal (before any
+/// catch-up): the caller chooses how to drive the install (the ordinary tick path or the fsync pump).
+fn setup_laggard_behind_compaction(seed: u64) -> (Cluster, u64, sailing_proto::Index) {
+  let mut c = Cluster::new_async_with(3, seed, |cfg| {
+    cfg
+      .with_pre_vote(true)
+      .with_snapshot_threshold(SNAP_THRESHOLD)
+  });
+  assert!(
+    c.run_until(3_000, |c| c.leader_count() == 1),
+    "the cluster must elect a single leader from a clean start"
+  );
+  let leader = c.leader().expect("a leader");
+  let laggard = c
+    .node_ids()
+    .into_iter()
+    .find(|&id| id != leader)
+    .expect("a follower to lag");
+  // Freeze the laggard's log by isolating it; the surviving {leader, other follower} pair is still a
+  // majority of 3 and keeps committing + applying + compacting.
+  let frozen_last = c.last_index_of(laggard);
+  c.isolate(laggard);
+  // Drive writes until EVERY surviving node's `first_index` has advanced strictly PAST the laggard's
+  // NEXT-needed index (`frozen_last + 1`) — so that index is compacted out of the survivors' logs and the
+  // laggard can ONLY be caught up by a TRANSFERRED snapshot, never by a plain append (which would leave it
+  // log-built and defeat the test). Checking all survivors is robust to a leadership change among them —
+  // whichever is leader on heal has compacted past.
+  let next_needed = frozen_last.get() + 1;
+  let compacted_past = |c: &Cluster| {
+    c.node_ids()
+      .into_iter()
+      .filter(|&id| id != laggard)
+      .all(|id| c.first_index_of(id).get() > next_needed)
+  };
+  for filler in (0u64..).take(256) {
+    if compacted_past(&c) {
+      break;
+    }
+    if c.propose(&encode_kv(FILLER_KEY, filler)).is_none() {
+      c.run_until(200, |c| c.leader_count() == 1);
+      continue;
+    }
+    c.run_until(400, &compacted_past);
+  }
+  assert!(
+    compacted_past(&c),
+    "the survivors must compact past the laggard's frozen log within the budget"
+  );
+  // Heal the laggard: behind the leader's first_index, it can only catch up via an InstallSnapshot transfer.
+  c.heal(laggard);
+  (c, laggard, frozen_last)
+}
+
+/// Drive a 3-node async cluster so one follower lags PAST the leader's compaction boundary and then catches
+/// up by INSTALLING a transferred snapshot via the ORDINARY tick path. Returns `(cluster, laggard_id)`.
+fn drive_snapshot_install(seed: u64) -> (Cluster, u64) {
+  let (mut c, laggard, _frozen) = setup_laggard_behind_compaction(seed);
+  assert!(
+    c.run_until(5_000, |c| c.snapshot_install_count(laggard) > 0),
+    "the healed laggard must install a TRANSFERRED snapshot to catch up past the compaction boundary"
+  );
+  (c, laggard)
+}
+
+/// REGRESSION (snapshot-membership oracle witness soundness): a node's snapshot-derived membership
+/// provenance must SURVIVE a crash, so a node that installed a transferred snapshot and then restarted is
+/// NEVER re-admitted as the membership oracle's "log-built" witness. The install EVENT counter
+/// (`snapshot_install_count`) resets on crash, but the node still recovers its membership from the durable
+/// snapshot it installed — using it as the sound reference would be circular and could mask a corrupt
+/// snapshot `ConfState`. The sticky lineage flag (surfaced as `NodeView::installed_snapshot`) must therefore
+/// stay set across the restart.
+#[test]
+fn snapshot_membership_lineage_survives_crash() {
+  let (mut c, laggard) = drive_snapshot_install(0x5A11);
+  assert!(
+    c.snapshot_install_count(laggard) > 0,
+    "the laggard must have installed a transferred snapshot"
+  );
+  let marked_before = c
+    .view()
+    .nodes
+    .into_iter()
+    .find(|n| n.id == laggard)
+    .map(|n| n.installed_snapshot)
+    .expect("the laggard is in the view");
+  assert!(
+    marked_before,
+    "a transfer-installed node must be marked snapshot-derived (under test, not a witness)"
+  );
+
+  // Crash + restart the laggard: it recovers its membership from the durable snapshot it installed.
+  c.crash(laggard);
+  assert_eq!(
+    c.snapshot_install_count(laggard),
+    0,
+    "the resettable install EVENT counter clears on crash"
+  );
+  let marked_after = c
+    .view()
+    .nodes
+    .into_iter()
+    .find(|n| n.id == laggard)
+    .map(|n| n.installed_snapshot)
+    .expect("the laggard is in the view");
+  assert!(
+    marked_after,
+    "snapshot-derived lineage must SURVIVE a crash: a restarted node recovers its membership from the \
+     durable snapshot, so it must NOT become eligible as the membership oracle's log-built witness"
+  );
+}
+
+/// REGRESSION (the fsync-pump event-drain): a snapshot install that COMPLETES inside the settle/flush pump
+/// (`open_fsync_window` → `flush_drain_collect_except`) must be FULLY accounted — the pump routes through the
+/// SAME shared `drain_node_events` as the per-tick drain, so the install bumps the counter AND marks the
+/// sticky snapshot-membership lineage (which must survive a crash, or the node could be mis-selected as the
+/// membership oracle's log-built witness). No drain path cherry-picks a subset of events.
+#[test]
+fn snapshot_install_in_fsync_pump_is_fully_accounted() {
+  let (mut c, laggard, frozen_last) = setup_laggard_behind_compaction(0x9B17);
+  // Drive the catch-up ENTIRELY through the fsync pump (never `tick`): `open_fsync_window` delivers the
+  // leader's InstallSnapshot to the laggard and flush-drains it, completing the install inside
+  // `flush_drain_collect_except`. `keep` is any non-laggard node (the laggard MUST be flushed/drained).
+  let keep = c
+    .node_ids()
+    .into_iter()
+    .find(|&id| id != laggard)
+    .expect("a non-laggard node to hold the window on");
+  let mut installed = false;
+  for _ in 0..400 {
+    c.open_fsync_window(keep, 50);
+    // The laggard's missing entries are compacted out of every survivor, so its `first_index` can only
+    // advance past the frozen boundary by INSTALLING a transferred snapshot.
+    if c.first_index_of(laggard).get() > frozen_last.get() {
+      installed = true;
+      break;
+    }
+  }
+  assert!(
+    installed,
+    "the laggard must install the transferred snapshot inside the fsync pump (first_index advanced past the \
+     frozen boundary)"
+  );
+  // The pump routes through the shared drain, so the install is FULLY accounted: the resettable counter is
+  // bumped AND the sticky lineage is marked.
+  assert!(
+    c.snapshot_install_count(laggard) >= 1,
+    "the shared drain must count an install that completed in the pump (no cherry-picking)"
+  );
+  let marked = |c: &Cluster| {
+    c.view()
+      .nodes
+      .into_iter()
+      .find(|n| n.id == laggard)
+      .map(|n| n.installed_snapshot)
+      .expect("the laggard is in the view")
+  };
+  assert!(
+    marked(&c),
+    "an install completing in the fsync pump must mark the snapshot-membership lineage (else the node could \
+     be mis-selected as the oracle's log-built witness)"
+  );
+  // The lineage is STICKY: a crash resets the resettable counter but the lineage survives.
+  c.crash(laggard);
+  assert_eq!(
+    c.snapshot_install_count(laggard),
+    0,
+    "the resettable install counter clears on crash"
+  );
+  assert!(
+    marked(&c),
+    "the pump-marked lineage must also survive a crash"
+  );
+}
+
+/// REGRESSION (the recurring event-drain-bypass class): a conf-change that COMMITS+APPLIES inside the fsync
+/// pump must be recorded as a committed-config transition (fed to the membership oracle's reference), not
+/// dropped. The pump routes through the SAME shared `drain_node_events` as the per-tick drain, so a
+/// `ConfChanged` applied there is captured BEFORE the log-built node's rising applied advances the oracle's
+/// completeness watermark past that index — otherwise the reference would be stale (the R4 bug).
+#[test]
+fn conf_change_applied_in_fsync_pump_is_recorded() {
+  let mut c = Cluster::new_async_with(3, 0xCF9A, |cfg| cfg.with_pre_vote(true));
+  assert!(
+    c.run_until(3_000, |c| c.leader_count() == 1),
+    "the cluster must elect a single leader from a clean start"
+  );
+  let _leader = c.leader().expect("a leader");
+  // Wire + propose an AddLearner — a committed conf-change to drive to apply through the pump.
+  let new_id = 9u64;
+  c.wire_joining_node(new_id);
+  // Hold the NEW LEARNER out of the flush (it never votes), so all three founder VOTERS flush, ack, and
+  // commit + apply the conf-change inside the pump.
+  let keep = new_id;
+  let cc = sailing_proto::ConfChangeV2::new(
+    sailing_proto::ConfChangeTransition::Implicit,
+    std::vec![sailing_proto::ConfChangeSingle::new(
+      sailing_proto::ConfChangeType::AddLearnerNode,
+      new_id,
+    )],
+    bytes::Bytes::new(),
+  );
+  assert!(
+    c.propose_conf_change_v2(cc).is_some(),
+    "the leader must accept the conf-change"
+  );
+  // Drive the conf-change to commit+apply ENTIRELY through the fsync pump (never `tick`).
+  for _ in 0..200 {
+    c.open_fsync_window(keep, 50);
+    if c.total_conf_changed() > 0 {
+      break;
+    }
+  }
+  assert!(
+    c.total_conf_changed() > 0,
+    "the conf-change must commit + apply through the pump (the shared drain counts it)"
+  );
+  // The shared drain recorded the applied conf-change as a committed-config transition — pre-fix the pump
+  // dropped `ConfChanged`, leaving this empty while the oracle's watermark still advanced (a stale reference).
+  assert!(
+    !c.view().committed_transitions.is_empty(),
+    "the pump must record the applied conf-change in the committed-config transitions (no drain cherry-picks)"
   );
 }

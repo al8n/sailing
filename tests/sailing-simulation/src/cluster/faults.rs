@@ -51,7 +51,10 @@ impl Cluster {
       stable,
     );
     self.logs[i].restore_cold_fetch(saved_cold);
-    // Reset the snapshot-install counter for the restarted node.
+    // Reset the snapshot-install EVENT counter for the restarted node (a fresh incarnation re-counts
+    // installs). The STICKY `snapshot_membership_lineage` is deliberately NOT reset: the node recovers
+    // its membership from the durable snapshot it installed, so its config stays snapshot-derived and it
+    // must keep being excluded as the membership oracle's log-built witness.
     self.snapshot_installs[i] = 0;
     self.restarts[i] += 1;
     // Drain any messages left in the bus to/from this node (stale in-flight traffic).
@@ -84,6 +87,13 @@ impl Cluster {
     self.stables.iter().map(|s| s.cold_snapshot_reads()).sum()
   }
 
+  /// Total proactive lease-refresh no-ops appended across all nodes (`Endpoint::lease_refreshes`) — the
+  /// non-vacuity signal that an `OnExpiry` / `Continuous` refresh mode actually re-anchored the lease,
+  /// summed at run end into the report. `0` for the demand-driven `Off` default and for non-LeaseGuard runs.
+  pub fn total_lease_refreshes(&self) -> u64 {
+    self.nodes.iter().map(|n| n.lease_refreshes()).sum()
+  }
+
   /// Install a seeded [`NetworkFaults`] config on the typed-message bus: per-message
   /// latency/jitter/drop/duplicate/reorder applied at the bus-push point in [`tick`](Self::tick),
   /// AFTER the structural oracles run. Faults are deterministic given the cluster seed (the network
@@ -98,6 +108,15 @@ impl Cluster {
     self.net_faults = faults;
     self.net_prng = NetPrng::new(seed);
     self.net_last_sched.clear();
+  }
+
+  /// Mark a node whose messages (to OR from it) are NEVER dropped/duplicated/delayed by the network-fault
+  /// model — delivered immediately, exactly once — or `None` to clear. The joint-membership entry uses this
+  /// to keep its reference node perpetually current and log-built (so the committed-config history stays
+  /// complete to the frontier); it does NOT override partition/isolation (a fully isolated node is still cut
+  /// off). `None` everywhere else, so every other entry keeps its byte-identical bus.
+  pub fn set_drop_immune_node(&mut self, id: Option<u64>) {
+    self.drop_immune_node = id;
   }
 
   /// Install a per-node clock-drift policy: `policy(id)` returns node `id`'s clock RATE as a
@@ -280,7 +299,9 @@ impl Cluster {
               });
             }
           }
-          while self.nodes[i].poll_event().is_some() {}
+          // Discard events, but record any snapshot install that completed in this pump so the node's
+          // membership lineage stays marked (never re-admitted as the oracle's log-built witness).
+          self.drain_node_events(i);
         }
 
         let delivered = self.deliver_due();
@@ -342,7 +363,9 @@ impl Cluster {
           });
         }
       }
-      while self.nodes[i].poll_event().is_some() {}
+      // Discard events, but record any snapshot install that completed in this flush+drain so the node's
+      // membership lineage stays marked (never re-admitted as the oracle's log-built witness).
+      self.drain_node_events(i);
     }
     produced
   }

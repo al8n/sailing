@@ -8,6 +8,7 @@ fn healthy_node(id: u64, commit: u64, durable_last: u64) -> NodeView {
       index: i,
       term: 1,
       data: std::vec![i as u8],
+      is_conf_change: false,
     })
     .collect();
   let applied_log: Vec<(u64, Vec<u8>)> = (1..=commit).map(|i| (i, std::vec![i as u8])).collect();
@@ -28,6 +29,15 @@ fn healthy_node(id: u64, commit: u64, durable_last: u64) -> NodeView {
     durable_entries,
     snapshot_last_index: 0,
     snapshot_last_term: 0,
+    // No transferred snapshot; an empty active config is fine — the membership oracle's genesis/history is
+    // taken from LOG-BUILT nodes' configs, so the membership-specific tests populate these explicitly.
+    installed_snapshot: false,
+    conf_voters: BTreeSet::new(),
+    conf_voters_outgoing: BTreeSet::new(),
+    conf_learners: BTreeSet::new(),
+    conf_learners_next: BTreeSet::new(),
+    conf_auto_leave: false,
+    conf_changed: 0,
     hardstate_commit: commit,
     inflight_staged: 0,
     incarnation: 0,
@@ -53,8 +63,60 @@ fn cv(seed: u64, tick: u64, nodes: Vec<NodeView>) -> ClusterView {
     } else {
       Some(voters)
     },
+    committed_transitions: Vec::new(),
+    new_installs: Vec::new(),
     nodes,
   }
+}
+
+/// A [`ConfSnapshot`] from voter + learner ids (the other three fields empty) — the common install/reference
+/// membership; tests needing `voters_outgoing` / `learners_next` / `auto_leave` mutate the result.
+fn conf(voters: &[u64], learners: &[u64]) -> ConfSnapshot {
+  ConfSnapshot {
+    voters: voters.iter().copied().collect(),
+    voters_outgoing: BTreeSet::new(),
+    learners: learners.iter().copied().collect(),
+    learners_next: BTreeSet::new(),
+    auto_leave: false,
+  }
+}
+
+/// Observe a transfer install `(node id, boundary, install-time ConfState)` in a view — what a
+/// `SnapshotInstalled` event feeds the oracle. The install-time ConfState (NOT any node's current config) is
+/// the membership the oracle compares against the committed-config reference at the boundary.
+fn with_install(
+  mut view: ClusterView,
+  id: u64,
+  boundary: u64,
+  install_conf: ConfSnapshot,
+) -> ClusterView {
+  view.new_installs.push((id, boundary, install_conf));
+  view
+}
+
+/// Single-tick convenience: RECORD a view's observations, then run the run-end final pass and return its
+/// verdict. Multi-tick tests instead call [`record_membership_observation`] per tick and
+/// [`finalize_membership`] once, so the verdict is rendered against the FINAL stable history.
+fn verdict(ck: &mut Checker, view: &ClusterView) -> Result<(), Violation> {
+  record_membership_observation(ck, view);
+  finalize_membership(ck)
+}
+
+/// Like [`cv`] but seeds this tick's committed conf-change transitions (for the membership oracle's
+/// step-function reference) — `(conf-change index, term, ConfState)` triples, as a log-built node's
+/// `ConfChanged` events would carry them (the term resolving same-index conflicts).
+fn cv_t(
+  seed: u64,
+  tick: u64,
+  transitions: Vec<(u64, u64, sailing_proto::ConfState<u64>)>,
+  nodes: Vec<NodeView>,
+) -> ClusterView {
+  let mut view = cv(seed, tick, nodes);
+  view.committed_transitions = transitions
+    .iter()
+    .map(|(idx, term, cs)| (*idx, *term, ConfSnapshot::from_conf_state(cs)))
+    .collect();
+  view
 }
 
 /// A healthy, fully-agreed 3-node cluster: every node committed+applied `commit` entries and
@@ -200,6 +262,8 @@ fn commit_is_quorum_durable_uses_authoritative_voter_set_not_self_view() {
     seed: 4,
     tick: 336,
     committed_voters: Some(BTreeSet::from([0, 1, 2])),
+    committed_transitions: Vec::new(),
+    new_installs: Vec::new(),
     nodes: std::vec![n0, n1, n2, n3],
   };
   assert_eq!(
@@ -231,6 +295,8 @@ fn commit_is_quorum_durable_keeps_teeth_with_authoritative_voter_set() {
     seed: 4,
     tick: 1,
     committed_voters: Some(BTreeSet::from([0, 1, 2])),
+    committed_transitions: Vec::new(),
+    new_installs: Vec::new(),
     nodes: std::vec![n0, n1, n2, n3],
   };
   let v = commit_is_quorum_durable(&view, 0).unwrap_err();
@@ -453,6 +519,743 @@ fn snapshot_boundary_coherent_witnesses_against_own_retained_log() {
   bad.snapshot_last_term = 7; // its own retained log says term 1 at index 4 → incoherent
   let v = snapshot_boundary_coherent(&cv(1, 1, std::vec![bad])).unwrap_err();
   assert_eq!(v.oracle, "snapshot_boundary_coherent");
+}
+
+/// Build a log-built node (never transfer-installed — the sound witness), with an explicit active config.
+fn log_node(id: u64, applied: u64, voters: &[u64], learners: &[u64]) -> NodeView {
+  let mut n = healthy_node(id, applied, applied.max(1));
+  n.installed_snapshot = false;
+  n.conf_voters = voters.iter().copied().collect();
+  n.conf_learners = learners.iter().copied().collect();
+  n
+}
+
+/// Mark the witness's retained durable entry at `idx` as a committed ConfChange at `term` — modelling reality
+/// (a conf-change index's committed entry IS a ConfChange at the conf-change's term), so `committed_log_kind`
+/// carries the EXACT-term ConfChange proof the strict resolver requires to trust the recorded transition.
+fn mark_cc(n: &mut NodeView, idx: u64, term: u64) {
+  let e = n
+    .durable_entries
+    .iter_mut()
+    .find(|e| e.index == idx)
+    .expect("witness must retain a durable entry at the conf-change index");
+  e.term = term;
+  e.is_conf_change = true;
+}
+
+#[test]
+fn snapshot_membership_coherent_accepts_matching_config() {
+  // A node installed a snapshot embedding membership {0,1,2}; a log-built node (n1) records the committed
+  // config {0,1,2} into the history (genesis), and the install matches it. The recorded comparison
+  // (membership_comparisons == 1, skipped == 0) proves the oracle genuinely judged, not skipped.
+  let mut ck = Checker::new();
+  let w = log_node(1, 5, &[0, 1, 2], &[]);
+  let view = with_install(cv(1, 1, std::vec![w]), 0, 5, conf(&[0, 1, 2], &[]));
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 1);
+  assert_eq!(ck.skipped_unwitnessed_installs(), 0);
+}
+
+#[test]
+fn snapshot_membership_coherent_detects_phantom_voter() {
+  // The snapshot installed at n0 still lists voter 3, but the committed config recorded by the log-built n1
+  // at the boundary has removed it — a PHANTOM voter that must be caught.
+  let mut ck = Checker::new();
+  let w = log_node(1, 5, &[0, 1, 2], &[]);
+  let view = with_install(cv(7, 9, std::vec![w]), 0, 5, conf(&[0, 1, 2, 3], &[]));
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {3}"),
+    "expected phantom voter 3 in the detail: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_detects_missing_joiner() {
+  // The snapshot installed at n0 is missing voter 2, but the committed config (recorded by n1) has already
+  // added it — a MISSING joiner that must be caught.
+  let mut ck = Checker::new();
+  let w = log_node(1, 5, &[0, 1, 2], &[]);
+  let view = with_install(cv(7, 9, std::vec![w]), 0, 5, conf(&[0, 1], &[]));
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("missing joiners {2}"),
+    "expected missing joiner 2 in the detail: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_detects_learner_divergence() {
+  // The voter halves agree but the installed snapshot dropped learner 9 the committed config carries —
+  // a mis-keyed ConfState that the full-config comparison still catches.
+  let mut ck = Checker::new();
+  let w = log_node(1, 5, &[0, 1, 2], &[9]);
+  let view = with_install(cv(1, 1, std::vec![w]), 0, 5, conf(&[0, 1, 2], &[]));
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+}
+
+#[test]
+fn snapshot_membership_coherent_detects_learners_next_divergence() {
+  // EVERY other ConfState field matches; only `learners_next` (the staged outgoing-voter demotions a joint
+  // leave applies) diverges. A snapshot that corrupted just this field would leave a wrong demotion staged,
+  // so the full-ConfState comparison must catch it — comparing only voters/outgoing/learners would not.
+  let mut ck = Checker::new();
+  let mut x = conf(&[0, 1, 2], &[]);
+  x.voters_outgoing = [0u64, 1, 2, 3].into_iter().collect();
+  x.learners_next = [3u64].into_iter().collect();
+  let mut w = log_node(1, 5, &[0, 1, 2], &[]);
+  w.conf_voters_outgoing = [0u64, 1, 2, 3].into_iter().collect();
+  w.conf_learners_next = BTreeSet::new(); // the committed config stages NO demotion
+  let view = with_install(cv(1, 1, std::vec![w]), 0, 5, x);
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("learners_next={3}"),
+    "expected the diverging learners_next in the detail: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_detects_auto_leave_divergence() {
+  // EVERY membership set matches; only the `auto_leave` flag (whether the leader auto-appends the
+  // leave-joint entry) diverges. A snapshot that flipped just this bit would change joint-exit behaviour
+  // while every set looks identical, so the full-ConfState comparison must catch it.
+  let mut ck = Checker::new();
+  let mut x = conf(&[0, 1, 2], &[]);
+  x.voters_outgoing = [0u64, 1].into_iter().collect();
+  x.auto_leave = true;
+  let mut w = log_node(1, 5, &[0, 1, 2], &[]);
+  w.conf_voters_outgoing = [0u64, 1].into_iter().collect();
+  w.conf_auto_leave = false; // the committed config does NOT auto-leave
+  let view = with_install(cv(1, 1, std::vec![w]), 0, 5, x);
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("auto_leave=true") && v.detail.contains("auto_leave=false"),
+    "expected both auto_leave values in the detail: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_accepts_matching_joint_config() {
+  // Mid joint transition: the log-built node records incoming {0,1,2} + outgoing {0,1}; the install carries
+  // the same joint halves — a correctly-installed joint ConfState passes.
+  let mut ck = Checker::new();
+  let mut x = conf(&[0, 1, 2], &[]);
+  x.voters_outgoing = [0u64, 1].into_iter().collect();
+  let mut w = log_node(1, 5, &[0, 1, 2], &[]);
+  w.conf_voters_outgoing = [0u64, 1].into_iter().collect();
+  let view = with_install(cv(1, 1, std::vec![w]), 0, 5, x);
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 1);
+
+  // A divergent outgoing half (the recorded committed config stages {0,2}, the install {0,1}) trips —
+  // a fresh checker so the history records the (correct) reference {0,2} before the install is checked.
+  let mut ck2 = Checker::new();
+  let mut x2 = conf(&[0, 1, 2], &[]);
+  x2.voters_outgoing = [0u64, 1].into_iter().collect();
+  let mut w2 = log_node(1, 5, &[0, 1, 2], &[]);
+  w2.conf_voters_outgoing = [0u64, 2].into_iter().collect();
+  let view2 = with_install(cv(1, 1, std::vec![w2]), 0, 5, x2);
+  let v = verdict(&mut ck2, &view2).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+}
+
+#[test]
+fn snapshot_membership_coherent_skips_when_no_log_built_node() {
+  // NO log-built node has ever been observed, so the completeness watermark is 0 and the reference is not
+  // certified at any index. Each OBSERVED install is UNWITNESSABLE — counted (observed minus compared), never
+  // silently flagged. The sweep's skipped_unwitnessed_installs == 0 assertion is what guards this in a run.
+  let mut ck = Checker::new();
+  let view = with_install(
+    with_install(cv(2, 2, std::vec![]), 0, 5, conf(&[0, 1, 2, 3], &[])),
+    1,
+    5,
+    conf(&[0, 1, 2], &[]),
+  );
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 0);
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    2,
+    "both observed installs are beyond the (zero) completeness watermark — counted, never flagged"
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_skips_beyond_the_completeness_watermark() {
+  // The only log-built node has reached applied 4, so the history is certified complete only up to 4. The
+  // install's boundary is 5 — beyond the watermark, the reference is not certified (a later conf-change could
+  // be unrecorded), so the OBSERVED install is counted (never flagged), even though configs differ.
+  let mut ck = Checker::new();
+  let w = log_node(1, 4, &[0, 1, 2], &[]); // certifies completeness only up to applied 4
+  let view = with_install(cv(3, 3, std::vec![w]), 0, 5, conf(&[0, 1, 2, 3], &[]));
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 0);
+  assert_eq!(ck.skipped_unwitnessed_installs(), 1);
+}
+
+#[test]
+fn snapshot_membership_coherent_uses_history_when_no_live_witness() {
+  // The exhaustion case the history exists to solve: earlier in the run a log-built node recorded the true
+  // committed config at applied 5; LATER every live node is snapshot-derived (no live log-built witness),
+  // and one carries a corrupt ConfState. The PERSISTENT history still supplies the reference, so the oracle
+  // CATCHES the divergence — proving the reference does not exhaust.
+  let mut ck = Checker::new();
+  // Tick A: a log-built node records the committed config {0,1,2} at applied 5.
+  let truth = log_node(0, 5, &[0, 1, 2], &[]);
+  assert_eq!(verdict(&mut ck, &cv(1, 1, std::vec![truth])), Ok(()));
+  // Tick B: EVERY live node is now snapshot-derived (no log-built node in the view). Two installs carry a
+  // phantom voter 3. The history (from tick A) must still catch it.
+  let view = with_install(
+    with_install(cv(2, 2, std::vec![]), 0, 5, conf(&[0, 1, 2, 3], &[])),
+    1,
+    5,
+    conf(&[0, 1, 2, 3], &[]),
+  );
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {3}"),
+    "the persistent history must still flag the phantom voter with no live witness: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_steps_to_the_config_in_effect_at_an_index() {
+  // The step function resolves the config in effect at an index BETWEEN conf-changes, regardless of how big
+  // a batch the apply jumped (the reference is keyed by EXACT conf-change index, not per applied index). A
+  // log-built node carries one recorded transition — config {0,1,2,3} took effect at index 3 — and has
+  // applied to 9 (certifying completeness up to 9).
+  let mut ck = Checker::new();
+  let cs = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]);
+  let mut a = log_node(0, 9, &[0, 1, 2, 3], &[]);
+  a.conf_changed = 1;
+  mark_cc(&mut a, 3, 1); // the committed entry at the conf-change index 3 is a ConfChange at term 1
+  assert_eq!(
+    verdict(&mut ck, &cv_t(1, 1, std::vec![(3, 1, cs)], std::vec![a])),
+    Ok(())
+  );
+  // An install at boundary 6 (between the transition at 3 and applied 9) is checked against the config in
+  // effect there ({0,1,2,3}, the greatest transition index <= 6); dropping voter 3 is a missing joiner.
+  let view = with_install(cv(2, 2, std::vec![]), 1, 6, conf(&[0, 1, 2], &[]));
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(v.detail.contains("missing joiners {3}"), "{}", v.detail);
+}
+
+#[test]
+fn snapshot_membership_coherent_distinct_boundaries_tracked_independently() {
+  // The coverage metric is observed-minus-compared, keyed PER install identity (node, boundary) and PERSISTENT:
+  // comparing one boundary on a node must NOT clear a different, still-uncompared boundary on the same node.
+  let mut ck = Checker::new();
+  // Tick A: no log-built node (watermark 0), so the high install boundary 9 is skipped — observed, uncompared.
+  let view_a = with_install(cv(1, 1, std::vec![]), 0, 9, conf(&[0, 1, 2], &[]));
+  assert_eq!(verdict(&mut ck, &view_a), Ok(()));
+  assert_eq!(ck.skipped_unwitnessed_installs(), 1);
+  // Tick B: a log-built node reaches applied 5 (watermark 5, genesis {0,1,2}); a SECOND install on the same
+  // node at boundary 5 IS compared (matches). Boundary 9 is still beyond the watermark, so it STAYS counted —
+  // comparing boundary 5 did not drop the distinct boundary-9 identity.
+  let w = log_node(1, 5, &[0, 1, 2], &[]);
+  let view_b = with_install(cv(2, 2, std::vec![w]), 0, 5, conf(&[0, 1, 2], &[]));
+  assert_eq!(verdict(&mut ck, &view_b), Ok(()));
+  assert!(ck.membership_comparisons() >= 1, "boundary 5 was compared");
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "the still-uncompared boundary 9 stays counted after the distinct boundary 5 is compared"
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_marks_same_term_divergence_ambiguous_not_poison() {
+  // Two log-built nodes report DIFFERENT folds at the SAME (index 4, term 2) — the ConfChanged ConfState is
+  // the node's apply-time fold, which an async in-memory apply can transiently diverge. First-writer-win would
+  // POISON the reference: an install whose conf happens to equal the first fold would be COMPARED and wrongly
+  // PASS. Instead the index is AMBIGUOUS, so the install is SKIPPED (uncompared) — surfaced, never passed.
+  let mut ck = Checker::new();
+  let conf_a = sailing_proto::ConfState::from_voters([0u64, 1, 2]); // first fold at (4, 2)
+  let conf_b = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]); // divergent fold at (4, 2) -> ambiguous
+  let mut w = log_node(1, 9, &[0, 1, 2], &[]);
+  w.conf_changed = 1; // a conf-change applied, so the reference at index 6 is the transition, not genesis
+  mark_cc(&mut w, 4, 2); // the committed entry at index 4 is a ConfChange at term 2 (proves the kind)
+  // The install's conf EQUALS the first fold (conf_a): poisoning would pass it; ambiguity skips it.
+  let view = with_install(
+    cv_t(
+      1,
+      1,
+      std::vec![(4, 2, conf_a), (4, 2, conf_b)],
+      std::vec![w],
+    ),
+    0,
+    6,
+    conf(&[0, 1, 2], &[]),
+  );
+  assert_eq!(
+    verdict(&mut ck, &view),
+    Ok(()),
+    "an ambiguous index is not a hard failure"
+  );
+  assert_eq!(
+    ck.membership_comparisons(),
+    0,
+    "an install resolving to an ambiguous index is NEVER compared (would be poison)"
+  );
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "the install at the ambiguous index stays uncompared (surfaced), not silently passed"
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_ambiguous_index_disambiguated_by_higher_term() {
+  // An ambiguous (index, term) is CLEARED by a strictly-higher-term transition (the later term re-applied the
+  // entry — the committed truth), after which the previously-skipped install is compared.
+  let mut ck = Checker::new();
+  let conf_a = sailing_proto::ConfState::from_voters([0u64, 1, 2]);
+  let conf_b = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]); // divergent at (4, 2) -> ambiguous
+  let mut w = log_node(1, 9, &[0, 1, 2], &[]);
+  w.conf_changed = 1;
+  mark_cc(&mut w, 4, 2); // the committed entry at index 4 is a ConfChange (term 2 here; superseded next tick)
+  // Tick 1: index 4 ambiguous -> the install at boundary 6 (resolving to index 4) is observed but skipped. Its
+  // install-time conf {0,1,2,3,4} matches the term-3 truth recorded next tick.
+  let view1 = with_install(
+    cv_t(
+      1,
+      1,
+      std::vec![(4, 2, conf_a), (4, 2, conf_b)],
+      std::vec![w],
+    ),
+    0,
+    6,
+    conf(&[0, 1, 2, 3, 4], &[]),
+  );
+  assert_eq!(verdict(&mut ck, &view1), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 0);
+  assert_eq!(ck.skipped_unwitnessed_installs(), 1);
+  // Tick 2: a term-3 transition at index 4 (the committed truth {0,1,2,3,4}) DISAMBIGUATES the history AND a
+  // witness retains the term-3 committed ConfChange at index 4 (the exact-term proof strict trust requires); the
+  // PERSISTENT install is now compared against that truth (and matches), so it is witnessed.
+  let truth = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3, 4]);
+  let mut w2 = log_node(1, 9, &[0, 1, 2, 3, 4], &[]);
+  w2.conf_changed = 1;
+  mark_cc(&mut w2, 4, 3); // the disambiguating term-3 committed ConfChange at index 4
+  assert_eq!(
+    verdict(
+      &mut ck,
+      &cv_t(2, 2, std::vec![(4, 3, truth)], std::vec![w2])
+    ),
+    Ok(())
+  );
+  assert_eq!(
+    ck.membership_comparisons(),
+    1,
+    "after a higher-term transition disambiguates the index, the install is compared"
+  );
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "the disambiguated install is now witnessed (observed minus compared falls to 0)"
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_catches_corrupt_install_after_current_config_repaired() {
+  // The oracle compares the INSTALL-TIME ConfState (fixed at install), NEVER the node's CURRENT config. A
+  // snapshot that installed a corrupt membership (phantom voter 3) at boundary 5 must be CAUGHT even after the
+  // node's CURRENT config has been repaired to the committed truth by a later ConfChange — a corrupt install
+  // does not earn a free pass because the live config later looks fine.
+  let mut ck = Checker::new();
+  // Tick A: observe the install at boundary 5 with its corrupt install-time conf {0,1,2,3}; no log-built node
+  // yet (watermark 0), so it is NOT compared and stays counted.
+  let view_a = with_install(cv(1, 1, std::vec![]), 0, 5, conf(&[0, 1, 2, 3], &[]));
+  assert_eq!(verdict(&mut ck, &view_a), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 0);
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "the corrupt install stays uncompared until the reference at its boundary is complete"
+  );
+  // Tick B: node 0 is now LOG-BUILT with a CORRECT current config {0,1,2} (the live config was repaired), and
+  // it plus a peer certify completeness up to 9 with genesis {0,1,2}. The oracle compares the STORED corrupt
+  // install conf {0,1,2,3} (not node 0's repaired current config), so it CATCHES the phantom voter.
+  let repaired = log_node(0, 9, &[0, 1, 2], &[]);
+  let w = log_node(1, 9, &[0, 1, 2], &[]);
+  let v = verdict(&mut ck, &cv(2, 2, std::vec![repaired, w])).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {3}") && v.detail.contains("boundary 5"),
+    "the corrupt install-time conf must be caught despite the repaired current config: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_rejudges_install_against_overwritten_reference() {
+  // The run-end final pass compares against the FINAL history, never a reference superseded later. A per-tick
+  // verdict would bless an install the first time its reference resolved and freeze it; here index 4's reference
+  // is FIRST (term 2, conf {0,1,2}) — which the install matches — then OVERWRITTEN by a strictly-higher (term 3,
+  // conf {0,1,2,3}). The final pass must re-judge the install against the FINAL {0,1,2,3} and CATCH it, NOT bless
+  // it against the stale term-2 value.
+  let mut ck = Checker::new();
+  let conf_a = sailing_proto::ConfState::from_voters([0u64, 1, 2]); // first reference at (4, 2)
+  let conf_b = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]); // overwrites at (4, 3) — the truth
+  let mut w = log_node(1, 9, &[0, 1, 2], &[]);
+  w.conf_changed = 1; // the reference at boundary 6 is the transition, not genesis
+  mark_cc(&mut w, 4, 2); // the committed entry at index 4 is a ConfChange (term 2 here; overwritten next tick)
+  // Tick 1: index 4 = (term 2, {0,1,2}); the install at boundary 6 carries {0,1,2}, which MATCHES this
+  // (non-final) reference — a per-tick verdict would compare and bless it here.
+  let view1 = with_install(
+    cv_t(1, 1, std::vec![(4, 2, conf_a)], std::vec![w]),
+    0,
+    6,
+    conf(&[0, 1, 2], &[]),
+  );
+  assert_eq!(verdict(&mut ck, &view1), Ok(()));
+  // Tick 2: a strictly-higher term-3 transition OVERWRITES index 4 with {0,1,2,3}, and a witness retains the
+  // term-3 committed ConfChange at index 4 (the exact-term proof). The run-end final pass now re-judges the
+  // install against this FINAL reference and CATCHES the missing joiner 3 — never frozen against the stale term-2.
+  let mut w2 = log_node(1, 9, &[0, 1, 2, 3], &[]);
+  w2.conf_changed = 1;
+  mark_cc(&mut w2, 4, 3); // the overwriting term-3 committed ConfChange at index 4
+  let v = verdict(
+    &mut ck,
+    &cv_t(2, 2, std::vec![(4, 3, conf_b)], std::vec![w2]),
+  )
+  .unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("missing joiners {3}"),
+    "the install must be re-judged against the FINAL overwritten reference, not blessed against the stale one: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_skips_install_against_later_ambiguated_reference() {
+  // The dual of the overwrite case: index 4's reference is FIRST a clean (term 2, {0,1,2}) the install matches,
+  // then a same-term DIVERGENT fold AMBIGUATES it. A per-tick verdict would have blessed the install against the
+  // clean value; the run-end final pass instead resolves to the now-ambiguous index and SKIPS the install
+  // (counted unwitnessed) — never blessed against an untrusted reference.
+  let mut ck = Checker::new();
+  let conf_a = sailing_proto::ConfState::from_voters([0u64, 1, 2]); // clean reference at (4, 2)
+  let conf_b = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]); // same-term divergent fold -> ambiguous
+  let mut w = log_node(1, 9, &[0, 1, 2], &[]);
+  w.conf_changed = 1;
+  mark_cc(&mut w, 4, 2); // the committed entry at index 4 is a ConfChange at term 2 (proves the kind)
+  // Tick 1: index 4 clean (term 2, {0,1,2}); the install at boundary 6 carries {0,1,2} and matches it.
+  let view1 = with_install(
+    cv_t(1, 1, std::vec![(4, 2, conf_a)], std::vec![w]),
+    0,
+    6,
+    conf(&[0, 1, 2], &[]),
+  );
+  assert_eq!(verdict(&mut ck, &view1), Ok(()));
+  assert_eq!(
+    ck.membership_comparisons(),
+    1,
+    "the clean reference compares the install on tick 1"
+  );
+  // Tick 2: a same-(index 4, term 2) DIVERGENT fold ambiguates the index. The final pass resolves the install to
+  // the now-ambiguous index and skips it — not blessed against the (no-longer-trusted) term-2 value.
+  assert_eq!(
+    verdict(&mut ck, &cv_t(2, 2, std::vec![(4, 2, conf_b)], std::vec![])),
+    Ok(())
+  );
+  assert_eq!(
+    ck.membership_comparisons(),
+    0,
+    "the ambiguated index is untrusted, so the final pass compares nothing"
+  );
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "the install resolving to the now-ambiguous index is skipped (surfaced), never blessed against the stale value"
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_tombstones_confchange_superseded_by_higher_term_normal() {
+  // The authoritative-source edge: a ConfChange applied in-memory at (index 4, term 2) — recorded in the history
+  // via its ConfChanged event — is truncated and SUPERSEDED by a higher-term (term 3) NORMAL entry committed at
+  // the SAME index 4, which emits NO ConfChanged event. The committed LOG is authoritative: the config does NOT
+  // change at index 4, so finalize_membership tombstones the stale transition and resolves boundary 5 to the
+  // PRIOR (genesis) config.
+  let conf_x = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]); // the stale, truncated ConfChange's conf
+  // The log-built witness: genesis {0,1,2}, completeness up to 9, with the FINAL committed entry at index 4 a
+  // term-3 NORMAL entry (is_conf_change = false) — the higher-term entry that superseded the truncated ConfChange.
+  let superseding = DurableEntry {
+    index: 4,
+    term: 3,
+    data: std::vec![0xEE],
+    is_conf_change: false,
+  };
+
+  // CAUGHT: an install carrying the stale {0,1,2,3} (the truncated ConfChange) at boundary 5 — the tombstone
+  // resolves boundary 5 to genesis {0,1,2}, so voter 3 is a phantom.
+  let mut ck = Checker::new();
+  let mut g = log_node(0, 9, &[0, 1, 2], &[]);
+  g.durable_entries[3] = superseding.clone();
+  let view = with_install(
+    cv_t(1, 1, std::vec![(4, 2, conf_x.clone())], std::vec![g]),
+    1,
+    5,
+    conf(&[0, 1, 2, 3], &[]),
+  );
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {3}"),
+    "the stale term-2 ConfChange must be tombstoned (config at 5 = genesis), catching voter 3: {}",
+    v.detail
+  );
+
+  // PASSES (and IS compared): an install carrying the correct post-tombstone {0,1,2} at boundary 5.
+  let mut ck2 = Checker::new();
+  let mut g2 = log_node(0, 9, &[0, 1, 2], &[]);
+  g2.durable_entries[3] = superseding;
+  let view2 = with_install(
+    cv_t(2, 2, std::vec![(4, 2, conf_x)], std::vec![g2]),
+    1,
+    5,
+    conf(&[0, 1, 2], &[]),
+  );
+  assert_eq!(verdict(&mut ck2, &view2), Ok(()));
+  assert_eq!(
+    ck2.membership_comparisons(),
+    1,
+    "the post-tombstone config is COMPARED, not skipped (the tombstone removes the transition, not the boundary)"
+  );
+  assert_eq!(ck2.skipped_unwitnessed_installs(), 0);
+}
+
+#[test]
+fn snapshot_membership_coherent_tombstone_survives_compaction_of_the_superseder() {
+  // The committed-log-kind record is PERSISTENT: a higher-term non-ConfChange that superseded a ConfChange at
+  // index 4 is captured the tick it is durable and KEPT even after compaction removes it from the retained log,
+  // so the tombstone still fires at finalization and a snapshot carrying the stale ConfState is CAUGHT.
+  let mut ck = Checker::new();
+  // Tick A: the superseding term-3 NORMAL entry at index 4 is durable + committed -> committed_log_kind[4] =
+  // (3, false) recorded persistently (genesis {0,1,2}, completeness to 9).
+  let mut g = log_node(0, 9, &[0, 1, 2], &[]);
+  g.durable_entries[3] = DurableEntry {
+    index: 4,
+    term: 3,
+    data: std::vec![0xEE],
+    is_conf_change: false,
+  };
+  record_membership_observation(
+    &mut ck,
+    &cv_t(
+      1,
+      1,
+      std::vec![(4, 2, sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]))],
+      std::vec![g],
+    ),
+  );
+  // Tick B: index 4 is COMPACTED (the retained committed log no longer holds it), and a node installs at
+  // boundary 5 carrying the stale term-2 ConfChange config. The PERSISTENT kind still tombstones the transition,
+  // so boundary 5 resolves to genesis {0,1,2} and voter 3 is caught as a phantom.
+  let mut comp = log_node(0, 9, &[0, 1, 2], &[]);
+  comp.durable_first = 6;
+  comp.durable_entries.retain(|e| e.index >= 6);
+  comp.snapshot_last_index = 5;
+  comp.snapshot_last_term = 3;
+  let view = with_install(cv(2, 2, std::vec![comp]), 1, 5, conf(&[0, 1, 2, 3], &[]));
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {3}"),
+    "the persistently-recorded superseder kind must tombstone even after compaction: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_compacted_kind_at_committed_final_index_is_a_sound_decline() {
+  // The soundness net: if the committed-log KIND at a recorded transition's index was compacted unobserved (no
+  // standalone-log observation, no same-term snapshot boundary), the transition is NOT trusted — never a
+  // fall-through to the stale apply-time ConfChange. When the index is committed-FINAL (covered by a durable
+  // snapshot) but its kind is gone, the oracle SOUNDLY DECLINES (it cannot tell a genuine ConfChange from a
+  // compacted-away superseder): a kind-unobservable decline, NOT a history-completeness gap.
+  let mut ck = Checker::new();
+  // A log-built node certifies completeness to 9, its log compacted past index 4 (durable snapshot boundary 5,
+  // so index 4 is committed-final) but no snapshot boundary lands on index 4 — its kind is NEVER observed.
+  let mut g = log_node(0, 9, &[0, 1, 2], &[]);
+  g.durable_first = 6;
+  g.durable_entries.retain(|e| e.index >= 6);
+  g.snapshot_last_index = 5;
+  g.snapshot_last_term = 1;
+  // A ConfChange transition recorded at index 4 (from its event), but no committed_log_kind[4] and no boundary at
+  // 4. An install carrying the stale config would look like a phantom — but with the kind unknown the oracle must
+  // NOT judge it: it is a kind-unobservable decline (counted separately), never compared, never trusted-stale.
+  let view = with_install(
+    cv_t(
+      1,
+      1,
+      std::vec![(4, 2, sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]))],
+      std::vec![g],
+    ),
+    1,
+    5,
+    conf(&[0, 1, 2, 3], &[]),
+  );
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 0);
+  assert_eq!(
+    ck.kind_unobservable_installs(),
+    1,
+    "a committed-final index whose kind was compacted is a sound decline, never trusted-stale"
+  );
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "a compacted KIND is not a committed-config-history completeness gap"
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_un_witnessed_snapshot_boundary_does_not_corroborate() {
+  // STRICT trust (R10 FINDING 1): an UN-independently-witnessed snapshot boundary is NO proof. A ConfChange
+  // compacted INTO a snapshot at its own index leaves no standalone log entry (committed_log_kind missing), and
+  // the snapshot's boundary term is itself unwitnessed — NO committed retained log entry attests it, so
+  // snapshot_boundary_coherent would skip it. The resolver must NOT let such a boundary self-corroborate the
+  // missing kind; the install is a sound kind-unobservable decline, never trusted against the transient ConfChange.
+  let conf_x = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]);
+  let mut ck = Checker::new();
+  // A log-built node compacted past index 4 (committed_log_kind[4] missing) whose durable snapshot boundary is
+  // exactly index 4 — but no committed retained log entry anywhere witnesses index 4's term (it is compacted).
+  let mut g = log_node(0, 9, &[0, 1, 2, 3], &[]);
+  g.conf_changed = 1;
+  g.durable_first = 5;
+  g.durable_entries.retain(|e| e.index >= 5);
+  g.snapshot_last_index = 4;
+  g.snapshot_last_term = 2;
+  let view = with_install(
+    cv_t(1, 1, std::vec![(4, 2, conf_x)], std::vec![g]),
+    1,
+    5,
+    conf(&[0, 1, 2, 3], &[]),
+  );
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(
+    ck.membership_comparisons(),
+    0,
+    "an un-witnessed snapshot boundary is no proof, so nothing is compared via it"
+  );
+  assert_eq!(
+    ck.kind_unobservable_installs(),
+    1,
+    "the un-witnessed boundary does NOT corroborate — a sound decline, never trusted-stale"
+  );
+  assert_eq!(ck.skipped_unwitnessed_installs(), 0);
+}
+
+#[test]
+fn snapshot_membership_coherent_stale_lower_term_record_is_not_trusted() {
+  // STRICT trust (R10 FINDING 2): a committed-log record at the resolving index with a LOWER term than the
+  // recorded ConfChange is stale (the higher-term ConfChange superseded it) and is NOT exact-term proof — the
+  // transition must NOT be trusted via it. The install is a sound kind-unobservable decline.
+  let mut ck = Checker::new();
+  let conf_x = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]);
+  // The witness retains index 4 as a term-1 entry (committed_log_kind[4] = (1, ...)), but the history records a
+  // ConfChange at (4, term 2) — a strictly higher term. The lower-term record is no proof of the term-2 entry.
+  let mut w = log_node(1, 9, &[0, 1, 2], &[]);
+  w.conf_changed = 1;
+  let view = with_install(
+    cv_t(1, 1, std::vec![(4, 2, conf_x)], std::vec![w]),
+    1,
+    6,
+    conf(&[0, 1, 2, 3], &[]),
+  );
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(ck.membership_comparisons(), 0);
+  assert_eq!(
+    ck.kind_unobservable_installs(),
+    1,
+    "a stale lower-term record is not exact-term proof — the ConfChange is not trusted via it"
+  );
+  assert_eq!(ck.skipped_unwitnessed_installs(), 0);
+}
+
+#[test]
+fn snapshot_membership_coherent_same_term_non_confchange_tombstones_not_trusts() {
+  // STRICT trust (R10 FINDING 2): a committed-log record at the resolving index that is a non-ConfChange at the
+  // SAME term as the recorded ConfChange is the committed entry there (committed entries are immutable, so the
+  // recorded ConfChange transition is stale) — the config does NOT change at that index ⇒ TOMBSTONE (walk past),
+  // NEVER trust the stale ConfChange. The install is then compared against the PRIOR (genesis) config.
+  let mut ck = Checker::new();
+  let conf_x = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]);
+  // A genesis witness (founding config {0,1,2}), and a witness whose committed entry at index 4 is a term-2
+  // NON-ConfChange (same term as the recorded ConfChange transition), so committed_log_kind[4] = (2, non-CC).
+  let genesis = log_node(0, 9, &[0, 1, 2], &[]); // conf_changed == 0 ⇒ genesis {0,1,2}
+  let mut w = log_node(1, 9, &[0, 1, 2], &[]);
+  w.conf_changed = 1;
+  w.durable_entries[3].term = 2; // index 4 is a term-2 entry, left a NON-ConfChange (is_conf_change == false)
+  // The install at boundary 6 carries the stale ConfChange config {0,1,2,3}; the same-term non-ConfChange
+  // tombstones the transition, so the reference is genesis {0,1,2} and the install's extra voter 3 is caught.
+  let view = with_install(
+    cv_t(1, 1, std::vec![(4, 2, conf_x)], std::vec![genesis, w]),
+    2,
+    6,
+    conf(&[0, 1, 2, 3], &[]),
+  );
+  let v = verdict(&mut ck, &view).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {3}"),
+    "a same-term non-ConfChange tombstones the transition (config unchanged), so the stale install is caught \
+     against genesis, never trusted against the stale ConfChange: {}",
+    v.detail
+  );
+}
+
+#[test]
+fn snapshot_membership_coherent_same_term_kind_conflict_is_order_independent_decline() {
+  // STRICT trust (R11): a same-term committed-log kind conflict is order-INDEPENDENT — here the exact-term
+  // ConfChange kind is recorded FIRST, then a same-term NON-ConfChange proof arrives LATER (the reverse of the
+  // tombstone regression). The committed entry at a given (index, term) is unique, so a same-term kind conflict
+  // means one observation is a transient/buggy artifact ⇒ the record becomes CONFLICTED and the transition is
+  // DECLINED: never trusted as a real ConfChange (no false-negative), never tombstoned as a non-ConfChange (no
+  // false-positive).
+  let mut ck = Checker::new();
+  let conf_x = sailing_proto::ConfState::from_voters([0u64, 1, 2, 3]);
+  // Tick 1: a witness whose committed entry at index 4 is a term-2 ConfChange — committed_log_kind[4] recorded
+  // FIRST as (2, ConfChange), with the matching ConfChange transition.
+  let mut w1 = log_node(1, 9, &[0, 1, 2, 3], &[]);
+  w1.conf_changed = 1;
+  mark_cc(&mut w1, 4, 2);
+  record_membership_observation(
+    &mut ck,
+    &cv_t(1, 1, std::vec![(4, 2, conf_x)], std::vec![w1]),
+  );
+  // Tick 2: a LATER witness proves the committed entry at (index 4, term 2) is a NON-ConfChange — a same-term
+  // kind conflict that must mark index 4 CONFLICTED despite the ConfChange being recorded first.
+  let mut w2 = log_node(2, 9, &[0, 1, 2], &[]);
+  w2.conf_changed = 1;
+  w2.durable_entries[3].term = 2; // index 4 is a term-2 NON-ConfChange (is_conf_change stays false)
+  let view = with_install(cv(2, 2, std::vec![w2]), 0, 6, conf(&[0, 1, 2, 3], &[]));
+  assert_eq!(verdict(&mut ck, &view), Ok(()));
+  assert_eq!(
+    ck.membership_comparisons(),
+    0,
+    "a same-term kind conflict (ConfChange recorded first, non-ConfChange later) is CONFLICTED — never trusted"
+  );
+  assert_eq!(
+    ck.kind_unobservable_installs(),
+    1,
+    "the conflicted index is a sound decline, independent of observation order"
+  );
+  assert_eq!(ck.skipped_unwitnessed_installs(), 0);
 }
 
 #[test]
