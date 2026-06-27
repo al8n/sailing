@@ -870,3 +870,99 @@ async fn status_reports_leader_role_term_and_commit() {
     "the lone voter is in the membership"
   );
 }
+
+/// REGRESSION: a `query` issued AFTER a committed read-mode migration — with NO further entry appended
+/// — must COMPLETE. A committed `SetReadMode` reports `Event::ReadModeChanged`, not `Applied`, so
+/// unless `route_event` advances the apply watermark on that event, the query confirms at the
+/// migration's index and then parks FOREVER (no later `Applied` lifts it), stranding its budget
+/// reservation. The per-query timeout turns that hang into a clear failure: before the watermark fix
+/// this loops until the deadline; after, the first query returns the read.
+#[tokio::test(flavor = "multi_thread")]
+async fn query_completes_after_read_mode_migration() {
+  let addr: SocketAddr = "127.0.0.1:43830".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT)
+    .unwrap()
+    .with_check_quorum(true);
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  // Establish leadership and a known FSM: one committed Normal entry.
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  // Migrate to another mode (retrying until leader). The SetReadMode is the LAST entry — nothing is
+  // appended after it, so only its ReadModeChanged can advance the watermark.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected set_read_mode error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to migrate"
+    );
+  }
+  // Wait until the migration APPLIES (ReadModeChanged on the tail).
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    let mut applied = false;
+    while let Ok(ev) = handle.events().try_recv() {
+      if matches!(ev, Event::ReadModeChanged(_)) {
+        applied = true;
+      }
+    }
+    if applied {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the read-mode migration never applied"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+
+  // The decisive check: a query AFTER the migration, with no further append. A per-query timeout
+  // distinguishes "parked forever" (the bug) from a transient retry; the overall deadline fails the
+  // test if the query never completes.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let count = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the post-migration query never completed — a committed read-mode change must advance the apply \
+       watermark"
+    );
+    match tokio::time::timeout(
+      Duration::from_secs(2),
+      handle.query(|sm: &CountSm| sm.count()),
+    )
+    .await
+    {
+      Ok(Ok(c)) => break c,
+      // A transient redirect/supersede: retry. A PARKED query (the bug) elapses the per-query timeout
+      // and also retries — until the overall deadline above fails the test.
+      Ok(Err(_)) | Err(_) => tokio::time::sleep(Duration::from_millis(30)).await,
+    }
+  };
+  assert_eq!(
+    count, 1,
+    "the linearizable read observes the one committed Normal entry"
+  );
+}
