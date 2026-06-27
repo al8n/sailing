@@ -431,25 +431,17 @@ where
       .reads
       .read_only
       .add_request(commit, context, from, me.cheap_clone());
-    // Single-node cluster fast-path: self-ack is already a quorum.
-    let single_node_quorum = {
-      let acks = self
-        .reads
-        .read_only
-        .acks_for(round.as_ref())
-        .cloned()
-        .unwrap_or_default();
-      let votes: BTreeMap<I, bool> = self
+    // Single-node cluster fast-path: self-ack is already a quorum. `vote_result_by` evaluates the SAME
+    // joint-voter quorum the materialized `BTreeMap<I, bool>` did (it queries only voter ids, each with a
+    // definite grant/reject), with no per-read allocation of the map, the `ids()` set, or an ack-set
+    // clone. `add_request` above seeds the self-ack, so `acks_for` is `Some` here; `None` would mean no
+    // acks at all, which is no quorum.
+    let single_node_quorum = match self.reads.read_only.acks_for(round.as_ref()) {
+      Some(acks) => self
         .tracker
-        .ids()
-        .into_iter()
-        .filter(|id| self.tracker.is_voter(id))
-        .map(|id| {
-          let acked = acks.contains(&id);
-          (id, acked)
-        })
-        .collect();
-      self.tracker.vote_result(&votes).is_won()
+        .vote_result_by(|id| acks.contains(&id))
+        .is_won(),
+      None => false,
     };
     if single_node_quorum {
       let confirmed = self.reads.read_only.advance(round.as_ref());
