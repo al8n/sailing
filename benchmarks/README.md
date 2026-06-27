@@ -30,8 +30,10 @@ so the two numbers are directly comparable:
   serialization, no sockets. This is the same shortcut openraft takes by calling the peer's `Raft`
   handle directly; it isolates consensus cost from transport cost.
 - **N client tasks.** Each proposes to the leader and awaits the commit+apply of its own write
-  (`-b` pipelines `batch` proposals before awaiting). A leader is elected first; throughput is the
-  committed put/s measured only over the load window.
+  (`-b` pipelines `batch` proposals before awaiting). A single leader is elected and confirmed
+  stable first; throughput is the committed put/s measured only over the load window. The window
+  requires that one leader to hold throughout — a leadership change aborts the run as invalid (loud
+  panic) rather than silently miscounting it. In the no-fault in-process cluster this never fires.
 
 Arguments mirror openraft's (`-c` clients, `-n` operations, `-m` members 1/3/5, `-b` batch; counts
 accept `_` separators and `k`/`m`/`g` suffixes):

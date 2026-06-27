@@ -8,6 +8,11 @@
 //! tasks each propose to the leader and await the commit+apply of their own write; throughput is the
 //! committed put/s over the load window.
 //!
+//! The measurement assumes a single stable leader for the whole timed window (the no-fault
+//! in-process case): clients target one leader captured before timing starts, and a leadership
+//! change during the window ABORTS the run loudly rather than silently miscounting it (an election
+//! stall inflates elapsed, and an already-accepted entry could otherwise be committed twice).
+//!
 //! Because sailing-proto is Sans-I/O, a node is NOT self-driving: each node task owns its
 //! `Endpoint` + stores and hand-turns the crank — feed an inbound message (or fire a due timer),
 //! then pump storage to quiescence (persist-before-ack/-vote), route the produced messages to peer
@@ -47,6 +52,13 @@ const DRAIN_BUDGET: usize = 1024;
 /// election timeout, so heartbeats/elections fire close to their deadline; the check is also run on
 /// every inbound wake, so under load the timer is effectively never late.
 const TIMER_TICK: Duration = Duration::from_millis(20);
+
+/// Aborting a run whose timed window saw a leadership change is the only correct response: a
+/// throughput number is only meaningful under a single stable leader, and a change mid-window means
+/// an election stall (inflated elapsed) plus entries that may commit under both the old and new
+/// leader (a miscount). A no-fault in-process cluster never trips this.
+const LEADER_CHANGED_MSG: &str =
+  "leader changed during the timed benchmark window — run invalid, re-run under a stable leader";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -150,15 +162,34 @@ async fn run(args: Args) {
     )));
   }
 
-  // Elect a leader before timing: the election is startup cost, not throughput.
+  // Elect AND stabilize a leader before timing: a throughput number is only meaningful under a
+  // single stable leader, so we wait for one and confirm it holds across a few heartbeat cycles
+  // before the clock starts. Any election churn here is startup cost, not throughput — handling it
+  // now (rather than mid-measurement) keeps the timed window clean.
   let elect_deadline = WallInstant::now() + Duration::from_secs(30);
-  while current_leader.load(Ordering::Acquire) == NO_LEADER {
+  let leader0 = loop {
     assert!(
       WallInstant::now() < elect_deadline,
-      "no leader elected within 30s"
+      "no stable leader elected within 30s"
     );
-    tokio::time::sleep(Duration::from_millis(2)).await;
-  }
+    let candidate = current_leader.load(Ordering::Acquire);
+    if candidate == NO_LEADER {
+      tokio::time::sleep(Duration::from_millis(2)).await;
+      continue;
+    }
+    let confirm_until = WallInstant::now() + Duration::from_millis(150);
+    let mut held = true;
+    while WallInstant::now() < confirm_until {
+      tokio::time::sleep(Duration::from_millis(5)).await;
+      if current_leader.load(Ordering::Acquire) != candidate {
+        held = false;
+        break;
+      }
+    }
+    if held {
+      break candidate;
+    }
+  };
 
   // openraft-identical op accounting: round per-client ops down to a whole number of batches.
   let ops_per_client = args.operations / args.clients / args.batch * args.batch;
@@ -171,53 +202,68 @@ async fn run(args: Args) {
     args.batch
   );
 
+  // Timed window. Every client targets the single captured leader `leader0` — under a stable leader
+  // every proposal is accepted, so there is no in-window leader re-discovery and no retry (retrying
+  // on a new leader would double-commit an entry that the original leader's log still carries). If
+  // leadership ever leaves `leader0`, the watcher below aborts the run rather than miscounting.
   let start = WallInstant::now();
   let mut client_handles = Vec::with_capacity(args.clients as usize);
   for _ in 0..args.clients {
     let senders = senders.clone();
-    let current_leader = current_leader.clone();
     let batch = args.batch;
     client_handles.push(tokio::spawn(async move {
+      let sender = &senders[leader0 as usize];
       let mut done = 0u64;
       while done < ops_per_client {
         let want = batch.min(ops_per_client - done);
-        let leader = loop {
-          let l = current_leader.load(Ordering::Acquire);
-          if l != NO_LEADER {
-            break l;
-          }
-          tokio::time::sleep(Duration::from_millis(1)).await;
-        };
-        let sender = &senders[leader as usize];
-
-        // Pipeline `want` proposals, then await each commit. A dropped reply (RecvError) means the
-        // proposal was rejected (the target is no longer leader) or its leader stepped down before
-        // applying — count only the successes and retry the remainder on the re-discovered leader.
         let mut rxs = Vec::with_capacity(want as usize);
         for _ in 0..want {
           let (tx, rx) = oneshot::channel();
           if sender.send(Inbound::Client { reply: tx }).is_err() {
-            break; // node task gone (cluster shutting down)
+            // The cluster stopped accepting (shutdown / leader gone). Never re-target another leader
+            // (that would double-count): park, so the leader-change watcher aborts the run.
+            std::future::pending::<()>().await;
           }
           rxs.push(rx);
         }
-        let mut ok = 0u64;
         for rx in rxs {
-          if rx.await.is_ok() {
-            ok += 1;
+          if rx.await.is_err() {
+            // leader0 rejected/abandoned this proposal — same reasoning: park and let the run abort.
+            std::future::pending::<()>().await;
           }
-        }
-        done += ok;
-        if ok < want {
-          tokio::time::sleep(Duration::from_millis(1)).await;
+          done += 1;
         }
       }
     }));
   }
 
-  for h in client_handles {
-    let _ = h.await;
+  // Drive the load to completion, but abort the instant leadership leaves `leader0`. A client only
+  // ever completes by committing all of its writes on `leader0`; on any anomaly it parks, so the
+  // join can finish only on a genuinely valid run, and the watcher catches everything else.
+  let clients_done = async {
+    for h in client_handles {
+      let _ = h.await;
+    }
+  };
+  tokio::pin!(clients_done);
+  tokio::select! {
+    biased;
+    _ = async {
+      loop {
+        if current_leader.load(Ordering::Acquire) != leader0 {
+          return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+      }
+    } => panic!("{LEADER_CHANGED_MSG}"),
+    _ = &mut clients_done => {}
   }
+  // Boundary guard: accept the result only if leadership never left `leader0`.
+  assert_eq!(
+    current_leader.load(Ordering::Acquire),
+    leader0,
+    "{LEADER_CHANGED_MSG}"
+  );
   let elapsed = start.elapsed();
 
   for h in &node_handles {
@@ -328,17 +374,19 @@ async fn run_node(
     if is_leader {
       current_leader.store(id, Ordering::Release);
     } else if was_leader {
-      // Stepped down: relinquish the published leadership and cancel outstanding replies so the
-      // waiting clients observe the cancellation and retry on the new leader (rather than hang).
+      // Stepped down: relinquish the published leadership so the timed-window watcher observes the
+      // change and aborts the run. Outstanding `pending` replies are intentionally NOT cancelled —
+      // those entries may still commit under the new leader, and cancelling them would invite a
+      // client re-propose that double-counts. (A stable benchmark never reaches this branch.)
       let _ = current_leader.compare_exchange(id, NO_LEADER, Ordering::AcqRel, Ordering::Acquire);
-      pending.clear();
     }
     was_leader = is_leader;
   }
 }
 
 /// Apply one inbound item: deliver a peer message, or propose a client write (recording its reply
-/// against the assigned index; a rejected propose drops `reply`, signaling the client to retry).
+/// against the assigned index, to fire on apply). A rejected propose drops `reply`; the awaiting
+/// client then parks and the timed-window watcher aborts the run (a stable leader never rejects).
 fn apply_inbound(
   now: Instant,
   ep: &mut Node,
@@ -351,8 +399,8 @@ fn apply_inbound(
   match m {
     Inbound::Peer { from, message } => ep.handle_message(now, log, stable, from, message),
     Inbound::Client { reply } => {
-      // A rejected propose (not leader / transfer in progress) drops `reply`, signaling the client
-      // to retry on the re-discovered leader.
+      // A rejected propose (this node is no longer leader) drops `reply` here; its client observes
+      // the cancellation, parks, and the run aborts. A stable leader accepts every proposal.
       if let Ok(index) = ep.propose(now, log, &*stable, payload) {
         pending.insert(index, reply);
       }
