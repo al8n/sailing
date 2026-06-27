@@ -186,6 +186,64 @@ where
     )
     .await
   }
+
+  /// Restart from durable storage with the default monotonic-only clock. Like [`bind`](Self::bind)
+  /// but reconciles the durable stores instead of booting a fresh endpoint — see
+  /// [`bind_restart_with_wall_clock`](Self::bind_restart_with_wall_clock).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<(I, SocketAddr)>,
+    log: L,
+    stable: S,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    Self::bind_restart_with_wall_clock(
+      addr, config, seed, fsm, boot_epoch, opts, cluster, peers, log, stable, Monotonic, driver_cfg,
+    )
+    .await
+  }
+
+  /// One-time MIGRATION restart from a pre-format store with the default monotonic-only clock — see
+  /// [`bind_restart_migrating_with_wall_clock`](Self::bind_restart_migrating_with_wall_clock).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart_migrating(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<Duration>,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<(I, SocketAddr)>,
+    log: L,
+    stable: S,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    Self::bind_restart_migrating_with_wall_clock(
+      addr,
+      config,
+      seed,
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      opts,
+      cluster,
+      peers,
+      log,
+      stable,
+      Monotonic,
+      driver_cfg,
+    )
+    .await
+  }
 }
 
 impl<R, I, F, L, S, W> ReactorQuicDriver<R, I, F, L, S, W>
@@ -235,7 +293,110 @@ where
     let mut clock = Clock::new(eps_unc_ns, wall);
     let endpoint = sailing_proto::Endpoint::new(config, clock.now(), seed, fsm);
     let coord = QuicCoordinator::with_identity(endpoint, opts, None, cluster);
+    Ok(Self::from_parts(
+      coord, log, stable, socket, clock, peers, driver_cfg,
+    ))
+  }
 
+  /// Restart the socket and driver from DURABLE storage after a crash, plus its [`Handle`].
+  ///
+  /// The crash-recovery sibling of [`bind_with_wall_clock`](Self::bind_with_wall_clock): instead of a
+  /// fresh endpoint it builds the coordinator over
+  /// [`Endpoint::restart`](sailing_proto::Endpoint::restart), which RECONCILES the durable
+  /// [`LogStore`]/[`StableStore`] — recovering the persisted term/vote/commit, replaying the committed
+  /// tail, and re-arming the lease/vote fences — so a restarting node never double-votes by booting at
+  /// term 0. `boot_epoch` MUST be strictly greater than every prior incarnation's and persisted
+  /// durably BEFORE this call (a fresh node uses 0, so the first restart passes at least 1).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart_with_wall_clock(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<(I, SocketAddr)>,
+    mut log: L,
+    mut stable: S,
+    wall: W,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    driver_cfg.validate()?;
+    let eps_unc_ns = validate_and_capture_eps::<I, W>(&config)?;
+    let socket = Arc::new(<R::Net as Net>::UdpSocket::bind(addr).await?);
+    let mut clock = Clock::new(eps_unc_ns, wall);
+    let endpoint = sailing_proto::Endpoint::restart(
+      config,
+      clock.now(),
+      seed,
+      fsm,
+      boot_epoch,
+      &mut log,
+      &mut stable,
+    );
+    let coord = QuicCoordinator::with_identity(endpoint, opts, None, cluster);
+    Ok(Self::from_parts(
+      coord, log, stable, socket, clock, peers, driver_cfg,
+    ))
+  }
+
+  /// One-time MIGRATION restart from a pre-format store (one that persisted no `lease_support` floor),
+  /// plus its [`Handle`]. Wraps
+  /// [`Endpoint::restart_migrating`](sailing_proto::Endpoint::restart_migrating):
+  /// `assume_prior_lease_support` upper-bounds the read-lease window this node may have advertised
+  /// before the crash so the post-restart vote fence honors it. Pass `None` (or just use
+  /// [`bind_restart_with_wall_clock`](Self::bind_restart_with_wall_clock)) once an enforcing restart
+  /// has recorded a real durable floor.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart_migrating_with_wall_clock(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<Duration>,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<(I, SocketAddr)>,
+    mut log: L,
+    mut stable: S,
+    wall: W,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    driver_cfg.validate()?;
+    let eps_unc_ns = validate_and_capture_eps::<I, W>(&config)?;
+    let socket = Arc::new(<R::Net as Net>::UdpSocket::bind(addr).await?);
+    let mut clock = Clock::new(eps_unc_ns, wall);
+    let endpoint = sailing_proto::Endpoint::restart_migrating(
+      config,
+      clock.now(),
+      seed,
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      &mut log,
+      &mut stable,
+    );
+    let coord = QuicCoordinator::with_identity(endpoint, opts, None, cluster);
+    Ok(Self::from_parts(
+      coord, log, stable, socket, clock, peers, driver_cfg,
+    ))
+  }
+
+  /// Assemble the driver + [`Handle`] from an already-constructed coordinator, clock, and bound
+  /// socket. Shared by the fresh-`bind` and crash-`restart` entry points — they differ ONLY in how the
+  /// endpoint inside `coord` is built (fresh vs. reconciled from the durable stores), so the
+  /// channel/budget/handle wiring lives here once.
+  fn from_parts(
+    coord: QuicCoordinator<I, F>,
+    log: L,
+    stable: S,
+    socket: Arc<<R::Net as Net>::UdpSocket>,
+    clock: Clock<W>,
+    peers: Vec<(I, SocketAddr)>,
+    driver_cfg: DriverConfig,
+  ) -> (Self, Handle<I, F>) {
     // Unbounded: the submit BUDGET — not the channel — is the binding bound on in-flight operations
     // (see the memory model), and an unbounded queue keeps shutdown from ever blocking on a full
     // channel.
@@ -257,7 +418,7 @@ where
       }
     };
 
-    Ok((
+    (
       Self {
         coord,
         log,
@@ -282,7 +443,7 @@ where
         teardown_tx: Some(teardown_tx),
       },
       handle,
-    ))
+    )
   }
 
   /// The count of times this node released its post-election commit-wait EARLY via the precise

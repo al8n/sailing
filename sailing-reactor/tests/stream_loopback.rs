@@ -8,8 +8,11 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
-use common::{CountSm, MemLog, MemStable};
-use sailing_proto::{ClusterId, Config, Data, LabelOptions, Labeled, Passthrough, TlsRecords};
+use common::{CountSm, MemLog, MemStable, SharedLog, SharedStable};
+use sailing_proto::{
+  ClusterId, Config, Data, Event, Index, LabelOptions, Labeled, LogStore, Passthrough,
+  ReadOnlyOption, Role, StableStore, Term, TlsRecords,
+};
 use sailing_reactor::{DriverConfig, DriverError, Handle, ReactorStreamDriver};
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -581,3 +584,144 @@ async fn storage_log_flood_does_not_trap_the_run_loop() {
   .expect("no livelock: the submit must commit despite the Compacted log flood");
   assert_eq!(committed, 1);
 }
+
+/// Plaintext dialer/acceptor factories for node `id` — the smallest stream setup the single-node
+/// tests below need (no peers, so the mesh is never actually dialed).
+fn plain_factories(
+  id: u64,
+) -> (
+  sailing_reactor::DialerFactory<u64, Labeled<Passthrough>>,
+  sailing_reactor::AcceptorFactory<Labeled<Passthrough>>,
+) {
+  let local = encoded(id);
+  let dial_local = local.clone();
+  let dialer: sailing_reactor::DialerFactory<u64, Labeled<Passthrough>> =
+    Arc::new(move |_: &u64| {
+      Labeled::dialer(
+        Passthrough::new(),
+        &LabelOptions {
+          cluster: cluster(),
+          local_id: dial_local.clone(),
+        },
+      )
+      .map_err(std::io::Error::other)
+    });
+  let acceptor: sailing_reactor::AcceptorFactory<Labeled<Passthrough>> = Arc::new(move || {
+    Labeled::acceptor(
+      Passthrough::new(),
+      &LabelOptions {
+        cluster: cluster(),
+        local_id: local.clone(),
+      },
+    )
+    .map_err(std::io::Error::other)
+  });
+  (dialer, acceptor)
+}
+
+/// A node that crashes and RESTARTS from the same durable stores must RECOVER its persisted
+/// term/vote/commit and replay the committed log — never boot fresh at term 0 (which would let it
+/// double-vote). `bind_restart` reconciles the durable stores through `Endpoint::restart`; a plain
+/// `bind` would discard them. The recovered FSM count is the decisive proof the committed log replayed:
+/// a fresh boot's count would be 0, so the next commit would return 1, not 4.
+#[tokio::test(flavor = "multi_thread")]
+async fn restart_recovers_durable_state_instead_of_booting_fresh() {
+  let addr: SocketAddr = "127.0.0.1:43800".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  // Boot 1: a fresh single-voter node elects itself and commits three entries.
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"a").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"b").await,
+    2
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"c").await,
+    3
+  );
+
+  // Wait for the durable HardState commit to catch up to the WHOLE committed log, so the restart's
+  // recovery is deterministic (every committed Normal entry is replayed, none stranded uncommitted).
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(3) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up to the committed log"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  // The durable ground truth the restart must recover: a real term, a self-vote, a non-trivial commit.
+  let durable = stable.hard_state();
+  assert!(
+    durable.term() >= Term::new(1),
+    "a leader advanced the durable term"
+  );
+  assert_eq!(
+    durable.vote(),
+    Some(1),
+    "the single voter persisted its self-vote"
+  );
+  assert!(durable.commit() >= Index::new(3));
+
+  // Crash: shut driver 1 down, KEEPING the shared stores (our clones outlive it).
+  handle
+    .shutdown()
+    .await
+    .expect("clean teardown frees the addr for restart");
+  let _ = task.await;
+
+  // Boot 2: RESTART (not a fresh bind) from the same durable stores; boot_epoch = 1 > the fresh 0.
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver2, handle2) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind_restart(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    1,
+    Vec::new(),
+    dialer,
+    acceptor,
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("restart bind");
+  let task2 = tokio::spawn(driver2.run());
+
+  // The recovered node replayed the three committed entries (FSM count = 3), so the next commit
+  // returns 4. A FRESH boot would have discarded the stores: count 0, so the next commit would be 1.
+  let next = submit_anywhere(std::slice::from_ref(&handle2), b"d").await;
+  assert_eq!(
+    next, 4,
+    "the restart replayed the durable committed log (count recovered to 3), not a fresh count-0 boot"
+  );
+
+  handle2.shutdown().await.expect("clean teardown");
+  let _ = task2.await;
+}
+

@@ -193,6 +193,65 @@ where
     )
     .await
   }
+
+  /// Restart from durable storage with the default monotonic-only clock. Like [`bind`](Self::bind)
+  /// but reconciles the durable stores instead of booting a fresh endpoint — see
+  /// [`bind_restart_with_wall_clock`](Self::bind_restart_with_wall_clock).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    peers: Vec<(I, SocketAddr)>,
+    dialer: DialerFactory<I, R>,
+    acceptor: AcceptorFactory<R>,
+    log: L,
+    stable: S,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    Self::bind_restart_with_wall_clock(
+      addr, config, seed, fsm, boot_epoch, peers, dialer, acceptor, log, stable, Monotonic,
+      driver_cfg,
+    )
+    .await
+  }
+
+  /// One-time MIGRATION restart from a pre-format store with the default monotonic-only clock — see
+  /// [`bind_restart_migrating_with_wall_clock`](Self::bind_restart_migrating_with_wall_clock).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart_migrating(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<Duration>,
+    peers: Vec<(I, SocketAddr)>,
+    dialer: DialerFactory<I, R>,
+    acceptor: AcceptorFactory<R>,
+    log: L,
+    stable: S,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    Self::bind_restart_migrating_with_wall_clock(
+      addr,
+      config,
+      seed,
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      peers,
+      dialer,
+      acceptor,
+      log,
+      stable,
+      Monotonic,
+      driver_cfg,
+    )
+    .await
+  }
 }
 
 impl<I, F, R, L, S, W> CompioStreamDriver<I, F, R, L, S, W>
@@ -239,7 +298,111 @@ where
     let listener = TcpListener::bind(addr).await?;
     let mut clock = Clock::new(eps_unc_ns, wall);
     let coord = StreamCoordinator::new(config, clock.now(), seed, fsm);
+    Ok(Self::from_parts(
+      coord, log, stable, listener, clock, peers, dialer, acceptor, driver_cfg,
+    ))
+  }
 
+  /// Restart the listener and driver from DURABLE storage after a crash, plus its [`Handle`].
+  ///
+  /// The crash-recovery sibling of [`bind_with_wall_clock`](Self::bind_with_wall_clock): instead of a
+  /// fresh endpoint it builds the coordinator through [`StreamCoordinator::restart`], which RECONCILES
+  /// the durable [`LogStore`]/[`StableStore`] — recovering the persisted term/vote/commit, replaying
+  /// the committed tail, and re-arming the lease/vote fences — so a restarting node never double-votes
+  /// by booting at term 0. `boot_epoch` MUST be strictly greater than every prior incarnation's and
+  /// persisted durably BEFORE this call (see [`StreamCoordinator::restart`]); a fresh node uses 0, so
+  /// the first restart passes at least 1. The connection table starts empty (peers are re-dialed/-
+  /// accepted).
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart_with_wall_clock(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    peers: Vec<(I, SocketAddr)>,
+    dialer: DialerFactory<I, R>,
+    acceptor: AcceptorFactory<R>,
+    mut log: L,
+    mut stable: S,
+    wall: W,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    driver_cfg.validate()?;
+    let eps_unc_ns = validate_and_capture_eps::<I, W>(&config)?;
+    let listener = TcpListener::bind(addr).await?;
+    let mut clock = Clock::new(eps_unc_ns, wall);
+    let coord = StreamCoordinator::restart(
+      config,
+      clock.now(),
+      seed,
+      fsm,
+      boot_epoch,
+      &mut log,
+      &mut stable,
+    );
+    Ok(Self::from_parts(
+      coord, log, stable, listener, clock, peers, dialer, acceptor, driver_cfg,
+    ))
+  }
+
+  /// One-time MIGRATION restart from a pre-format store (one that persisted no `lease_support` floor),
+  /// plus its [`Handle`]. Wraps [`StreamCoordinator::restart_migrating`]:
+  /// `assume_prior_lease_support` upper-bounds the read-lease window this node may have advertised
+  /// before the crash so the post-restart vote fence honors it. Pass `None` (or just use
+  /// [`bind_restart_with_wall_clock`](Self::bind_restart_with_wall_clock)) once an enforcing restart
+  /// has recorded a real durable floor.
+  #[allow(clippy::too_many_arguments)]
+  pub async fn bind_restart_migrating_with_wall_clock(
+    addr: SocketAddr,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<Duration>,
+    peers: Vec<(I, SocketAddr)>,
+    dialer: DialerFactory<I, R>,
+    acceptor: AcceptorFactory<R>,
+    mut log: L,
+    mut stable: S,
+    wall: W,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, Handle<I, F>), BindError> {
+    driver_cfg.validate()?;
+    let eps_unc_ns = validate_and_capture_eps::<I, W>(&config)?;
+    let listener = TcpListener::bind(addr).await?;
+    let mut clock = Clock::new(eps_unc_ns, wall);
+    let coord = StreamCoordinator::restart_migrating(
+      config,
+      clock.now(),
+      seed,
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      &mut log,
+      &mut stable,
+    );
+    Ok(Self::from_parts(
+      coord, log, stable, listener, clock, peers, dialer, acceptor, driver_cfg,
+    ))
+  }
+
+  /// Assemble the driver + [`Handle`] from an already-constructed coordinator, clock, and bound
+  /// listener. Shared by the fresh-`bind` and crash-`restart` entry points — they differ ONLY in how
+  /// `coord` is built (a fresh endpoint vs. one reconciled from the durable stores), so the
+  /// channel/budget/handle wiring lives here once.
+  #[allow(clippy::too_many_arguments)]
+  fn from_parts(
+    coord: StreamCoordinator<I, F, R>,
+    log: L,
+    stable: S,
+    listener: TcpListener,
+    clock: Clock<W>,
+    peers: Vec<(I, SocketAddr)>,
+    dialer: DialerFactory<I, R>,
+    acceptor: AcceptorFactory<R>,
+    driver_cfg: DriverConfig,
+  ) -> (Self, Handle<I, F>) {
     // Unbounded: the submit BUDGET is the binding bound on in-flight operations, so the channel
     // carries no cap of its own and shutdown can never block on a full queue.
     let (cmd_tx, cmd_rx) = flume::unbounded();
@@ -269,7 +432,7 @@ where
     let max_conns = driver_cfg.max_conns.max(2 * peers.len());
     let max_failover_limbo_bytes = driver_cfg.max_failover_limbo_bytes;
 
-    Ok((
+    (
       Self {
         coord,
         log,
@@ -304,7 +467,7 @@ where
         teardown_tx: Some(teardown_tx),
       },
       handle,
-    ))
+    )
   }
 
   /// The count of times this node released its post-election commit-wait EARLY via the precise
