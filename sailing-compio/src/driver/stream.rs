@@ -1124,6 +1124,15 @@ where
     while let Some(ev) = self.coord.poll_event() {
       run_queries |= self.routing.route_event(ev);
     }
+    // Eventless applies advance the endpoint's applied index with NO routed event — a fresh leader's
+    // `Empty` no-op, and the committed prefix a restart replays (its events are cleared) — so reconcile
+    // the driver watermark to the endpoint HERE, or a read confirmed at such an index never becomes
+    // runnable. Skipped on a poisoned node: the fail-stop sweep below owns its parked work.
+    if !self.coord.endpoint().is_poisoned() {
+      run_queries |= self
+        .routing
+        .sync_applied(self.coord.endpoint().applied_index());
+    }
     // Leadership-loss backstop, BEFORE the serve: defense-in-depth for a loss NOT carried by a routed
     // `LeaderChanged` (which `route_event` already swept). Sweeping ahead of the serve voids parked
     // inherited-reads `Err(Superseded)` — the serve's None arm can never drain them `Ok(None)` first.
