@@ -7,8 +7,8 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use sailing_proto::{
-  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotChunkRead, SnapshotMeta,
-  StableDone, StableStore, StateMachine, Term,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotChunkRead,
+  SnapshotMeta, StableDone, StableStore, StateMachine, Term,
 };
 
 /// A counting state machine: applies are counted; the response is the post-apply count.
