@@ -58,17 +58,45 @@ pub(crate) fn partition(
   st: &mut VoprState,
   prng: &mut FaultPrng,
   report: &mut VoprReport,
+  joint: bool,
 ) {
+  // Joint entry only: with a 1-in-8 coin, isolate a committed LEARNER instead of a voter. A learner never
+  // votes, so partitioning it can NEVER strand the quorum (no budget check) — it simply lags and must later
+  // snapshot-install to catch up, which both feeds the joint-snapshot coverage AND proves a lagging learner
+  // cannot deadlock calm-window progress (the calm window measures only voters and heals every isolated node,
+  // learners included). The rate is deliberately LOW: a partitioned learner re-syncs via a full snapshot
+  // stream under the lowered threshold, so isolating learners aggressively makes the run spend its budget on
+  // perpetual transfers. The coin (and the learner pick) are drawn ONLY when `joint`, so a non-joint run never
+  // advances the PRNG here and stays byte-identical.
+  if joint && prng.next_u64().is_multiple_of(8) {
+    let learners: BTreeSet<u64> = st
+      .learners
+      .iter()
+      .filter(|id| !st.down.contains(id) && !st.gone.contains(id))
+      .copied()
+      .collect();
+    if let Some(victim) = pick_from(&learners, prng) {
+      c.isolate(victim);
+      st.down.insert(victim);
+      report.partitions += 1;
+      report.learner_partitions += 1;
+      return;
+    }
+    // No isolatable learner right now — fall through to the usual voter partition.
+  }
+
   if st.budget_remaining() == 0 {
     return; // taking another voter down would break quorum — skip
   }
   // Eligible victims: voters currently up, not already down, and NOT an in-flight removal victim — a
   // `removing` node is kept network-live so it can ack/vote its own RemoveNode's quorum (under
-  // apply-time that removal commits through the OLD config, which still includes the victim).
+  // apply-time that removal commits through the OLD config, which still includes the victim). The joint
+  // entry also spares the perpetual log-built reference node.
   let eligible: BTreeSet<u64> = st
     .voters
     .iter()
     .filter(|id| !st.down.contains(id) && !st.removing.contains(id))
+    .filter(|&&id| !(joint && id == REFERENCE_NODE))
     .copied()
     .collect();
   if let Some(victim) = pick_from(&eligible, prng) {
@@ -117,15 +145,46 @@ pub(crate) fn crash_one(
   st: &mut VoprState,
   prng: &mut FaultPrng,
   report: &mut VoprReport,
+  joint: bool,
 ) {
   // Crash any live (non-removed) node, isolated or not. Crashing a participating voter is the
   // highest-value case (it exercises fsync-loss + recovery while the cluster is making progress),
   // and since a crash auto-restarts, it never sustains an outage past the budget.
-  let live = st.live_ids();
+  let mut live = st.live_ids();
+  // The joint entry keeps the reference node perpetually log-built (a crash could drop it behind the
+  // compaction boundary and force it to snapshot-install, losing its log-built provenance).
+  if joint {
+    live.remove(&REFERENCE_NODE);
+  }
   if let Some(victim) = pick_from(&live, prng) {
     c.crash(victim);
     report.crashes += 1;
     report.restarts += 1;
+  }
+}
+
+/// Submit a SINGLE-op conf-change on the leader, either as a v1 [`sailing_proto::ConfChange`] (a simple
+/// config change) or — in the joint entry (`joint == true`) — as a [`sailing_proto::ConfChangeV2`] with the
+/// `Implicit` (auto-leaving) transition. A single op under `Implicit` routes through a REAL joint configuration
+/// (the proto auto-appends the leave entry that simplifies it), so a lagging node can snapshot-install a
+/// transiently-joint `ConfState`. The membership delta and the accept/reject conditions are identical either
+/// way, so the harness's `wired`/`removing` bookkeeping is unchanged — only the transition path differs.
+fn propose_single_conf_change(
+  c: &mut Cluster,
+  ty: sailing_proto::ConfChangeType,
+  id: u64,
+  joint: bool,
+) -> Option<sailing_proto::Index> {
+  if joint {
+    let cc = sailing_proto::ConfChangeV2::new(
+      sailing_proto::ConfChangeTransition::Implicit,
+      std::vec![sailing_proto::ConfChangeSingle::new(ty, id)],
+      bytes::Bytes::new(),
+    );
+    c.propose_conf_change_v2(cc)
+  } else {
+    let cc = sailing_proto::ConfChange::new(ty, id, bytes::Bytes::new());
+    c.propose_conf_change(cc)
   }
 }
 
@@ -139,11 +198,15 @@ pub(crate) fn crash_one(
 /// `mark_removed` path, checking the returned `Option` itself. A `RemoveNode` is skipped if it would
 /// drop the voter set below [`MIN_VOTERS`] or remove the only surviving quorum (which would poison
 /// the leader via the proto's `EmptyVoterSet` apply-time guard).
+///
+/// In the joint entry (`joint == true`) each single op is submitted as a `ConfChangeV2(Implicit)` via
+/// [`propose_single_conf_change`], routing it through a real auto-leaving joint configuration.
 pub(crate) fn conf_change(
   c: &mut Cluster,
   st: &mut VoprState,
   prng: &mut FaultPrng,
   report: &mut VoprReport,
+  joint: bool,
 ) {
   if st.conf_in_flight {
     return; // one change in flight at a time (mirrors the proto's pending_conf gate)
@@ -161,6 +224,8 @@ pub(crate) fn conf_change(
     st.voters
       .iter()
       .filter(|&&id| id != leader)
+      // The joint entry never removes the perpetual log-built reference node (it must stay a current voter).
+      .filter(|&&id| !(joint && id == REFERENCE_NODE))
       .filter(|&&id| {
         // After removing `id`, the voter set is voters \ {id}; require a surviving majority among the
         // up voters (those neither VOPR-isolated nor already cluster-removed). Keeps liveness
@@ -196,12 +261,8 @@ pub(crate) fn conf_change(
       let id = st.next_id;
       st.next_id += 1;
       c.wire_joining_node(id);
-      let cc = sailing_proto::ConfChange::new(
-        sailing_proto::ConfChangeType::AddNode,
-        id,
-        bytes::Bytes::new(),
-      );
-      if c.propose_conf_change(cc).is_some() {
+      if propose_single_conf_change(c, sailing_proto::ConfChangeType::AddNode, id, joint).is_some()
+      {
         st.wired.insert(id);
         st.missing_streak.insert(id, 0);
         true
@@ -216,12 +277,9 @@ pub(crate) fn conf_change(
       let id = st.next_id;
       st.next_id += 1;
       c.wire_joining_node(id);
-      let cc = sailing_proto::ConfChange::new(
-        sailing_proto::ConfChangeType::AddLearnerNode,
-        id,
-        bytes::Bytes::new(),
-      );
-      if c.propose_conf_change(cc).is_some() {
+      if propose_single_conf_change(c, sailing_proto::ConfChangeType::AddLearnerNode, id, joint)
+        .is_some()
+      {
         st.wired.insert(id);
         st.missing_streak.insert(id, 0);
         true
@@ -239,12 +297,9 @@ pub(crate) fn conf_change(
       // committed configs, hence counted toward quorum, yet unreachable — which deadlocks an election
       // if the removal never propagates. Recording it in `removing` is what defers the isolation.
       if let Some(victim) = pick_from(&removable, prng) {
-        let cc = sailing_proto::ConfChange::new(
-          sailing_proto::ConfChangeType::RemoveNode,
-          victim,
-          bytes::Bytes::new(),
-        );
-        if c.propose_conf_change(cc).is_some() {
+        if propose_single_conf_change(c, sailing_proto::ConfChangeType::RemoveNode, victim, joint)
+          .is_some()
+        {
           st.removing.insert(victim);
           true
         } else {
@@ -351,13 +406,24 @@ pub(crate) fn transfer_leader(
 /// Re-roll the network + per-node storage fault intensities to a new seed-chosen level (an
 /// adversarial schedule that shifts over the run). Uses a fresh per-call seed derived from the master
 /// PRNG so the schedule stays deterministic.
-pub(crate) fn fault_reroll(c: &mut Cluster, st: &VoprState, prng: &mut FaultPrng, seed: u64) {
+pub(crate) fn fault_reroll(
+  c: &mut Cluster,
+  st: &VoprState,
+  prng: &mut FaultPrng,
+  seed: u64,
+  joint: bool,
+) {
   let net = roll_network_faults(prng, /* calm */ false);
   let net_seed = prng.next_u64();
   c.set_network_faults(net, net_seed);
   // Re-roll storage faults on every live node (voters + learners), each with its own seed.
   for id in st.voters.iter().chain(st.learners.iter()).copied() {
-    let sf = roll_storage_faults(prng);
+    let mut sf = roll_storage_faults(prng);
+    // The joint entry keeps the reference node fault-free (never poisoned, always current). The draw above
+    // still happens, so a non-joint run is byte-identical.
+    if joint && id == REFERENCE_NODE {
+      sf = StorageFaults::none();
+    }
     c.set_node_faults(id, sf, seed.wrapping_add(id).wrapping_add(prng.next_u64()));
   }
 }

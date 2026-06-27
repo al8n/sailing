@@ -99,6 +99,21 @@ pub struct Cluster {
   /// Per-node count of `Event::SnapshotInstalled` events drained during `tick`.
   /// Monotonically incremented; reset to zero on `crash`+restart.
   snapshot_installs: Vec<SnapCount>,
+  /// Per-node STICKY provenance: `true` once the node has installed a TRANSFERRED snapshot, i.e. its
+  /// active membership is snapshot-derived rather than built purely by applying the log. UNLIKE
+  /// [`snapshot_installs`](Self::snapshot_installs) this is NEVER reset on crash: a restarted node
+  /// recovers its membership from the durable snapshot it installed, so the provenance survives the
+  /// restart. The membership-coherence oracle uses this (not the resettable counter) to pick a sound,
+  /// non-circular witness — a post-crash snapshot-installed node must NOT serve as the "log-built"
+  /// reference, or it could mask exactly the corrupt-snapshot-`ConfState` class the oracle catches.
+  snapshot_membership_lineage: Vec<bool>,
+  /// This tick's NEW transfer installs `(node id, snapshot boundary, install-time ConfState)` from each
+  /// `Event::SnapshotInstalled`'s `SnapshotMeta`, appended by [`drain_node_events`](Self::drain_node_events) on
+  /// EVERY drain path and handed to the membership oracle via [`ClusterView::new_installs`]; cleared only AFTER
+  /// a check folds it (same lifecycle as [`pending_transitions`](Self::pending_transitions)). The install-time
+  /// ConfState is the exact membership the snapshot installed — the oracle compares THAT, not the node's
+  /// current (drifting) config.
+  pending_new_installs: Vec<(u64, u64, checker::ConfSnapshot)>,
   /// Per-node restart counter (incarnation), bumped each time `crash` rebuilds the node from
   /// durable storage. The checker resets a node's commit/term monotonicity baseline when its
   /// incarnation changes: the batched commit/term persist can drop an in-memory advance still in
@@ -107,6 +122,14 @@ pub struct Cluster {
   /// Per-node count of `Event::ConfChanged` events drained during `tick`.
   /// Monotonically incremented; never reset.
   conf_changed: Vec<ConfChangedCount>,
+  /// Committed conf-changes observed on LOG-BUILT nodes since the last oracle fold, as `(conf-change index,
+  /// node term at apply, ConfState)` from `Event::ConfChanged`. Appended by
+  /// [`drain_node_events`](Self::drain_node_events) on EVERY drain path (per-tick AND the settle/flush pumps),
+  /// handed to the membership oracle via [`ClusterView::committed_transitions`], and cleared only AFTER a
+  /// check folds it — so a conf-change applied inside a pump survives to be folded at the next check (not
+  /// dropped). The oracle keys the committed-config step-function reference by EXACT conf-change index
+  /// (gap-free regardless of apply-batch size); the term resolves a same-index conflict (higher term wins).
+  pending_transitions: Vec<(u64, u64, checker::ConfSnapshot)>,
   /// Per-node list of `ReadState`s confirmed via `Event::ReadState` during `tick`.
   /// Appended monotonically; never cleared. Index into the outer Vec by node position.
   read_states: Vec<Vec<ReadState>>,
@@ -119,6 +142,12 @@ pub struct Cluster {
   /// duplicate/reorder). Default [`NetworkFaults::none()`] — a faultless, zero-latency, FIFO bus
   /// byte-identical to the original bus. Installed via [`Cluster::set_network_faults`].
   net_faults: NetworkFaults,
+  /// A node whose messages (to OR from it) are NEVER dropped/duplicated/delayed by the network-fault model —
+  /// delivered immediately, exactly once. Used ONLY by the joint-membership entry to keep its reference node
+  /// perpetually current and log-built (a dropped append could make even a fault-free node lag past the
+  /// compaction boundary and snapshot-install, losing the log-built provenance that anchors the
+  /// committed-config history). `None` (no immunity) everywhere else, so every other entry is byte-identical.
+  drop_immune_node: Option<u64>,
   /// Seeded network-fault PRNG, on a stream distinct from the per-node store seeds. Drives every
   /// drop/dup roll and jitter draw, so the same cluster seed yields an identical run. Only consumed
   /// when `net_faults` is non-`none()` (an all-off config touches the PRNG only for the bounded
@@ -303,22 +332,66 @@ impl Cluster {
     })
   }
 
-  /// Drain node `i`'s event queue: bump the snapshot/conf-change tallies and append every `ReadState`
-  /// to its confirmed-reads history. Returns whether anything was drained (so the tick loop can mark
-  /// progress). The cross-leader non-vacuity counter is driven by the SERVE-TIME context set, not by the
-  /// cluster state at this (later, possibly drifted) drain: a `ReadState` whose context was recorded at
-  /// `read_index` time as served by a superseded leader (see [`note_read_issue`]) bumps the counter and
-  /// retires its context. Draining itself is unchanged from the original single-clock cluster, so it has
-  /// no effect on the run — only the bookkeeping is new.
-  fn drain_events(&mut self, i: usize) -> bool {
+  /// THE single event-drain for node `i`. EVERY drain site routes here — the per-tick drain AND the internal
+  /// settle / flush pumps (`open_fsync_window` / `flush_drain_collect_except`) — so no tracked event is ever
+  /// cherry-picked or dropped on any path. Each event type is accounted in exactly ONE place, so adding a
+  /// tracked event later means editing only this function:
+  ///   - `SnapshotInstalled` → the sticky snapshot-membership lineage (never cleared; survives the crash that
+  ///     resets the counter, so the membership oracle keeps excluding this node as a log-built witness) AND
+  ///     the per-incarnation install counter.
+  ///   - `ConfChanged` → the per-node conf-change counter AND (from a LOG-BUILT node only — a snapshot-derived
+  ///     node's config could be wire-corrupt) the committed-config transition at its EXACT index, which feeds
+  ///     the membership oracle's persistent step-function reference. A `SnapshotInstalled` drained earlier
+  ///     this pass already set the lineage, so the transition is correctly skipped then.
+  ///   - `ReadState` → the read-linearizability ledger (the cross-leader non-vacuity counter is driven by the
+  ///     SERVE-TIME context set recorded in [`note_read_issue`], not by this later drain).
+  ///
+  /// A deferred snapshot install or a conf-change can COMPLETE inside a pump; routing the pumps here is what
+  /// keeps the lineage AND the committed-config history fed on those paths (the recurring bypass class).
+  /// Returns whether any event was drained.
+  fn drain_node_events(&mut self, i: usize) -> bool {
     let mut drained = false;
     while let Some(ev) = self.nodes[i].poll_event() {
       drained = true;
-      if ev.is_snapshot_installed() {
+      if let sailing_proto::Event::SnapshotInstalled(meta) = &ev {
         self.snapshot_installs[i] += 1;
+        self.snapshot_membership_lineage[i] = true;
+        // An OBSERVED install handed to the membership oracle: its identity (id, boundary) AND the
+        // INSTALL-TIME ConfState the snapshot embedded (from the event's SnapshotMeta — the exact membership
+        // installed, captured before any later apply can drift the node's current config). The oracle compares
+        // THIS fixed value against the committed-config reference at the boundary.
+        self.pending_new_installs.push((
+          self.node_ids[i],
+          meta.last_index().get(),
+          checker::ConfSnapshot::from_conf_state(meta.conf()),
+        ));
       }
-      if ev.is_conf_changed() {
+      if let sailing_proto::Event::ConfChanged(cc) = &ev {
         self.conf_changed[i] += 1;
+        if !self.snapshot_membership_lineage[i] {
+          // Tag the transition with the conf-change ENTRY's term (a non-faulting log lookup — NOT the node's
+          // CURRENT term, which can be higher than the entry it is applying). In async mode a node can apply a
+          // conf-change IN-MEMORY (commit outran durability) that a HIGHER-term entry later truncates and
+          // supersedes at the same log index; the higher entry-term is the committed truth, so the fold uses
+          // it to resolve a same-index conflict (higher wins; a same-(index,term) divergence is a genuine
+          // committed-rewrite bug). `0` if the entry was already compacted out (then superseded by any real
+          // term — another node records the real one).
+          let idx = cc.index();
+          let entry_term = {
+            let commit = self.nodes[i].commit_index();
+            self.logs[i]
+              .committed_entries_no_fault(commit)
+              .iter()
+              .find(|e| e.index() == idx)
+              .map(|e| e.term().get())
+              .unwrap_or(0)
+          };
+          self.pending_transitions.push((
+            idx.get(),
+            entry_term,
+            checker::ConfSnapshot::from_conf_state(cc.conf()),
+          ));
+        }
       }
       if let sailing_proto::Event::ReadState(rs) = ev {
         if self.superseded_read_contexts.remove(rs.context().as_ref()) {
@@ -381,7 +454,7 @@ impl Cluster {
           self.schedule_send(i, to, message);
         }
       }
-      self.drain_events(i);
+      self.drain_node_events(i);
     }
     any_new
   }
@@ -454,6 +527,19 @@ impl Cluster {
     // Fast path: faults off ⇒ original behavior (zero-latency, FIFO, single push). Keeps the
     // sync path byte-identical to the original and never touches the network PRNG or FIFO map.
     if self.net_faults.is_none() {
+      self.bus.push_back(InFlight {
+        deliver_at: self.now,
+        from,
+        to,
+        message,
+      });
+      return true;
+    }
+
+    // Drop-immune node (joint entry only): deliver immediately, exactly once, drawing nothing — so the
+    // reference node never misses an append and never falls behind the compaction boundary. `None` outside
+    // the joint entry, so this branch is never taken there and the stream stays byte-identical.
+    if self.drop_immune_node == Some(from) || self.drop_immune_node == Some(to) {
       self.bus.push_back(InFlight {
         deliver_at: self.now,
         from,
@@ -598,7 +684,7 @@ impl Cluster {
             self.schedule_send(i, to, message);
           }
         }
-        if self.drain_events(i) {
+        if self.drain_node_events(i) {
           progressed = true;
         }
       }
@@ -639,6 +725,10 @@ impl Cluster {
     self.tick_count += 1;
     let view = self.view();
     self.checker.check_or_panic(&view);
+    // The checker has folded this view's committed-config transitions; clear the buffer so the next batch
+    // (including any drained inside a between-tick settle/flush pump) accumulates fresh and is folded next.
+    self.pending_transitions.clear();
+    self.pending_new_installs.clear();
 
     progressed
   }

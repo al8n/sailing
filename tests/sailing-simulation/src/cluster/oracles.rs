@@ -34,6 +34,7 @@ impl Cluster {
             index: e.index().get(),
             term: e.term().get(),
             data: e.data().to_vec(),
+            is_conf_change: e.kind().is_conf_change(),
           })
           .collect();
         // Read the DURABLE (fsync'd) snapshot, NEVER the submit-visible `stable.snapshot()` slot —
@@ -50,6 +51,11 @@ impl Cluster {
           .iter()
           .map(|(idx, cmd)| (idx.get(), cmd.to_vec()))
           .collect();
+        // The node's ACTIVE membership (current/joint halves + learners), read ONCE from the proto's
+        // runtime `conf_state()` (which folds every applied ConfChange and adopts an installed snapshot's
+        // ConfState verbatim). Cloned into the view so the membership-coherence oracle can compare a
+        // snapshot-installed node against a log-built peer at the same applied index.
+        let cs = node.conf_state();
         NodeView {
           id,
           removed: self.removed.contains(&id),
@@ -57,7 +63,7 @@ impl Cluster {
           // from the proto's runtime `conf_state()` (tracks applied ConfChanges), so a learner or a
           // freshly-wired-but-not-yet-applied joiner reports `false` — the quorum-durability oracle
           // uses this as its denominator population so growth/learners don't inflate the quorum.
-          is_voter: node.conf_state().is_voter(&id),
+          is_voter: cs.is_voter(&id),
           poisoned: node.is_poisoned(),
           is_leader: node.role().is_leader(),
           term: node.term().get(),
@@ -70,6 +76,18 @@ impl Cluster {
           durable_entries,
           snapshot_last_index,
           snapshot_last_term,
+          // Whether this node's membership is SNAPSHOT-DERIVED (it installed a transferred snapshot),
+          // from the STICKY lineage flag — NOT the resettable `snapshot_installs` counter, so a node that
+          // installed-then-restarted stays marked (its durable snapshot is its membership source). The
+          // membership oracle keys "under test" on this AND excludes such nodes as the log-built witness;
+          // a LOCAL compaction (durable snapshot but config still log-built) leaves it `false`.
+          installed_snapshot: self.snapshot_membership_lineage[i],
+          conf_voters: cs.voters().clone(),
+          conf_voters_outgoing: cs.voters_outgoing().clone(),
+          conf_learners: cs.learners().clone(),
+          conf_learners_next: cs.learners_next().clone(),
+          conf_auto_leave: cs.auto_leave(),
+          conf_changed: self.conf_changed[i],
           hardstate_commit: stable.hard_state().commit().get(),
           inflight_staged: usize::from(log.has_inflight()) + usize::from(stable.has_inflight()),
           incarnation: self.restarts[i],
@@ -90,6 +108,11 @@ impl Cluster {
         let v = self.committed_voters();
         if v.is_empty() { None } else { Some(v) }
       },
+      // This tick's committed conf-changes from log-built nodes (recorded in `drain_node_events`), for the
+      // membership oracle's step-function reference. Cloned (small — one entry per conf-change this tick).
+      committed_transitions: self.pending_transitions.clone(),
+      // This tick's new transfer installs (id, boundary), for the oracle's observed-install set.
+      new_installs: self.pending_new_installs.clone(),
       nodes,
     }
   }
@@ -100,13 +123,60 @@ impl Cluster {
   pub fn run_oracles(&mut self) {
     let view = self.view();
     self.checker.check_or_panic(&view);
+    // The checker folded this view's committed-config transitions; clear the buffer (see `tick`).
+    self.pending_transitions.clear();
+    self.pending_new_installs.clear();
+  }
+
+  /// Run the membership oracle's run-end final pass: compare every observed install's install-time ConfState
+  /// against the FINAL, now-stable committed-config history at its boundary, panicking with the oracle name +
+  /// seed on a mismatch (for exact VOPR replay). Must run ONCE after the last tick — only then is the history
+  /// final, so no install is judged against a value a later overwrite/ambiguation supersedes. Also populates the
+  /// [`membership_oracle_comparisons`](Self::membership_oracle_comparisons) /
+  /// [`skipped_unwitnessed_installs`](Self::skipped_unwitnessed_installs) counters the report reads.
+  pub fn finalize_membership_or_panic(&mut self, seed: u64) {
+    if let Err(v) = checker::finalize_membership(&mut self.checker) {
+      panic!(
+        "SAFETY ORACLE VIOLATION (run-end final pass): {v}\n  seed={seed}\n  (replay: run_vopr-family \
+         entry for this seed and inspect the snapshot install at the reported boundary)",
+      );
+    }
+  }
+
+  /// How many membership-coherence comparisons the run-end final pass (`checker::finalize_membership`)
+  /// performed; `0` until [`finalize_membership_or_panic`](Self::finalize_membership_or_panic) runs. A sweep
+  /// reads this to assert the membership oracle genuinely COMPARED a snapshot-installed node against the
+  /// committed-config history — a green run where it only ever skipped would be vacuous coverage.
+  pub fn membership_oracle_comparisons(&self) -> u64 {
+    self.checker.membership_comparisons()
+  }
+
+  /// How many observed installs the run-end final pass could NOT compare due to an incomplete committed-config
+  /// HISTORY (boundary beyond the watermark, an unresolved divergence, or an absent reference); `0` until
+  /// [`finalize_membership_or_panic`](Self::finalize_membership_or_panic) runs. A sweep asserts this is `0` — on a
+  /// converged run every boundary's reference is complete + non-ambiguous. Distinct from
+  /// [`kind_unobservable_installs`](Self::kind_unobservable_installs).
+  pub fn skipped_unwitnessed_installs(&self) -> u64 {
+    self.checker.skipped_unwitnessed_installs()
+  }
+
+  /// How many observed installs the run-end final pass SOUNDLY declined because the resolved conf-change index is
+  /// committed-FINAL but its committed-log KIND was compacted before any tick observed it (so a genuine ConfChange
+  /// cannot be told from a compacted-away superseder). The net declines rather than risk a stale verdict — a
+  /// bounded coverage limitation of compaction, not a soundness hole. `0` until the final pass runs.
+  pub fn kind_unobservable_installs(&self) -> u64 {
+    self.checker.kind_unobservable_installs()
   }
 
   /// Borrow the [`Violation`](crate::Violation)-or-`Ok` result of running the suite WITHOUT
   /// panicking — for tests that want to assert the suite is green at a point.
   pub fn check_oracles(&mut self) -> Result<(), checker::Violation> {
     let view = self.view();
-    self.checker.check(&view)
+    let r = self.checker.check(&view);
+    // The checker folded this view's committed-config transitions; clear the buffer (see `tick`).
+    self.pending_transitions.clear();
+    self.pending_new_installs.clear();
+    r
   }
 
   /// True if every non-removed node's applied `(index, command)` sequence agrees as a

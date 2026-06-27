@@ -87,6 +87,7 @@ impl Cluster {
       node_ids.push(id);
     }
     let snapshot_installs = vec![0u64; n];
+    let snapshot_membership_lineage = vec![false; n];
     let restarts = vec![0u64; n];
     let conf_changed = vec![0u64; n];
     let read_states = vec![Vec::new(); n];
@@ -103,13 +104,17 @@ impl Cluster {
       removed: BTreeSet::new(),
       grants: BTreeMap::new(),
       snapshot_installs,
+      snapshot_membership_lineage,
+      pending_new_installs: Vec::new(),
       multi_chunk_deliveries: 0,
       restarts,
       node_configure,
       conf_changed,
+      pending_transitions: Vec::new(),
       read_states,
       async_mode,
       net_faults: NetworkFaults::none(),
+      drop_immune_node: None,
       // Network-fault PRNG seed: derived from the cluster seed on a stream DISTINCT from the
       // per-node store seeds (which use `seed ^ id` / `seed.rotate_left(32) ^ id`), so the network
       // schedule is reproducible yet independent of storage faults. `0x4E_4554` spells "NET".
@@ -205,6 +210,7 @@ impl Cluster {
     }
     self.configs.push(base);
     self.snapshot_installs.push(0);
+    self.snapshot_membership_lineage.push(false);
     self.restarts.push(0);
     self.conf_changed.push(0);
     self.read_states.push(Vec::new());

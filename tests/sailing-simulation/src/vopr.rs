@@ -54,6 +54,15 @@ use std::{collections::BTreeSet, vec::Vec};
 /// quorum (and never trips the proto's `EmptyVoterSet` apply-time poison).
 const MIN_VOTERS: usize = 2;
 
+/// The founder voter the joint-membership entry NEVER faults (never partitions, crashes, or removes), so it
+/// stays connected and applies every committed entry from its log — a PERPETUALLY log-built, current node.
+/// It is what keeps `snapshot_membership_coherent`'s committed-config history complete up to the frontier:
+/// without a node that reaches each committed index purely by applying the log, a configuration only ever
+/// adopted via snapshot transfer has no independent ground truth, and an install there could not be checked.
+/// Only the joint entry honours it (every other entry leaves this `false`, unchanged); the other founders
+/// and all added nodes still churn, so the chaos and the snapshot/learner coverage are undiminished.
+const REFERENCE_NODE: u64 = 0;
+
 /// The number of distinct KEYS the keyed-value workload writes to (and the per-key VALUE oracle reads
 /// from). The client payload is a `(key, value)` pair so the oracle can assert per-key linearizability
 /// — a confirmed read of a key must never observe a value older than the one committed for that key at
@@ -264,6 +273,34 @@ pub struct VoprReport {
   /// Count of delivered MULTI-chunk `InstallSnapshot` chunks (offset > 0) — the chunking-coverage
   /// non-vacuity witness (a single-chunk transfer only ever delivers offset 0).
   pub multi_chunk_snapshots: u64,
+  /// Non-vacuity WITNESS for the joint-membership × snapshot entry: snapshot installs (transfer-received)
+  /// observed AFTER the first conf-change committed — i.e. into a membership lineage that went through a
+  /// joint transition. `0` outside `run_vopr_joint_snapshot`. A positive count proves a lagging node
+  /// actually snapshot-installed a joint-produced configuration (the scenario `snapshot_membership_coherent`
+  /// judges).
+  pub joint_snapshot_installs: u64,
+  /// Non-vacuity WITNESS: the number of times the partition action isolated a LEARNER (not a voter). `0`
+  /// outside the joint-membership entry (only it targets learners). A positive count proves the
+  /// lagging-learner path — a learner partitioned away from calm-window progress — was actually exercised.
+  pub learner_partitions: u64,
+  /// Total proactive lease-refresh no-ops fired across the run (`Endpoint::lease_refreshes` summed over
+  /// nodes) — the non-vacuity witness that an `OnExpiry` / `Continuous` refresh ACTUALLY re-anchored the
+  /// lease. `0` for the demand-driven `Off` default and for every non-LeaseGuard run.
+  pub lease_refreshes_fired: u64,
+  /// Total times the `snapshot_membership_coherent` oracle actually COMPARED a snapshot-installed node
+  /// against the committed-config history across the run (summed over ticks). The joint-snapshot sweep
+  /// asserts this is `> 0` to prove the oracle genuinely judged a membership rather than skipping every
+  /// install.
+  pub membership_oracle_comparisons: u64,
+  /// Observed installs the membership oracle could NOT witness due to an incomplete committed-config HISTORY (a
+  /// boundary beyond the completeness watermark or an unresolved divergence) at run end. The joint-snapshot sweep
+  /// asserts this is `0` — a converged run has a complete, non-ambiguous reference for every install.
+  pub skipped_unwitnessed_installs: u64,
+  /// Observed installs the membership oracle SOUNDLY DECLINED because the resolved conf-change index is
+  /// committed-final but its committed-log KIND was compacted before any tick observed it (so a genuine ConfChange
+  /// cannot be told from a compacted-away superseder). A bounded coverage limitation of compaction, not a
+  /// soundness hole — the net never trusts a possibly-stale ConfChange.
+  pub kind_unobservable_installs: u64,
 }
 
 /// The weighted action menu. Client load dominates; faults are frequent but not constant; structural
@@ -725,7 +762,7 @@ impl ReadLedger {
 /// progress within a generous bound), or a quiesce failure (a fully-healed cluster failed to
 /// converge / apply the committed history).
 pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, false, false, None)
+  run_vopr_inner(seed, ticks, false, false, false, None, false, false)
 }
 
 /// Like [`run_vopr`] but additionally draws the proactive [`sailing_proto::LeaseRefresh`] sub-coin on
@@ -736,7 +773,7 @@ pub fn run_vopr(seed: u64, ticks: usize) -> VoprReport {
 /// that coverage. Only the dedicated lease-refresh coverage opts into the volume.
 #[cfg(test)]
 pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, true, false, false, None)
+  run_vopr_inner(seed, ticks, true, false, false, None, false, false)
 }
 
 /// Like [`run_vopr`] but additionally opts into mid-run READ-MODE migrations: the leader occasionally
@@ -747,7 +784,7 @@ pub(crate) fn run_vopr_refresh(seed: u64, ticks: usize) -> VoprReport {
 /// migration coverage opts in; the read-linearizability oracle judges reads across each migration.
 #[cfg(test)]
 pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, true, false, None)
+  run_vopr_inner(seed, ticks, false, true, false, None, false, false)
 }
 
 /// Like [`run_vopr`] but arms the seeded COLD-read fault on every node: a fraction of committed-range
@@ -758,7 +795,7 @@ pub(crate) fn run_vopr_migrate(seed: u64, ticks: usize) -> VoprReport {
 /// only the per-store read PRNG, so the master action/topology stream is unchanged.
 #[cfg(test)]
 pub(crate) fn run_vopr_cold(seed: u64, ticks: usize) -> VoprReport {
-  run_vopr_inner(seed, ticks, false, false, true, None)
+  run_vopr_inner(seed, ticks, false, false, true, None, false, false)
 }
 
 /// Like [`run_vopr_cold`] but additionally lowers `snapshot_threshold` to a MODERATE seed-derived value
@@ -777,9 +814,68 @@ pub(crate) fn run_vopr_cold_compacting(seed: u64, ticks: usize) -> VoprReport {
   // sub-PRNG distinct from every master/sub stream so it draws nothing the master run observes.
   let mut p = FaultPrng::new(seed.rotate_left(32) ^ 0x534E_4150_5448_5231); // "SNAPTHR1"
   let threshold = 256 + (p.next_u64() % 256) as usize; // 256..=511
-  run_vopr_inner(seed, ticks, false, false, true, Some(threshold))
+  run_vopr_inner(
+    seed,
+    ticks,
+    false,
+    false,
+    true,
+    Some(threshold),
+    false,
+    false,
+  )
 }
 
+/// Like [`run_vopr_cold_compacting`]'s compaction setup (a lowered `snapshot_threshold` so the cluster
+/// streams a snapshot to a lagging node mid-run) but, instead of the cold fault, drives JOINT membership
+/// changes — every conf-change is proposed as a `ConfChangeV2` with the `Implicit` (auto-leaving) transition,
+/// which enters a real joint configuration before the auto-appended leave entry simplifies it. With a node
+/// lagging (partitioned, including LEARNERS), that node snapshot-installs a configuration whose `ConfState`
+/// was produced through a joint transition, exercising `snapshot_membership_coherent` against the highest-value
+/// membership shape. A SEPARATE entry (the `joint` flag) so `run_vopr` and every other entry stay
+/// byte-identical: the flag only changes HOW a conf-change is submitted (v2-implicit vs v1) and lets the
+/// partition action also target a learner — neither alters the master PRNG draws of a non-joint run. The
+/// threshold is drawn from a DEDICATED sub-stream, so the master action/topology stream observes nothing of it.
+#[cfg(test)]
+pub(crate) fn run_vopr_joint_snapshot(seed: u64, ticks: usize) -> VoprReport {
+  let mut p = FaultPrng::new(seed.rotate_left(28) ^ 0x4A4F_494E_5448_5231); // "JOINTHR1"
+  let threshold = 256 + (p.next_u64() % 256) as usize; // 256..=511
+  run_vopr_inner(
+    seed,
+    ticks,
+    false,
+    false,
+    false,
+    Some(threshold),
+    true,
+    false,
+  )
+}
+
+/// Like [`run_vopr_cold_compacting`]'s compaction setup but FORCES the LeaseGuard FAILOVER clock tier (a
+/// synchronized wall carrying a per-node bounded, re-syncing OFFSET) instead of the cold fault, so a snapshot
+/// install RACES a backward wall-offset resync — the precise commit-anchor's release path overlapping the
+/// chunked transfer + install, under worst-case cross-node wall skew. A SEPARATE entry (the `force_failover`
+/// flag) so every other entry stays byte-identical: the master `read_mode` draw still happens (the stream
+/// stays aligned), only its SELECTION is overridden to the failover tier. The threshold is drawn from a
+/// DEDICATED sub-stream. The run staying read-linearizable across the transfer IS the safety assertion.
+#[cfg(test)]
+pub(crate) fn run_vopr_failover_compacting(seed: u64, ticks: usize) -> VoprReport {
+  let mut p = FaultPrng::new(seed.rotate_left(36) ^ 0x4641_494C_5448_5231); // "FAILTHR1"
+  let threshold = 256 + (p.next_u64() % 256) as usize; // 256..=511
+  run_vopr_inner(
+    seed,
+    ticks,
+    false,
+    false,
+    false,
+    Some(threshold),
+    false,
+    true,
+  )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_vopr_inner(
   seed: u64,
   ticks: usize,
@@ -787,6 +883,8 @@ fn run_vopr_inner(
   migrate: bool,
   cold: bool,
   snapshot_threshold: Option<usize>,
+  joint: bool,
+  force_failover: bool,
 ) -> VoprReport {
   // The single master PRNG. Every draw in the run comes from here (deterministic from `seed`).
   let mut prng = FaultPrng::new(seed ^ 0x564F_5052_5F5F_5631); // "VOPR__V1"
@@ -802,6 +900,20 @@ fn run_vopr_inner(
   // ε_drift=50ms < the 1000ms election timeout (the LeaseGuard validity bound). Drawn from the
   // master PRNG like every other choice.
   let read_mode = prng.next_u64() % 4;
+  // The failover-compacting entry FORCES the LeaseGuard failover tier (read_mode 3 + failover) regardless of
+  // the draw, so a snapshot install reliably races the wall-offset resync. The joint entry FORCES
+  // CheckQuorum (read_mode 1): its heavy membership turnover (founders removed, peers added/demoted) churns
+  // leadership, and CheckQuorum makes a superseded/partitioned leader STEP DOWN so the cluster reconverges to
+  // a single leader — without it a stale leader keeps `leader_count > 1` and the calm window cannot settle.
+  // The master draw above still happens (so the stream stays aligned with a normal run); only the SELECTION
+  // is overridden. Every other entry passes both flags `false`, so this is a transparent no-op for them.
+  let read_mode = if force_failover {
+    3
+  } else if joint {
+    1
+  } else {
+    read_mode
+  };
   // Within the LeaseGuard read mode, split into two MUTUALLY-EXCLUSIVE clock regimes, chosen from a
   // DEDICATED sub-seed so the master PRNG stream (every other choice + every non-LeaseGuard run) is
   // untouched and bit-for-bit unchanged:
@@ -813,10 +925,10 @@ fn run_vopr_inner(
   //     otherwise never fire in a randomized run. Complementary per the failover design: drift keeps
   //     the basic-mode coverage, and the successor's own rate drift is irrelevant to the wall-LEVEL
   //     precise release (its window absorbs the predecessor's monotonic drift).
-  let failover = read_mode == 3 && {
+  let failover = (read_mode == 3 && {
     let mut p = FaultPrng::new(seed.rotate_left(24) ^ 0x4F46_4653_4554_5631); // "OFFSETV1"
     (p.next_u64() & 1) == 1
-  };
+  }) || force_failover;
   // ASYMMETRIC sub-coin + the per-resync violation factor: ONE dedicated stream (a fresh, unused
   // rotation), drawn ONLY when `failover` so non-failover AND offset runs keep their master/off_prng
   // streams bit-for-bit unchanged. The asymmetric path draws a BACKWARD-only contract violation; a stale
@@ -824,7 +936,11 @@ fn run_vopr_inner(
   // serve and release gates are exact duals on the same wall floor, so holding a window open wedges that
   // leader's own commit-wait; detection is proven by `value_oracle_panics_on_stale_inherited_serve`).
   let mut asym_prng = FaultPrng::new(seed.rotate_left(20) ^ 0x4153_594D_4D45_5431); // "ASYMMET1"
-  let asymmetric = failover && (asym_prng.next_u64() & 1) == 1;
+  // The forced failover-compacting entry stays NON-asymmetric (valid skew only): a normal `resync_offsets`
+  // already steps the wall BACKWARD within ±ε_unc, which is the race the entry wants, without the
+  // contract-violating injection complicating a snapshot transfer. `!force_failover` short-circuits BEFORE
+  // the draw, so a normal failover run is byte-identical (it still draws exactly when `failover`).
+  let asymmetric = failover && !force_failover && (asym_prng.next_u64() & 1) == 1;
   let drifted = read_mode == 3 && !failover;
   // HETEROGENEOUS failover sub-variant: with a coin (a DEDICATED sub-seed, drawn only when `failover`, so
   // non-failover runs stay bit-identical), make ONE voter NON-armed — Safe mode but STILL carrying ε_unc.
@@ -893,6 +1009,13 @@ fn run_vopr_inner(
     }
   });
 
+  // Joint entry: make the reference node immune to network drops too, so it never misses an append, never
+  // falls behind the compaction boundary, and never snapshot-installs — staying a perpetual log-built,
+  // current node that keeps the membership oracle's committed-config history complete to the frontier.
+  if joint {
+    c.set_drop_immune_node(Some(REFERENCE_NODE));
+  }
+
   // DRIFT sub-mode: install per-node clock RATE drift bounded by ε/Δ from a dedicated sub-seed (the one
   // thing that exercises the conservative cross-leader commit-wait: a slow deposed leader's lease
   // outlives a fast successor's wait in real time only if the Δ·(Δ+ε)/(Δ−ε) window is too short, which
@@ -939,6 +1062,12 @@ fn run_vopr_inner(
       // field assignment draws NOTHING from `prng` — the master stream stays byte-identical.
       sf.cold_fetch_per_mille = 80;
     }
+    // The joint entry keeps the reference node fault-free so it is never poisoned and stays current — a
+    // perpetual log-built node whose applied frontier keeps the committed-config history complete. The draw
+    // above still happens, so only the override differs (a non-joint run is byte-identical).
+    if joint && id == REFERENCE_NODE {
+      sf = StorageFaults::none();
+    }
     c.set_node_faults(id, sf, seed.wrapping_add(id).rotate_left(11));
   }
 
@@ -966,6 +1095,12 @@ fn run_vopr_inner(
     final_cluster_size: size,
     ..VoprReport::default()
   };
+
+  // Joint-snapshot witness baseline (joint entry only): the cumulative snapshot-install count captured the
+  // FIRST tick a conf-change has committed. Every later install is into a membership lineage that went
+  // through a joint transition, so the run-end delta is exactly the lagging-node-installs-a-joint-config
+  // count. `None` until the first committed conf-change; stays `None` (witness 0) in non-joint runs.
+  let mut joint_installs_baseline: Option<u64> = None;
 
   // Elect an initial leader (bounded). A fresh async cluster under modest faults must elect; if it
   // cannot even from a clean start, that is itself a liveness bug.
@@ -1012,11 +1147,11 @@ fn run_vopr_inner(
     let action = pick_action(&mut prng);
     match action {
       Action::ClientLoad => client_load(&mut c, &mut st, &mut prng, &mut report),
-      Action::Partition => partition(&mut c, &mut st, &mut prng, &mut report),
+      Action::Partition => partition(&mut c, &mut st, &mut prng, &mut report, joint),
       Action::Heal => heal_one(&mut c, &mut st, &mut prng, &mut report),
-      Action::Crash => crash_one(&mut c, &mut st, &mut prng, &mut report),
-      Action::ConfChange => conf_change(&mut c, &mut st, &mut prng, &mut report),
-      Action::FaultReroll => fault_reroll(&mut c, &st, &mut prng, seed),
+      Action::Crash => crash_one(&mut c, &mut st, &mut prng, &mut report, joint),
+      Action::ConfChange => conf_change(&mut c, &mut st, &mut prng, &mut report, joint),
+      Action::FaultReroll => fault_reroll(&mut c, &st, &mut prng, seed, joint),
       Action::ReadIndex => read_index_load(&mut c, &st, &mut reads, &mut prng, &mut report, seed),
       Action::TransferLeader => transfer_leader(&mut c, &st, &mut prng, &mut report),
     }
@@ -1040,6 +1175,12 @@ fn run_vopr_inner(
     observe(&mut c, &mut st, &mut report);
     reads.scan(&c, &mut report, seed);
     refresh_conf_in_flight(&c, &mut st);
+
+    // Joint entry only: latch the snapshot-install baseline at the first committed conf-change, so the
+    // run-end delta counts only installs into a joint-produced membership lineage.
+    if joint && joint_installs_baseline.is_none() && c.total_conf_changed() > 0 {
+      joint_installs_baseline = Some(c.total_snapshot_installs());
+    }
 
     if iter + 1 >= next_calm {
       calm_window(&mut c, &mut st, &mut prng, &mut report, seed);
@@ -1088,6 +1229,23 @@ fn run_vopr_inner(
   // FAILOVER non-vacuity: how many times the precise commit-anchor early-released, summed over live
   // nodes. `0` outside the failover sub-mode (no synchronized wall ⇒ the anchor never fires).
   report.precise_releases = c.precise_releases_total();
+  // Proactive lease-refresh non-vacuity: total re-anchoring no-ops fired across nodes. `0` for the
+  // demand-driven `Off` default and every non-LeaseGuard run.
+  report.lease_refreshes_fired = c.total_lease_refreshes();
+  // Joint-snapshot non-vacuity: installs (transfer-received) observed AFTER the first conf-change
+  // committed — i.e. into a joint-produced membership lineage (including the quiesce catch-up installs).
+  // `0` outside the joint entry (the baseline is never latched).
+  if let Some(base) = joint_installs_baseline {
+    report.joint_snapshot_installs = c.total_snapshot_installs().saturating_sub(base);
+  }
+  // Membership-oracle VERDICT: the run-end final pass compares every observed install's install-time ConfState
+  // against the FINAL, now-stable committed-config history (a per-tick verdict could bless an install against a
+  // reference a later higher-term overwrite/ambiguation supersedes). Panics on a mismatch; populates the
+  // non-vacuity counters below. The joint-snapshot sweep asserts comparisons `> 0` AND skipped `== 0`.
+  c.finalize_membership_or_panic(seed);
+  report.membership_oracle_comparisons = c.membership_oracle_comparisons();
+  report.skipped_unwitnessed_installs = c.skipped_unwitnessed_installs();
+  report.kind_unobservable_installs = c.kind_unobservable_installs();
   report
 }
 
