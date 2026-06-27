@@ -58,6 +58,10 @@ pub struct Conn<I, R> {
   /// decoder. A field (cleared per pass) rather than a per-iteration `Vec::new()` — `handle_data`
   /// runs once per socket read, so the allocation churn would be steady per-chunk overhead.
   scratch: Vec<u8>,
+  /// Per-connection outbound encoder: caches the snapshot-transfer meta so a chunked `InstallSnapshot`
+  /// encodes its (identical) `SnapshotMeta` once per transfer rather than once per chunk. Byte-identical
+  /// to the stateless `wire::encode_message`.
+  encoder: crate::wire::MessageEncoder<I>,
 }
 
 impl<I: NodeId, R: RecordIo> Conn<I, R> {
@@ -71,6 +75,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       out_pos: 0,
       max_out: MAX_CONN_OUT_BUF,
       scratch: Vec::new(),
+      encoder: crate::wire::MessageEncoder::new(),
     }
   }
 
@@ -165,7 +170,19 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     if self.peer().is_none() {
       return Ok(());
     }
-    while let Some(frame) = self.decoder.poll()? {
+    loop {
+      // A latched decoder fault (an oversized frame → `FrameTooLarge`) is a transport fault: close the
+      // connection as integrity-suspect — the SAME close path as a malformed envelope below — BEFORE
+      // propagating, so the close-on-transport-fault invariant holds for any owner (it clears the
+      // encoder cache and sets `Closed`), not only the router that drops the `Conn` after an `Err`.
+      let frame = match self.decoder.poll() {
+        Ok(Some(frame)) => frame,
+        Ok(None) => break,
+        Err(e) => {
+          self.close_suspect();
+          return Err(e);
+        }
+      };
       // ZERO-COPY: the frame is a shared slice of the decoder's buffer, and the wire decode
       // slices the message's `Bytes` fields (entry payloads, blobs, contexts, encoded ids) out
       // of the SAME allocation; a frame must carry exactly one well-formed envelope.
@@ -194,7 +211,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       return;
     }
     let mut payload = Vec::new();
-    crate::wire::encode_message(msg, &mut payload);
+    self.encoder.encode_message(msg, &mut payload);
     // The bound covers EVERY layer of outbound buffering: this connection's pending frames PLUS
     // whatever the record layer (and its inner layers) already hold — `buffered_outbound` is the
     // occupancy projection that keeps the cap from drifting per layer.
@@ -233,6 +250,9 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     self.out_plain = Vec::new();
     self.out_pos = 0;
     self.scratch = Vec::new();
+    // The encoder's snapshot-meta cache is an outbound resource; drop it on close so a closed-but-not-yet-
+    // reaped connection retains no cached metadata (the size bound + completion clear already bound it).
+    self.encoder.clear();
   }
 
   /// Drain queued outbound wire bytes into `out`, returning the number written.

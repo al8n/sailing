@@ -937,3 +937,201 @@ fn install_snapshot_encoded_len_agrees_with_encoder() {
     }
   }
 }
+
+/// [`MessageEncoder`] must produce BYTE-IDENTICAL frames to the stateless [`encode_message`] for every
+/// message — exercising the snapshot-meta cache across HITs (consecutive chunks of one transfer),
+/// MISSes (a superseding meta, and a same-identity-but-different-bounds meta whose body differs even
+/// though `identity_eq` matches), and non-snapshot messages interleaved between chunks (which must leave
+/// the cache untouched). This is the guarantee the cached splice stays in lockstep with the encoder.
+#[test]
+fn encoder_is_byte_identical_to_encode_message() {
+  fn assert_same(enc: &mut MessageEncoder<u64>, msg: &Message<u64>) {
+    let mut want = Vec::new();
+    encode_message(msg, &mut want);
+    let mut got = Vec::new();
+    enc.encode_message(msg, &mut got);
+    assert_eq!(got, want, "encoder must match encode_message for {msg:?}");
+  }
+
+  let meta_a = SnapshotMeta::new(
+    Index::new(5000),
+    Term::new(6),
+    ConfState::new([1u64, 2, 3, 4, 5], [9u64], [1u64, 2, 3], [7u64], true),
+  );
+  // SAME identity as `meta_a` (equal last_index/last_term/conf) but DIFFERENT bounds: `identity_eq`
+  // matches yet the encoded body differs, so the cache (keyed on the FULL meta) must miss and re-encode.
+  let meta_a_bounded = meta_a.clone().with_max_lease_window(123_456);
+  // A genuinely different (superseding) meta.
+  let meta_b = SnapshotMeta::new(
+    Index::new(9000),
+    Term::new(7),
+    ConfState::from_voters([10u64, 20, 30]),
+  )
+  .with_read_only(ReadOnlyOption::LeaseGuard);
+
+  // Single-message agreement across the field space (mirrors the encoded-len corpus); a fresh encoder
+  // each time isolates the splice from the cache.
+  for (term_raw, leader, offset, total) in [
+    (0u64, 1u64, 0u64, 0u64),
+    (5, 7, 0, 0),
+    (5, 7, 4096, 60 << 20),
+    (u64::MAX, u64::MAX, u64::MAX, u64::MAX),
+  ] {
+    let term = Term::new(term_raw);
+    for meta in [&meta_a, &meta_a_bounded, &meta_b] {
+      for data_len in [0u64, 1, 100, 65536] {
+        let msg = Message::InstallSnapshot(InstallSnapshot::new_chunk(
+          term,
+          leader,
+          meta.clone(),
+          Bytes::from(std::vec![0xCDu8; data_len as usize]),
+          offset,
+          total,
+        ));
+        assert_same(&mut MessageEncoder::new(), &msg);
+      }
+    }
+  }
+
+  // A realistic transfer through ONE encoder: many chunks of `meta_a` (cache HITs) with a heartbeat
+  // interleaved between chunks (the cache must stay untouched), then a supersede.
+  let mut enc = MessageEncoder::new();
+  let total = 10_000u64;
+  let chunk = 2048u64;
+  let mut offset = 0u64;
+  while offset < total {
+    let len = chunk.min(total - offset);
+    assert_same(
+      &mut enc,
+      &Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(6),
+        1u64,
+        meta_a.clone(),
+        Bytes::from(std::vec![0xABu8; len as usize]),
+        offset,
+        total,
+      )),
+    );
+    assert_same(
+      &mut enc,
+      &Message::Heartbeat(Heartbeat::new(
+        Term::new(6),
+        1u64,
+        Index::new(offset),
+        Bytes::new(),
+      )),
+    );
+    offset += len;
+  }
+  // Supersede with a different meta (miss + re-cache), then the same-identity-different-bounds meta
+  // (must NOT reuse the stale body), then back to `meta_a`.
+  for meta in [&meta_b, &meta_a_bounded, &meta_a] {
+    assert_same(
+      &mut enc,
+      &Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(7),
+        2u64,
+        meta.clone(),
+        Bytes::from_static(b"tail"),
+        0,
+        4,
+      )),
+    );
+  }
+}
+
+/// The snapshot-meta cache is MEMORY-BOUNDED: a body over [`SNAPSHOT_META_CACHE_MAX_BYTES`] is not
+/// cached (it re-encodes per chunk, still byte-identical), the cache RELEASES the moment a transfer
+/// completes (the final chunk, or a legacy single-shot), and [`MessageEncoder::clear`] drops it on
+/// teardown. The cache is a pure optimization, so output is byte-identical whether cached or not.
+#[test]
+fn encoder_cache_is_bounded_and_clears() {
+  fn chunk(meta: &SnapshotMeta<u64>, offset: u64, len: usize, total: u64) -> Message<u64> {
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(6),
+      1u64,
+      meta.clone(),
+      Bytes::from(std::vec![0xAB; len]),
+      offset,
+      total,
+    ))
+  }
+  fn assert_same(enc: &mut MessageEncoder<u64>, msg: &Message<u64>) {
+    let mut want = Vec::new();
+    encode_message(msg, &mut want);
+    let mut got = Vec::new();
+    enc.encode_message(msg, &mut got);
+    assert_eq!(
+      got, want,
+      "cache state must never change the bytes: {msg:?}"
+    );
+  }
+
+  let small = SnapshotMeta::new(
+    Index::new(7),
+    Term::new(6),
+    ConfState::from_voters([1u64, 2, 3]),
+  );
+  // Enough u64 voters that the encoded body comfortably exceeds the threshold (>= 3 bytes per id-entry,
+  // so 40_000 entries > 64 KiB regardless of the id's own encoding width).
+  let big = SnapshotMeta::new(
+    Index::new(7),
+    Term::new(6),
+    ConfState::from_voters(1..=40_000u64),
+  );
+
+  // SIZE BOUND: a small meta is cached (within the threshold); an over-threshold meta is NOT — both
+  // byte-identical, and the big one supersedes (clears) the small entry rather than pinning either.
+  let mut enc = MessageEncoder::new();
+  assert_same(&mut enc, &chunk(&small, 0, 8, 1_000_000));
+  assert!(
+    enc
+      .cached_body_len()
+      .is_some_and(|n| n <= SNAPSHOT_META_CACHE_MAX_BYTES),
+    "a small meta must be cached within the threshold"
+  );
+  assert_same(&mut enc, &chunk(&big, 0, 8, 1_000_000));
+  assert_eq!(
+    enc.cached_body_len(),
+    None,
+    "an over-threshold meta must not be cached"
+  );
+  // A repeat of the big meta still re-encodes byte-identically (no cache to hit).
+  assert_same(&mut enc, &chunk(&big, 8, 8, 1_000_000));
+  assert_eq!(enc.cached_body_len(), None);
+
+  // COMPLETION CLEAR: the final chunk (is_last) of a small transfer releases the cache.
+  let mut enc = MessageEncoder::new();
+  assert_same(&mut enc, &chunk(&small, 0, 8, 16)); // non-final (8 < 16) → cached
+  assert!(enc.cached_body_len().is_some());
+  assert_same(&mut enc, &chunk(&small, 8, 8, 16)); // is_last (8 + 8 == 16) → released
+  assert_eq!(
+    enc.cached_body_len(),
+    None,
+    "a completed transfer must release the cache"
+  );
+
+  // A legacy single-shot (total_len == 0) retains nothing.
+  let mut enc = MessageEncoder::new();
+  assert_same(
+    &mut enc,
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(6),
+      1u64,
+      small.clone(),
+      Bytes::from_static(b"blob"),
+    )),
+  );
+  assert_eq!(
+    enc.cached_body_len(),
+    None,
+    "a single-shot must not retain a cache"
+  );
+
+  // TEARDOWN: clear() drops the cache.
+  let mut enc = MessageEncoder::new();
+  assert_same(&mut enc, &chunk(&small, 0, 8, 1_000_000));
+  assert!(enc.cached_body_len().is_some());
+  enc.clear();
+  assert_eq!(enc.cached_body_len(), None);
+}

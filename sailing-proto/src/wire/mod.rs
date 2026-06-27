@@ -35,7 +35,7 @@
 
 use crate::{
   ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-  EntryKind, Index, Message, NodeId, SnapshotMeta, Term,
+  EntryKind, Index, InstallSnapshot, Message, NodeId, SnapshotMeta, Term,
   data::{Data, DecodeError},
 };
 use buffa::{EnumValue, Message as _};
@@ -168,6 +168,177 @@ pub(crate) fn id_within_wire_bound<I: Data>(id: &I) -> bool {
 /// transports and the simulation harness all route through here).
 pub fn encode_message<I: NodeId>(msg: &Message<I>, buf: &mut Vec<u8>) {
   pb_message(msg).encode(buf);
+}
+
+/// The largest encoded `SnapshotMeta` body the [`MessageEncoder`] will CACHE. A normal `ConfState` is a
+/// handful of node ids — hundreds of bytes — and even a multi-thousand-node cluster encodes to a few tens
+/// of KiB, so the common case is always cached. A pathologically large but VALID `ConfState` (membership
+/// validity does not bound the encoded size, and a metadata-only `InstallSnapshot` frame may approach
+/// [`MAX_FRAME_BYTES`]) is NOT cached — it re-encodes per chunk (rare, frame-bounded) rather than pinning
+/// up to ~`MAX_FRAME_BYTES` of encoded metadata per long-lived connection. 64 KiB is ~1/1024 of
+/// `MAX_FRAME_BYTES`, so the worst-case cached body per connection is bounded to this.
+const SNAPSHOT_META_CACHE_MAX_BYTES: usize = 64 * 1024;
+
+/// A stateful [`encode_message`] that caches the encoded [`SnapshotMeta`] body across the chunks of a
+/// single snapshot transfer.
+///
+/// Every chunk of a chunked `InstallSnapshot` carries the IDENTICAL [`SnapshotMeta`] (only `data` and
+/// `offset` differ), whose `ConfState` otherwise costs one [`Bytes`] allocation per member id to
+/// rebuild on every chunk. Encoding that body once and splicing it into each chunk's frame removes the
+/// per-chunk rebuild — the win confirmed by the `snapshot_transfer` codec bench.
+///
+/// The output is BYTE-IDENTICAL to [`encode_message`]: the spliced `InstallSnapshot` frame writes the
+/// exact same field bytes buffa's generated encoder would (the same tags and varints around the same
+/// `pb::SnapshotMeta` body), pinned by `encoder_is_byte_identical_to_encode_message`. The cache is a
+/// single entry keyed on the FULL meta — identity AND the LeaseGuard / read-mode bounds — so a
+/// SUPERSEDING snapshot, or any meta difference, misses and re-encodes; a non-`InstallSnapshot` message
+/// leaves the cache untouched and routes through the stateless [`encode_message`]. Hold one per outbound
+/// connection so every chunk of a transfer hits.
+///
+/// The cache is MEMORY-BOUNDED: it holds at most [`SNAPSHOT_META_CACHE_MAX_BYTES`] (a large meta is not
+/// cached at all), it is released the moment a transfer COMPLETES (the final chunk, or a legacy
+/// single-shot), and it can be dropped on connection teardown via [`clear`](Self::clear) — so nothing is
+/// retained after a transfer. Clearing never affects output (a cleared cache simply re-encodes).
+#[derive(Debug)]
+pub struct MessageEncoder<I> {
+  /// The last meta encoded and its encoded body (the `pb::SnapshotMeta` message bytes, no field
+  /// tag/length prefix). `None` until the first `InstallSnapshot` is encoded.
+  snapshot_meta: Option<(SnapshotMeta<I>, Bytes)>,
+}
+
+impl<I: NodeId> Default for MessageEncoder<I> {
+  fn default() -> Self {
+    Self::new()
+  }
+}
+
+impl<I: NodeId> MessageEncoder<I> {
+  /// A fresh encoder with an empty cache.
+  pub const fn new() -> Self {
+    Self {
+      snapshot_meta: None,
+    }
+  }
+
+  /// Drop the cached snapshot-transfer meta, releasing its memory. Call on connection teardown so a
+  /// closed-but-not-yet-dropped connection retains nothing. A no-op on output (the next encode re-encodes).
+  pub fn clear(&mut self) {
+    self.snapshot_meta = None;
+  }
+
+  /// The cached body length, for tests that assert the cache state (size bound + completion clear).
+  #[cfg(test)]
+  pub(crate) fn cached_body_len(&self) -> Option<usize> {
+    self.snapshot_meta.as_ref().map(|(_, body)| body.len())
+  }
+
+  /// Encode one consensus message into `buf`, reusing the cached snapshot-transfer meta when `msg` is an
+  /// `InstallSnapshot` whose meta matches the one last encoded. Byte-identical to [`encode_message`].
+  pub fn encode_message(&mut self, msg: &Message<I>, buf: &mut Vec<u8>) {
+    match msg {
+      Message::InstallSnapshot(is) => self.encode_install_snapshot(is, buf),
+      other => encode_message(other, buf),
+    }
+  }
+
+  /// The encoded `pb::SnapshotMeta` body for `meta` (no field tag/length prefix), reused from the cache
+  /// on a full-meta match or recomputed on a miss. The returned [`Bytes`] is an O(1) refcount handle on a
+  /// hit; a miss clones the meta into the cache (once per transfer / supersede) — UNLESS the body exceeds
+  /// [`SNAPSHOT_META_CACHE_MAX_BYTES`], in which case it is NOT cached (a stale smaller entry is cleared)
+  /// so a pathologically large meta cannot pin up to ~`MAX_FRAME_BYTES` of metadata on the connection.
+  fn meta_body(&mut self, meta: &SnapshotMeta<I>) -> Bytes {
+    if let Some((cached, body)) = &self.snapshot_meta
+      && cached == meta
+    {
+      return body.clone();
+    }
+    let body = pb_snapshot_meta(meta).encode_to_bytes();
+    // Replace the (now-stale, different-meta) entry on a miss. Cache the new body only when it is small;
+    // a large body is dropped here (`None`) rather than pinned — the next chunk re-encodes it (rare, and
+    // each re-encode is itself frame-bounded). A no-op on output either way (the splice uses `body`).
+    self.snapshot_meta = if body.len() <= SNAPSHOT_META_CACHE_MAX_BYTES {
+      Some((meta.clone(), body.clone()))
+    } else {
+      None
+    };
+    body
+  }
+
+  /// Splice one `InstallSnapshot` frame, reusing the cached meta body. Mirrors buffa's generated encode
+  /// of the `pb::Message::InstallSnapshot` oneof arm (field 7, length-delimited) wrapping the
+  /// InstallSnapshot body fields 1..=6 in ascending order, each gated on its proto3 default — so the
+  /// bytes match [`encode_message`] exactly. The same buffa primitives the generated encoder uses write
+  /// the tags/varints/bytes, so only the field order and gating are restated here.
+  fn encode_install_snapshot(&mut self, is: &InstallSnapshot<I>, buf: &mut Vec<u8>) {
+    use buffa::{
+      encoding::{Tag, WireType, encode_varint, varint_len},
+      types::{bytes_encoded_len, encode_bytes, encode_uint64, uint64_encoded_len},
+    };
+
+    let meta_body = self.meta_body(is.snapshot());
+    let term = is.term().get();
+    let leader = encode_id(&is.leader());
+    let data = is.data();
+    let offset = is.offset();
+    let total_len = is.total_len();
+
+    // InstallSnapshot body size (mirrors the generated `compute_size`): a present scalar costs its
+    // 1-byte tag + body, a proto3-default scalar is absent, and the snapshot sub-message (always set)
+    // costs tag + length-prefix + body.
+    let mut body_len = 0usize;
+    if term != 0 {
+      body_len += 1 + uint64_encoded_len(term);
+    }
+    if !leader.is_empty() {
+      body_len += 1 + bytes_encoded_len(&leader);
+    }
+    body_len += 1 + varint_len(meta_body.len() as u64) + meta_body.len();
+    if !data.is_empty() {
+      body_len += 1 + bytes_encoded_len(data);
+    }
+    if offset != 0 {
+      body_len += 1 + uint64_encoded_len(offset);
+    }
+    if total_len != 0 {
+      body_len += 1 + uint64_encoded_len(total_len);
+    }
+
+    // Message envelope: the InstallSnapshot oneof arm is field 7, length-delimited.
+    Tag::new(7, WireType::LengthDelimited).encode(buf);
+    encode_varint(body_len as u64, buf);
+
+    // InstallSnapshot body, fields 1..=6 in ascending order (buffa's write order).
+    if term != 0 {
+      Tag::new(1, WireType::Varint).encode(buf);
+      encode_uint64(term, buf);
+    }
+    if !leader.is_empty() {
+      Tag::new(2, WireType::LengthDelimited).encode(buf);
+      encode_bytes(&leader, buf);
+    }
+    Tag::new(3, WireType::LengthDelimited).encode(buf);
+    encode_varint(meta_body.len() as u64, buf);
+    buf.extend_from_slice(&meta_body);
+    if !data.is_empty() {
+      Tag::new(4, WireType::LengthDelimited).encode(buf);
+      encode_bytes(data, buf);
+    }
+    if offset != 0 {
+      Tag::new(5, WireType::Varint).encode(buf);
+      encode_uint64(offset, buf);
+    }
+    if total_len != 0 {
+      Tag::new(6, WireType::Varint).encode(buf);
+      encode_uint64(total_len, buf);
+    }
+
+    // Release the cache the moment the transfer completes — the final chunk (`is_last`) or a legacy
+    // single-shot (`total_len == 0`) is not followed by more chunks of this meta, so holding it until the
+    // next transfer or teardown would only pin memory. A later resend re-encodes (cache miss); correct.
+    if total_len == 0 || is.is_last() {
+      self.snapshot_meta = None;
+    }
+  }
 }
 
 /// Decode one frame (the COMPLETE payload of a transport frame) into a consensus

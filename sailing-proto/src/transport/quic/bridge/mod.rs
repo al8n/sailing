@@ -182,6 +182,11 @@ pub(crate) struct Bridge<I> {
   /// `service` consumes it (an inline pass per message would be O(messages × connections) of
   /// redundant quinn polling).
   needs_service: bool,
+  /// Outbound encoder shared across this bridge's connections: caches the snapshot-transfer meta so a
+  /// chunked `InstallSnapshot` encodes its (identical) `SnapshotMeta` once per transfer rather than once
+  /// per chunk — and reuses it across followers receiving the SAME snapshot. Byte-identical to the
+  /// stateless `wire::encode_message`; an interleaved different meta simply misses and re-encodes.
+  encoder: crate::wire::MessageEncoder<I>,
   /// Test-only: how many service passes have run — the observable that pins "every connect exit
   /// services" (a drained deferral queue alone is also true of an exit that skipped the pass).
   #[cfg(test)]
@@ -215,6 +220,7 @@ impl<I: NodeId> Bridge<I> {
       deferred_ready: VecDeque::new(),
       lost: VecDeque::new(),
       needs_service: false,
+      encoder: crate::wire::MessageEncoder::new(),
       #[cfg(test)]
       services_run: 0,
     }
@@ -856,7 +862,7 @@ impl<I: NodeId> Bridge<I> {
       return;
     }
     let mut payload = Vec::new();
-    crate::wire::encode_message(msg, &mut payload);
+    self.encoder.encode_message(msg, &mut payload);
     if payload.len() > MAX_FRAME_LEN {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
       return;
