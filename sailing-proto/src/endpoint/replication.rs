@@ -873,10 +873,16 @@ where
         // Drop in-flight append records the truncation supersedes: those entries are overwritten,
         // so their (possibly still-pending) completions must NOT re-advance `durable_index` into
         // the truncated range. The new suffix's own record is added by `submit_append` below.
-        self
+        // Records are pushed in increasing index order, so the superseded ones (`Index >=
+        // truncate_from`) are exactly a back-suffix — pop the back while it overlaps the range.
+        while self
           .durable
           .inflight_append_upto
-          .retain(|_, upto| *upto < truncate_from);
+          .back()
+          .is_some_and(|(_, upto)| *upto >= truncate_from)
+        {
+          self.durable.inflight_append_upto.pop_back();
+        }
         let opid = self.mint_op_id();
         self.submit_append(log, opid, &entries[i..]);
         appended_opid = Some(opid);
