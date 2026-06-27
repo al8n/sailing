@@ -189,6 +189,56 @@ fn eof_closes_the_conn() {
 }
 
 #[test]
+fn oversized_frame_closes_the_conn_and_clears_the_encoder_cache() {
+  let mut d = dialer(7);
+  let mut a = acceptor(9);
+  pump(&mut d, &mut a);
+  assert_eq!(a.peer(), Some(7));
+
+  // Prime the receiver's OUTBOUND encoder with a cacheable (small, NON-final) snapshot transfer so the
+  // meta is held in the cache.
+  let meta = crate::SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    crate::conf::ConfState::from_voters([1u64, 2, 3]),
+  );
+  a.send_message(&Message::InstallSnapshot(
+    crate::InstallSnapshot::new_chunk(
+      Term::new(2),
+      9,
+      meta,
+      bytes::Bytes::from_static(&[0xAB; 32]),
+      0,
+      1_000_000, // non-final (offset + len < total) → the cache is retained, not completion-cleared
+    ),
+  ));
+  assert!(
+    a.encoder.cached_body_len().is_some(),
+    "the send must populate the encoder cache"
+  );
+
+  // Feed a raw oversized frame HEADER (declared length far above MAX_FRAME_LEN); the decoder latches
+  // `FrameTooLarge` at the header, before any payload.
+  d.record_write_for_test(&[0xFF, 0xFF, 0xFF, 0xFF]);
+  pump(&mut d, &mut a);
+
+  // The latched decoder fault must surface AS a close: an error is returned, the conn is Closed, and the
+  // close path cleared the encoder cache — so a direct owner that keeps the conn retains no metadata.
+  let mut msgs = Vec::new();
+  let res = a.poll_decoded(&mut msgs);
+  assert!(
+    res.is_err(),
+    "a latched oversized frame must surface an error"
+  );
+  assert!(a.is_closed(), "a transport fault must close the conn");
+  assert_eq!(
+    a.encoder.cached_body_len(),
+    None,
+    "the close must clear the encoder cache (no retained snapshot metadata)"
+  );
+}
+
+#[test]
 fn backpressured_write_never_truncates_a_frame() {
   // A record layer that accepts only 3 plaintext bytes per write — a hostile backpressure pattern.
   // The full framed message must still reach the wire intact across repeated drains, never a prefix

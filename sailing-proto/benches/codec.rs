@@ -120,6 +120,67 @@ fn bench_decode(c: &mut Criterion) {
   g.finish();
 }
 
+/// `n` chunks of ONE snapshot transfer: a shared joint-config `SnapshotMeta` (the expensive part — one
+/// `Bytes` allocation per member id to rebuild) with only `data`/`offset` differing per chunk.
+fn snapshot_transfer_chunks(n: usize, chunk_bytes: usize) -> Vec<Message<u64>> {
+  let conf = ConfState::new(
+    std::vec![1u64, 2, 3, 4, 5],
+    std::vec![9u64],
+    std::vec![1u64, 2, 3],
+    std::vec![7u64],
+    true,
+  );
+  let meta = SnapshotMeta::new(Index::new(5000), Term::new(6), conf);
+  let total = (n * chunk_bytes) as u64;
+  (0..n)
+    .map(|i| {
+      Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(7),
+        1u64,
+        meta.clone(),
+        Bytes::from(vec![0xCD; chunk_bytes]),
+        (i * chunk_bytes) as u64,
+        total,
+      ))
+    })
+    .collect()
+}
+
+/// Encoding a whole multi-chunk transfer: the stateless `encode_message` rebuilds the identical
+/// `SnapshotMeta` (its `ConfState`) for every chunk, while a `MessageEncoder` encodes it once and
+/// splices the cached body into each chunk — the per-chunk win. Both reuse one output buffer so the
+/// delta isolates the meta cost. A fresh `MessageEncoder` per iteration measures a full transfer (first
+/// chunk misses, the rest hit). A small chunk size keeps the meta the dominant per-chunk cost.
+fn bench_snapshot_transfer(c: &mut Criterion) {
+  let mut g = c.benchmark_group("snapshot_transfer");
+  for chunk_bytes in [256usize, 4096] {
+    let n = 64;
+    let chunks = snapshot_transfer_chunks(n, chunk_bytes);
+    g.bench_function(format!("stateless/64x{chunk_bytes}"), |b| {
+      b.iter(|| {
+        let mut buf = std::vec::Vec::new();
+        for msg in &chunks {
+          buf.clear();
+          wire::encode_message(black_box(msg), &mut buf);
+          black_box(&buf);
+        }
+      });
+    });
+    g.bench_function(format!("cached/64x{chunk_bytes}"), |b| {
+      b.iter(|| {
+        let mut enc = wire::MessageEncoder::new();
+        let mut buf = std::vec::Vec::new();
+        for msg in &chunks {
+          buf.clear();
+          enc.encode_message(black_box(msg), &mut buf);
+          black_box(&buf);
+        }
+      });
+    });
+  }
+  g.finish();
+}
+
 fn bench_data_seam(c: &mut Criterion) {
   fn roundtrip<T: Data + Clone>(
     g: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
@@ -154,5 +215,11 @@ fn bench_data_seam(c: &mut Criterion) {
   g.finish();
 }
 
-criterion_group!(benches, bench_encode, bench_decode, bench_data_seam);
+criterion_group!(
+  benches,
+  bench_encode,
+  bench_decode,
+  bench_snapshot_transfer,
+  bench_data_seam
+);
 criterion_main!(benches);
