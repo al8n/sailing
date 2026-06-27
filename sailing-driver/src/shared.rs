@@ -411,6 +411,17 @@ impl<I: sailing_proto::NodeId, R: Clone, F> Routing<I, R, F> {
           advanced = true;
         }
       }
+      Event::ReadModeChanged(rmc) => {
+        // A committed SetReadMode applied at this index but reports ReadModeChanged, NOT Applied (the
+        // sibling of the ConfChanged arm above) — so the watermark must advance HERE too, or a
+        // post-migration query confirmed at this index parks forever (no later Applied arrives to lift
+        // it). No pending waiter to complete: `set_read_mode` returns the propose verdict immediately
+        // and never parks a `Pending` by index.
+        if rmc.index() > self.applied {
+          self.applied = rmc.index();
+          advanced = true;
+        }
+      }
       // The context is this driver's minted counter (big-endian u64). A context this driver
       // did not mint (an embedder driving read_index through the coordinator directly, or a
       // different width entirely) just passes through to the tail.
@@ -812,6 +823,38 @@ mod tests {
     assert!(advanced);
     assert_eq!(r.applied, Index::new(9));
     assert_eq!(r.take_runnable_queries().len(), 1);
+  }
+
+  #[test]
+  fn read_mode_changed_advances_the_watermark_and_releases_queries() {
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    let ctx = r.mint_query_ctx();
+    r.queries.insert(
+      ctx,
+      ParkedQuery {
+        ready_at: Some(Index::new(5)),
+        complete: Box::new(|_| {}),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    // A committed SetReadMode applied at index 5 reports ReadModeChanged, not Applied — yet it MUST
+    // advance the watermark, or a query confirmed at 5 parks forever. Without the route_event arm this
+    // returns false and the query never runs.
+    let advanced = r.route_event(Event::ReadModeChanged(sailing_proto::ReadModeChanged::new(
+      Index::new(5),
+      sailing_proto::ReadOnlyOption::LeaseBased,
+    )));
+    assert!(
+      advanced,
+      "a committed read-mode change advances the apply watermark"
+    );
+    assert_eq!(r.applied, Index::new(5));
+    assert_eq!(
+      r.take_runnable_queries().len(),
+      1,
+      "the post-migration query becomes runnable once the watermark reaches its read index"
+    );
   }
 
   #[test]
