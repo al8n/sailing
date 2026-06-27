@@ -32,8 +32,10 @@ so the two numbers are directly comparable:
 - **N client tasks.** Each proposes to the leader and awaits the commit+apply of its own write
   (`-b` pipelines `batch` proposals before awaiting). A single leader is elected and confirmed
   stable first; throughput is the committed put/s measured only over the load window. The window
-  requires that one leader to hold throughout — a leadership change aborts the run as invalid (loud
-  panic) rather than silently miscounting it. In the no-fault in-process cluster this never fires.
+  requires one stable leader and all `members` nodes alive throughout — a leadership change *or* a
+  node task dying aborts the run as invalid (loud panic) rather than silently miscounting it (e.g. a
+  degraded quorum reported under the full `members` label). In the no-fault in-process cluster
+  neither fires.
 
 Arguments mirror openraft's (`-c` clients, `-n` operations, `-m` members 1/3/5, `-b` batch; counts
 accept `_` separators and `k`/`m`/`g` suffixes):
