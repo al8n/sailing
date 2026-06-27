@@ -13,7 +13,7 @@ use sailing_proto::{
   ClusterId, Config, Data, Event, Index, LabelOptions, Labeled, LogStore, Passthrough,
   ReadOnlyOption, Role, StableStore, Term, TlsRecords,
 };
-use sailing_reactor::{DriverConfig, DriverError, Handle, ReactorStreamDriver};
+use sailing_reactor::{DriverConfig, DriverError, Handle, Node, ReactorStreamDriver};
 
 const ELECTION: Duration = Duration::from_millis(300);
 const HEARTBEAT: Duration = Duration::from_millis(60);
@@ -142,7 +142,7 @@ async fn three_node_plaintext_cluster_commits_and_queries() {
   for id in 1u64..=3 {
     let peers: Vec<_> = (1u64..=3)
       .filter(|&p| p != id)
-      .map(|p| (p, addrs[(p - 1) as usize]))
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
       .collect();
     let config = Config::try_new(id, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap();
     let local = encoded(id);
@@ -253,7 +253,7 @@ async fn three_node_tls_cluster_commits() {
   for id in 1u64..=3 {
     let peers: Vec<_> = (1u64..=3)
       .filter(|&p| p != id)
-      .map(|p| (p, addrs[(p - 1) as usize]))
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
       .collect();
     let config = Config::try_new(id, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap();
 

@@ -11,7 +11,7 @@ use sailing_proto::{
 };
 
 use sailing_driver::{
-  Command, Handle, Status, jittered,
+  Command, Handle, Node, Status, jittered,
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
@@ -130,7 +130,7 @@ where
   /// peer legitimately carries a stale past `at`, and a past deadline fires the timer
   /// instantly, every iteration, for the whole stability window.
   redial_wake: Option<std::time::Instant>,
-  peers: Vec<(I, SocketAddr)>,
+  peers: Vec<Node<I, SocketAddr>>,
   dialer: DialerFactory<I, R>,
   acceptor: AcceptorFactory<R>,
   inbound_tx: lochan::mpsc::Sender<BridgeInbound>,
@@ -181,7 +181,7 @@ where
     config: Config<I>,
     seed: u64,
     fsm: F,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     dialer: DialerFactory<I, R>,
     acceptor: AcceptorFactory<R>,
     log: L,
@@ -204,7 +204,7 @@ where
     seed: u64,
     fsm: F,
     boot_epoch: u64,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     dialer: DialerFactory<I, R>,
     acceptor: AcceptorFactory<R>,
     log: L,
@@ -228,7 +228,7 @@ where
     fsm: F,
     boot_epoch: u64,
     assume_prior_lease_support: Option<Duration>,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     dialer: DialerFactory<I, R>,
     acceptor: AcceptorFactory<R>,
     log: L,
@@ -277,7 +277,7 @@ where
     config: Config<I>,
     seed: u64,
     fsm: F,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     dialer: DialerFactory<I, R>,
     acceptor: AcceptorFactory<R>,
     log: L,
@@ -320,7 +320,7 @@ where
     seed: u64,
     fsm: F,
     boot_epoch: u64,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     dialer: DialerFactory<I, R>,
     acceptor: AcceptorFactory<R>,
     mut log: L,
@@ -360,7 +360,7 @@ where
     fsm: F,
     boot_epoch: u64,
     assume_prior_lease_support: Option<Duration>,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     dialer: DialerFactory<I, R>,
     acceptor: AcceptorFactory<R>,
     mut log: L,
@@ -398,7 +398,7 @@ where
     stable: S,
     listener: TcpListener,
     clock: Clock<W>,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     dialer: DialerFactory<I, R>,
     acceptor: AcceptorFactory<R>,
     driver_cfg: DriverConfig,
@@ -751,7 +751,8 @@ where
   fn reconcile_peer_links(&mut self, now: Instant) {
     let std_now = std::time::Instant::now();
     let mut wake: Option<std::time::Instant> = None;
-    for (peer, addr) in self.peers.clone() {
+    for node in self.peers.clone() {
+      let (peer, addr) = node.into_parts();
       if self.coord.conn_of(&peer).is_some() {
         // Bound. Failure history is cleared only once the binding proves stable; a doomed
         // tie-break survivor (dead within an RTT) never reaches the window, so its round

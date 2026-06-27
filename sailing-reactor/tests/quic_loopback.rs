@@ -11,7 +11,7 @@ use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
 use common::{CountSm, MemLog, MemStable, TestCa};
 use sailing_proto::{ClusterId, Config};
-use sailing_reactor::{DriverConfig, DriverError, Handle, ReactorQuicDriver};
+use sailing_reactor::{DriverConfig, DriverError, Handle, Node, ReactorQuicDriver};
 
 const ELECTION: Duration = Duration::from_millis(300);
 const HEARTBEAT: Duration = Duration::from_millis(60);
@@ -30,7 +30,7 @@ async fn build_node(
   ca: &TestCa,
   id: u64,
   addr: SocketAddr,
-  peers: Vec<(u64, SocketAddr)>,
+  peers: Vec<Node<u64, SocketAddr>>,
   cfg: DriverConfig,
 ) -> (
   ReactorQuicDriver<TokioRuntime, u64, CountSm, MemLog, MemStable>,
@@ -61,7 +61,7 @@ async fn spawn_cluster(ca: &TestCa, base_port: u16) -> Vec<Handle<u64, CountSm>>
   for id in 1u64..=3 {
     let peers: Vec<_> = (1u64..=3)
       .filter(|&p| p != id)
-      .map(|p| (p, addrs[(p - 1) as usize]))
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
       .collect();
     let (driver, handle) = build_node(
       ca,
@@ -248,7 +248,7 @@ async fn no_quorum_means_not_leader_not_a_hang() {
   let ca = TestCa::new();
   let addrs = addrs(43_830, 3);
   // Only node 1 runs; 2 and 3 are configured but never started.
-  let peers = vec![(2u64, addrs[1]), (3u64, addrs[2])];
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
   let (driver, handle) = build_node(&ca, 1, addrs[0], peers, DriverConfig::default()).await;
   tokio::spawn(driver.run());
 
