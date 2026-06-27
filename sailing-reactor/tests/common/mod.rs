@@ -3,7 +3,10 @@
 //! submit queues its completion immediately), which satisfies the prefix-ordered durability
 //! contract trivially; the storage-ready seam is exercised separately.
 
-use std::collections::VecDeque;
+use std::{
+  collections::VecDeque,
+  sync::{Arc, Mutex},
+};
 
 use bytes::Bytes;
 use sailing_proto::{
@@ -448,5 +451,128 @@ impl TestCa {
       rustls::pki_types::PrivateKeyDer::try_from(key.serialize_der()).expect("key DER"),
     )
     .build()
+  }
+}
+
+/// A [`MemLog`] whose state lives behind an `Arc<Mutex<_>>`, so it SURVIVES the driver that owns one
+/// clone: a restart test runs a first driver against `log.clone()`, drops it, then builds a second
+/// driver from another clone pointing at the SAME durable entries. `entries` re-materializes OWNED so
+/// the read outlives the lock guard.
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+pub struct SharedLog(Arc<Mutex<MemLog>>);
+
+#[allow(dead_code)]
+impl SharedLog {
+  pub fn new() -> Self {
+    Self(Arc::new(Mutex::new(MemLog::new())))
+  }
+}
+
+impl LogStore for SharedLog {
+  type Error = std::convert::Infallible;
+
+  fn first_index(&self) -> Index {
+    self.0.lock().unwrap().first_index()
+  }
+  fn last_index(&self) -> Index {
+    self.0.lock().unwrap().last_index()
+  }
+  fn term(&self, index: Index) -> Result<Term, Self::Error> {
+    self.0.lock().unwrap().term(index)
+  }
+  fn entries(
+    &self,
+    range: std::ops::Range<Index>,
+    max_bytes: u64,
+  ) -> Result<EntriesRead<'_>, Self::Error> {
+    // Re-materialize OWNED: a `Borrowed` slice would dangle past the lock guard dropped here.
+    let owned = match self.0.lock().unwrap().entries(range, max_bytes)? {
+      EntriesRead::Ready(m) => m.into_vec(),
+      EntriesRead::Pending => return Ok(EntriesRead::Pending),
+    };
+    Ok(EntriesRead::Ready(MaybeOwned::from(owned)))
+  }
+  fn submit_append(&mut self, id: OpId, entries: &[Entry]) {
+    self.0.lock().unwrap().submit_append(id, entries);
+  }
+  fn compact(&mut self, up_to: Index) {
+    self.0.lock().unwrap().compact(up_to);
+  }
+  fn restore(&mut self, last_index: Index, last_term: Term) {
+    self.0.lock().unwrap().restore(last_index, last_term);
+  }
+  fn poll(&mut self) -> Option<Result<LogDone, Self::Error>> {
+    self.0.lock().unwrap().poll()
+  }
+  fn has_pending(&self) -> bool {
+    self.0.lock().unwrap().has_pending()
+  }
+}
+
+/// A [`MemStable`] behind an `Arc<Mutex<_>>` — the durable-state sibling of [`SharedLog`], so a
+/// restart test recovers the SAME persisted [`HardState`]/snapshot across two driver incarnations.
+#[derive(Clone, Default)]
+#[allow(dead_code)]
+pub struct SharedStable(Arc<Mutex<MemStable>>);
+
+#[allow(dead_code)]
+impl SharedStable {
+  pub fn new() -> Self {
+    Self(Arc::new(Mutex::new(MemStable::new())))
+  }
+}
+
+impl StableStore for SharedStable {
+  type NodeId = u64;
+  type Error = std::convert::Infallible;
+
+  fn hard_state(&self) -> HardState<u64> {
+    self.0.lock().unwrap().hard_state()
+  }
+  fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {
+    self.0.lock().unwrap().submit_write(id, hard_state);
+  }
+  fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<u64>, data: Bytes) {
+    self.0.lock().unwrap().submit_snapshot(id, meta, data);
+  }
+  fn snapshot(&self) -> Option<(SnapshotMeta<u64>, Bytes)> {
+    self.0.lock().unwrap().snapshot()
+  }
+  fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
+    self.0.lock().unwrap().durable_snapshot()
+  }
+  #[allow(clippy::type_complexity)]
+  fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<u64>, u64, SnapshotChunkRead), Self::Error>> {
+    self.0.lock().unwrap().snapshot_chunk(offset, len)
+  }
+  fn accept_snapshot_chunk(
+    &mut self,
+    meta: &SnapshotMeta<u64>,
+    total_len: u64,
+    offset: u64,
+    data: &Bytes,
+  ) -> Result<u64, Self::Error> {
+    self
+      .0
+      .lock()
+      .unwrap()
+      .accept_snapshot_chunk(meta, total_len, offset, data)
+  }
+  fn take_staged_snapshot(&mut self, meta: &SnapshotMeta<u64>) -> Option<Bytes> {
+    self.0.lock().unwrap().take_staged_snapshot(meta)
+  }
+  fn discard_snapshot_staging(&mut self) {
+    self.0.lock().unwrap().discard_snapshot_staging();
+  }
+  fn poll(&mut self) -> Option<Result<StableDone, Self::Error>> {
+    self.0.lock().unwrap().poll()
+  }
+  fn has_pending(&self) -> bool {
+    self.0.lock().unwrap().has_pending()
   }
 }
