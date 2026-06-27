@@ -229,6 +229,9 @@ async fn run(args: Args) {
   for _ in 0..args.clients {
     let senders = senders.clone();
     let batch = args.batch;
+    // Each client returns the number of writes it actually committed. It only ever returns after
+    // committing its full share (it parks on any anomaly), so the returned count is `ops_per_client`
+    // on success — and the run's reported throughput is the SUM of these, never a configured guess.
     client_handles.push(tokio::spawn(async move {
       let sender = &senders[leader0 as usize];
       let mut done = 0u64;
@@ -252,20 +255,24 @@ async fn run(args: Args) {
           done += 1;
         }
       }
+      done
     }));
   }
 
   // Drive the load to completion, but abort the instant the run becomes invalid: leadership leaves
-  // `leader0`, or any node task ends (a death). A client only ever completes by committing all of
-  // its writes on `leader0`; on any anomaly it parks, so the join can finish only on a genuinely
-  // valid run with every node still alive.
+  // `leader0`, or any node task ends (a death). The join sums each client's committed-write count;
+  // a client `JoinError` (panic / cancel) is FATAL — a dead client must never be scored as success.
   let clients_done = async {
+    let mut observed = 0u64;
     for h in client_handles {
-      let _ = h.await;
+      observed += h
+        .await
+        .expect("client task panicked or was cancelled — run invalid");
     }
+    observed
   };
   tokio::pin!(clients_done);
-  tokio::select! {
+  let observed = tokio::select! {
     biased;
     _ = async {
       loop {
@@ -278,31 +285,45 @@ async fn run(args: Args) {
     // `join_next` resolves to `Some` only when a node task ends (the set is non-empty for members >= 1),
     // which during the window can only mean a node died.
     _ = nodes.join_next() => panic!("{NODE_DIED_MSG}"),
-    _ = &mut clients_done => {}
-  }
+    obs = &mut clients_done => obs,
+  };
   let elapsed = start.elapsed();
+
+  // Close the same-select-turn race: a node may have completed after `join_next` last polled Pending
+  // but before the client join was observed, so its death would not have won the select. The JoinSet
+  // retains that completion, so reap it non-blocking now — any completion is a node death.
+  if nodes.try_join_next().is_some() {
+    panic!("{NODE_DIED_MSG}");
+  }
   timing_active.store(false, Ordering::Release);
 
-  // Boundary guard: accept the result only if leadership never left `leader0`.
+  // Accept the result only if leadership never left `leader0` AND the clients committed exactly the
+  // configured total (each client returns only after committing its full share, so on a valid run
+  // the observed sum equals `total` by construction).
   assert_eq!(
     current_leader.load(Ordering::Acquire),
     leader0,
     "{LEADER_CHANGED_MSG}"
   );
+  assert_eq!(
+    observed, total,
+    "clients committed {observed} ops, expected {total} — run invalid"
+  );
 
   nodes.abort_all();
 
-  let put_s = total as f64 / elapsed.as_secs_f64();
+  // Throughput is derived from the OBSERVED committed count, not the configured constant.
+  let put_s = observed as f64 / elapsed.as_secs_f64();
   let millis = elapsed.as_millis().max(1);
   println!(
     "parity  members={} clients={} batch={} ops={} elapsed={:.3}s  put/s={:.0}  op/ms={}",
     members,
     args.clients,
     args.batch,
-    total,
+    observed,
     elapsed.as_secs_f64(),
     put_s,
-    (total as u128) / millis,
+    (observed as u128) / millis,
   );
 }
 
