@@ -25,7 +25,7 @@
 use std::{net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
-use sailing_compio::{CompioQuicDriver, DriverConfig, DriverError};
+use sailing_compio::{CompioQuicDriver, DriverConfig, DriverError, Node};
 use sailing_proto::{ClusterId, Config};
 
 #[path = "../tests/common/mod.rs"]
@@ -56,7 +56,7 @@ fn main() {
         .block_on(async move {
           let peers: Vec<_> = (1u64..=3)
             .filter(|&p| p != id)
-            .map(|p| (p, addrs[(p - 1) as usize]))
+            .map(|p| Node::new(p, addrs[(p - 1) as usize]))
             .collect();
           let config = Config::try_new(
             id,

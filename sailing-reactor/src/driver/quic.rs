@@ -20,7 +20,7 @@ use sailing_proto::{
 };
 
 use sailing_driver::{
-  Command, Handle, Status, jittered,
+  Command, Handle, Node, Status, jittered,
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
@@ -128,7 +128,7 @@ where
   /// immediately and busy-loop the select arm).
   _storage_ready_keepalive: Option<flume::Sender<()>>,
   /// The configured peer book: every OTHER node's address, dialed and redialed as needed.
-  peers: Vec<(I, SocketAddr)>,
+  peers: Vec<Node<I, SocketAddr>>,
   redial: BTreeMap<I, Redial>,
   cmd_budget: usize,
   recv_cap: usize,
@@ -176,7 +176,7 @@ where
     fsm: F,
     opts: QuicOptions,
     cluster: ClusterId,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     log: L,
     stable: S,
     driver_cfg: DriverConfig,
@@ -199,7 +199,7 @@ where
     boot_epoch: u64,
     opts: QuicOptions,
     cluster: ClusterId,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     log: L,
     stable: S,
     driver_cfg: DriverConfig,
@@ -222,7 +222,7 @@ where
     assume_prior_lease_support: Option<Duration>,
     opts: QuicOptions,
     cluster: ClusterId,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     log: L,
     stable: S,
     driver_cfg: DriverConfig,
@@ -274,7 +274,7 @@ where
     fsm: F,
     opts: QuicOptions,
     cluster: ClusterId,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     log: L,
     stable: S,
     wall: W,
@@ -316,7 +316,7 @@ where
     boot_epoch: u64,
     opts: QuicOptions,
     cluster: ClusterId,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     mut log: L,
     mut stable: S,
     wall: W,
@@ -358,7 +358,7 @@ where
     assume_prior_lease_support: Option<Duration>,
     opts: QuicOptions,
     cluster: ClusterId,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     mut log: L,
     mut stable: S,
     wall: W,
@@ -394,7 +394,7 @@ where
     stable: S,
     socket: Arc<<R::Net as Net>::UdpSocket>,
     clock: Clock<W>,
-    peers: Vec<(I, SocketAddr)>,
+    peers: Vec<Node<I, SocketAddr>>,
     driver_cfg: DriverConfig,
   ) -> (Self, Handle<I, F>) {
     // Unbounded: the submit BUDGET — not the channel — is the binding bound on in-flight operations
@@ -859,7 +859,8 @@ where
   /// that re-binds resets its backoff.
   fn reconcile_peer_links(&mut self, now: Instant) {
     let std_now = std::time::Instant::now();
-    for (peer, addr) in self.peers.clone() {
+    for node in self.peers.clone() {
+      let (peer, addr) = node.into_parts();
       if self.coord.has_bound_conn(&peer) {
         self.redial.remove(&peer);
         continue;
