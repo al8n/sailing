@@ -27,7 +27,7 @@ use std::{
   collections::HashMap,
   sync::{
     Arc,
-    atomic::{AtomicU64, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
   },
   time::{Duration, Instant as WallInstant},
 };
@@ -36,7 +36,10 @@ use bytes::Bytes;
 use clap::Parser;
 use sailing_proto::{Config, Endpoint, Event, Index, Instant, Message, Outgoing};
 use sailing_simulation::{LogSm, MemLog, MemStable};
-use tokio::sync::{mpsc, oneshot};
+use tokio::{
+  sync::{mpsc, oneshot},
+  task::JoinSet,
+};
 
 type Node = Endpoint<u64, LogSm>;
 
@@ -59,6 +62,12 @@ const TIMER_TICK: Duration = Duration::from_millis(20);
 /// leader (a miscount). A no-fault in-process cluster never trips this.
 const LEADER_CHANGED_MSG: &str =
   "leader changed during the timed benchmark window — run invalid, re-run under a stable leader";
+
+/// Aborting when a node task ends mid-window is the liveness half of the same contract: the cluster
+/// must keep all `members` nodes alive for the whole measurement. If one dies, the leader silently
+/// commits on the surviving quorum and the harness would report a degraded run under the full
+/// `members` label — a bogus N-node number. A no-fault in-process cluster never trips this.
+const NODE_DIED_MSG: &str = "a node task exited during the timed benchmark window — run invalid";
 
 #[derive(Parser, Debug)]
 #[command(
@@ -148,18 +157,26 @@ async fn run(args: Args) {
   }
   let senders = Arc::new(senders_vec);
 
-  let mut node_handles = Vec::with_capacity(members as usize);
+  // True only for the duration of the timed window. The node tasks consult it to decide whether a
+  // peer-channel send failure (a dead peer) is a fatal anomaly or just shutdown noise.
+  let timing_active = Arc::new(AtomicBool::new(false));
+
+  // Node tasks live in a JoinSet so the timed window can monitor them: in a healthy run they never
+  // finish (they loop until aborted after timing), so any completion during the window is a death.
+  let mut nodes: JoinSet<()> = JoinSet::new();
   for (id, rx) in receivers.into_iter().enumerate() {
     let senders = senders.clone();
     let current_leader = current_leader.clone();
-    node_handles.push(tokio::spawn(run_node(
+    let timing_active = timing_active.clone();
+    nodes.spawn(run_node(
       id as u64,
       members,
       origin,
       rx,
       senders,
       current_leader,
-    )));
+      timing_active,
+    ));
   }
 
   // Elect AND stabilize a leader before timing: a throughput number is only meaningful under a
@@ -206,6 +223,7 @@ async fn run(args: Args) {
   // every proposal is accepted, so there is no in-window leader re-discovery and no retry (retrying
   // on a new leader would double-commit an entry that the original leader's log still carries). If
   // leadership ever leaves `leader0`, the watcher below aborts the run rather than miscounting.
+  timing_active.store(true, Ordering::Release);
   let start = WallInstant::now();
   let mut client_handles = Vec::with_capacity(args.clients as usize);
   for _ in 0..args.clients {
@@ -237,9 +255,10 @@ async fn run(args: Args) {
     }));
   }
 
-  // Drive the load to completion, but abort the instant leadership leaves `leader0`. A client only
-  // ever completes by committing all of its writes on `leader0`; on any anomaly it parks, so the
-  // join can finish only on a genuinely valid run, and the watcher catches everything else.
+  // Drive the load to completion, but abort the instant the run becomes invalid: leadership leaves
+  // `leader0`, or any node task ends (a death). A client only ever completes by committing all of
+  // its writes on `leader0`; on any anomaly it parks, so the join can finish only on a genuinely
+  // valid run with every node still alive.
   let clients_done = async {
     for h in client_handles {
       let _ = h.await;
@@ -256,19 +275,22 @@ async fn run(args: Args) {
         tokio::time::sleep(Duration::from_millis(2)).await;
       }
     } => panic!("{LEADER_CHANGED_MSG}"),
+    // `join_next` resolves to `Some` only when a node task ends (the set is non-empty for members >= 1),
+    // which during the window can only mean a node died.
+    _ = nodes.join_next() => panic!("{NODE_DIED_MSG}"),
     _ = &mut clients_done => {}
   }
+  let elapsed = start.elapsed();
+  timing_active.store(false, Ordering::Release);
+
   // Boundary guard: accept the result only if leadership never left `leader0`.
   assert_eq!(
     current_leader.load(Ordering::Acquire),
     leader0,
     "{LEADER_CHANGED_MSG}"
   );
-  let elapsed = start.elapsed();
 
-  for h in &node_handles {
-    h.abort();
-  }
+  nodes.abort_all();
 
   let put_s = total as f64 / elapsed.as_secs_f64();
   let millis = elapsed.as_millis().max(1);
@@ -292,6 +314,7 @@ async fn run_node(
   mut inbound_rx: mpsc::UnboundedReceiver<Inbound>,
   senders: Arc<Vec<mpsc::UnboundedSender<Inbound>>>,
   current_leader: Arc<AtomicU64>,
+  timing_active: Arc<AtomicBool>,
 ) {
   let voters: Vec<u64> = (0..members).collect();
   let cfg = Config::try_new(
@@ -368,6 +391,7 @@ async fn run_node(
       &senders,
       id,
       &mut pending,
+      &timing_active,
     );
 
     let is_leader = ep.role().is_leader();
@@ -411,6 +435,7 @@ fn apply_inbound(
 /// Pump the Sans-I/O crank to local quiescence: complete persistence (persist-before-ack/-vote),
 /// route every produced message to its target's inbound channel, and fire client replies as their
 /// proposals apply. Loops while storage reports more work or any message was produced.
+#[allow(clippy::too_many_arguments)]
 fn pump(
   now: Instant,
   ep: &mut Node,
@@ -419,6 +444,7 @@ fn pump(
   senders: &[mpsc::UnboundedSender<Inbound>],
   id: u64,
   pending: &mut HashMap<Index, oneshot::Sender<()>>,
+  timing_active: &AtomicBool,
 ) {
   let mut guard = 0u64;
   loop {
@@ -432,7 +458,15 @@ fn pump(
     while let Some(out) = ep.poll_message() {
       let (to, message) = Outgoing::into_parts(out);
       if let Some(s) = senders.get(to as usize) {
-        let _ = s.send(Inbound::Peer { from: id, message });
+        // A closed peer channel means that node's task is gone. During the timed window that is a
+        // fatal anomaly (a silently degraded quorum); panicking ends this node task too, which the
+        // main monitor observes as a node death and aborts the run. Outside the window (election or
+        // shutdown) a send failure is benign. A healthy in-process run never fails a send.
+        if s.send(Inbound::Peer { from: id, message }).is_err()
+          && timing_active.load(Ordering::Acquire)
+        {
+          panic!("node {id}: peer {to}'s channel is closed (peer dead) during the timed window");
+        }
       }
       progress = true;
     }
