@@ -56,7 +56,9 @@ impl<I> Tracker<I> {
   }
 
   /// The full progress map (all voters + learners + learners_next).
-  #[allow(dead_code, reason = "exercised by unit tests; progress accessor")]
+  ///
+  /// Keys iterate in ascending order, identical to [`ids`](Self::ids) (every member has a `Progress`
+  /// entry per the type invariant), so a caller iterating peers from here is deterministic.
   pub fn progress_map(&self) -> &BTreeMap<I, Progress> {
     &self.progress
   }

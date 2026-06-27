@@ -541,6 +541,7 @@ where
         lead_transferee: None,
         transfer_deadline: None,
       },
+      peers_scratch: Vec::new(),
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).

@@ -1120,6 +1120,17 @@ where
   check_quorum_lease: CheckQuorumLease<I>,
   /// The leader-transfer state (forced-handoff flag + transferee target + abort deadline).
   transfer: Transfer<I>,
+  /// Reusable scratch for the per-round peer fan-out (the periodic heartbeat, the Safe-read heartbeat,
+  /// and the propose broadcast). Cleared and refilled from `tracker.progress_map()` each round so the
+  /// broadcast neither allocates a fresh `ids()` `BTreeSet` nor a `collect()`ed `Vec` per round. Each
+  /// pair is `(peer, value)` where `value` is the heartbeat's per-peer commit clamp `min(commit,
+  /// match_index)`, captured while the `&Progress` is in hand so the send loop needs no second
+  /// `tracker.progress` lookup; the propose fan-out (which re-reads progress inside `maybe_send_append`)
+  /// ignores `value`. `progress_map()` keys iterate in the SAME ascending order as `ids()` (the
+  /// documented + debug-asserted "every member has a Progress" invariant), so the send order — and thus
+  /// determinism — is unchanged. Taken out via `mem::take` during the send loop to break the `&mut self`
+  /// borrow, then restored with its retained capacity.
+  peers_scratch: Vec<(I, Index)>,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1266,6 +1277,7 @@ where
         lead_transferee: None,
         transfer_deadline: None,
       },
+      peers_scratch: Vec::new(),
     };
     ep.arm_election_timer(now);
     ep
