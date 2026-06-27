@@ -13,7 +13,13 @@ sailing-proto = { workspace = true, features = ["std"] }
 sailing-simulation = { path = "../tests/sailing-simulation" }
 bytes = { workspace = true }
 clap = { workspace = true }
+# The `parity` bench runs the cluster on a real async runtime to mirror openraft's harness.
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "sync", "time"] }
 
 [[bin]]
 name = "pure_core"
 path = "src/bin/pure_core.rs"
+
+[[bin]]
+name = "parity"
+path = "src/bin/parity.rs"
