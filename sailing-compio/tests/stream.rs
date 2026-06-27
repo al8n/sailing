@@ -732,3 +732,69 @@ async fn set_read_mode_migrates_the_active_mode() {
   );
 }
 
+/// `Handle::status` surfaces the runtime consensus state — previously unreachable from the cross-thread
+/// handle — via a oneshot round-trip. A single-voter leader reports `role = Leader`, the self leader
+/// hint, a real term, the committed/applied indices, and the default (Safe) active read mode.
+#[compio::test]
+async fn status_reports_leader_role_term_and_commit() {
+  let addr: SocketAddr = "127.0.0.1:43320".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  // Commit two entries so commit/applied are non-trivial.
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"y").await,
+    2
+  );
+
+  // Poll status until this node reports leadership, then assert the full snapshot.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let status = loop {
+    let st = handle.status().await.expect("status round-trips");
+    if st.role == Role::Leader {
+      break st;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the node never reported leadership via status"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  };
+  assert_eq!(status.role, Role::Leader);
+  assert_eq!(status.leader, Some(1), "the leader hint is self");
+  assert!(status.term >= Term::new(1));
+  assert!(
+    status.commit_index >= Index::new(2),
+    "both submits committed, got {:?}",
+    status.commit_index
+  );
+  assert!(status.applied_index >= Index::new(2));
+  assert_eq!(
+    status.active_read_mode,
+    ReadOnlyOption::Safe,
+    "the default read mode is Safe"
+  );
+  assert!(!status.is_poisoned);
+  assert!(
+    status.conf_state.voters().contains(&1),
+    "the lone voter is in the membership"
+  );
+}

@@ -20,5 +20,6 @@ pub use driver::{AcceptorFactory, DialerFactory, ReactorQuicDriver, ReactorStrea
 pub use sailing_driver::UnverifiedSystemClock;
 pub use sailing_driver::{
   BindError, Clock, DriverConfig, DriverConfigError, DriverError, Handle, MAX_BOUNDED_QUEUE_DEPTH,
-  MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic, NtpDisciplinedClock, WallClock, WallReading,
+  MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic, NtpDisciplinedClock, Status, WallClock,
+  WallReading,
 };

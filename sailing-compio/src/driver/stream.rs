@@ -11,7 +11,7 @@ use sailing_proto::{
 };
 
 use sailing_driver::{
-  Command, Handle, jittered,
+  Command, Handle, Status, jittered,
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
@@ -1016,6 +1016,23 @@ where
         let _ = reply.send(r);
         // The migration applies cluster-wide once the entry commits; the verdict here is immediate, so
         // nothing parks — release with the reply.
+        drop(reservation);
+      }
+      Command::Status { reply, reservation } => {
+        let ep = self.coord.endpoint();
+        let status = Status {
+          role: ep.role(),
+          term: ep.term(),
+          leader: ep.leader(),
+          commit_index: ep.commit_index(),
+          applied_index: ep.applied_index(),
+          active_read_mode: ep.active_read_mode(),
+          conf_state: ep.conf_state(),
+          is_poisoned: ep.is_poisoned(),
+          precise_releases: ep.precise_releases(),
+          unprovable_floor_holds: ep.unprovable_floor_holds(),
+        };
+        let _ = reply.send(status);
         drop(reservation);
       }
       Command::Shutdown => return true,

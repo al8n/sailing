@@ -92,10 +92,46 @@ where
     /// so handle clones cannot amplify unbudgeted commands into the channel.
     reservation: ReservationGuard,
   },
+  /// Snapshot the driver's runtime [`Status`]; answer `reply` with the status read off the live
+  /// endpoint ON the driver thread (so it is one consistent instant, not raced field reads).
+  Status {
+    /// Answered with the status snapshot.
+    reply: futures_channel::oneshot::Sender<Status<I>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
   /// Ask the driver to stop. A plain signal: every `shutdown()` caller observes COMPLETION through
   /// the shared teardown channel (fired after the fd-release barrier), not a per-command ack, so this
   /// variant carries no reply.
   Shutdown,
+}
+
+/// A point-in-time snapshot of a node's consensus status, returned by [`Handle::status`].
+///
+/// Built ON the driver thread from the live endpoint and shipped back through a oneshot, so every
+/// field reflects ONE consistent instant — never a set of independently-raced cross-thread reads.
+#[derive(Debug, Clone)]
+pub struct Status<I> {
+  /// This node's current consensus role.
+  pub role: Role,
+  /// The current term.
+  pub term: Term,
+  /// The believed leader, if any (the client-redirect hint).
+  pub leader: Option<I>,
+  /// The highest log index believed committed.
+  pub commit_index: Index,
+  /// The highest log index applied to the state machine (`applied_index <= commit_index`).
+  pub applied_index: Index,
+  /// The read mode CURRENTLY in effect — the last applied `SetReadMode`, or the config default.
+  pub active_read_mode: ReadOnlyOption,
+  /// The live committed-configuration membership.
+  pub conf_state: ConfState<I>,
+  /// Whether the endpoint has fail-stopped (poisoned): the node is dead and must be restarted.
+  pub is_poisoned: bool,
+  /// Failover-tier commit-waits this node released EARLY via the precise wall anchor (`0` off-tier).
+  pub precise_releases: u64,
+  /// Failover-tier commit-waits HELD because the inherited walled-lease floor was unprovable.
+  pub unprovable_floor_holds: u64,
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to submit operations and observe events.
@@ -327,6 +363,20 @@ where
       reservation,
     })?;
     rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Snapshot this node's runtime [`Status`] — role, term, leader, commit/applied indices, the active
+  /// read mode, membership, poison state, and the failover counters — read off the live endpoint ON
+  /// the driver thread (mirrors [`query`](Self::query)'s oneshot round-trip), so it is one consistent
+  /// instant rather than raced field reads.
+  pub async fn status(&self) -> Result<Status<I>, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = futures_channel::oneshot::channel();
+    self.send(Command::Status {
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)
   }
 
   /// The best-effort events tail (committed entries, leader changes, conf changes, …). Bounded
