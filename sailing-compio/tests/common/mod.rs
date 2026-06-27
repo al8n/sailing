@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 
 use bytes::Bytes;
 use sailing_proto::{
-  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotMeta,
+  EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, OpId, SnapshotChunkRead, SnapshotMeta,
   StableDone, StableStore, StateMachine, Term,
 };
 
@@ -232,6 +232,16 @@ impl StableStore for MemStable {
     self.snap.as_ref().map(|(m, _)| m.clone())
   }
 
+  #[allow(clippy::type_complexity)]
+  fn snapshot_chunk(
+    &self,
+    offset: u64,
+    len: u64,
+  ) -> Option<Result<(SnapshotMeta<u64>, u64, SnapshotChunkRead), Self::Error>> {
+    // Fully resident: slice the whole blob (an O(1) `Bytes` slice).
+    self.resident_snapshot_chunk(offset, len)
+  }
+
   fn accept_snapshot_chunk(
     &mut self,
     meta: &SnapshotMeta<u64>,
@@ -261,7 +271,8 @@ impl StableStore for MemStable {
         .as_mut()
         .expect("staging set above")
         .1
-        .accept(offset, data),
+        .accept(offset, data)
+        .expect("test store: small snapshots stay within MAX_STAGING_RUNS"),
     )
   }
 
