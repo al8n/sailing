@@ -725,3 +725,82 @@ async fn restart_recovers_durable_state_instead_of_booting_fresh() {
   let _ = task2.await;
 }
 
+/// `Handle::set_read_mode` drives a mid-life read-mode migration the proto already supports but no
+/// `Command`/`Handle` path reached before. A leader migrates Safe -> LeaseBased; the change applies
+/// cluster-wide once the `SetReadMode` entry commits, surfacing as `Event::ReadModeChanged` on the
+/// events tail.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_read_mode_migrates_the_active_mode() {
+  let addr: SocketAddr = "127.0.0.1:43810".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  // LeaseBased requires check_quorum on the proposer (the migration validity gate).
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT)
+    .unwrap()
+    .with_check_quorum(true);
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  // Establish leadership.
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  // Migrate Safe -> LeaseBased (retrying until this node is the leader).
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let proposed = loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Ok(index) => break index,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(30)).await;
+      }
+      Err(e) => panic!("unexpected set_read_mode error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to migrate"
+    );
+  };
+
+  // The migration takes effect apply-time: observe ReadModeChanged for the new mode on the tail.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let changed = loop {
+    let mut seen = None;
+    while let Ok(ev) = handle.events().try_recv() {
+      if let Event::ReadModeChanged(rmc) = ev {
+        seen = Some(rmc);
+      }
+    }
+    if let Some(rmc) = seen {
+      break rmc;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the read-mode migration never applied"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  };
+  assert_eq!(
+    changed.mode(),
+    ReadOnlyOption::LeaseBased,
+    "the active read mode migrated to LeaseBased"
+  );
+  assert!(
+    changed.index() >= proposed,
+    "the migration applied at (or after) the proposed index"
+  );
+}
+

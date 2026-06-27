@@ -7,7 +7,10 @@ use std::sync::{
 
 use futures_channel::oneshot;
 use futures_util::{FutureExt, future::Shared};
-use sailing_proto::{ConfChange, ConfChangeV2, Data, Entry, Event, FailoverReadWindow, Index};
+use sailing_proto::{
+  ConfChange, ConfChangeV2, ConfState, Data, Entry, Event, FailoverReadWindow, Index,
+  ReadOnlyOption, Role, Term,
+};
 
 use crate::{
   DriverError,
@@ -76,6 +79,17 @@ where
     reply: futures_channel::oneshot::Sender<Result<(), DriverError<I>>>,
     /// The owning budget reservation (zero-byte): transfers are budgeted like every other
     /// operation so handle clones cannot amplify unbudgeted commands into the channel.
+    reservation: ReservationGuard,
+  },
+  /// Migrate the cluster-wide read mode; answer `reply` with the leader's immediate verdict (the
+  /// proposed log index). The migration takes effect apply-time on every node once the entry commits.
+  SetReadMode {
+    /// The target read mode.
+    mode: ReadOnlyOption,
+    /// Answered with the endpoint's immediate verdict: the proposed log index, or the rejection.
+    reply: futures_channel::oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation (zero-byte): migrations are budgeted like every other operation
+    /// so handle clones cannot amplify unbudgeted commands into the channel.
     reservation: ReservationGuard,
   },
   /// Ask the driver to stop. A plain signal: every `shutdown()` caller observes COMPLETION through
@@ -290,6 +304,25 @@ where
     let (tx, rx) = futures_channel::oneshot::channel();
     self.send(Command::Transfer {
       to,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Migrate the cluster-wide read mode, awaiting the leader's IMMEDIATE verdict.
+  ///
+  /// On `Ok(index)` the `SetReadMode` entry was appended at `index`; the migration takes effect
+  /// APPLY-TIME on every node once it commits (observe
+  /// [`Event::ReadModeChanged`](sailing_proto::Event) on the [`events`](Self::events) tail, or poll
+  /// [`status`](Self::status)). Fails [`NotLeader`](DriverError::NotLeader) off the leader, or
+  /// [`Rejected`](DriverError::Rejected) when a migration is already in flight or this leader lacks
+  /// the target mode's required knobs.
+  pub async fn set_read_mode(&self, mode: ReadOnlyOption) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = futures_channel::oneshot::channel();
+    self.send(Command::SetReadMode {
+      mode,
       reply: tx,
       reservation,
     })?;
