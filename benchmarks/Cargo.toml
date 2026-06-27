@@ -1,0 +1,19 @@
+[package]
+name = "sailing-benchmark"
+description = "Cluster-throughput benchmarks for sailing: a parity harness matching openraft, and a pure consensus-core harness isolating the Sans-I/O logic"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+sailing-proto = { workspace = true, features = ["std"] }
+sailing-simulation = { path = "../tests/sailing-simulation" }
+bytes = { workspace = true }
+clap = { workspace = true }
+
+[[bin]]
+name = "pure_core"
+path = "src/bin/pure_core.rs"
