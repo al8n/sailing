@@ -43,18 +43,27 @@ where
       .last_pending_request_ctx()
       .cloned()
       .unwrap_or_default();
-    for peer in self.peers().collect::<Vec<_>>() {
-      // Clamp the advertised commit to this peer's known match index. A heartbeat carries
-      // no prev-log check, so the follower can only safely commit up to the prefix it has
-      // proven (via a consistency-checked AppendEntries) matches ours. Telling a peer to
-      // commit past its match index lets a freshly-restarted node with a divergent,
-      // uncommitted tail commit+apply a stale entry (the etcd `min(committed, pr.Match)`
-      // rule). Default to ZERO if progress is unknown.
-      let peer_commit = self
-        .tracker
-        .progress(&peer)
-        .map(|pr| core::cmp::min(self.commit, pr.match_index()))
-        .unwrap_or(Index::ZERO);
+    // Refill the reusable peer scratch from `progress_map()` (no per-round `ids()`/`collect()` alloc),
+    // capturing each peer's clamped commit WHILE the `&Progress` is in hand so the send loop needs no
+    // second `tracker.progress` lookup. `mem::take`/restore breaks the `&mut self` borrow for `send`.
+    //
+    // Clamp the advertised commit to this peer's known match index: a heartbeat carries no prev-log
+    // check, so the follower can only safely commit up to the prefix it has proven (via a
+    // consistency-checked AppendEntries) matches ours. Telling a peer to commit past its match index
+    // lets a freshly-restarted node with a divergent, uncommitted tail commit+apply a stale entry (the
+    // etcd `min(committed, pr.Match)` rule).
+    let mut peers = core::mem::take(&mut self.peers_scratch);
+    peers.clear();
+    for (peer, pr) in self.tracker.progress_map() {
+      if *peer == me {
+        continue;
+      }
+      peers.push((
+        peer.cheap_clone(),
+        core::cmp::min(self.commit, pr.match_index()),
+      ));
+    }
+    for (peer, peer_commit) in peers.drain(..) {
       self.send(
         peer,
         Message::Heartbeat(
@@ -63,6 +72,7 @@ where
         ),
       );
     }
+    self.peers_scratch = peers;
   }
 
   /// Broadcast a heartbeat to all peers carrying a specific `context`.
@@ -77,12 +87,20 @@ where
       self.config.id(),
       self.check_quorum_lease.lease_round,
     );
-    for peer in self.peers().collect::<Vec<_>>() {
-      let peer_commit = self
-        .tracker
-        .progress(&peer)
-        .map(|pr| core::cmp::min(self.commit, pr.match_index()))
-        .unwrap_or(Index::ZERO);
+    // Reuse the peer scratch (see `broadcast_heartbeat`): refill from `progress_map()` capturing each
+    // peer's clamped commit, then drain to send. `mem::take`/restore breaks the `&mut self` borrow.
+    let mut peers = core::mem::take(&mut self.peers_scratch);
+    peers.clear();
+    for (peer, pr) in self.tracker.progress_map() {
+      if *peer == me {
+        continue;
+      }
+      peers.push((
+        peer.cheap_clone(),
+        core::cmp::min(self.commit, pr.match_index()),
+      ));
+    }
+    for (peer, peer_commit) in peers.drain(..) {
       self.send(
         peer,
         Message::Heartbeat(
@@ -91,6 +109,7 @@ where
         ),
       );
     }
+    self.peers_scratch = peers;
   }
 
   /// The cap-unit "size" of one entry: a FIXED per-entry overhead (Term 8 + Index 8 + EntryKind 1)
@@ -622,9 +641,22 @@ where
     self
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
-    for peer in self.peers().collect::<Vec<_>>() {
+    // Reuse the peer scratch (see `broadcast_heartbeat`): collect peer ids from `progress_map()`, then
+    // drain to send. `maybe_send_append` re-reads each peer's progress itself, so the scratch's `value`
+    // slot is unused here (filled with `Index::ZERO`). `mem::take`/restore breaks the `&mut self` borrow.
+    let me = self.config.id();
+    let mut peers = core::mem::take(&mut self.peers_scratch);
+    peers.clear();
+    for peer in self.tracker.progress_map().keys() {
+      if *peer == me {
+        continue;
+      }
+      peers.push((peer.cheap_clone(), Index::ZERO));
+    }
+    for (peer, _) in peers.drain(..) {
       self.maybe_send_append(now, peer, log, stable);
     }
+    self.peers_scratch = peers;
     // The entry was ALREADY appended (durable-pending) ABOVE, before the broadcast — so report Ok(index)
     // even if the broadcast then self-poisoned. The entry is a real proposal that WILL commit via the
     // durable log (a restart or a new leader drives it); returning Err here would make the caller treat a
