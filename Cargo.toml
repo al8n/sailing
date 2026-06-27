@@ -41,3 +41,11 @@ socket2 = { version = "0.6", features = ["all"] }
 [workspace.lints.rust]
 missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+
+# A workspace release profile: it speeds up the benches/examples/tests built in release here and
+# makes the openraft comparison fairer (openraft's benches build with the same optimizations). A
+# profile in a workspace root applies only when building THIS workspace; it has no effect on a
+# downstream crate that depends on these libraries.
+[profile.release]
+lto = true
+codegen-units = 1

@@ -34,14 +34,15 @@ use std::{
 
 use bytes::Bytes;
 use clap::Parser;
+use sailing_benchmark::CountSm;
 use sailing_proto::{Config, Endpoint, Event, Index, Instant, Message, Outgoing};
-use sailing_simulation::{LogSm, MemLog, MemStable};
+use sailing_simulation::{MemLog, MemStable};
 use tokio::{
   sync::{mpsc, oneshot},
   task::JoinSet,
 };
 
-type Node = Endpoint<u64, LogSm>;
+type Node = Endpoint<u64, CountSm>;
 
 /// `current_leader` sentinel: no leader currently known.
 const NO_LEADER: u64 = u64::MAX;
@@ -86,6 +87,12 @@ struct Args {
   /// Batch size for writes: 1 = single writes, >1 = pipeline `batch` proposals before awaiting.
   #[arg(short = 'b', long, default_value_t = 1, value_parser = parse_count)]
   batch: u64,
+  /// Number of tokio worker threads. Default 4: this harness drives each node from one serial task
+  /// loop, so extra workers buy no parallelism — they only add cross-thread futex wakeups and
+  /// work-stealing migration. A small fixed count keeps the measurement about consensus throughput
+  /// rather than scheduler churn. openraft's harness uses ~16 worker threads — sweep `-w` to compare.
+  #[arg(short = 'w', long, default_value_t = 4)]
+  workers: usize,
 }
 
 /// Parse a `u64` with optional `_` separators and a decimal unit suffix (`k`/`m`/`g`), matching
@@ -123,14 +130,23 @@ enum Wake {
   Tick,
 }
 
-#[tokio::main]
-async fn main() {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
   let args = Args::parse();
+  assert!(args.workers >= 1, "--workers must be >= 1");
   eprintln!(
-    "parity config: clients={} operations={} members={} batch={}",
-    args.clients, args.operations, args.members, args.batch
+    "parity config: clients={} operations={} members={} batch={} workers={}",
+    args.clients, args.operations, args.members, args.batch, args.workers
   );
-  run(args).await;
+  // Pin the runtime to a fixed worker count rather than `#[tokio::main]`'s default (one worker per
+  // CPU). This workload's per-node loop is serial, so the extra default workers add cross-thread
+  // futex wakeups and work-stealing churn without buying parallelism; a small fixed count keeps the
+  // number a read on consensus throughput. `-w` lets the operator sweep it.
+  let rt = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(args.workers)
+    .enable_all()
+    .build()?;
+  rt.block_on(run(args));
+  Ok(())
 }
 
 async fn run(args: Args) {
@@ -345,7 +361,10 @@ async fn run_node(
     Duration::from_millis(100),
   )
   .expect("valid config");
-  let mut ep: Node = Endpoint::new(cfg, Instant::ORIGIN, id, LogSm::new());
+  // Compaction stays on at the default `snapshot_threshold`: the log holds ~one threshold of entries
+  // in steady state, so this measures bounded consensus work. `CountSm`'s O(1) snapshot keeps that
+  // compaction cheap (the simulation `LogSm`'s O(n) snapshot is the artifact `CountSm` avoids).
+  let mut ep: Node = Endpoint::new(cfg, Instant::ORIGIN, id, CountSm::new());
   let mut log = MemLog::new();
   let mut stable = MemStable::<u64>::new();
   // Every client write carries the same small fixed payload — the FSM only counts applies, so the
