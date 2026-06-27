@@ -1074,6 +1074,20 @@ where
         // A transfer parks nothing (the verdict is immediate); release with the reply.
         drop(reservation);
       }
+      Command::SetReadMode {
+        mode,
+        reply,
+        reservation,
+      } => {
+        let r = self
+          .coord
+          .propose_read_mode_change(now, &mut self.log, &self.stable, mode)
+          .map_err(map_propose_err);
+        let _ = reply.send(r);
+        // The migration applies cluster-wide once the entry commits; the verdict here is immediate, so
+        // nothing parks — release with the reply.
+        drop(reservation);
+      }
       Command::Shutdown => return true,
     }
     false
