@@ -894,3 +894,149 @@ async fn query_completes_after_read_mode_migration() {
     "the linearizable read observes the one committed Normal entry"
   );
 }
+
+/// REGRESSION: a `query` on a fresh leader whose ONLY committed entry is its `Empty` no-op must
+/// COMPLETE. The no-op advances the endpoint's applied index but emits NO routed event, so without
+/// `Routing::sync_applied` the driver watermark stays 0 and the read — confirmed at the no-op index —
+/// parks forever. The per-query timeout turns that hang into a clear failure.
+#[compio::test]
+async fn query_after_noop_tail() {
+  let addr: SocketAddr = "127.0.0.1:43340".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  // Become leader WITHOUT appending any Normal entry: the only committed entry is the Empty no-op.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    if handle.status().await.expect("status round-trips").role == Role::Leader {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the node never became leader"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  }
+
+  // The query confirms at the no-op index and must run. Before the watermark sync it parks (the
+  // watermark stays 0 with no Applied event behind the no-op).
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let count = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the query never completed — the eventless no-op apply did not advance the driver watermark"
+    );
+    match compio::time::timeout(
+      Duration::from_secs(2),
+      handle.query(|sm: &CountSm| sm.count()),
+    )
+    .await
+    {
+      Ok(Ok(c)) => break c,
+      Ok(Err(_)) | Err(_) => compio::time::sleep(Duration::from_millis(30)).await,
+    }
+  };
+  assert_eq!(
+    count, 0,
+    "no Normal entry committed, so the read sees count 0"
+  );
+}
+
+/// REGRESSION: a `query` right after `bind_restart`, BEFORE any post-restart write, must COMPLETE.
+/// Restart replays the committed log (the endpoint's applied index recovers high) but CLEARS the
+/// replay events and starts a ZEROED `Routing`, so without `Routing::sync_applied` the driver
+/// watermark stays 0 and the post-restart read parks forever.
+#[compio::test]
+async fn query_after_restart_before_write() {
+  let addr: SocketAddr = "127.0.0.1:43350".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  // Boot 1: commit one Normal entry, then crash (keeping the durable stores).
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = compio::runtime::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(2) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  }
+  handle.shutdown().await.expect("clean teardown");
+  let _ = task.await;
+
+  // Boot 2: RESTART, then query BEFORE any post-restart write.
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver2, handle2) = CompioStreamDriver::bind_restart(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    1,
+    Vec::new(),
+    dialer,
+    acceptor,
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("restart bind");
+  compio::runtime::spawn(driver2.run()).detach();
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let count = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the post-restart query never completed — the recovered applied index did not advance the \
+       driver watermark"
+    );
+    match compio::time::timeout(
+      Duration::from_secs(2),
+      handle2.query(|sm: &CountSm| sm.count()),
+    )
+    .await
+    {
+      Ok(Ok(c)) => break c,
+      Ok(Err(_)) | Err(_) => compio::time::sleep(Duration::from_millis(30)).await,
+    }
+  };
+  assert_eq!(count, 1, "the read sees the one recovered committed entry");
+}

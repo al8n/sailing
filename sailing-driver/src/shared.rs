@@ -322,6 +322,23 @@ impl<I, R, F> Routing<I, R, F> {
     ctx
   }
 
+  /// Reconcile the driver watermark to the ENDPOINT's applied index, returning whether it moved.
+  ///
+  /// Some committed entries advance the endpoint's applied index WITHOUT emitting a routed event — a
+  /// fresh leader's `Empty` no-op, and the committed prefix a restart replays (whose events are
+  /// cleared) — so `route_event` alone leaves `applied` lagging and a read confirmed at such an index
+  /// would never become runnable. The driver calls this each pump (after draining events) and runs the
+  /// now-runnable queries when it returns `true`. Monotone: the endpoint's applied index only grows and
+  /// routed events never exceed it, so this only ever advances the watermark.
+  pub fn sync_applied(&mut self, endpoint_applied: Index) -> bool {
+    if endpoint_applied > self.applied {
+      self.applied = endpoint_applied;
+      true
+    } else {
+      false
+    }
+  }
+
   /// Queries whose confirmed read index the apply watermark has reached — popped for execution
   /// against the state machine (the DRIVER runs them; this module only books them).
   pub fn take_runnable_queries(&mut self) -> Vec<ParkedQuery<I, F>> {
@@ -855,6 +872,33 @@ mod tests {
       1,
       "the post-migration query becomes runnable once the watermark reaches its read index"
     );
+  }
+
+  #[test]
+  fn sync_applied_tracks_the_endpoint_for_eventless_commits() {
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    // A query confirmed at index 4 with NO routed event behind it (a fresh leader's Empty no-op, or a
+    // restart's replayed prefix): only the endpoint's applied index reflects it.
+    let ctx = r.mint_query_ctx();
+    r.queries.insert(
+      ctx,
+      ParkedQuery {
+        ready_at: Some(Index::new(4)),
+        complete: Box::new(|_| {}),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    assert!(r.take_runnable_queries().is_empty(), "watermark still at 0");
+    // Reconciling to the endpoint's applied index advances the watermark and releases the query —
+    // without this the query parks forever (no Applied/ConfChanged/ReadModeChanged event ever arrives).
+    assert!(r.sync_applied(Index::new(4)), "the watermark moved to 4");
+    assert_eq!(r.applied, Index::new(4));
+    assert_eq!(r.take_runnable_queries().len(), 1);
+    // Monotone + idempotent: a non-greater endpoint index never moves it (and never backward).
+    assert!(!r.sync_applied(Index::new(4)));
+    assert!(!r.sync_applied(Index::new(2)));
+    assert_eq!(r.applied, Index::new(4));
   }
 
   #[test]
