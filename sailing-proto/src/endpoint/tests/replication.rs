@@ -3018,3 +3018,95 @@ fn on_heartbeat_fail_stops_when_apply_committed_poisons() {
     "no HeartbeatResponse on a dead node"
   );
 }
+
+/// `flush_appends` must be idempotent for a PROBE peer. `maybe_send_append` leaves a Probe peer's
+/// `next_index` UNMOVED on a complete send, so the behind-gate alone re-passes every pump; without the
+/// `replication_pending` dirty flag the peer is re-sent the same `AppendEntries` every flush until it
+/// acks. Asserts a second flush (no propose, no ack) emits nothing — fails on the un-gated code.
+#[test]
+fn flush_appends_is_idempotent_for_a_probe_peer() {
+  use crate::Message;
+  // 3-voter leader (node 1), no-op committed via a peer-2 ack.
+  let (mut ep, mut log, stable, d) = make_three_node_leader();
+
+  // Put peer 3 in PROBE at the current tail (next_index == last_index + 1). A complete send to a Probe
+  // peer leaves next_index UNMOVED and does not pause it — the exact shape the dirty flag must guard.
+  let tail = log.last_index();
+  if let Some(p) = ep.tracker.progress_mut(&3u64) {
+    p.become_probe();
+    p.set_next_index(tail.next());
+  }
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Propose ONE command (index = tail + 1) and stage the fan-out.
+  let idx = ep
+    .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
+    .unwrap();
+  assert_eq!(idx, tail.next());
+
+  // FIRST flush: peer 3 is now behind the new tail → it gets exactly ONE AppendEntries carrying the
+  // proposal.
+  ep.flush_appends(d, &log, &stable);
+  let first_to_3 = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| {
+      o.to() == 3u64
+        && matches!(o.message(), Message::AppendEntries(ae) if ae.entries().iter().any(|e| e.index() == idx))
+    })
+    .count();
+  assert_eq!(
+    first_to_3, 1,
+    "the first flush must send the proposal to the Probe peer exactly once"
+  );
+
+  // SECOND flush: no new propose, no ack from peer 3 (still Probe, still behind). The dirty flag is
+  // clear, so this flush must emit NOTHING — without it, peer 3 re-passes the behind-gate and is re-sent.
+  ep.flush_appends(d, &log, &stable);
+  let second_appends = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| matches!(o.message(), Message::AppendEntries(_)))
+    .count();
+  assert_eq!(
+    second_appends, 0,
+    "a second flush with no new append must be a no-op — a Probe peer must NOT be re-sent every pump"
+  );
+}
+
+/// Companion to `flush_appends_is_idempotent_for_a_probe_peer`: a propose landing AFTER a flush cleared
+/// the dirty flag must still fan out on the NEXT flush — the clear is per-staged-append, not a permanent
+/// latch, so a later proposal is never stranded.
+#[test]
+fn flush_appends_re_arms_for_a_later_propose() {
+  use crate::Message;
+  let (mut ep, mut log, stable, d) = make_three_node_leader();
+
+  let tail = log.last_index();
+  if let Some(p) = ep.tracker.progress_mut(&3u64) {
+    p.become_probe();
+    p.set_next_index(tail.next());
+  }
+  while ep.poll_message().is_some() {}
+
+  // First propose + flush (drains the flag).
+  let idx1 = ep
+    .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"a"))
+    .unwrap();
+  ep.flush_appends(d, &log, &stable);
+  while ep.poll_message().is_some() {}
+
+  // A SECOND propose after the clear must re-arm the flag so the next flush fans out.
+  let idx2 = ep
+    .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"b"))
+    .unwrap();
+  assert_eq!(idx2, idx1.next());
+  ep.flush_appends(d, &log, &stable);
+  let to_3 = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| {
+      o.to() == 3u64
+        && matches!(o.message(), Message::AppendEntries(ae) if ae.entries().iter().any(|e| e.index() == idx2))
+    })
+    .count();
+  assert_eq!(
+    to_3, 1,
+    "a propose after the dirty flag cleared must still replicate on the next flush"
+  );
+}

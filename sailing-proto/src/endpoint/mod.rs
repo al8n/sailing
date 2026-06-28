@@ -1138,6 +1138,13 @@ where
   /// determinism — is unchanged. Taken out via `mem::take` during the send loop to break the `&mut self`
   /// borrow, then restored with its retained capacity.
   peers_scratch: Vec<(I, Index)>,
+  /// Whether a propose-family append still needs replication fan-out: set right after `submit_append` on
+  /// every propose path, cleared by `flush_appends` after it sends. It makes the pump-folded
+  /// `flush_appends` idempotent — `maybe_send_append` leaves a PROBE peer's `next_index` UNMOVED on a
+  /// complete send, so the behind-gate (`next_index <= last_index`) alone would re-send that peer the same
+  /// `AppendEntries` every pump until an ack; gating on this flag broadcasts each staged append once. The
+  /// election no-op fans out directly (not via `flush_appends`), so it deliberately does NOT set the flag.
+  replication_pending: bool,
 }
 
 // Default-`Prng` seed constructors: the public entry points (byte-identical-preserving).
@@ -1285,6 +1292,7 @@ where
         transfer_deadline: None,
       },
       peers_scratch: Vec::new(),
+      replication_pending: false,
     };
     ep.arm_election_timer(now);
     ep
@@ -1575,6 +1583,16 @@ where
   #[inline(always)]
   pub fn id(&self) -> I {
     self.config.id()
+  }
+
+  /// Test-only: force `peer`'s `Progress` into a sustained `Probe` at `next`, reproducing the flow-control
+  /// shape (`next_index` unmoved after a complete send) the public API only reaches via real timing.
+  #[cfg(test)]
+  pub(crate) fn force_peer_probe_for_test(&mut self, peer: &I, next: Index) {
+    if let Some(p) = self.tracker.progress_mut(peer) {
+      p.become_probe();
+      p.set_next_index(next);
+    }
   }
 
   /// The believed leader, if any.
