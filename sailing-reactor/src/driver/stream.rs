@@ -972,7 +972,7 @@ where
         reservation,
       } => match self
         .coord
-        .submit_propose(now, &mut self.log, &self.stable, &cmd)
+        .submit_propose_deferred(now, &mut self.log, &self.stable, &cmd)
       {
         Ok(index) => {
           self.routing.pending.insert(

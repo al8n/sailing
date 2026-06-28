@@ -190,6 +190,59 @@ fn leader_replicates_a_proposal_over_the_transport() {
   );
 }
 
+/// `submit_propose` must replicate the accepted entry IMMEDIATELY. `settle()` only moves bytes and
+/// drains storage (no `handle_timeout`, no `flush_appends`), so the entry reaches the follower ONLY if
+/// `submit_propose` already fanned out the `AppendEntries` — the deferred-only variant would not.
+#[test]
+fn submit_propose_replicates_immediately_to_peers() {
+  let mut w = World::new();
+  w.settle();
+  for _ in 0..40 {
+    w.step();
+    if w.a_is_leader() || w.b.role().is_leader() {
+      break;
+    }
+  }
+  assert!(w.a_is_leader() || w.b.role().is_leader());
+
+  // Capture the FOLLOWER's pre-propose log tail (the election no-op already replicated via the
+  // step() heartbeats), then propose on the leader and move bytes ONCE with no timer/pump.
+  let cmd = bytes::Bytes::from_static(b"x");
+  let (idx, before) = if w.a_is_leader() {
+    let before = w.lb.last_index();
+    let idx = w
+      .a
+      .submit_propose(w.now, &mut w.la, &w.sa, &cmd)
+      .expect("propose on the leader");
+    (idx, before)
+  } else {
+    let before = w.la.last_index();
+    let idx = w
+      .b
+      .submit_propose(w.now, &mut w.lb, &w.sb, &cmd)
+      .expect("propose on the leader");
+    (idx, before)
+  };
+  // settle() = move queued bytes + drain storage; NO handle_timeout, NO flush_appends. The only
+  // way the entry reaches the follower is the AppendEntries submit_propose queued itself.
+  w.settle();
+
+  let follower_last = if w.a_is_leader() {
+    w.lb.last_index()
+  } else {
+    w.la.last_index()
+  };
+  assert!(
+    follower_last > before,
+    "submit_propose must emit the AppendEntries immediately — the follower's log did not advance \
+     (before={before:?}, after={follower_last:?})"
+  );
+  assert!(
+    follower_last >= idx,
+    "the follower received the accepted entry index {idx:?} (log tail {follower_last:?})"
+  );
+}
+
 /// The coordinator-assigned id counter must never silently wrap into reuse: u64
 /// exhaustion is unreachable in practice, but a release-mode wrap would hand a LIVE id to a new
 /// connection and break the tie-break's uniqueness assumption — so it is a checked panic.
