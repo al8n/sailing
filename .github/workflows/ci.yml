@@ -113,8 +113,9 @@ jobs:
           rustup target add ${{ matrix.target }}
           # The driver crates are the platform-bound I/O layer — compio's proactor backends
           # (io_uring/IOCP/kqueue) and the reactor's agnostic/socket2 readiness sockets — so
-          # cross-portability is the protocol crate's property, not theirs.
-          cargo build --workspace --exclude sailing-compio --exclude sailing-reactor --target ${{ matrix.target }}
+          # cross-portability is the protocol crate's property, not theirs. The benchmark crate is a
+          # host dev tool whose bins can't link without a target cross-linker, so exclude it too.
+          cargo build --workspace --exclude sailing-compio --exclude sailing-reactor --exclude sailing-benchmark --target ${{ matrix.target }}
 
   # Verify the declared MSRV (rust-version in Cargo.toml) actually compiles the library and its
   # feature surface — without this job the declaration is aspirational.
