@@ -542,6 +542,8 @@ where
         transfer_deadline: None,
       },
       peers_scratch: Vec::new(),
+      // A restarted node comes up Follower; the propose paths set this once it (re-)wins an election.
+      replication_pending: false,
     };
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).

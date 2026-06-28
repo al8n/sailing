@@ -403,6 +403,13 @@ where
   pub const fn endpoint(&self) -> &Endpoint<I, F> {
     &self.endpoint
   }
+
+  /// Test-only mutable access to the wrapped endpoint, so a test can force a peer's `Progress` into a
+  /// flow-control state (e.g. a sustained `Probe`) the public API only reaches through real timing.
+  #[cfg(test)]
+  pub(crate) fn endpoint_mut(&mut self) -> &mut Endpoint<I, F> {
+    &mut self.endpoint
+  }
 }
 
 #[cfg(test)]

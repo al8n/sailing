@@ -39,8 +39,7 @@ where
     &mut self,
     now: Now,
     log: &mut L,
-    // Vestigial since the fan-out moved to `flush_appends`; kept so `propose_conf_change_v2` threads the
-    // same `(log, stable)` pair it always did.
+    // Unused since the fan-out moved to `flush_appends`; kept so the propose APIs still thread `&stable`.
     _stable: &S,
     cc: ConfChangeV2<I>,
   ) -> Option<Index>
@@ -71,6 +70,9 @@ where
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
     self.pending_conf_index = index;
+    // Stage the append for the next `flush_appends` (see `replication_pending`); shared by
+    // `propose_conf_change`/`_v2` and the auto-leave leave-joint append.
+    self.replication_pending = true;
     // Apply-time membership (etcd, spec §9): the leader does NOT fold the conf-change into its tracker
     // here. The configuration changes only when the entry is committed-and-applied (apply_committed) —
     // so `conf_state()`/`quorum_committed()` always reflect the COMMITTED voter set, never an

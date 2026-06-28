@@ -254,3 +254,73 @@ fn conn_id_exhaustion_panics_instead_of_wrapping() {
   // This open hands out ConnId(u64::MAX) and must refuse to wrap the successor.
   let _ = c.on_conn_open(label(1, true), Instant::ORIGIN);
 }
+
+/// The coordinator/driver counterpart of `flush_appends_is_idempotent_for_a_probe_peer`: the driver
+/// calls `flush_appends` every crank, so a no-ack PROBE peer must be sent a staged append exactly once.
+/// Forces the follower into a sustained `Probe`, stages a proposal via the deferred-propose path, and
+/// flushes twice with no intervening timer or ack — the second flush must emit nothing, failing on the
+/// un-gated code.
+#[test]
+fn coordinator_flush_appends_does_not_re_send_a_probe_peer_each_pump() {
+  use crate::Index;
+  let mut w = World::new();
+  w.settle(); // complete the label handshake so peer↔conn is bound both ways
+  assert_eq!(w.a.conn_of(&2), Some(ConnId(1)));
+
+  // Elect a leader over the wire, then drive the proposal from WHICHEVER node won (the World's election
+  // is randomized per seed). Bind `(leader, follower)` once so the rest is winner-agnostic.
+  for _ in 0..40 {
+    w.step();
+    if w.a_is_leader() || w.b.role().is_leader() {
+      break;
+    }
+  }
+  assert!(w.a_is_leader() || w.b.role().is_leader());
+  let leader_is_a = w.a_is_leader();
+  let follower_id: u64 = if leader_is_a { 2 } else { 1 };
+
+  // Borrow the leader coordinator + its log/stable, winner-agnostic.
+  let (leader, llog, lstable): (&mut Coord, &mut VecLog, &NoopStable) = if leader_is_a {
+    (&mut w.a, &mut w.la, &w.sa)
+  } else {
+    (&mut w.b, &mut w.lb, &w.sb)
+  };
+
+  // Force the follower into a sustained PROBE at the tail — a complete send leaves next_index UNMOVED,
+  // the shape the dirty flag must guard. Its ack is never delivered below, so it stays Probe.
+  let tail: Index = llog.last_index();
+  leader
+    .endpoint_mut()
+    .force_peer_probe_for_test(&follower_id, tail.next());
+  let _ = leader.poll_transmit(); // clean baseline
+
+  // An idle flush (no propose since the last flush — the election no-op does NOT set the dirty flag)
+  // must be a no-op.
+  leader.flush_appends(w.now, llog, lstable);
+  let idle = leader.poll_transmit();
+  assert!(
+    idle.iter().all(|(_, b)| b.is_empty()),
+    "an idle flush must emit nothing — the election no-op is not re-sent every pump"
+  );
+
+  // Stage ONE proposal without fanning out, then flush: the leader sends it to the Probe peer once.
+  let cmd = bytes::Bytes::from_static(b"x");
+  leader
+    .submit_propose_deferred(w.now, llog, lstable, &cmd)
+    .expect("propose on the leader");
+  leader.flush_appends(w.now, llog, lstable);
+  let first = leader.poll_transmit();
+  assert!(
+    first.iter().any(|(_, b)| !b.is_empty()),
+    "the first flush after a propose must send the entry to the Probe peer"
+  );
+
+  // SECOND flush: no new propose, no ack, no timer in this window — the only possible output is a
+  // replication re-send, which the dirty flag suppresses. It must emit nothing.
+  leader.flush_appends(w.now, llog, lstable);
+  let second = leader.poll_transmit();
+  assert!(
+    second.iter().all(|(_, b)| b.is_empty()),
+    "a second flush with no new append must emit nothing — a Probe peer must NOT be re-sent every pump"
+  );
+}

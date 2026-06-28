@@ -79,15 +79,15 @@ where
     self
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
+    // Stage the append for the next `flush_appends` (see `replication_pending`).
+    self.replication_pending = true;
     // Apply-time migration (mirror apply-time membership): the mode changes only when the entry is
     // committed-and-applied (`apply_committed`). At append the leader records only the one-in-flight
     // guard; `active_read_mode` does not move yet.
     self.reads.pending_read_mode_index = index;
-    // The replication fan-out is deferred to the driver's coalesced `flush_appends` (see `propose`).
-    // The SetReadMode entry was ALREADY appended (durable-pending) above — report Ok(index) even if a
-    // later flush self-poisons. It is a real proposal that WILL commit via the durable log; returning Err
-    // would make the caller treat a committed entry as never-proposed. The poison does no further work
-    // (every op entry-guards) and surfaces on the next public-API call.
+    // Fan-out deferred to the driver's `flush_appends` (see `propose`). The entry was ALREADY appended
+    // (durable-pending) above — report Ok(index) even if a later flush self-poisons; it WILL commit via
+    // the durable log, and returning Err would make the caller treat a committed entry as never-proposed.
     Ok(index)
   }
 }

@@ -328,13 +328,12 @@ where
   }
 
   /// Ship the coalesced replication batch: ONE `AppendEntries` per BEHIND peer carrying everything the
-  /// propose-family appended since the last flush. The propose-family no longer fans out per call; the
-  /// driver folds this into its pump chokepoint so a burst of proposals replicates as a single broadcast.
-  /// Correctness-preserving: the log is the single source of truth and `maybe_send_append` derives each
-  /// peer's `next..last_index` from live state every call, so coalescing only changes message COUNT, not
-  /// the entries any peer receives.
+  /// propose-family appended since the last flush. The driver folds this into its pump chokepoint so a
+  /// burst of proposals replicates as a single broadcast. Correctness-preserving: `maybe_send_append`
+  /// derives each peer's `next..last_index` from live state, so coalescing changes only message COUNT.
   ///
-  /// `&L` (read-only): replication only reads the log via `maybe_send_append`.
+  /// Idempotent per staged append: the [`replication_pending`](Self::replication_pending) dirty flag
+  /// gates the fan-out, so the unconditional per-pump call sends only when a new append was staged.
   pub fn flush_appends<L, S>(&mut self, now: impl Into<Now>, log: &L, stable: &S)
   where
     L: LogStore,
@@ -345,10 +344,13 @@ where
     if self.poison.poisoned {
       return;
     }
-    // MANDATORY role-guard: `step_down_to_follower` does NOT clear the tracker, so a follower still
-    // carries leader progress. An unguarded flush would make it emit `AppendEntries` stamped with this
-    // node's now-stale leader term. `maybe_send_append` has no role check of its own, so it must be here.
+    // Role-guard: `step_down_to_follower` does NOT clear the tracker, so without this a follower would
+    // emit `AppendEntries` stamped with its now-stale leader term (`maybe_send_append` has no role check).
     if !self.role.is_leader() {
+      return;
+    }
+    // Idempotency gate: nothing staged since the last flush ⇒ no fan-out (see `replication_pending`).
+    if !self.replication_pending {
       return;
     }
     // Reuse the peer scratch (see `broadcast_heartbeat`): collect peer ids from `progress_map()`, then
@@ -363,14 +365,9 @@ where
       }
       peers.push((peer.cheap_clone(), Index::ZERO));
     }
-    // BEHIND-GATE (the load-bearing fix that makes a per-pump flush safe): only send to a peer whose
-    // `next_index <= last_index` — one that is actually MISSING entries. A caught-up peer
-    // (`next_index > last_index`) otherwise gets a deliberate EMPTY `AppendEntries` (the heartbeat-commit
-    // probe in `maybe_send_append`, which must NOT be removed from there). Folded into the per-iteration
-    // pump, an ungated flush would storm those empty probes to caught-up peers. After a propose every
-    // peer is behind the new tail, so this gate is a NO-OP versus the old post-propose fan-out; the
-    // empty probe still flows on its own cadence via `broadcast_heartbeat`. Stateless — no dirty flag, no
-    // resets (the `has_pending` complete-by-construction house style).
+    // Behind-gate: send only to a peer actually missing entries (`next_index <= last_index`). A caught-up
+    // peer would otherwise get the deliberate EMPTY heartbeat-commit probe `maybe_send_append` emits;
+    // that probe must keep flowing on its own cadence via `broadcast_heartbeat`, not on every flush.
     let last = log.last_index();
     for (peer, _) in peers.drain(..) {
       if self
@@ -382,6 +379,8 @@ where
       }
     }
     self.peers_scratch = peers;
+    // Clear AFTER the fan-out; a propose landing after this re-sets the flag and fans out next flush.
+    self.replication_pending = false;
   }
 
   /// THE single definition of the FAILOVER wall horizon: has a successor's commit-wait on a walled
@@ -654,8 +653,7 @@ where
     &mut self,
     now: impl Into<Now>,
     log: &mut L,
-    // Vestigial since the propose fan-out moved to `flush_appends`; kept for call-site stability (the
-    // driver/coordinator propose APIs still thread `&stable`).
+    // Unused since the fan-out moved to `flush_appends`; kept so the propose APIs still thread `&stable`.
     _stable: &S,
     cmd: &F::Command,
   ) -> Result<Index, ProposeError<I>>
@@ -700,13 +698,13 @@ where
     self
       .pending
       .insert(opid, Pending::LeaderAppend { upto: index });
-    // The coalesced fan-out is DEFERRED: the driver folds `flush_appends` into its pump chokepoint, so a
-    // burst of proposals replicates as one `AppendEntries` per peer instead of one per propose.
+    // Stage the append for the next `flush_appends` (see `replication_pending`); the fan-out is DEFERRED
+    // to the driver's pump chokepoint.
+    self.replication_pending = true;
     // The entry was ALREADY appended (durable-pending) ABOVE — report Ok(index) even if a later flush
-    // self-poisons. The entry is a real proposal that WILL commit via the durable log (a restart or a new
-    // leader drives it); returning Err here would make the caller treat a committed entry as
-    // never-proposed (the VOPR's "conjured command" failure). The poison does no further work — every op
-    // entry-guards — and surfaces on the caller's NEXT public-API call.
+    // self-poisons. It is a real proposal that WILL commit via the durable log (a restart or a new leader
+    // drives it); returning Err would make the caller treat a committed entry as never-proposed (the
+    // VOPR's "conjured command" failure). The poison surfaces on the caller's NEXT public-API call.
     Ok(index)
   }
 
