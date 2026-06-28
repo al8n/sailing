@@ -460,7 +460,7 @@ fn reconcile_restart_log(
 
 /// What the core owes once a storage write completes.
 #[derive(Debug, Clone, Copy)]
-enum Pending<I> {
+pub(crate) enum Pending<I> {
   /// Emit `VoteResponse(grant)` to `to` once the term+vote write is durable.
   /// `term` records the term at which the vote was cast so stale completions can be
   /// detected and dropped if the term has since advanced.
@@ -934,7 +934,7 @@ where
   /// analogue of `pending_compact` deferring `log.compact` until the blob is durable — the core owns
   /// the ordering rather than the storage layer (the audited golden fix). Holds the DECODED snapshot
   /// (move-out-and-replace on supersede, never `Clone` — `F::Snapshot` has only a `Data` bound); a
-  /// separate field, so a higher-term step-down's `self.pending.clear()` does NOT drop it (a boundary
+  /// separate field, so a higher-term step-down's pending-action clears do NOT drop it (a boundary
   /// that is already quorum-committed stays valid across a pure term bump). `restart` resets it to `None`.
   pending_install: Option<(OpId, crate::SnapshotMeta<I>, F::Snapshot, I)>,
   /// In-flight snapshot write: `(opid, up_to)`. Compaction is deferred until the snapshot
@@ -1104,8 +1104,23 @@ where
   tracker: Tracker<I>,
   /// Monotonically minted id for every storage submission.
   next_op_id: OpId,
-  /// Outstanding write → deferred action.
-  pending: BTreeMap<OpId, Pending<I>>,
+  /// Outstanding LOG-seam writes → deferred action, completed by [`on_log_appended`](Self::on_log_appended)
+  /// once the append is durable: the [`Pending::FollowerAck`] and [`Pending::LeaderAppend`] variants.
+  ///
+  /// A `VecDeque`, not a map (mirroring [`inflight_append_upto`](Durability::inflight_append_upto)):
+  /// actions are pushed in `OpId`-ascending submit order and drain to empty between bursts, so the
+  /// completing op is the FRONT in the common case (an O(1) `pop_front`). The `LogStore` contract
+  /// permits completions in ANY order, so [`take_log_pending`](Self::take_log_pending) falls back to a
+  /// search-remove on a front mismatch — byte-identical to the old remove-by-key. The split from the
+  /// stable seam is exact: each variant's seam matches its completion channel, and no operation ever
+  /// observes the two seams' COMBINED order (every reader filters/counts/looks-up by key), so
+  /// determinism is unchanged.
+  pending_log: VecDeque<(OpId, Pending<I>)>,
+  /// Outstanding STABLE-seam writes → deferred action, completed by [`on_stable_wrote`](Self::on_stable_wrote)
+  /// once the hard-state write is durable: the [`Pending::CastVote`] and [`Pending::Campaign`] variants.
+  /// Same `VecDeque` discipline as [`pending_log`](Self::pending_log); drained via
+  /// [`take_stable_pending`](Self::take_stable_pending).
+  pending_stable: VecDeque<(OpId, Pending<I>)>,
   /// The fail-stop state (poisoned flag + first-cause reason).
   poison: Poison,
   /// The durability watermarks and gated acks (persist-before-respond / -advertise / -ack): the term +
@@ -1242,7 +1257,8 @@ where
       },
       tracker,
       next_op_id: OpId::ZERO,
-      pending: BTreeMap::new(),
+      pending_log: VecDeque::new(),
+      pending_stable: VecDeque::new(),
       poison: Poison::default(),
       durable: Durability {
         // fresh node at Term::ZERO — trivially "durable" (nothing to persist), so
@@ -1473,14 +1489,14 @@ where
     debug_assert!(
       self.outputs.outgoing.len() < TRIPWIRE
         && self.outputs.events.len() < TRIPWIRE
-        && self.pending.len() < TRIPWIRE
+        && self.pending_len() < TRIPWIRE
         && self.durable.inflight_append_upto.len() < TRIPWIRE,
       "endpoint work queues exceeded the drain tripwire (outgoing={}, events={}, pending={}, \
        inflight={}) — a driver MUST drain poll_message/poll_event and call handle_storage between \
        dispatches (see poll_message)",
       self.outputs.outgoing.len(),
       self.outputs.events.len(),
-      self.pending.len(),
+      self.pending_len(),
       self.durable.inflight_append_upto.len(),
     );
   }
@@ -1891,7 +1907,8 @@ where
         // (`pending_install` is a SEPARATE field, so it survives this clear — a deferred install
         // whose boundary is already quorum-committed stays valid across a pure term bump; the
         // completion-time staleness re-check in `install_snapshot_now` is the final guard.)
-        self.pending.clear();
+        self.pending_log.clear();
+        self.pending_stable.clear();
         // Drop all ReadIndex state too: a stale read confirmation must never leak across a term
         // change. Mirrors `step_down_to_follower` / `become_leader` (read confirmation is
         // leader-gated, so this is robustness, not a behavior change).

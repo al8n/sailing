@@ -76,9 +76,7 @@ where
     .with_wall_timestamp(self.lease_wall_stamp(now));
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
-    self
-      .pending
-      .insert(opid, Pending::LeaderAppend { upto: index });
+    self.push_pending(opid, Pending::LeaderAppend { upto: index });
     // Stage the append for the next `flush_appends` (see `replication_pending`).
     self.replication_pending = true;
     // Apply-time migration (mirror apply-time membership): the mode changes only when the entry is

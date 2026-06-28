@@ -766,9 +766,10 @@ where
     // now-discarded entries, and abandon any in-flight leader-side compaction (its old `SnapshotWritten`
     // harmlessly finds None). Deferred to HERE, not receipt: the OLD log stayed live — and its in-flight
     // appends valid — throughout the deferral window. Vote-persistence pendings survive (log-independent).
+    self.pending_log.clear();
     self
-      .pending
-      .retain(|_, p| matches!(p, Pending::CastVote { .. }));
+      .pending_stable
+      .retain(|(_, p)| matches!(p, Pending::CastVote { .. }));
     self.snapshot.pending_compact = None;
 
     // Step 3: advance commit + applied to the snapshot boundary.

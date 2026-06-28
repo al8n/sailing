@@ -222,7 +222,7 @@ fn durable_index_advances_after_same_term_leader_step_down() {
   // captured it (the completion is still queued in the log).
   let upto_before = ep.durable.durable_index;
   assert!(
-    !ep.pending.is_empty(),
+    !ep.pending_is_empty(),
     "the leader's no-op append is pending as a LeaderAppend"
   );
   let noop_index = log.last_index();

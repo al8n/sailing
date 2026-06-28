@@ -82,9 +82,9 @@ where
   /// same term.
   pub(crate) fn self_vote_durable(&self) -> bool {
     !self
-      .pending
-      .values()
-      .any(|p| matches!(p, Pending::Campaign { term } if *term == self.term))
+      .pending_stable
+      .iter()
+      .any(|(_, p)| matches!(p, Pending::Campaign { term } if *term == self.term))
   }
 
   /// Whether the post-restart vote-suppression fence currently blocks GRANTING a vote (LeaseBased
@@ -208,7 +208,7 @@ where
         .with_commit(self.durable_commit());
       self.submit_write(stable, opid, hs);
       self.durable.committed_persisted = self.durable_commit();
-      self.pending.insert(
+      self.push_pending(
         opid,
         Pending::CastVote {
           to: rv.candidate(),
@@ -317,7 +317,8 @@ where
     self.term = next_term;
     // All pending work from the previous term is now stale (spec §7). Clear before recording
     // the self-vote below so old completions that arrive later are harmlessly ignored.
-    self.pending.clear();
+    self.pending_log.clear();
+    self.pending_stable.clear();
     self.role = Role::Candidate;
     self.set_leader(None);
     self.voted_for = Some(self.config.id());
@@ -338,9 +339,7 @@ where
     // Defer acting on the self-vote until it is DURABLE (persist-before-act, symmetric with the
     // follower `CastVote` path): `become_leader` fires from `on_stable_wrote` (single-node now, or
     // once peer votes arrive) only after this write's `StableDone::Wrote`.
-    self
-      .pending
-      .insert(opid, Pending::Campaign { term: self.term });
+    self.push_pending(opid, Pending::Campaign { term: self.term });
     self.arm_election_timer(now);
 
     let (term, me) = (self.term, self.config.id());
@@ -449,9 +448,7 @@ where
     .with_wall_timestamp(self.lease_wall_stamp(now));
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&noop));
-    self
-      .pending
-      .insert(opid, Pending::LeaderAppend { upto: noop_index });
+    self.push_pending(opid, Pending::LeaderAppend { upto: noop_index });
     Some(noop_index)
   }
 
