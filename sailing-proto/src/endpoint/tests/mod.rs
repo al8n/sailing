@@ -69,6 +69,7 @@ fn make_single_node_leader_with_entries(
   for i in 0..n {
     let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
     let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+    ep.flush_appends(d, &log, &stable);
     // Drain storage each time to let the self-append complete (quorum=1: auto-commits).
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
@@ -115,6 +116,7 @@ fn make_single_node_leader_dropping_snapshot_completion(
   for i in 0..n {
     let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
     let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}

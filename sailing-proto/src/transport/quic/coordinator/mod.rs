@@ -438,6 +438,19 @@ where
     r
   }
 
+  /// Ship the coalesced replication batch (see [`Endpoint::flush_appends`]) and pump the resulting
+  /// outbound frames. The driver folds this into its pump chokepoint so a burst of
+  /// [`submit_propose`](Self::submit_propose) calls replicates as a single broadcast per peer.
+  pub fn flush_appends<L, S>(&mut self, now: impl Into<Now>, log: &L, stable: &S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    self.endpoint.flush_appends(now, log, stable);
+    self.pump(now.mono());
+  }
+
   /// Propose a membership change (single-step). Mirrors [`Endpoint::propose_conf_change`].
   pub fn propose_conf_change<L, S>(
     &mut self,

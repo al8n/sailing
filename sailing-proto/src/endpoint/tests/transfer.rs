@@ -319,6 +319,7 @@ fn transfer_to_lagging_follower_waits_for_catch_up() {
   // Propose a second entry (index 2) to create lag for peer 2.
   ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   // log.last_index() == 2, but peer 2 match_index == 0 (has NOT acked yet).
@@ -420,6 +421,7 @@ fn proposals_refused_during_transfer_allowed_after_abort() {
     &stable,
     &bytes::Bytes::from_static(b"after_abort"),
   );
+  ep.flush_appends(deadline, &log, &stable);
   assert!(
     ok.is_ok(),
     "propose must succeed after transfer abort; got {ok:?}"
@@ -468,6 +470,7 @@ fn transfer_aborts_on_deadline() {
     &stable,
     &bytes::Bytes::from_static(b"resumed"),
   );
+  ep.flush_appends(after_deadline, &log, &stable);
   assert!(ok.is_ok(), "propose must succeed after abort");
 }
 
@@ -788,6 +791,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
     &stable,
     &bytes::Bytes::from_static(b"resumed"),
   );
+  ep.flush_appends(past_first_deadline, &log, &stable);
   assert!(
     ok.is_ok(),
     "propose must succeed immediately after transferee is removed; got {ok:?}"

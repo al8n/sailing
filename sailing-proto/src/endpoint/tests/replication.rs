@@ -183,6 +183,7 @@ fn propose_appends_and_replicates() {
   let idx = ep
     .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   assert_eq!(idx, Index::new(2)); // after the no-op at 1
   let mut appends = 0;
   while let Some(o) = ep.poll_message() {
@@ -607,6 +608,7 @@ fn quorum_ack_commits_and_applies() {
   let idx = ep
     .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
     .unwrap(); // index 2
+  ep.flush_appends(d, &log, &stable);
   // Drain storage so the LeaderAppend for index 2 fires (advances self match_index to 2).
   ep.handle_storage(d, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
@@ -764,6 +766,7 @@ fn single_node_leader_commits_after_storage_drain() {
   // Now propose a Normal entry and drain storage so it commits.
   ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
 
   // Applied event for the Normal entry must have been emitted.
@@ -811,6 +814,7 @@ fn apply_defers_on_cold_read_without_poisoning() {
   log.return_cold_on_read();
   ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
   ep.handle_timeout(d, &mut log, &mut stable);
 
@@ -915,6 +919,7 @@ fn cold_apply_is_redriven_by_handle_storage_without_a_completion() {
   log.return_cold_on_read();
   ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
     !core::iter::from_fn(|| ep.poll_event()).any(|e| matches!(e, Event::Applied(_))),
@@ -963,6 +968,7 @@ fn apply_reads_are_byte_capped_and_handle_owned_entries() {
   while ep.poll_message().is_some() {}
   ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
 
   assert!(
@@ -1135,6 +1141,7 @@ fn heartbeat_commit_is_clamped_to_peer_match() {
     .unwrap();
   ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"y"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable); // leader self-match → 3
   while ep.poll_message().is_some() {}
 
@@ -1253,6 +1260,7 @@ fn leader_paces_by_inflight_window() {
     let _ = ep
       .propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(&[i]))
       .unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
   }
 
@@ -1391,6 +1399,7 @@ fn single_ack_does_not_rewind_replicate_window() {
     let _ = ep
       .propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(&[i]))
       .unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
   }
   while ep.poll_message().is_some() {}
@@ -1848,10 +1857,12 @@ fn heartbeat_response_resumes_stalled_probe() {
   let _ = ep
     .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd1"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
   let _ = ep
     .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd2"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
   // Drain all messages from the propose phase (probe fires on first propose, then pauses).
   while ep.poll_message().is_some() {}
@@ -1861,6 +1872,7 @@ fn heartbeat_response_resumes_stalled_probe() {
   let _ = ep
     .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd3"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
   let mut probe_blocked = true;
   while let Some(out) = ep.poll_message() {
@@ -2066,6 +2078,7 @@ fn empty_appends_do_not_wedge_inflight_window() {
   let _idx = ep
     .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"new"))
     .unwrap();
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
 
   let mut delivered = false;
@@ -2854,6 +2867,7 @@ fn ack_pumps_multiple_batches_to_a_lagging_follower() {
   let payload = bytes::Bytes::from(std::vec![0u8; 100 * 1024]);
   for _ in 0..30 {
     ep.propose(d, &mut log, &stable, &payload).unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
   }
   while ep.poll_message().is_some() {} // discard the optimistic per-propose sends

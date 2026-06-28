@@ -170,6 +170,7 @@ fn restart_recovers_commit_persisted_via_real_path() {
   for cmd in cmds {
     ep.propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(cmd))
       .unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}
@@ -569,6 +570,7 @@ fn restart_no_snapshot_replays_from_one() {
   for b in [b"a".as_slice(), b"b".as_slice()] {
     ep.propose(d, &mut log, &stable, &bytes::Bytes::copy_from_slice(b))
       .unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}

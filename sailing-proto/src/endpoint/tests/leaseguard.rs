@@ -42,6 +42,7 @@ fn leaseguard_leader_stamps_appended_entries() {
     let idx = ep
       .propose(now, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
       .expect("leader accepts the proposal");
+    ep.flush_appends(now, &log, &stable);
     // Find the proposed entry in the broadcast AppendEntries and read its timestamp.
     while let Some(out) = ep.poll_message() {
       if let Message::AppendEntries(ae) = out.message()
@@ -474,6 +475,7 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
     let idx = ep
       .propose(now, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
       .expect("leader accepts the proposal");
+    ep.flush_appends(now, &log, &stable);
     while let Some(out) = ep.poll_message() {
       if let Message::AppendEntries(ae) = out.message()
         && let Some(e) = ae.entries().iter().find(|e| e.index() == idx)
@@ -829,6 +831,7 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
     &bytes::Bytes::from_static(b"x"),
   )
   .expect("a leader appends during the commit-wait");
+  ep.flush_appends(at(before), &log, &stable);
   ep.handle_storage(at(before), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
@@ -856,6 +859,7 @@ fn leaseguard_failover_precise_anchor_lifts_commit_wait_early() {
     &bytes::Bytes::from_static(b"y"),
   )
   .expect("a leader appends during the commit-wait");
+  ep.flush_appends(at(after), &log, &stable);
   ep.handle_storage(at(after), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
@@ -1064,6 +1068,7 @@ fn leaseguard_read_serves_live_lease_then_degrades_when_stale() {
   let idx2 = ep
     .propose(t1, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
     .unwrap();
+  ep.flush_appends(t1, &log, &stable);
   ep.handle_storage(t1, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   ep.handle_message(
@@ -1563,6 +1568,7 @@ fn leaseguard_read_gate_does_not_wrap_near_u64_max_nanos() {
   let idx = ep
     .propose(t_huge, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
     .unwrap();
+  ep.flush_appends(t_huge, &log, &stable);
   ep.handle_storage(t_huge, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   ep.handle_message(

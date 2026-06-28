@@ -192,6 +192,19 @@ where
     r
   }
 
+  /// Ship the coalesced replication batch (see [`Endpoint::flush_appends`]) and flush the resulting
+  /// outbound messages. The driver folds this into its pump chokepoint so a burst of
+  /// [`submit_propose`](Self::submit_propose) calls replicates as a single broadcast per peer.
+  pub fn flush_appends<L, S>(&mut self, now: impl Into<Now>, log: &L, stable: &S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    self.endpoint.flush_appends(now, log, stable);
+    self.flush();
+  }
+
   /// Initiate a linearizable read; the resulting `ReadState` surfaces via [`Self::poll_event`].
   pub fn read_index<L, S>(
     &mut self,
