@@ -84,26 +84,58 @@ stabilize
 > n1 ready
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
-  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
-  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
-  AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120a12080400000000000000120c080112080100000000000000, 1/3 conf-change]
   n1 conf-changed index=2 voters={2,3,4}|{1,2,3}(joint)
 > n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
 > n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  AppendResponse term=1 match=2
+  n2 conf-changed index=2 voters={2,3,4}|{1,2,3}(joint)
+> n3 ready
+  AppendResponse term=1 match=2
+  n3 conf-changed index=2 voters={2,3,4}|{1,2,3}(joint)
+> n1 recv AppendResponse term=1 match=2
+> n1 recv AppendResponse term=1 match=2
+
+tick-heartbeat 1
+----
+Heartbeat term=1 commit=2
+Heartbeat term=1 commit=2
+Heartbeat term=1 commit=0
+
+stabilize
+----
+> n2 recv Heartbeat term=1 commit=2
+> n3 recv Heartbeat term=1 commit=2
+> n4 recv Heartbeat term=1 commit=0
+> n2 ready
+  HeartbeatResponse term=1
+> n3 ready
+  HeartbeatResponse term=1
+> n4 ready
+  HeartbeatResponse term=1
+  n4 leader-changed term=1 lead=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 recv HeartbeatResponse term=1
+> n1 ready
+  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+  AppendEntries term=1 prev=1/3 commit=2 entries=[]
+  AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+  AppendEntries term=1 prev=1/3 commit=2 entries=[]
+  AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120a12080400000000000000120c080112080100000000000000, 1/3 conf-change]
 > n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+> n2 recv AppendEntries term=1 prev=1/3 commit=2 entries=[]
 > n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change]
+> n3 recv AppendEntries term=1 prev=1/3 commit=2 entries=[]
 > n4 recv AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 conf-change 0x120a12080400000000000000120c080112080100000000000000, 1/3 conf-change]
 > n2 ready
   AppendResponse term=1 match=2
   AppendResponse term=1 match=3
-  n2 conf-changed index=2 voters={2,3,4}|{1,2,3}(joint)
 > n3 ready
   AppendResponse term=1 match=2
   AppendResponse term=1 match=3
-  n3 conf-changed index=2 voters={2,3,4}|{1,2,3}(joint)
 > n4 ready
   AppendResponse term=1 reject hint=0/0
-  n4 leader-changed term=1 lead=1
 > n1 recv AppendResponse term=1 match=2
 > n1 recv AppendResponse term=1 match=3
 > n1 recv AppendResponse term=1 match=2
@@ -123,14 +155,6 @@ stabilize
   n3 conf-changed index=3 voters={2,3,4}
 > n1 recv AppendResponse term=1 match=3
 > n1 recv AppendResponse term=1 match=3
-
-tick-heartbeat 1
-----
-ok
-
-stabilize
-----
-ok
 
 campaign 2
 ----
