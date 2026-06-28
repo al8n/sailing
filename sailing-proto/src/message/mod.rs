@@ -3,7 +3,7 @@
 use crate::{CheapClone, Entry, Index, ReadOnlyOption, Term, conf::ConfState};
 use bytes::Bytes;
 use core::time::Duration;
-use std::vec::Vec;
+use std::{sync::Arc, vec::Vec};
 
 /// AppendEntries / heartbeat-with-entries (log replication).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -12,7 +12,7 @@ pub struct AppendEntries<I> {
   leader: I,
   prev_log_index: Index,
   prev_log_term: Term,
-  entries: Vec<Entry>,
+  entries: Arc<[Entry]>,
   leader_commit: Index,
 }
 
@@ -25,6 +25,27 @@ impl<I: CheapClone> AppendEntries<I> {
     prev_log_index: Index,
     prev_log_term: Term,
     entries: Vec<Entry>,
+    leader_commit: Index,
+  ) -> Self {
+    Self::new_shared(
+      term,
+      leader,
+      prev_log_index,
+      prev_log_term,
+      entries.into(),
+      leader_commit,
+    )
+  }
+
+  /// Construct from an already-shared entry slice, so the leader broadcast can hand the same
+  /// `Arc<[Entry]>` to every peer at one send range without re-cloning the suffix per peer.
+  #[allow(clippy::too_many_arguments)]
+  pub(crate) fn new_shared(
+    term: Term,
+    leader: I,
+    prev_log_index: Index,
+    prev_log_term: Term,
+    entries: Arc<[Entry]>,
     leader_commit: Index,
   ) -> Self {
     Self {

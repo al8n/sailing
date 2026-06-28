@@ -3,6 +3,19 @@ use crate::{
   AppendEntries, AppendResponse, Entry, Heartbeat, HeartbeatResponse, MaybeOwned, ProgressState,
   ProposeError,
 };
+use std::sync::Arc;
+
+/// Per-dispatch scratch so peers at the same send range build the entry batch once and share one
+/// `Arc<[Entry]>` allocation, instead of cloning the suffix per peer. The leader fans the same suffix
+/// to every caught-up follower in `flush_appends`; a matching `(next, end)` key carries identical
+/// entries because the leader's `[next, end)` tail is append-only.
+struct SharedEntries {
+  next: Index,
+  end: Index,
+  entries: Arc<[Entry]>,
+  last_sent: Index,
+  bytes_sent: u64,
+}
 
 impl<I, F, R> Endpoint<I, F, R>
 where
@@ -179,6 +192,20 @@ where
     log: &L,
     stable: &S,
   ) {
+    self.maybe_send_append_shared(now, peer, log, stable, &mut None);
+  }
+
+  /// Like [`Self::maybe_send_append`] but reuses a caller-owned scratch so peers at the same send range
+  /// (the steady-state broadcast in [`Self::flush_appends`]) share one `Arc<[Entry]>` build instead of
+  /// cloning the suffix per peer.
+  fn maybe_send_append_shared<L: LogStore, S: StableStore<NodeId = I>>(
+    &mut self,
+    now: Now,
+    peer: I,
+    log: &L,
+    stable: &S,
+    shared: &mut Option<SharedEntries>,
+  ) {
     // A poisoned node performs no work; every poison-capable op no-ops at entry so a mid-dispatch poison
     // cannot drive further sends, commits, or state mutation before the public entry point returns.
     if self.poison.poisoned {
@@ -249,53 +276,70 @@ where
     let read_end = end.min(Index::new(
       next.get().saturating_add(MAX_READ_BATCH_ENTRIES),
     ));
-    // Bind the MaybeOwned to a local so a cold-fetch store's OWNED buffer outlives the `slice` borrow.
-    let read: MaybeOwned<'_, [Entry]> = if next < end {
-      match log.entries(next..read_end, max_bytes) {
-        Ok(EntriesRead::Ready(e)) => e,
-        // Cold: the range isn't resident. Defer the whole send — no Progress mutation, no inflight
-        // slot consumed — and retry on the next pump. A cold read is NOT a fault, so never poison
-        // (unlike an Err, which IS fatal, same policy as `apply_committed`'s LogRead).
-        Ok(EntriesRead::Pending) => return,
-        Err(_) => {
-          self.poison(PoisonReason::LogRead);
-          return;
-        }
-      }
-    } else {
-      MaybeOwned::Borrowed(&[])
-    };
-    let slice: &[Entry] = &read;
-
-    // Cap at max_size_per_msg bytes, but always send at least one entry.
-    let entries = if slice.is_empty() || max_bytes == u64::MAX {
-      slice.to_vec()
-    } else {
-      let mut budget = max_bytes;
-      let mut count = 0usize;
-      for e in slice {
-        let sz = Self::entry_size(e);
-        if count == 0 {
-          // always include at least one entry regardless of size
-          count += 1;
-          budget = budget.saturating_sub(sz);
-        } else if sz <= budget {
-          count += 1;
-          budget -= sz;
+    // Reuse the batch a same-range peer already built this dispatch (the steady-state broadcast in
+    // `flush_appends` fans the same suffix to every caught-up follower): share one Arc allocation
+    // rather than re-reading and cloning the suffix per peer.
+    let (entries, last_sent, bytes_sent): (Arc<[Entry]>, Index, u64) =
+      if let Some(s) = shared.as_ref().filter(|s| s.next == next && s.end == end) {
+        (s.entries.clone(), s.last_sent, s.bytes_sent)
+      } else {
+        // Bind the MaybeOwned to a local so a cold-fetch store's OWNED buffer outlives the `slice` borrow.
+        let read: MaybeOwned<'_, [Entry]> = if next < end {
+          match log.entries(next..read_end, max_bytes) {
+            Ok(EntriesRead::Ready(e)) => e,
+            // Cold: the range isn't resident. Defer the whole send — no Progress mutation, no inflight
+            // slot consumed — and retry on the next pump. A cold read is NOT a fault, so never poison
+            // (unlike an Err, which IS fatal, same policy as `apply_committed`'s LogRead).
+            Ok(EntriesRead::Pending) => return,
+            Err(_) => {
+              self.poison(PoisonReason::LogRead);
+              return;
+            }
+          }
         } else {
-          break;
-        }
-      }
-      slice[..count].to_vec()
-    };
+          MaybeOwned::Borrowed(&[])
+        };
+        let slice: &[Entry] = &read;
 
-    // Compute the last index and total bytes for sent_entries.
-    let last_sent = if entries.is_empty() {
-      prev_index
-    } else {
-      entries.last().unwrap().index()
-    };
-    let bytes_sent: u64 = entries.iter().map(Self::entry_size).sum();
+        // Cap at max_size_per_msg bytes, but always send at least one entry.
+        let capped: &[Entry] = if slice.is_empty() || max_bytes == u64::MAX {
+          slice
+        } else {
+          let mut budget = max_bytes;
+          let mut count = 0usize;
+          for e in slice {
+            let sz = Self::entry_size(e);
+            if count == 0 {
+              // always include at least one entry regardless of size
+              count += 1;
+              budget = budget.saturating_sub(sz);
+            } else if sz <= budget {
+              count += 1;
+              budget -= sz;
+            } else {
+              break;
+            }
+          }
+          &slice[..count]
+        };
+        let entries: Arc<[Entry]> = Arc::from(capped);
+
+        // Compute the last index and total bytes for sent_entries.
+        let last_sent = if entries.is_empty() {
+          prev_index
+        } else {
+          entries.last().unwrap().index()
+        };
+        let bytes_sent: u64 = entries.iter().map(Self::entry_size).sum();
+        *shared = Some(SharedEntries {
+          next,
+          end,
+          entries: entries.clone(),
+          last_sent,
+          bytes_sent,
+        });
+        (entries, last_sent, bytes_sent)
+      };
     let entries_len = entries.len();
     // Whether we sent a partial batch (capped below last_index). In Probe mode we only
     // pause the window when we're holding back entries due to the byte cap — if we sent
@@ -306,7 +350,7 @@ where
     let (term, me, commit) = (self.term, self.config.id(), self.commit);
     self.send(
       peer.cheap_clone(),
-      Message::AppendEntries(AppendEntries::new(
+      Message::AppendEntries(AppendEntries::new_shared(
         term, me, prev_index, prev_term, entries, commit,
       )),
     );
@@ -369,13 +413,16 @@ where
     // peer would otherwise get the deliberate EMPTY heartbeat-commit probe `maybe_send_append` emits;
     // that probe must keep flowing on its own cadence via `broadcast_heartbeat`, not on every flush.
     let last = log.last_index();
+    // Build the entry batch once and share it across peers at the same send range: the broadcast fans
+    // the same suffix to every caught-up follower, so one Arc allocation serves them all.
+    let mut shared: Option<SharedEntries> = None;
     for (peer, _) in peers.drain(..) {
       if self
         .tracker
         .progress(&peer)
         .is_some_and(|pr| pr.next_index() <= last)
       {
-        self.maybe_send_append(now, peer, log, stable);
+        self.maybe_send_append_shared(now, peer, log, stable, &mut shared);
       }
     }
     self.peers_scratch = peers;
