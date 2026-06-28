@@ -359,7 +359,7 @@ where
     let me = self.config.id();
     let mut peers = core::mem::take(&mut self.peers_scratch);
     peers.clear();
-    for peer in self.tracker.progress_map().keys() {
+    for (peer, _) in self.tracker.progress_map() {
       if *peer == me {
         continue;
       }

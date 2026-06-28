@@ -350,7 +350,7 @@ fn progress_map_in_sync_after_operations() {
   }
   // No orphan progress entries.
   let needed = t.ids();
-  for id in t.progress_map().keys() {
+  for (id, _) in t.progress_map() {
     assert!(needed.contains(id), "orphan progress for {id}");
   }
 }
