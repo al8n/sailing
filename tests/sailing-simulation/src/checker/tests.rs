@@ -203,6 +203,48 @@ fn commit_is_quorum_durable_detects_solo_commit() {
 }
 
 #[test]
+fn commit_is_quorum_durable_detects_nonquorum_volatile_commit() {
+  // A volatile commit that is NOT quorum-durable must trip even though the lagging durable commit alone
+  // looks fine. Node 0 has volatile commit=5 (durable commit only 4) and is the ONLY voter holding index
+  // 5 → 1 of 3 durable copies, below quorum. The volatile commit is what the node applies and serves, so
+  // checking only the durable commit (4) would miss it.
+  let mut n0 = healthy_node(0, 5, 5); // volatile commit=5, durably holds 5
+  n0.hardstate_commit = 4; // ...but the durable commit watermark lags (unflushed)
+  n0.applied = 4;
+  let n1 = healthy_node(1, 4, 4);
+  let n2 = healthy_node(2, 4, 4);
+  let view = cv(3, 13, std::vec![n0, n1, n2]);
+  let v = commit_is_quorum_durable(&view, 0).unwrap_err();
+  assert_eq!(v.oracle, "commit_is_quorum_durable");
+  assert!(
+    v.detail.contains("only 1 of 3 voter durable logs"),
+    "{}",
+    v.detail
+  );
+}
+
+#[test]
+fn commit_is_quorum_durable_accepts_follower_ahead_with_compacted_witness() {
+  // The follower-ahead case UNDER COMPACTION (a false positive a naive max-term fallback hits). Node 0's
+  // volatile commit is 5 but it has not durably reached 5. The entry IS quorum-durable: node 1 RETAINS
+  // (5, term 1) and node 2 COMPACTED past 5 with a higher boundary term (2) — it applied 5 before
+  // snapshotting, so it holds the content (the boundary term is not the entry term). Deriving the witness
+  // from the boundary term would mis-score node 1 and false-fire; the correct check counts the retained
+  // term-1 holder + the compacted cover = 2 of 3, a quorum → no violation.
+  let mut n0 = healthy_node(0, 5, 4); // volatile commit=5, durable only to 4 (self-undurable at 5)
+  n0.hardstate_commit = 4; // the DURABLE commit watermark lags with the durable log (not corruption)
+  n0.applied = 4;
+  let n1 = healthy_node(1, 5, 5); // retains (5, term 1)
+  let mut n2 = healthy_node(2, 5, 8); // snapshotted past 5: compacted with a higher boundary term
+  n2.snapshot_last_index = 6;
+  n2.snapshot_last_term = 2;
+  n2.durable_first = 7;
+  n2.durable_entries.retain(|e| e.index >= 7);
+  let view = cv(3, 14, std::vec![n0, n1, n2]);
+  assert_eq!(commit_is_quorum_durable(&view, 0), Ok(()));
+}
+
+#[test]
 fn commit_is_quorum_durable_detects_term_mismatch() {
   // A quorum holds index 5, but with a DIFFERENT term than the committing node — not the same
   // committed entry. Must be detected (the heartbeat-commit-of-stale-tail class).
