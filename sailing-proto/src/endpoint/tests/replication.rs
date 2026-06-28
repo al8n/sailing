@@ -532,7 +532,7 @@ fn durable_index_advances_after_term_cleared_follower_ack() {
   );
   while ep.poll_message().is_some() {}
   assert!(
-    ep.pending.is_empty(),
+    ep.pending_is_empty(),
     "term change must have cleared the pending FollowerAck"
   );
 

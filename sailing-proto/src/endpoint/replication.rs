@@ -695,9 +695,7 @@ where
     // Self-match advance is deferred until the append is durable (on_log_appended).
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
-    self
-      .pending
-      .insert(opid, Pending::LeaderAppend { upto: index });
+    self.push_pending(opid, Pending::LeaderAppend { upto: index });
     // Stage the append for the next `flush_appends` (see `replication_pending`); the fan-out is DEFERRED
     // to the driver's pump chokepoint.
     self.replication_pending = true;
@@ -967,7 +965,7 @@ where
 
     if let Some(opid) = appended_opid {
       // A new suffix was submitted — defer the ack until the append is durable.
-      self.pending.insert(
+      self.push_pending(
         opid,
         Pending::FollowerAck {
           to: ae.leader(),

@@ -1,6 +1,82 @@
 use super::*;
 use crate::{AppendResponse, HardState, LogDone, SnapshotResponse, StableDone, StorageProgress};
 
+// The pending-action seam queues. Kept in a minimal-bound block (the struct's `F: StateMachine` only)
+// so the drain tripwire and the cross-seam helpers stay callable from the RNG-free impl blocks too.
+impl<I, F, R> Endpoint<I, F, R>
+where
+  F: StateMachine,
+{
+  /// Route a freshly-submitted deferred action to its storage seam — the seam matches the action's
+  /// completion channel: [`FollowerAck`](Pending::FollowerAck) / [`LeaderAppend`](Pending::LeaderAppend)
+  /// complete on LOG durability ([`on_log_appended`](Self::on_log_appended)); [`CastVote`](Pending::CastVote)
+  /// / [`Campaign`](Pending::Campaign) complete on STABLE durability ([`on_stable_wrote`](Self::on_stable_wrote)).
+  /// `OpId`s are minted monotonically and pushed right after their mint, so each seam stays in ascending
+  /// submit order (the `pop_front` fast path in the `take_*` drains).
+  pub(crate) fn push_pending(&mut self, opid: OpId, action: Pending<I>) {
+    match action {
+      Pending::FollowerAck { .. } | Pending::LeaderAppend { .. } => {
+        self.pending_log.push_back((opid, action));
+      }
+      Pending::CastVote { .. } | Pending::Campaign { .. } => {
+        self.pending_stable.push_back((opid, action));
+      }
+    }
+  }
+
+  /// Remove and return the LOG-seam action for `opid`: the FRONT in the common case (prefix-ordered
+  /// durability + in-order completions, an O(1) `pop_front`), else a search-remove since the `LogStore`
+  /// contract permits completions in ANY order. An `opid` not present (pruned by a truncation/restore,
+  /// or never a log action) yields `None` — byte-identical to the old `BTreeMap::remove(&opid)`. Mirrors
+  /// the [`inflight_append_upto`](Durability::inflight_append_upto) drain.
+  fn take_log_pending(&mut self, opid: OpId) -> Option<Pending<I>> {
+    if self
+      .pending_log
+      .front()
+      .is_some_and(|(front, _)| *front == opid)
+    {
+      self.pending_log.pop_front().map(|(_, p)| p)
+    } else {
+      self
+        .pending_log
+        .iter()
+        .position(|(id, _)| *id == opid)
+        .and_then(|i| self.pending_log.remove(i))
+        .map(|(_, p)| p)
+    }
+  }
+
+  /// Remove and return the STABLE-seam action for `opid` — the stable analogue of
+  /// [`take_log_pending`](Self::take_log_pending).
+  fn take_stable_pending(&mut self, opid: OpId) -> Option<Pending<I>> {
+    if self
+      .pending_stable
+      .front()
+      .is_some_and(|(front, _)| *front == opid)
+    {
+      self.pending_stable.pop_front().map(|(_, p)| p)
+    } else {
+      self
+        .pending_stable
+        .iter()
+        .position(|(id, _)| *id == opid)
+        .and_then(|i| self.pending_stable.remove(i))
+        .map(|(_, p)| p)
+    }
+  }
+
+  /// Total outstanding deferred actions across both seams (the drain tripwire's denominator).
+  pub(crate) fn pending_len(&self) -> usize {
+    self.pending_log.len() + self.pending_stable.len()
+  }
+
+  /// Whether both pending-action seams are empty.
+  #[cfg(test)]
+  pub(crate) fn pending_is_empty(&self) -> bool {
+    self.pending_log.is_empty() && self.pending_stable.is_empty()
+  }
+}
+
 impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
@@ -117,7 +193,8 @@ where
     self.outputs.outgoing.retain(|o| {
       !matches!(o.message(), Message::AppendResponse(a) if !a.reject() && a.match_index() > boundary)
     });
-    self.pending.retain(|_, p| match p {
+    // Only the LOG seam can hold a `FollowerAck`; the stable seam (CastVote/Campaign) is untouched.
+    self.pending_log.retain(|(_, p)| match p {
       Pending::FollowerAck { match_index, .. } => *match_index <= boundary,
       _ => true,
     });
@@ -633,7 +710,7 @@ where
     if let Some(upto) = upto {
       self.durable.durable_index = self.durable.durable_index.max(upto);
     }
-    match self.pending.remove(&opid) {
+    match self.take_log_pending(opid) {
       Some(Pending::FollowerAck { to, match_index }) => {
         // `match_index` is the extent this append proved (its `last_new`). `send_or_gate_append_ack`
         // applies the persist-before-ack clamp `proven.min(ack_watermark())` itself — both when sending
@@ -682,7 +759,7 @@ where
     {
       self.durable.durable_lease_support = self.durable.last_submitted_lease_support;
     }
-    match self.pending.remove(&opid) {
+    match self.take_stable_pending(opid) {
       Some(Pending::CastVote { to, term }) => {
         // Only emit the grant if the term hasn't changed and we still hold the vote for `to`.
         // If either condition is false the write was superseded by a term advance; drop silently.

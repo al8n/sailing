@@ -474,7 +474,8 @@ where
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup
       // and every `>=` watermark check). The same boot_epoch namespaces forwarded-read tokens below.
       next_op_id: OpId::first_of_epoch(boot_epoch),
-      pending: BTreeMap::new(),
+      pending_log: VecDeque::new(),
+      pending_stable: VecDeque::new(),
       poison: Poison {
         poisoned,
         poison_reason,
