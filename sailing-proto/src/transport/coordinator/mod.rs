@@ -188,6 +188,30 @@ where
   {
     let now: Now = now.into();
     let r = self.endpoint.propose(now, log, stable, cmd);
+    // Replicate immediately: a direct caller submits then drains the wire, so the AppendEntries must be
+    // queued here. Coalescing drivers use `submit_propose_deferred` + a per-crank `flush_appends` instead.
+    self.endpoint.flush_appends(now, log, stable);
+    self.flush();
+    r
+  }
+
+  /// Append a proposal WITHOUT fanning out its `AppendEntries` now; the caller MUST drive replication
+  /// afterward via [`flush_appends`](Self::flush_appends) (the driver does this once per crank to coalesce
+  /// a burst into one broadcast per peer). Direct callers should prefer
+  /// [`submit_propose`](Self::submit_propose), which replicates immediately.
+  pub fn submit_propose_deferred<L, S>(
+    &mut self,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    cmd: &F::Command,
+  ) -> Result<Index, ProposeError<I>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self.endpoint.propose(now, log, stable, cmd);
     self.flush();
     r
   }
@@ -268,6 +292,7 @@ where
   {
     let now: Now = now.into();
     let r = self.endpoint.propose_conf_change(now, log, stable, cc);
+    self.endpoint.flush_appends(now, log, stable);
     self.flush();
     r
   }
@@ -287,6 +312,7 @@ where
   {
     let now: Now = now.into();
     let r = self.endpoint.propose_conf_change_v2(now, log, stable, cc);
+    self.endpoint.flush_appends(now, log, stable);
     self.flush();
     r
   }
@@ -307,6 +333,7 @@ where
     let r = self
       .endpoint
       .propose_read_mode_change(now, log, stable, mode);
+    self.endpoint.flush_appends(now, log, stable);
     self.flush();
     r
   }
