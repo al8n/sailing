@@ -90,6 +90,23 @@ pub(crate) fn reconcile_membership(c: &mut Cluster, st: &mut VoprState) {
       st.gone.insert(id);
       st.down.remove(&id);
     }
+    // Phantom stale-leader sweep: a leader that is NOT in the committed config and sits STRICTLY BELOW
+    // the max leader term is a removed ex-leader that never stepped down (the current leader stopped
+    // replicating to it once its RemoveNode committed). If it departed while itself the max-term leader,
+    // the orphan filter above skipped it (to avoid hiding a same-term split) and it has since left
+    // `prev_tracked`, so only this sweep can re-catch it; left alone it inflates `leader_count()`. A
+    // strictly-lower term cannot mask a same-term split, so isolating it keeps the oracle's teeth.
+    if let Some(max_term) = max_leader_term {
+      let phantoms: Vec<u64> = (0..c.size() as u64)
+        .filter(|id| !voters.contains(id) && !learners.contains(id) && !st.gone.contains(id))
+        .filter(|id| c.role_of(*id).is_leader() && c.term_of(*id) < max_term)
+        .collect();
+      for id in phantoms {
+        c.mark_removed(id);
+        st.gone.insert(id);
+        st.down.remove(&id);
+      }
+    }
   }
   // A VOPR-isolated node that is no longer a voter (e.g. its RemoveNode committed) should leave
   // `down` so it stops being counted — `voters_down` already filters by `voters`, but pruning keeps
