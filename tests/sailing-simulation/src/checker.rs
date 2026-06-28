@@ -697,86 +697,88 @@ pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
 /// the false positive a per-node `is_voter & !removed` denominator produced. A
 /// learner's own `commit` watermark is not checked here (it makes no quorum claim; the same entry is
 /// checked via the voters), but a learner that holds the entry still does no harm.
+///
+/// Does a durable QUORUM hold the committed entry `(c, witness_term)`? Returns
+/// `(holds, copies, effective, quorum)`. A retained holder counts only at the exact term (catching a
+/// stale-tail / wrong-branch commit); a voter that COMPACTED past `c` counts as a term-agnostic witness
+/// (it applied `c` before compacting, and the snapshot boundary term is not the entry's own term). The
+/// denominator excludes voters provably on a strictly-lower-term branch at `c` and voters whose durable
+/// log has not reached the reconfiguration floor.
+fn quorum_holds_committed(
+  view: &ClusterView,
+  c: u64,
+  witness_term: u64,
+  commit_floor: u64,
+) -> (bool, usize, usize, usize) {
+  let excluded = view
+    .voters()
+    .filter(|m| {
+      m.durable_term(c).map(|t| t < witness_term).unwrap_or(false) || m.durable_last < commit_floor
+    })
+    .count();
+  let effective = view.voter_count().saturating_sub(excluded);
+  let quorum = effective / 2 + 1;
+  let copies = view
+    .voters()
+    .filter(|m| {
+      if c >= m.durable_first {
+        m.durable_term(c) == Some(witness_term)
+      } else {
+        m.durable_covers(c)
+      }
+    })
+    .count();
+  (copies >= quorum, copies, effective, quorum)
+}
+
 pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result<(), Violation> {
   for n in view.voters() {
+    // (1) DURABLE-commit self-coverage: the persisted `HardState.commit` must lie within THIS node's own
+    // durable log; a persisted commit beyond it is real corruption (append-before-commit-persist).
+    if n.hardstate_commit != 0 && n.durable_term(n.hardstate_commit).is_none() {
+      return Err(Violation::new(
+        "commit_is_quorum_durable",
+        std::format!(
+          "node {} has durable commit={} beyond its durable log (durable_first={}, durable_last={}, \
+           snapshot_last_index={})",
+          n.id,
+          n.hardstate_commit,
+          n.durable_first,
+          n.durable_last,
+          n.snapshot_last_index,
+        ),
+      ));
+    }
+    // (2) VOLATILE-commit quorum-durability: the in-memory commit (what the node applies and serves) MAY
+    // run ahead of THIS node's durable log, because durability is fenced at PERSIST, not at the commit-
+    // advance (see `commit_persist_is_fenced_by_durable_index`). That is safe only because the index is
+    // durable on a QUORUM (acks are clamped to each peer's durable watermark). So the committing node need
+    // not self-cover `c`, but a voter quorum must — derived and checked below.
     let c = n.commit;
     if c == 0 {
       continue; // nothing committed
     }
-    // The committing voter must itself durably cover its commit index (this is the append-before-
-    // ack ordering; a violation here is also a violation, reported precisely).
-    let witness_term = match n.durable_term(c) {
-      Some(t) => t,
-      None => {
-        return Err(Violation::new(
-          "commit_is_quorum_durable",
-          std::format!(
-            "node {} has commit={} but does not durably cover it (durable_first={}, \
-             durable_last={}, snapshot_last_index={})",
-            n.id,
-            c,
-            n.durable_first,
-            n.durable_last,
-            n.snapshot_last_index,
-          ),
-        ));
-      }
-    };
-    // An entry at or below the reconfiguration floor was committed under a configuration older than
-    // the current voter set; its quorum was defined by that config, so the current voters need not
-    // all hold it. Its safety is covered by agreement / no_committed_rewrite / durable_prefix.
+    // An entry at or below the reconfiguration floor was committed under an older configuration; its quorum
+    // was that config's, so the current voters need not all hold it (covered by agreement /
+    // no_committed_rewrite / durable_prefix).
     if c <= commit_floor {
       continue;
     }
-    // Quorum DENOMINATOR. Start from the AUTHORITATIVE committed-voter count (`committed_voters.len()`
-    // when known — a momentarily-absent voter view must not shrink it and weaken the oracle),
-    // then SUBTRACT voters provably on a stale STRICTLY-LOWER-term branch at `c`. Such a voter
-    // durably holds a different, older-term entry, so it never acked `(c, witness_term)` — a same-index
-    // entry cannot revert to an older term — and it was not in the quorum that committed this entry (the
-    // higher-term log will overwrite it). Excluding ONLY lower-term divergence keeps full teeth: a
-    // merely-LAGGING voter (no entry at `c`) and a HIGHER-term divergent voter both remain, so a solo /
-    // under-replicated commit AND a commit on a LOSING branch still trip. (e.g. a term-3 entry
-    // committed under a smaller config while two voters sit on a stale term-2 branch.)
-    // A second exclusion handles the deep-churn boundary: a voter whose DURABLE log does not even reach
-    // the reconfiguration floor (`durable_last < commit_floor`) is a freshly-added member still catching
-    // up to the prior committed config — it could not have witnessed ANY entry above the floor, so it
-    // was not in the quorum that committed `c` (which is just above the floor). Counting it demands a
-    // phantom ack it could never have given. This is distinct from a merely-LAGGING real voter (which
-    // HAS reached the floor and is only missing the latest entries) — that one stays counted, so a true
-    // under-replication still trips. (e.g. idx 2056 committed under a small config that
-    // then grew to 5 voters, three of which sit far below the floor at 223/490/2034 vs floor 2055.)
-    let excluded = view
-      .voters()
-      .filter(|m| {
-        m.durable_term(c).map(|t| t < witness_term).unwrap_or(false)
-          || m.durable_last < commit_floor
-      })
-      .count();
-    let effective = view.voter_count().saturating_sub(excluded);
-    let quorum = effective / 2 + 1;
-    let copies = view
-      .voters()
-      .filter(|m| {
-        // A voter witnesses the committed entry at `c` if it durably holds that entry's content.
-        // LIVE (`c` in the retained log): the term must EQUAL the witness term — the teeth that catch a
-        // stale-tail / heartbeat commit one tick before `agreement` would. COMPACTED (`c` below the
-        // retained log, subsumed by the voter's snapshot): the voter APPLIED `c` before compacting it
-        // away (compaction follows apply), so it durably holds the committed content regardless of the
-        // snapshot's BOUNDARY term — which is necessarily >= the entry's term and is NOT the entry's own
-        // term, so a boundary-term match is the WRONG test. The applied content of a compacted entry is
-        // already validated by `agreement`, so a subsumed index counts as a durable witness here.
-        // Without this, a committed entry that an ahead voter has snapshotted past is mis-scored as a
-        // term-divergent branch and the count drops below quorum (a false positive under frequent
-        // compaction, where the snapshot boundary outranks a still-live-elsewhere earlier committed entry).
-        if c >= m.durable_first {
-          m.durable_term(c) == Some(witness_term)
-        } else {
-          m.durable_covers(c)
-        }
-      })
-      .count();
-    if copies < quorum {
-      let per_voter: std::vec::Vec<_> = view
+    // Pick the witness term, then check quorum-durability of `c`. When the committing node RETAINS `c`,
+    // use ITS term, so a (c, term A) commit while the quorum durably holds (c, term B) — a stale-tail /
+    // wrong-branch commit — still trips. When it does NOT retain `c` (volatile commit ahead of its own
+    // durable log, or it compacted `c` whose boundary term is not the entry term), it did not choose the
+    // term, so accept if `c` is quorum-durable at ANY term a holder retains (compacted = wildcard); a
+    // compacted-cover-only quorum is accepted (term-unobservable). `quorum_holds_committed`'s denominator
+    // excludes lower-term-branch and below-floor voters, so solo / under-replicated / losing-branch
+    // commits all still trip.
+    let committer_term = if c >= n.durable_first {
+      n.durable_term(c)
+    } else {
+      None // `c` is compacted on this node (boundary term ≠ entry term) → holder fallback
+    };
+    let per_voter = || -> std::vec::Vec<_> {
+      view
         .voters()
         .map(|m| {
           std::format!(
@@ -788,23 +790,56 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
             m.durable_covers(c)
           )
         })
+        .collect()
+    };
+    if let Some(witness_term) = committer_term {
+      let (holds, copies, effective, quorum) =
+        quorum_holds_committed(view, c, witness_term, commit_floor);
+      if !holds {
+        return Err(Violation::new(
+          "commit_is_quorum_durable",
+          std::format!(
+            "node {} committed index {} (term {}) but only {} of {} voter durable logs hold it with \
+             that term (quorum needs {})\n  commit_floor={} committed_voters={:?}\n  voters: {}",
+            n.id,
+            c,
+            witness_term,
+            copies,
+            effective,
+            quorum,
+            commit_floor,
+            view.committed_voters,
+            per_voter().join(" "),
+          ),
+        ));
+      }
+    } else {
+      let retained: BTreeSet<u64> = view
+        .voters()
+        .filter(|m| c >= m.durable_first)
+        .filter_map(|m| m.durable_term(c))
         .collect();
-      return Err(Violation::new(
-        "commit_is_quorum_durable",
-        std::format!(
-          "node {} committed index {} (term {}) but only {} of {} voter durable logs hold it with \
-           that term (quorum needs {})\n  commit_floor={} committed_voters={:?}\n  voters: {}",
-          n.id,
-          c,
-          witness_term,
-          copies,
-          effective,
-          quorum,
-          commit_floor,
-          view.committed_voters,
-          per_voter.join(" "),
-        ),
-      ));
+      let quorum_durable = if retained.is_empty() {
+        view.voters().filter(|m| m.durable_covers(c)).count() > view.voter_count() / 2
+      } else {
+        retained
+          .iter()
+          .any(|&t| quorum_holds_committed(view, c, t, commit_floor).0)
+      };
+      if !quorum_durable {
+        return Err(Violation::new(
+          "commit_is_quorum_durable",
+          std::format!(
+            "node {} committed index {} (ahead of its own durable log) but no term holds a durable \
+             quorum\n  commit_floor={} committed_voters={:?}\n  voters: {}",
+            n.id,
+            c,
+            commit_floor,
+            view.committed_voters,
+            per_voter().join(" "),
+          ),
+        ));
+      }
     }
   }
   Ok(())
