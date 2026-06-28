@@ -22,6 +22,19 @@
 //!
 //! Contrast with the `pure_core` bench, which strips the async framework entirely to expose the
 //! consensus core's raw single-threaded cost.
+//!
+//! # Multi-group sharding (`-g`)
+//!
+//! sailing's consensus is serial per Raft *group* (Sans-I/O — one group is roughly one core of
+//! consensus work), so it scales throughput the way TiKV/CockroachDB do: by *sharding* into many
+//! independent Raft groups, not by parallelizing one group. `-g K` runs K fully-independent groups —
+//! each with its own node set, channels, leader, and integrity guards — concurrently on the same
+//! runtime, over one shared timed window. `-c` is the per-group client count; `-n` is the TOTAL op
+//! budget across all groups (distributed exactly, so the aggregate committed count is exactly `-n`).
+//! The reported put/s is the AGGREGATE:
+//! every group's committed ops over the single wall clock. It scales ~linearly with K until the
+//! runtime's worker threads saturate the cores — give each group roughly one core, so raise `-w` as
+//! you raise `-g`. `-g 1` (the default) is exactly the single-group benchmark above.
 
 use std::{
   collections::HashMap,
@@ -75,22 +88,34 @@ const NODE_DIED_MSG: &str = "a node task exited during the timed benchmark windo
   about = "Async cluster-throughput benchmark matching openraft's method (typed-message channels, no I/O)"
 )]
 struct Args {
-  /// Number of concurrent client tasks proposing writes.
+  /// Number of concurrent client tasks proposing writes, per group.
   #[arg(short = 'c', long, default_value_t = 4096, value_parser = parse_count)]
   clients: u64,
-  /// Total number of operations across all clients.
+  /// Total number of operations across all clients — and, with `-g`, across all groups. Distributed
+  /// exactly: the remainder is spread across the first groups (and, within a group, across its
+  /// clients), so the aggregate committed count equals this value exactly, never rounded down.
   #[arg(short = 'n', long, default_value_t = 20_000_000, value_parser = parse_count)]
   operations: u64,
-  /// Cluster size (1, 3, or 5).
+  /// Cluster size per group (1, 3, or 5).
   #[arg(short = 'm', long, default_value_t = 3)]
   members: u64,
+  /// Number of independent Raft groups (shards) driven concurrently. sailing's consensus is serial
+  /// per group, so aggregate throughput scales by sharding into many groups (the TiKV/CockroachDB
+  /// pattern), not by parallelizing one. `-n` is the TOTAL op budget across all groups (distributed
+  /// exactly across them); the reported put/s is the aggregate over one shared timed window. `1`
+  /// (default) is the single-group benchmark — give each group ~one core, so raise `-w` as you raise
+  /// `-g`.
+  #[arg(short = 'g', long, default_value_t = 1)]
+  groups: u64,
   /// Batch size for writes: 1 = single writes, >1 = pipeline `batch` proposals before awaiting.
   #[arg(short = 'b', long, default_value_t = 1, value_parser = parse_count)]
   batch: u64,
-  /// Number of tokio worker threads. Default 4: this harness drives each node from one serial task
+  /// Number of tokio worker threads. At `-g 1` this harness drives each node from one serial task
   /// loop, so extra workers buy no parallelism — they only add cross-thread futex wakeups and
-  /// work-stealing migration. A small fixed count keeps the measurement about consensus throughput
-  /// rather than scheduler churn. openraft's harness uses ~16 worker threads — sweep `-w` to compare.
+  /// work-stealing migration, so a small fixed count keeps the measurement about consensus
+  /// throughput rather than scheduler churn (`-w 2` is typically fastest at `-g 1`). With `-g K` the
+  /// K groups run in parallel, so raise `-w` toward one core per group (e.g. `-w 8`). openraft's
+  /// harness uses ~16 worker threads — sweep `-w` to compare. Default 4.
   #[arg(short = 'w', long, default_value_t = 4)]
   workers: usize,
 }
@@ -134,13 +159,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
   let args = Args::parse();
   assert!(args.workers >= 1, "--workers must be >= 1");
   eprintln!(
-    "parity config: clients={} operations={} members={} batch={} workers={}",
-    args.clients, args.operations, args.members, args.batch, args.workers
+    "parity config: groups={} clients={} operations={} members={} batch={} workers={}",
+    args.groups, args.clients, args.operations, args.members, args.batch, args.workers
   );
   // Pin the runtime to a fixed worker count rather than `#[tokio::main]`'s default (one worker per
-  // CPU). This workload's per-node loop is serial, so the extra default workers add cross-thread
-  // futex wakeups and work-stealing churn without buying parallelism; a small fixed count keeps the
-  // number a read on consensus throughput. `-w` lets the operator sweep it.
+  // CPU). At `-g 1` this workload's per-node loop is serial, so the extra default workers add
+  // cross-thread futex wakeups and work-stealing churn without buying parallelism; a small fixed
+  // count keeps the number a read on consensus throughput. With `-g K` the groups run in parallel,
+  // so raise `-w` toward one core per group. `-w` lets the operator sweep it either way.
   let rt = tokio::runtime::Builder::new_multi_thread()
     .worker_threads(args.workers)
     .enable_all()
@@ -153,10 +179,220 @@ async fn run(args: Args) {
   assert!(args.members >= 1, "--members must be >= 1");
   assert!(args.batch >= 1, "--batch must be >= 1");
   assert!(args.clients >= 1, "--clients must be >= 1");
-  let members = args.members;
+  assert!(args.groups >= 1, "--groups must be >= 1");
 
-  // A single monotonic origin shared by every node, so `now = ORIGIN + origin.elapsed()` advances
-  // with real time. The cluster runs no LeaseGuard failover here, so the synchronized wall is absent.
+  // `-n` is the total op budget across every group, distributed EXACTLY: each group commits `base`
+  // ops, and the first `rem` groups commit one extra, so the per-group shares sum to `args.operations`
+  // with no rounding loss (the aggregate committed count is exactly `-n`).
+  let groups = args.groups;
+  assert!(
+    args.operations >= groups,
+    "operations ({}) too small for groups ({groups}) — each group needs at least one op",
+    args.operations,
+  );
+  let base = args.operations / groups;
+  let rem = args.operations % groups;
+
+  // Phase 1 — build and elect every group concurrently, OUTSIDE the timed window. Each group is a
+  // fully independent cluster (its own monotonic origin, node set, channels, published-leader cell,
+  // and timing flag — nothing is shared across groups); its `setup` task returns once that group
+  // holds a single stable leader. Awaiting all of them is the barrier: the timed window below starts
+  // only after every group is quiesced on a stable leader, so election churn is startup cost, never
+  // throughput. A panic in any setup (e.g. a group that never elects) is FATAL to the whole run.
+  let mut setups: JoinSet<GroupReady> = JoinSet::new();
+  for group in 0..groups {
+    let ops_for_group = base + if group < rem { 1 } else { 0 };
+    setups.spawn(setup_group(
+      group,
+      args.members,
+      args.clients,
+      args.batch,
+      ops_for_group,
+    ));
+  }
+  let mut ready: Vec<GroupReady> = Vec::with_capacity(groups as usize);
+  while let Some(res) = setups.join_next().await {
+    ready.push(res.expect("a group's setup task panicked — run invalid"));
+  }
+  // The per-group exact shares sum to `-n` by construction; assert it as a guard against a
+  // distribution bug before the timed window relies on it.
+  let aggregate_total: u64 = ready.iter().map(|g| g.group_total).sum();
+  assert_eq!(
+    aggregate_total, args.operations,
+    "internal: per-group shares sum to {aggregate_total}, expected -n = {} — distribution bug",
+    args.operations,
+  );
+
+  // Phase 2 — one shared timed window across ALL groups. Arm every group's timing flag, start a
+  // single wall clock, then drive every group's client load concurrently while CENTRALLY policing
+  // every group's integrity for the WHOLE window. A group's clients finishing only records that
+  // group's committed count: the group's nodes and ALL its guards (stable-leader watcher, node-death
+  // monitor, timing flag) stay armed and its nodes keep running until the single global elapsed
+  // timestamp is taken — so no finished group goes unguarded, and no group's consensus load vanishes
+  // early to inflate the tail. Only after the aggregate window closes do we disarm timing and tear the
+  // groups down. Because the K groups run in parallel (one core each, runtime permitting), the
+  // aggregate put/s — every group's committed ops over this one window — scales with K.
+  for g in &ready {
+    g.timing_active.store(true, Ordering::Release);
+  }
+  let start = WallInstant::now();
+
+  // Split each ready group into its client-load task (which records the group's committed count) and
+  // its live guard (node tasks + leader cell + timing flag), kept here so the central window loop can
+  // police it for the entire shared window — including after its own clients have finished.
+  let mut loads: JoinSet<u64> = JoinSet::new();
+  let mut guards: Vec<Guard> = Vec::with_capacity(groups as usize);
+  for g in ready {
+    let GroupReady {
+      group,
+      senders,
+      leader0,
+      nodes,
+      current_leader,
+      timing_active,
+      batch,
+      client_ops,
+      group_total,
+    } = g;
+    loads.spawn(run_group_load(
+      group,
+      senders,
+      leader0,
+      batch,
+      client_ops,
+      group_total,
+    ));
+    guards.push(Guard {
+      group,
+      leader0,
+      nodes,
+      current_leader,
+      timing_active,
+    });
+  }
+
+  // Drive the window: drain the per-group load tasks as they finish, and on every idle tick sweep
+  // EVERY group's guards. The per-group load tasks stay pending until a whole group's clients finish,
+  // so in steady state the loop sweeps roughly every 2ms; a leadership change away from any group's
+  // captured leader, or any group's node task ending, is fatal and aborts the whole run. A load-task
+  // `JoinError` (panic / cancel) is fatal too — a dead load must never be scored as success.
+  let mut sweep = tokio::time::interval(Duration::from_millis(2));
+  sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+  let mut observed = 0u64;
+  let mut remaining = guards.len();
+  while remaining > 0 {
+    tokio::select! {
+      biased;
+      load = loads.join_next() => match load {
+        Some(res) => {
+          observed += res.expect("a group's client load task panicked or was cancelled — run invalid");
+          remaining -= 1;
+        }
+        None => break,
+      },
+      _ = sweep.tick() => {
+        for guard in &mut guards {
+          check_group_integrity(guard);
+        }
+      }
+    }
+  }
+  let elapsed = start.elapsed();
+
+  // Close the boundary race: a node may have died or leadership moved between the last load completing
+  // and the window closing, so sweep every group's guards once more before the number is reported.
+  for guard in &mut guards {
+    check_group_integrity(guard);
+  }
+
+  // The window is closed. Disarm every group's timing flag FIRST — so a peer-channel send that loses
+  // the teardown race counts as benign shutdown noise, not a fatal anomaly — then abort all nodes.
+  for guard in &mut guards {
+    guard.timing_active.store(false, Ordering::Release);
+  }
+  for guard in &mut guards {
+    guard.nodes.abort_all();
+  }
+
+  // Each group committed exactly its own share, and the per-group shares sum to `-n` with no rounding
+  // loss, so the aggregate equals the user's `-n` exactly on a valid run. Assert against `-n` directly.
+  assert_eq!(
+    observed, args.operations,
+    "groups committed {observed} ops, expected -n = {} — run invalid",
+    args.operations,
+  );
+
+  // Aggregate throughput: every group's committed ops over the single shared wall clock.
+  let put_s = observed as f64 / elapsed.as_secs_f64();
+  let millis = elapsed.as_millis().max(1);
+  let per_group = put_s / groups as f64;
+  println!(
+    "parity  groups={} members={} clients={} batch={} ops={} elapsed={:.3}s  put/s={:.0}  \
+     op/ms={}  per-group put/s={:.0}",
+    groups,
+    args.members,
+    args.clients,
+    args.batch,
+    observed,
+    elapsed.as_secs_f64(),
+    put_s,
+    (observed as u128) / millis,
+    per_group,
+  );
+}
+
+/// A group built and quiesced on a single stable leader, ready to join the timed window. Carries the
+/// client-load inputs plus the live guard (node tasks + leader cell + timing flag) that the shared
+/// window polices for the whole measurement.
+struct GroupReady {
+  /// This group's index, for diagnostics in abort messages.
+  group: u64,
+  /// Per-node inbound senders, indexed by node id — this group's private message "network".
+  senders: Arc<Vec<mpsc::UnboundedSender<Inbound>>>,
+  /// The single leader elected and confirmed stable in phase 1; every client targets it.
+  leader0: u64,
+  /// The group's live node tasks; in a healthy window none ever ends, so any completion is a death.
+  nodes: JoinSet<()>,
+  /// The group's published-leader cell, watched during the window for a leadership change.
+  current_leader: Arc<AtomicU64>,
+  /// Armed for the duration of the window so node tasks treat a dead-peer send as a fatal anomaly.
+  timing_active: Arc<AtomicBool>,
+  /// Per-write batch (pipeline depth) for this group's clients.
+  batch: u64,
+  /// Exact per-client op shares (sum == `group_total`); one client task is spawned per entry.
+  client_ops: Vec<u64>,
+  /// Total ops this group commits on a valid run (`client_ops.iter().sum()`).
+  group_total: u64,
+}
+
+/// A live group's integrity state, policed centrally for the WHOLE shared window — including after the
+/// group's own clients have finished. A leadership change away from `leader0`, or any node task ending
+/// (a death), is fatal; the timing flag is disarmed at teardown, before the nodes are aborted.
+struct Guard {
+  /// This group's index, for diagnostics in abort messages.
+  group: u64,
+  /// The captured stable leader; any change away from it during the window invalidates the run.
+  leader0: u64,
+  /// The group's live node tasks; any completion during the window is a node death.
+  nodes: JoinSet<()>,
+  /// The group's published-leader cell, watched for a leadership change.
+  current_leader: Arc<AtomicU64>,
+  /// Disarmed once the window closes, before the nodes are aborted.
+  timing_active: Arc<AtomicBool>,
+}
+
+/// Build one independent group's cluster, spawn its node tasks, and elect + stabilize a single leader
+/// — all OUTSIDE any timed window. Returns once the group holds one stable leader, handing the live
+/// node `JoinSet` and routing to the caller for the timed phase. Nothing here is shared across groups.
+async fn setup_group(
+  group: u64,
+  members: u64,
+  clients: u64,
+  batch: u64,
+  ops_per_group: u64,
+) -> GroupReady {
+  // A monotonic origin private to this group, so `now = ORIGIN + origin.elapsed()` advances with real
+  // time. This cluster runs no LeaseGuard failover, so the synchronized wall is absent.
   let origin = WallInstant::now();
   let current_leader = Arc::new(AtomicU64::new(NO_LEADER));
 
@@ -195,15 +431,15 @@ async fn run(args: Args) {
     ));
   }
 
-  // Elect AND stabilize a leader before timing: a throughput number is only meaningful under a
-  // single stable leader, so we wait for one and confirm it holds across a few heartbeat cycles
-  // before the clock starts. Any election churn here is startup cost, not throughput — handling it
-  // now (rather than mid-measurement) keeps the timed window clean.
+  // Elect AND stabilize a leader before timing: a throughput number is only meaningful under a single
+  // stable leader, so we wait for one and confirm it holds across a few heartbeat cycles before this
+  // group joins the timed window. Any election churn here is startup cost, not throughput — handling
+  // it now (rather than mid-measurement) keeps the timed window clean.
   let elect_deadline = WallInstant::now() + Duration::from_secs(30);
   let leader0 = loop {
     assert!(
       WallInstant::now() < elect_deadline,
-      "no stable leader elected within 30s"
+      "group {group}: no stable leader elected within 30s"
     );
     let candidate = current_leader.load(Ordering::Acquire);
     if candidate == NO_LEADER {
@@ -224,41 +460,66 @@ async fn run(args: Args) {
     }
   };
 
-  // openraft-identical op accounting: round per-client ops down to a whole number of batches.
-  let ops_per_client = args.operations / args.clients / args.batch * args.batch;
-  let total = ops_per_client * args.clients;
+  // Distribute this group's exact op budget across its clients: each commits `q` or `q + 1`, with the
+  // first `r` clients taking the extra, so the per-client shares sum to `ops_per_group` EXACTLY (no
+  // rounding loss — the aggregate over groups is then exactly `-n`). `batch` is only the client's
+  // pipeline depth: it fires up to `batch` proposals before awaiting them, with a partial final batch
+  // when a share isn't a whole multiple of `batch`, so exactness costs at most a shorter last pipeline.
+  let q = ops_per_group / clients;
+  let r = ops_per_group % clients;
+  let client_ops: Vec<u64> = (0..clients)
+    .map(|i| if i < r { q + 1 } else { q })
+    .collect();
+  let group_total = ops_per_group;
   assert!(
-    total > 0,
-    "operations ({}) too small for clients*batch ({}*{})",
-    args.operations,
-    args.clients,
-    args.batch
+    group_total > 0,
+    "group {group}: ops/group ({ops_per_group}) must be > 0"
   );
 
-  // Timed window. Every client targets the single captured leader `leader0` — under a stable leader
-  // every proposal is accepted, so there is no in-window leader re-discovery and no retry (retrying
-  // on a new leader would double-commit an entry that the original leader's log still carries). If
-  // leadership ever leaves `leader0`, the watcher below aborts the run rather than miscounting.
-  timing_active.store(true, Ordering::Release);
-  let start = WallInstant::now();
-  let mut client_handles = Vec::with_capacity(args.clients as usize);
-  for _ in 0..args.clients {
+  GroupReady {
+    group,
+    senders,
+    leader0,
+    nodes,
+    current_leader,
+    timing_active,
+    batch,
+    client_ops,
+    group_total,
+  }
+}
+
+/// Drive one group's timed client load: spawn one client task per per-client share, await them all,
+/// and return the group's committed count (== `group_total` on a valid run). Each client returns only
+/// after committing its full share — on any anomaly (leader gone / proposal abandoned) it parks
+/// forever, so a short count never returns; the central window loop's guard sweep is what observes the
+/// anomaly and aborts the whole run. This function deliberately neither watches for anomalies nor
+/// tears the group down: the group's nodes and guards stay armed for the entire shared window.
+async fn run_group_load(
+  group: u64,
+  senders: Arc<Vec<mpsc::UnboundedSender<Inbound>>>,
+  leader0: u64,
+  batch: u64,
+  client_ops: Vec<u64>,
+  group_total: u64,
+) -> u64 {
+  let mut client_handles = Vec::with_capacity(client_ops.len());
+  for ops_for_client in client_ops {
     let senders = senders.clone();
-    let batch = args.batch;
     // Each client returns the number of writes it actually committed. It only ever returns after
-    // committing its full share (it parks on any anomaly), so the returned count is `ops_per_client`
-    // on success — and the run's reported throughput is the SUM of these, never a configured guess.
+    // committing its full share (it parks on any anomaly), so the returned count is that share on
+    // success — and the group's throughput is the SUM of these, never a configured guess.
     client_handles.push(tokio::spawn(async move {
       let sender = &senders[leader0 as usize];
       let mut done = 0u64;
-      while done < ops_per_client {
-        let want = batch.min(ops_per_client - done);
+      while done < ops_for_client {
+        let want = batch.min(ops_for_client - done);
         let mut rxs = Vec::with_capacity(want as usize);
         for _ in 0..want {
           let (tx, rx) = oneshot::channel();
           if sender.send(Inbound::Client { reply: tx }).is_err() {
             // The cluster stopped accepting (shutdown / leader gone). Never re-target another leader
-            // (that would double-count): park, so the leader-change watcher aborts the run.
+            // (that would double-count): park, so the window's guard sweep aborts the run.
             std::future::pending::<()>().await;
           }
           rxs.push(rx);
@@ -275,72 +536,35 @@ async fn run(args: Args) {
     }));
   }
 
-  // Drive the load to completion, but abort the instant the run becomes invalid: leadership leaves
-  // `leader0`, or any node task ends (a death). The join sums each client's committed-write count;
-  // a client `JoinError` (panic / cancel) is FATAL — a dead client must never be scored as success.
-  let clients_done = async {
-    let mut observed = 0u64;
-    for h in client_handles {
-      observed += h
-        .await
-        .expect("client task panicked or was cancelled — run invalid");
-    }
-    observed
-  };
-  tokio::pin!(clients_done);
-  let observed = tokio::select! {
-    biased;
-    _ = async {
-      loop {
-        if current_leader.load(Ordering::Acquire) != leader0 {
-          return;
-        }
-        tokio::time::sleep(Duration::from_millis(2)).await;
-      }
-    } => panic!("{LEADER_CHANGED_MSG}"),
-    // `join_next` resolves to `Some` only when a node task ends (the set is non-empty for members >= 1),
-    // which during the window can only mean a node died.
-    _ = nodes.join_next() => panic!("{NODE_DIED_MSG}"),
-    obs = &mut clients_done => obs,
-  };
-  let elapsed = start.elapsed();
-
-  // Close the same-select-turn race: a node may have completed after `join_next` last polled Pending
-  // but before the client join was observed, so its death would not have won the select. The JoinSet
-  // retains that completion, so reap it non-blocking now — any completion is a node death.
-  if nodes.try_join_next().is_some() {
-    panic!("{NODE_DIED_MSG}");
+  // The clients only return after committing their full shares (any anomaly parks them), so this sum
+  // equals `group_total` by construction on a valid run; assert it as defense-in-depth. A client
+  // `JoinError` (panic / cancel) is FATAL — a dead client must never be scored as success.
+  let mut observed = 0u64;
+  for h in client_handles {
+    observed += h
+      .await
+      .expect("client task panicked or was cancelled — run invalid");
   }
-  timing_active.store(false, Ordering::Release);
-
-  // Accept the result only if leadership never left `leader0` AND the clients committed exactly the
-  // configured total (each client returns only after committing its full share, so on a valid run
-  // the observed sum equals `total` by construction).
   assert_eq!(
-    current_leader.load(Ordering::Acquire),
-    leader0,
-    "{LEADER_CHANGED_MSG}"
+    observed, group_total,
+    "group {group}: clients committed {observed} ops, expected {group_total} — run invalid"
   );
-  assert_eq!(
-    observed, total,
-    "clients committed {observed} ops, expected {total} — run invalid"
-  );
+  observed
+}
 
-  nodes.abort_all();
-
-  // Throughput is derived from the OBSERVED committed count, not the configured constant.
-  let put_s = observed as f64 / elapsed.as_secs_f64();
-  let millis = elapsed.as_millis().max(1);
-  println!(
-    "parity  members={} clients={} batch={} ops={} elapsed={:.3}s  put/s={:.0}  op/ms={}",
-    members,
-    args.clients,
-    args.batch,
-    observed,
-    elapsed.as_secs_f64(),
-    put_s,
-    (observed as u128) / millis,
-  );
+/// Police one group for the two anomalies that invalidate a throughput number — leadership leaving the
+/// captured `leader0`, or a node task ending (a death) — panicking (which aborts the whole run) on
+/// either. Called for every group on every window sweep AND once more after the window closes, so a
+/// group stays guarded for the entire shared window, including after its own clients have finished.
+fn check_group_integrity(guard: &mut Guard) {
+  if guard.current_leader.load(Ordering::Acquire) != guard.leader0 {
+    panic!("group {}: {LEADER_CHANGED_MSG}", guard.group);
+  }
+  // `try_join_next` is non-blocking: `Some` means a node task ended, which during the window can only
+  // be a death (a healthy node task loops until aborted after the window).
+  if guard.nodes.try_join_next().is_some() {
+    panic!("group {}: {NODE_DIED_MSG}", guard.group);
+  }
 }
 
 /// One cluster node: owns its `Endpoint` + in-memory stores and hand-drives the Sans-I/O crank.
