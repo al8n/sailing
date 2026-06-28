@@ -1603,7 +1603,10 @@ where
 
   /// Test-only: force `peer`'s `Progress` into a sustained `Probe` at `next`, reproducing the flow-control
   /// shape (`next_index` unmoved after a complete send) the public API only reaches via real timing.
+  // Only the feature-gated transport coordinator tests call this, so it is unused under the
+  // std-only / non-transport configs of the `--each-feature` test matrix.
   #[cfg(test)]
+  #[allow(dead_code)]
   pub(crate) fn force_peer_probe_for_test(&mut self, peer: &I, next: Index) {
     if let Some(p) = self.tracker.progress_mut(peer) {
       p.become_probe();
