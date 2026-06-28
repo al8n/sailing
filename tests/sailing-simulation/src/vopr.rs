@@ -1563,6 +1563,10 @@ fn calm_window(
         per_node.join(" "),
       );
     }
+    // Reconcile each iteration so a removed ex-leader that re-campaigns mid-window (the phantom-leader
+    // sweep in `reconcile_membership`) is swept back out; otherwise it inflates `leader_count()` and the
+    // propose gate below skips every tick, falsely stranding progress while the real leader is live.
+    reconcile_membership(c, st);
     // Top up client load if there is a leader to accept it (re-propose past any non-committing ones).
     if c.leader_count() == 1 {
       let key = (st.cmd_counter % NUM_KEYS as u64) as u16;
