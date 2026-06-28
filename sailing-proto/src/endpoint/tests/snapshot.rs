@@ -335,6 +335,7 @@ fn non_failover_leaseguard_snapshot_has_zero_wall_plus_window() {
   for i in 0..3 {
     let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
     let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}
@@ -412,6 +413,7 @@ fn non_failover_leaseguard_snapshot_unwalled_tracks_lease_window() {
   for i in 0..3 {
     let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
     let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}
@@ -489,6 +491,7 @@ fn dropped_snapshot_completion_reconciled_against_durable_snapshot() {
   for i in 0..4usize {
     let cmd = bytes::Bytes::copy_from_slice(&[100 + i as u8]);
     let _ = ep.propose(d, &mut log, &stable, &cmd).unwrap();
+    ep.flush_appends(d, &log, &stable);
     ep.handle_storage(d, &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     while ep.poll_event().is_some() {}
@@ -1334,6 +1337,7 @@ fn leader_processes_snapshot_response_success_and_reject() {
     ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
       .unwrap();
   }
+  ep.flush_appends(d, &log, &stable);
   ep.handle_storage(d, &mut log, &mut stable);
   assert_eq!(log.last_index(), Index::new(10));
   while ep.poll_message().is_some() {}

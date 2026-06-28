@@ -26,7 +26,8 @@ where
     &mut self,
     now: impl Into<Now>,
     log: &mut L,
-    stable: &S,
+    // Vestigial since the propose fan-out moved to `flush_appends`; kept for call-site stability.
+    _stable: &S,
     mode: crate::ReadOnlyOption,
   ) -> Result<Index, ProposeError<I>>
   where
@@ -82,13 +83,11 @@ where
     // committed-and-applied (`apply_committed`). At append the leader records only the one-in-flight
     // guard; `active_read_mode` does not move yet.
     self.reads.pending_read_mode_index = index;
-    for peer in self.peers().collect::<std::vec::Vec<_>>() {
-      self.maybe_send_append(now, peer, log, stable);
-    }
-    // The SetReadMode entry was ALREADY appended (durable-pending) above, before the broadcast — report
-    // Ok(index) even if the broadcast self-poisoned. It is a real proposal that WILL commit via the durable
-    // log; returning Err would make the caller treat a committed entry as never-proposed. The poison does no
-    // further work (every op entry-guards) and surfaces on the next public-API call.
+    // The replication fan-out is deferred to the driver's coalesced `flush_appends` (see `propose`).
+    // The SetReadMode entry was ALREADY appended (durable-pending) above — report Ok(index) even if a
+    // later flush self-poisons. It is a real proposal that WILL commit via the durable log; returning Err
+    // would make the caller treat a committed entry as never-proposed. The poison does no further work
+    // (every op entry-guards) and surfaces on the next public-API call.
     Ok(index)
   }
 }

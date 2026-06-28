@@ -39,7 +39,9 @@ where
     &mut self,
     now: Now,
     log: &mut L,
-    stable: &S,
+    // Vestigial since the fan-out moved to `flush_appends`; kept so `propose_conf_change_v2` threads the
+    // same `(log, stable)` pair it always did.
+    _stable: &S,
     cc: ConfChangeV2<I>,
   ) -> Option<Index>
   where
@@ -73,9 +75,7 @@ where
     // here. The configuration changes only when the entry is committed-and-applied (apply_committed) —
     // so `conf_state()`/`quorum_committed()` always reflect the COMMITTED voter set, never an
     // uncommitted log tail. At append the leader records only `pending_conf_index` (one in flight).
-    for peer in self.peers().collect::<Vec<_>>() {
-      self.maybe_send_append(now, peer, log, stable);
-    }
+    // The replication fan-out is deferred to the driver's coalesced `flush_appends` (see `propose`).
     Some(index)
   }
 
