@@ -710,6 +710,9 @@ fn pump(
   pending: &mut HashMap<Index, oneshot::Sender<()>>,
   timing_active: &AtomicBool,
 ) {
+  // Flush the coalesced batch ONCE before the drain loop; re-flushing each iteration would re-send to
+  // a still-Probe peer (a complete send leaves it un-paused with next_index unmoved), wedging the loop.
+  ep.flush_appends(now, log, &*stable);
   let mut guard = 0u64;
   loop {
     guard += 1;

@@ -123,6 +123,8 @@ fn main() {
       let cmd = Bytes::copy_from_slice(&proposed.to_le_bytes());
       let _ = nodes[leader_i].propose(now, &mut logs[leader_i], &stables[leader_i], &cmd);
     }
+    // Flush the whole batch before settling (propose no longer fans out per call).
+    nodes[leader_i].flush_appends(now, &logs[leader_i], &stables[leader_i]);
     drain(
       &mut nodes,
       &mut logs,
