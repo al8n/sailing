@@ -20,8 +20,9 @@ use std::{
 
 use bytes::Bytes;
 use clap::Parser;
+use sailing_benchmark::CountSm;
 use sailing_proto::{Config, Endpoint, Event, Instant, Message, Outgoing};
-use sailing_simulation::{LogSm, MemLog, MemStable};
+use sailing_simulation::{MemLog, MemStable};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,7 +40,7 @@ struct Args {
   batch: u64,
 }
 
-type Node = Endpoint<u64, LogSm>;
+type Node = Endpoint<u64, CountSm>;
 
 fn main() {
   let args = Args::parse();
@@ -62,7 +63,10 @@ fn main() {
       Duration::from_millis(100),
     )
     .expect("valid config");
-    nodes.push(Endpoint::new(cfg, Instant::ORIGIN, id, LogSm::new()));
+    // Compaction stays on at the default `snapshot_threshold`: the log holds ~one threshold of
+    // entries in steady state, so this measures bounded consensus work. `CountSm`'s O(1) snapshot
+    // keeps that compaction cheap (the simulation `LogSm`'s O(n) snapshot is the artifact it avoids).
+    nodes.push(Endpoint::new(cfg, Instant::ORIGIN, id, CountSm::new()));
     logs.push(MemLog::new());
     stables.push(MemStable::new());
   }
