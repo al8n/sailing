@@ -4,7 +4,85 @@
 //!
 //! Faithful port of etcd `tracker/tracker.go` and `confchange/confchange.go`.
 use crate::{CheapClone, ConfState, Index, JointConfig, MajorityConfig, Progress, VoteResult};
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  vec::Vec,
+};
+
+/// A sorted-by-key association list standing in for the old `BTreeMap<I, Progress>`.
+///
+/// Cluster membership is small (typically 3-7 voters + learners), so a contiguous `Vec` kept in
+/// ascending key order serves every access the tracker needs — a binary-search lookup and an
+/// O(n) sorted insert/remove — without the per-node B-tree allocation churn the membership-hot
+/// `progress_map()` fan-out otherwise pays. Iteration is in ascending key order, IDENTICAL to the
+/// `BTreeMap` it replaces, so the replication fan-out's message order (and thus VOPR determinism
+/// and the canonical wire order) is unchanged.
+#[derive(Debug, Clone)]
+struct ProgressMap<I> {
+  /// Strictly ascending in the key `I`; every mutator preserves this invariant so iteration and
+  /// `binary_search` stay correct.
+  entries: Vec<(I, Progress)>,
+}
+
+impl<I> ProgressMap<I> {
+  fn new() -> Self {
+    Self {
+      entries: Vec::new(),
+    }
+  }
+
+  fn as_slice(&self) -> &[(I, Progress)] {
+    &self.entries
+  }
+
+  fn keys(&self) -> impl Iterator<Item = &I> {
+    self.entries.iter().map(|(id, _)| id)
+  }
+
+  fn values_mut(&mut self) -> impl Iterator<Item = &mut Progress> {
+    self.entries.iter_mut().map(|(_, p)| p)
+  }
+
+  fn clear(&mut self) {
+    self.entries.clear();
+  }
+}
+
+impl<I: Ord> ProgressMap<I> {
+  fn get(&self, id: &I) -> Option<&Progress> {
+    self
+      .entries
+      .binary_search_by(|(k, _)| k.cmp(id))
+      .ok()
+      .map(|i| &self.entries[i].1)
+  }
+
+  fn get_mut(&mut self, id: &I) -> Option<&mut Progress> {
+    match self.entries.binary_search_by(|(k, _)| k.cmp(id)) {
+      Ok(i) => Some(&mut self.entries[i].1),
+      Err(_) => None,
+    }
+  }
+
+  fn contains_key(&self, id: &I) -> bool {
+    self.entries.binary_search_by(|(k, _)| k.cmp(id)).is_ok()
+  }
+
+  /// Insert or replace the entry for `id`, preserving the ascending-key invariant.
+  fn insert(&mut self, id: I, p: Progress) {
+    match self.entries.binary_search_by(|(k, _)| k.cmp(&id)) {
+      Ok(i) => self.entries[i].1 = p,
+      Err(i) => self.entries.insert(i, (id, p)),
+    }
+  }
+
+  fn remove(&mut self, id: &I) -> Option<Progress> {
+    match self.entries.binary_search_by(|(k, _)| k.cmp(id)) {
+      Ok(i) => Some(self.entries.remove(i).1),
+      Err(_) => None,
+    }
+  }
+}
 
 /// Runtime membership state: joint voter configuration, learner sets, and per-peer [`Progress`].
 ///
@@ -27,7 +105,7 @@ pub struct Tracker<I> {
   /// be moved into `learners` by [`confchange::Changer::leave_joint`].
   learners_next: BTreeSet<I>,
   auto_leave: bool,
-  progress: BTreeMap<I, Progress>,
+  progress: ProgressMap<I>,
 }
 
 impl<I> Default for Tracker<I> {
@@ -46,7 +124,7 @@ impl<I> Tracker<I> {
       learners: BTreeSet::new(),
       learners_next: BTreeSet::new(),
       auto_leave: false,
-      progress: BTreeMap::new(),
+      progress: ProgressMap::new(),
     }
   }
 
@@ -55,12 +133,13 @@ impl<I> Tracker<I> {
     !self.voters.outgoing().is_empty()
   }
 
-  /// The full progress map (all voters + learners + learners_next).
+  /// The full progress list (all voters + learners + learners_next), as `(id, progress)` pairs in
+  /// ascending `id` order.
   ///
-  /// Keys iterate in ascending order, identical to [`ids`](Self::ids) (every member has a `Progress`
-  /// entry per the type invariant), so a caller iterating peers from here is deterministic.
-  pub fn progress_map(&self) -> &BTreeMap<I, Progress> {
-    &self.progress
+  /// The order is identical to [`ids`](Self::ids) (every member has a `Progress` entry per the type
+  /// invariant), so a caller iterating peers from here is deterministic.
+  pub fn progress_map(&self) -> &[(I, Progress)] {
+    self.progress.as_slice()
   }
 
   /// The joint voter configuration.
@@ -165,7 +244,7 @@ impl<I: Ord + CheapClone> Tracker<I> {
     max_inflight_bytes: u64,
   ) -> Self {
     let next = last_index.next();
-    let mut p: BTreeMap<I, Progress> = BTreeMap::new();
+    let mut p = ProgressMap::new();
 
     // Install a fresh Progress for every member that needs one, without duplicates.
     for id in cs
@@ -175,8 +254,12 @@ impl<I: Ord + CheapClone> Tracker<I> {
       .chain(cs.learners().iter())
       .chain(cs.learners_next().iter())
     {
-      p.entry(id.cheap_clone())
-        .or_insert_with(|| Progress::new(next, max_inflight_msgs, max_inflight_bytes));
+      if !p.contains_key(id) {
+        p.insert(
+          id.cheap_clone(),
+          Progress::new(next, max_inflight_msgs, max_inflight_bytes),
+        );
+      }
     }
 
     Self {
@@ -584,8 +667,10 @@ pub mod confchange {
       self.remove(tr, id.cheap_clone());
 
       // Restore Progress that remove() may have deleted (we still need it).
-      if let Some(pr) = saved_pr {
-        tr.progress.entry(id.cheap_clone()).or_insert(pr);
+      if let Some(pr) = saved_pr
+        && !tr.progress.contains_key(&id)
+      {
+        tr.progress.insert(id.cheap_clone(), pr);
       }
 
       // If id is in the outgoing voters half, it still participates in the old quorum.
