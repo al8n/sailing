@@ -656,6 +656,14 @@ impl Cluster {
       }
     }
 
+    // Flush the coalesced batch ONCE before the settle loop; the loop then drives the rest via acks.
+    // Re-flushing each pass would re-send to a still-Probe peer (a complete send leaves it un-paused
+    // with next_index unmoved), so the loop's progress flag would never clear.
+    for i in 0..self.nodes.len() {
+      let now_i = self.now_now(i);
+      self.nodes[i].flush_appends(now_i, &self.logs[i], &self.stables[i]);
+    }
+
     // Step c: flush outgoing → deliver → drain storage → repeat until stable.
     let mut iters = 0u32;
     loop {

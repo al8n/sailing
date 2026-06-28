@@ -21,6 +21,7 @@ impl InteractionEnv {
       "drop-msgs" => self.drop_msgs(d),
       "process-ready" => self.process_ready(d),
       "propose" => self.propose(d),
+      "broadcast-appends" => self.broadcast_appends(d),
       "propose-conf-change" => self.propose_conf_change(d),
       "propose-conf-change-v2" => self.propose_conf_change_v2(d),
       "transfer-leadership" => self.transfer_leadership(d),
@@ -147,11 +148,46 @@ impl InteractionEnv {
       None => return "propose: missing node id\n".to_string(),
     };
     let cmd = bytes::Bytes::from(d.positional(1).unwrap_or("").as_bytes().to_vec());
+    // `defer=true` STAGES the entry without flushing or draining it, so several proposals accumulate
+    // and a following `broadcast-appends` ships them as ONE coalesced AppendEntries per peer.
+    let defer = d.flag("defer");
     let mut out = String::new();
     {
       let now = self.now;
       let n = self.nodes.get_mut(&id).unwrap();
       let _ = n.ep.propose(now, &mut n.log, &n.stable, &cmd);
+      // Flush once at the propose point, not inside the drain loop: a re-driven flush would keep
+      // re-sending to a peer that cannot ack this pass (partitioned, or still in Probe), wedging it.
+      if !defer {
+        n.ep.flush_appends(now, &n.log, &n.stable);
+      }
+    }
+    if defer {
+      out.push_str("ok (deferred)\n");
+      return out;
+    }
+    self.drain_node(id, &mut out);
+    if out.is_empty() {
+      out.push_str("ok\n");
+    }
+    out
+  }
+
+  /// `broadcast-appends <id>` — ship node `id`'s coalesced replication batch (one AppendEntries per
+  /// behind peer carrying every entry proposed since the last flush) onto the bus. The explicit crank
+  /// for entries staged by `propose … defer=true`.
+  pub(crate) fn broadcast_appends(&mut self, d: &Directive) -> String {
+    let id: u64 = match d.positional(0).and_then(|s| s.parse().ok()) {
+      Some(id) => id,
+      None => return "broadcast-appends: missing node id\n".to_string(),
+    };
+    let mut out = String::new();
+    {
+      let now = self.now;
+      let Some(n) = self.nodes.get_mut(&id) else {
+        return std::format!("n{id}: no such node\n");
+      };
+      n.ep.flush_appends(now, &n.log, &n.stable);
     }
     self.drain_node(id, &mut out);
     if out.is_empty() {
@@ -217,6 +253,8 @@ impl InteractionEnv {
         )),
         Err(e) => out.push_str(&std::format!("n{leader} conf-change rejected: {e:?}\n")),
       }
+      // Flush the conf-change at the propose point (see `propose`).
+      n.ep.flush_appends(now, &n.log, &n.stable);
     }
     self.drain_node(leader, &mut out);
     out
@@ -298,6 +336,8 @@ impl InteractionEnv {
         }
         Err(e) => out.push_str(&std::format!("n{leader} conf-change-v2 rejected: {e:?}\n")),
       }
+      // Flush the conf-change at the propose point (see `propose`).
+      n.ep.flush_appends(now, &n.log, &n.stable);
     }
     self.drain_node(leader, &mut out);
     out
