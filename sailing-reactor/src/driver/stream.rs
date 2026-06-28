@@ -491,7 +491,7 @@ where
     // The first reconciler pass dials the full configured mesh (nothing is bound yet).
     let now = self.clock.now();
     self.reconcile_peer_links(now.mono());
-    let mut poisoned = self.pump().await;
+    let mut poisoned = self.pump(now).await;
 
     while !poisoned {
       let now = self.clock.now();
@@ -551,7 +551,7 @@ where
           .handle_timeout(now, &mut self.log, &mut self.stable);
       }
       self.reconcile_peer_links(now.mono());
-      if self.pump().await {
+      if self.pump(now).await {
         break;
       }
 
@@ -699,7 +699,7 @@ where
       self
         .coord
         .handle_storage(now, &mut self.log, &mut self.stable);
-      poisoned = self.pump().await;
+      poisoned = self.pump(now).await;
     }
 
     // Teardown. Classify the fail-stop FIRST: an exit that raced a poison (a Shutdown command winning
@@ -1170,7 +1170,9 @@ where
 
   /// Drain the coordinator's outputs: wire bytes to each conn's writer (byte-budgeted), internal
   /// closes into teardown (the reconciler repairs), events into completions and queries.
-  async fn pump(&mut self) -> bool {
+  async fn pump(&mut self, now: Now) -> bool {
+    // Coalesce replication BEFORE draining poll_transmit so the batch leaves on this pass.
+    self.coord.flush_appends(now, &self.log, &self.stable);
     for (id, bytes) in self.coord.poll_transmit() {
       let Some(conn) = self.conns.get(&id) else {
         continue; // already closed; the coordinator's stale bytes die with it
