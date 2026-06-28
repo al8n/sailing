@@ -446,7 +446,7 @@ where
 
     let now = self.clock.now();
     self.reconcile_peer_links(now.mono());
-    let mut poisoned = self.pump().await;
+    let mut poisoned = self.pump(now).await;
 
     while !poisoned {
       let now = self.clock.now();
@@ -492,7 +492,7 @@ where
       // Redial any configured peer with no bound connection BEFORE the pump, so a fresh dial's
       // handshake Initial transmits this iteration rather than after the next wake.
       self.reconcile_peer_links(now.mono());
-      if self.pump().await {
+      if self.pump(now).await {
         break;
       }
 
@@ -594,7 +594,7 @@ where
       self
         .coord
         .handle_storage(now, &mut self.log, &mut self.stable);
-      poisoned = self.pump().await;
+      poisoned = self.pump(now).await;
     }
 
     // Teardown. Fail everything parked (each entry's reservation releases on drop), cancel the
@@ -880,7 +880,9 @@ where
 
   /// Drain the coordinator's outputs: transmits to the socket, events into the routing (and any
   /// queries whose read index the apply watermark now covers, run against the state machine).
-  async fn pump(&mut self) -> bool {
+  async fn pump(&mut self, now: Now) -> bool {
+    // Coalesce replication BEFORE the transmit drain so the batch leaves on this pass.
+    self.coord.flush_appends(now, &self.log, &self.stable);
     // Drain the coordinator's queued datagrams FIRST. These awaited sends precede the failover serve
     // below BY DESIGN — parity with the normal-query serve: user-closure serves follow the consensus
     // output, never the reverse, so unbounded user read closures cannot stall outbound consensus
