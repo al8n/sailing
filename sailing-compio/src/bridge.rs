@@ -124,3 +124,148 @@ pub(crate) async fn bridge_write(
   // Sender dropped: the run loop closed this connection gracefully; flush and exit.
   let _ = half.flush().await;
 }
+
+#[cfg(test)]
+mod tests {
+  use std::{cell::Cell, rc::Rc};
+
+  use bytes::Bytes;
+  use compio::{
+    buf::{BufResult, IoBuf, IoBufMut},
+    io::{AsyncRead, AsyncWrite},
+  };
+  use sailing_proto::ConnId;
+
+  use super::{BridgeInbound, BridgeOut, bridge_read, bridge_write};
+
+  /// A reader whose every read reports a clean EOF (`Ok(0)`). The owned buffer rides back untouched —
+  /// the EOF arm never inspects it.
+  struct EofReader;
+  impl AsyncRead for EofReader {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+      BufResult(Ok(0), buf)
+    }
+  }
+
+  /// A reader whose every read fails.
+  struct ErrReader;
+  impl AsyncRead for ErrReader {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+      BufResult(Err(std::io::Error::other("read boom")), buf)
+    }
+  }
+
+  /// A reader that always yields a few bytes (the run loop's recv buffer is pre-zeroed, so the
+  /// chunk-forward path needs no buffer fill here).
+  struct DataReader;
+  impl AsyncRead for DataReader {
+    async fn read<B: IoBufMut>(&mut self, buf: B) -> BufResult<usize, B> {
+      BufResult(Ok(4), buf)
+    }
+  }
+
+  /// A writer that accepts every byte at once (`write_all` completes in one call).
+  struct OkWriter;
+  impl AsyncWrite for OkWriter {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+      let n = buf.buf_len();
+      BufResult(Ok(n), buf)
+    }
+    async fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  /// A writer whose every write fails.
+  struct FailWriter;
+  impl AsyncWrite for FailWriter {
+    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
+      BufResult(Err(std::io::Error::other("write boom")), buf)
+    }
+    async fn flush(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+    async fn shutdown(&mut self) -> std::io::Result<()> {
+      Ok(())
+    }
+  }
+
+  /// A clean peer EOF is reported as a tagged `Eof` frame, then the reader returns.
+  #[compio::test]
+  async fn bridge_read_reports_eof_then_returns() {
+    let (tx, mut rx) = lochan::mpsc::unbounded();
+    bridge_read(EofReader, ConnId(7), tx).await;
+    assert!(matches!(
+      rx.recv().await,
+      Some(BridgeInbound::Eof { id: ConnId(7) })
+    ));
+  }
+
+  /// A read error is reported as a tagged `Error` frame, then the reader returns.
+  #[compio::test]
+  async fn bridge_read_reports_a_read_error_then_returns() {
+    let (tx, mut rx) = lochan::mpsc::unbounded();
+    bridge_read(ErrReader, ConnId(9), tx).await;
+    assert!(matches!(
+      rx.recv().await,
+      Some(BridgeInbound::Error { id: ConnId(9) })
+    ));
+  }
+
+  /// When the run loop dropped its inbound receiver, the reader's tagged-chunk `send` fails and the
+  /// reader returns (teardown) rather than spinning.
+  #[compio::test]
+  async fn bridge_read_returns_when_the_run_loop_dropped_the_receiver() {
+    let (tx, rx) = lochan::mpsc::unbounded::<BridgeInbound>();
+    drop(rx); // the run loop is gone: the first chunk-forward fails
+    compio::time::timeout(
+      std::time::Duration::from_secs(5),
+      bridge_read(DataReader, ConnId(1), tx),
+    )
+    .await
+    .expect("bridge_read returns once its inbound receiver is gone");
+  }
+
+  /// The whole-chunk byte release: the writer drains one frame, `queued_bytes` returns to zero, and a
+  /// dropped sender drives the graceful flush-and-exit.
+  #[compio::test]
+  async fn bridge_write_releases_the_whole_chunk_then_exits_on_sender_drop() {
+    let total = 64usize;
+    let queued = Rc::new(Cell::new(total));
+    let (out_tx, out_rx) = lochan::mpsc::unbounded();
+    let (inbound_tx, _inbound_rx) = lochan::mpsc::unbounded();
+    out_tx
+      .send(BridgeOut(Bytes::from(vec![7u8; total])))
+      .await
+      .expect("enqueue");
+    drop(out_tx); // the writer exits once the single frame drains
+    bridge_write(OkWriter, ConnId(0), out_rx, queued.clone(), inbound_tx).await;
+    assert_eq!(
+      queued.get(),
+      0,
+      "the whole chunk's bytes are released once the frame is written"
+    );
+  }
+
+  /// A failed write reports a tagged `Error` frame and releases the chunk's bytes before returning.
+  #[compio::test]
+  async fn bridge_write_reports_an_error_and_releases_the_charge() {
+    let total = 32usize;
+    let queued = Rc::new(Cell::new(total));
+    let (out_tx, out_rx) = lochan::mpsc::unbounded();
+    let (inbound_tx, mut inbound_rx) = lochan::mpsc::unbounded();
+    out_tx
+      .send(BridgeOut(Bytes::from(vec![0u8; total])))
+      .await
+      .expect("enqueue");
+    bridge_write(FailWriter, ConnId(3), out_rx, queued.clone(), inbound_tx).await;
+    assert_eq!(queued.get(), 0, "the charge is released on the error path");
+    assert!(matches!(
+      inbound_rx.recv().await,
+      Some(BridgeInbound::Error { id: ConnId(3) })
+    ));
+  }
+}
