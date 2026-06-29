@@ -10,6 +10,21 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+# Pick the ring crypto backend out of the box; switch with `--no-default-features` + your choice
+# (e.g. `quic-rustls-aws-lc-rs`). sailing-proto's tls/quic are backend-agnostic.
+default = ["tls-rustls-ring", "quic-rustls-ring"]
+
+# TLS/QUIC crypto-backend passthroughs (forwarded to sailing-proto).
+tls-rustls-ring = ["sailing-proto/tls-rustls-ring"]
+tls-rustls-aws-lc-rs = ["sailing-proto/tls-rustls-aws-lc-rs"]
+quic-rustls-ring = ["sailing-proto/quic-rustls-ring"]
+quic-rustls-aws-lc-rs = ["sailing-proto/quic-rustls-aws-lc-rs"]
+quic-bloom = ["sailing-proto/quic-bloom"]
+quic-log = ["sailing-proto/quic-log"]
+quic-rustls-log = ["sailing-proto/quic-rustls-log"]
+quic-qlog = ["sailing-proto/quic-qlog"]
+quic-platform-verifier = ["sailing-proto/quic-platform-verifier"]
+
 # The raw-SystemTime wall source (UnverifiedSystemClock) — off by default so it cannot be selected in a
 # failover deployment by accident. For tests / tightly-disciplined single-region only.
 unverified-wall-clock = ["sailing-driver/unverified-wall-clock"]

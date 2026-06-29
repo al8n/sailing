@@ -20,17 +20,25 @@ std = [
 alloc = ["cheap-clone/alloc"]
 tcp = []
 fuzzing = []
-tls = ["tcp", "std", "dep:rustls", "tls-ring"]
-tls-ring = ["rustls?/ring"]
-tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
-quic = [
-  "tcp",
-  "std",
-  "dep:rustls",
-  "dep:quinn-proto",
-  "dep:rustls-pemfile",
-  "tls-ring",
-]
+
+# TLS-over-TCP record layer — backend-agnostic. Bare `tls` links rustls but no crypto provider;
+# enable a passthrough below (e.g. `tls-rustls-ring`) to pick one. `quinn-proto?/...` keeps the
+# QUIC provider in step when both transports are built.
+tls = ["tcp", "std", "dep:rustls", "dep:rustls-pemfile"]
+tls-rustls-ring = ["tls", "rustls/ring", "quinn-proto?/rustls-ring"]
+tls-rustls-aws-lc-rs = ["tls", "rustls/aws_lc_rs", "quinn-proto?/rustls-aws-lc-rs"]
+
+# QUIC (quinn-proto) — backend-agnostic. Bare `quic` has no crypto provider (a `compile_error!` in
+# the coordinator guides you); enable a passthrough below. The crypto backends build the rustls
+# provider the QUIC configs are constructed from; the auxiliaries are quinn-proto pass-throughs.
+quic = ["tcp", "std", "dep:rustls", "dep:quinn-proto", "dep:rustls-pemfile"]
+quic-rustls-ring = ["quic", "rustls/ring", "quinn-proto/rustls-ring"]
+quic-rustls-aws-lc-rs = ["quic", "rustls/aws_lc_rs", "quinn-proto/rustls-aws-lc-rs"]
+quic-bloom = ["quic", "quinn-proto/bloom"]
+quic-log = ["quic", "quinn-proto/log"]
+quic-rustls-log = ["quic", "quinn-proto/rustls-log"]
+quic-qlog = ["quic", "quinn-proto/qlog"]
+quic-platform-verifier = ["quic", "quinn-proto/platform-verifier"]
 
 serde = ["std", "dep:serde", "serde/std", "dep:humantime-serde"]
 clap = ["std", "dep:clap", "dep:humantime"]
@@ -69,5 +77,19 @@ harness = false
 workspace = true
 
 [package.metadata.docs.rs]
-all-features = true
+# Explicit set instead of all-features: the *-fips backends pull aws-lc-rs-fips, which needs a Go
+# toolchain docs.rs does not provide. This documents the full public API without fips.
+features = [
+  "std",
+  "tcp",
+  "tls-rustls-ring",
+  "quic-rustls-ring",
+  "quic-bloom",
+  "quic-log",
+  "quic-rustls-log",
+  "quic-qlog",
+  "quic-platform-verifier",
+  "serde",
+  "clap",
+]
 rustdoc-args = ["--cfg", "docsrs"]
