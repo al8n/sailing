@@ -6,9 +6,11 @@ mod common;
 use std::{net::SocketAddr, time::Duration};
 
 use bytes::Bytes;
-use common::{CountSm, MemLog, MemStable, TestCa};
+use common::{CountSm, MemLog, MemStable, SharedLog, SharedStable, TestCa};
 use sailing_compio::{CompioQuicDriver, DriverConfig, DriverError, Handle, Node};
-use sailing_proto::{ClusterId, Config};
+use sailing_proto::{
+  ClusterId, Config, Event, Index, LogStore, ReadOnlyOption, Role, StableStore, Term,
+};
 
 const ELECTION: Duration = Duration::from_millis(300);
 const HEARTBEAT: Duration = Duration::from_millis(60);
@@ -421,4 +423,479 @@ async fn storage_log_flood_does_not_trap_the_run_loop() {
   .await
   .expect("no livelock: the submit must commit despite the Compacted log flood");
   assert_eq!(committed, 1);
+}
+
+/// The QUIC membership + transfer + accessor command paths (lone-voter learner additions, a
+/// non-voter transfer rejection, and the driver-side failover accessors).
+#[compio::test]
+async fn membership_transfer_and_accessor_commands() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42500".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  assert_eq!(driver.precise_releases(), 0);
+  assert_eq!(driver.unprovable_floor_holds(), 0);
+  compio::runtime::spawn(driver.run()).detach();
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let idx = loop {
+    match handle
+      .conf_change(ConfChange::new(
+        ConfChangeType::AddLearnerNode,
+        2u64,
+        Bytes::new(),
+      ))
+      .await
+    {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the learner"
+    );
+  };
+
+  let idx2 = loop {
+    let v2 = ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 3u64)],
+      Bytes::new(),
+    );
+    match handle.conf_change_v2(v2).await {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change_v2 error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the second learner"
+    );
+  };
+  assert!(
+    idx2 > idx,
+    "the joint-form change applied after the v1 change"
+  );
+
+  match handle.transfer_leader(99u64).await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("expected Rejected for a non-voter transfer target, got {other:?}"),
+  }
+}
+
+/// `transfer_leader` off the leader maps to `NotLeader`.
+#[compio::test]
+async fn transfer_on_a_non_leader_is_not_leader() {
+  let ca = TestCa::new();
+  let addrs = addrs(42_510, 3);
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = build_node(&ca, 1, addrs[0], peers, DriverConfig::default()).await;
+  compio::runtime::spawn(driver.run()).detach();
+
+  compio::time::sleep(ELECTION * 4).await;
+  match handle.transfer_leader(2u64).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader off the leader, got {other:?}"),
+  }
+}
+
+/// A `failover_query` off the failover tier resolves `Ok(None)`.
+#[compio::test]
+async fn failover_query_without_a_window_falls_back() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42520".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let out: Option<u64> = handle
+    .failover_query(|_fsm: &CountSm, _limbo: &[sailing_proto::Entry], _win| Some(123u64))
+    .await
+    .expect("the failover query resolves");
+  assert_eq!(out, None, "no serve window → fall back to a normal read");
+}
+
+/// A QUIC node that crashes and RESTARTS from the same durable stores recovers and replays the
+/// committed log — the recovered FSM count proves it (a fresh boot would commit 1 next, not 3).
+#[compio::test]
+async fn bind_restart_recovers_durable_state() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42530".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = compio::runtime::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"a").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"b").await,
+    2
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(2) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  }
+  handle
+    .shutdown()
+    .await
+    .expect("clean teardown frees the addr for restart");
+  let _ = task.await;
+
+  let (driver2, handle2) = CompioQuicDriver::bind_restart(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    1,
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("restart bind");
+  let task2 = compio::runtime::spawn(driver2.run());
+
+  let next = submit_anywhere(std::slice::from_ref(&handle2), b"c").await;
+  assert_eq!(
+    next, 3,
+    "the restart replayed the durable committed log (count recovered to 2), not a fresh count-0 boot"
+  );
+  handle2.shutdown().await.expect("clean teardown");
+  let _ = task2.await;
+}
+
+/// `bind_restart_migrating` recovers from a PRE-FORMAT QUIC store, upper-bounding the prior advertised
+/// read-lease window.
+#[compio::test]
+async fn bind_restart_migrating_recovers_durable_state() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42540".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = compio::runtime::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"a").await,
+    1
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(2) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  }
+  handle.shutdown().await.expect("clean teardown");
+  let _ = task.await;
+
+  let (driver2, handle2) = CompioQuicDriver::bind_restart_migrating(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    1,
+    Some(Duration::from_millis(50)),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("migrating restart bind");
+  let task2 = compio::runtime::spawn(driver2.run());
+
+  let next = submit_anywhere(std::slice::from_ref(&handle2), b"b").await;
+  assert_eq!(
+    next, 2,
+    "the migrating restart replayed the durable committed log (count recovered to 1)"
+  );
+  handle2.shutdown().await.expect("clean teardown");
+  let _ = task2.await;
+}
+
+/// `Handle::status` over QUIC: a lone-voter leader reports Leader/self-hint/term/commit/applied and
+/// the default Safe read mode.
+#[compio::test]
+async fn status_reports_leader_role_term_and_commit() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42550".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"y").await,
+    2
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let status = loop {
+    let st = handle.status().await.expect("status round-trips");
+    if st.role == Role::Leader {
+      break st;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the node never reported leadership via status"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  };
+  assert_eq!(status.role, Role::Leader);
+  assert_eq!(status.leader, Some(1));
+  assert!(status.term >= Term::new(1));
+  assert!(status.commit_index >= Index::new(2));
+  assert!(status.applied_index >= Index::new(2));
+  assert_eq!(status.active_read_mode, ReadOnlyOption::Safe);
+  assert!(!status.is_poisoned);
+  assert!(status.conf_state.voters().contains(&1));
+}
+
+/// A QUIC read-mode migration Safe → LeaseBased surfaces as `Event::ReadModeChanged`.
+#[compio::test]
+async fn set_read_mode_migrates_the_active_mode() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42560".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT)
+    .unwrap()
+    .with_check_quorum(true);
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let proposed = loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Ok(index) => break index,
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected set_read_mode error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to migrate"
+    );
+  };
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let changed = loop {
+    let mut seen = None;
+    while let Ok(ev) = handle.events().try_recv() {
+      if let Event::ReadModeChanged(rmc) = ev {
+        seen = Some(rmc);
+      }
+    }
+    if let Some(rmc) = seen {
+      break rmc;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the read-mode migration never applied"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  };
+  assert_eq!(changed.mode(), ReadOnlyOption::LeaseBased);
+  assert!(changed.index() >= proposed);
+}
+
+/// Membership/query commands on a non-leader QUIC node take the propose/read ERROR arms (NotLeader).
+#[compio::test]
+async fn commands_on_a_non_leader_redirect() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let ca = TestCa::new();
+  let addrs = addrs(42_570, 3);
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = build_node(&ca, 1, addrs[0], peers, DriverConfig::default()).await;
+  compio::runtime::spawn(driver.run()).detach();
+
+  compio::time::sleep(ELECTION * 4).await;
+  match handle
+    .conf_change(ConfChange::new(
+      ConfChangeType::AddLearnerNode,
+      4u64,
+      Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change off the leader, got {other:?}"),
+  }
+  match handle
+    .conf_change_v2(ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 5u64)],
+      Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change_v2 off the leader, got {other:?}"),
+  }
+  match handle.query(|sm: &CountSm| sm.count()).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected the no-leader redirect for a query off the leader, got {other:?}"),
+  }
+}
+
+/// A LeaseBased migration WITHOUT `check_quorum` is rejected at the proposer.
+#[compio::test]
+async fn set_read_mode_without_check_quorum_is_rejected() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:42580".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = CompioQuicDriver::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Err(DriverError::Rejected { .. }) => break,
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      other => panic!("expected Rejected without check_quorum, got {other:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to attempt the migration"
+    );
+  }
 }
