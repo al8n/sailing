@@ -64,7 +64,11 @@ jobs:
     - name: Apply clippy lints
       # The crate needs std-or-alloc (a compile_error! enforces it); --at-least-one-of keeps the
       # sweep off the impossible bare combos (e.g. `tcp` alone) while still covering every feature.
-      run: cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing --at-least-one-of std,alloc
+      # The umbrella (`sailing`) re-exports the others behind a large feature set — powerset would
+      # explode, so it is excluded here and linted with a curated all-features build instead.
+      run: |
+        cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing --exclude sailing --at-least-one-of std,alloc
+        cargo clippy -p sailing --all-features --no-deps -- -D warnings
 
   # Run tests on some extra platforms
   cross:
@@ -190,7 +194,11 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run build
-      run: cargo hack build --feature-powerset --exclude-features fuzzing --at-least-one-of std,alloc
+      run: |
+        cargo hack build --feature-powerset --exclude-features fuzzing --exclude sailing --at-least-one-of std,alloc
+        # The umbrella (`sailing`): curated builds — all-features, then the no_std + alloc core.
+        cargo build -p sailing --all-features
+        cargo build -p sailing --no-default-features --features alloc,tcp
 
   test:
     name: test
