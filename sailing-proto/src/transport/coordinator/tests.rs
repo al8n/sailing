@@ -324,3 +324,117 @@ fn coordinator_flush_appends_does_not_re_send_a_probe_peer_each_pump() {
     "a second flush with no new append must emit nothing — a Probe peer must NOT be re-sent every pump"
   );
 }
+
+/// The crash-recovery constructors wrap [`Endpoint::restart`] / [`Endpoint::restart_migrating`] with
+/// an empty connection table. A fresh restart from an empty durable store reconstructs a follower
+/// (no leader, election timer armed) — the driver re-dials/re-accepts its peers.
+#[test]
+fn restart_and_restart_migrating_rebuild_a_follower() {
+  let cfg = || crate::Config::try_new(1u64, std::vec![1u64, 2u64], ELECTION, HEARTBEAT).unwrap();
+
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let c: Coord = StreamCoordinator::restart(
+    cfg(),
+    Instant::ORIGIN,
+    1,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(
+    c.role().is_follower(),
+    "a fresh restart from an empty store is a follower"
+  );
+  assert!(
+    c.poll_timeout().is_some(),
+    "the election timer is armed after restart"
+  );
+
+  let mut log2 = VecLog::default();
+  let mut stable2 = NoopStable::default();
+  let c2: Coord = StreamCoordinator::restart_migrating(
+    cfg(),
+    Instant::ORIGIN,
+    1,
+    CountSm::default(),
+    1,
+    Some(Duration::from_millis(100)),
+    &mut log2,
+    &mut stable2,
+  );
+  assert!(c2.role().is_follower());
+}
+
+/// `on_conn_close` is a DRIVER-initiated removal: the driver already knows the socket is gone, so it
+/// is NOT echoed back through `poll_conn_closed` (unlike a transport-initiated close).
+#[test]
+fn driver_initiated_close_is_not_echoed() {
+  let mut c = coord(1);
+  let id = c.on_conn_open(label(1, true), Instant::ORIGIN);
+  c.on_conn_close(id);
+  assert_eq!(
+    c.poll_conn_closed(),
+    None,
+    "a driver-initiated close is not surfaced back to the driver"
+  );
+}
+
+/// A connection that never completes its handshake is reaped past the handshake deadline and the
+/// transport-initiated close IS surfaced via `poll_conn_closed` so the driver releases the socket.
+#[test]
+fn unvalidated_conn_reaped_surfaces_via_poll_conn_closed() {
+  let mut w = World::new();
+  // No `settle()` — the handshake never completes. Fire the coordinator's housekeeping past the
+  // 10s handshake deadline.
+  let late = Instant::ORIGIN + Duration::from_secs(11);
+  w.a.handle_timeout(late, &mut w.la, &mut w.sa);
+  assert_eq!(
+    w.a.poll_conn_closed(),
+    Some((
+      ConnId(1),
+      Some(crate::transport::TransportError::NotValidated)
+    )),
+    "an un-validated connection past the deadline is reaped and reported"
+  );
+}
+
+/// The read / transfer / membership / read-mode proxies each delegate to the wrapped endpoint and
+/// run the coordinator's flush. On a fresh follower the endpoint refuses each (not the leader), but
+/// the delegation + flush path executes — and `poll_event` / `endpoint()` expose the endpoint.
+#[test]
+fn coordinator_proxies_delegate_to_the_endpoint() {
+  let mut c = coord(1);
+  let mut log = VecLog::default();
+  let stable = NoopStable::default();
+  let now = Instant::ORIGIN;
+
+  assert!(
+    c.read_index(now, &log, &stable, bytes::Bytes::new())
+      .is_err(),
+    "a follower cannot serve a read index"
+  );
+  assert!(
+    c.transfer_leader(now, &log, &stable, 2u64).is_err(),
+    "a follower cannot transfer leadership"
+  );
+  let add3 = crate::ConfChange::new(crate::ConfChangeType::AddNode, 3u64, bytes::Bytes::new());
+  assert!(
+    c.propose_conf_change(now, &mut log, &stable, add3.clone())
+      .is_err(),
+    "a follower cannot propose a conf change"
+  );
+  assert!(
+    c.propose_conf_change_v2(now, &mut log, &stable, add3.into_v2())
+      .is_err()
+  );
+  assert!(
+    c.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseBased)
+      .is_err()
+  );
+
+  // `poll_event` drains the application-event queue; `endpoint()` exposes the wrapped endpoint.
+  while c.poll_event().is_some() {}
+  assert_eq!(c.endpoint().role(), c.role());
+}
