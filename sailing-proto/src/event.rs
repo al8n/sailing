@@ -160,6 +160,18 @@ mod tests {
   }
 
   #[test]
+  fn applied_accessors_and_into_parts() {
+    // `response()` borrows the apply result; `into_parts()` decomposes to `(index, response)` in order —
+    // the two ways an embedder extracts a committed `Normal` entry's outcome.
+    let a = Applied::new(Index::new(3), std::string::String::from("ok"));
+    assert_eq!(a.index(), Index::new(3));
+    assert_eq!(a.response(), "ok");
+    let (index, response) = a.into_parts();
+    assert_eq!(index, Index::new(3));
+    assert_eq!(response, "ok");
+  }
+
+  #[test]
   fn read_state_event_construct_and_classify() {
     use crate::ReadState;
     let rs = ReadState::new(Index::new(7), bytes::Bytes::from_static(b"ctx"));

@@ -81,4 +81,27 @@ mod tests {
     assert_eq!(Term::new(u64::MAX).checked_next(), None);
     assert_eq!(std::format!("{}", Term::new(7)), "7");
   }
+
+  #[test]
+  fn counter_data_roundtrip() {
+    use crate::Data;
+    use bytes::Bytes;
+    // The `Data` impl is the fixed 8-byte little-endian `u64` codec; every value round-trips.
+    for &v in &[0u64, 1, 42, u64::MAX] {
+      let mut buf = std::vec::Vec::new();
+      Term::new(v).encode(&mut buf);
+      assert_eq!(
+        buf.len(),
+        8,
+        "a counter encodes as exactly one u64 (8 bytes LE)"
+      );
+      assert_eq!(Term::decode_exact(Bytes::from(buf)).unwrap(), Term::new(v));
+    }
+    let mut buf = std::vec::Vec::new();
+    Index::new(0x0102_0304_0506_0708).encode(&mut buf);
+    assert_eq!(
+      Index::decode_exact(Bytes::from(buf)).unwrap(),
+      Index::new(0x0102_0304_0506_0708)
+    );
+  }
 }

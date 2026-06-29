@@ -11,6 +11,26 @@ fn jc(incoming: &[u64], outgoing: &[u64]) -> JointConfig<u64> {
 }
 
 #[test]
+fn vote_result_as_str_and_display() {
+  for (r, name) in [
+    (VoteResult::Won, "won"),
+    (VoteResult::Lost, "lost"),
+    (VoteResult::Pending, "pending"),
+  ] {
+    assert_eq!(r.as_str(), name);
+    assert_eq!(std::format!("{r}"), name);
+  }
+}
+
+#[test]
+fn majority_len_and_is_empty() {
+  assert_eq!(mc(&[]).len(), 0);
+  assert!(mc(&[]).is_empty());
+  assert_eq!(mc(&[1, 2, 3]).len(), 3);
+  assert!(!mc(&[1, 2, 3]).is_empty());
+}
+
+#[test]
 fn majority_committed_empty_returns_max() {
   let c = mc(&[]);
   assert_eq!(c.committed_index(|_| Index::new(0)), Index::new(u64::MAX));
