@@ -4769,6 +4769,22 @@ fn propose_read_mode_change_rejects_on_guards() {
   );
 }
 
+/// At the log-index ceiling a migration is refused (`LogIndexExhausted`) rather than aliasing the
+/// entry at `u64::MAX` — the same guard as `propose` / `propose_conf_change`.
+#[test]
+fn propose_read_mode_change_refused_at_index_ceiling() {
+  use crate::{Index, LogStore as _};
+  let (mut ep, mut log, stable, d) = make_single_node_leader();
+  // Re-baseline the log to the ceiling (a crafted/recovered log): allocating a fresh index would
+  // saturate at u64::MAX and alias the existing entry.
+  log.restore(Index::new(u64::MAX), Term::new(1));
+  assert_eq!(log.last_index(), Index::new(u64::MAX));
+  assert_eq!(
+    ep.propose_read_mode_change(Now::monotonic(d), &mut log, &stable, ReadOnlyOption::Safe),
+    Err(ProposeError::LogIndexExhausted)
+  );
+}
+
 /// Only one read-mode migration may be in flight at a time (mirror pending_conf_index).
 #[test]
 fn one_read_mode_change_in_flight() {
