@@ -245,3 +245,98 @@ fn duplicate_conn_id_registration_is_rejected_not_replaced() {
   );
   assert!(router.route(7, &hb(10)), "the original conn still routes");
 }
+
+use crate::transport::stream::Intake;
+
+fn enc(id: u64) -> Vec<u8> {
+  let mut v = Vec::new();
+  id.encode(&mut v);
+  v
+}
+
+/// A record layer that validates IMMEDIATELY (fixed identity, not handshaking) and reports a huge
+/// outbound backlog, so the very first `send_message` trips the connection's outbound cap.
+struct HugeBuffered {
+  ident: Vec<u8>,
+}
+
+impl crate::transport::stream::sealed::Sealed for HugeBuffered {}
+
+impl RecordIo for HugeBuffered {
+  fn handle_transport_data(&mut self, _input: &[u8], _now: Instant) -> Intake {
+    Intake::Done
+  }
+  fn poll_transport_transmit(&mut self, _out: &mut Vec<u8>) -> usize {
+    0
+  }
+  fn read_plaintext(&mut self, _out: &mut Vec<u8>) -> usize {
+    0
+  }
+  fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    plaintext.len()
+  }
+  /// Far above the 2 * 64 MiB connection outbound cap, but small enough that `occupancy + 4 +
+  /// payload` never overflows `usize`.
+  fn buffered_outbound(&self) -> usize {
+    256 * 1024 * 1024
+  }
+  fn is_handshaking(&self) -> bool {
+    false
+  }
+  fn peer_identity(&self) -> Option<&[u8]> {
+    Some(&self.ident)
+  }
+  fn peer_has_closed(&self) -> bool {
+    false
+  }
+  fn is_secure() -> bool {
+    false
+  }
+}
+
+/// Inbound bytes for a connection the router has no record of are silently dropped (`Ok`, nothing
+/// delivered, no close queued) — a late read for an already-removed connection is benign.
+#[test]
+fn data_for_an_unknown_conn_is_ignored() {
+  let mut router = R::new();
+  let mut out = Vec::new();
+  router
+    .handle_conn_data(ConnId(9), b"bytes", false, Instant::ORIGIN, &mut out)
+    .unwrap();
+  assert!(out.is_empty());
+  assert_eq!(router.poll_conn_closed(), None);
+}
+
+/// A `route` whose `send_message` trips the connection's outbound cap (the peer stopped draining)
+/// drops the route immediately and reports the clean close, so no later message is queued into a
+/// dead connection.
+#[test]
+fn route_that_trips_the_outbound_cap_drops_the_route() {
+  let mut router: PeerRouter<u64, HugeBuffered> = PeerRouter::new();
+  let id = ConnId(1);
+  router.register(id, HugeBuffered { ident: enc(7) }, Instant::ORIGIN);
+  // One inbound read validates peer 7 (the record reports its identity immediately).
+  let mut out = Vec::new();
+  router
+    .handle_conn_data(id, b"x", false, Instant::ORIGIN, &mut out)
+    .unwrap();
+  assert_eq!(router.conn_of(&7), Some(id), "the peer bound on validation");
+
+  assert!(
+    !router.route(7, &hb(10)),
+    "a send that trips the outbound cap drops the route"
+  );
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, None)),
+    "the outbound-cap stall is reported (a clean close, no fault)"
+  );
+  assert_eq!(router.conn_of(&7), None, "the route is cleared");
+}
+
+/// `Default` yields an empty router (no connections, no bindings).
+#[test]
+fn default_is_an_empty_router() {
+  let router: R = PeerRouter::default();
+  assert!(router.conn_of(&1).is_none());
+}
