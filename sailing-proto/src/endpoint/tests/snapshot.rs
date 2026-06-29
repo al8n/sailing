@@ -1232,6 +1232,33 @@ fn stale_snapshot_does_not_install() {
   );
 }
 
+/// A snapshot whose boundary index is the reserved sentinel `u64::MAX` is malformed: a correct leader
+/// never snapshots the sentinel, and installing it would set commit/applied to an unrepresentable
+/// index. The receiver fail-stops (`LogExhausted`) before mutating any commit/applied state.
+#[test]
+fn install_snapshot_at_sentinel_boundary_poisons() {
+  use crate::{Index, Instant, PoisonReason};
+  let (mut ep, mut log, mut stable) = make_follower();
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    install_at(u64::MAX),
+  );
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::LogExhausted));
+  assert_eq!(
+    ep.commit,
+    Index::ZERO,
+    "commit untouched on the malformed boundary"
+  );
+  assert_eq!(
+    ep.applied,
+    Index::ZERO,
+    "applied untouched on the malformed boundary"
+  );
+}
+
 /// Test 3: malformed snapshot data poisons the node; no partial state is applied.
 #[test]
 fn malformed_snapshot_data_poisons_node() {
@@ -2503,6 +2530,89 @@ fn stale_resume_cursor_emits_clamped_offset() {
     resent.offset(),
     resent.total_len(),
   );
+}
+
+/// When the store holds NO snapshot, `send_snapshot_chunk` is a benign no-send (`Deferred`) — it emits
+/// nothing and does NOT poison (the snapshot may simply not be captured yet).
+#[test]
+fn send_snapshot_chunk_without_a_stored_snapshot_defers() {
+  use crate::Index;
+  // make_three_node_leader's NoopStable never holds a snapshot, so snapshot_chunk resolves to None.
+  let (mut ep, _log, stable, _d) = make_three_node_leader();
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_snapshot(Index::new(1), 9);
+  }
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.send_snapshot_chunk(2u64, &stable, 0),
+    ChunkSend::Deferred
+  );
+  assert!(
+    ep.poll_message().is_none(),
+    "a no-snapshot send emits nothing"
+  );
+  assert!(!ep.is_poisoned(), "an absent snapshot is benign, not fatal");
+}
+
+/// A FATAL store fault reading the snapshot chunk (`snapshot_chunk` → `Err`) poisons the sender
+/// (`SnapshotRead`) and reports `Poisoned` so the caller bails — never a silent skipped send.
+#[test]
+fn send_snapshot_chunk_store_error_poisons() {
+  use crate::{HardState, Index, OpId, PoisonReason, SnapshotChunkRead, StableDone, StableStore};
+
+  struct FailingChunkStable;
+  impl StableStore for FailingChunkStable {
+    type NodeId = u64;
+    type Error = ();
+    fn hard_state(&self) -> HardState<u64> {
+      HardState::initial()
+    }
+    fn submit_write(&mut self, _id: OpId, _hs: HardState<u64>) {}
+    fn submit_snapshot(&mut self, _id: OpId, _meta: SnapshotMeta<u64>, _data: bytes::Bytes) {}
+    fn snapshot(&self) -> Option<(SnapshotMeta<u64>, bytes::Bytes)> {
+      None
+    }
+    fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
+      None
+    }
+    #[allow(clippy::type_complexity)]
+    fn snapshot_chunk(
+      &self,
+      _offset: u64,
+      _len: u64,
+    ) -> Option<Result<(SnapshotMeta<u64>, u64, SnapshotChunkRead), ()>> {
+      Some(Err(())) // a genuine store read fault
+    }
+    fn accept_snapshot_chunk(
+      &mut self,
+      _meta: &SnapshotMeta<u64>,
+      _total_len: u64,
+      _offset: u64,
+      _data: &bytes::Bytes,
+    ) -> Result<u64, ()> {
+      Ok(0)
+    }
+    fn take_staged_snapshot(&mut self, _meta: &SnapshotMeta<u64>) -> Option<bytes::Bytes> {
+      None
+    }
+    fn discard_snapshot_staging(&mut self) {}
+    fn poll(&mut self) -> Option<Result<StableDone, ()>> {
+      None
+    }
+    fn has_pending(&self) -> bool {
+      false
+    }
+  }
+
+  let (mut ep, _log, _stable, _d) = make_three_node_leader();
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_snapshot(Index::new(1), 9);
+  }
+  assert_eq!(
+    ep.send_snapshot_chunk(2u64, &FailingChunkStable, 0),
+    ChunkSend::Poisoned
+  );
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::SnapshotRead));
 }
 
 /// A COLD snapshot read (the store reports the blob NOT resident — `SnapshotChunkRead::Pending`) makes
