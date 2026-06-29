@@ -1112,3 +1112,384 @@ async fn query_after_restart_before_write() {
   };
   assert_eq!(count, 1, "the read sees the one recovered committed entry");
 }
+
+/// The membership + transfer + accessor command paths the basic suite never reached. A lone-voter
+/// leader applies two learner additions (`conf_change` v1 and the general `conf_change_v2`, both
+/// committing on the single voter), then a `transfer_leader` to a NON-VOTER is rejected with the
+/// typed reason — covering the driver's Conf/ConfV2/Transfer arms and the propose/transfer error
+/// mappers. The driver-side failover counters read zero on a fresh monotonic node.
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_transfer_and_accessor_commands() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let addr: SocketAddr = "127.0.0.1:43860".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  // The driver-side failover accessors read 0 on a fresh monotonic node (the tier is inert).
+  assert_eq!(driver.precise_releases(), 0);
+  assert_eq!(driver.unprovable_floor_holds(), 0);
+  tokio::spawn(driver.run());
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let idx = loop {
+    match handle
+      .conf_change(ConfChange::new(
+        ConfChangeType::AddLearnerNode,
+        2u64,
+        bytes::Bytes::new(),
+      ))
+      .await
+    {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the learner"
+    );
+  };
+
+  let idx2 = loop {
+    let v2 = ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 3u64)],
+      bytes::Bytes::new(),
+    );
+    match handle.conf_change_v2(v2).await {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change_v2 error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the second learner"
+    );
+  };
+  assert!(
+    idx2 > idx,
+    "the joint-form change applied after the v1 change"
+  );
+
+  // A transfer to a node that is not a voter is rejected with the typed reason — exercising the
+  // Transfer command arm and `map_transfer_err`'s NotAVoter→Rejected mapping.
+  match handle.transfer_leader(99u64).await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("expected Rejected for a non-voter transfer target, got {other:?}"),
+  }
+}
+
+/// `transfer_leader` on a node that is NOT the leader maps to `NotLeader` (the redirect mapper's
+/// transfer arm). A node configured with peers it can never reach has no quorum, so it never leads
+/// and a transfer request returns the redirect.
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_on_a_non_leader_is_not_leader() {
+  let addrs = addrs(43_872);
+  let (dialer, acceptor) = plain_factories(1);
+  // A 3-voter config but only node 1 runs: it can never win, so it stays a non-leader.
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addrs[0],
+    Config::try_new(1u64, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  // A few election timeouts: without quorum it never becomes leader, so the transfer is NotLeader.
+  tokio::time::sleep(ELECTION * 4).await;
+  match handle.transfer_leader(2u64).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader off the leader, got {other:?}"),
+  }
+}
+
+/// A `failover_query` off the failover tier (a monotonic-only node has no serve window) resolves
+/// `Ok(None)` — the caller's signal to fall back to a normal read. Covers the driver's FailoverWindow
+/// command arm and `run_failover_serve`'s no-window arm; the closure is never invoked.
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_query_without_a_window_falls_back() {
+  let addr: SocketAddr = "127.0.0.1:43862".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let out: Option<u64> = handle
+    .failover_query(|_fsm: &CountSm, _limbo: &[sailing_proto::Entry], _win| Some(123u64))
+    .await
+    .expect("the failover query resolves");
+  assert_eq!(
+    out, None,
+    "no serve window off the failover tier → fall back to a normal read"
+  );
+}
+
+/// Connection-refused fault: a peer addr nothing listens on. Every dial completes with an error
+/// (`DialReady { result: Err }` → `close_conn` → the reconciler re-dials on backoff), which must
+/// not wedge the lone-voter node — it still elects and commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn dial_to_a_closed_port_is_retried_not_fatal() {
+  // Grab a port, then drop the listener so the address is CLOSED (connects are refused).
+  let closed = {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    let a = l.local_addr().expect("local addr");
+    drop(l);
+    a
+  };
+  let addr: SocketAddr = "127.0.0.1:43864".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let peers = vec![Node::new(2u64, closed)];
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  let committed = tokio::time::timeout(
+    Duration::from_secs(10),
+    submit_anywhere(std::slice::from_ref(&handle), b"x"),
+  )
+  .await
+  .expect("the lone voter commits despite the refused dials");
+  assert_eq!(committed, 1);
+}
+
+/// A dialer factory that always fails exercises the record-factory-failure path in `dial` (the
+/// attempt is abandoned before any socket is created; the reconciler retries on its armed backoff).
+/// The lone voter still commits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_dialer_factory_is_retried_not_fatal() {
+  let closed = {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    let a = l.local_addr().expect("local addr");
+    drop(l);
+    a
+  };
+  let addr: SocketAddr = "127.0.0.1:43866".parse().unwrap();
+  let dialer: sailing_reactor::DialerFactory<u64, Labeled<Passthrough>> =
+    Arc::new(|_: &u64| Err(std::io::Error::other("dialer factory boom")));
+  let local = encoded(1);
+  let acceptor: sailing_reactor::AcceptorFactory<Labeled<Passthrough>> = Arc::new(move || {
+    Labeled::acceptor(
+      Passthrough::new(),
+      &LabelOptions {
+        cluster: cluster(),
+        local_id: local.clone(),
+      },
+    )
+    .map_err(std::io::Error::other)
+  });
+  let peers = vec![Node::new(2u64, closed)];
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  let committed = tokio::time::timeout(
+    Duration::from_secs(10),
+    submit_anywhere(std::slice::from_ref(&handle), b"x"),
+  )
+  .await
+  .expect("the lone voter commits despite the failing dialer factory");
+  assert_eq!(committed, 1);
+}
+
+/// An acceptor factory that always fails exercises `handle_accept`'s mis-built-record-layer path: an
+/// inbound TCP connection is accepted by the listener, the record layer fails to build, and the
+/// socket is dropped. The node stays healthy and keeps committing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_failing_acceptor_factory_drops_the_inbound_socket() {
+  let addr: SocketAddr = "127.0.0.1:43868".parse().unwrap();
+  let local = encoded(1);
+  let dialer: sailing_reactor::DialerFactory<u64, Labeled<Passthrough>> =
+    Arc::new(move |_: &u64| {
+      Labeled::dialer(
+        Passthrough::new(),
+        &LabelOptions {
+          cluster: cluster(),
+          local_id: local.clone(),
+        },
+      )
+      .map_err(std::io::Error::other)
+    });
+  let acceptor: sailing_reactor::AcceptorFactory<Labeled<Passthrough>> =
+    Arc::new(|| Err(std::io::Error::other("acceptor factory boom")));
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  // A raw inbound connection: the driver accepts it, the acceptor factory fails to build the record
+  // layer, and the socket is dropped (handle_accept's Err arm).
+  let conn = std::net::TcpStream::connect(addr).expect("the listener accepts the TCP connection");
+  tokio::time::sleep(Duration::from_millis(200)).await;
+  drop(conn);
+
+  // The node is unharmed by the rejected inbound socket: another submit still commits.
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"y").await,
+    2
+  );
+}
+
+/// `bind_restart_migrating` recovers durable state from a PRE-FORMAT store (one that persisted no
+/// lease-support floor), upper-bounding the prior advertised read-lease window via
+/// `assume_prior_lease_support`. The recovered FSM count proves the committed log replayed.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_restart_migrating_recovers_durable_state() {
+  let addr: SocketAddr = "127.0.0.1:43870".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  // Boot 1: a fresh lone voter commits two entries.
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"a").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"b").await,
+    2
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(2) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  handle.shutdown().await.expect("clean teardown");
+  let _ = task.await;
+
+  // Boot 2: MIGRATING restart, upper-bounding any pre-crash advertised lease window.
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver2, handle2) =
+    ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind_restart_migrating(
+      addr,
+      Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+      1,
+      CountSm::default(),
+      1,
+      Some(Duration::from_millis(50)),
+      Vec::new(),
+      dialer,
+      acceptor,
+      log.clone(),
+      stable.clone(),
+      DriverConfig::default(),
+    )
+    .await
+    .expect("migrating restart bind");
+  let task2 = tokio::spawn(driver2.run());
+
+  // The recovered node replayed two committed entries, so the next commit returns 3.
+  let next = submit_anywhere(std::slice::from_ref(&handle2), b"c").await;
+  assert_eq!(
+    next, 3,
+    "the migrating restart replayed the durable committed log (count recovered to 2)"
+  );
+  handle2.shutdown().await.expect("clean teardown");
+  let _ = task2.await;
+}
