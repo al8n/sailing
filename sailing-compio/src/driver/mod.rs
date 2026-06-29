@@ -49,3 +49,60 @@ pub(crate) fn map_read_err<I>(e: sailing_proto::ReadIndexError) -> DriverError<I
     },
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use sailing_proto::{ProposeError, ReadIndexError, TransferError};
+
+  use super::{map_propose_err, map_read_err, map_transfer_err};
+  use crate::DriverError;
+
+  #[test]
+  fn propose_err_maps_redirect_poison_and_reason() {
+    assert_eq!(
+      map_propose_err::<u64>(ProposeError::NotLeader { leader: Some(7) }),
+      DriverError::NotLeader { leader: Some(7) }
+    );
+    assert_eq!(
+      map_propose_err::<u64>(ProposeError::Poisoned),
+      DriverError::Poisoned
+    );
+    // Every other rejection carries the proto's own description.
+    assert!(matches!(
+      map_propose_err::<u64>(ProposeError::ConfChangeInFlight),
+      DriverError::Rejected { .. }
+    ));
+  }
+
+  #[test]
+  fn transfer_err_maps_redirect_poison_and_reason() {
+    assert_eq!(
+      map_transfer_err::<u64>(TransferError::NotLeader { leader: Some(2) }),
+      DriverError::NotLeader { leader: Some(2) }
+    );
+    assert_eq!(
+      map_transfer_err::<u64>(TransferError::Poisoned),
+      DriverError::Poisoned
+    );
+    assert!(matches!(
+      map_transfer_err::<u64>(TransferError::NotAVoter),
+      DriverError::Rejected { .. }
+    ));
+  }
+
+  #[test]
+  fn read_err_maps_no_leader_poison_and_reason() {
+    assert_eq!(
+      map_read_err::<u64>(ReadIndexError::NoLeader),
+      DriverError::NotLeader { leader: None }
+    );
+    assert_eq!(
+      map_read_err::<u64>(ReadIndexError::Poisoned),
+      DriverError::Poisoned
+    );
+    assert!(matches!(
+      map_read_err::<u64>(ReadIndexError::ForwardingDisabled),
+      DriverError::Rejected { .. }
+    ));
+  }
+}
