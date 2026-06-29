@@ -10,7 +10,9 @@ use std::{net::SocketAddr, time::Duration};
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
 use common::{CountSm, MemLog, MemStable, SharedLog, SharedStable, TestCa};
-use sailing_proto::{ClusterId, Config, Index, LogStore, StableStore};
+use sailing_proto::{
+  ClusterId, Config, Event, Index, LogStore, ReadOnlyOption, Role, StableStore, Term,
+};
 use sailing_reactor::{DriverConfig, DriverError, Handle, Node, ReactorQuicDriver};
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -771,6 +773,209 @@ async fn bind_restart_migrating_recovers_durable_state() {
   );
   handle2.shutdown().await.expect("clean teardown");
   let _ = task2.await;
+}
+
+/// `Handle::status` over QUIC: a lone-voter leader reports `role = Leader`, the self leader hint, a
+/// real term, the committed/applied indices, and the default (Safe) active read mode — the QUIC
+/// counterpart of the stream suite's status test (the QUIC Status command arm was never exercised).
+#[tokio::test(flavor = "multi_thread")]
+async fn status_reports_leader_role_term_and_commit() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:43890".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"y").await,
+    2
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let status = loop {
+    let st = handle.status().await.expect("status round-trips");
+    if st.role == Role::Leader {
+      break st;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the node never reported leadership via status"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  };
+  assert_eq!(status.role, Role::Leader);
+  assert_eq!(status.leader, Some(1), "the leader hint is self");
+  assert!(status.term >= Term::new(1));
+  assert!(status.commit_index >= Index::new(2));
+  assert!(status.applied_index >= Index::new(2));
+  assert_eq!(status.active_read_mode, ReadOnlyOption::Safe);
+  assert!(!status.is_poisoned);
+  assert!(status.conf_state.voters().contains(&1));
+}
+
+/// A QUIC read-mode migration: a leader migrates Safe → LeaseBased; the change applies cluster-wide
+/// once the `SetReadMode` entry commits, surfacing as `Event::ReadModeChanged`. The QUIC SetReadMode
+/// command arm was never exercised.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_read_mode_migrates_the_active_mode() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:43892".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT)
+    .unwrap()
+    .with_check_quorum(true);
+  let (driver, handle) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let proposed = loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Ok(index) => break index,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected set_read_mode error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to migrate"
+    );
+  };
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let changed = loop {
+    let mut seen = None;
+    while let Ok(ev) = handle.events().try_recv() {
+      if let Event::ReadModeChanged(rmc) = ev {
+        seen = Some(rmc);
+      }
+    }
+    if let Some(rmc) = seen {
+      break rmc;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the read-mode migration never applied"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  };
+  assert_eq!(changed.mode(), ReadOnlyOption::LeaseBased);
+  assert!(changed.index() >= proposed);
+}
+
+/// Membership/query commands on a non-leader QUIC node take the propose/read ERROR arms (NotLeader).
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_on_a_non_leader_redirect() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let ca = TestCa::new();
+  let addrs = addrs(43_894, 3);
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = build_node(&ca, 1, addrs[0], peers, DriverConfig::default()).await;
+  tokio::spawn(driver.run());
+
+  tokio::time::sleep(ELECTION * 4).await;
+  match handle
+    .conf_change(ConfChange::new(
+      ConfChangeType::AddLearnerNode,
+      4u64,
+      Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change off the leader, got {other:?}"),
+  }
+  match handle
+    .conf_change_v2(ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 5u64)],
+      Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change_v2 off the leader, got {other:?}"),
+  }
+  match handle.query(|sm: &CountSm| sm.count()).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected the no-leader redirect for a query off the leader, got {other:?}"),
+  }
+}
+
+/// A LeaseBased migration WITHOUT `check_quorum` is rejected at the proposer — the QUIC SetReadMode
+/// reply-error arm and `map_propose_err`'s Rejected mapping.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_read_mode_without_check_quorum_is_rejected() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:43896".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Err(DriverError::Rejected { .. }) => break,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      other => panic!("expected Rejected without check_quorum, got {other:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to attempt the migration"
+    );
+  }
 }
 
 /// The recv task holds an `Arc` clone of the UDP socket; if teardown only SCHEDULED its abort, a
