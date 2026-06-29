@@ -915,4 +915,185 @@ mod tests {
     assert_eq!(rx.len(), 1);
     assert_eq!(r.applied, Index::new(3));
   }
+
+  #[test]
+  fn conf_changed_completes_the_matching_conf_and_advances_the_watermark() {
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    let (tx, mut rx) = futures_channel::oneshot::channel();
+    r.pending.insert(
+      Index::new(6),
+      Pending::Conf {
+        reply: tx,
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    // A ConfChanged at the parked index completes its waiter with the applied index AND advances the
+    // watermark — the membership sibling of the Applied arm (a SetReadMode reports ReadModeChanged, a
+    // membership change reports ConfChanged).
+    let advanced = r.route_event(Event::ConfChanged(sailing_proto::ConfChanged::new(
+      Index::new(6),
+      sailing_proto::ConfState::from_voters(std::vec![1u64]),
+    )));
+    assert!(advanced);
+    assert_eq!(rx.try_recv().unwrap().unwrap(), Ok(Index::new(6)));
+    assert_eq!(r.applied, Index::new(6));
+    assert_eq!(b.in_flight(), (0, 0), "completion released the reservation");
+  }
+
+  #[test]
+  fn fail_all_supersedes_a_parked_conf_and_query() {
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    // A parked Conf and a parked query: BOTH must be swept (the Conf arm and the query arm of fail_all,
+    // alongside the Submit/failover arms the other tests cover).
+    let (conf_tx, mut conf_rx) = futures_channel::oneshot::channel();
+    r.pending.insert(
+      Index::new(4),
+      Pending::Conf {
+        reply: conf_tx,
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    let (q_tx, mut q_rx) = futures_channel::oneshot::channel();
+    let ctx = r.mint_query_ctx();
+    r.queries.insert(
+      ctx,
+      ParkedQuery {
+        ready_at: Some(Index::new(4)),
+        complete: Box::new(move |res: Result<&(), DriverError<u64>>| {
+          let _ = q_tx.send(matches!(res, Err(DriverError::Superseded)));
+        }),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    r.fail_all(&DriverError::Superseded);
+    assert_eq!(
+      conf_rx.try_recv().unwrap().unwrap(),
+      Err(DriverError::Superseded),
+      "the parked conf change was superseded"
+    );
+    assert_eq!(
+      q_rx.try_recv().unwrap(),
+      Some(true),
+      "the parked query was superseded"
+    );
+    assert!(r.pending.is_empty() && r.queries.is_empty());
+    assert_eq!(
+      b.in_flight(),
+      (0, 0),
+      "the sweep released both reservations"
+    );
+  }
+
+  #[test]
+  fn an_unmatched_event_passes_through_to_the_tail_without_advancing() {
+    let (mut r, rx) = routing();
+    // A `ReadState` whose context is NOT this driver's 8-byte minted counter (a different width) is no
+    // query of ours: it falls through to the catch-all arm — never advancing the watermark — yet is
+    // still forwarded to the best-effort tail.
+    let advanced = r.route_event(Event::ReadState(sailing_proto::ReadState::new(
+      Index::new(9),
+      bytes::Bytes::from_static(&[1u8, 2, 3, 4]),
+    )));
+    assert!(!advanced, "a foreign-width ReadState advances nothing");
+    assert_eq!(r.applied, Index::ZERO);
+    assert_eq!(rx.len(), 1, "the event still reached the tail");
+  }
+
+  /// A tiny `LogStore` returning a fixed `entries` result — `Ready` over an owned slice, or `Pending` —
+  /// for the `read_limbo` success/cold paths the failing/panicking fixtures above do not reach.
+  struct StubLog {
+    entries: Vec<Entry>,
+    pending: bool,
+  }
+
+  impl LogStore for StubLog {
+    type Error = ();
+    fn first_index(&self) -> Index {
+      Index::new(1)
+    }
+    fn last_index(&self) -> Index {
+      Index::new(100)
+    }
+    fn term(&self, _: Index) -> Result<sailing_proto::Term, ()> {
+      Ok(sailing_proto::Term::ZERO)
+    }
+    fn entries(
+      &self,
+      _: core::ops::Range<Index>,
+      _: u64,
+    ) -> Result<sailing_proto::EntriesRead<'_>, ()> {
+      if self.pending {
+        Ok(sailing_proto::EntriesRead::Pending)
+      } else {
+        Ok(sailing_proto::EntriesRead::Ready(
+          sailing_proto::MaybeOwned::Borrowed(&self.entries),
+        ))
+      }
+    }
+    fn submit_append(&mut self, _: sailing_proto::OpId, _: &[Entry]) {
+      unreachable!()
+    }
+    fn compact(&mut self, _: Index) {
+      unreachable!()
+    }
+    fn restore(&mut self, _: Index, _: sailing_proto::Term) {
+      unreachable!()
+    }
+    fn poll(&mut self) -> Option<Result<sailing_proto::LogDone, ()>> {
+      unreachable!()
+    }
+    fn has_pending(&self) -> bool {
+      false
+    }
+  }
+
+  #[test]
+  fn read_limbo_serves_a_complete_in_budget_region() {
+    use sailing_proto::{EntryKind, Term};
+    let e = |idx: u64, kind| Entry::new(Term::new(1), Index::new(idx), kind, bytes::Bytes::new());
+    // Region (commit=4, limbo_upper=7]: a COMPLETE contiguous [5,8) within budget returns the
+    // Normal-only entries — the happy path the failing/panicking/empty fixtures never exercise.
+    let log = StubLog {
+      entries: std::vec![
+        e(5, EntryKind::Normal),
+        e(6, EntryKind::Empty),
+        e(7, EntryKind::Normal)
+      ],
+      pending: false,
+    };
+    let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
+    let served = read_limbo(&log, &window, 1_000_000)
+      .expect("a readable region is not a fault")
+      .expect("a complete contiguous in-budget region serves");
+    assert_eq!(served.len(), 2, "only the two Normal entries are kept");
+  }
+
+  #[test]
+  fn read_limbo_falls_back_on_a_cold_region() {
+    // A `Pending` (cold) limbo read is a SAFE fallback to a normal read, never a fault: `Ok(None)`.
+    let log = StubLog {
+      entries: Vec::new(),
+      pending: true,
+    };
+    let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
+    assert_eq!(read_limbo(&log, &window, u64::MAX), Ok(None));
+  }
+
+  #[test]
+  fn read_limbo_fails_closed_at_the_index_ceiling_without_reading() {
+    // A window whose index is at the u64 ceiling cannot express a half-open upper bound, so `read_limbo`
+    // returns the safe fallback BEFORE touching the log (the `pending` field would otherwise be observed).
+    let log = StubLog {
+      entries: Vec::new(),
+      pending: true,
+    };
+    let at_ceiling = FailoverReadWindow::new(Index::new(u64::MAX), Index::new(u64::MAX));
+    assert_eq!(
+      read_limbo(&log, &at_ceiling, u64::MAX),
+      Ok(None),
+      "the index-ceiling fallback short-circuits before the log read"
+    );
+  }
 }
