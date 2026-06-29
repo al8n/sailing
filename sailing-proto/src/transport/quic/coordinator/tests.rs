@@ -621,3 +621,160 @@ fn quic_election_preserves_synchronized_wall_on_leader_noop() {
     "the network-driven election must stamp the no-op with the synchronized wall (FIX 2)"
   );
 }
+
+/// `QuicCoordinator::new` builds a mutual-mTLS coordinator (the panic-on-no-auth public path) — a
+/// fresh follower.
+#[test]
+fn new_constructs_a_mutual_auth_coordinator() {
+  let ca = TestClusterCa::generate();
+  let c7 = cluster(7);
+  let cfg = Config::try_new(1u64, std::vec![1u64, 2u64], ELECTION, HEARTBEAT).unwrap();
+  let opts = ca
+    .cluster_tls(&san(1, &c7))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let c: Coord = QuicCoordinator::new(cfg, Instant::ORIGIN, 1, CountSm::default(), opts, c7);
+  assert!(c.role().is_follower());
+}
+
+/// The read / transfer / membership / read-mode / deferred-propose / flush proxies each delegate to
+/// the wrapped endpoint and run the coordinator's pump. On a fresh follower the endpoint refuses
+/// each, but the delegation + pump executes; the observers expose endpoint state.
+#[test]
+fn quic_coordinator_proxies_delegate_to_the_endpoint() {
+  let ca = TestClusterCa::generate();
+  let mut c = coord(&ca, 1, cluster(7));
+  let mut log = VecLog::default();
+  let stable = NoopStable::default();
+  let now = Instant::ORIGIN;
+  let cmd = bytes::Bytes::from_static(b"x");
+
+  assert!(
+    c.submit_propose_deferred(now, &mut log, &stable, &cmd)
+      .is_err()
+  );
+  c.flush_appends(now, &log, &stable);
+  let add3 = crate::ConfChange::new(crate::ConfChangeType::AddNode, 3u64, bytes::Bytes::new());
+  assert!(
+    c.propose_conf_change_v2(now, &mut log, &stable, add3.into_v2())
+      .is_err()
+  );
+  assert!(
+    c.propose_read_mode_change(now, &mut log, &stable, crate::ReadOnlyOption::LeaseBased)
+      .is_err()
+  );
+  assert!(
+    c.read_index(now, &log, &stable, bytes::Bytes::new())
+      .is_err()
+  );
+  assert!(c.transfer_leader(now, &log, &stable, 2u64).is_err());
+
+  while c.poll_event().is_some() {}
+  assert_eq!(c.oversized_outbound_dropped(), 0);
+  assert!(std::format!("{c:?}").contains("QuicCoordinator"));
+}
+
+/// Without a quinn clock anchor (nothing fed to quinn yet) the quic side of `poll_timeout` is `None`,
+/// so the deadline is the endpoint's election timer (the `(Some, None)` arm).
+#[test]
+fn poll_timeout_is_the_endpoint_deadline_without_a_quinn_anchor() {
+  let ca = TestClusterCa::generate();
+  let mut c = coord(&ca, 1, cluster(7));
+  assert!(
+    c.poll_timeout().is_some(),
+    "a fresh follower reports its election deadline"
+  );
+}
+
+/// A CALLER-SUPPLIED identity source (`dangerous_custom_identity`) cannot bypass the coordinator's
+/// binding policy: the cross-checks run on the candidate `authenticate` returns. A candidate that
+/// (a) is not the dialed peer, (b) is this node's own id, or (c) attests a foreign cluster is closed
+/// — never bound — even over a fully-completed mTLS handshake.
+#[test]
+fn custom_identity_binding_policy_rejects_bad_candidates() {
+  use crate::transport::quic::{Hello, Identified, IdentityCtx, IdentityOutcome, IdentitySource};
+
+  /// Writes a normal `Hello` preface (so the Hello PEER can authenticate us), but its own
+  /// `authenticate` returns a scripted candidate the coordinator's policy must reject.
+  struct ScriptedId {
+    cluster: ClusterId,
+    mode: u8,
+  }
+
+  impl IdentitySource<u64> for ScriptedId {
+    fn write_control_preface(&self, me: &u64, out: &mut Vec<u8>) {
+      <Hello as IdentitySource<u64>>::write_control_preface(&Hello::new(self.cluster), me, out);
+    }
+    fn authenticate(&self, ctx: &IdentityCtx<'_>) -> IdentityOutcome<u64> {
+      if ctx.control_frame().is_none() {
+        return IdentityOutcome::Pending;
+      }
+      match self.mode {
+        // Not the dialed peer (dialed 2) → dialed-match-or-abort closes.
+        0 => IdentityOutcome::Identified(Identified::new(99u64, *ctx.our_cluster())),
+        // Our own id → the never-bind-self gate closes.
+        1 => IdentityOutcome::Identified(Identified::new(1u64, *ctx.our_cluster())),
+        // A foreign cluster → the cluster cross-check closes.
+        _ => IdentityOutcome::Identified(Identified::new(2u64, ClusterId([99; 16]))),
+      }
+    }
+  }
+
+  /// Dial a scripted (mode) dialer at a normal Hello acceptor over real mTLS; return whether the
+  /// dialer bound peer 2.
+  fn dialer_binds_peer2(ca: &TestClusterCa, mode: u8) -> bool {
+    let c7 = cluster(7);
+    let a_endpoint = Endpoint::new(
+      Config::try_new(1u64, std::vec![1u64, 2u64], ELECTION, HEARTBEAT).unwrap(),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+    );
+    let a_opts = ca
+      .cluster_tls(&san(1, &c7))
+      .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+      .build();
+    let mut a: QuicCoordinator<u64, CountSm, ScriptedId> =
+      QuicCoordinator::dangerous_custom_identity(
+        a_endpoint,
+        a_opts,
+        Some([1; 32]),
+        ScriptedId { cluster: c7, mode },
+        c7,
+      );
+    let mut b = coord(ca, 2, c7);
+    let (mut la, mut sa) = (VecLog::default(), NoopStable::default());
+    let (mut lb, mut sb) = (VecLog::default(), NoopStable::default());
+    let now = Instant::ORIGIN;
+    a.connect(now, addr(2), 2u64).expect("dial");
+    for _ in 0..200 {
+      let mut progressed = false;
+      while let Some((_, bytes)) = a.poll_transmit() {
+        progressed = true;
+        b.handle_udp(now, addr(1), None, &bytes, &mut lb, &mut sb);
+      }
+      while let Some((_, bytes)) = b.poll_transmit() {
+        progressed = true;
+        a.handle_udp(now, addr(2), None, &bytes, &mut la, &mut sa);
+      }
+      if !progressed {
+        break;
+      }
+    }
+    a.has_bound_conn(&2u64)
+  }
+
+  let ca = TestClusterCa::generate();
+  assert!(
+    !dialer_binds_peer2(&ca, 0),
+    "a candidate != the dialed peer must not bind"
+  );
+  assert!(
+    !dialer_binds_peer2(&ca, 1),
+    "a candidate == our own id must not bind"
+  );
+  assert!(
+    !dialer_binds_peer2(&ca, 2),
+    "a foreign-cluster candidate must not bind"
+  );
+}

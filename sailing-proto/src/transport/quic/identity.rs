@@ -327,4 +327,15 @@ mod tests {
     let preface = preface_of(u64::MAX, cluster(0xFF));
     assert!(preface.len() <= super::super::MAX_HELLO_LEN);
   }
+
+  #[test]
+  fn ctx_and_hello_accessors() {
+    let c = cluster(7);
+    // The TLS-validated cert chain surfaces through `peer_certs` (empty in this probe).
+    let ctx = IdentityCtx::new(&[], None, c);
+    assert!(ctx.peer_certs().is_empty());
+    assert_eq!(ctx.our_cluster(), &c);
+    // A `Hello` source reports the cluster it writes into its preface.
+    assert_eq!(Hello::new(c).cluster(), &c);
+  }
 }

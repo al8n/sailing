@@ -1242,4 +1242,55 @@ pub(crate) mod tests {
     // The other non-default fields are still preserved across the clamped update.
     assert_eq!(cli.tuning.initial_rtt_millis(), 120);
   }
+
+  #[test]
+  fn quic_options_new_is_the_accept_any_path() {
+    // The public `new` is the no-mandatory-auth construction (embedders building their own configs):
+    // `requires_client_auth` stays false (only `ClusterTls::build` pins it true), and the cap
+    // defaults.
+    let opts = QuicOptions::new(
+      EndpointConfig::default(),
+      None::<ClientConfig>,
+      None::<ServerConfig>,
+      QuicTuning::new(),
+    );
+    assert!(
+      !opts.requires_client_auth(),
+      "new() does not pin mandatory mTLS"
+    );
+    assert!(opts.client_config().is_none());
+    assert!(opts.server_config().is_none());
+    assert_eq!(opts.max_connections(), DEFAULT_MAX_CONNECTIONS);
+  }
+
+  #[cfg(feature = "clap")]
+  #[test]
+  fn tuning_clap_update_applies_window_and_keepalive_overrides() {
+    use clap::Parser;
+    #[derive(Parser)]
+    struct Cli {
+      #[command(flatten)]
+      tuning: QuicTuning,
+    }
+    let mut cli = Cli {
+      tuning: QuicTuning::new(),
+    };
+    // The connection-window and keep-alive override applied on UPDATE — the value-source-gated take
+    // branches the preserve-omitted test does not exercise.
+    cli
+      .try_update_from([
+        "app",
+        "--quic-connection-receive-window",
+        "33554432",
+        "--quic-keep-alive-interval-millis",
+        "0",
+      ])
+      .unwrap();
+    assert_eq!(cli.tuning.connection_receive_window(), 33_554_432);
+    assert_eq!(
+      cli.tuning.keep_alive_interval_millis(),
+      0,
+      "an explicit 0 override turns keep-alive off on update"
+    );
+  }
 }
