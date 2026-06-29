@@ -6,6 +6,7 @@ ignore:
   - "**/examples/**"
   - "**/tests/**"
   - tests/
+  - sailing-proto/src/testkit.rs
 
 coverage:
   status:
