@@ -1,0 +1,54 @@
+[package]
+name = "sailing"
+version = "0.0.0"
+description = "Sans-I/O Raft: the protocol core plus pluggable I/O drivers, behind one umbrella crate."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[dependencies]
+sailing-proto = { workspace = true, default-features = false }
+sailing-reactor = { workspace = true, optional = true }
+sailing-compio = { workspace = true, optional = true }
+
+[features]
+default = ["std", "tokio"]
+
+# Capability tiers, forwarded to the protocol core. `std` and `alloc` are independent
+# (the core is no_std+alloc-capable), mirroring sailing-proto.
+alloc = ["sailing-proto/alloc"]
+std = ["sailing-proto/std"]
+
+# I/O driver selection. `reactor` is the runtime-agnostic driver (pick the runtime with
+# `tokio` or `smol`); `compio` is the completion-I/O backend. Both require std.
+reactor = ["dep:sailing-reactor", "std"]
+tokio = ["reactor", "sailing-reactor/tokio"]
+smol = ["reactor", "sailing-reactor/smol"]
+compio = ["dep:sailing-compio", "std"]
+
+# Transport record layer, forwarded to the core. The reactor/compio drivers already pull
+# tls + quic, so these matter mainly for a proto-only build via `sailing::proto`. Bare `tls`
+# uses the ring backend; add `tls-aws-lc-rs` for the aws-lc-rs provider.
+tcp = ["sailing-proto/tcp"]
+tls = ["sailing-proto/tls"]
+tls-aws-lc-rs = ["tls", "sailing-proto/tls-aws-lc-rs"]
+quic = ["sailing-proto/quic"]
+
+# Optional config layering: `serde` adds gated Serialize/Deserialize, `clap` a gated
+# clap::Args derive — forwarded to the core and to whichever drivers are enabled.
+serde = ["std", "sailing-proto/serde", "sailing-reactor?/serde", "sailing-compio?/serde"]
+clap = ["std", "sailing-proto/clap", "sailing-reactor?/clap", "sailing-compio?/clap"]
+
+# The raw-SystemTime wall-clock source (off by default; std drivers only — see the driver docs).
+unverified-wall-clock = [
+  "sailing-reactor?/unverified-wall-clock",
+  "sailing-compio?/unverified-wall-clock",
+]
+
+[lints]
+workspace = true
