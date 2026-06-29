@@ -794,3 +794,247 @@ fn with_identity_rejects_options_without_mandatory_client_auth() {
   );
   let _c: Coord = QuicCoordinator::with_identity(endpoint, opts, Some([1; 32]), cluster(7));
 }
+
+/// A framing violation on a validated connection (a frame declaring more than `MAX_FRAME_LEN`)
+/// closes the connection from inside `drain_bridge` — terminal for the link, never for the
+/// consensus core.
+#[test]
+fn drain_bridge_closes_on_a_framing_violation() {
+  let ca = TestClusterCa::generate();
+  let mut w = World::new(&ca, None);
+  w.settle();
+  assert!(w.a.has_bound_conn(&2u64) && w.b.has_bound_conn(&1u64));
+
+  let h = w
+    .a
+    .bridge_mut_for_test()
+    .handle_for(&2u64)
+    .expect("a bound b");
+  let std_now = std::time::Instant::now();
+  {
+    let bridge = w.a.bridge_mut_for_test();
+    bridge.stage_outbound_for_test(h, &[0xFF, 0xFF, 0xFF, 0xFF]); // declares ~4 GiB
+    bridge.flush_stream(std_now, h);
+  }
+  w.settle();
+  assert!(
+    !w.b.has_bound_conn(&1u64),
+    "b closed the connection on the framing violation"
+  );
+}
+
+/// A well-formed frame whose payload is NOT a valid `Message` encoding closes the connection from
+/// inside `drain_bridge` (a peer fault, never an endpoint poison).
+#[test]
+fn drain_bridge_closes_on_an_undecodable_frame() {
+  let ca = TestClusterCa::generate();
+  let mut w = World::new(&ca, None);
+  w.settle();
+
+  let h = w
+    .a
+    .bridge_mut_for_test()
+    .handle_for(&2u64)
+    .expect("a bound b");
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&[0xFF], &mut framed); // a complete frame, bogus payload
+  let std_now = std::time::Instant::now();
+  {
+    let bridge = w.a.bridge_mut_for_test();
+    bridge.stage_outbound_for_test(h, &framed);
+    bridge.flush_stream(std_now, h);
+  }
+  w.settle();
+  assert!(
+    !w.b.has_bound_conn(&1u64),
+    "b closed the connection on the undecodable frame"
+  );
+}
+
+/// A peer's graceful FIN: `drain_bridge` delivers the complete frames read before it, THEN closes
+/// the connection (deliver-before-close).
+#[test]
+fn drain_bridge_closes_after_delivering_a_graceful_fin() {
+  let ca = TestClusterCa::generate();
+  let mut w = World::new(&ca, None);
+  w.settle();
+
+  let h = w
+    .a
+    .bridge_mut_for_test()
+    .handle_for(&2u64)
+    .expect("a bound b");
+  let msg = crate::Message::TimeoutNow(crate::TimeoutNow::new(crate::Term::new(9), 1u64));
+  let mut payload = Vec::new();
+  crate::wire::encode_message(&msg, &mut payload);
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&payload, &mut framed);
+  let std_now = std::time::Instant::now();
+  {
+    let bridge = w.a.bridge_mut_for_test();
+    bridge.stage_outbound_for_test(h, &framed);
+    let sid = bridge.send_sid_for_test(h).expect("a's send stream");
+    bridge.flush_stream(std_now, h);
+    bridge.finish_send_for_test(h, sid);
+    bridge.service(std_now);
+  }
+  w.settle();
+  assert!(
+    !w.b.has_bound_conn(&1u64),
+    "b closed the connection after delivering the FIN'd frame"
+  );
+}
+
+/// An [`IdentityOutcome::Rejected`] from the identity source closes the connection in
+/// `apply_outcome` — the candidate is never bound even over a completed mTLS handshake.
+#[test]
+fn rejected_identity_closes_the_connection() {
+  use crate::transport::quic::{Hello, IdentityCtx, IdentityOutcome, IdentitySource};
+
+  struct RejectingId {
+    cluster: ClusterId,
+  }
+  impl IdentitySource<u64> for RejectingId {
+    fn write_control_preface(&self, me: &u64, out: &mut Vec<u8>) {
+      <Hello as IdentitySource<u64>>::write_control_preface(&Hello::new(self.cluster), me, out);
+    }
+    fn authenticate(&self, ctx: &IdentityCtx<'_>) -> IdentityOutcome<u64> {
+      if ctx.control_frame().is_none() {
+        IdentityOutcome::Pending
+      } else {
+        IdentityOutcome::Rejected
+      }
+    }
+  }
+
+  let ca = TestClusterCa::generate();
+  let c7 = cluster(7);
+  let a_endpoint = Endpoint::new(
+    Config::try_new(1u64, std::vec![1u64, 2u64], ELECTION, HEARTBEAT).unwrap(),
+    Instant::ORIGIN,
+    1,
+    CountSm::default(),
+  );
+  let a_opts = ca
+    .cluster_tls(&san(1, &c7))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut a: QuicCoordinator<u64, CountSm, RejectingId> =
+    QuicCoordinator::dangerous_custom_identity(
+      a_endpoint,
+      a_opts,
+      Some([1; 32]),
+      RejectingId { cluster: c7 },
+      c7,
+    );
+  let mut b = coord(&ca, 2, c7);
+  let (mut la, mut sa) = (VecLog::default(), NoopStable::default());
+  let (mut lb, mut sb) = (VecLog::default(), NoopStable::default());
+  let now = Instant::ORIGIN;
+  a.connect(now, addr(2), 2u64).expect("dial");
+  for _ in 0..200 {
+    let mut progressed = false;
+    while let Some((_, bytes)) = a.poll_transmit() {
+      progressed = true;
+      b.handle_udp(now, addr(1), None, &bytes, &mut lb, &mut sb);
+    }
+    while let Some((_, bytes)) = b.poll_transmit() {
+      progressed = true;
+      a.handle_udp(now, addr(2), None, &bytes, &mut la, &mut sa);
+    }
+    if !progressed {
+      break;
+    }
+  }
+  assert!(
+    !a.has_bound_conn(&2u64),
+    "a rejected the peer identity and never bound it"
+  );
+}
+
+/// While the bridge holds deferred work (a freshly-validated connection's rescheduled read), the
+/// coordinator's `poll_timeout` returns the IMMEDIATE (last-`now`) deadline so an event-driven
+/// driver re-pumps at once rather than sleeping.
+#[test]
+fn poll_timeout_reports_immediate_work_while_the_bridge_has_pending() {
+  let ca = TestClusterCa::generate();
+  let mut a = coord(&ca, 1, cluster(7));
+  let mut b = coord(&ca, 2, cluster(7));
+  let (mut la, mut sa) = (VecLog::default(), NoopStable::default());
+  let (mut lb, mut sb) = (VecLog::default(), NoopStable::default());
+  let now = Instant::ORIGIN;
+  a.connect(now, addr(2), 2u64).expect("dial");
+  let mut saw_immediate = false;
+  for _ in 0..200 {
+    let mut progressed = false;
+    while let Some((_, bytes)) = a.poll_transmit() {
+      progressed = true;
+      b.handle_udp(now, addr(1), None, &bytes, &mut lb, &mut sb);
+    }
+    while let Some((_, bytes)) = b.poll_transmit() {
+      progressed = true;
+      a.handle_udp(now, addr(2), None, &bytes, &mut la, &mut sa);
+    }
+    // The immediate deadline is the last `now` (here `ORIGIN`); the endpoint deadline is strictly
+    // later, so `Some(ORIGIN)` uniquely identifies the has-pending-work arm.
+    if a.poll_timeout() == Some(now) || b.poll_timeout() == Some(now) {
+      saw_immediate = true;
+      break;
+    }
+    if !progressed {
+      break;
+    }
+  }
+  assert!(
+    saw_immediate,
+    "poll_timeout reports the immediate deadline while the bridge holds deferred work"
+  );
+}
+
+/// For a NON-VOTER (observer) endpoint the consensus `poll_timeout` is `None` (it never campaigns),
+/// so the QUIC connection timer is the sole deadline — the `(None, Some)` fold arm.
+#[test]
+fn poll_timeout_uses_the_quic_deadline_for_a_non_voter() {
+  let ca = TestClusterCa::generate();
+  let c7 = cluster(7);
+  let cfg = Config::try_new_observer(1u64, std::vec![2u64], ELECTION, HEARTBEAT).unwrap();
+  let endpoint = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let a_opts = ca
+    .cluster_tls(&san(1, &c7))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut a: Coord = QuicCoordinator::with_identity(endpoint, a_opts, Some([1; 32]), c7);
+  let mut b = coord(&ca, 2, c7);
+  let (mut la, mut sa) = (VecLog::default(), NoopStable::default());
+  let (mut lb, mut sb) = (VecLog::default(), NoopStable::default());
+  let now = Instant::ORIGIN;
+  a.connect(now, addr(2), 2u64).expect("dial");
+  // Settle the handshake without firing timers (no election), draining all deferred bridge work.
+  for _ in 0..200 {
+    let mut progressed = false;
+    a.handle_storage(now, &mut la, &mut sa);
+    b.handle_storage(now, &mut lb, &mut sb);
+    while let Some((_, bytes)) = a.poll_transmit() {
+      progressed = true;
+      b.handle_udp(now, addr(1), None, &bytes, &mut lb, &mut sb);
+    }
+    while let Some((_, bytes)) = b.poll_transmit() {
+      progressed = true;
+      a.handle_udp(now, addr(2), None, &bytes, &mut la, &mut sa);
+    }
+    if !progressed {
+      break;
+    }
+  }
+  assert!(a.has_bound_conn(&2u64), "the observer validated its peer");
+  let d = a.poll_timeout();
+  assert!(
+    d.is_some(),
+    "the QUIC connection timer supplies the deadline"
+  );
+  assert_ne!(
+    d,
+    Some(now),
+    "it is the future quic deadline, not the immediate (pending-work) value"
+  );
+}

@@ -770,6 +770,13 @@ where
   pub(crate) fn effective_max_connections(&self) -> usize {
     self.bridge.max_connections_for_test()
   }
+
+  /// Test-only mutable access to the wrapped bridge — lets a test inject a transport fault (a
+  /// framing violation, an undecodable frame, a graceful FIN) onto a validated connection and then
+  /// drive it through the coordinator's own `drain_bridge`.
+  pub(crate) fn bridge_mut_for_test(&mut self) -> &mut Bridge<I> {
+    &mut self.bridge
+  }
 }
 
 impl<I, F, ID> core::fmt::Debug for QuicCoordinator<I, F, ID>
