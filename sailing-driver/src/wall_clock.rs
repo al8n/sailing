@@ -210,4 +210,17 @@ mod tests {
     #[cfg(not(target_os = "linux"))]
     assert!(c.now().is_none());
   }
+
+  /// The unverified clock ALWAYS supplies a reading with zero claimed error ("trust me") — it never
+  /// self-degrades, the property that makes it test-only.
+  #[cfg(feature = "unverified-wall-clock")]
+  #[test]
+  fn unverified_clock_always_supplies_zero_error() {
+    let mut c = UnverifiedSystemClock;
+    let r = c
+      .now()
+      .expect("the unverified clock always supplies a reading");
+    assert_eq!(r.max_error_nanos(), 0, "it reports zero claimed error");
+    assert!(r.wall_nanos() > 0);
+  }
 }
