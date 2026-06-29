@@ -4727,6 +4727,48 @@ fn propose_rejects_unconfigured_target() {
   );
 }
 
+/// `propose_read_mode_change` refuses on the same guards as every other proposal — a non-leader, a
+/// leader with a transfer in flight, and a poisoned node (which takes precedence) — appending nothing.
+#[test]
+fn propose_read_mode_change_rejects_on_guards() {
+  // NotLeader: a fresh follower has no authority to propose a migration.
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut follower = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut flog = VecLog::default();
+  let fstable = NoopStable::default();
+  assert!(follower.role().is_follower());
+  assert!(matches!(
+    follower.propose_read_mode_change(
+      Now::monotonic(Instant::ORIGIN),
+      &mut flog,
+      &fstable,
+      ReadOnlyOption::Safe,
+    ),
+    Err(ProposeError::NotLeader { .. })
+  ));
+
+  // LeaderTransferInProgress: arm a transfer on a leader and the migration is refused (one at a time).
+  let (mut leader, mut log, stable, d) = make_three_node_leader();
+  leader.transfer.lead_transferee = Some(2u64);
+  assert_eq!(
+    leader.propose_read_mode_change(Now::monotonic(d), &mut log, &stable, ReadOnlyOption::Safe),
+    Err(ProposeError::LeaderTransferInProgress)
+  );
+
+  // Poisoned is checked first, so it wins even with a transfer also armed.
+  leader.poison(crate::PoisonReason::LogRead);
+  assert_eq!(
+    leader.propose_read_mode_change(Now::monotonic(d), &mut log, &stable, ReadOnlyOption::Safe),
+    Err(ProposeError::Poisoned)
+  );
+}
+
 /// Only one read-mode migration may be in flight at a time (mirror pending_conf_index).
 #[test]
 fn one_read_mode_change_in_flight() {
