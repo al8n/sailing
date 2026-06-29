@@ -1004,6 +1004,91 @@ mod tests {
 
   #[cfg(feature = "clap")]
   #[test]
+  fn clap_update_applies_only_operator_supplied_overrides() {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+      #[command(flatten)]
+      driver: DriverConfig,
+    }
+
+    // A baseline parse with a non-default `--max-conns`, plus a live runtime channel the update must
+    // carry across (it is not a flag, so only the field clone preserves it). The funnel requires the
+    // coalescing `flume::bounded(1)` shape, so a passing update also proves the channel survived.
+    let mut cli = Cli::try_parse_from(["prog", "--max-conns", "100"]).unwrap();
+    cli.driver.storage_ready = Some(flume::bounded(1).1);
+    assert_eq!(cli.driver.max_conns, 100);
+
+    // The update supplies a spread of knobs (`usize`, `Duration`, and the last-declared `usize`):
+    // exactly those change. Every unsupplied field — the earlier `--max-conns` override and the
+    // runtime channel — is preserved, never reset to its clap default (the `value_source` gate, not a
+    // bare derived update).
+    cli
+      .try_update_from([
+        "prog",
+        "--max-inflight",
+        "8",
+        "--redial-base",
+        "250ms",
+        "--max-failover-limbo-bytes",
+        "4096",
+      ])
+      .unwrap();
+    assert_eq!(
+      cli.driver.max_inflight, 8,
+      "the supplied usize knob is applied"
+    );
+    assert_eq!(
+      cli.driver.redial_base,
+      Duration::from_millis(250),
+      "the supplied duration knob is applied"
+    );
+    assert_eq!(
+      cli.driver.max_failover_limbo_bytes, 4096,
+      "the last-declared knob is applied through the same gate"
+    );
+    assert_eq!(
+      cli.driver.max_conns, 100,
+      "an unsupplied knob keeps its prior value, not the clap default"
+    );
+    assert!(
+      cli.driver.storage_ready.is_some(),
+      "the runtime channel survives the transactional update"
+    );
+  }
+
+  #[cfg(feature = "clap")]
+  #[test]
+  fn clap_update_rejecting_an_invalid_override_leaves_the_config_unchanged() {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+      #[command(flatten)]
+      driver: DriverConfig,
+    }
+
+    let mut cli = Cli::try_parse_from(["prog", "--max-inflight", "8"]).unwrap();
+    let before = cli.driver.max_inflight;
+
+    // An update whose value fails the validating funnel is surfaced through clap's own error path,
+    // and the transactional update leaves `self` byte-for-byte unchanged — a caller that catches the
+    // error keeps a still-valid config.
+    let arg = format!("{}", usize::MAX);
+    assert!(
+      cli
+        .try_update_from(["prog", "--max-inflight", &arg])
+        .is_err()
+    );
+    assert_eq!(
+      cli.driver.max_inflight, before,
+      "a rejected update must not mutate the config"
+    );
+  }
+
+  #[cfg(feature = "clap")]
+  #[test]
   fn clap_rejects_channel_caps_above_ceiling() {
     use clap::Parser;
 
