@@ -266,9 +266,9 @@ jobs:
         with:
           repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust
-        run: rustup update nightly && rustup default nightly
-      - name: Install cargo-tarpaulin
-        run: cargo install cargo-tarpaulin
+        run: rustup update nightly && rustup default nightly && rustup component add llvm-tools-preview
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
       - name: Cache cargo build and registry
         uses: actions/cache@v6
         with:
@@ -279,13 +279,15 @@ jobs:
           key: ${{ runner.os }}-coverage-${{ hashFiles('Cargo.toml', '*/Cargo.toml', 'tests/*/Cargo.toml') }}
           restore-keys: |
             ${{ runner.os }}-coverage-
-      - name: Run tarpaulin
-        env:
-          RUSTFLAGS: "--cfg tarpaulin"
-        run: cargo tarpaulin --engine llvm --all-features --run-types lib --run-types tests --run-types doctests --workspace --out xml
+      - name: Run llvm-cov
+        # Coverage scope is the library crates (proto + driver + compio + reactor); the benchmark
+        # (dev tooling) and the simulation (test harness) still RUN to exercise the proto, but their
+        # own source is excluded from the report via --ignore-filename-regex.
+        run: cargo llvm-cov --workspace --all-features --ignore-filename-regex '(benchmarks|tests/sailing-simulation)/' --lcov --output-path lcov.info
       - name: Upload to codecov.io
         uses: codecov/codecov-action@v7
         with:
           token: ${{ secrets.CODECOV_TOKEN }}
           slug: ${{ github.repository }}
+          files: lcov.info
           fail_ci_if_error: false
