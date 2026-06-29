@@ -108,12 +108,19 @@ MSRV: **1.91**.
 
 ## License
 
-`sailing` is under the terms of both the MIT license and the Apache License (Version 2.0).
-
-See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
+`sailing` is under the terms of the MPL-2.0 license. See [LICENSE] for details.
 
 Copyright (c) 2026 Al Liu.
 
+[`quinn-proto`]: https://docs.rs/quinn-proto
+[`agnostic`]: https://github.com/al8n/agnostic
+[`sailing`]: https://crates.io/crates/sailing
+[`sailing-proto`]: https://crates.io/crates/sailing-proto
+[`sailing-reactor`]: https://crates.io/crates/sailing-reactor
+[`sailing-compio`]: https://crates.io/crates/sailing-compio
+[`sailing-embedded`]: https://crates.io/crates/sailing-embedded
+[`sailing-smoltcp`]: https://crates.io/crates/sailing-smoltcp
+[`sailing-embassy`]: https://crates.io/crates/sailing-embassy
 [Github-url]: https://github.com/al8n/sailing/
 [CI-url]: https://github.com/al8n/sailing/actions/workflows/ci.yml
 [codecov-url]: https://app.codecov.io/gh/al8n/sailing/

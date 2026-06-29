@@ -22,26 +22,32 @@ clap = ["sailing-driver/clap"]
 
 [dependencies]
 sailing-proto = { workspace = true, features = ["tls", "quic"] }
-sailing-driver = { workspace = true }
-bytes = { workspace = true }
-thiserror = { workspace = true }
-compio = { workspace = true, features = ["net", "runtime", "macros", "time", "io-uring", "polling"] }
-flume = { workspace = true }
-lochan = { workspace = true }
-futures-channel = { workspace = true }
-# `std` (over the workspace default's macro-only set) brings in `FutureExt::shared` + `Shared`,
-# which the coalesced shutdown uses to fan ONE teardown-completion oneshot out to every Handle
-# clone. sailing-compio is std, so this adds nothing the crate did not already require.
+sailing-driver.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+compio = { workspace = true, features = [
+  "net",
+  "runtime",
+  "macros",
+  "time",
+  "io-uring",
+  "polling",
+] }
+flume.workspace = true
+lochan.workspace = true
+futures-channel.workspace = true
 futures-util = { workspace = true, features = ["std"] }
 
 # Linux-only: the disciplined wall clock reads the kernel's NTP sync state via adjtimex.
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
+libc.workspace = true
 
 [dev-dependencies]
-rcgen = { workspace = true }
-rustls = { workspace = true }
-futures-executor = { version = "0.3", default-features = false, features = ["std"] }
+rcgen.workspace = true
+rustls.workspace = true
+futures-executor = { version = "0.3", default-features = false, features = [
+  "std",
+] }
 
 [lints]
 workspace = true

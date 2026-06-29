@@ -9,31 +9,34 @@ repository.workspace = true
 
 [features]
 default = ["std"]
-# `std` and `alloc` are INDEPENDENT (never `std = ["alloc"]`): `std` layers each dependency's std
-# feature; `alloc` is the no_std heap tier (the deps use `alloc` automatically under
-# `default-features = false`, so there is nothing to layer). The crate requires at least one.
-std = ["bytes/std", "thiserror/std", "derive_more/std", "buffa/std", "rand/std", "cheap-clone/default"]
+std = [
+  "bytes/std",
+  "thiserror/std",
+  "derive_more/std",
+  "buffa/std",
+  "rand/std",
+  "cheap-clone/default",
+]
 alloc = ["cheap-clone/alloc"]
-tcp = []                                   # no_std + alloc OK (no crypto)
-# Exposes pub(crate) decode entry points to the `fuzz/` cargo-fuzz crate via a doc-hidden
-# `fuzz_internals` module. Off by default, never enabled by a normal build; NOT semver-stable.
+tcp = []
 fuzzing = []
 tls = ["tcp", "std", "dep:rustls", "tls-ring"]
 tls-ring = ["rustls?/ring"]
 tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
-quic = ["tcp", "std", "dep:rustls", "dep:quinn-proto", "dep:rustls-pemfile", "tls-ring"]
+quic = [
+  "tcp",
+  "std",
+  "dep:rustls",
+  "dep:quinn-proto",
+  "dep:rustls-pemfile",
+  "tls-ring",
+]
 
-# Optional config layering on `Config` and the read-mode enums. `serde` adds gated
-# Serialize/Deserialize (config files, round-trip; the `Duration` knobs render as humantime
-# strings via `humantime-serde`); `clap` adds a gated `clap::Args` mirror (CLI flags + env vars).
-# Both leave the default build byte-identical (everything gated) and both pull `std`: `clap` is
-# std-only, and `serde` uses `humantime-serde` for the `Duration` fields (a no_std `humantime`
-# does not yet exist — until then the config serde layer is std-only).
 serde = ["std", "dep:serde", "serde/std", "dep:humantime-serde"]
 clap = ["std", "dep:clap", "dep:humantime"]
 
 [dependencies]
-buffa = { version = "0.7", default-features = false }
+buffa = { version = "0.8", default-features = false }
 cheap-clone = { version = "0.3", default-features = false }
 bytes.workspace = true
 thiserror.workspace = true
@@ -49,16 +52,14 @@ humantime = { workspace = true, optional = true }
 clap = { workspace = true, optional = true }
 
 [build-dependencies]
-# Generates the wire envelope types from proto/sailing/v1/messages.proto (requires protoc).
-buffa-build = "0.7"
+buffa-build = "0.8"
 
 [dev-dependencies]
-# Test-only: generates the self-signed certs the `tls` record-layer tests handshake with.
-rcgen = { workspace = true }
-# Bench-only: criterion without plotters/rayon (lean dep tree; `cargo bench` + CI compile-check).
-criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
-# Test-only: JSON round-trip of the `serde`-gated `Config`.
-serde_json = { workspace = true }
+rcgen.workspace = true
+criterion = { version = "0.8", default-features = false, features = [
+  "cargo_bench_support",
+] }
+serde_json.workspace = true
 
 [[bench]]
 name = "codec"
