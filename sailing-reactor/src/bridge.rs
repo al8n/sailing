@@ -205,10 +205,86 @@ mod tests {
   };
 
   use bytes::Bytes;
-  use futures_util::io::AsyncWrite;
+  use futures_util::io::{AsyncRead, AsyncWrite};
   use sailing_proto::ConnId;
 
-  use super::{BridgeOut, bridge_write};
+  use super::{BridgeInbound, BridgeOut, bridge_read, bridge_write};
+
+  /// An `AsyncRead` whose every read reports a clean EOF (`Ok(0)`).
+  struct EofReader;
+  impl AsyncRead for EofReader {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      _buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+      Poll::Ready(Ok(0))
+    }
+  }
+
+  /// An `AsyncRead` whose every read fails.
+  struct ErrReader;
+  impl AsyncRead for ErrReader {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      _buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+      Poll::Ready(Err(std::io::Error::other("read boom")))
+    }
+  }
+
+  /// An `AsyncRead` that always yields a few bytes — to drive the chunk-forward path.
+  struct DataReader;
+  impl AsyncRead for DataReader {
+    fn poll_read(
+      self: Pin<&mut Self>,
+      _cx: &mut Context<'_>,
+      buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+      let n = buf.len().min(4);
+      buf[..n].fill(7);
+      Poll::Ready(Ok(n))
+    }
+  }
+
+  /// A clean peer EOF (`read` → `Ok(0)`) is reported as a tagged `Eof` frame, then the reader returns.
+  #[tokio::test]
+  async fn bridge_read_reports_eof_then_returns() {
+    let (tx, rx) = flume::unbounded();
+    bridge_read(EofReader, ConnId(7), tx).await;
+    assert!(matches!(
+      rx.try_recv(),
+      Ok(BridgeInbound::Eof { id: ConnId(7) })
+    ));
+  }
+
+  /// A read error is reported as a tagged `Error` frame, then the reader returns.
+  #[tokio::test]
+  async fn bridge_read_reports_a_read_error_then_returns() {
+    let (tx, rx) = flume::unbounded();
+    bridge_read(ErrReader, ConnId(9), tx).await;
+    assert!(matches!(
+      rx.try_recv(),
+      Ok(BridgeInbound::Error { id: ConnId(9) })
+    ));
+  }
+
+  /// When the run loop has dropped its inbound receiver, the reader's tagged-chunk `send_async` fails
+  /// and the reader returns (teardown) rather than spinning — even though the socket keeps yielding
+  /// bytes.
+  #[tokio::test]
+  async fn bridge_read_returns_when_the_run_loop_dropped_the_receiver() {
+    let (tx, rx) = flume::unbounded::<BridgeInbound>();
+    drop(rx); // the run loop is gone: the very first chunk-forward fails
+    // Returns promptly (a `timeout` would fire if it spun); the unit return type asserts completion.
+    tokio::time::timeout(
+      std::time::Duration::from_secs(5),
+      bridge_read(DataReader, ConnId(1), tx),
+    )
+    .await
+    .expect("bridge_read returns once its inbound receiver is gone");
+  }
 
   /// An `AsyncWrite` that accepts ONE byte per poll and records the `queued_bytes` value observed on
   /// each write, so the test can prove the per-connection byte budget is charged WHOLE-CHUNK (constant
