@@ -64,7 +64,14 @@ jobs:
     - name: Apply clippy lints
       # The crate needs std-or-alloc (a compile_error! enforces it); --at-least-one-of keeps the
       # sweep off the impossible bare combos (e.g. `tcp` alone) while still covering every feature.
-      run: cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing --at-least-one-of std,alloc
+      # The umbrella + the backend-agnostic transport drivers (compio/reactor) can't be powerset --
+      # the umbrella's surface explodes, and the drivers' crypto backend comes from a default feature
+      # that --no-default-features drops -- so they are excluded here and linted curated, with ring.
+      run: |
+        cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
+        cargo clippy -p sailing-compio --features serde,clap,unverified-wall-clock --no-deps -- -D warnings
+        cargo clippy -p sailing-reactor --features tokio,smol,serde,clap,unverified-wall-clock --no-deps -- -D warnings
+        cargo clippy -p sailing --features tokio,smol,compio,serde,clap,unverified-wall-clock --no-deps -- -D warnings
 
   # Run tests on some extra platforms
   cross:
@@ -115,7 +122,8 @@ jobs:
           # (io_uring/IOCP/kqueue) and the reactor's agnostic/socket2 readiness sockets — so
           # cross-portability is the protocol crate's property, not theirs. The benchmark crate is a
           # host dev tool whose bins can't link without a target cross-linker, so exclude it too.
-          cargo build --workspace --exclude sailing-compio --exclude sailing-reactor --exclude sailing-benchmark --target ${{ matrix.target }}
+          # The umbrella (sailing) pulls a driver (its default enables the reactor) -- exclude it too.
+          cargo build --workspace --exclude sailing-compio --exclude sailing-reactor --exclude sailing-benchmark --exclude sailing --target ${{ matrix.target }}
 
   # Verify the declared MSRV (rust-version in Cargo.toml) actually compiles the library and its
   # feature surface — without this job the declaration is aspirational.
@@ -133,8 +141,8 @@ jobs:
     - name: Check sailing-proto on the MSRV (default + tls + quic)
       run: |
         cargo check -p sailing-proto
-        cargo check -p sailing-proto --features tls
-        cargo check -p sailing-proto --features quic
+        cargo check -p sailing-proto --features tls-rustls-ring
+        cargo check -p sailing-proto --features quic-rustls-ring
 
   # Prove the no_std core (sailing-proto) links on a real bare-metal target with only `alloc` and
   # no `std`. Any accidental std dependency fails to build here.
@@ -190,7 +198,14 @@ jobs:
     - name: Install cargo-hack
       run: cargo install cargo-hack
     - name: Run build
-      run: cargo hack build --feature-powerset --exclude-features fuzzing --at-least-one-of std,alloc
+      run: |
+        cargo hack build --feature-powerset --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
+        # The umbrella (`sailing`): curated builds — the ring backend across all drivers (this also
+        # covers compio/reactor, excluded from the powerset above), then the
+        # no_std + alloc core. aws-lc-rs + the quinn auxiliaries are CI-excluded (as in memberlist:
+        # aws-lc-rs needs cmake/nasm); their feature wiring is exercised locally.
+        cargo build -p sailing --features tokio,smol,compio,serde,clap,unverified-wall-clock
+        cargo build -p sailing --no-default-features --features alloc,tcp
 
   test:
     name: test
@@ -238,17 +253,18 @@ jobs:
       # std/alloc, so it runs once per tier with that tier as the --features base (--at-least-one-of is
       # powerset-only). Each feature thus compiles and tests on both the std and the no_std/alloc tier.
       run: |
-        cargo hack test -p sailing-proto --each-feature --features std --exclude-features fuzzing
-        cargo hack test -p sailing-proto --each-feature --features alloc --exclude-features fuzzing
+        cargo hack test -p sailing-proto --each-feature --features std --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier
+        cargo hack test -p sailing-proto --each-feature --features alloc --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier
     - name: Integration, driver, and simulation tests
-      # The downstream crates carry no test-relevant feature combinatorics, so each runs ONCE with all
-      # features (the reactor loopback needs the agnostic runtime, the simulator's VOPR exercises the wire
-      # codec) rather than per powerset combo.
+      # The downstream crates carry no test-relevant feature combinatorics, so each runs ONCE rather
+      # than per powerset combo. The transport drivers use the ring backend (aws-lc-rs is CI-excluded
+      # as in memberlist); sailing-driver + the simulator carry no transport backend, so --all-features
+      # stays fine there.
       run: |
         cargo test -p sailing-driver --all-features
         cargo test -p sailing-simulation --all-features
-        cargo test -p sailing-compio --all-features
-        cargo test -p sailing-reactor --all-features
+        cargo test -p sailing-compio --features serde,clap,unverified-wall-clock
+        cargo test -p sailing-reactor --features tokio,smol,serde,clap,unverified-wall-clock
 
   coverage:
     name: coverage

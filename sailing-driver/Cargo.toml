@@ -20,7 +20,9 @@ serde = ["dep:serde", "dep:humantime-serde"]
 clap = ["dep:clap", "dep:humantime"]
 
 [dependencies]
-sailing-proto.workspace = true
+# The driver core is a std crate; the workspace proto dep is default-features = false (for the
+# umbrella's no_std build), so enable std explicitly here.
+sailing-proto = { workspace = true, features = ["std"] }
 bytes.workspace = true
 thiserror.workspace = true
 flume.workspace = true

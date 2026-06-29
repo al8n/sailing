@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["sailing-proto", "sailing-driver", "sailing-compio", "sailing-reactor", "tests/sailing-simulation", "benchmarks"]
+members = ["sailing-proto", "sailing-driver", "sailing-compio", "sailing-reactor", "tests/sailing-simulation", "benchmarks", "sailing"]
 # The cargo-fuzz crate is nightly + libfuzzer with its own target dir; it is its own workspace.
 exclude = ["sailing-proto/fuzz"]
 
@@ -33,8 +33,10 @@ agnostic = { version = "0.10", default-features = false }
 agnostic-lite = { version = "0.6", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
 
-sailing-proto = { path = "sailing-proto" }
-sailing-driver = { path = "sailing-driver" }
+sailing-proto = { version = "0.0.0", path = "sailing-proto", default-features = false }
+sailing-driver = { version = "0.0.0", path = "sailing-driver", default-features = false }
+sailing-compio = { version = "0.0.0", path = "sailing-compio", default-features = false }
+sailing-reactor = { version = "0.0.0", path = "sailing-reactor", default-features = false }
 
 [workspace.lints.rust]
 missing_docs = "warn"

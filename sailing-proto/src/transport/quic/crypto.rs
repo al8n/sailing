@@ -35,17 +35,24 @@ use quinn_proto::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
 /// The rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) the QUIC TLS configs are built
-/// from, selected by the same `tls-*` features the byte-stream `tls` layer links (so the provider
-/// matches the one `quinn-proto` is compiled against). `ring` takes precedence when both are
-/// present; the `quic` feature itself enables `tls-ring`, so at least one arm is always live.
+/// from, selected by the enabled `quic-rustls-*` backend (so the provider matches the one
+/// `quinn-proto` is compiled against). `ring` takes precedence when both are present; a bare `quic`
+/// with no backend is a `compile_error!` directing the caller to enable one.
 fn active_provider() -> Arc<rustls::crypto::CryptoProvider> {
-  #[cfg(feature = "tls-ring")]
+  #[cfg(feature = "quic-rustls-ring")]
   {
     Arc::new(rustls::crypto::ring::default_provider())
   }
-  #[cfg(all(feature = "tls-aws-lc-rs", not(feature = "tls-ring")))]
+  #[cfg(all(feature = "quic-rustls-aws-lc-rs", not(feature = "quic-rustls-ring")))]
   {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
+  }
+  #[cfg(not(any(feature = "quic-rustls-ring", feature = "quic-rustls-aws-lc-rs")))]
+  {
+    compile_error!(
+      "the `quic` feature needs a crypto backend; enable `quic-rustls-ring` or \
+       `quic-rustls-aws-lc-rs`"
+    )
   }
 }
 
