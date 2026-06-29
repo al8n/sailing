@@ -166,3 +166,77 @@ fn close_notify_surfaces_as_peer_has_closed() {
     "close_notify latches the in-band close"
   );
 }
+
+/// `buffered_outbound` reflects accepted-but-undrained plaintext, and `TlsRecords` carries no
+/// identity of its own (the `Labeled` decorator supplies it).
+#[test]
+fn buffered_outbound_tracks_plaintext_and_peer_identity_is_none() {
+  let (client_cfg, server_cfg) = test_configs();
+  let mut c = TlsRecords::client(client_cfg, "localhost".try_into().unwrap()).unwrap();
+  let mut s = TlsRecords::server(server_cfg).unwrap();
+  pump(&mut c, &mut s);
+
+  let n = c.write_plaintext(b"some application bytes");
+  assert!(n > 0, "post-handshake plaintext is accepted");
+  assert_eq!(
+    c.buffered_outbound(),
+    n,
+    "buffered_outbound counts the accepted, not-yet-drained plaintext"
+  );
+  assert_eq!(c.peer_identity(), None, "the TLS layer is anonymous");
+}
+
+/// After a peer's clean close_notify: trailing ciphertext is consumed-as-nothing (the `read_tls`
+/// `Ok(0)` post-close latch, never a fault), and `read_plaintext` reaches a clean EOF (the reader's
+/// `Ok(0)` arm) surfacing no further plaintext.
+#[test]
+fn post_close_latch_consumes_trailing_bytes_and_read_reaches_eof() {
+  let (client_cfg, server_cfg) = test_configs();
+  let mut c = TlsRecords::client(client_cfg, "localhost".try_into().unwrap()).unwrap();
+  let mut s = TlsRecords::server(server_cfg).unwrap();
+  pump(&mut c, &mut s);
+
+  c.send_close_notify_for_test();
+  let mut wire = Vec::new();
+  c.poll_transport_transmit(&mut wire);
+  assert_ne!(
+    s.handle_transport_data(&wire, Instant::ORIGIN),
+    Intake::Failed
+  );
+  assert!(s.peer_has_closed());
+
+  // Trailing bytes after close_notify are consumed-as-nothing, never a fault.
+  assert_ne!(
+    s.handle_transport_data(b"trailing", Instant::ORIGIN),
+    Intake::Failed,
+    "post-close trailing bytes are discarded, not a fault"
+  );
+
+  // The reader is at clean EOF: read_plaintext surfaces nothing.
+  let mut out = Vec::new();
+  assert_eq!(
+    s.read_plaintext(&mut out),
+    0,
+    "no plaintext after a clean close"
+  );
+}
+
+/// A TLS record header declaring a fragment past rustls's record-size cap fails at `read_tls` (the
+/// record-framing layer, distinct from the decrypt-stage fault), latching the session aborted —
+/// never a panic — and the abort is sticky.
+#[test]
+fn oversized_tls_record_aborts_via_read_tls() {
+  let (_c, server_cfg) = test_configs();
+  let mut s = TlsRecords::server(server_cfg).unwrap();
+  // ApplicationData, TLS 1.2, declared length 0xFFFF (65535) — over the ~16 KiB record cap.
+  let oversized = [0x17u8, 0x03, 0x03, 0xFF, 0xFF];
+  assert_eq!(
+    s.handle_transport_data(&oversized, Instant::ORIGIN),
+    Intake::Failed
+  );
+  assert_eq!(
+    s.handle_transport_data(b"x", Instant::ORIGIN),
+    Intake::Failed,
+    "the abort is sticky"
+  );
+}
