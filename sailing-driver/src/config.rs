@@ -1146,6 +1146,43 @@ mod tests {
   }
 
   #[test]
+  fn programmatic_validate_rejects_each_zero_knob() {
+    // The sibling of the overflow sweep: every knob whose ZERO turns a budget/cap into a
+    // reject-everything gate (or a hot retry loop) is rejected with its own typed variant. Each case
+    // zeroes ONE field over the valid defaults, so the asserted variant pins exactly that check.
+    macro_rules! rejects_zero {
+      ($field:ident, $variant:ident) => {
+        assert!(
+          matches!(
+            DriverConfig {
+              $field: 0,
+              ..DriverConfig::default()
+            }
+            .validate(),
+            Err(DriverConfigError::$variant)
+          ),
+          concat!(
+            "a zero ",
+            stringify!($field),
+            " must be rejected as ",
+            stringify!($variant)
+          )
+        );
+      };
+    }
+    rejects_zero!(max_inflight, ZeroMaxInflight);
+    rejects_zero!(cmd_budget, ZeroCmdBudget);
+    rejects_zero!(events_cap, ZeroEventsCap);
+    rejects_zero!(recv_cap, ZeroRecvCap);
+    rejects_zero!(inbound_cap, ZeroInboundCap);
+    rejects_zero!(accept_cap, ZeroAcceptCap);
+    rejects_zero!(max_pending_bytes, ZeroMaxPendingBytes);
+    rejects_zero!(max_outbound_backlog, ZeroMaxOutboundBacklog);
+    rejects_zero!(max_conns, ZeroMaxConns);
+    rejects_zero!(max_failover_limbo_bytes, ZeroMaxFailoverLimboBytes);
+  }
+
+  #[test]
   fn validate_requires_a_coalescing_storage_ready() {
     // None (no async-store seam) is fine.
     assert!(DriverConfig::default().validate().is_ok());
