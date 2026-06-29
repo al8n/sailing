@@ -1493,3 +1493,158 @@ async fn bind_restart_migrating_recovers_durable_state() {
   handle2.shutdown().await.expect("clean teardown");
   let _ = task2.await;
 }
+
+/// A storage fault fail-stops the stream-driver endpoint (poison): the driver must fail everything
+/// parked with the TYPED verdict and exit its run loop (the QUIC suite's poison test for the stream
+/// driver — covering `pump`'s poison sweep and teardown classification).
+#[tokio::test(flavor = "multi_thread")]
+async fn storage_fault_poisons_with_a_typed_verdict() {
+  use common::PoisonableLog;
+
+  let addr: SocketAddr = "127.0.0.1:43880".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (log, fail_appends) = PoisonableLog::new();
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    log,
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  let task = tokio::spawn(driver.run());
+
+  // A healthy commit first (the node works end to end before the fault).
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no leadership in time"
+    );
+    match handle.submit(Bytes::from_static(b"ok")).await {
+      Ok(1) => break,
+      Ok(n) => panic!("unexpected count {n}"),
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected error: {e:?}"),
+    }
+  }
+
+  // Inject the fault: the next append's completion is a storage error → fail-stop.
+  fail_appends.store(true, std::sync::atomic::Ordering::Release);
+  match handle.submit(Bytes::from_static(b"doomed")).await {
+    Err(DriverError::Poisoned) => {}
+    other => panic!("expected Poisoned, got {other:?}"),
+  }
+
+  // The run loop exited on the poison; later operations surface the teardown error.
+  let _ = task.await;
+  match handle.submit(Bytes::from_static(b"late")).await {
+    Err(DriverError::ShuttingDown) => {}
+    other => panic!("expected ShuttingDown, got {other:?}"),
+  }
+}
+
+/// Membership/query commands on a node that is NOT the leader take the propose/read ERROR arms:
+/// `conf_change` / `conf_change_v2` redirect `NotLeader`, and a `query` returns the no-leader
+/// redirect. A node with peers it can never reach has no quorum, so it never leads.
+#[tokio::test(flavor = "multi_thread")]
+async fn commands_on_a_non_leader_redirect() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let addrs = addrs(43_882);
+  let (dialer, acceptor) = plain_factories(1);
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addrs[0],
+    Config::try_new(1u64, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+
+  tokio::time::sleep(ELECTION * 4).await;
+  match handle
+    .conf_change(ConfChange::new(
+      ConfChangeType::AddLearnerNode,
+      4u64,
+      bytes::Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change off the leader, got {other:?}"),
+  }
+  match handle
+    .conf_change_v2(ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 5u64)],
+      bytes::Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change_v2 off the leader, got {other:?}"),
+  }
+  match handle.query(|sm: &CountSm| sm.count()).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected the no-leader redirect for a query off the leader, got {other:?}"),
+  }
+}
+
+/// A LeaseBased read-mode migration WITHOUT `check_quorum` is rejected at the proposer (the migration
+/// validity gate) — exercising the SetReadMode command's reply-error arm and `map_propose_err`'s
+/// Rejected mapping.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_read_mode_without_check_quorum_is_rejected() {
+  let addr: SocketAddr = "127.0.0.1:43884".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  // Default config: NO check_quorum, so a LeaseBased migration cannot be proposed.
+  let (driver, handle) = ReactorStreamDriver::<TokioRuntime, _, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Err(DriverError::Rejected { .. }) => break,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      other => panic!("expected Rejected without check_quorum, got {other:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to attempt the migration"
+    );
+  }
+}
