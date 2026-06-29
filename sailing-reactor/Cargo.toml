@@ -1,40 +1,39 @@
 [package]
 name = "sailing-reactor"
-version = "0.1.0"
+version = "0.0.0"
 description = "Reactor-I/O (tokio/smol via agnostic) reference driver for sailing-proto"
 edition.workspace = true
-# agnostic's tree floors the MSRV here (same as sailing-compio); the no_std proto crate keeps 1.91.
 rust-version = "1.95"
 license.workspace = true
 repository.workspace = true
 
 [features]
-# Pull in a concrete `agnostic` runtime for embedders who want one wired here; the driver is generic
-# over any `agnostic::Runtime` and needs neither feature to compile.
 tokio = ["agnostic/tokio"]
 smol = ["agnostic/smol"]
-# Forward the `DriverConfig` config-layering to sailing-driver (where it lives), mirroring sailing-compio.
+
 serde = ["sailing-driver/serde"]
 clap = ["sailing-driver/clap"]
 unverified-wall-clock = ["sailing-driver/unverified-wall-clock"]
 
 [dependencies]
 sailing-proto = { workspace = true, features = ["tls", "quic"] }
-sailing-driver = { workspace = true }
+sailing-driver.workspace = true
 agnostic = { workspace = true, features = ["net"] }
 agnostic-lite = { workspace = true, features = ["time"] }
 bytes = { workspace = true, features = ["std"] }
-flume = { workspace = true }
-futures-channel = { workspace = true }
-# `std` over the workspace default's macro-only set brings in `select_biased!` support, `FutureExt`,
-# and `Shared` — all used by the run loop and the coalesced shutdown (sailing-compio does the same).
+flume.workspace = true
+futures-channel.workspace = true
 futures-util = { workspace = true, features = ["std"] }
-socket2 = { workspace = true }
+socket2.workspace = true
 
 [dev-dependencies]
-rcgen = { workspace = true }
-rustls = { workspace = true }
-tokio = { version = "1", default-features = false, features = ["rt-multi-thread", "macros", "time"] }
+rcgen.workspace = true
+rustls.workspace = true
+tokio = { version = "1", default-features = false, features = [
+  "rt-multi-thread",
+  "macros",
+  "time",
+] }
 
 # The loopback cluster runs on a concrete tokio runtime (the multi-thread flavor proves `run()` is Send).
 [[test]]

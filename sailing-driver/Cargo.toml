@@ -1,6 +1,6 @@
 [package]
 name = "sailing-driver"
-version = "0.1.0"
+version = "0.0.0"
 description = "Runtime-agnostic driver core for sailing-proto, shared by the sailing-compio and sailing-reactor drivers"
 edition.workspace = true
 rust-version = "1.91"
@@ -20,11 +20,11 @@ serde = ["dep:serde", "dep:humantime-serde"]
 clap = ["dep:clap", "dep:humantime"]
 
 [dependencies]
-sailing-proto = { workspace = true }
-bytes = { workspace = true }
-thiserror = { workspace = true }
-flume = { workspace = true }
-futures-channel = { workspace = true }
+sailing-proto.workspace = true
+bytes.workspace = true
+thiserror.workspace = true
+flume.workspace = true
+futures-channel.workspace = true
 # `std` (over the workspace default's macro-only set) brings in `FutureExt::shared` + `Shared`, which
 # the coalesced shutdown uses to fan ONE teardown-completion oneshot out to every Handle clone.
 futures-util = { workspace = true, features = ["std"] }
@@ -35,12 +35,14 @@ clap = { workspace = true, optional = true }
 
 # Linux-only: the disciplined wall clock reads the kernel's NTP sync state via adjtimex.
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = { workspace = true }
+libc.workspace = true
 
 [dev-dependencies]
-futures-executor = { version = "0.3", default-features = false, features = ["std"] }
+futures-executor = { version = "0.3", default-features = false, features = [
+  "std",
+] }
 # Test-only: JSON round-trip of the `serde`-gated `DriverConfig`.
-serde_json = { workspace = true }
+serde_json.workspace = true
 
 [lints]
 workspace = true

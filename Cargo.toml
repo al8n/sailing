@@ -7,23 +7,19 @@ exclude = ["sailing-proto/fuzz"]
 [workspace.package]
 edition = "2024"
 rust-version = "1.91"
-license = "MIT OR Apache-2.0"
+license = "MPL-2.0"
 repository = "https://github.com/al8n/sailing"
 
 [workspace.dependencies]
-sailing-proto = { path = "sailing-proto" }
-sailing-driver = { path = "sailing-driver" }
 bytes = { version = "1", default-features = false }
 thiserror = { version = "2", default-features = false }
 derive_more = { version = "2", default-features = false, features = ["display", "is_variant", "unwrap", "try_unwrap"] }
-# Optional config layering on `Config` (gated behind the proto crate's `serde` / `clap` features).
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = "1"
 humantime = "2"
 humantime-serde = "1"
 clap = { version = "4", default-features = false, features = ["std", "derive", "env"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
-# PEM loader for the `quic` from-files config layer (cert/key/CA paths -> DER). std-only by nature.
 rustls-pemfile = "2"
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls"] }
 rcgen = { version = "0.14" }
@@ -33,10 +29,12 @@ flume = { version = "0.12", default-features = false, features = ["async"] }
 lochan = "0.1"
 futures-channel = { version = "0.3", default-features = false, features = ["std"] }
 futures-util = { version = "0.3", default-features = false, features = ["async-await-macro"] }
-# Reactor driver (sailing-reactor): the agnostic runtime abstraction (tokio/smol) + socket tuning.
-agnostic = { version = "0.9", default-features = false }
+agnostic = { version = "0.10", default-features = false }
 agnostic-lite = { version = "0.6", default-features = false }
 socket2 = { version = "0.6", features = ["all"] }
+
+sailing-proto = { path = "sailing-proto" }
+sailing-driver = { path = "sailing-driver" }
 
 [workspace.lints.rust]
 missing_docs = "warn"
