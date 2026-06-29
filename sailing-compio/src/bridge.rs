@@ -164,26 +164,21 @@ mod tests {
     }
   }
 
-  /// A writer that accepts every byte at once (`write_all` completes in one call).
-  struct OkWriter;
-  impl AsyncWrite for OkWriter {
-    async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-      let n = buf.buf_len();
-      BufResult(Ok(n), buf)
-    }
-    async fn flush(&mut self) -> std::io::Result<()> {
-      Ok(())
-    }
-    async fn shutdown(&mut self) -> std::io::Result<()> {
-      Ok(())
-    }
+  /// A writer that either accepts every byte at once (`fail = false`) or fails every write
+  /// (`fail = true`). One fixture covers both the graceful-drain path (`write` + the `flush` a dropped
+  /// sender drives) and the error path, so the trait's `shutdown` — which `bridge_write` never calls —
+  /// is the only uncovered stub, counted once.
+  struct TestWriter {
+    fail: bool,
   }
-
-  /// A writer whose every write fails.
-  struct FailWriter;
-  impl AsyncWrite for FailWriter {
+  impl AsyncWrite for TestWriter {
     async fn write<T: IoBuf>(&mut self, buf: T) -> BufResult<usize, T> {
-      BufResult(Err(std::io::Error::other("write boom")), buf)
+      if self.fail {
+        BufResult(Err(std::io::Error::other("write boom")), buf)
+      } else {
+        let n = buf.buf_len();
+        BufResult(Ok(n), buf)
+      }
     }
     async fn flush(&mut self) -> std::io::Result<()> {
       Ok(())
@@ -242,7 +237,14 @@ mod tests {
       .await
       .expect("enqueue");
     drop(out_tx); // the writer exits once the single frame drains
-    bridge_write(OkWriter, ConnId(0), out_rx, queued.clone(), inbound_tx).await;
+    bridge_write(
+      TestWriter { fail: false },
+      ConnId(0),
+      out_rx,
+      queued.clone(),
+      inbound_tx,
+    )
+    .await;
     assert_eq!(
       queued.get(),
       0,
@@ -261,7 +263,14 @@ mod tests {
       .send(BridgeOut(Bytes::from(vec![0u8; total])))
       .await
       .expect("enqueue");
-    bridge_write(FailWriter, ConnId(3), out_rx, queued.clone(), inbound_tx).await;
+    bridge_write(
+      TestWriter { fail: true },
+      ConnId(3),
+      out_rx,
+      queued.clone(),
+      inbound_tx,
+    )
+    .await;
     assert_eq!(queued.get(), 0, "the charge is released on the error path");
     assert!(matches!(
       inbound_rx.recv().await,
