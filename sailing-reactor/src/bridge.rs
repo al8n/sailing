@@ -286,26 +286,39 @@ mod tests {
     .expect("bridge_read returns once its inbound receiver is gone");
   }
 
-  /// An `AsyncWrite` that accepts ONE byte per poll and records the `queued_bytes` value observed on
-  /// each write, so the test can prove the per-connection byte budget is charged WHOLE-CHUNK (constant
-  /// until the frame finishes) rather than released per partial write.
-  struct OneBytePartialWriter {
-    queued: Arc<AtomicUsize>,
-    samples: Arc<Mutex<Vec<usize>>>,
+  /// How the shared [`TestWriter`] behaves on each `poll_write`.
+  enum WriteBehavior {
+    /// Accept ONE byte per poll, recording the `queued_bytes` value observed on each write — so a test
+    /// can prove the per-connection byte budget is charged WHOLE-CHUNK (constant until the frame
+    /// finishes) rather than released per partial write.
+    OneBytePartial {
+      queued: Arc<AtomicUsize>,
+      samples: Arc<Mutex<Vec<usize>>>,
+    },
+    /// Fail every write.
+    Fail,
   }
 
-  impl AsyncWrite for OneBytePartialWriter {
+  /// An `AsyncWrite` driven by a [`WriteBehavior`]. One fixture covers both the graceful-drain path
+  /// (`poll_write` + the `poll_flush` a dropped sender drives) and the write-error path, so the trait's
+  /// `poll_close` — which `bridge_write` never calls — is the only uncovered stub, counted once.
+  struct TestWriter {
+    behavior: WriteBehavior,
+  }
+
+  impl AsyncWrite for TestWriter {
     fn poll_write(
       self: Pin<&mut Self>,
       _cx: &mut Context<'_>,
       buf: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-      self
-        .samples
-        .lock()
-        .unwrap()
-        .push(self.queued.load(Ordering::Relaxed));
-      Poll::Ready(Ok(buf.len().min(1)))
+      match &self.behavior {
+        WriteBehavior::OneBytePartial { queued, samples } => {
+          samples.lock().unwrap().push(queued.load(Ordering::Relaxed));
+          Poll::Ready(Ok(buf.len().min(1)))
+        }
+        WriteBehavior::Fail => Poll::Ready(Err(std::io::Error::other("boom"))),
+      }
     }
     fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
       Poll::Ready(Ok(()))
@@ -333,9 +346,11 @@ mod tests {
       .unwrap();
     drop(out_tx); // the writer exits once the single frame drains
 
-    let writer = OneBytePartialWriter {
-      queued: queued.clone(),
-      samples: samples.clone(),
+    let writer = TestWriter {
+      behavior: WriteBehavior::OneBytePartial {
+        queued: queued.clone(),
+        samples: samples.clone(),
+      },
     };
     bridge_write(writer, ConnId(0), out_rx, queued.clone(), inbound_tx).await;
 
@@ -378,24 +393,6 @@ mod tests {
       }
     }
 
-    // A writer whose every write fails.
-    struct FailingWriter;
-    impl AsyncWrite for FailingWriter {
-      fn poll_write(
-        self: Pin<&mut Self>,
-        _cx: &mut Context<'_>,
-        _buf: &[u8],
-      ) -> Poll<std::io::Result<usize>> {
-        Poll::Ready(Err(std::io::Error::other("boom")))
-      }
-      fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-      }
-      fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        Poll::Ready(Ok(()))
-      }
-    }
-
     let total = 32usize;
     let queued = Arc::new(AtomicUsize::new(total));
     let dropped = Arc::new(AtomicBool::new(false));
@@ -412,7 +409,16 @@ mod tests {
 
     let q = queued.clone();
     let writer = tokio::spawn(async move {
-      bridge_write(FailingWriter, ConnId(0), out_rx, q, inbound_tx).await;
+      bridge_write(
+        TestWriter {
+          behavior: WriteBehavior::Fail,
+        },
+        ConnId(0),
+        out_rx,
+        q,
+        inbound_tx,
+      )
+      .await;
     });
 
     // Let the writer reach its parked error report (the rendezvous has no receiver yet).
