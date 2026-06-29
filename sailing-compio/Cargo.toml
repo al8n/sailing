@@ -1,6 +1,6 @@
 [package]
 name = "sailing-compio"
-version = "0.1.0"
+version = "0.0.0"
 description = "Proactor (compio) reference driver for sailing-proto"
 edition.workspace = true
 # compio's tree floors this well above the workspace's 1.85 (cfg_select in

@@ -1,6 +1,6 @@
 [package]
 name = "sailing-driver"
-version = "0.1.0"
+version = "0.0.0"
 description = "Runtime-agnostic driver core for sailing-proto, shared by the sailing-compio and sailing-reactor drivers"
 edition.workspace = true
 rust-version = "1.91"

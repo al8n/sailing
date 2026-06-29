@@ -1,6 +1,6 @@
 [package]
 name = "sailing-reactor"
-version = "0.1.0"
+version = "0.0.0"
 description = "Reactor-I/O (tokio/smol via agnostic) reference driver for sailing-proto"
 edition.workspace = true
 rust-version = "1.95"

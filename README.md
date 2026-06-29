@@ -2,7 +2,7 @@
 
 <img src="https://raw.githubusercontent.com/al8n/sailing/main/art/logo.png" height = "200px">
 
-<h1>sailing</h1>
+<h1>Sailing</h1>
 </div>
 <div align="center">
 
