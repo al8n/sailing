@@ -943,6 +943,79 @@ fn poison_reason_as_str_display_and_predicate() {
   assert!(PoisonReason::CommittedTruncation.is_committed_truncation());
 }
 
+/// Every `PoisonReason` maps to its stable snake_case name. Going through `Display` (`format!`)
+/// exercises `as_str` at runtime for each arm — a direct `as_str()` on a known variant can be
+/// const-folded by the optimizer, leaving the match arms unexecuted.
+#[test]
+fn poison_reason_as_str_covers_all_variants() {
+  use crate::PoisonReason::*;
+  for (reason, name) in [
+    (LogRead, "log_read"),
+    (SnapshotRead, "snapshot_read"),
+    (LogPoll, "log_poll"),
+    (StablePoll, "stable_poll"),
+    (LogTerm, "log_term"),
+    (NormalEntryDecode, "normal_entry_decode"),
+    (Apply, "apply"),
+    (SnapshotCapture, "snapshot_capture"),
+    (ConfChangeDecode, "conf_change_decode"),
+    (SetReadModeDecode, "set_read_mode_decode"),
+    (ConfChangeApply, "conf_change_apply"),
+    (SnapshotDecode, "snapshot_decode"),
+    (SnapshotRestore, "snapshot_restore"),
+    (CommittedTruncation, "committed_truncation"),
+    (NonContiguousAppend, "non_contiguous_append"),
+    (InvalidConfState, "invalid_conf_state"),
+    (SnapshotRebaseline, "snapshot_rebaseline"),
+    (OrphanedLog, "orphaned_log"),
+    (InconsistentLeaseFloor, "inconsistent_lease_floor"),
+    (WallHorizonUnrepresentable, "wall_horizon_unrepresentable"),
+    (CommitWaitUnrepresentable, "commit_wait_unrepresentable"),
+    (LogExhausted, "log_exhausted"),
+    (LegacyLeaseUnrecoverable, "legacy_lease_unrecoverable"),
+  ] {
+    assert_eq!(reason.as_str(), name);
+    assert_eq!(std::format!("{reason}"), name, "Display mirrors as_str");
+  }
+}
+
+/// `Role::as_str` (and its `Display`) for every role.
+#[test]
+fn role_as_str_covers_all_variants() {
+  for (role, name) in [
+    (Role::Follower, "follower"),
+    (Role::PreCandidate, "pre_candidate"),
+    (Role::Candidate, "candidate"),
+    (Role::Leader, "leader"),
+  ] {
+    assert_eq!(role.as_str(), name);
+    assert_eq!(std::format!("{role}"), name);
+  }
+}
+
+/// `TimerKind::as_str`/`Display` for every kind, and the fixed-order `ALL` array.
+#[test]
+fn timer_kind_as_str_covers_all_variants() {
+  for (kind, name) in [
+    (TimerKind::Election, "election"),
+    (TimerKind::Heartbeat, "heartbeat"),
+    (TimerKind::Transfer, "transfer"),
+    (TimerKind::CommitWait, "commit_wait"),
+  ] {
+    assert_eq!(kind.as_str(), name);
+    assert_eq!(std::format!("{kind}"), name);
+  }
+  assert_eq!(
+    TimerKind::ALL,
+    [
+      TimerKind::Election,
+      TimerKind::Heartbeat,
+      TimerKind::Transfer,
+      TimerKind::CommitWait,
+    ]
+  );
+}
+
 /// A node that POISONS mid-handler must emit NOTHING for the rest of that handler — no
 /// `HeartbeatResponse` (the central `send` halt) and no `ReadState`. Here a `Heartbeat` advances commit
 /// over a durable-but-undecodable `Normal` entry; `apply_committed` poisons (`NormalEntryDecode`)
