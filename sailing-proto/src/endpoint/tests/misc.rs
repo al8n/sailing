@@ -132,6 +132,29 @@ fn handle_storage_is_budget_bounded_and_loses_nothing() {
   );
 }
 
+/// The observability accessors reflect real post-operation state (not just defaults): after a
+/// single-node leader commits and applies its election no-op, `applied_index` tracks `commit_index`,
+/// `id` is the configured id, a Safe leader has performed no proactive lease refreshes, and the state
+/// machine is observable for agreement checks.
+#[test]
+fn observability_accessors_reflect_applied_state() {
+  use crate::Index;
+  let (ep, _log, _stable, _d) = make_single_node_leader();
+  assert_eq!(ep.id(), 1u64);
+  assert_eq!(ep.applied_index(), Index::new(1));
+  assert_eq!(
+    ep.applied_index(),
+    ep.commit_index(),
+    "the no-op is committed AND applied"
+  );
+  assert_eq!(
+    ep.lease_refreshes(),
+    0,
+    "a Safe-mode leader performs no proactive lease refreshes"
+  );
+  let _sm: &CountSm = ep.state_machine();
+}
+
 #[test]
 fn endpoint_constructs_and_polls_empty() {
   let cfg = Config::try_new(
