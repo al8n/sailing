@@ -4,6 +4,21 @@ use crate::{
   testkit::{CountSm, NoopStable, VecLog},
 };
 
+/// At the log-index ceiling, `propose_conf_change` is refused with `LogIndexExhausted` rather than
+/// aliasing the entry at `u64::MAX` (the `append_conf_change` → `next_log_index` None path).
+#[test]
+fn propose_conf_change_refused_at_index_ceiling() {
+  use crate::{ConfChange, ConfChangeType, Index, LogStore as _, ProposeError};
+  let (mut ep, mut log, stable, d) = make_single_node_leader();
+  log.restore(Index::new(u64::MAX), Term::new(1));
+  assert_eq!(log.last_index(), Index::new(u64::MAX));
+  let cc = ConfChange::new(ConfChangeType::AddNode, 2u64, bytes::Bytes::new());
+  assert_eq!(
+    ep.propose_conf_change(d, &mut log, &stable, cc),
+    Err(ProposeError::LogIndexExhausted)
+  );
+}
+
 /// Test 1: One-in-flight refusal.
 /// A second `propose_conf_change` before the first is applied → `ConfChangeInFlight`.
 /// After apply, a new one is accepted.

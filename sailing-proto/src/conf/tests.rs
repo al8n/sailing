@@ -149,6 +149,10 @@ fn conf_change_transition_display_and_variants() {
 #[test]
 fn conf_change_into_v2() {
   let c = ConfChange::new(ConfChangeType::AddNode, 5u64, Bytes::from_static(b"x"));
+  // The v1 accessors report exactly what was constructed.
+  assert_eq!(c.ty(), ConfChangeType::AddNode);
+  assert_eq!(c.node(), 5u64);
+  assert_eq!(c.context(), &Bytes::from_static(b"x"));
   let v2 = c.clone().into_v2();
   assert_eq!(v2.transition(), ConfChangeTransition::Auto);
   assert_eq!(v2.changes().len(), 1);
