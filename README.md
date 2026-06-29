@@ -9,8 +9,8 @@
 A Sans-I/O [Raft](https://raft.github.io/) consensus library for Rust — `no_std` + `alloc`, deterministic, and fuzz-hardened.
 
 [<img alt="github" src="https://img.shields.io/badge/github-al8n/sailing-8da0cb?style=for-the-badge&logo=Github" height="22">][Github-url]
-<img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2Fd29ceff54c025fe4e8b144a51efb9324%2Fraw%2Fsailing" height="22">
-[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/al8n/sailing/coverage.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
+<img alt="LoC" src="https://img.shields.io/endpoint?url=https%3A%2F%2Fgist.githubusercontent.com%2Fal8n%2F327b2a8aef9003246e45c6e47fe63937%2Fraw%2Fatomic-time" height="22">
+[<img alt="Build" src="https://img.shields.io/github/actions/workflow/status/al8n/sailing/ci.yml?logo=Github-Actions&style=for-the-badge" height="22">][CI-url]
 [<img alt="codecov" src="https://img.shields.io/codecov/c/gh/al8n/sailing?style=for-the-badge&token=6R3QFWRWHL&logo=codecov" height="22">][codecov-url]
 
 [<img alt="docs.rs" src="https://img.shields.io/badge/docs.rs-sailing-66c2a5?style=for-the-badge&labelColor=555555&logo=docs.rs" height="20">][doc-url]
@@ -115,7 +115,7 @@ See [LICENSE-APACHE](LICENSE-APACHE), [LICENSE-MIT](LICENSE-MIT) for details.
 Copyright (c) 2026 Al Liu.
 
 [Github-url]: https://github.com/al8n/sailing/
-[CI-url]: https://github.com/al8n/sailing/actions/workflows/coverage.yml
+[CI-url]: https://github.com/al8n/sailing/actions/workflows/ci.yml
 [codecov-url]: https://app.codecov.io/gh/al8n/sailing/
 [doc-url]: https://docs.rs/sailing
 [crates-url]: https://crates.io/crates/sailing

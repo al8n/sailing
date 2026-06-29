@@ -5,55 +5,69 @@ on:
     branches:
       - main
     paths-ignore:
-      - 'README.md'
-      - 'COPYRIGHT'
-      - 'LICENSE*'
-      - '**.md'
-      - '**.txt'
-      - 'art'
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
   pull_request:
     paths-ignore:
-      - 'README.md'
-      - 'COPYRIGHT'
-      - 'LICENSE*'
-      - '**.md'
-      - '**.txt'
-      - 'art'
+      - "README.md"
+      - "COPYRIGHT"
+      - "LICENSE*"
+      - "**.md"
+      - "**.txt"
+      - "art"
   workflow_dispatch:
 
 jobs:
   loc:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Rust
-        run: |
-          rustup update stable && rustup default stable
-          rustup component add clippy
-          rustup component add rustfmt
-      
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly
+          components: clippy, rustfmt
+
       - name: Install tokeit
         run: |
           cargo install tokeit --force
-      
-      - name: Count total lines of code
+
+      - name: Count lines of code (workspace total + each crate)
         run: |
-          tokeit --lang rust
-      - name: Upload total loc to GitHub Gist
-        if: github.event_name != 'pull_request'
+          set -euo pipefail
+          tokeit
+          mv tokeit.json loc-sailing.json
+          for c in sailing-proto sailing-compio sailing-reactor; do
+            ( cd "$c" && tokeit )
+            mv "$c/tokeit.json" "loc-$c.json"
+          done
+
+      - name: Upload all loc to the gist in one request
         uses: actions/github-script@v9
         with:
           github-token: ${{ secrets.GIST_PAT }}
           script: |
             const fs = require('fs');
-            const output = fs.readFileSync('tokeit.json', 'utf8');
-            const gistId = '327b2a8aef9003246e45c6e47fe63937';
-            await github.rest.gists.update({
-              gist_id: gistId,
-              files: {
-                "sailing": {
-                  content: output
-                }
-              }
-            });
+            const gistId = 'd29ceff54c025fe4e8b144a51efb9324';
+            // Gist file `sailing` is the workspace total; the rest are
+            // per-crate. These names match the LoC badge URLs in the crate
+            // READMEs (…/raw/<name>). The gists API accepts every file in one
+            // PATCH, so one request avoids the per-crate rate-limit storm.
+            const crates = [
+              'sailing-proto',
+              'sailing-compio',
+              'sailing-reactor'
+            ];
+            const files = {
+              sailing: { content: fs.readFileSync('loc-sailing.json', 'utf8') },
+            };
+            for (const c of crates) {
+              files[c] = { content: fs.readFileSync(`loc-${c}.json`, 'utf8') };
+            }
+            await github.rest.gists.update({ gist_id: gistId, files });
+            console.log('Gist updated');
