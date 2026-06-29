@@ -9,8 +9,8 @@ use std::{net::SocketAddr, time::Duration};
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
-use common::{CountSm, MemLog, MemStable, TestCa};
-use sailing_proto::{ClusterId, Config};
+use common::{CountSm, MemLog, MemStable, SharedLog, SharedStable, TestCa};
+use sailing_proto::{ClusterId, Config, Index, LogStore, StableStore};
 use sailing_reactor::{DriverConfig, DriverError, Handle, Node, ReactorQuicDriver};
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -486,6 +486,291 @@ async fn storage_log_flood_does_not_trap_the_run_loop() {
   .await
   .expect("no livelock: the submit must commit despite the Compacted log flood");
   assert_eq!(committed, 1);
+}
+
+/// The QUIC membership + transfer + accessor command paths. A lone-voter leader applies two learner
+/// additions (`conf_change` and `conf_change_v2`), then a transfer to a non-voter is rejected with
+/// the typed reason — covering the QUIC driver's Conf/ConfV2/Transfer arms and the error mappers. The
+/// driver-side failover counters read zero on a fresh monotonic node.
+#[tokio::test(flavor = "multi_thread")]
+async fn membership_transfer_and_accessor_commands() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:43870".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  assert_eq!(driver.precise_releases(), 0);
+  assert_eq!(driver.unprovable_floor_holds(), 0);
+  tokio::spawn(driver.run());
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let idx = loop {
+    match handle
+      .conf_change(ConfChange::new(
+        ConfChangeType::AddLearnerNode,
+        2u64,
+        Bytes::new(),
+      ))
+      .await
+    {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the learner"
+    );
+  };
+
+  let idx2 = loop {
+    let v2 = ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 3u64)],
+      Bytes::new(),
+    );
+    match handle.conf_change_v2(v2).await {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change_v2 error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the second learner"
+    );
+  };
+  assert!(
+    idx2 > idx,
+    "the joint-form change applied after the v1 change"
+  );
+
+  match handle.transfer_leader(99u64).await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("expected Rejected for a non-voter transfer target, got {other:?}"),
+  }
+}
+
+/// `transfer_leader` off the leader maps to `NotLeader`: a node with no reachable quorum never leads.
+#[tokio::test(flavor = "multi_thread")]
+async fn transfer_on_a_non_leader_is_not_leader() {
+  let ca = TestCa::new();
+  let addrs = addrs(43_872, 3);
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = build_node(&ca, 1, addrs[0], peers, DriverConfig::default()).await;
+  tokio::spawn(driver.run());
+
+  tokio::time::sleep(ELECTION * 4).await;
+  match handle.transfer_leader(2u64).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader off the leader, got {other:?}"),
+  }
+}
+
+/// A `failover_query` off the failover tier resolves `Ok(None)` — covering the QUIC driver's
+/// FailoverWindow command arm and `run_failover_serve`'s no-window arm.
+#[tokio::test(flavor = "multi_thread")]
+async fn failover_query_without_a_window_falls_back() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:43874".parse().unwrap();
+  let config = Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap();
+  let (driver, handle) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind(
+    addr,
+    config,
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let out: Option<u64> = handle
+    .failover_query(|_fsm: &CountSm, _limbo: &[sailing_proto::Entry], _win| Some(123u64))
+    .await
+    .expect("the failover query resolves");
+  assert_eq!(
+    out, None,
+    "no serve window off the failover tier → fall back to a normal read"
+  );
+}
+
+/// A QUIC node that crashes and RESTARTS from the same durable stores recovers its persisted
+/// term/vote/commit and replays the committed log — never boots fresh at term 0. The recovered FSM
+/// count is the decisive proof: a fresh boot would commit 1 next, not 3.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_restart_recovers_durable_state() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:43876".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  // Boot 1: a fresh lone voter commits two entries.
+  let (driver, handle) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"a").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"b").await,
+    2
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(2) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  handle
+    .shutdown()
+    .await
+    .expect("clean teardown frees the addr for restart");
+  let _ = task.await;
+
+  // Boot 2: RESTART from the same durable stores (boot_epoch 1 > the fresh 0).
+  let (driver2, handle2) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind_restart(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    1,
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("restart bind");
+  let task2 = tokio::spawn(driver2.run());
+
+  let next = submit_anywhere(std::slice::from_ref(&handle2), b"c").await;
+  assert_eq!(
+    next, 3,
+    "the restart replayed the durable committed log (count recovered to 2), not a fresh count-0 boot"
+  );
+  handle2.shutdown().await.expect("clean teardown");
+  let _ = task2.await;
+}
+
+/// `bind_restart_migrating` recovers from a PRE-FORMAT QUIC store, upper-bounding the prior advertised
+/// read-lease window. The recovered FSM count proves the committed log replayed.
+#[tokio::test(flavor = "multi_thread")]
+async fn bind_restart_migrating_recovers_durable_state() {
+  let ca = TestCa::new();
+  let addr: SocketAddr = "127.0.0.1:43878".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  let (driver, handle) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = tokio::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"a").await,
+    1
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(2) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  handle.shutdown().await.expect("clean teardown");
+  let _ = task.await;
+
+  let (driver2, handle2) = ReactorQuicDriver::<TokioRuntime, _, _, _, _>::bind_restart_migrating(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    1,
+    Some(Duration::from_millis(50)),
+    ca.options(1, &cluster()),
+    cluster(),
+    Vec::new(),
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("migrating restart bind");
+  let task2 = tokio::spawn(driver2.run());
+
+  let next = submit_anywhere(std::slice::from_ref(&handle2), b"b").await;
+  assert_eq!(
+    next, 2,
+    "the migrating restart replayed the durable committed log (count recovered to 1)"
+  );
+  handle2.shutdown().await.expect("clean teardown");
+  let _ = task2.await;
 }
 
 /// The recv task holds an `Arc` clone of the UDP socket; if teardown only SCHEDULED its abort, a
