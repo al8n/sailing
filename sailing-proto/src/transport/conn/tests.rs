@@ -438,3 +438,100 @@ fn wedged_record_layer_closes_instead_of_dropping_the_tail() {
   assert!(res.is_err(), "a wedged record layer is a transport fault");
   assert!(conn.is_closed());
 }
+
+/// A record layer that always faults its intake — the transport-fault path through `Conn`.
+struct FailRec;
+
+impl sealed::Sealed for FailRec {}
+
+impl RecordIo for FailRec {
+  fn handle_transport_data(&mut self, _input: &[u8], _now: Instant) -> Intake {
+    Intake::Failed
+  }
+  fn poll_transport_transmit(&mut self, _out: &mut Vec<u8>) -> usize {
+    0
+  }
+  fn read_plaintext(&mut self, _out: &mut Vec<u8>) -> usize {
+    0
+  }
+  fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    plaintext.len()
+  }
+  fn buffered_outbound(&self) -> usize {
+    0
+  }
+  fn is_handshaking(&self) -> bool {
+    true
+  }
+  fn peer_identity(&self) -> Option<&[u8]> {
+    None
+  }
+  fn peer_has_closed(&self) -> bool {
+    false
+  }
+  fn is_secure() -> bool {
+    false
+  }
+}
+
+/// An `Intake::Failed` from the record layer is a transport fault: the connection closes as
+/// integrity-suspect (no peer retained) and `handle_data` returns the error.
+#[test]
+fn record_intake_failure_closes_the_conn_as_suspect() {
+  let mut conn: Conn<u64, FailRec> = Conn::new(FailRec);
+  let res = conn.handle_data(b"bytes", false, Instant::ORIGIN);
+  assert!(res.is_err(), "an intake fault is a transport error");
+  assert!(conn.is_closed());
+  assert_eq!(
+    conn.peer(),
+    None,
+    "an integrity-suspect close retains no peer"
+  );
+}
+
+/// Before validation there is no peer, so `peer()` is `None` and `poll_decoded` yields nothing (it
+/// gates application frames until a peer is bound).
+#[test]
+fn peer_and_poll_decoded_are_inert_while_handshaking() {
+  let mut d = dialer(7);
+  assert_eq!(d.peer(), None, "no peer is bound while handshaking");
+  let mut msgs = Vec::new();
+  d.poll_decoded(&mut msgs).unwrap();
+  assert!(
+    msgs.is_empty(),
+    "no application frame decodes before validation"
+  );
+}
+
+/// A terminally-closed connection is inert: a further `handle_data` returns `Ok` immediately and a
+/// `send_message` drops the message (it has no route).
+#[test]
+fn operations_on_a_closed_conn_are_inert() {
+  let mut a = acceptor(9);
+  a.handle_data(&[], true, Instant::ORIGIN).unwrap(); // EOF closes it
+  assert!(a.is_closed());
+
+  // handle_data on a Closed conn short-circuits to Ok.
+  a.handle_data(b"more", false, Instant::ORIGIN).unwrap();
+  // send_message on a Closed conn is a no-op (the message is dropped).
+  a.send_message(&sample_msg());
+  let mut out = Vec::new();
+  assert_eq!(
+    a.poll_transmit(&mut out),
+    0,
+    "a closed connection transmits nothing"
+  );
+}
+
+/// A record layer accepting NOTHING (cap 0) whose single small frame stays UNDER the outbound cap:
+/// the send does not close the connection — `drain_out` simply returns with the bytes still buffered
+/// for a later drain (the `write_plaintext == 0` backpressure arm).
+#[test]
+fn fully_backpressured_drain_retains_bytes_without_closing() {
+  let mut conn: Conn<u64, Throttle> = Conn::new(Throttle::new(0, Some(enc_id(7))));
+  conn.send_message(&sample_msg());
+  assert!(
+    !conn.is_closed(),
+    "a stalled-but-under-cap send does not close the connection"
+  );
+}
