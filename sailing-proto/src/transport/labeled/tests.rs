@@ -339,3 +339,122 @@ fn label_options_serde_requires_both_identity_fields() {
     "a wrong-length cluster array is an error"
   );
 }
+
+/// A record layer that always faults its intake — drives the `Labeled` decorator's inner-failure
+/// propagation.
+struct FailingInner;
+
+impl super::super::stream::sealed::Sealed for FailingInner {}
+
+impl RecordIo for FailingInner {
+  fn handle_transport_data(&mut self, _input: &[u8], _now: Instant) -> Intake {
+    Intake::Failed
+  }
+  fn poll_transport_transmit(&mut self, _out: &mut Vec<u8>) -> usize {
+    0
+  }
+  fn read_plaintext(&mut self, _out: &mut Vec<u8>) -> usize {
+    0
+  }
+  fn write_plaintext(&mut self, plaintext: &[u8]) -> usize {
+    plaintext.len()
+  }
+  fn buffered_outbound(&self) -> usize {
+    0
+  }
+  fn is_handshaking(&self) -> bool {
+    true
+  }
+  fn peer_identity(&self) -> Option<&[u8]> {
+    None
+  }
+  fn peer_has_closed(&self) -> bool {
+    false
+  }
+  fn is_secure() -> bool {
+    false
+  }
+}
+
+/// Once a `Labeled` layer latches `failed` (a foreign cluster), it is terminally inert: every
+/// `RecordIo` method short-circuits — no further intake, no transmit (not even the local hello), no
+/// accepted plaintext.
+#[test]
+fn failed_layer_is_terminally_inert() {
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
+  // A hello advertising a DIFFERENT cluster latches `failed`.
+  let foreign = build_hello(&ClusterId([2; 16]), &enc(7));
+  assert_eq!(
+    b.handle_transport_data(&foreign, Instant::ORIGIN),
+    Intake::Failed
+  );
+  // Sticky + inert across every method.
+  assert_eq!(
+    b.handle_transport_data(b"more", Instant::ORIGIN),
+    Intake::Failed,
+    "intake stays Failed"
+  );
+  let mut out = Vec::new();
+  assert_eq!(
+    b.poll_transport_transmit(&mut out),
+    0,
+    "a rejected stream emits nothing, not even its hello"
+  );
+  assert_eq!(
+    b.write_plaintext(b"app"),
+    0,
+    "writes are refused after failure"
+  );
+}
+
+/// A fault from the INNER record layer latches the `Labeled` decorator failed and propagates as
+/// `Intake::Failed`, then stays inert.
+#[test]
+fn inner_layer_failure_propagates_and_latches() {
+  let mut l = Labeled::dialer(FailingInner, &opts(1, 7)).unwrap();
+  assert_eq!(
+    l.handle_transport_data(b"x", Instant::ORIGIN),
+    Intake::Failed,
+    "an inner-layer fault surfaces as Failed"
+  );
+  assert_eq!(
+    l.handle_transport_data(b"y", Instant::ORIGIN),
+    Intake::Failed,
+    "the failure is latched"
+  );
+}
+
+/// The peer-id length bound (`1..=MAX_PEER_ID_LEN`) is enforced by `advance_handshake` on a hello
+/// carrying the CURRENT magic + version — built via `build_hello`, then its `u16` length field
+/// tampered. (The companion `zero_length_and_oversized_peer_ids_are_rejected` hand-rolls the header
+/// and so rejects earlier, at the version check.)
+#[test]
+fn peer_id_length_bounds_are_enforced_after_the_version_check() {
+  // peer_id_len == 0: a valid current-version hello with its length field zeroed.
+  let mut zero = build_hello(&ClusterId([1; 16]), &enc(7));
+  zero[18] = 0;
+  zero[19] = 0;
+  let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
+  assert_eq!(
+    b.handle_transport_data(&zero, Instant::ORIGIN),
+    Intake::Failed,
+    "an empty peer id is rejected"
+  );
+
+  // peer_id_len > MAX_PEER_ID_LEN: the length field claims more than the cap.
+  let mut huge = build_hello(&ClusterId([1; 16]), &enc(7));
+  let over = (MAX_PEER_ID_LEN as u16) + 1;
+  huge[18..20].copy_from_slice(&over.to_be_bytes());
+  let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
+  assert_eq!(
+    b2.handle_transport_data(&huge, Instant::ORIGIN),
+    Intake::Failed,
+    "an oversized peer id is rejected before any id byte is buffered"
+  );
+}
+
+/// `is_secure` reflects the inner layer: `Labeled<Passthrough>` is plaintext.
+#[test]
+fn is_secure_reflects_the_inner_layer() {
+  assert!(!<Labeled<Passthrough> as RecordIo>::is_secure());
+}
