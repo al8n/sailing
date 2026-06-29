@@ -317,3 +317,87 @@ impl<I: Ord + CheapClone> ConnTable<I> {
       .min()
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::transport::quic::{QuicOptions, crypto::tests::TestClusterCa};
+  use std::net::SocketAddr;
+
+  /// A quinn endpoint + options over a fresh test cluster CA.
+  fn endpoint_and_opts() -> (quinn_proto::Endpoint, QuicOptions) {
+    let ca = TestClusterCa::generate();
+    let opts = ca
+      .cluster_tls("node-01.00000000000000000000000000000000.sailing")
+      .build();
+    let ep = quinn_proto::Endpoint::new(
+      opts.endpoint_config(),
+      opts.server_config(),
+      true,
+      Some([0u8; 32]),
+    );
+    (ep, opts)
+  }
+
+  /// Mint a real (Sans-I/O) quinn client connection. `ConnTable` bookkeeping only touches the
+  /// entry's peer/phase/seq fields, so the connection never needs to handshake.
+  fn dial(ep: &mut quinn_proto::Endpoint, opts: &QuicOptions) -> (ConnectionHandle, Connection) {
+    let remote: SocketAddr = ([127, 0, 0, 1], 4433).into();
+    ep.connect(
+      std::time::Instant::now(),
+      opts.client_config().expect("client config present"),
+      remote,
+      "node-02.00000000000000000000000000000000.sailing",
+    )
+    .expect("mint a Sans-I/O connection")
+  }
+
+  #[test]
+  fn remove_clears_the_routing_slot_for_a_bound_peer() {
+    let (mut ep, opts) = endpoint_and_opts();
+    let (h, c) = dial(&mut ep, &opts);
+    let mut table: ConnTable<u64> = ConnTable::new();
+    table.insert(h, ConnEntry::new(c, None));
+    // Bind peer 2 to this connection, then drop it: the routing slot is cleared with the entry.
+    table.validate_routing(h, &2u64, 4);
+    assert_eq!(table.handle_for(&2u64), Some(h));
+    table.remove(h);
+    assert_eq!(
+      table.handle_for(&2u64),
+      None,
+      "remove cleared the routing slot bound to the dropped connection"
+    );
+    assert_eq!(table.len(), 0);
+  }
+
+  #[test]
+  fn promote_routing_repoints_an_unbound_slot_to_the_newest_live_sibling() {
+    let (mut ep, opts) = endpoint_and_opts();
+    let (h1, c1) = dial(&mut ep, &opts);
+    let (h2, c2) = dial(&mut ep, &opts);
+    let mut table: ConnTable<u64> = ConnTable::new();
+    table.insert(h1, ConnEntry::new(c1, None));
+    table.insert(h2, ConnEntry::new(c2, None));
+    // Two validated mutual-dial siblings for peer 2; the later-validated one (h2) is routed.
+    table.entry(h1).unwrap().phase = Phase::Validated;
+    table.entry(h2).unwrap().phase = Phase::Validated;
+    table.validate_routing(h1, &2u64, 4);
+    table.validate_routing(h2, &2u64, 4);
+    assert_eq!(table.handle_for(&2u64), Some(h2));
+
+    // Already bound → promote is a no-op.
+    table.promote_routing_if_unbound(&2u64);
+    assert_eq!(table.handle_for(&2u64), Some(h2));
+
+    // Unbind the routed slot, then promote: it re-points to the newest live validated sibling.
+    table.unbind(h2);
+    assert_eq!(table.handle_for(&2u64), None);
+    table.promote_routing_if_unbound(&2u64);
+    assert_eq!(
+      table.handle_for(&2u64),
+      Some(h2),
+      "promote re-points the empty slot at the newest live sibling"
+    );
+    assert_eq!(table.live_peer_count(&2u64), 2);
+  }
+}
