@@ -425,3 +425,38 @@ fn drained_purge_clears_stale_queues_before_handle_reuse() {
     "no stale loss mis-targets the reused handle"
   );
 }
+
+/// `min_opt` folds the two optional deadlines (quinn's earliest connection timer and the auth
+/// deadline) without either masking the other.
+#[test]
+fn min_opt_folds_both_optional_instants() {
+  let t0 = Instant::now();
+  let t1 = t0 + Duration::from_secs(1);
+  assert_eq!(
+    super::min_opt(Some(t0), Some(t1)),
+    Some(t0),
+    "both present → the earlier"
+  );
+  assert_eq!(super::min_opt(Some(t1), Some(t0)), Some(t0));
+  assert_eq!(super::min_opt(Some(t0), None), Some(t0));
+  assert_eq!(super::min_opt(None, Some(t1)), Some(t1));
+  assert_eq!(super::min_opt(None, None), None);
+}
+
+/// An accept-only bridge (no client config) cannot dial: `connect` surfaces a typed `DialError`
+/// (never a panic) after running its service pass.
+#[test]
+fn dial_without_a_client_config_is_refused() {
+  let opts = crate::transport::quic::QuicOptions::new(
+    quinn_proto::EndpointConfig::default(),
+    None,
+    None,
+    QuicTuning::new(),
+  );
+  let mut bridge: Bridge<u64> = Bridge::new(&opts, Some([1; 32]));
+  let now = Instant::now();
+  assert!(
+    bridge.connect(now, addr(2), &san(2), 2u64).is_err(),
+    "an accept-only bridge has no client config to dial with"
+  );
+}

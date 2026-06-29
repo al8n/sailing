@@ -778,3 +778,19 @@ fn custom_identity_binding_policy_rejects_bad_candidates() {
     "a foreign-cluster candidate must not bind"
   );
 }
+
+/// `with_identity` requires mandatory mTLS: building it on accept-any options (no client auth) is a
+/// programming error and panics — the Hello self-claim has no cryptographic backstop otherwise.
+#[test]
+#[should_panic(expected = "mandatory mTLS")]
+fn with_identity_rejects_options_without_mandatory_client_auth() {
+  let cfg = Config::try_new(1u64, std::vec![1u64, 2u64], ELECTION, HEARTBEAT).unwrap();
+  let endpoint = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let opts = crate::transport::quic::QuicOptions::new(
+    quinn_proto::EndpointConfig::default(),
+    None,
+    None,
+    QuicTuning::new(),
+  );
+  let _c: Coord = QuicCoordinator::with_identity(endpoint, opts, Some([1; 32]), cluster(7));
+}
