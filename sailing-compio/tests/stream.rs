@@ -1040,3 +1040,508 @@ async fn query_after_restart_before_write() {
   };
   assert_eq!(count, 1, "the read sees the one recovered committed entry");
 }
+
+/// The membership + transfer + accessor command paths. A lone-voter leader applies two learner
+/// additions (`conf_change` and `conf_change_v2`), then a transfer to a non-voter is rejected with
+/// the typed reason — covering the Conf/ConfV2/Transfer arms and the error mappers. The driver-side
+/// failover counters read zero on a fresh monotonic node.
+#[compio::test]
+async fn membership_transfer_and_accessor_commands() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let addr: SocketAddr = "127.0.0.1:43360".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  assert_eq!(driver.precise_releases(), 0);
+  assert_eq!(driver.unprovable_floor_holds(), 0);
+  compio::runtime::spawn(driver.run()).detach();
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let idx = loop {
+    match handle
+      .conf_change(ConfChange::new(
+        ConfChangeType::AddLearnerNode,
+        2u64,
+        Bytes::new(),
+      ))
+      .await
+    {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the learner"
+    );
+  };
+
+  let idx2 = loop {
+    let v2 = ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 3u64)],
+      Bytes::new(),
+    );
+    match handle.conf_change_v2(v2).await {
+      Ok(i) => break i,
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected conf_change_v2 error: {e:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to add the second learner"
+    );
+  };
+  assert!(
+    idx2 > idx,
+    "the joint-form change applied after the v1 change"
+  );
+
+  match handle.transfer_leader(99u64).await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("expected Rejected for a non-voter transfer target, got {other:?}"),
+  }
+}
+
+/// `transfer_leader` off the leader maps to `NotLeader`: a node with no reachable quorum never leads.
+#[compio::test]
+async fn transfer_on_a_non_leader_is_not_leader() {
+  let addrs = addrs(43_372);
+  let (dialer, acceptor) = plain_factories(1);
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = CompioStreamDriver::bind(
+    addrs[0],
+    Config::try_new(1u64, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  compio::time::sleep(ELECTION * 4).await;
+  match handle.transfer_leader(2u64).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader off the leader, got {other:?}"),
+  }
+}
+
+/// A `failover_query` off the failover tier resolves `Ok(None)` — covering the FailoverWindow command
+/// arm and `run_failover_serve`'s no-window arm; the closure is never invoked.
+#[compio::test]
+async fn failover_query_without_a_window_falls_back() {
+  let addr: SocketAddr = "127.0.0.1:43362".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let out: Option<u64> = handle
+    .failover_query(|_fsm: &CountSm, _limbo: &[sailing_proto::Entry], _win| Some(123u64))
+    .await
+    .expect("the failover query resolves");
+  assert_eq!(
+    out, None,
+    "no serve window off the failover tier → fall back to a normal read"
+  );
+}
+
+/// Connection-refused fault: a peer addr nothing listens on. Every dial completes with an error
+/// (`DialReady` error → `close_conn` → redial), which must not wedge the lone-voter node.
+#[compio::test]
+async fn dial_to_a_closed_port_is_retried_not_fatal() {
+  let closed = {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    let a = l.local_addr().expect("local addr");
+    drop(l);
+    a
+  };
+  let addr: SocketAddr = "127.0.0.1:43364".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let peers = vec![Node::new(2u64, closed)];
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  let committed = compio::time::timeout(
+    Duration::from_secs(10),
+    submit_anywhere(std::slice::from_ref(&handle), b"x"),
+  )
+  .await
+  .expect("the lone voter commits despite the refused dials");
+  assert_eq!(committed, 1);
+}
+
+/// A dialer factory that always fails exercises the record-factory-failure path in `dial`.
+#[compio::test]
+async fn a_failing_dialer_factory_is_retried_not_fatal() {
+  let closed = {
+    let l = std::net::TcpListener::bind("127.0.0.1:0").expect("ephemeral bind");
+    let a = l.local_addr().expect("local addr");
+    drop(l);
+    a
+  };
+  let addr: SocketAddr = "127.0.0.1:43366".parse().unwrap();
+  let dialer: sailing_compio::DialerFactory<u64, Labeled<Passthrough>> =
+    Rc::new(|_: &u64| Err(std::io::Error::other("dialer factory boom")));
+  let local = encoded(1);
+  let acceptor: sailing_compio::AcceptorFactory<Labeled<Passthrough>> = Rc::new(move || {
+    Labeled::acceptor(
+      Passthrough::new(),
+      &LabelOptions {
+        cluster: cluster(),
+        local_id: local.clone(),
+      },
+    )
+    .map_err(std::io::Error::other)
+  });
+  let peers = vec![Node::new(2u64, closed)];
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  let committed = compio::time::timeout(
+    Duration::from_secs(10),
+    submit_anywhere(std::slice::from_ref(&handle), b"x"),
+  )
+  .await
+  .expect("the lone voter commits despite the failing dialer factory");
+  assert_eq!(committed, 1);
+}
+
+/// A failing acceptor factory exercises `handle_accept`'s mis-built-record-layer path: an inbound TCP
+/// connection is accepted, the record layer fails to build, the socket is dropped. The node stays healthy.
+#[compio::test]
+async fn a_failing_acceptor_factory_drops_the_inbound_socket() {
+  let addr: SocketAddr = "127.0.0.1:43368".parse().unwrap();
+  let local = encoded(1);
+  let dialer: sailing_compio::DialerFactory<u64, Labeled<Passthrough>> = Rc::new(move |_: &u64| {
+    Labeled::dialer(
+      Passthrough::new(),
+      &LabelOptions {
+        cluster: cluster(),
+        local_id: local.clone(),
+      },
+    )
+    .map_err(std::io::Error::other)
+  });
+  let acceptor: sailing_compio::AcceptorFactory<Labeled<Passthrough>> =
+    Rc::new(|| Err(std::io::Error::other("acceptor factory boom")));
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let conn = std::net::TcpStream::connect(addr).expect("the listener accepts the TCP connection");
+  compio::time::sleep(Duration::from_millis(200)).await;
+  drop(conn);
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"y").await,
+    2
+  );
+}
+
+/// A storage fault fail-stops the stream-driver endpoint (poison): everything parked fails with the
+/// typed verdict and the run loop exits (covering `pump`'s poison sweep + teardown classification).
+#[compio::test]
+async fn storage_fault_poisons_with_a_typed_verdict() {
+  use common::PoisonableLog;
+
+  let addr: SocketAddr = "127.0.0.1:43380".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (log, fail_appends) = PoisonableLog::new();
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    log,
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  let task = compio::runtime::spawn(driver.run());
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no leadership in time"
+    );
+    match handle.submit(Bytes::from_static(b"ok")).await {
+      Ok(1) => break,
+      Ok(n) => panic!("unexpected count {n}"),
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      Err(e) => panic!("unexpected error: {e:?}"),
+    }
+  }
+
+  fail_appends.store(true, std::sync::atomic::Ordering::Release);
+  match handle.submit(Bytes::from_static(b"doomed")).await {
+    Err(DriverError::Poisoned) => {}
+    other => panic!("expected Poisoned, got {other:?}"),
+  }
+
+  let _ = task.await;
+  match handle.submit(Bytes::from_static(b"late")).await {
+    Err(DriverError::ShuttingDown) => {}
+    other => panic!("expected ShuttingDown, got {other:?}"),
+  }
+}
+
+/// Membership/query commands on a non-leader node take the propose/read ERROR arms (NotLeader).
+#[compio::test]
+async fn commands_on_a_non_leader_redirect() {
+  use sailing_proto::{
+    ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  };
+
+  let addrs = addrs(43_382);
+  let (dialer, acceptor) = plain_factories(1);
+  let peers = vec![Node::new(2u64, addrs[1]), Node::new(3u64, addrs[2])];
+  let (driver, handle) = CompioStreamDriver::bind(
+    addrs[0],
+    Config::try_new(1u64, vec![1u64, 2, 3], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    peers,
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  compio::time::sleep(ELECTION * 4).await;
+  match handle
+    .conf_change(ConfChange::new(
+      ConfChangeType::AddLearnerNode,
+      4u64,
+      Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change off the leader, got {other:?}"),
+  }
+  match handle
+    .conf_change_v2(ConfChangeV2::new(
+      ConfChangeTransition::Auto,
+      vec![ConfChangeSingle::new(ConfChangeType::AddLearnerNode, 5u64)],
+      Bytes::new(),
+    ))
+    .await
+  {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected NotLeader for conf_change_v2 off the leader, got {other:?}"),
+  }
+  match handle.query(|sm: &CountSm| sm.count()).await {
+    Err(DriverError::NotLeader { .. }) => {}
+    other => panic!("expected the no-leader redirect for a query off the leader, got {other:?}"),
+  }
+}
+
+/// A LeaseBased migration WITHOUT `check_quorum` is rejected at the proposer — the SetReadMode
+/// reply-error arm and `map_propose_err`'s Rejected mapping.
+#[compio::test]
+async fn set_read_mode_without_check_quorum_is_rejected() {
+  let addr: SocketAddr = "127.0.0.1:43384".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    match handle.set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Err(DriverError::Rejected { .. }) => break,
+      Err(DriverError::NotLeader { .. }) => compio::time::sleep(Duration::from_millis(30)).await,
+      other => panic!("expected Rejected without check_quorum, got {other:?}"),
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to attempt the migration"
+    );
+  }
+}
+
+/// `bind_restart_migrating` recovers durable state from a PRE-FORMAT store, upper-bounding the prior
+/// advertised read-lease window. The recovered FSM count proves the committed log replayed.
+#[compio::test]
+async fn bind_restart_migrating_recovers_durable_state() {
+  let addr: SocketAddr = "127.0.0.1:43370".parse().unwrap();
+  let log = SharedLog::new();
+  let stable = SharedStable::new();
+
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("fresh bind");
+  let task = compio::runtime::spawn(driver.run());
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"a").await,
+    1
+  );
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"b").await,
+    2
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(5);
+  loop {
+    let last = log.last_index();
+    if stable.hard_state().commit() == last && last >= Index::new(2) {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the durable commit never caught up"
+    );
+    compio::time::sleep(Duration::from_millis(30)).await;
+  }
+  handle.shutdown().await.expect("clean teardown");
+  let _ = task.await;
+
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver2, handle2) = CompioStreamDriver::bind_restart_migrating(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    1,
+    Some(Duration::from_millis(50)),
+    Vec::new(),
+    dialer,
+    acceptor,
+    log.clone(),
+    stable.clone(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("migrating restart bind");
+  let task2 = compio::runtime::spawn(driver2.run());
+
+  let next = submit_anywhere(std::slice::from_ref(&handle2), b"c").await;
+  assert_eq!(
+    next, 3,
+    "the migrating restart replayed the durable committed log (count recovered to 2)"
+  );
+  handle2.shutdown().await.expect("clean teardown");
+  let _ = task2.await;
+}
