@@ -1202,6 +1202,74 @@ impl<I: NodeId> Bridge<I> {
   pub(crate) fn max_connections_for_test(&self) -> usize {
     self.max_connections
   }
+
+  /// Test-only: the consensus send stream this side opened on `h` (`None` before the preface step).
+  #[cfg(test)]
+  pub(crate) fn send_sid_for_test(&mut self, h: ConnectionHandle) -> Option<quinn_proto::StreamId> {
+    self.table.entry(h).and_then(|e| e.send)
+  }
+
+  /// Test-only: the peer-opened consensus stream this side reads on `h` (`None` until adopted).
+  #[cfg(test)]
+  pub(crate) fn recv_sid_for_test(&mut self, h: ConnectionHandle) -> Option<quinn_proto::StreamId> {
+    self.table.entry(h).and_then(|e| e.recv)
+  }
+
+  /// Test-only: STOP_SENDING the peer on `sid` of `h` — drives the remote's `StreamEvent::Stopped`
+  /// (the stand-in for a peer that stops consuming one half of a bidi stream).
+  #[cfg(test)]
+  pub(crate) fn stop_recv_for_test(&mut self, h: ConnectionHandle, sid: quinn_proto::StreamId) {
+    if let Some(e) = self.table.entry(h) {
+      let _ = e.conn.recv_stream(sid).stop(VarInt::from_u32(7));
+    }
+  }
+
+  /// Test-only: gracefully FINISH `sid` of `h` — drives the remote's FIN (`ReadError`-free
+  /// end-of-stream), the stand-in for a peer that cleanly half-closes its send direction.
+  #[cfg(test)]
+  pub(crate) fn finish_send_for_test(&mut self, h: ConnectionHandle, sid: quinn_proto::StreamId) {
+    if let Some(e) = self.table.entry(h) {
+      let _ = e.conn.send_stream(sid).finish();
+    }
+  }
+
+  /// Test-only: RESET `sid` of `h` — drives the remote's `ReadError::Reset` (the peer abandoned its
+  /// send half; the bytes are gone).
+  #[cfg(test)]
+  pub(crate) fn reset_send_for_test(&mut self, h: ConnectionHandle, sid: quinn_proto::StreamId) {
+    if let Some(e) = self.table.entry(h) {
+      let _ = e.conn.send_stream(sid).reset(VarInt::from_u32(7));
+    }
+  }
+
+  /// Test-only: open a SECOND peer-opened bidi stream on `h` and write a byte to it — the stand-in
+  /// for a peer that violates the one-consensus-stream contract (the receiver closes on the second
+  /// adoption).
+  #[cfg(test)]
+  pub(crate) fn open_extra_stream_for_test(&mut self, h: ConnectionHandle) {
+    if let Some(e) = self.table.entry(h)
+      && let Some(sid) = e.conn.streams().open(Dir::Bi)
+    {
+      let _ = e.conn.send_stream(sid).write(b"x");
+    }
+  }
+
+  /// Test-only: whether `h` is still pooled (an un-drained entry survives a local close for the
+  /// drain; this distinguishes "closed but present" from "reaped").
+  #[cfg(test)]
+  pub(crate) fn has_entry_for_test(&mut self, h: ConnectionHandle) -> bool {
+    self.table.entry(h).is_some()
+  }
+
+  /// Test-only: resize `h`'s staged outbound buffer to exactly `len` zero bytes (efficient, unlike
+  /// a byte-by-byte stage) — for driving the [`MAX_CONN_OUT_BUF`] overflow close without a
+  /// multi-pass write.
+  #[cfg(test)]
+  pub(crate) fn fill_outbound_for_test(&mut self, h: ConnectionHandle, len: usize) {
+    if let Some(e) = self.table.entry(h) {
+      e.outbound.resize(len, 0);
+    }
+  }
 }
 
 #[cfg(test)]
