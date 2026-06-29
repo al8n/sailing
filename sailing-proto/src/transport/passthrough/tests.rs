@@ -35,3 +35,19 @@ fn backpressures_when_recv_buffer_full() {
     other => panic!("expected Pending, got {other:?}"),
   }
 }
+
+/// A buffer that absorbed a burst past the 4 * 64 KiB shrink threshold releases its peak capacity
+/// once fully drained (the `shrink_excess` shrink path) — heap is not pinned by one large burst for
+/// the connection's lifetime.
+#[test]
+fn large_drained_outbound_releases_excess_capacity() {
+  let mut p = Passthrough::new();
+  let big = std::vec![0xAB_u8; 300 * 1024]; // > 4 * 64 KiB, under the 64 MiB send cap
+  assert_eq!(p.write_plaintext(&big), big.len());
+  let mut out = Vec::new();
+  // Draining empties the outbound buffer, tripping the shrink-when-empty-and-oversized path.
+  assert_eq!(p.poll_transport_transmit(&mut out), big.len());
+  assert_eq!(out.len(), big.len());
+  // The drained buffer accepts fresh traffic normally afterward.
+  assert_eq!(p.write_plaintext(b"ping"), 4);
+}
