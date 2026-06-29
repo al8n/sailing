@@ -1232,6 +1232,62 @@ fn stale_snapshot_does_not_install() {
   );
 }
 
+/// `on_snapshot_response` guard arms ignore (never poison): a non-leader recipient, a leader ack from
+/// a node outside the configuration, and a success ack whose match_index runs past the leader's log.
+#[test]
+fn on_snapshot_response_guard_arms_are_ignored() {
+  use crate::{Index, Instant, Message, SnapshotResponse, Term};
+
+  // not-leader: a follower routes it to the handler, which returns without acting.
+  let (mut f, mut flog, mut fstable) = make_follower();
+  f.handle_message(
+    Instant::ORIGIN,
+    &mut flog,
+    &mut fstable,
+    1u64,
+    Message::SnapshotResponse(SnapshotResponse::new(
+      Term::new(1),
+      1u64,
+      false,
+      Index::new(1),
+    )),
+  );
+  assert!(!f.role().is_leader() && !f.is_poisoned());
+
+  // no-progress: a leader ignores an ack from a node that has no Progress (outside the config).
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    99u64,
+    Message::SnapshotResponse(SnapshotResponse::new(
+      Term::new(1),
+      99u64,
+      false,
+      Index::new(1),
+    )),
+  );
+  assert!(!ep.is_poisoned());
+
+  // over-log: a success ack whose match_index exceeds the leader's last_index is ignored, not applied.
+  let last = ep.commit_index();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(SnapshotResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::new(u64::MAX),
+    )),
+  );
+  assert!(!ep.is_poisoned());
+  assert_eq!(ep.commit_index(), last, "an over-log ack advances nothing");
+}
+
 /// A snapshot whose boundary index is the reserved sentinel `u64::MAX` is malformed: a correct leader
 /// never snapshots the sentinel, and installing it would set commit/applied to an unrepresentable
 /// index. The receiver fail-stops (`LogExhausted`) before mutating any commit/applied state.
