@@ -64,10 +64,13 @@ jobs:
     - name: Apply clippy lints
       # The crate needs std-or-alloc (a compile_error! enforces it); --at-least-one-of keeps the
       # sweep off the impossible bare combos (e.g. `tcp` alone) while still covering every feature.
-      # The umbrella (`sailing`) re-exports the others behind a large feature set — powerset would
-      # explode, so it is excluded here and linted with a curated all-features build instead.
+      # The umbrella + the backend-agnostic transport drivers (compio/reactor) can't be powerset --
+      # the umbrella's surface explodes, and the drivers' crypto backend comes from a default feature
+      # that --no-default-features drops -- so they are excluded here and linted curated, with ring.
       run: |
-        cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --at-least-one-of std,alloc
+        cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
+        cargo clippy -p sailing-compio --features serde,clap,unverified-wall-clock --no-deps -- -D warnings
+        cargo clippy -p sailing-reactor --features tokio,smol,serde,clap,unverified-wall-clock --no-deps -- -D warnings
         cargo clippy -p sailing --features tokio,smol,compio,serde,clap,unverified-wall-clock --no-deps -- -D warnings
 
   # Run tests on some extra platforms
@@ -196,8 +199,9 @@ jobs:
       run: cargo install cargo-hack
     - name: Run build
       run: |
-        cargo hack build --feature-powerset --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --at-least-one-of std,alloc
-        # The umbrella (`sailing`): curated builds — the ring backend across all drivers, then the
+        cargo hack build --feature-powerset --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
+        # The umbrella (`sailing`): curated builds — the ring backend across all drivers (this also
+        # covers compio/reactor, excluded from the powerset above), then the
         # no_std + alloc core. aws-lc-rs + the quinn auxiliaries are CI-excluded (as in memberlist:
         # aws-lc-rs needs cmake/nasm); their feature wiring is exercised locally.
         cargo build -p sailing --features tokio,smol,compio,serde,clap,unverified-wall-clock
