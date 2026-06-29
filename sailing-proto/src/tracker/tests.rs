@@ -181,6 +181,67 @@ fn enter_joint_basic_swap() {
 }
 
 #[test]
+fn enter_joint_rejects_empty_incoming() {
+  // A joint transition snapshots the incoming voters as the outgoing quorum; an empty incoming set
+  // would leave the old quorum empty, so it is rejected.
+  let empty = tracker_with_voters(&[]);
+  let err = changer(5)
+    .enter_joint(&empty, false, &[add(4)])
+    .unwrap_err();
+  assert_eq!(err, ConfChangeError::EmptyIncomingForJoint);
+}
+
+#[test]
+fn simple_add_learner_is_idempotent() {
+  // Re-adding an existing learner is a no-op (the `make_learner` already-a-learner short-circuit).
+  let t = tracker_with_voters(&[1, 2, 3]);
+  let t = changer(5).simple(&t, &[add_learner(4)]).unwrap();
+  assert!(t.is_learner(&4));
+  let again = changer(5).simple(&t, &[add_learner(4)]).unwrap();
+  assert!(again.is_learner(&4));
+  assert!(!again.is_voter(&4));
+  assert_eq!(again.progress_map().len(), 4, "no duplicate progress entry");
+}
+
+#[test]
+fn simple_remove_nonmember_is_noop() {
+  // Removing a node that is not in the cluster is a no-op (the `remove` not-in-progress short-circuit),
+  // not an error.
+  let t = tracker_with_voters(&[1, 2, 3]);
+  let next = changer(5).simple(&t, &[remove(99)]).unwrap();
+  assert_eq!(next.ids().len(), 3);
+  assert!(next.is_voter(&1) && next.is_voter(&2) && next.is_voter(&3));
+}
+
+#[test]
+fn tracker_progress_map_mutators_and_accessors() {
+  use crate::progress::Progress;
+  // Default delegates to new() (an empty tracker).
+  let d = Tracker::<u64>::default();
+  assert!(d.ids().is_empty());
+  assert!(!d.is_joint());
+
+  let mut t = tracker_with_voters(&[1, 2, 3]);
+  // insert_progress: a NEW id inserts; the SAME id REPLACES in place (the binary-search map's two arms).
+  t.insert_progress(9, Progress::new(Index::new(7), 256, 0));
+  assert_eq!(t.progress(&9).unwrap().next_index(), Index::new(7));
+  t.insert_progress(9, Progress::new(Index::new(11), 256, 0));
+  assert_eq!(
+    t.progress(&9).unwrap().next_index(),
+    Index::new(11),
+    "re-inserting an existing id replaces in place"
+  );
+  // progress_mut on a missing id resolves to None (the map's get_mut Err arm).
+  assert!(t.progress_mut(&404).is_none());
+  // remove_progress: a present id is removed; an absent id is a no-op.
+  t.remove_progress(&9);
+  assert!(t.progress(&9).is_none());
+  t.remove_progress(&404);
+  // learners_next is empty in a simple config.
+  assert!(t.learners_next().is_empty());
+}
+
+#[test]
 fn enter_joint_rejects_already_joint() {
   let t = tracker_with_voters(&[1, 2, 3]);
   let joint = changer(5).enter_joint(&t, false, &[add(4)]).unwrap();

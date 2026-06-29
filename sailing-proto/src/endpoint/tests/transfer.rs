@@ -187,6 +187,73 @@ fn forced_handoff_disables_leasebased_reads_for_the_term_even_after_abort() {
   );
 }
 
+/// Re-issuing a transfer to the SAME target is idempotent: the second call returns Ok via the
+/// `lead_transferee == Some(to)` short-circuit, without re-arming or panicking.
+#[test]
+fn transfer_to_same_target_is_idempotent() {
+  let (mut leader, log, stable) = setup_leader_with_peer2_caught_up();
+  leader
+    .transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
+    .expect("the first transfer arms");
+  assert_eq!(leader.transfer.lead_transferee, Some(2u64));
+  leader
+    .transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
+    .expect("re-targeting the same node is a no-op success");
+  assert_eq!(leader.transfer.lead_transferee, Some(2u64));
+}
+
+/// A non-voter (observer) that receives a `TimeoutNow` from its known leader silently ignores it —
+/// it can never be elected, so it must NOT campaign (the `is_voter(self)` guard in `on_timeout_now`).
+#[test]
+fn timeout_now_ignored_by_non_voter() {
+  use core::time::Duration;
+  let cfg = Config::try_new_observer(
+    4u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut obs = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  // Establish leader=1 belief at term 1 via a heartbeat-shaped AppendEntries (so the equal-term
+  // TimeoutNow authenticates against the known leader rather than being dropped).
+  obs.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![],
+      Index::ZERO,
+    )),
+  );
+  assert_eq!(obs.leader(), Some(1u64));
+  assert!(obs.role().is_follower());
+  while obs.poll_message().is_some() {}
+
+  obs.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64)),
+  );
+  assert!(
+    obs.role().is_follower(),
+    "a non-voter must not campaign on TimeoutNow"
+  );
+  assert!(
+    obs.poll_message().is_none(),
+    "an ignored TimeoutNow broadcasts no RequestVote"
+  );
+}
+
 /// Test 1: transfer_leader to a caught-up follower sends TimeoutNow immediately.
 /// When peer 2 receives TimeoutNow it becomes a real Candidate (even with pre_vote=true)
 /// and broadcasts RequestVote{leader_transfer:true, pre_vote:false}.

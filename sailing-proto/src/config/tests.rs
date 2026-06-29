@@ -46,6 +46,83 @@ fn read_only_option_u8_round_trips() {
 }
 
 #[test]
+fn try_new_rejects_zero_heartbeat() {
+  assert!(matches!(
+    Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::ZERO
+    ),
+    Err(ConfigError::ZeroHeartbeat)
+  ));
+}
+
+#[test]
+fn try_new_observer_validates_timeouts_but_not_membership() {
+  // An observer's id is NOT among the voter seed by design — a valid one constructs.
+  let obs = Config::try_new_observer(
+    9u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .expect("an observer id need not be a voter");
+  assert!(!obs.is_voter(9u64));
+
+  // It still enforces the universal timeout invariants.
+  assert!(matches!(
+    Config::try_new_observer(
+      9u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::ZERO
+    ),
+    Err(ConfigError::ZeroHeartbeat)
+  ));
+  assert!(matches!(
+    Config::try_new_observer(
+      9u64,
+      std::vec![1u64],
+      Duration::from_millis(50),
+      Duration::from_millis(100)
+    ),
+    Err(ConfigError::ElectionNotGreaterThanHeartbeat { .. })
+  ));
+}
+
+#[test]
+fn validate_rejects_election_not_greater_than_heartbeat() {
+  // `validate` (the parsed-config funnel) re-checks the election/heartbeat ordering even when a
+  // constructor already passed: reach the runtime comparison via the test-only election setter.
+  let mut c = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  c.set_election_timeout_for_test(Duration::from_millis(100)); // == heartbeat, not strictly greater
+  assert!(matches!(
+    c.validate(),
+    Err(ConfigError::ElectionNotGreaterThanHeartbeat { .. })
+  ));
+}
+
+#[test]
+fn validate_rejects_empty_voters() {
+  // An observer constructor permits an empty voter seed; `validate` (the universal funnel) rejects it.
+  let empty = Config::try_new_observer(
+    9u64,
+    std::vec![],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .expect("observer construction skips the membership check");
+  assert_eq!(empty.validate(), Err(ConfigError::EmptyVoters));
+}
+
+#[test]
 fn config_validation_and_defaults() {
   let c = Config::try_new(
     1u64,

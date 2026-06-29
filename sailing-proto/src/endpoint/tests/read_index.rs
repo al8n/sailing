@@ -1045,6 +1045,98 @@ fn leader_at_capacity_rejects_forwarded_read_and_follower_clears_strand() {
   );
 }
 
+/// The leader-side duplicate-context guard: a Safe read registered pending its heartbeat quorum is
+/// in flight, so a second read reusing that exact context is refused (not silently coalesced).
+#[test]
+fn read_index_leader_rejects_duplicate_context() {
+  let (mut ep, log, stable, d) = make_leader_with_current_term_commit();
+  let ctx = bytes::Bytes::from_static(b"dup-ctx");
+  ep.read_index(d, &log, &stable, ctx.clone())
+    .expect("the first read registers pending the heartbeat quorum");
+  assert_eq!(
+    ep.read_index(d, &log, &stable, ctx.clone()),
+    Err(ReadIndexError::DuplicateContext),
+    "a second read reusing the in-flight context is refused"
+  );
+}
+
+/// A follower with proposal-forwarding disabled cannot serve or forward a read — it is rejected
+/// before any leader lookup.
+#[test]
+fn read_index_follower_forwarding_disabled_is_rejected() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_disable_proposal_forwarding(true);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let log = VecLog::default();
+  let stable = NoopStable::default();
+  assert!(ep.role().is_follower());
+  assert_eq!(
+    ep.read_index(
+      Instant::ORIGIN,
+      &log,
+      &stable,
+      bytes::Bytes::from_static(b"x")
+    ),
+    Err(ReadIndexError::ForwardingDisabled)
+  );
+}
+
+/// A follower with forwarding enabled but NO known leader has nowhere to forward the read.
+#[test]
+fn read_index_follower_without_leader_reports_no_leader() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let log = VecLog::default();
+  let stable = NoopStable::default();
+  assert!(ep.role().is_follower() && ep.leader().is_none());
+  assert_eq!(
+    ep.read_index(
+      Instant::ORIGIN,
+      &log,
+      &stable,
+      bytes::Bytes::from_static(b"x")
+    ),
+    Err(ReadIndexError::NoLeader)
+  );
+}
+
+/// A candidate has no leader to confirm a read against.
+#[test]
+fn read_index_candidate_reports_no_leader() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable); // campaign
+  assert!(matches!(ep.role(), Role::Candidate | Role::PreCandidate));
+  assert_eq!(
+    ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"x")),
+    Err(ReadIndexError::NoLeader)
+  );
+}
+
 /// A poisoned node's `read_index` returns `Err(Poisoned)` BEFORE any side effect. A poisoned
 /// node suppresses `poll_event`, so a `ReadState` would never arrive; returning `Ok(())` would
 /// strand the caller waiting on a confirmation that can never come.
