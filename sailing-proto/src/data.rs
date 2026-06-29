@@ -263,6 +263,54 @@ mod tests {
     roundtrip(false);
   }
 
+  /// A `bool` byte outside `{0, 1}` is non-canonical and must DECODE TO AN ERROR — never silently
+  /// coerce to `true` — so distinct byte strings cannot decode to the same value.
+  #[test]
+  fn bool_decode_rejects_non_canonical_byte() {
+    assert_eq!(
+      bool::decode_exact(Bytes::from_static(&[2u8])),
+      Err(DecodeError::Invalid("bool"))
+    );
+    assert_eq!(
+      bool::decode_exact(Bytes::from_static(&[0xffu8])),
+      Err(DecodeError::Invalid("bool"))
+    );
+  }
+
+  /// A non-empty `Vec<T>` round-trips through the length-prefixed encoder/decoder (the encode side and
+  /// the successful per-element decode `push`).
+  #[test]
+  fn vec_roundtrips_non_empty() {
+    roundtrip(std::vec![1u64, 2u64, 3u64, u64::MAX]);
+    roundtrip(std::vec![
+      Bytes::from_static(b"a"),
+      Bytes::from_static(b"bcd")
+    ]);
+  }
+
+  /// A `BTreeSet<T>` round-trips through its length-prefixed encoder (and the ascending-order decode).
+  #[test]
+  fn btreeset_roundtrips_non_empty() {
+    let set: BTreeSet<u64> = BTreeSet::from([3, 1, 4, 1, 5, 9]);
+    let mut buf = Vec::new();
+    set.encode(&mut buf);
+    assert_eq!(
+      <BTreeSet<u64>>::decode_exact(Bytes::from(buf)).unwrap(),
+      BTreeSet::from([1, 3, 4, 5, 9])
+    );
+  }
+
+  /// A `BTreeSet` of a zero-width element type must not spin `len` times from only the count prefix.
+  #[test]
+  fn btreeset_decode_rejects_zero_width_element() {
+    let mut buf = Vec::new();
+    1u64.encode(&mut buf); // claim one `()` element, which consumes no input bytes
+    assert_eq!(
+      <BTreeSet<()>>::decode_exact(Bytes::from(buf)),
+      Err(DecodeError::Invalid("zero-width set element"))
+    );
+  }
+
   #[test]
   fn bytes_roundtrips_zero_copy() {
     let mut buf = std::vec::Vec::new();

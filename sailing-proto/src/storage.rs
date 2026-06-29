@@ -638,6 +638,12 @@ mod tests {
   #[test]
   fn snapshot_staging_tracks_contiguous_runs() {
     let mut s = SnapshotStaging::new(Index::new(10), 6, 1024).unwrap();
+    assert_eq!(
+      s.boundary(),
+      Index::new(10),
+      "staging is keyed on its snapshot boundary"
+    );
+    assert_eq!(s.total_len(), 6);
     assert_eq!(s.accept(0, b"ab"), Some(2));
     assert_eq!(
       s.accept(4, b"ef"),
@@ -722,6 +728,112 @@ mod tests {
     next = next.next();
     assert_ne!(a, next);
     assert_eq!(next.get(), 1);
+  }
+
+  #[test]
+  fn opid_epoch_major_layout() {
+    // `first_of_epoch(N)` seeds seq 0 of boot epoch N; `new(v)` is seq v of epoch 0. The derived `Ord` is
+    // epoch-major, so a prior incarnation's id sorts strictly below this one's.
+    let cur = OpId::first_of_epoch(5);
+    assert_eq!(cur.epoch(), 5);
+    assert_eq!(cur.seq(), 0);
+    assert_eq!(cur.get(), cur.seq(), "`get` is the retained alias of `seq`");
+    let prior = OpId::first_of_epoch(4).next();
+    assert!(prior < cur, "any id of a lower boot epoch is strictly less");
+    // `next()` advances seq within the SAME epoch.
+    let n = cur.next();
+    assert_eq!((n.epoch(), n.seq()), (5, 1));
+    // The legacy `new` constructor lives in epoch 0.
+    let z = OpId::new(7);
+    assert_eq!((z.epoch(), z.seq()), (0, 7));
+  }
+
+  /// A fully-resident store satisfies `snapshot_chunk` by delegating to the default
+  /// [`StableStore::resident_snapshot_chunk`], whose offset/len clamp + O(1) slice this exercises.
+  #[test]
+  fn resident_snapshot_chunk_slices_clamps_and_reports_eof() {
+    use crate::{ConfState, SnapshotMeta};
+    use core::convert::Infallible;
+
+    struct ResidentStable {
+      snap: Option<(SnapshotMeta<u64>, Bytes)>,
+    }
+    impl StableStore for ResidentStable {
+      type NodeId = u64;
+      type Error = Infallible;
+      fn hard_state(&self) -> HardState<u64> {
+        HardState::initial()
+      }
+      fn submit_write(&mut self, _id: OpId, _hs: HardState<u64>) {}
+      fn submit_snapshot(&mut self, _id: OpId, _meta: SnapshotMeta<u64>, _data: Bytes) {}
+      fn snapshot(&self) -> Option<(SnapshotMeta<u64>, Bytes)> {
+        self.snap.clone()
+      }
+      fn durable_snapshot(&self) -> Option<SnapshotMeta<u64>> {
+        None
+      }
+      #[allow(clippy::type_complexity)]
+      fn snapshot_chunk(
+        &self,
+        offset: u64,
+        len: u64,
+      ) -> Option<Result<(SnapshotMeta<u64>, u64, SnapshotChunkRead), Infallible>> {
+        self.resident_snapshot_chunk(offset, len)
+      }
+      fn accept_snapshot_chunk(
+        &mut self,
+        _meta: &SnapshotMeta<u64>,
+        _total_len: u64,
+        _offset: u64,
+        _data: &Bytes,
+      ) -> Result<u64, Infallible> {
+        Ok(0)
+      }
+      fn take_staged_snapshot(&mut self, _meta: &SnapshotMeta<u64>) -> Option<Bytes> {
+        None
+      }
+      fn discard_snapshot_staging(&mut self) {}
+      fn poll(&mut self) -> Option<Result<StableDone, Infallible>> {
+        None
+      }
+      fn has_pending(&self) -> bool {
+        false
+      }
+    }
+
+    fn ready(read: SnapshotChunkRead) -> Bytes {
+      match read {
+        SnapshotChunkRead::Ready(b) => b,
+        SnapshotChunkRead::Pending => panic!("a resident store never returns Pending"),
+      }
+    }
+
+    let meta = SnapshotMeta::new(
+      Index::new(9),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64]),
+    );
+    let s = ResidentStable {
+      snap: Some((meta.clone(), Bytes::from_static(b"abcdef"))),
+    };
+
+    // A mid-blob, length-capped read returns exactly [offset, offset+len) plus the full total_len.
+    let (m, total, read) = s.snapshot_chunk(1, 3).unwrap().unwrap();
+    assert!(m.identity_eq(&meta));
+    assert_eq!(total, 6);
+    assert_eq!(ready(read), Bytes::from_static(b"bcd"));
+
+    // `len` past the end CLAMPS to the tail (never reads past total_len).
+    let (_, _, tail) = s.snapshot_chunk(4, 100).unwrap().unwrap();
+    assert_eq!(ready(tail), Bytes::from_static(b"ef"));
+
+    // `offset >= total_len` yields the benign empty tail (the transfer-complete signal).
+    let (_, _, eof) = s.snapshot_chunk(6, 4).unwrap().unwrap();
+    assert!(ready(eof).is_empty());
+
+    // No snapshot resident → None (like `snapshot()`).
+    let empty = ResidentStable { snap: None };
+    assert!(empty.snapshot_chunk(0, 4).is_none());
   }
 
   #[test]

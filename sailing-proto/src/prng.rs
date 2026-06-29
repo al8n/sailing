@@ -82,4 +82,58 @@ mod tests {
       assert!(t >= base && t < base * 2); // [T, 2T)
     }
   }
+
+  #[test]
+  fn next_u32_is_deterministic_and_truncates_u64() {
+    let mut a = Prng::new(7);
+    let mut b = Prng::new(7);
+    assert_eq!(a.next_u32(), b.next_u32()); // same seed → same u32 stream
+    // `next_u32` advances the same state as `next_u64` and returns its low 32 bits.
+    let mut c = Prng::new(123);
+    let mut d = Prng::new(123);
+    assert_eq!(c.next_u32(), d.next_u64() as u32);
+  }
+
+  #[test]
+  fn fill_bytes_covers_chunks_and_remainder() {
+    // 20 bytes = two full 8-byte chunks + a 4-byte remainder (both branches of `try_fill_bytes`).
+    let mut p = Prng::new(42);
+    let mut buf = [0u8; 20];
+    p.fill_bytes(&mut buf);
+
+    // Reproduce byte-for-byte from the raw u64 stream of an identically seeded generator.
+    let mut q = Prng::new(42);
+    let w0 = q.next_u64().to_le_bytes();
+    let w1 = q.next_u64().to_le_bytes();
+    let w2 = q.next_u64().to_le_bytes();
+    let mut expected = [0u8; 20];
+    expected[0..8].copy_from_slice(&w0);
+    expected[8..16].copy_from_slice(&w1);
+    expected[16..20].copy_from_slice(&w2[..4]); // remainder is the LE prefix of the next word
+    assert_eq!(buf, expected);
+  }
+
+  #[test]
+  fn fill_bytes_exact_multiple_has_no_remainder() {
+    // 16 bytes = exactly two chunks: the `!rem.is_empty()` branch must NOT fire.
+    let mut p = Prng::new(99);
+    let mut buf = [0u8; 16];
+    p.fill_bytes(&mut buf);
+    let mut q = Prng::new(99);
+    let mut expected = [0u8; 16];
+    expected[0..8].copy_from_slice(&q.next_u64().to_le_bytes());
+    expected[8..16].copy_from_slice(&q.next_u64().to_le_bytes());
+    assert_eq!(buf, expected);
+  }
+
+  #[test]
+  fn election_timeout_zero_base_returns_zero_without_drawing() {
+    // A zero base short-circuits the modulo (which would panic on `% 0`) AND draws no randomness —
+    // the documented "EXACTLY one draw when base is non-zero" contract.
+    let mut a = Prng::new(1);
+    let mut untouched = a.clone();
+    assert_eq!(election_timeout(&mut a, Duration::ZERO), Duration::ZERO);
+    // No draw consumed state: the generator still produces its first value.
+    assert_eq!(a.next_u64(), untouched.next_u64());
+  }
 }

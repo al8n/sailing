@@ -193,6 +193,19 @@ mod tests {
   }
 
   #[test]
+  fn lease_support_default_and_promised_arms() {
+    // Genesis default is RECORDED-nothing (never `Unrecorded`), distinguishing a native node from a legacy decode.
+    assert_eq!(LeaseSupport::default(), LeaseSupport::Recorded(None));
+    // `promised()` reports the magnitude on both arms: a recorded value, and `None` for a legacy (unrecorded) record.
+    assert_eq!(
+      LeaseSupport::Recorded(Some(Duration::from_millis(250))).promised(),
+      Some(Duration::from_millis(250))
+    );
+    assert_eq!(LeaseSupport::Recorded(None).promised(), None);
+    assert_eq!(LeaseSupport::Unrecorded.promised(), None);
+  }
+
+  #[test]
   fn lease_support_raise_upgrades_provenance_and_is_monotone() {
     use core::time::Duration;
     // raise() upgrades Unrecorded -> Recorded (self-heal) and never lowers a recorded magnitude.

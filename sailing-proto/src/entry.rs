@@ -169,4 +169,18 @@ mod tests {
     assert_eq!(EntryKind::ConfChange.as_str(), "conf_change");
     assert_eq!(std::format!("{}", EntryKind::Empty), "empty");
   }
+
+  #[test]
+  fn entry_kind_as_str_all_variants() {
+    // The stable snake_case names every variant maps to (the Display impl routes through `as_str`).
+    for (kind, name) in [
+      (EntryKind::Normal, "normal"),
+      (EntryKind::ConfChange, "conf_change"),
+      (EntryKind::Empty, "empty"),
+      (EntryKind::SetReadMode, "set_read_mode"),
+    ] {
+      assert_eq!(kind.as_str(), name);
+      assert_eq!(std::format!("{kind}"), name);
+    }
+  }
 }
