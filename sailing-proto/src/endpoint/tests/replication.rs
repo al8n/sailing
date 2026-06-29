@@ -5,6 +5,24 @@ use crate::{
   testkit::{AsyncStable, CountSm, FailTermLog, NoopLog, NoopStable, VecLog},
 };
 
+/// A follower cannot `propose`: the entry has no leader to replicate it, so the call is refused with
+/// `NotLeader` (carrying the believed leader hint) rather than appending a phantom entry.
+#[test]
+fn propose_on_follower_is_not_leader() {
+  use crate::ProposeError;
+  let (mut ep, mut log, stable) = make_follower();
+  assert!(ep.role().is_follower());
+  let err = ep
+    .propose(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      &bytes::Bytes::from_static(b"cmd"),
+    )
+    .expect_err("a follower must refuse propose");
+  assert!(matches!(err, ProposeError::NotLeader { .. }));
+}
+
 /// Regression (the follower must also reject IMPORTING the reserved sentinel index): the
 /// leader reserves u64::MAX, but a malformed/version-skewed AppendEntries with prev_log_index
 /// == u64::MAX - 1 carrying an entry at u64::MAX must be REJECTED, not imported — an entry committed
