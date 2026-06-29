@@ -486,6 +486,70 @@ mod tests {
     rx
   }
 
+  /// How the shared [`MockLog`]'s `entries` behaves. `read_limbo` only ever calls `entries`, so one
+  /// configurable fixture covers every scenario its tests need — a fatal fault, an oversized-region
+  /// preflight, a complete in-budget region, a cold region — and the trait methods it never calls stay
+  /// stubs counted once rather than re-declared per test.
+  enum LogMode {
+    /// `entries` returns a fatal storage fault (corruption / I/O).
+    Fail,
+    /// `entries` PANICS: a fixture for the width preflight, which must fail closed BEFORE any read, so
+    /// a large owned zero-payload limbo tail is never materialized.
+    PanicOnRead,
+    /// `entries` returns these entries as a ready borrowed slice.
+    Ready(Vec<Entry>),
+    /// `entries` returns `Pending` (a cold region the read falls safely back from).
+    Pending,
+  }
+
+  struct MockLog {
+    mode: LogMode,
+  }
+
+  impl LogStore for MockLog {
+    type Error = ();
+    fn first_index(&self) -> Index {
+      Index::ZERO
+    }
+    fn last_index(&self) -> Index {
+      Index::new(u64::MAX - 1)
+    }
+    fn term(&self, _: Index) -> Result<sailing_proto::Term, ()> {
+      Ok(sailing_proto::Term::ZERO)
+    }
+    fn entries(
+      &self,
+      _: core::ops::Range<Index>,
+      _: u64,
+    ) -> Result<sailing_proto::EntriesRead<'_>, ()> {
+      match &self.mode {
+        LogMode::Fail => Err(()),
+        LogMode::PanicOnRead => {
+          panic!("the preflight must reject an oversized limbo region before reading")
+        }
+        LogMode::Ready(entries) => Ok(sailing_proto::EntriesRead::Ready(
+          sailing_proto::MaybeOwned::Borrowed(entries),
+        )),
+        LogMode::Pending => Ok(sailing_proto::EntriesRead::Pending),
+      }
+    }
+    fn submit_append(&mut self, _: sailing_proto::OpId, _: &[Entry]) {
+      unreachable!()
+    }
+    fn compact(&mut self, _: Index) {
+      unreachable!()
+    }
+    fn restore(&mut self, _: Index, _: sailing_proto::Term) {
+      unreachable!()
+    }
+    fn poll(&mut self) -> Option<Result<sailing_proto::LogDone, ()>> {
+      unreachable!()
+    }
+    fn has_pending(&self) -> bool {
+      false
+    }
+  }
+
   #[test]
   fn budget_reserves_and_releases_on_drop() {
     let b = InflightBudget::new(2, 100);
@@ -634,96 +698,32 @@ mod tests {
 
   #[test]
   fn read_limbo_surfaces_a_fatal_log_error_not_a_fallback() {
-    use core::ops::Range;
-    use sailing_proto::{LogDone, OpId, Term};
-    // A `LogStore` whose `entries` always fails — a fatal storage fault (corruption / I/O).
-    struct FailingLog;
-    impl LogStore for FailingLog {
-      type Error = ();
-      fn first_index(&self) -> Index {
-        Index::ZERO
-      }
-      fn last_index(&self) -> Index {
-        Index::new(100)
-      }
-      fn term(&self, _: Index) -> Result<Term, ()> {
-        Ok(Term::ZERO)
-      }
-      fn entries(&self, _: Range<Index>, _: u64) -> Result<sailing_proto::EntriesRead<'_>, ()> {
-        Err(())
-      }
-      fn submit_append(&mut self, _: OpId, _: &[Entry]) {
-        unreachable!()
-      }
-      fn compact(&mut self, _: Index) {
-        unreachable!()
-      }
-      fn restore(&mut self, _: Index, _: Term) {
-        unreachable!()
-      }
-      fn poll(&mut self) -> Option<Result<LogDone, ()>> {
-        unreachable!()
-      }
-      fn has_pending(&self) -> bool {
-        false
-      }
-    }
-    // A non-empty limbo region forces the log read: the fatal error MUST surface as `Err` (the driver
-    // fail-stops `Poisoned`), NOT collapse to `Ok(None)` — which would hide a corrupt committed-range
-    // log behind a normal-read fallback and let the node keep serving.
+    // A non-empty limbo region forces the log read: a fatal `entries` error MUST surface as `Err` (the
+    // driver fail-stops `Poisoned`), NOT collapse to `Ok(None)` — which would hide a corrupt
+    // committed-range log behind a normal-read fallback and let the node keep serving.
+    let log = MockLog {
+      mode: LogMode::Fail,
+    };
     let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
-    assert!(read_limbo(&FailingLog, &window, u64::MAX).is_err());
+    assert!(read_limbo(&log, &window, u64::MAX).is_err());
     // An empty region never touches the log -> `Ok(Some(empty))`, no spurious fault.
     let empty = FailoverReadWindow::new(Index::new(4), Index::new(4));
-    assert_eq!(
-      read_limbo(&FailingLog, &empty, u64::MAX),
-      Ok(Some(Vec::new()))
-    );
+    assert_eq!(read_limbo(&log, &empty, u64::MAX), Ok(Some(Vec::new())));
   }
 
   #[test]
   fn read_limbo_preflights_an_oversized_region_without_reading() {
-    use core::ops::Range;
-    use sailing_proto::{LogDone, OpId, Term};
-    // A `LogStore` whose `entries` PANICS — proving the preflight fails closed WITHOUT reading, so a
-    // large owned zero-payload inherited limbo tail is never materialized (the OOM a payload-only byte
-    // cap would miss). Without the width preflight, `read_limbo` would call `entries` and panic here.
-    struct PanicOnReadLog;
-    impl LogStore for PanicOnReadLog {
-      type Error = ();
-      fn first_index(&self) -> Index {
-        Index::ZERO
-      }
-      fn last_index(&self) -> Index {
-        Index::new(u64::MAX - 1)
-      }
-      fn term(&self, _: Index) -> Result<Term, ()> {
-        Ok(Term::ZERO)
-      }
-      fn entries(&self, _: Range<Index>, _: u64) -> Result<sailing_proto::EntriesRead<'_>, ()> {
-        panic!("the preflight must reject an oversized limbo region before reading")
-      }
-      fn submit_append(&mut self, _: OpId, _: &[Entry]) {
-        unreachable!()
-      }
-      fn compact(&mut self, _: Index) {
-        unreachable!()
-      }
-      fn restore(&mut self, _: Index, _: Term) {
-        unreachable!()
-      }
-      fn poll(&mut self) -> Option<Result<LogDone, ()>> {
-        unreachable!()
-      }
-      fn has_pending(&self) -> bool {
-        false
-      }
-    }
+    // `entries` PANICS, so reaching it fails the test: the width preflight must fail closed WITHOUT
+    // reading, so a large owned zero-payload inherited limbo tail is never materialized (the OOM a
+    // payload-only byte cap would miss). Without the preflight, `read_limbo` would call `entries`.
+    let log = MockLog {
+      mode: LogMode::PanicOnRead,
+    };
     // Budget 640 / LIMBO_ENTRY_OVERHEAD (64) = 10 entries max; a ~1000-index limbo region far exceeds it,
     // so the preflight fails closed (`Ok(None)`) WITHOUT touching the log.
     let window = FailoverReadWindow::new(Index::new(4), Index::new(1003)); // half-open width 999 >> 10
     assert_eq!(
-      read_limbo(&PanicOnReadLog, &window, 640),
+      read_limbo(&log, &window, 640),
       Ok(None),
       "an oversized limbo region must fail closed via the preflight, never reading + materializing it"
     );
@@ -1001,67 +1001,18 @@ mod tests {
     assert_eq!(rx.len(), 1, "the event still reached the tail");
   }
 
-  /// A tiny `LogStore` returning a fixed `entries` result — `Ready` over an owned slice, or `Pending` —
-  /// for the `read_limbo` success/cold paths the failing/panicking fixtures above do not reach.
-  struct StubLog {
-    entries: Vec<Entry>,
-    pending: bool,
-  }
-
-  impl LogStore for StubLog {
-    type Error = ();
-    fn first_index(&self) -> Index {
-      Index::new(1)
-    }
-    fn last_index(&self) -> Index {
-      Index::new(100)
-    }
-    fn term(&self, _: Index) -> Result<sailing_proto::Term, ()> {
-      Ok(sailing_proto::Term::ZERO)
-    }
-    fn entries(
-      &self,
-      _: core::ops::Range<Index>,
-      _: u64,
-    ) -> Result<sailing_proto::EntriesRead<'_>, ()> {
-      if self.pending {
-        Ok(sailing_proto::EntriesRead::Pending)
-      } else {
-        Ok(sailing_proto::EntriesRead::Ready(
-          sailing_proto::MaybeOwned::Borrowed(&self.entries),
-        ))
-      }
-    }
-    fn submit_append(&mut self, _: sailing_proto::OpId, _: &[Entry]) {
-      unreachable!()
-    }
-    fn compact(&mut self, _: Index) {
-      unreachable!()
-    }
-    fn restore(&mut self, _: Index, _: sailing_proto::Term) {
-      unreachable!()
-    }
-    fn poll(&mut self) -> Option<Result<sailing_proto::LogDone, ()>> {
-      unreachable!()
-    }
-    fn has_pending(&self) -> bool {
-      false
-    }
-  }
-
   #[test]
   fn read_limbo_serves_a_complete_in_budget_region() {
     use sailing_proto::{EntryKind, Term};
     let e = |idx: u64, kind| Entry::new(Term::new(1), Index::new(idx), kind, bytes::Bytes::new());
     // Region (commit=4, limbo_upper=7]: a COMPLETE contiguous [5,8) within budget returns the
     // Normal-only entries — the happy path the failing/panicking/empty fixtures never exercise.
-    let log = StubLog {
-      entries: std::vec![
+    let log = MockLog {
+      mode: LogMode::Ready(std::vec![
         e(5, EntryKind::Normal),
         e(6, EntryKind::Empty),
         e(7, EntryKind::Normal)
-      ],
-      pending: false,
+      ]),
     };
     let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
     let served = read_limbo(&log, &window, 1_000_000)
@@ -1073,9 +1024,8 @@ mod tests {
   #[test]
   fn read_limbo_falls_back_on_a_cold_region() {
     // A `Pending` (cold) limbo read is a SAFE fallback to a normal read, never a fault: `Ok(None)`.
-    let log = StubLog {
-      entries: Vec::new(),
-      pending: true,
+    let log = MockLog {
+      mode: LogMode::Pending,
     };
     let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
     assert_eq!(read_limbo(&log, &window, u64::MAX), Ok(None));
@@ -1084,10 +1034,9 @@ mod tests {
   #[test]
   fn read_limbo_fails_closed_at_the_index_ceiling_without_reading() {
     // A window whose index is at the u64 ceiling cannot express a half-open upper bound, so `read_limbo`
-    // returns the safe fallback BEFORE touching the log (the `pending` field would otherwise be observed).
-    let log = StubLog {
-      entries: Vec::new(),
-      pending: true,
+    // returns the safe fallback BEFORE touching the log (a `Pending`-mode read would otherwise occur).
+    let log = MockLog {
+      mode: LogMode::Pending,
     };
     let at_ceiling = FailoverReadWindow::new(Index::new(u64::MAX), Index::new(u64::MAX));
     assert_eq!(
