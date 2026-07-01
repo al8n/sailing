@@ -22,18 +22,33 @@ tcp = []
 fuzzing = []
 
 # TLS-over-TCP record layer — backend-agnostic. Bare `tls` links rustls but no crypto provider;
-# enable a passthrough below (e.g. `tls-rustls-ring`) to pick one. `quinn-proto?/...` keeps the
-# QUIC provider in step when both transports are built.
+# enable a passthrough below (e.g. `tls-rustls-ring`) to pick one. These pick ONLY the rustls
+# provider for the byte-stream transport — they deliberately do NOT touch quinn-proto's backend, so
+# a mixed build (e.g. `tls-rustls-ring` + `quic-aws-lc-rs`) keeps QUIC genuinely aws-lc-rs-only.
+# NOTE: in such a mixed build rustls links BOTH providers, so the byte-stream TLS caller must pick
+# one explicitly (`rustls::*::builder_with_provider` or `CryptoProvider::install_default`) — the
+# transport takes a caller-built rustls config and installs no process default of its own.
 tls = ["tcp", "std", "dep:rustls", "dep:rustls-pemfile"]
-tls-rustls-ring = ["tls", "rustls/ring", "quinn-proto?/rustls-ring"]
-tls-rustls-aws-lc-rs = ["tls", "rustls/aws_lc_rs", "quinn-proto?/rustls-aws-lc-rs"]
+tls-rustls-ring = ["tls", "rustls/ring"]
+tls-rustls-aws-lc-rs = ["tls", "rustls/aws_lc_rs"]
 
 # QUIC (quinn-proto) — backend-agnostic. Bare `quic` has no crypto provider (a `compile_error!` in
 # the coordinator guides you); enable a passthrough below. The crypto backends build the rustls
 # provider the QUIC configs are constructed from; the auxiliaries are quinn-proto pass-throughs.
 quic = ["tcp", "std", "dep:rustls", "dep:quinn-proto", "dep:rustls-pemfile"]
+# Crypto backends. quinn-proto's QUIC handshake is rustls-only (its sole `crypto::Session`), so
+# "ring"/"aws-lc-rs" ARE the rustls CryptoProviders. A backend feature supplies the compile-time
+# default for the built-in mTLS builder; a caller can also choose the provider at runtime via
+# `ClusterTls::with_provider`, or build the quinn configs directly via `QuicOptions::new`.
 quic-rustls-ring = ["quic", "rustls/ring", "quinn-proto/rustls-ring"]
 quic-rustls-aws-lc-rs = ["quic", "rustls/aws_lc_rs", "quinn-proto/rustls-aws-lc-rs"]
+# Convenience aliases onto the rustls providers (memberlist-style names); `quic-rustls` follows
+# quinn's own `rustls = rustls-ring` default. (A FIPS build is a runtime choice via
+# `ClusterTls::with_provider` / `QuicOptions::new`, not a compile-time feature: a compile-time FIPS
+# selection could be silently overridden by ring under feature unification.)
+quic-ring = ["quic-rustls-ring"]
+quic-aws-lc-rs = ["quic-rustls-aws-lc-rs"]
+quic-rustls = ["quic-rustls-ring"]
 quic-bloom = ["quic", "quinn-proto/bloom"]
 quic-log = ["quic", "quinn-proto/log"]
 quic-rustls-log = ["quic", "quinn-proto/rustls-log"]
@@ -77,8 +92,8 @@ harness = false
 workspace = true
 
 [package.metadata.docs.rs]
-# Explicit set instead of all-features: the *-fips backends pull aws-lc-rs-fips, which needs a Go
-# toolchain docs.rs does not provide. This documents the full public API without fips.
+# Explicit ring-backed set instead of all-features: the aws-lc-rs backends pull a C/cmake build
+# docs.rs does not reliably provide. This documents the full public API on the ring provider.
 features = [
   "std",
   "tcp",
