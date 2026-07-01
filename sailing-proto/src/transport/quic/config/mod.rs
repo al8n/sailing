@@ -13,17 +13,20 @@
 //! private key). It then hands the parsed DER to
 //! [`ClusterTls::try_build`](super::ClusterTls::try_build), whose mandatory-mTLS assembly returns a
 //! recoverable error — surfaced here as [`QuicConfigError::Tls`] — when the bundle is invalid (an
-//! empty root store, a key that does not match the leaf, TLS 1.3 unsupported by the linked
-//! provider). A mismatched cert/key is an ordinary cert-rotation mistake, so the WHOLE PEM→bundle
+//! empty root store, a key that does not match the leaf, an unusable crypto provider). A mismatched
+//! cert/key is an ordinary cert-rotation mistake, so the WHOLE PEM→bundle
 //! path is recoverable; nothing in `build` panics. (The infallible-looking
 //! [`ClusterTls::build`](super::ClusterTls::build) still panics on a bad bundle, for callers that
 //! construct the DER bundle by hand and treat a misconfig as a programming error.)
 //!
 //! # Crypto provider
 //!
-//! Like [`ClusterTls`](super::ClusterTls), the built configs use the rustls provider selected by
-//! the `tls-*` features (`ring` by default under `quic`); there is no process-default-provider
-//! requirement.
+//! This file-based path uses the compile-time default rustls provider (the enabled `quic-rustls-*`
+//! backend; `ring` by default). To choose the provider at runtime — ring / aws-lc-rs / a FIPS
+//! module / a custom provider — parse the bundle yourself and use
+//! [`ClusterTls::with_provider`](super::ClusterTls::with_provider), or build the quinn configs
+//! directly via [`QuicOptions::new`](super::QuicOptions::new): a serde-able file config
+//! intentionally carries no runtime `CryptoProvider`.
 
 use std::path::{Path, PathBuf};
 
@@ -138,7 +141,7 @@ impl QuicConfigOptions {
   /// The certificate chain is parsed from `cert_file`, the private key from `key_file`, and the CA
   /// certificate(s) from `ca_file` into a `RootCertStore`. The whole path is fully fallible: this
   /// `Result` covers file/PEM failures AND an invalid cluster-CA bundle (a mismatched cert/key, an
-  /// invalid leaf, a provider without TLS 1.3), the latter via [`QuicConfigError::Tls`] from
+  /// invalid leaf, an unusable crypto provider), the latter via [`QuicConfigError::Tls`] from
   /// [`ClusterTls::try_build`](super::ClusterTls::try_build). A mismatched cert/key is an ordinary
   /// cert-rotation mistake, so it is a recoverable `Err` here rather than a process panic.
   pub fn build(&self) -> Result<QuicOptions, QuicConfigError> {
@@ -286,8 +289,8 @@ fn load_roots(path: &Path) -> Result<rustls::RootCertStore, QuicConfigError> {
 ///
 /// Covers the whole PEM→bundle path: the FILE/PARSE failures (a missing/unreadable file, a file
 /// with no certificate, a key file with no key, a CA cert that is not a valid trust anchor) AND an
-/// invalid cluster-CA bundle ([`Self::Tls`]) — a mismatched cert/key, an invalid leaf, a provider
-/// without TLS 1.3 — surfaced from [`ClusterTls::try_build`](super::ClusterTls::try_build). The
+/// invalid cluster-CA bundle ([`Self::Tls`]) — a mismatched cert/key, an invalid leaf, an unusable
+/// crypto provider — surfaced from [`ClusterTls::try_build`](super::ClusterTls::try_build). The
 /// whole path is recoverable; nothing here panics.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
@@ -310,8 +313,8 @@ pub enum QuicConfigError {
   #[error("invalid CA certificate in {0}: {1}")]
   Anchor(PathBuf, rustls::Error),
   /// The PEM files parsed, but assembling the mandatory-mTLS bundle from them failed — a
-  /// mismatched cert/key, an invalid leaf, an empty root store, or no TLS 1.3 (see
-  /// [`ClusterTlsError`]).
+  /// mismatched cert/key, an invalid leaf, an empty root store, or an unusable crypto provider
+  /// (see [`ClusterTlsError`]).
   #[error("invalid cluster TLS bundle: {0}")]
   Tls(#[from] ClusterTlsError),
 }

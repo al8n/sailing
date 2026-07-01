@@ -1,4 +1,6 @@
-//! Crypto-provider plumbing for the QUIC transport (backed by the same rustls provider as `tls`).
+//! Crypto-provider plumbing for the QUIC transport. Its rustls provider is chosen by the enabled
+//! `quic-rustls-*` backend, independently of the byte-stream `tls-*` backend — they coincide only
+//! when the caller enables matching features.
 //!
 //! [`QuicOptions`] holds the quinn-proto configs plus a tuned `TransportConfig` whose timer/window
 //! values come from a [`QuicTuning`] (defaults shown):
@@ -34,10 +36,22 @@ use quinn_proto::{
 };
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 
-/// The rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) the QUIC TLS configs are built
-/// from, selected by the enabled `quic-rustls-*` backend (so the provider matches the one
-/// `quinn-proto` is compiled against). `ring` takes precedence when both are present; a bare `quic`
-/// with no backend is a `compile_error!` directing the caller to enable one.
+/// The default rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) the mTLS QUIC configs are
+/// built from, selected by the enabled `quic-rustls-*` backend. The whole QUIC crypto stack follows
+/// this one backend: quinn-proto's rustls TLS handshake AND the endpoint retry-token /
+/// stateless-reset keys quinn derives from the same compiled provider (the workspace `quinn-proto`
+/// dep links only the enabled backend, so `quic-aws-lc-rs` is genuinely aws-lc-rs-only). `ring` takes
+/// precedence when both are present.
+///
+/// This single-backend guarantee holds within sailing's own feature graph (a CI cargo-tree check
+/// enforces it). Cargo feature unification is global, though: a *different* crate in the dependency
+/// tree enabling `quinn-proto/rustls-ring` pulls ring in alongside, and quinn then prefers ring for
+/// the endpoint keys — so a strict single-backend / FIPS deployment must ensure nothing else enables
+/// another quinn backend, or supply the endpoint keys explicitly via [`QuicOptions::new`].
+///
+/// A caller can override the TLS-handshake provider at runtime via [`ClusterTls::with_provider`], or
+/// build every quinn config directly via [`QuicOptions::new`].
+#[cfg(any(feature = "quic-rustls-ring", feature = "quic-rustls-aws-lc-rs"))]
 fn active_provider() -> Arc<rustls::crypto::CryptoProvider> {
   #[cfg(feature = "quic-rustls-ring")]
   {
@@ -47,14 +61,18 @@ fn active_provider() -> Arc<rustls::crypto::CryptoProvider> {
   {
     Arc::new(rustls::crypto::aws_lc_rs::default_provider())
   }
-  #[cfg(not(any(feature = "quic-rustls-ring", feature = "quic-rustls-aws-lc-rs")))]
-  {
-    compile_error!(
-      "the `quic` feature needs a crypto backend; enable `quic-rustls-ring` or \
-       `quic-rustls-aws-lc-rs`"
-    )
-  }
 }
+
+// `quic` links quinn-proto's core but NOT its rustls integration (the workspace dep no longer bakes
+// a backend), so the QUIC transport cannot assemble any config without one. Require a backend.
+#[cfg(all(
+  feature = "quic",
+  not(any(feature = "quic-rustls-ring", feature = "quic-rustls-aws-lc-rs"))
+))]
+compile_error!(
+  "the `quic` feature needs a crypto backend: enable `quic-rustls-ring` or `quic-rustls-aws-lc-rs` \
+   (or an alias: `quic-ring` / `quic-aws-lc-rs` / `quic-rustls`)"
+);
 
 /// The ALPN protocol every sailing QUIC connection negotiates. A non-sailing peer (or a
 /// version-skewed one once this changes) fails the TLS handshake instead of mis-decoding frames.
@@ -543,9 +561,22 @@ pub struct QuicOptions {
 }
 
 impl QuicOptions {
-  /// Build from caller-supplied configs and a tuning. The tuned `TransportConfig` (idle timeout +
-  /// keep-alive + stream caps + flow-control windows) is constructed internally and installed on
-  /// both the server and client configs.
+  /// Build from **fully caller-supplied** quinn configs plus a tuning — the config-level escape hatch
+  /// (mirroring memberlist). A `quic-rustls-*` backend feature is still required (it links quinn's
+  /// rustls integration and sets quinn's default endpoint-key crypto); on top of it the caller
+  /// assembles every config, so the handshake provider — ring / aws-lc-rs / a FIPS module / a custom
+  /// provider — and, by building the keys below, the endpoint crypto too, are the caller's. The
+  /// caller assembles the `EndpointConfig` (its reset
+  /// key sets stateless-reset crypto) and the quinn `ClientConfig`/`ServerConfig`
+  /// (`rustls::*::builder_with_provider(..)` + `Quic{Client,Server}Config::try_from`). For full
+  /// backend / FIPS control the server's retry/validation-token key is separate: it comes from
+  /// `ServerConfig` (whose `with_crypto` derives it from the compiled backend), so override
+  /// `ServerConfig::token_key` too, not just the `EndpointConfig`.
+  ///
+  /// This leaves `requires_client_auth = false`, so the cluster-CA mTLS enforcement is the caller's
+  /// responsibility on this path; use [`ClusterTls`] (optionally with [`ClusterTls::with_provider`])
+  /// for the batteries-included mTLS build. The tuned `TransportConfig` (idle timeout + keep-alive +
+  /// stream caps + flow-control windows) is constructed internally and installed on both configs.
   pub fn new(
     endpoint: EndpointConfig,
     client: Option<ClientConfig>,
@@ -686,6 +717,7 @@ pub struct ClusterTls {
   chain: Vec<CertificateDer<'static>>,
   key: PrivateKeyDer<'static>,
   tuning: QuicTuning,
+  provider: Option<Arc<rustls::crypto::CryptoProvider>>,
 }
 
 impl ClusterTls {
@@ -705,7 +737,31 @@ impl ClusterTls {
       chain,
       key,
       tuning: QuicTuning::new(),
+      provider: None,
     }
+  }
+
+  /// Override the rustls [`CryptoProvider`](rustls::crypto::CryptoProvider) used to assemble the mTLS
+  /// **TLS-handshake** configs, letting the caller pick the backend at runtime (ring / aws-lc-rs / a
+  /// FIPS module / a custom provider) instead of the compile-time `quic-rustls-*` default.
+  ///
+  /// This overrides the TLS-handshake provider ONLY; the QUIC endpoint retry-token / stateless-reset
+  /// keys always follow the compile-time `quic-rustls-*` backend, and nothing checks that the two
+  /// agree. Whenever the provider you pass differs from that backend — a custom or FIPS provider in
+  /// any build, or a mismatched provider in a multi-backend build — the result is a SPLIT config
+  /// (handshake from your provider, endpoint keys from the backend), not an error. To keep one
+  /// backend end to end, pass a provider matching the compiled `quic-rustls-*` (or rely on the
+  /// default); for a runtime backend that also drives the endpoint keys, build every quinn config
+  /// directly via [`QuicOptions::new`].
+  ///
+  /// The provider must build a usable rustls TLS 1.3 config (else [`Self::try_build`] fails with
+  /// [`ClusterTlsError::Rustls`]) AND expose the QUIC initial cipher suite `TLS13_AES_128_GCM_SHA256`
+  /// (else [`ClusterTlsError::Quic`]). Left unset, the build uses the feature-selected backend default
+  /// (`quic` requires one).
+  #[must_use]
+  pub fn with_provider(mut self, provider: Arc<rustls::crypto::CryptoProvider>) -> Self {
+    self.provider = Some(provider);
+    self
   }
 
   /// Override the transport timer/window tuning for the built [`QuicOptions`]. The default is
@@ -722,8 +778,9 @@ impl ClusterTls {
   ///
   /// # Panics
   ///
-  /// Panics if the supplied roots/chain/key are not a valid cluster-CA bundle (an empty root
-  /// store, a key that does not match the leaf, TLS 1.3 unsupported by the linked provider). This
+  /// Panics if the supplied roots/chain/key are not a valid cluster-CA bundle (an empty root store,
+  /// a key that does not match the leaf, or an unusable crypto provider — an invalid TLS 1.3 config,
+  /// or one missing the `TLS13_AES_128_GCM_SHA256` QUIC initial suite). This
   /// is the back-compat panic-on-misconfig surface; [`Self::try_build`] returns those same
   /// failures as a recoverable [`ClusterTlsError`] instead (preferred for any path that parses the
   /// bundle from operator-supplied files, where a mismatched cert/key is an ordinary
@@ -741,15 +798,15 @@ impl ClusterTls {
   /// Every fallible assembly step is mapped to a recoverable error: building the cluster-CA
   /// certificate verifiers ([`ClusterTlsError::Verifier`]), the rustls config assembly — selecting
   /// TLS 1.3 and accepting the leaf cert/key pair, where a **mismatched cert and key** surfaces
-  /// ([`ClusterTlsError::Rustls`]), and the quinn TLS-config conversion, which fails when the
-  /// provider offers no TLS 1.3 cipher suite ([`ClusterTlsError::Quic`]). A mismatched cert/key, an
-  /// invalid leaf, or a no-TLS-1.3 provider are ordinary cert-rotation / configuration mistakes,
-  /// so they are recoverable here rather than a process panic.
+  /// ([`ClusterTlsError::Rustls`]), and the quinn TLS-config conversion, which fails when the provider
+  /// lacks the QUIC initial cipher suite `TLS13_AES_128_GCM_SHA256` ([`ClusterTlsError::Quic`]). A
+  /// mismatched cert/key, an invalid leaf, or an unusable provider are ordinary cert-rotation /
+  /// configuration mistakes, so they are recoverable here rather than a process panic.
   pub fn try_build(self) -> Result<QuicOptions, ClusterTlsError> {
     use quinn_proto::crypto::rustls::{QuicClientConfig, QuicServerConfig};
     use rustls::{client::WebPkiServerVerifier, server::WebPkiClientVerifier};
 
-    let provider = active_provider();
+    let provider = self.provider.clone().unwrap_or_else(active_provider);
     let roots = Arc::new(self.roots);
 
     // Server: mandatory client-cert auth via the cluster CA.
@@ -805,9 +862,14 @@ pub enum ClusterTlsError {
   /// do not match (a bad/mismatched cert/key pair).
   #[error("invalid cluster TLS configuration (cert/key mismatch or TLS 1.3 unsupported): {0}")]
   Rustls(#[from] rustls::Error),
-  /// Converting the assembled rustls config into a quinn QUIC crypto config failed because the
-  /// negotiated TLS configuration exposes no initial (TLS 1.3) cipher suite for QUIC.
-  #[error("cluster TLS configuration is not usable for QUIC (no TLS 1.3 cipher suite): {0}")]
+  /// Converting the assembled rustls config into a quinn QUIC crypto config failed: the provider
+  /// exposes no QUIC initial cipher suite (`TLS13_AES_128_GCM_SHA256`, the fixed suite QUIC uses for
+  /// Initial packets). Distinct from [`Self::Rustls`] — the rustls TLS 1.3 config itself is valid, it
+  /// just lacks that one required suite.
+  #[error(
+    "cluster TLS configuration is not usable for QUIC (provider lacks the QUIC initial cipher suite \
+     TLS13_AES_128_GCM_SHA256): {0}"
+  )]
   Quic(#[from] quinn_proto::crypto::rustls::NoInitialCipherSuite),
 }
 
@@ -911,6 +973,45 @@ pub(crate) mod tests {
     assert!(opts.requires_client_auth());
     assert!(opts.client_config().is_some());
     assert!(opts.server_config().is_some());
+  }
+
+  #[cfg(feature = "quic-rustls-ring")]
+  #[test]
+  fn with_provider_overrides_the_default_and_builds() {
+    // The runtime provider seam: supplying an explicit `CryptoProvider` builds the same
+    // mandatory-mTLS bundle the compile-time default would (here, ring), rather than being locked to
+    // the feature-selected `active_provider()`.
+    let ca = TestClusterCa::generate();
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let opts = ca
+      .cluster_tls("node-01.00000000000000000000000000000000.sailing")
+      .with_provider(provider)
+      .try_build()
+      .expect("an explicit provider builds a valid cluster bundle");
+    assert!(opts.requires_client_auth());
+    assert!(opts.client_config().is_some());
+    assert!(opts.server_config().is_some());
+  }
+
+  #[cfg(feature = "quic-rustls-ring")]
+  #[test]
+  fn with_provider_missing_quic_initial_suite_fails_with_quic_error() {
+    // A provider with TLS 1.3 suites but WITHOUT the QUIC initial suite (AES-128-GCM) still satisfies
+    // rustls, then fails quinn's QUIC config conversion -- surfaced as ClusterTlsError::Quic, not
+    // Rustls. Locks in the two-stage provider contract documented on `with_provider`.
+    let ca = TestClusterCa::generate();
+    let mut provider = rustls::crypto::ring::default_provider();
+    provider
+      .cipher_suites
+      .retain(|cs| cs.suite() != rustls::CipherSuite::TLS13_AES_128_GCM_SHA256);
+    let result = ca
+      .cluster_tls("node-01.00000000000000000000000000000000.sailing")
+      .with_provider(Arc::new(provider))
+      .try_build();
+    assert!(
+      matches!(result, Err(ClusterTlsError::Quic(_))),
+      "a provider without the QUIC initial suite must fail as ClusterTlsError::Quic"
+    );
   }
 
   #[test]
