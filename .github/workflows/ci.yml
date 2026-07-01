@@ -68,7 +68,7 @@ jobs:
       # the umbrella's surface explodes, and the drivers' crypto backend comes from a default feature
       # that --no-default-features drops -- so they are excluded here and linted curated, with ring.
       run: |
-        cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
+        cargo hack clippy --feature-powerset --depth 2 --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
         cargo clippy -p sailing-compio --features serde,clap,unverified-wall-clock --no-deps -- -D warnings
         cargo clippy -p sailing-reactor --features tokio,smol,serde,clap,unverified-wall-clock --no-deps -- -D warnings
         cargo clippy -p sailing --features tokio,smol,compio,serde,clap,unverified-wall-clock --no-deps -- -D warnings
@@ -197,9 +197,23 @@ jobs:
       run: rustup update stable --no-self-update && rustup default stable
     - name: Install cargo-hack
       run: cargo install cargo-hack
+    - name: Assert TLS/QUIC crypto backends are isolated
+      # A TCP-TLS backend feature must not drag quinn-proto's QUIC backend along: a mixed
+      # tls-rustls-ring + quic-aws-lc-rs build keeps QUIC aws-lc-rs-only, and the reverse ring-only.
+      # Match the `quinn-proto feature "..."` lines specifically (a bare `rustls-ring` also appears in
+      # the sailing `tls-rustls-ring` feature name). Linux-only: the feature graph is OS-independent.
+      if: runner.os == 'Linux'
+      run: |
+        aws=$(cargo tree -p sailing-proto --no-default-features --features tls-rustls-ring,quic-aws-lc-rs -e features -i quinn-proto)
+        echo "$aws" | grep -q 'quinn-proto feature "rustls-aws-lc-rs"' || { echo "::error::quic-aws-lc-rs did not enable quinn-proto rustls-aws-lc-rs"; exit 1; }
+        if echo "$aws" | grep -q 'quinn-proto feature "rustls-ring"'; then echo "::error::tls-rustls-ring contaminated quinn-proto with rustls-ring under quic-aws-lc-rs"; exit 1; fi
+        ring=$(cargo tree -p sailing-proto --no-default-features --features tls-rustls-aws-lc-rs,quic-ring -e features -i quinn-proto)
+        echo "$ring" | grep -q 'quinn-proto feature "rustls-ring"' || { echo "::error::quic-ring did not enable quinn-proto rustls-ring"; exit 1; }
+        if echo "$ring" | grep -q 'quinn-proto feature "rustls-aws-lc-rs"'; then echo "::error::tls-rustls-aws-lc-rs contaminated quinn-proto with rustls-aws-lc-rs under quic-ring"; exit 1; fi
+        echo "QUIC crypto backends are isolated from the TCP-TLS backend features."
     - name: Run build
       run: |
-        cargo hack build --feature-powerset --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
+        cargo hack build --feature-powerset --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier --exclude sailing --exclude sailing-compio --exclude sailing-reactor --at-least-one-of std,alloc
         # The umbrella (`sailing`): curated builds — the ring backend across all drivers (this also
         # covers compio/reactor, excluded from the powerset above), then the
         # no_std + alloc core. aws-lc-rs + the quinn auxiliaries are CI-excluded (as in memberlist:
@@ -253,8 +267,8 @@ jobs:
       # std/alloc, so it runs once per tier with that tier as the --features base (--at-least-one-of is
       # powerset-only). Each feature thus compiles and tests on both the std and the no_std/alloc tier.
       run: |
-        cargo hack test -p sailing-proto --each-feature --features std --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier
-        cargo hack test -p sailing-proto --each-feature --features alloc --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier
+        cargo hack test -p sailing-proto --each-feature --features std --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier
+        cargo hack test -p sailing-proto --each-feature --features alloc --exclude-features fuzzing,tls,quic,tls-rustls-aws-lc-rs,quic-rustls-aws-lc-rs,quic-aws-lc-rs,quic-bloom,quic-log,quic-rustls-log,quic-qlog,quic-platform-verifier
     - name: Integration, driver, and simulation tests
       # The downstream crates carry no test-relevant feature combinatorics, so each runs ONCE rather
       # than per powerset combo. The transport drivers use the ring backend (aws-lc-rs is CI-excluded
