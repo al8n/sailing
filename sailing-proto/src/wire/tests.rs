@@ -1159,7 +1159,7 @@ fn decode_rejects_a_frame_stuffed_with_unknown_fields() {
   // recognize and so counts as one unknown field. More than the cap must be refused.
   let mut buf = Vec::new();
   for _ in 0..(MAX_UNKNOWN_FIELDS + 8) {
-    push_varint(&mut buf, (100u64 << 3) | 0); // tag: field 100, wire type 0 (varint)
+    push_varint(&mut buf, 100u64 << 3); // tag: field 100, wire type 0 (varint)
     push_varint(&mut buf, 0); // its value
   }
   let r = decode_message::<u64>(bytes::Bytes::from(buf));

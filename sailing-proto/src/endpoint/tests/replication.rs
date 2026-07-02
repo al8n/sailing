@@ -1789,11 +1789,13 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
       bytes::Bytes::from_static(b"e"),
     ),
   ]);
-  // Peer 2 had been replicating, so its next_index is high (here 6). A deep-divergence reject
-  // arrives: with a one-index decrement the leader would step to next=5 (prev=4).
+  // Peer 3 never acked (match == 0), so it is GENUINELY deeply divergent — nothing is proven
+  // replicated, so the jump may floor at index 1. Its next_index is high (here 6); a deep-divergence
+  // reject arrives, and with a one-index decrement the leader would step to next=5 (prev=4). (Peer 2
+  // acked index 1 in the helper, so its match+1 floor would legitimately hold the jump at 2.)
   leader
     .tracker
-    .progress_mut(&2u64)
+    .progress_mut(&3u64)
     .unwrap()
     .set_next_index(Index::new(6));
   while leader.poll_message().is_some() {}
@@ -1802,10 +1804,10 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
     d,
     &mut log,
     &mut stable,
-    2u64,
+    3u64,
     Message::AppendResponse(AppendResponse::new(
       Term::new(1),
-      2u64,
+      3u64,
       true,        // reject
       Index::ZERO, // reject_hint_index = 0  ┐ the follower's whole log conflicts:
       Term::ZERO,  // reject_hint_term  = 0  ┘ the `(0,0)` bottomed-out hint
@@ -1816,7 +1818,7 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
   // The leader must probe at prev_log_index = 0 (next_index jumped straight to 1) in ONE step.
   let mut prev = None;
   while let Some(out) = leader.poll_message() {
-    if out.to() == 2u64
+    if out.to() == 3u64
       && let Message::AppendEntries(ae) = out.message()
     {
       prev = Some(ae.prev_log_index());
