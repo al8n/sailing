@@ -1474,7 +1474,44 @@ where
     if self.poison.poisoned {
       return None;
     }
+    // Trace the front BEFORE removing it: emitting an event runs subscriber code synchronously, and a
+    // subscriber that unwinds must not have consumed the queued event — otherwise a caught panic would
+    // drop an undelivered consensus notification.
+    #[cfg(feature = "tracing")]
+    if let Some(e) = self.outputs.events.front() {
+      Self::trace_event(e);
+    }
     self.outputs.events.pop_front()
+  }
+
+  /// Emit a `tracing` event for a consensus milestone as it leaves the state machine. Node IDs are
+  /// omitted (the Sans-I/O core does not bound `I: Debug`); the driver layer, which does, adds peer
+  /// detail. A no-op unless the `tracing` feature is enabled.
+  #[cfg(feature = "tracing")]
+  #[inline]
+  fn trace_event(event: &Event<I, F::Response>) {
+    match event {
+      // LeaderChanged/ConfChanged accessors bound `I: CheapClone`/`Clone`, which the Sans-I/O core
+      // does not carry here — the event itself is the signal, so log it without the field.
+      Event::LeaderChanged(_) => {
+        tracing::info!(target: "sailing::consensus", "leader changed");
+      }
+      Event::SnapshotInstalled(m) => {
+        tracing::info!(target: "sailing::consensus", last_index = m.last_index().get(), "snapshot installed");
+      }
+      Event::ConfChanged(_) => {
+        tracing::info!(target: "sailing::consensus", "membership changed");
+      }
+      Event::ReadModeChanged(e) => {
+        tracing::debug!(target: "sailing::consensus", index = e.index().get(), mode = ?e.mode(), "read mode changed");
+      }
+      Event::Applied(e) => {
+        tracing::trace!(target: "sailing::consensus", index = e.index().get(), "entry applied");
+      }
+      Event::ReadState(e) => {
+        tracing::trace!(target: "sailing::consensus", index = e.index().get(), "read index confirmed");
+      }
+    }
   }
 
   /// Debug-only tripwire for the driver's drain obligation (see [`poll_message`](Self::poll_message)):
