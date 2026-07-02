@@ -43,6 +43,18 @@ pub enum ProposeError<I> {
   /// (2^64 entries); reachable only from a crafted or corrupt recovered log. Nothing was appended.
   #[error("the log index space is exhausted")]
   LogIndexExhausted,
+
+  /// The proposed entry is too large to ever fit in one transport frame. Accepting it would append a
+  /// committed log entry that no `AppendEntries` could carry, so every follower's connection would
+  /// close on each resend and replication would wedge cluster-wide. `size` is the entry's worst-case
+  /// wire cost and `max` the per-frame entry budget, in bytes. Nothing was appended.
+  #[error("the proposed entry is too large for one transport frame ({size} > {max} bytes)")]
+  EntryTooLarge {
+    /// The entry's worst-case encoded wire cost, in bytes.
+    size: usize,
+    /// The per-frame entry budget, in bytes.
+    max: usize,
+  },
 }
 
 /// Why a leader-transfer request was rejected.
@@ -149,6 +161,11 @@ pub enum ConfigError {
   /// `max_inflight_msgs` was zero.
   #[error("max_inflight_msgs must be greater than zero")]
   ZeroInflight,
+  /// `max_size_per_msg` was zero (which caps every `AppendEntries` at a single entry — a throughput
+  /// footgun). The per-frame cap is enforced independently, so this is a sanity floor, not the frame
+  /// bound.
+  #[error("max_size_per_msg must be greater than zero")]
+  ZeroMaxSizePerMsg,
   /// `snapshot_chunk_bytes` was zero (which would livelock on empty chunks) or exceeded the frame-safe
   /// maximum (which would produce an unsendable wire frame).
   #[error("snapshot_chunk_bytes must be in 1..={max} (got {value})")]

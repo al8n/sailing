@@ -915,6 +915,9 @@ impl<I> Config<I> {
     if self.max_inflight_msgs == 0 {
       return Err(ConfigError::ZeroInflight);
     }
+    if self.max_size_per_msg == 0 {
+      return Err(ConfigError::ZeroMaxSizePerMsg);
+    }
     if self.voters.is_empty() {
       return Err(ConfigError::EmptyVoters);
     }

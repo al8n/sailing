@@ -378,6 +378,13 @@ fn flow_control_defaults_and_validation() {
     c.clone().with_max_inflight_msgs(0),
     Err(ConfigError::ZeroInflight)
   ));
+
+  // ZeroMaxSizePerMsg: max_size_per_msg = 0 (which would cap every AppendEntries at a single entry)
+  // is rejected at validation.
+  assert!(matches!(
+    c.clone().with_max_size_per_msg(0).validate(),
+    Err(ConfigError::ZeroMaxSizePerMsg)
+  ));
 }
 
 #[test]

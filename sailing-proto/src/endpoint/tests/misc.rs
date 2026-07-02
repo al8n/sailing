@@ -230,6 +230,40 @@ fn propose_at_max_index_is_refused_not_truncating() {
   );
 }
 
+/// An entry whose encoded `AppendEntries` frame would exceed the transport limit
+/// ([`crate::wire::MAX_FRAME_BYTES`]) is refused at `propose` time — it must never enter the log,
+/// because a committed entry no `AppendEntries` can carry would close every follower's connection on
+/// each resend and wedge replication cluster-wide.
+///
+/// MUTATION: remove the `EntryTooLarge` guard in `propose` → the oversized entry is appended and
+/// `propose` returns `Ok`, so the refuse-and-not-appended assertions below fail.
+#[test]
+fn propose_oversized_entry_is_refused_not_appended() {
+  let (mut ep, mut log, stable, d) = make_single_node_leader();
+  let last_before = log.last_index();
+
+  // A command whose entry cost (data + per-entry overhead) exceeds the single-frame budget.
+  let oversized = bytes::Bytes::from(std::vec![0u8; crate::wire::MAX_FRAME_BYTES]);
+  let r = ep.propose(d, &mut log, &stable, &oversized);
+  assert!(
+    matches!(r, Err(ProposeError::EntryTooLarge { .. })),
+    "an entry too large for one transport frame must be refused, got {r:?}"
+  );
+  assert_eq!(
+    log.last_index(),
+    last_before,
+    "the oversized entry must NOT be appended to the log"
+  );
+  assert!(
+    ep.poison_reason().is_none(),
+    "a refused proposal must not poison the node"
+  );
+
+  // A normal small proposal still succeeds afterward.
+  let ok = ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"ok"));
+  assert!(ok.is_ok(), "a normal proposal still works, got {ok:?}");
+}
+
 /// Regression (reserve u64::MAX as a non-allocatable sentinel index): even ONE BELOW the
 /// ceiling, `last_index == u64::MAX - 1`, must NOT allocate `u64::MAX`. An entry there could be
 /// committed but never applied or replicated: the half-open log ranges `[i, i.next())` (apply) and

@@ -301,21 +301,32 @@ where
         };
         let slice: &[Entry] = &read;
 
-        // Cap at max_size_per_msg bytes, but always send at least one entry.
-        let capped: &[Entry] = if slice.is_empty() || max_bytes == u64::MAX {
+        // Cap the batch at `max_size_per_msg` bytes AND at the transport frame budget, but always send
+        // at least one entry. The frame cap holds even when `max_size_per_msg` is `u64::MAX`
+        // (unlimited): `entry_size` undercounts an entry's real wire cost, so an unbounded byte budget
+        // could otherwise pack a batch whose encoded `AppendEntries` exceeds `MAX_FRAME_BYTES` and is
+        // dropped/closed by the transport. The always-included first entry is safe because
+        // `propose`/`append_conf_change` refuse any single entry above the frame budget.
+        let capped: &[Entry] = if slice.is_empty() {
           slice
         } else {
           let mut budget = max_bytes;
+          let mut frame_used = 0usize;
           let mut count = 0usize;
           for e in slice {
             let sz = Self::entry_size(e);
+            let frame_cost = crate::wire::entry_frame_cost(e);
             if count == 0 {
               // always include at least one entry regardless of size
               count += 1;
               budget = budget.saturating_sub(sz);
-            } else if sz <= budget {
+              frame_used = frame_cost;
+            } else if (max_bytes == u64::MAX || sz <= budget)
+              && frame_used.saturating_add(frame_cost) <= crate::wire::APPEND_FRAME_ENTRY_BUDGET
+            {
               count += 1;
-              budget -= sz;
+              budget = budget.saturating_sub(sz);
+              frame_used += frame_cost;
             } else {
               break;
             }
@@ -739,6 +750,17 @@ where
     .with_timestamp(self.lease_stamp(now.mono()))
     .with_lease_window(self.lease_window_stamp())
     .with_wall_timestamp(self.lease_wall_stamp(now));
+    // Refuse an entry that no single `AppendEntries` frame could carry BEFORE it enters the log: once
+    // appended it is committed history no transport can move, so every follower's connection would close
+    // on each resend and replication would wedge cluster-wide while the leader stays up. Rejecting here
+    // (nothing was appended, the index is not consumed) keeps that entry out of the log entirely.
+    let cost = crate::wire::entry_frame_cost(&entry);
+    if cost > crate::wire::APPEND_FRAME_ENTRY_BUDGET {
+      return Err(ProposeError::EntryTooLarge {
+        size: cost,
+        max: crate::wire::APPEND_FRAME_ENTRY_BUDGET,
+      });
+    }
     // Self-match advance is deferred until the append is durable (on_log_appended).
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&entry));
