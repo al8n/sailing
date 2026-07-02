@@ -2420,13 +2420,15 @@ where
               .outputs
               .events
               .push_back(Event::ConfChanged(crate::ConfChanged::new(idx, conf)));
-            // A leader that this change removed (or demoted to learner) is no longer a voter in the
-            // new configuration and must stop acting as leader. `is_voter()` checks BOTH joint halves,
-            // so during a joint phase where we are still in the outgoing config we keep leading (we must
-            // shepherd the joint → simple transition). We only step down once removed from BOTH halves.
-            // The step-down is at the SAME term (no term bump): a leader yielding to its own removal,
-            // not losing an election.
-            if self.role.is_leader()
+            // A node this change removed (or demoted to learner) is no longer a voter in the new
+            // configuration and must stop acting as leader OR candidate: applied the instant the removal
+            // commits, so a node campaigning when its own removal applies aborts the campaign here (and
+            // `become_leader` refuses to lead a non-voter as a backstop for the win-before-apply order).
+            // `is_voter()` checks BOTH joint halves, so during a joint phase where we are still in the
+            // outgoing config we keep leading (we must shepherd the joint → simple transition). We only
+            // step down once removed from BOTH halves. The step-down is at the SAME term (no term bump):
+            // a node yielding to its own removal, not losing an election.
+            if !self.role.is_follower()
               && self.config.step_down_on_removal()
               && !self.tracker.is_voter(&self.config.id())
             {
