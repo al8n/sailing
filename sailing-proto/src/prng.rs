@@ -56,13 +56,20 @@ impl rand_core::TryRng for Prng {
 /// so the default [`Prng`] reproduces the simulator's byte-identical stream.
 #[inline]
 pub(crate) fn election_timeout<R: rand::Rng>(rng: &mut R, base: Duration) -> Duration {
-  let base_ms = base.as_millis() as u64;
-  let extra = if base_ms == 0 {
+  // Jitter is drawn at NANOSECOND granularity. A millisecond-granular draw (`next_u64() % base_ms`)
+  // collapses to zero for any sub-2 ms base — `base_ms` rounds to 0 or 1, and `x % {0,1}` is always
+  // 0 — pinning the timeout to exactly `base` and defeating Raft's [T, 2T) split-vote randomization
+  // for sub-millisecond election timeouts.
+  let base_ns = base.as_nanos();
+  let extra_ns = if base_ns == 0 {
     0
   } else {
-    rng.next_u64() % base_ms
+    // `next_u64()` is the u64 dividend, so its remainder modulo any positive `base_ns` never exceeds
+    // it and always fits back into u64 — the `as u64` is lossless for any `base`. Exactly ONE draw
+    // on this non-zero path preserves the simulator's byte-identical single-draw stream (see above).
+    (rng.next_u64() as u128 % base_ns) as u64
   };
-  base + Duration::from_millis(extra)
+  base + Duration::from_nanos(extra_ns)
 }
 
 #[cfg(test)]
@@ -124,6 +131,27 @@ mod tests {
     expected[0..8].copy_from_slice(&q.next_u64().to_le_bytes());
     expected[8..16].copy_from_slice(&q.next_u64().to_le_bytes());
     assert_eq!(buf, expected);
+  }
+
+  #[test]
+  fn sub_millisecond_base_still_jitters() {
+    // A sub-millisecond base rounds to 0 ms, so a millisecond-granular jitter would draw `% 0/1`
+    // (always 0) and return a FIXED `base` for every seed — collapsing the [T, 2T) spread. At
+    // nanosecond granularity the same base still spreads across seeds while staying in range.
+    let base = Duration::from_micros(800);
+    let first = election_timeout(&mut Prng::new(0), base);
+    let mut all_equal = true;
+    for seed in 0..1000u64 {
+      let t = election_timeout(&mut Prng::new(seed), base);
+      assert!(t >= base && t < base * 2, "still within [T, 2T)");
+      if t != first {
+        all_equal = false;
+      }
+    }
+    assert!(
+      !all_equal,
+      "a sub-millisecond base must still produce distinct jittered timeouts"
+    );
   }
 
   #[test]
