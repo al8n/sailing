@@ -385,6 +385,12 @@ fn flow_control_defaults_and_validation() {
     c.clone().with_max_size_per_msg(0).validate(),
     Err(ConfigError::ZeroMaxSizePerMsg)
   ));
+
+  // ZeroSnapshotThreshold: snapshot_threshold = 0 (which would snapshot on every drain) is rejected.
+  assert!(matches!(
+    c.clone().with_snapshot_threshold(0).validate(),
+    Err(ConfigError::ZeroSnapshotThreshold)
+  ));
 }
 
 #[test]

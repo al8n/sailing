@@ -166,6 +166,11 @@ pub enum ConfigError {
   /// bound.
   #[error("max_size_per_msg must be greater than zero")]
   ZeroMaxSizePerMsg,
+  /// `snapshot_threshold` was zero. The snapshot trigger fires when `applied - first_index >=
+  /// threshold`, so a zero threshold matches on every applied index and captures a full snapshot on
+  /// every storage drain — a perpetual snapshot/compaction loop.
+  #[error("snapshot_threshold must be greater than zero")]
+  ZeroSnapshotThreshold,
   /// `snapshot_chunk_bytes` was zero (which would livelock on empty chunks) or exceeded the frame-safe
   /// maximum (which would produce an unsendable wire frame).
   #[error("snapshot_chunk_bytes must be in 1..={max} (got {value})")]
