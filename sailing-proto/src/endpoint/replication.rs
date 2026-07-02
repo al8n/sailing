@@ -1297,6 +1297,18 @@ where
       return;
     };
     if response.reject() {
+      // Ignore a reject for a peer that is mid snapshot-transfer. A stale/duplicate AppendEntries reject
+      // (delivered out of order, or a leftover from before the peer entered Snapshot) would otherwise kick
+      // it back to Probe, destroying the transfer cursor and restarting the stream at offset 0. etcd's
+      // MaybeDecrTo leaves a StateSnapshot peer untouched; an actual snapshot rejection arrives as a
+      // SnapshotResponse (handled in on_snapshot_response).
+      if matches!(pr.state(), ProgressState::Snapshot { .. }) {
+        return;
+      }
+      // Floor `next` at `match + 1` below: a delayed/duplicated reject must never drag `next` below the
+      // proven match (etcd's `pr.Match + 1` clamp), which would re-send already-acked entries or, at the
+      // extreme, spuriously re-enter snapshotting.
+      let match_floor = pr.match_index().get().saturating_add(1);
       // Use the term-skip hint to jump next_index forward in one step.
       // find_conflict_by_term walks the leader's log from reject_hint_index downward
       // until we find an entry whose term ≤ reject_hint_term (the follower's conflicting
@@ -1317,9 +1329,9 @@ where
         return;
       };
       // etcd `Progress.MaybeDecrTo`: jump next_index to `min(rejected_prev, conflict+1)`, floored at
-      // 1 — NOT a one-index decrement. The jump makes catch-up of a deeply-divergent follower O(terms)
-      // round-trips instead of O(entries): a `(0,0)` hint (the follower's WHOLE log conflicts, so
-      // `find_conflict_by_term` bottomed out at 0) jumps straight to index 1 in a single step rather
+      // `match + 1` — NOT a one-index decrement. The jump makes catch-up of a deeply-divergent follower
+      // O(terms) round-trips instead of O(entries): a `(0,0)` hint (the follower's WHOLE log conflicts, so
+      // `find_conflict_by_term` bottomed out at 0) jumps straight to `match + 1` in a single step rather
       // than walking down one index per reject. The one-index decrement is recovered automatically
       // for a stale/unhelpful hint (`conflict >= cur_next` ⇒ `conflict+1 > rejected_prev` ⇒ the `min`
       // picks `rejected_prev = cur_next-1`). (The O(entries) walk was pathologically slow —
@@ -1327,7 +1339,7 @@ where
       let rejected_prev = cur_next.get().saturating_sub(1);
       let safe_next = Index::new(core::cmp::max(
         core::cmp::min(rejected_prev, conflict.get().saturating_add(1)),
-        1,
+        match_floor,
       ));
       // Re-acquire progress to update (prior `pr` reference dropped implicitly by this point).
       if let Some(p) = self.tracker.progress_mut(&from) {

@@ -3128,3 +3128,90 @@ fn flush_appends_re_arms_for_a_later_propose() {
     "a propose after the dirty flag cleared must still replicate on the next flush"
   );
 }
+
+/// A stale/duplicate AppendEntries reject must NOT disturb a peer that is mid snapshot-transfer:
+/// kicking it to Probe would destroy the transfer cursor and restart the stream at offset 0.
+///
+/// MUTATION: remove the `ProgressState::Snapshot` guard in the reject arm → the peer is kicked to
+/// Probe, so the state assertion below fails.
+#[test]
+fn stale_reject_preserves_a_snapshot_transfer() {
+  use crate::{AppendResponse, Index, Message, ProgressState, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+    .unwrap();
+  {
+    let p = ep.tracker.progress_mut(&2u64).unwrap();
+    p.become_snapshot(Index::new(2), 100);
+  }
+
+  // A stale AppendEntries reject (delivered out of order, or left over from before the peer entered
+  // Snapshot) arrives while the snapshot transfer is in flight.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      true,
+      Index::new(1),
+      Term::new(1),
+      Index::ZERO,
+    )),
+  );
+
+  assert!(
+    matches!(
+      ep.tracker.progress(&2u64).unwrap().state(),
+      ProgressState::Snapshot { .. }
+    ),
+    "a stale reject must not kick a Snapshot-state peer to Probe"
+  );
+}
+
+/// A delayed/duplicated reject must never drag `next` below the proven `match + 1` (etcd's
+/// `MaybeDecrTo` clamp) — doing so would re-send already-acked entries or spuriously re-snapshot.
+///
+/// MUTATION: revert the `safe_next` floor from `match_floor` to `1` → a whole-log-conflict hint drives
+/// `next` to 1, failing the assertion below.
+#[test]
+fn reject_floors_next_at_match_plus_one() {
+  use crate::{AppendResponse, Index, Message, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  for _ in 0..10 {
+    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+      .unwrap();
+  }
+  {
+    let p = ep.tracker.progress_mut(&2u64).unwrap();
+    p.become_replicate();
+    p.maybe_update(Index::new(5)); // match = 5
+    p.set_next_index(Index::new(10)); // next = 10
+  }
+
+  // A reject whose hint claims the whole log conflicts (0, 0): the jump must floor at match + 1 = 6.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      true,
+      Index::ZERO,
+      Term::ZERO,
+      Index::ZERO,
+    )),
+  );
+
+  assert_eq!(
+    ep.tracker.progress(&2u64).unwrap().next_index(),
+    Index::new(6),
+    "a reject must not drag next below match + 1"
+  );
+}
