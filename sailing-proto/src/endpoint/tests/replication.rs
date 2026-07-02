@@ -3301,8 +3301,9 @@ fn append_below_snapshot_boundary_does_not_poison() {
   ep.applied = Index::new(7);
   ep.durable.durable_index = Index::new(7);
 
-  // The leader re-sends from index 1 (prev = 0): indices 1..=5 are compacted on this follower.
-  let entries: Vec<_> = (1u64..=7)
+  // The leader re-sends with prev = 3 (below the boundary but non-zero — the case the consistency check
+  // must accept, not the trivial prev == 0), entries 4..=7: indices 4, 5 are compacted on this follower.
+  let entries: Vec<_> = (4u64..=7)
     .map(|i| {
       Entry::new(
         Term::new(1),
@@ -3321,8 +3322,8 @@ fn append_below_snapshot_boundary_does_not_poison() {
     Message::AppendEntries(AppendEntries::new(
       Term::new(1),
       1u64,
-      Index::ZERO,
-      Term::ZERO,
+      Index::new(3),
+      Term::new(1),
       entries,
       Index::new(7),
     )),

@@ -855,6 +855,13 @@ where
     // Log-consistency check at prev_log_index/term. A fatal term-read poisons via `log_term` and
     // produces `None` → not consistent → reject path; the poisoned node's later dispatch no-ops.
     let consistent = ae.prev_log_index() == Index::ZERO
+      // A prev below `first_index` is at or below our snapshot boundary, i.e. committed history: we hold
+      // a matching entry there (Log Matching + Leader Completeness in CFT), so it is trivially
+      // consistent. `log_term` returns `Term::ZERO` for a strictly-compacted index, so the term
+      // comparison below would spuriously reject — wedging a leader that re-sends below the boundary (a
+      // reject that dragged its `next` down). Accepting it here lets the entry scan (which likewise skips
+      // sub-`first_index` entries) append only the in-range suffix.
+      || ae.prev_log_index() < log.first_index()
       || (ae.prev_log_index() <= log.last_index()
         && self
           .log_term(log, ae.prev_log_index())
@@ -1263,7 +1270,13 @@ where
     mut index: Index,
     term: Term,
   ) -> Option<Index> {
-    while index > Index::ZERO {
+    // Stop at `first_index`, not 0: everything below it is compacted into a snapshot, i.e. committed
+    // history that cannot be a conflict point, and `log_term` returns `Term::ZERO` there (a spurious
+    // low term that would end the walk on a compacted index). Bottoming out returns `first_index - 1`
+    // (the boundary), telling the caller "no conflict at or below the boundary". With no snapshot
+    // (`first_index == 1`) this is exactly the historical `while index > 0`.
+    let floor = log.first_index();
+    while index >= floor {
       // A fatal term-read poisoned the node (inside `log_term`): propagate `None` so the caller
       // short-circuits rather than acting on a fabricated index the incomplete search would return.
       let t = self.log_term(log, index)?;
