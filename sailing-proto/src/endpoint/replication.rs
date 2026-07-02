@@ -937,7 +937,16 @@ where
       let mut conflict_at: Option<usize> = None;
       for (i, entry) in entries.iter().enumerate() {
         let idx = entry.index();
-        let matches_existing = if idx <= log.last_index() {
+        let matches_existing = if idx < log.first_index() {
+          // Below `first_index`: compacted into a snapshot, so it is committed history. In CFT (Log
+          // Matching + Leader Completeness) it is identical to what any valid leader sends, so it cannot
+          // conflict — treat it as already-present and skip it. Without this, `log_term` returns
+          // `Term::ZERO` for a compacted index, misreading a matching committed entry as a conflict and
+          // fail-stopping via `CommittedTruncation`. This is what makes a reject that re-sends below the
+          // snapshot boundary (a stale reject that dragged the leader's `next` down, or an older peer on
+          // the floor-at-1 path) harmless rather than a follower poison.
+          true
+        } else if idx <= log.last_index() {
           match self.log_term(log, idx) {
             Some(t) => t == entry.term(),
             // Fatal term-read: poisoned; abort rather than mis-classify as a conflict.
