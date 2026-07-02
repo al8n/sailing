@@ -449,6 +449,11 @@ where
     let opid = self.mint_op_id();
     self.submit_append(log, opid, core::slice::from_ref(&noop));
     self.push_pending(opid, Pending::LeaderAppend { upto: noop_index });
+    // Mark the append for the next coalesced `flush_appends`, like every other propose-family mutation.
+    // Without this a lease-refresh no-op would replicate only when a heartbeat RESPONSE next triggers a
+    // pump (~1 RTT later), eating into the proactive-refresh margin. `become_leader` fans out explicitly
+    // regardless, so this is harmless there.
+    self.replication_pending = true;
     Some(noop_index)
   }
 
@@ -548,6 +553,13 @@ where
       self.election_deadline = None;
       return;
     }
+    // Clear the leader-scoped replication dirty flags: a `propose`/read that set them in a term this
+    // node was then deposed out of must not trigger a spurious broadcast or refresh no-op in THIS fresh
+    // leadership. The election no-op below re-sets `replication_pending` for its own append, and the
+    // explicit fan-out follows, so nothing legitimate is lost.
+    self.replication_pending = false;
+    self.lease_guard.lease_refresh_wanted = false;
+    self.lease_guard.read_since_anchor = false;
     self.role = Role::Leader;
     self.set_leader(Some(self.config.id()));
     // Reset read-index state from the previous term (stale pending reads must not
