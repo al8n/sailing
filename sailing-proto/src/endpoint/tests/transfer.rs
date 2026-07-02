@@ -1009,7 +1009,12 @@ fn transfer_to_a_snapshot_target_sends_timeout_now() {
     &mut log,
     &mut stable,
     2u64,
-    Message::SnapshotResponse(SnapshotResponse::new(Term::new(1), 2u64, false, Index::new(2))),
+    Message::SnapshotResponse(SnapshotResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::new(2),
+    )),
   );
 
   // The handoff fired: TimeoutNow was sent (which arms the forced-handoff flag).
