@@ -3171,3 +3171,99 @@ fn stale_reject_preserves_a_snapshot_transfer() {
     "a stale reject must not kick a Snapshot-state peer to Probe"
   );
 }
+
+/// With the follower echoing its rejected prev index (`rejected_index > match`), the leader floors the
+/// reject's jump at `match + 1` (etcd's MaybeDecrTo clamp) — safe because the staleness guard has
+/// already dropped any reject at or below `match`.
+///
+/// MUTATION: revert the floor to `1` (drop the `rejected != 0` branch) → a whole-log-conflict hint
+/// drives next to 1, failing the assertion.
+#[test]
+fn reject_floors_next_at_match_plus_one() {
+  use crate::{AppendResponse, Index, Message, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  for _ in 0..10 {
+    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+      .unwrap();
+  }
+  {
+    let p = ep.tracker.progress_mut(&2u64).unwrap();
+    p.become_replicate();
+    p.maybe_update(Index::new(5)); // match = 5
+    p.set_next_index(Index::new(10)); // next = 10
+  }
+
+  // A FRESH reject (rejected prev = 9 = next - 1, above match) whose hint claims the whole log conflicts.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(
+      AppendResponse::new(
+        Term::new(1),
+        2u64,
+        true,
+        Index::ZERO,
+        Term::ZERO,
+        Index::ZERO,
+      )
+      .with_rejected_index(Index::new(9)),
+    ),
+  );
+
+  assert_eq!(
+    ep.tracker.progress(&2u64).unwrap().next_index(),
+    Index::new(6),
+    "a fresh reject floors next at match + 1"
+  );
+}
+
+/// A reject echoing a rejected index at or below the proven match is stale (the follower has since
+/// acked past it) and is IGNORED — next is unchanged, so a stale reject can neither livelock nor drive a
+/// re-send below the follower's committed prefix.
+///
+/// MUTATION: remove the `rejected <= match` staleness guard → the stale reject is processed and drags
+/// next down, failing the unchanged-next assertion.
+#[test]
+fn stale_reject_below_match_is_ignored() {
+  use crate::{AppendResponse, Index, Message, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  for _ in 0..10 {
+    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+      .unwrap();
+  }
+  {
+    let p = ep.tracker.progress_mut(&2u64).unwrap();
+    p.become_replicate();
+    p.maybe_update(Index::new(5)); // match = 5
+    p.set_next_index(Index::new(10)); // next = 10
+  }
+
+  // A STALE reject: it rejects prev = 3, at or below the proven match 5.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(
+      AppendResponse::new(
+        Term::new(1),
+        2u64,
+        true,
+        Index::new(2),
+        Term::new(1),
+        Index::ZERO,
+      )
+      .with_rejected_index(Index::new(3)),
+    ),
+  );
+
+  assert_eq!(
+    ep.tracker.progress(&2u64).unwrap().next_index(),
+    Index::new(10),
+    "a stale reject (rejected <= match) is ignored — next is unchanged"
+  );
+}

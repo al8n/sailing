@@ -889,14 +889,14 @@ where
       };
       self.send(
         ae.leader(),
-        Message::AppendResponse(AppendResponse::new(
-          term,
-          me,
-          true,
-          hint_index,
-          hint_term,
-          Index::ZERO,
-        )),
+        Message::AppendResponse(
+          AppendResponse::new(term, me, true, hint_index, hint_term, Index::ZERO)
+            // Echo the rejected `prev_log_index` so the leader can drop a stale/duplicate reject whose
+            // rejected index is at or below the proven match (etcd's MaybeDecrTo guard). `prev == 0` is
+            // unconditionally consistent, so a real reject always echoes `>= 1`; the leader treats a `0`
+            // as an older peer that does not echo and falls back to the historical floor-at-1.
+            .with_rejected_index(ae.prev_log_index()),
+        ),
       );
       return;
     }
@@ -1305,6 +1305,21 @@ where
       if matches!(pr.state(), ProgressState::Snapshot { .. }) {
         return;
       }
+      // Capture the peer's progress before the `pr` borrow ends (the conflict walk below re-borrows self).
+      let rejected = response.rejected_index();
+      let match_index = pr.match_index();
+      let cur_next = pr.next_index();
+      // etcd `Progress.MaybeDecrTo` staleness guard: a reject echoing a rejected index at or below the
+      // proven match is stale or duplicate — the follower has since acked past it (or it is a reordered
+      // older reject) — so ignore it. Without this the `match + 1` floor below would re-send `prev =
+      // match`, a follower whose log was re-baselined by a snapshot rejects again, and the leader
+      // re-sends: a livelock; and driving `next` below `match` would re-send entries below the follower's
+      // snapshot boundary, where its compacted-conflict check fail-stops it via `CommittedTruncation`.
+      // `rejected == 0` is an older peer that does not echo the field (a real reject always has `prev >=
+      // 1`, since `prev == 0` is unconditionally consistent) — fall back to the historical floor-at-1.
+      if rejected != Index::ZERO && rejected <= match_index {
+        return;
+      }
       // Use the term-skip hint to jump next_index forward in one step.
       // find_conflict_by_term walks the leader's log from reject_hint_index downward
       // until we find an entry whose term ≤ reject_hint_term (the follower's conflicting
@@ -1317,32 +1332,35 @@ where
       // `on_append_entries` (`min(prev_log_index, last_index)`).
       let hint_index = core::cmp::min(response.reject_hint_index(), log.last_index());
       let hint_term = response.reject_hint_term();
-      let cur_next = pr.next_index();
       // Compute the conflict index before re-borrowing self.tracker.progress mutably. A fatal
       // term-read mid-walk poisons and returns `None`; short-circuit before mutating peer progress
       // or sending — a poisoned node must neither advance `next_index` nor emit an AppendEntries.
       let Some(conflict) = self.find_conflict_by_term(log, hint_index, hint_term) else {
         return;
       };
-      // etcd `Progress.MaybeDecrTo`: jump next_index to `min(rejected_prev, conflict+1)`, floored at
-      // 1 — NOT a one-index decrement. The jump makes catch-up of a deeply-divergent follower O(terms)
-      // round-trips instead of O(entries): a `(0,0)` hint (the follower's WHOLE log conflicts, so
-      // `find_conflict_by_term` bottomed out at 0) jumps straight to index 1 in a single step rather
-      // than walking down one index per reject. The one-index decrement is recovered automatically
-      // for a stale/unhelpful hint (`conflict >= cur_next` ⇒ `conflict+1 > rejected_prev` ⇒ the `min`
-      // picks `rejected_prev = cur_next-1`). (The O(entries) walk was pathologically slow —
-      // thousands of reject round-trips compressed into each instant-delivery tick.)
+      // etcd `Progress.MaybeDecrTo`: jump next_index to `min(rejected_prev, conflict+1)` — NOT a one-index
+      // decrement. The jump makes catch-up of a deeply-divergent follower O(terms) round-trips instead of
+      // O(entries): a `(0,0)` hint (the follower's WHOLE log conflicts, so `find_conflict_by_term`
+      // bottomed out at 0) jumps straight to the floor in a single step rather than walking down one index
+      // per reject. The one-index decrement is recovered automatically for a stale/unhelpful hint
+      // (`conflict >= cur_next` ⇒ `conflict+1 > rejected_prev` ⇒ the `min` picks `rejected_prev =
+      // cur_next-1`). (The O(entries) walk was pathologically slow — thousands of reject round-trips
+      // compressed into each instant-delivery tick.)
       //
-      // NOT floored at `pr.Match + 1` (etcd's clamp): that needs the follower's rejected-prev index
-      // echoed in `AppendResponse` (a wire change out of scope here). Flooring at `match + 1` WITHOUT
-      // that guard wedges — a stale reject against a follower whose log was re-baselined by a snapshot
-      // would pin `next` at `match + 1`, re-send `prev = match` (now compacted on the follower), and
-      // draw another reject: a livelock. Flooring at 1 is churny-but-safe (re-sending acked entries is
-      // idempotent) and self-corrects; the Snapshot-state ignore above is the reachable-harm fix.
+      // Floored at `match + 1` when the follower echoes its rejected index (`rejected != 0`): the
+      // staleness guard above dropped any reject at/below `match`, so the surviving reject is fresh and
+      // the floor cannot pin `next` at a stale `match` — no livelock — and `next` never drops below
+      // `match`, so a re-send never reaches the follower's compacted committed prefix. An older
+      // non-echoing peer (`rejected == 0`) keeps the historical floor-at-1.
       let rejected_prev = cur_next.get().saturating_sub(1);
+      let floor = if rejected != Index::ZERO {
+        match_index.get().saturating_add(1)
+      } else {
+        1
+      };
       let safe_next = Index::new(core::cmp::max(
         core::cmp::min(rejected_prev, conflict.get().saturating_add(1)),
-        1,
+        floor,
       ));
       // Re-acquire progress to update (prior `pr` reference dropped implicitly by this point).
       if let Some(p) = self.tracker.progress_mut(&from) {

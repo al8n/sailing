@@ -104,6 +104,7 @@ pub struct AppendResponse<I> {
   reject_hint_index: Index,
   reject_hint_term: Term,
   match_index: Index,
+  rejected_index: Index,
 }
 
 impl<I: CheapClone> AppendResponse<I> {
@@ -124,7 +125,24 @@ impl<I: CheapClone> AppendResponse<I> {
       reject_hint_index,
       reject_hint_term,
       match_index,
+      rejected_index: Index::ZERO,
     }
+  }
+
+  /// Set the rejected `prev_log_index` (the index of the `AppendEntries` this reject responds to).
+  /// Left at `0` on success and by peers that predate the field.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_rejected_index(mut self, rejected_index: Index) -> Self {
+    self.rejected_index = rejected_index;
+    self
+  }
+
+  /// The `prev_log_index` this reject responds to (`0` on success or from a peer that predates the
+  /// field). The leader ignores a reject whose rejected index is at or below the proven match.
+  #[inline(always)]
+  pub const fn rejected_index(&self) -> Index {
+    self.rejected_index
   }
 
   /// The respondent's current term.

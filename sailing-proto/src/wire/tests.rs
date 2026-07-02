@@ -52,6 +52,18 @@ fn round_trips_every_variant() {
     Term::new(2),
     Index::new(0),
   )));
+  // A reject that echoes its rejected prev index (the staleness-guard field) round-trips too.
+  rt(Message::AppendResponse(
+    AppendResponse::new(
+      Term::new(3),
+      2,
+      true,
+      Index::new(4),
+      Term::new(2),
+      Index::new(0),
+    )
+    .with_rejected_index(Index::new(7)),
+  ));
   rt(Message::RequestVote(RequestVote::new(
     Term::new(3),
     1,

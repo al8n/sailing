@@ -628,6 +628,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       reject_hint_index: m.reject_hint_index().get(),
       reject_hint_term: m.reject_hint_term().get(),
       match_index: m.match_index().get(),
+      rejected_index: m.rejected_index().get(),
       ..Default::default()
     }),
     Message::RequestVote(m) => Body::from(pb::RequestVote {
@@ -721,14 +722,17 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
         .collect::<Result<Vec<_>, _>>()?,
       Index::new(m.leader_commit),
     )),
-    Body::AppendResponse(m) => Message::AppendResponse(crate::AppendResponse::new(
-      Term::new(m.term),
-      decode_id(&m.from_id)?,
-      m.reject,
-      Index::new(m.reject_hint_index),
-      Term::new(m.reject_hint_term),
-      Index::new(m.match_index),
-    )),
+    Body::AppendResponse(m) => Message::AppendResponse(
+      crate::AppendResponse::new(
+        Term::new(m.term),
+        decode_id(&m.from_id)?,
+        m.reject,
+        Index::new(m.reject_hint_index),
+        Term::new(m.reject_hint_term),
+        Index::new(m.match_index),
+      )
+      .with_rejected_index(Index::new(m.rejected_index)),
+    ),
     Body::RequestVote(m) => Message::RequestVote(crate::RequestVote::new(
       Term::new(m.term),
       decode_id(&m.candidate_id)?,

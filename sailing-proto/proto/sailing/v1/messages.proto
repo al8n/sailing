@@ -122,6 +122,10 @@ message AppendResponse {
   uint64 reject_hint_index = 4;
   uint64 reject_hint_term = 5;
   uint64 match_index = 6;
+  // The prev_log_index of the AppendEntries this response rejects (0 on success, or from a peer that
+  // predates this field). Lets the leader ignore a stale/duplicate reject whose rejected index is at or
+  // below the proven match, per etcd's MaybeDecrTo staleness guard.
+  uint64 rejected_index = 7;
 }
 
 // Vote / PreVote request.
