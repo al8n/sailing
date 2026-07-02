@@ -1461,6 +1461,43 @@ fn poisoned_node_rejects_work_and_persists_nothing() {
   );
 }
 
+/// `ensure_term_durable` must not re-submit an identical HardState write while an earlier one for the
+/// same `(term, vote, floor)` is still in the fsync window. With a store whose `hard_state()` reports
+/// the last-DURABLE value (lagging until the write completes), comparing only against it would
+/// re-submit on every call — load amplification proportional to message rate × fsync latency.
+///
+/// MUTATION: drop the `last_submitted` arm of the `ensure_term_durable` dedup → each repeated call
+/// submits another identical write, so `pending_writes()` climbs past 1.
+#[test]
+fn ensure_term_durable_dedups_within_the_fsync_window() {
+  use crate::Term;
+
+  let (mut ep, _log, mut stable) = make_follower();
+  // Model an async store: `hard_state()` returns the last-durable value until the write completes.
+  stable.set_last_durable_reads(true);
+
+  // Adopt a new term in memory (as an inbound higher-term message would, before its write drains).
+  ep.term = Term::new(5);
+  ep.voted_for = None;
+
+  ep.ensure_term_durable(&mut stable);
+  assert_eq!(
+    stable.pending_writes(),
+    1,
+    "the adopted term is persisted exactly once"
+  );
+
+  // Repeated calls while the write is still in flight (durable read still lags) must not re-submit.
+  ep.ensure_term_durable(&mut stable);
+  ep.ensure_term_durable(&mut stable);
+  ep.ensure_term_durable(&mut stable);
+  assert_eq!(
+    stable.pending_writes(),
+    1,
+    "no duplicate HardState writes while the first is still in the fsync window"
+  );
+}
+
 /// Emitting a tracing event runs subscriber code synchronously inside `poll_event`. A subscriber
 /// that unwinds must not have consumed the queued event: `poll_event` traces the FRONT and removes
 /// it only after, so a caught panic leaves the undelivered consensus notification queued.

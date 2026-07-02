@@ -256,6 +256,9 @@ where
       self.durable.last_submitted_lease_support = hard_state.lease_support().promised();
       self.durable.lease_support_persist_opid = id;
     }
+    // Track the vote this write carries so `ensure_term_durable` can dedup an identical re-submit while
+    // this write is still in the fsync window. Every write carries a vote, so record it unconditionally.
+    self.durable.last_submitted_vote = hard_state.vote();
     stable.submit_write(id, hard_state);
   }
 
@@ -394,13 +397,25 @@ where
       return;
     }
     let durable = stable.hard_state();
-    // also force a write when the in-memory lease-support floor has outrun the durable one — a fresh
-    // node that adopted its term via AppendEntries (no term change here) then bumped the floor on its first
-    // enforcing Heartbeat would otherwise early-return and never persist the promise it is about to advertise.
-    if durable.term() == self.term
-      && durable.vote() == self.voted_for
-      && durable.promised_lease_support() == self.durable.lease_support_floor
-    {
+    // Skip the write when the current `(term, vote, lease-support floor)` is ALREADY durable OR already
+    // carried by the most recent submitted (in-flight) write. Checking only the durable read re-submits
+    // an identical write on every inbound dispatch throughout an fsync window, since `hard_state()` lags
+    // until the write completes. The persist-before-RESPOND gates still wait on the in-flight write's
+    // completion, so deduping a redundant re-submit changes nothing observable — only the store load.
+    // (The floor check also forces a write when the in-memory floor outran what was persisted — a node
+    // that adopted its term via AppendEntries then bumped the floor on its first enforcing heartbeat.)
+    let matches_state = |term: Term, vote: &Option<I>, floor: Option<Duration>| {
+      term == self.term && *vote == self.voted_for && floor == self.durable.lease_support_floor
+    };
+    if matches_state(
+      durable.term(),
+      &durable.vote(),
+      durable.promised_lease_support(),
+    ) || matches_state(
+      self.durable.last_submitted_term,
+      &self.durable.last_submitted_vote,
+      self.durable.last_submitted_lease_support,
+    ) {
       return;
     }
     let opid = self.mint_op_id();
