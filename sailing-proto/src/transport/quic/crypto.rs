@@ -174,6 +174,26 @@ const fn clamp_keep_alive(v: u64) -> u64 {
   }
 }
 
+/// Cap the EFFECTIVE initial-RTT estimate against the idle timeout. quinn reaps an idle connection
+/// after `max(max_idle_timeout, 3 * PTO)` (QUIC's minimum-idle rule), and before the first RTT
+/// sample the probe timeout (PTO) is seeded from `initial_rtt`. An `initial_rtt` larger than roughly
+/// `idle/3` therefore pushes `3 * PTO` past the configured idle timeout, making THAT the effective
+/// idle — so a connection (a CLOSED one included) lingers far beyond `max_idle_timeout`, pinning a
+/// `max_connections` slot for potentially a year on a units mistake (e.g. a nanosecond count pasted
+/// into this millisecond field). Capping the effective `initial_rtt`
+/// at `idle/3` keeps `3 * PTO` within the idle budget; a `0` cap (an idle timeout below 3 ms) floors
+/// to the `1`-ms minimum so quinn never receives a zero RTT estimate. `idle_timeout_millis` is the
+/// already-clamped resolved value, so the cap is computed against the timeout actually installed.
+const fn effective_initial_rtt_millis(initial_rtt_millis: u64, idle_timeout_millis: u64) -> u64 {
+  let cap = idle_timeout_millis / 3;
+  let capped = if initial_rtt_millis > cap {
+    cap
+  } else {
+    initial_rtt_millis
+  };
+  if capped == 0 { 1 } else { capped }
+}
+
 // `serde(default = "…")` needs a function PATH (the pinned consts above are private, so they cannot
 // be named in an `#[arg(default_value_t = …)]` from another module either — but they ARE in scope
 // here, which is all the clap mirror needs). Each value knob's serde default is wrapped to return
@@ -669,7 +689,14 @@ impl QuicOptions {
     if keep_alive > 0 {
       tc.keep_alive_interval(Some(Duration::from_millis(keep_alive)));
     }
-    tc.initial_rtt(Duration::from_millis(tuning.initial_rtt_millis()));
+    // Cap the initial RTT against the idle timeout: quinn's effective idle is `max(idle, 3 * PTO)`
+    // and the pre-sample PTO is seeded from `initial_rtt`, so an over-large `initial_rtt` would let
+    // `3 * PTO` dominate the idle timeout and keep even a closed connection pinned far past it (see
+    // `effective_initial_rtt_millis`).
+    tc.initial_rtt(Duration::from_millis(effective_initial_rtt_millis(
+      tuning.initial_rtt_millis(),
+      tuning.idle_timeout_millis(),
+    )));
     tc.max_concurrent_bidi_streams(VarInt::from_u32(MAX_BIDI_STREAMS));
     // Close the protocol surfaces this transport does NOT use, so a buggy/version-skewed but
     // fully validated peer cannot pin connection-level receive credit or memory on them:
@@ -1135,6 +1162,37 @@ pub(crate) mod tests {
         "the clamped timer {ms} ms must be Instant-addable"
       );
     }
+    let _ = QuicOptions::build_transport(&t);
+  }
+
+  #[test]
+  fn initial_rtt_is_capped_against_the_idle_timeout() {
+    // The default RTT is well under idle/3, so it passes through unchanged.
+    assert_eq!(
+      effective_initial_rtt_millis(INITIAL_RTT_MILLIS, IDLE_TIMEOUT_MILLIS),
+      INITIAL_RTT_MILLIS
+    );
+    // A pathological initial RTT (e.g. a nanosecond count pasted into the millisecond field) is
+    // capped at idle/3, so quinn's 3*PTO stays within the idle budget instead of dominating it and
+    // keeping a closed connection pinned far past max_idle_timeout (a max_connections slot leak).
+    let idle = IDLE_TIMEOUT_MILLIS;
+    assert_eq!(
+      effective_initial_rtt_millis(50_000_000, idle),
+      idle / 3,
+      "a huge initial RTT is capped at idle/3"
+    );
+    // Even the clamped timer ceiling cannot dominate the idle timeout.
+    assert_eq!(
+      effective_initial_rtt_millis(MAX_TIMER_MILLIS, idle),
+      idle / 3
+    );
+    // A degenerate idle timeout (below 3 ms) floors the cap to the 1-ms minimum, never 0.
+    assert_eq!(effective_initial_rtt_millis(50, 1), 1);
+    assert_eq!(effective_initial_rtt_millis(50, 2), 1);
+    // build_transport wires the cap in: a pathological tuning still builds a finite config.
+    let t = QuicTuning::new()
+      .with_idle_timeout_millis(3_000)
+      .with_initial_rtt_millis(50_000_000);
     let _ = QuicOptions::build_transport(&t);
   }
 
