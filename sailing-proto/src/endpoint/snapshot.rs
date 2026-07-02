@@ -935,7 +935,16 @@ where
         return;
       }
       self.maybe_flush_deferred_reads(now, log, stable);
-      self.maybe_send_append(now, from, log, stable);
+      self.maybe_send_append(now, from.cheap_clone(), log, stable);
+      // maybe_flush_deferred_reads / maybe_send_append can self-poison → fail-stop before the transfer
+      // tail attempts a TimeoutNow on a dead node (mirrors on_append_response).
+      if self.poison.poisoned {
+        return;
+      }
+      // Leader transfer: a transferee that caught up via this snapshot must trigger the handoff too —
+      // its match jumps to last_index on the snapshot ack and never advances again, so the append-path
+      // trigger would never fire.
+      self.maybe_hand_off_to_transferee(&from, log);
     }
   }
 }
