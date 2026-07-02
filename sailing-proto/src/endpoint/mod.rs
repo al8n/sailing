@@ -603,6 +603,11 @@ struct Durability<I> {
   /// The highest lease-support floor ever submitted to the `StableStore` (paired with
   /// `lease_support_persist_opid`, exactly like `last_submitted_term`/`term_persist_opid`).
   last_submitted_lease_support: Option<Duration>,
+  /// The `vote` carried by the most recent HardState write submitted to the `StableStore`. Lets
+  /// `ensure_term_durable` skip re-submitting an identical `(term, vote, floor)` write while an earlier
+  /// one is still in the fsync window — the durable `hard_state()` read lags until it completes, so
+  /// comparing only against it re-submits the same write on every inbound dispatch (load amplification).
+  last_submitted_vote: Option<I>,
   /// The highest lease-support floor whose HardState write has reached stable storage. A follower must NOT
   /// advertise its real `lease_support` until `durable_lease_support >= Some(this_run)` — otherwise a crash
   /// in the fsync window erases a promise the leader already counted toward a live lease (persist-before-
@@ -1271,6 +1276,7 @@ where
         // `ensure_term_durable`); until then `durable_lease_support` is None and the advertise gate emits ZERO.
         lease_support_floor: None,
         last_submitted_lease_support: None,
+        last_submitted_vote: None,
         durable_lease_support: None,
         lease_support_persist_opid: OpId::ZERO,
         committed_persisted: Index::ZERO,

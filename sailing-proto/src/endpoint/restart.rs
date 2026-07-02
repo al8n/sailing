@@ -493,6 +493,8 @@ where
         // floor already equals the recovered value, so the gate is true immediately (no advertise stall).
         lease_support_floor,
         last_submitted_lease_support: recovered_floor,
+        // The recovered durable vote IS what was last submitted (and is durable).
+        last_submitted_vote: hs.vote(),
         durable_lease_support: recovered_floor,
         lease_support_persist_opid: OpId::ZERO,
         // Recovered commit is already durable in HardState — seed `committed_persisted` to it so
