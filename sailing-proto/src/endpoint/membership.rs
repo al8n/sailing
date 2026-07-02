@@ -173,6 +173,24 @@ where
         return Err(ProposeError::InvalidConfChange);
       }
     }
+    // Reject a conf change whose entry would exceed one transport frame BEFORE it enters the log: the
+    // `context` is caller-controlled and arbitrarily large, so without this an oversized conf change
+    // would wedge replication exactly as an oversized `propose` (the entry no `AppendEntries` can carry
+    // sits at every follower's suffix and re-closes the connection on each resend). Checked here rather
+    // than in `append_conf_change` because that path is shared with the always-small auto-leave append.
+    {
+      let mut buf = Vec::new();
+      crate::wire::encode_conf_change_v2(&cc, &mut buf);
+      let cost = buf
+        .len()
+        .saturating_add(crate::wire::ENTRY_WIRE_OVERHEAD_MAX);
+      if cost > crate::wire::APPEND_FRAME_ENTRY_BUDGET {
+        return Err(ProposeError::EntryTooLarge {
+          size: cost,
+          max: crate::wire::APPEND_FRAME_ENTRY_BUDGET,
+        });
+      }
+    }
     // append_conf_change appends the entry (durable-pending) BEFORE its broadcast, so a broadcast self-poison
     // does not un-append it — report Ok(index). It returns None ONLY for a genuine LogIndexExhausted (the
     // already-poisoned entry case is caught by this method's own entry guard above, so it can't reach here),

@@ -1158,3 +1158,32 @@ fn auto_leave_is_frozen_during_leader_transfer() {
     "auto-leave resumes and appends leave-joint once the transfer clears"
   );
 }
+
+/// A conf change whose entry would exceed one transport frame — here via a large caller-supplied
+/// `context` — is refused at propose time, just like an oversized `propose`. Without the guard the
+/// membership path would append an entry no `AppendEntries` could carry, wedging replication.
+///
+/// MUTATION: remove the frame-fit check in `propose_conf_change_v2` → the oversized conf change is
+/// appended and returns `Ok`, so the refuse-and-not-appended assertions below fail.
+#[test]
+fn oversized_conf_change_context_is_refused() {
+  use crate::{ConfChangeTransition, ConfChangeType, ProposeError};
+
+  let (mut ep, mut log, stable, d) = make_three_node_leader();
+  let before = log.last_index();
+  let cc = ConfChangeV2::new(
+    ConfChangeTransition::Auto,
+    std::vec![ConfChangeSingle::new(ConfChangeType::AddNode, 4u64)],
+    bytes::Bytes::from(std::vec![0u8; crate::wire::MAX_FRAME_BYTES]), // 64 MiB context
+  );
+  let r = ep.propose_conf_change_v2(d, &mut log, &stable, cc);
+  assert!(
+    matches!(r, Err(ProposeError::EntryTooLarge { .. })),
+    "an oversized conf-change context must be refused, got {r:?}"
+  );
+  assert_eq!(
+    log.last_index(),
+    before,
+    "the oversized conf change must NOT be appended"
+  );
+}
