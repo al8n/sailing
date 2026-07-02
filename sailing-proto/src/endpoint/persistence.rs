@@ -608,7 +608,14 @@ where
     // flight, the leader appends an empty leave-joint entry to transition back to a simple
     // config. Re-evaluated each call so a freshly-elected leader also finishes the job.
     // The condition stops once is_joint() is false — no infinite loop risk.
+    //
+    // Frozen during a leader transfer: `propose`/`propose_conf_change_v2` stop appending so the
+    // transferee can catch up to a fixed `last_index` and win its forced election. Appending
+    // leave-joint here would advance `last_index` past the transferee, so its `TimeoutNow` campaign is
+    // rejected on `log_ok` and the cluster is leaderless for an election timeout. The re-evaluation each
+    // call resumes the auto-leave once the transfer resolves (etcd drops proposals during a transfer).
     if self.role.is_leader()
+      && self.transfer.lead_transferee.is_none()
       && self.tracker.is_joint()
       && self.tracker.auto_leave()
       && self.pending_conf_index <= self.applied
