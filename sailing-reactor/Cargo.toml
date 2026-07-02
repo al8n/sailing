@@ -33,6 +33,10 @@ serde = ["sailing-driver/serde"]
 clap = ["sailing-driver/clap"]
 unverified-wall-clock = ["sailing-driver/unverified-wall-clock"]
 
+# Emit `tracing` events for consensus milestones (forwarded to the protocol core, which owns the
+# instrumentation). Off by default = zero cost.
+tracing = ["sailing-proto/tracing"]
+
 [dependencies]
 sailing-proto = { workspace = true, features = ["tls", "quic"] }
 sailing-driver.workspace = true

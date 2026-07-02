@@ -57,6 +57,11 @@ quic-platform-verifier = ["sailing-proto/quic-platform-verifier", "sailing-react
 serde = ["std", "sailing-proto/serde", "sailing-reactor?/serde", "sailing-compio?/serde"]
 clap = ["std", "sailing-proto/clap", "sailing-reactor?/clap", "sailing-compio?/clap"]
 
+# Emit `tracing` events for consensus milestones (leader/term changes, commits, snapshot installs,
+# membership + read-mode changes), forwarded to the core and whichever drivers are enabled. Off by
+# default = zero cost, no `std` required.
+tracing = ["sailing-proto/tracing", "sailing-reactor?/tracing", "sailing-compio?/tracing"]
+
 # The raw-SystemTime wall-clock source (off by default; std drivers only — see the driver docs).
 unverified-wall-clock = [
   "sailing-reactor?/unverified-wall-clock",
