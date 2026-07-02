@@ -62,6 +62,33 @@ const MAX_ID_LEN: usize = 1024;
 /// layer derives its own limit from this const.
 pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
+/// An upper bound on one [`crate::Entry`]'s wire cost inside an `AppendEntries` frame: its non-`data`
+/// fields (`term`/`index`/`kind`/`timestamp`/`lease_window`/`wall_timestamp`, each ≤ a 1-byte tag plus
+/// a 10-byte `uint64` varint, plus the `data` field's tag and length varint) AND the repeated-field
+/// framing that wraps the entry inside the message (a tag plus a length varint). The exact worst case
+/// is 78 bytes; 128 leaves headroom and stays negligible against [`MAX_FRAME_BYTES`].
+pub(crate) const ENTRY_WIRE_OVERHEAD_MAX: usize = 128;
+
+/// An upper bound on the `AppendEntries` bytes that are NOT entries: the header (`term`; the leader id
+/// as a length-delimited `bytes` field ≤ [`MAX_ID_LEN`]; `prev_log_index`; `prev_log_term`;
+/// `leader_commit`), the `Message` oneof envelope, and the 4-byte transport frame length prefix. The
+/// exact worst case is `MAX_ID_LEN + 56`; the extra headroom absorbs anything this estimate misses.
+pub(crate) const APPEND_ENTRIES_HEADER_RESERVE: usize = MAX_ID_LEN + 256;
+
+/// The largest total entry cost (each entry's `data` length plus [`ENTRY_WIRE_OVERHEAD_MAX`]) that one
+/// `AppendEntries` frame can carry within [`MAX_FRAME_BYTES`]. `propose` refuses an entry whose cost
+/// alone exceeds this — such an entry could never traverse the transport, so a follower's connection
+/// would close on every resend and replication would wedge cluster-wide — and the per-follower packing
+/// loop stops a batch before it crosses this bound.
+pub(crate) const APPEND_FRAME_ENTRY_BUDGET: usize = MAX_FRAME_BYTES - APPEND_ENTRIES_HEADER_RESERVE;
+
+/// One [`crate::Entry`]'s upper-bound wire cost inside an `AppendEntries` frame (see
+/// [`ENTRY_WIRE_OVERHEAD_MAX`]). Saturating so a pathological `data` length cannot overflow `usize`.
+#[inline]
+pub(crate) fn entry_frame_cost(entry: &crate::Entry) -> usize {
+  entry.data().len().saturating_add(ENTRY_WIRE_OVERHEAD_MAX)
+}
+
 /// The encoded byte length of the `InstallSnapshot` frame this would produce:
 ///
 /// ```ignore
