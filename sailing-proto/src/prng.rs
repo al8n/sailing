@@ -56,20 +56,24 @@ impl rand_core::TryRng for Prng {
 /// so the default [`Prng`] reproduces the simulator's byte-identical stream.
 #[inline]
 pub(crate) fn election_timeout<R: rand::Rng>(rng: &mut R, base: Duration) -> Duration {
-  // Jitter is drawn at NANOSECOND granularity. A millisecond-granular draw (`next_u64() % base_ms`)
-  // collapses to zero for any sub-2 ms base — `base_ms` rounds to 0 or 1, and `x % {0,1}` is always
-  // 0 — pinning the timeout to exactly `base` and defeating Raft's [T, 2T) split-vote randomization
-  // for sub-millisecond election timeouts.
-  let base_ns = base.as_nanos();
-  let extra_ns = if base_ns == 0 {
-    0
+  let base_ms = base.as_millis() as u64;
+  if base_ms >= 2 {
+    // Realistic election timeouts: millisecond-granular jitter, kept byte-identical to the historical
+    // behavior so it does not perturb the simulator's RNG-derived schedules (`next_u64() % base_ms`
+    // has a meaningful non-degenerate range once `base_ms >= 2`).
+    base + Duration::from_millis(rng.next_u64() % base_ms)
   } else {
-    // `next_u64()` is the u64 dividend, so its remainder modulo any positive `base_ns` never exceeds
-    // it and always fits back into u64 — the `as u64` is lossless for any `base`. Exactly ONE draw
-    // on this non-zero path preserves the simulator's byte-identical single-draw stream (see above).
-    (rng.next_u64() as u128 % base_ns) as u64
-  };
-  base + Duration::from_nanos(extra_ns)
+    // Sub-2ms timeouts: `base_ms` is 0 or 1, so `x % base_ms` collapses to 0, pinning the timeout to
+    // exactly `base` and defeating Raft's [T, 2T) split-vote randomization. Draw at NANOSECOND
+    // granularity instead. `next_u64()` is the u64 dividend, so its remainder modulo any positive
+    // `base_ns` fits back into u64 (the `as u64` is lossless). A degenerate zero base draws nothing.
+    let base_ns = base.as_nanos();
+    if base_ns == 0 {
+      base
+    } else {
+      base + Duration::from_nanos((rng.next_u64() as u128 % base_ns) as u64)
+    }
+  }
 }
 
 #[cfg(test)]
