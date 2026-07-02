@@ -1135,3 +1135,36 @@ fn encoder_cache_is_bounded_and_clears() {
   enc.clear();
   assert_eq!(enc.cached_body_len(), None);
 }
+
+/// A frame packed with unknown protobuf fields is rejected rather than materializing an unbounded run
+/// of `UnknownField` entries: `decode_message` caps the allowance at [`MAX_UNKNOWN_FIELDS`].
+///
+/// MUTATION: revert `decode_message` to buffa's default allowance (1,000,000) → a frame with far more
+/// unknown fields than the cap decodes without error (or allocates megabytes first), failing this.
+#[test]
+fn decode_rejects_a_frame_stuffed_with_unknown_fields() {
+  fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+      let b = (v & 0x7f) as u8;
+      v >>= 7;
+      if v == 0 {
+        buf.push(b);
+        break;
+      }
+      buf.push(b | 0x80);
+    }
+  }
+
+  // Each entry is a `uint64` field at an unused high field number (100), which `pb::Message` does not
+  // recognize and so counts as one unknown field. More than the cap must be refused.
+  let mut buf = Vec::new();
+  for _ in 0..(MAX_UNKNOWN_FIELDS + 8) {
+    push_varint(&mut buf, (100u64 << 3) | 0); // tag: field 100, wire type 0 (varint)
+    push_varint(&mut buf, 0); // its value
+  }
+  let r = decode_message::<u64>(bytes::Bytes::from(buf));
+  assert!(
+    r.is_err(),
+    "a frame with more than MAX_UNKNOWN_FIELDS unknown fields must be rejected"
+  );
+}
