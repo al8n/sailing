@@ -1498,6 +1498,40 @@ fn ensure_term_durable_dedups_within_the_fsync_window() {
   );
 }
 
+/// The leader-scoped replication dirty flags are leadership-scoped: `append_leader_noop` marks
+/// `replication_pending` (so a lease-refresh no-op rides the coalesced flush, not just the ~1-RTT-later
+/// heartbeat-response pump), and `become_leader` clears the lease-refresh flags that a prior, deposed
+/// term may have left set (so they cannot trigger a spurious refresh in the fresh leadership).
+///
+/// MUTATION: drop the `replication_pending = true` in `append_leader_noop` → the first assertion fails;
+/// drop the flag resets in `become_leader` → the stale lease flags survive and the later ones fail.
+#[test]
+fn leader_scoped_dirty_flags_are_reset_on_becoming_leader() {
+  let (mut ep, mut log, mut stable, d) = make_single_node_leader();
+
+  // append_leader_noop marks replication_pending for the coalesced fan-out.
+  ep.replication_pending = false;
+  let last = log.last_index();
+  ep.append_leader_noop(d.into(), &mut log, last);
+  assert!(
+    ep.replication_pending,
+    "a leader no-op marks replication_pending for the coalesced flush"
+  );
+
+  // Stale lease-refresh flags (as a prior term's activity would leave) are reset on becoming leader.
+  ep.lease_guard.lease_refresh_wanted = true;
+  ep.lease_guard.read_since_anchor = true;
+  ep.become_leader(d.into(), &mut log, &mut stable);
+  assert!(
+    !ep.lease_guard.lease_refresh_wanted,
+    "lease_refresh_wanted is reset on becoming leader"
+  );
+  assert!(
+    !ep.lease_guard.read_since_anchor,
+    "read_since_anchor is reset on becoming leader"
+  );
+}
+
 /// Emitting a tracing event runs subscriber code synchronously inside `poll_event`. A subscriber
 /// that unwinds must not have consumed the queued event: `poll_event` traces the FRONT and removes
 /// it only after, so a caught panic leaves the undelivered consensus notification queued.
