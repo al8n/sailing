@@ -921,6 +921,9 @@ impl<I> Config<I> {
     if self.voters.is_empty() {
       return Err(ConfigError::EmptyVoters);
     }
+    if self.snapshot_threshold == 0 {
+      return Err(ConfigError::ZeroSnapshotThreshold);
+    }
     if self.snapshot_chunk_bytes == 0 || self.snapshot_chunk_bytes > MAX_SNAPSHOT_CHUNK_BYTES {
       return Err(ConfigError::SnapshotChunkBytesOutOfRange {
         value: self.snapshot_chunk_bytes,

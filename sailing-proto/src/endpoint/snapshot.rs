@@ -245,8 +245,11 @@ where
       // Nothing has been applied yet — nothing to snapshot.
       return;
     }
+    // Floor the threshold at 1: `Config::validate` rejects a zero `snapshot_threshold`, but
+    // `Endpoint::new` does not validate, and a zero threshold would make `x < 0` always false and
+    // capture a full snapshot on every drain — a perpetual snapshot/compaction loop.
     if self.applied.get().saturating_sub(log.first_index().get())
-      < self.config.snapshot_threshold() as u64
+      < (self.config.snapshot_threshold() as u64).max(1)
     {
       return;
     }
