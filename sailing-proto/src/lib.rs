@@ -88,6 +88,9 @@ pub use event::{Applied, ConfChanged, Event, LeaderChanged, ReadModeChanged};
 mod endpoint;
 pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 
+mod multi;
+pub use multi::{GroupExists, GroupId, MultiRaft};
+
 mod tracker;
 pub(crate) use tracker::Tracker;
 
