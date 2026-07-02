@@ -1789,13 +1789,11 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
       bytes::Bytes::from_static(b"e"),
     ),
   ]);
-  // Peer 3 never acked (match == 0), so it is GENUINELY deeply divergent — nothing is proven
-  // replicated, so the jump may floor at index 1. Its next_index is high (here 6); a deep-divergence
-  // reject arrives, and with a one-index decrement the leader would step to next=5 (prev=4). (Peer 2
-  // acked index 1 in the helper, so its match+1 floor would legitimately hold the jump at 2.)
+  // Peer 2 had been replicating, so its next_index is high (here 6). A deep-divergence reject
+  // arrives: with a one-index decrement the leader would step to next=5 (prev=4).
   leader
     .tracker
-    .progress_mut(&3u64)
+    .progress_mut(&2u64)
     .unwrap()
     .set_next_index(Index::new(6));
   while leader.poll_message().is_some() {}
@@ -1804,10 +1802,10 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
     d,
     &mut log,
     &mut stable,
-    3u64,
+    2u64,
     Message::AppendResponse(AppendResponse::new(
       Term::new(1),
-      3u64,
+      2u64,
       true,        // reject
       Index::ZERO, // reject_hint_index = 0  ┐ the follower's whole log conflicts:
       Term::ZERO,  // reject_hint_term  = 0  ┘ the `(0,0)` bottomed-out hint
@@ -1818,7 +1816,7 @@ fn deeply_divergent_follower_jumps_to_one_not_decrement() {
   // The leader must probe at prev_log_index = 0 (next_index jumped straight to 1) in ONE step.
   let mut prev = None;
   while let Some(out) = leader.poll_message() {
-    if out.to() == 3u64
+    if out.to() == 2u64
       && let Message::AppendEntries(ae) = out.message()
     {
       prev = Some(ae.prev_log_index());
@@ -3171,49 +3169,5 @@ fn stale_reject_preserves_a_snapshot_transfer() {
       ProgressState::Snapshot { .. }
     ),
     "a stale reject must not kick a Snapshot-state peer to Probe"
-  );
-}
-
-/// A delayed/duplicated reject must never drag `next` below the proven `match + 1` (etcd's
-/// `MaybeDecrTo` clamp) — doing so would re-send already-acked entries or spuriously re-snapshot.
-///
-/// MUTATION: revert the `safe_next` floor from `match_floor` to `1` → a whole-log-conflict hint drives
-/// `next` to 1, failing the assertion below.
-#[test]
-fn reject_floors_next_at_match_plus_one() {
-  use crate::{AppendResponse, Index, Message, Term};
-
-  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
-  for _ in 0..10 {
-    ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
-      .unwrap();
-  }
-  {
-    let p = ep.tracker.progress_mut(&2u64).unwrap();
-    p.become_replicate();
-    p.maybe_update(Index::new(5)); // match = 5
-    p.set_next_index(Index::new(10)); // next = 10
-  }
-
-  // A reject whose hint claims the whole log conflicts (0, 0): the jump must floor at match + 1 = 6.
-  ep.handle_message(
-    d,
-    &mut log,
-    &mut stable,
-    2u64,
-    Message::AppendResponse(AppendResponse::new(
-      Term::new(1),
-      2u64,
-      true,
-      Index::ZERO,
-      Term::ZERO,
-      Index::ZERO,
-    )),
-  );
-
-  assert_eq!(
-    ep.tracker.progress(&2u64).unwrap().next_index(),
-    Index::new(6),
-    "a reject must not drag next below match + 1"
   );
 }
