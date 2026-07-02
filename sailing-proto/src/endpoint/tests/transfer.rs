@@ -966,3 +966,55 @@ fn timeout_now_is_authenticated_against_current_leader() {
     "the leader-authorized TimeoutNow must broadcast RequestVote"
   );
 }
+
+/// A leader-transfer target that catches up via an `InstallSnapshot` (not `AppendEntries`) must still
+/// be sent `TimeoutNow`: its match jumps to `last_index` on the snapshot ack and never advances again,
+/// so the append-path trigger alone would never fire and the transfer would silently abort at its
+/// deadline.
+///
+/// MUTATION: remove the `maybe_hand_off_to_transferee` call from `on_snapshot_response` → no
+/// `TimeoutNow` is sent on the snapshot ack, so `forced_handoff_this_term` stays false.
+#[test]
+fn transfer_to_a_snapshot_target_sends_timeout_now() {
+  use crate::{Index, Message, SnapshotResponse, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  // Advance the log tip to 2 so node 2 (match 1) is genuinely behind, then force it into Snapshot
+  // state (behind the compaction horizon). Its match stays at 1 < last_index 2.
+  ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"x"))
+    .expect("leader accepts the proposal");
+  assert_eq!(log.last_index(), Index::new(2));
+  ep.tracker
+    .progress_mut(&2u64)
+    .unwrap()
+    .become_snapshot(Index::new(2), 9);
+
+  // Transfer to node 2. It is NOT caught up (match 1 < last_index 2), so no TimeoutNow yet — the
+  // transfer waits with node 2 as the pending transferee.
+  ep.transfer_leader(d, &log, &stable, 2u64).unwrap();
+  assert!(
+    !ep.transfer.forced_handoff_this_term,
+    "no TimeoutNow before the target catches up"
+  );
+  assert_eq!(
+    ep.transfer.lead_transferee,
+    Some(2u64),
+    "node 2 is the pending transferee"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Node 2 installs the snapshot and acks a match at the log tip (index 2) — via the SNAPSHOT path.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(SnapshotResponse::new(Term::new(1), 2u64, false, Index::new(2))),
+  );
+
+  // The handoff fired: TimeoutNow was sent (which arms the forced-handoff flag).
+  assert!(
+    ep.transfer.forced_handoff_this_term,
+    "a transferee that caught up via snapshot must be sent TimeoutNow"
+  );
+}

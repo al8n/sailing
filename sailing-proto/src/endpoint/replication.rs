@@ -1381,20 +1381,33 @@ where
           return;
         }
         // Leader transfer: if this peer just caught up to last_index, send TimeoutNow.
-        if self.transfer.lead_transferee.as_ref() == Some(&from) {
-          let peer_match = self
-            .tracker
-            .progress(&from)
-            .map(|p| p.match_index())
-            .unwrap_or(crate::Index::ZERO);
-          if peer_match == log.last_index() {
-            let (term, me) = (self.term, self.config.id());
-            self.send(from, Message::TimeoutNow(crate::TimeoutNow::new(term, me)));
-            // a forced campaign is now authorized for this term — disable LeaseBased reads for the
-            // rest of it (the forced campaign can elect a new leader at any later point, even post-abort).
-            self.transfer.forced_handoff_this_term = true;
-          }
-        }
+        self.maybe_hand_off_to_transferee(&from, log);
+      }
+    }
+  }
+
+  /// If `from` is the leader-transfer target and it has now caught up to the log tip, send it a
+  /// `TimeoutNow` to trigger its forced campaign. Shared by the append-ack ([`on_append_response`]) and
+  /// snapshot-ack ([`on_snapshot_response`](Self::on_snapshot_response)) paths: a transferee that
+  /// catches up via `InstallSnapshot` (its match jumps to `last_index` on the snapshot ack, never
+  /// again advancing) must trigger the handoff exactly as one that catches up via `AppendEntries` —
+  /// otherwise the transfer silently aborts at its deadline.
+  pub(crate) fn maybe_hand_off_to_transferee<L: LogStore>(&mut self, from: &I, log: &L) {
+    if self.transfer.lead_transferee.as_ref() == Some(from) {
+      let peer_match = self
+        .tracker
+        .progress(from)
+        .map(|p| p.match_index())
+        .unwrap_or(crate::Index::ZERO);
+      if peer_match == log.last_index() {
+        let (term, me) = (self.term, self.config.id());
+        self.send(
+          from.cheap_clone(),
+          Message::TimeoutNow(crate::TimeoutNow::new(term, me)),
+        );
+        // a forced campaign is now authorized for this term — disable LeaseBased reads for the
+        // rest of it (the forced campaign can elect a new leader at any later point, even post-abort).
+        self.transfer.forced_handoff_this_term = true;
       }
     }
   }
