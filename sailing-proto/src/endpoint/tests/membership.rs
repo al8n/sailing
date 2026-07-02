@@ -1050,3 +1050,111 @@ fn candidate_removed_by_own_conf_change_steps_down_and_cannot_lead() {
     "the refused would-be leader steps down to follower"
   );
 }
+
+/// Auto-leave must be FROZEN during a leader transfer: appending the leave-joint entry would advance
+/// `last_index` past the caught-up transferee, so its forced `TimeoutNow` campaign loses on `log_ok`
+/// and the cluster is leaderless for an election timeout. With a transfer in progress the leader holds
+/// the joint config; once the transfer resolves it resumes and appends leave-joint.
+///
+/// MUTATION: drop the `lead_transferee.is_none()` guard on the auto-leave condition → the leave-joint
+/// entry is appended while the transfer is in progress, advancing `last_index` and leaving the joint
+/// config early, so the frozen-window assertions below fail.
+#[test]
+fn auto_leave_is_frozen_during_leader_transfer() {
+  use crate::{AppendResponse, ConfChangeTransition, ConfChangeType, Index, Message, Term};
+  use core::time::Duration;
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  // Elect node 1 and commit its no-op.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_event().is_some() {}
+  while ep.poll_message().is_some() {}
+
+  // An IMPLICIT joint change (auto_leave = true): add node 4, remove node 3. Node 1 stays in both
+  // halves, so it keeps leading through the joint phase.
+  let ccv2 = ConfChangeV2::new(
+    ConfChangeTransition::Implicit,
+    std::vec![
+      ConfChangeSingle::new(ConfChangeType::AddNode, 4u64),
+      ConfChangeSingle::new(ConfChangeType::RemoveNode, 3u64),
+    ],
+    bytes::Bytes::new(),
+  );
+  let idx = ep
+    .propose_conf_change_v2(d, &mut log, &stable, ccv2)
+    .expect("joint conf change must be accepted");
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  while ep.poll_message().is_some() {}
+
+  // A leader transfer is now in progress (transferee is node 2, a voter in the new config).
+  ep.transfer.lead_transferee = Some(2u64);
+  let last_before = log.last_index();
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.tracker.is_joint(),
+    "auto-leave must be frozen during a transfer — the cluster stays joint"
+  );
+  assert_eq!(
+    log.last_index(),
+    last_before,
+    "no leave-joint entry is appended while the transfer is in progress"
+  );
+
+  // The transfer resolves: auto-leave resumes and appends the leave-joint entry.
+  ep.transfer.lead_transferee = None;
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    log.last_index() > last_before,
+    "auto-leave resumes and appends leave-joint once the transfer clears"
+  );
+}
