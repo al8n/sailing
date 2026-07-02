@@ -4686,3 +4686,70 @@ fn receiver_stages_out_of_order_chunks_by_offset() {
     "the completed install sends exactly one success ack at the snapshot boundary"
   );
 }
+
+/// A deferred snapshot install whose blob becomes durable AFTER this node left the follower role must
+/// NOT run: the destructive re-baseline would discard the log tail the election was counted on (Leader
+/// Completeness), and the `pending_stable` retain would delete a live `Pending::Campaign` self-vote
+/// (making `self_vote_durable()` lie). A candidate/leader holds every committed entry through the
+/// boundary already, so the install is dropped.
+///
+/// MUTATION: remove the `!self.role.is_follower()` guard atop `install_snapshot_now` → the candidate's
+/// visible tail (11..=15) is truncated to the boundary (10) and its campaign pending is deleted, so the
+/// tail and campaign assertions below fail.
+#[test]
+fn deferred_install_off_follower_preserves_log_and_campaign() {
+  use super::super::{Pending, Role};
+  use crate::{Entry, EntryKind, Index, Term, conf::ConfState};
+
+  let (mut ep, mut log, _stable) = make_follower();
+
+  // A visible, consistent log tail through index 15; commit and durable_index sit BELOW the snapshot
+  // boundary (10) so the completion-time redundancy check does not drop the install on its own.
+  let entries: Vec<_> = (1u64..=15)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"x"),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+  ep.commit = Index::new(5);
+  ep.applied = Index::new(5);
+  ep.durable.durable_index = Index::new(5);
+
+  // The node campaigned before the deferred install's blob became durable: it is now a candidate at a
+  // higher term with a durable self-vote still pending.
+  ep.term = Term::new(2);
+  ep.role = Role::Candidate;
+  let opid = ep.mint_op_id_for_test();
+  ep.pending_stable
+    .push_back((opid, Pending::Campaign { term: Term::new(2) }));
+
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(1),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.install_snapshot_now(&mut log, meta, 7u64, 1u64);
+
+  assert!(!ep.poison.poisoned, "the guarded drop must not poison");
+  assert_eq!(
+    log.last_index(),
+    Index::new(15),
+    "the election-counted visible tail must survive an off-follower install"
+  );
+  assert!(
+    ep.pending_stable
+      .iter()
+      .any(|(_, p)| matches!(p, Pending::Campaign { .. })),
+    "the campaign self-vote pending must survive"
+  );
+  assert!(ep.role().is_candidate(), "the node stays a candidate");
+  assert!(
+    core::iter::from_fn(|| ep.poll_event()).all(|e| !e.is_snapshot_installed()),
+    "no SnapshotInstalled event for a dropped off-follower install"
+  );
+}

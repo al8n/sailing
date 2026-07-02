@@ -686,6 +686,21 @@ where
     if self.poison.poisoned {
       return;
     }
+    // Only a FOLLOWER installs a snapshot (etcd parity). A deferred install can complete after this node
+    // became a candidate or leader — its blob fsync outliving an election it won on a longer, visible
+    // log. Running the re-baseline below would then discard the log tail the election was counted on
+    // (Leader Completeness), and the `pending_stable` retain further down would delete a live
+    // `Pending::Campaign` self-vote (so `self_vote_durable()` would wrongly report the self-vote durable,
+    // reopening a same-term double vote). A winner already holds every committed entry through the
+    // boundary (the up-to-date check + Leader Completeness), so the snapshot is redundant with entries it
+    // has — drop it. The blob stays durable in the store: a genuinely-behind candidate that reverts to
+    // follower re-fetches from the leader (its ack never advanced), and a restart would
+    // `reconcile_restart_log::Restore` to the boundary. Skipping the `durable_snapshot_index` raise below
+    // is deliberate here: for a leader it would claim local durability at a boundary the real log has not
+    // yet reached.
+    if !self.role.is_follower() {
+      return;
+    }
     // this runs ONLY once the blob is durable (the matching `SnapshotWritten` or `durable_snapshot()`
     // evidence), so the snapshot boundary is now a durable RECOVERABLE prefix — a crash would
     // `reconcile_restart_log::Restore` to it. Record it BEFORE the stale-drop below, so `ack_watermark()`
