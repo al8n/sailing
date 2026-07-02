@@ -683,10 +683,17 @@ impl<I: NodeId> Bridge<I> {
       .unwrap_or_default()
   }
 
-  /// Open the consensus send stream for a freshly `Connected` connection and stage the identity
-  /// preface as its FIRST frame. An empty preface (a cert-only identity scheme) frames nothing;
-  /// an over-budget preface closes the connection here (it could never authenticate — the peer's
-  /// pre-auth intake bound rejects it) rather than opening streams on a doomed connection.
+  /// Stage the identity preface as the FIRST frame on `h`'s consensus send stream, then open that
+  /// stream. An empty preface (a cert-only identity scheme) frames nothing; an over-budget preface
+  /// closes the connection here (it could never authenticate — the peer's pre-auth intake bound
+  /// rejects it) rather than opening streams on a doomed connection.
+  ///
+  /// The preface is staged BEFORE the stream is opened, so an open that cannot succeed yet does not
+  /// lose it: a peer that has granted no bidi stream (advertised `max_concurrent_bidi_streams == 0`)
+  /// leaves the preface staged with `preface_done` latched, and the `StreamEvent::Available` retry
+  /// (`flush_stream` -> `flush_outbound`) opens the stream and writes the preface first. The preface
+  /// therefore always leads the stream — `flush_outbound` refuses to open a stream until
+  /// `preface_done`, so a consensus frame can never become frame zero.
   pub(crate) fn open_send_and_preface(
     &mut self,
     now: Instant,
@@ -704,33 +711,31 @@ impl<I: NodeId> Bridge<I> {
       encode_frame(preface, &mut framed);
       Some(framed)
     };
-    let opened = {
+    {
       let Some(e) = self.table.entry(h) else {
         return;
       };
       if e.preface_done {
         return;
       }
-      if e.send.is_none() {
-        // `open` returns `None` only when the concurrent-stream limit is exhausted, which cannot
-        // happen for the first stream on a fresh connection.
-        match e.conn.streams().open(Dir::Bi) {
-          Some(sid) => e.send = Some(sid),
-          None => return,
-        }
-      }
-      // The send stream is empty here (consensus frames are gated until `Validated`), so the
-      // preface frame leads the stream.
+      // Stage the preface and latch `preface_done` BEFORE attempting the open: consensus frames are
+      // gated until `Validated`, so the send stream is empty here and the preface frame leads it.
       if let Some(framed) = framed_preface {
         e.outbound.extend(framed);
       }
       e.preface_done = true;
-      true
-    };
-    if opened {
-      self.flush_outbound(now, h);
-      self.service(now);
+      // Open the send stream best-effort. `open` returns `None` only when the peer advertised
+      // `max_concurrent_bidi_streams == 0` (a non-sailing peer; sailing pins MAX_BIDI_STREAMS): the
+      // preface stays staged and the `StreamEvent::Available` retry opens it once the peer grants a
+      // stream — the flush below and that retry both write the still-leading preface first.
+      if e.send.is_none()
+        && let Some(sid) = e.conn.streams().open(Dir::Bi)
+      {
+        e.send = Some(sid);
+      }
     }
+    self.flush_outbound(now, h);
+    self.service(now);
   }
 
   /// Bind the authenticated `peer` to connection `h` and promote it to [`Phase::Validated`],
@@ -1106,10 +1111,11 @@ impl<I: NodeId> Bridge<I> {
 
   /// Front-drain `h`'s staged outbound buffer into its send stream, returning whether bytes
   /// reached the stream (the caller turns progress into a service pass). A no-op when the buffer
-  /// is empty. If staged bytes exist but no send stream is open (a fresh post-`Connected` write
-  /// racing the preface step), a stream is opened first. quinn accepts a contiguous slice, so
-  /// the buffer is made contiguous and written from the front: a partial write drops only the
-  /// written prefix; `Blocked` leaves everything staged for the `Writable` retry; a terminal
+  /// is empty. If staged bytes exist but no send stream is open, one is opened first — but ONLY
+  /// after the preface has been staged (`preface_done`), so the identity preface always leads the
+  /// stream and a consensus frame can never open it as frame zero. quinn accepts a contiguous
+  /// slice, so the buffer is made contiguous and written from the front: a partial write drops only
+  /// the written prefix; `Blocked` leaves everything staged for the `Writable` retry; a terminal
   /// `Stopped`/`ClosedStream` means the peer stopped consuming consensus — the connection is
   /// closed (`close_local` services itself via the pump-end pass).
   fn flush_outbound(&mut self, now: Instant, h: ConnectionHandle) -> bool {
@@ -1121,6 +1127,13 @@ impl<I: NodeId> Bridge<I> {
         return false;
       }
       if e.send.is_none() {
+        // The identity preface is frame zero on the send stream. Opening it here before the preface
+        // has been staged would put a consensus frame first, so gate the open on `preface_done`:
+        // until `open_send_and_preface` has staged the preface, hold the staged bytes back (they
+        // flush once the preface is staged and the stream can be opened).
+        if !e.preface_done {
+          return false;
+        }
         match e.conn.streams().open(Dir::Bi) {
           Some(sid) => e.send = Some(sid),
           None => return false,

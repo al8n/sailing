@@ -961,20 +961,38 @@ fn next_frame_and_flush_on_absent_handles_are_noops() {
   a.flush_stream(now, bogus);
 }
 
-/// Staged bytes with no send stream open yet (a write racing the preface step): the flush opens the
-/// stream first, then writes.
+/// FAILS-ON-OLD: staged bytes with no send stream open must NOT open the stream until the identity
+/// preface has been staged. The preface is frame zero on the send stream, so a consensus frame
+/// queued behind an un-sent preface has to be held back — on the old code the flush opened the
+/// stream and wrote that frame as the stream's first bytes. Once the preface step latches
+/// `preface_done`, the flush opens the stream and drains the staged bytes.
 #[test]
-fn flush_outbound_opens_the_send_stream_when_needed() {
+fn flush_outbound_gates_the_stream_open_on_the_preface() {
   let ca = TestClusterCa::generate();
   let (mut a, mut b) = pair(&ca);
   let now = Instant::now();
   let (ha, _hb) = handshake(now, &mut a, &mut b);
   assert!(a.send_sid_for_test(ha).is_none());
-  a.stage_outbound_for_test(ha, &[1, 2, 3, 4]);
+
+  // A consensus frame staged with `preface_done` still false: the flush leaves the stream unopened.
+  let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(4), 1u64));
+  let mut payload = Vec::new();
+  crate::wire::encode_message(&msg, &mut payload);
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&payload, &mut framed);
+  a.stage_outbound_for_test(ha, &framed);
   a.flush_stream(now, ha);
+  assert_eq!(
+    a.send_sid_for_test(ha),
+    None,
+    "no send stream opens before the preface is staged"
+  );
+
+  // The preface step latches `preface_done`, so the flush now opens the stream for the staged bytes.
+  a.open_send_and_preface(now, ha, &[]);
   assert!(
     a.send_sid_for_test(ha).is_some(),
-    "flush opened the send stream for the staged bytes"
+    "the preface step opens the send stream"
   );
 }
 
