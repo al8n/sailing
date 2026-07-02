@@ -19,6 +19,7 @@ serde_json = "1"
 humantime = "2"
 humantime-serde = "1"
 clap = { version = "4", default-features = false, features = ["std", "derive", "env"] }
+tracing = { version = "0.1", default-features = false }
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12"] }
 rustls-pemfile = "2"
 quinn-proto = { version = "0.11", default-features = false }

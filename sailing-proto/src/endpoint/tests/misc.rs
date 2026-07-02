@@ -1426,3 +1426,69 @@ fn poisoned_node_rejects_work_and_persists_nothing() {
     "submit_append must no-op when poisoned: the durable tail must not advance"
   );
 }
+
+/// Emitting a tracing event runs subscriber code synchronously inside `poll_event`. A subscriber
+/// that unwinds must not have consumed the queued event: `poll_event` traces the FRONT and removes
+/// it only after, so a caught panic leaves the undelivered consensus notification queued.
+///
+/// Requires `std`: `catch_unwind` and tracing's `with_default` dispatcher are both std-only (under
+/// `alloc` the crate aliases `alloc as std`, which has neither).
+#[cfg(all(feature = "tracing", feature = "std"))]
+#[test]
+fn tracing_subscriber_panic_does_not_drop_a_queued_event() {
+  use crate::{Config, Instant, testkit::AsyncStable};
+
+  struct PanicOnEvent;
+
+  impl tracing::Subscriber for PanicOnEvent {
+    fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+      true
+    }
+
+    fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+      tracing::span::Id::from_u64(1)
+    }
+
+    fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+    fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+    fn event(&self, _: &tracing::Event<'_>) {
+      panic!("subscriber panic on event");
+    }
+
+    fn enter(&self, _: &tracing::span::Id) {}
+
+    fn exit(&self, _: &tracing::span::Id) {}
+  }
+
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable); // campaign
+  ep.handle_storage(d, &mut log, &mut stable); // self-vote durable -> become leader
+  assert!(ep.role().is_leader());
+  // Becoming leader queued a `LeaderChanged`; leave it undrained.
+
+  let unwound = tracing::subscriber::with_default(PanicOnEvent, || {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| ep.poll_event())).is_err()
+  });
+  assert!(
+    unwound,
+    "the panicking subscriber must have unwound poll_event"
+  );
+
+  // The event survived the unwind: a normal poll (default no-op subscriber) still returns it.
+  assert!(
+    ep.poll_event().is_some(),
+    "a queued consensus event must survive a tracing subscriber panic"
+  );
+}
