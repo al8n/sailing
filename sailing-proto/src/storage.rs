@@ -211,6 +211,13 @@ pub trait LogStore {
   /// Queue an append (truncating any conflicting suffix first). Durable on the matching `poll`
   /// (a [`LogDone::Appended`] for this `id`).
   ///
+  /// **The read view updates immediately (NORMATIVE):** the appended entries become visible to
+  /// `first_index` / `last_index` / `term` / `entries` BEFORE this call returns — ahead of
+  /// durability. The core reads the just-appended (not-yet-durable) tail SYNCHRONOUSLY: `propose`
+  /// allocates the next index from `last_index()`, §5.3 conflict detection reads a submitted entry's
+  /// `term`, and the volatile commit applies the unflushed tail. A store whose read view lagged until
+  /// the `poll` completion would let two proposals allocate the SAME index and silently drop one.
+  ///
   /// **Durability is prefix-ordered (NORMATIVE):** a Raft log is a sequential record, so making the
   /// entry at index `N` durable implies every entry in `first_index()..=N` is also durable. A
   /// [`LogDone::Appended`] completion for an append whose highest index is `N` therefore guarantees
