@@ -368,11 +368,24 @@ impl<I: NodeId> MessageEncoder<I> {
   }
 }
 
+/// The unknown-field allowance for decoding a wire message. A well-formed sailing envelope carries
+/// ZERO unknown fields — cross-version peers are fenced at the `Labeled` handshake, so decode never
+/// legitimately meets one — and buffa's default allowance is 1,000,000. A hostile frame packed with
+/// minimal unknown fields would otherwise materialize up to that many `UnknownField` entries (tens of
+/// MiB transient) before the frame is rejected and the connection closed. A small bound caps that
+/// allocation while leaving generous forward-compat headroom.
+const MAX_UNKNOWN_FIELDS: usize = 16;
+
 /// Decode one frame (the COMPLETE payload of a transport frame) into a consensus
 /// message. The frame's `Bytes` is the backing allocation: decoded payloads alias it
 /// (O(1) refcount slices — the frame stays alive as long as any decoded field does).
 pub fn decode_message<I: NodeId>(mut frame: Bytes) -> Result<Message<I>, DecodeError> {
-  let wire = pb::Message::decode(&mut frame).map_err(map_err)?;
+  // `DecodeOptions::decode` takes the `Bytes` by `Buf`, so decoded `bytes` fields still alias the
+  // frame (zero-copy); it only additionally bounds the unknown-field allowance.
+  let wire = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::Message>(&mut frame)
+    .map_err(map_err)?;
   message_from(wire)
 }
 
@@ -399,7 +412,10 @@ pub(crate) fn encode_conf_change_v2<I: NodeId>(cc: &ConfChangeV2<I>, buf: &mut V
 pub(crate) fn decode_conf_change_v2<I: NodeId>(
   mut data: Bytes,
 ) -> Result<ConfChangeV2<I>, DecodeError> {
-  let w = pb::ConfChangeV2::decode(&mut data).map_err(map_err)?;
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::ConfChangeV2>(&mut data)
+    .map_err(map_err)?;
   let transition = match w.transition {
     EnumValue::Known(pb::ConfChangeTransition::Auto) => ConfChangeTransition::Auto,
     EnumValue::Known(pb::ConfChangeTransition::Implicit) => ConfChangeTransition::Implicit,
