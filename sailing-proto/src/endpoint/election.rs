@@ -535,6 +535,19 @@ where
     log: &mut L,
     stable: &mut S,
   ) {
+    // A node removed (or demoted to learner) by an applied conf change must NEVER assume leadership —
+    // even if it tallied a quorum from the NEW configuration before its own removal applied (the grants
+    // come from voters that no longer include it). Step down to follower instead of leading. `is_voter`
+    // checks BOTH joint halves, so a node still in the outgoing half keeps leading to shepherd the
+    // joint → simple transition. This is the airtight chokepoint: both win paths (`on_vote_response`
+    // and the `Campaign` completion) funnel through here.
+    if self.config.step_down_on_removal() && !self.tracker.is_voter(&self.config.id()) {
+      self.role = Role::Follower;
+      self.set_leader(None);
+      self.heartbeat_deadline = None;
+      self.election_deadline = None;
+      return;
+    }
     self.role = Role::Leader;
     self.set_leader(Some(self.config.id()));
     // Reset read-index state from the previous term (stale pending reads must not

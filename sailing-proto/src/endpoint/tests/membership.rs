@@ -982,3 +982,71 @@ fn conf_change_with_overwide_id_is_rejected_at_propose() {
   assert!(matches!(err, ProposeError::InvalidConfChange));
   assert_eq!(log.last_index(), before, "nothing was appended");
 }
+
+/// A node removed by its OWN committed conf change while CAMPAIGNING must abort the candidacy (step
+/// down to follower) the instant the removal applies, and — as a backstop for the win-before-apply
+/// order — `become_leader` must refuse to lead a non-voter. Together, a decommissioned node can never
+/// lead a configuration it is not part of, honouring `step_down_on_removal`.
+///
+/// MUTATION: restore the `self.role.is_leader()` gate on the apply-time step-down (dropping the
+/// candidate case) OR remove the `become_leader` non-voter guard → a removed candidate keeps its role
+/// and can assume leadership, failing the follower / not-leader assertions below.
+#[test]
+fn candidate_removed_by_own_conf_change_steps_down_and_cannot_lead() {
+  use super::super::Role;
+  use crate::{ConfChange, ConfChangeType, Entry, EntryKind, Index, Instant, Term};
+
+  let (mut ep, mut log, mut stable) = make_follower(); // id = 2, voters {1,2,3}
+  let self_id = ep.id();
+
+  // A committed-but-unapplied RemoveNode(self) conf change in the log (the previous leader committed it
+  // before dying).
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, self_id, bytes::Bytes::new()).into_v2();
+  let mut buf = Vec::new();
+  crate::wire::encode_conf_change_v2(&cc, &mut buf);
+  let entry = Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::ConfChange,
+    bytes::Bytes::from(buf),
+  );
+  log.force_append(core::slice::from_ref(&entry));
+  ep.term = Term::new(1);
+  ep.commit = Index::new(1);
+  ep.applied = Index::ZERO;
+  ep.durable.durable_index = Index::new(1);
+
+  // The node is campaigning when the removal is about to apply.
+  ep.role = Role::Candidate;
+  assert!(
+    ep.tracker.is_voter(&self_id),
+    "self is still a voter before the removal applies"
+  );
+
+  // Applying the committed removal (driven by the storage handler) aborts the candidacy.
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    !ep.tracker.is_voter(&self_id),
+    "self is removed once the conf change applies"
+  );
+  assert!(
+    ep.role().is_follower(),
+    "a candidate removed by its own conf change steps down to follower"
+  );
+  assert!(
+    ep.election_deadline.is_none(),
+    "a removed node holds no election timer"
+  );
+
+  // Backstop: even forced back into Candidate, a non-voter must not assume leadership.
+  ep.role = Role::Candidate;
+  ep.become_leader(Instant::ORIGIN.into(), &mut log, &mut stable);
+  assert!(
+    !ep.role().is_leader(),
+    "become_leader must refuse to lead a non-voter"
+  );
+  assert!(
+    ep.role().is_follower(),
+    "the refused would-be leader steps down to follower"
+  );
+}
