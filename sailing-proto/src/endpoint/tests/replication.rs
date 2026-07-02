@@ -3267,3 +3267,81 @@ fn stale_reject_below_match_is_ignored() {
     "a stale reject (rejected <= match) is ignored — next is unchanged"
   );
 }
+
+/// An AppendEntries that re-sends entries BELOW a follower's snapshot boundary (as a reject that
+/// dragged the leader's `next` down would) must NOT poison the follower: the compacted entries are
+/// committed history that cannot conflict, so they are skipped, and only the in-range suffix counts.
+///
+/// MUTATION: drop the `idx < first_index` skip in the conflict scan → `log_term` returns `Term::ZERO`
+/// for the compacted indices, they read as a conflict at/below commit, and the follower poisons via
+/// `CommittedTruncation` — failing the not-poisoned assertion.
+#[test]
+fn append_below_snapshot_boundary_does_not_poison() {
+  use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};
+
+  let (mut ep, mut log, mut stable) = make_follower(); // id 2, voters {1,2,3}
+  // Re-baseline on a snapshot at boundary 5 (first_index = 6), then hold entries 6, 7.
+  log.restore(Index::new(5), Term::new(1));
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(6),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"f"),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(7),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"g"),
+    ),
+  ]);
+  ep.term = Term::new(1);
+  ep.commit = Index::new(7);
+  ep.applied = Index::new(7);
+  ep.durable.durable_index = Index::new(7);
+
+  // The leader re-sends from index 1 (prev = 0): indices 1..=5 are compacted on this follower.
+  let entries: Vec<_> = (1u64..=7)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Normal,
+        bytes::Bytes::from_static(b"x"),
+      )
+    })
+    .collect();
+  let last_before = log.last_index();
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(7),
+    )),
+  );
+
+  assert!(
+    !ep.poison.poisoned,
+    "re-sending entries below the snapshot boundary must not poison the follower"
+  );
+  assert_eq!(
+    log.last_index(),
+    last_before,
+    "the compacted prefix is skipped — nothing is truncated"
+  );
+  assert_eq!(ep.commit, Index::new(7), "commit must not regress");
+  let sent_reject = core::iter::from_fn(|| ep.poll_message())
+    .any(|out| matches!(out.message(), Message::AppendResponse(r) if r.reject()));
+  assert!(
+    !sent_reject,
+    "the follower does not reject a below-boundary re-send"
+  );
+}
