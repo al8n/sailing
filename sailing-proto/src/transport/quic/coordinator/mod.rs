@@ -652,10 +652,13 @@ where
           // connection (consensus retransmission re-drives anything lost); the endpoint is never
           // poisoned by transport input.
           let from = self.bridge.bound_peer_of(h);
-          // Split the group-demux header off before decoding the consensus message; a single-group
-          // host ignores the tag. A malformed header or body is a peer fault (same close path).
+          // Split the group-demux header off before decoding the consensus message. A single-group
+          // host requires the EMPTY tag: a tagged frame means a multi-group peer (a deployment-
+          // shape mismatch) whose foreign-group traffic must not reach this endpoint — it folds to
+          // `None` and closes below, exactly like a malformed header or body.
           let decoded = super::super::frame::split_group_header(frame)
             .ok()
+            .filter(|(group, _)| group.is_empty())
             .and_then(|(_group, message)| crate::wire::decode_message::<I>(message).ok());
           match (from, decoded) {
             (Some(from), Some(msg)) => {

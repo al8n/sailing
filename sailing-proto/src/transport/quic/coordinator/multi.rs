@@ -248,8 +248,9 @@ where
 
   /// Feed one inbound UDP datagram from `remote` into the QUIC stack, decode its group-tagged frames
   /// into consensus messages routed to their owning group's endpoint (resolved through `stores`),
-  /// then pump every group's resulting outbound messages back out. A frame whose group tag fails to
-  /// decode, or whose group has no store, is dropped (the sender retries).
+  /// then pump every group's resulting outbound messages back out. A frame whose group has no store
+  /// is dropped (the sender retries); a group tag that does not decode as `G`, or an undecodable
+  /// message body, closes the connection as integrity-suspect.
   ///
   /// `ecn` is the received ECN codepoint when the driver's socket reports one (`None` is always
   /// safe).

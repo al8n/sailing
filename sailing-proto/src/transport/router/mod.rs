@@ -76,6 +76,16 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     self.closed.push_back((id, reason));
   }
 
+  /// Close `id` on the OWNER's initiative — for an integrity fault detected above the router (a
+  /// group tag that does not decode, a deployment-shape mismatch). Queues the close notification
+  /// like any router-detected fault; a no-op if the connection is already gone, so a fault found
+  /// while draining a connection's final frames does not double-notify.
+  pub fn close(&mut self, id: ConnId, reason: Option<TransportError>) {
+    if self.conns.contains_key(&id) {
+      self.remove_internal(id, reason);
+    }
+  }
+
   /// The next connection the router closed on its own initiative, with the fault (if any). The
   /// driver must close the underlying socket; for a dialed peer it may redial (the redial gets a
   /// fresh, higher `ConnId`).
