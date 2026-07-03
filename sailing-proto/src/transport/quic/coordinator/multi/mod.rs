@@ -1050,8 +1050,11 @@ where
         crate::wire::encode_message(&msg, &mut scratch);
         let entry_len = 1 + 2 + group_bytes.len() + 4 + scratch.len();
         if entry_len > crate::transport::frame::COALESCED_FRAME_BUDGET {
+          // Re-arm only for a group still hosted (see the stream sibling): a lifecycle removal
+          // between the stamp and this divert must not leave a dormant intent behind.
           if flags & COALESCED_FLAG_QUIESCE != 0
             && let Ok(gid) = G::decode_exact(bytes::Bytes::from(group_bytes.clone()))
+            && self.multi.contains_group(&gid)
           {
             self.quiesce_intents.insert(gid);
           }
