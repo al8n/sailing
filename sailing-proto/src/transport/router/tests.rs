@@ -344,3 +344,33 @@ fn default_is_an_empty_router() {
   let router: R = PeerRouter::default();
   assert!(router.conn_of(&1).is_none());
 }
+
+/// The OWNER-initiated `close` (an integrity fault detected above the router, e.g. a group tag
+/// that does not decode) notifies exactly once, and closing an already-gone or unknown id is a
+/// silent no-op — a fault found while draining a connection's final frames must not double-notify.
+#[test]
+fn owner_close_notifies_once_and_is_absent_safe() {
+  use crate::transport::TransportError;
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register(id, acceptor(10), Instant::ORIGIN);
+  let mut peer = Conn::new(dialer(7));
+  pump(&mut router, id, &mut peer);
+  assert_eq!(router.conn_of(&7), Some(id), "validated and bound");
+
+  router.close(id, Some(TransportError::Decode));
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, Some(TransportError::Decode))),
+    "the owner close surfaces with its reason"
+  );
+  assert_eq!(router.poll_conn_closed(), None, "exactly once");
+  assert_eq!(router.conn_of(&7), None, "the peer binding is cleared");
+
+  // A second close of the same (now absent) id queues nothing.
+  router.close(id, Some(TransportError::Decode));
+  assert_eq!(router.poll_conn_closed(), None);
+  // A close of a never-registered id queues nothing either.
+  router.close(ConnId(99), None);
+  assert_eq!(router.poll_conn_closed(), None);
+}
