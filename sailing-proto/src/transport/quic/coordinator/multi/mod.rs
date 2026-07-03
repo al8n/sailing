@@ -633,8 +633,13 @@ where
     let std_now = self.quinn_now(now.mono());
     while let Some(h) = self.bridge.take_connected() {
       let Some(me) = self.node_id() else {
-        // No identity latched yet: our preface cannot be staged, so the peer's preface (or the
-        // auth deadline, if none arrives) closes this connection in the drain below.
+        // No identity latched yet (no group has ever been admitted): the Connected event fires
+        // exactly once, so this was the connection's ONLY chance to stage our preface — it can
+        // never validate, no matter what is admitted later. Close it here, at the source,
+        // strictly BEFORE any of the peer's preface bytes are examined: a group admitted between
+        // this event and the (possibly trickling) preface's arrival must not let the connection
+        // bind half-duplex. The peer sees the close and redials after admission.
+        self.bridge.close_local(std_now, h);
         continue;
       };
       let mut preface = Vec::new();
@@ -662,11 +667,10 @@ where
         };
         if self.bridge.is_authenticating(h) {
           if self.node_id().is_none() {
-            // No identity yet (no group has ever been admitted): the self-id gate would be
-            // vacuous, our preface was never staged, and the peer's preface was ALREADY popped by
-            // next_frame above — this connection can never validate, even if a group is admitted
-            // a moment from now. Close it immediately (an observable close the peer redials
-            // after) rather than leaving it to wedge until the auth deadline.
+            // Backstop only: an identity-less connection is closed at its Connected event above,
+            // and the identity latch never clears, so a frame cannot legitimately reach this arm
+            // with no identity. If one does, the invariant still holds — our preface was never
+            // staged, so binding would wedge half-duplex: close, never bind.
             self.bridge.close_local(std_now, h);
             break;
           }

@@ -334,6 +334,13 @@ fn group_admitted_before_auth_deadline_recovers() {
     .unwrap();
   sb.map
     .insert(100, (VecLog::default(), AsyncStable::default()));
+  // The stale connection was closed at its Connected event — strictly before any preface byte is
+  // examined — so even bytes arriving AFTER admission (a trickling peer preface) cannot bind it.
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  assert!(
+    !b.has_bound_conn(&1u64) && !a.has_bound_conn(&2u64),
+    "post-admission traffic cannot resurrect the identity-less connection"
+  );
   a.connect(now, addr(2), 2u64).expect("redial");
   settle(&mut a, &mut b, &mut sa, &mut sb, now);
   assert!(
