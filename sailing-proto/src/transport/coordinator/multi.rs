@@ -228,10 +228,30 @@ where
     self.router.poll_transmit()
   }
 
-  /// The earliest timer deadline across all groups.
+  /// The earliest deadline the driver must wake for: the minimum over every group's consensus
+  /// deadline AND the transport's earliest handshake deadline. The transport half matters when no
+  /// group surfaces a deadline at all (zero hosted groups, every group poisoned, or a host of
+  /// non-voter learners) — without it, un-validated connections would never be reaped. On expiry
+  /// call [`handle_transport_timeout`](Self::handle_transport_timeout) unconditionally and
+  /// [`handle_timeout`](Self::handle_timeout) for whichever groups are due.
   #[must_use]
   pub fn poll_timeout(&self) -> Option<Instant> {
-    self.multi.poll_timeout()
+    match (
+      self.multi.poll_timeout(),
+      self.router.next_handshake_deadline(),
+    ) {
+      (Some(a), Some(b)) => Some(a.min(b)),
+      (a, None) => a,
+      (None, b) => b,
+    }
+  }
+
+  /// Fire the transport's own housekeeping (handshake-deadline reaping) without touching any
+  /// group. Call at every [`poll_timeout`](Self::poll_timeout) expiry: the surfaced deadline may
+  /// be a transport deadline with no group due.
+  pub fn handle_transport_timeout(&mut self, now: impl Into<Now>) {
+    let now: Now = now.into();
+    self.router.reap_handshakes(now.mono());
   }
 
   /// Each group's next deadline — a driver's input for an aggregate timing wheel.
