@@ -824,3 +824,53 @@ fn unhosted_coalesced_entry_drops_but_the_frame_delivers() {
     "the hosted entry dispatched; the unhosted one dropped silently"
   );
 }
+
+/// Removal TOMBSTONES the group id at the coordinator: straggler frames for it drop SILENTLY —
+/// no close (the shared connection carries the live groups' traffic), no control — until a
+/// create re-admits the SAME id (the supported rejoin path), which lifts the tombstone and lets
+/// traffic reach the fresh replica again.
+#[test]
+fn tombstoned_group_drops_frames_silently_until_recreated() {
+  let mut w = World::new(&[100, 200], &[100, 200]);
+  w.settle();
+  w.elect_a(100);
+  while w.b.poll_group_control().is_some() {}
+
+  assert!(!w.b.is_retired(&100), "a hosted group is not tombstoned");
+  assert!(w.b.remove_group(&100).is_some());
+  assert!(w.b.is_retired(&100), "removal tombstones the id");
+
+  // The unaware leader keeps beating group 100; b's tombstone absorbs every frame silently.
+  w.fire_a(100);
+  w.fire_a(100);
+  assert_eq!(
+    w.b.poll_conn_closed(),
+    None,
+    "no close on a tombstoned straggler"
+  );
+  assert_eq!(
+    w.b.poll_group_control(),
+    None,
+    "no control for a tombstoned group"
+  );
+  assert!(w.b.group(&100).is_none(), "the group stays removed");
+
+  // The co-located group is untouched by the sibling's tombstone.
+  w.elect_a(200);
+  assert!(w.b.group(&200).unwrap().term() >= Term::new(1));
+
+  // Re-admitting the SAME id lifts the tombstone; the fresh replica (fresh stores, as a driver
+  // would provision) hears the still-beating leader again.
+  w.sb
+    .map
+    .insert(100, (VecLog::default(), AsyncStable::default()));
+  w.b
+    .create_group(100, two_voter(2), w.now, 2, CountSm::default())
+    .unwrap();
+  assert!(!w.b.is_retired(&100), "re-admission lifts the tombstone");
+  w.fire_a(100);
+  assert!(
+    w.b.group(&100).unwrap().term() >= Term::new(1),
+    "traffic flows to the re-created group"
+  );
+}

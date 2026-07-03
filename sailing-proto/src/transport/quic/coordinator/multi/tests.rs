@@ -439,6 +439,82 @@ fn unhosted_coalesced_entry_drops_over_quic() {
   );
 }
 
+/// Removal TOMBSTONES the id at the QUIC coordinator: straggler entries for it drop silently —
+/// the shared connection and the co-located group's traffic untouched, no control — until a
+/// create re-admits the SAME id, which lifts the tombstone and lets traffic reach the fresh
+/// replica again.
+#[test]
+fn tombstoned_group_drops_entries_silently_until_recreated() {
+  use crate::GroupControl;
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut a = multi_coord(&ca, 1, cluster);
+  let mut b = multi_coord(&ca, 2, cluster);
+  for g in [100u64, 200] {
+    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
+      .unwrap();
+    b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
+      .unwrap();
+  }
+  let mut sa = group_stores(&[100, 200]);
+  let mut sb = group_stores(&[100, 200]);
+  let mut now = Instant::ORIGIN;
+
+  a.connect(now, addr(2), 2u64).expect("dial");
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 100, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  let _ = drain_controls(&mut b);
+
+  assert!(!b.is_retired(&100), "a hosted group is not tombstoned");
+  assert!(b.remove_group(&100).is_some());
+  assert!(b.is_retired(&100), "removal tombstones the id");
+
+  // Both leaders beat in one crank: the coalesced frame carries a tombstoned entry (100) beside
+  // a live one (200) — the tombstone absorbs its entry, the sibling's still dispatches.
+  let d100 = a.group(&100).unwrap().poll_timeout().unwrap();
+  let d200 = a.group(&200).unwrap().poll_timeout().unwrap();
+  now = now.max(d100).max(d200);
+  {
+    let (l, s) = sa.stores(&100).unwrap();
+    a.handle_timeout(&100, now, l, s).unwrap();
+  }
+  {
+    let (l, s) = sa.stores(&200).unwrap();
+    a.handle_timeout(&200, now, l, s).unwrap();
+  }
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  assert_eq!(
+    drain_controls(&mut b),
+    std::vec![(200, GroupControl::Wake)],
+    "the tombstoned entry surfaced no control; the live sibling dispatched"
+  );
+  assert!(b.group(&100).is_none(), "the group stays removed");
+  assert!(
+    a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
+    "a tombstoned straggler never costs the shared connection"
+  );
+
+  // Re-admitting the SAME id lifts the tombstone; the fresh replica (fresh stores) hears the
+  // still-beating leader again.
+  sb.map
+    .insert(100, (VecLog::default(), AsyncStable::default()));
+  b.create_group(100, two_voter(2), now, 2, CountSm::default())
+    .unwrap();
+  assert!(!b.is_retired(&100), "re-admission lifts the tombstone");
+  let d = a.group(&100).unwrap().poll_timeout().unwrap();
+  now = now.max(d);
+  {
+    let (l, s) = sa.stores(&100).unwrap();
+    a.handle_timeout(&100, now, l, s).unwrap();
+  }
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  assert!(
+    b.group(&100).unwrap().term() >= Term::new(1),
+    "traffic flows to the re-created group"
+  );
+}
+
 /// A zero-group host CLOSES a preface-bearing connection immediately (the preface was already
 /// consumed, so it could never validate) — admission plus a fresh dial therefore recover well
 /// WITHIN the auth-deadline window, with no reap wait.

@@ -80,6 +80,10 @@ where
   quiesce_intents: BTreeSet<G>,
   /// Group-scoped scheduling signals for the driver, in dispatch order (see [`GroupControl`]).
   controls: VecDeque<(G, GroupControl)>,
+  /// Tombstoned group ids: REMOVED groups whose inbound frames drop silently until a
+  /// create/restore re-admits the id (see [`remove_group`](Self::remove_group)). In-memory and
+  /// volatile — a restart starts clean; the embedder's group catalog owns removal persistence.
+  retired: BTreeSet<G>,
 }
 
 impl<G, I, F, R> MultiStreamCoordinator<G, I, F, R>
@@ -102,10 +106,13 @@ where
       hb_batches: BTreeMap::new(),
       quiesce_intents: BTreeSet::new(),
       controls: VecDeque::new(),
+      retired: BTreeSet::new(),
     }
   }
 
-  /// Create a fresh group (see [`MultiRaft::create_group`]).
+  /// Create a fresh group (see [`MultiRaft::create_group`]). Successful admission lifts the id's
+  /// tombstone, if any — re-creating the SAME group id is the supported rejoin path (see
+  /// [`remove_group`](Self::remove_group)).
   ///
   /// # Errors
   /// The admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
@@ -117,10 +124,14 @@ where
     seed: u64,
     fsm: F,
   ) -> Result<(), CreateGroupError> {
-    self.multi.create_group(gid, config, now, seed, fsm)
+    let key = gid.cheap_clone();
+    self.multi.create_group(gid, config, now, seed, fsm)?;
+    self.retired.remove(&key);
+    Ok(())
   }
 
-  /// Recover a group from durable storage (see [`MultiRaft::restore_group`]).
+  /// Recover a group from durable storage (see [`MultiRaft::restore_group`]). Successful
+  /// admission lifts the id's tombstone, if any, exactly as [`create_group`](Self::create_group).
   ///
   /// # Errors
   /// The admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
@@ -141,19 +152,40 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
+    let key = gid.cheap_clone();
     self
       .multi
-      .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)
+      .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
+    self.retired.remove(&key);
+    Ok(())
   }
 
   /// Remove a group, returning its endpoint if present. Drops the group's pending quiesce intent
   /// and queued controls with it (its per-peer batched beats, if any, still ship — a removed
   /// group's in-flight heartbeat is indistinguishable from one that left just before removal, and
-  /// the receiver's unhosted-entry drop absorbs it).
+  /// the receiver's unhosted-entry drop absorbs it) — and TOMBSTONES the id: inbound frames tagged
+  /// with it drop silently, before store resolution, until a create/restore re-admits it.
+  ///
+  /// The tombstone is IN-MEMORY and GROUP-keyed — deliberately weaker than the references, which
+  /// persist replica-keyed tombstones for exactly this straggler problem (TiKV a region-epoch +
+  /// peer-id tombstone, CockroachDB a NextReplicaID floor, each a monotonic incarnation
+  /// discriminator): sailing group ids carry no incarnation number, so SINGLE-INCARNATION ids are
+  /// the embedder contract — re-creating the SAME group id is the supported rejoin path, and
+  /// reusing an id for a DIFFERENT logical group is unsound without epochs (matching the NodeId
+  /// reuse rules). Across a restart the tombstone is gone; the embedder's placement catalog is
+  /// the persistent record of what must not live here.
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F>> {
     self.quiesce_intents.remove(gid);
     self.controls.retain(|(g, _)| g != gid);
+    self.retired.insert(gid.cheap_clone());
     self.multi.remove_group(gid)
+  }
+
+  /// Whether `gid` is TOMBSTONED: removed and not re-admitted since, its inbound frames dropping
+  /// silently (see [`remove_group`](Self::remove_group)). Volatile — a restart starts clean.
+  #[must_use]
+  pub fn is_retired(&self, gid: &G) -> bool {
+    self.retired.contains(gid)
   }
 
   /// Register a freshly opened connection, returning the coordinator-assigned [`ConnId`] the driver
@@ -220,6 +252,13 @@ where
       if flags & COALESCED_FLAG_QUIESCE != 0 && !msg.is_heartbeat() {
         self.router.close(conn, Some(TransportError::Decode));
         break;
+      }
+      // A tombstoned (removed, not re-admitted) group's frame is a straggler from the group's
+      // past life on this host: drop it silently — never a close (the shared connection carries
+      // the live groups' traffic) and never a control. Ordered AFTER the integrity gates (a
+      // malformed tag or violating flag still closes) and BEFORE store resolution.
+      if self.retired.contains(&group) {
+        continue;
       }
       if let Some((log, stable)) = stores.stores(&group) {
         let wake = Self::is_wake_class(&msg);
