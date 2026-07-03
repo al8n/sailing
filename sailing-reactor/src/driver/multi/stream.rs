@@ -1352,11 +1352,15 @@ where
       .was_leader
       .insert(gid.cheap_clone(), is_leader)
       .unwrap_or(false);
-    if was
-      && !is_leader
-      && let Some(routing) = self.routing.get_mut(gid)
-    {
-      routing.fail_all(&DriverError::Superseded);
+    if was && !is_leader {
+      // Deposition can be TIMER-driven (a CheckQuorum step-down) with no inbound wake control,
+      // so the role edge itself must funnel the wake: a quiesce intent recorded under the old
+      // leadership dies here, never to be stamped onto a re-elected term's beat before fresh
+      // eligibility is proven.
+      self.wake_group(gid);
+      if let Some(routing) = self.routing.get_mut(gid) {
+        routing.fail_all(&DriverError::Superseded);
+      }
     }
     if !poisoned && self.run_failover_serve(gid) {
       // A FATAL limbo storage fault is GROUP-scoped on a multi host: fail that group's parked

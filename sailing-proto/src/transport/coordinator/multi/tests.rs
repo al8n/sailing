@@ -452,6 +452,54 @@ fn a_single_heartbeat_stays_a_plain_frame() {
   );
 }
 
+/// The receive side enforces what the send side promises: a quiesce flag on anything but a
+/// Heartbeat is a protocol violation (a buggy or stale-version peer) and closes the connection —
+/// honoring it would freeze the group on a message class that deliberately emits no `Wake`.
+#[test]
+fn flagged_response_closes_the_connection() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  assert_eq!(w.b.conn_of(&1), Some(ConnId(1)));
+
+  // A crafted 1-entry coalesced frame: a QUIESCE-flagged HeartbeatResponse.
+  let hbr = Message::HeartbeatResponse(crate::HeartbeatResponse::new(
+    Term::new(1),
+    1u64,
+    bytes::Bytes::new(),
+  ));
+  let mut msg_bytes = Vec::new();
+  crate::wire::encode_message(&hbr, &mut msg_bytes);
+  let mut gb = Vec::new();
+  sailing_encode_u64(100, &mut gb);
+  let mut payload = Vec::new();
+  crate::transport::frame::write_coalesced_marker(&mut payload);
+  crate::transport::frame::write_coalesced_entry(1, &gb, &msg_bytes, &mut payload);
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&payload, &mut framed);
+
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  assert_eq!(
+    w.b.poll_conn_closed(),
+    Some((ConnId(1), Some(TransportError::Decode))),
+    "a flagged non-heartbeat is integrity-suspect"
+  );
+  let mut controls = Vec::new();
+  while let Some(c) = w.b.poll_group_control() {
+    controls.push(c);
+  }
+  assert!(
+    !controls.contains(&(100, GroupControl::Quiesce)),
+    "the violating flag is never honored"
+  );
+}
+
+/// `Data`-encode a `u64` group id (the test-side mirror of the coordinators' tag stamping).
+fn sailing_encode_u64(id: u64, out: &mut Vec<u8>) {
+  use crate::Data as _;
+  id.encode(out);
+}
+
 /// The quiesce flag rides ONLY a leader's own Heartbeat broadcast: an intent marked on a
 /// FOLLOWER (or a leader deposed before its next beat) must never leak onto the
 /// HeartbeatResponses it keeps sending — a flagged response would freeze the very leader that

@@ -213,6 +213,14 @@ where
         self.router.close(conn, Some(TransportError::Decode));
         break;
       };
+      // Receive-side gate on the quiesce bit: it is only ever STAMPED on a leader's own
+      // Heartbeat broadcast, so a flagged anything-else is a protocol violation (a buggy or
+      // stale-version peer) — and honoring it would freeze this group on a message class that
+      // deliberately emits no Wake. Close as integrity-suspect, the uniform violation policy.
+      if flags & COALESCED_FLAG_QUIESCE != 0 && !msg.is_heartbeat() {
+        self.router.close(conn, Some(TransportError::Decode));
+        break;
+      }
       if let Some((log, stable)) = stores.stores(&group) {
         let wake = Self::is_wake_class(&msg);
         // `None` here means `stores` resolved a group `MultiRaft` does not host — the same

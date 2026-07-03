@@ -1062,11 +1062,14 @@ where
       .was_leader
       .insert(gid.cheap_clone(), is_leader)
       .unwrap_or(false);
-    if was
-      && !is_leader
-      && let Some(routing) = self.routing.get_mut(gid)
-    {
-      routing.fail_all(&DriverError::Superseded);
+    if was && !is_leader {
+      // Deposition can be TIMER-driven (a CheckQuorum step-down) with no inbound wake control —
+      // the role edge funnels the wake so a stale quiesce intent dies with the old leadership
+      // (see the stream sibling).
+      self.wake_group(gid);
+      if let Some(routing) = self.routing.get_mut(gid) {
+        routing.fail_all(&DriverError::Superseded);
+      }
     }
     if !poisoned && self.run_failover_serve(gid) {
       if let Some(routing) = self.routing.get_mut(gid) {

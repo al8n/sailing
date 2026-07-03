@@ -777,6 +777,14 @@ where
               malformed = true;
               break;
             };
+            // Receive-side gate on the quiesce bit: only a leader's own Heartbeat broadcast ever
+            // stamps it, so a flagged anything-else is a protocol violation — and honoring it
+            // would freeze this group on a class that deliberately emits no Wake (see the stream
+            // sibling).
+            if flags & COALESCED_FLAG_QUIESCE != 0 && !msg.is_heartbeat() {
+              malformed = true;
+              break;
+            }
             // A well-formed entry for a group this host does not carry is dropped — entry by
             // entry, never the frame or the connection: the link is shared, so one unhosted
             // group must not cost the others their frames. Its flags drop with it.
