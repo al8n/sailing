@@ -12,9 +12,12 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
 use common::{CountSm, TrapSm};
-use sailing_proto::{ClusterId, Config, Data, LabelOptions, Labeled, Passthrough, Role};
+use sailing_proto::{
+  ClusterId, ConfChange, ConfChangeType, Config, Data, LabelOptions, Labeled, Passthrough, Role,
+};
 use sailing_reactor::{
-  DriverConfig, DriverError, GroupHandle, MultiHandle, MultiReactorStreamDriver, Node,
+  DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle, MultiReactorStreamDriver,
+  Node,
 };
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -131,6 +134,11 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
       }
       Err(DriverError::Superseded) => {}
+      // A node that does not host the group (de-hosted mid-test): try the next one.
+      Err(DriverError::Rejected { .. }) => {
+        at = (at + 1) % groups.len();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
       Err(e) => panic!("unexpected submit error: {e:?}"),
     }
   }
@@ -150,6 +158,46 @@ async fn query_anywhere(groups: &[GroupHandle<u64, u64, CountSm>]) -> u64 {
       }
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+}
+
+/// Await a lifecycle event satisfying `pred` on `rx` (draining non-matching ones), within 15s.
+async fn await_lifecycle<P>(rx: &flume::Receiver<LifecycleEvent<u64, u64>>, what: &str, mut pred: P)
+where
+  P: FnMut(&LifecycleEvent<u64, u64>) -> bool,
+{
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    assert!(
+      remaining > Duration::ZERO,
+      "{what}: no matching lifecycle event in time"
+    );
+    match tokio::time::timeout(remaining, rx.recv_async()).await {
+      Ok(Ok(ev)) if pred(&ev) => return,
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => panic!("{what}: the lifecycle tail closed: {e:?}"),
+      Err(_) => panic!("{what}: no matching lifecycle event in time"),
+    }
+  }
+}
+
+/// Group 100's current leader index among `groups` (status-polled, deadline-bounded).
+async fn find_leader(groups: &[GroupHandle<u64, u64, CountSm>], what: &str) -> usize {
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: no leader in time"
+    );
+    for (i, g) in groups.iter().enumerate() {
+      if let Ok(status) = g.status().await
+        && status.role == Role::Leader
+      {
+        return i;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
   }
 }
 
@@ -635,4 +683,215 @@ async fn lifecycle_admission_errors_are_typed() {
     1,
     "the re-created group is fresh and functional"
   );
+}
+
+/// The embedder-driven placement flow, end to end: node 1 creates group 100 (voters {1,2}) and
+/// campaigns into the void; node 2 — which does NOT host it — surfaces
+/// `UnknownGroup { group: 100, from: 1 }` on its lifecycle tail; the test (playing the placement
+/// brain) creates the group there; the campaigner's next election retry completes and BOTH sides
+/// commit — while the co-hosted sibling group is untouched by the churn.
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_group_event_drives_creation() {
+  let addrs = addrs(44_240, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // The sibling group exists everywhere: it binds the mesh and proves cross-group isolation.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists ONLY on node 1; its campaign solicits node 2 over the shared mesh.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(handles[1].lifecycle(), "node 2 unknown-group", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::UnknownGroup {
+        group: 100,
+        from: 1
+      }
+    )
+  })
+  .await;
+
+  // The test IS the placement brain: create the solicited group on node 2. The campaigner's
+  // next retry then finds its quorum, and the joined group commits and reads on both sides.
+  handles[1]
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 2");
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
+  assert_eq!(query_anywhere(&g100).await, 1);
+
+  // The sibling group was untouched by the lifecycle churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
+
+/// A committed remove-node conf change that drops a host from a group surfaces
+/// `RemovedSelf { group }` on THAT host's lifecycle tail, and the app-driven teardown leaves
+/// everything else standing: the removed node's OTHER group keeps committing, the survivors keep
+/// committing the shrunk group, and the removed node's tombstone silently absorbs the stragglers
+/// (no unknown-group resurrection prompt ever fires for the removed id, and no connection churn).
+///
+/// The removed node is the group's LEADER, removing itself: the node driving the commit is the
+/// one node guaranteed to APPLY its own removal. A removed FOLLOWER never learns the commit that
+/// excised it — the leader prunes it from the tracker in the same fused commit+apply pass, and
+/// sailing (unlike etcd's commit-then-bcastAppend) sends no further append to it — so the
+/// follower-side RemovedSelf needs a final commit-carrying probe the core does not perform.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_self_event_and_teardown() {
+  let addrs = addrs(44_260, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"seed").await, 1);
+
+  // Group 100's leader proposes REMOVING ITSELF (v1 remove-node); retry through pre-propose
+  // leadership moves.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let removed_at = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed self-removal in time"
+    );
+    let at = find_leader(&g100, "group 100 pre-removal").await;
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, at as u64 + 1, Bytes::new());
+    match g100[at].conf_change(cc).await {
+      Ok(_) => break at,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  };
+
+  // The removed node's lifecycle tail names the group it no longer belongs to.
+  await_lifecycle(handles[removed_at].lifecycle(), "removed-self", |ev| {
+    matches!(ev, LifecycleEvent::RemovedSelf { group: 100 })
+  })
+  .await;
+
+  // The app decides: tear the local replica down (until now it kept running, harmlessly — the
+  // committed change already excluded it from every quorum).
+  assert!(
+    handles[removed_at]
+      .remove_group(100)
+      .await
+      .expect("remove resolves"),
+    "the removed node hosted group 100"
+  );
+
+  // The removed node's OTHER group is untouched, and the SURVIVORS keep committing the shrunk
+  // group (electing afresh, since the departed leader fell silent).
+  assert_eq!(submit_anywhere(&g200, b"alive").await, 2);
+  let survivors: Vec<usize> = (0..3usize).filter(|&i| i != removed_at).collect();
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  'committed: loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no post-removal commit within the deadline"
+    );
+    for &i in &survivors {
+      if let Ok(count) = g100[i].submit(Bytes::from_static(b"after")).await {
+        assert_eq!(count, 2, "the shrunk group applied seed + after");
+        break 'committed;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+
+  // No resurrection prompt and no reconnect churn: the survivors' straggler frames (their
+  // election-era votes and beats while their configs still named the removed node) died against
+  // the tombstone silently — the removed node's lifecycle tail never solicits group 100 back.
+  while let Ok(ev) = handles[removed_at].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
+      "a tombstoned group must never re-solicit placement: {ev:?}"
+    );
+  }
+}
+
+/// Tombstone-then-recreate at the driver level: one follower of a LIVE 3-node group de-hosts its
+/// replica (the unaware leader keeps beating; the tombstone absorbs the stragglers with no
+/// closes — the shared mesh and the sibling group stay clean), then re-admits the SAME id: the
+/// admission succeeds (the tombstone lifts) and the group keeps committing throughout.
+///
+/// The group's liveness deliberately rides the REMAINING majority, not the re-created replica's
+/// catch-up: a fresh-log replica behind the leader's STALE positive `match` cannot be walked
+/// back by the reject path (its rejects echo indexes at or below the old match and are dropped
+/// as stale, and the `match + 1` resend floor never reaches its empty log), so full rejoin is
+/// the restore/snapshot path's job — this test pins admission + no wedge for everyone else.
+#[tokio::test(flavor = "multi_thread")]
+async fn tombstoned_id_recreates_cleanly() {
+  let addrs = addrs(44_280, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere(&handles, 900, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g100, b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // ONE follower de-hosts its replica of the live group; the majority keeps the group up.
+  let leader_at = find_leader(&g100, "group 100").await;
+  let follower_at = (0..3usize).find(|&i| i != leader_at).unwrap();
+  assert!(
+    handles[follower_at]
+      .remove_group(100)
+      .await
+      .expect("remove resolves")
+  );
+
+  // Several heartbeat intervals of straggler beats die against the tombstone; the shared mesh
+  // stays healthy — the sibling group keeps committing through EVERY node, and the de-hosted
+  // group keeps committing through its remaining majority.
+  tokio::time::sleep(HEARTBEAT * 4).await;
+  assert_eq!(submit_anywhere(&g900, b"mesh-alive").await, 2);
+  assert_eq!(submit_anywhere(&g100, b"majority").await, 2);
+
+  // Re-admitting the SAME id (fresh storage, as a driver provisions) lifts the tombstone: the
+  // admission is clean and the group keeps committing — no wedge anywhere.
+  handles[follower_at]
+    .create_group(
+      100,
+      config(follower_at as u64 + 1, vec![1, 2, 3]),
+      9,
+      CountSm::default(),
+    )
+    .await
+    .expect("the tombstoned id re-admits");
+  assert_eq!(submit_anywhere(&g100, b"rejoined").await, 3);
+  assert_eq!(submit_anywhere(&g900, b"still").await, 3);
 }
