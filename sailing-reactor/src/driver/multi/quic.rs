@@ -391,11 +391,9 @@ where
   /// The per-crank storage step (the stream sibling's verbatim): one gated engine barrier, then
   /// every hosted group's bounded completion drain.
   fn storage_crank(&mut self, now: Now) {
-    let released = if self.flush_pending {
-      self.engine.flush()
-    } else {
-      0
-    };
+    if self.flush_pending {
+      self.engine.flush();
+    }
     let mut more = false;
     let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
     for g in &hosted {
@@ -413,7 +411,10 @@ where
         }
       }
     }
-    self.flush_pending = released > 0 || more;
+    // The engine's staged-work signal, measured AFTER the drains, is the exact re-arm predicate —
+    // a release-count inference would miss a write the storage tail staged during a crank whose
+    // barrier released nothing (see the stream sibling).
+    self.flush_pending = self.engine.has_staged() || more;
     self
       .metrics
       .record(self.engine.flushes(), self.engine.ops_flushed());

@@ -18,6 +18,37 @@ fn voter_meta(last_index: u64, last_term: u64) -> SnapshotMeta<u64> {
   )
 }
 
+/// `has_staged` is the driver's exact barrier re-arm signal: it sees work `has_pending` hides
+/// (staged pre-barrier), flips false once a flush releases everything, and — the case a
+/// release-count predicate misses — flips true again when a write is staged AFTER a flush that
+/// released nothing.
+#[test]
+fn has_staged_tracks_pre_barrier_work_exactly() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(1));
+  assert!(!eng.has_staged());
+
+  {
+    let (log, _) = eng.stores(&1).unwrap();
+    log.submit_append(OpId::new(1), &[empty_entry(1, 1)]);
+    assert!(log.has_staged() && !log.has_pending());
+  }
+  assert!(eng.has_staged());
+
+  assert_eq!(eng.flush(), 1);
+  assert!(!eng.has_staged(), "released work is no longer staged");
+
+  // A flush that releases nothing, THEN a stage (the storage-tail submit while draining a
+  // completion): the release count says quiescent, has_staged says re-arm.
+  assert_eq!(eng.flush(), 0);
+  {
+    let (_, stable) = eng.stores(&1).unwrap();
+    stable.submit_write(OpId::new(2), HardState::initial().with_term(Term::new(1)));
+    assert!(stable.has_staged() && !stable.has_pending());
+  }
+  assert!(eng.has_staged());
+}
+
 /// The two staging-capacity bounds part ways: a declared `total_len` over the cap is a FATAL
 /// error (the core poisons — a zero watermark would re-solicit the same declaration forever),
 /// while the same store keeps accepting an allocatable transfer afterward.

@@ -150,6 +150,21 @@ impl<G, I> GroupEngine<G, I> {
     self.ops_flushed
   }
 
+  /// Whether ANY hosted group holds staged-but-unreleased work — the driver's exact re-arm signal
+  /// for the next barrier. Staged completions are deliberately invisible to the stores'
+  /// `has_pending` (the consensus core must not observe pre-barrier work), so a driver deriving
+  /// its barrier schedule from `has_pending` — or from a prior flush's release count — would miss
+  /// writes staged DURING a completion drain (the core's storage tail submits, e.g., the
+  /// commit-watermark HardState write while draining an append completion). Poll this AFTER the
+  /// per-group drains: `true` means schedule another barrier immediately.
+  #[must_use]
+  pub fn has_staged(&self) -> bool {
+    self
+      .groups
+      .values()
+      .any(|s| s.log.has_staged() || s.stable.has_staged())
+  }
+
   /// THE durability barrier: make every group's staged log appends/compactions and stable
   /// writes/snapshots durable at once, releasing their completions into each owning group's poll
   /// FIFO. Returns the number of operations completed across all groups.
@@ -294,6 +309,13 @@ impl EngineLog {
       StagedLog::Compacted(i) => LogDone::Compacted(i),
     }));
     n
+  }
+
+  /// Whether this log holds staged-but-unreleased work (invisible to `has_pending` by contract) —
+  /// see [`GroupEngine::has_staged`].
+  #[must_use]
+  pub fn has_staged(&self) -> bool {
+    !self.staged.is_empty()
   }
 }
 
@@ -479,6 +501,13 @@ impl<I> EngineStable<I> {
     let n = self.staged.len();
     self.ready.append(&mut self.staged);
     n
+  }
+
+  /// Whether this store holds staged-but-unreleased work (invisible to `has_pending` by contract)
+  /// — see [`GroupEngine::has_staged`].
+  #[must_use]
+  pub fn has_staged(&self) -> bool {
+    !self.staged.is_empty()
   }
 }
 

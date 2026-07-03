@@ -488,11 +488,9 @@ where
   /// next crank). v1 deliberately iterates ALL hosted groups — an idle group's drain is a cheap
   /// no-op poll — with dirty-set tracking as the scale refinement.
   fn storage_crank(&mut self, now: Now) {
-    let released = if self.flush_pending {
-      self.engine.flush()
-    } else {
-      0
-    };
+    if self.flush_pending {
+      self.engine.flush();
+    }
     let mut more = false;
     let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
     for g in &hosted {
@@ -510,11 +508,12 @@ where
         }
       }
     }
-    // Completions drained above can STAGE follow-up writes (a commit's HardState write) that stay
-    // invisible until the next barrier — so a crank that released anything keeps the re-drive
-    // deadline immediate, and a crank that released nothing proves quiescence and lets the loop
-    // sleep.
-    self.flush_pending = released > 0 || more;
+    // Completions drained above can STAGE follow-up writes (a commit's HardState write submitted
+    // by the core's storage tail) that stay invisible to has_pending until the next barrier — so
+    // the re-arm predicate is the engine's own staged-work signal, measured AFTER the drains: it
+    // is exact, where a release-count inference would miss a write staged by a crank whose
+    // barrier released nothing.
+    self.flush_pending = self.engine.has_staged() || more;
     self
       .metrics
       .record(self.engine.flushes(), self.engine.ops_flushed());
