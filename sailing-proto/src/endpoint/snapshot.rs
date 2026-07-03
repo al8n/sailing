@@ -146,8 +146,11 @@ where
     // would close the connection / QUIC would drop it): return without sending. The peer stays in Snapshot
     // — this is a misconfiguration (a membership too large to snapshot), not a transient condition a
     // re-send resolves.
-    let frame_budget =
-      crate::wire::MAX_FRAME_BYTES.saturating_sub(overhead + data_field_max_self_cost) as u64;
+    // Also reserve the transport's group-demux header (prepended to every frame payload) so a
+    // maximum-size chunk plus a group tag still fits under the frame limit.
+    let frame_budget = crate::wire::MAX_FRAME_BYTES
+      .saturating_sub(overhead + data_field_max_self_cost + crate::wire::GROUP_HEADER_RESERVE)
+      as u64;
     if frame_budget == 0 {
       return ChunkSend::Deferred;
     }

@@ -88,7 +88,7 @@ fn decodes_inbound_messages_with_their_peer() {
   let mut peer = Conn::new(dialer(7));
   pump(&mut router, id, &mut peer);
 
-  peer.send_message(&hb(7));
+  peer.send_message(&[], &hb(7));
   let mut delivered = Vec::new();
   for _ in 0..8 {
     let mut back = Vec::new();

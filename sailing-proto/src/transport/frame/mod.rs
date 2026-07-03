@@ -15,6 +15,30 @@ pub(crate) fn encode_frame(payload: &[u8], out: &mut Vec<u8>) {
   out.extend_from_slice(payload);
 }
 
+/// Prepend the multi-Raft group-demux header `[u16 BE group_len][group bytes]` to a frame payload
+/// being built. An empty group (`group_len == 0`) is the single-group / default tag. The caller
+/// guarantees `group.len() <= crate::wire::MAX_GROUP_ID_LEN` (a `GroupId` encoding is bounded by
+/// that; the single-group path passes an empty slice).
+pub(crate) fn write_group_header(group: &[u8], out: &mut Vec<u8>) {
+  debug_assert!(group.len() <= crate::wire::MAX_GROUP_ID_LEN);
+  out.extend_from_slice(&(group.len() as u16).to_be_bytes());
+  out.extend_from_slice(group);
+}
+
+/// Split the group-demux header off a decoded frame, returning `(group_id_bytes, message_bytes)` as
+/// zero-copy slices of the same buffer. `Err(Decode)` if the header is truncated or declares a group
+/// past [`crate::wire::MAX_GROUP_ID_LEN`].
+pub(crate) fn split_group_header(frame: Bytes) -> Result<(Bytes, Bytes), TransportError> {
+  if frame.len() < 2 {
+    return Err(TransportError::Decode);
+  }
+  let group_len = u16::from_be_bytes([frame[0], frame[1]]) as usize;
+  if group_len > crate::wire::MAX_GROUP_ID_LEN || frame.len() < 2 + group_len {
+    return Err(TransportError::Decode);
+  }
+  Ok((frame.slice(2..2 + group_len), frame.slice(2 + group_len..)))
+}
+
 /// Reassembles length-prefixed frames from a byte stream that may arrive in arbitrary chunks.
 ///
 /// [`push`](Self::push) walks the input frame by frame and validates each frame's length header

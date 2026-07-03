@@ -649,8 +649,13 @@ where
           // connection (consensus retransmission re-drives anything lost); the endpoint is never
           // poisoned by transport input.
           let from = self.bridge.bound_peer_of(h);
-          match (from, crate::wire::decode_message::<I>(frame)) {
-            (Some(from), Ok(msg)) => {
+          // Split the group-demux header off before decoding the consensus message; a single-group
+          // host ignores the tag. A malformed header or body is a peer fault (same close path).
+          let decoded = super::super::frame::split_group_header(frame)
+            .ok()
+            .and_then(|(_group, message)| crate::wire::decode_message::<I>(message).ok());
+          match (from, decoded) {
+            (Some(from), Some(msg)) => {
               self.endpoint.handle_message(now, log, stable, from, msg);
             }
             _ => {

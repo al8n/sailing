@@ -69,11 +69,21 @@ pub const MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 /// is 78 bytes; 128 leaves headroom and stays negligible against [`MAX_FRAME_BYTES`].
 pub(crate) const ENTRY_WIRE_OVERHEAD_MAX: usize = 128;
 
+/// The largest group-demux id encoding accepted on a frame — the multi-Raft group tag, bounded by
+/// the same rule as the hello's peer id ([`MAX_ID_LEN`]).
+pub(crate) const MAX_GROUP_ID_LEN: usize = MAX_ID_LEN;
+
+/// The worst-case group-demux header the transport prepends to every frame payload:
+/// `[u16 group_len][group bytes]`. Reserved from the frame budget so a maximum-size message plus any
+/// group tag still fits one frame.
+pub(crate) const GROUP_HEADER_RESERVE: usize = 2 + MAX_GROUP_ID_LEN;
+
 /// An upper bound on the `AppendEntries` bytes that are NOT entries: the header (`term`; the leader id
 /// as a length-delimited `bytes` field ≤ [`MAX_ID_LEN`]; `prev_log_index`; `prev_log_term`;
-/// `leader_commit`), the `Message` oneof envelope, and the 4-byte transport frame length prefix. The
-/// exact worst case is `MAX_ID_LEN + 56`; the extra headroom absorbs anything this estimate misses.
-pub(crate) const APPEND_ENTRIES_HEADER_RESERVE: usize = MAX_ID_LEN + 256;
+/// `leader_commit`), the `Message` oneof envelope, the 4-byte transport frame length prefix, and the
+/// transport's group-demux header ([`GROUP_HEADER_RESERVE`]). The exact worst case is `MAX_ID_LEN + 56`
+/// plus the group header; the extra headroom absorbs anything this estimate misses.
+pub(crate) const APPEND_ENTRIES_HEADER_RESERVE: usize = MAX_ID_LEN + 256 + GROUP_HEADER_RESERVE;
 
 /// The largest total entry cost (each entry's `data` length plus [`ENTRY_WIRE_OVERHEAD_MAX`]) that one
 /// `AppendEntries` frame can carry within [`MAX_FRAME_BYTES`]. `propose` refuses an entry whose cost
