@@ -10,7 +10,7 @@ mod identity;
 
 pub use bridge::DialError;
 pub use config::{QuicConfigError, QuicConfigOptions};
-pub use coordinator::QuicCoordinator;
+pub use coordinator::{MultiQuicCoordinator, QuicCoordinator};
 
 /// The largest possible hello encoding: the fixed header plus a maximum-length peer id. The QUIC
 /// transport bounds its pre-authentication read with this (the control preface IS a hello, framed),

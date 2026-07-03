@@ -849,11 +849,12 @@ impl<I: NodeId> Bridge<I> {
     self.table.unbind(h);
   }
 
-  /// Frame-encode `msg` and write it to connection `h`'s send stream. The framed bytes are
-  /// appended to the BACK of the strict-FIFO `outbound` buffer, then a single front-draining
-  /// flush pushes into the stream — appending first keeps on-wire frame order equal to call
-  /// order under partial/blocked writes. The service pass that turns written stream bytes into
-  /// datagrams is DEFERRED to the coordinator's pump-end `service`.
+  /// Frame-encode `msg` — stamped with the `group` demux tag ([`write_group_header`]; the
+  /// single-group caller passes an empty slice) — and write it to connection `h`'s send stream.
+  /// The framed bytes are appended to the BACK of the strict-FIFO `outbound` buffer, then a
+  /// single front-draining flush pushes into the stream — appending first keeps on-wire frame
+  /// order equal to call order under partial/blocked writes. The service pass that turns written
+  /// stream bytes into datagrams is DEFERRED to the coordinator's pump-end `service`.
   ///
   /// Consensus frames are gated behind identity: a frame is staged ONLY on a `Validated`
   /// connection (the router cannot even resolve a non-validated one — this is defense in depth).
@@ -862,12 +863,18 @@ impl<I: NodeId> Bridge<I> {
   /// re-drives the dropped messages). An encoded message over [`MAX_FRAME_LEN`] is counted and
   /// dropped — the peer's decoder would fatally reject its declared length, so it could never
   /// deliver.
-  pub(crate) fn write_framed(&mut self, now: Instant, h: ConnectionHandle, msg: &Message<I>) {
+  pub(crate) fn write_framed(
+    &mut self,
+    now: Instant,
+    h: ConnectionHandle,
+    group: &[u8],
+    msg: &Message<I>,
+  ) {
     if !self.is_validated(h) {
       return;
     }
     let mut payload = Vec::new();
-    write_group_header(&[], &mut payload);
+    write_group_header(group, &mut payload);
     self.encoder.encode_message(msg, &mut payload);
     if payload.len() > MAX_FRAME_LEN {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);
