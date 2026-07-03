@@ -30,7 +30,7 @@ use sailing_proto::{
 };
 
 use sailing_driver::{
-  MultiCommand, MultiHandle, Node, Status, jittered,
+  LifecycleEvent, MultiCommand, MultiHandle, Node, Status, jittered,
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
@@ -42,7 +42,9 @@ use crate::{
 
 use crate::driver::{map_propose_err, map_read_err, map_transfer_err};
 
-use super::{EngineMetrics, GroupActivity, STORAGE_REDRIVES, group_idle, no_such_group, rejected};
+use super::{
+  EngineMetrics, GroupActivity, STORAGE_REDRIVES, conf_names, group_idle, no_such_group, rejected,
+};
 
 /// Backstop wake cadence while configured peers exist (the link reconciler's pacing on an
 /// otherwise-idle node — see the single-group QUIC driver).
@@ -80,6 +82,9 @@ where
   events_tx: flume::Sender<(G, Event<I, F::Response>)>,
   /// The dead-end sender each per-group `Routing` is built over (receiver dropped at bind).
   stub_events_tx: flume::Sender<Event<I, F::Response>>,
+  /// The driver-owned lifecycle tail: unknown-group placement signals and removed-self
+  /// notifications (see [`LifecycleEvent`]), bounded and best-effort like the events tail.
+  lifecycle_tx: flume::Sender<LifecycleEvent<G, I>>,
   storage_ready: flume::Receiver<()>,
   _storage_ready_keepalive: Option<flume::Sender<()>>,
   peers: Vec<Node<I, SocketAddr>>,
@@ -160,9 +165,10 @@ where
   ) -> (Self, MultiHandle<G, I, F>) {
     let (cmd_tx, cmd_rx) = flume::unbounded();
     let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
+    let (lifecycle_tx, lifecycle_rx) = flume::bounded(driver_cfg.events_cap);
     let budget = InflightBudget::new(driver_cfg.max_inflight, driver_cfg.max_pending_bytes);
     let (teardown_tx, teardown_rx) = futures_channel::oneshot::channel();
-    let handle = MultiHandle::new(cmd_tx, event_rx, budget, teardown_rx);
+    let handle = MultiHandle::new(cmd_tx, event_rx, lifecycle_rx, budget, teardown_rx);
 
     // The per-group Routing's stub tail (receiver dropped): the driver forwards the
     // group-stamped copies itself — see the stream sibling.
@@ -187,6 +193,7 @@ where
         routing: BTreeMap::new(),
         events_tx: event_tx,
         stub_events_tx,
+        lifecycle_tx,
         storage_ready,
         _storage_ready_keepalive: keepalive,
         peers,
@@ -920,6 +927,20 @@ where
       {
         run_queries.insert(g.cheap_clone());
       }
+      // REMOVED-SELF: a committed configuration change whose NEW configuration no longer names
+      // this host in any role. An observation only — no auto-teardown: the replica keeps running,
+      // harmlessly (the committed change already excluded it from every quorum), until the
+      // application drains its reads and calls remove_group.
+      if let Event::ConfChanged(cc) = &ev
+        && self
+          .coord
+          .host_id()
+          .is_some_and(|me| !conf_names(cc.conf(), me))
+      {
+        let _ = self.lifecycle_tx.try_send(LifecycleEvent::RemovedSelf {
+          group: g.cheap_clone(),
+        });
+      }
       let _ = self.events_tx.try_send((g, ev));
     }
     // Fold the coordinator's group-scoped scheduling signals IN DISPATCH ORDER: a flagged beat
@@ -936,6 +957,14 @@ where
         GroupControl::Wake => self.wake_group(&g),
         _ => {}
       }
+    }
+    // UNKNOWN-GROUP placement signals into the lifecycle tail: the embedder's trigger to create
+    // or restore the group on this host — or to ignore it (the coordinator keeps dropping the
+    // group's entries either way).
+    while let Some((group, from)) = self.coord.poll_unknown_group() {
+      let _ = self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::UnknownGroup { group, from });
     }
     let with_routing: Vec<G> = self.routing.keys().map(|g| g.cheap_clone()).collect();
     for g in &with_routing {

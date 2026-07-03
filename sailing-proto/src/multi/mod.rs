@@ -7,16 +7,18 @@
 //! all groups. The consensus core stays completely group-unaware; this layer owns only the routing
 //! and the aggregate drains.
 //!
-//! See `MULTI_RAFT.md` for the architecture and the phased roadmap. The group set is append-only
-//! in policy — [`remove_group`](MultiRaft::remove_group) ships as the dynamic-lifecycle teardown
-//! seam, but there is no create/destroy protocol yet — over caller-injected per-group storage
-//! (each group is handed its own `LogStore`/`StableStore` per call, mirroring [`Endpoint`]). The
-//! group-tagged wire (the multi-group coordinators) and the shared storage engine
-//! ([`GroupEngine`] — every co-located group's stores behind ONE batched durability barrier)
-//! consume this surface without reshaping it; the threaded reactor, heartbeat coalescing, and
-//! dynamic group lifecycle are later phases. Every client-facing routing method of the
-//! single-group [`Endpoint`] — propose, conf changes (v1/v2), read-index, leader transfer,
-//! read-mode migration — has a group-keyed delegate here.
+//! See `MULTI_RAFT.md` for the architecture and the phased roadmap. Groups are created and
+//! removed at runtime over caller-injected per-group storage (each group is handed its own
+//! `LogStore`/`StableStore` per call, mirroring [`Endpoint`]); `MultiRaft` itself stays the PURE
+//! container — the dynamic-lifecycle mechanics around it (removal tombstones, unknown-group
+//! surfacing, removed-self notification) live in the multi coordinators and the drivers, and the
+//! placement POLICY — where a group should live, when to tear a removed replica down — is
+//! explicitly the embedder's (no auto-create, no auto-teardown). The group-tagged wire (the
+//! multi-group coordinators) and the shared storage engine ([`GroupEngine`] — every co-located
+//! group's stores behind ONE batched durability barrier) consume this surface without reshaping
+//! it. Every client-facing routing method of the single-group [`Endpoint`] — propose, conf
+//! changes (v1/v2), read-index, leader transfer, read-mode migration — has a group-keyed
+//! delegate here.
 
 mod engine;
 pub use engine::{EngineLog, EngineStable, EngineStorageError, GroupEngine};
@@ -149,9 +151,11 @@ where
   }
 
   /// Remove and return a group's [`Endpoint`]. Stale drain-queue entries for it are skipped on the
-  /// next poll. This is the teardown seam the dynamic-lifecycle phase builds on. The host identity
-  /// is NOT cleared — even removing the last group leaves it latched, so a re-created group must
-  /// carry the same node id (live transport connections stay authenticated under it).
+  /// next poll. This is the dynamic-lifecycle teardown seam: the container stays PURE (no
+  /// tombstone here — the multi coordinators tombstone the id so the wire's stragglers drop
+  /// silently). The host identity is NOT cleared — even removing the last group leaves it
+  /// latched, so a re-created group must carry the same node id (live transport connections stay
+  /// authenticated under it).
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
     self.groups.remove(gid)
   }

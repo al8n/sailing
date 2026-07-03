@@ -515,6 +515,95 @@ fn tombstoned_group_drops_entries_silently_until_recreated() {
   );
 }
 
+/// Fire one campaign round of `a`'s `group` (its election timer) and settle — the solicitation
+/// generator for the unknown-group tests (`b` does not host the group, so no election completes).
+fn campaign_a(
+  a: &mut MCoord,
+  b: &mut MCoord,
+  sa: &mut Stores,
+  sb: &mut Stores,
+  group: u64,
+  mut now: Instant,
+) -> Instant {
+  let d = a.group(&group).unwrap().poll_timeout().unwrap();
+  now = now.max(d);
+  {
+    let (l, s) = sa.stores(&group).unwrap();
+    a.handle_timeout(&group, now, l, s).unwrap();
+  }
+  settle(a, b, sa, sb, now);
+  now
+}
+
+/// The unknown-group placement signal over live QUIC: a campaign for a group `b` does not host
+/// surfaces `(group, sender)` once until polled, polling re-arms it, a tombstoned id stays
+/// silent, and the dedupe set is capped.
+#[test]
+fn unknown_group_traffic_surfaces_over_quic() {
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut a = multi_coord(&ca, 1, cluster);
+  let mut b = multi_coord(&ca, 2, cluster);
+  for g in [100u64, 200] {
+    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
+      .unwrap();
+  }
+  b.create_group(100, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
+    .unwrap();
+  let mut sa = group_stores(&[100, 200]);
+  let mut sb = group_stores(&[100]);
+  let mut now = Instant::ORIGIN;
+
+  a.connect(now, addr(2), 2u64).expect("dial");
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 100, now);
+  assert_eq!(
+    b.poll_unknown_group(),
+    None,
+    "hosted traffic is never unknown"
+  );
+
+  // Two campaign rounds for un-hosted group 200 before the embedder polls: ONE deduped signal.
+  now = campaign_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  now = campaign_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  assert_eq!(
+    b.poll_unknown_group(),
+    Some((200, 1)),
+    "the unknown group surfaces with its soliciting peer"
+  );
+  assert_eq!(b.poll_unknown_group(), None, "deduped until polled");
+
+  // Polling re-arms the group for a fresh signal.
+  now = campaign_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  assert_eq!(b.poll_unknown_group(), Some((200, 1)));
+
+  // Tombstoning the id silences the solicitations entirely (an unhosted removal still
+  // tombstones: the embedder declared the id retired).
+  assert!(b.remove_group(&200).is_none(), "b never hosted 200");
+  assert!(b.is_retired(&200));
+  let _ = campaign_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  assert_eq!(
+    b.poll_unknown_group(),
+    None,
+    "tombstoned: silent, not unknown"
+  );
+  assert!(
+    a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
+    "unknown and tombstoned solicitations never cost the connection"
+  );
+
+  // The pending set is CAPPED at 64 distinct groups (the wire path into the queue is covered
+  // above; the bound itself is a container property).
+  for gid in 0..(UNKNOWN_GROUP_SIGNAL_CAP as u64 + 6) {
+    b.note_unknown_group(3000 + gid, 1u64);
+  }
+  let mut drained = 0;
+  while b.poll_unknown_group().is_some() {
+    drained += 1;
+  }
+  assert_eq!(drained, UNKNOWN_GROUP_SIGNAL_CAP);
+}
+
 /// A zero-group host CLOSES a preface-bearing connection immediately (the preface was already
 /// consumed, so it could never validate) — admission plus a fresh dial therefore recover well
 /// WITHIN the auth-deadline window, with no reap wait.

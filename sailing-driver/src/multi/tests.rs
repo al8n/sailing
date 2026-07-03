@@ -29,6 +29,7 @@ impl sailing_proto::StateMachine for CountSm {
 type TestHandle = MultiHandle<u64, u64, CountSm>;
 type CmdRx = flume::Receiver<MultiCommand<u64, u64, CountSm>>;
 type EventTx = flume::Sender<(u64, Event<u64, u64>)>;
+type LifecycleTx = flume::Sender<LifecycleEvent<u64, u64>>;
 
 /// Both the multi handle and its group projection cross threads; a regression in either's
 /// `Send + Sync` composition is a compile error here.
@@ -38,14 +39,18 @@ const _: fn() = || {
   assert_send_sync::<GroupHandle<u64, u64, CountSm>>();
 };
 
-/// The handle under test plus the stub driver's ends: the command receiver, the held event sender
-/// (so the events tail is not pre-disconnected), and the teardown sender the driver would fire.
-fn test_handle(budget: InflightBudget) -> (TestHandle, CmdRx, EventTx, oneshot::Sender<()>) {
+/// The handle under test plus the stub driver's ends: the command receiver, the held event and
+/// lifecycle senders (so neither tail is pre-disconnected), and the teardown sender the driver
+/// would fire.
+fn test_handle(
+  budget: InflightBudget,
+) -> (TestHandle, CmdRx, EventTx, LifecycleTx, oneshot::Sender<()>) {
   let (cmd_tx, cmd_rx) = flume::unbounded();
   let (event_tx, event_rx) = flume::bounded(4);
+  let (lifecycle_tx, lifecycle_rx) = flume::bounded(4);
   let (teardown_tx, teardown_rx) = oneshot::channel();
-  let handle = MultiHandle::new(cmd_tx, event_rx, budget, teardown_rx);
-  (handle, cmd_rx, event_tx, teardown_tx)
+  let handle = MultiHandle::new(cmd_tx, event_rx, lifecycle_rx, budget, teardown_rx);
+  (handle, cmd_rx, event_tx, lifecycle_tx, teardown_tx)
 }
 
 fn config() -> sailing_proto::Config<u64> {
@@ -63,7 +68,8 @@ fn config() -> sailing_proto::Config<u64> {
 #[test]
 fn group_projection_stamps_the_group_id() {
   futures_executor::block_on(async {
-    let (handle, cmd_rx, _event_tx, _teardown_tx) = test_handle(InflightBudget::new(8, 64));
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
     let g7 = handle.group(7);
     assert_eq!(*g7.group_id(), 7);
 
@@ -96,7 +102,7 @@ fn group_projection_stamps_the_group_id() {
 fn budget_is_shared_across_group_projections_and_lifecycle() {
   futures_executor::block_on(async {
     let budget = InflightBudget::new(2, 1024);
-    let (handle, cmd_rx, _event_tx, _teardown_tx) = test_handle(budget);
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) = test_handle(budget);
     let g1 = handle.group(1);
     let g2 = handle.group(2);
 
@@ -135,7 +141,8 @@ fn budget_is_shared_across_group_projections_and_lifecycle() {
 #[test]
 fn lifecycle_commands_round_trip_their_replies() {
   futures_executor::block_on(async {
-    let (handle, cmd_rx, _event_tx, _teardown_tx) = test_handle(InflightBudget::new(8, 64));
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
 
     let mut create = Box::pin(handle.create_group(100, config(), 1, CountSm));
     assert!(matches!(
@@ -176,7 +183,8 @@ fn lifecycle_commands_round_trip_their_replies() {
 #[test]
 fn shutdown_coalesces_and_awaits_teardown() {
   futures_executor::block_on(async {
-    let (handle, cmd_rx, _event_tx, teardown_tx) = test_handle(InflightBudget::new(8, 64));
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
     let clones: Vec<TestHandle> = (0..4).map(|_| handle.clone()).collect();
 
     let mut futs: Vec<_> = std::iter::once(&handle)
@@ -210,7 +218,8 @@ fn shutdown_coalesces_and_awaits_teardown() {
 #[test]
 fn disconnected_driver_is_shutting_down_everywhere() {
   futures_executor::block_on(async {
-    let (handle, cmd_rx, _event_tx, teardown_tx) = test_handle(InflightBudget::new(8, 64));
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
     let group = handle.group(1);
     drop(cmd_rx);
 
@@ -230,4 +239,27 @@ fn disconnected_driver_is_shutting_down_everywhere() {
       other => panic!("expected ShuttingDown from an aborted teardown, got {other:?}"),
     }
   });
+}
+
+/// The lifecycle tail hands the driver's placement signals to the embedder verbatim and in
+/// order, and clones share the one tail — any clone can host the placement brain.
+#[test]
+fn lifecycle_tail_delivers_signals_to_any_clone() {
+  let (handle, _cmd_rx, _event_tx, lifecycle_tx, _teardown_tx) =
+    test_handle(InflightBudget::new(8, 64));
+  lifecycle_tx
+    .try_send(LifecycleEvent::UnknownGroup { group: 7, from: 3 })
+    .expect("the tail has room");
+  lifecycle_tx
+    .try_send(LifecycleEvent::RemovedSelf { group: 9 })
+    .expect("the tail has room");
+  let clone = handle.clone();
+  assert_eq!(
+    clone.lifecycle().try_recv().expect("the first signal"),
+    LifecycleEvent::UnknownGroup { group: 7, from: 3 }
+  );
+  assert_eq!(
+    clone.lifecycle().try_recv().expect("the second signal"),
+    LifecycleEvent::RemovedSelf { group: 9 }
+  );
 }

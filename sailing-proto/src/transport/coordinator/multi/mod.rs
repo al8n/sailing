@@ -60,6 +60,29 @@ pub enum GroupControl {
   Wake,
 }
 
+/// Bound on DISTINCT groups a coordinator queues as unknown-group placement signals; beyond it
+/// new unknown groups drop silently until the embedder drains the queue. The signal is an
+/// optimization, never load-bearing (the sender's retry cadence re-delivers), so a small fixed
+/// bound caps the state a scanner spraying group ids can pin.
+pub(crate) const UNKNOWN_GROUP_SIGNAL_CAP: usize = 64;
+
+/// Whether an inbound message is INITIAL-SHAPED — a kind that legitimately SOLICITS state
+/// creation on a host that does not carry its group: a campaigner's vote request (any,
+/// pre-vote included), or a leader's first-contact heartbeat (the per-peer commit clamp
+/// `min(commit, match)` makes a genuinely-initial beat carry commit 0 by construction). Mirrors
+/// TiKV's `is_initial_msg` gate (only these kinds may create a peer): surfacing arbitrary
+/// traffic would let a delayed straggler — an old append or snapshot chunk from a removed
+/// group's past life — prompt the embedder's placement brain to resurrect a group it just
+/// destroyed, while an initial-shaped message means a live peer is actively soliciting this
+/// node, and the sender's own retry loop re-delivers everything else once the group exists.
+pub(crate) fn is_initial_shaped<I: crate::CheapClone>(msg: &Message<I>) -> bool {
+  match msg {
+    Message::RequestVote(_) => true,
+    Message::Heartbeat(hb) => hb.commit() == Index::ZERO,
+    _ => false,
+  }
+}
+
 /// A multi-group consensus node speaking over framed reliable connections (`R` is the record layer,
 /// e.g. `Labeled<Passthrough>` for TCP or `Labeled<TlsRecords>` for TLS).
 pub struct MultiStreamCoordinator<G, I, F, R>
@@ -84,6 +107,13 @@ where
   /// create/restore re-admits the id (see [`remove_group`](Self::remove_group)). In-memory and
   /// volatile — a restart starts clean; the embedder's group catalog owns removal persistence.
   retired: BTreeSet<G>,
+  /// Unknown-group placement signals, in arrival order: `(group, authenticated sender)` for
+  /// initial-shaped traffic whose group is neither hosted, nor store-resolvable, nor tombstoned
+  /// (see [`poll_unknown_group`](Self::poll_unknown_group)).
+  unknown_pending: VecDeque<(G, I)>,
+  /// The groups currently queued in `unknown_pending` — the dedupe set (one signal per group
+  /// until polled off), bounded by [`UNKNOWN_GROUP_SIGNAL_CAP`].
+  unknown_seen: BTreeSet<G>,
 }
 
 impl<G, I, F, R> MultiStreamCoordinator<G, I, F, R>
@@ -107,6 +137,8 @@ where
       quiesce_intents: BTreeSet::new(),
       controls: VecDeque::new(),
       retired: BTreeSet::new(),
+      unknown_pending: VecDeque::new(),
+      unknown_seen: BTreeSet::new(),
     }
   }
 
@@ -127,6 +159,7 @@ where
     let key = gid.cheap_clone();
     self.multi.create_group(gid, config, now, seed, fsm)?;
     self.retired.remove(&key);
+    self.purge_unknown_signal(&key);
     Ok(())
   }
 
@@ -157,6 +190,7 @@ where
       .multi
       .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
     self.retired.remove(&key);
+    self.purge_unknown_signal(&key);
     Ok(())
   }
 
@@ -164,7 +198,8 @@ where
   /// and queued controls with it (its per-peer batched beats, if any, still ship — a removed
   /// group's in-flight heartbeat is indistinguishable from one that left just before removal, and
   /// the receiver's unhosted-entry drop absorbs it) — and TOMBSTONES the id: inbound frames tagged
-  /// with it drop silently, before store resolution, until a create/restore re-admits it.
+  /// with it drop silently, before store resolution and WITHOUT an unknown-group signal, until a
+  /// create/restore re-admits it.
   ///
   /// The tombstone is IN-MEMORY and GROUP-keyed — deliberately weaker than the references, which
   /// persist replica-keyed tombstones for exactly this straggler problem (TiKV a region-epoch +
@@ -178,6 +213,7 @@ where
     self.quiesce_intents.remove(gid);
     self.controls.retain(|(g, _)| g != gid);
     self.retired.insert(gid.cheap_clone());
+    self.purge_unknown_signal(gid);
     self.multi.remove_group(gid)
   }
 
@@ -186,6 +222,51 @@ where
   #[must_use]
   pub fn is_retired(&self, gid: &G) -> bool {
     self.retired.contains(gid)
+  }
+
+  /// Drain the next UNKNOWN-GROUP placement signal: `(group, authenticated sender)` for
+  /// well-formed INITIAL-SHAPED traffic — a vote request, or a first-contact heartbeat carrying
+  /// commit 0 — whose group this host neither hosts, nor resolves stores for, nor has
+  /// tombstoned. The embedder's PLACEMENT BRAIN decides what to do with it: create/restore the
+  /// group here (the soliciting peer's retry then completes the join) or ignore it (the
+  /// coordinator keeps dropping the frames). Placement policy is deliberately NOT the
+  /// coordinator's job — no auto-create, ever.
+  ///
+  /// One signal per group until polled off; polling re-arms the group for a fresh signal. At
+  /// most 64 distinct groups are queued — beyond the cap new unknown groups drop silently (the
+  /// signal is an optimization; the sender retries on its own cadence).
+  pub fn poll_unknown_group(&mut self) -> Option<(G, I)> {
+    let (group, from) = self.unknown_pending.pop_front()?;
+    self.unknown_seen.remove(&group);
+    Some((group, from))
+  }
+
+  /// The node's host identity — LATCHED by the first admitted group for the container's
+  /// lifetime (a multi-Raft host is one physical node), stable across group removals and
+  /// zero-group windows. `None` only before any group has ever been admitted.
+  #[must_use]
+  pub fn host_id(&self) -> Option<&I> {
+    self.multi.host_id()
+  }
+
+  /// Queue an unknown-group placement signal, deduped by group until polled off and dropped
+  /// beyond [`UNKNOWN_GROUP_SIGNAL_CAP`] pending groups (see
+  /// [`poll_unknown_group`](Self::poll_unknown_group)).
+  fn note_unknown_group(&mut self, group: G, from: I) {
+    if self.unknown_seen.contains(&group) || self.unknown_seen.len() >= UNKNOWN_GROUP_SIGNAL_CAP {
+      return;
+    }
+    self.unknown_seen.insert(group.cheap_clone());
+    self.unknown_pending.push_back((group, from));
+  }
+
+  /// Drop any queued unknown-group signal for `gid`: after an admission or a removal the queued
+  /// claim is stale — polling it would hand the placement brain a lie (an "unknown" group that
+  /// is now hosted, or one the embedder just retired).
+  fn purge_unknown_signal(&mut self, gid: &G) {
+    if self.unknown_seen.remove(gid) {
+      self.unknown_pending.retain(|(g, _)| g != gid);
+    }
   }
 
   /// Register a freshly opened connection, returning the coordinator-assigned [`ConnId`] the driver
@@ -215,8 +296,10 @@ where
 
   /// Feed inbound bytes from `conn`: decode each frame, resolve its group's store through `stores`,
   /// feed the owning group's endpoint, then flush every group's resulting outbound messages. A frame
-  /// whose group has no store is dropped (the sender retries on its own cadence); a group tag that
-  /// does not decode as `G` closes the connection as integrity-suspect (reported via
+  /// whose group has no store is dropped (the sender retries on its own cadence) — and when it is
+  /// initial-shaped for a group neither hosted nor tombstoned, surfaced once via
+  /// [`poll_unknown_group`](Self::poll_unknown_group); a group tag that does not decode as `G`
+  /// closes the connection as integrity-suspect (reported via
   /// [`poll_conn_closed`](Self::poll_conn_closed)).
   pub fn handle_conn_data<L, S, St>(
     &mut self,
@@ -255,8 +338,10 @@ where
       }
       // A tombstoned (removed, not re-admitted) group's frame is a straggler from the group's
       // past life on this host: drop it silently — never a close (the shared connection carries
-      // the live groups' traffic) and never a control. Ordered AFTER the integrity gates (a
-      // malformed tag or violating flag still closes) and BEFORE store resolution.
+      // the live groups' traffic), never a control, and never an unknown-group signal (the
+      // embedder retired the id; resurrecting it on a straggler's say-so would undo the
+      // removal). Ordered AFTER the integrity gates (a malformed tag or violating flag still
+      // closes) and BEFORE store resolution.
       if self.retired.contains(&group) {
         continue;
       }
@@ -283,6 +368,11 @@ where
           let flags = self.accepted_flags(&group, flags, beat_term, &sender);
           self.push_dispatch_controls(&group, wake, flags);
         }
+      } else if is_initial_shaped(&msg) && !self.multi.contains_group(&group) {
+        // Neither store-resolvable nor hosted (nor tombstoned — gated above): a live peer is
+        // actively soliciting a group this host does not carry. Surface it ONCE to the
+        // embedder's placement brain; every other kind for the group drops silently.
+        self.note_unknown_group(group, from);
       }
     }
     self.flush();

@@ -8,7 +8,11 @@
 //! ([`Routing`](sailing_driver::shared::Routing)) is the single-group type instantiated PER GROUP,
 //! and the one armed deadline folds every group's earliest consensus deadline in. Groups arrive
 //! and leave at runtime through [`MultiCommand`](sailing_driver::MultiCommand) lifecycle commands
-//! — the drivers bind EMPTY.
+//! — the drivers bind EMPTY — and the drivers surface the placement TRIGGERS (unknown-group
+//! solicitations, removed-self conf changes) on the
+//! [`MultiHandle::lifecycle`](sailing_driver::MultiHandle::lifecycle) tail: the placement policy
+//! itself — where a group should live, when to tear a removed replica down — is explicitly the
+//! embedder's, whether a PD-style external placer or a Cockroach-style local one.
 
 mod quic;
 mod stream;
@@ -41,6 +45,17 @@ pub(crate) fn rejected<I>(e: impl core::fmt::Display) -> DriverError<I> {
   DriverError::Rejected {
     reason: e.to_string(),
   }
+}
+
+/// Whether `conf` still names `me` in ANY membership role — voter in either joint half, learner,
+/// or incoming learner. The complement is the REMOVED-SELF trigger: a committed configuration
+/// that no longer names the host anywhere (during a joint phase the outgoing half still counts,
+/// so a leaving member fires only on the final, fully-departed configuration).
+pub(crate) fn conf_names<I: Ord>(conf: &sailing_proto::ConfState<I>, me: &I) -> bool {
+  conf.voters().contains(me)
+    || conf.voters_outgoing().contains(me)
+    || conf.learners().contains(me)
+    || conf.learners_next().contains(me)
 }
 
 /// A group's last OBSERVED consensus state and the instant it last changed — the idle clock the

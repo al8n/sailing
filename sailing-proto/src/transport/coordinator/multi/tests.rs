@@ -874,3 +874,195 @@ fn tombstoned_group_drops_frames_silently_until_recreated() {
     "traffic flows to the re-created group"
   );
 }
+
+/// A vote request for a group this host neither hosts nor has tombstoned surfaces ONCE via
+/// `poll_unknown_group` — keyed to the authenticated sender, deduped until polled, re-armed by
+/// polling, and purged by an admission — while hosted and tombstoned groups stay silent.
+#[test]
+fn unknown_group_traffic_surfaces_once_until_polled() {
+  let mut w = World::new(&[100, 200], &[100]);
+  w.settle();
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    None,
+    "the handshake alone signals nothing"
+  );
+
+  // Two campaign rounds for un-hosted group 200 arrive before the embedder polls: ONE signal.
+  w.fire_a(200);
+  w.fire_a(200);
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    Some((200, 1)),
+    "the unknown group surfaces with its soliciting peer"
+  );
+  assert_eq!(w.b.poll_unknown_group(), None, "deduped until polled");
+
+  // Polling re-arms: the next solicitation surfaces afresh.
+  w.fire_a(200);
+  assert_eq!(w.b.poll_unknown_group(), Some((200, 1)));
+  assert_eq!(w.b.poll_unknown_group(), None);
+
+  // Admission PURGES a stale queued signal: polling after the create must not hand the
+  // placement brain an "unknown" claim about a group this host now carries.
+  w.fire_a(200);
+  w.sb
+    .map
+    .insert(200, (VecLog::default(), AsyncStable::default()));
+  w.b
+    .create_group(200, two_voter(2), w.now, 2, CountSm::default())
+    .unwrap();
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    None,
+    "the stale signal died with the admission"
+  );
+
+  // Hosted traffic never signals.
+  w.elect_a(100);
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    None,
+    "a hosted group's traffic is not unknown"
+  );
+
+  // A tombstoned id never signals — even for initial-shaped traffic.
+  assert!(w.b.remove_group(&100).is_some());
+  let mut tag = Vec::new();
+  sailing_encode_u64(100, &mut tag);
+  let rv = Message::RequestVote(crate::RequestVote::new(
+    Term::new(9),
+    1u64,
+    Index::ZERO,
+    Term::ZERO,
+    false,
+    false,
+  ));
+  let framed = crafted_frame(&tag, &rv);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    None,
+    "tombstoned: silent, not unknown"
+  );
+  assert_eq!(w.b.poll_conn_closed(), None);
+}
+
+/// The unknown-group signal is gated on INITIAL-SHAPED kinds (TiKV's `is_initial_msg`): a vote
+/// request or a commit-0 first-contact heartbeat surfaces; an AppendEntries or an established
+/// (commit > 0) heartbeat — the shape of a removed group's delayed stragglers — drops with NO
+/// signal, so a stale frame can never prompt the placement brain to resurrect a destroyed group.
+#[test]
+fn only_initial_shaped_traffic_signals_an_unknown_group() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  let mut tag = Vec::new();
+  sailing_encode_u64(999, &mut tag);
+
+  // Non-initial kinds for unknown group 999: an append and an established heartbeat — silent.
+  let ae = Message::AppendEntries(crate::AppendEntries::new(
+    Term::new(3),
+    1u64,
+    Index::ZERO,
+    Term::ZERO,
+    Vec::new(),
+    Index::new(5),
+  ));
+  let framed = crafted_frame(&tag, &ae);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  let hb = Message::Heartbeat(crate::Heartbeat::new(
+    Term::new(3),
+    1u64,
+    Index::new(5),
+    bytes::Bytes::new(),
+  ));
+  let framed = crafted_frame(&tag, &hb);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    None,
+    "non-initial kinds never signal"
+  );
+
+  // Initial-shaped kinds: a first-contact (commit-0) heartbeat, then a (pre-)vote request.
+  let hb0 = Message::Heartbeat(crate::Heartbeat::new(
+    Term::new(3),
+    1u64,
+    Index::ZERO,
+    bytes::Bytes::new(),
+  ));
+  let framed = crafted_frame(&tag, &hb0);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    Some((999, 1)),
+    "a first-contact beat signals"
+  );
+  let rv = Message::RequestVote(crate::RequestVote::new(
+    Term::new(3),
+    1u64,
+    Index::ZERO,
+    Term::ZERO,
+    true,
+    false,
+  ));
+  let framed = crafted_frame(&tag, &rv);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    Some((999, 1)),
+    "a (pre-)vote request signals"
+  );
+  assert_eq!(
+    w.b.poll_conn_closed(),
+    None,
+    "well-formed unknown traffic never closes"
+  );
+}
+
+/// The pending unknown-group set is CAPPED at 64 distinct groups: beyond it new signals drop
+/// silently (the sender retries on its own cadence), and polling frees capacity for fresh ones.
+#[test]
+fn unknown_group_signals_cap_and_recover_on_poll() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  let rv_frame = |gid: u64| {
+    let mut tag = Vec::new();
+    sailing_encode_u64(gid, &mut tag);
+    let msg = Message::RequestVote(crate::RequestVote::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      false,
+      false,
+    ));
+    crafted_frame(&tag, &msg)
+  };
+  for gid in 0..70u64 {
+    let framed = rv_frame(1000 + gid);
+    w.b
+      .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  }
+  let mut drained = Vec::new();
+  while let Some(sig) = w.b.poll_unknown_group() {
+    drained.push(sig);
+  }
+  assert_eq!(
+    drained.len(),
+    UNKNOWN_GROUP_SIGNAL_CAP,
+    "the queue holds at most the cap"
+  );
+  assert_eq!(drained[0], (1000, 1), "FIFO from the first solicitation");
+
+  // Polling freed the set: a fresh unknown group signals again.
+  let framed = rv_frame(2000);
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
+  assert_eq!(w.b.poll_unknown_group(), Some((2000, 1)));
+}
