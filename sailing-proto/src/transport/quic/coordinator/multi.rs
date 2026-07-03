@@ -46,7 +46,6 @@ use crate::{
 /// with the anchor captured LAZILY on the first call.
 pub struct MultiQuicCoordinator<G, I, F, ID = Hello>
 where
-  G: GroupId,
   F: StateMachine,
 {
   multi: MultiRaft<G, I, F>,
@@ -294,6 +293,7 @@ where
   }
 
   /// Propose a command on `group`'s leader, replicating immediately. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn submit_propose<L, S>(
     &mut self,
     group: &G,
@@ -317,6 +317,7 @@ where
   /// replication afterward via [`flush_appends`](Self::flush_appends), once per crank, so a burst
   /// coalesces into one broadcast per peer. Direct callers should prefer
   /// [`submit_propose`](Self::submit_propose). `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn submit_propose_deferred<L, S>(
     &mut self,
     group: &G,
@@ -336,6 +337,7 @@ where
   }
 
   /// Ship `group`'s coalesced replication batch and pump. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn flush_appends<L, S>(
     &mut self,
     group: &G,
@@ -355,6 +357,7 @@ where
 
   /// Propose a membership change (single-step) on `group`, replicating immediately. `None` if no
   /// such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn propose_conf_change<L, S>(
     &mut self,
     group: &G,
@@ -378,6 +381,7 @@ where
 
   /// Propose a membership change (joint-consensus capable) on `group`, replicating immediately.
   /// `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn propose_conf_change_v2<L, S>(
     &mut self,
     group: &G,
@@ -401,6 +405,7 @@ where
 
   /// Propose a cluster-wide read-mode migration on `group`, replicating immediately. `None` if no
   /// such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn propose_read_mode_change<L, S>(
     &mut self,
     group: &G,
@@ -424,6 +429,7 @@ where
 
   /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
   /// [`poll_event`](Self::poll_event) stamped with the group. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn read_index<L, S>(
     &mut self,
     group: &G,
@@ -443,6 +449,7 @@ where
   }
 
   /// Begin transferring `group`'s leadership to `to`. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn transfer_leader<L, S>(
     &mut self,
     group: &G,
@@ -463,6 +470,7 @@ where
 
   /// Fire `group`'s CONSENSUS timers, then pump. `None` if no such group. The shared QUIC transport
   /// timers are fired by [`handle_transport_timeout`](Self::handle_transport_timeout).
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn handle_timeout<L, S>(
     &mut self,
     group: &G,
@@ -481,6 +489,7 @@ where
   }
 
   /// Drain `group`'s storage completions, then pump. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn handle_storage<L, S>(
     &mut self,
     group: &G,
@@ -686,7 +695,10 @@ where
               // A well-formed frame for a group this host does not carry is dropped, not fatal: the
               // connection is shared, so one unhosted group must not tear it down for the others.
               if let Some((log, stable)) = stores.stores(&group) {
-                self
+                // `None` here means `stores` resolved a group `MultiRaft` does not host — the
+                // same unhosted-group drop as a missing store, so the verdict is deliberately
+                // ignored.
+                let _ = self
                   .multi
                   .handle_message(&group, now, log, stable, from, msg);
               }
@@ -868,13 +880,13 @@ mod tests {
     let d = coord.group(&100).unwrap().poll_timeout().unwrap();
     {
       let (l, s) = stores.stores(&100).unwrap();
-      coord.handle_timeout(&100, d, l, s); // campaign
+      coord.handle_timeout(&100, d, l, s).unwrap(); // campaign
     }
     for _ in 0..2 {
       // First drain: the self-vote becomes durable and the group becomes leader (appending a no-op);
       // second drain: the no-op append completes, so quorum=1 commits and applies it.
       let (l, s) = stores.stores(&100).unwrap();
-      coord.handle_storage(&100, d, l, s);
+      coord.handle_storage(&100, d, l, s).unwrap();
     }
     assert!(coord.group(&100).unwrap().role().is_leader());
     assert!(coord.group(&200).unwrap().role().is_follower());
@@ -887,7 +899,7 @@ mod tests {
     }
     {
       let (l, s) = stores.stores(&100).unwrap();
-      coord.handle_storage(&100, d, l, s);
+      coord.handle_storage(&100, d, l, s).unwrap();
     }
     while let Some((g, _)) = coord.poll_event() {
       assert_eq!(g, 100, "events are stamped with the originating group");
