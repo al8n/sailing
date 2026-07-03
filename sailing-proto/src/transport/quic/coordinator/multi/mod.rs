@@ -36,8 +36,8 @@ use crate::{
 /// many groups, and the transport authenticates the node once per connection. The binding policy is
 /// the single-group coordinator's verbatim: an unconditional `cluster == our cluster` cross-check, a
 /// never-bind-our-own-id gate, then dialed→match-or-abort / accepted→adopt. The node's own id (the
-/// preface self-claim and the self-id gate operand) is the id every hosted group shares; it is read
-/// from any hosted group.
+/// preface self-claim and the self-id gate operand) is the host identity LATCHED by the first
+/// admitted group — stable across group removals and zero-group windows, enforced at admission.
 ///
 /// # Clock
 ///
@@ -563,17 +563,13 @@ where
     self.bridge.oversized_dropped()
   }
 
-  /// The node's transport identity — the id every hosted group shares (a multi-Raft host is one
-  /// physical node). Read from any hosted group; `None` only when no group is hosted yet, in which
-  /// case there is no identity to advertise (the preface step and the self-id gate are skipped, and
-  /// an un-authenticatable connection is reaped by the bridge's auth deadline).
+  /// The node's transport identity — the host id latched by the first admitted group (a
+  /// multi-Raft host is one physical node), stable across group removals and zero-group windows.
+  /// `None` only before ANY group has ever been admitted, in which case there is no identity to
+  /// advertise: our preface cannot be staged, and an inbound preface closes its connection (the
+  /// peer redials once admission happens).
   fn node_id(&self) -> Option<I> {
-    self
-      .multi
-      .group_ids()
-      .next()
-      .and_then(|gid| self.multi.group(gid))
-      .map(|ep| ep.id())
+    self.multi.host_id().map(CheapClone::cheap_clone)
   }
 
   /// The mesh floor against the UNION of every hosted group's tracked peers: co-located groups share
@@ -581,7 +577,6 @@ where
   /// learners, and incoming learners), not any one group. Excludes this node itself.
   fn effective_cap(&self) -> usize {
     let mut peers: BTreeSet<I> = BTreeSet::new();
-    let mut me: Option<I> = None;
     for gid in self.multi.group_ids() {
       if let Some(ep) = self.multi.group(gid) {
         let conf = ep.conf_state();
@@ -589,10 +584,9 @@ where
         peers.extend(conf.voters_outgoing().iter().map(CheapClone::cheap_clone));
         peers.extend(conf.learners().iter().map(CheapClone::cheap_clone));
         peers.extend(conf.learners_next().iter().map(CheapClone::cheap_clone));
-        me = Some(ep.id());
       }
     }
-    if let Some(me) = me {
+    if let Some(me) = self.node_id() {
       peers.remove(&me);
     }
     self

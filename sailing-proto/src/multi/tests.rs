@@ -17,6 +17,47 @@ fn single_node_cfg(id: u64) -> Config<u64> {
 }
 
 #[test]
+fn host_identity_is_latched_across_group_removal() {
+  let mut mr = MultiRaft::<u64, u64, CountSm>::new();
+  assert!(mr.host_id().is_none(), "no identity before any admission");
+  mr.create_group(
+    1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+  )
+  .unwrap();
+  assert_eq!(mr.host_id(), Some(&1));
+
+  // Removing the LAST group must not un-latch the identity: live transport connections stay
+  // authenticated under it, so a re-created group with a different id would silently wedge.
+  assert!(mr.remove_group(&1).is_some());
+  assert!(mr.is_empty());
+  assert_eq!(mr.host_id(), Some(&1), "identity survives an empty host");
+  assert_eq!(
+    mr.create_group(
+      2,
+      single_node_cfg(2),
+      Instant::ORIGIN,
+      42,
+      CountSm::default()
+    ),
+    Err(CreateGroupError::NodeIdMismatch)
+  );
+  // The latched id re-admits.
+  mr.create_group(
+    2,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+  )
+  .unwrap();
+  assert_eq!(mr.host_id(), Some(&1));
+}
+
+#[test]
 fn two_groups_are_isolated() {
   let mut mr = MultiRaft::<u64, u64, CountSm>::new();
   mr.create_group(

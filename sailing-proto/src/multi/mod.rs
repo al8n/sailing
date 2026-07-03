@@ -33,11 +33,13 @@ use std::{
 };
 
 /// The create/restore admission check shared by every group constructor: group-id uniqueness, the
-/// wire bound on the encoded group id, and cross-group node-id agreement (a multi-Raft host is one
-/// physical node, so every group must be configured with the same local id — the transport
-/// authenticates exactly one identity per connection).
+/// wire bound on the encoded group id, and agreement with the LATCHED host identity (a multi-Raft
+/// host is one physical node for its whole lifetime — the transport authenticates exactly one
+/// identity per connection, and live connections outlast group removal, so the check must not
+/// relax when the map empties).
 fn validate_new_group<G, I, F, R>(
   groups: &BTreeMap<G, Endpoint<I, F, R>>,
+  host_id: &Option<I>,
   gid: &G,
   config: &Config<I>,
 ) -> Result<(), CreateGroupError>
@@ -54,8 +56,8 @@ where
   if encoded.is_empty() || encoded.len() > crate::wire::MAX_GROUP_ID_LEN {
     return Err(CreateGroupError::InvalidGroupId);
   }
-  if let Some(existing) = groups.values().next()
-    && existing.id() != config.id()
+  if let Some(host) = host_id
+    && *host != config.id()
   {
     return Err(CreateGroupError::NodeIdMismatch);
   }
@@ -77,6 +79,12 @@ where
   dirty_msgs: VecDeque<G>,
   /// Groups that may have a pending event to drain (see [`poll_event`](Self::poll_event)).
   dirty_events: VecDeque<G>,
+  /// The host's node identity, latched by the FIRST admitted group and retained for the
+  /// container's whole lifetime — including across [`remove_group`](Self::remove_group) emptying
+  /// the map. A multi-Raft host is one physical node: live transport connections stay
+  /// authenticated under this id, so a later admission must never change it (see
+  /// [`CreateGroupError::NodeIdMismatch`]).
+  host_id: Option<I>,
 }
 
 // No `I` (or `R`) bound: the container and drain surface neither keys by, encodes, nor clones a
@@ -93,6 +101,7 @@ where
       groups: BTreeMap::new(),
       dirty_msgs: VecDeque::new(),
       dirty_events: VecDeque::new(),
+      host_id: None,
     }
   }
 
@@ -114,6 +123,14 @@ where
     self.groups.contains_key(gid)
   }
 
+  /// The host's node identity — latched by the first admitted group and retained across group
+  /// removals ([`CreateGroupError::NodeIdMismatch`] enforces it). `None` until any group has ever
+  /// been admitted.
+  #[must_use]
+  pub fn host_id(&self) -> Option<&I> {
+    self.host_id.as_ref()
+  }
+
   /// A shared reference to one group's [`Endpoint`], for observability (role, term, commit,
   /// applied index, leader, poison, the state machine). `None` if no such group.
   #[must_use]
@@ -127,7 +144,9 @@ where
   }
 
   /// Remove and return a group's [`Endpoint`]. Stale drain-queue entries for it are skipped on the
-  /// next poll. This is the teardown seam the dynamic-lifecycle phase builds on.
+  /// next poll. This is the teardown seam the dynamic-lifecycle phase builds on. The host identity
+  /// is NOT cleared — even removing the last group leaves it latched, so a re-created group must
+  /// carry the same node id (live transport connections stay authenticated under it).
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
     self.groups.remove(gid)
   }
@@ -227,7 +246,8 @@ where
     seed: u64,
     fsm: F,
   ) -> Result<(), CreateGroupError> {
-    validate_new_group(&self.groups, &gid, &config)?;
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
     let ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
     self.groups.insert(gid, ep);
     Ok(())
@@ -262,7 +282,8 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    validate_new_group(&self.groups, &gid, &config)?;
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
     let ep = Endpoint::restart(
       config,
       now,
@@ -307,7 +328,8 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    validate_new_group(&self.groups, &gid, &config)?;
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
     let ep = Endpoint::restart_migrating(
       config,
       now,
@@ -347,7 +369,8 @@ where
     rng: R,
     fsm: F,
   ) -> Result<(), CreateGroupError> {
-    validate_new_group(&self.groups, &gid, &config)?;
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
     let ep = Endpoint::new_with_rng(config, now, rng, fsm);
     self.groups.insert(gid, ep);
     Ok(())
@@ -378,7 +401,8 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    validate_new_group(&self.groups, &gid, &config)?;
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
     let ep = Endpoint::restart_with_rng(config, now, rng, fsm, boot_epoch, log, stable);
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
@@ -411,7 +435,8 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    validate_new_group(&self.groups, &gid, &config)?;
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
     let ep = Endpoint::restart_migrating_with_rng(
       config,
       now,
