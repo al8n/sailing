@@ -1,0 +1,914 @@
+//! [`MultiReactorQuicDriver`]: one `Send` task owning a [`MultiQuicCoordinator`], a shared
+//! [`GroupEngine`], and a UDP socket, driving N co-located consensus groups over real QUIC
+//! datagrams on any [`agnostic::Runtime`].
+//!
+//! The single-group [`ReactorQuicDriver`](crate::ReactorQuicDriver) loop generalized exactly as
+//! the stream sibling ([`MultiReactorStreamDriver`](super::MultiReactorStreamDriver)) generalizes
+//! its own: one recv task, awaited sends in the pump, the recv-task join as the fd-release
+//! barrier — with the consensus steps fanned out per group and the storage crank's one engine
+//! barrier per pass. Two QUIC-specific deltas: the shared transport timeout takes the ENGINE as
+//! stores (the quinn bridge drain delivers consensus messages, unlike the stream transport's
+//! stores-less handshake reap), and the node's transport identity latches from the FIRST admitted
+//! group — a zero-group host closes inbound identity-less connections until then, so peers bind
+//! via their standing redial once admission happens.
+
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  net::SocketAddr,
+  sync::Arc,
+  time::Duration,
+};
+
+use agnostic::{
+  Runtime,
+  net::{Net, UdpSocket},
+};
+use bytes::Bytes;
+use sailing_proto::{
+  ClusterId, Config, Event, GroupEngine, GroupId, Instant, MultiQuicCoordinator, Now, StateMachine,
+  StorageProgress, quic::QuicOptions,
+};
+
+use sailing_driver::{
+  MultiCommand, MultiHandle, Node, Status, jittered,
+  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  validate_and_capture_eps,
+};
+
+use crate::{
+  BindError, Clock, DriverConfig, DriverError, Monotonic, driver::quic::recv_datagrams,
+  task::AbortOnDrop,
+};
+
+use crate::driver::{map_propose_err, map_read_err, map_transfer_err};
+
+use super::{EngineMetrics, STORAGE_REDRIVES, no_such_group, rejected};
+
+/// Backstop wake cadence while configured peers exist (the link reconciler's pacing on an
+/// otherwise-idle node — see the single-group QUIC driver).
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
+/// Per-iteration bound on each loop-top channel drain (datagrams, storage coalesce).
+const IO_BUDGET: usize = 256;
+
+/// Per-peer redial state (the single-group QUIC driver's verbatim).
+struct Redial {
+  at: std::time::Instant,
+  backoff: Duration,
+}
+
+/// A multi-group consensus host over QUIC on a readiness runtime — the datagram sibling of
+/// [`MultiReactorStreamDriver`](super::MultiReactorStreamDriver): same lifecycle commands, same
+/// per-group routing and fault scope, same storage crank over the shared engine; only the I/O
+/// model differs. Monotonic-only in v1, exactly as the stream sibling (a walled failover-tier
+/// group config is rejected loudly at admission).
+pub struct MultiReactorQuicDriver<R, G, I, F>
+where
+  R: Runtime,
+  I: sailing_proto::NodeId,
+  F: StateMachine,
+{
+  coord: MultiQuicCoordinator<G, I, F>,
+  engine: GroupEngine<G, I>,
+  socket: Arc<<R::Net as Net>::UdpSocket>,
+  clock: Clock,
+  /// Byte cap on each group's failover inherited-read limbo scan.
+  max_failover_limbo_bytes: usize,
+  commands: flume::Receiver<MultiCommand<G, I, F>>,
+  /// Per-group routing state (see the stream sibling — group-scoped completions and sweeps).
+  routing: BTreeMap<G, Routing<I, F::Response, F>>,
+  /// The driver-owned, group-stamped events tail.
+  events_tx: flume::Sender<(G, Event<I, F::Response>)>,
+  /// The dead-end sender each per-group `Routing` is built over (receiver dropped at bind).
+  stub_events_tx: flume::Sender<Event<I, F::Response>>,
+  storage_ready: flume::Receiver<()>,
+  _storage_ready_keepalive: Option<flume::Sender<()>>,
+  peers: Vec<Node<I, SocketAddr>>,
+  redial: BTreeMap<I, Redial>,
+  cmd_budget: usize,
+  recv_cap: usize,
+  redial_base: Duration,
+  redial_cap: Duration,
+  storage_closed: bool,
+  /// Per-group leadership edge-detect (the supersede backstop, one entry per hosted group).
+  was_leader: BTreeMap<G, bool>,
+  /// The possibly-staged-engine-work flag deriving the immediate storage-redrive deadline (see
+  /// the stream sibling's field — the engine's `has_pending` is READY-only by design).
+  flush_pending: bool,
+  /// Published engine counters (see [`EngineMetrics`]).
+  metrics: EngineMetrics,
+  teardown_tx: Option<futures_channel::oneshot::Sender<()>>,
+}
+
+impl<R, G, I, F> MultiReactorQuicDriver<R, G, I, F>
+where
+  R: Runtime,
+  G: GroupId + Send,
+  I: sailing_proto::NodeId + Send,
+  F: StateMachine + Send,
+  F::Command: sailing_proto::Data + Send,
+  F::Snapshot: sailing_proto::Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+{
+  /// Bind `addr` and build an EMPTY host plus its [`MultiHandle`]: groups arrive via
+  /// [`MultiHandle::create_group`] / [`MultiHandle::restore_group`], and the node's transport
+  /// identity latches from the FIRST admitted group's config. Until then an inbound connection
+  /// cannot be answered with an identity preface and is closed — a configured peer binds via its
+  /// standing redial once the first group exists, so admit groups promptly after `run()` starts.
+  ///
+  /// `opts` must be a [`ClusterTls`](sailing_proto::quic::ClusterTls) bundle (the provided
+  /// identity scheme requires mandatory mTLS), as on the single-group driver.
+  pub async fn bind(
+    addr: SocketAddr,
+    opts: QuicOptions,
+    cluster: ClusterId,
+    peers: Vec<Node<I, SocketAddr>>,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, MultiHandle<G, I, F>), BindError> {
+    driver_cfg.validate()?;
+    let socket = Arc::new(<R::Net as Net>::UdpSocket::bind(addr).await?);
+    let coord = MultiQuicCoordinator::with_identity(opts, None, cluster);
+    Ok(Self::from_parts(coord, socket, peers, driver_cfg))
+  }
+
+  /// Assemble the driver + [`MultiHandle`] from the bound socket.
+  fn from_parts(
+    coord: MultiQuicCoordinator<G, I, F>,
+    socket: Arc<<R::Net as Net>::UdpSocket>,
+    peers: Vec<Node<I, SocketAddr>>,
+    driver_cfg: DriverConfig,
+  ) -> (Self, MultiHandle<G, I, F>) {
+    let (cmd_tx, cmd_rx) = flume::unbounded();
+    let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
+    let budget = InflightBudget::new(driver_cfg.max_inflight, driver_cfg.max_pending_bytes);
+    let (teardown_tx, teardown_rx) = futures_channel::oneshot::channel();
+    let handle = MultiHandle::new(cmd_tx, event_rx, budget, teardown_rx);
+
+    // The per-group Routing's stub tail (receiver dropped): the driver forwards the
+    // group-stamped copies itself — see the stream sibling.
+    let (stub_events_tx, _) = flume::bounded(0);
+
+    let (storage_ready, keepalive) = match driver_cfg.storage_ready {
+      Some(rx) => (rx, None),
+      None => {
+        let (tx, rx) = flume::bounded(1);
+        (rx, Some(tx))
+      }
+    };
+
+    (
+      Self {
+        coord,
+        engine: GroupEngine::new(),
+        socket,
+        clock: Clock::new(None, Monotonic),
+        max_failover_limbo_bytes: driver_cfg.max_failover_limbo_bytes,
+        commands: cmd_rx,
+        routing: BTreeMap::new(),
+        events_tx: event_tx,
+        stub_events_tx,
+        storage_ready,
+        _storage_ready_keepalive: keepalive,
+        peers,
+        redial: BTreeMap::new(),
+        cmd_budget: driver_cfg.cmd_budget.max(1),
+        recv_cap: driver_cfg.recv_cap,
+        redial_base: driver_cfg.redial_base,
+        redial_cap: driver_cfg.redial_cap,
+        storage_closed: false,
+        was_leader: BTreeMap::new(),
+        flush_pending: false,
+        metrics: EngineMetrics::default(),
+        teardown_tx: Some(teardown_tx),
+      },
+      handle,
+    )
+  }
+
+  /// The shared engine's cross-thread batching counters — clone BEFORE spawning `run()`.
+  #[must_use]
+  pub fn engine_metrics(&self) -> EngineMetrics {
+    self.metrics.clone()
+  }
+
+  /// Drive every hosted group until shutdown (or until every `MultiHandle` clone has dropped and
+  /// the buffered commands drained). The single-group QUIC loop's iteration order with the
+  /// multi-group storage crank; teardown joins the recv task before dropping the socket (the
+  /// fd-release barrier), exactly as on the single driver.
+  pub async fn run(mut self) {
+    use futures_util::{FutureExt, select_biased};
+
+    let (recv_tx, recv_rx) = flume::bounded(self.recv_cap);
+    let (recv_shutdown_tx, recv_shutdown_rx) = futures_channel::oneshot::channel();
+    let recv_task = AbortOnDrop::<R>::new(R::spawn(recv_datagrams::<R>(
+      self.socket.clone(),
+      recv_tx,
+      recv_shutdown_rx,
+    )));
+
+    let now = self.clock.now();
+    self.reconcile_peer_links(now.mono());
+    self.pump(now).await;
+
+    loop {
+      let now = self.clock.now();
+
+      // Fairness: a bounded command drain before the biased select.
+      let mut exit = false;
+      for _ in 0..self.cmd_budget {
+        match self.commands.try_recv() {
+          Ok(cmd) => {
+            if self.handle_command(now, cmd) {
+              exit = true;
+              break;
+            }
+          }
+          Err(e) => {
+            if matches!(e, flume::TryRecvError::Disconnected) {
+              exit = true;
+            }
+            break;
+          }
+        }
+      }
+      if exit {
+        break;
+      }
+
+      // Fairness: a bounded datagram drain at the loop top (see the single-group driver).
+      for _ in 0..IO_BUDGET {
+        match recv_rx.try_recv() {
+          Ok((datagram, from)) => {
+            self
+              .coord
+              .handle_udp(self.clock.now(), from, None, &datagram, &mut self.engine);
+            self.flush_pending = true;
+          }
+          Err(_) => break,
+        }
+      }
+
+      // Fire an already-due deadline before the select. The coordinator's poll_timeout folds the
+      // aggregate consensus deadline, quinn's timers, the auth deadline, AND the bridge's
+      // deferred-work immediate deadline into one instant.
+      if self
+        .coord
+        .poll_timeout()
+        .is_some_and(|d| d <= self.clock.mono())
+      {
+        self.fire_timeouts(now);
+      }
+      self.reconcile_peer_links(now.mono());
+      self.pump(now).await;
+
+      let housekeeping =
+        (!self.peers.is_empty()).then(|| std::time::Instant::now() + HOUSEKEEPING_INTERVAL);
+      // The pending-flush flag stands in for a live staged-store check (see the stream sibling).
+      let storage_redrive = self.flush_pending.then(std::time::Instant::now);
+      let deadline = self
+        .coord
+        .poll_timeout()
+        .map(|d| self.clock.to_std(d))
+        .into_iter()
+        .chain(housekeeping)
+        .chain(storage_redrive)
+        .min()
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
+
+      enum Wake<G, I, F: StateMachine> {
+        Datagram((Vec<u8>, SocketAddr)),
+        Timer,
+        Command(Option<MultiCommand<G, I, F>>),
+        Storage,
+        StorageClosed,
+      }
+      let wake = {
+        let recv_fut = recv_rx.recv_async().fuse();
+        let timer_fut =
+          R::sleep(deadline.saturating_duration_since(std::time::Instant::now())).fuse();
+        let storage_closed = self.storage_closed;
+        let storage_rx = &self.storage_ready;
+        let storage_fut = async move {
+          if storage_closed {
+            std::future::pending::<Result<(), flume::RecvError>>().await
+          } else {
+            storage_rx.recv_async().await
+          }
+        }
+        .fuse();
+        let cmd_fut = self.commands.recv_async().fuse();
+        futures_util::pin_mut!(recv_fut, timer_fut, storage_fut, cmd_fut);
+
+        select_biased! {
+          got = recv_fut => Wake::Datagram(got.expect("recv_task outlives the loop")),
+          _ = timer_fut => Wake::Timer,
+          cmd = cmd_fut => Wake::Command(cmd.ok()),
+          got = storage_fut => {
+            if got.is_err() { Wake::StorageClosed } else { Wake::Storage }
+          }
+        }
+      };
+      for _ in 0..IO_BUDGET {
+        if self.storage_ready.try_recv().is_err() {
+          break;
+        }
+      }
+
+      let now = self.clock.now();
+      match wake {
+        Wake::Datagram((datagram, from)) => {
+          self
+            .coord
+            .handle_udp(now, from, None, &datagram, &mut self.engine);
+          self.flush_pending = true;
+        }
+        Wake::Timer => self.fire_timeouts(now),
+        Wake::Command(Some(cmd)) => {
+          if self.handle_command(now, cmd) {
+            break;
+          }
+        }
+        Wake::Command(None) => break,
+        Wake::Storage => {}
+        Wake::StorageClosed => self.storage_closed = true,
+      }
+      self.storage_crank(now);
+      self.pump(now).await;
+    }
+
+    // Teardown. Classify each group's fail-stop FIRST, then the ShuttingDown sweep; then stop the
+    // recv task and AWAIT its join so the final socket drop is the fd-release barrier (see the
+    // single-group driver's teardown notes).
+    let hosted: Vec<G> = self.routing.keys().map(|g| g.cheap_clone()).collect();
+    for g in &hosted {
+      if self.coord.group(g).is_some_and(|ep| ep.is_poisoned())
+        && let Some(routing) = self.routing.get_mut(g)
+      {
+        routing.fail_all(&DriverError::Poisoned);
+      }
+    }
+    for routing in self.routing.values_mut() {
+      routing.fail_all(&DriverError::ShuttingDown);
+    }
+    let _ = recv_shutdown_tx.send(());
+    drop(recv_rx);
+    if let Some(handle) = recv_task.into_handle() {
+      let _ = handle.await;
+    }
+    while let Ok(cmd) = self.commands.try_recv() {
+      drop(cmd);
+    }
+    drop(self.commands);
+    drop(self.socket);
+    if let Some(tx) = self.teardown_tx.take() {
+      let _ = tx.send(());
+    }
+  }
+
+  /// Fire the shared QUIC transport timers — WITH the engine as stores: the quinn bridge drain
+  /// delivers group-tagged consensus messages, unlike the stream transport's stores-less reap —
+  /// then every DUE group's consensus timers (the v1 aggregate-timer dispatch; the indexed wheel
+  /// over [`MultiQuicCoordinator::deadlines`] is the scale refinement seam).
+  fn fire_timeouts(&mut self, now: Now) {
+    self.coord.handle_transport_timeout(now, &mut self.engine);
+    let mono = self.clock.mono();
+    let due: Vec<G> = self
+      .coord
+      .deadlines()
+      .filter(|(_, d)| *d <= mono)
+      .map(|(g, _)| g)
+      .collect();
+    for g in &due {
+      if let Some((log, stable)) = self.engine.stores(g) {
+        let _ = self.coord.handle_timeout(g, now, log, stable);
+      }
+    }
+    // The transport drain itself can deliver consensus messages that stage writes (not just the
+    // due-group sweep), so the flag is set unconditionally here.
+    self.flush_pending = true;
+  }
+
+  /// The per-crank storage step (the stream sibling's verbatim): one gated engine barrier, then
+  /// every hosted group's bounded completion drain.
+  fn storage_crank(&mut self, now: Now) {
+    if self.flush_pending {
+      self.engine.flush();
+    }
+    let mut more = false;
+    let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
+    for g in &hosted {
+      let mut redrives = 0;
+      while let Some((log, stable)) = self.engine.stores(g) {
+        match self.coord.handle_storage(g, now, log, stable) {
+          Some(StorageProgress::MorePending) => {
+            redrives += 1;
+            if redrives >= STORAGE_REDRIVES {
+              more = true;
+              break;
+            }
+          }
+          _ => break,
+        }
+      }
+    }
+    // The engine's staged-work signal, measured AFTER the drains, is the exact re-arm predicate —
+    // a release-count inference would miss a write the storage tail staged during a crank whose
+    // barrier released nothing (see the stream sibling).
+    self.flush_pending = self.engine.has_staged() || more;
+    self
+      .metrics
+      .record(self.engine.flushes(), self.engine.ops_flushed());
+  }
+
+  /// Dial every configured peer with no bound connection whose backoff has elapsed (the
+  /// single-group QUIC reconciler verbatim — the shared connections are group-agnostic).
+  fn reconcile_peer_links(&mut self, now: Instant) {
+    let std_now = std::time::Instant::now();
+    for node in self.peers.clone() {
+      let (peer, addr) = node.into_parts();
+      if self.coord.has_bound_conn(&peer) {
+        self.redial.remove(&peer);
+        continue;
+      }
+      let due = self.redial.get(&peer).is_none_or(|r| std_now >= r.at);
+      if !due {
+        continue;
+      }
+      let _ = self.coord.connect(now, addr, peer.cheap_clone());
+      let backoff = self
+        .redial
+        .get(&peer)
+        .map(|r| (r.backoff * 2).min(self.redial_cap))
+        .unwrap_or(self.redial_base);
+      self.redial.insert(
+        peer,
+        Redial {
+          at: std_now + jittered(backoff),
+          backoff,
+        },
+      );
+    }
+  }
+
+  /// Admit a group's driver-side client state (routing + the leadership edge-detect).
+  fn admit_group(&mut self, gid: G) {
+    self
+      .routing
+      .insert(gid.cheap_clone(), Routing::new(self.stub_events_tx.clone()));
+    self.was_leader.insert(gid, false);
+  }
+
+  /// Create a fresh group: engine storage + coordinator endpoint + driver routing together (see
+  /// the stream sibling — same admission gate, same rollback).
+  fn create_group(
+    &mut self,
+    now: Now,
+    gid: G,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+  ) -> Result<(), DriverError<I>> {
+    validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
+    let added = self.engine.add_group(gid.cheap_clone());
+    match self
+      .coord
+      .create_group(gid.cheap_clone(), config, now, seed, fsm)
+    {
+      Ok(()) => {
+        self.admit_group(gid);
+        Ok(())
+      }
+      Err(e) => {
+        if added {
+          self.engine.remove_group(&gid);
+        }
+        Err(rejected(e))
+      }
+    }
+  }
+
+  /// Recover a group from the engine's storage, the driver deriving the boot epoch.
+  fn restore_group(
+    &mut self,
+    now: Now,
+    gid: G,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+  ) -> Result<(), DriverError<I>> {
+    validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
+    let added = self.engine.add_group(gid.cheap_clone());
+    let epoch = self
+      .engine
+      .next_boot_epoch(&gid)
+      .expect("storage admitted above");
+    let result = {
+      let (log, stable) = self.engine.stores(&gid).expect("storage admitted above");
+      self.coord.restore_group(
+        gid.cheap_clone(),
+        config,
+        now,
+        seed,
+        fsm,
+        epoch,
+        log,
+        stable,
+      )
+    };
+    match result {
+      Ok(()) => {
+        self.flush_pending = true;
+        self.admit_group(gid);
+        Ok(())
+      }
+      Err(e) => {
+        if added {
+          self.engine.remove_group(&gid);
+        }
+        Err(rejected(e))
+      }
+    }
+  }
+
+  /// Remove a group: endpoint, storage, and routing torn down together; the group's parked work
+  /// fails with the group-scoped teardown verdict. Returns whether the group was hosted.
+  fn remove_group(&mut self, gid: &G) -> bool {
+    let existed = self.coord.remove_group(gid).is_some();
+    let had_storage = self.engine.remove_group(gid);
+    self.was_leader.remove(gid);
+    if let Some(mut routing) = self.routing.remove(gid) {
+      routing.fail_all(&DriverError::ShuttingDown);
+    }
+    existed || had_storage
+  }
+
+  /// Handle one command (the stream sibling's dispatch verbatim over the QUIC coordinator).
+  /// Returns `true` when the loop should exit (a `Shutdown`).
+  fn handle_command(&mut self, now: Now, cmd: MultiCommand<G, I, F>) -> bool {
+    match cmd {
+      MultiCommand::Submit {
+        group,
+        cmd,
+        reply,
+        reservation,
+      } => {
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          let _ = reply.send(Err(no_such_group()));
+          return false;
+        };
+        match self
+          .coord
+          .submit_propose_deferred(&group, now, log, stable, &cmd)
+        {
+          Some(Ok(index)) => {
+            self.flush_pending = true;
+            if let Some(routing) = self.routing.get_mut(&group) {
+              routing.pending.insert(
+                index,
+                Pending::Submit {
+                  reply,
+                  _reservation: reservation,
+                },
+              );
+            }
+          }
+          Some(Err(e)) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+          None => {
+            let _ = reply.send(Err(no_such_group()));
+          }
+        }
+      }
+      MultiCommand::Conf {
+        group,
+        cc,
+        reply,
+        reservation,
+      } => {
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          let _ = reply.send(Err(no_such_group()));
+          return false;
+        };
+        match self.coord.propose_conf_change(&group, now, log, stable, cc) {
+          Some(Ok(index)) => {
+            self.flush_pending = true;
+            if let Some(routing) = self.routing.get_mut(&group) {
+              routing.pending.insert(
+                index,
+                Pending::Conf {
+                  reply,
+                  _reservation: reservation,
+                },
+              );
+            }
+          }
+          Some(Err(e)) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+          None => {
+            let _ = reply.send(Err(no_such_group()));
+          }
+        }
+      }
+      MultiCommand::ConfV2 {
+        group,
+        cc,
+        reply,
+        reservation,
+      } => {
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          let _ = reply.send(Err(no_such_group()));
+          return false;
+        };
+        match self
+          .coord
+          .propose_conf_change_v2(&group, now, log, stable, cc)
+        {
+          Some(Ok(index)) => {
+            self.flush_pending = true;
+            if let Some(routing) = self.routing.get_mut(&group) {
+              routing.pending.insert(
+                index,
+                Pending::Conf {
+                  reply,
+                  _reservation: reservation,
+                },
+              );
+            }
+          }
+          Some(Err(e)) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+          None => {
+            let _ = reply.send(Err(no_such_group()));
+          }
+        }
+      }
+      MultiCommand::Query {
+        group,
+        complete,
+        reservation,
+      } => {
+        let Some(routing) = self.routing.get_mut(&group) else {
+          complete(Err(no_such_group()));
+          return false;
+        };
+        let ctx = routing.mint_query_ctx();
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          complete(Err(no_such_group()));
+          return false;
+        };
+        match self.coord.read_index(
+          &group,
+          now,
+          log,
+          stable,
+          Bytes::copy_from_slice(&ctx.to_be_bytes()),
+        ) {
+          Some(Ok(())) => {
+            routing.queries.insert(
+              ctx,
+              ParkedQuery {
+                ready_at: None,
+                complete,
+                _reservation: reservation,
+              },
+            );
+          }
+          Some(Err(e)) => complete(Err(map_read_err(e))),
+          None => complete(Err(no_such_group())),
+        }
+      }
+      MultiCommand::FailoverWindow {
+        group,
+        complete,
+        reservation,
+      } => {
+        if let Some(routing) = self.routing.get_mut(&group) {
+          routing.failovers.push(ParkedFailover {
+            complete,
+            _reservation: reservation,
+          });
+        } else {
+          complete(Err(no_such_group()));
+        }
+      }
+      MultiCommand::Transfer {
+        group,
+        to,
+        reply,
+        reservation,
+      } => {
+        let verdict = match self.engine.stores(&group) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => match self.coord.transfer_leader(&group, now, log, stable, to) {
+            Some(r) => r.map_err(map_transfer_err),
+            None => Err(no_such_group()),
+          },
+        };
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+      MultiCommand::SetReadMode {
+        group,
+        mode,
+        reply,
+        reservation,
+      } => {
+        let verdict = match self.engine.stores(&group) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => {
+            match self
+              .coord
+              .propose_read_mode_change(&group, now, log, stable, mode)
+            {
+              Some(r) => r.map_err(map_propose_err),
+              None => Err(no_such_group()),
+            }
+          }
+        };
+        if verdict.is_ok() {
+          self.flush_pending = true;
+        }
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+      MultiCommand::Status {
+        group,
+        reply,
+        reservation,
+      } => {
+        let status = self.coord.group(&group).map(|ep| Status {
+          role: ep.role(),
+          term: ep.term(),
+          leader: ep.leader(),
+          commit_index: ep.commit_index(),
+          applied_index: ep.applied_index(),
+          active_read_mode: ep.active_read_mode(),
+          conf_state: ep.conf_state(),
+          is_poisoned: ep.is_poisoned(),
+          precise_releases: ep.precise_releases(),
+          unprovable_floor_holds: ep.unprovable_floor_holds(),
+        });
+        let _ = reply.send(status.ok_or_else(no_such_group));
+        drop(reservation);
+      }
+      MultiCommand::CreateGroup {
+        gid,
+        config,
+        seed,
+        fsm,
+        reply,
+        reservation,
+      } => {
+        let _ = reply.send(self.create_group(now, gid, config, seed, fsm));
+        drop(reservation);
+      }
+      MultiCommand::RestoreGroup {
+        gid,
+        config,
+        seed,
+        fsm,
+        reply,
+        reservation,
+      } => {
+        let _ = reply.send(self.restore_group(now, gid, config, seed, fsm));
+        drop(reservation);
+      }
+      MultiCommand::RemoveGroup {
+        gid,
+        reply,
+        reservation,
+      } => {
+        let _ = reply.send(self.remove_group(&gid));
+        drop(reservation);
+      }
+      MultiCommand::Shutdown => return true,
+    }
+    false
+  }
+
+  /// Serve (or fall back) ONE group's parked failover inherited-read queries (the stream
+  /// sibling's verbatim — structurally inert on this monotonic-only v1 host, kept whole for the
+  /// wall-clock generalization). Returns `true` on a FATAL limbo storage fault (group-scoped).
+  fn run_failover_serve(&mut self, gid: &G) -> bool {
+    let Some(routing) = self.routing.get_mut(gid) else {
+      return false;
+    };
+    if routing.failovers.is_empty() {
+      return false;
+    }
+    let now = self.clock.now();
+    let Some(ep) = self.coord.group(gid) else {
+      return false;
+    };
+    match ep.failover_read_window(now) {
+      None => {
+        for p in std::mem::take(&mut routing.failovers) {
+          (p.complete)(Ok(None));
+        }
+      }
+      Some(window) if routing.applied >= window.index() => {
+        let Some((log, _stable)) = self.engine.stores(gid) else {
+          return false;
+        };
+        match sailing_driver::shared::read_limbo(log, &window, self.max_failover_limbo_bytes as u64)
+        {
+          Ok(Some(limbo)) => {
+            let parked = std::mem::take(&mut routing.failovers);
+            let fsm = ep.state_machine();
+            sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+              self
+                .coord
+                .group(gid)
+                .is_some_and(|e| e.failover_read_window(self.clock.now()).is_some())
+            });
+          }
+          Ok(None) => {
+            for p in std::mem::take(&mut routing.failovers) {
+              (p.complete)(Ok(None));
+            }
+          }
+          Err(_) => return true,
+        }
+      }
+      Some(_) => {}
+    }
+    false
+  }
+
+  /// Drain the coordinator's aggregate outputs: datagrams to the socket (awaited sends, exactly
+  /// as on the single-group driver), group-stamped events into each group's routing plus the
+  /// driver-owned stamped tail — then each hosted group's completion tail. No conn-closed drain:
+  /// QUIC connection teardown is the coordinator's own.
+  async fn pump(&mut self, now: Now) {
+    let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
+    for g in &hosted {
+      if let Some((log, stable)) = self.engine.stores(g) {
+        let _ = self.coord.flush_appends(g, now, log, stable);
+      }
+    }
+    while let Some((dest, bytes)) = self.coord.poll_transmit() {
+      let _ = self.socket.send_to(&bytes, dest).await;
+    }
+    let mut run_queries: BTreeSet<G> = BTreeSet::new();
+    while let Some((g, ev)) = self.coord.poll_event() {
+      if let Some(routing) = self.routing.get_mut(&g)
+        && routing.route_event(ev.clone())
+      {
+        run_queries.insert(g.cheap_clone());
+      }
+      let _ = self.events_tx.try_send((g, ev));
+    }
+    let with_routing: Vec<G> = self.routing.keys().map(|g| g.cheap_clone()).collect();
+    for g in &with_routing {
+      self.pump_group_tail(g, run_queries.contains(g));
+    }
+  }
+
+  /// One group's per-pass completion tail (the stream sibling's verbatim): watermark sync, the
+  /// leadership-loss backstop, the failover serve, runnable queries, and the GROUP-scoped poison
+  /// sweep — the driver keeps running for the co-located groups.
+  fn pump_group_tail(&mut self, gid: &G, mut run_queries: bool) {
+    let Some(ep) = self.coord.group(gid) else {
+      return;
+    };
+    let poisoned = ep.is_poisoned();
+    let applied = ep.applied_index();
+    let is_leader = ep.role().is_leader();
+    if !poisoned
+      && let Some(routing) = self.routing.get_mut(gid)
+      && routing.sync_applied(applied)
+    {
+      run_queries = true;
+    }
+    let was = self
+      .was_leader
+      .insert(gid.cheap_clone(), is_leader)
+      .unwrap_or(false);
+    if was
+      && !is_leader
+      && let Some(routing) = self.routing.get_mut(gid)
+    {
+      routing.fail_all(&DriverError::Superseded);
+    }
+    if !poisoned && self.run_failover_serve(gid) {
+      if let Some(routing) = self.routing.get_mut(gid) {
+        routing.fail_all(&DriverError::Poisoned);
+      }
+      return;
+    }
+    if run_queries
+      && let Some(ep) = self.coord.group(gid)
+      && let Some(routing) = self.routing.get_mut(gid)
+    {
+      for q in routing.take_runnable_queries() {
+        (q.complete)(Ok(ep.state_machine()));
+      }
+    }
+    if poisoned && let Some(routing) = self.routing.get_mut(gid) {
+      routing.fail_all(&DriverError::Poisoned);
+    }
+  }
+}

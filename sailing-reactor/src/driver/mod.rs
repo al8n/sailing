@@ -3,9 +3,11 @@
 //! coordinator, the embedder's stores, and its listener, and runs the §6.2 driver loop on one
 //! `Send` task. The proto-error mapping it shares with the compio drivers lives here.
 
+mod multi;
 mod quic;
 mod stream;
 
+pub use multi::{EngineMetrics, MultiReactorQuicDriver, MultiReactorStreamDriver};
 pub use quic::ReactorQuicDriver;
 pub use stream::{AcceptorFactory, DialerFactory, ReactorStreamDriver};
 

@@ -1,0 +1,1194 @@
+//! [`MultiReactorStreamDriver`]: one `Send` task owning a [`MultiStreamCoordinator`], a shared
+//! [`GroupEngine`], and a TCP listener, driving N co-located consensus groups over framed reliable
+//! streams on any [`agnostic::Runtime`].
+//!
+//! The single-group [`ReactorStreamDriver`](crate::ReactorStreamDriver) loop generalized to N
+//! groups: the socket, accept, redial, and command plumbing is identical (one connection per peer
+//! carries EVERY group's traffic), the per-iteration crank order is identical, and only the
+//! consensus-facing steps fan out — the one armed deadline folds every group's earliest deadline,
+//! a timer fire sweeps the DUE groups, and the single `handle_storage` call becomes the storage
+//! crank: ONE engine flush (the batched durability barrier all groups share) followed by every
+//! hosted group's completion drain. Groups arrive via [`MultiCommand`] lifecycle commands — the
+//! driver binds EMPTY, and the host identity latches from the first admitted group.
+//!
+//! Fault scope is PER GROUP: a poisoned group fails its own parked work with the typed verdict
+//! and the driver keeps serving the co-located groups; only driver-level events (shutdown, every
+//! handle dropping) end `run()`.
+
+use std::{
+  collections::{BTreeMap, BTreeSet},
+  io,
+  net::SocketAddr,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  time::Duration,
+};
+
+use agnostic::{
+  Runtime,
+  net::{Net, TcpListener, TcpStream},
+};
+use bytes::Bytes;
+use sailing_proto::{
+  Config, ConnId, Event, GroupEngine, GroupId, Instant, MultiStreamCoordinator, Now, RecordIo,
+  StateMachine, StorageProgress,
+};
+
+use sailing_driver::{
+  MultiCommand, MultiHandle, Node, Status, jittered,
+  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  validate_and_capture_eps,
+};
+
+use crate::{
+  BindError, Clock, DriverConfig, DriverError, Monotonic,
+  bridge::{
+    BridgeInbound, BridgeOut, Conn, ConnTask, DialReady, StreamOf, bridge_read, bridge_write,
+  },
+  driver::{
+    map_propose_err, map_read_err, map_transfer_err,
+    stream::{AcceptorFactory, DialerFactory},
+  },
+  task::AbortOnDrop,
+};
+
+use super::{EngineMetrics, STORAGE_REDRIVES, no_such_group, rejected};
+
+/// Backoff before re-arming `accept()` after an accept error (see the single-group driver — the
+/// arm parks on this deadline, which folds into the run loop's timer, so a persistent accept
+/// error cannot hot-spin the loop).
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Backstop wake cadence while connections exist, exactly as on the single-group loop: with ZERO
+/// hosted groups (or only timerless ones) `poll_timeout()` can be `None` while un-handshaked
+/// connections still need reaping and a capacity-parked accept arm needs re-enabling.
+const HOUSEKEEPING_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Per-iteration bound on each loop-top channel drain (see the single-group driver's fairness
+/// notes — the loop-top drains make guaranteed progress independent of the biased select).
+const IO_BUDGET: usize = 256;
+
+/// Per-peer link-repair state (the single-group driver's `Redial` verbatim: failure history that
+/// persists until the binding proves STABLE for `redial_base`).
+struct Redial {
+  at: std::time::Instant,
+  backoff: Duration,
+  bound_since: Option<std::time::Instant>,
+}
+
+/// A multi-group consensus host over framed reliable streams on a readiness runtime. `R` is the
+/// [`agnostic::Runtime`]; `G` the group id; `Rec` the record layer the factories build.
+///
+/// The `run()` future is `Send` (given `Send` group-id/state-machine types), so it rides a
+/// work-stealing multi-thread runtime; the whole HOST stays serial because it is ONE task.
+/// Storage is the owned [`GroupEngine`]: v1 hosts the concrete shared in-memory engine (a disk
+/// engine motivates the storage-trait seam later), and each crank runs one engine-wide barrier.
+///
+/// The host is monotonic-only in v1: a group config that demands the LeaseGuard FAILOVER tier
+/// (`bounded_clock_uncertainty`) is rejected loudly at admission, exactly as a single-group
+/// `bind` under the default [`Monotonic`] clock rejects it — never a silently-inert tier. The
+/// wall-clock generalization is a later seam.
+pub struct MultiReactorStreamDriver<R, G, I, F, Rec>
+where
+  R: Runtime,
+  I: sailing_proto::NodeId,
+  F: StateMachine,
+  Rec: RecordIo,
+{
+  coord: MultiStreamCoordinator<G, I, F, Rec>,
+  engine: GroupEngine<G, I>,
+  listener: <R::Net as Net>::TcpListener,
+  /// See the single-group driver: while `Some`, the accept arm is parked until this deadline.
+  accept_backoff_until: Option<std::time::Instant>,
+  clock: Clock,
+  /// Byte cap on each group's failover inherited-read limbo scan.
+  max_failover_limbo_bytes: usize,
+  commands: flume::Receiver<MultiCommand<G, I, F>>,
+  /// The single-group routing state instantiated PER GROUP: pending completions, parked queries,
+  /// and the apply watermark are group-scoped, so one group's supersede/poison sweep never
+  /// touches a co-located group's parked work.
+  routing: BTreeMap<G, Routing<I, F::Response, F>>,
+  /// The driver-owned, group-stamped events tail (the per-group `Routing`'s own tail is a stub —
+  /// see `from_parts`).
+  events_tx: flume::Sender<(G, Event<I, F::Response>)>,
+  /// The dead-end sender each per-group `Routing` is built over: its receiver dropped at bind, so
+  /// the single-group type's own best-effort forward is a no-op and the driver forwards the
+  /// group-stamped copy itself.
+  stub_events_tx: flume::Sender<Event<I, F::Response>>,
+  storage_ready: flume::Receiver<()>,
+  _storage_ready_keepalive: Option<flume::Sender<()>>,
+  conns: BTreeMap<ConnId, Conn<R, I>>,
+  redial: BTreeMap<I, Redial>,
+  redial_wake: Option<std::time::Instant>,
+  peers: Vec<Node<I, SocketAddr>>,
+  dialer: DialerFactory<I, Rec>,
+  acceptor: AcceptorFactory<Rec>,
+  inbound_tx: flume::Sender<BridgeInbound>,
+  inbound_rx: flume::Receiver<BridgeInbound>,
+  dial_ready_tx: flume::Sender<DialReady<R>>,
+  dial_ready_rx: flume::Receiver<DialReady<R>>,
+  cmd_budget: usize,
+  max_outbound_backlog: usize,
+  max_conns: usize,
+  redial_base: Duration,
+  redial_cap: Duration,
+  storage_closed: bool,
+  /// Per-group leadership as of the END of the last pass — the group-scoped supersede backstop
+  /// (the single driver's `was_leader` bool, one edge-detect per hosted group).
+  was_leader: BTreeMap<G, bool>,
+  /// Whether any dispatch since the last barrier may have STAGED engine work. The engine's
+  /// `has_pending` reports READY completions only (staged work is invisible BY DESIGN), so this
+  /// flag stands in for the single loop's live-store `has_pending` check when deriving the
+  /// immediate storage-redrive deadline; every staging dispatch sets it and each crank recomputes
+  /// it (a crank that released nothing proves quiescence).
+  flush_pending: bool,
+  /// Published engine counters (see [`EngineMetrics`]).
+  metrics: EngineMetrics,
+  teardown_tx: Option<futures_channel::oneshot::Sender<()>>,
+}
+
+impl<R, G, I, F, Rec> MultiReactorStreamDriver<R, G, I, F, Rec>
+where
+  R: Runtime,
+  G: GroupId + Send,
+  I: sailing_proto::NodeId + Send,
+  F: StateMachine + Send,
+  F::Command: sailing_proto::Data + Send,
+  F::Snapshot: sailing_proto::Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+  Rec: RecordIo,
+{
+  /// Bind the listener and build an EMPTY host plus its [`MultiHandle`]: no group exists yet —
+  /// they arrive via [`MultiHandle::create_group`] / [`MultiHandle::restore_group`] commands, and
+  /// the host identity latches from the first admitted group's config. The configured peers are
+  /// dialed at `run()` start and redialed exactly as on the single-group driver (the shared
+  /// connections are group-agnostic).
+  pub async fn bind(
+    addr: SocketAddr,
+    peers: Vec<Node<I, SocketAddr>>,
+    dialer: DialerFactory<I, Rec>,
+    acceptor: AcceptorFactory<Rec>,
+    driver_cfg: DriverConfig,
+  ) -> Result<(Self, MultiHandle<G, I, F>), BindError> {
+    driver_cfg.validate()?;
+    let listener = <R::Net as Net>::TcpListener::bind(addr).await?;
+    let coord = MultiStreamCoordinator::new();
+    Ok(Self::from_parts(
+      coord, listener, peers, dialer, acceptor, driver_cfg,
+    ))
+  }
+
+  /// Assemble the driver + [`MultiHandle`] from the bound listener (the single driver's
+  /// `from_parts`, with the per-group maps and the shared engine in place of one group's stores).
+  fn from_parts(
+    coord: MultiStreamCoordinator<G, I, F, Rec>,
+    listener: <R::Net as Net>::TcpListener,
+    peers: Vec<Node<I, SocketAddr>>,
+    dialer: DialerFactory<I, Rec>,
+    acceptor: AcceptorFactory<Rec>,
+    driver_cfg: DriverConfig,
+  ) -> (Self, MultiHandle<G, I, F>) {
+    let (cmd_tx, cmd_rx) = flume::unbounded();
+    let (event_tx, event_rx) = flume::bounded(driver_cfg.events_cap);
+    let budget = InflightBudget::new(driver_cfg.max_inflight, driver_cfg.max_pending_bytes);
+    let (teardown_tx, teardown_rx) = futures_channel::oneshot::channel();
+    let handle = MultiHandle::new(cmd_tx, event_rx, budget, teardown_rx);
+
+    // Each per-group `Routing` needs an events sender, but the GROUP-STAMPED tail is driver-owned
+    // (the shared single-group type cannot stamp a group id): the stub's receiver is dropped here,
+    // so `route_event`'s own best-effort forward is a no-op and `pump` forwards the stamped copy.
+    let (stub_events_tx, _) = flume::bounded(0);
+
+    let (storage_ready, keepalive) = match driver_cfg.storage_ready {
+      Some(rx) => (rx, None),
+      None => {
+        let (tx, rx) = flume::bounded(1);
+        (rx, Some(tx))
+      }
+    };
+    let (inbound_tx, inbound_rx) = flume::bounded(driver_cfg.inbound_cap);
+    let (dial_ready_tx, dial_ready_rx) = flume::unbounded();
+    let max_conns = driver_cfg.max_conns.max(2 * peers.len());
+
+    (
+      Self {
+        coord,
+        engine: GroupEngine::new(),
+        listener,
+        accept_backoff_until: None,
+        clock: Clock::new(None, Monotonic),
+        max_failover_limbo_bytes: driver_cfg.max_failover_limbo_bytes,
+        commands: cmd_rx,
+        routing: BTreeMap::new(),
+        events_tx: event_tx,
+        stub_events_tx,
+        storage_ready,
+        _storage_ready_keepalive: keepalive,
+        conns: BTreeMap::new(),
+        redial: BTreeMap::new(),
+        redial_wake: None,
+        peers,
+        dialer,
+        acceptor,
+        inbound_tx,
+        inbound_rx,
+        dial_ready_tx,
+        dial_ready_rx,
+        cmd_budget: driver_cfg.cmd_budget.max(1),
+        max_outbound_backlog: driver_cfg.max_outbound_backlog,
+        max_conns,
+        redial_base: driver_cfg.redial_base,
+        redial_cap: driver_cfg.redial_cap,
+        storage_closed: false,
+        was_leader: BTreeMap::new(),
+        flush_pending: false,
+        metrics: EngineMetrics::default(),
+        teardown_tx: Some(teardown_tx),
+      },
+      handle,
+    )
+  }
+
+  /// The shared engine's cross-thread batching counters — clone BEFORE spawning `run()`.
+  #[must_use]
+  pub fn engine_metrics(&self) -> EngineMetrics {
+    self.metrics.clone()
+  }
+
+  /// Drive every hosted group until shutdown (or until every `MultiHandle` clone has dropped and
+  /// the buffered commands drained). Per-iteration crank order is the single-group loop's, with
+  /// the storage crank replacing the single `handle_storage` call.
+  pub async fn run(mut self) {
+    use futures_util::{FutureExt, select_biased};
+
+    let now = self.clock.now();
+    self.reconcile_peer_links(now.mono());
+    self.pump(now).await;
+
+    loop {
+      let now = self.clock.now();
+
+      // Fairness: a bounded command drain before the biased select.
+      let mut exit = false;
+      for _ in 0..self.cmd_budget {
+        match self.commands.try_recv() {
+          Ok(cmd) => {
+            if self.handle_command(now, cmd) {
+              exit = true;
+              break;
+            }
+          }
+          Err(e) => {
+            if matches!(e, flume::TryRecvError::Disconnected) {
+              exit = true;
+            }
+            break;
+          }
+        }
+      }
+      if exit {
+        break;
+      }
+
+      // Fairness across the biased select: bounded loop-top drains (see the single-group driver).
+      for _ in 0..IO_BUDGET {
+        match self.inbound_rx.try_recv() {
+          Ok(inbound) => self.handle_inbound(now, inbound),
+          Err(_) => break,
+        }
+      }
+      for _ in 0..IO_BUDGET {
+        match self.dial_ready_rx.try_recv() {
+          Ok(ready) => self.handle_dial_ready(ready),
+          Err(_) => break,
+        }
+      }
+
+      // Fire an already-due deadline before the select; the housekeeping condition mirrors the
+      // single loop (a timerless host with live connections still reaps handshakes).
+      let poll_timeout = self.coord.poll_timeout();
+      if poll_timeout.is_some_and(|d| d <= self.clock.mono())
+        || (poll_timeout.is_none() && !self.conns.is_empty())
+      {
+        self.fire_timeouts(now);
+      }
+      self.reconcile_peer_links(now.mono());
+      self.pump(now).await;
+
+      if self
+        .accept_backoff_until
+        .is_some_and(|until| until <= std::time::Instant::now())
+      {
+        self.accept_backoff_until = None;
+      }
+
+      let housekeeping =
+        (!self.conns.is_empty()).then(|| std::time::Instant::now() + HOUSEKEEPING_INTERVAL);
+      // The multi analog of the single loop's live-store `has_pending` deadline: staged engine
+      // work is invisible until the barrier (READY-only `has_pending` by design), so the
+      // pending-flush flag — set by every staging dispatch, recomputed by every crank — derives
+      // the immediate re-drive wake instead.
+      let storage_redrive = self.flush_pending.then(std::time::Instant::now);
+      let deadline = self
+        .coord
+        .poll_timeout()
+        .map(|d| self.clock.to_std(d))
+        .into_iter()
+        .chain(self.redial_wake)
+        .chain(self.accept_backoff_until)
+        .chain(housekeeping)
+        .chain(storage_redrive)
+        .min()
+        .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
+
+      enum Wake<R: Runtime, G, I, F: StateMachine> {
+        Inbound(BridgeInbound),
+        Accepted(StreamOf<R>),
+        AcceptErr,
+        DialReady(DialReady<R>),
+        Timer,
+        Command(Option<MultiCommand<G, I, F>>),
+        Storage,
+        StorageClosed,
+      }
+      let wake = {
+        let accept_parked =
+          self.accept_backoff_until.is_some() || self.conns.len() >= self.max_conns;
+        let accept_fut = if accept_parked {
+          futures_util::future::pending::<io::Result<(StreamOf<R>, SocketAddr)>>().right_future()
+        } else {
+          self.listener.accept().left_future()
+        }
+        .fuse();
+        let inbound_fut = self.inbound_rx.recv_async().fuse();
+        let dial_fut = self.dial_ready_rx.recv_async().fuse();
+        let timer_fut =
+          R::sleep(deadline.saturating_duration_since(std::time::Instant::now())).fuse();
+        let storage_closed = self.storage_closed;
+        let storage_rx = &self.storage_ready;
+        let storage_fut = async move {
+          if storage_closed {
+            std::future::pending::<Result<(), flume::RecvError>>().await
+          } else {
+            storage_rx.recv_async().await
+          }
+        }
+        .fuse();
+        let cmd_fut = self.commands.recv_async().fuse();
+        futures_util::pin_mut!(
+          accept_fut,
+          inbound_fut,
+          dial_fut,
+          timer_fut,
+          storage_fut,
+          cmd_fut
+        );
+
+        select_biased! {
+          got = accept_fut => match got {
+            Ok((s, _from)) => Wake::Accepted(s),
+            Err(_) => Wake::AcceptErr,
+          },
+          got = inbound_fut => Wake::Inbound(got.expect("inbound_tx outlives the loop")),
+          got = dial_fut => Wake::DialReady(got.expect("dial_ready_tx outlives the loop")),
+          _ = timer_fut => Wake::Timer,
+          cmd = cmd_fut => Wake::Command(cmd.ok()),
+          got = storage_fut => {
+            if got.is_err() { Wake::StorageClosed } else { Wake::Storage }
+          }
+        }
+      };
+      // Coalesce storage-ready wakes to a bounded count (see the single-group driver).
+      for _ in 0..IO_BUDGET {
+        if self.storage_ready.try_recv().is_err() {
+          break;
+        }
+      }
+
+      let now = self.clock.now();
+      match wake {
+        Wake::Inbound(inbound) => self.handle_inbound(now, inbound),
+        Wake::Accepted(socket) => self.handle_accept(now.mono(), socket),
+        Wake::AcceptErr => {
+          self.accept_backoff_until = Some(std::time::Instant::now() + ACCEPT_ERROR_BACKOFF);
+        }
+        Wake::DialReady(ready) => self.handle_dial_ready(ready),
+        Wake::Timer => self.fire_timeouts(now),
+        Wake::Command(Some(cmd)) => {
+          if self.handle_command(now, cmd) {
+            break;
+          }
+        }
+        Wake::Command(None) => break,
+        Wake::Storage => {}
+        Wake::StorageClosed => self.storage_closed = true,
+      }
+      self.storage_crank(now);
+      self.pump(now).await;
+    }
+
+    // Teardown. Classify each group's fail-stop FIRST (a poisoned group's parked work fails with
+    // the typed verdict even when a Shutdown raced the poisoning crank), then the ShuttingDown
+    // sweep — a no-op on the already-emptied groups.
+    let hosted: Vec<G> = self.routing.keys().map(|g| g.cheap_clone()).collect();
+    for g in &hosted {
+      if self.coord.group(g).is_some_and(|ep| ep.is_poisoned())
+        && let Some(routing) = self.routing.get_mut(g)
+      {
+        routing.fail_all(&DriverError::Poisoned);
+      }
+    }
+    for routing in self.routing.values_mut() {
+      routing.fail_all(&DriverError::ShuttingDown);
+    }
+    self.conns.clear();
+    while let Ok(cmd) = self.commands.try_recv() {
+      drop(cmd);
+    }
+    drop(self.commands);
+    // The fd-release point, then the teardown signal — the single driver's ordering verbatim.
+    drop(self.listener);
+    if let Some(tx) = self.teardown_tx.take() {
+      let _ = tx.send(());
+    }
+  }
+
+  /// Fire the transport's shared housekeeping (handshake reaping), then every DUE group's
+  /// consensus timers. This is the v1 aggregate-timer dispatch: ONE armed deadline, an O(groups)
+  /// due sweep on fire; an indexed timing wheel over [`MultiStreamCoordinator::deadlines`] is the
+  /// scale refinement seam.
+  fn fire_timeouts(&mut self, now: Now) {
+    self.coord.handle_transport_timeout(now);
+    let mono = self.clock.mono();
+    let due: Vec<G> = self
+      .coord
+      .deadlines()
+      .filter(|(_, d)| *d <= mono)
+      .map(|(g, _)| g)
+      .collect();
+    for g in &due {
+      if let Some((log, stable)) = self.engine.stores(g) {
+        let _ = self.coord.handle_timeout(g, now, log, stable);
+      }
+    }
+    if !due.is_empty() {
+      // A fired election/heartbeat can stage vote/append writes: barrier them this crank.
+      self.flush_pending = true;
+    }
+  }
+
+  /// The per-crank storage step, replacing the single loop's one `handle_storage` call:
+  /// (a) ONE engine flush — the batched durability barrier every hosted group's staged writes
+  /// share, the fsync-amortization point — gated on the pending-flush flag so an idle pass never
+  /// burns a barrier on a knowably-empty batch; then (b) every hosted group's completion drain,
+  /// re-driving a budget-cut group at most [`STORAGE_REDRIVES`] times (the remainder rides the
+  /// next crank). v1 deliberately iterates ALL hosted groups — an idle group's drain is a cheap
+  /// no-op poll — with dirty-set tracking as the scale refinement.
+  fn storage_crank(&mut self, now: Now) {
+    if self.flush_pending {
+      self.engine.flush();
+    }
+    let mut more = false;
+    let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
+    for g in &hosted {
+      let mut redrives = 0;
+      while let Some((log, stable)) = self.engine.stores(g) {
+        match self.coord.handle_storage(g, now, log, stable) {
+          Some(StorageProgress::MorePending) => {
+            redrives += 1;
+            if redrives >= STORAGE_REDRIVES {
+              more = true;
+              break;
+            }
+          }
+          _ => break,
+        }
+      }
+    }
+    // Completions drained above can STAGE follow-up writes (a commit's HardState write submitted
+    // by the core's storage tail) that stay invisible to has_pending until the next barrier — so
+    // the re-arm predicate is the engine's own staged-work signal, measured AFTER the drains: it
+    // is exact, where a release-count inference would miss a write staged by a crank whose
+    // barrier released nothing.
+    self.flush_pending = self.engine.has_staged() || more;
+    self
+      .metrics
+      .record(self.engine.flushes(), self.engine.ops_flushed());
+  }
+
+  /// One inbound bridge frame: feed bytes/EOF to the coordinator, which demuxes each frame's
+  /// group tag through the engine's per-group stores (errors close the conn).
+  fn handle_inbound(&mut self, now: Now, inbound: BridgeInbound) {
+    match inbound {
+      BridgeInbound::Bytes { id, bytes } => {
+        self
+          .coord
+          .handle_conn_data(id, &bytes, false, now, &mut self.engine);
+        self.flush_pending = true;
+      }
+      BridgeInbound::Eof { id } => {
+        self
+          .coord
+          .handle_conn_data(id, &[], true, now, &mut self.engine);
+        self.flush_pending = true;
+      }
+      BridgeInbound::Error { id } => self.close_conn(id),
+    }
+  }
+
+  /// One accepted socket (the single-group driver's admission + bridging verbatim).
+  fn handle_accept(&mut self, now: Instant, socket: StreamOf<R>) {
+    if self.conns.len() >= self.max_conns {
+      return;
+    }
+    let record = match (self.acceptor)() {
+      Ok(r) => r,
+      Err(_) => return,
+    };
+    let _ = socket.set_nodelay(true);
+    let id = self.coord.on_conn_open(record, now);
+    let (out_tx, out_rx) = flume::unbounded();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let (read_half, write_half) = socket.into_split();
+    let read = AbortOnDrop::new(R::spawn(bridge_read(
+      read_half,
+      id,
+      self.inbound_tx.clone(),
+    )));
+    let write = AbortOnDrop::new(R::spawn(bridge_write(
+      write_half,
+      id,
+      out_rx,
+      queued.clone(),
+      self.inbound_tx.clone(),
+    )));
+    self.conns.insert(
+      id,
+      Conn {
+        tasks: ConnTask::Bridged { read, write },
+        out_tx,
+        queued_bytes: queued,
+        dialed_to: None,
+      },
+    );
+  }
+
+  /// The standing per-peer link reconciler (the single-group driver's verbatim — the shared
+  /// connections are group-agnostic, so link repair is too).
+  fn reconcile_peer_links(&mut self, now: Instant) {
+    let std_now = std::time::Instant::now();
+    let mut wake: Option<std::time::Instant> = None;
+    for node in self.peers.clone() {
+      let (peer, addr) = node.into_parts();
+      if self.coord.conn_of(&peer).is_some() {
+        let stable = match self.redial.get_mut(&peer) {
+          None => false,
+          Some(r) => {
+            let since = *r.bound_since.get_or_insert(std_now);
+            std_now.duration_since(since) >= self.redial_base
+          }
+        };
+        if stable {
+          self.redial.remove(&peer);
+        }
+        continue;
+      }
+      if let Some(r) = self.redial.get_mut(&peer) {
+        r.bound_since = None;
+      }
+      if self
+        .conns
+        .values()
+        .any(|c| c.dialed_to.as_ref() == Some(&peer))
+      {
+        continue;
+      }
+      if let Some(r) = self.redial.get(&peer)
+        && std_now < r.at
+      {
+        wake = Some(wake.map_or(r.at, |w| w.min(r.at)));
+        continue;
+      }
+      let delay = self
+        .redial
+        .get(&peer)
+        .map_or(self.redial_base, |r| r.backoff);
+      let at = std_now + jittered(delay);
+      self.redial.insert(
+        peer.cheap_clone(),
+        Redial {
+          at,
+          backoff: (delay * 2).min(self.redial_cap),
+          bound_since: None,
+        },
+      );
+      self.dial(now, peer, addr);
+      wake = Some(wake.map_or(at, |w| w.min(at)));
+    }
+    self.redial_wake = wake;
+  }
+
+  /// Register + start one dial attempt (single-group verbatim).
+  fn dial(&mut self, now: Instant, peer: I, addr: SocketAddr) {
+    let record = match (self.dialer)(&peer) {
+      Ok(r) => r,
+      Err(_) => return,
+    };
+    let id = self.coord.on_conn_open(record, now);
+    let (out_tx, out_rx) = flume::unbounded();
+    let queued = Arc::new(AtomicUsize::new(0));
+    let dial_ready = self.dial_ready_tx.clone();
+    let qb_for_task = queued.clone();
+    let task = AbortOnDrop::new(R::spawn(async move {
+      let result = StreamOf::<R>::connect(addr).await;
+      let _ = dial_ready
+        .send_async(DialReady {
+          id,
+          result,
+          out_rx,
+          queued_bytes: qb_for_task,
+        })
+        .await;
+    }));
+    self.conns.insert(
+      id,
+      Conn {
+        tasks: ConnTask::Connecting(task),
+        out_tx,
+        queued_bytes: queued,
+        dialed_to: Some(peer),
+      },
+    );
+  }
+
+  /// One dial completion: bridge the socket, or close (the reconciler retries).
+  fn handle_dial_ready(&mut self, ready: DialReady<R>) {
+    let DialReady {
+      id,
+      result,
+      out_rx,
+      queued_bytes,
+    } = ready;
+    match result {
+      Ok(socket) => {
+        if let Some(conn) = self.conns.get_mut(&id) {
+          let _ = socket.set_nodelay(true);
+          let (read_half, write_half) = socket.into_split();
+          let read = AbortOnDrop::new(R::spawn(bridge_read(
+            read_half,
+            id,
+            self.inbound_tx.clone(),
+          )));
+          let write = AbortOnDrop::new(R::spawn(bridge_write(
+            write_half,
+            id,
+            out_rx,
+            queued_bytes,
+            self.inbound_tx.clone(),
+          )));
+          conn.tasks = ConnTask::Bridged { read, write };
+        }
+      }
+      Err(_) => self.close_conn(id),
+    }
+  }
+
+  /// Tear one connection down (single-group verbatim: no repair decision here).
+  fn close_conn(&mut self, id: ConnId) {
+    self.coord.on_conn_close(id);
+    drop(self.conns.remove(&id));
+  }
+
+  /// Admit a group's driver-side client state (routing + the leadership edge-detect).
+  fn admit_group(&mut self, gid: G) {
+    self
+      .routing
+      .insert(gid.cheap_clone(), Routing::new(self.stub_events_tx.clone()));
+    self.was_leader.insert(gid, false);
+  }
+
+  /// Create a fresh group: engine storage + coordinator endpoint + driver routing, admitted
+  /// together (engine admission rolled back if the coordinator refuses).
+  fn create_group(
+    &mut self,
+    now: Now,
+    gid: G,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+  ) -> Result<(), DriverError<I>> {
+    // The single drivers validate the Config — and loudly reject a walled failover tier on a
+    // monotonic host — at bind; group admission is the same gate, per group.
+    validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
+    let added = self.engine.add_group(gid.cheap_clone());
+    match self
+      .coord
+      .create_group(gid.cheap_clone(), config, now, seed, fsm)
+    {
+      Ok(()) => {
+        self.admit_group(gid);
+        Ok(())
+      }
+      Err(e) => {
+        // Roll back ONLY an admission this call made; pre-existing storage is not ours to drop.
+        if added {
+          self.engine.remove_group(&gid);
+        }
+        Err(rejected(e))
+      }
+    }
+  }
+
+  /// Recover a group from the engine's storage, the driver deriving the boot epoch from the
+  /// engine's per-group counter.
+  fn restore_group(
+    &mut self,
+    now: Now,
+    gid: G,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+  ) -> Result<(), DriverError<I>> {
+    validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
+    let added = self.engine.add_group(gid.cheap_clone());
+    let epoch = self
+      .engine
+      .next_boot_epoch(&gid)
+      .expect("storage admitted above");
+    let result = {
+      let (log, stable) = self.engine.stores(&gid).expect("storage admitted above");
+      self.coord.restore_group(
+        gid.cheap_clone(),
+        config,
+        now,
+        seed,
+        fsm,
+        epoch,
+        log,
+        stable,
+      )
+    };
+    match result {
+      Ok(()) => {
+        // The restore may leave one staged stable write (a recovered lease floor): barrier it.
+        self.flush_pending = true;
+        self.admit_group(gid);
+        Ok(())
+      }
+      Err(e) => {
+        if added {
+          self.engine.remove_group(&gid);
+        }
+        Err(rejected(e))
+      }
+    }
+  }
+
+  /// Remove a group: coordinator endpoint, engine storage, and driver routing torn down together;
+  /// the group's parked work fails with the group-scoped teardown verdict. Returns whether the
+  /// group was hosted.
+  fn remove_group(&mut self, gid: &G) -> bool {
+    let existed = self.coord.remove_group(gid).is_some();
+    let had_storage = self.engine.remove_group(gid);
+    self.was_leader.remove(gid);
+    if let Some(mut routing) = self.routing.remove(gid) {
+      routing.fail_all(&DriverError::ShuttingDown);
+    }
+    existed || had_storage
+  }
+
+  /// Handle one command. Returns `true` when the loop should exit (a `Shutdown`).
+  fn handle_command(&mut self, now: Now, cmd: MultiCommand<G, I, F>) -> bool {
+    match cmd {
+      MultiCommand::Submit {
+        group,
+        cmd,
+        reply,
+        reservation,
+      } => {
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          let _ = reply.send(Err(no_such_group()));
+          return false;
+        };
+        match self
+          .coord
+          .submit_propose_deferred(&group, now, log, stable, &cmd)
+        {
+          Some(Ok(index)) => {
+            self.flush_pending = true;
+            if let Some(routing) = self.routing.get_mut(&group) {
+              routing.pending.insert(
+                index,
+                Pending::Submit {
+                  reply,
+                  _reservation: reservation,
+                },
+              );
+            }
+          }
+          Some(Err(e)) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+          None => {
+            let _ = reply.send(Err(no_such_group()));
+          }
+        }
+      }
+      MultiCommand::Conf {
+        group,
+        cc,
+        reply,
+        reservation,
+      } => {
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          let _ = reply.send(Err(no_such_group()));
+          return false;
+        };
+        match self.coord.propose_conf_change(&group, now, log, stable, cc) {
+          Some(Ok(index)) => {
+            self.flush_pending = true;
+            if let Some(routing) = self.routing.get_mut(&group) {
+              routing.pending.insert(
+                index,
+                Pending::Conf {
+                  reply,
+                  _reservation: reservation,
+                },
+              );
+            }
+          }
+          Some(Err(e)) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+          None => {
+            let _ = reply.send(Err(no_such_group()));
+          }
+        }
+      }
+      MultiCommand::ConfV2 {
+        group,
+        cc,
+        reply,
+        reservation,
+      } => {
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          let _ = reply.send(Err(no_such_group()));
+          return false;
+        };
+        match self
+          .coord
+          .propose_conf_change_v2(&group, now, log, stable, cc)
+        {
+          Some(Ok(index)) => {
+            self.flush_pending = true;
+            if let Some(routing) = self.routing.get_mut(&group) {
+              routing.pending.insert(
+                index,
+                Pending::Conf {
+                  reply,
+                  _reservation: reservation,
+                },
+              );
+            }
+          }
+          Some(Err(e)) => {
+            let _ = reply.send(Err(map_propose_err(e)));
+          }
+          None => {
+            let _ = reply.send(Err(no_such_group()));
+          }
+        }
+      }
+      MultiCommand::Query {
+        group,
+        complete,
+        reservation,
+      } => {
+        let Some(routing) = self.routing.get_mut(&group) else {
+          complete(Err(no_such_group()));
+          return false;
+        };
+        let ctx = routing.mint_query_ctx();
+        let Some((log, stable)) = self.engine.stores(&group) else {
+          complete(Err(no_such_group()));
+          return false;
+        };
+        match self.coord.read_index(
+          &group,
+          now,
+          log,
+          stable,
+          Bytes::copy_from_slice(&ctx.to_be_bytes()),
+        ) {
+          Some(Ok(())) => {
+            routing.queries.insert(
+              ctx,
+              ParkedQuery {
+                ready_at: None,
+                complete,
+                _reservation: reservation,
+              },
+            );
+          }
+          Some(Err(e)) => complete(Err(map_read_err(e))),
+          None => complete(Err(no_such_group())),
+        }
+      }
+      MultiCommand::FailoverWindow {
+        group,
+        complete,
+        reservation,
+      } => {
+        if let Some(routing) = self.routing.get_mut(&group) {
+          routing.failovers.push(ParkedFailover {
+            complete,
+            _reservation: reservation,
+          });
+        } else {
+          complete(Err(no_such_group()));
+        }
+      }
+      MultiCommand::Transfer {
+        group,
+        to,
+        reply,
+        reservation,
+      } => {
+        let verdict = match self.engine.stores(&group) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => match self.coord.transfer_leader(&group, now, log, stable, to) {
+            Some(r) => r.map_err(map_transfer_err),
+            None => Err(no_such_group()),
+          },
+        };
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+      MultiCommand::SetReadMode {
+        group,
+        mode,
+        reply,
+        reservation,
+      } => {
+        let verdict = match self.engine.stores(&group) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => {
+            match self
+              .coord
+              .propose_read_mode_change(&group, now, log, stable, mode)
+            {
+              Some(r) => r.map_err(map_propose_err),
+              None => Err(no_such_group()),
+            }
+          }
+        };
+        if verdict.is_ok() {
+          self.flush_pending = true;
+        }
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+      MultiCommand::Status {
+        group,
+        reply,
+        reservation,
+      } => {
+        let status = self.coord.group(&group).map(|ep| Status {
+          role: ep.role(),
+          term: ep.term(),
+          leader: ep.leader(),
+          commit_index: ep.commit_index(),
+          applied_index: ep.applied_index(),
+          active_read_mode: ep.active_read_mode(),
+          conf_state: ep.conf_state(),
+          is_poisoned: ep.is_poisoned(),
+          precise_releases: ep.precise_releases(),
+          unprovable_floor_holds: ep.unprovable_floor_holds(),
+        });
+        let _ = reply.send(status.ok_or_else(no_such_group));
+        drop(reservation);
+      }
+      MultiCommand::CreateGroup {
+        gid,
+        config,
+        seed,
+        fsm,
+        reply,
+        reservation,
+      } => {
+        let _ = reply.send(self.create_group(now, gid, config, seed, fsm));
+        drop(reservation);
+      }
+      MultiCommand::RestoreGroup {
+        gid,
+        config,
+        seed,
+        fsm,
+        reply,
+        reservation,
+      } => {
+        let _ = reply.send(self.restore_group(now, gid, config, seed, fsm));
+        drop(reservation);
+      }
+      MultiCommand::RemoveGroup {
+        gid,
+        reply,
+        reservation,
+      } => {
+        let _ = reply.send(self.remove_group(&gid));
+        drop(reservation);
+      }
+      MultiCommand::Shutdown => return true,
+    }
+    false
+  }
+
+  /// Serve (or fall back) ONE group's parked failover inherited-read queries — the single-group
+  /// `run_failover_serve` scoped to `gid`. Structurally inert on this monotonic-only v1 host
+  /// (no group can arm a serve window without the failover tier), but kept whole so the wall-clock
+  /// generalization does not reshape the loop. Returns `true` on a FATAL limbo storage fault; the
+  /// caller then fails THAT group's parked work `Poisoned` (group-scoped, never the driver).
+  fn run_failover_serve(&mut self, gid: &G) -> bool {
+    let Some(routing) = self.routing.get_mut(gid) else {
+      return false;
+    };
+    if routing.failovers.is_empty() {
+      return false;
+    }
+    let now = self.clock.now();
+    let Some(ep) = self.coord.group(gid) else {
+      return false;
+    };
+    match ep.failover_read_window(now) {
+      None => {
+        for p in std::mem::take(&mut routing.failovers) {
+          (p.complete)(Ok(None));
+        }
+      }
+      Some(window) if routing.applied >= window.index() => {
+        let Some((log, _stable)) = self.engine.stores(gid) else {
+          return false;
+        };
+        match sailing_driver::shared::read_limbo(log, &window, self.max_failover_limbo_bytes as u64)
+        {
+          Ok(Some(limbo)) => {
+            let parked = std::mem::take(&mut routing.failovers);
+            let fsm = ep.state_machine();
+            sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+              self
+                .coord
+                .group(gid)
+                .is_some_and(|e| e.failover_read_window(self.clock.now()).is_some())
+            });
+          }
+          Ok(None) => {
+            for p in std::mem::take(&mut routing.failovers) {
+              (p.complete)(Ok(None));
+            }
+          }
+          Err(_) => return true,
+        }
+      }
+      Some(_) => {}
+    }
+    false
+  }
+
+  /// Drain the coordinator's aggregate outputs: wire bytes to each conn's writer (byte-budgeted),
+  /// transport closes into teardown, group-stamped events into each group's routing plus the
+  /// driver-owned stamped tail — then each hosted group's completion tail.
+  async fn pump(&mut self, now: Now) {
+    // Coalesce replication BEFORE the transmit drain, per hosted group. v1 flushes every group
+    // unconditionally: `flush_appends` is idempotent and cheap when nothing is pending (the
+    // proto's replication_pending flag), so proposed-this-crank tracking is a later refinement.
+    let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
+    for g in &hosted {
+      if let Some((log, stable)) = self.engine.stores(g) {
+        let _ = self.coord.flush_appends(g, now, log, stable);
+      }
+    }
+    for (id, bytes) in self.coord.poll_transmit() {
+      let Some(conn) = self.conns.get(&id) else {
+        continue;
+      };
+      let projected = conn.queued_bytes.load(Ordering::Relaxed) + bytes.len();
+      if projected > self.max_outbound_backlog {
+        self.close_conn(id);
+        continue;
+      }
+      conn.queued_bytes.fetch_add(bytes.len(), Ordering::Relaxed);
+      let _ = conn.out_tx.try_send(BridgeOut(Bytes::from(bytes)));
+    }
+    while let Some((id, _err)) = self.coord.poll_conn_closed() {
+      self.close_conn(id);
+    }
+    // Route each group-stamped event into ITS group's routing; the driver forwards the stamped
+    // copy to the shared tail itself (the per-group Routing's own tail is the bind-time stub).
+    let mut run_queries: BTreeSet<G> = BTreeSet::new();
+    while let Some((g, ev)) = self.coord.poll_event() {
+      if let Some(routing) = self.routing.get_mut(&g)
+        && routing.route_event(ev.clone())
+      {
+        run_queries.insert(g.cheap_clone());
+      }
+      let _ = self.events_tx.try_send((g, ev));
+    }
+    // The single pump's completion tail, PER GROUP — one group's supersede or fail-stop never
+    // touches a co-located group's parked work.
+    let with_routing: Vec<G> = self.routing.keys().map(|g| g.cheap_clone()).collect();
+    for g in &with_routing {
+      self.pump_group_tail(g, run_queries.contains(g));
+    }
+  }
+
+  /// One group's per-pass completion tail: watermark sync, the leadership-loss backstop, the
+  /// failover serve, runnable queries, and the group-scoped poison sweep — the single-group
+  /// pump's tail with every step keyed to `gid`. A poisoned group fails ITS parked work with the
+  /// typed verdict; the driver keeps running for the co-located groups.
+  fn pump_group_tail(&mut self, gid: &G, mut run_queries: bool) {
+    let Some(ep) = self.coord.group(gid) else {
+      return;
+    };
+    let poisoned = ep.is_poisoned();
+    let applied = ep.applied_index();
+    let is_leader = ep.role().is_leader();
+    if !poisoned
+      && let Some(routing) = self.routing.get_mut(gid)
+      && routing.sync_applied(applied)
+    {
+      run_queries = true;
+    }
+    let was = self
+      .was_leader
+      .insert(gid.cheap_clone(), is_leader)
+      .unwrap_or(false);
+    if was
+      && !is_leader
+      && let Some(routing) = self.routing.get_mut(gid)
+    {
+      routing.fail_all(&DriverError::Superseded);
+    }
+    if !poisoned && self.run_failover_serve(gid) {
+      // A FATAL limbo storage fault is GROUP-scoped on a multi host: fail that group's parked
+      // work with the typed verdict; co-located groups (and the driver) keep running.
+      if let Some(routing) = self.routing.get_mut(gid) {
+        routing.fail_all(&DriverError::Poisoned);
+      }
+      return;
+    }
+    if run_queries
+      && let Some(ep) = self.coord.group(gid)
+      && let Some(routing) = self.routing.get_mut(gid)
+    {
+      for q in routing.take_runnable_queries() {
+        (q.complete)(Ok(ep.state_machine()));
+      }
+    }
+    if poisoned && let Some(routing) = self.routing.get_mut(gid) {
+      routing.fail_all(&DriverError::Poisoned);
+    }
+  }
+}
