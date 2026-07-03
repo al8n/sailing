@@ -671,13 +671,27 @@ async fn lifecycle_admission_errors_are_typed() {
     other => panic!("expected the missing-wall-source rejection, got {other:?}"),
   }
 
-  // Removal round-trips the was-hosted bool, and the id is re-admittable under the same identity.
+  // Removal round-trips the was-hosted bool and TOMBSTONES the id: a re-create is refused with
+  // the typed Retired flatten until an explicit clear_tombstone consents to re-admission.
   assert!(!handle.remove_group(999).await.expect("remove resolves"));
   assert!(handle.remove_group(100).await.expect("remove resolves"));
+  match handle
+    .create_group(100, config(1, vec![1]), 3, CountSm::default())
+    .await
+  {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(reason.contains("tombstoned"), "got: {reason}");
+    }
+    other => panic!("expected the tombstoned-id rejection, got {other:?}"),
+  }
+  assert!(
+    handle.clear_tombstone(100).await.expect("clear resolves"),
+    "a tombstone existed"
+  );
   handle
     .create_group(100, config(1, vec![1]), 3, CountSm::default())
     .await
-    .expect("a removed id is re-admittable under the latched identity");
+    .expect("a cleared id is re-admittable under the latched identity");
   assert_eq!(
     submit_anywhere(std::slice::from_ref(&handle.group(100)), b"x").await,
     1,
@@ -736,6 +750,97 @@ async fn unknown_group_event_drives_creation() {
 
   // The sibling group was untouched by the lifecycle churn.
   assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
+
+/// THE stale-advisory regression: an `UnknownGroup` observation consumed AFTER the embedder
+/// tombstoned the id must not resurrect the group. The lifecycle tail is asynchronous — the
+/// event was captured at emission, and by consumption the embedder has already removed the id —
+/// so a naive placement brain replaying it into `create_group` is exactly the implicit
+/// resurrection the references forbid: the driver fails it closed (`Rejected`), the group stays
+/// un-hosted, and only the deliberate two-act rejoin — `clear_tombstone`, then `create_group` —
+/// re-admits the id and lets the solicited election complete.
+#[tokio::test(flavor = "multi_thread")]
+async fn stale_unknown_group_event_cannot_resurrect() {
+  let addrs = addrs(44_300, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its campaign solicits node 2. Wait for the UnknownGroup
+  // observation to LAND on node 2's lifecycle tail — but do not consume it yet.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 1");
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while handles[1].lifecycle().is_empty() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no unknown-group event landed in time"
+    );
+    tokio::time::sleep(Duration::from_millis(20)).await;
+  }
+
+  // The embedder tombstones the id BEFORE consuming the tail (a placement decision racing the
+  // queued advisory). Node 2 never hosted 100, so the remove reports false — and still
+  // tombstones.
+  assert!(
+    !handles[1].remove_group(100).await.expect("remove resolves"),
+    "node 2 never hosted group 100"
+  );
+
+  // NOW the naive brain consumes the stale advisory and replays it into a create: refused —
+  // the tombstone fails the resurrection closed, and the group stays un-hosted.
+  await_lifecycle(handles[1].lifecycle(), "the stale solicitation", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::UnknownGroup {
+        group: 100,
+        from: 1
+      }
+    )
+  })
+  .await;
+  match handles[1]
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .await
+  {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(reason.contains("tombstoned"), "got: {reason}");
+    }
+    other => panic!("expected the stale re-create to be rejected, got {other:?}"),
+  }
+  match handles[1].group(100).status().await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("the group must stay un-hosted, got {other:?}"),
+  }
+
+  // The legitimate re-admission is two deliberate acts: clear the tombstone, then create — the
+  // campaigner's next retry then completes the election and both sides commit.
+  assert!(
+    handles[1]
+      .clear_tombstone(100)
+      .await
+      .expect("clear resolves"),
+    "a tombstone existed"
+  );
+  handles[1]
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 2 after the explicit clear");
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
 }
 
 /// A committed remove-node conf change that drops a host from a group surfaces
@@ -836,8 +941,8 @@ async fn removed_self_event_and_teardown() {
 
 /// Tombstone-then-recreate at the driver level: one follower of a LIVE 3-node group de-hosts its
 /// replica (the unaware leader keeps beating; the tombstone absorbs the stragglers with no
-/// closes — the shared mesh and the sibling group stay clean), then re-admits the SAME id: the
-/// admission succeeds (the tombstone lifts) and the group keeps committing throughout.
+/// closes — the shared mesh and the sibling group stay clean), then re-admits the SAME id
+/// through the explicit clear-then-create rejoin, and the group keeps committing throughout.
 ///
 /// The group's liveness deliberately rides the REMAINING majority, not the re-created replica's
 /// catch-up: a fresh-log replica behind the leader's STALE positive `match` cannot be walked
@@ -881,8 +986,16 @@ async fn tombstoned_id_recreates_cleanly() {
   assert_eq!(submit_anywhere(&g900, b"mesh-alive").await, 2);
   assert_eq!(submit_anywhere(&g100, b"majority").await, 2);
 
-  // Re-admitting the SAME id (fresh storage, as a driver provisions) lifts the tombstone: the
-  // admission is clean and the group keeps committing — no wedge anywhere.
+  // Re-admission is the deliberate two-act rejoin: clear the tombstone (the explicit consent),
+  // then re-create the SAME id (fresh storage, as a driver provisions). The admission is clean
+  // and the group keeps committing — no wedge anywhere.
+  assert!(
+    handles[follower_at]
+      .clear_tombstone(100)
+      .await
+      .expect("clear resolves"),
+    "a tombstone existed"
+  );
   handles[follower_at]
     .create_group(
       100,
@@ -891,7 +1004,7 @@ async fn tombstoned_id_recreates_cleanly() {
       CountSm::default(),
     )
     .await
-    .expect("the tombstoned id re-admits");
+    .expect("the cleared id re-admits");
   assert_eq!(submit_anywhere(&g100, b"rejoined").await, 3);
   assert_eq!(submit_anywhere(&g900, b"still").await, 3);
 }
