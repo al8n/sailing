@@ -386,6 +386,45 @@ fn quiesce_flag_round_trips_over_quic() {
   );
 }
 
+/// The wake-classification pin on this coordinator's own copy (the stream sibling pins it
+/// end-to-end): only a `HeartbeatResponse` is absorbed — an empty `AppendEntries` and an
+/// `AppendResponse` wake, since the gated heartbeat-response pump leaves an idle round with no
+/// empty-append tail and quiesce eligibility excludes the probing peers that would still draw it.
+#[test]
+fn only_the_heartbeat_response_is_absorbed() {
+  use crate::Index;
+  let empty_ae = Message::AppendEntries(crate::AppendEntries::new(
+    Term::new(1),
+    1u64,
+    Index::ZERO,
+    Term::ZERO,
+    Vec::new(),
+    Index::ZERO,
+  ));
+  assert!(
+    MCoord::is_wake_class(&empty_ae),
+    "an empty AppendEntries wakes"
+  );
+  let ack = Message::AppendResponse(crate::AppendResponse::new(
+    Term::new(1),
+    2u64,
+    false,
+    Index::ZERO,
+    Term::ZERO,
+    Index::ZERO,
+  ));
+  assert!(MCoord::is_wake_class(&ack), "an AppendResponse wakes");
+  let hbr = Message::HeartbeatResponse(crate::HeartbeatResponse::new(
+    Term::new(1),
+    2u64,
+    bytes::Bytes::new(),
+  ));
+  assert!(
+    !MCoord::is_wake_class(&hbr),
+    "the heartbeat response is absorbed"
+  );
+}
+
 /// A coalesced entry for a group the receiver no longer hosts is dropped ENTRY by entry over
 /// QUIC: the co-located group's beat in the same frame still dispatches and the shared connection
 /// survives.

@@ -45,18 +45,21 @@ pub enum GroupControl {
   /// to wake everything.
   Quiesce,
   /// WAKE-class inbound traffic was dispatched to the group. The absorbed (non-waking) complement
-  /// is exactly one heartbeat round's response tail — `HeartbeatResponse`, the empty
-  /// `AppendEntries` the leader pumps back at each responder, and that probe's `AppendResponse` —
-  /// because a quiescing group's FINAL flagged round still exchanges precisely those, and waking
-  /// on any of them would re-arm a timer and keep the round-trip alive forever. Absorbing them is
-  /// safe: each can only be the echo of a round the quiesced side itself completed pre-quiesce
-  /// (a quiesced leader sends no new beats or appends to respond to; quiesce eligibility required
-  /// every voter matched and commit applied, so no straggler ack can carry new progress, and a
-  /// commit can only advance behind a NON-empty append that already woke its follower).
-  /// Everything else wakes: a `Heartbeat` tells a quiesced follower its leader is active again
-  /// (restoring the silent-wedge detection its swept election timer provides), a non-empty
-  /// `AppendEntries` is live replication, votes/transfers/reads/snapshots are live consensus —
-  /// and a connection loss, the liveness oracle, is the driver's own wake signal.
+  /// is exactly one message kind — `HeartbeatResponse` — because a quiescing group's FINAL
+  /// flagged round exchanges precisely `Heartbeat` + `HeartbeatResponse` and nothing else, and
+  /// waking on that response would re-arm the leader's timers and keep the round-trip alive
+  /// forever. That the final round is exactly the pair rests on two gates: quiesce eligibility
+  /// (every voter matched, NO peer probing, commit applied) means no responder is behind or in
+  /// probe, and the gated heartbeat-response append pump sends nothing to a caught-up,
+  /// replicating responder — so the round has no empty-append tail to absorb. Absorbing the
+  /// response is safe: it can only echo a beat the quiesced side itself sent pre-quiesce (a
+  /// quiesced leader emits no new beats), and eligibility ensured no straggler ack carries new
+  /// progress. Everything else wakes — a `Heartbeat` tells a quiesced follower its leader is
+  /// active again (restoring the silent-wedge detection its swept election timer provides), a
+  /// non-empty `AppendEntries` is live replication, votes/transfers/reads/snapshots are live
+  /// consensus, and an empty `AppendEntries` or `AppendResponse` no longer belongs to an idle
+  /// round at all, so a spurious one costs one wake instead of riding the absorb trust surface.
+  /// A connection loss, the liveness oracle, is the driver's own wake signal.
   Wake,
 }
 
@@ -825,8 +828,8 @@ where
   }
 
   /// Queue the dispatch-driven [`GroupControl`]s for one delivered message: a `Wake` for every
-  /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat round's response tail is
-  /// absorbed), then a `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
+  /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat response is absorbed), then a
+  /// `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
   /// beat nets quiesced. Consecutive duplicates collapse (a burst of appends is one `Wake`).
   fn push_dispatch_controls(&mut self, group: &G, wake: bool, flags: u8) {
     if wake {
@@ -838,16 +841,13 @@ where
   }
 
   /// Whether a delivered message is WAKE-class for its group. The absorbed complement is exactly
-  /// the response tail of one heartbeat round in this codebase — `HeartbeatResponse`, the empty
-  /// `AppendEntries` the leader pumps back at each responder, and that probe's `AppendResponse` —
-  /// so a quiescing group's FINAL flagged round dies out instead of re-waking either side (see
-  /// [`GroupControl::Wake`] for the safety argument).
+  /// `HeartbeatResponse` — with the heartbeat-response append pump gated and quiesce eligibility
+  /// excluding probing peers, a quiescing group's FINAL flagged round is precisely
+  /// `Heartbeat` + `HeartbeatResponse`, so absorbing that one response is all it takes for the
+  /// round to die out instead of re-waking either side (see [`GroupControl::Wake`] for the
+  /// safety argument).
   fn is_wake_class(msg: &Message<I>) -> bool {
-    match msg {
-      Message::HeartbeatResponse(_) | Message::AppendResponse(_) => false,
-      Message::AppendEntries(ae) => !ae.entries().is_empty(),
-      _ => true,
-    }
+    !msg.is_heartbeat_response()
   }
 
   fn push_control(&mut self, group: &G, ctrl: GroupControl) {

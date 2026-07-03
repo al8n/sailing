@@ -2197,6 +2197,85 @@ fn heartbeat_response_pump_gated_on_responder_behind() {
   );
 }
 
+/// `has_probing_peer` — the quiesce-eligibility read: true on a leader while ANY tracked peer
+/// (self excluded) probes, false once every peer replicates, false on a non-leader (whose
+/// tracker holds fresh probe-state entries that describe nothing). A probing peer at FULL match
+/// stays true — an equal-match ack does not promote it to Replicate, so it keeps drawing the
+/// gated heartbeat-response pump every round, exactly the shape that must block quiescence.
+#[test]
+fn has_probing_peer_reflects_probe_state_on_the_leader() {
+  use crate::{Index, Message, Term};
+
+  // A fresh follower reports false even though its tracker holds probe-state entries.
+  let follower_cfg = crate::Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let follower: Endpoint<u64, CountSm> =
+    Endpoint::new(follower_cfg, Instant::ORIGIN, 7, CountSm::default());
+  assert!(
+    !follower.has_probing_peer(),
+    "a non-leader reports no probing peer"
+  );
+
+  // The 3-voter leader: peer 2 acked (Replicate), peer 3 never acked (Probe, behind).
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  assert!(ep.tracker.progress(&3u64).unwrap().state().is_probe());
+  assert!(
+    ep.has_probing_peer(),
+    "an unacked peer probes — the leader must not quiesce"
+  );
+
+  // Peer 3's ADVANCING ack promotes it to Replicate: no probing peer remains.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert!(ep.tracker.progress(&3u64).unwrap().state().is_replicate());
+  assert!(
+    !ep.has_probing_peer(),
+    "every peer replicating clears the predicate"
+  );
+
+  // A peer regressed to Probe AT FULL MATCH still reports true, and an EQUAL-match ack does not
+  // clear it (no promotion without an advance) — the pump-drawing shape quiescence must exclude.
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_probe();
+  }
+  assert!(ep.has_probing_peer(), "probing at full match still blocks");
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert!(
+    ep.has_probing_peer(),
+    "an equal-match ack does not promote — the peer keeps probing"
+  );
+}
+
 // ---- Fix 2 regression: lagging-follower hint is O(terms) not O(entries) ----
 
 /// A follower that is simply behind (prev_log_index > last_index) must emit a reject hint

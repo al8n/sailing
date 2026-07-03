@@ -1859,6 +1859,28 @@ where
       paused: p.is_paused(),
     })
   }
+
+  /// Whether any tracked peer's replication progress (voters AND learners, this node excluded) is
+  /// in the probe state. `false` on a non-leader — a follower's tracker holds fresh probe-state
+  /// entries that describe nothing (only a leader replicates).
+  ///
+  /// The quiesce-eligibility predicate: a probing peer still draws the gated heartbeat-response
+  /// append pump (contact matters to a probe regardless of `match`), and an EQUAL-match ack does
+  /// not promote it to Replicate — so a probing peer at full match re-draws the pump every round.
+  /// A leader must therefore not quiesce while any peer probes: the final flagged round's pump
+  /// pair would either churn wake/quiesce cycles or have to ride the absorb set, and the absorb
+  /// set is deliberately exactly the `HeartbeatResponse`.
+  pub fn has_probing_peer(&self) -> bool {
+    if !self.role.is_leader() {
+      return false;
+    }
+    let me = self.config.id();
+    self
+      .tracker
+      .progress_map()
+      .iter()
+      .any(|(id, p)| *id != me && p.state().is_probe())
+  }
 }
 
 impl<I, F, R> Endpoint<I, F, R>

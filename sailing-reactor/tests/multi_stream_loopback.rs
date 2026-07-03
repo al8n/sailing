@@ -618,6 +618,77 @@ async fn conn_loss_wakes_quiesced_followers_and_reelects() {
   }
 }
 
+/// A probing peer blocks quiescence: group 100 adds a learner that never comes up, so its
+/// Progress sits in Probe forever (equal-match acks never arrive to promote it), and group 100
+/// must never quiesce — a probing peer still draws the gated heartbeat-response append pump, the
+/// traffic the shrunk absorb set (exactly `HeartbeatResponse`) no longer covers. The follower
+/// side never quiesces either (its only quiesce path is the leader's flagged beat, which
+/// eligibility now withholds), so BOTH drivers' gauges settle at exactly 1 — the sibling group —
+/// and hold across a long quiet window, with both groups still serving.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_probing_peer_blocks_quiescence() {
+  let addrs = addrs(44_500, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2]).await;
+  create_group_everywhere(&handles, 200, &[1, 2]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b").await, 1);
+
+  // Add learner 9 to group 100; node 9 is never started, so its Progress probes forever.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed learner add in time"
+    );
+    let at = find_leader(&g100, "group 100 pre-learner").await;
+    let cc = ConfChange::new(ConfChangeType::AddLearnerNode, 9, Bytes::new());
+    match g100[at].conf_change(cc).await {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  }
+
+  // The sibling quiesces on BOTH drivers; group 100 cannot (its learner probes), so each gauge
+  // settles at exactly 1 and HOLDS — before the probing gate, group 100 quiesced too and the
+  // gauges reached 2.
+  wait_for_quiesced(&metrics[0], 1, "node 1 sibling only").await;
+  wait_for_quiesced(&metrics[1], 1, "node 2 sibling only").await;
+  for _ in 0..10 {
+    tokio::time::sleep(HEARTBEAT).await;
+    assert_eq!(
+      metrics[0].quiesced_groups(),
+      1,
+      "node 1: the probing-learner group must not quiesce"
+    );
+    assert_eq!(
+      metrics[1].quiesced_groups(),
+      1,
+      "node 2: the probing-learner group must not quiesce"
+    );
+  }
+
+  // Both groups still serve.
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+}
+
 /// Group admission is validated LOUDLY: duplicate ids, a config whose node id contradicts the
 /// latched host identity, and a walled failover-tier config on this monotonic-only host are all
 /// typed rejections — and a removed id can be re-admitted under the same host identity.

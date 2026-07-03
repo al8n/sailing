@@ -1116,8 +1116,8 @@ where
   }
 
   /// Queue the dispatch-driven [`GroupControl`]s for one delivered message: a `Wake` for every
-  /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat round's response tail is
-  /// absorbed), then a `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
+  /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat response is absorbed), then a
+  /// `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
   /// beat nets quiesced. Consecutive duplicates collapse (a burst of appends is one `Wake`).
   fn push_dispatch_controls(&mut self, group: &G, wake: bool, flags: u8) {
     if wake {
@@ -1129,16 +1129,13 @@ where
   }
 
   /// Whether a delivered message is WAKE-class for its group. The absorbed complement is exactly
-  /// the response tail of one heartbeat round in this codebase — `HeartbeatResponse`, the empty
-  /// `AppendEntries` the leader pumps back at each responder, and that probe's `AppendResponse` —
-  /// so a quiescing group's FINAL flagged round dies out instead of re-waking either side (see
-  /// [`GroupControl::Wake`] for the safety argument).
+  /// `HeartbeatResponse` — with the heartbeat-response append pump gated and quiesce eligibility
+  /// excluding probing peers, a quiescing group's FINAL flagged round is precisely
+  /// `Heartbeat` + `HeartbeatResponse`, so absorbing that one response is all it takes for the
+  /// round to die out instead of re-waking either side (see [`GroupControl::Wake`] for the
+  /// safety argument).
   fn is_wake_class(msg: &Message<I>) -> bool {
-    match msg {
-      Message::HeartbeatResponse(_) | Message::AppendResponse(_) => false,
-      Message::AppendEntries(ae) => !ae.entries().is_empty(),
-      _ => true,
-    }
+    !msg.is_heartbeat_response()
   }
 
   fn push_control(&mut self, group: &G, ctrl: GroupControl) {
