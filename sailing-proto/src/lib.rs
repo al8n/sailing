@@ -144,6 +144,8 @@ mod transport;
 pub use transport::TlsRecords;
 #[cfg(feature = "quic")]
 pub use transport::quic;
+#[cfg(feature = "quic")]
+pub use transport::quic::MultiQuicCoordinator;
 #[cfg(any(feature = "tcp", feature = "quic"))]
 pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
 #[cfg(feature = "tcp")]

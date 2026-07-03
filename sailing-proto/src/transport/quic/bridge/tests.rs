@@ -97,7 +97,7 @@ fn loopback_pair_exchanges_a_framed_message() {
 
   // A framed consensus message from a to b…
   let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(8), 1u64));
-  a.write_framed(now, ha, &msg);
+  a.write_framed(now, ha, &[], &msg);
   a.service_if_deferred(now);
   pump(now, &mut a, &mut b);
 
@@ -119,7 +119,7 @@ fn loopback_pair_exchanges_a_framed_message() {
   // …and the reverse direction works over the SAME connection (each side writes the stream it
   // opened and reads the stream the peer opened).
   let reply = Message::TimeoutNow(TimeoutNow::new(Term::new(9), 2u64));
-  b.write_framed(now, hb, &reply);
+  b.write_framed(now, hb, &[], &reply);
   b.service_if_deferred(now);
   pump(now, &mut a, &mut b);
   let ready = a.take_ready_unique();
@@ -163,7 +163,7 @@ fn unvalidated_connections_stage_no_consensus_bytes() {
   // Still `Authenticating`: a consensus write must stage NOTHING (no byte rides out ahead of the
   // identity preface / before the peer is bound).
   let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64));
-  a.write_framed(now, ha, &msg);
+  a.write_framed(now, ha, &[], &msg);
   a.service_if_deferred(now);
   pump(now, &mut a, &mut b);
   let ready = b.take_ready_unique();
@@ -479,13 +479,13 @@ fn validated(
   pump(now, a, b);
   // One frame each way so both sides adopt the peer-opened stream (its recv sid).
   let m = Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64));
-  a.write_framed(now, ha, &m);
+  a.write_framed(now, ha, &[], &m);
   a.service_if_deferred(now);
   pump(now, a, b);
   let _ = b.take_ready_unique();
   assert!(!b.ingest_recv(now, hb));
   let _ = b.next_frame(hb);
-  b.write_framed(now, hb, &m);
+  b.write_framed(now, hb, &[], &m);
   b.service_if_deferred(now);
   pump(now, a, b);
   let _ = a.take_ready_unique();
@@ -759,7 +759,7 @@ fn write_framed_drops_an_oversized_message() {
   );
   let msg = Message::InstallSnapshot(InstallSnapshot::new(Term::new(1), 1u64, meta, data));
   assert_eq!(a.oversized_dropped(), 0);
-  a.write_framed(now, ha, &msg);
+  a.write_framed(now, ha, &[], &msg);
   assert_eq!(
     a.oversized_dropped(),
     1,
@@ -779,7 +779,7 @@ fn write_framed_closes_on_outbound_overflow() {
   a.bind_validated(now, ha, 2u64);
   a.fill_outbound_for_test(ha, super::MAX_CONN_OUT_BUF);
   let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(1), 1u64));
-  a.write_framed(now, ha, &msg);
+  a.write_framed(now, ha, &[], &msg);
   assert_eq!(
     a.take_lost(),
     Some(ha),
@@ -848,7 +848,7 @@ fn oversized_read_defers_to_the_next_pump() {
     ConfState::from_voters(std::vec![1u64, 2]),
   );
   let msg = Message::InstallSnapshot(InstallSnapshot::new(Term::new(1), 1u64, meta, data));
-  a.write_framed(now, ha, &msg);
+  a.write_framed(now, ha, &[], &msg);
   a.service_if_deferred(now);
   pump(now, &mut a, &mut b);
   let ready = b.take_ready_unique();
@@ -890,7 +890,7 @@ fn graceful_fin_delivers_then_latches_close() {
   let now = Instant::now();
   let (ha, hb) = validated(now, &mut a, &mut b);
   let msg = Message::TimeoutNow(TimeoutNow::new(Term::new(7), 2u64));
-  b.write_framed(now, hb, &msg);
+  b.write_framed(now, hb, &[], &msg);
   b.service_if_deferred(now);
   let b_send = b.send_sid_for_test(hb).expect("b's send stream");
   b.finish_send_for_test(hb, b_send);
@@ -1019,7 +1019,7 @@ fn blocked_write_backpressures_then_resumes_on_writable() {
     ConfState::from_voters(std::vec![1u64, 2]),
   );
   let msg = Message::InstallSnapshot(InstallSnapshot::new(Term::new(1), 1u64, meta, data));
-  a.write_framed(now, ha, &msg); // blocks after ~one window
+  a.write_framed(now, ha, &[], &msg); // blocks after ~one window
   a.service_if_deferred(now);
 
   let mut got: Option<bytes::Bytes> = None;

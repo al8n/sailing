@@ -21,6 +21,9 @@ use crate::{
 use core::error::Error;
 use std::collections::BTreeSet;
 
+mod multi;
+pub use multi::MultiQuicCoordinator;
+
 /// Derive the SNI server-name a dial presents for `peer` in `cluster`, matching the per-node cert
 /// SAN minted by a [`ClusterTls`](super::ClusterTls) deployment:
 /// `node-<id-hex>.<cluster-hex>.sailing`, where `id-hex` is the lowercase hex of the peer id's
@@ -757,7 +760,7 @@ where
     for o in outgoing {
       let (to, msg) = o.into_parts();
       if let Some(h) = self.bridge.handle_for(&to) {
-        self.bridge.write_framed(std_now, h, &msg);
+        self.bridge.write_framed(std_now, h, &[], &msg);
       }
     }
     self.bridge.service(std_now);
