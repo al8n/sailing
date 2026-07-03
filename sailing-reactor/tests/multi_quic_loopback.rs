@@ -12,9 +12,9 @@ use std::{net::SocketAddr, time::Duration};
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
 use common::{CountSm, TestCa, TrapSm};
-use sailing_proto::{ClusterId, Config, Data, Role};
+use sailing_proto::{ClusterId, ConfChange, ConfChangeType, Config, Data, Role};
 use sailing_reactor::{
-  DriverConfig, DriverError, GroupHandle, MultiHandle, MultiReactorQuicDriver, Node,
+  DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle, MultiReactorQuicDriver, Node,
 };
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -98,6 +98,11 @@ where
         tokio::time::sleep(Duration::from_millis(50)).await;
       }
       Err(DriverError::Superseded) => {}
+      // A node that does not host the group (de-hosted mid-test): try the next one.
+      Err(DriverError::Rejected { .. }) => {
+        at = (at + 1) % groups.len();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
       Err(e) => panic!("unexpected submit error: {e:?}"),
     }
   }
@@ -117,6 +122,46 @@ async fn query_anywhere(groups: &[GroupHandle<u64, u64, CountSm>]) -> u64 {
       }
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+}
+
+/// Await a lifecycle event satisfying `pred` on `rx` (draining non-matching ones), within 15s.
+async fn await_lifecycle<P>(rx: &flume::Receiver<LifecycleEvent<u64, u64>>, what: &str, mut pred: P)
+where
+  P: FnMut(&LifecycleEvent<u64, u64>) -> bool,
+{
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    assert!(
+      remaining > Duration::ZERO,
+      "{what}: no matching lifecycle event in time"
+    );
+    match tokio::time::timeout(remaining, rx.recv_async()).await {
+      Ok(Ok(ev)) if pred(&ev) => return,
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => panic!("{what}: the lifecycle tail closed: {e:?}"),
+      Err(_) => panic!("{what}: no matching lifecycle event in time"),
+    }
+  }
+}
+
+/// The group's current leader index among `groups` (status-polled, deadline-bounded).
+async fn find_leader(groups: &[GroupHandle<u64, u64, CountSm>], what: &str) -> usize {
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: no leader in time"
+    );
+    for (i, g) in groups.iter().enumerate() {
+      if let Ok(status) = g.status().await
+        && status.role == Role::Leader
+      {
+        return i;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
   }
 }
 
@@ -513,4 +558,202 @@ async fn a_poisoned_group_leaves_co_hosted_groups_committing() {
     .await
     .expect("the failover query resolves");
   assert_eq!(out, None, "no serve window → normal-read fallback");
+}
+
+/// The embedder-driven placement flow over QUIC (the stream suite's money test): node 1 creates
+/// group 100 (voters {1,2}) and campaigns into the void; node 2 surfaces
+/// `UnknownGroup { group: 100, from: 1 }` on its lifecycle tail; the test creates the group
+/// there; the campaigner's retry completes and both sides commit, with the sibling untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn unknown_group_event_drives_creation() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_440, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // The sibling group exists everywhere: it latches both hosts' transport identities (a
+  // zero-group QUIC host cannot bind) and proves the shared mesh.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists ONLY on node 1; its campaign solicits node 2 over the shared mesh.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(handles[1].lifecycle(), "node 2 unknown-group", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::UnknownGroup {
+        group: 100,
+        from: 1
+      }
+    )
+  })
+  .await;
+
+  // The test IS the placement brain: create the solicited group on node 2 and watch the join
+  // complete.
+  handles[1]
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 2");
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
+  assert_eq!(query_anywhere(&g100).await, 1);
+
+  // The sibling group was untouched by the lifecycle churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
+
+/// The removed-self flow over QUIC (see the stream suite for the leader-self-removal rationale):
+/// the group's leader removes ITSELF via a committed v1 remove-node, its lifecycle tail yields
+/// `RemovedSelf { group: 100 }`, the app tears the local replica down, the removed node's other
+/// group keeps committing, the survivors keep committing the shrunk group, and the tombstone
+/// absorbs every straggler without re-soliciting placement.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_self_event_and_teardown() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_460, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"seed").await, 1);
+
+  // Group 100's leader proposes REMOVING ITSELF; retry through pre-propose leadership moves.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let removed_at = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed self-removal in time"
+    );
+    let at = find_leader(&g100, "group 100 pre-removal").await;
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, at as u64 + 1, Bytes::new());
+    match g100[at].conf_change(cc).await {
+      Ok(_) => break at,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  };
+
+  await_lifecycle(handles[removed_at].lifecycle(), "removed-self", |ev| {
+    matches!(ev, LifecycleEvent::RemovedSelf { group: 100 })
+  })
+  .await;
+
+  // The app decides: tear the local replica down.
+  assert!(
+    handles[removed_at]
+      .remove_group(100)
+      .await
+      .expect("remove resolves"),
+    "the removed node hosted group 100"
+  );
+
+  // The removed node's OTHER group is untouched, and the survivors keep committing the shrunk
+  // group (electing afresh, since the departed leader fell silent).
+  assert_eq!(submit_anywhere(&g200, b"alive").await, 2);
+  let survivors: Vec<usize> = (0..3usize).filter(|&i| i != removed_at).collect();
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  'committed: loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no post-removal commit within the deadline"
+    );
+    for &i in &survivors {
+      if let Ok(count) = g100[i].submit(Bytes::from_static(b"after")).await {
+        assert_eq!(count, 2, "the shrunk group applied seed + after");
+        break 'committed;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+
+  // No resurrection prompt: the tombstone absorbed the stragglers silently.
+  while let Ok(ev) = handles[removed_at].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
+      "a tombstoned group must never re-solicit placement: {ev:?}"
+    );
+  }
+}
+
+/// Tombstone-then-recreate over QUIC: one follower of a live 3-node group de-hosts its replica,
+/// the leader's straggler beats die silently against the tombstone (the shared mTLS mesh and the
+/// sibling group stay clean), and re-admitting the SAME id succeeds while the group keeps
+/// committing through its majority (see the stream sibling for why full rejoin of the fresh
+/// replica is the restore/snapshot path's job, not the reject walk-back's).
+#[tokio::test(flavor = "multi_thread")]
+async fn tombstoned_id_recreates_cleanly() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_480, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere(&handles, 900, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g100, b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // ONE follower de-hosts its replica of the live group; the majority keeps the group up.
+  let leader_at = find_leader(&g100, "group 100").await;
+  let follower_at = (0..3usize).find(|&i| i != leader_at).unwrap();
+  assert!(
+    handles[follower_at]
+      .remove_group(100)
+      .await
+      .expect("remove resolves")
+  );
+
+  // Several heartbeat intervals of straggler beats die against the tombstone; the shared mesh
+  // stays healthy — the sibling group keeps committing through EVERY node, and the de-hosted
+  // group keeps committing through its remaining majority.
+  tokio::time::sleep(HEARTBEAT * 4).await;
+  assert_eq!(submit_anywhere(&g900, b"mesh-alive").await, 2);
+  assert_eq!(submit_anywhere(&g100, b"majority").await, 2);
+
+  // Re-admitting the SAME id (fresh storage, as a driver provisions) lifts the tombstone: the
+  // admission is clean and the group keeps committing — no wedge anywhere.
+  handles[follower_at]
+    .create_group(
+      100,
+      config(follower_at as u64 + 1, vec![1, 2, 3]),
+      9,
+      CountSm::default(),
+    )
+    .await
+    .expect("the tombstoned id re-admits");
+  assert_eq!(submit_anywhere(&g100, b"rejoined").await, 3);
+  assert_eq!(submit_anywhere(&g900, b"still").await, 3);
 }
