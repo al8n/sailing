@@ -711,14 +711,84 @@ fn quiesce_flag_round_trips_as_group_control() {
     "a HeartbeatResponse is absorbed: no Wake for the quiesced leader"
   );
 
-  // The round's remaining tail (the leader's empty-append probe and its response) dies out with
-  // no wake on EITHER side — the flagged round settles instead of ping-ponging the pair awake.
+  // The round has no further tail: the gated heartbeat-response pump sends nothing to a
+  // caught-up, replicating responder, so the flagged round is exactly the beat + its absorbed
+  // response and both sides settle.
   w.settle();
   assert_eq!(w.a.poll_group_control(), None, "the leader stays settled");
   assert_eq!(
     w.b.poll_group_control(),
     None,
     "the follower stays settled after the round's tail"
+  );
+}
+
+/// With the heartbeat-response append pump gated (an idle round has no empty-append tail) and
+/// quiesce eligibility excluding probing peers, the absorb set shrinks to exactly
+/// `HeartbeatResponse`: a delivered empty `AppendEntries` or `AppendResponse` is WAKE-class —
+/// the conservative direction, a spurious pair costs one wake instead of riding the absorb
+/// trust surface.
+#[test]
+fn empty_append_and_append_response_are_wake_class() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  w.elect_a(100);
+  while w.a.poll_group_control().is_some() {}
+  while w.b.poll_group_control().is_some() {}
+  let term = w.b.group(&100).unwrap().term();
+  let commit = w.b.group(&100).unwrap().commit_index();
+  let mut gb = Vec::new();
+  sailing_encode_u64(100, &mut gb);
+
+  // An empty AppendEntries delivered to the follower wakes its group.
+  let empty_ae = Message::AppendEntries(crate::AppendEntries::new(
+    term,
+    1u64,
+    Index::ZERO,
+    Term::ZERO,
+    Vec::new(),
+    commit,
+  ));
+  let frame = crafted_frame(&gb, &empty_ae);
+  w.b
+    .handle_conn_data(ConnId(1), &frame, false, w.now, &mut w.sb);
+  assert_eq!(
+    w.b.poll_group_control(),
+    Some((100, GroupControl::Wake)),
+    "an empty AppendEntries is WAKE-class"
+  );
+
+  // An AppendResponse delivered to the leader wakes its group.
+  let ack = Message::AppendResponse(crate::AppendResponse::new(
+    term,
+    2u64,
+    false,
+    Index::ZERO,
+    Term::ZERO,
+    commit,
+  ));
+  let frame = crafted_frame(&gb, &ack);
+  w.a
+    .handle_conn_data(ConnId(1), &frame, false, w.now, &mut w.sa);
+  assert_eq!(
+    w.a.poll_group_control(),
+    Some((100, GroupControl::Wake)),
+    "an AppendResponse is WAKE-class"
+  );
+
+  // The heartbeat response stays the sole absorbed kind.
+  let hbr = Message::HeartbeatResponse(crate::HeartbeatResponse::new(
+    term,
+    2u64,
+    bytes::Bytes::new(),
+  ));
+  let frame = crafted_frame(&gb, &hbr);
+  w.a
+    .handle_conn_data(ConnId(1), &frame, false, w.now, &mut w.sa);
+  assert_eq!(
+    w.a.poll_group_control(),
+    None,
+    "a HeartbeatResponse stays absorbed"
   );
 }
 
