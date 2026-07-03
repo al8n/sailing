@@ -619,13 +619,14 @@ async fn conn_loss_wakes_quiesced_followers_and_reelects() {
   }
 }
 
-/// A probing peer blocks quiescence: group 100 adds a learner that never comes up, so its
-/// Progress sits in Probe forever (equal-match acks never arrive to promote it), and group 100
-/// must never quiesce — a probing peer still draws the gated heartbeat-response append pump, the
-/// traffic the shrunk absorb set (exactly `HeartbeatResponse`) no longer covers. The follower
-/// side never quiesces either (its only quiesce path is the leader's flagged beat, which
-/// eligibility now withholds), so BOTH drivers' gauges settle at exactly 1 — the sibling group —
-/// and hold across a long quiet window, with both groups still serving.
+/// A probing peer blocks quiescence (the Probe leg of the lagging-peer eligibility gate): group
+/// 100 adds a learner that never comes up, so its Progress sits in Probe forever (equal-match
+/// acks never arrive to promote it), and group 100 must never quiesce — a probing peer still
+/// draws the gated heartbeat-response append pump, the traffic the shrunk absorb set (exactly
+/// `HeartbeatResponse`) no longer covers. The follower side never quiesces either (its only
+/// quiesce path is the leader's flagged beat, which eligibility withholds), so BOTH drivers'
+/// gauges settle at exactly 1 — the sibling group — and hold across a long quiet window, with
+/// both groups still serving.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_probing_peer_blocks_quiescence() {
   let addrs = addrs(44_500, 2);
@@ -688,6 +689,112 @@ async fn a_probing_peer_blocks_quiescence() {
   // Both groups still serve.
   assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
   assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+}
+
+/// A lagging LEARNER blocks quiescence (the match leg of the lagging-peer eligibility gate — the
+/// Replicate-state sibling of the probing case): a live learner catches up, so its group
+/// quiesces on every host; then the learner's node dies and the voters commit past its match, so
+/// its tracked Progress sits in Replicate with a stale match. The leader must stay awake — the
+/// learner's catch-up appends ride heartbeat responses, and a quiesced leader stops beating, so
+/// quiescing here would strand the down learner until an unrelated wake. The voters' gauges
+/// re-settle at exactly 1 (the all-voter sibling group re-quiesces after the conn-loss wake) and
+/// HOLD past a full election window, with the group still committing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lagging_learner_blocks_quiescence() {
+  let addrs = addrs(44_620, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  // The learner's node DIALS IN (the voters' address books omit it, like a joining observer):
+  // the shared one-conn-per-peer link serves the voters' outbound replication while the learner
+  // lives, and after its death there is no redial — a redial to a dead address fails into the
+  // conn-loss wake every attempt, which would keep waking the sibling group and turn the gauges
+  // into noise rather than the eligibility signal this test pins.
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // Group 100: voters {1, 2} + node 3 pre-provisioned as the joining OBSERVER replica (its
+  // bootstrap voter seed is the existing cluster's, so it cannot campaign). Group 200 is the
+  // all-voter sibling on nodes 1 and 2 only.
+  for id in 1u64..=2 {
+    handles[(id - 1) as usize]
+      .create_group(100, config(id, vec![1, 2]), id, CountSm::default())
+      .await
+      .expect("group admission");
+  }
+  handles[2]
+    .create_group(
+      100,
+      Config::try_new_observer(3u64, vec![1, 2], ELECTION, HEARTBEAT).unwrap(),
+      3,
+      CountSm::default(),
+    )
+    .await
+    .expect("the observer replica admits");
+  create_group_everywhere(&handles[0..2], 200, &[1, 2]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles[0..2].iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100[0..2], b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"seed").await, 1);
+
+  // Wire in learner 3 via a committed conf change through the leader.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed learner add in time"
+    );
+    let at = find_leader(&g100[0..2], "group 100 pre-learner").await;
+    let cc = ConfChange::new(ConfChangeType::AddLearnerNode, 3, Bytes::new());
+    match g100[at].conf_change(cc).await {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  }
+
+  // With the LIVE learner fully caught up, everything quiesces: eligibility requires the learner
+  // matched, so the voters' gauges reaching 2 witness the catch-up, and the learner host's own
+  // gauge is the flagged beat's follower-side round-trip.
+  wait_for_quiesced(&metrics[0], 2, "node 1 both groups").await;
+  wait_for_quiesced(&metrics[1], 2, "node 2 both groups").await;
+  wait_for_quiesced(&metrics[2], 1, "the learner host").await;
+
+  // The learner's node dies (the conn loss wakes every group), and the voters commit PAST the
+  // dead learner's match — its Progress now reads Replicate with a stale match.
+  handles[2]
+    .shutdown()
+    .await
+    .expect("the learner driver tears down");
+  assert_eq!(submit_anywhere(&g100[0..2], b"past").await, 2);
+
+  // The all-voter sibling re-quiesces; the lagging-learner group must NOT — each voter gauge
+  // settles at exactly 1 and HOLDS well past a full election window (a re-quiesce would land
+  // within one), with the group still serving.
+  wait_for_quiesced(&metrics[0], 1, "node 1 sibling only").await;
+  wait_for_quiesced(&metrics[1], 1, "node 2 sibling only").await;
+  for _ in 0..12 {
+    tokio::time::sleep(HEARTBEAT).await;
+    assert_eq!(
+      metrics[0].quiesced_groups(),
+      1,
+      "node 1: the lagging-learner group must not quiesce"
+    );
+    assert_eq!(
+      metrics[1].quiesced_groups(),
+      1,
+      "node 2: the lagging-learner group must not quiesce"
+    );
+  }
+  assert_eq!(submit_anywhere(&g100[0..2], b"again").await, 3);
 }
 
 /// Group admission is validated LOUDLY: duplicate ids, a config whose node id contradicts the

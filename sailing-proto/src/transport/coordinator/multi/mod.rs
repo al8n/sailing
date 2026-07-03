@@ -49,9 +49,10 @@ pub enum GroupControl {
   /// flagged round exchanges precisely `Heartbeat` + `HeartbeatResponse` and nothing else, and
   /// waking on that response would re-arm the leader's timers and keep the round-trip alive
   /// forever. That the final round is exactly the pair rests on two gates: quiesce eligibility
-  /// (every voter matched, NO peer probing, commit applied) means no responder is behind or in
-  /// probe, and the gated heartbeat-response append pump sends nothing to a caught-up,
-  /// replicating responder — so the round has no empty-append tail to absorb. Absorbing the
+  /// (every tracked peer — learners included — caught up and replicating, commit applied) means
+  /// no responder is behind, probing, or awaiting a snapshot, and the gated heartbeat-response
+  /// append pump sends nothing to a caught-up, replicating responder — so the round has no
+  /// empty-append tail to absorb. Absorbing the
   /// response is safe: it can only echo a beat the quiesced side itself sent pre-quiesce (a
   /// quiesced leader emits no new beats), and eligibility ensured no straggler ack carries new
   /// progress. Everything else wakes — a `Heartbeat` tells a quiesced follower its leader is
@@ -842,7 +843,7 @@ where
 
   /// Whether a delivered message is WAKE-class for its group. The absorbed complement is exactly
   /// `HeartbeatResponse` — with the heartbeat-response append pump gated and quiesce eligibility
-  /// excluding probing peers, a quiescing group's FINAL flagged round is precisely
+  /// excluding lagging peers, a quiescing group's FINAL flagged round is precisely
   /// `Heartbeat` + `HeartbeatResponse`, so absorbing that one response is all it takes for the
   /// round to die out instead of re-waking either side (see [`GroupControl::Wake`] for the
   /// safety argument).
