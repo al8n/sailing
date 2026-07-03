@@ -148,7 +148,8 @@ pub use transport::quic;
 pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
 #[cfg(feature = "tcp")]
 pub use transport::{
-  Intake, LabelOptions, Labeled, Passthrough, RecordIo, StreamCoordinator, StreamTransport,
+  GroupStores, Intake, LabelOptions, Labeled, MultiStreamCoordinator, Passthrough, RecordIo,
+  StreamCoordinator, StreamTransport,
 };
 
 #[cfg(test)]

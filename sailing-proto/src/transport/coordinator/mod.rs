@@ -12,6 +12,9 @@ use crate::{
 use bytes::Bytes;
 use std::vec::Vec;
 
+mod multi;
+pub use multi::{GroupStores, MultiStreamCoordinator};
+
 /// A consensus node speaking over framed reliable connections (`R` is the record layer, e.g.
 /// `Labeled<Passthrough>` for TCP or `Labeled<TlsRecords>` for TLS).
 pub struct StreamCoordinator<I, F, R>
