@@ -13,7 +13,8 @@ use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
 use common::{CountSm, TrapSm};
 use sailing_proto::{
-  ClusterId, ConfChange, ConfChangeType, Config, Data, LabelOptions, Labeled, Passthrough, Role,
+  ClusterId, ConfChange, ConfChangeType, Config, Data, Event, LabelOptions, Labeled, Passthrough,
+  ReadOnlyOption, Role,
 };
 use sailing_reactor::{
   DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle, MultiReactorStreamDriver,
@@ -1243,4 +1244,182 @@ async fn tombstoned_id_recreates_cleanly() {
     .expect("the cleared id re-admits");
   assert_eq!(submit_anywhere(&g100, b"rejoined").await, 3);
   assert_eq!(submit_anywhere(&g900, b"still").await, 3);
+}
+
+/// Bind a 2-node mesh and return its handles (the read-mode suites' shared preamble).
+async fn bind_pair(base_port: u16) -> Vec<MultiHandle<u64, u64, CountSm>> {
+  let addrs = addrs(base_port, 2);
+  let mut handles = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  handles
+}
+
+/// Poll every replica of `groups` until each reports `want` as its active read mode.
+async fn wait_for_mode(
+  groups: &[GroupHandle<u64, u64, CountSm>],
+  want: ReadOnlyOption,
+  what: &str,
+) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  for g in groups {
+    loop {
+      let mode = g.status().await.expect("status").active_read_mode;
+      if mode == want {
+        break;
+      }
+      assert!(
+        std::time::Instant::now() < deadline,
+        "{what}: active mode stuck at {mode:?} (want {want:?})"
+      );
+      tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+  }
+}
+
+/// Per-group read modes are heterogeneous on one multi host: group 100 runs `Safe` and group 200
+/// runs `LeaseGuard` on the SAME host pair — the v1 monotonic-only host admits the plain
+/// LeaseGuard tier (its lease gate reads each node's own monotonic clock; only the FAILOVER tier,
+/// `bounded_clock_uncertainty`, is walled at admission) — and each group serves linearizable
+/// reads under ITS mode with the counts strictly isolated: the Safe group confirms on the
+/// read-index round while the LeaseGuard group serves lease-fresh reads locally (degrading to
+/// the same safe round only when the lease is stale — either way the value is correct).
+#[tokio::test(flavor = "multi_thread")]
+async fn co_hosted_groups_serve_heterogeneous_read_modes() {
+  let handles = bind_pair(44_540).await;
+  for id in 1u64..=2 {
+    handles[(id - 1) as usize]
+      .create_group(100, config(id, vec![1, 2]), id, CountSm::default())
+      .await
+      .expect("the Safe group admits");
+    handles[(id - 1) as usize]
+      .create_group(
+        200,
+        config(id, vec![1, 2])
+          .with_read_only(ReadOnlyOption::LeaseGuard)
+          .with_lease_duration(Duration::from_millis(100))
+          .with_clock_drift_bound(Duration::from_millis(2)),
+        id,
+        CountSm::default(),
+      )
+      .await
+      .expect("the plain LeaseGuard tier admits on the monotonic-only host");
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+
+  // Interleaved commits: each group's apply stream counts only its own.
+  assert_eq!(submit_anywhere(&g100, b"s1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"l1").await, 1);
+  assert_eq!(submit_anywhere(&g100, b"s2").await, 2);
+
+  // Every replica reports its group's configured mode — per-group, not per-host.
+  wait_for_mode(&g100, ReadOnlyOption::Safe, "group 100 mode").await;
+  wait_for_mode(&g200, ReadOnlyOption::LeaseGuard, "group 200 mode").await;
+
+  // Both groups serve reads under their own modes, independently and correctly. The LeaseGuard
+  // read lands inside the lease window of the submit above (lease-fresh serve) on a quiet run.
+  assert_eq!(query_anywhere(&g100).await, 2, "the Safe group's reads");
+  assert_eq!(
+    query_anywhere(&g200).await,
+    1,
+    "the LeaseGuard group's reads"
+  );
+
+  // And again after further interleaving — the modes keep serving side by side.
+  assert_eq!(submit_anywhere(&g200, b"l2").await, 2);
+  assert_eq!(query_anywhere(&g200).await, 2);
+  assert_eq!(query_anywhere(&g100).await, 2);
+}
+
+/// A committed `SetReadMode` migrates exactly ITS group: group 100 migrates Safe -> LeaseBased
+/// (apply-time, surfacing as the group-stamped `ReadModeChanged` on the shared events tail) while
+/// co-hosted group 200's active mode stays `Safe` on every replica, and both groups keep
+/// committing and serving reads through the migration.
+#[tokio::test(flavor = "multi_thread")]
+async fn set_read_mode_migrates_one_group_only() {
+  let handles = bind_pair(44_580).await;
+  // Both groups start Safe; check_quorum is the LeaseBased migration's validity gate.
+  for gid in [100u64, 200] {
+    for id in 1u64..=2 {
+      handles[(id - 1) as usize]
+        .create_group(
+          gid,
+          config(id, vec![1, 2]).with_check_quorum(true),
+          id * 10 + gid,
+          CountSm::default(),
+        )
+        .await
+        .expect("group admission");
+    }
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"seed").await, 1);
+
+  // Migrate ONLY group 100 (through its leader, wherever it is).
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let (proposed, leader_at) = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "never became leader to migrate"
+    );
+    let at = find_leader(&g100, "group 100 pre-migration").await;
+    match g100[at].set_read_mode(ReadOnlyOption::LeaseBased).await {
+      Ok(index) => break (index, at),
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected set_read_mode error: {e:?}"),
+    }
+  };
+
+  // The migration takes effect APPLY-TIME: the proposer host's shared events tail surfaces the
+  // group-stamped ReadModeChanged for group 100 — and for group 100 only.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let changed = loop {
+    let mut seen = None;
+    while let Ok((gid, ev)) = handles[leader_at].events().try_recv() {
+      if let Event::ReadModeChanged(rmc) = ev {
+        assert_eq!(gid, 100, "only the migrated group changes mode");
+        seen = Some(rmc);
+      }
+    }
+    if let Some(rmc) = seen {
+      break rmc;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the read-mode migration never applied"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  };
+  assert_eq!(changed.mode(), ReadOnlyOption::LeaseBased);
+  assert!(
+    changed.index() >= proposed,
+    "the migration applied at (or after) the proposed index"
+  );
+
+  // Group 100's replicas all migrate; co-hosted group 200's stay Safe on the same hosts.
+  wait_for_mode(
+    &g100,
+    ReadOnlyOption::LeaseBased,
+    "group 100 post-migration",
+  )
+  .await;
+  wait_for_mode(&g200, ReadOnlyOption::Safe, "group 200 untouched").await;
+
+  // Both groups keep committing and serving reads after the one-group migration.
+  assert_eq!(submit_anywhere(&g100, b"after").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"after").await, 2);
+  assert_eq!(query_anywhere(&g100).await, 2);
+  assert_eq!(query_anywhere(&g200).await, 2);
 }
