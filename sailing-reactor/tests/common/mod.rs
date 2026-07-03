@@ -47,6 +47,39 @@ impl StateMachine for CountSm {
   }
 }
 
+/// A counting state machine whose apply FAILS on the magic `b"BOOM"` payload. An FSM apply error
+/// is a fatal fault the endpoint answers by fail-stopping (poisoning) — on a multi-group host
+/// that poisons exactly ONE group, the isolation the multi suites assert.
+#[derive(Default)]
+#[allow(dead_code)]
+pub struct TrapSm {
+  count: u64,
+}
+
+impl StateMachine for TrapSm {
+  type Command = Bytes;
+  type Response = u64;
+  type Snapshot = u64;
+  type Error = std::io::Error;
+
+  fn apply(&mut self, _index: Index, cmd: Bytes) -> Result<u64, Self::Error> {
+    if cmd.as_ref() == b"BOOM" {
+      return Err(std::io::Error::other("trapped apply"));
+    }
+    self.count += 1;
+    Ok(self.count)
+  }
+
+  fn snapshot(&self) -> Result<u64, Self::Error> {
+    Ok(self.count)
+  }
+
+  fn restore(&mut self, snapshot: u64) -> Result<(), Self::Error> {
+    self.count = snapshot;
+    Ok(())
+  }
+}
+
 /// A synchronous in-memory log honoring the normative `term`/`entries` domain contract.
 #[derive(Default)]
 pub struct MemLog {
