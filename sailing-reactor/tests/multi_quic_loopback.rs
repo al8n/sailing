@@ -803,14 +803,38 @@ async fn removed_follower_learns_via_farewell_and_tears_down() {
     "the removed follower hosted group 100"
   );
 
-  // A + B keep the group; the sibling group's quorum NEEDS the torn-down node's driver, so its
-  // commit proves C's driver survived the group-scoped teardown.
+  // A + B keep the group: the shrunk single-voter group commits through A, and learner B's
+  // apply stream follows it.
   let leader_at = 1 - removed_at;
   assert_eq!(
     submit_anywhere(std::slice::from_ref(&g100[leader_at]), b"after").await,
     2,
     "the shrunk group applied seed + after"
   );
+  let a_applied = g100[leader_at]
+    .status()
+    .await
+    .expect("leader status")
+    .applied_index;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let b_applied = g100[2]
+      .status()
+      .await
+      .expect("learner status")
+      .applied_index;
+    if b_applied >= a_applied {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "learner B never caught up: {b_applied:?} < {a_applied:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+
+  // The sibling group is unaffected — and its quorum NEEDS the torn-down node's driver, so a
+  // commit proves C's driver survived its group-scoped teardown.
   assert_eq!(submit_anywhere(&g300, b"still").await, 2);
 }
 
