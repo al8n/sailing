@@ -500,6 +500,75 @@ fn sailing_encode_u64(id: u64, out: &mut Vec<u8>) {
   id.encode(out);
 }
 
+/// Build a 1-entry coalesced frame carrying a QUIESCE-flagged Heartbeat for group 100.
+fn flagged_beat_frame(term: u64, leader: u64) -> Vec<u8> {
+  let hb = Message::Heartbeat(crate::Heartbeat::new(
+    Term::new(term),
+    leader,
+    Index::ZERO,
+    bytes::Bytes::new(),
+  ));
+  let mut msg_bytes = Vec::new();
+  crate::wire::encode_message(&hb, &mut msg_bytes);
+  let mut gb = Vec::new();
+  sailing_encode_u64(100, &mut gb);
+  let mut payload = Vec::new();
+  crate::transport::frame::write_coalesced_marker(&mut payload);
+  crate::transport::frame::write_coalesced_entry(1, &gb, &msg_bytes, &mut payload);
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&payload, &mut framed);
+  framed
+}
+
+/// A quiesce flag is honored only when the CORE accepted the beat as current-leader contact: a
+/// STALE-term flagged beat (the core rejects it) and a flagged beat whose payload names a node
+/// other than the authenticated transport peer (the core's sender-authenticity drop) must both
+/// strip the flag — freezing timers on a rejected input's say-so would quiesce a live group.
+#[test]
+fn rejected_flagged_beats_never_quiesce() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  w.elect_a(100);
+  while w.b.poll_group_control().is_some() {}
+  let live_term = w.b.group(&100).unwrap().term().get();
+  assert!(live_term >= 1);
+
+  // (a) A stale-term flagged beat from the legitimate leader's connection.
+  let stale = flagged_beat_frame(0, 1);
+  w.b
+    .handle_conn_data(ConnId(1), &stale, false, w.now, &mut w.sb);
+  // (b) A current-term flagged beat whose payload names node 3, arriving over node 1's conn.
+  let spoofed = flagged_beat_frame(live_term, 3);
+  w.b
+    .handle_conn_data(ConnId(1), &spoofed, false, w.now, &mut w.sb);
+
+  let mut controls = Vec::new();
+  while let Some(c) = w.b.poll_group_control() {
+    controls.push(c);
+  }
+  assert!(
+    !controls.contains(&(100, GroupControl::Quiesce)),
+    "neither rejected beat quiesces: {controls:?}"
+  );
+  assert_eq!(
+    w.b.poll_conn_closed(),
+    None,
+    "valid heartbeat kinds do not close"
+  );
+
+  // A genuine flagged beat from the live leader still quiesces (the gate passes real traffic).
+  w.a.mark_quiescing(&100);
+  w.fire_a(100);
+  let mut controls = Vec::new();
+  while let Some(c) = w.b.poll_group_control() {
+    controls.push(c);
+  }
+  assert!(
+    controls.contains(&(100, GroupControl::Quiesce)),
+    "the accepted flagged beat quiesces: {controls:?}"
+  );
+}
+
 /// Heartbeat entries are BOUNDED BY CONSTRUCTION: the wire heartbeat context is the read
 /// machinery's internal 8-byte round token, never the caller's context (which rides the
 /// non-coalesced ReadIndex/ReadIndexResponse pair) — so even a read with a huge caller context

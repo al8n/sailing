@@ -223,6 +223,17 @@ where
       }
       if let Some((log, stable)) = stores.stores(&group) {
         let wake = Self::is_wake_class(&msg);
+        let beat_term = msg.term();
+        let sender = from.cheap_clone();
+        // The core's own sender-authenticity rule, mirrored pre-dispatch: a payload naming a
+        // different node than the authenticated transport peer is dropped by the endpoint, so its
+        // quiesce flag must drop with it (the post-dispatch gate alone cannot see this case when
+        // the transport peer IS the current leader relaying a foreign payload).
+        let flags = if msg.from() == from {
+          flags
+        } else {
+          flags & !COALESCED_FLAG_QUIESCE
+        };
         // `None` here means `stores` resolved a group `MultiRaft` does not host — the same
         // unhosted-group drop as a missing store; an unhosted entry's flags drop with it.
         if self
@@ -230,11 +241,32 @@ where
           .handle_message(&group, now, log, stable, from, msg)
           .is_some()
         {
+          let flags = self.accepted_flags(&group, flags, beat_term, &sender);
           self.push_dispatch_controls(&group, wake, flags);
         }
       }
     }
     self.flush();
+  }
+
+  /// Strip the quiesce flag unless the dispatched beat was ACCEPTED as current-leader contact:
+  /// after the dispatch this group must be a follower of exactly `sender` at exactly the beat's
+  /// term. A hosted-group dispatch verdict alone proves nothing — the core silently drops a
+  /// sender-mismatched payload and a stale-term beat, and freezing timers on a message Raft threw
+  /// away would quiesce a group on a rejected input's say-so. `Wake` is deliberately NOT gated:
+  /// waking on a rejected message is the conservative direction.
+  fn accepted_flags(&self, group: &G, flags: u8, beat_term: crate::Term, sender: &I) -> u8 {
+    if flags & COALESCED_FLAG_QUIESCE == 0 {
+      return flags;
+    }
+    let accepted = self.multi.group(group).is_some_and(|ep| {
+      !ep.role().is_leader() && ep.term() == beat_term && ep.leader().as_ref() == Some(sender)
+    });
+    if accepted {
+      flags
+    } else {
+      flags & !COALESCED_FLAG_QUIESCE
+    }
   }
 
   /// Propose a command on `group`'s leader, replicating immediately. `None` if no such group.

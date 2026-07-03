@@ -790,11 +790,20 @@ where
             // group must not cost the others their frames. Its flags drop with it.
             if let Some((log, stable)) = stores.stores(&group) {
               let wake = Self::is_wake_class(&msg);
+              let beat_term = msg.term();
+              // The core's sender-authenticity rule mirrored pre-dispatch (see the stream
+              // sibling): a payload naming another node is dropped, so its flag drops too.
+              let flags = if msg.from() == from {
+                flags
+              } else {
+                flags & !COALESCED_FLAG_QUIESCE
+              };
               if self
                 .multi
                 .handle_message(&group, now, log, stable, from.cheap_clone(), msg)
                 .is_some()
               {
+                let flags = self.accepted_flags(&group, flags, beat_term, &from);
                 self.push_dispatch_controls(&group, wake, flags);
               }
             }
@@ -953,6 +962,24 @@ where
       }
     }
     self.bridge.service(std_now);
+  }
+
+  /// Strip the quiesce flag unless the dispatched beat was ACCEPTED as current-leader contact —
+  /// after the dispatch this group must be a follower of exactly `sender` at exactly the beat's
+  /// term (the core silently drops sender-mismatched and stale-term beats, and a rejected input
+  /// must not freeze timers; see the stream sibling). `Wake` is deliberately not gated.
+  fn accepted_flags(&self, group: &G, flags: u8, beat_term: crate::Term, sender: &I) -> u8 {
+    if flags & COALESCED_FLAG_QUIESCE == 0 {
+      return flags;
+    }
+    let accepted = self.multi.group(group).is_some_and(|ep| {
+      !ep.role().is_leader() && ep.term() == beat_term && ep.leader().as_ref() == Some(sender)
+    });
+    if accepted {
+      flags
+    } else {
+      flags & !COALESCED_FLAG_QUIESCE
+    }
   }
 
   /// Queue the dispatch-driven [`GroupControl`]s for one delivered message: a `Wake` for every
