@@ -918,14 +918,38 @@ where
       return;
     }
     let std_now = self.quinn_now(self.last_now);
+    let mut scratch = Vec::new();
     for (to, batch) in core::mem::take(&mut self.hb_batches) {
       let Some(h) = self.bridge.handle_for(&to) else {
         continue;
       };
-      if let [(0, group_bytes, msg)] = batch.as_slice() {
-        self.bridge.write_framed(std_now, h, group_bytes, msg);
-      } else {
-        self.bridge.write_coalesced(std_now, h, &batch);
+      // An entry alone over the coalesced budget diverts to a normal frame, re-arming a flagged
+      // one's intent — the receiver enforces the budget, so an oversized coalesced emission would
+      // reject on every delivery (see the stream sibling).
+      let mut fitting: Vec<crate::transport::CoalescedEntry<I>> = Vec::with_capacity(batch.len());
+      for (flags, group_bytes, msg) in batch {
+        scratch.clear();
+        crate::wire::encode_message(&msg, &mut scratch);
+        let entry_len = 1 + 2 + group_bytes.len() + 4 + scratch.len();
+        if entry_len > crate::transport::frame::COALESCED_FRAME_BUDGET {
+          if flags & COALESCED_FLAG_QUIESCE != 0
+            && let Ok(gid) = G::decode_exact(bytes::Bytes::from(group_bytes.clone()))
+          {
+            self.quiesce_intents.insert(gid);
+          }
+          self.bridge.write_framed(std_now, h, &group_bytes, &msg);
+        } else {
+          fitting.push((flags, group_bytes, msg));
+        }
+      }
+      match fitting.as_slice() {
+        [] => {}
+        [(0, group_bytes, msg)] => {
+          self.bridge.write_framed(std_now, h, group_bytes, msg);
+        }
+        _ => {
+          self.bridge.write_coalesced(std_now, h, &fitting);
+        }
       }
     }
     self.bridge.service(std_now);

@@ -184,6 +184,48 @@ fn round_trips_a_tagged_message() {
   assert_eq!(msgs[0].2, sample_msg());
 }
 
+/// The coalesced sender's oversized-entry fallback: an entry whose encoded size alone exceeds the
+/// coalesced budget (unreachable from real heartbeat traffic — the wire heartbeat context is an
+/// 8-byte internal token — so this pins the defense-in-depth path with an arbitrary big message)
+/// ships as a NORMAL frame the receiver accepts, while the small entry of the same batch still
+/// delivers; nothing closes.
+#[test]
+fn oversized_coalesced_entry_falls_back_to_a_normal_frame() {
+  let mut d = dialer(7);
+  let mut a = acceptor(9);
+  pump(&mut d, &mut a);
+  let tag = enc_id(42);
+  let big = Message::InstallSnapshot(crate::InstallSnapshot::new(
+    crate::Term::new(1),
+    7u64,
+    crate::SnapshotMeta::new(
+      crate::Index::new(1),
+      crate::Term::new(1),
+      crate::ConfState::from_voters(std::vec![7u64, 9]),
+    ),
+    bytes::Bytes::from(std::vec![0xEE; 80 * 1024]),
+  ));
+  d.send_coalesced(&[
+    (0, tag.clone(), big.clone()),
+    (0, tag.clone(), sample_msg()),
+  ]);
+  pump(&mut d, &mut a);
+  let mut msgs = Vec::new();
+  a.poll_decoded(&mut msgs).unwrap();
+  assert_eq!(msgs.len(), 2, "both entries deliver");
+  assert!(
+    msgs
+      .iter()
+      .any(|(g, f, m)| g[..] == tag[..] && *f == 0 && *m == big),
+    "the oversized entry arrived via a normal frame"
+  );
+  assert!(
+    msgs.iter().any(|(_, _, m)| *m == sample_msg()),
+    "the small entry still delivered"
+  );
+  assert!(!a.is_closed() && !d.is_closed(), "no reject churn");
+}
+
 /// A frame whose group header is valid (empty tag) but whose envelope is bogus closes the
 /// connection as integrity-suspect — the header split succeeding must not soften the message
 /// decode gate.

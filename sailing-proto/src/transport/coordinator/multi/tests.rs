@@ -500,6 +500,47 @@ fn sailing_encode_u64(id: u64, out: &mut Vec<u8>) {
   id.encode(out);
 }
 
+/// Heartbeat entries are BOUNDED BY CONSTRUCTION: the wire heartbeat context is the read
+/// machinery's internal 8-byte round token, never the caller's context (which rides the
+/// non-coalesced ReadIndex/ReadIndexResponse pair) — so even a read with a huge caller context
+/// produces only small, budget-conforming coalesced frames, the peer accepts everything, and the
+/// coordinators' oversized-entry divert stays pure defense-in-depth.
+#[test]
+fn huge_caller_context_never_inflates_the_wire_heartbeat() {
+  let mut w = World::new(&[100, 200], &[100, 200]);
+  w.settle();
+  w.elect_a(100);
+  w.elect_a(200);
+  let big = bytes::Bytes::from(std::vec![0xCD; 70 * 1024]);
+  {
+    let (l, s) = w.sa.stores(&100).unwrap();
+    w.a.read_index(&100, w.now, l, s, big).unwrap().unwrap();
+  }
+  // Fire group 200's beat by hand (`fire_a` would settle and deliver the frames before they can
+  // be inspected) so the drain batches beats for the one peer.
+  let d = w.a.group(&200).unwrap().poll_timeout().unwrap();
+  w.now = w.now.max(d);
+  let now = w.now;
+  {
+    let (l, s) = w.sa.stores(&200).unwrap();
+    w.a.handle_timeout(&200, now, l, s).unwrap();
+  }
+  let out = w.a.poll_transmit();
+  let frames = transmit_frames(&out);
+  assert!(!frames.is_empty());
+  for f in &frames {
+    assert!(
+      f.len() <= 2 + crate::transport::frame::COALESCED_FRAME_BUDGET,
+      "every frame stays small: the 70 KiB caller context never reaches the wire heartbeat"
+    );
+  }
+  for (_, bytes) in &out {
+    w.b
+      .handle_conn_data(ConnId(1), bytes, false, w.now, &mut w.sb);
+  }
+  assert_eq!(w.b.poll_conn_closed(), None, "the peer accepted everything");
+}
+
 /// The quiesce flag rides ONLY a leader's own Heartbeat broadcast: an intent marked on a
 /// FOLLOWER (or a leader deposed before its next beat) must never leak onto the
 /// HeartbeatResponses it keeps sending — a flagged response would freeze the very leader that

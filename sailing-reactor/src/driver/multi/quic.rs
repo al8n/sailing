@@ -99,6 +99,11 @@ where
   /// Groups whose consensus deadlines the driver neither arms nor sweeps (see
   /// [`Self::quiesce_sweep`]); everything else flows normally for a quiesced group.
   quiesced: BTreeSet<G>,
+  /// Whether ANY connection was lost in the current loop pass (set by [`Self::wake_all`]).
+  /// A queued `GroupControl::Quiesce` decoded earlier in the same pass predates the loss, and
+  /// honoring it would consume the liveness signal — the control drain drops `Quiesce` while this
+  /// is set, so a same-pass close always wins. Cleared at the top of each pass.
+  link_lost_in_pass: bool,
   /// Leader groups marked quiescing whose FLAGGED beat has not yet been stamped (they keep being
   /// swept until the coordinator consumes the intent, then move into `quiesced`).
   quiesce_pending: BTreeSet<G>,
@@ -195,6 +200,7 @@ where
         flush_pending: false,
         metrics: EngineMetrics::default(),
         quiesced: BTreeSet::new(),
+        link_lost_in_pass: false,
         quiesce_pending: BTreeSet::new(),
         activity: BTreeMap::new(),
         election: BTreeMap::new(),
@@ -232,6 +238,7 @@ where
 
     loop {
       let now = self.clock.now();
+      self.link_lost_in_pass = false;
 
       // Fairness: a bounded command drain before the biased select.
       let mut exit = false;
@@ -921,7 +928,10 @@ where
     while let Some((g, ctrl)) = self.coord.poll_group_control() {
       match ctrl {
         GroupControl::Quiesce => {
-          self.quiesced.insert(g);
+          // A loss in this pass supersedes a Quiesce queued before it was known.
+          if !self.link_lost_in_pass {
+            self.quiesced.insert(g);
+          }
         }
         GroupControl::Wake => self.wake_group(&g),
         _ => {}
@@ -969,6 +979,7 @@ where
   /// Wake EVERY quiesced (and pending) group — the connection-loss path (see
   /// [`Self::reconcile_peer_links`]).
   fn wake_all(&mut self) {
+    self.link_lost_in_pass = true;
     let woken: Vec<G> = self
       .quiesced
       .iter()

@@ -262,11 +262,14 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
   /// message.
   ///
   /// The batch is flushed into a new frame before its payload would exceed
-  /// [`COALESCED_FRAME_BUDGET`] (a flush threshold, not a hard cap: one oversized entry still goes
-  /// out alone, bounded by [`emit_frame`](Self::emit_frame)'s [`MAX_FRAME_LEN`]/occupancy checks —
-  /// the SAME per-frame discipline as a single-message send, applied to the whole coalesced
-  /// payload). Messages are encoded through the per-connection [`crate::wire::MessageEncoder`] as
-  /// everywhere else (its snapshot-meta cache is simply never exercised by heartbeats).
+  /// [`COALESCED_FRAME_BUDGET`] — a HARD cap, because the receiver rejects any coalesced frame
+  /// past the budget. An entry whose encoded size alone exceeds it (the multi coordinators
+  /// pre-size and divert these, so reaching this is a caller bug) falls back to a NORMAL
+  /// single-message frame rather than emitting a coalesced frame every receiver would reject;
+  /// its flags cannot ride a normal frame and are dropped — the safe direction (no false
+  /// quiesce), debug-asserted against. Messages are encoded through the per-connection
+  /// [`crate::wire::MessageEncoder`] as everywhere else (its snapshot-meta cache is simply never
+  /// exercised by heartbeats).
   pub fn send_coalesced(&mut self, entries: &[CoalescedEntry<I>]) {
     if matches!(self.state, ConnState::Closed { .. }) || entries.is_empty() {
       return;
@@ -278,6 +281,19 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       msg_scratch.clear();
       self.encoder.encode_message(msg, &mut msg_scratch);
       let entry_len = 1 + 2 + group.len() + 4 + msg_scratch.len();
+      if entry_len > COALESCED_FRAME_BUDGET {
+        debug_assert!(
+          *flags == 0,
+          "a flagged entry must be pre-sized by its coordinator"
+        );
+        let mut normal = Vec::with_capacity(2 + group.len() + msg_scratch.len());
+        write_group_header(group, &mut normal);
+        normal.extend_from_slice(&msg_scratch);
+        if !self.emit_frame(&normal) {
+          return;
+        }
+        continue;
+      }
       // Flush the frame under construction before this entry would push it past the budget (a
       // frame always carries at least one entry — the marker alone is 2 bytes).
       if payload.len() > 2 && payload.len() + entry_len > COALESCED_FRAME_BUDGET {

@@ -914,9 +914,11 @@ impl<I: NodeId> Bridge<I> {
   /// on connection `h`'s send stream — [`write_framed`](Self::write_framed)'s batch counterpart
   /// (the multi-group heartbeat path), under the same identity gate, the same strict-FIFO staging,
   /// and the same outbound-cap close. The batch is flushed into a new frame before its payload
-  /// would exceed [`COALESCED_FRAME_BUDGET`] (a flush threshold; each emitted frame is still bound
-  /// by [`MAX_FRAME_LEN`], an over-bound frame counting as oversized-dropped like an over-bound
-  /// message). Service is deferred to the pump-end `service`, exactly as for a per-message write.
+  /// would exceed [`COALESCED_FRAME_BUDGET`] — a HARD cap (the receiver rejects a coalesced frame
+  /// past it): an entry that alone exceeds the budget falls back to a normal frame via
+  /// [`write_framed`](Self::write_framed), its flags dropped (debug-asserted zero — the
+  /// coordinators pre-size flagged entries). Service is deferred to the pump-end `service`,
+  /// exactly as for a per-message write.
   pub(crate) fn write_coalesced(
     &mut self,
     now: Instant,
@@ -934,6 +936,19 @@ impl<I: NodeId> Bridge<I> {
       msg_scratch.clear();
       self.encoder.encode_message(msg, &mut msg_scratch);
       let entry_len = 1 + 2 + group.len() + 4 + msg_scratch.len();
+      if entry_len > COALESCED_FRAME_BUDGET {
+        // The receiver hard-rejects a coalesced frame past the budget, so an entry that alone
+        // exceeds it falls back to a normal frame (the coordinators pre-size and divert these —
+        // reaching this is a caller bug; a flag cannot ride a normal frame and drops, the safe
+        // no-false-quiesce direction).
+        debug_assert!(
+          *flags == 0,
+          "a flagged entry must be pre-sized by its coordinator"
+        );
+        self.write_framed(now, h, group, msg);
+        staged = true;
+        continue;
+      }
       if payload.len() > 2 && payload.len() + entry_len > COALESCED_FRAME_BUDGET {
         match self.stage_coalesced(now, h, &payload) {
           Staging::Staged => staged = true,

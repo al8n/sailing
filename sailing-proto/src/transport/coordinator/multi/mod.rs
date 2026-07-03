@@ -596,15 +596,45 @@ where
   /// Ship the batched heartbeats: a batch of ONE unflagged beat goes as a normal single-message
   /// frame (no format change for the trivial case); anything else — many beats, or a flagged one
   /// (only a coalesced entry has a flags byte) — ships as coalesced frames.
+  ///
+  /// An entry whose encoded size ALONE exceeds the coalesced budget is diverted to a normal
+  /// single-message frame: the receiver enforces the budget on coalesced frames, so an oversized
+  /// coalesced emission would be rejected on every delivery and churn the shared connection.
+  /// Real heartbeat entries are bounded BY CONSTRUCTION (the wire heartbeat context is the read
+  /// machinery's 8-byte internal round token, never the caller's context), so this divert is
+  /// defense-in-depth — send/receive symmetry that holds whatever rides the batch in the future.
+  /// A flagged oversized beat additionally RE-ARMS the quiesce intent instead of shipping the
+  /// flag (a normal frame carries none): the promise waits for a beat that fits.
   fn ship_heartbeats(&mut self) {
     if self.hb_batches.is_empty() {
       return;
     }
+    let mut scratch = Vec::new();
     for (to, batch) in core::mem::take(&mut self.hb_batches) {
-      if let [(0, group_bytes, msg)] = batch.as_slice() {
-        self.router.route(group_bytes, to, msg);
-      } else {
-        self.router.route_coalesced(to, &batch);
+      let mut fitting: Vec<CoalescedEntry<I>> = Vec::with_capacity(batch.len());
+      for (flags, group_bytes, msg) in batch {
+        scratch.clear();
+        crate::wire::encode_message(&msg, &mut scratch);
+        let entry_len = 1 + 2 + group_bytes.len() + 4 + scratch.len();
+        if entry_len > crate::transport::frame::COALESCED_FRAME_BUDGET {
+          if flags & COALESCED_FLAG_QUIESCE != 0
+            && let Ok(gid) = G::decode_exact(bytes::Bytes::from(group_bytes.clone()))
+          {
+            self.quiesce_intents.insert(gid);
+          }
+          self.router.route(&group_bytes, to.cheap_clone(), &msg);
+        } else {
+          fitting.push((flags, group_bytes, msg));
+        }
+      }
+      match fitting.as_slice() {
+        [] => {}
+        [(0, group_bytes, msg)] => {
+          self.router.route(group_bytes, to, msg);
+        }
+        _ => {
+          self.router.route_coalesced(to, &fitting);
+        }
       }
     }
   }
