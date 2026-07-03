@@ -68,11 +68,12 @@ pub enum CreateGroupError {
   /// A group with this id is already hosted.
   #[error("a group with this id already exists")]
   Exists,
-  /// The group's `Config` node id differs from the id every already-hosted group shares. A
-  /// multi-Raft host is ONE physical node — the transport authenticates a single identity per
-  /// connection — so a divergent per-group id's messages would be silently dropped by every
-  /// receiver's sender-authenticity check.
-  #[error("the group's node id differs from the host's other groups")]
+  /// The group's `Config` node id differs from the host identity latched by the first group ever
+  /// admitted. The latch survives group removal — even of the last group — because a multi-Raft
+  /// host is ONE physical node whose live transport connections stay authenticated under that
+  /// identity: a divergent per-group id's messages would be silently dropped by every receiver's
+  /// sender-authenticity check.
+  #[error("the group's node id differs from the host's latched identity")]
   NodeIdMismatch,
   /// The group id's `Data` encoding is outside the wire bound (1..=1024 bytes). An empty encoding
   /// is indistinguishable from the single-group frame tag, and an oversized one would produce
