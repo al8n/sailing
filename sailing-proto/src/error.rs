@@ -58,10 +58,10 @@ pub enum ProposeError<I> {
 }
 
 /// Why [`MultiRaft::create_group`](crate::MultiRaft::create_group) /
-/// [`restore_group`](crate::MultiRaft::restore_group) refused to admit a group. The already-hosted
-/// groups are left untouched in every case; the moved-in inputs (including the state machine) are
-/// dropped — pre-check [`contains_group`](crate::MultiRaft::contains_group) when they must be
-/// preserved.
+/// [`restore_group`](crate::MultiRaft::restore_group) — or a multi coordinator's tombstone-aware
+/// wrapper of them — refused to admit a group. The already-hosted groups are left untouched in
+/// every case; the moved-in inputs (including the state machine) are dropped — pre-check
+/// [`contains_group`](crate::MultiRaft::contains_group) when they must be preserved.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum CreateGroupError {
@@ -80,6 +80,13 @@ pub enum CreateGroupError {
   /// frames every receiver rejects at the group header.
   #[error("the group id's encoding is empty or exceeds the wire bound")]
   InvalidGroupId,
+  /// The id is TOMBSTONED by a removal (a coordinator-level refusal): creation refuses until an
+  /// explicit `clear_tombstone` consents to re-admission — so a stale unknown-group advisory,
+  /// consumed after the embedder retired the id, can never resurrect a removed group by prompting
+  /// a naive re-create. Mirrors the references' tombstone-refuses-creation rule (TiKV's
+  /// `RaftGroupDeletedError`, CockroachDB's tombstone check): re-admission is never implicit.
+  #[error("the group id is tombstoned by a removal; clear the tombstone to re-admit it")]
+  Retired,
 }
 
 /// Why a leader-transfer request was rejected.

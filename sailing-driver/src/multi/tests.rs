@@ -137,7 +137,7 @@ fn budget_is_shared_across_group_projections_and_lifecycle() {
 
 /// The lifecycle commands ride the shared channel with their typed payloads, and their replies
 /// resolve the awaiting caller: `create_group` round-trips an admission verdict, `remove_group`
-/// round-trips the was-hosted bool.
+/// round-trips the was-hosted bool, and `clear_tombstone` round-trips the tombstone-existed bool.
 #[test]
 fn lifecycle_commands_round_trip_their_replies() {
   futures_executor::block_on(async {
@@ -174,6 +174,17 @@ fn lifecycle_commands_round_trip_their_replies() {
       _ => panic!("expected a RemoveGroup"),
     }
     assert!(remove.await.expect("the remove resolves"));
+
+    let mut clear = Box::pin(handle.clear_tombstone(100));
+    assert!(matches!(futures_util::poll!(clear.as_mut()), Poll::Pending));
+    match cmd_rx.try_recv().expect("the clear was enqueued") {
+      MultiCommand::ClearTombstone { gid, reply, .. } => {
+        assert_eq!(gid, 100);
+        reply.send(true).expect("the caller is awaiting");
+      }
+      _ => panic!("expected a ClearTombstone"),
+    }
+    assert!(clear.await.expect("the clear resolves"));
   });
 }
 

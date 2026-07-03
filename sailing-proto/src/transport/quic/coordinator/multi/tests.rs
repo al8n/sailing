@@ -440,11 +440,11 @@ fn unhosted_coalesced_entry_drops_over_quic() {
 }
 
 /// Removal TOMBSTONES the id at the QUIC coordinator: straggler entries for it drop silently —
-/// the shared connection and the co-located group's traffic untouched, no control — until a
-/// create re-admits the SAME id, which lifts the tombstone and lets traffic reach the fresh
-/// replica again.
+/// the shared connection and the co-located group's traffic untouched, no control — and a
+/// create of the id refuses with `Retired` until an explicit `clear_tombstone` consents to
+/// re-admission; the clear-then-create rejoin then lets traffic reach the fresh replica again.
 #[test]
-fn tombstoned_group_drops_entries_silently_until_recreated() {
+fn tombstoned_group_refuses_recreation_until_cleared() {
   use crate::GroupControl;
   let ca = TestClusterCa::generate();
   let cluster = ClusterId([7u8; 16]);
@@ -495,13 +495,27 @@ fn tombstoned_group_drops_entries_silently_until_recreated() {
     "a tombstoned straggler never costs the shared connection"
   );
 
-  // Re-admitting the SAME id lifts the tombstone; the fresh replica (fresh stores) hears the
-  // still-beating leader again.
+  // A tombstoned id REFUSES re-creation — a stale unknown-group advisory replayed into a naive
+  // create can never resurrect it; only the explicit clear consents to re-admission.
+  assert_eq!(
+    b.create_group(100, two_voter(2), now, 2, CountSm::default())
+      .unwrap_err(),
+    CreateGroupError::Retired,
+    "create refuses a tombstoned id"
+  );
+  assert!(b.is_retired(&100), "the refused create lifts nothing");
+  assert!(b.clear_tombstone(&100), "a tombstone existed");
+  assert!(
+    !b.is_retired(&100),
+    "the explicit clear lifts the tombstone"
+  );
+
+  // The clear-then-create rejoin: the fresh replica (fresh stores) hears the still-beating
+  // leader again.
   sb.map
     .insert(100, (VecLog::default(), AsyncStable::default()));
   b.create_group(100, two_voter(2), now, 2, CountSm::default())
     .unwrap();
-  assert!(!b.is_retired(&100), "re-admission lifts the tombstone");
   let d = a.group(&100).unwrap().poll_timeout().unwrap();
   now = now.max(d);
   {

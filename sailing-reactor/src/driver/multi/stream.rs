@@ -1108,6 +1108,14 @@ where
         let _ = reply.send(self.remove_group(&gid));
         drop(reservation);
       }
+      MultiCommand::ClearTombstone {
+        gid,
+        reply,
+        reservation,
+      } => {
+        let _ = reply.send(self.coord.clear_tombstone(&gid));
+        drop(reservation);
+      }
       MultiCommand::Shutdown => return true,
     }
     false

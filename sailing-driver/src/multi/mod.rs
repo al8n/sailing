@@ -132,8 +132,8 @@ where
   },
   /// Create a fresh group on this host. The driver admits it into its shared storage engine and
   /// the multi coordinator together; a refusal (duplicate id, host-identity mismatch, invalid
-  /// group-id encoding, invalid config) answers `reply` with
-  /// [`DriverError::Rejected`] carrying the typed refusal's description.
+  /// group-id encoding, a tombstoned id awaiting its explicit clear, invalid config) answers
+  /// `reply` with [`DriverError::Rejected`] carrying the typed refusal's description.
   CreateGroup {
     /// The new group's id.
     gid: G,
@@ -176,6 +176,17 @@ where
     /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
+  /// Lift a group id's tombstone — the EXPLICIT re-admission consent a removal demands before
+  /// the id can be created/restored again (see [`MultiHandle::clear_tombstone`]). Answer `reply`
+  /// with whether a tombstone existed.
+  ClearTombstone {
+    /// The tombstoned group's id.
+    gid: G,
+    /// Answered with whether a tombstone existed for this id.
+    reply: oneshot::Sender<bool>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
   /// Ask the driver to stop. Same contract as the single-group
   /// [`Command::Shutdown`](crate::Command::Shutdown): a plain signal, completion observed through
   /// the shared teardown channel.
@@ -187,6 +198,15 @@ where
 /// (a PD-style external placer and a Cockroach-style local policy are both built on exactly
 /// these triggers). Rides its own bounded tail, [`MultiHandle::lifecycle`], best-effort like the
 /// events tail.
+///
+/// Events are OBSERVATIONS captured at emission, riding a best-effort asynchronous tail: by the
+/// time one is consumed, the host's lifecycle may have moved on (the group created, removed, or
+/// tombstoned since), so the placement brain must order its consumption of the tail against its
+/// own lifecycle mutations. The tombstone-refusal rule makes the dangerous stale case fail
+/// closed at the driver: an `UnknownGroup` consumed AFTER the embedder removed the group cannot
+/// resurrect it — the naive re-create is rejected ([`DriverError::Rejected`]), because
+/// re-admission always requires the two deliberate acts,
+/// [`MultiHandle::clear_tombstone`] then create/restore.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum LifecycleEvent<G, I> {
@@ -305,8 +325,9 @@ where
   ///
   /// `config`'s node id must match the host identity latched by the FIRST group ever admitted (a
   /// multi-Raft host is one physical node); the first admission latches it. A refusal — duplicate
-  /// group id, identity mismatch, an out-of-bound group-id encoding, or an invalid `config` —
-  /// resolves [`DriverError::Rejected`] carrying the refusal's description.
+  /// group id, identity mismatch, an out-of-bound group-id encoding, a tombstoned id whose
+  /// removal [`clear_tombstone`](Self::clear_tombstone) has not consented to reversing, or an
+  /// invalid `config` — resolves [`DriverError::Rejected`] carrying the refusal's description.
   pub async fn create_group(
     &self,
     gid: G,
@@ -352,11 +373,29 @@ where
 
   /// Remove a group, awaiting whether it was hosted. The group's parked operations fail with
   /// [`DriverError::ShuttingDown`] (the group-scoped teardown verdict); co-hosted groups are
-  /// untouched.
+  /// untouched. The removal TOMBSTONES the id: straggler frames drop silently and a
+  /// create/restore of the id is rejected until [`clear_tombstone`](Self::clear_tombstone)
+  /// explicitly consents to re-admission.
   pub async fn remove_group(&self, gid: G) -> Result<bool, DriverError<I>> {
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     self.send(MultiCommand::RemoveGroup {
+      gid,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)
+  }
+
+  /// Lift `gid`'s tombstone, awaiting whether one existed — the EXPLICIT re-admission consent,
+  /// and the only way a removed id becomes creatable again: rejoining an id is always the two
+  /// deliberate acts, `clear_tombstone` then [`create_group`](Self::create_group) /
+  /// [`restore_group`](Self::restore_group) — so a stale [`LifecycleEvent::UnknownGroup`]
+  /// consumed after the removal can never resurrect the id on its own.
+  pub async fn clear_tombstone(&self, gid: G) -> Result<bool, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::ClearTombstone {
       gid,
       reply: tx,
       reservation,

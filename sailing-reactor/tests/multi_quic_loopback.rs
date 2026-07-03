@@ -702,9 +702,9 @@ async fn removed_self_event_and_teardown() {
 
 /// Tombstone-then-recreate over QUIC: one follower of a live 3-node group de-hosts its replica,
 /// the leader's straggler beats die silently against the tombstone (the shared mTLS mesh and the
-/// sibling group stay clean), and re-admitting the SAME id succeeds while the group keeps
-/// committing through its majority (see the stream sibling for why full rejoin of the fresh
-/// replica is the restore/snapshot path's job, not the reject walk-back's).
+/// sibling group stay clean), and the explicit clear-then-create rejoin re-admits the SAME id
+/// while the group keeps committing through its majority (see the stream sibling for why full
+/// rejoin of the fresh replica is the restore/snapshot path's job, not the reject walk-back's).
 #[tokio::test(flavor = "multi_thread")]
 async fn tombstoned_id_recreates_cleanly() {
   let ca = TestCa::new();
@@ -743,8 +743,16 @@ async fn tombstoned_id_recreates_cleanly() {
   assert_eq!(submit_anywhere(&g900, b"mesh-alive").await, 2);
   assert_eq!(submit_anywhere(&g100, b"majority").await, 2);
 
-  // Re-admitting the SAME id (fresh storage, as a driver provisions) lifts the tombstone: the
-  // admission is clean and the group keeps committing — no wedge anywhere.
+  // Re-admission is the deliberate two-act rejoin: clear the tombstone (the explicit consent),
+  // then re-create the SAME id (fresh storage, as a driver provisions). The admission is clean
+  // and the group keeps committing — no wedge anywhere.
+  assert!(
+    handles[follower_at]
+      .clear_tombstone(100)
+      .await
+      .expect("clear resolves"),
+    "a tombstone existed"
+  );
   handles[follower_at]
     .create_group(
       100,
@@ -753,7 +761,7 @@ async fn tombstoned_id_recreates_cleanly() {
       CountSm::default(),
     )
     .await
-    .expect("the tombstoned id re-admits");
+    .expect("the cleared id re-admits");
   assert_eq!(submit_anywhere(&g100, b"rejoined").await, 3);
   assert_eq!(submit_anywhere(&g900, b"still").await, 3);
 }

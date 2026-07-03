@@ -103,9 +103,10 @@ where
   quiesce_intents: BTreeSet<G>,
   /// Group-scoped scheduling signals for the driver, in dispatch order (see [`GroupControl`]).
   controls: VecDeque<(G, GroupControl)>,
-  /// Tombstoned group ids: REMOVED groups whose inbound frames drop silently until a
-  /// create/restore re-admits the id (see [`remove_group`](Self::remove_group)). In-memory and
-  /// volatile — a restart starts clean; the embedder's group catalog owns removal persistence.
+  /// Tombstoned group ids: REMOVED groups whose inbound frames drop silently and whose
+  /// create/restore refuses until an explicit [`clear_tombstone`](Self::clear_tombstone) (see
+  /// [`remove_group`](Self::remove_group)). In-memory and volatile — a restart starts clean; the
+  /// embedder's group catalog owns removal persistence.
   retired: BTreeSet<G>,
   /// Unknown-group placement signals, in arrival order: `(group, authenticated sender)` for
   /// initial-shaped traffic whose group is neither hosted, nor store-resolvable, nor tombstoned
@@ -142,12 +143,14 @@ where
     }
   }
 
-  /// Create a fresh group (see [`MultiRaft::create_group`]). Successful admission lifts the id's
-  /// tombstone, if any — re-creating the SAME group id is the supported rejoin path (see
+  /// Create a fresh group (see [`MultiRaft::create_group`]). A tombstoned id REFUSES creation
+  /// until an explicit [`clear_tombstone`](Self::clear_tombstone) consents to re-admission — the
+  /// clear-then-create pair is the supported rejoin path (see
   /// [`remove_group`](Self::remove_group)).
   ///
   /// # Errors
-  /// The admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
+  /// [`CreateGroupError::Retired`] when the id is tombstoned by a removal; otherwise the
+  /// admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
   pub fn create_group(
     &mut self,
     gid: G,
@@ -156,18 +159,22 @@ where
     seed: u64,
     fsm: F,
   ) -> Result<(), CreateGroupError> {
+    if self.retired.contains(&gid) {
+      return Err(CreateGroupError::Retired);
+    }
     let key = gid.cheap_clone();
     self.multi.create_group(gid, config, now, seed, fsm)?;
-    self.retired.remove(&key);
     self.purge_unknown_signal(&key);
     Ok(())
   }
 
-  /// Recover a group from durable storage (see [`MultiRaft::restore_group`]). Successful
-  /// admission lifts the id's tombstone, if any, exactly as [`create_group`](Self::create_group).
+  /// Recover a group from durable storage (see [`MultiRaft::restore_group`]). A tombstoned id
+  /// refuses restoration exactly as [`create_group`](Self::create_group) refuses creation: an
+  /// explicit [`clear_tombstone`](Self::clear_tombstone) must precede re-admission.
   ///
   /// # Errors
-  /// The admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
+  /// [`CreateGroupError::Retired`] when the id is tombstoned by a removal; otherwise the
+  /// admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn restore_group<L, S>(
     &mut self,
@@ -185,11 +192,13 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
+    if self.retired.contains(&gid) {
+      return Err(CreateGroupError::Retired);
+    }
     let key = gid.cheap_clone();
     self
       .multi
       .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
-    self.retired.remove(&key);
     self.purge_unknown_signal(&key);
     Ok(())
   }
@@ -198,17 +207,20 @@ where
   /// and queued controls with it (its per-peer batched beats, if any, still ship — a removed
   /// group's in-flight heartbeat is indistinguishable from one that left just before removal, and
   /// the receiver's unhosted-entry drop absorbs it) — and TOMBSTONES the id: inbound frames tagged
-  /// with it drop silently, before store resolution and WITHOUT an unknown-group signal, until a
-  /// create/restore re-admits it.
+  /// with it drop silently, before store resolution and WITHOUT an unknown-group signal, and a
+  /// create/restore of the id refuses ([`CreateGroupError::Retired`]). Re-admission is EXPLICIT:
+  /// [`clear_tombstone`](Self::clear_tombstone), then create/restore — so a stale unknown-group
+  /// advisory consumed after this removal can never resurrect the id through a naive re-create.
   ///
   /// The tombstone is IN-MEMORY and GROUP-keyed — deliberately weaker than the references, which
   /// persist replica-keyed tombstones for exactly this straggler problem (TiKV a region-epoch +
   /// peer-id tombstone, CockroachDB a NextReplicaID floor, each a monotonic incarnation
   /// discriminator): sailing group ids carry no incarnation number, so SINGLE-INCARNATION ids are
-  /// the embedder contract — re-creating the SAME group id is the supported rejoin path, and
-  /// reusing an id for a DIFFERENT logical group is unsound without epochs (matching the NodeId
-  /// reuse rules). Across a restart the tombstone is gone; the embedder's placement catalog is
-  /// the persistent record of what must not live here.
+  /// the embedder contract — re-creating the SAME group id (an explicit clear, then a
+  /// create/restore) is the supported rejoin path, and reusing an id for a DIFFERENT logical
+  /// group is unsound without epochs (matching the NodeId reuse rules). Across a restart the
+  /// tombstone is gone; the embedder's placement catalog is the persistent record of what must
+  /// not live here.
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F>> {
     self.quiesce_intents.remove(gid);
     self.controls.retain(|(g, _)| g != gid);
@@ -217,8 +229,17 @@ where
     self.multi.remove_group(gid)
   }
 
-  /// Whether `gid` is TOMBSTONED: removed and not re-admitted since, its inbound frames dropping
-  /// silently (see [`remove_group`](Self::remove_group)). Volatile — a restart starts clean.
+  /// Lift `gid`'s tombstone, returning whether one existed. The EXPLICIT re-admission consent —
+  /// the ONLY way a retired id becomes creatable again (a subsequent create/restore then admits
+  /// it): admission itself never lifts a tombstone, so consenting is always a deliberate act of
+  /// the embedder's placement brain, never the side effect of replaying a stale advisory.
+  pub fn clear_tombstone(&mut self, gid: &G) -> bool {
+    self.retired.remove(gid)
+  }
+
+  /// Whether `gid` is TOMBSTONED: removed and not explicitly cleared since — its inbound frames
+  /// dropping silently and its re-creation refusing (see [`remove_group`](Self::remove_group)).
+  /// Volatile — a restart starts clean.
   #[must_use]
   pub fn is_retired(&self, gid: &G) -> bool {
     self.retired.contains(gid)
@@ -336,7 +357,7 @@ where
         self.router.close(conn, Some(TransportError::Decode));
         break;
       }
-      // A tombstoned (removed, not re-admitted) group's frame is a straggler from the group's
+      // A tombstoned (removed, not cleared since) group's frame is a straggler from the group's
       // past life on this host: drop it silently — never a close (the shared connection carries
       // the live groups' traffic), never a control, and never an unknown-group signal (the
       // embedder retired the id; resurrecting it on a straggler's say-so would undo the

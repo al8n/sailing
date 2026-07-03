@@ -826,11 +826,13 @@ fn unhosted_coalesced_entry_drops_but_the_frame_delivers() {
 }
 
 /// Removal TOMBSTONES the group id at the coordinator: straggler frames for it drop SILENTLY —
-/// no close (the shared connection carries the live groups' traffic), no control — until a
-/// create re-admits the SAME id (the supported rejoin path), which lifts the tombstone and lets
-/// traffic reach the fresh replica again.
+/// no close (the shared connection carries the live groups' traffic), no control — and BOTH
+/// admission paths refuse the id with `Retired` until an explicit `clear_tombstone` consents to
+/// re-admission (the references' tombstone-refuses-creation rule). The supported rejoin is the
+/// two deliberate acts — clear, then create — after which traffic reaches the fresh replica
+/// again.
 #[test]
-fn tombstoned_group_drops_frames_silently_until_recreated() {
+fn tombstoned_group_refuses_recreation_until_cleared() {
   let mut w = World::new(&[100, 200], &[100, 200]);
   w.settle();
   w.elect_a(100);
@@ -859,15 +861,51 @@ fn tombstoned_group_drops_frames_silently_until_recreated() {
   w.elect_a(200);
   assert!(w.b.group(&200).unwrap().term() >= Term::new(1));
 
-  // Re-admitting the SAME id lifts the tombstone; the fresh replica (fresh stores, as a driver
-  // would provision) hears the still-beating leader again.
+  // A tombstoned id REFUSES both admission paths: a stale unknown-group advisory replayed into
+  // a naive create can never resurrect the id — only an explicit clear consents.
+  assert_eq!(
+    w.b
+      .create_group(100, two_voter(2), w.now, 2, CountSm::default())
+      .unwrap_err(),
+    CreateGroupError::Retired,
+    "create refuses a tombstoned id"
+  );
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    w.b
+      .restore_group(
+        100,
+        two_voter(2),
+        w.now,
+        2,
+        CountSm::default(),
+        1,
+        &mut log,
+        &mut stable,
+      )
+      .unwrap_err(),
+    CreateGroupError::Retired,
+    "restore is gated exactly like create"
+  );
+  assert!(w.b.is_retired(&100), "a refused admission lifts nothing");
+
+  // The legitimate rejoin is the two deliberate acts — clear, then create. The fresh replica
+  // (fresh stores, as a driver would provision) hears the still-beating leader again.
+  assert!(w.b.clear_tombstone(&100), "a tombstone existed");
+  assert!(
+    !w.b.clear_tombstone(&100),
+    "the second clear reports no tombstone left"
+  );
+  assert!(
+    !w.b.is_retired(&100),
+    "the explicit clear lifts the tombstone"
+  );
   w.sb
     .map
     .insert(100, (VecLog::default(), AsyncStable::default()));
   w.b
     .create_group(100, two_voter(2), w.now, 2, CountSm::default())
     .unwrap();
-  assert!(!w.b.is_retired(&100), "re-admission lifts the tombstone");
   w.fire_a(100);
   assert!(
     w.b.group(&100).unwrap().term() >= Term::new(1),
