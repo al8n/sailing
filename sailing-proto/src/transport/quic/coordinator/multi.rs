@@ -276,8 +276,10 @@ where
   /// Fire all QUIC transport timers (quinn's connection timers plus the authentication deadline),
   /// drain the bridge into the owning groups (resolved through `stores`), then pump. The per-group
   /// CONSENSUS timers are fired separately via [`handle_timeout`](Self::handle_timeout); this is the
-  /// shared transport half, and the method the driver calls while [`poll_timeout`](Self::poll_timeout)
-  /// reports the bridge's immediate deferred work.
+  /// shared transport half. Call it at EVERY [`poll_timeout`](Self::poll_timeout) expiry — the
+  /// surfaced deadline may be a pure transport deadline (a quinn retransmit or the auth reap) with
+  /// no group due — as well as whenever `poll_timeout` reports the bridge's immediate deferred
+  /// work.
   pub fn handle_transport_timeout<L, S, St>(&mut self, now: impl Into<Now>, stores: &mut St)
   where
     L: LogStore,
@@ -506,6 +508,13 @@ where
           }
         };
         if self.bridge.is_authenticating(h) {
+          if self.node_id().is_none() {
+            // No hosted group yet: there is no identity to bind against, so the self-id gate
+            // would be vacuous and the connection would validate WITHOUT our preface ever having
+            // been staged — a half-duplex wedge. Leave it authenticating; the auth deadline reaps
+            // it locally, and the peer redials once groups exist.
+            break;
+          }
           let certs = self.bridge.peer_certs(h);
           let outcome =
             self
