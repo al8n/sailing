@@ -920,11 +920,10 @@ async fn stale_unknown_group_event_cannot_resurrect() {
 /// committing the shrunk group, and the removed node's tombstone silently absorbs the stragglers
 /// (no unknown-group resurrection prompt ever fires for the removed id, and no connection churn).
 ///
-/// The removed node is the group's LEADER, removing itself: the node driving the commit is the
-/// one node guaranteed to APPLY its own removal. A removed FOLLOWER never learns the commit that
-/// excised it — the leader prunes it from the tracker in the same fused commit+apply pass, and
-/// sailing (unlike etcd's commit-then-bcastAppend) sends no further append to it — so the
-/// follower-side RemovedSelf needs a final commit-carrying probe the core does not perform.
+/// The removed node here is the group's LEADER, removing itself: the node driving the commit
+/// applies its own removal directly. The removed-FOLLOWER path — learning the excising commit
+/// from the leader's farewell heartbeat — is
+/// `removed_follower_learns_via_farewell_and_tears_down`'s.
 #[tokio::test(flavor = "multi_thread")]
 async fn removed_self_event_and_teardown() {
   let addrs = addrs(44_260, 3);
@@ -1002,6 +1001,172 @@ async fn removed_self_event_and_teardown() {
   // No resurrection prompt and no reconnect churn: the survivors' straggler frames (their
   // election-era votes and beats while their configs still named the removed node) died against
   // the tombstone silently — the removed node's lifecycle tail never solicits group 100 back.
+  while let Ok(ev) = handles[removed_at].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
+      "a tombstoned group must never re-solicit placement: {ev:?}"
+    );
+  }
+}
+
+/// A removed FOLLOWER learns of its removal end-to-end: the leader's farewell heartbeat —
+/// emitted at the apply-time fold, before the tracker swap drops the pruned peer — delivers the
+/// excising commit to a follower that never drives it, so ITS lifecycle tail yields
+/// `RemovedSelf` and the app can tear the replica down (the leader-self-removal path is
+/// `removed_self_event_and_teardown`'s).
+///
+/// The 3-node group is shaped voters {1, 2} + learner 3 (B), with C the non-leader VOTER: the
+/// farewell delivers the removal commit exactly when the leader processed the pruned peer's ack
+/// of the conf entry before the fold, and a 3-VOTER group commits on whichever of the two
+/// follower acks lands first — a coin flip that leaves the removed voter merely ignorant (the
+/// clamped in-flight-ack residual the embedder catalog covers) half the time. Requiring C in
+/// the quorum makes the farewell's commit-carrying shape deterministic, which is the shape this
+/// test pins.
+///
+/// Group 100 runs pre-vote + check-quorum so the farewell is the ONLY way C can learn: without
+/// them, an ignorant C (still seeing voters {A, C}) eventually campaigns at a higher term, wins
+/// A's vote with its up-to-date log, and commits its own removal — learning by usurpation, not
+/// by the farewell. Check-quorum's in-lease rejection plus pre-vote's non-disruptive probes
+/// wall that path off, so a farewell regression turns this test into a clean timeout.
+#[tokio::test(flavor = "multi_thread")]
+async fn removed_follower_learns_via_farewell_and_tears_down() {
+  let addrs = addrs(44_520, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // Group 100 lives on all three nodes: voters {1, 2}, node 3 pre-provisioned as the joining
+  // OBSERVER replica the AddLearnerNode below wires in (its bootstrap voter seed is the
+  // EXISTING cluster's, so it cannot campaign). The sibling 2-node group 300 isolates the churn.
+  for id in 1u64..=2 {
+    handles[(id - 1) as usize]
+      .create_group(
+        100,
+        config(id, vec![1, 2])
+          .with_pre_vote(true)
+          .with_check_quorum(true),
+        id,
+        CountSm::default(),
+      )
+      .await
+      .expect("group admission");
+  }
+  handles[2]
+    .create_group(
+      100,
+      Config::try_new_observer(3u64, vec![1, 2], ELECTION, HEARTBEAT)
+        .unwrap()
+        .with_pre_vote(true)
+        .with_check_quorum(true),
+      3,
+      CountSm::default(),
+    )
+    .await
+    .expect("the observer replica admits");
+  create_group_everywhere(&handles[0..2], 300, &[1, 2]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g300: Vec<_> = handles[0..2].iter().map(|h| h.group(300)).collect();
+  assert_eq!(submit_anywhere(&g100, b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g300, b"seed").await, 1);
+
+  // Wire in learner 3 (B) via a committed conf change through the leader.
+  let voters = &g100[0..2];
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed learner add in time"
+    );
+    let at = find_leader(voters, "group 100 pre-learner").await;
+    let cc = ConfChange::new(ConfChangeType::AddLearnerNode, 3, Bytes::new());
+    match g100[at].conf_change(cc).await {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  }
+
+  // A (the leader) proposes removing C (the OTHER voter). C's ack is required for the commit
+  // quorum {1, 2}, so at the apply-time fold C's match covers the conf entry and the farewell
+  // heartbeat carries the removal commit — C, which never drives the commit, learns from it.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let removed_at = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed follower removal in time"
+    );
+    let at = find_leader(voters, "group 100 pre-removal").await;
+    let c = 1 - at;
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, c as u64 + 1, Bytes::new());
+    match g100[at].conf_change(cc).await {
+      Ok(_) => break c,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  };
+
+  // The pruned follower's lifecycle tail names the group it no longer belongs to — reachable
+  // only through the farewell (the leader prunes C in the same fused pass and never appends to
+  // it again).
+  await_lifecycle(handles[removed_at].lifecycle(), "removed-follower", |ev| {
+    matches!(ev, LifecycleEvent::RemovedSelf { group: 100 })
+  })
+  .await;
+
+  // The app tears the local replica down; the removal reports it was hosted.
+  assert!(
+    handles[removed_at]
+      .remove_group(100)
+      .await
+      .expect("remove resolves"),
+    "the removed follower hosted group 100"
+  );
+
+  // A + B keep the group: the shrunk single-voter group commits through A, and learner B's
+  // apply stream follows it.
+  let leader_at = 1 - removed_at;
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&g100[leader_at]), b"after").await,
+    2,
+    "the shrunk group applied seed + after"
+  );
+  let a_applied = g100[leader_at]
+    .status()
+    .await
+    .expect("leader status")
+    .applied_index;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let b_applied = g100[2]
+      .status()
+      .await
+      .expect("learner status")
+      .applied_index;
+    if b_applied >= a_applied {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "learner B never caught up: {b_applied:?} < {a_applied:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+
+  // The sibling group is unaffected — and its quorum NEEDS the torn-down node's driver, so a
+  // commit proves C's driver survived its group-scoped teardown.
+  assert_eq!(submit_anywhere(&g300, b"still").await, 2);
+
+  // No resurrection prompt on the removed follower: the tombstone absorbs the stragglers.
   while let Ok(ev) = handles[removed_at].lifecycle().try_recv() {
     assert!(
       !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
