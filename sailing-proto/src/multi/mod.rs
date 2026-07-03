@@ -11,17 +11,19 @@
 //! scaffold**: a static, append-only group set over caller-injected per-group storage (each group
 //! is handed its own `LogStore`/`StableStore` per call, mirroring [`Endpoint`]). The shared storage
 //! engine, the group-tagged wire, the threaded reactor, heartbeat coalescing, and dynamic group
-//! lifecycle are later phases that consume this surface without reshaping it. The read/transfer/
-//! conf-change routing methods (`read_index`, `transfer_leader`, `propose_conf_change_v2`) delegate
-//! identically to the ones here and are added as the layer grows.
+//! lifecycle are later phases that consume this surface without reshaping it. Every client-facing
+//! routing method of the single-group [`Endpoint`] — propose, conf changes (v1/v2), read-index,
+//! leader transfer, read-mode migration — has a group-keyed delegate here.
 
 mod group_id;
 pub use group_id::GroupId;
 
 use crate::{
-  Config, CreateGroupError, Data, Endpoint, Event, Index, Instant, LogStore, Message, NodeId, Now,
-  Outgoing, Prng, ProposeError, StableStore, StateMachine, StorageProgress,
+  ConfChange, ConfChangeV2, Config, CreateGroupError, Data, Endpoint, Event, Index, Instant,
+  LogStore, Message, NodeId, Now, Outgoing, Prng, ProposeError, ReadIndexError, ReadOnlyOption,
+  StableStore, StateMachine, StorageProgress, TransferError,
 };
+use bytes::Bytes;
 use cheap_clone::CheapClone;
 use std::{
   collections::{BTreeMap, VecDeque},
@@ -367,6 +369,123 @@ where
     self.groups.get_mut(gid)?.flush_appends(now, log, stable);
     self.mark_dirty(gid);
     Some(())
+  }
+
+  /// Propose a membership change (single-step) on `gid`, which must be the leader. `None` if no
+  /// such group. As with [`propose`](Self::propose), call [`flush_appends`](Self::flush_appends)
+  /// for the group once after a burst.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn propose_conf_change<L, S>(
+    &mut self,
+    gid: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    cc: ConfChange<I>,
+  ) -> Option<Result<Index, ProposeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let result = self
+      .groups
+      .get_mut(gid)?
+      .propose_conf_change(now, log, stable, cc);
+    self.mark_dirty(gid);
+    Some(result)
+  }
+
+  /// Propose a membership change (joint-consensus capable) on `gid`, which must be the leader.
+  /// `None` if no such group. As with [`propose`](Self::propose), call
+  /// [`flush_appends`](Self::flush_appends) for the group once after a burst.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn propose_conf_change_v2<L, S>(
+    &mut self,
+    gid: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    cc: ConfChangeV2<I>,
+  ) -> Option<Result<Index, ProposeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let result = self
+      .groups
+      .get_mut(gid)?
+      .propose_conf_change_v2(now, log, stable, cc);
+    self.mark_dirty(gid);
+    Some(result)
+  }
+
+  /// Propose a cluster-wide read-mode migration on `gid`, which must be the leader. `None` if no
+  /// such group. As with [`propose`](Self::propose), call [`flush_appends`](Self::flush_appends)
+  /// for the group once after a burst.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn propose_read_mode_change<L, S>(
+    &mut self,
+    gid: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    mode: ReadOnlyOption,
+  ) -> Option<Result<Index, ProposeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let result = self
+      .groups
+      .get_mut(gid)?
+      .propose_read_mode_change(now, log, stable, mode);
+    self.mark_dirty(gid);
+    Some(result)
+  }
+
+  /// Initiate a linearizable read on `gid`; the resulting `ReadState` surfaces via
+  /// [`poll_event`](Self::poll_event) stamped with the group. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — no read was initiated"]
+  pub fn read_index<L, S>(
+    &mut self,
+    gid: &G,
+    now: impl Into<Now>,
+    log: &L,
+    stable: &S,
+    context: Bytes,
+  ) -> Option<Result<(), ReadIndexError>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let result = self
+      .groups
+      .get_mut(gid)?
+      .read_index(now, log, stable, context);
+    self.mark_dirty(gid);
+    Some(result)
+  }
+
+  /// Begin transferring `gid`'s leadership to `to`. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — no transfer was initiated"]
+  pub fn transfer_leader<L, S>(
+    &mut self,
+    gid: &G,
+    now: impl Into<Now>,
+    log: &L,
+    stable: &S,
+    to: I,
+  ) -> Option<Result<(), TransferError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let result = self
+      .groups
+      .get_mut(gid)?
+      .transfer_leader(now, log, stable, to);
+    self.mark_dirty(gid);
+    Some(result)
   }
 }
 
