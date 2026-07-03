@@ -4,8 +4,9 @@ How sailing hosts many Raft groups in one process. This document tracks the desi
 and the phased roadmap; it is the companion to [`WIRE.md`](./WIRE.md) for the
 multi-group layer.
 
-Status: **Phase 0 (the `multi` module scaffold) in progress.** Everything past Phase 0
-is roadmap, not yet built.
+Status: **Phases 0 and 1 are implemented** — the `MultiRaft` container, the group-demux
+wire, and both multi-group coordinators (`MultiStreamCoordinator`, `MultiQuicCoordinator`).
+Phases 2–6 are roadmap, not yet built.
 
 ---
 
@@ -45,7 +46,7 @@ multiplexing unit. What is per-group vs. shareable across a host:
 | **PRNG** | Per-instance SplitMix64 seeded at `new`/`restart` (`prng.rs`) | Seed each group distinctly (mix the group id into the seed) or identical election jitter correlates elections |
 | **OpId** | Per-`Endpoint` `{epoch, seq}`; epoch namespaces boot incarnations, **not** groups (`storage.rs`) | A shared physical store must key completions `(group_id, OpId)` and feed each group a per-group boot-epoch |
 | **Wire** | Nothing carries a group id; `Message<I>` embeds the sender, `Outgoing<I>` carries `to: I` only (`message/mod.rs`) | Tag the **transport frame envelope** with the group id (see below) |
-| **LeaseGuard** | Lease safety rides per-entry `lease_window`/`wall_timestamp` on *AppendEntries* + the per-group commit-wait — **not** the heartbeat (`Heartbeat` carries no lease data) | Heartbeat coalescing is *structurally* safe; it cannot break LeaseGuard |
+| **LeaseGuard** | The per-entry lease window (`lease_window`/`wall_timestamp`) rides *AppendEntries* + the per-group commit-wait; the heartbeat pair's `lease_round`/`lease_support` (the CheckQuorum/LeaseBased renewal) is per-group state | Heartbeat coalescing is *structurally* safe: a coalesced batch carries every per-group field intact, and batching delay is on the conservative side for both lease families |
 
 Two findings are worth calling out because they are gifts:
 
@@ -107,28 +108,32 @@ Adopted patterns, by source:
   so the common case sends nothing at all (at 10^4 idle groups, *not sending* beats
   coalescing them).
 
-## The wire change (Phase 1 preview)
+## The wire change (landed in Phase 1)
 
-Tag the **transport frame envelope**, not the protobuf `Message`:
+Tag the **transport frame envelope**, not the protobuf `Message` (normative layout: WIRE.md §3):
 
 ```
-[u32 BE total_len][group_id: fixed u64 BE][protobuf Message body]
+[u32 BE total_len][u16 BE group_len][group id bytes][protobuf Message body]
 ```
 
-The router must pick the target `Endpoint` *before* decoding the Raft payload — groups may
-have different state-machine command/snapshot types, and a `InstallSnapshot` frame can
-approach the 64 MiB frame bound, so decoding it just to learn its group is untenable. A
-fixed-offset header field is an `O(1)` read. Because `LABEL_VERSION` fences mixed-version
-peers at the connection hello, this is a clean version break (bump 5 -> 6), not a
-wire-coexistence exercise. The envelope layout also reserves room for a future coalesced
-frame `[len][(group_id, msg_len, msg)*]` — which a protobuf field could not.
+The router picks the target `Endpoint` *before* decoding the Raft payload — groups may
+have different state-machine command/snapshot types, and an `InstallSnapshot` frame can
+approach the 64 MiB frame bound, so decoding it just to learn its group is untenable. The
+group id is the `GroupId`'s `Data` encoding, bounded 1..=1024 bytes and enforced at
+`create_group` (the empty tag is the single-group form), so ids stay generic rather than a
+fixed u64. Because `LABEL_VERSION` fences mixed-version peers at the connection hello, this
+was a clean break: the version byte was RESET to 1 as the group-tagged baseline (nothing is
+published; the pre-group formats burned 1..=5, and a byte must never be reused once anything
+ships). The header's front-of-payload position composes into a future coalesced layout
+`[len][(group_len, group, msg_len, msg)*]` behind another version bump — which a
+protobuf-embedded tag could not.
 
 ## Phased roadmap
 
 | Phase | Deliverable | Where |
 | --- | --- | --- |
-| **0** | `mod multi` scaffold: container + `GroupId` + routing + aggregate output/deadline surface + group-distinct seeding; static group set; downstream seams reserved | `sailing-proto` |
-| **1** | Wire group-demux: frame-envelope `group_id`, `LABEL_VERSION` 5 -> 6, `(target, group)` router | `sailing-proto` wire + transport |
+| **0** (done) | `mod multi` scaffold: container + `GroupId` + routing + aggregate output/deadline surface + group-distinct seeding; append-only group set; downstream seams reserved | `sailing-proto` |
+| **1** (done) | Wire group-demux: the frame-envelope group tag, `LABEL_VERSION` reset to 1, the `(group, peer)` demux through the router/bridge, and both multi-group coordinators | `sailing-proto` wire + transport |
 | **2** | Shared storage engine: group-prefixed keys, batch-first append, one fsync/batch, per-group completion fan-out, `(group_id, OpId)` keying, per-group boot-epoch | driver / storage impl |
 | **3** | Shared reactor: ready-set scheduler + `poll_timeout` timing wheel + storage-worker pool | `sailing-reactor` |
 | **4** | Heartbeat coalescing + quiescence (idle-group scale win) | transport + reactor |
@@ -138,63 +143,59 @@ frame `[len][(group_id, msg_len, msg)*]` — which a protobuf field could not.
 Split/merge is deferred hard: it couples the state machine's key range to Raft-group
 identity and needs a transactional handoff. It must not shape the Phase-0 container.
 
-## Phase 0: the `multi` module scaffold
+## The `multi` container (as built)
 
 New module `sailing-proto/src/multi/` — Sans-I/O, `no_std` + `alloc`,
 `#![deny(missing_docs)]`, with the group-agnostic consensus core untouched.
 
 ```rust
-// multi/group_id.rs  — mirrors id.rs's NodeId
-pub trait GroupId: Ord + CheapClone + core::fmt::Debug {}   // blanket impl; u64 works
+// multi/group_id.rs — mirrors id.rs's NodeId (blanket impl; u64 works out of the box; the
+// Data encoding is the wire tag, bounded 1..=1024 bytes and enforced at create_group)
+pub trait GroupId: Data + CheapClone + Ord + Hash + Debug + Display + 'static {}
 
-// multi/mod.rs
-pub struct MultiRaft<G, I, F, R = Prng>
-where G: GroupId, I: NodeId, F: StateMachine {
-    groups: BTreeMap<G, Endpoint<I, F, R>>,
-    dirty:  VecDeque<G>,          // groups with output to drain (filled on dispatch)
-    // aggregate next-deadline tracking for poll_timeout
-}
+// multi/mod.rs — as built
+pub struct MultiRaft<G, I, F, R = Prng> { /* BTreeMap<G, Endpoint<I, F, R>> + dirty queues */ }
 
 impl MultiRaft {
-    pub fn new() -> Self;
+    // admission — validated (id uniqueness, the encoding bound, one shared node id per host);
+    // the full Endpoint constructor family, group-seeded or caller-RNG'd
+    create_group(_with_rng) / restore_group(_with_rng) / restore_group_migrating(_with_rng)
+    remove_group / group / contains_group / len / is_empty / group_ids
 
-    // lifecycle — rung 1 (static / append-only); remove_group reserved for rung 2/5
-    pub fn create_group(&mut self, gid: G, cfg: Config<I>, now, seed: u64, fsm: F) -> Result<(), _>;
-    pub fn restore_group(&mut self, gid, cfg, now, seed, fsm, boot_epoch, log, stable) -> Result<(), _>;
-    pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F, R>>;
-    pub fn group(&self, &G) / group_mut(&mut self, &G) / len / is_empty / group_ids();
-
-    // input routing — delegate to the group, then track dirty + deadline
-    pub fn handle_message(&mut self, gid: &G, now, log, stable, from: I, msg: Message<I>);
-    pub fn handle_timeout(&mut self, gid: &G, now, log, stable);
-    pub fn handle_storage(&mut self, gid: &G, now, log, stable) -> StorageProgress;
-    pub fn propose / propose_conf_change_v2 / read_index / transfer_leader / flush_appends (per gid);
+    // input routing — every wrapper #[must_use]: None = no such group, nothing happened
+    handle_message / handle_timeout / handle_storage
+    propose / flush_appends / propose_conf_change(_v2) / propose_read_mode_change
+    read_index / transfer_leader
 
     // aggregate output — stamped with the originating group
-    pub fn poll_message(&mut self) -> Option<(G, Outgoing<I>)>;   // walks the dirty-set, zero-copy
-    pub fn poll_event(&mut self)   -> Option<(G, Event<I, F::Response>)>;
+    poll_message() -> Option<(G, Outgoing<I>)>     // walks the dirty-set, zero-copy
+    poll_event()   -> Option<(G, Event<I, F::Response>)>
 
     // aggregate scheduling surface for the reactor's wheel
-    pub fn poll_timeout(&self)     -> Option<Instant>;             // min over groups
-    pub fn deadlines(&self) -> impl Iterator<Item = (G, Instant)>; // reactor builds its wheel
+    poll_timeout() -> Option<Instant>              // O(N) min over groups
+    deadlines()    -> impl Iterator<Item = (G, Instant)>
 }
 ```
+
+There is deliberately no mutable endpoint access (`group()` is shared-only): a driver mutating
+an `Endpoint` directly would enqueue output the aggregate drains never learn about.
 
 **Group-distinct seeding.** `create_group` mixes `gid` into the PRNG seed so co-located
 groups do not draw identical election-timeout jitter (which would correlate elections).
 
-**Reserved seams** (documented, not built in Phase 0):
+**Reserved seams:**
 
-- Storage is injected per call today; a `StoreRouter` trait slots in at Phase 2 without
-  changing this surface.
-- `poll_message` returns `(G, Outgoing)` so the wire group-tag (Phase 1) is a pure
-  transport concern.
+- `MultiRaft` takes storage per call; the coordinators resolve per-group stores through the
+  `GroupStores` trait (the seam that shipped — the Phase-2 engine implements it over
+  group-scoped handles without changing the surface).
+- `poll_message` returns `(G, Outgoing)` so the wire group-tag stays a pure transport
+  concern (the coordinators stamp it).
 - `remove_group` + a store/node-FSM hook anticipate Phase 5 (dynamic lifecycle).
 
-**Testing.** A `MultiHarness` over the existing `testkit`: two groups over one mock
-store map, asserting group isolation (group A's traffic never perturbs B), cross-group
-interleaved drive, group-distinct election seeding, and aggregate `poll_timeout`
-correctness.
+**Testing.** Container tests assert group isolation, the admission checks, seed
+decorrelation, and the unknown-group verdicts; the transport layers round-trip group-tagged
+frames at the unit level and drive multi-group coordinators end-to-end over live
+connections (demux to the right group, unhosted-group drop, malformed-tag close).
 
 ## References
 

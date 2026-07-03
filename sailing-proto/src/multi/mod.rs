@@ -7,9 +7,10 @@
 //! all groups. The consensus core stays completely group-unaware; this layer owns only the routing
 //! and the aggregate drains.
 //!
-//! See `MULTI_RAFT.md` for the architecture and the phased roadmap. This is the **Phase 0
-//! scaffold**: a static, append-only group set over caller-injected per-group storage (each group
-//! is handed its own `LogStore`/`StableStore` per call, mirroring [`Endpoint`]). The shared storage
+//! See `MULTI_RAFT.md` for the architecture and the phased roadmap. The group set is append-only
+//! in policy — [`remove_group`](MultiRaft::remove_group) ships as the dynamic-lifecycle teardown
+//! seam, but there is no create/destroy protocol yet — over caller-injected per-group storage
+//! (each group is handed its own `LogStore`/`StableStore` per call, mirroring [`Endpoint`]). The shared storage
 //! engine, the group-tagged wire, the threaded reactor, heartbeat coalescing, and dynamic group
 //! lifecycle are later phases that consume this surface without reshaping it. Every client-facing
 //! routing method of the single-group [`Endpoint`] — propose, conf changes (v1/v2), read-index,
@@ -209,8 +210,8 @@ where
   F: StateMachine,
 {
   /// Create a fresh group (Follower, term 0, empty log view). The group's election RNG is seeded by
-  /// `seed` folded with `gid`, so co-located groups never draw identical election-timeout jitter
-  /// (which would correlate their elections into a host-wide storm).
+  /// `seed` folded with `gid`, so co-located groups draw decorrelated election-timeout jitter
+  /// (identical jitter would correlate their elections into a host-wide storm).
   ///
   /// # Errors
   /// [`CreateGroupError::Exists`] if a group with `gid` is already hosted,
@@ -232,8 +233,11 @@ where
     Ok(())
   }
 
-  /// Recover a group from durable storage, replaying its committed tail (which may enqueue
-  /// `Applied` events to drain). Same `gid`-folded seeding as [`create_group`](Self::create_group).
+  /// Recover a group from durable storage, replaying its committed tail into the state machine.
+  /// Replay surfaces NO events (mirroring [`Endpoint::restart`], which deliberately clears them —
+  /// replay is not new work); the restore MAY leave one pending stable write (a grown lease
+  /// floor), drained by the driver's normal `handle_storage` cadence. Same `gid`-folded seeding as
+  /// [`create_group`](Self::create_group).
   ///
   /// # Errors
   /// The same admission checks as [`create_group`](Self::create_group) — see
@@ -269,6 +273,8 @@ where
       stable,
     );
     self.groups.insert(gid.cheap_clone(), ep);
+    // Defensive only: `Endpoint::restart` currently surfaces no output (replay events are
+    // deliberately cleared), so this marks an empty queue. The restore variants below mirror it.
     self.mark_dirty(&gid);
     Ok(())
   }
@@ -496,7 +502,8 @@ where
     Some(progress)
   }
 
-  /// Propose a command to `gid`'s leader. `None` if no such group, else the append result. Call
+  /// Propose a command on `gid`, which must be the leader. `None` if no such group, else the
+  /// append result. Call
   /// [`flush_appends`](Self::flush_appends) for the group once after a burst of proposals.
   #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn propose<L, S>(
