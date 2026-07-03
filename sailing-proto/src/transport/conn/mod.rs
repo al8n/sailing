@@ -163,10 +163,14 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     Ok(())
   }
 
-  /// Decode any complete application frames into `out`. Yields nothing until a peer is bound
-  /// (`Validated`, or a CLEAN `Closed` retaining the peer for the final drain); a frame that is not
-  /// exactly one `Message` closes the connection as integrity-suspect.
-  pub fn poll_decoded(&mut self, out: &mut Vec<Message<I>>) -> Result<(), TransportError> {
+  /// Decode any complete application frames into `out` as `(group_id_bytes, message)` pairs. Yields
+  /// nothing until a peer is bound (`Validated`, or a CLEAN `Closed` retaining the peer for the final
+  /// drain); a frame that is not a group header plus exactly one `Message` closes the connection as
+  /// integrity-suspect. The group id (empty for a single-group host) selects the target Raft group.
+  pub fn poll_decoded(
+    &mut self,
+    out: &mut Vec<(bytes::Bytes, Message<I>)>,
+  ) -> Result<(), TransportError> {
     if self.peer().is_none() {
       return Ok(());
     }
@@ -186,7 +190,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       // Split the transport's group-demux header off the front; the remainder is the encoded
       // `Message`. The group id selects the target Raft group in a multi-group host; a single-group
       // owner sends an empty tag and ignores it here.
-      let (_group, message) = match split_group_header(frame) {
+      let (group, message) = match split_group_header(frame) {
         Ok(split) => split,
         Err(e) => {
           self.close_suspect();
@@ -197,7 +201,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       // slices the message's `Bytes` fields (entry payloads, blobs, contexts, encoded ids) out
       // of the SAME allocation; a frame must carry exactly one well-formed envelope.
       match crate::wire::decode_message::<I>(message) {
-        Ok(msg) => out.push(msg),
+        Ok(msg) => out.push((group, msg)),
         Err(_) => {
           self.close_suspect();
           return Err(TransportError::Decode);

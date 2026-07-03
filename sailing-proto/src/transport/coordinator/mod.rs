@@ -162,7 +162,7 @@ where
     let _ = self
       .router
       .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
-    for (from, msg) in decoded {
+    for (_group, from, msg) in decoded {
       self.endpoint.handle_message(now, log, stable, from, msg);
     }
     self.flush();
@@ -376,7 +376,7 @@ where
   fn flush(&mut self) {
     while let Some(out) = self.endpoint.poll_message() {
       let (to, msg) = out.into_parts();
-      self.router.route(to, &msg);
+      self.router.route(&[], to, &msg);
     }
   }
 

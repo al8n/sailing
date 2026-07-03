@@ -107,7 +107,7 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     bytes: &[u8],
     eof: bool,
     now: Instant,
-    out: &mut Vec<(I, Message<I>)>,
+    out: &mut Vec<(bytes::Bytes, I, Message<I>)>,
   ) -> Result<(), TransportError> {
     let result = self.handle_conn_data_inner(id, bytes, eof, now, out);
     // A connection that errored OR reached EOF/Closed must drop its peer binding — otherwise the
@@ -129,7 +129,7 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     bytes: &[u8],
     eof: bool,
     now: Instant,
-    out: &mut Vec<(I, Message<I>)>,
+    out: &mut Vec<(bytes::Bytes, I, Message<I>)>,
   ) -> Result<(), TransportError> {
     let conn = match self.conns.get_mut(&id) {
       Some(c) => c,
@@ -163,9 +163,9 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     let mut msgs = Vec::new();
     conn.poll_decoded(&mut msgs)?;
     let peer = conn.peer();
-    for m in msgs {
+    for (group, msg) in msgs {
       if let Some(p) = &peer {
-        out.push((p.cheap_clone(), m));
+        out.push((group, p.cheap_clone(), msg));
       }
     }
     Ok(())
@@ -176,16 +176,16 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   /// A send that closes the connection (the outbound cap tripped — the peer stopped draining) drops
   /// the route immediately and reports the close, so no later message is silently queued into a
   /// dead connection.
-  pub fn route(&mut self, to: I, msg: &Message<I>) -> bool {
+  pub fn route(&mut self, group: &[u8], to: I, msg: &Message<I>) -> bool {
     let Some(&id) = self.peer_of.get(&to) else {
       return false;
     };
     let Some(conn) = self.conns.get_mut(&id) else {
       return false;
     };
-    // The single-group router sends the empty group tag; the multi-group coordinator stamps a real
-    // group id here once it drives a `MultiRaft`.
-    conn.send_message(&[], msg);
+    // `group` is the group-demux tag stamped onto the frame: an empty slice for a single-group host,
+    // the encoded `GroupId` for a multi-group coordinator.
+    conn.send_message(group, msg);
     if conn.is_closed() {
       self.remove_internal(id, None);
       return false;
