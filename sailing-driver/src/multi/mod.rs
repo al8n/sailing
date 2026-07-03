@@ -4,7 +4,9 @@
 //! The single-group [`Handle`](crate::Handle)/[`Command`](crate::Command) pair is untouched (it is
 //! shared with every single-group driver); this module is the ADDITIVE group-keyed sibling. Every
 //! per-group operation is the single-group operation plus the group id it addresses, and the
-//! multi-only surface — group lifecycle (create/restore/remove) and the group-stamped events tail —
+//! multi-only surface — group lifecycle (create/restore/remove), the group-stamped events tail,
+//! and the [`LifecycleEvent`] tail feeding the embedder's placement brain (unknown-group
+//! solicitations, removed-self conf changes; the policy is the embedder's, never the driver's) —
 //! lives on [`MultiHandle`] itself. The budget, shutdown-coalescing, and teardown-completion
 //! machinery are reused as-is: ONE [`InflightBudget`] spans every group projection (co-located
 //! groups share the host's memory, so they share its in-flight bound), one shutdown flag dedups the
@@ -180,6 +182,36 @@ where
   Shutdown,
 }
 
+/// A group-lifecycle observation from a multi-group driver — the PLACEMENT-BRAIN feed. sailing
+/// ships the lifecycle MECHANICS only: no auto-create, no auto-teardown — the embedder decides
+/// (a PD-style external placer and a Cockroach-style local policy are both built on exactly
+/// these triggers). Rides its own bounded tail, [`MultiHandle::lifecycle`], best-effort like the
+/// events tail.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum LifecycleEvent<G, I> {
+  /// An authenticated peer sent well-formed, INITIAL-SHAPED consensus traffic (a vote request,
+  /// or a first-contact heartbeat) for a group this host neither carries nor has tombstoned.
+  /// The embedder decides placement: create/restore the group on this host (the soliciting
+  /// peer's retry then completes the join) or ignore the signal (the driver keeps dropping the
+  /// group's frames). Recurs after each poll while the solicitation continues.
+  UnknownGroup {
+    /// The unhosted group.
+    group: G,
+    /// The authenticated peer soliciting it.
+    from: I,
+  },
+  /// A committed configuration change REMOVED this host from `group`'s membership — no longer a
+  /// voter in either joint half, a learner, or an incoming learner. NO auto-teardown: between
+  /// this event and the application's [`MultiHandle::remove_group`] the replica keeps running
+  /// Raft, harmlessly (the committed change already excluded it from every quorum, so it can
+  /// only campaign into the void). The application drains its reads, then removes the group.
+  RemovedSelf {
+    /// The group whose committed membership no longer names this host.
+    group: G,
+  },
+}
+
 /// A cheaply-cloneable, `Send + Sync` handle to a MULTI-GROUP driver: group lifecycle, the
 /// group-stamped events tail, and shutdown live here; per-group operations live on the
 /// [`GroupHandle`] projection minted by [`group`](Self::group).
@@ -196,6 +228,8 @@ where
   commands: flume::Sender<MultiCommand<G, I, F>>,
   /// The best-effort events tail, each event stamped with its originating group.
   events: flume::Receiver<(G, Event<I, F::Response>)>,
+  /// The best-effort group-lifecycle tail (see [`LifecycleEvent`]).
+  lifecycle: flume::Receiver<LifecycleEvent<G, I>>,
   budget: InflightBudget,
   /// Shared across every clone: set once by the first `shutdown` to COALESCE all later (and
   /// concurrent) shutdown requests to a single enqueued [`MultiCommand::Shutdown`].
@@ -213,6 +247,7 @@ where
     Self {
       commands: self.commands.clone(),
       events: self.events.clone(),
+      lifecycle: self.lifecycle.clone(),
       budget: self.budget.clone(),
       shutdown: self.shutdown.clone(),
       teardown: self.teardown.clone(),
@@ -229,16 +264,19 @@ where
   F::Response: Send,
 {
   /// Build a multi-group handle. `teardown` is the receiver half of the driver's
-  /// teardown-completion oneshot, stored as a `Shared` so every clone awaits the one signal.
+  /// teardown-completion oneshot, stored as a `Shared` so every clone awaits the one signal;
+  /// `lifecycle` is the driver's group-lifecycle tail (see [`lifecycle`](Self::lifecycle)).
   pub fn new(
     commands: flume::Sender<MultiCommand<G, I, F>>,
     events: flume::Receiver<(G, Event<I, F::Response>)>,
+    lifecycle: flume::Receiver<LifecycleEvent<G, I>>,
     budget: InflightBudget,
     teardown: oneshot::Receiver<()>,
   ) -> Self {
     Self {
       commands,
       events,
+      lifecycle,
       budget,
       shutdown: Arc::new(AtomicBool::new(false)),
       teardown: teardown.shared(),
@@ -330,6 +368,16 @@ where
   /// dropped-on-full: an observer that falls behind loses events, never slows consensus.
   pub fn events(&self) -> &flume::Receiver<(G, Event<I, F::Response>)> {
     &self.events
+  }
+
+  /// The best-effort group-LIFECYCLE tail (see [`LifecycleEvent`]): unknown-group placement
+  /// signals and removed-self notifications, bounded and dropped-on-full exactly like
+  /// [`events`](Self::events) — a lagging observer loses signals, never slows the driver. A
+  /// dropped `UnknownGroup` recurs (the soliciting peer retries on its own cadence); a dropped
+  /// `RemovedSelf` does not, but remains derivable from [`GroupHandle::status`] (a conf state
+  /// that no longer names this host).
+  pub fn lifecycle(&self) -> &flume::Receiver<LifecycleEvent<G, I>> {
+    &self.lifecycle
   }
 
   /// Ask the driver to stop and await teardown completion — the single-group

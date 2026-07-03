@@ -14,6 +14,7 @@ use std::vec::Vec;
 
 mod multi;
 pub use multi::{GroupControl, GroupStores, MultiStreamCoordinator};
+pub(crate) use multi::{UNKNOWN_GROUP_SIGNAL_CAP, is_initial_shaped};
 
 /// A consensus node speaking over framed reliable connections (`R` is the record layer, e.g.
 /// `Labeled<Passthrough>` for TCP or `Labeled<TlsRecords>` for TLS).

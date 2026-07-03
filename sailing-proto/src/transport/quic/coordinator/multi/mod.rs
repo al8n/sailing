@@ -29,7 +29,11 @@ use crate::{
   CheapClone, Config, CreateGroupError, Data, Endpoint, Event, GroupControl, GroupId, GroupStores,
   Index, Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError, StableStore,
   StateMachine, StorageProgress,
-  transport::{ClusterId, CoalescedEntry, frame::COALESCED_FLAG_QUIESCE},
+  transport::{
+    ClusterId, CoalescedEntry,
+    coordinator::{UNKNOWN_GROUP_SIGNAL_CAP, is_initial_shaped},
+    frame::COALESCED_FLAG_QUIESCE,
+  },
 };
 
 /// A multi-group consensus node speaking QUIC: a [`MultiRaft`] composed with the quinn-proto bridge
@@ -83,6 +87,13 @@ where
   /// create/restore re-admits the id (see [`remove_group`](Self::remove_group)). In-memory and
   /// volatile — a restart starts clean; the embedder's group catalog owns removal persistence.
   retired: BTreeSet<G>,
+  /// Unknown-group placement signals, in arrival order: `(group, authenticated sender)` for
+  /// initial-shaped traffic whose group is neither hosted, nor store-resolvable, nor tombstoned
+  /// (see [`poll_unknown_group`](Self::poll_unknown_group)).
+  unknown_pending: VecDeque<(G, I)>,
+  /// The groups currently queued in `unknown_pending` — the dedupe set (one signal per group
+  /// until polled off), bounded by [`UNKNOWN_GROUP_SIGNAL_CAP`].
+  unknown_seen: BTreeSet<G>,
 }
 
 impl<G, I, F> MultiQuicCoordinator<G, I, F, Hello>
@@ -181,6 +192,8 @@ where
       quiesce_intents: BTreeSet::new(),
       controls: VecDeque::new(),
       retired: BTreeSet::new(),
+      unknown_pending: VecDeque::new(),
+      unknown_seen: BTreeSet::new(),
     }
   }
 
@@ -201,6 +214,7 @@ where
     let key = gid.cheap_clone();
     self.multi.create_group(gid, config, now, seed, fsm)?;
     self.retired.remove(&key);
+    self.purge_unknown_signal(&key);
     // A fresh group can widen the tracked-peer union; raise the connection cap now rather than at
     // the next pump, so accepts arriving in the gap are not statelessly refused.
     self.bridge.raise_max_connections(self.effective_cap());
@@ -234,6 +248,7 @@ where
       .multi
       .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
     self.retired.remove(&key);
+    self.purge_unknown_signal(&key);
     // Same cap-raise as `create_group`: the restored group widens the tracked-peer union.
     self.bridge.raise_max_connections(self.effective_cap());
     Ok(())
@@ -242,7 +257,8 @@ where
   /// Remove a group, returning its endpoint if present. Drops the group's pending quiesce intent
   /// and queued controls with it (its per-peer batched beats, if any, still ship — the receiver's
   /// unhosted-entry drop absorbs them) — and TOMBSTONES the id: inbound entries tagged with it
-  /// drop silently, before store resolution, until a create/restore re-admits it.
+  /// drop silently, before store resolution and WITHOUT an unknown-group signal, until a
+  /// create/restore re-admits it.
   ///
   /// The tombstone is IN-MEMORY and GROUP-keyed — deliberately weaker than the references, which
   /// persist replica-keyed tombstones for exactly this straggler problem (TiKV a region-epoch +
@@ -256,6 +272,7 @@ where
     self.quiesce_intents.remove(gid);
     self.controls.retain(|(g, _)| g != gid);
     self.retired.insert(gid.cheap_clone());
+    self.purge_unknown_signal(gid);
     self.multi.remove_group(gid)
   }
 
@@ -264,6 +281,51 @@ where
   #[must_use]
   pub fn is_retired(&self, gid: &G) -> bool {
     self.retired.contains(gid)
+  }
+
+  /// Drain the next UNKNOWN-GROUP placement signal: `(group, authenticated sender)` for
+  /// well-formed INITIAL-SHAPED traffic — a vote request, or a first-contact heartbeat carrying
+  /// commit 0 — whose group this host neither hosts, nor resolves stores for, nor has
+  /// tombstoned. The embedder's PLACEMENT BRAIN decides what to do with it: create/restore the
+  /// group here (the soliciting peer's retry then completes the join) or ignore it (the
+  /// coordinator keeps dropping the entries). Placement policy is deliberately NOT the
+  /// coordinator's job — no auto-create, ever.
+  ///
+  /// One signal per group until polled off; polling re-arms the group for a fresh signal. At
+  /// most 64 distinct groups are queued — beyond the cap new unknown groups drop silently (the
+  /// signal is an optimization; the sender retries on its own cadence).
+  pub fn poll_unknown_group(&mut self) -> Option<(G, I)> {
+    let (group, from) = self.unknown_pending.pop_front()?;
+    self.unknown_seen.remove(&group);
+    Some((group, from))
+  }
+
+  /// The node's host identity — LATCHED by the first admitted group for the container's
+  /// lifetime (a multi-Raft host is one physical node), stable across group removals and
+  /// zero-group windows. `None` only before any group has ever been admitted.
+  #[must_use]
+  pub fn host_id(&self) -> Option<&I> {
+    self.multi.host_id()
+  }
+
+  /// Queue an unknown-group placement signal, deduped by group until polled off and dropped
+  /// beyond [`UNKNOWN_GROUP_SIGNAL_CAP`] pending groups (see
+  /// [`poll_unknown_group`](Self::poll_unknown_group)).
+  fn note_unknown_group(&mut self, group: G, from: I) {
+    if self.unknown_seen.contains(&group) || self.unknown_seen.len() >= UNKNOWN_GROUP_SIGNAL_CAP {
+      return;
+    }
+    self.unknown_seen.insert(group.cheap_clone());
+    self.unknown_pending.push_back((group, from));
+  }
+
+  /// Drop any queued unknown-group signal for `gid`: after an admission or a removal the queued
+  /// claim is stale — polling it would hand the placement brain a lie (an "unknown" group that
+  /// is now hosted, or one the embedder just retired).
+  fn purge_unknown_signal(&mut self, gid: &G) {
+    if self.unknown_seen.remove(gid) {
+      self.unknown_pending.retain(|(g, _)| g != gid);
+    }
   }
 
   /// Dial the node `peer` at `remote` — the shared connection carries every co-located group's
@@ -300,8 +362,10 @@ where
   /// Feed one inbound UDP datagram from `remote` into the QUIC stack, decode its group-tagged frames
   /// into consensus messages routed to their owning group's endpoint (resolved through `stores`),
   /// then pump every group's resulting outbound messages back out. A frame whose group has no store
-  /// is dropped (the sender retries); a group tag that does not decode as `G`, or an undecodable
-  /// message body, closes the connection as integrity-suspect.
+  /// is dropped (the sender retries) — and when it is initial-shaped for a group neither hosted nor
+  /// tombstoned, surfaced once via [`poll_unknown_group`](Self::poll_unknown_group); a group tag
+  /// that does not decode as `G`, or an undecodable message body, closes the connection as
+  /// integrity-suspect.
   ///
   /// `ecn` is the received ECN codepoint when the driver's socket reports one (`None` is always
   /// safe).
@@ -713,8 +777,9 @@ where
   /// - stream-ready → retry staged sends, then decode each frame — an `Authenticating` connection's
   ///   first frame authenticates; a `Validated` connection's frame splits its group tag, decodes to
   ///   `G` + a consensus `Message`, and (if the group is hosted) feeds that group's endpoint. An
-  ///   unknown-but-well-formed group drops the frame (the connection stays up for other groups); a
-  ///   malformed tag, an undecodable message, or a framing violation closes the connection;
+  ///   unknown-but-well-formed group drops the frame (the connection stays up for other groups),
+  ///   surfacing an unknown-group signal when it is initial-shaped and untombstoned; a malformed
+  ///   tag, an undecodable message, or a framing violation closes the connection;
   /// - `lost` → reap the closed connection from routing.
   // Takes the full `Now`: a decoded consensus message dispatched below can drive a network election
   // whose leader no-op must stamp the SYNCHRONIZED wall. Only the quinn/bridge timers use `now.mono()`.
@@ -817,9 +882,10 @@ where
             }
             // A tombstoned (removed, not re-admitted) group's entry is a straggler from the
             // group's past life on this host: drop the ENTRY silently — per entry, like the
-            // unhosted drop, so the shared frame's other groups still dispatch. Ordered AFTER
-            // the integrity gates (a malformed tag or violating flag still closes) and BEFORE
-            // store resolution.
+            // unhosted drop, so the shared frame's other groups still dispatch, and never an
+            // unknown-group signal (the embedder retired the id; resurrecting it on a
+            // straggler's say-so would undo the removal). Ordered AFTER the integrity gates (a
+            // malformed tag or violating flag still closes) and BEFORE store resolution.
             if self.retired.contains(&group) {
               continue;
             }
@@ -844,6 +910,11 @@ where
                 let flags = self.accepted_flags(&group, flags, beat_term, &from);
                 self.push_dispatch_controls(&group, wake, flags);
               }
+            } else if is_initial_shaped(&msg) && !self.multi.contains_group(&group) {
+              // Neither store-resolvable nor hosted (nor tombstoned — gated above): a live peer
+              // is actively soliciting a group this host does not carry. Surface it ONCE to the
+              // embedder's placement brain; every other kind for the group drops silently.
+              self.note_unknown_group(group, from.cheap_clone());
             }
           }
           if malformed {

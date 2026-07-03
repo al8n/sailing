@@ -4,9 +4,11 @@ How sailing hosts many Raft groups in one process. This document tracks the desi
 and the phased roadmap; it is the companion to [`WIRE.md`](./WIRE.md) for the
 multi-group layer.
 
-Status: **Phases 0–2 are implemented** — the `MultiRaft` container, the group-demux wire,
-both multi-group coordinators (`MultiStreamCoordinator`, `MultiQuicCoordinator`), and the
-shared in-memory storage engine (`GroupEngine`). Phases 3–6 are roadmap, not yet built.
+Status: **Phases 0–5 are implemented** — the `MultiRaft` container, the group-demux wire,
+both multi-group coordinators (`MultiStreamCoordinator`, `MultiQuicCoordinator`), the
+shared in-memory storage engine (`GroupEngine`), the multi reactor drivers, coalesced
+heartbeats + quiescence, and the dynamic-lifecycle mechanics (tombstones, unknown-group
+surfacing, removed-self). Phase 3b (sharded compio) is roadmap; Phase 6 is deferred.
 
 ---
 
@@ -135,10 +137,10 @@ frame that landed in Phase 4 — `[len][0xFFFF][(flags, group_len, group, msg_le
 | **0** (done) | `mod multi` scaffold: container + `GroupId` + routing + aggregate output/deadline surface + group-distinct seeding; append-only group set; downstream seams reserved | `sailing-proto` |
 | **1** (done) | Wire group-demux: the frame-envelope group tag, `LABEL_VERSION` reset to 1, the `(group, peer)` demux through the router/bridge, and both multi-group coordinators | `sailing-proto` wire + transport |
 | **2** (done) | Shared storage engine: the in-memory reference `GroupEngine` — every group's stores behind per-group staged-until-flush handles, ONE `flush()` barrier covering all groups' writes (the fsync amortization), per-group completion FIFOs and boot epochs. A disk engine in driver-land mirrors this contract | `sailing-proto` `multi::engine` |
-| **3** | Shared reactor host (the I/O layer: real sockets/timers, `flush()` becomes the fsync point): ready-set scheduler + a `deadlines()` timing wheel + a group-keyed client `Handle` | `sailing-reactor` |
+| **3** (done) | Shared reactor host (the I/O layer: real sockets/timers, `flush()` becomes the fsync point): the multi stream/QUIC drivers over one shared `GroupEngine` barrier per crank, a quiesce-aware aggregate deadline fold, and the group-keyed client `MultiHandle`/`GroupHandle` | `sailing-reactor` |
 | **3b** | Sharded compio host: shard-per-core `MultiRaft` + per-core engine shards (a per-core WAL — no cross-core fsync contention); cross-core handoff at the TRANSPORT EDGE only, since a peer connection stays core-owned (per-core connections would fight the router's one-conn-per-peer model) | `sailing-compio` |
 | **4** (done) | Heartbeat coalescing + quiescence (idle-group scale win): one coalesced control frame per node pair per crank, idle groups stop exchanging beats entirely (any traffic or a connection loss wakes them) | transport + reactor |
-| **5** | Dynamic create/destroy via the store FSM | `multi` + reactor |
+| **5** (done) | Dynamic group-lifecycle mechanics: coordinator-level TOMBSTONES (a removed id's straggler frames drop silently until re-admission; in-memory by design — the embedder's catalog owns persistence, unlike TiKV/CockroachDB's persisted incarnation-keyed tombstones), UNKNOWN-GROUP surfacing (initial-shaped traffic for an unhosted, untombstoned group → `poll_unknown_group` → the drivers' `LifecycleEvent::UnknownGroup` tail), and the REMOVED-SELF flow (a committed conf change that drops the host from every membership role → `LifecycleEvent::RemovedSelf`; the replica keeps running harmlessly until the app removes it). The PLACEMENT BRAIN is explicitly the embedder's — no auto-create, no auto-teardown; a PD-style external placer and a Cockroach-style local policy are both buildable on exactly these triggers | coordinators + driver + reactor |
 | **6** (deferred) | Snapshot-bootstrapped group creation; split / merge | separate project |
 
 Split/merge is deferred hard: it couples the state machine's key range to Raft-group
@@ -191,7 +193,8 @@ groups do not draw identical election-timeout jitter (which would correlate elec
   group-scoped handles without changing the surface).
 - `poll_message` returns `(G, Outgoing)` so the wire group-tag stays a pure transport
   concern (the coordinators stamp it).
-- `remove_group` + a store/node-FSM hook anticipate Phase 5 (dynamic lifecycle).
+- `remove_group` is the Phase-5 teardown seam, now consumed: the coordinators wrap it with the
+  lifecycle mechanics (tombstones, unknown-group surfacing) while the container stays pure.
 
 **Testing.** Container tests assert group isolation, the admission checks, seed
 decorrelation, and the unknown-group verdicts; the transport layers round-trip group-tagged

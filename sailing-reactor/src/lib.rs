@@ -23,6 +23,6 @@ pub use driver::{
 pub use sailing_driver::UnverifiedSystemClock;
 pub use sailing_driver::{
   BindError, Clock, DriverConfig, DriverConfigError, DriverError, GroupHandle, Handle,
-  MAX_BOUNDED_QUEUE_DEPTH, MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic, MultiCommand,
-  MultiHandle, Node, NtpDisciplinedClock, Status, WallClock, WallReading,
+  LifecycleEvent, MAX_BOUNDED_QUEUE_DEPTH, MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic,
+  MultiCommand, MultiHandle, Node, NtpDisciplinedClock, Status, WallClock, WallReading,
 };
