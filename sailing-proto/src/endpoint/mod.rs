@@ -1860,26 +1860,40 @@ where
     })
   }
 
-  /// Whether any tracked peer's replication progress (voters AND learners, this node excluded) is
-  /// in the probe state. `false` on a non-leader — a follower's tracker holds fresh probe-state
-  /// entries that describe nothing (only a leader replicates).
+  /// Whether ANY tracked peer's replication progress (voters AND learners, this node excluded)
+  /// is still owed catch-up traffic: in the `Probe` or `Snapshot` state, or matched short of the
+  /// leader's own durable last index. `false` on a non-leader — a follower's tracker holds fresh
+  /// probe-state entries that describe nothing (only a leader replicates).
   ///
-  /// The quiesce-eligibility predicate: a probing peer still draws the gated heartbeat-response
-  /// append pump (contact matters to a probe regardless of `match`), and an EQUAL-match ack does
-  /// not promote it to Replicate — so a probing peer at full match re-draws the pump every round.
-  /// A leader must therefore not quiesce while any peer probes: the final flagged round's pump
-  /// pair would either churn wake/quiesce cycles or have to ride the absorb set, and the absorb
-  /// set is deliberately exactly the `HeartbeatResponse`.
-  pub fn has_probing_peer(&self) -> bool {
+  /// The quiesce-eligibility predicate: the exact complement, over every tracked peer, of the
+  /// heartbeat-response append-pump condition (`match < last_index || Probe` in
+  /// `on_heartbeat_response`) plus the snapshot-recovery resend. A leader must not quiesce while
+  /// any peer would still draw that traffic: a probing peer draws the pump even at full match (an
+  /// EQUAL-match ack does not promote it to Replicate), a behind peer's catch-up is
+  /// response-driven — a quiesced leader stops beating, so a behind-and-DOWN peer would stall
+  /// until an unrelated wake — and a Snapshot-state peer is owed the paced blob resend. Any of
+  /// those keeps the final flagged round from settling to the bare `Heartbeat` +
+  /// `HeartbeatResponse`, and the absorb set is deliberately exactly the `HeartbeatResponse`.
+  /// Learners count exactly like voters: the pump is per-responder and role-blind.
+  ///
+  /// The reference index is the leader's own tracked match — the durable-last read, equal to the
+  /// log's last index exactly when every local append is durable (an in-flight local append keeps
+  /// storage completions moving, which the quiesce sweep's idle window already excludes). A
+  /// missing self entry reads as lagging: with no durable-last reference no peer can be certified
+  /// caught up.
+  pub fn has_lagging_peer(&self) -> bool {
     if !self.role.is_leader() {
       return false;
     }
     let me = self.config.id();
+    let Some(last) = self.tracker.progress(&me).map(|p| p.match_index()) else {
+      return true;
+    };
     self
       .tracker
       .progress_map()
       .iter()
-      .any(|(id, p)| *id != me && p.state().is_probe())
+      .any(|(id, p)| *id != me && (!p.state().is_replicate() || p.match_index() < last))
   }
 }
 

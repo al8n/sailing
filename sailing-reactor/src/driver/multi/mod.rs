@@ -70,19 +70,20 @@ pub(crate) struct GroupActivity {
 
 /// Whether a group's CONSENSUS state is quiesce-eligible on the leader: this node leads it in the
 /// `Safe` read mode (the lease modes are ineligible in v1 — a LeaseGuard/LeaseBased leader must
-/// keep renewing through heartbeat rounds), NO tracked peer is probing
-/// ([`has_probing_peer`](sailing_proto::Endpoint::has_probing_peer) — a probing peer still draws
-/// the gated heartbeat-response append pump, and an equal-match ack does not promote it, so the
-/// final flagged round would not settle to the bare `Heartbeat` + `HeartbeatResponse` the wake
-/// classification absorbs), every voter in BOTH joint halves has matched the
-/// leader's own durable last index, and that index is fully committed AND applied — nothing is in
-/// flight anywhere. The leader's own [`peer_progress`](sailing_proto::Endpoint::peer_progress)
-/// match is the durable-last read (public surface): it equals the log's last index exactly when
-/// every local append is durable, an extra conservatism consistent with idleness. Learners'
-/// MATCH is deliberately NOT gated on (a catching-up Replicate learner's appends are
-/// response-driven, not timer-driven, so quiescence does not stall it) — but a PROBING learner
-/// blocks like any probing peer, since the pump is per-responder; a finer learner-aware
-/// refinement is a seam.
+/// keep renewing through heartbeat rounds), NO tracked peer is lagging
+/// ([`has_lagging_peer`](sailing_proto::Endpoint::has_lagging_peer) — the exact complement of the
+/// heartbeat-response append pump condition plus the snapshot-recovery resend, over EVERY tracked
+/// peer, learners included: a peer that is probing, receiving a snapshot, or matched short of the
+/// leader's durable last index still draws catch-up traffic, so the final flagged round would not
+/// settle to the bare `Heartbeat` + `HeartbeatResponse` the wake classification absorbs — and
+/// since catch-up is response-driven and a quiesced leader stops beating, a behind-and-down peer
+/// would otherwise stall until an unrelated wake), and the leader's own durable last index is
+/// fully committed AND applied — nothing is in flight anywhere. The leader's own
+/// [`peer_progress`](sailing_proto::Endpoint::peer_progress) match is the durable-last read
+/// (public surface): it equals the log's last index exactly when every local append is durable,
+/// an extra conservatism consistent with idleness. Voter completeness is implied: every voter in
+/// BOTH joint halves sits in the lagging sweep, so eligibility means every voter — and every
+/// learner — has matched the leader's durable last index.
 ///
 /// The driver adds its own conditions on top: no parked driver work for the group and a full
 /// election timeout of observed inactivity.
@@ -94,7 +95,7 @@ where
   if ep.is_poisoned()
     || !ep.role().is_leader()
     || !matches!(ep.active_read_mode(), sailing_proto::ReadOnlyOption::Safe)
-    || ep.has_probing_peer()
+    || ep.has_lagging_peer()
   {
     return false;
   }
@@ -102,19 +103,8 @@ where
   if commit != ep.applied_index() {
     return false;
   }
-  let Some(mine) = ep.peer_progress(&ep.id()) else {
-    return false;
-  };
-  let last = mine.match_index;
-  if last != commit {
-    return false;
-  }
-  let conf = ep.conf_state();
-  conf
-    .voters()
-    .iter()
-    .chain(conf.voters_outgoing().iter())
-    .all(|v| ep.peer_progress(v).is_some_and(|p| p.match_index == last))
+  ep.peer_progress(&ep.id())
+    .is_some_and(|mine| mine.match_index == commit)
 }
 
 /// Cross-thread observability for a multi driver: the driver republishes the shared engine's

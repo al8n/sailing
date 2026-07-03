@@ -1130,7 +1130,7 @@ where
 
   /// Whether a delivered message is WAKE-class for its group. The absorbed complement is exactly
   /// `HeartbeatResponse` — with the heartbeat-response append pump gated and quiesce eligibility
-  /// excluding probing peers, a quiescing group's FINAL flagged round is precisely
+  /// excluding lagging peers, a quiescing group's FINAL flagged round is precisely
   /// `Heartbeat` + `HeartbeatResponse`, so absorbing that one response is all it takes for the
   /// round to die out instead of re-waking either side (see [`GroupControl::Wake`] for the
   /// safety argument).

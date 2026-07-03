@@ -2197,13 +2197,14 @@ fn heartbeat_response_pump_gated_on_responder_behind() {
   );
 }
 
-/// `has_probing_peer` — the quiesce-eligibility read: true on a leader while ANY tracked peer
-/// (self excluded) probes, false once every peer replicates, false on a non-leader (whose
-/// tracker holds fresh probe-state entries that describe nothing). A probing peer at FULL match
-/// stays true — an equal-match ack does not promote it to Replicate, so it keeps drawing the
-/// gated heartbeat-response pump every round, exactly the shape that must block quiescence.
+/// `has_lagging_peer` — the quiesce-eligibility read: true on a leader while ANY tracked peer
+/// (self excluded) probes or trails the leader's durable last index, false once every peer
+/// replicates at full match, false on a non-leader (whose tracker holds fresh probe-state
+/// entries that describe nothing). A probing peer at FULL match stays true — an equal-match ack
+/// does not promote it to Replicate, so it keeps drawing the gated heartbeat-response pump every
+/// round, exactly the shape that must block quiescence.
 #[test]
-fn has_probing_peer_reflects_probe_state_on_the_leader() {
+fn has_lagging_peer_reflects_probe_state_on_the_leader() {
   use crate::{Index, Message, Term};
 
   // A fresh follower reports false even though its tracker holds probe-state entries.
@@ -2217,19 +2218,19 @@ fn has_probing_peer_reflects_probe_state_on_the_leader() {
   let follower: Endpoint<u64, CountSm> =
     Endpoint::new(follower_cfg, Instant::ORIGIN, 7, CountSm::default());
   assert!(
-    !follower.has_probing_peer(),
-    "a non-leader reports no probing peer"
+    !follower.has_lagging_peer(),
+    "a non-leader reports no lagging peer"
   );
 
   // The 3-voter leader: peer 2 acked (Replicate), peer 3 never acked (Probe, behind).
   let (mut ep, mut log, mut stable, d) = make_three_node_leader();
   assert!(ep.tracker.progress(&3u64).unwrap().state().is_probe());
   assert!(
-    ep.has_probing_peer(),
+    ep.has_lagging_peer(),
     "an unacked peer probes — the leader must not quiesce"
   );
 
-  // Peer 3's ADVANCING ack promotes it to Replicate: no probing peer remains.
+  // Peer 3's ADVANCING ack promotes it to Replicate at full match: no lagging peer remains.
   ep.handle_message(
     d,
     &mut log,
@@ -2246,8 +2247,8 @@ fn has_probing_peer_reflects_probe_state_on_the_leader() {
   );
   assert!(ep.tracker.progress(&3u64).unwrap().state().is_replicate());
   assert!(
-    !ep.has_probing_peer(),
-    "every peer replicating clears the predicate"
+    !ep.has_lagging_peer(),
+    "every peer replicating at full match clears the predicate"
   );
 
   // A peer regressed to Probe AT FULL MATCH still reports true, and an EQUAL-match ack does not
@@ -2255,7 +2256,7 @@ fn has_probing_peer_reflects_probe_state_on_the_leader() {
   if let Some(p) = ep.tracker.progress_mut(&2u64) {
     p.become_probe();
   }
-  assert!(ep.has_probing_peer(), "probing at full match still blocks");
+  assert!(ep.has_lagging_peer(), "probing at full match still blocks");
   ep.handle_message(
     d,
     &mut log,
@@ -2271,8 +2272,145 @@ fn has_probing_peer_reflects_probe_state_on_the_leader() {
     )),
   );
   assert!(
-    ep.has_probing_peer(),
+    ep.has_lagging_peer(),
     "an equal-match ack does not promote — the peer keeps probing"
+  );
+}
+
+/// A LEARNER counts: the heartbeat-response append pump is per-responder and role-blind, so a
+/// Replicate learner whose match trails the leader's last index draws catch-up appends on every
+/// heartbeat response exactly like a behind voter — `has_lagging_peer` must stay true for it (a
+/// probe-only read misses precisely this shape, and a leader that quiesced over it would strand
+/// the learner: its catch-up is response-driven, and a quiesced leader stops beating). Only every
+/// tracked peer — learner included — replicating at full match clears the predicate.
+#[test]
+fn has_lagging_peer_counts_a_behind_replicate_learner() {
+  use crate::{ConfChange, ConfChangeType, Index, Message, Term};
+
+  // 3-voter leader with the no-op@1 committed; bring peer 3 to full match too.
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert!(!ep.has_lagging_peer(), "all voters at full match");
+
+  // Add learner 4: the ConfChange entry @2 commits via the voters' acks and folds at apply.
+  ep.propose_conf_change(
+    d,
+    &mut log,
+    &stable,
+    ConfChange::new(ConfChangeType::AddLearnerNode, 4u64, bytes::Bytes::new()),
+  )
+  .expect("AddLearnerNode(4) must be accepted");
+  ep.handle_storage(d, &mut log, &mut stable);
+  for peer in [2u64, 3u64] {
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      peer,
+      Message::AppendResponse(AppendResponse::new(
+        Term::new(1),
+        peer,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        Index::new(2),
+      )),
+    );
+  }
+  ep.handle_storage(d, &mut log, &mut stable);
+
+  // The fresh learner probes from zero: lagging (probe leg).
+  assert!(ep.tracker.progress(&4u64).unwrap().state().is_probe());
+  assert!(ep.has_lagging_peer(), "a probing learner blocks");
+
+  // An ADVANCING ack short of the tail promotes the learner to Replicate — still one entry
+  // behind, so it still draws the pump and must still read as lagging (match leg).
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    4u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      4u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert!(ep.tracker.progress(&4u64).unwrap().state().is_replicate());
+  assert!(
+    ep.has_lagging_peer(),
+    "a behind Replicate learner still draws catch-up appends — it must block"
+  );
+
+  // The learner reaches the tail: every tracked peer is caught up and replicating.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    4u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      4u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert!(
+    !ep.has_lagging_peer(),
+    "every tracked peer caught up — learner included — clears the predicate"
+  );
+}
+
+/// A Snapshot-state peer blocks on the STATE leg alone: the leader owes it the paced
+/// `InstallSnapshot` resend regardless of `match`, so the pending boundary is deliberately set
+/// PAST the peer's full match here to prove the leg does not lean on the match comparison (in
+/// live flows a Snapshot peer is also behind the durable last index, so both legs fire).
+#[test]
+fn has_lagging_peer_counts_a_snapshot_state_peer() {
+  use crate::{Index, Message, Term};
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert!(!ep.has_lagging_peer(), "all voters at full match");
+
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_snapshot(Index::new(5), 9);
+  }
+  assert!(ep.tracker.progress(&2u64).unwrap().state().is_snapshot());
+  assert!(
+    ep.has_lagging_peer(),
+    "a Snapshot-state peer still owes the blob resend — it must block"
   );
 }
 
