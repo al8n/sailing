@@ -77,7 +77,7 @@ fn binds_peer_on_validation_and_routes() {
   pump(&mut router, id, &mut peer);
   let mut got = Vec::new();
   peer.poll_decoded(&mut got).unwrap();
-  let got: std::vec::Vec<_> = got.into_iter().map(|(_, m)| m).collect();
+  let got: std::vec::Vec<_> = got.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(got, std::vec![hb(10)]);
 }
 
@@ -101,7 +101,7 @@ fn decodes_inbound_messages_with_their_peer() {
       .handle_conn_data(id, &back, false, Instant::ORIGIN, &mut delivered)
       .unwrap();
   }
-  assert_eq!(delivered, std::vec![(bytes::Bytes::new(), 7, hb(7))]);
+  assert_eq!(delivered, std::vec![(bytes::Bytes::new(), 0u8, 7, hb(7))]);
 }
 
 #[test]

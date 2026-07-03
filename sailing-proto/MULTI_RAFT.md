@@ -124,9 +124,9 @@ group id is the `GroupId`'s `Data` encoding, bounded 1..=1024 bytes and enforced
 fixed u64. Because `LABEL_VERSION` fences mixed-version peers at the connection hello, this
 was a clean break: the version byte was RESET to 1 as the group-tagged baseline (nothing is
 published; the pre-group formats burned 1..=5, and a byte must never be reused once anything
-ships). The header's front-of-payload position composes into a future coalesced layout
-`[len][(group_len, group, msg_len, msg)*]` behind another version bump — which a
-protobuf-embedded tag could not.
+ships). The header's front-of-payload position composed directly into the coalesced control
+frame that landed in Phase 4 — `[len][0xFFFF][(flags, group_len, group, msg_len, msg)+]`, WIRE.md
+§3.1, behind the version-2 hello bump — which a protobuf-embedded tag could not have.
 
 ## Phased roadmap
 
@@ -137,7 +137,7 @@ protobuf-embedded tag could not.
 | **2** (done) | Shared storage engine: the in-memory reference `GroupEngine` — every group's stores behind per-group staged-until-flush handles, ONE `flush()` barrier covering all groups' writes (the fsync amortization), per-group completion FIFOs and boot epochs. A disk engine in driver-land mirrors this contract | `sailing-proto` `multi::engine` |
 | **3** | Shared reactor host (the I/O layer: real sockets/timers, `flush()` becomes the fsync point): ready-set scheduler + a `deadlines()` timing wheel + a group-keyed client `Handle` | `sailing-reactor` |
 | **3b** | Sharded compio host: shard-per-core `MultiRaft` + per-core engine shards (a per-core WAL — no cross-core fsync contention); cross-core handoff at the TRANSPORT EDGE only, since a peer connection stays core-owned (per-core connections would fight the router's one-conn-per-peer model) | `sailing-compio` |
-| **4** | Heartbeat coalescing + quiescence (idle-group scale win) | transport + reactor |
+| **4** (done) | Heartbeat coalescing + quiescence (idle-group scale win): one coalesced control frame per node pair per crank, idle groups stop exchanging beats entirely (any traffic or a connection loss wakes them) | transport + reactor |
 | **5** | Dynamic create/destroy via the store FSM | `multi` + reactor |
 | **6** (deferred) | Snapshot-bootstrapped group creation; split / merge | separate project |
 

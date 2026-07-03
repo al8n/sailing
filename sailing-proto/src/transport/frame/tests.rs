@@ -243,3 +243,212 @@ fn group_header_rejects_length_past_end() {
     Err(TransportError::Decode)
   ));
 }
+
+/// A payload with the marker and `entries` coalesced records, as a sender builds it.
+fn coalesced_payload(entries: &[(u8, &[u8], &[u8])]) -> Vec<u8> {
+  let mut payload = Vec::new();
+  write_coalesced_marker(&mut payload);
+  for (flags, group, msg) in entries {
+    write_coalesced_entry(*flags, group, msg, &mut payload);
+  }
+  payload
+}
+
+#[test]
+fn coalesced_one_entry_round_trips() {
+  let payload = coalesced_payload(&[(COALESCED_FLAG_QUIESCE, b"grp-id", b"the-message")]);
+  // Full wire cycle: frame it, reassemble it, split the entries back out.
+  let mut wire = Vec::new();
+  encode_frame(&payload, &mut wire);
+  let mut dec = FrameDecoder::new();
+  dec.push(&wire);
+  let frame = dec.poll().unwrap().expect("one complete frame");
+  assert!(is_coalesced_frame(&frame));
+  let entries = split_coalesced(frame).expect("well-formed");
+  assert_eq!(entries.len(), 1);
+  assert_eq!(entries[0].0, COALESCED_FLAG_QUIESCE);
+  assert_eq!(&entries[0].1[..], b"grp-id");
+  assert_eq!(&entries[0].2[..], b"the-message");
+}
+
+#[test]
+fn coalesced_two_entry_frame_matches_golden_bytes() {
+  let payload = coalesced_payload(&[
+    (0x01, &[0xAA], &[0x01, 0x02]),
+    (0x00, &[0xBB, 0xCC], &[0x03]),
+  ]);
+  // Golden: [marker FF FF] then per entry [flags][u16 BE group_len][group][u32 BE msg_len][msg].
+  #[rustfmt::skip]
+  let golden: &[u8] = &[
+    0xFF, 0xFF,
+    0x01, 0x00, 0x01, 0xAA, 0x00, 0x00, 0x00, 0x02, 0x01, 0x02,
+    0x00, 0x00, 0x02, 0xBB, 0xCC, 0x00, 0x00, 0x00, 0x01, 0x03,
+  ];
+  assert_eq!(&payload[..], golden, "the coalesced layout is byte-exact");
+  let entries = split_coalesced(Bytes::from(payload)).expect("well-formed");
+  assert_eq!(entries.len(), 2);
+  assert_eq!(
+    (entries[0].0, &entries[0].1[..], &entries[0].2[..]),
+    (0x01, &[0xAA][..], &[0x01, 0x02][..])
+  );
+  assert_eq!(
+    (entries[1].0, &entries[1].1[..], &entries[1].2[..]),
+    (0x00, &[0xBB, 0xCC][..], &[0x03][..])
+  );
+}
+
+#[test]
+fn coalesced_many_entries_round_trip() {
+  let groups: Vec<Vec<u8>> = (0u16..40).map(|i| i.to_be_bytes().to_vec()).collect();
+  let msgs: Vec<Vec<u8>> = (0u8..40).map(|i| std::vec![i; 1 + i as usize]).collect();
+  let mut payload = Vec::new();
+  write_coalesced_marker(&mut payload);
+  for i in 0..40 {
+    write_coalesced_entry((i % 2) as u8, &groups[i], &msgs[i], &mut payload);
+  }
+  let entries = split_coalesced(Bytes::from(payload)).expect("well-formed");
+  assert_eq!(entries.len(), 40);
+  for (i, (flags, group, msg)) in entries.iter().enumerate() {
+    assert_eq!(*flags, (i % 2) as u8, "entry {i} flags");
+    assert_eq!(&group[..], &groups[i][..], "entry {i} group");
+    assert_eq!(&msg[..], &msgs[i][..], "entry {i} message");
+  }
+}
+
+#[test]
+fn coalesced_rejects_missing_marker_and_empty_list() {
+  // A single-message payload (group header first) is not a coalesced frame.
+  let mut normal = Vec::new();
+  write_group_header(b"grp", &mut normal);
+  normal.extend_from_slice(b"msg");
+  assert!(!is_coalesced_frame(&normal));
+  assert!(matches!(
+    split_coalesced(Bytes::from(normal)),
+    Err(TransportError::Decode)
+  ));
+  // A bare marker with no entries is an empty list, not a valid frame.
+  assert!(matches!(
+    split_coalesced(Bytes::from_static(&[0xFF, 0xFF])),
+    Err(TransportError::Decode)
+  ));
+  // As is anything shorter than the marker itself.
+  assert!(matches!(
+    split_coalesced(Bytes::from_static(&[0xFF])),
+    Err(TransportError::Decode)
+  ));
+}
+
+#[test]
+fn coalesced_rejects_truncated_entries() {
+  let whole = coalesced_payload(&[(0x00, b"gg", b"mm"), (0x01, b"hh", b"nn")]);
+  // Every strict prefix that still carries the marker must reject: a cut anywhere inside an entry
+  // is a truncated entry, and a cut at an entry boundary is caught by the second entry vanishing
+  // only when the cut also removed it entirely (those prefixes are themselves valid ONE-entry
+  // frames — the boundary cut after entry 1 is the single valid shorter form).
+  let entry1_end = 2 + (1 + 2 + 2 + 4 + 2);
+  for cut in 2..whole.len() {
+    let prefix = Bytes::copy_from_slice(&whole[..cut]);
+    if cut == entry1_end {
+      assert_eq!(split_coalesced(prefix).expect("entry boundary").len(), 1);
+    } else {
+      assert!(
+        matches!(split_coalesced(prefix), Err(TransportError::Decode)),
+        "cut {cut} must reject as truncated"
+      );
+    }
+  }
+}
+
+#[test]
+fn coalesced_rejects_zero_and_oversized_group_lengths() {
+  // group_len == 0: the empty single-group tag never rides a coalesced frame.
+  let mut zero = std::vec![0xFF, 0xFF, 0x00];
+  zero.extend_from_slice(&0u16.to_be_bytes());
+  zero.extend_from_slice(&0u32.to_be_bytes());
+  assert!(matches!(
+    split_coalesced(Bytes::from(zero)),
+    Err(TransportError::Decode)
+  ));
+  // group_len == MAX_GROUP_ID_LEN + 1, with every declared byte present — the bound trips.
+  let over = crate::wire::MAX_GROUP_ID_LEN + 1;
+  let mut big = std::vec![0xFF, 0xFF, 0x00];
+  big.extend_from_slice(&(over as u16).to_be_bytes());
+  big.extend_from_slice(&std::vec![0xAB; over]);
+  big.extend_from_slice(&0u32.to_be_bytes());
+  assert!(matches!(
+    split_coalesced(Bytes::from(big)),
+    Err(TransportError::Decode)
+  ));
+  // The bound is inclusive: exactly MAX_GROUP_ID_LEN splits cleanly.
+  let mut ok = std::vec![0xFF, 0xFF, 0x00];
+  ok.extend_from_slice(&(crate::wire::MAX_GROUP_ID_LEN as u16).to_be_bytes());
+  ok.extend_from_slice(&std::vec![0xAB; crate::wire::MAX_GROUP_ID_LEN]);
+  ok.extend_from_slice(&1u32.to_be_bytes());
+  ok.push(0x77);
+  let entries = split_coalesced(Bytes::from(ok)).expect("at the bound");
+  assert_eq!(entries[0].1.len(), crate::wire::MAX_GROUP_ID_LEN);
+  assert_eq!(&entries[0].2[..], &[0x77]);
+}
+
+#[test]
+fn coalesced_rejects_msg_len_overrunning_the_frame() {
+  // The entry declares a 100-byte message but only 2 bytes follow.
+  let mut bad = std::vec![0xFF, 0xFF, 0x00, 0x00, 0x01, 0xAA];
+  bad.extend_from_slice(&100u32.to_be_bytes());
+  bad.extend_from_slice(&[1, 2]);
+  assert!(matches!(
+    split_coalesced(Bytes::from(bad)),
+    Err(TransportError::Decode)
+  ));
+}
+
+/// The send budget is also the receive bound: one otherwise-valid frame of minimal entries under
+/// the 64 MiB frame cap would otherwise materialize millions of slice tuples before the first
+/// message decode could reject (an authenticated-peer allocation amplification).
+#[test]
+fn coalesced_rejects_payload_over_the_budget() {
+  // Minimal 9-byte entries (1 flags + 2 group_len + 1 group + 4 msg_len + 1 msg), repeated past
+  // the budget: structurally valid, rejected on size alone.
+  let mut payload = Vec::new();
+  write_coalesced_marker(&mut payload);
+  while payload.len() <= 2 + COALESCED_FRAME_BUDGET {
+    write_coalesced_entry(0, b"g", b"m", &mut payload);
+  }
+  assert!(matches!(
+    split_coalesced(Bytes::from(payload)),
+    Err(TransportError::Decode)
+  ));
+
+  // A frame at the budget still parses: the bound rejects only what a conforming sender never
+  // produces.
+  let mut ok = Vec::new();
+  write_coalesced_marker(&mut ok);
+  while ok.len() + 9 <= 2 + COALESCED_FRAME_BUDGET {
+    write_coalesced_entry(0, b"g", b"m", &mut ok);
+  }
+  let entries = split_coalesced(Bytes::from(ok)).expect("within budget");
+  assert!(!entries.is_empty());
+}
+
+#[test]
+fn coalesced_rejects_trailing_garbage() {
+  // One complete entry, then a remainder too short to be an entry prefix.
+  let mut tail = coalesced_payload(&[(0x00, b"gg", b"mm")]);
+  tail.extend_from_slice(&[0x00, 0x00]);
+  assert!(matches!(
+    split_coalesced(Bytes::from(tail)),
+    Err(TransportError::Decode)
+  ));
+}
+
+/// The marker and a group length are DISJOINT: handing a coalesced frame to the single-message
+/// parser must error (0xFFFF is over the group-length bound), never alias as a group tag — and the
+/// reverse hand-off errors too.
+#[test]
+fn coalesced_marker_and_group_length_are_disjoint() {
+  let coalesced = coalesced_payload(&[(0x00, b"grp", b"msg")]);
+  assert!(matches!(
+    split_group_header(Bytes::from(coalesced)),
+    Err(TransportError::Decode)
+  ));
+}

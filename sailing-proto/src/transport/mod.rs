@@ -23,7 +23,7 @@ mod stream;
 mod tls;
 
 #[cfg(feature = "tcp")]
-pub use coordinator::{GroupStores, MultiStreamCoordinator, StreamCoordinator};
+pub use coordinator::{GroupControl, GroupStores, MultiStreamCoordinator, StreamCoordinator};
 #[cfg(feature = "tcp")]
 pub use labeled::{LabelOptions, Labeled};
 #[cfg(feature = "tcp")]
@@ -32,6 +32,11 @@ pub use passthrough::Passthrough;
 pub use stream::{Intake, RecordIo, StreamTransport};
 #[cfg(feature = "tls")]
 pub use tls::TlsRecords;
+
+/// One batched control entry bound for a coalesced frame: `(entry flags, encoded group tag,
+/// message)` — the shape the multi coordinators batch per peer and the conn/bridge seams encode.
+#[cfg(feature = "tcp")]
+pub(crate) type CoalescedEntry<I> = (u8, std::vec::Vec<u8>, crate::Message<I>);
 
 /// Release excess capacity from a FULLY-DRAINED buffer that once absorbed a large burst.
 ///

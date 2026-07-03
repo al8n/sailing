@@ -307,6 +307,138 @@ fn zero_group_host_never_binds() {
   );
 }
 
+/// Drain every queued group control from a coordinator.
+fn drain_controls(c: &mut MCoord) -> Vec<(u64, crate::GroupControl)> {
+  let mut controls = Vec::new();
+  while let Some(ctrl) = c.poll_group_control() {
+    controls.push(ctrl);
+  }
+  controls
+}
+
+/// The quiesce round-trip over QUIC: `mark_quiescing` stamps the group's next beat (the intent is
+/// consumed by that broadcast), the flag surfaces exactly one `GroupControl::Quiesce` on the
+/// follower — AFTER the beat's own `Wake`, so folding in order nets quiesced — the co-located
+/// group's beat rides the same crank untouched, and the returning `HeartbeatResponse`s wake
+/// NOTHING on the leader (the flap-free property that lets a quiesced leader stay quiesced).
+#[test]
+fn quiesce_flag_round_trips_over_quic() {
+  use crate::GroupControl;
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut a = multi_coord(&ca, 1, cluster);
+  let mut b = multi_coord(&ca, 2, cluster);
+  for g in [100u64, 200] {
+    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
+      .unwrap();
+    b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
+      .unwrap();
+  }
+  let mut sa = group_stores(&[100, 200]);
+  let mut sb = group_stores(&[100, 200]);
+  let mut now = Instant::ORIGIN;
+
+  a.connect(now, addr(2), 2u64).expect("dial");
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 100, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  let _ = drain_controls(&mut a); // drop the election-era controls
+  let _ = drain_controls(&mut b);
+
+  a.mark_quiescing(&100);
+  assert!(a.is_quiescing(&100));
+  // Fire BOTH leaders' heartbeat timers in one crank; the beats coalesce at the transmit drain.
+  let d100 = a.group(&100).unwrap().poll_timeout().unwrap();
+  let d200 = a.group(&200).unwrap().poll_timeout().unwrap();
+  now = now.max(d100).max(d200);
+  {
+    let (l, s) = sa.stores(&100).unwrap();
+    a.handle_timeout(&100, now, l, s).unwrap();
+  }
+  {
+    let (l, s) = sa.stores(&200).unwrap();
+    a.handle_timeout(&200, now, l, s).unwrap();
+  }
+  assert!(
+    !a.is_quiescing(&100),
+    "the intent is consumed by the stamped broadcast"
+  );
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+
+  let controls = drain_controls(&mut b);
+  assert_eq!(
+    controls,
+    std::vec![
+      (100, GroupControl::Wake),
+      (100, GroupControl::Quiesce),
+      (200, GroupControl::Wake),
+    ],
+    "both beats delivered; only the flagged group quiesces, ordered flag-last"
+  );
+  assert_eq!(
+    drain_controls(&mut a),
+    Vec::new(),
+    "HeartbeatResponses are absorbed: no Wake for the quiescing leader"
+  );
+  assert!(
+    a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
+    "the shared connection survived the coalesced exchange"
+  );
+}
+
+/// A coalesced entry for a group the receiver no longer hosts is dropped ENTRY by entry over
+/// QUIC: the co-located group's beat in the same frame still dispatches and the shared connection
+/// survives.
+#[test]
+fn unhosted_coalesced_entry_drops_over_quic() {
+  use crate::GroupControl;
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut a = multi_coord(&ca, 1, cluster);
+  let mut b = multi_coord(&ca, 2, cluster);
+  for g in [100u64, 200] {
+    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
+      .unwrap();
+    b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
+      .unwrap();
+  }
+  let mut sa = group_stores(&[100, 200]);
+  let mut sb = group_stores(&[100, 200]);
+  let mut now = Instant::ORIGIN;
+
+  a.connect(now, addr(2), 2u64).expect("dial");
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 100, now);
+  now = elect_a(&mut a, &mut b, &mut sa, &mut sb, 200, now);
+  let _ = drain_controls(&mut b);
+
+  // b de-hosts group 200; a (unaware) keeps beating both groups in one coalesced frame.
+  assert!(b.remove_group(&200).is_some());
+  let d100 = a.group(&100).unwrap().poll_timeout().unwrap();
+  let d200 = a.group(&200).unwrap().poll_timeout().unwrap();
+  now = now.max(d100).max(d200);
+  {
+    let (l, s) = sa.stores(&100).unwrap();
+    a.handle_timeout(&100, now, l, s).unwrap();
+  }
+  {
+    let (l, s) = sa.stores(&200).unwrap();
+    a.handle_timeout(&200, now, l, s).unwrap();
+  }
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+
+  let controls = drain_controls(&mut b);
+  assert_eq!(
+    controls,
+    std::vec![(100, GroupControl::Wake)],
+    "the hosted entry dispatched; the de-hosted one dropped silently"
+  );
+  assert!(
+    a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
+    "an unhosted entry never costs the shared connection"
+  );
+}
+
 /// A zero-group host CLOSES a preface-bearing connection immediately (the preface was already
 /// consumed, so it could never validate) — admission plus a fresh dial therefore recover well
 /// WITHIN the auth-deadline window, with no reap wait.

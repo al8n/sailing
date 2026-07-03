@@ -162,6 +162,39 @@ Each `Message` rides one frame:
   frame-by-frame: the shared connection survives for co-located groups, and the sender's retries
   cover the gap (a group being created/removed).
 
+### 3.1 The coalesced control frame (multi-group hosts)
+
+A multi-group sender may batch several groups' control messages to the same peer into ONE frame
+(one syscall, one length prefix). A coalesced frame reuses the `[u32 length]` transport framing;
+its payload opens with the `u16` big-endian marker `0xFFFF` followed by one or more entries:
+
+```text
+[ 0xFF 0xFF ][ entry ]+    entry = [ u8 flags ][ u16 group length, BE (1..=1024) ][ group id bytes ][ u32 message length, BE ][ one encoded sailing.v1.Message ]
+```
+
+- **The marker cannot alias a group length.** A single-message payload opens with its group length,
+  bounded 0..=1024 — `0xFFFF` is outside that range, so the two payload forms are disjoint at the
+  first two bytes: a pre-coalescing parser handed a coalesced frame errors (closing the connection)
+  rather than mis-reading it, and §4's `LABEL_VERSION` fence rejects such a peer at the hello before
+  any frame flows. Version 2 of the hello is the coalescing baseline; ALL nodes of a cluster must be
+  upgraded together (the hello fences a mixed deployment into refusing connections, never
+  mis-decoding).
+- `flags` bit 0 is QUIESCE: the sender stops exchanging this group's heartbeats after this beat, and
+  the receiver's driver may stop arming the group's timers until traffic or a connection loss wakes
+  it. All other bits must be zero on encode and are ignored on decode (forward room).
+- Every entry carries a NON-empty group tag (`1..=1024` bytes): coalescing is a multi-group feature,
+  so a single-group host closes on any coalesced frame — the same policy as any non-empty tag. A
+  well-formed entry for a group the host does not carry is dropped ENTRY-by-entry; the frame's other
+  entries still deliver and the connection survives.
+- A malformed coalesced payload closes the connection: a truncated entry, a group length of zero or
+  over the bound, a message length overrunning the frame, an empty entry list, or trailing bytes
+  after the last complete entry.
+- **Policy: only `Heartbeat` and `HeartbeatResponse` ride coalesced frames.** The frame layer is
+  payload-agnostic, but the built-in senders coalesce exactly the heartbeat pair — every other
+  message (AppendEntries, votes, snapshots, reads) keeps its own frame. Senders flush a coalesced
+  frame before its payload would exceed 64 KiB (`COALESCED_FRAME_BUDGET` — thousands of heartbeats,
+  never anywhere near the 64 MiB frame bound).
+
 ## 4. The `Labeled` hello (`tcp`/`tls`/`quic` features)
 
 One-time, before any application frame, in each direction:

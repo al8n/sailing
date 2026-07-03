@@ -43,12 +43,66 @@ pub(crate) fn rejected<I>(e: impl core::fmt::Display) -> DriverError<I> {
   }
 }
 
-/// Cross-thread observability for a multi driver's shared engine: the driver republishes the
-/// engine's [`flushes`](sailing_proto::GroupEngine::flushes) /
-/// [`ops_flushed`](sailing_proto::GroupEngine::ops_flushed) counters after every storage crank, so
-/// a test or operator thread can watch the fsync-amortization ratio (operations per barrier)
-/// while the driver task exclusively owns the engine. Obtain it from the driver BEFORE spawning
-/// `run()` (e.g. `driver.engine_metrics()`); clones share the counters.
+/// A group's last OBSERVED consensus state and the instant it last changed — the idle clock the
+/// quiesce sweep reads. State observation (rather than dispatch counting) is the activity signal
+/// because an idle group's heartbeat exchange dispatches forever without changing any of these.
+pub(crate) struct GroupActivity {
+  pub(crate) term: sailing_proto::Term,
+  pub(crate) commit: sailing_proto::Index,
+  pub(crate) applied: sailing_proto::Index,
+  pub(crate) at: std::time::Instant,
+}
+
+/// Whether a group's CONSENSUS state is quiesce-eligible on the leader: this node leads it in the
+/// `Safe` read mode (the lease modes are ineligible in v1 — a LeaseGuard/LeaseBased leader must
+/// keep renewing through heartbeat rounds), every voter in BOTH joint halves has matched the
+/// leader's own durable last index, and that index is fully committed AND applied — nothing is in
+/// flight anywhere. The leader's own [`peer_progress`](sailing_proto::Endpoint::peer_progress)
+/// match is the durable-last read (public surface): it equals the log's last index exactly when
+/// every local append is durable, an extra conservatism consistent with idleness. Learners are
+/// deliberately NOT gated on (a catching-up learner's appends are response-driven, not
+/// timer-driven, so quiescence does not stall it); a learner-aware refinement is a seam.
+///
+/// The driver adds its own conditions on top: no parked driver work for the group and a full
+/// election timeout of observed inactivity.
+pub(crate) fn group_idle<I, F>(ep: &sailing_proto::Endpoint<I, F>) -> bool
+where
+  I: sailing_proto::NodeId,
+  F: sailing_proto::StateMachine,
+{
+  if ep.is_poisoned()
+    || !ep.role().is_leader()
+    || !matches!(ep.active_read_mode(), sailing_proto::ReadOnlyOption::Safe)
+  {
+    return false;
+  }
+  let commit = ep.commit_index();
+  if commit != ep.applied_index() {
+    return false;
+  }
+  let Some(mine) = ep.peer_progress(&ep.id()) else {
+    return false;
+  };
+  let last = mine.match_index;
+  if last != commit {
+    return false;
+  }
+  let conf = ep.conf_state();
+  conf
+    .voters()
+    .iter()
+    .chain(conf.voters_outgoing().iter())
+    .all(|v| ep.peer_progress(v).is_some_and(|p| p.match_index == last))
+}
+
+/// Cross-thread observability for a multi driver: the driver republishes the shared engine's
+/// [`flushes`](sailing_proto::GroupEngine::flushes) /
+/// [`ops_flushed`](sailing_proto::GroupEngine::ops_flushed) counters after every storage crank —
+/// so a test or operator thread can watch the fsync-amortization ratio (operations per barrier)
+/// while the driver task exclusively owns the engine — plus the QUIESCED-group gauge the driver's
+/// scheduler maintains (idle groups whose timers it neither arms nor sweeps), published after
+/// every quiesce sweep. Obtain it from the driver BEFORE spawning `run()` (e.g.
+/// `driver.engine_metrics()`); clones share the counters.
 #[derive(Clone, Default)]
 pub struct EngineMetrics {
   inner: Arc<EngineMetricsInner>,
@@ -58,6 +112,7 @@ pub struct EngineMetrics {
 struct EngineMetricsInner {
   flushes: AtomicU64,
   ops_flushed: AtomicU64,
+  quiesced_groups: AtomicU64,
 }
 
 impl EngineMetrics {
@@ -75,9 +130,24 @@ impl EngineMetrics {
     self.inner.ops_flushed.load(Ordering::Acquire)
   }
 
+  /// The number of hosted groups currently QUIESCED (idle: the driver neither arms nor sweeps
+  /// their consensus deadlines; any traffic, a local command, or a connection loss wakes them).
+  #[must_use]
+  pub fn quiesced_groups(&self) -> u64 {
+    self.inner.quiesced_groups.load(Ordering::Acquire)
+  }
+
   /// Publish the engine's current counters (driver-side, once per crank).
   pub(crate) fn record(&self, flushes: u64, ops_flushed: u64) {
     self.inner.flushes.store(flushes, Ordering::Release);
     self.inner.ops_flushed.store(ops_flushed, Ordering::Release);
+  }
+
+  /// Publish the quiesced-group gauge (driver-side, once per quiesce sweep).
+  pub(crate) fn record_quiesced(&self, quiesced: u64) {
+    self
+      .inner
+      .quiesced_groups
+      .store(quiesced, Ordering::Release);
   }
 }

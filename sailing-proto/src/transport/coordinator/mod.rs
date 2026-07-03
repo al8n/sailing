@@ -13,7 +13,7 @@ use bytes::Bytes;
 use std::vec::Vec;
 
 mod multi;
-pub use multi::{GroupStores, MultiStreamCoordinator};
+pub use multi::{GroupControl, GroupStores, MultiStreamCoordinator};
 
 /// A consensus node speaking over framed reliable connections (`R` is the record layer, e.g.
 /// `Labeled<Passthrough>` for TCP or `Labeled<TlsRecords>` for TLS).
@@ -165,7 +165,10 @@ where
     let _ = self
       .router
       .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
-    for (group, from, msg) in decoded {
+    // The entry flags are a multi-group control surface: every flag-bearing (coalesced) entry
+    // carries a non-empty tag, so the empty-tag-only policy below already closes on all of them —
+    // a single-group host never acts on a flag.
+    for (group, _flags, from, msg) in decoded {
       if !group.is_empty() {
         // A group-tagged frame on a single-group host: the peer is a multi-group node (a
         // deployment-shape mismatch), and feeding it through would inject a foreign group's

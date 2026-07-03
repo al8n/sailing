@@ -5,8 +5,12 @@
 //! `Message<I>`s. Any transport-layer fault closes the connection (`Closed`) without ever touching
 //! the consensus `Endpoint`.
 use super::{
-  TransportError,
-  frame::{FrameDecoder, MAX_FRAME_LEN, encode_frame, split_group_header, write_group_header},
+  CoalescedEntry, TransportError,
+  frame::{
+    COALESCED_FRAME_BUDGET, FrameDecoder, MAX_FRAME_LEN, encode_frame, is_coalesced_frame,
+    split_coalesced, split_group_header, write_coalesced_entry, write_coalesced_marker,
+    write_group_header,
+  },
   stream::{Intake, RecordIo},
 };
 use crate::{CheapClone, Instant, Message, NodeId};
@@ -163,13 +167,18 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     Ok(())
   }
 
-  /// Decode any complete application frames into `out` as `(group_id_bytes, message)` pairs. Yields
-  /// nothing until a peer is bound (`Validated`, or a CLEAN `Closed` retaining the peer for the final
-  /// drain); a frame that is not a group header plus exactly one `Message` closes the connection as
-  /// integrity-suspect. The group id (empty for a single-group host) selects the target Raft group.
+  /// Decode any complete application frames into `out` as `(group_id_bytes, entry_flags, message)`
+  /// triples. Yields nothing until a peer is bound (`Validated`, or a CLEAN `Closed` retaining the
+  /// peer for the final drain); a frame that is not a group header plus exactly one `Message` — or
+  /// a well-formed coalesced control frame — closes the connection as integrity-suspect. The group
+  /// id (empty for a single-group host) selects the target Raft group; a single-message frame
+  /// yields flags `0`, while a coalesced frame expands to one triple per entry carrying that
+  /// entry's flags (the QUIESCE bit — a multi-group control surface a single-group owner never
+  /// sees, since every coalesced entry's tag is non-empty and the empty-tag-only policy closes
+  /// first).
   pub fn poll_decoded(
     &mut self,
-    out: &mut Vec<(bytes::Bytes, Message<I>)>,
+    out: &mut Vec<(bytes::Bytes, u8, Message<I>)>,
   ) -> Result<(), TransportError> {
     if self.peer().is_none() {
       return Ok(());
@@ -187,6 +196,28 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
           return Err(e);
         }
       };
+      if is_coalesced_frame(&frame) {
+        // A coalesced control frame: expand its entries in order, each the same zero-copy
+        // (group, flags, message) shape as a single-message frame. Any malformed entry poisons
+        // the whole frame (the same integrity-suspect close as a malformed envelope).
+        let entries = match split_coalesced(frame) {
+          Ok(entries) => entries,
+          Err(e) => {
+            self.close_suspect();
+            return Err(e);
+          }
+        };
+        for (flags, group, message) in entries {
+          match crate::wire::decode_message::<I>(message) {
+            Ok(msg) => out.push((group, flags, msg)),
+            Err(_) => {
+              self.close_suspect();
+              return Err(TransportError::Decode);
+            }
+          }
+        }
+        continue;
+      }
       // Split the transport's group-demux header off the front; the remainder is the encoded
       // `Message`. The group id selects the target Raft group in a multi-group host; a single-group
       // owner sends an empty tag and ignores it here.
@@ -201,7 +232,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
       // slices the message's `Bytes` fields (entry payloads, blobs, contexts, encoded ids) out
       // of the SAME allocation; a frame must carry exactly one well-formed envelope.
       match crate::wire::decode_message::<I>(message) {
-        Ok(msg) => out.push((group, msg)),
+        Ok(msg) => out.push((group, 0, msg)),
         Err(_) => {
           self.close_suspect();
           return Err(TransportError::Decode);
@@ -213,13 +244,7 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
 
   /// Encode + frame `msg` and queue it for transmission. A closed connection drops the message (it
   /// has no route); the router clears the peer binding so the consensus layer re-routes/retries.
-  ///
-  /// Bounds are enforced BEFORE the frame is built or queued:
-  /// - a payload over [`MAX_FRAME_LEN`] closes the connection (the receiver's frame bound would
-  ///   reject it and kill the connection on every resend — failing at the source avoids a permanent
-  ///   connect/kill flap loop, and keeps the `u32` length prefix exact);
-  /// - a send that would push outbound occupancy past the cap closes the connection (the peer has
-  ///   stopped draining) instead of growing without bound.
+  /// Bounds are enforced per frame by [`emit_frame`](Self::emit_frame) before anything is queued.
   pub fn send_message(&mut self, group: &[u8], msg: &Message<I>) {
     if matches!(self.state, ConnState::Closed { .. }) {
       return;
@@ -227,6 +252,72 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     let mut payload = Vec::new();
     write_group_header(group, &mut payload);
     self.encoder.encode_message(msg, &mut payload);
+    self.emit_frame(&payload);
+  }
+
+  /// Encode + frame a batch of `(flags, encoded_group, message)` entries as COALESCED control
+  /// frames and queue them for transmission — the multi-group heartbeat path (the frame layer is
+  /// payload-agnostic; the caller's policy is what restricts the batch to the heartbeat pair). A
+  /// closed connection drops the batch exactly as [`send_message`](Self::send_message) drops one
+  /// message.
+  ///
+  /// The batch is flushed into a new frame before its payload would exceed
+  /// [`COALESCED_FRAME_BUDGET`] — a HARD cap, because the receiver rejects any coalesced frame
+  /// past the budget. An entry whose encoded size alone exceeds it (the multi coordinators
+  /// pre-size and divert these, so reaching this is a caller bug) falls back to a NORMAL
+  /// single-message frame rather than emitting a coalesced frame every receiver would reject;
+  /// its flags cannot ride a normal frame and are dropped — the safe direction (no false
+  /// quiesce), debug-asserted against. Messages are encoded through the per-connection
+  /// [`crate::wire::MessageEncoder`] as everywhere else (its snapshot-meta cache is simply never
+  /// exercised by heartbeats).
+  pub fn send_coalesced(&mut self, entries: &[CoalescedEntry<I>]) {
+    if matches!(self.state, ConnState::Closed { .. }) || entries.is_empty() {
+      return;
+    }
+    let mut payload = Vec::new();
+    write_coalesced_marker(&mut payload);
+    let mut msg_scratch = Vec::new();
+    for (flags, group, msg) in entries {
+      msg_scratch.clear();
+      self.encoder.encode_message(msg, &mut msg_scratch);
+      let entry_len = 1 + 2 + group.len() + 4 + msg_scratch.len();
+      if entry_len > COALESCED_FRAME_BUDGET {
+        debug_assert!(
+          *flags == 0,
+          "a flagged entry must be pre-sized by its coordinator"
+        );
+        let mut normal = Vec::with_capacity(2 + group.len() + msg_scratch.len());
+        write_group_header(group, &mut normal);
+        normal.extend_from_slice(&msg_scratch);
+        if !self.emit_frame(&normal) {
+          return;
+        }
+        continue;
+      }
+      // Flush the frame under construction before this entry would push it past the budget (a
+      // frame always carries at least one entry — the marker alone is 2 bytes).
+      if payload.len() > 2 && payload.len() + entry_len > COALESCED_FRAME_BUDGET {
+        if !self.emit_frame(&payload) {
+          return; // the frame tripped a bound and closed the connection
+        }
+        payload.clear();
+        write_coalesced_marker(&mut payload);
+      }
+      write_coalesced_entry(*flags, group, &msg_scratch, &mut payload);
+    }
+    if payload.len() > 2 {
+      self.emit_frame(&payload);
+    }
+  }
+
+  /// Frame `payload` and queue it, enforcing the per-frame bounds BEFORE anything is queued.
+  /// Returns whether the frame was accepted (`false` = the connection closed):
+  /// - a payload over [`MAX_FRAME_LEN`] closes the connection (the receiver's frame bound would
+  ///   reject it and kill the connection on every resend — failing at the source avoids a permanent
+  ///   connect/kill flap loop, and keeps the `u32` length prefix exact);
+  /// - a send that would push outbound occupancy past the cap closes the connection (the peer has
+  ///   stopped draining) instead of growing without bound.
+  fn emit_frame(&mut self, payload: &[u8]) -> bool {
     // The bound covers EVERY layer of outbound buffering: this connection's pending frames PLUS
     // whatever the record layer (and its inner layers) already hold — `buffered_outbound` is the
     // occupancy projection that keeps the cap from drifting per layer.
@@ -237,10 +328,11 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
         peer: self.current_peer(),
       };
       self.release_out();
-      return;
+      return false;
     }
-    encode_frame(&payload, &mut self.out_plain);
+    encode_frame(payload, &mut self.out_plain);
     self.drain_out();
+    true
   }
 
   /// Feed pending framed bytes into the record layer, advancing the cursor by exactly the count it

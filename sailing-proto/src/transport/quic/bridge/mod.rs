@@ -40,12 +40,15 @@ use quinn_proto::{
 use rustls::pki_types::CertificateDer;
 
 use super::{
-  super::frame::{MAX_FRAME_LEN, encode_frame, write_group_header},
+  super::frame::{
+    COALESCED_FRAME_BUDGET, MAX_FRAME_LEN, encode_frame, write_coalesced_entry,
+    write_coalesced_marker, write_group_header,
+  },
   MAX_HELLO_LEN,
   conn::{ConnEntry, ConnTable, Phase},
   crypto::QuicOptions,
 };
-use crate::{CheapClone, Message, NodeId, TransportError};
+use crate::{CheapClone, Message, NodeId, TransportError, transport::CoalescedEntry};
 
 /// Maximum number of LIVE connections the bridge keeps for any ONE peer. On validation the bridge
 /// closes the OLDEST same-peer connections beyond this bound, so a flapping or crash-looping
@@ -86,6 +89,17 @@ const MAX_CONN_OUT_BUF: usize = 2 * MAX_FRAME_LEN;
 
 /// Application error code on a locally-issued connection close.
 const CONNECTION_CLOSE_CODE: u32 = 1;
+
+/// Verdict of staging one coalesced frame (`Bridge::stage_coalesced`): whether the batch keeps
+/// going and whether a flush/service pass is owed.
+enum Staging {
+  /// The frame is on the outbound buffer.
+  Staged,
+  /// The frame was over [`MAX_FRAME_LEN`] and was counted + dropped; later frames may still fit.
+  Dropped,
+  /// The connection closed (cap overflow, or the entry vanished) — nothing further can stage.
+  Closed,
+}
 
 /// Application error code on a per-stream RESET (the retire of a violating peer-opened stream).
 const STREAM_RESET_CODE: u32 = 2;
@@ -894,6 +908,89 @@ impl<I: NodeId> Bridge<I> {
     }
     self.flush_outbound(now, h);
     self.needs_service = true;
+  }
+
+  /// Frame-encode a batch of `(flags, encoded_group, message)` entries as COALESCED control frames
+  /// on connection `h`'s send stream — [`write_framed`](Self::write_framed)'s batch counterpart
+  /// (the multi-group heartbeat path), under the same identity gate, the same strict-FIFO staging,
+  /// and the same outbound-cap close. The batch is flushed into a new frame before its payload
+  /// would exceed [`COALESCED_FRAME_BUDGET`] — a HARD cap (the receiver rejects a coalesced frame
+  /// past it): an entry that alone exceeds the budget falls back to a normal frame via
+  /// [`write_framed`](Self::write_framed), its flags dropped (debug-asserted zero — the
+  /// coordinators pre-size flagged entries). Service is deferred to the pump-end `service`,
+  /// exactly as for a per-message write.
+  pub(crate) fn write_coalesced(
+    &mut self,
+    now: Instant,
+    h: ConnectionHandle,
+    entries: &[CoalescedEntry<I>],
+  ) {
+    if !self.is_validated(h) || entries.is_empty() {
+      return;
+    }
+    let mut payload = Vec::new();
+    write_coalesced_marker(&mut payload);
+    let mut msg_scratch = Vec::new();
+    let mut staged = false;
+    for (flags, group, msg) in entries {
+      msg_scratch.clear();
+      self.encoder.encode_message(msg, &mut msg_scratch);
+      let entry_len = 1 + 2 + group.len() + 4 + msg_scratch.len();
+      if entry_len > COALESCED_FRAME_BUDGET {
+        // The receiver hard-rejects a coalesced frame past the budget, so an entry that alone
+        // exceeds it falls back to a normal frame (the coordinators pre-size and divert these —
+        // reaching this is a caller bug; a flag cannot ride a normal frame and drops, the safe
+        // no-false-quiesce direction).
+        debug_assert!(
+          *flags == 0,
+          "a flagged entry must be pre-sized by its coordinator"
+        );
+        self.write_framed(now, h, group, msg);
+        staged = true;
+        continue;
+      }
+      if payload.len() > 2 && payload.len() + entry_len > COALESCED_FRAME_BUDGET {
+        match self.stage_coalesced(now, h, &payload) {
+          Staging::Staged => staged = true,
+          Staging::Dropped => {}
+          Staging::Closed => return,
+        }
+        payload.clear();
+        write_coalesced_marker(&mut payload);
+      }
+      write_coalesced_entry(*flags, group, &msg_scratch, &mut payload);
+    }
+    if payload.len() > 2 {
+      match self.stage_coalesced(now, h, &payload) {
+        Staging::Staged => staged = true,
+        Staging::Dropped | Staging::Closed => {}
+      }
+    }
+    if staged {
+      self.flush_outbound(now, h);
+      self.needs_service = true;
+    }
+  }
+
+  /// Stage one coalesced payload onto `h`'s outbound buffer under [`write_framed`](Self::write_framed)'s
+  /// bounds: over [`MAX_FRAME_LEN`] counts as oversized-dropped (the batch continues), an
+  /// outbound-cap overflow closes the connection (the batch stops).
+  fn stage_coalesced(&mut self, now: Instant, h: ConnectionHandle, payload: &[u8]) -> Staging {
+    if payload.len() > MAX_FRAME_LEN {
+      self.oversized_dropped = self.oversized_dropped.saturating_add(1);
+      return Staging::Dropped;
+    }
+    let mut framed = Vec::new();
+    encode_frame(payload, &mut framed);
+    let Some(e) = self.table.entry(h) else {
+      return Staging::Closed;
+    };
+    if e.outbound.len().saturating_add(framed.len()) > MAX_CONN_OUT_BUF {
+      self.close_local(now, h);
+      return Staging::Closed;
+    }
+    e.outbound.extend(framed);
+    Staging::Staged
   }
 
   /// Run a deferred `service` pass iff the per-message write path marked one — the white-box

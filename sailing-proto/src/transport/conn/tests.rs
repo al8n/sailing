@@ -150,7 +150,7 @@ fn gates_app_frames_until_validated_then_decodes() {
 
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg()]);
 }
 
@@ -163,7 +163,7 @@ fn round_trips_a_message_after_handshake() {
   pump(&mut d, &mut a);
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg()]);
 }
 
@@ -180,7 +180,50 @@ fn round_trips_a_tagged_message() {
   a.poll_decoded(&mut msgs).unwrap();
   assert_eq!(msgs.len(), 1, "exactly one tagged message");
   assert_eq!(&msgs[0].0[..], &tag[..], "the tag bytes survive the wire");
-  assert_eq!(msgs[0].1, sample_msg());
+  assert_eq!(msgs[0].1, 0, "a single-message frame yields flags 0");
+  assert_eq!(msgs[0].2, sample_msg());
+}
+
+/// The coalesced sender's oversized-entry fallback: an entry whose encoded size alone exceeds the
+/// coalesced budget (unreachable from real heartbeat traffic — the wire heartbeat context is an
+/// 8-byte internal token — so this pins the defense-in-depth path with an arbitrary big message)
+/// ships as a NORMAL frame the receiver accepts, while the small entry of the same batch still
+/// delivers; nothing closes.
+#[test]
+fn oversized_coalesced_entry_falls_back_to_a_normal_frame() {
+  let mut d = dialer(7);
+  let mut a = acceptor(9);
+  pump(&mut d, &mut a);
+  let tag = enc_id(42);
+  let big = Message::InstallSnapshot(crate::InstallSnapshot::new(
+    crate::Term::new(1),
+    7u64,
+    crate::SnapshotMeta::new(
+      crate::Index::new(1),
+      crate::Term::new(1),
+      crate::ConfState::from_voters(std::vec![7u64, 9]),
+    ),
+    bytes::Bytes::from(std::vec![0xEE; 80 * 1024]),
+  ));
+  d.send_coalesced(&[
+    (0, tag.clone(), big.clone()),
+    (0, tag.clone(), sample_msg()),
+  ]);
+  pump(&mut d, &mut a);
+  let mut msgs = Vec::new();
+  a.poll_decoded(&mut msgs).unwrap();
+  assert_eq!(msgs.len(), 2, "both entries deliver");
+  assert!(
+    msgs
+      .iter()
+      .any(|(g, f, m)| g[..] == tag[..] && *f == 0 && *m == big),
+    "the oversized entry arrived via a normal frame"
+  );
+  assert!(
+    msgs.iter().any(|(_, _, m)| *m == sample_msg()),
+    "the small entry still delivered"
+  );
+  assert!(!a.is_closed() && !d.is_closed(), "no reject churn");
 }
 
 /// A frame whose group header is valid (empty tag) but whose envelope is bogus closes the
@@ -300,7 +343,7 @@ fn backpressured_write_never_truncates_a_frame() {
   receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
   let mut msgs = Vec::new();
   receiver.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
 }
 
@@ -358,7 +401,7 @@ fn frames_in_the_final_read_before_eof_still_deliver() {
   assert!(a.is_closed());
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(
     msgs,
     std::vec![sample_msg()],
@@ -463,7 +506,7 @@ fn pending_refeed_reassembles_across_a_tiny_receive_buffer() {
   receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
   let mut msgs = Vec::new();
   receiver.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
 }
 
@@ -538,7 +581,7 @@ fn peer_and_poll_decoded_are_inert_while_handshaking() {
   assert_eq!(d.peer(), None, "no peer is bound while handshaking");
   let mut msgs = Vec::new();
   d.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert!(
     msgs.is_empty(),
     "no application frame decodes before validation"
