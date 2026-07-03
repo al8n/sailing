@@ -140,8 +140,24 @@ frame that landed in Phase 4 — `[len][0xFFFF][(flags, group_len, group, msg_le
 | **3** (done) | Shared reactor host (the I/O layer: real sockets/timers, `flush()` becomes the fsync point): the multi stream/QUIC drivers over one shared `GroupEngine` barrier per crank, a quiesce-aware aggregate deadline fold, and the group-keyed client `MultiHandle`/`GroupHandle` | `sailing-reactor` |
 | **3b** | Sharded compio host: shard-per-core `MultiRaft` + per-core engine shards (a per-core WAL — no cross-core fsync contention); cross-core handoff at the TRANSPORT EDGE only, since a peer connection stays core-owned (per-core connections would fight the router's one-conn-per-peer model) | `sailing-compio` |
 | **4** (done) | Heartbeat coalescing + quiescence (idle-group scale win): one coalesced control frame per node pair per crank, idle groups stop exchanging beats entirely (any traffic or a connection loss wakes them) | transport + reactor |
-| **5** (done) | Dynamic group-lifecycle mechanics: coordinator-level TOMBSTONES (a removed id's straggler frames drop silently until re-admission; in-memory by design — the embedder's catalog owns persistence, unlike TiKV/CockroachDB's persisted incarnation-keyed tombstones), UNKNOWN-GROUP surfacing (initial-shaped traffic for an unhosted, untombstoned group → `poll_unknown_group` → the drivers' `LifecycleEvent::UnknownGroup` tail), and the REMOVED-SELF flow (a committed conf change that drops the host from every membership role → `LifecycleEvent::RemovedSelf`; the replica keeps running harmlessly until the app removes it). The PLACEMENT BRAIN is explicitly the embedder's — no auto-create, no auto-teardown; a PD-style external placer and a Cockroach-style local policy are both buildable on exactly these triggers | coordinators + driver + reactor |
-| **6** (deferred) | Snapshot-bootstrapped group creation; split / merge | separate project |
+| **5** (done) | Dynamic group-lifecycle mechanics: coordinator-level TOMBSTONES (a removed id's straggler frames drop silently until re-admission; in-memory by design — the embedder's catalog owns persistence, unlike TiKV/CockroachDB's persisted incarnation-keyed tombstones), UNKNOWN-GROUP surfacing (initial-shaped traffic for an unhosted, untombstoned group → `poll_unknown_group` → the drivers' `LifecycleEvent::UnknownGroup` tail), and the REMOVED-SELF flow (a committed conf change that drops the host from every membership role → `LifecycleEvent::RemovedSelf`; the replica keeps running harmlessly until the app removes it). The PLACEMENT BRAIN is explicitly the embedder's — no auto-create, no auto-teardown | coordinators + driver + reactor |
+| **5b** | Cockroach-shaped auto-materialization: the embedder registers a group FACTORY (`G -> (Config, state machine)`) at bind, and the driver auto-creates a group on GATED unknown-group traffic (the same initial-shape gate Phase 5 surfaces on) — membership decisions then ride ordinary conf changes proposed wherever the embedder's policy lives, with no per-replica application intervention (the `getOrCreateReplica` / `maybe_create_peer` shape both references converge on) | driver + reactor |
+| **6** (deferred) | Snapshot-bootstrapped group creation; split / merge. Epoch doctrine, settled in advance: generations are INTRA-group — allocated by the group's own conf changes and fenced by persisted tombstones carrying a next-incarnation floor (CockroachDB's `NextReplicaID` model) — never by a central allocator | separate project |
+
+**Placement doctrine.** The blessed path is the symmetric, embedded, Cockroach-style policy
+loop: every host runs its own placement decisions against the observability this layer already
+exposes (per-group role/term/commit, the lifecycle tail, quiescence state), the way CockroachDB's
+replicate/split/merge queues run on each store's leaseholders with no separate control plane. A
+PD-style external placer remains *buildable* on the same triggers, but nothing in this design may
+ever REQUIRE one — in particular, no central ID, epoch, or placement allocation.
+
+**Membership-level rejoin (the supported recipe).** A node whose group replica lost its log
+(removed then re-created fresh) must NOT be walked back by the append protocol: the leader's
+progress still carries the old `match`, and the staleness guard rightly drops rejects at or below
+it — under one identity, a durable log must never regress (the same invariant every Raft library
+holds). Rejoin instead goes through membership: conf-change the node OUT and back IN, which
+recreates its leader-side progress at zero and catches it up by snapshot — the membership-level
+analogue of the references' new-replica-ID rule.
 
 Split/merge is deferred hard: it couples the state machine's key range to Raft-group
 identity and needs a transactional handoff. It must not shape the Phase-0 container.
