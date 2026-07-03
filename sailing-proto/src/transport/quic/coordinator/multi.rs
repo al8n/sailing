@@ -308,7 +308,155 @@ where
   {
     let now: Now = now.into();
     let r = self.multi.propose(group, now, log, stable, cmd)?;
-    self.multi.flush_appends(group, now, log, stable);
+    let _ = self.multi.flush_appends(group, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Append a proposal on `group` WITHOUT fanning out its `AppendEntries` now; the caller drives
+  /// replication afterward via [`flush_appends`](Self::flush_appends), once per crank, so a burst
+  /// coalesces into one broadcast per peer. Direct callers should prefer
+  /// [`submit_propose`](Self::submit_propose). `None` if no such group.
+  pub fn submit_propose_deferred<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    cmd: &F::Command,
+  ) -> Option<Result<Index, ProposeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self.multi.propose(group, now, log, stable, cmd)?;
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Ship `group`'s coalesced replication batch and pump. `None` if no such group.
+  pub fn flush_appends<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &L,
+    stable: &S,
+  ) -> Option<()>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    self.multi.flush_appends(group, now, log, stable)?;
+    self.pump(now.mono());
+    Some(())
+  }
+
+  /// Propose a membership change (single-step) on `group`, replicating immediately. `None` if no
+  /// such group.
+  pub fn propose_conf_change<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    cc: crate::ConfChange<I>,
+  ) -> Option<Result<Index, ProposeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self
+      .multi
+      .propose_conf_change(group, now, log, stable, cc)?;
+    let _ = self.multi.flush_appends(group, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Propose a membership change (joint-consensus capable) on `group`, replicating immediately.
+  /// `None` if no such group.
+  pub fn propose_conf_change_v2<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    cc: crate::ConfChangeV2<I>,
+  ) -> Option<Result<Index, ProposeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self
+      .multi
+      .propose_conf_change_v2(group, now, log, stable, cc)?;
+    let _ = self.multi.flush_appends(group, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Propose a cluster-wide read-mode migration on `group`, replicating immediately. `None` if no
+  /// such group.
+  pub fn propose_read_mode_change<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    mode: crate::ReadOnlyOption,
+  ) -> Option<Result<Index, ProposeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self
+      .multi
+      .propose_read_mode_change(group, now, log, stable, mode)?;
+    let _ = self.multi.flush_appends(group, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
+  /// [`poll_event`](Self::poll_event) stamped with the group. `None` if no such group.
+  pub fn read_index<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &L,
+    stable: &S,
+    context: bytes::Bytes,
+  ) -> Option<Result<(), crate::ReadIndexError>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self.multi.read_index(group, now, log, stable, context)?;
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Begin transferring `group`'s leadership to `to`. `None` if no such group.
+  pub fn transfer_leader<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &L,
+    stable: &S,
+    to: I,
+  ) -> Option<Result<(), crate::TransferError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self.multi.transfer_leader(group, now, log, stable, to)?;
     self.pump(now.mono());
     Some(r)
   }
