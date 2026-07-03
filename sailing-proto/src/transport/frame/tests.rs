@@ -402,6 +402,34 @@ fn coalesced_rejects_msg_len_overrunning_the_frame() {
   ));
 }
 
+/// The send budget is also the receive bound: one otherwise-valid frame of minimal entries under
+/// the 64 MiB frame cap would otherwise materialize millions of slice tuples before the first
+/// message decode could reject (an authenticated-peer allocation amplification).
+#[test]
+fn coalesced_rejects_payload_over_the_budget() {
+  // Minimal 9-byte entries (1 flags + 2 group_len + 1 group + 4 msg_len + 1 msg), repeated past
+  // the budget: structurally valid, rejected on size alone.
+  let mut payload = Vec::new();
+  write_coalesced_marker(&mut payload);
+  while payload.len() <= 2 + COALESCED_FRAME_BUDGET {
+    write_coalesced_entry(0, b"g", b"m", &mut payload);
+  }
+  assert!(matches!(
+    split_coalesced(Bytes::from(payload)),
+    Err(TransportError::Decode)
+  ));
+
+  // A frame at the budget still parses: the bound rejects only what a conforming sender never
+  // produces.
+  let mut ok = Vec::new();
+  write_coalesced_marker(&mut ok);
+  while ok.len() + 9 <= 2 + COALESCED_FRAME_BUDGET {
+    write_coalesced_entry(0, b"g", b"m", &mut ok);
+  }
+  let entries = split_coalesced(Bytes::from(ok)).expect("within budget");
+  assert!(!entries.is_empty());
+}
+
 #[test]
 fn coalesced_rejects_trailing_garbage() {
   // One complete entry, then a remainder too short to be an entry prefix.

@@ -100,6 +100,13 @@ pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, T
   if !is_coalesced_frame(&frame) {
     return Err(TransportError::Decode);
   }
+  // The send budget is ALSO the receive bound: a conforming sender never exceeds it, and without
+  // this check one otherwise-valid frame of minimal entries (8 bytes each under the 64 MiB frame
+  // cap) would materialize millions of slice tuples before the first message decode could reject
+  // — an authenticated-peer allocation amplification. Bounding the payload bounds the entry list.
+  if frame.len() > 2 + COALESCED_FRAME_BUDGET {
+    return Err(TransportError::Decode);
+  }
   let mut entries = Vec::new();
   let mut at = 2usize;
   while at < frame.len() {

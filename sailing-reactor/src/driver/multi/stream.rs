@@ -1229,11 +1229,14 @@ where
     }
   }
 
-  /// Un-quiesce one group: it re-enters the armed fold (a stale deadline fires immediately) and
-  /// its idle clock restarts so it cannot re-mark before a fresh full election timeout.
+  /// Un-quiesce one group: it re-enters the armed fold (a stale deadline fires immediately), its
+  /// idle clock restarts so it cannot re-mark before a fresh full election timeout, and any
+  /// not-yet-stamped quiesce intent is cancelled at the coordinator — the eligibility that
+  /// justified the intent no longer holds, so it must never reach a later beat.
   fn wake_group(&mut self, g: &G) {
     self.quiesced.remove(g);
     self.quiesce_pending.remove(g);
+    self.coord.cancel_quiescing(g);
     if let Some(a) = self.activity.get_mut(g) {
       a.at = std::time::Instant::now();
     }

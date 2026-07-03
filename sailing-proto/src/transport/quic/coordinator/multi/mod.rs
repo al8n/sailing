@@ -556,6 +556,14 @@ where
     self.quiesce_intents.contains(group)
   }
 
+  /// Cancel a pending quiesce intent for `group` (a no-op if none). The driver calls this on
+  /// EVERY un-quiesce trigger — a wake control, a local command, a connection loss, a leadership
+  /// change — so an intent recorded before the wake can never be stamped onto a later beat: the
+  /// eligibility that justified it no longer holds.
+  pub fn cancel_quiescing(&mut self, group: &G) {
+    self.quiesce_intents.remove(group);
+  }
+
   /// Drain the next group-scoped scheduling signal, in dispatch order (see [`GroupControl`]).
   pub fn poll_group_control(&mut self) -> Option<(G, GroupControl)> {
     self.controls.pop_front()
@@ -864,7 +872,9 @@ where
     for (group, o) in outgoing {
       let (to, msg) = o.into_parts();
       if msg.is_heartbeat() || msg.is_heartbeat_response() {
-        let flags = if self.quiesce_intents.contains(&group) {
+        // Stamp ONLY the leader's own Heartbeat broadcast, never a HeartbeatResponse — a stale
+        // intent on a response would freeze the NEW leader (see the stream sibling).
+        let flags = if msg.is_heartbeat() && self.quiesce_intents.contains(&group) {
           stamped.insert(group.cheap_clone());
           COALESCED_FLAG_QUIESCE
         } else {

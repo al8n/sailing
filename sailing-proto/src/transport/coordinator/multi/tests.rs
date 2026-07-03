@@ -452,6 +452,42 @@ fn a_single_heartbeat_stays_a_plain_frame() {
   );
 }
 
+/// The quiesce flag rides ONLY a leader's own Heartbeat broadcast: an intent marked on a
+/// FOLLOWER (or a leader deposed before its next beat) must never leak onto the
+/// HeartbeatResponses it keeps sending — a flagged response would freeze the very leader that
+/// never chose to quiesce. The intent stays pending (a follower never broadcasts) until
+/// explicitly cancelled, the un-quiesce path's job.
+#[test]
+fn stale_intent_never_rides_a_response() {
+  let mut w = World::new(&[100, 200], &[100, 200]);
+  w.settle();
+  w.elect_a(100);
+  while w.a.poll_group_control().is_some() {}
+  while w.b.poll_group_control().is_some() {}
+
+  // B is group 100's FOLLOWER; a (stale) intent on B can only ever meet HeartbeatResponses.
+  w.b.mark_quiescing(&100);
+  w.fire_a(100); // A beats; B responds
+  w.settle();
+
+  let mut a_controls = Vec::new();
+  while let Some(c) = w.a.poll_group_control() {
+    a_controls.push(c);
+  }
+  assert!(
+    !a_controls.contains(&(100, GroupControl::Quiesce)),
+    "the follower's responses carried no quiesce flag"
+  );
+  assert!(
+    w.b.is_quiescing(&100),
+    "the intent is NOT consumed by a response — only a leader broadcast stamps"
+  );
+
+  // The un-quiesce path cancels it, so no later beat can carry the stale promise.
+  w.b.cancel_quiescing(&100);
+  assert!(!w.b.is_quiescing(&100));
+}
+
 /// `mark_quiescing` stamps the group's next heartbeat with the QUIESCE flag (a flagged single
 /// rides a one-entry coalesced frame — only a coalesced entry has a flags byte), the intent is
 /// consumed by that broadcast, and the receiver surfaces exactly one `GroupControl::Quiesce` for
