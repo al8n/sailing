@@ -4212,6 +4212,108 @@ fn progress_ack_cold_pump_clears_resend_pacing_so_retry_is_immediate() {
   );
 }
 
+// A DUPLICATED progress ack (same watermark) must NOT re-send the chunk: the per-ack pump fires only
+// when the ack MOVES the cursor (the snapshot sibling of the append path's maybe_update advance gate).
+// Without the gate, every network-duplicated chunk or ack raises the stream's in-flight multiplicity
+// forever — the follower re-acks each duplicate at its true watermark and each such ack re-sent the
+// chunk — compounding into an unbounded per-transfer message storm under a duplicating network.
+// Liveness is preserved: a lost next-chunk stalls the cursor and the heartbeat-paced resend re-sends
+// FROM the stalled cursor within one election timeout.
+//
+// MUTATION: drop the cursor-moved gate in `on_snapshot_response`'s per-ack pump → the duplicate ack
+// below draws a second identical chunk.
+#[test]
+fn duplicate_snapshot_progress_ack_pumps_no_second_chunk() {
+  use crate::{Index, Instant, Message, SnapshotResponse, Term};
+  let offset = 5u64;
+  let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(offset, 2);
+  while ep.poll_message().is_some() {}
+
+  let progress_ack = |acked: u64| {
+    Message::SnapshotResponse(
+      SnapshotResponse::new(Term::new(1), 2u64, false, Index::ZERO).with_acked_through(acked),
+    )
+  };
+  let chunks_to_2 = |ep: &mut Endpoint<u64, CountSm>| {
+    core::iter::from_fn(|| ep.poll_message())
+      .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+      .count()
+  };
+
+  // A cursor-ADVANCING progress ack (0 → 1) pumps exactly the next chunk.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    progress_ack(1),
+  );
+  assert_eq!(
+    chunks_to_2(&mut ep),
+    1,
+    "an advancing progress ack pumps exactly one next chunk"
+  );
+
+  // The SAME ack again (a network duplicate): the cursor does not move, so nothing is pumped.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    progress_ack(1),
+  );
+  assert_eq!(
+    chunks_to_2(&mut ep),
+    0,
+    "a duplicated same-watermark ack must pump NO chunk"
+  );
+  assert!(
+    ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+    "the peer stays mid-transfer"
+  );
+
+  // The transfer still advances on the next real ack (1 → 2).
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    progress_ack(2),
+  );
+  assert_eq!(
+    chunks_to_2(&mut ep),
+    1,
+    "the next advancing ack resumes the stream"
+  );
+
+  // Liveness backstop: if the pumped chunk is lost (no further acks), the heartbeat-paced resend
+  // re-sends FROM the stalled cursor within one election timeout.
+  let later = Instant::ORIGIN + ep.config.election_timeout();
+  ep.handle_message(
+    later,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(crate::HeartbeatResponse::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::new(),
+    )),
+  );
+  let resent: Vec<_> = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| o.to() == 2u64 && matches!(o.message(), Message::InstallSnapshot(_)))
+    .collect();
+  assert_eq!(
+    resent.len(),
+    1,
+    "the paced heartbeat resend recovers a stalled stream"
+  );
+  if let Message::InstallSnapshot(is) = resent[0].message() {
+    assert_eq!(is.offset(), 2, "the resend resumes from the stalled cursor");
+    assert_eq!(is.snapshot().last_index(), pending);
+  }
+}
+
 // A fatal `term` read during `reclaim_stale_snapshot_recv`'s Log-Matching proof must FAIL-STOP the whole
 // storage handler — `reclaim` poisons (PoisonReason::LogTerm) and returns false, and `handle_storage` bails
 // rather than continuing handler work on a poisoned node.
