@@ -1398,6 +1398,12 @@ async fn wait_for_mode(
 /// reads under ITS mode with the counts strictly isolated: the Safe group confirms on the
 /// read-index round while the LeaseGuard group serves lease-fresh reads locally (degrading to
 /// the same safe round only when the lease is stale — either way the value is correct).
+///
+/// The PATH is then pinned behaviorally, not just the configured modes (matching modes + counts
+/// would also pass if every read silently rode the Safe round): with both leaders on one node
+/// and the peer KILLED, a lease-fresh LeaseGuard read still completes — it serves from the local
+/// commit inside the lease window, no quorum round — while the Safe group's read on the very
+/// same partitioned leader parks on its unreachable read-index quorum.
 #[tokio::test(flavor = "multi_thread")]
 async fn co_hosted_groups_serve_heterogeneous_read_modes() {
   let handles = bind_pair(44_540).await;
@@ -1406,12 +1412,16 @@ async fn co_hosted_groups_serve_heterogeneous_read_modes() {
       .create_group(100, config(id, vec![1, 2]), id, CountSm::default())
       .await
       .expect("the Safe group admits");
+    // The wider election window admits a lease window roomy enough for the partition pin below
+    // (validation requires the commit-wait window, just past Δ, to fit under the election
+    // timeout), so the post-kill read lands comfortably inside the anchor's Δ.
     handles[(id - 1) as usize]
       .create_group(
         200,
-        config(id, vec![1, 2])
+        Config::try_new(id, vec![1, 2], Duration::from_millis(1200), HEARTBEAT)
+          .unwrap()
           .with_read_only(ReadOnlyOption::LeaseGuard)
-          .with_lease_duration(Duration::from_millis(100))
+          .with_lease_duration(Duration::from_millis(600))
           .with_clock_drift_bound(Duration::from_millis(2)),
         id,
         CountSm::default(),
@@ -1444,22 +1454,87 @@ async fn co_hosted_groups_serve_heterogeneous_read_modes() {
   assert_eq!(submit_anywhere(&g200, b"l2").await, 2);
   assert_eq!(query_anywhere(&g200).await, 2);
   assert_eq!(query_anywhere(&g100).await, 2);
+
+  // ---- The read-PATH pin. ----
+  // Co-locate both leaders: move the SAFE group's leadership onto the LeaseGuard leader's node
+  // (never the lease group's — a forced handoff would put its fresh leader into the commit-wait
+  // and disable its lease reads for the term).
+  let lease_at = find_leader(&g200, "group 200 lease leader").await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the Safe group's leadership never co-located"
+    );
+    let at = find_leader(&g100, "group 100 leader").await;
+    if at == lease_at {
+      break;
+    }
+    match g100[at].transfer_leader(lease_at as u64 + 1).await {
+      Ok(()) | Err(DriverError::NotLeader { .. }) => {}
+      Err(e) => panic!("unexpected transfer error: {e:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  // A commit through each group: the Safe group proves its relocated leader commits (a
+  // current-term anchor for its reads), and the LeaseGuard commit re-anchors the lease window
+  // right before the partition.
+  assert_eq!(submit_anywhere(&g100, b"s3").await, 3);
+  assert_eq!(submit_anywhere(&g200, b"l3").await, 3);
+
+  // Sever the leaders from their peer: the quorum is now unreachable for BOTH groups.
+  let dead = 1 - lease_at;
+  handles[dead].shutdown().await.expect("the peer tears down");
+
+  // LeaseGuard serves the lease-fresh read LOCALLY — no quorum round to park on, so completion
+  // itself is the path witness (a read degraded onto the Safe round could never confirm here).
+  assert_eq!(
+    g200[lease_at]
+      .query(|sm: &CountSm| sm.count())
+      .await
+      .expect("the lease-fresh read serves without the peer"),
+    3,
+    "the LeaseGuard read serves from the local commit"
+  );
+
+  // The Safe read on the SAME partitioned leader parks on its read-index heartbeat round: no
+  // quorum ack can arrive, so it must never serve a value inside the window.
+  let parked = tokio::time::timeout(
+    Duration::from_millis(500),
+    g100[lease_at].query(|sm: &CountSm| sm.count()),
+  )
+  .await;
+  assert!(
+    !matches!(parked, Ok(Ok(_))),
+    "a Safe read must park on the unreachable quorum, got {parked:?}"
+  );
 }
 
 /// A committed `SetReadMode` migrates exactly ITS group: group 100 migrates Safe -> LeaseBased
 /// (apply-time, surfacing as the group-stamped `ReadModeChanged` on the shared events tail) while
 /// co-hosted group 200's active mode stays `Safe` on every replica, and both groups keep
 /// committing and serving reads through the migration.
+///
+/// The post-migration read PATH is then pinned behaviorally (mode + count assertions alone would
+/// also pass if the migrated group's reads silently stayed on the Safe round): with both leaders
+/// on one node and the peer KILLED, the migrated group's read still completes inside the
+/// check-quorum lease window — LeaseBased serves from the local commit, no per-read quorum round
+/// — while the still-Safe sibling's read on the same partitioned leader never serves.
 #[tokio::test(flavor = "multi_thread")]
 async fn set_read_mode_migrates_one_group_only() {
   let handles = bind_pair(44_580).await;
-  // Both groups start Safe; check_quorum is the LeaseBased migration's validity gate.
+  // Both groups start Safe; check_quorum is the LeaseBased migration's validity gate. The wider
+  // election window sizes the check-quorum lease residual the partition pin below serves inside
+  // (the lease outlives the severed peer by up to `min support ≈ election` from its last
+  // heartbeat round, and the leader's own check-quorum step-down lands on the same scale).
   for gid in [100u64, 200] {
     for id in 1u64..=2 {
       handles[(id - 1) as usize]
         .create_group(
           gid,
-          config(id, vec![1, 2]).with_check_quorum(true),
+          Config::try_new(id, vec![1, 2], Duration::from_millis(600), HEARTBEAT)
+            .unwrap()
+            .with_check_quorum(true),
           id * 10 + gid,
           CountSm::default(),
         )
@@ -1529,4 +1604,57 @@ async fn set_read_mode_migrates_one_group_only() {
   assert_eq!(submit_anywhere(&g200, b"after").await, 2);
   assert_eq!(query_anywhere(&g100).await, 2);
   assert_eq!(query_anywhere(&g200).await, 2);
+
+  // ---- The post-migration read-PATH pin. ----
+  // Co-locate both leaders on the MIGRATED group's leader node (transfer the Safe sibling, never
+  // the lease group — `forced_handoff_this_term` disables lease reads on a handed-off leader).
+  let lease_at = find_leader(&g100, "group 100 post-migration leader").await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the Safe sibling's leadership never co-located"
+    );
+    let at = find_leader(&g200, "group 200 leader").await;
+    if at == lease_at {
+      break;
+    }
+    match g200[at].transfer_leader(lease_at as u64 + 1).await {
+      Ok(()) | Err(DriverError::NotLeader { .. }) => {}
+      Err(e) => panic!("unexpected transfer error: {e:?}"),
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  // A commit through each group: the sibling proves its relocated leader commits, and the
+  // migrated group's commit gives its LeaseBased reads a current-term anchor right before the
+  // partition (the check-quorum lease itself keeps renewing on every heartbeat round).
+  assert_eq!(submit_anywhere(&g200, b"pin").await, 3);
+  assert_eq!(submit_anywhere(&g100, b"pin").await, 3);
+
+  // Sever the leaders from their peer, then read INSIDE the lease residual: LeaseBased serves
+  // from the local commit with no per-read quorum round — completion is the path witness (a
+  // read still on the Safe round could never confirm without the peer).
+  let dead = 1 - lease_at;
+  handles[dead].shutdown().await.expect("the peer tears down");
+  assert_eq!(
+    g100[lease_at]
+      .query(|sm: &CountSm| sm.count())
+      .await
+      .expect("the LeaseBased read serves without the peer"),
+    3,
+    "the migrated group's read serves from the local commit"
+  );
+
+  // The Safe sibling's read on the SAME partitioned leader must never serve a value: it parks on
+  // its unreachable read-index quorum (and past the check-quorum window it would fail, not
+  // serve).
+  let parked = tokio::time::timeout(
+    Duration::from_millis(500),
+    g200[lease_at].query(|sm: &CountSm| sm.count()),
+  )
+  .await;
+  assert!(
+    !matches!(parked, Ok(Ok(_))),
+    "a Safe read must not serve on the unreachable quorum, got {parked:?}"
+  );
 }
