@@ -151,8 +151,16 @@ Each `Message` rides one frame:
 - Maximum payload: **64 MiB** (`MAX_FRAME_LEN`), covering the group header and the envelope. A receiver
   rejects a larger declared length at the header, before buffering any payload byte; a sender refuses to
   emit one (closing the connection at the source rather than flap-looping against the receiver's bound).
-- A frame's payload must be a valid group header followed by **one** `Message` envelope with a present
-  body (a malformed payload closes the connection).
+- After the hello/preface (§4), a frame's payload must be a valid group header followed by **one**
+  `Message` envelope with a present body (a malformed payload closes the connection). The QUIC
+  preface frame predates authentication and carries a hello instead (§4), so this rule scopes to
+  post-authentication consensus frames.
+- All nodes of one cluster must agree on the deployment shape — single-group (empty tags) vs
+  multi-group — and on the group-id type/encoding. A tag a host cannot accept (one that does not
+  decode as its group-id type, or ANY non-empty tag on a single-group host) closes the connection
+  as integrity-suspect. Only a well-formed tag for a group the host does not carry is dropped
+  frame-by-frame: the shared connection survives for co-located groups, and the sender's retries
+  cover the gap (a group being created/removed).
 
 ## 4. The `Labeled` hello (`tcp`/`tls`/`quic` features)
 

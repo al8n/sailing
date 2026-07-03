@@ -126,7 +126,9 @@ where
 
   /// Feed inbound bytes from `conn`: decode each frame, resolve its group's store through `stores`,
   /// feed the owning group's endpoint, then flush every group's resulting outbound messages. A frame
-  /// whose group tag fails to decode, or whose group has no store, is dropped (the sender retries).
+  /// whose group has no store is dropped (the sender retries on its own cadence); a group tag that
+  /// does not decode as `G` closes the connection as integrity-suspect (reported via
+  /// [`poll_conn_closed`](Self::poll_conn_closed)).
   pub fn handle_conn_data<L, S, St>(
     &mut self,
     conn: ConnId,
@@ -146,7 +148,13 @@ where
       .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
     for (group_bytes, from, msg) in decoded {
       let Ok(group) = G::decode_exact(group_bytes) else {
-        continue; // a malformed group tag is a peer fault; drop the frame
+        // A well-framed tag that is not a valid `G` is a systematic peer fault (a different
+        // group-id type, or a single-group node on a multi-group cluster): every frame reproduces
+        // it, and dropping silently would black-hole consensus traffic on a healthy-looking
+        // connection. Close as integrity-suspect — the connection's remaining frames are equally
+        // suspect.
+        self.router.close(conn, Some(TransportError::Decode));
+        break;
       };
       if let Some((log, stable)) = stores.stores(&group) {
         self

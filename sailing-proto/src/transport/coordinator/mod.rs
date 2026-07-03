@@ -165,7 +165,14 @@ where
     let _ = self
       .router
       .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
-    for (_group, from, msg) in decoded {
+    for (group, from, msg) in decoded {
+      if !group.is_empty() {
+        // A group-tagged frame on a single-group host: the peer is a multi-group node (a
+        // deployment-shape mismatch), and feeding it through would inject a foreign group's
+        // traffic into this endpoint. Close as integrity-suspect instead.
+        self.router.close(conn, Some(super::TransportError::Decode));
+        break;
+      }
       self.endpoint.handle_message(now, log, stable, from, msg);
     }
     self.flush();
