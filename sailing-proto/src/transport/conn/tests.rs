@@ -150,7 +150,7 @@ fn gates_app_frames_until_validated_then_decodes() {
 
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg()]);
 }
 
@@ -163,7 +163,7 @@ fn round_trips_a_message_after_handshake() {
   pump(&mut d, &mut a);
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg()]);
 }
 
@@ -180,7 +180,8 @@ fn round_trips_a_tagged_message() {
   a.poll_decoded(&mut msgs).unwrap();
   assert_eq!(msgs.len(), 1, "exactly one tagged message");
   assert_eq!(&msgs[0].0[..], &tag[..], "the tag bytes survive the wire");
-  assert_eq!(msgs[0].1, sample_msg());
+  assert_eq!(msgs[0].1, 0, "a single-message frame yields flags 0");
+  assert_eq!(msgs[0].2, sample_msg());
 }
 
 /// A frame whose group header is valid (empty tag) but whose envelope is bogus closes the
@@ -300,7 +301,7 @@ fn backpressured_write_never_truncates_a_frame() {
   receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
   let mut msgs = Vec::new();
   receiver.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
 }
 
@@ -358,7 +359,7 @@ fn frames_in_the_final_read_before_eof_still_deliver() {
   assert!(a.is_closed());
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(
     msgs,
     std::vec![sample_msg()],
@@ -463,7 +464,7 @@ fn pending_refeed_reassembles_across_a_tiny_receive_buffer() {
   receiver.handle_data(&wire, false, Instant::ORIGIN).unwrap();
   let mut msgs = Vec::new();
   receiver.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert_eq!(msgs, std::vec![sample_msg(), sample_msg()]);
 }
 
@@ -538,7 +539,7 @@ fn peer_and_poll_decoded_are_inert_while_handshaking() {
   assert_eq!(d.peer(), None, "no peer is bound while handshaking");
   let mut msgs = Vec::new();
   d.poll_decoded(&mut msgs).unwrap();
-  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, m)| m).collect();
+  let msgs: std::vec::Vec<_> = msgs.into_iter().map(|(_, _, m)| m).collect();
   assert!(
     msgs.is_empty(),
     "no application frame decodes before validation"

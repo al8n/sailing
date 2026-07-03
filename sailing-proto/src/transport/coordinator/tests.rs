@@ -467,3 +467,39 @@ fn tagged_frame_closes_on_a_single_group_host() {
   );
   assert_eq!(w.b.conn_of(&1), None, "the route is gone");
 }
+
+/// A COALESCED control frame arriving at a SINGLE-group host closes the connection: coalescing is
+/// a multi-group feature and every coalesced entry carries a non-empty tag, so the empty-tag-only
+/// policy fires on the first expanded entry.
+#[test]
+fn coalesced_frame_closes_on_a_single_group_host() {
+  let mut w = World::new();
+  w.settle();
+  assert_eq!(w.b.conn_of(&1), Some(ConnId(1)));
+
+  // A well-formed one-entry coalesced frame (valid tag, valid Message, flags 0).
+  let msg = crate::Message::Heartbeat(crate::message::Heartbeat::new(
+    crate::Term::new(3),
+    1u64,
+    crate::Index::new(0),
+    bytes::Bytes::new(),
+  ));
+  let mut tag = Vec::new();
+  100u64.encode(&mut tag);
+  let mut msg_bytes = Vec::new();
+  crate::wire::encode_message(&msg, &mut msg_bytes);
+  let mut payload = Vec::new();
+  crate::transport::frame::write_coalesced_marker(&mut payload);
+  crate::transport::frame::write_coalesced_entry(0, &tag, &msg_bytes, &mut payload);
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&payload, &mut framed);
+
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.lb, &mut w.sb);
+  assert_eq!(
+    w.b.poll_conn_closed(),
+    Some((ConnId(1), Some(crate::transport::TransportError::Decode))),
+    "a coalesced frame is multi-only; a single-group receiver closes"
+  );
+  assert_eq!(w.b.conn_of(&1), None, "the route is gone");
+}

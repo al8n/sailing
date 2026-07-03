@@ -1,7 +1,7 @@
 //! `PeerRouter<I, R>`: the per-peer connection table. It owns every live `Conn`, binds each to its
 //! peer once validated, routes an outbound `Message` to the right connection, and reports every
 //! connection the transport closes on its own initiative so the driver can release the socket.
-use super::{ConnId, TransportError, conn::Conn, stream::RecordIo};
+use super::{CoalescedEntry, ConnId, TransportError, conn::Conn, stream::RecordIo};
 use crate::{Instant, Message, NodeId};
 use core::time::Duration;
 use std::{
@@ -116,16 +116,18 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   }
 
   /// Feed inbound bytes to connection `id`, decode any complete messages, and bind the peer on
-  /// validation. Returns the decoded `(peer, message)` pairs. A connection that faults or reaches a
-  /// clean close is removed and reported via [`poll_conn_closed`](Self::poll_conn_closed) — after
-  /// its final decoded frames (clean close only) have been delivered.
+  /// validation. Returns the decoded `(group, entry_flags, peer, message)` tuples (flags are `0`
+  /// for a single-message frame; a coalesced frame expands to one tuple per entry). A connection
+  /// that faults or reaches a clean close is removed and reported via
+  /// [`poll_conn_closed`](Self::poll_conn_closed) — after its final decoded frames (clean close
+  /// only) have been delivered.
   pub fn handle_conn_data(
     &mut self,
     id: ConnId,
     bytes: &[u8],
     eof: bool,
     now: Instant,
-    out: &mut Vec<(bytes::Bytes, I, Message<I>)>,
+    out: &mut Vec<(bytes::Bytes, u8, I, Message<I>)>,
   ) -> Result<(), TransportError> {
     let result = self.handle_conn_data_inner(id, bytes, eof, now, out);
     // A connection that errored OR reached EOF/Closed must drop its peer binding — otherwise the
@@ -147,7 +149,7 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     bytes: &[u8],
     eof: bool,
     now: Instant,
-    out: &mut Vec<(bytes::Bytes, I, Message<I>)>,
+    out: &mut Vec<(bytes::Bytes, u8, I, Message<I>)>,
   ) -> Result<(), TransportError> {
     let conn = match self.conns.get_mut(&id) {
       Some(c) => c,
@@ -181,9 +183,9 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     let mut msgs = Vec::new();
     conn.poll_decoded(&mut msgs)?;
     let peer = conn.peer();
-    for (group, msg) in msgs {
+    for (group, flags, msg) in msgs {
       if let Some(p) = &peer {
-        out.push((group, p.cheap_clone(), msg));
+        out.push((group, flags, p.cheap_clone(), msg));
       }
     }
     Ok(())
@@ -204,6 +206,25 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     // `group` is the group-demux tag stamped onto the frame: an empty slice for a single-group host,
     // the encoded `GroupId` for a multi-group coordinator.
     conn.send_message(group, msg);
+    if conn.is_closed() {
+      self.remove_internal(id, None);
+      return false;
+    }
+    true
+  }
+
+  /// Encode a batch of `(flags, encoded_group, message)` entries as coalesced control frames and
+  /// queue them to `to`'s connection — [`route`](Self::route)'s batch counterpart, with the same
+  /// no-route drop and the same drop-the-route-on-close discipline (the cap/oversize checks run in
+  /// [`Conn::send_coalesced`] against each whole coalesced payload).
+  pub fn route_coalesced(&mut self, to: I, entries: &[CoalescedEntry<I>]) -> bool {
+    let Some(&id) = self.peer_of.get(&to) else {
+      return false;
+    };
+    let Some(conn) = self.conns.get_mut(&id) else {
+      return false;
+    };
+    conn.send_coalesced(entries);
     if conn.is_closed() {
       self.remove_internal(id, None);
       return false;

@@ -54,7 +54,6 @@ const _: () = assert!(COALESCED_MARKER as usize > crate::wire::MAX_GROUP_ID_LEN)
 /// Entry-flags bit 0: the sender QUIESCES this entry's group after this beat — the receiver's driver
 /// may stop arming that group's timers until traffic or a connection loss wakes it. All other bits
 /// must be zero on encode and are ignored on decode (forward room).
-#[allow(dead_code)]
 pub(crate) const COALESCED_FLAG_QUIESCE: u8 = 0b0000_0001;
 
 /// Senders flush a coalesced frame before its payload would exceed this budget (64 KiB — thousands
@@ -68,14 +67,12 @@ pub(crate) const COALESCED_FRAME_BUDGET: usize = 64 * 1024;
 const _: () = assert!(COALESCED_FRAME_BUDGET <= MAX_FRAME_LEN / 1024);
 
 /// Whether a decoded frame payload is a coalesced control frame (opens with [`COALESCED_MARKER`]).
-#[allow(dead_code)]
 pub(crate) fn is_coalesced_frame(frame: &[u8]) -> bool {
   frame.len() >= 2 && frame[..2] == COALESCED_MARKER.to_be_bytes()
 }
 
 /// Open a coalesced frame payload being built: the [`COALESCED_MARKER`], then one or more
 /// [`write_coalesced_entry`] records.
-#[allow(dead_code)]
 pub(crate) fn write_coalesced_marker(out: &mut Vec<u8>) {
   out.extend_from_slice(&COALESCED_MARKER.to_be_bytes());
 }
@@ -84,7 +81,6 @@ pub(crate) fn write_coalesced_marker(out: &mut Vec<u8>) {
 /// payload opened by [`write_coalesced_marker`]. The caller guarantees a NON-empty group within
 /// [`crate::wire::MAX_GROUP_ID_LEN`] (coalescing is a multi-group feature — the empty single-group
 /// tag never rides here) and only defined flag bits.
-#[allow(dead_code)]
 pub(crate) fn write_coalesced_entry(flags: u8, group: &[u8], msg_bytes: &[u8], out: &mut Vec<u8>) {
   debug_assert!(!group.is_empty() && group.len() <= crate::wire::MAX_GROUP_ID_LEN);
   debug_assert_eq!(flags & !COALESCED_FLAG_QUIESCE, 0, "undefined flag bits");
@@ -100,7 +96,6 @@ pub(crate) fn write_coalesced_entry(flags: u8, group: &[u8], msg_bytes: &[u8], o
 /// truncated entry, a group length of zero or past [`crate::wire::MAX_GROUP_ID_LEN`], a message
 /// length overrunning the frame, or an empty entry list — the payload must be exactly one or more
 /// complete entries, so any trailing remainder after the last complete one rejects too.
-#[allow(dead_code)]
 pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, TransportError> {
   if !is_coalesced_frame(&frame) {
     return Err(TransportError::Decode);

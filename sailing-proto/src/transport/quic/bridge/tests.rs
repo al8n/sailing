@@ -787,6 +787,68 @@ fn write_framed_closes_on_outbound_overflow() {
   );
 }
 
+/// `write_coalesced` ships a whole heartbeat batch as EXACTLY ONE frame on the wire — the frame
+/// count at the bridge seam — and the receiver splits back the same `(flags, group, message)`
+/// entries in order.
+#[test]
+fn write_coalesced_ships_one_frame_for_a_batch() {
+  let ca = TestClusterCa::generate();
+  let (mut a, mut b) = pair(&ca);
+  let now = Instant::now();
+  let (ha, hb) = handshake(now, &mut a, &mut b);
+  a.open_send_and_preface(now, ha, &[]);
+  b.open_send_and_preface(now, hb, &[]);
+  a.bind_validated(now, ha, 2u64);
+  b.bind_validated(now, hb, 1u64);
+  pump(now, &mut a, &mut b);
+
+  let beat = |gid: u64| {
+    let mut tag = Vec::new();
+    crate::Data::encode(&gid, &mut tag);
+    let msg = Message::Heartbeat(crate::message::Heartbeat::new(
+      Term::new(3),
+      1u64,
+      Index::new(0),
+      bytes::Bytes::new(),
+    ));
+    (tag, msg)
+  };
+  use crate::Data as _;
+  let (tag100, hb100) = beat(100);
+  let (tag200, hb200) = beat(200);
+  let entries = std::vec![(0u8, tag100, hb100.clone()), (1u8, tag200, hb200.clone())];
+  a.write_coalesced(now, ha, &entries);
+  a.service_if_deferred(now);
+  pump(now, &mut a, &mut b);
+
+  let ready = b.take_ready_unique();
+  assert!(ready.contains(&hb), "b's stream became readable");
+  assert!(!b.ingest_recv(now, hb));
+  let frame = b
+    .next_frame(hb)
+    .expect("no framing violation")
+    .expect("one complete frame");
+  assert!(crate::transport::frame::is_coalesced_frame(&frame));
+  let got = crate::transport::frame::split_coalesced(frame).expect("well-formed");
+  assert_eq!(got.len(), 2, "both beats in the one frame");
+  assert_eq!(got[0].0, 0);
+  assert_eq!(u64::decode_exact(got[0].1.clone()).expect("u64 tag"), 100);
+  assert_eq!(
+    crate::wire::decode_message::<u64>(got[0].2.clone()).expect("decodes"),
+    hb100
+  );
+  assert_eq!(got[1].0, 1, "the per-entry flag survives");
+  assert_eq!(u64::decode_exact(got[1].1.clone()).expect("u64 tag"), 200);
+  assert_eq!(
+    crate::wire::decode_message::<u64>(got[1].2.clone()).expect("decodes"),
+    hb200
+  );
+  assert!(
+    matches!(b.next_frame(hb), Ok(None)),
+    "exactly one frame was sent for the whole batch"
+  );
+}
+
 /// `ingest_recv` is a no-op on an absent handle and on a still-handshaking connection.
 #[test]
 fn ingest_recv_skips_absent_and_handshaking() {

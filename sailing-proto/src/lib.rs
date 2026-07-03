@@ -150,8 +150,8 @@ pub use transport::quic::MultiQuicCoordinator;
 pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
 #[cfg(feature = "tcp")]
 pub use transport::{
-  GroupStores, Intake, LabelOptions, Labeled, MultiStreamCoordinator, Passthrough, RecordIo,
-  StreamCoordinator, StreamTransport,
+  GroupControl, GroupStores, Intake, LabelOptions, Labeled, MultiStreamCoordinator, Passthrough,
+  RecordIo, StreamCoordinator, StreamTransport,
 };
 
 #[cfg(test)]

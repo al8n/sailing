@@ -6,12 +6,18 @@
 //! co-located group's traffic. Storage is per group: [`handle_conn_data`](MultiStreamCoordinator::handle_conn_data)
 //! resolves each decoded frame's group store through a caller-supplied [`GroupStores`], while the
 //! single-group driving methods take the target group's store directly.
-use super::super::{ConnId, TransportError, router::PeerRouter, stream::RecordIo};
-use crate::{
-  Config, CreateGroupError, Data, Endpoint, Event, GroupId, Index, Instant, LogStore, MultiRaft,
-  NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
+use super::super::{
+  CoalescedEntry, ConnId, TransportError, frame::COALESCED_FLAG_QUIESCE, router::PeerRouter,
+  stream::RecordIo,
 };
-use std::vec::Vec;
+use crate::{
+  Config, CreateGroupError, Data, Endpoint, Event, GroupId, Index, Instant, LogStore, Message,
+  MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
+};
+use std::{
+  collections::{BTreeMap, BTreeSet, VecDeque},
+  vec::Vec,
+};
 
 /// Per-group storage a [`MultiStreamCoordinator`] uses to drive each group's endpoint when inbound
 /// bytes span multiple groups. The caller implements it over its own per-group store table.
@@ -26,6 +32,34 @@ pub trait GroupStores<G, L, S> {
   fn stores(&mut self, group: &G) -> Option<(&mut L, &mut S)>;
 }
 
+/// A group-scoped scheduling signal a multi-group coordinator surfaces to its driver (drained via
+/// `poll_group_control`, like `poll_event`). The queue preserves DISPATCH ORDER, so a driver that
+/// folds the signals left to right always lands on the group's latest state — e.g. a quiesce-flagged
+/// beat followed by an append in the same read yields `Quiesce` then `Wake`, ending awake.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GroupControl {
+  /// The group's leader quiesced it after the beat that carried this flag: the peer promised
+  /// heartbeat silence, so the driver may stop arming/sweeping the group's timers — safe because
+  /// any traffic surfaces a [`Wake`](Self::Wake) and a connection loss is the driver's own signal
+  /// to wake everything.
+  Quiesce,
+  /// WAKE-class inbound traffic was dispatched to the group. The absorbed (non-waking) complement
+  /// is exactly one heartbeat round's response tail — `HeartbeatResponse`, the empty
+  /// `AppendEntries` the leader pumps back at each responder, and that probe's `AppendResponse` —
+  /// because a quiescing group's FINAL flagged round still exchanges precisely those, and waking
+  /// on any of them would re-arm a timer and keep the round-trip alive forever. Absorbing them is
+  /// safe: each can only be the echo of a round the quiesced side itself completed pre-quiesce
+  /// (a quiesced leader sends no new beats or appends to respond to; quiesce eligibility required
+  /// every voter matched and commit applied, so no straggler ack can carry new progress, and a
+  /// commit can only advance behind a NON-empty append that already woke its follower).
+  /// Everything else wakes: a `Heartbeat` tells a quiesced follower its leader is active again
+  /// (restoring the silent-wedge detection its swept election timer provides), a non-empty
+  /// `AppendEntries` is live replication, votes/transfers/reads/snapshots are live consensus —
+  /// and a connection loss, the liveness oracle, is the driver's own wake signal.
+  Wake,
+}
+
 /// A multi-group consensus node speaking over framed reliable connections (`R` is the record layer,
 /// e.g. `Labeled<Passthrough>` for TCP or `Labeled<TlsRecords>` for TLS).
 pub struct MultiStreamCoordinator<G, I, F, R>
@@ -35,6 +69,17 @@ where
   multi: MultiRaft<G, I, F>,
   router: PeerRouter<I, R>,
   next_conn_id: u64,
+  /// Heartbeat/HeartbeatResponse batches diverted per peer by [`flush`](Self::flush), shipped as
+  /// coalesced frames at the [`poll_transmit`](Self::poll_transmit) chokepoint. Batching across
+  /// flushes (rather than per flush) is what coalesces a driver's PER-GROUP `handle_timeout` sweep
+  /// — each call flushes separately, but all of a crank's beats leave in that crank's transmit
+  /// drain as one frame per peer.
+  hb_batches: BTreeMap<I, Vec<CoalescedEntry<I>>>,
+  /// Groups whose NEXT heartbeat broadcast carries the QUIESCE flag (set by
+  /// [`mark_quiescing`](Self::mark_quiescing), consumed by the flush that stamps the beats).
+  quiesce_intents: BTreeSet<G>,
+  /// Group-scoped scheduling signals for the driver, in dispatch order (see [`GroupControl`]).
+  controls: VecDeque<(G, GroupControl)>,
 }
 
 impl<G, I, F, R> MultiStreamCoordinator<G, I, F, R>
@@ -54,6 +99,9 @@ where
       multi: MultiRaft::new(),
       router: PeerRouter::new(),
       next_conn_id: 1,
+      hb_batches: BTreeMap::new(),
+      quiesce_intents: BTreeSet::new(),
+      controls: VecDeque::new(),
     }
   }
 
@@ -98,8 +146,13 @@ where
       .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)
   }
 
-  /// Remove a group, returning its endpoint if present.
+  /// Remove a group, returning its endpoint if present. Drops the group's pending quiesce intent
+  /// and queued controls with it (its per-peer batched beats, if any, still ship — a removed
+  /// group's in-flight heartbeat is indistinguishable from one that left just before removal, and
+  /// the receiver's unhosted-entry drop absorbs it).
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F>> {
+    self.quiesce_intents.remove(gid);
+    self.controls.retain(|(g, _)| g != gid);
     self.multi.remove_group(gid)
   }
 
@@ -150,7 +203,7 @@ where
     let _ = self
       .router
       .handle_conn_data(conn, bytes, eof, now.mono(), &mut decoded);
-    for (group_bytes, from, msg) in decoded {
+    for (group_bytes, flags, from, msg) in decoded {
       let Ok(group) = G::decode_exact(group_bytes) else {
         // A well-framed tag that is not a valid `G` is a systematic peer fault (a different
         // group-id type, or a single-group node on a multi-group cluster): every frame reproduces
@@ -161,11 +214,16 @@ where
         break;
       };
       if let Some((log, stable)) = stores.stores(&group) {
+        let wake = Self::is_wake_class(&msg);
         // `None` here means `stores` resolved a group `MultiRaft` does not host — the same
-        // unhosted-group drop as a missing store, so the verdict is deliberately ignored.
-        let _ = self
+        // unhosted-group drop as a missing store; an unhosted entry's flags drop with it.
+        if self
           .multi
-          .handle_message(&group, now, log, stable, from, msg);
+          .handle_message(&group, now, log, stable, from, msg)
+          .is_some()
+        {
+          self.push_dispatch_controls(&group, wake, flags);
+        }
       }
     }
     self.flush();
@@ -392,9 +450,45 @@ where
     Some(progress)
   }
 
-  /// Drain queued outbound wire bytes as `(conn, bytes)` pairs for the driver to write.
+  /// Drain queued outbound wire bytes as `(conn, bytes)` pairs for the driver to write. This is
+  /// the drain-end chokepoint where the crank's batched heartbeats ship (one coalesced frame per
+  /// peer — see [`flush`](Self::flush)), so every `handle_*` call's beats leave with that call's
+  /// transmit drain.
   pub fn poll_transmit(&mut self) -> Vec<(ConnId, Vec<u8>)> {
+    self.ship_heartbeats();
     self.router.poll_transmit()
+  }
+
+  /// Record the intent to QUIESCE `group`: its next heartbeat broadcast is stamped with the
+  /// quiesce flag (every copy in that broadcast — all followers hear the promise), after which the
+  /// intent clears and [`is_quiescing`](Self::is_quiescing) reports `false`. The driver then stops
+  /// arming the group's timers; each follower surfaces [`GroupControl::Quiesce`] to its own driver.
+  /// A no-op for an unhosted group.
+  pub fn mark_quiescing(&mut self, group: &G) {
+    if self.multi.contains_group(group) {
+      self.quiesce_intents.insert(group.cheap_clone());
+    }
+  }
+
+  /// Whether `group`'s quiesce intent is still pending (its flagged beat has not yet been stamped).
+  /// The driver's cue to move the group into its quiesced set once this flips to `false`.
+  #[must_use]
+  pub fn is_quiescing(&self, group: &G) -> bool {
+    self.quiesce_intents.contains(group)
+  }
+
+  /// Drain the next group-scoped scheduling signal, in dispatch order (see [`GroupControl`]).
+  pub fn poll_group_control(&mut self) -> Option<(G, GroupControl)> {
+    self.controls.pop_front()
+  }
+
+  /// The transport's OWN earliest deadline (handshake reaping), without any group's consensus
+  /// deadline — the [`poll_timeout`](Self::poll_timeout) decomposition a quiescing driver needs:
+  /// it folds this with the non-quiesced subset of [`deadlines`](Self::deadlines) instead of the
+  /// all-groups aggregate.
+  #[must_use]
+  pub fn transport_timeout(&self) -> Option<Instant> {
+    self.router.next_handshake_deadline()
   }
 
   /// The earliest deadline the driver must wake for: the minimum over every group's consensus
@@ -439,16 +533,97 @@ where
     self.multi.group(gid)
   }
 
-  /// Route every group's queued outbound messages to peer connections, stamping each frame with its
-  /// group tag.
+  /// Route every group's queued outbound messages, stamping each frame with its group tag.
+  /// `Heartbeat`/`HeartbeatResponse` are DIVERTED into per-peer batches (shipped coalesced at the
+  /// [`poll_transmit`](Self::poll_transmit) chokepoint); everything else routes immediately as its
+  /// own frame. Reordering a batched beat behind a same-crank `AppendEntries` is safe by
+  /// construction: a heartbeat's `commit` is clamped to the follower's acked match, so no beat can
+  /// reference state its follower has not durably acknowledged.
+  ///
+  /// A group with a pending quiesce intent has EVERY beat copy in this drain stamped with the
+  /// quiesce flag (the whole broadcast — each follower must hear the promise), and the intent is
+  /// consumed at drain end.
   fn flush(&mut self) {
     let mut group_bytes = Vec::new();
+    let mut stamped: BTreeSet<G> = BTreeSet::new();
     while let Some((group, out)) = self.multi.poll_message() {
       let (to, msg) = out.into_parts();
-      group_bytes.clear();
-      group.encode(&mut group_bytes);
-      self.router.route(&group_bytes, to, &msg);
+      if msg.is_heartbeat() || msg.is_heartbeat_response() {
+        let flags = if self.quiesce_intents.contains(&group) {
+          stamped.insert(group.cheap_clone());
+          COALESCED_FLAG_QUIESCE
+        } else {
+          0
+        };
+        let mut gb = Vec::new();
+        group.encode(&mut gb);
+        self
+          .hb_batches
+          .entry(to)
+          .or_default()
+          .push((flags, gb, msg));
+      } else {
+        group_bytes.clear();
+        group.encode(&mut group_bytes);
+        self.router.route(&group_bytes, to, &msg);
+      }
     }
+    for group in &stamped {
+      self.quiesce_intents.remove(group);
+    }
+  }
+
+  /// Ship the batched heartbeats: a batch of ONE unflagged beat goes as a normal single-message
+  /// frame (no format change for the trivial case); anything else — many beats, or a flagged one
+  /// (only a coalesced entry has a flags byte) — ships as coalesced frames.
+  fn ship_heartbeats(&mut self) {
+    if self.hb_batches.is_empty() {
+      return;
+    }
+    for (to, batch) in core::mem::take(&mut self.hb_batches) {
+      if let [(0, group_bytes, msg)] = batch.as_slice() {
+        self.router.route(group_bytes, to, msg);
+      } else {
+        self.router.route_coalesced(to, &batch);
+      }
+    }
+  }
+
+  /// Queue the dispatch-driven [`GroupControl`]s for one delivered message: a `Wake` for every
+  /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat round's response tail is
+  /// absorbed), then a `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
+  /// beat nets quiesced. Consecutive duplicates collapse (a burst of appends is one `Wake`).
+  fn push_dispatch_controls(&mut self, group: &G, wake: bool, flags: u8) {
+    if wake {
+      self.push_control(group, GroupControl::Wake);
+    }
+    if flags & COALESCED_FLAG_QUIESCE != 0 {
+      self.push_control(group, GroupControl::Quiesce);
+    }
+  }
+
+  /// Whether a delivered message is WAKE-class for its group. The absorbed complement is exactly
+  /// the response tail of one heartbeat round in this codebase — `HeartbeatResponse`, the empty
+  /// `AppendEntries` the leader pumps back at each responder, and that probe's `AppendResponse` —
+  /// so a quiescing group's FINAL flagged round dies out instead of re-waking either side (see
+  /// [`GroupControl::Wake`] for the safety argument).
+  fn is_wake_class(msg: &Message<I>) -> bool {
+    match msg {
+      Message::HeartbeatResponse(_) | Message::AppendResponse(_) => false,
+      Message::AppendEntries(ae) => !ae.entries().is_empty(),
+      _ => true,
+    }
+  }
+
+  fn push_control(&mut self, group: &G, ctrl: GroupControl) {
+    if self
+      .controls
+      .back()
+      .is_some_and(|(g, c)| g == group && *c == ctrl)
+    {
+      return;
+    }
+    self.controls.push_back((group.cheap_clone(), ctrl));
   }
 }
 
