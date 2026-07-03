@@ -233,16 +233,6 @@ stabilize
 > n1 recv HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
-> n1 ready
-  AppendEntries term=1 prev=1/5 commit=5 entries=[]
-  AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n2 ready
-  AppendResponse term=1 match=5
-  AppendResponse term=1 match=5
-> n1 recv AppendResponse term=1 match=5
-> n1 recv AppendResponse term=1 match=5
 
 # Advance the leader's clock past the resend deadline; the next heartbeat round then RESUMES the transfer
 # from offset 40 — re-sending the lost middle chunk and the final chunk — and the install completes,
@@ -274,19 +264,10 @@ stabilize
 > n1 recv HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
 > n1 ready
-  AppendEntries term=1 prev=1/5 commit=5 entries=[]
-  AppendEntries term=1 prev=1/5 commit=5 entries=[]
   InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
-> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n3 recv InstallSnapshot term=1 snap=1/5 offset=40 len=40 last=false
-> n2 ready
-  AppendResponse term=1 match=5
-  AppendResponse term=1 match=5
 > n3 ready
   SnapshotResponse term=1 reject=false match=1 acked=80
-> n1 recv AppendResponse term=1 match=5
-> n1 recv AppendResponse term=1 match=5
 > n1 recv SnapshotResponse term=1 reject=false match=1 acked=80
 > n1 ready
   InstallSnapshot term=1 snap=1/5 offset=80 len=4 last=true

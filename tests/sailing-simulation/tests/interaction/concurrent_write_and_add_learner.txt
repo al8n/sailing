@@ -173,20 +173,10 @@ stabilize
 > n1 recv HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
 > n1 ready
-  AppendEntries term=1 prev=1/4 commit=4 entries=[]
-  AppendEntries term=1 prev=1/4 commit=4 entries=[]
   AppendEntries term=1 prev=1/3 commit=4 entries=[1/4 normal 0x010000000000000062]
-> n2 recv AppendEntries term=1 prev=1/4 commit=4 entries=[]
-> n3 recv AppendEntries term=1 prev=1/4 commit=4 entries=[]
 > n4 recv AppendEntries term=1 prev=1/3 commit=4 entries=[1/4 normal 0x010000000000000062]
-> n2 ready
-  AppendResponse term=1 match=4
-> n3 ready
-  AppendResponse term=1 match=4
 > n4 ready
   AppendResponse term=1 reject hint=0/0
-> n1 recv AppendResponse term=1 match=4
-> n1 recv AppendResponse term=1 match=4
 > n1 recv AppendResponse term=1 reject hint=0/0
 > n1 ready
   AppendEntries term=1 prev=0/0 commit=4 entries=[1/1 empty, 1/2 normal 0x010000000000000061, 1/3 conf-change 0x120c080212080400000000000000, 1/4 normal 0x010000000000000062]

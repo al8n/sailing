@@ -132,17 +132,6 @@ stabilize
   n3 leader-changed term=1 lead=1
 > n1 recv HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
-> n1 ready
-  AppendEntries term=1 prev=1/1 commit=1 entries=[]
-  AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n2 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n3 recv AppendEntries term=1 prev=1/1 commit=1 entries=[]
-> n2 ready
-  AppendResponse term=1 match=1
-> n3 ready
-  AppendResponse term=1 match=1
-> n1 recv AppendResponse term=1 match=1
-> n1 recv AppendResponse term=1 match=1
 
 raft-state
 ----

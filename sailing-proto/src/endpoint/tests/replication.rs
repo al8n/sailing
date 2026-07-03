@@ -2015,10 +2015,17 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
 
 // ---- Fix 1 regression: empty appends must NOT consume the inflight window ----
 
-/// A caught-up Replicate peer triggers an empty AppendEntries on every HeartbeatResponse.
-/// Before the fix, each call to `sent_entries` added a zero-byte inflight slot that was
-/// never freed (no ack for empty sends), so after `max_inflight_msgs` heartbeat-responses
-/// the window filled and newly proposed entries were silently not delivered.
+/// A Replicate peer whose `match` is STALE (caught up by `next_index`, but the acks were lost in
+/// transit) triggers an empty AppendEntries on every HeartbeatResponse — the probe whose success
+/// ack refreshes `match`. Before the fix, each call to `sent_entries` added a zero-byte inflight
+/// slot that was never freed (no ack for empty sends), so after `max_inflight_msgs`
+/// heartbeat-responses the window filled and newly proposed entries were silently not delivered.
+///
+/// (This regression originally drove the empty probe through a fully CAUGHT-UP peer — `match ==
+/// last_index` — but such a responder no longer draws any append at all: the heartbeat-response
+/// pump is gated on the responder being behind or probing. The stale-`match` shape here is the one
+/// that still legitimately elicits per-response empty appends, so it is the one that keeps this
+/// pin FAILS-ON-OLD for the recording guard.)
 ///
 /// This test uses a small window (4 slots), delivers many HeartbeatResponses (more than 4),
 /// then proposes a new entry and asserts that an AppendEntries carrying it IS emitted.
@@ -2075,8 +2082,19 @@ fn empty_appends_do_not_wedge_inflight_window() {
   );
   while ep.poll_message().is_some() {}
 
-  // Deliver 10 HeartbeatResponses from peer 2 (each triggers an empty AppendEntries for a
-  // caught-up peer). With window=4 and the bug, only 4 responses suffice to wedge the window.
+  // Make peer 2's `match` STALE: propose cmd@2 and send it, but never deliver the ack. Peer 2 is
+  // now caught up by `next_index` (3) while `match` (1) sits below `last_index` (2) — exactly the
+  // shape whose HeartbeatResponses elicit the empty refresh probe.
+  let _stale = ep
+    .propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"lost"))
+    .unwrap();
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Deliver 10 HeartbeatResponses from peer 2 (each triggers an empty AppendEntries for the
+  // stale-match peer). With window=4 and the bug, a few responses suffice to wedge the window.
   for _ in 0..10 {
     ep.handle_message(
       d,
@@ -2111,6 +2129,71 @@ fn empty_appends_do_not_wedge_inflight_window() {
   assert!(
     delivered,
     "after 10 heartbeat-responses the inflight window must not be wedged; proposed entry must be delivered to peer 2"
+  );
+}
+
+/// A heartbeat round to a CAUGHT-UP follower costs 2 messages, not 4: its HeartbeatResponse draws
+/// NO AppendEntries back (etcd MsgHeartbeatResp parity — sendAppend only when `match < lastIndex`
+/// or the peer is in StateProbe). The heartbeat already advertised the commit, so the empty append
+/// (and the AppendResponse it would draw) is pure per-round amplification. A BEHIND follower's
+/// response still draws the append, and a caught-up-but-PROBING peer still draws the empty append
+/// whose success ack re-promotes it to Replicate.
+///
+/// MUTATION: drop the responder-needs-contact gate in `on_heartbeat_response` → the caught-up
+/// phase below sees an (empty) AppendEntries to peer 2.
+#[test]
+fn heartbeat_response_pump_gated_on_responder_behind() {
+  use crate::{Message, Term};
+
+  // 3-voter leader (node 1) with the no-op@1 committed via a peer-2 ack: peer 2 is CAUGHT UP
+  // (match == last_index == 1, Replicate), peer 3 is BEHIND (match == 0, never acked).
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+  assert!(ep.tracker.progress(&2u64).unwrap().state().is_replicate());
+  assert_eq!(
+    ep.tracker.progress(&2u64).unwrap().match_index(),
+    log.last_index()
+  );
+
+  let hb_response = |from: u64| {
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      from,
+      bytes::Bytes::new(),
+    ))
+  };
+
+  // CAUGHT UP: peer 2's response draws nothing at all back from the leader.
+  ep.handle_message(d, &mut log, &mut stable, 2u64, hb_response(2));
+  let to_2: Vec<_> = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| o.to() == 2u64)
+    .collect();
+  assert!(
+    to_2.is_empty(),
+    "a caught-up follower's HeartbeatResponse must draw NO message (got {to_2:?})"
+  );
+
+  // BEHIND: peer 3's response still draws the catch-up AppendEntries.
+  ep.handle_message(d, &mut log, &mut stable, 3u64, hb_response(3));
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .any(|o| o.to() == 3u64 && matches!(o.message(), Message::AppendEntries(_))),
+    "a behind follower's HeartbeatResponse must still draw the append"
+  );
+
+  // PROBING at the tail (e.g. regressed to Probe after leaving Snapshot state at a fully
+  // compacted boundary): even with `match == last_index` the response draws the empty append —
+  // the Probe carve-out keeps contact flowing so the peer's next advancing ack (of a real entry)
+  // promotes it back to Replicate rather than idling in Probe across quiet rounds.
+  if let Some(p) = ep.tracker.progress_mut(&2u64) {
+    p.become_probe();
+  }
+  ep.handle_message(d, &mut log, &mut stable, 2u64, hb_response(2));
+  let empty_probe = core::iter::from_fn(|| ep.poll_message()).any(|o| {
+    o.to() == 2u64 && matches!(o.message(), Message::AppendEntries(ae) if ae.entries().is_empty())
+  });
+  assert!(
+    empty_probe,
+    "a caught-up peer stuck in Probe must still draw the empty contact append"
   );
 }
 

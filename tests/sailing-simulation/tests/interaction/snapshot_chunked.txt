@@ -154,14 +154,9 @@ stabilize
 > n1 recv HeartbeatResponse term=1
 > n1 ready
   AppendEntries term=1 prev=1/5 commit=5 entries=[]
-  AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n2 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
 > n3 recv AppendEntries term=1 prev=1/5 commit=5 entries=[]
-> n2 ready
-  AppendResponse term=1 match=5
 > n3 ready
   AppendResponse term=1 reject hint=1/1
-> n1 recv AppendResponse term=1 match=5
 > n1 recv AppendResponse term=1 reject hint=1/1
 > n1 ready
   InstallSnapshot term=1 snap=1/5 offset=0 len=40 last=false

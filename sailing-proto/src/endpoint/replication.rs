@@ -1144,7 +1144,28 @@ where
       // round instead of wedging until an unrelated proposal triggers a send.
       pr.free_inflight_on_heartbeat();
     }
-    self.pump_appends(now, from.cheap_clone(), log, stable);
+    // Pump ONLY a responder that still needs contact (etcd MsgHeartbeatResp: sendAppend iff
+    // `pr.Match < lastIndex || pr.State == StateProbe`):
+    //  - `match < last_index`: the responder is missing entries — or its `match` is merely STALE
+    //    (acks lost in transit), where the pump's EMPTY append is the probe whose success ack
+    //    refreshes `match` and unclamps the heartbeat commit (suppressing that send wedges a
+    //    healed follower's commit forever).
+    //  - `Probe`: contact matters regardless of `match` — the (possibly empty) append's ack is
+    //    what promotes the peer back to Replicate.
+    // A CAUGHT-UP Replicate responder gets nothing: the heartbeat that elicited this response
+    // already advertised the commit, so the empty append (and the AppendResponse it draws back)
+    // is pure amplification — this gate is what makes an idle round cost 2 messages per peer,
+    // not 4. A Snapshot-state responder always has `match < pending <= last_index`, so it still
+    // reaches the pump (a no-op while paused) and the snapshot resend pacing below is untouched.
+    // The Safe read path is unaffected either way: reads confirm on the response-ctx quorum
+    // below, never on the pump.
+    let responder_needs_contact = self
+      .tracker
+      .progress(&from)
+      .is_some_and(|pr| pr.match_index() < log.last_index() || pr.state().is_probe());
+    if responder_needs_contact {
+      self.pump_appends(now, from.cheap_clone(), log, stable);
+    }
     // pump_appends can poison (a log read in the append path) → fail-stop before the snapshot-resend and
     // the ReadIndex path below confirm reads / send on a dead node.
     if self.poison.poisoned {

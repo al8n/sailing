@@ -246,16 +246,11 @@ stabilize
 > n2 recv HeartbeatResponse term=2
 > n2 ready
   InstallSnapshot term=2 snap=2/6 offset=0 len=84 last=true
-  AppendEntries term=2 prev=2/6 commit=6 entries=[]
 > n1 recv InstallSnapshot term=2 snap=2/6 offset=0 len=84 last=true
-> n3 recv AppendEntries term=2 prev=2/6 commit=6 entries=[]
 > n1 ready
   SnapshotResponse term=2 reject=false match=6 acked=0
   n1 snapshot-installed snap=2/6
-> n3 ready
-  AppendResponse term=2 match=6
 > n2 recv SnapshotResponse term=2 reject=false match=6 acked=0
-> n2 recv AppendResponse term=2 match=6
 > n2 ready
   AppendEntries term=2 prev=2/6 commit=6 entries=[]
 > n1 recv AppendEntries term=2 prev=2/6 commit=6 entries=[]
