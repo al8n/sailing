@@ -3,7 +3,7 @@
 This document pins the byte-level encoding of everything `sailing-proto` puts on a wire or a disk:
 the consensus envelope, the embedder-id (`Data`) seam, the stream-transport frame, and the
 `Labeled` hello. **Any change to anything below MUST bump `LABEL_VERSION`**
-(`src/transport/labeled.rs`) so mixed-version nodes reject each other at the handshake instead of
+(`src/transport/labeled/mod.rs`) so mixed-version nodes reject each other at the handshake instead of
 mis-decoding consensus traffic. The golden byte vectors in `src/wire/tests.rs`
 (`golden_byte_vectors`) pin representative encodings; a deliberate format change updates this
 document, the schema, the vectors, and the version byte in the same commit.
@@ -35,7 +35,7 @@ reference — this section pins the SEMANTICS:
 - Varints reject overlong encodings; nested messages are recursion-depth-limited; every
   declared length is bounds-checked against the remaining input BEFORE any allocation.
 
-**Sailing's validation (enforced at the wire→programming conversion, `src/wire.rs`):**
+**Sailing's validation (enforced at the wire→programming conversion, `src/wire/mod.rs`):**
 
 - An id field (`*_id`, set elements, `ConfChangeSingle.node_id`) carries the embedder
   `NodeId`'s `Data` encoding. It must be **1..=1024 bytes** (the hello's bound) and must decode

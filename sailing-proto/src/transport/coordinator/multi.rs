@@ -15,6 +15,11 @@ use std::vec::Vec;
 
 /// Per-group storage a [`MultiStreamCoordinator`] uses to drive each group's endpoint when inbound
 /// bytes span multiple groups. The caller implements it over its own per-group store table.
+///
+/// CONTRACT: resolution must be STABLE (the same group always resolves to the same stores) and
+/// NON-ALIASING (two groups must never share a store — a shared log is a safety violation).
+/// Returning `Some` for a group the `MultiRaft` does not host is a harmless per-message drop;
+/// returning `None` for a hosted group starves it.
 pub trait GroupStores<G, L, S> {
   /// The `(log, stable)` stores for `group`, or `None` if this host has no storage for it — an
   /// inbound message for an unknown group is then dropped (the sender retries on its own cadence).

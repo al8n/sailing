@@ -200,9 +200,11 @@ pub(crate) fn id_within_wire_bound<I: Data>(id: &I) -> bool {
   !v.is_empty() && v.len() <= MAX_ID_LEN
 }
 
-/// Encode one consensus message into `buf` as the protobuf envelope — the payload of one
-/// transport frame. The public seam for custom transports (the built-in stream/QUIC
-/// transports and the simulation harness all route through here).
+/// Encode one consensus message into `buf` as the protobuf envelope — the message body that
+/// FOLLOWS the group-demux header inside one transport frame (see WIRE.md §3; a custom transport
+/// prepends the `[u16 group_len][group bytes]` header itself). The public seam for custom
+/// transports (the built-in stream/QUIC transports and the simulation harness all route through
+/// here).
 pub fn encode_message<I: NodeId>(msg: &Message<I>, buf: &mut Vec<u8>) {
   pb_message(msg).encode(buf);
 }
@@ -386,9 +388,10 @@ impl<I: NodeId> MessageEncoder<I> {
 /// allocation while leaving generous forward-compat headroom.
 const MAX_UNKNOWN_FIELDS: usize = 16;
 
-/// Decode one frame (the COMPLETE payload of a transport frame) into a consensus
-/// message. The frame's `Bytes` is the backing allocation: decoded payloads alias it
-/// (O(1) refcount slices — the frame stays alive as long as any decoded field does).
+/// Decode one encoded consensus message — the bytes FOLLOWING the group-demux header in a
+/// transport frame's payload (see WIRE.md §3; the built-in transports strip the header before
+/// calling this). The input `Bytes` is the backing allocation: decoded payloads alias it
+/// (O(1) refcount slices — it stays alive as long as any decoded field does).
 pub fn decode_message<I: NodeId>(mut frame: Bytes) -> Result<Message<I>, DecodeError> {
   // `DecodeOptions::decode` takes the `Bytes` by `Buf`, so decoded `bytes` fields still alias the
   // frame (zero-copy); it only additionally bounds the unknown-field allowance.
