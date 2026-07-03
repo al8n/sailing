@@ -140,7 +140,7 @@ fn gates_app_frames_until_validated_then_decodes() {
   let mut d = dialer(7);
   let mut a = acceptor(9);
   // A message queued before the handshake settles must not decode on the peer prematurely.
-  d.send_message(&sample_msg());
+  d.send_message(&[], &sample_msg());
   assert!(d.is_handshaking() && a.is_handshaking());
 
   pump(&mut d, &mut a);
@@ -158,7 +158,7 @@ fn round_trips_a_message_after_handshake() {
   let mut d = dialer(7);
   let mut a = acceptor(9);
   pump(&mut d, &mut a); // settle the handshake first
-  d.send_message(&sample_msg());
+  d.send_message(&[], &sample_msg());
   pump(&mut d, &mut a);
   let mut msgs = Vec::new();
   a.poll_decoded(&mut msgs).unwrap();
@@ -202,16 +202,17 @@ fn oversized_frame_closes_the_conn_and_clears_the_encoder_cache() {
     Term::new(2),
     crate::conf::ConfState::from_voters([1u64, 2, 3]),
   );
-  a.send_message(&Message::InstallSnapshot(
-    crate::InstallSnapshot::new_chunk(
+  a.send_message(
+    &[],
+    &Message::InstallSnapshot(crate::InstallSnapshot::new_chunk(
       Term::new(2),
       9,
       meta,
       bytes::Bytes::from_static(&[0xAB; 32]),
       0,
       1_000_000, // non-final (offset + len < total) → the cache is retained, not completion-cleared
-    ),
-  ));
+    )),
+  );
   assert!(
     a.encoder.cached_body_len().is_some(),
     "the send must populate the encoder cache"
@@ -244,8 +245,8 @@ fn backpressured_write_never_truncates_a_frame() {
   // The full framed message must still reach the wire intact across repeated drains, never a prefix
   // that a later frame could complete into a corrupted-but-valid message.
   let mut sender: Conn<u64, Throttle> = Conn::new(Throttle::new(3, Some(enc_id(7))));
-  sender.send_message(&sample_msg());
-  sender.send_message(&sample_msg());
+  sender.send_message(&[], &sample_msg());
+  sender.send_message(&[], &sample_msg());
 
   // Drain the wire in many small pulls, exactly as the throttle allows.
   let mut wire = Vec::new();
@@ -271,7 +272,7 @@ fn outbound_cap_exceeded_closes_the_conn() {
   // trips, the connection closes instead of growing without bound.
   let mut conn: Conn<u64, Throttle> = Conn::new(Throttle::new(0, Some(enc_id(7))));
   conn.set_max_out_for_test(16);
-  conn.send_message(&sample_msg()); // a heartbeat frame is well over 16 bytes
+  conn.send_message(&[], &sample_msg()); // a heartbeat frame is well over 16 bytes
   assert!(
     conn.is_closed(),
     "exceeding the outbound cap closes the connection"
@@ -310,7 +311,7 @@ fn frames_in_the_final_read_before_eof_still_deliver() {
   let mut d = dialer(7);
   let mut a = acceptor(9);
   pump(&mut d, &mut a); // validated
-  d.send_message(&sample_msg());
+  d.send_message(&[], &sample_msg());
   let mut wire = Vec::new();
   d.poll_transmit(&mut wire);
   // The frame and the EOF arrive in the SAME read: a clean close retains the peer so the final
@@ -410,8 +411,8 @@ fn pending_refeed_reassembles_across_a_tiny_receive_buffer() {
   // 8-byte receive cap: a multi-hundred-byte read is consumed in many Pending rounds, with
   // plaintext drained between each. Both messages must reassemble exactly.
   let mut sender: Conn<u64, TinyRecv> = Conn::new(TinyRecv::new(usize::MAX, Some(enc_id(7))));
-  sender.send_message(&sample_msg());
-  sender.send_message(&sample_msg());
+  sender.send_message(&[], &sample_msg());
+  sender.send_message(&[], &sample_msg());
   let mut wire = Vec::new();
   sender.poll_transmit(&mut wire);
   assert!(
@@ -514,7 +515,7 @@ fn operations_on_a_closed_conn_are_inert() {
   // handle_data on a Closed conn short-circuits to Ok.
   a.handle_data(b"more", false, Instant::ORIGIN).unwrap();
   // send_message on a Closed conn is a no-op (the message is dropped).
-  a.send_message(&sample_msg());
+  a.send_message(&[], &sample_msg());
   let mut out = Vec::new();
   assert_eq!(
     a.poll_transmit(&mut out),
@@ -529,7 +530,7 @@ fn operations_on_a_closed_conn_are_inert() {
 #[test]
 fn fully_backpressured_drain_retains_bytes_without_closing() {
   let mut conn: Conn<u64, Throttle> = Conn::new(Throttle::new(0, Some(enc_id(7))));
-  conn.send_message(&sample_msg());
+  conn.send_message(&[], &sample_msg());
   assert!(
     !conn.is_closed(),
     "a stalled-but-under-cap send does not close the connection"

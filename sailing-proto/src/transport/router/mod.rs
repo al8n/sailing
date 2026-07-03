@@ -183,7 +183,9 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     let Some(conn) = self.conns.get_mut(&id) else {
       return false;
     };
-    conn.send_message(msg);
+    // The single-group router sends the empty group tag; the multi-group coordinator stamps a real
+    // group id here once it drives a `MultiRaft`.
+    conn.send_message(&[], msg);
     if conn.is_closed() {
       self.remove_internal(id, None);
       return false;

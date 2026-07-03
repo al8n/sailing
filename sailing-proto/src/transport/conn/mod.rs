@@ -6,7 +6,7 @@
 //! the consensus `Endpoint`.
 use super::{
   TransportError,
-  frame::{FrameDecoder, MAX_FRAME_LEN, encode_frame},
+  frame::{FrameDecoder, MAX_FRAME_LEN, encode_frame, split_group_header, write_group_header},
   stream::{Intake, RecordIo},
 };
 use crate::{CheapClone, Instant, Message, NodeId};
@@ -183,10 +183,20 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
           return Err(e);
         }
       };
-      // ZERO-COPY: the frame is a shared slice of the decoder's buffer, and the wire decode
+      // Split the transport's group-demux header off the front; the remainder is the encoded
+      // `Message`. The group id selects the target Raft group in a multi-group host; a single-group
+      // owner sends an empty tag and ignores it here.
+      let (_group, message) = match split_group_header(frame) {
+        Ok(split) => split,
+        Err(e) => {
+          self.close_suspect();
+          return Err(e);
+        }
+      };
+      // ZERO-COPY: the message bytes are a shared slice of the decoder's buffer, and the wire decode
       // slices the message's `Bytes` fields (entry payloads, blobs, contexts, encoded ids) out
       // of the SAME allocation; a frame must carry exactly one well-formed envelope.
-      match crate::wire::decode_message::<I>(frame) {
+      match crate::wire::decode_message::<I>(message) {
         Ok(msg) => out.push(msg),
         Err(_) => {
           self.close_suspect();
@@ -206,11 +216,12 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
   ///   connect/kill flap loop, and keeps the `u32` length prefix exact);
   /// - a send that would push outbound occupancy past the cap closes the connection (the peer has
   ///   stopped draining) instead of growing without bound.
-  pub fn send_message(&mut self, msg: &Message<I>) {
+  pub fn send_message(&mut self, group: &[u8], msg: &Message<I>) {
     if matches!(self.state, ConnState::Closed { .. }) {
       return;
     }
     let mut payload = Vec::new();
+    write_group_header(group, &mut payload);
     self.encoder.encode_message(msg, &mut payload);
     // The bound covers EVERY layer of outbound buffering: this connection's pending frames PLUS
     // whatever the record layer (and its inner layers) already hold — `buffered_outbound` is the

@@ -40,7 +40,7 @@ use quinn_proto::{
 use rustls::pki_types::CertificateDer;
 
 use super::{
-  super::frame::{MAX_FRAME_LEN, encode_frame},
+  super::frame::{MAX_FRAME_LEN, encode_frame, write_group_header},
   MAX_HELLO_LEN,
   conn::{ConnEntry, ConnTable, Phase},
   crypto::QuicOptions,
@@ -867,6 +867,7 @@ impl<I: NodeId> Bridge<I> {
       return;
     }
     let mut payload = Vec::new();
+    write_group_header(&[], &mut payload);
     self.encoder.encode_message(msg, &mut payload);
     if payload.len() > MAX_FRAME_LEN {
       self.oversized_dropped = self.oversized_dropped.saturating_add(1);

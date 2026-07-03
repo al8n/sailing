@@ -11,19 +11,12 @@ use crate::Instant;
 use std::vec::Vec;
 
 const LABEL_MAGIC: u8 = 0xCA;
-/// The hello wire version. CONTRACT: any change to the transport wire format — the hello layout,
-/// the frame format, or the `Message` codec itself — MUST bump this byte, so mixed-version nodes
-/// reject each other at the handshake instead of mis-decoding consensus traffic. The same fence
-/// covers a field whose MEANING a peer must not under-populate: version 3 is the failover precise
-/// commit-anchor — the first CONSUMER of `SnapshotMeta.max_wall_plus_window` and
-/// `max_unwalled_lease_window` (added inert at version 2). A pre-anchor peer that does not fold those
-/// floors would feed a successor an under-sized release bound (a stale read), so it must be rejected at
-/// the handshake, not tolerated as a forward-compatible additive field. Version 4 adds the `SetReadMode`
-/// entry kind (mid-life read-mode migration): a pre-version-4 peer would reject it as an unknown
-/// `EntryKind` and close the connection, so the handshake must fence such a peer instead. Version 5
-/// adds chunked `InstallSnapshot` (`offset`/`total_len`) and `SnapshotResponse.acked_through`: a
-/// pre-version-5 peer would mis-stage a partial chunk as a whole blob, so it must be fenced.
-const LABEL_VERSION: u8 = 5;
+/// The hello wire version. CONTRACT: any change to the transport wire format — the hello layout, the
+/// frame format (including the multi-Raft group-demux header that precedes every encoded `Message`),
+/// or the `Message` codec itself — MUST bump this byte, so mixed-version nodes reject each other at the
+/// handshake instead of mis-decoding consensus traffic. Version 1 is the group-tagged wire baseline:
+/// each frame payload is `[u16 group_len][group bytes]` followed by the encoded `Message`.
+const LABEL_VERSION: u8 = 1;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 /// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes

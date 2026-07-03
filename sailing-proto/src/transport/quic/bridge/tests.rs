@@ -109,7 +109,7 @@ fn loopback_pair_exchanges_a_framed_message() {
     .next_frame(hb)
     .expect("no framing violation")
     .expect("one complete frame");
-  let decoded = crate::wire::decode_message::<u64>(frame).expect("frame decodes");
+  let decoded = crate::wire::decode_message::<u64>(strip_group(frame)).expect("frame decodes");
   assert_eq!(decoded, msg, "the message survives the QUIC round-trip");
   assert!(
     matches!(b.next_frame(hb), Ok(None)),
@@ -127,7 +127,7 @@ fn loopback_pair_exchanges_a_framed_message() {
   assert!(!a.ingest_recv(now, ha));
   let frame = a.next_frame(ha).expect("ok").expect("one frame");
   assert_eq!(
-    crate::wire::decode_message::<u64>(frame).expect("decodes"),
+    crate::wire::decode_message::<u64>(strip_group(frame)).expect("decodes"),
     reply
   );
 }
@@ -870,7 +870,7 @@ fn oversized_read_defers_to_the_next_pump() {
     }
     if let Ok(Some(f)) = b.next_frame(hb) {
       assert_eq!(
-        crate::wire::decode_message::<u64>(f).expect("decodes"),
+        crate::wire::decode_message::<u64>(strip_group(f)).expect("decodes"),
         msg,
         "the deferred large frame reassembles intact"
       );
@@ -908,7 +908,7 @@ fn graceful_fin_delivers_then_latches_close() {
     .expect("ok")
     .expect("the frame before the FIN");
   assert_eq!(
-    crate::wire::decode_message::<u64>(frame).expect("decodes"),
+    crate::wire::decode_message::<u64>(strip_group(frame)).expect("decodes"),
     msg
   );
 }
@@ -1049,7 +1049,7 @@ fn blocked_write_backpressures_then_resumes_on_writable() {
   );
   let got = got.expect("the backpressured frame fully transferred");
   assert_eq!(
-    crate::wire::decode_message::<u64>(got).expect("decodes"),
+    crate::wire::decode_message::<u64>(strip_group(got)).expect("decodes"),
     msg
   );
 }
@@ -1111,4 +1111,12 @@ fn peer_stop_on_an_unused_half_only_resets_it() {
     "a STOP on an unused half does not close the connection"
   );
   assert!(a.has_entry_for_test(ha));
+}
+
+/// Strip the group-demux header off a received frame, yielding the encoded-message bytes. Tests send
+/// an empty group tag, so this mirrors `write_framed`'s header on the receive side.
+fn strip_group(frame: bytes::Bytes) -> bytes::Bytes {
+  crate::transport::frame::split_group_header(frame)
+    .expect("group header")
+    .1
 }

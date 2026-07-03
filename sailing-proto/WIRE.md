@@ -12,7 +12,8 @@ document, the schema, the vectors, and the version byte in the same commit.
 
 The envelope is **protobuf (proto3)**, defined normatively by
 [`proto/sailing/v1/messages.proto`](proto/sailing/v1/messages.proto) and generated into the crate
-at build time (via `buffa`). One transport frame carries exactly one `sailing.v1.Message`; a
+at build time (via `buffa`). One transport frame carries a multi-Raft group-demux tag and exactly one
+`sailing.v1.Message` (see §3); a
 `ConfChange` entry's payload carries one `sailing.v1.ConfChangeV2`. The schema file is the field
 reference — this section pins the SEMANTICS:
 
@@ -74,7 +75,7 @@ reference — this section pins the SEMANTICS:
   entries that are LEASE-bearing but WALL-ABSENT — folded by the ENTRY property on EVERY node, so it is
   NOT zero off-tier (it equals `max_lease_window` in a non-failover LeaseGuard cluster) but is inert
   there (only the failover tier reads it). **The precise commit-anchor is the first CONSUMER of these
-  release floors, so `LABEL_VERSION` was bumped to 3:** a peer predating the consumed floors would feed a
+  release floors, so a pre-anchor peer is fenced by `LABEL_VERSION`:** a peer predating the consumed floors would feed a
   successor an under-sized release bound (a stale read), so it is rejected at the handshake — the
   mixed-version / field-strip fence (the fresh-cluster / matched-schema contract above) is ENFORCED for
   the failover floors, not merely documented. The handshake fences a PEER; the one residual it cannot
@@ -91,7 +92,7 @@ reference — this section pins the SEMANTICS:
   absent on the wire (byte-identical to a pre-migration snapshot); an explicit mode is present. **A node
   predating the
   `SetReadMode` kind would poison on (or silently drop) a committed migration — diverging the replicated
-  mode across the cluster — so `LABEL_VERSION` is now 4:** the handshake fences a pre-migration peer. (A
+  mode across the cluster — so a pre-migration peer is fenced by `LABEL_VERSION`:** the handshake fences it. (A
   node restarting from its OWN pre-migration durable log never sees a `SetReadMode`, so there is no
   divergence to fence — the same residual as the floors above.)
 - `InstallSnapshot.offset` (5) and `total_len` (6), and `SnapshotResponse.acked_through` (5), carry
@@ -100,7 +101,7 @@ reference — this section pins the SEMANTICS:
   `offset` within a `total_len`-byte blob, and `acked_through` is the receiver's highest contiguous
   staged offset (driving the leader's per-chunk pacing + resume). A `0` for any of the three is absent
   on the wire. **A node predating chunking would mis-stage a partial chunk as a whole blob (a decode
-  failure or corrupt install), so `LABEL_VERSION` is now 5:** the handshake fences a pre-chunking peer.
+  failure or corrupt install), so a pre-chunking peer is fenced by `LABEL_VERSION`:** the handshake fences it.
 - An enum field must carry a KNOWN value; the `Message.body` oneof must be present. Either
   failure rejects the message (parity with the old codec's unknown-tag reject).
 - A rejected message closes the connection (transport) — the endpoint is never poisoned by
@@ -138,23 +139,27 @@ decode with `decode_exact` (trailing bytes reject); truncated input errors, neve
 Each `Message` rides one frame:
 
 ```text
-[ u32 payload length, BIG-endian ][ payload = one encoded sailing.v1.Message ]
+[ u32 payload length, BIG-endian ][ payload = [ u16 group length, BE ][ group id bytes ][ one encoded sailing.v1.Message ] ]
 ```
 
-- The length prefix is big-endian (conventional for network framing); the payload is the
-  protobuf envelope.
-- Maximum payload: **64 MiB** (`MAX_FRAME_LEN`). A receiver rejects a larger declared length at
-  the header, before buffering any payload byte; a sender refuses to emit one (closing the
-  connection at the source rather than flap-looping against the receiver's bound).
-- A frame's payload must decode as **one** `Message` envelope with a present body (a malformed
-  payload closes the connection).
+- The length prefix is big-endian (conventional for network framing) and covers the WHOLE payload:
+  the multi-Raft group-demux header plus the protobuf envelope.
+- The group-demux header tags each consensus frame (on BOTH the stream and QUIC transports) with its
+  Raft group, so a multi-group host routes the frame to the right endpoint by reading the group id at a
+  fixed offset — WITHOUT decoding the `Message`. A single-group host sends an empty tag
+  (`group length == 0`); the group id is bounded 0..=1024 bytes.
+- Maximum payload: **64 MiB** (`MAX_FRAME_LEN`), covering the group header and the envelope. A receiver
+  rejects a larger declared length at the header, before buffering any payload byte; a sender refuses to
+  emit one (closing the connection at the source rather than flap-looping against the receiver's bound).
+- A frame's payload must be a valid group header followed by **one** `Message` envelope with a present
+  body (a malformed payload closes the connection).
 
 ## 4. The `Labeled` hello (`tcp`/`tls`/`quic` features)
 
 One-time, before any application frame, in each direction:
 
 ```text
-[ magic 0xCA ][ version 0x05 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
+[ magic 0xCA ][ version 0x01 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
 ```
 
 The ENCODING is shared by both transports — one format, one parser family, one version byte
