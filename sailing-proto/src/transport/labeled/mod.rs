@@ -39,6 +39,10 @@ pub struct LabelOptions {
   /// The cluster this node belongs to; a peer advertising a different cluster is rejected.
   pub cluster: ClusterId,
   /// The local node id, already encoded via `NodeId`/`Data` — the bytes carried in the hello.
+  ///
+  /// On a multi-group host this must be the ONE id every hosted group's `Config` shares (the
+  /// bound `MultiRaft::create_group` enforces): the receiver's sender-authenticity check drops
+  /// any message whose embedded sender differs from this authenticated identity.
   pub local_id: Vec<u8>,
 }
 

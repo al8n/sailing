@@ -8,8 +8,8 @@
 //! single-group driving methods take the target group's store directly.
 use super::super::{ConnId, TransportError, router::PeerRouter, stream::RecordIo};
 use crate::{
-  Config, Data, Endpoint, Event, GroupExists, GroupId, Index, Instant, LogStore, MultiRaft, NodeId,
-  Now, ProposeError, StableStore, StateMachine, StorageProgress,
+  Config, CreateGroupError, Data, Endpoint, Event, GroupId, Index, Instant, LogStore, MultiRaft,
+  NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
 };
 use std::vec::Vec;
 
@@ -56,7 +56,7 @@ where
   /// Create a fresh group (see [`MultiRaft::create_group`]).
   ///
   /// # Errors
-  /// [`GroupExists`] if the group id is already hosted.
+  /// The admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
   pub fn create_group(
     &mut self,
     gid: G,
@@ -64,14 +64,14 @@ where
     now: impl Into<Now>,
     seed: u64,
     fsm: F,
-  ) -> Result<(), GroupExists> {
+  ) -> Result<(), CreateGroupError> {
     self.multi.create_group(gid, config, now, seed, fsm)
   }
 
   /// Recover a group from durable storage (see [`MultiRaft::restore_group`]).
   ///
   /// # Errors
-  /// [`GroupExists`] if the group id is already hosted.
+  /// The admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn restore_group<L, S>(
     &mut self,
@@ -83,7 +83,7 @@ where
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
-  ) -> Result<(), GroupExists>
+  ) -> Result<(), CreateGroupError>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
