@@ -639,7 +639,9 @@ where
     let std_now = self.quinn_now(now.mono());
     while let Some(h) = self.bridge.take_connected() {
       let Some(me) = self.node_id() else {
-        continue; // no group hosted: nothing to authenticate as; the connection auth-times out
+        // No identity latched yet: our preface cannot be staged, so the peer's preface (or the
+        // auth deadline, if none arrives) closes this connection in the drain below.
+        continue;
       };
       let mut preface = Vec::new();
       self.identity.write_control_preface(&me, &mut preface);
@@ -666,10 +668,12 @@ where
         };
         if self.bridge.is_authenticating(h) {
           if self.node_id().is_none() {
-            // No hosted group yet: there is no identity to bind against, so the self-id gate
-            // would be vacuous and the connection would validate WITHOUT our preface ever having
-            // been staged — a half-duplex wedge. Leave it authenticating; the auth deadline reaps
-            // it locally, and the peer redials once groups exist.
+            // No identity yet (no group has ever been admitted): the self-id gate would be
+            // vacuous, our preface was never staged, and the peer's preface was ALREADY popped by
+            // next_frame above — this connection can never validate, even if a group is admitted
+            // a moment from now. Close it immediately (an observable close the peer redials
+            // after) rather than leaving it to wedge until the auth deadline.
+            self.bridge.close_local(std_now, h);
             break;
           }
           let certs = self.bridge.peer_certs(h);

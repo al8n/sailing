@@ -306,3 +306,38 @@ fn zero_group_host_never_binds() {
     "the election crossed after the group appeared"
   );
 }
+
+/// A zero-group host CLOSES a preface-bearing connection immediately (the preface was already
+/// consumed, so it could never validate) — admission plus a fresh dial therefore recover well
+/// WITHIN the auth-deadline window, with no reap wait.
+#[test]
+fn group_admitted_before_auth_deadline_recovers() {
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut a = multi_coord(&ca, 1, cluster);
+  let mut b = multi_coord(&ca, 2, cluster); // hosts NO groups yet
+  a.create_group(100, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
+    .unwrap();
+  let mut sa = group_stores(&[100]);
+  let mut sb = group_stores(&[]);
+  let now = Instant::ORIGIN;
+
+  a.connect(now, addr(2), 2u64).expect("dial");
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  assert!(
+    !b.has_bound_conn(&1u64),
+    "the identity-less host closed the connection instead of binding"
+  );
+
+  // No time passes: the group appears and a fresh dial binds long before the 5s deadline.
+  b.create_group(100, two_voter(2), now, 2, CountSm::default())
+    .unwrap();
+  sb.map
+    .insert(100, (VecLog::default(), AsyncStable::default()));
+  a.connect(now, addr(2), 2u64).expect("redial");
+  settle(&mut a, &mut b, &mut sa, &mut sb, now);
+  assert!(
+    a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
+    "both bind with zero elapsed time"
+  );
+}
