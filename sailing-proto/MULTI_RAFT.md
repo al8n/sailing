@@ -4,9 +4,9 @@ How sailing hosts many Raft groups in one process. This document tracks the desi
 and the phased roadmap; it is the companion to [`WIRE.md`](./WIRE.md) for the
 multi-group layer.
 
-Status: **Phases 0 and 1 are implemented** — the `MultiRaft` container, the group-demux
-wire, and both multi-group coordinators (`MultiStreamCoordinator`, `MultiQuicCoordinator`).
-Phases 2–6 are roadmap, not yet built.
+Status: **Phases 0–2 are implemented** — the `MultiRaft` container, the group-demux wire,
+both multi-group coordinators (`MultiStreamCoordinator`, `MultiQuicCoordinator`), and the
+shared in-memory storage engine (`GroupEngine`). Phases 3–6 are roadmap, not yet built.
 
 ---
 
@@ -134,8 +134,9 @@ protobuf-embedded tag could not.
 | --- | --- | --- |
 | **0** (done) | `mod multi` scaffold: container + `GroupId` + routing + aggregate output/deadline surface + group-distinct seeding; append-only group set; downstream seams reserved | `sailing-proto` |
 | **1** (done) | Wire group-demux: the frame-envelope group tag, `LABEL_VERSION` reset to 1, the `(group, peer)` demux through the router/bridge, and both multi-group coordinators | `sailing-proto` wire + transport |
-| **2** | Shared storage engine: group-prefixed keys, batch-first append, one fsync/batch, per-group completion fan-out, `(group_id, OpId)` keying, per-group boot-epoch | driver / storage impl |
-| **3** | Shared reactor: ready-set scheduler + `poll_timeout` timing wheel + storage-worker pool | `sailing-reactor` |
+| **2** (done) | Shared storage engine: the in-memory reference `GroupEngine` — every group's stores behind per-group staged-until-flush handles, ONE `flush()` barrier covering all groups' writes (the fsync amortization), per-group completion FIFOs and boot epochs. A disk engine in driver-land mirrors this contract | `sailing-proto` `multi::engine` |
+| **3** | Shared reactor host (the I/O layer: real sockets/timers, `flush()` becomes the fsync point): ready-set scheduler + a `deadlines()` timing wheel + a group-keyed client `Handle` | `sailing-reactor` |
+| **3b** | Sharded compio host: shard-per-core `MultiRaft` + per-core engine shards (a per-core WAL — no cross-core fsync contention); cross-core handoff at the TRANSPORT EDGE only, since a peer connection stays core-owned (per-core connections would fight the router's one-conn-per-peer model) | `sailing-compio` |
 | **4** | Heartbeat coalescing + quiescence (idle-group scale win) | transport + reactor |
 | **5** | Dynamic create/destroy via the store FSM | `multi` + reactor |
 | **6** (deferred) | Snapshot-bootstrapped group creation; split / merge | separate project |

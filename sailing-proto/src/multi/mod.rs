@@ -10,11 +10,16 @@
 //! See `MULTI_RAFT.md` for the architecture and the phased roadmap. The group set is append-only
 //! in policy — [`remove_group`](MultiRaft::remove_group) ships as the dynamic-lifecycle teardown
 //! seam, but there is no create/destroy protocol yet — over caller-injected per-group storage
-//! (each group is handed its own `LogStore`/`StableStore` per call, mirroring [`Endpoint`]). The shared storage
-//! engine, the group-tagged wire, the threaded reactor, heartbeat coalescing, and dynamic group
-//! lifecycle are later phases that consume this surface without reshaping it. Every client-facing
-//! routing method of the single-group [`Endpoint`] — propose, conf changes (v1/v2), read-index,
-//! leader transfer, read-mode migration — has a group-keyed delegate here.
+//! (each group is handed its own `LogStore`/`StableStore` per call, mirroring [`Endpoint`]). The
+//! group-tagged wire (the multi-group coordinators) and the shared storage engine
+//! ([`GroupEngine`] — every co-located group's stores behind ONE batched durability barrier)
+//! consume this surface without reshaping it; the threaded reactor, heartbeat coalescing, and
+//! dynamic group lifecycle are later phases. Every client-facing routing method of the
+//! single-group [`Endpoint`] — propose, conf changes (v1/v2), read-index, leader transfer,
+//! read-mode migration — has a group-keyed delegate here.
+
+mod engine;
+pub use engine::{EngineLog, EngineStable, EngineStorageError, GroupEngine};
 
 mod group_id;
 pub use group_id::GroupId;
