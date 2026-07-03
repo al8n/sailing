@@ -19,7 +19,7 @@
 //! read-mode migration — has a group-keyed delegate here.
 
 mod engine;
-pub use engine::{EngineLog, EngineStable, GroupEngine};
+pub use engine::{EngineLog, EngineStable, EngineStorageError, GroupEngine};
 
 mod group_id;
 pub use group_id::GroupId;

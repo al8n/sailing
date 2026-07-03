@@ -89,7 +89,7 @@ mod endpoint;
 pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 
 mod multi;
-pub use multi::{EngineLog, EngineStable, GroupEngine, GroupId, MultiRaft};
+pub use multi::{EngineLog, EngineStable, EngineStorageError, GroupEngine, GroupId, MultiRaft};
 
 mod tracker;
 pub(crate) use tracker::Tracker;

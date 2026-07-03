@@ -18,6 +18,59 @@ fn voter_meta(last_index: u64, last_term: u64) -> SnapshotMeta<u64> {
   )
 }
 
+/// The two staging-capacity bounds part ways: a declared `total_len` over the cap is a FATAL
+/// error (the core poisons — a zero watermark would re-solicit the same declaration forever),
+/// while the same store keeps accepting an allocatable transfer afterward.
+#[test]
+fn over_cap_staging_declaration_is_fatal() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  eng.set_snapshot_staging_cap(1024);
+  assert!(eng.add_group(1));
+  let (_, stable) = eng.stores(&1).unwrap();
+  let meta = voter_meta(9, 2);
+
+  let err = stable
+    .accept_snapshot_chunk(&meta, 4096, 0, &Bytes::from_static(&[1, 2, 3]))
+    .unwrap_err();
+  assert_eq!(
+    err,
+    EngineStorageError::StagingUnallocatable { total_len: 4096 }
+  );
+
+  // An allocatable declaration on the same store still stages normally.
+  let got = stable
+    .accept_snapshot_chunk(&meta, 4, 0, &Bytes::from_static(&[9, 9, 9, 9]))
+    .unwrap();
+  assert_eq!(got, 4);
+}
+
+/// A large-but-allocatable declaration stages and makes progress — the cap defaults to
+/// allocator-bound, so a legitimate big snapshot never spins on zero-watermark retries.
+#[test]
+fn large_allocatable_staging_never_spins() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(1));
+  let (_, stable) = eng.stores(&1).unwrap();
+  let meta = voter_meta(9, 2);
+  let total = 1u64 << 20;
+
+  let chunk = Bytes::from(std::vec![7u8; 4096]);
+  assert_eq!(
+    stable
+      .accept_snapshot_chunk(&meta, total, 0, &chunk)
+      .unwrap(),
+    4096,
+    "the contiguous watermark advances"
+  );
+  assert_eq!(
+    stable
+      .accept_snapshot_chunk(&meta, total, 4096, &chunk)
+      .unwrap(),
+    8192,
+    "and keeps advancing — no zero-watermark restart"
+  );
+}
+
 /// A pre-barrier §5.3 conflict truncation invalidates the superseded staged completion: releasing
 /// it would claim a durable prefix through an index the barrier no longer makes durable.
 #[test]

@@ -25,10 +25,22 @@ use std::{
   vec::Vec,
 };
 
-/// Byte cap on one group's chunked-snapshot staging buffer: bounds a forged `total_len` without
-/// allocating (the fallible [`SnapshotStaging::new`] refuses anything larger, and the engine
-/// reports a zero watermark instead of erroring — see the capacity note on [`EngineStable`]).
-const MAX_SNAPSHOT_STAGING_BYTES: usize = 1 << 30;
+/// A fatal fault surfaced by [`EngineStable`] as `Err`, which the consensus core treats as poison
+/// — reserved for conditions genuinely terminal for an in-memory store.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum EngineStorageError {
+  /// A snapshot transfer declared a `total_len` the staging buffer cannot hold: over the
+  /// configured cap ([`GroupEngine::set_snapshot_staging_cap`]) or beyond what the allocator
+  /// grants. Terminal, not transient — an in-memory store that cannot stage the blob could not
+  /// hold its durable slot either (the disk store's disk-full equivalent), and a zero watermark
+  /// here would just re-solicit the same unstageable declaration forever.
+  #[error("snapshot staging cannot hold the declared blob ({total_len} bytes)")]
+  StagingUnallocatable {
+    /// The transfer's declared blob length.
+    total_len: u64,
+  },
+}
 
 /// One group's hosted storage. `log` and `stable` are separate fields so [`GroupEngine::stores`]
 /// can lend both mutably at once; `boot_epochs` backs [`GroupEngine::next_boot_epoch`].
@@ -40,10 +52,10 @@ struct GroupStorage<I> {
 }
 
 impl<I> GroupStorage<I> {
-  fn new() -> Self {
+  fn new(staging_cap: usize) -> Self {
     Self {
       log: EngineLog::new(),
-      stable: EngineStable::new(),
+      stable: EngineStable::new(staging_cap),
       boot_epochs: 0,
     }
   }
@@ -77,6 +89,9 @@ pub struct GroupEngine<G, I> {
   groups: BTreeMap<G, GroupStorage<I>>,
   flushes: u64,
   ops_flushed: u64,
+  /// The per-group snapshot-staging byte cap (see
+  /// [`set_snapshot_staging_cap`](Self::set_snapshot_staging_cap)); allocator-bound by default.
+  staging_cap: usize,
 }
 
 // No `G` bound: nothing here keys the map. `flush` alone needs `I: Clone` (folding the visible
@@ -89,6 +104,18 @@ impl<G, I> GroupEngine<G, I> {
       groups: BTreeMap::new(),
       flushes: 0,
       ops_flushed: 0,
+      staging_cap: usize::MAX,
+    }
+  }
+
+  /// Cap one group's chunked-snapshot staging buffer, in bytes (default: allocator-bound —
+  /// effectively unlimited). A transfer declaring a `total_len` above the cap fails FATALLY
+  /// ([`EngineStorageError::StagingUnallocatable`] — the core poisons that group) rather than
+  /// spinning on a transfer that can never stage. Applies to every current and future group.
+  pub fn set_snapshot_staging_cap(&mut self, cap: usize) {
+    self.staging_cap = cap;
+    for storage in self.groups.values_mut() {
+      storage.stable.staging_cap = cap;
     }
   }
 
@@ -163,7 +190,7 @@ where
     match self.groups.entry(gid) {
       MapEntry::Occupied(_) => false,
       MapEntry::Vacant(v) => {
-        v.insert(GroupStorage::new());
+        v.insert(GroupStorage::new(self.staging_cap));
         true
       }
     }
@@ -391,12 +418,14 @@ impl LogStore for EngineLog {
 /// release in submit order, as the trait requires.
 ///
 /// Chunked-snapshot staging (the `accept_snapshot_chunk` trio) is single-slot and independent of
-/// the barrier — staging is volatile pre-durability state by contract. Capacity exhaustion (a
-/// `total_len` beyond the staging byte cap, or a transfer fragmented past the disjoint-run bound)
-/// cannot surface as `Err` here (`Error` is [`Infallible`]); the engine instead discards the
-/// partial and reports a ZERO contiguous watermark, restarting the transfer with memory still
-/// bounded. An honest sender (one chunk per ack, resuming from the contiguous cursor) never
-/// approaches either bound.
+/// the barrier — staging is volatile pre-durability state by contract. Its two capacity bounds
+/// part ways: a transfer fragmented past the disjoint-run bound is TRANSIENT — the partial is
+/// discarded and a ZERO contiguous watermark restarts the transfer with memory still bounded (an
+/// honest sender, one chunk per ack from the contiguous cursor, never fragments) — while a
+/// declared `total_len` the buffer cannot hold at all is TERMINAL and surfaces as
+/// [`EngineStorageError::StagingUnallocatable`], which the core treats as poison: a store that
+/// cannot stage the blob could not hold its durable slot either, and a zero watermark would only
+/// re-solicit the same declaration forever.
 ///
 /// Handles are created by [`GroupEngine::add_group`] and borrowed via [`GroupEngine::stores`].
 #[derive(Debug)]
@@ -414,10 +443,13 @@ pub struct EngineStable<I> {
   /// Completions released by a barrier — what `poll`/`has_pending` see.
   ready: VecDeque<StableDone>,
   staging: Option<(SnapshotMeta<I>, SnapshotStaging)>,
+  /// The staging byte cap this group inherited from the engine (see
+  /// [`GroupEngine::set_snapshot_staging_cap`]).
+  staging_cap: usize,
 }
 
 impl<I> EngineStable<I> {
-  fn new() -> Self {
+  fn new(staging_cap: usize) -> Self {
     Self {
       visible: HardState::initial(),
       durable: HardState::initial(),
@@ -426,6 +458,7 @@ impl<I> EngineStable<I> {
       staged: VecDeque::new(),
       ready: VecDeque::new(),
       staging: None,
+      staging_cap,
     }
   }
 
@@ -451,7 +484,7 @@ impl<I> EngineStable<I> {
 
 impl<I: NodeId> StableStore for EngineStable<I> {
   type NodeId = I;
-  type Error = Infallible;
+  type Error = EngineStorageError;
 
   fn hard_state(&self) -> HardState<I> {
     self.durable.clone()
@@ -499,11 +532,12 @@ impl<I: NodeId> StableStore for EngineStable<I> {
       _ => {}
     }
     if self.staging.is_none() {
-      // The cap bounds a forged `total_len` WITHOUT allocating; refusal installs no staging and
-      // reports a zero watermark — see the capacity note on the type.
-      match SnapshotStaging::new(boundary, total_len, MAX_SNAPSHOT_STAGING_BYTES) {
+      // Over the cap, or beyond what the allocator grants: TERMINAL, not transient — a zero
+      // watermark would re-solicit the same unstageable declaration forever, while the
+      // fragmentation discard below stays a self-correcting restart.
+      match SnapshotStaging::new(boundary, total_len, self.staging_cap) {
         Some(s) => self.staging = Some((meta.clone(), s)),
-        None => return Ok(0),
+        None => return Err(EngineStorageError::StagingUnallocatable { total_len }),
       }
     }
     let contiguous = self
