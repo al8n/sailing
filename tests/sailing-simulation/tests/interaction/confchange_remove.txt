@@ -81,13 +81,18 @@ stabilize
 > n1 recv AppendResponse term=1 match=2
 > n1 recv AppendResponse term=1 match=2
 > n1 ready
+  Heartbeat term=1 commit=1
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
   n1 conf-changed index=2 voters={1,2}
+> n3 recv Heartbeat term=1 commit=1
 > n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
 > n2 ready
   AppendResponse term=1 match=2
   n2 conf-changed index=2 voters={1,2}
+> n3 ready
+  HeartbeatResponse term=1
 > n1 recv AppendResponse term=1 match=2
+> n1 recv HeartbeatResponse term=1
 
 raft-state
 ----

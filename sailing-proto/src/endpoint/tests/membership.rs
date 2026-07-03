@@ -1187,3 +1187,251 @@ fn oversized_conf_change_context_is_refused() {
     "the oversized conf change must NOT be appended"
   );
 }
+
+/// The commit that REMOVES a follower must still reach that follower: `apply_committed` prunes it
+/// from the tracker in the same fused pass that folds the change, and every later send targets only
+/// tracked peers — so without the farewell the removed node never learns and retries elections
+/// against a cluster that ignores it. At apply time the leader emits ONE farewell Heartbeat to the
+/// pruned peer whose commit clamp `min(commit, match)` covers the conf entry (the peer acked it),
+/// and feeding that beat to the removed node makes it apply its own removal (mirrors etcd's
+/// bcastAppend-before-application ordering).
+///
+/// MUTATION: drop the farewell emission in `apply_committed` → no Heartbeat to node 3 below.
+#[test]
+fn removal_commit_reaches_pruned_follower_via_farewell_heartbeat() {
+  use crate::{
+    AppendEntries, AppendResponse, ConfChange, ConfChangeType, Entry, EntryKind, Index, Message,
+    Term,
+  };
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+
+  // Propose RemoveNode(3) at index 2 and make the leader's own append durable.
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(3) must be accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Node 3 ACKS the conf entry, and its ack completes the quorum {1, 3}: commit advances to
+  // `idx`, the change applies, and node 3 is pruned — all in this one dispatch.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  assert!(
+    !ep.tracker.is_voter(&3u64) && ep.tracker.progress(&3u64).is_none(),
+    "node 3 must be pruned once the removal applies"
+  );
+
+  // Exactly one farewell Heartbeat to node 3 rides the normal outgoing queue, and its commit
+  // clamp min(commit, match) covers the conf entry (node 3 acked it: match == idx).
+  let farewells: Vec<_> = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| o.to() == 3u64 && matches!(o.message(), Message::Heartbeat(_)))
+    .collect();
+  assert_eq!(
+    farewells.len(),
+    1,
+    "the pruned follower must get exactly one farewell Heartbeat"
+  );
+  let farewell = match farewells.into_iter().next().unwrap().into_parts() {
+    (_, Message::Heartbeat(hb)) => {
+      assert!(
+        hb.commit() >= idx,
+        "the farewell's commit ({:?}) must cover the removal entry ({idx:?})",
+        hb.commit()
+      );
+      Message::Heartbeat(hb)
+    }
+    _ => unreachable!(),
+  };
+
+  // Node 3's side: it holds the replicated log [no-op@1, conf@2] (it acked the entry) but has not
+  // learned the commit. The farewell delivers it: node 3 applies its own removal and reports a
+  // ConfChanged whose config no longer contains it.
+  let cfg3 = Config::try_new(
+    3u64,
+    std::vec![1u64, 2u64, 3u64],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut c = Endpoint::new(cfg3, Instant::ORIGIN, 9, CountSm::default());
+  let mut log3 = VecLog::default();
+  let mut stable3 = NoopStable::default();
+  let conf_payload = {
+    let v2 = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new()).into_v2();
+    let mut buf = Vec::new();
+    crate::wire::encode_conf_change_v2(&v2, &mut buf);
+    bytes::Bytes::from(buf)
+  };
+  c.handle_message(
+    d,
+    &mut log3,
+    &mut stable3,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Empty,
+          bytes::Bytes::new()
+        ),
+        Entry::new(Term::new(1), idx, EntryKind::ConfChange, conf_payload),
+      ],
+      Index::new(1), // the removal itself is not yet known committed
+    )),
+  );
+  c.handle_storage(d, &mut log3, &mut stable3);
+  while c.poll_message().is_some() {}
+  while c.poll_event().is_some() {}
+
+  c.handle_message(d, &mut log3, &mut stable3, 1u64, farewell);
+  let removed = core::iter::from_fn(|| c.poll_event()).any(
+    |e| matches!(&e, Event::ConfChanged(ev) if ev.index() == idx && !ev.conf().is_voter(&3u64)),
+  );
+  assert!(
+    removed,
+    "the farewell must make the removed follower apply the removal (ConfChanged without node 3)"
+  );
+}
+
+/// The straggler residual: a follower removed WITHOUT having acked the conf entry still gets the
+/// farewell, but clamped at its proven match (`min(commit, match)` — a heartbeat carries no
+/// prev-log check, so the peer may only be told to commit what it has proven to hold). The clamped
+/// beat cannot mislead it: it advances commit at most to the prefix it replicated and applies no
+/// removal it never received — the node simply remains ignorant (the embedder's catalog / lazy GC
+/// covers that residual).
+#[test]
+fn farewell_to_straggler_is_clamped_at_its_match() {
+  use crate::{
+    AppendEntries, AppendResponse, ConfChange, ConfChangeType, Entry, EntryKind, Index, Message,
+    Term,
+  };
+
+  let (mut ep, mut log, mut stable, d) = make_three_node_leader();
+
+  // Node 3 has proven only the no-op@1 (match = 1) and will never see the conf entry.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+
+  let cc = ConfChange::new(ConfChangeType::RemoveNode, 3u64, bytes::Bytes::new());
+  let idx = ep
+    .propose_conf_change(d, &mut log, &stable, cc)
+    .expect("RemoveNode(3) must be accepted");
+  ep.flush_appends(d, &log, &stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Node 2's ack commits the removal; node 3 (match = 1 < idx) is pruned as a straggler.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      idx,
+    )),
+  );
+  assert!(ep.tracker.progress(&3u64).is_none(), "node 3 pruned");
+
+  // The farewell still goes out, clamped at node 3's match — never at the removal commit it
+  // cannot safely be told about.
+  let farewell = core::iter::from_fn(|| ep.poll_message())
+    .find(|o| o.to() == 3u64 && matches!(o.message(), Message::Heartbeat(_)))
+    .expect("the straggler must still get its farewell Heartbeat");
+  let farewell = match farewell.into_parts() {
+    (_, Message::Heartbeat(hb)) => {
+      assert_eq!(
+        hb.commit(),
+        Index::new(1),
+        "the farewell must be clamped at the straggler's match, not the removal commit"
+      );
+      Message::Heartbeat(hb)
+    }
+    _ => unreachable!(),
+  };
+
+  // Fed to the straggler (which holds only the no-op@1), the clamped beat advances its commit to
+  // 1 and applies nothing about the removal: node 3 still believes it is a voter — ignorant, not
+  // misled.
+  let cfg3 = Config::try_new(
+    3u64,
+    std::vec![1u64, 2u64, 3u64],
+    core::time::Duration::from_millis(1000),
+    core::time::Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut c = Endpoint::new(cfg3, Instant::ORIGIN, 9, CountSm::default());
+  let mut log3 = VecLog::default();
+  let mut stable3 = NoopStable::default();
+  c.handle_message(
+    d,
+    &mut log3,
+    &mut stable3,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::Empty,
+        bytes::Bytes::new()
+      )],
+      Index::ZERO,
+    )),
+  );
+  c.handle_storage(d, &mut log3, &mut stable3);
+  while c.poll_message().is_some() {}
+  while c.poll_event().is_some() {}
+
+  c.handle_message(d, &mut log3, &mut stable3, 1u64, farewell);
+  assert!(
+    !core::iter::from_fn(|| c.poll_event()).any(|e| e.is_conf_changed()),
+    "a clamped farewell must not make the straggler apply a removal it never received"
+  );
+  assert!(
+    c.tracker.is_voter(&3u64),
+    "the straggler remains (safely) ignorant of its removal"
+  );
+}

@@ -216,6 +216,7 @@ stabilize
   AppendEntries term=2 prev=1/3 commit=2 entries=[2/4 empty]
   AppendEntries term=2 prev=2/4 commit=2 entries=[]
   AppendEntries term=2 prev=1/3 commit=2 entries=[2/4 empty]
+  Heartbeat term=2 commit=4
   AppendEntries term=2 prev=2/4 commit=4 entries=[]
   AppendEntries term=2 prev=1/3 commit=4 entries=[2/4 empty]
   AppendEntries term=2 prev=0/0 commit=4 entries=[1/1 empty, 1/2 conf-change 0x120a12080400000000000000120c080112080100000000000000, 1/3 conf-change, 2/4 empty]
@@ -223,12 +224,14 @@ stabilize
 > n1 recv AppendEntries term=2 prev=1/3 commit=2 entries=[2/4 empty]
 > n1 recv AppendEntries term=2 prev=2/4 commit=2 entries=[]
 > n3 recv AppendEntries term=2 prev=1/3 commit=2 entries=[2/4 empty]
+> n1 recv Heartbeat term=2 commit=4
 > n3 recv AppendEntries term=2 prev=2/4 commit=4 entries=[]
 > n4 recv AppendEntries term=2 prev=1/3 commit=4 entries=[2/4 empty]
 > n4 recv AppendEntries term=2 prev=0/0 commit=4 entries=[1/1 empty, 1/2 conf-change 0x120a12080400000000000000120c080112080100000000000000, 1/3 conf-change, 2/4 empty]
 > n1 ready
   AppendResponse term=2 match=4
   AppendResponse term=2 match=4
+  HeartbeatResponse term=2
 > n3 ready
   AppendResponse term=2 match=4
   AppendResponse term=2 match=4
@@ -239,6 +242,7 @@ stabilize
   n4 conf-changed index=3 voters={2,3,4}
 > n2 recv AppendResponse term=2 match=4
 > n2 recv AppendResponse term=2 match=4
+> n2 recv HeartbeatResponse term=2
 > n2 recv AppendResponse term=2 match=4
 > n2 recv AppendResponse term=2 match=4
 > n2 recv AppendResponse term=2 reject hint=0/0

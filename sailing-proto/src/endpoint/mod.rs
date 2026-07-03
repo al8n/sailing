@@ -2392,6 +2392,54 @@ where
             };
             match result {
               Ok(new_tracker) => {
+                // Farewell to each peer this change PRUNES, emitted BEFORE the tracker swap
+                // drops its Progress: THIS commit is the one that deletes the peer, and every
+                // later send targets only tracked peers — so without it the removed node never
+                // learns the removal committed (`maybe_advance_commit` does not broadcast, and
+                // this fused apply prunes in the same pass). etcd avoids the gap by ordering
+                // bcastAppend (maybeCommit) before the async application; sailing's equivalent
+                // is one Heartbeat per pruned peer carrying the broadcast rule's per-peer clamp
+                // `min(commit, match)`, read from the OLD tracker while the Progress is still
+                // resolvable. The clamp delivers the removal commit iff the leader has PROCESSED
+                // the peer's ack of the conf entry (`match >= its index`); a peer whose ack the
+                // leader has not seen — a true straggler, or one whose ack is still in flight
+                // when another voter's completes the quorum — gets a beat clamped at/below its
+                // match: safe by the same rule (it cannot be told to commit past what it has
+                // proven), it merely stays ignorant, a residual the embedder catalog covers (the
+                // references handle it with lazy GC; etcd's unclamped prev-checked bcastAppend
+                // also covers the in-flight-ack shape, at the cost of the append machinery here).
+                // Leader-only: followers fold the same change without send authority. Fires
+                // exactly once per removal by construction: a joint removal keeps the outgoing
+                // voter's Progress until the final single-config application (leave_joint), so
+                // only THAT application's old-vs-new diff sees it disappear (while a learner
+                // removed by the enter_joint batch is pruned — and bid farewell — at the joint
+                // commit itself). No lease round: the farewell is not part of any CheckQuorum
+                // round, so its echo must not count toward the lease (and cannot: the responder
+                // is no longer a voter, and round 0 never matches a live round).
+                if self.role.is_leader() {
+                  let me = self.config.id();
+                  let (term, commit) = (self.term, self.commit);
+                  let mut peers = core::mem::take(&mut self.peers_scratch);
+                  peers.clear();
+                  for (peer, pr) in self.tracker.progress_map() {
+                    if *peer == me || new_tracker.progress(peer).is_some() {
+                      continue;
+                    }
+                    peers.push((peer.cheap_clone(), core::cmp::min(commit, pr.match_index())));
+                  }
+                  for (peer, peer_commit) in peers.drain(..) {
+                    self.send(
+                      peer,
+                      Message::Heartbeat(crate::Heartbeat::new(
+                        term,
+                        me.cheap_clone(),
+                        peer_commit,
+                        Bytes::new(),
+                      )),
+                    );
+                  }
+                  self.peers_scratch = peers;
+                }
                 self.tracker = new_tracker;
                 // Membership-change lease revocation: the LeaseBased read lease is safe only because
                 // the lease quorum OVERLAPS any new-leader quorum (one shared voter's `in_lease` blocks the
