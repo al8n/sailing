@@ -902,13 +902,30 @@ where
       // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_response).
       pr.maybe_update(response.match_index());
       // Advance the resume cursor from the follower's contiguous watermark, then — if the peer is STILL
-      // mid-transfer (a progress ack did not lift it out of Snapshot via maybe_update above) — send the
-      // next chunk. A single-chunk snapshot's FINAL ack lifts the peer out of Snapshot, so this no-ops.
+      // mid-transfer (a progress ack did not lift it out of Snapshot via maybe_update above) AND this
+      // ack MOVED the cursor — send the next chunk. A single-chunk snapshot's FINAL ack lifts the peer
+      // out of Snapshot, so this no-ops.
+      //
+      // The moved-gate is the snapshot sibling of the append path's advance gate (`on_append_response`
+      // pumps only when `maybe_update` ADVANCED the match): a DUPLICATED ack echoing the same watermark
+      // must not send the chunk again. Without it every network-duplicated chunk or ack raises the
+      // stream's in-flight multiplicity FOREVER (the follower re-acks each duplicate chunk at its true
+      // watermark, each such ack re-sent the chunk, and further duplications compound) — an unbounded
+      // per-transfer message storm under a lossy/duplicating network. Suppressing the same-cursor pump
+      // loses no liveness: a lost next-chunk stalls the cursor, and the heartbeat-paced
+      // `resend_snapshot` (on_heartbeat_response) re-sends FROM the stalled cursor within one election
+      // timeout. A CHANGED cursor pumps regardless of direction — a regression to a lower watermark (a
+      // follower that restarted its staging) legitimately resumes the stream from the new position.
+      let cursor_before = match self.tracker.progress(&from).map(|p| p.state()) {
+        Some(ProgressState::Snapshot { acked_through, .. }) => Some(acked_through),
+        _ => None,
+      };
       if let Some(pr) = self.tracker.progress_mut(&from) {
         pr.snapshot_acked(response.acked_through());
       }
       if let Some(ProgressState::Snapshot { acked_through, .. }) =
         self.tracker.progress(&from).map(|p| p.state())
+        && cursor_before != Some(acked_through)
       {
         // Pump the NEXT chunk. Arm resend-pacing on a real send; CLEAR it on a benign defer so the next
         // heartbeat retries immediately (merely not re-arming is insufficient HERE — the prior pump left a
