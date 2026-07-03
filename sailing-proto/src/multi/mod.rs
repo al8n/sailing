@@ -25,6 +25,7 @@ use crate::{
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
+use core::time::Duration;
 use std::{
   collections::{BTreeMap, VecDeque},
   vec::Vec,
@@ -77,10 +78,11 @@ where
   dirty_events: VecDeque<G>,
 }
 
+// No `I` (or `R`) bound: the container and drain surface neither keys by, encodes, nor clones a
+// node id — the delegated `Endpoint` polls live in its bound-free block.
 impl<G, I, F, R> MultiRaft<G, I, F, R>
 where
   G: GroupId,
-  I: NodeId,
   F: StateMachine,
 {
   /// An empty host with no groups.
@@ -129,27 +131,6 @@ where
     self.groups.remove(gid)
   }
 
-  /// The earliest serviceable timer deadline across all groups, or `None` if no group has one.
-  ///
-  /// This is the pure-core convenience: an `O(N)` minimum. The Phase-3 reactor keeps an aggregate
-  /// timing wheel over [`deadlines`](Self::deadlines) instead, waking only the due group.
-  #[must_use]
-  pub fn poll_timeout(&self) -> Option<Instant> {
-    self
-      .groups
-      .values()
-      .filter_map(Endpoint::poll_timeout)
-      .min()
-  }
-
-  /// Each group's next serviceable deadline — the reactor's input for building its timing wheel.
-  pub fn deadlines(&self) -> impl Iterator<Item = (G, Instant)> + '_ {
-    self
-      .groups
-      .iter()
-      .filter_map(|(gid, ep)| ep.poll_timeout().map(|d| (gid.cheap_clone(), d)))
-  }
-
   /// The next outbound message from any group, stamped with its group id. Drain fully between
   /// drives (the per-group queues are unbounded, as [`Endpoint::poll_message`] is).
   pub fn poll_message(&mut self) -> Option<(G, Outgoing<I>)> {
@@ -189,8 +170,38 @@ where
   }
 }
 
+// The aggregate scheduling surface, split from the block above because `Endpoint::poll_timeout`
+// carries the full node-id bound.
+impl<G, I, F, R> MultiRaft<G, I, F, R>
+where
+  G: GroupId,
+  I: NodeId,
+  F: StateMachine,
+{
+  /// The earliest serviceable timer deadline across all groups, or `None` if no group has one.
+  ///
+  /// This is the pure-core convenience: an `O(N)` minimum. The Phase-3 reactor keeps an aggregate
+  /// timing wheel over [`deadlines`](Self::deadlines) instead, waking only the due group.
+  #[must_use]
+  pub fn poll_timeout(&self) -> Option<Instant> {
+    self
+      .groups
+      .values()
+      .filter_map(Endpoint::poll_timeout)
+      .min()
+  }
+
+  /// Each group's next serviceable deadline — the reactor's input for building its timing wheel.
+  pub fn deadlines(&self) -> impl Iterator<Item = (G, Instant)> + '_ {
+    self
+      .groups
+      .iter()
+      .filter_map(|(gid, ep)| ep.poll_timeout().map(|d| (gid.cheap_clone(), d)))
+  }
+}
+
 // Default-`Prng` constructors, mirroring `Endpoint::new`/`restart` (which are `Prng`-only; the
-// generic-RNG entry points live on `Endpoint` and a `MultiRaft` follow-on).
+// generic-RNG entry points live on `Endpoint`'s and this type's `*_with_rng` family).
 impl<G, I, F> MultiRaft<G, I, F, Prng>
 where
   G: GroupId,
@@ -261,6 +272,154 @@ where
     self.mark_dirty(&gid);
     Ok(())
   }
+
+  /// Recover a group from a pre-format store, wrapping [`Endpoint::restart_migrating`] — the
+  /// ONE-TIME upgrade path for a node that persisted no lease-support floor. See that method for
+  /// the `assume_prior_lease_support` contract.
+  ///
+  /// # Errors
+  /// The same admission checks as [`create_group`](Self::create_group) — see
+  /// [`CreateGroupError`]. Refusal happens BEFORE any store is read.
+  #[allow(clippy::too_many_arguments)]
+  pub fn restore_group_migrating<L, S>(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    seed: u64,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<Duration>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    validate_new_group(&self.groups, &gid, &config)?;
+    let ep = Endpoint::restart_migrating(
+      config,
+      now,
+      group_seed(seed, &gid),
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      log,
+      stable,
+    );
+    self.groups.insert(gid.cheap_clone(), ep);
+    self.mark_dirty(&gid);
+    Ok(())
+  }
+}
+
+// Caller-supplied-RNG constructors, mirroring `Endpoint`'s `*_with_rng` family. The seed-taking
+// constructors fold the group id into the seed automatically; here the CALLER owns cross-group
+// decorrelation — supply a distinctly-seeded RNG per group, or co-located groups draw correlated
+// election jitter.
+impl<G, I, F, R> MultiRaft<G, I, F, R>
+where
+  G: GroupId,
+  I: NodeId,
+  F: StateMachine,
+  R: rand::Rng,
+{
+  /// Create a fresh group driven by a caller-supplied RNG (see [`Endpoint::new_with_rng`]).
+  ///
+  /// # Errors
+  /// The admission checks of [`CreateGroupError`], as on the seed-taking constructors.
+  pub fn create_group_with_rng(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+  ) -> Result<(), CreateGroupError> {
+    validate_new_group(&self.groups, &gid, &config)?;
+    let ep = Endpoint::new_with_rng(config, now, rng, fsm);
+    self.groups.insert(gid, ep);
+    Ok(())
+  }
+
+  /// Recover a group from durable storage with a caller-supplied RNG (see
+  /// [`Endpoint::restart_with_rng`]).
+  ///
+  /// # Errors
+  /// The admission checks of [`CreateGroupError`]; refusal happens BEFORE any store is read.
+  #[allow(clippy::too_many_arguments)]
+  pub fn restore_group_with_rng<L, S>(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+    boot_epoch: u64,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    validate_new_group(&self.groups, &gid, &config)?;
+    let ep = Endpoint::restart_with_rng(config, now, rng, fsm, boot_epoch, log, stable);
+    self.groups.insert(gid.cheap_clone(), ep);
+    self.mark_dirty(&gid);
+    Ok(())
+  }
+
+  /// Recover a group from a pre-format store with a caller-supplied RNG (see
+  /// [`Endpoint::restart_migrating_with_rng`]).
+  ///
+  /// # Errors
+  /// The admission checks of [`CreateGroupError`]; refusal happens BEFORE any store is read.
+  #[allow(clippy::too_many_arguments)]
+  pub fn restore_group_migrating_with_rng<L, S>(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+    boot_epoch: u64,
+    assume_prior_lease_support: Option<Duration>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    validate_new_group(&self.groups, &gid, &config)?;
+    let ep = Endpoint::restart_migrating_with_rng(
+      config,
+      now,
+      rng,
+      fsm,
+      boot_epoch,
+      assume_prior_lease_support,
+      log,
+      stable,
+    );
+    self.groups.insert(gid.cheap_clone(), ep);
+    self.mark_dirty(&gid);
+    Ok(())
+  }
 }
 
 // The per-group driving surface. Delegates to the group then marks it for an output drain. Each
@@ -276,6 +435,7 @@ where
   F::Error: core::error::Error,
 {
   /// Route an inbound peer message to `gid`. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn handle_message<L, S>(
     &mut self,
     gid: &G,
@@ -299,6 +459,7 @@ where
   }
 
   /// Fire `gid`'s due timers. `None` if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn handle_timeout<L, S>(
     &mut self,
     gid: &G,
@@ -317,6 +478,7 @@ where
 
   /// Drain `gid`'s storage completions. `None` if no such group, else that group's
   /// [`StorageProgress`] (`MorePending` asks to be re-driven without sleeping).
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn handle_storage<L, S>(
     &mut self,
     gid: &G,
@@ -336,6 +498,7 @@ where
 
   /// Propose a command to `gid`'s leader. `None` if no such group, else the append result. Call
   /// [`flush_appends`](Self::flush_appends) for the group once after a burst of proposals.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn propose<L, S>(
     &mut self,
     gid: &G,
@@ -355,6 +518,7 @@ where
 
   /// Flush `gid`'s coalesced replication fan-out (once per drive, after a propose burst). `None`
   /// if no such group.
+  #[must_use = "`None` means no group with this id is hosted — the call did nothing"]
   pub fn flush_appends<L, S>(
     &mut self,
     gid: &G,
@@ -492,7 +656,6 @@ where
 impl<G, I, F, R> Default for MultiRaft<G, I, F, R>
 where
   G: GroupId,
-  I: NodeId,
   F: StateMachine,
 {
   fn default() -> Self {
