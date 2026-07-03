@@ -25,8 +25,8 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  ClusterId, Config, Event, GroupEngine, GroupId, Instant, MultiQuicCoordinator, Now, StateMachine,
-  StorageProgress, quic::QuicOptions,
+  ClusterId, Config, Event, GroupControl, GroupEngine, GroupId, Instant, MultiQuicCoordinator, Now,
+  StateMachine, StorageProgress, quic::QuicOptions,
 };
 
 use sailing_driver::{
@@ -42,7 +42,7 @@ use crate::{
 
 use crate::driver::{map_propose_err, map_read_err, map_transfer_err};
 
-use super::{EngineMetrics, STORAGE_REDRIVES, no_such_group, rejected};
+use super::{EngineMetrics, GroupActivity, STORAGE_REDRIVES, group_idle, no_such_group, rejected};
 
 /// Backstop wake cadence while configured peers exist (the link reconciler's pacing on an
 /// otherwise-idle node — see the single-group QUIC driver).
@@ -96,6 +96,21 @@ where
   flush_pending: bool,
   /// Published engine counters (see [`EngineMetrics`]).
   metrics: EngineMetrics,
+  /// Groups whose consensus deadlines the driver neither arms nor sweeps (see
+  /// [`Self::quiesce_sweep`]); everything else flows normally for a quiesced group.
+  quiesced: BTreeSet<G>,
+  /// Leader groups marked quiescing whose FLAGGED beat has not yet been stamped (they keep being
+  /// swept until the coordinator consumes the intent, then move into `quiesced`).
+  quiesce_pending: BTreeSet<G>,
+  /// Per-group observed consensus state + the instant it last changed (the idle clock).
+  activity: BTreeMap<G, GroupActivity>,
+  /// Each group's election timeout, captured at admission — the quiesce-eligibility idle window.
+  election: BTreeMap<G, Duration>,
+  /// Configured peers observed BOUND on the last reconcile — the falling edge of
+  /// [`MultiQuicCoordinator::has_bound_conn`] is this driver's connection-loss signal (QUIC has
+  /// no socket EOF; quinn surfaces a loss by dropping the binding after its idle/keep-alive
+  /// machinery gives up).
+  bound_peers: BTreeSet<I>,
   teardown_tx: Option<futures_channel::oneshot::Sender<()>>,
 }
 
@@ -179,6 +194,11 @@ where
         was_leader: BTreeMap::new(),
         flush_pending: false,
         metrics: EngineMetrics::default(),
+        quiesced: BTreeSet::new(),
+        quiesce_pending: BTreeSet::new(),
+        activity: BTreeMap::new(),
+        election: BTreeMap::new(),
+        bound_peers: BTreeSet::new(),
         teardown_tx: Some(teardown_tx),
       },
       handle,
@@ -248,26 +268,26 @@ where
         }
       }
 
-      // Fire an already-due deadline before the select. The coordinator's poll_timeout folds the
-      // aggregate consensus deadline, quinn's timers, the auth deadline, AND the bridge's
-      // deferred-work immediate deadline into one instant.
+      // Fire an already-due deadline before the select. The armed deadline is the QUIESCE-AWARE
+      // fold ([`Self::armed_deadline`]): the non-quiesced groups' earliest consensus deadline
+      // plus the coordinator's TRANSPORT-only deadline (quinn's timers, the auth deadline, and
+      // the bridge's deferred-work immediate deadline).
       if self
-        .coord
-        .poll_timeout()
+        .armed_deadline()
         .is_some_and(|d| d <= self.clock.mono())
       {
         self.fire_timeouts(now);
       }
       self.reconcile_peer_links(now.mono());
       self.pump(now).await;
+      self.quiesce_sweep();
 
       let housekeeping =
         (!self.peers.is_empty()).then(|| std::time::Instant::now() + HOUSEKEEPING_INTERVAL);
       // The pending-flush flag stands in for a live staged-store check (see the stream sibling).
       let storage_redrive = self.flush_pending.then(std::time::Instant::now);
       let deadline = self
-        .coord
-        .poll_timeout()
+        .armed_deadline()
         .map(|d| self.clock.to_std(d))
         .into_iter()
         .chain(housekeeping)
@@ -372,10 +392,12 @@ where
   fn fire_timeouts(&mut self, now: Now) {
     self.coord.handle_transport_timeout(now, &mut self.engine);
     let mono = self.clock.mono();
+    // A QUIESCED group is skipped: its deadline is stale by design (frozen, not cancelled — the
+    // wake path re-admits it to the fold, where being long past due makes it fire immediately).
     let due: Vec<G> = self
       .coord
       .deadlines()
-      .filter(|(_, d)| *d <= mono)
+      .filter(|(g, d)| *d <= mono && !self.quiesced.contains(g))
       .map(|(g, _)| g)
       .collect();
     for g in &due {
@@ -428,7 +450,16 @@ where
       let (peer, addr) = node.into_parts();
       if self.coord.has_bound_conn(&peer) {
         self.redial.remove(&peer);
+        self.bound_peers.insert(peer);
         continue;
+      }
+      // The FALLING edge of an established binding is this transport's connection-loss signal:
+      // wake every quiesced group — connection health is the quiesce liveness oracle (a dead
+      // leader's connection idles out here, the followers' stale election deadlines re-enter the
+      // fold and fire immediately — the desired leader-failure election). Whole-set clearing is
+      // deliberately conservative; per-leader scoping is the refinement seam.
+      if self.bound_peers.remove(&peer) {
+        self.wake_all();
       }
       let due = self.redial.get(&peer).is_none_or(|r| std_now >= r.at);
       if !due {
@@ -469,12 +500,14 @@ where
     fsm: F,
   ) -> Result<(), DriverError<I>> {
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
+    let election = config.election_timeout();
     let added = self.engine.add_group(gid.cheap_clone());
     match self
       .coord
       .create_group(gid.cheap_clone(), config, now, seed, fsm)
     {
       Ok(()) => {
+        self.election.insert(gid.cheap_clone(), election);
         self.admit_group(gid);
         Ok(())
       }
@@ -497,6 +530,7 @@ where
     fsm: F,
   ) -> Result<(), DriverError<I>> {
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
+    let election = config.election_timeout();
     let added = self.engine.add_group(gid.cheap_clone());
     let epoch = self
       .engine
@@ -518,6 +552,7 @@ where
     match result {
       Ok(()) => {
         self.flush_pending = true;
+        self.election.insert(gid.cheap_clone(), election);
         self.admit_group(gid);
         Ok(())
       }
@@ -536,6 +571,10 @@ where
     let existed = self.coord.remove_group(gid).is_some();
     let had_storage = self.engine.remove_group(gid);
     self.was_leader.remove(gid);
+    self.quiesced.remove(gid);
+    self.quiesce_pending.remove(gid);
+    self.activity.remove(gid);
+    self.election.remove(gid);
     if let Some(mut routing) = self.routing.remove(gid) {
       routing.fail_all(&DriverError::ShuttingDown);
     }
@@ -545,6 +584,21 @@ where
   /// Handle one command (the stream sibling's dispatch verbatim over the QUIC coordinator).
   /// Returns `true` when the loop should exit (a `Shutdown`).
   fn handle_command(&mut self, now: Now, cmd: MultiCommand<G, I, F>) -> bool {
+    // Any group-addressed CLIENT operation un-quiesces its group BEFORE dispatch (see the stream
+    // sibling); pure observability (`Status`) and the lifecycle commands do not wake.
+    match &cmd {
+      MultiCommand::Submit { group, .. }
+      | MultiCommand::Conf { group, .. }
+      | MultiCommand::ConfV2 { group, .. }
+      | MultiCommand::Query { group, .. }
+      | MultiCommand::FailoverWindow { group, .. }
+      | MultiCommand::Transfer { group, .. }
+      | MultiCommand::SetReadMode { group, .. } => {
+        let group = group.cheap_clone();
+        self.wake_group(&group);
+      }
+      _ => {}
+    }
     match cmd {
       MultiCommand::Submit {
         group,
@@ -861,10 +915,128 @@ where
       }
       let _ = self.events_tx.try_send((g, ev));
     }
+    // Fold the coordinator's group-scoped scheduling signals IN DISPATCH ORDER: a flagged beat
+    // quiesces its group (the follower-side entry); any wake-class dispatch un-freezes it (the
+    // core re-armed its timers during the dispatch — no stale fire).
+    while let Some((g, ctrl)) = self.coord.poll_group_control() {
+      match ctrl {
+        GroupControl::Quiesce => {
+          self.quiesced.insert(g);
+        }
+        GroupControl::Wake => self.wake_group(&g),
+        _ => {}
+      }
+    }
     let with_routing: Vec<G> = self.routing.keys().map(|g| g.cheap_clone()).collect();
     for g in &with_routing {
       self.pump_group_tail(g, run_queries.contains(g));
     }
+  }
+
+  /// The deadline actually ARMED: the earliest NON-quiesced group deadline folded with the
+  /// coordinator's TRANSPORT-only deadline ([`MultiQuicCoordinator::transport_timeout`]: quinn's
+  /// timers, the auth reap, and the bridge's deferred-work immediate deadline) — the
+  /// `poll_timeout()` decomposition quiescing requires. A quiesced group's deadline is excluded
+  /// here AND skipped in [`Self::fire_timeouts`]'s due sweep; the core still records it, so a
+  /// wake re-admits it and a long-stale one fires immediately.
+  fn armed_deadline(&mut self) -> Option<Instant> {
+    let group = self
+      .coord
+      .deadlines()
+      .filter(|(g, _)| !self.quiesced.contains(g))
+      .map(|(_, d)| d)
+      .min();
+    match (group, self.coord.transport_timeout()) {
+      (Some(a), Some(b)) => Some(a.min(b)),
+      (a, None) => a,
+      (None, b) => b,
+    }
+  }
+
+  /// Un-quiesce one group: it re-enters the armed fold (a stale deadline fires immediately) and
+  /// its idle clock restarts so it cannot re-mark before a fresh full election timeout.
+  fn wake_group(&mut self, g: &G) {
+    self.quiesced.remove(g);
+    self.quiesce_pending.remove(g);
+    if let Some(a) = self.activity.get_mut(g) {
+      a.at = std::time::Instant::now();
+    }
+  }
+
+  /// Wake EVERY quiesced (and pending) group — the connection-loss path (see
+  /// [`Self::reconcile_peer_links`]).
+  fn wake_all(&mut self) {
+    let woken: Vec<G> = self
+      .quiesced
+      .iter()
+      .chain(self.quiesce_pending.iter())
+      .map(|g| g.cheap_clone())
+      .collect();
+    for g in &woken {
+      self.wake_group(g);
+    }
+  }
+
+  /// The per-iteration quiesce scheduler (the stream sibling's verbatim — see its notes on the
+  /// two phases and on why OBSERVED-state diffing, not dispatch counting, is the idle clock).
+  fn quiesce_sweep(&mut self) {
+    let now_std = std::time::Instant::now();
+    let stamped: Vec<G> = self
+      .quiesce_pending
+      .iter()
+      .filter(|g| !self.coord.is_quiescing(g))
+      .map(|g| g.cheap_clone())
+      .collect();
+    for g in stamped {
+      self.quiesce_pending.remove(&g);
+      self.quiesced.insert(g);
+    }
+    let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
+    for g in &hosted {
+      let Some(ep) = self.coord.group(g) else {
+        continue;
+      };
+      let (term, commit, applied) = (ep.term(), ep.commit_index(), ep.applied_index());
+      let entry = self
+        .activity
+        .entry(g.cheap_clone())
+        .or_insert(GroupActivity {
+          term,
+          commit,
+          applied,
+          at: now_std,
+        });
+      if (entry.term, entry.commit, entry.applied) != (term, commit, applied) {
+        *entry = GroupActivity {
+          term,
+          commit,
+          applied,
+          at: now_std,
+        };
+      }
+      let idle_since = entry.at;
+      if self.quiesced.contains(g) || self.quiesce_pending.contains(g) {
+        continue;
+      }
+      let Some(window) = self.election.get(g).copied() else {
+        continue;
+      };
+      if now_std.duration_since(idle_since) < window {
+        continue;
+      }
+      let parked = self
+        .routing
+        .get(g)
+        .is_some_and(|r| !r.pending.is_empty() || !r.queries.is_empty() || !r.failovers.is_empty());
+      if parked {
+        continue;
+      }
+      if self.coord.group(g).is_some_and(group_idle) {
+        self.coord.mark_quiescing(g);
+        self.quiesce_pending.insert(g.cheap_clone());
+      }
+    }
+    self.metrics.record_quiesced(self.quiesced.len() as u64);
   }
 
   /// One group's per-pass completion tail (the stream sibling's verbatim): watermark sync, the

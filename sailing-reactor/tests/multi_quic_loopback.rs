@@ -297,6 +297,176 @@ async fn remove_group_fails_parked_ops_and_the_host_survives() {
   }
 }
 
+/// Poll `metrics` until its quiesced-group gauge reaches `want`.
+async fn wait_for_quiesced(metrics: &sailing_reactor::EngineMetrics, want: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while metrics.quiesced_groups() != want {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: quiesced gauge stuck at {} (want {want})",
+      metrics.quiesced_groups()
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+}
+
+/// The stream suite's quiesce cycle over QUIC: both groups quiesce on BOTH drivers (leader by
+/// eligibility, follower by the flagged beat's GroupControl round-trip), hold across a quiet
+/// window with terms frozen (the zero-frame witness: a quiesced leader emits no beats by
+/// construction and any arriving wake-class frame would drop the follower's gauge), a propose
+/// wakes exactly its group while the sibling stays quiesced, and the woken group re-quiesces.
+#[tokio::test(flavor = "multi_thread")]
+async fn idle_groups_quiesce_and_a_propose_wakes_only_its_group() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_400, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2]).await;
+  create_group_everywhere(&handles, 200, &[1, 2]).await;
+
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b").await, 1);
+
+  wait_for_quiesced(&metrics[0], 2, "node 1 both groups").await;
+  wait_for_quiesced(&metrics[1], 2, "node 2 both groups").await;
+
+  let term100 = g100[0].status().await.expect("status").term;
+  let term200 = g200[0].status().await.expect("status").term;
+  for _ in 0..10 {
+    tokio::time::sleep(HEARTBEAT).await;
+    assert_eq!(metrics[0].quiesced_groups(), 2, "node 1 stays quiesced");
+    assert_eq!(metrics[1].quiesced_groups(), 2, "node 2 stays quiesced");
+  }
+  assert_eq!(
+    g100[0].status().await.expect("status").term,
+    term100,
+    "no election disturbed the quiesced group"
+  );
+
+  assert_eq!(submit_anywhere(&g100, b"wake").await, 2);
+  let status200 = g200[0].status().await.expect("status");
+  assert_eq!(status200.term, term200, "group 200 saw no traffic");
+  assert!(
+    metrics.iter().all(|m| m.quiesced_groups() >= 1),
+    "the sibling group stayed quiesced through the wake"
+  );
+
+  wait_for_quiesced(&metrics[0], 2, "node 1 re-quiesce").await;
+  wait_for_quiesced(&metrics[1], 2, "node 2 re-quiesce").await;
+}
+
+/// Wake-on-connection-loss over QUIC: the leader's driver shuts down; the survivors' quinn stacks
+/// declare the shared connection lost (keep-alives stop being acknowledged, the idle timeout
+/// fires), the has_bound_conn falling edge wakes every quiesced group, the stale election
+/// deadlines fire, and a NEW leader emerges — a submit through the survivors commits. Detection
+/// rides quinn's idle machinery (seconds), unlike the stream driver's immediate socket EOF, so
+/// the re-election deadline here is generous.
+#[tokio::test(flavor = "multi_thread")]
+async fn conn_loss_wakes_quiesced_followers_and_reelects() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_420, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  let mut metrics = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    metrics.push(driver.engine_metrics());
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"seed").await, 1);
+
+  for (i, m) in metrics.iter().enumerate() {
+    wait_for_quiesced(m, 1, &format!("node {} quiesces", i + 1)).await;
+  }
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let leader_at = loop {
+    assert!(std::time::Instant::now() < deadline, "no leader in time");
+    let mut found = None;
+    for (i, g) in g100.iter().enumerate() {
+      if g.status().await.expect("status").role == Role::Leader {
+        found = Some(i);
+        break;
+      }
+    }
+    if let Some(i) = found {
+      break i;
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  };
+  let survivors: Vec<usize> = (0..3).filter(|&i| i != leader_at).collect();
+  let old_term = g100[survivors[0]].status().await.expect("status").term;
+  handles[leader_at]
+    .shutdown()
+    .await
+    .expect("the leader driver tears down");
+
+  // The conn-loss wake, observed in ISOLATION: only wake-free status/gauge polling below, so the
+  // gauges dropping to 0 is the connection-loss trigger itself (no command ever wakes these
+  // groups) — and the drop cannot revert, since re-quiescing needs every voter matched and the
+  // dead voter's match can never advance again.
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  for &i in &survivors {
+    while metrics[i].quiesced_groups() != 0 {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "survivor {i} never observed the connection loss"
+      );
+      tokio::time::sleep(Duration::from_millis(30)).await;
+    }
+  }
+
+  // The woken survivors' STALE election deadlines fire immediately: a new leader emerges at a
+  // higher term, still with no command issued.
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  'reelected: loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no re-election within the deadline"
+    );
+    for &i in &survivors {
+      let status = g100[i].status().await.expect("status");
+      if status.role == Role::Leader && status.term > old_term {
+        break 'reelected;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+
+  // And the re-elected group commits through the survivors.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  'committed: loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no post-election commit within the deadline"
+    );
+    for &i in &survivors {
+      if g100[i].submit(Bytes::from_static(b"after")).await.is_ok() {
+        break 'committed;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+  }
+}
+
 /// One group's fail-stop stays GROUP-scoped on the QUIC host: a trapped FSM apply poisons group
 /// 100 (typed verdicts for its parked and later work) while co-hosted group 200 keeps committing
 /// on the same driver.
