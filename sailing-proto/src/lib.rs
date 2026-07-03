@@ -66,7 +66,7 @@ pub use storage::{
 };
 
 mod error;
-pub use error::{ConfigError, ProposeError, ReadIndexError, TransferError};
+pub use error::{ConfigError, CreateGroupError, ProposeError, ReadIndexError, TransferError};
 
 mod inflights;
 pub(crate) use inflights::Inflights;
@@ -89,7 +89,7 @@ mod endpoint;
 pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 
 mod multi;
-pub use multi::{GroupExists, GroupId, MultiRaft};
+pub use multi::{GroupId, MultiRaft};
 
 mod tracker;
 pub(crate) use tracker::Tracker;

@@ -22,9 +22,9 @@ use super::{
   sni_for,
 };
 use crate::{
-  CheapClone, Config, Data, Endpoint, Event, GroupExists, GroupId, GroupStores, Index, Instant,
-  LogStore, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
-  transport::ClusterId,
+  CheapClone, Config, CreateGroupError, Data, Endpoint, Event, GroupId, GroupStores, Index,
+  Instant, LogStore, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine,
+  StorageProgress, transport::ClusterId,
 };
 
 /// A multi-group consensus node speaking QUIC: a [`MultiRaft`] composed with the quinn-proto bridge
@@ -165,7 +165,7 @@ where
   /// Create a fresh group (see [`MultiRaft::create_group`]).
   ///
   /// # Errors
-  /// [`GroupExists`] if the group id is already hosted.
+  /// The admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
   pub fn create_group(
     &mut self,
     gid: G,
@@ -173,14 +173,18 @@ where
     now: impl Into<Now>,
     seed: u64,
     fsm: F,
-  ) -> Result<(), GroupExists> {
-    self.multi.create_group(gid, config, now, seed, fsm)
+  ) -> Result<(), CreateGroupError> {
+    self.multi.create_group(gid, config, now, seed, fsm)?;
+    // A fresh group can widen the tracked-peer union; raise the connection cap now rather than at
+    // the next pump, so accepts arriving in the gap are not statelessly refused.
+    self.bridge.raise_max_connections(self.effective_cap());
+    Ok(())
   }
 
   /// Recover a group from durable storage (see [`MultiRaft::restore_group`]).
   ///
   /// # Errors
-  /// [`GroupExists`] if the group id is already hosted.
+  /// The admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn restore_group<L, S>(
     &mut self,
@@ -192,7 +196,7 @@ where
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
-  ) -> Result<(), GroupExists>
+  ) -> Result<(), CreateGroupError>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
@@ -200,7 +204,10 @@ where
   {
     self
       .multi
-      .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)
+      .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
+    // Same cap-raise as `create_group`: the restored group widens the tracked-peer union.
+    self.bridge.raise_max_connections(self.effective_cap());
+    Ok(())
   }
 
   /// Remove a group, returning its endpoint if present.

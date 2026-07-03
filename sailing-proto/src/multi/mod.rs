@@ -19,28 +19,44 @@ mod group_id;
 pub use group_id::GroupId;
 
 use crate::{
-  Config, Data, Endpoint, Event, Index, Instant, LogStore, Message, NodeId, Now, Outgoing, Prng,
-  ProposeError, StableStore, StateMachine, StorageProgress,
+  Config, CreateGroupError, Data, Endpoint, Event, Index, Instant, LogStore, Message, NodeId, Now,
+  Outgoing, Prng, ProposeError, StableStore, StateMachine, StorageProgress,
 };
 use cheap_clone::CheapClone;
-use core::fmt;
 use std::{
   collections::{BTreeMap, VecDeque},
   vec::Vec,
 };
 
-/// The group id was already present. [`MultiRaft::create_group`] / [`MultiRaft::restore_group`]
-/// leaves the existing group untouched and returns this.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GroupExists;
-
-impl fmt::Display for GroupExists {
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.write_str("a group with this id already exists")
+/// The create/restore admission check shared by every group constructor: group-id uniqueness, the
+/// wire bound on the encoded group id, and cross-group node-id agreement (a multi-Raft host is one
+/// physical node, so every group must be configured with the same local id — the transport
+/// authenticates exactly one identity per connection).
+fn validate_new_group<G, I, F, R>(
+  groups: &BTreeMap<G, Endpoint<I, F, R>>,
+  gid: &G,
+  config: &Config<I>,
+) -> Result<(), CreateGroupError>
+where
+  G: GroupId,
+  I: NodeId,
+  F: StateMachine,
+{
+  if groups.contains_key(gid) {
+    return Err(CreateGroupError::Exists);
   }
+  let mut encoded = Vec::new();
+  gid.encode(&mut encoded);
+  if encoded.is_empty() || encoded.len() > crate::wire::MAX_GROUP_ID_LEN {
+    return Err(CreateGroupError::InvalidGroupId);
+  }
+  if let Some(existing) = groups.values().next()
+    && existing.id() != config.id()
+  {
+    return Err(CreateGroupError::NodeIdMismatch);
+  }
+  Ok(())
 }
-
-impl core::error::Error for GroupExists {}
 
 /// A container of single-group [`Endpoint`]s multiplexed by [`GroupId`].
 ///
@@ -184,7 +200,11 @@ where
   /// (which would correlate their elections into a host-wide storm).
   ///
   /// # Errors
-  /// [`GroupExists`] if a group with `gid` is already hosted; the existing group is left untouched.
+  /// [`CreateGroupError::Exists`] if a group with `gid` is already hosted,
+  /// [`CreateGroupError::NodeIdMismatch`] if `config`'s id differs from the hosted groups' shared
+  /// node id, and [`CreateGroupError::InvalidGroupId`] if `gid`'s encoding is outside the wire
+  /// bound (1..=1024 bytes). Hosted groups are untouched in every case; on `Err` the moved-in
+  /// `fsm` is dropped — pre-check [`contains_group`](Self::contains_group) to preserve it.
   pub fn create_group(
     &mut self,
     gid: G,
@@ -192,10 +212,8 @@ where
     now: impl Into<Now>,
     seed: u64,
     fsm: F,
-  ) -> Result<(), GroupExists> {
-    if self.groups.contains_key(&gid) {
-      return Err(GroupExists);
-    }
+  ) -> Result<(), CreateGroupError> {
+    validate_new_group(&self.groups, &gid, &config)?;
     let ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
     self.groups.insert(gid, ep);
     Ok(())
@@ -205,7 +223,8 @@ where
   /// `Applied` events to drain). Same `gid`-folded seeding as [`create_group`](Self::create_group).
   ///
   /// # Errors
-  /// [`GroupExists`] if a group with `gid` is already hosted; the existing group is left untouched.
+  /// The same admission checks as [`create_group`](Self::create_group) — see
+  /// [`CreateGroupError`]. Refusal happens BEFORE any store is read.
   #[allow(clippy::too_many_arguments)]
   pub fn restore_group<L, S>(
     &mut self,
@@ -217,7 +236,7 @@ where
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
-  ) -> Result<(), GroupExists>
+  ) -> Result<(), CreateGroupError>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
@@ -226,9 +245,7 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
-    if self.groups.contains_key(&gid) {
-      return Err(GroupExists);
-    }
+    validate_new_group(&self.groups, &gid, &config)?;
     let ep = Endpoint::restart(
       config,
       now,
@@ -485,12 +502,97 @@ mod tests {
         42,
         CountSm::default()
       ),
-      Err(GroupExists)
+      Err(CreateGroupError::Exists)
     );
     assert_eq!(mr.len(), 1);
     assert!(mr.remove_group(&1).is_some());
     assert!(mr.is_empty());
     assert!(mr.remove_group(&1).is_none());
+  }
+
+  #[test]
+  fn mismatched_node_id_is_rejected() {
+    let mut mr = MultiRaft::<u64, u64, CountSm>::new();
+    mr.create_group(
+      1,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      CountSm::default(),
+    )
+    .unwrap();
+    // A second group configured with a DIFFERENT local node id: refused (a multi-Raft host is one
+    // physical node), and the hosted set is untouched.
+    assert_eq!(
+      mr.create_group(
+        2,
+        single_node_cfg(2),
+        Instant::ORIGIN,
+        42,
+        CountSm::default()
+      ),
+      Err(CreateGroupError::NodeIdMismatch)
+    );
+    assert_eq!(mr.len(), 1);
+    // The same id on a new group id is admitted.
+    mr.create_group(
+      2,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      CountSm::default(),
+    )
+    .unwrap();
+    assert_eq!(mr.len(), 2);
+  }
+
+  /// A test-only group id whose `Data` encoding is exactly `self.0` bytes — exercises the wire
+  /// bound on the encoded group id (`0` = empty, large = oversized).
+  #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+  struct SizedId(usize);
+
+  impl core::fmt::Display for SizedId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(f, "sized-{}", self.0)
+    }
+  }
+
+  impl CheapClone for SizedId {}
+
+  impl Data for SizedId {
+    fn encode(&self, buf: &mut Vec<u8>) {
+      buf.extend(core::iter::repeat_n(0xAB, self.0));
+    }
+    fn decode(_: &mut crate::ByteCursor) -> Result<Self, crate::DecodeError> {
+      Err(crate::DecodeError::Invalid("test-only id is never decoded"))
+    }
+  }
+
+  #[test]
+  fn out_of_bound_group_id_encodings_are_rejected() {
+    let mut mr = MultiRaft::<SizedId, u64, CountSm>::new();
+    for bad in [SizedId(0), SizedId(1025)] {
+      assert_eq!(
+        mr.create_group(
+          bad,
+          single_node_cfg(1),
+          Instant::ORIGIN,
+          42,
+          CountSm::default()
+        ),
+        Err(CreateGroupError::InvalidGroupId)
+      );
+    }
+    assert!(mr.is_empty());
+    // The bound is inclusive: exactly 1024 bytes is admitted.
+    mr.create_group(
+      SizedId(1024),
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      CountSm::default(),
+    )
+    .unwrap();
   }
 
   #[test]
