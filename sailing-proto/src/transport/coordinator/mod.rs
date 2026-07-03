@@ -14,6 +14,9 @@ use std::vec::Vec;
 
 mod multi;
 pub use multi::{GroupControl, GroupStores, MultiStreamCoordinator};
+// Shared with the QUIC multi coordinator alone (the stream one reaches them as module siblings),
+// so the re-export is dead weight in a tcp-without-quic build.
+#[cfg(feature = "quic")]
 pub(crate) use multi::{UNKNOWN_GROUP_SIGNAL_CAP, is_initial_shaped};
 
 /// A consensus node speaking over framed reliable connections (`R` is the record layer, e.g.
