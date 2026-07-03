@@ -10,8 +10,10 @@
 //! and leave at runtime through [`MultiCommand`](sailing_driver::MultiCommand) lifecycle commands
 //! — the drivers bind EMPTY.
 
+mod quic;
 mod stream;
 
+pub use quic::MultiReactorQuicDriver;
 pub use stream::MultiReactorStreamDriver;
 
 use std::sync::{

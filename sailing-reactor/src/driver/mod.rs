@@ -7,7 +7,7 @@ mod multi;
 mod quic;
 mod stream;
 
-pub use multi::{EngineMetrics, MultiReactorStreamDriver};
+pub use multi::{EngineMetrics, MultiReactorQuicDriver, MultiReactorStreamDriver};
 pub use quic::ReactorQuicDriver;
 pub use stream::{AcceptorFactory, DialerFactory, ReactorStreamDriver};
 

@@ -70,5 +70,9 @@ required-features = ["tokio"]
 name = "multi_stream_loopback"
 required-features = ["tokio"]
 
+[[test]]
+name = "multi_quic_loopback"
+required-features = ["tokio"]
+
 [lints]
 workspace = true

@@ -59,7 +59,7 @@ const IO_BUDGET: usize = 256;
 /// teardown shutdown signal (or when the channel receiver drops), releasing its socket clone; the
 /// driver's teardown block awaits that join to make the final socket drop the fd-release barrier (see
 /// `run`). The [`AbortOnDrop`] handle the driver also owns is the panic-path abort backstop.
-async fn recv_datagrams<R: Runtime>(
+pub(crate) async fn recv_datagrams<R: Runtime>(
   socket: Arc<<R::Net as Net>::UdpSocket>,
   inbound: flume::Sender<(Vec<u8>, SocketAddr)>,
   mut shutdown: futures_channel::oneshot::Receiver<()>,

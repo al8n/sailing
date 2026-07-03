@@ -15,8 +15,8 @@ mod driver;
 mod task;
 
 pub use driver::{
-  AcceptorFactory, DialerFactory, EngineMetrics, MultiReactorStreamDriver, ReactorQuicDriver,
-  ReactorStreamDriver,
+  AcceptorFactory, DialerFactory, EngineMetrics, MultiReactorQuicDriver, MultiReactorStreamDriver,
+  ReactorQuicDriver, ReactorStreamDriver,
 };
 
 #[cfg(feature = "unverified-wall-clock")]
