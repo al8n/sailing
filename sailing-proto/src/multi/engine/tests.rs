@@ -18,6 +18,71 @@ fn voter_meta(last_index: u64, last_term: u64) -> SnapshotMeta<u64> {
   )
 }
 
+/// A pre-barrier §5.3 conflict truncation invalidates the superseded staged completion: releasing
+/// it would claim a durable prefix through an index the barrier no longer makes durable.
+#[test]
+fn conflict_truncation_invalidates_staged_completions() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(7));
+  let (log, _stable) = eng.stores(&7).unwrap();
+
+  // Stage 1..=3, then a conflicting suffix from index 2 BEFORE any barrier: the first append's
+  // extent (3) is truncated away, so its completion must never be released.
+  log.submit_append(
+    OpId::new(1),
+    &[empty_entry(1, 1), empty_entry(1, 2), empty_entry(1, 3)],
+  );
+  log.submit_append(OpId::new(2), &[empty_entry(2, 2)]);
+  assert_eq!(log.last_index(), Index::new(2));
+
+  assert_eq!(eng.flush(), 1, "only the surviving completion is released");
+  let (log, _stable) = eng.stores(&7).unwrap();
+  assert!(matches!(
+    log.poll(),
+    Some(Ok(LogDone::Appended(id))) if id == OpId::new(2)
+  ));
+  assert!(log.poll().is_none(), "the superseded completion is gone");
+}
+
+/// A PARTIAL overlap drops the superseded completion too: the surviving prefix of the first
+/// append is covered by the conflicting append's own completion (its extent is at least the
+/// truncation point), so under-reporting never claims false durability.
+#[test]
+fn partial_overlap_keeps_only_the_superseding_completion() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(7));
+  let (log, _stable) = eng.stores(&7).unwrap();
+
+  log.submit_append(
+    OpId::new(1),
+    &[
+      empty_entry(1, 1),
+      empty_entry(1, 2),
+      empty_entry(1, 3),
+      empty_entry(1, 4),
+      empty_entry(1, 5),
+    ],
+  );
+  // Conflicts from index 4: indices 1..=3 of the first batch survive and become durable at the
+  // same barrier the superseding append's completion (extent 4) proves.
+  log.submit_append(OpId::new(2), &[empty_entry(2, 4)]);
+  assert_eq!(log.last_index(), Index::new(4));
+
+  assert_eq!(eng.flush(), 1);
+  let (log, _stable) = eng.stores(&7).unwrap();
+  assert!(matches!(
+    log.poll(),
+    Some(Ok(LogDone::Appended(id))) if id == OpId::new(2)
+  ));
+  assert!(log.poll().is_none());
+  assert_eq!(
+    log.term(Index::new(3)),
+    Ok(Term::new(1)),
+    "the surviving prefix is intact"
+  );
+  assert_eq!(log.term(Index::new(4)), Ok(Term::new(2)));
+}
+
 /// The trait's visibility split: `submit_append` updates the log READ VIEW immediately (ahead of
 /// durability) while `hard_state()` keeps returning the last-durable value; neither store has
 /// anything to poll until the barrier releases the staged completions.
@@ -184,16 +249,24 @@ fn log_prefix_durability_and_any_order() {
     "the truncated index is out of domain"
   );
 
-  assert_eq!(eng.flush(), 4, "all four submits complete at one barrier");
+  assert_eq!(
+    eng.flush(),
+    2,
+    "only the completions whose extents survived the truncation release"
+  );
   let (log, _) = eng.stores(&1).unwrap();
-  for i in 1u64..=4 {
+  for i in [1u64, 4] {
     assert_eq!(
       log.poll(),
       Some(Ok(LogDone::Appended(OpId::new(i)))),
       "completion {i} carries its submit's id"
     );
   }
-  assert!(log.poll().is_none());
+  assert!(
+    log.poll().is_none(),
+    "the truncated-away extents (ids 2 and 3) never complete: released, they would claim a \
+     durable prefix through indices the barrier does not make durable"
+  );
 }
 
 /// The chunk-staging trio: out-of-order chunks hold the contiguous watermark,

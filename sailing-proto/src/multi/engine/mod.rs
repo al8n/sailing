@@ -49,6 +49,18 @@ impl<I> GroupStorage<I> {
   }
 }
 
+/// A log completion staged behind the engine barrier. An append records its extent (`upto`) so a
+/// pre-barrier §5.3 conflict truncation can invalidate a superseded completion: releasing an
+/// `Appended` whose extent was truncated away would claim a durable prefix through an index that
+/// no longer exists — the normative [`LogStore`] prefix-durability contract forbids it.
+#[derive(Debug)]
+enum StagedLog {
+  /// A `submit_append`'s completion; `upto` is the visible last index at submit time.
+  Appended { id: OpId, upto: Index },
+  /// A `compact`'s completion (front-boundary — unaffected by suffix truncation).
+  Compacted(Index),
+}
+
 /// A shared in-memory storage engine: ONE engine hosts EVERY co-located group's replicated log
 /// and stable state, keyed by group id, with a single batched durability barrier
 /// ([`flush`](Self::flush)) spanning all of them.
@@ -231,7 +243,7 @@ pub struct EngineLog {
   /// Term at `offset` (the boundary term retained across compaction and restore).
   compacted_term: Term,
   /// Completions staged by `submit_append`/`compact`, awaiting the engine barrier.
-  staged: VecDeque<LogDone>,
+  staged: VecDeque<StagedLog>,
   /// Completions released by a barrier — what `poll`/`has_pending` see.
   ready: VecDeque<LogDone>,
 }
@@ -250,7 +262,10 @@ impl EngineLog {
   /// Release every staged completion into the poll FIFO (the barrier), returning how many.
   fn release_staged(&mut self) -> usize {
     let n = self.staged.len();
-    self.ready.append(&mut self.staged);
+    self.ready.extend(self.staged.drain(..).map(|s| match s {
+      StagedLog::Appended { id, .. } => LogDone::Appended(id),
+      StagedLog::Compacted(i) => LogDone::Compacted(i),
+    }));
     n
   }
 }
@@ -313,9 +328,20 @@ impl LogStore for EngineLog {
         (fi - offset - 1) as usize
       };
       self.entries.truncate(from);
+      // A conflicting append supersedes every staged completion whose extent reaches into the
+      // truncated suffix: released, such a completion would claim a durable prefix through an
+      // index the barrier no longer makes durable. The survivors' prefix is covered by THIS
+      // append's own completion (its extent is at least the truncation point), and the core
+      // prunes its records on the same truncation, so a dropped op id never wedges it.
+      let fi_idx = first.index();
+      self.staged.retain(|s| match s {
+        StagedLog::Appended { upto, .. } => *upto < fi_idx,
+        StagedLog::Compacted(_) => true,
+      });
     }
     self.entries.extend_from_slice(entries);
-    self.staged.push_back(LogDone::Appended(id));
+    let upto = self.last_index();
+    self.staged.push_back(StagedLog::Appended { id, upto });
   }
 
   fn compact(&mut self, up_to: Index) {
@@ -329,7 +355,7 @@ impl LogStore for EngineLog {
     self.entries.drain(0..drain_count);
     self.offset = up_to;
     self.compacted_term = boundary_term;
-    self.staged.push_back(LogDone::Compacted(up_to));
+    self.staged.push_back(StagedLog::Compacted(up_to));
   }
 
   fn restore(&mut self, last_index: Index, last_term: Term) {
