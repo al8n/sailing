@@ -124,9 +124,9 @@ group id is the `GroupId`'s `Data` encoding, bounded 1..=1024 bytes and enforced
 fixed u64. Because `LABEL_VERSION` fences mixed-version peers at the connection hello, this
 was a clean break: the version byte was RESET to 1 as the group-tagged baseline (nothing is
 published; the pre-group formats burned 1..=5, and a byte must never be reused once anything
-ships). The header's front-of-payload position composes into a future coalesced layout
-`[len][(group_len, group, msg_len, msg)*]` behind another version bump — which a
-protobuf-embedded tag could not.
+ships). The header's front-of-payload position composed directly into the coalesced control
+frame that landed in Phase 4 — `[len][0xFFFF][(flags, group_len, group, msg_len, msg)+]`, WIRE.md
+§3.1, behind the version-2 hello bump — which a protobuf-embedded tag could not have.
 
 ## Phased roadmap
 

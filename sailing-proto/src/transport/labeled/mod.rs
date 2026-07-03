@@ -15,10 +15,14 @@ const LABEL_MAGIC: u8 = 0xCA;
 /// frame format (including the multi-Raft group-demux header that precedes every encoded `Message`),
 /// or the `Message` codec itself — MUST bump this byte, so mixed-version nodes reject each other at the
 /// handshake instead of mis-decoding consensus traffic. Version 1 is the group-tagged wire baseline:
-/// each frame payload is `[u16 group_len][group bytes]` followed by the encoded `Message`. The byte
-/// deliberately RESTARTS the sequence (the pre-group formats burned 1..=5) — a reuse permissible
-/// only while nothing is published; once any build ships, a version byte must never be reused.
-const LABEL_VERSION: u8 = 1;
+/// each frame payload is `[u16 group_len][group bytes]` followed by the encoded `Message`. Version 2
+/// adds the coalesced control frame (payload marker 0xFFFF, then `[flags][group_len][group][msg_len]
+/// [msg]` entries — WIRE.md §3) and its per-entry QUIESCE flag: a version-1 peer would reject the
+/// marker as an over-bound group length frame-by-frame, so the fence keeps the failure at the hello.
+/// The byte deliberately RESTARTED the sequence at 1 (the pre-group formats burned 1..=5) — a reuse
+/// permissible only while nothing is published; once any build ships, a version byte must never be
+/// reused.
+const LABEL_VERSION: u8 = 2;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 /// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes

@@ -219,7 +219,7 @@ fn magic_and_version_mismatches_are_rejected() {
 #[test]
 fn zero_length_and_oversized_peer_ids_are_rejected() {
   // Hand-craft a hello with peer_id_len == 0.
-  let mut zero = std::vec![0xCA_u8, 1];
+  let mut zero = std::vec![LABEL_MAGIC, LABEL_VERSION];
   zero.extend_from_slice(&[1u8; 16]); // cluster
   zero.extend_from_slice(&0u16.to_be_bytes());
   let mut b = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();
@@ -231,7 +231,7 @@ fn zero_length_and_oversized_peer_ids_are_rejected() {
 
   // And one claiming a 64 KiB id (over MAX_PEER_ID_LEN) — rejected at the header, before any
   // id byte is buffered.
-  let mut huge = std::vec![0xCA_u8, 1];
+  let mut huge = std::vec![LABEL_MAGIC, LABEL_VERSION];
   huge.extend_from_slice(&[1u8; 16]);
   huge.extend_from_slice(&u16::MAX.to_be_bytes());
   let mut b2 = Labeled::acceptor(Passthrough::new(), &opts(1, 9)).unwrap();

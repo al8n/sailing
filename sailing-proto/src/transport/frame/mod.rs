@@ -27,7 +27,8 @@ pub(crate) fn write_group_header(group: &[u8], out: &mut Vec<u8>) {
 
 /// Split the group-demux header off a decoded frame, returning `(group_id_bytes, message_bytes)` as
 /// zero-copy slices of the same buffer. `Err(Decode)` if the header is truncated or declares a group
-/// past [`crate::wire::MAX_GROUP_ID_LEN`].
+/// past [`crate::wire::MAX_GROUP_ID_LEN`] — which includes the [`COALESCED_MARKER`] (0xFFFF), so a
+/// coalesced frame handed to the single-message parser errors instead of aliasing as a group tag.
 pub(crate) fn split_group_header(frame: Bytes) -> Result<(Bytes, Bytes), TransportError> {
   if frame.len() < 2 {
     return Err(TransportError::Decode);
@@ -37,6 +38,105 @@ pub(crate) fn split_group_header(frame: Bytes) -> Result<(Bytes, Bytes), Transpo
     return Err(TransportError::Decode);
   }
   Ok((frame.slice(2..2 + group_len), frame.slice(2 + group_len..)))
+}
+
+/// The `u16` big-endian value opening a COALESCED control frame's payload, where a single-message
+/// frame carries its group length. 0xFFFF is impossible as a group length — the bound is
+/// [`crate::wire::MAX_GROUP_ID_LEN`] (1024) — so the two payload forms are disjoint at the first two
+/// bytes: a pre-coalescing peer's parser rejects a coalesced frame outright rather than mis-reading
+/// it (and the `LABEL_VERSION` hello fence rejects such a peer before any frame flows anyway).
+pub(crate) const COALESCED_MARKER: u16 = 0xFFFF;
+
+// COHERENCE (compile-time): the marker sits OUTSIDE the group-length range, so the two payload
+// forms stay disjoint at their first two bytes.
+const _: () = assert!(COALESCED_MARKER as usize > crate::wire::MAX_GROUP_ID_LEN);
+
+/// Entry-flags bit 0: the sender QUIESCES this entry's group after this beat — the receiver's driver
+/// may stop arming that group's timers until traffic or a connection loss wakes it. All other bits
+/// must be zero on encode and are ignored on decode (forward room).
+#[allow(dead_code)]
+pub(crate) const COALESCED_FLAG_QUIESCE: u8 = 0b0000_0001;
+
+/// Senders flush a coalesced frame before its payload would exceed this budget (64 KiB — thousands
+/// of heartbeats per frame). Deliberately nowhere near [`MAX_FRAME_LEN`] (1/1024 of it), so the
+/// append/snapshot frame-fit sizer math is untouched: a coalesced control frame can never contend
+/// with a data frame for the frame bound.
+pub(crate) const COALESCED_FRAME_BUDGET: usize = 64 * 1024;
+
+// COHERENCE (compile-time): the budget stays 1/1024 of the frame bound, keeping the doc's
+// never-near-the-sizer-math claim honest if either constant moves.
+const _: () = assert!(COALESCED_FRAME_BUDGET <= MAX_FRAME_LEN / 1024);
+
+/// Whether a decoded frame payload is a coalesced control frame (opens with [`COALESCED_MARKER`]).
+#[allow(dead_code)]
+pub(crate) fn is_coalesced_frame(frame: &[u8]) -> bool {
+  frame.len() >= 2 && frame[..2] == COALESCED_MARKER.to_be_bytes()
+}
+
+/// Open a coalesced frame payload being built: the [`COALESCED_MARKER`], then one or more
+/// [`write_coalesced_entry`] records.
+#[allow(dead_code)]
+pub(crate) fn write_coalesced_marker(out: &mut Vec<u8>) {
+  out.extend_from_slice(&COALESCED_MARKER.to_be_bytes());
+}
+
+/// Append one coalesced entry `[u8 flags][u16 BE group_len][group bytes][u32 BE msg_len][msg]` to a
+/// payload opened by [`write_coalesced_marker`]. The caller guarantees a NON-empty group within
+/// [`crate::wire::MAX_GROUP_ID_LEN`] (coalescing is a multi-group feature — the empty single-group
+/// tag never rides here) and only defined flag bits.
+#[allow(dead_code)]
+pub(crate) fn write_coalesced_entry(flags: u8, group: &[u8], msg_bytes: &[u8], out: &mut Vec<u8>) {
+  debug_assert!(!group.is_empty() && group.len() <= crate::wire::MAX_GROUP_ID_LEN);
+  debug_assert_eq!(flags & !COALESCED_FLAG_QUIESCE, 0, "undefined flag bits");
+  out.push(flags);
+  out.extend_from_slice(&(group.len() as u16).to_be_bytes());
+  out.extend_from_slice(group);
+  out.extend_from_slice(&(msg_bytes.len() as u32).to_be_bytes());
+  out.extend_from_slice(msg_bytes);
+}
+
+/// Split a coalesced frame into its `(flags, group_id_bytes, message_bytes)` entries, each a
+/// zero-copy slice of the frame (like [`split_group_header`]). `Err(Decode)` on a missing marker, a
+/// truncated entry, a group length of zero or past [`crate::wire::MAX_GROUP_ID_LEN`], a message
+/// length overrunning the frame, or an empty entry list — the payload must be exactly one or more
+/// complete entries, so any trailing remainder after the last complete one rejects too.
+#[allow(dead_code)]
+pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, TransportError> {
+  if !is_coalesced_frame(&frame) {
+    return Err(TransportError::Decode);
+  }
+  let mut entries = Vec::new();
+  let mut at = 2usize;
+  while at < frame.len() {
+    // [u8 flags][u16 BE group_len] — the fixed entry prefix.
+    if frame.len() - at < 3 {
+      return Err(TransportError::Decode);
+    }
+    let flags = frame[at];
+    let group_len = u16::from_be_bytes([frame[at + 1], frame[at + 2]]) as usize;
+    if group_len == 0 || group_len > crate::wire::MAX_GROUP_ID_LEN {
+      return Err(TransportError::Decode);
+    }
+    at += 3;
+    if frame.len() - at < group_len + 4 {
+      return Err(TransportError::Decode);
+    }
+    let group = frame.slice(at..at + group_len);
+    at += group_len;
+    let msg_len =
+      u32::from_be_bytes([frame[at], frame[at + 1], frame[at + 2], frame[at + 3]]) as usize;
+    at += 4;
+    if frame.len() - at < msg_len {
+      return Err(TransportError::Decode);
+    }
+    let msg = frame.slice(at..at + msg_len);
+    at += msg_len;
+    entries.push((flags, group, msg));
+  }
+  if entries.is_empty() {
+    return Err(TransportError::Decode);
+  }
+  Ok(entries)
 }
 
 /// Reassembles length-prefixed frames from a byte stream that may arrive in arbitrary chunks.
