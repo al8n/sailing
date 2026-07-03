@@ -168,6 +168,41 @@ fn round_trips_a_message_after_handshake() {
 }
 
 #[test]
+fn round_trips_a_tagged_message() {
+  let mut d = dialer(7);
+  let mut a = acceptor(9);
+  pump(&mut d, &mut a); // settle the handshake first
+  // Stamp the frame with an 8-byte group tag (a u64 group id's `Data` encoding).
+  let tag = enc_id(42);
+  d.send_message(&tag, &sample_msg());
+  pump(&mut d, &mut a);
+  let mut msgs = Vec::new();
+  a.poll_decoded(&mut msgs).unwrap();
+  assert_eq!(msgs.len(), 1, "exactly one tagged message");
+  assert_eq!(&msgs[0].0[..], &tag[..], "the tag bytes survive the wire");
+  assert_eq!(msgs[0].1, sample_msg());
+}
+
+/// A frame whose group header is valid (empty tag) but whose envelope is bogus closes the
+/// connection as integrity-suspect — the header split succeeding must not soften the message
+/// decode gate.
+#[test]
+fn valid_header_bogus_envelope_closes() {
+  let mut d = dialer(7);
+  let mut a = acceptor(9);
+  pump(&mut d, &mut a);
+  // `[00 00]` = an empty group tag, then one byte that is not a valid Message encoding.
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&[0x00, 0x00, 0xFF], &mut framed);
+  d.record_write_for_test(&framed);
+  pump(&mut d, &mut a);
+  let mut msgs = Vec::new();
+  let res = a.poll_decoded(&mut msgs);
+  assert!(res.is_err(), "a bogus envelope is a transport fault");
+  assert!(a.is_closed());
+}
+
+#[test]
 fn undecodable_frame_closes_the_conn() {
   let mut d = dialer(7);
   let mut a = acceptor(9);

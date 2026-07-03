@@ -166,3 +166,80 @@ fn every_two_chunk_split_reassembles_three_frames() {
     assert_eq!(dec.buffered_for_test(), 0, "cut {cut}: fully drained");
   }
 }
+
+#[test]
+fn group_header_round_trips() {
+  let mut payload = Vec::new();
+  write_group_header(b"grp-id", &mut payload);
+  // Golden: the header is exactly `[u16 BE group_len][group bytes]`.
+  assert_eq!(&payload[..2], &[0x00, 0x06], "u16 BE length prefix");
+  assert_eq!(&payload[2..], b"grp-id");
+  payload.extend_from_slice(b"the-message-bytes");
+
+  // Full wire cycle: frame it, reassemble it, then split the group header back off.
+  let mut wire = Vec::new();
+  encode_frame(&payload, &mut wire);
+  let mut dec = FrameDecoder::new();
+  dec.push(&wire);
+  let frame = dec.poll().unwrap().expect("one complete frame");
+  let (group, message) = split_group_header(frame).expect("well-formed header");
+  assert_eq!(&group[..], b"grp-id", "the group tag is byte-exact");
+  assert_eq!(
+    &message[..],
+    b"the-message-bytes",
+    "the message remainder is byte-exact"
+  );
+}
+
+#[test]
+fn group_header_empty_tag_round_trips() {
+  let mut payload = Vec::new();
+  write_group_header(&[], &mut payload);
+  assert_eq!(
+    &payload[..],
+    &[0x00, 0x00],
+    "the single-group tag is a zero length"
+  );
+  payload.extend_from_slice(b"msg");
+  let (group, message) = split_group_header(Bytes::from(payload)).expect("well-formed header");
+  assert!(group.is_empty(), "an empty tag splits to an empty group");
+  assert_eq!(&message[..], b"msg");
+}
+
+#[test]
+fn group_header_rejects_truncation() {
+  // One byte cannot even hold the u16 length prefix.
+  assert!(matches!(
+    split_group_header(Bytes::from_static(&[0x00])),
+    Err(TransportError::Decode)
+  ));
+}
+
+#[test]
+fn group_header_rejects_oversized_group() {
+  // A declared group length of MAX_GROUP_ID_LEN + 1 (1025) is rejected even when every declared
+  // byte is present — the bound, not truncation, trips.
+  let over = crate::wire::MAX_GROUP_ID_LEN + 1;
+  let mut buf = std::vec![0xAB_u8; 2 + over + 3];
+  buf[..2].copy_from_slice(&(over as u16).to_be_bytes());
+  assert!(matches!(
+    split_group_header(Bytes::from(buf)),
+    Err(TransportError::Decode)
+  ));
+
+  // The bound is inclusive: exactly MAX_GROUP_ID_LEN splits cleanly.
+  let mut ok = std::vec![0xAB_u8; 2 + crate::wire::MAX_GROUP_ID_LEN + 1];
+  ok[..2].copy_from_slice(&(crate::wire::MAX_GROUP_ID_LEN as u16).to_be_bytes());
+  let (group, message) = split_group_header(Bytes::from(ok)).expect("at the bound");
+  assert_eq!(group.len(), crate::wire::MAX_GROUP_ID_LEN);
+  assert_eq!(message.len(), 1);
+}
+
+#[test]
+fn group_header_rejects_length_past_end() {
+  // The header declares a 10-byte group but only 4 bytes remain in the frame.
+  assert!(matches!(
+    split_group_header(Bytes::from_static(&[0x00, 0x0A, 1, 2, 3, 4])),
+    Err(TransportError::Decode)
+  ));
+}

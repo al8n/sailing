@@ -438,3 +438,32 @@ fn coordinator_proxies_delegate_to_the_endpoint() {
   while c.poll_event().is_some() {}
   assert_eq!(c.endpoint().role(), c.role());
 }
+
+/// A group-TAGGED but otherwise valid frame arriving at a SINGLE-group host is a deployment-shape
+/// mismatch (the peer is a multi-group node): the connection closes as integrity-suspect rather
+/// than injecting a foreign group's traffic into this endpoint.
+#[test]
+fn tagged_frame_closes_on_a_single_group_host() {
+  let mut w = World::new();
+  w.settle(); // complete the label handshake so the crafted frame arrives on a VALIDATED conn
+  assert_eq!(w.b.conn_of(&1), Some(ConnId(1)));
+
+  // A valid Message stamped with a well-formed NON-empty group tag.
+  let msg = crate::Message::TimeoutNow(crate::TimeoutNow::new(crate::Term::new(3), 1u64));
+  let mut tag = Vec::new();
+  100u64.encode(&mut tag);
+  let mut payload = Vec::new();
+  crate::transport::frame::write_group_header(&tag, &mut payload);
+  crate::wire::encode_message(&msg, &mut payload);
+  let mut framed = Vec::new();
+  crate::transport::frame::encode_frame(&payload, &mut framed);
+
+  w.b
+    .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.lb, &mut w.sb);
+  assert_eq!(
+    w.b.poll_conn_closed(),
+    Some((ConnId(1), Some(crate::transport::TransportError::Decode))),
+    "any non-empty tag closes a single-group receiver"
+  );
+  assert_eq!(w.b.conn_of(&1), None, "the route is gone");
+}
