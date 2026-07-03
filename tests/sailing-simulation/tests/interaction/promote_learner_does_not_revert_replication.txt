@@ -75,12 +75,6 @@ stabilize
 > n2 ready
   HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
-> n1 ready
-  AppendEntries term=1 prev=1/4 commit=4 entries=[]
-> n2 recv AppendEntries term=1 prev=1/4 commit=4 entries=[]
-> n2 ready
-  AppendResponse term=1 match=4
-> n1 recv AppendResponse term=1 match=4
 
 raft-log 2
 ----

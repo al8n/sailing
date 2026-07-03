@@ -116,14 +116,9 @@ stabilize
 > n1 recv HeartbeatResponse term=1
 > n1 ready
   AppendEntries term=1 prev=1/2 commit=2 entries=[]
-  AppendEntries term=1 prev=1/2 commit=2 entries=[]
-> n2 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
 > n3 recv AppendEntries term=1 prev=1/2 commit=2 entries=[]
-> n2 ready
-  AppendResponse term=1 match=2
 > n3 ready
   AppendResponse term=1 reject hint=1/1
-> n1 recv AppendResponse term=1 match=2
 > n1 recv AppendResponse term=1 reject hint=1/1
 > n1 ready
   AppendEntries term=1 prev=1/1 commit=2 entries=[1/2 normal 0x010000000000000061]

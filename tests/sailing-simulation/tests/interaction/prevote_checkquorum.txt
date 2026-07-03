@@ -152,14 +152,9 @@ stabilize
 > n2 recv HeartbeatResponse term=2
 > n2 ready
   AppendEntries term=2 prev=1/1 commit=2 entries=[2/2 empty]
-  AppendEntries term=2 prev=2/2 commit=2 entries=[]
 > n1 recv AppendEntries term=2 prev=1/1 commit=2 entries=[2/2 empty]
-> n3 recv AppendEntries term=2 prev=2/2 commit=2 entries=[]
 > n1 ready
   AppendResponse term=2 match=2
-> n3 ready
-  AppendResponse term=2 match=2
-> n2 recv AppendResponse term=2 match=2
 > n2 recv AppendResponse term=2 match=2
 > n2 ready
   AppendEntries term=2 prev=2/2 commit=2 entries=[]

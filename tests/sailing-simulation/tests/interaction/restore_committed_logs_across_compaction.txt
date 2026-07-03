@@ -256,17 +256,6 @@ stabilize
   HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
 > n1 recv HeartbeatResponse term=1
-> n1 ready
-  AppendEntries term=1 prev=1/6 commit=6 entries=[]
-  AppendEntries term=1 prev=1/6 commit=6 entries=[]
-> n2 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
-> n3 recv AppendEntries term=1 prev=1/6 commit=6 entries=[]
-> n2 ready
-  AppendResponse term=1 match=6
-> n3 ready
-  AppendResponse term=1 match=6
-> n1 recv AppendResponse term=1 match=6
-> n1 recv AppendResponse term=1 match=6
 
 raft-state
 ----
