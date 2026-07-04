@@ -27,9 +27,10 @@ mod group_id;
 pub use group_id::GroupId;
 
 use crate::{
-  ConfChange, ConfChangeV2, Config, CreateGroupError, Data, Endpoint, Event, Index, Instant,
-  LogStore, Message, NodeId, Now, Outgoing, Prng, ProposeError, ReadIndexError, ReadOnlyOption,
-  StableStore, StateMachine, StorageProgress, TransferError,
+  ConfChange, ConfChangeV2, ConfState, Config, CreateGroupError, Data, Endpoint, Event, HardState,
+  Index, Instant, LogStore, Message, NodeId, Now, OpId, Outgoing, Prng, ProposeError,
+  ReadIndexError, ReadOnlyOption, SnapshotMeta, StableStore, StateMachine, StorageProgress, Term,
+  TransferError,
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
@@ -116,6 +117,58 @@ where
   fn lineage(&self, gid: &G) -> u64 {
     self.group_gen(gid)
   }
+}
+
+/// The log index of the synthetic snapshot baseline every forked group boots at. Index 1, not 0:
+/// meta index 0 is the no-snapshot sentinel, and the baseline must push `first_index` to 2 so a
+/// zero-progress joiner (match 0, next 1) satisfies `next < first_index` and is structurally
+/// forced onto the snapshot path — an uncompacted fork would LOG-WALK the joiner, replaying only
+/// post-fork entries onto its EMPTY state machine (silent, permanent divergence from the
+/// preloaded replicas).
+pub const FORK_BASE_INDEX: Index = Index::new(1);
+
+/// The term of the fork baseline entry. Term 1, not 0: a well-formed store never holds an entry
+/// above its own durable term, so the manufactured HardState carries this term and the baseline
+/// meta claims it — the exact shape a real snapshot install leaves behind.
+pub const FORK_BASE_TERM: Term = Term::new(1);
+
+/// Manufacture the fork baseline in a child's fresh stores — the exact store shape a completed
+/// snapshot install leaves behind, so [`Endpoint::restart`] recovers it with the install
+/// machinery's own validation: HardState at the baseline term (commit at the boundary), the
+/// AUTHORITATIVE blob persisted at `(FORK_BASE_INDEX, FORK_BASE_TERM)` under the boot voters,
+/// and the log re-baselined so `first_index == 2` (blob-then-rebaseline, the install order).
+///
+/// The write ids ride the PRIOR boot epoch (`boot_epoch - 1`): restart seeds the endpoint's op
+/// counter at `first_of_epoch(boot_epoch)`, so a completion from these manufacture-time writes is
+/// epoch-strictly-below every id the child ever mints — it can never alias a live op in the
+/// pending maps or falsely satisfy a `>=` durability watermark (the OpId epoch-major contract).
+/// Same-epoch ids would collide with the child's first ops: a vote write pending at
+/// `(boot_epoch, 0)` would see OUR completion and ack a not-yet-durable vote.
+fn write_fork_baseline<I, L, S>(
+  config: &Config<I>,
+  snapshot: Bytes,
+  boot_epoch: u64,
+  log: &mut L,
+  stable: &mut S,
+) where
+  I: NodeId,
+  L: LogStore,
+  S: StableStore<NodeId = I>,
+{
+  let opid = OpId::first_of_epoch(boot_epoch.saturating_sub(1));
+  stable.submit_write(
+    opid,
+    HardState::initial()
+      .with_term(FORK_BASE_TERM)
+      .with_commit(FORK_BASE_INDEX),
+  );
+  let conf = ConfState::from_voters(config.voters().iter().map(CheapClone::cheap_clone));
+  stable.submit_snapshot(
+    opid.next(),
+    SnapshotMeta::new(FORK_BASE_INDEX, FORK_BASE_TERM, conf),
+    snapshot,
+  );
+  log.restore(FORK_BASE_INDEX, FORK_BASE_TERM);
 }
 
 /// The create/restore admission check shared by every group constructor: group-id uniqueness, the
@@ -432,6 +485,74 @@ where
     self.mark_dirty(&gid);
     Ok(())
   }
+
+  /// Create a group born from LOCALLY-FORKED state: a manufactured snapshot install. The
+  /// baseline — meta `(`[`FORK_BASE_INDEX`]`, `[`FORK_BASE_TERM`]`)`, the caller's `snapshot`
+  /// blob, the log compacted through the boundary — is written into the FRESH `log`/`stable`
+  /// first, and the group then boots through the [`Endpoint::restart`] path, inheriting its
+  /// boundary validation, poison discipline, and applied/commit derivation wholesale. Because
+  /// `first_index` starts at 2, a zero-progress joiner added later is structurally forced onto
+  /// the snapshot path and receives exactly the persisted blob — never a log walk onto its empty
+  /// state machine.
+  ///
+  /// **The blob is authoritative.** `fsm` is the restore VESSEL — restart overwrites it from the
+  /// blob, so a caller-supplied fsm/blob mismatch cannot diverge replicas (the blob wins
+  /// identically everywhere; their equality is an efficiency contract, not a safety one). A blob
+  /// that fails boundary/decode/restore POISONS the group exactly as a corrupt durable snapshot
+  /// would at crash-restart — construction still returns `Ok`, and co-hosted groups are
+  /// untouched.
+  ///
+  /// A fork is a LOCAL act by an already-authorized replica: it is never solicited over the
+  /// wire, and no factory path reaches it — a catalog that marks ids fork-born should DECLINE
+  /// solicitations for them. Same `boot_epoch` contract as
+  /// [`restore_group`](Self::restore_group) (at least 1; strictly above every prior incarnation
+  /// of this group on this node — a re-fork after removal is a later incarnation). The stores
+  /// must be FRESH: the baseline overwrites whatever they hold. On a stable store whose
+  /// `hard_state()` lags submitted writes to a durability barrier, the child boots at the
+  /// store's PRIOR durable term (the baseline meta alone drives the applied/commit derivation,
+  /// so the boot is unchanged otherwise) and the manufactured term becomes durable at the next
+  /// barrier — the crash-recovery shape is the spec'd one either way.
+  ///
+  /// # Errors
+  /// The same admission checks as [`create_group`](Self::create_group) — see
+  /// [`CreateGroupError`]. Refusal happens BEFORE any store write.
+  #[allow(clippy::too_many_arguments)]
+  pub fn create_group_from_fork<L, S>(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    seed: u64,
+    fsm: F,
+    snapshot: Bytes,
+    boot_epoch: u64,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
+    write_fork_baseline(&config, snapshot, boot_epoch, log, stable);
+    let ep = Endpoint::restart(
+      config,
+      now,
+      group_seed(seed, &gid),
+      fsm,
+      boot_epoch,
+      log,
+      stable,
+    );
+    self.groups.insert(gid.cheap_clone(), ep);
+    self.mark_dirty(&gid);
+    Ok(())
+  }
 }
 
 // Caller-supplied-RNG constructors, mirroring `Endpoint`'s `*_with_rng` family. The seed-taking
@@ -535,6 +656,42 @@ where
       log,
       stable,
     );
+    self.groups.insert(gid.cheap_clone(), ep);
+    self.mark_dirty(&gid);
+    Ok(())
+  }
+
+  /// Create a group from locally forked state with a caller-supplied RNG (see
+  /// [`create_group_from_fork`](Self::create_group_from_fork) for the manufactured-install
+  /// contract and [`Endpoint::restart_with_rng`] for the RNG one).
+  ///
+  /// # Errors
+  /// The admission checks of [`CreateGroupError`]; refusal happens BEFORE any store write.
+  #[allow(clippy::too_many_arguments)]
+  pub fn create_group_from_fork_with_rng<L, S>(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    rng: R,
+    fsm: F,
+    snapshot: Bytes,
+    boot_epoch: u64,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Command: Data,
+    F::Snapshot: Data,
+    F::Error: core::error::Error,
+    I: Data,
+  {
+    validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    self.host_id.get_or_insert(config.id());
+    write_fork_baseline(&config, snapshot, boot_epoch, log, stable);
+    let ep = Endpoint::restart_with_rng(config, now, rng, fsm, boot_epoch, log, stable);
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())

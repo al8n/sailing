@@ -1,10 +1,423 @@
 use super::*;
 use crate::{
-  Config, Instant,
+  Config, Instant, PoisonReason,
   testkit::{AsyncStable, CountSm, VecLog},
 };
 use bytes::Bytes;
 use core::time::Duration;
+
+/// Encode `n` as a CountSm snapshot blob (the `Data` encoding of its `u64` snapshot type).
+fn fork_blob(n: u64) -> Bytes {
+  let mut v = Vec::new();
+  Data::encode(&n, &mut v);
+  Bytes::from(v)
+}
+
+/// A CountSm vessel preloaded to count `n` — the state a fork's caller derived locally.
+fn preloaded_sm(n: u64) -> CountSm {
+  let mut sm = CountSm::default();
+  StateMachine::restore(&mut sm, n).unwrap();
+  sm
+}
+
+/// Drain `gid`'s storage completions to quiescence on one host.
+fn drain_storage(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  gid: u64,
+  now: Instant,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+) {
+  while matches!(
+    m.handle_storage(&gid, now, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+}
+
+/// Route every queued message of `gid` between two single-group hosts until neither side moves,
+/// draining storage after every dispatch — the deterministic two-node message loop the fork
+/// election/joiner pins drive. `tap_a_to_b` observes each a→b message before delivery (the
+/// replication-transcript capture).
+#[allow(clippy::too_many_arguments)]
+fn route_until_quiescent(
+  a: &mut MultiRaft<u64, u64, CountSm>,
+  a_id: u64,
+  la: &mut VecLog,
+  sa: &mut AsyncStable,
+  b: &mut MultiRaft<u64, u64, CountSm>,
+  b_id: u64,
+  lb: &mut VecLog,
+  sb: &mut AsyncStable,
+  now: Instant,
+  gid: u64,
+  tap_a_to_b: &mut dyn FnMut(&Message<u64>),
+) {
+  loop {
+    let mut moved = false;
+    while let Some((g, out)) = a.poll_message() {
+      let (to, msg) = out.into_parts();
+      if g == gid && to == b_id {
+        tap_a_to_b(&msg);
+        b.handle_message(&g, now, lb, sb, a_id, msg).unwrap();
+        drain_storage(b, g, now, lb, sb);
+        moved = true;
+      }
+    }
+    while let Some((g, out)) = b.poll_message() {
+      let (to, msg) = out.into_parts();
+      if g == gid && to == a_id {
+        a.handle_message(&g, now, la, sa, b_id, msg).unwrap();
+        drain_storage(a, g, now, la, sa);
+        moved = true;
+      }
+    }
+    if !moved {
+      break;
+    }
+  }
+}
+
+#[test]
+fn fork_boots_at_the_synthetic_baseline() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let blob = fork_blob(3);
+  m.create_group_from_fork(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    preloaded_sm(3),
+    blob.clone(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+
+  let ep = m.group(&7).unwrap();
+  assert_eq!(ep.applied_index(), FORK_BASE_INDEX);
+  assert_eq!(ep.commit_index(), FORK_BASE_INDEX);
+  assert!(ep.role().is_follower());
+  assert!(!ep.is_poisoned());
+  assert_eq!(ep.term(), FORK_BASE_TERM, "boot term reads the baseline");
+  assert_eq!(ep.state_machine().count(), 3, "restored from the blob");
+
+  // The stores hold the exact post-install shape: log compacted through the baseline, the
+  // authoritative blob persisted at (1, 1), HardState at the baseline term.
+  assert_eq!(log.first_index().get(), 2, "compacted through the baseline");
+  assert_eq!(log.last_index().get(), 1);
+  assert_eq!(
+    log.term(FORK_BASE_INDEX).unwrap(),
+    FORK_BASE_TERM,
+    "the boundary term is retained"
+  );
+  let (meta, stored) = stable.snapshot().expect("baseline blob persisted");
+  assert_eq!(
+    (meta.last_index(), meta.last_term()),
+    (FORK_BASE_INDEX, FORK_BASE_TERM)
+  );
+  assert_eq!(stored, blob, "the stored blob IS the preloaded state");
+  assert_eq!(stable.hard_state().term(), FORK_BASE_TERM);
+
+  assert!(m.poll_message().is_none(), "a fork boots silent");
+  assert!(m.poll_event().is_none(), "and surfaces no replay events");
+}
+
+#[test]
+fn fork_admission_matches_create_group() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(
+    1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+  )
+  .unwrap();
+
+  // Refusals precede EVERY store write: after each one the fresh stores are untouched.
+  let untouched = |log: &VecLog, stable: &AsyncStable| {
+    assert_eq!(log.first_index().get(), 1, "log untouched on refusal");
+    assert_eq!(log.last_index().get(), 0);
+    assert!(stable.snapshot().is_none(), "snapshot slot untouched");
+    assert_eq!(stable.hard_state().term(), Term::ZERO);
+  };
+
+  assert_eq!(
+    m.create_group_from_fork(
+      1,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      preloaded_sm(3),
+      fork_blob(3),
+      1,
+      &mut log,
+      &mut stable,
+    ),
+    Err(CreateGroupError::Exists)
+  );
+  untouched(&log, &stable);
+
+  assert_eq!(
+    m.create_group_from_fork(
+      2,
+      single_node_cfg(2),
+      Instant::ORIGIN,
+      42,
+      preloaded_sm(3),
+      fork_blob(3),
+      1,
+      &mut log,
+      &mut stable,
+    ),
+    Err(CreateGroupError::NodeIdMismatch)
+  );
+  untouched(&log, &stable);
+
+  let mut sized: MultiRaft<SizedId, u64, CountSm> = MultiRaft::new();
+  for bad in [SizedId(0), SizedId(1025)] {
+    assert_eq!(
+      sized.create_group_from_fork(
+        bad,
+        single_node_cfg(1),
+        Instant::ORIGIN,
+        42,
+        preloaded_sm(3),
+        fork_blob(3),
+        1,
+        &mut log,
+        &mut stable,
+      ),
+      Err(CreateGroupError::InvalidGroupId)
+    );
+    untouched(&log, &stable);
+  }
+}
+
+#[test]
+fn fork_blob_is_authoritative_over_the_vessel() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  // The vessel disagrees with the blob: the blob must win identically everywhere.
+  m.create_group_from_fork(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    preloaded_sm(5),
+    fork_blob(9),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().count(),
+    9,
+    "the BLOB's content is the post-boot state; the vessel's is absorbed"
+  );
+
+  // Live continuity off the blob baseline: a one-node elect + commit applies ON TOP of 9.
+  let d = m.group(&7).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&7, d, &mut log, &mut stable).unwrap();
+  drain_storage(&mut m, 7, d, &mut log, &mut stable);
+  assert!(m.group(&7).unwrap().role().is_leader());
+  let cmd = Bytes::from_static(b"x");
+  m.propose(&7, d, &mut log, &stable, &cmd).unwrap().unwrap();
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  drain_storage(&mut m, 7, d, &mut log, &mut stable);
+  assert_eq!(m.group(&7).unwrap().state_machine().count(), 10);
+}
+
+#[test]
+fn fork_with_a_corrupt_blob_poisons_only_that_group() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  m.create_group(
+    1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+  )
+  .unwrap();
+
+  // A blob that cannot decode as the FSM snapshot: the fork constructor still returns Ok (the
+  // restart discipline — construction is infallible, the GROUP is poisoned), and only group 7
+  // is dead.
+  let (mut log7, mut stable7) = (VecLog::default(), AsyncStable::default());
+  m.create_group_from_fork(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+    Bytes::from_static(&[1, 2, 3]),
+    1,
+    &mut log7,
+    &mut stable7,
+  )
+  .unwrap();
+  let ep = m.group(&7).unwrap();
+  assert!(ep.is_poisoned(), "a corrupt blob poisons at construction");
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::SnapshotDecode));
+
+  // The sibling group on the same container keeps working.
+  let (mut log1, mut stable1) = (VecLog::default(), AsyncStable::default());
+  let d = m.group(&1).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&1, d, &mut log1, &mut stable1).unwrap();
+  drain_storage(&mut m, 1, d, &mut log1, &mut stable1);
+  assert!(m.group(&1).unwrap().role().is_leader());
+  let cmd = Bytes::from_static(b"x");
+  m.propose(&1, d, &mut log1, &stable1, &cmd)
+    .unwrap()
+    .unwrap();
+  m.flush_appends(&1, d, &log1, &stable1).unwrap();
+  drain_storage(&mut m, 1, d, &mut log1, &mut stable1);
+  assert_eq!(m.group(&1).unwrap().state_machine().count(), 1);
+}
+
+#[test]
+fn forked_group_elects_off_the_baseline() {
+  fn voter_pair_cfg(id: u64) -> Config<u64> {
+    Config::try_new(
+      id,
+      std::vec![1, 2],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  }
+  let mut a: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut b: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut la, mut sa) = (VecLog::default(), AsyncStable::default());
+  let (mut lb, mut sb) = (VecLog::default(), AsyncStable::default());
+  // Both replicas fork the SAME blob — the fork contract for a multi-replica child.
+  a.create_group_from_fork(
+    7,
+    voter_pair_cfg(1),
+    Instant::ORIGIN,
+    42,
+    preloaded_sm(4),
+    fork_blob(4),
+    1,
+    &mut la,
+    &mut sa,
+  )
+  .unwrap();
+  b.create_group_from_fork(
+    7,
+    voter_pair_cfg(2),
+    Instant::ORIGIN,
+    43,
+    preloaded_sm(4),
+    fork_blob(4),
+    1,
+    &mut lb,
+    &mut sb,
+  )
+  .unwrap();
+
+  // Node 1 campaigns: the vote's up-to-date checks read (1, 1) off the meta on BOTH sides —
+  // the election succeeding IS the last-entry derivation pin.
+  let d = a.group(&7).unwrap().poll_timeout().unwrap();
+  a.handle_timeout(&7, d, &mut la, &mut sa).unwrap();
+  drain_storage(&mut a, 7, d, &mut la, &mut sa);
+  route_until_quiescent(
+    &mut a,
+    1,
+    &mut la,
+    &mut sa,
+    &mut b,
+    2,
+    &mut lb,
+    &mut sb,
+    d,
+    7,
+    &mut |_| {},
+  );
+  let leader = a.group(&7).unwrap();
+  assert!(leader.role().is_leader(), "the forked pair elects");
+  assert!(
+    leader.term() >= Term::new(2),
+    "the first campaign runs ABOVE the baseline term, got {:?}",
+    leader.term()
+  );
+  assert!(
+    leader.commit_index() >= Index::new(2),
+    "the no-op above the baseline commits at index 2"
+  );
+
+  // One heartbeat round propagates the commit to the follower.
+  let hb = a.group(&7).unwrap().poll_timeout().unwrap();
+  a.handle_timeout(&7, hb, &mut la, &mut sa).unwrap();
+  drain_storage(&mut a, 7, hb, &mut la, &mut sa);
+  route_until_quiescent(
+    &mut a,
+    1,
+    &mut la,
+    &mut sa,
+    &mut b,
+    2,
+    &mut lb,
+    &mut sb,
+    hb,
+    7,
+    &mut |_| {},
+  );
+  assert!(
+    b.group(&7).unwrap().commit_index() >= Index::new(2),
+    "the follower commits the same index"
+  );
+  assert_eq!(b.group(&7).unwrap().state_machine().count(), 4);
+}
+
+#[test]
+fn fork_then_store_roundtrip_equals_restore() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_from_fork(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    preloaded_sm(6),
+    fork_blob(6),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+
+  // A SECOND container restoring a FRESH vessel from the same stores is indistinguishable:
+  // the fork IS a manufactured install, so restore recovers it as one.
+  let mut r: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  r.restore_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+    2,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+
+  let forked = m.group(&7).unwrap();
+  let restored = r.group(&7).unwrap();
+  assert_eq!(restored.term(), forked.term());
+  assert_eq!(restored.applied_index(), forked.applied_index());
+  assert_eq!(restored.commit_index(), forked.commit_index());
+  assert_eq!(
+    restored.state_machine().count(),
+    forked.state_machine().count()
+  );
+  assert!(restored.role().is_follower());
+  assert!(!restored.is_poisoned());
+}
 
 fn single_node_cfg(id: u64) -> Config<u64> {
   Config::try_new(
