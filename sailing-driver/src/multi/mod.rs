@@ -178,7 +178,8 @@ where
     generation: u64,
     /// Answered with the admission verdict.
     reply: oneshot::Sender<Result<(), DriverError<I>>>,
-    /// The owning budget reservation (zero-byte).
+    /// The owning budget reservation, sized to the snapshot blob: the byte leg of the budget is
+    /// the drivers' memory gate, and the blob rides an unbounded channel until consumed.
     reservation: ReservationGuard,
   },
   /// Recover a group from the host's shared storage engine. The DRIVER supplies the boot epoch
@@ -395,6 +396,11 @@ where
   /// [`restore_group`](Self::restore_group); admission (tombstone, floor, `generation`) and the
   /// refusal surface are exactly [`create_group`](Self::create_group)'s. A fork is a local act
   /// by an already-authorized replica — never solicited over the wire, never factory-built.
+  ///
+  /// The blob counts against `max_pending_bytes` exactly like a proposal payload — a fork is the
+  /// largest single allocation a caller can push at a driver — so an over-budget snapshot
+  /// resolves [`DriverError::Busy`] before anything is queued, and the bytes stay reserved until
+  /// the driver consumes the command.
   pub async fn create_group_from_fork(
     &self,
     gid: G,
@@ -404,7 +410,7 @@ where
     snapshot: bytes::Bytes,
     generation: u64,
   ) -> Result<(), DriverError<I>> {
-    let reservation = self.budget.try_reserve(0)?;
+    let reservation = self.budget.try_reserve(snapshot.len())?;
     let (tx, rx) = oneshot::channel();
     self.send(MultiCommand::CreateGroupFromFork {
       gid,

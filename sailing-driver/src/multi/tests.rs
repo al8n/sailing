@@ -280,6 +280,63 @@ fn lifecycle_tail_delivers_signals_to_any_clone() {
   );
 }
 
+/// A fork's snapshot blob counts against the shared BYTE budget exactly like a proposal
+/// payload — the blob is the largest single allocation a caller can push at a driver, and the
+/// command channel is unbounded, so a zero-byte reservation would let stalled forks grow the
+/// driver's memory past `max_pending_bytes` instead of failing `Busy`. An over-budget blob is
+/// refused BEFORE anything reaches the channel; a second fork is refused while the first's
+/// reservation holds the bytes; consuming the first's command releases them and the second
+/// admits.
+#[test]
+fn fork_snapshot_bytes_count_against_the_inflight_budget() {
+  futures_executor::block_on(async {
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
+
+    // (a) A blob past the byte cap fails fast: nothing queued, the caller told Busy up front.
+    let oversized = Bytes::from(vec![0u8; 100]);
+    let mut over = Box::pin(handle.create_group_from_fork(301, config(), 1, CountSm, oversized, 0));
+    match futures_util::poll!(over.as_mut()) {
+      Poll::Ready(Err(DriverError::Busy)) => {}
+      other => panic!("expected an immediate Busy for an over-budget fork blob, got {other:?}"),
+    }
+    assert_eq!(
+      cmd_rx.len(),
+      0,
+      "the refused blob never reached the channel"
+    );
+
+    // (b) Two blobs that TOGETHER exceed the cap: the first's live reservation refuses the second.
+    let blob = Bytes::from(vec![0u8; 40]);
+    let mut first =
+      Box::pin(handle.create_group_from_fork(302, config(), 2, CountSm, blob.clone(), 0));
+    assert!(matches!(futures_util::poll!(first.as_mut()), Poll::Pending));
+    let mut second =
+      Box::pin(handle.create_group_from_fork(303, config(), 3, CountSm, blob.clone(), 0));
+    match futures_util::poll!(second.as_mut()) {
+      Poll::Ready(Err(DriverError::Busy)) => {}
+      other => panic!("expected Busy while the first blob holds the bytes, got {other:?}"),
+    }
+    assert_eq!(cmd_rx.len(), 1, "only the first fork was admitted");
+
+    // (c) The driver consuming the first command (reply sent, reservation dropped with the
+    // command) releases its bytes: the same blob now admits.
+    match cmd_rx.try_recv().expect("the first fork was enqueued") {
+      MultiCommand::CreateGroupFromFork { reply, .. } => {
+        reply.send(Ok(())).expect("the caller is awaiting");
+      }
+      _ => panic!("expected a CreateGroupFromFork"),
+    }
+    first.await.expect("the first fork resolves");
+    let mut third = Box::pin(handle.create_group_from_fork(303, config(), 3, CountSm, blob, 0));
+    assert!(
+      matches!(futures_util::poll!(third.as_mut()), Poll::Pending),
+      "the released bytes admit the next fork"
+    );
+    assert_eq!(cmd_rx.len(), 1, "the admitted fork reached the channel");
+  });
+}
+
 /// The fork lifecycle command round-trips its typed payload — the snapshot bytes and the vessel
 /// FSM move through the channel intact — and its reply resolves the awaiting caller, flattened
 /// exactly like the other lifecycle verbs.
