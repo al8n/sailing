@@ -229,14 +229,14 @@ pub struct Cluster {
 /// relies on (one node's wall near `u64::MAX`, another wrapped near `0`). `i128` holds `base + offset`
 /// exactly for every `base` a virtual-time run reaches and every offset the install accepts
 /// (`|offset| ≤ i64::MAX`).
-fn project_wall(base: u128, offset: i64) -> u64 {
+pub(crate) fn project_wall(base: u128, offset: i64) -> u64 {
   (base as i128 + offset as i128).clamp(0, u64::MAX as i128) as u64
 }
 
 /// Scale a duration by `num/den`, rounding DOWN (the `local_now` direction). u128 intermediate so a
 /// long run cannot overflow; the result is clamped into `u64` nanos (a >584-year run would saturate,
 /// never wrap). `num == den` is the exact identity.
-fn scale_floor(d: Duration, num: u64, den: u64) -> Duration {
+pub(crate) fn scale_floor(d: Duration, num: u64, den: u64) -> Duration {
   let ns = d.as_nanos() * num as u128 / den as u128;
   Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
@@ -244,7 +244,7 @@ fn scale_floor(d: Duration, num: u64, den: u64) -> Duration {
 /// Scale a duration by `num/den`, rounding UP (the `global_of` inverse direction). Pairing ceil here
 /// with floor in [`scale_floor`] makes the global instant at which a node's local deadline fires
 /// EXACT: `local_now(global_of(ld)) >= ld` and no smaller global instant satisfies it.
-fn scale_ceil(d: Duration, num: u64, den: u64) -> Duration {
+pub(crate) fn scale_ceil(d: Duration, num: u64, den: u64) -> Duration {
   let ns = (d.as_nanos() * num as u128).div_ceil(den as u128);
   Duration::from_nanos(u64::try_from(ns).unwrap_or(u64::MAX))
 }
@@ -254,7 +254,7 @@ fn scale_ceil(d: Duration, num: u64, den: u64) -> Duration {
 /// a meaningful drift, and both would corrupt or panic the scheduler. The per-protocol drift ENVELOPE
 /// (e.g. LeaseGuard's `±ε/Δ`) is the caller's contract; this enforces only the non-degeneracy the
 /// scheduler arithmetic itself requires, so an invalid policy fails loudly at install, not mid-run.
-fn validate_rate((num, den): (u64, u64)) -> (u64, u64) {
+pub(crate) fn validate_rate((num, den): (u64, u64)) -> (u64, u64) {
   assert!(
     num > 0 && den > 0,
     "clock-drift rate must have a positive numerator and denominator, got ({num}, {den})"
