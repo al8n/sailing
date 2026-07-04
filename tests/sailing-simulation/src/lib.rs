@@ -24,4 +24,4 @@ mod interaction;
 pub use interaction::{InteractionEnv, run_interaction_file};
 
 mod multi;
-pub use multi::MultiWorld;
+pub use multi::{MultiAction, MultiProfile, MultiVoprReport, MultiWorld, run_multi_vopr};

@@ -8,9 +8,14 @@
 //! single-group VOPR retains that coverage; the hooks stay reserved here.
 
 use super::oracles::{self, GrantKey};
-use crate::{AppliedLog, Checker, DurableEntry, LogSm, MemLog, MemStable, checker};
+use crate::{
+  AppliedLog, Checker, DurableEntry, LogSm, MemLog, MemStable, NetworkFaults, StorageFaults,
+  checker, network::NetPrng,
+};
 use core::time::Duration;
-use sailing_proto::{Config, Event, Instant, LogStore, Message, MultiRaft, Outgoing, StableStore};
+use sailing_proto::{
+  Config, Event, Instant, LogStore, Message, MultiRaft, Outgoing, ReadState, StableStore,
+};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// An in-flight group-tagged typed message: `(deliver_at, gid, from, to, message)`.
@@ -71,6 +76,47 @@ pub struct MultiWorld {
   /// Frozen checker archive for retired incarnations, keyed `(gid, generation)` — each ran one
   /// final check at removal and keeps its cross-tick history inspectable.
   retired: BTreeMap<(u64, u64), Checker>,
+  /// Per-`(directed link, group)` mutes: a delivery whose `(from, to, gid)` is muted drops
+  /// silently at the bus (AFTER the send-point oracles, like isolation).
+  muted: BTreeSet<(u64, u64, u64)>,
+  /// Seeded network fault model applied per message at the bus-push point (all-off default —
+  /// byte-identical to the faultless bus).
+  net_faults: NetworkFaults,
+  /// The network-fault PRNG (a stream distinct from the per-replica store seeds).
+  net_prng: NetPrng,
+  /// Per-`(from, to)` last-scheduled delivery time — the FIFO clamp when reorder is off (one
+  /// physical link per node pair carries every group's traffic, so the clamp is per PAIR).
+  net_last_sched: BTreeMap<(u64, u64), Instant>,
+  /// Messages dropped by the seeded network fault model (non-vacuity counter).
+  net_dropped: u64,
+  /// Message duplications fired by the seeded network fault model (non-vacuity counter).
+  net_duplicated: u64,
+  /// Per-`(node, gid)` replica config, retained so a node crash can rebuild every hosted replica
+  /// from durable state under its original knobs.
+  configs: BTreeMap<(u64, u64), Config<u64>>,
+  /// Per-`(node, gid)` replica incarnation, bumped on every (re)wire and on node crash — the
+  /// per-group checkers reset their commit/term monotonicity baselines on a change.
+  restarts: BTreeMap<(u64, u64), u64>,
+  /// Per-node crash counter — the durable boot epoch handed to `restore_group` so a restarted
+  /// node's forwarded-read tokens are unique across incarnations.
+  boot_epochs: BTreeMap<u64, u64>,
+  /// Per-`(node, gid)` confirmed `ReadState`s in confirmation order. Monotone and NEVER removed
+  /// on replica teardown, so the read ledger's scan offsets stay valid across re-wiring.
+  read_states: BTreeMap<(u64, u64), Vec<ReadState>>,
+  /// Per-`(node, gid)`: whether the replica's LAST-APPLIED config listed the node itself. The
+  /// RemovedSelf teardown keys on the member→non-member TRANSITION — a catching-up observer
+  /// applies historical confs that predate its own AddNode (self absent throughout), and tearing
+  /// it down there would destroy a committed voter's replica mid-join.
+  member_view: BTreeMap<(u64, u64), bool>,
+  /// PARKED replicas: delivery-isolated for their group and `removed` in its checker view, with
+  /// ALL STATE RETAINED — the multi analogue of the single-group `mark_removed` (which never
+  /// destroys a node). The departed sweep parks rather than tears down: a stale-leader reconcile
+  /// can misjudge a REAL member as departed, and destroying its replica would punch a hole in
+  /// the group view that the quorum-durability oracle rightly flags. Reconcile UNPARKS a parked
+  /// replica the committed membership still lists; only an applied self-removal tears down.
+  parked: BTreeSet<(u64, u64)>,
+  /// Total gid-tagged applied entries the cross-talk sweep has decoded and judged (non-vacuity).
+  cross_talk_checked: u64,
 }
 
 impl MultiWorld {
@@ -95,6 +141,20 @@ impl MultiWorld {
       pending_new_installs: BTreeMap::new(),
       groups: BTreeMap::new(),
       retired: BTreeMap::new(),
+      muted: BTreeSet::new(),
+      net_faults: NetworkFaults::none(),
+      // Same stream derivation as the single-group bus ("NET"), distinct from replica seeds.
+      net_prng: NetPrng::new(seed.rotate_left(16) ^ 0x004E_4554),
+      net_last_sched: BTreeMap::new(),
+      net_dropped: 0,
+      net_duplicated: 0,
+      configs: BTreeMap::new(),
+      restarts: BTreeMap::new(),
+      boot_epochs: BTreeMap::new(),
+      read_states: BTreeMap::new(),
+      member_view: BTreeMap::new(),
+      parked: BTreeSet::new(),
+      cross_talk_checked: 0,
     }
   }
 
@@ -137,19 +197,27 @@ impl MultiWorld {
         Duration::from_millis(100),
       )
       .expect("valid multi-world config");
-      self.wire_replica(node, gid, config);
+      self.wire_replica(node, gid, config, true);
     }
   }
 
-  /// Wire one `(node, gid)` replica: fresh stores + container admission under `config`. The shared
-  /// seam for group creation (voter bootstrap here; observers and recreation reuse it later).
-  fn wire_replica(&mut self, node: u64, gid: u64, config: Config<u64>) {
+  /// Wire one `(node, gid)` replica: fresh stores + container admission under `config`.
+  /// `is_member` seeds the RemovedSelf transition tracker: `true` for a bootstrap voter (its
+  /// founding config lists it), `false` for a catching-up observer (its own AddNode is still
+  /// ahead of it in the log).
+  fn wire_replica(&mut self, node: u64, gid: u64, config: Config<u64>, is_member: bool) {
     let host = self
       .hosts
       .get_mut(&node)
       .unwrap_or_else(|| panic!("wire_replica: node {node} was never added"));
     self.logs.insert((node, gid), MemLog::new());
     self.stables.insert((node, gid), MemStable::new());
+    self.configs.insert((node, gid), config.clone());
+    self.member_view.insert((node, gid), is_member);
+    // Bump the replica incarnation on EVERY (re)wire: a member re-added after a teardown starts
+    // a fresh endpoint at commit 0, and the group checker must reset that node's monotonicity
+    // baseline rather than flag the legitimate drop.
+    *self.restarts.entry((node, gid)).or_insert(0) += 1;
     // Per-NODE seed decorrelation: the container folds the GROUP id into the seed (co-located
     // groups on one host draw distinct jitter), but replicas of the SAME group on DIFFERENT nodes
     // need distinct base seeds too — identical streams under the shared global clock would draw
@@ -164,14 +232,16 @@ impl MultiWorld {
   /// HIGHEST term. A removed replica the farewell append never reached lingers in Leader role at
   /// its stale term (at etcd-parity defaults higher-term peers silently ignore its beats, so
   /// nothing ever deposes it), and a first-match scan in id order would let that zombie shadow
-  /// the live quorum's leader for every consumer that targets "the" leader. Every replica of a
-  /// gid shares the world's one generation for it (removal tears all replicas down before
-  /// recreation), so the term alone orders leader claims; the lowest-id tie-break is determinism
-  /// only (two same-term leaders cannot exist).
+  /// the live quorum's leader for every consumer that targets "the" leader. Parked replicas are
+  /// excluded — a reaped replica is no longer a protocol participant (the single-group
+  /// `mark_removed` rule). Every replica of a gid shares the world's one generation for it
+  /// (removal tears all replicas down before recreation), so the term alone orders leader
+  /// claims; the lowest-id tie-break is determinism only (two same-term leaders cannot exist).
   pub fn leader_of(&self, gid: u64) -> Option<u64> {
     self
       .node_ids
       .iter()
+      .filter(|&&n| !self.parked.contains(&(n, gid)))
       .filter_map(|&n| {
         self.hosts[&n]
           .group(&gid)
@@ -364,8 +434,10 @@ impl MultiWorld {
       // A crash-restore can legitimately SHRINK the applied prefix (apply outruns the batched
       // commit persist); clamp, and re-sweeping a replayed suffix is harmless (same entries).
       let start = (*hw).min(applied.len());
-      oracles::assert_no_cross_talk(self.seed, self.tick_count, node, gid, &applied[start..]);
+      let checked =
+        oracles::assert_no_cross_talk(self.seed, self.tick_count, node, gid, &applied[start..]);
       *hw = applied.len();
+      self.cross_talk_checked += checked;
     }
   }
 
@@ -412,7 +484,7 @@ impl MultiWorld {
       let cs = ep.conf_state();
       nodes.push(checker::NodeView {
         id: node,
-        removed: false,
+        removed: self.parked.contains(&(node, gid)),
         is_voter: cs.is_voter(&node),
         poisoned: ep.is_poisoned(),
         is_leader: ep.role().is_leader(),
@@ -435,7 +507,7 @@ impl MultiWorld {
         conf_changed: self.conf_changed.get(&(node, gid)).copied().unwrap_or(0),
         hardstate_commit: stable.hard_state().commit().get(),
         inflight_staged: usize::from(log.has_inflight()) + usize::from(stable.has_inflight()),
-        incarnation: 0,
+        incarnation: self.restarts.get(&(node, gid)).copied().unwrap_or(0),
       });
     }
     checker::ClusterView {
@@ -524,7 +596,10 @@ impl MultiWorld {
   ///     ENTRY's term (a non-faulting log lookup — not the replica's current term).
   ///   - `ConfChanged` whose resulting config no longer lists the replica ITSELF → the replica
   ///     applied its own removal (the farewell append landed): the embedder-on-RemovedSelf
-  ///     teardown drops it from the container after the drain.
+  ///     response PARKS it after the drain. Parked, not destroyed: the ex-member's durable log
+  ///     is still a real witness for entries it acked, and the other members may lag applying
+  ///     the removal — destroying the view here would under-count quorum durability exactly as
+  ///     a stale-leader misjudgement would.
   fn drain_host_events(&mut self, node: u64) {
     let mut self_removed: Vec<u64> = Vec::new();
     loop {
@@ -535,6 +610,15 @@ impl MultiWorld {
       match ev {
         Event::SnapshotInstalled(meta) => {
           self.snapshot_lineage.insert((node, gid));
+          // The install adopts the snapshot's ConfState verbatim — refresh the membership view
+          // WITHOUT a teardown (no explicit removal event rides an install; a genuinely
+          // departed replica is the reconcile sweep's to reap).
+          let cs = meta.conf();
+          let is_member = cs.voters().contains(&node)
+            || cs.voters_outgoing().contains(&node)
+            || cs.learners().contains(&node)
+            || cs.learners_next().contains(&node);
+          self.member_view.insert((node, gid), is_member);
           self.pending_new_installs.entry(gid).or_default().push((
             node,
             meta.last_index().get(),
@@ -545,11 +629,17 @@ impl MultiWorld {
           *self.conf_changed.entry((node, gid)).or_insert(0) += 1;
           {
             let cs = cc.conf();
-            if !cs.voters().contains(&node)
-              && !cs.voters_outgoing().contains(&node)
-              && !cs.learners().contains(&node)
-              && !cs.learners_next().contains(&node)
-            {
+            let is_member = cs.voters().contains(&node)
+              || cs.voters_outgoing().contains(&node)
+              || cs.learners().contains(&node)
+              || cs.learners_next().contains(&node);
+            let was_member = self
+              .member_view
+              .insert((node, gid), is_member)
+              .unwrap_or(false);
+            // RemovedSelf = the member → non-member TRANSITION. A catching-up joiner applying
+            // historical pre-join confs (self absent throughout) is NOT a removal.
+            if was_member && !is_member {
               self_removed.push(gid);
             }
           }
@@ -574,13 +664,18 @@ impl MultiWorld {
             ));
           }
         }
+        Event::ReadState(rs) => {
+          self.read_states.entry((node, gid)).or_default().push(rs);
+        }
         _ => {}
       }
     }
-    // Embedder-on-RemovedSelf teardown, after the drain so it never truncates the event pass.
+    // Embedder-on-RemovedSelf parking, after the drain so it never truncates the event pass.
+    // (A self-removed endpoint has stepped down and disarmed its election timer, so the parked
+    // replica is quiet; a later committed re-add unparks it with its retained state.)
     for gid in self_removed {
       if self.hosts[&node].contains_group(&gid) {
-        self.drop_group_replica(gid, node);
+        self.parked.insert((node, gid));
       }
     }
   }
@@ -624,13 +719,59 @@ impl MultiWorld {
         to,
       );
     }
-    self.bus.push_back(GInFlight {
-      deliver_at: self.now,
-      gid,
-      from,
-      to,
-      message,
-    });
+
+    // Fast path: faults off ⇒ zero-latency, FIFO, exactly-once (byte-identical to the original
+    // bus; the PRNG is never touched).
+    if self.net_faults.is_none() {
+      self.bus.push_back(GInFlight {
+        deliver_at: self.now,
+        gid,
+        from,
+        to,
+        message,
+      });
+      return;
+    }
+    if self
+      .net_prng
+      .chance_per_mille(self.net_faults.drop_per_mille)
+    {
+      self.net_dropped += 1;
+      return; // lost in flight
+    }
+    let copies = if self
+      .net_prng
+      .chance_per_mille(self.net_faults.duplicate_per_mille)
+    {
+      self.net_duplicated += 1;
+      2
+    } else {
+      1
+    };
+    for _ in 0..copies {
+      // Each copy draws its own jitter (a dup may overtake its twin).
+      let jitter = self.net_prng.jitter_draw(self.net_faults.jitter);
+      let mut deliver_at = self.now + self.net_faults.latency + jitter;
+      // FIFO clamp per ORDERED NODE PAIR when reorder is off: one physical link carries every
+      // group's traffic, so the clamp spans groups exactly as the wire does.
+      if !self.net_faults.reorder {
+        let last = self
+          .net_last_sched
+          .entry((from, to))
+          .or_insert(Instant::ORIGIN);
+        if deliver_at < *last {
+          deliver_at = *last;
+        }
+        *last = deliver_at;
+      }
+      self.bus.push_back(GInFlight {
+        deliver_at,
+        gid,
+        from,
+        to,
+        message: message.clone(),
+      });
+    }
   }
 
   /// Deliver every bus message due at or before `now`. A message to a node that does not host its
@@ -646,6 +787,12 @@ impl MultiWorld {
       }
       if self.isolated.contains(&m.from) || self.isolated.contains(&m.to) {
         continue; // partition swallows it
+      }
+      if self.muted.contains(&(m.from, m.to, m.gid)) {
+        continue; // the (link, group) mute swallows it — other groups on the link still flow
+      }
+      if self.parked.contains(&(m.from, m.gid)) || self.parked.contains(&(m.to, m.gid)) {
+        continue; // a parked replica is delivery-isolated for its group (state retained)
       }
       let Some(host) = self.hosts.get_mut(&m.to) else {
         continue; // unknown node id — drop safely
@@ -695,4 +842,6 @@ impl MultiWorld {
 #[cfg(test)]
 mod tests;
 
+mod faults;
 mod lifecycle;
+mod query;

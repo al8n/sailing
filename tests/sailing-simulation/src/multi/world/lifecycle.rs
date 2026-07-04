@@ -5,11 +5,11 @@
 use super::*;
 
 /// The number of consecutive reconcile passes a hosting replica may stay settled-but-absent from
-/// its group's committed membership before the harness tears it down (the catalog-acting-embedder
-/// model). The grace keeps the fast path — the removal entry reaching the victim via the farewell
-/// append, which self-removes it — the COMMON teardown, so that class stays exercised; the sweep
-/// only reaps a victim the farewell never reached (or an orphaned joiner whose add never
-/// committed), which would otherwise linger and churn elections forever.
+/// its group's committed membership before the harness PARKS it (the catalog-acting-embedder
+/// model, state retained). The grace keeps the fast path — the removal entry reaching the victim
+/// via the farewell append, which self-removes-and-parks it — the COMMON path, so that class
+/// stays exercised; the sweep only parks a victim the farewell never reached (or an orphaned
+/// joiner whose add never committed), which would otherwise linger and churn elections forever.
 const DEPARTED_GRACE_PASSES: u32 = 3;
 
 /// Harness-side registry entry for one logical group (one per group id, across incarnations).
@@ -110,7 +110,7 @@ impl MultiWorld {
         Duration::from_millis(100),
       )
       .expect("valid multi-world config");
-      self.wire_replica(node, gid, config);
+      self.wire_replica(node, gid, config, true);
     }
   }
 
@@ -134,7 +134,7 @@ impl MultiWorld {
       Duration::from_millis(100),
     )
     .expect("valid observer config");
-    self.wire_replica(node, gid, config);
+    self.wire_replica(node, gid, config, false);
   }
 
   /// Propose a v1 conf-change on `gid`'s current leader; returns the assigned index (`None`
@@ -165,12 +165,15 @@ impl MultiWorld {
   ///   - keep the last-known sets while leaderless (don't thrash on a transient election);
   ///   - promote a wired joiner once it appears in the committed membership;
   ///   - sweep departed replicas: a hosting node absent from the committed membership for
-  ///     [`DEPARTED_GRACE_PASSES`] settled passes is torn down (the ignorant-victim residual and
-  ///     the never-committed orphan; the common case self-removes via the farewell append first).
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the multi VOPR loop wires this")
-  )]
+  ///     [`DEPARTED_GRACE_PASSES`] settled passes is PARKED — delivery-isolated with state
+  ///     retained (the ignorant-victim residual and the never-committed orphan; the common case
+  ///     self-removes-and-parks via the farewell append first). Parking, never destroying,
+  ///     keeps every replica's view whole for the quorum-durability oracle — an ex-member's
+  ///     durable log is a real witness while others lag applying the removal, and a
+  ///     stale-leader reconcile can even misjudge a CURRENT member;
+  ///   - UNPARK / RESURRECT a committed member (the single-group `reinstate` arm): a parked
+  ///     member rejoins with its retained state; a torn-down member re-wires as a catching-up
+  ///     observer — otherwise its group could never fully converge.
   pub(crate) fn reconcile_membership(&mut self, gid: u64) {
     self.refresh_conf_in_flight(gid);
     if self.groups.get(&gid).is_none_or(|m| m.retired) {
@@ -198,11 +201,11 @@ impl MultiWorld {
       .into_iter()
       .filter(|n| self.hosts[n].contains_group(&gid))
       .collect();
-    let mut reap: Vec<u64> = Vec::new();
     {
+      let parked = self.parked.clone();
       let meta = self.groups.get_mut(&gid).expect("registered group");
       for node in hosting {
-        if voters.contains(&node) || learners.contains(&node) {
+        if voters.contains(&node) || learners.contains(&node) || parked.contains(&(node, gid)) {
           meta.departed_streak.remove(&node);
           continue;
         }
@@ -215,15 +218,34 @@ impl MultiWorld {
         let streak = meta.departed_streak.entry(node).or_insert(0);
         *streak += 1;
         if *streak >= DEPARTED_GRACE_PASSES {
-          reap.push(node);
+          self.parked.insert((node, gid));
         }
       }
     }
-    for node in reap {
-      self.drop_group_replica(gid, node);
-      let meta = self.groups.get_mut(&gid).expect("registered group");
-      meta.wired.remove(&node);
-      meta.departed_streak.remove(&node);
+
+    // Unpark / resurrect committed members. A parked member rejoins with its retained state; a
+    // genuinely torn-down member (post self-removal, later re-added) re-wires as a fresh
+    // observer whose bootstrap excludes itself, so it cannot campaign until it learns its own
+    // membership from the log.
+    let members: Vec<u64> = voters.iter().chain(learners.iter()).copied().collect();
+    for member in members {
+      if self.parked.remove(&(member, gid)) {
+        let meta = self.groups.get_mut(&gid).expect("registered group");
+        meta.departed_streak.remove(&member);
+        continue;
+      }
+      if self.hosts_group(member, gid) || !self.hosts.contains_key(&member) {
+        continue;
+      }
+      let bootstrap: Vec<u64> = voters.iter().copied().filter(|&v| v != member).collect();
+      let config = Config::try_new_observer(
+        member,
+        bootstrap,
+        Duration::from_millis(1000),
+        Duration::from_millis(100),
+      )
+      .expect("valid observer config");
+      self.wire_replica(member, gid, config, false);
     }
   }
 
@@ -267,9 +289,14 @@ impl MultiWorld {
     host.remove_group(&gid);
     self.logs.remove(&(node, gid));
     self.stables.remove(&(node, gid));
+    self.configs.remove(&(node, gid));
     self.swept.remove(&(node, gid));
     self.conf_changed.remove(&(node, gid));
     self.snapshot_lineage.remove(&(node, gid));
+    self.member_view.remove(&(node, gid));
+    self.parked.remove(&(node, gid));
+    // `restarts` and `read_states` deliberately survive: a later re-wire of the same (node, gid)
+    // must bump past the old incarnation, and ledger scan offsets index the monotone vec.
   }
 
   /// The committed LEARNER set of `gid`, read like [`committed_voters_of`](Self::committed_voters_of)
@@ -303,6 +330,19 @@ impl MultiWorld {
       .unwrap_or_default()
   }
 
+  /// Abandon a wired-but-never-committed joiner replica of `gid` on `node`: tear the observer
+  /// replica down and unwire it, so an orphan (its AddNode/AddLearner refused or lost) can never
+  /// pin the group's quiesce.
+  pub(crate) fn abandon_wired(&mut self, gid: u64, node: u64) {
+    if self.hosts_group(node, gid) {
+      self.drop_group_replica(gid, node);
+    }
+    if let Some(meta) = self.groups.get_mut(&gid) {
+      meta.wired.remove(&node);
+      meta.departed_streak.remove(&node);
+    }
+  }
+
   /// The number of retired (frozen-archived) checker incarnations — the removal tally.
   #[cfg_attr(
     not(test),
@@ -318,10 +358,6 @@ impl MultiWorld {
   }
 
   /// Group `gid`'s reconciled committed voter set (the registry view).
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the multi VOPR budgets wire this")
-  )]
   pub(crate) fn group_voters(&self, gid: u64) -> BTreeSet<u64> {
     self
       .groups
@@ -331,10 +367,6 @@ impl MultiWorld {
   }
 
   /// Group `gid`'s reconciled committed learner set (the registry view).
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the multi VOPR budgets wire this")
-  )]
   pub(crate) fn group_learners(&self, gid: u64) -> BTreeSet<u64> {
     self
       .groups
