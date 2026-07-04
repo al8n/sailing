@@ -1,12 +1,15 @@
 //! The compio reference drivers: one consensus group over framed reliable streams ([`stream`]) or
-//! over QUIC datagrams ([`quic`]). Each owns its coordinator, the embedder's stores, and its
-//! socket(s), and runs the §6.2 driver loop on one thread; the two differ only in the I/O primitive
-//! (completion reads/writes over TCP vs datagrams over UDP). The proto-error mapping both share lives
-//! here.
+//! over QUIC datagrams ([`quic`]), plus the multi-group stream host ([`multi`]) carrying N
+//! co-located groups over one shared engine barrier. Each owns its coordinator, the stores (the
+//! embedder's for the single-group drivers, the shared [`GroupEngine`](sailing_proto::GroupEngine)
+//! for the multi host), and its socket(s), and runs the §6.2 driver loop on one thread. The
+//! proto-error mapping they all share lives here.
 
+mod multi;
 mod quic;
 mod stream;
 
+pub use multi::{CompioMultiStreamDriver, EngineMetrics};
 pub use quic::CompioQuicDriver;
 pub use stream::{AcceptorFactory, CompioStreamDriver, DialerFactory};
 
