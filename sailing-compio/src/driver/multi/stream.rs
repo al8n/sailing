@@ -433,6 +433,10 @@ where
         .min()
         .unwrap_or_else(|| std::time::Instant::now() + Duration::from_secs(3600));
 
+      // A transient select result, matched and consumed on the stack within this iteration —
+      // never stored — so the variant-size spread (a lifecycle command's Config + fork blob vs
+      // a unit timer wake) costs nothing; boxing would add an allocation per hot-path command.
+      #[allow(clippy::large_enum_variant)]
       enum Wake<G, I, F: StateMachine> {
         Inbound(BridgeInbound),
         Accepted(TcpStream),
@@ -895,6 +899,66 @@ where
     }
   }
 
+  /// Create a group from LOCALLY-FORKED state (the reactor hosts' manufactured-baseline flow
+  /// on the compio plane): [`FloorSnapshot`] pre-read, engine boot epoch, the baseline staged
+  /// behind the next barrier, and create's rollback discipline on refusal.
+  #[allow(clippy::too_many_arguments)]
+  fn create_group_from_fork(
+    &mut self,
+    now: Now,
+    gid: G,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    snapshot: Bytes,
+    generation: u64,
+  ) -> Result<(), DriverError<I>> {
+    validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
+    let election = config.election_timeout();
+    let lineage = FloorSnapshot {
+      floor: self.engine.group_floor(&gid),
+      lineage: self.engine.group_gen(&gid),
+    };
+    let added = self.engine.add_group(gid.cheap_clone());
+    let epoch = self
+      .engine
+      .next_boot_epoch(&gid)
+      .expect("storage admitted above");
+    let result = {
+      let (log, stable) = self.engine.stores(&gid).expect("storage admitted above");
+      self.coord.create_group_from_fork(
+        gid.cheap_clone(),
+        config,
+        now,
+        seed,
+        fsm,
+        snapshot,
+        epoch,
+        generation,
+        &lineage,
+        log,
+        stable,
+      )
+    };
+    match result {
+      Ok(()) => {
+        self.engine.set_group_gen(&gid, generation);
+        // The manufactured baseline is STAGED in the group's stores: barrier it, so blob and
+        // log re-baseline become flush-durable together with everything else this crank staged.
+        self.flush_pending = true;
+        self.election.insert(gid.cheap_clone(), election);
+        self.admit_group(gid);
+        Ok(())
+      }
+      Err(e) => {
+        if added {
+          self.engine.remove_group(&gid);
+        }
+        Err(rejected(e))
+      }
+    }
+  }
+
   /// Remove a group: coordinator endpoint, engine storage, and driver routing torn down together;
   /// the group's parked work fails with the group-scoped teardown verdict. Returns whether the
   /// group was hosted.
@@ -1159,6 +1223,20 @@ where
         reservation,
       } => {
         let _ = reply.send(self.create_group(now, gid, config, seed, fsm, generation));
+        drop(reservation);
+      }
+      MultiCommand::CreateGroupFromFork {
+        gid,
+        config,
+        seed,
+        fsm,
+        snapshot,
+        generation,
+        reply,
+        reservation,
+      } => {
+        let _ = reply
+          .send(self.create_group_from_fork(now, gid, config, seed, fsm, snapshot, generation));
         drop(reservation);
       }
       MultiCommand::RestoreGroup {

@@ -2654,3 +2654,81 @@ async fn floors_survive_what_the_engine_survives() {
     "the post-restart incarnation serves"
   );
 }
+
+/// Fork admission failures leave NO engine residue and never touch a live group's storage: a
+/// duplicate-gid fork is refused with the hosted group still serving off its own stores
+/// (pre-existing storage is not the fork's to roll back), and a tombstoned-id fork — whose
+/// engine admission DID happen before the coordinator refused — is rolled back so a later
+/// restore sees virgin stores: no manufactured baseline leaks through a refusal.
+#[tokio::test(flavor = "multi_thread")]
+async fn fork_rollback_leaves_no_engine_residue() {
+  let addr: SocketAddr = "127.0.0.1:44940".parse().unwrap();
+  let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("the live group admits");
+  let g100 = handle.group(100);
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&g100), b"live").await,
+    1
+  );
+
+  // Leg 1: a duplicate-gid fork refuses at the container; the live group's storage survives
+  // and it keeps serving.
+  let blob = encoded(7).into();
+  match handle
+    .create_group_from_fork(100, config(1, vec![1]), 9, CountSm::default(), blob, 0)
+    .await
+  {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(reason.contains("already exists"), "got: {reason}");
+    }
+    other => panic!("expected the duplicate-id rejection, got {other:?}"),
+  }
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&g100), b"still").await,
+    2,
+    "the live group's storage survived the refused fork"
+  );
+
+  // Leg 2: a tombstoned-id fork is refused AFTER engine admission — the rollback must remove
+  // the freshly-added storage, or the staged baseline would leak into a later admission.
+  assert!(!handle.remove_group(300).await.expect("remove resolves"));
+  let blob = encoded(7).into();
+  match handle
+    .create_group_from_fork(300, config(1, vec![1]), 9, CountSm::default(), blob, 0)
+    .await
+  {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(reason.contains("tombstoned"), "got: {reason}");
+    }
+    other => panic!("expected the tombstoned-id rejection, got {other:?}"),
+  }
+  assert!(
+    handle.clear_tombstone(300).await.expect("clear resolves"),
+    "a tombstone existed"
+  );
+  handle
+    .restore_group(300, config(1, vec![1]), 9, CountSm::default(), 0)
+    .await
+    .expect("a cleared id restores");
+  let status = handle
+    .group(300)
+    .status()
+    .await
+    .expect("the restored group answers");
+  assert_eq!(
+    status.applied_index,
+    Index::ZERO,
+    "virgin stores: the refused fork's baseline did NOT leak through the rollback"
+  );
+
+  // The driver keeps serving after both refusals.
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&g100), b"after").await,
+    3
+  );
+}
