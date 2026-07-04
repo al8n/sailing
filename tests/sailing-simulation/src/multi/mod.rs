@@ -13,3 +13,6 @@ mod world;
 pub use world::MultiWorld;
 
 mod oracles;
+
+mod vopr;
+pub use vopr::{MultiAction, MultiProfile, MultiVoprReport, run_multi_vopr};

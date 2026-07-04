@@ -16,10 +16,6 @@ use std::{collections::BTreeMap, vec::Vec};
 
 /// Encode a gid-tagged keyed-value client command: `gid` (8 bytes LE) ++ `key` (2 bytes LE) ++
 /// `value` (8 bytes LE) — 18 bytes exactly.
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "the multi VOPR client load wires this")
-)]
 pub(crate) fn encode_gkv(gid: u64, key: u16, value: u64) -> Vec<u8> {
   let mut buf = Vec::with_capacity(18);
   buf.extend_from_slice(&gid.to_le_bytes());
@@ -43,14 +39,16 @@ pub(crate) fn decode_gkv(cmd: &[u8]) -> Option<(u64, u16, u64)> {
 
 /// Assert that none of `new_entries` — the entries applied under `gid` on `node` since the last
 /// sweep — carries ANOTHER group's tag. A mismatch is a cross-group leak (wrong-group delivery
-/// or apply) and panics with the exact seed/tick/node/gid/index for replay.
+/// or apply) and panics with the exact seed/tick/node/gid/index for replay. Returns how many
+/// entries carried a decodable tag and were judged (the oracle's non-vacuity count).
 pub(crate) fn assert_no_cross_talk(
   seed: u64,
   tick: u64,
   node: u64,
   gid: u64,
   new_entries: &[(u64, Vec<u8>)],
-) {
+) -> u64 {
+  let mut checked = 0;
   for (index, cmd) in new_entries {
     if let Some((tag, key, value)) = decode_gkv(cmd) {
       assert!(
@@ -59,8 +57,10 @@ pub(crate) fn assert_no_cross_talk(
          {gid} (index={index} key={key} value={value})\n  seed={seed} tick={tick} \
          (replay: run_multi_vopr(seed, ticks) and inspect tick {tick})",
       );
+      checked += 1;
     }
   }
+  checked
 }
 
 /// The one-identity grant key: `(granter, gid, generation, term)`. Gen is the group's INCARNATION
