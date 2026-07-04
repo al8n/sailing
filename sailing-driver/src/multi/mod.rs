@@ -149,6 +149,10 @@ where
     seed: u64,
     /// The group's state machine.
     fsm: F,
+    /// The id's incarnation under the single-incarnation contract; 0 unless the embedder
+    /// reshapes ids. Checked against the id's persisted admission floor and recorded in the
+    /// host's engine on admission.
+    generation: u64,
     /// Answered with the admission verdict.
     reply: oneshot::Sender<Result<(), DriverError<I>>>,
     /// The owning budget reservation (zero-byte): lifecycle commands are budgeted like every
@@ -166,6 +170,9 @@ where
     seed: u64,
     /// The group's (pre-replay) state machine.
     fsm: F,
+    /// The id's incarnation, supplied by the embedder's catalog — the cross-restart incarnation
+    /// authority; 0 unless the embedder reshapes ids.
+    generation: u64,
     /// Answered with the admission verdict.
     reply: oneshot::Sender<Result<(), DriverError<I>>>,
     /// The owning budget reservation (zero-byte).
@@ -329,16 +336,20 @@ where
   /// Create a fresh group on the host and await the admission verdict.
   ///
   /// `config`'s node id must match the host identity latched by the FIRST group ever admitted (a
-  /// multi-Raft host is one physical node); the first admission latches it. A refusal — duplicate
-  /// group id, identity mismatch, an out-of-bound group-id encoding, a tombstoned id whose
-  /// removal [`clear_tombstone`](Self::clear_tombstone) has not consented to reversing, or an
-  /// invalid `config` — resolves [`DriverError::Rejected`] carrying the refusal's description.
+  /// multi-Raft host is one physical node); the first admission latches it. `generation` is the
+  /// id's incarnation under the single-incarnation contract — pass 0 unless the embedder
+  /// reshapes ids; a reshaping embedder's catalog supplies it, and an incarnation below the id's
+  /// persisted admission floor is refused. A refusal — duplicate group id, identity mismatch, an
+  /// out-of-bound group-id encoding, an under-floor incarnation, a tombstoned id whose removal
+  /// [`clear_tombstone`](Self::clear_tombstone) has not consented to reversing, or an invalid
+  /// `config` — resolves [`DriverError::Rejected`] carrying the refusal's description.
   pub async fn create_group(
     &self,
     gid: G,
     config: Config<I>,
     seed: u64,
     fsm: F,
+    generation: u64,
   ) -> Result<(), DriverError<I>> {
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
@@ -347,6 +358,7 @@ where
       config,
       seed,
       fsm,
+      generation,
       reply: tx,
       reservation,
     })?;
@@ -355,13 +367,17 @@ where
 
   /// Recover a group from the host's shared storage engine and await the admission verdict. The
   /// driver derives the boot epoch from the engine's per-group counter, so restarts never reuse an
-  /// incarnation's operation ids.
+  /// incarnation's operation ids. `generation` comes from the embedder's catalog — the
+  /// cross-restart incarnation authority (pass 0 unless the embedder reshapes ids): a restore
+  /// that lies about it collapses two incarnations into one identity for every gen-keyed
+  /// observer, voiding exactly what the admission floor exists to distinguish.
   pub async fn restore_group(
     &self,
     gid: G,
     config: Config<I>,
     seed: u64,
     fsm: F,
+    generation: u64,
   ) -> Result<(), DriverError<I>> {
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
@@ -370,6 +386,7 @@ where
       config,
       seed,
       fsm,
+      generation,
       reply: tx,
       reservation,
     })?;

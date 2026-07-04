@@ -118,7 +118,7 @@ fn budget_is_shared_across_group_projections_and_lifecycle() {
       other => panic!("expected Busy on the shared budget, got {other:?}"),
     }
     // Lifecycle commands draw on the SAME budget.
-    match handle.create_group(4, config(), 4, CountSm).await {
+    match handle.create_group(4, config(), 4, CountSm, 0).await {
       Err(DriverError::Busy) => {}
       other => panic!("expected Busy for a lifecycle command too, got {other:?}"),
     }
@@ -144,17 +144,22 @@ fn lifecycle_commands_round_trip_their_replies() {
     let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) =
       test_handle(InflightBudget::new(8, 64));
 
-    let mut create = Box::pin(handle.create_group(100, config(), 1, CountSm));
+    let mut create = Box::pin(handle.create_group(100, config(), 1, CountSm, 5));
     assert!(matches!(
       futures_util::poll!(create.as_mut()),
       Poll::Pending
     ));
     match cmd_rx.try_recv().expect("the create was enqueued") {
       MultiCommand::CreateGroup {
-        gid, seed, reply, ..
+        gid,
+        seed,
+        generation,
+        reply,
+        ..
       } => {
         assert_eq!(gid, 100);
         assert_eq!(seed, 1);
+        assert_eq!(generation, 5, "the incarnation rides the command");
         reply.send(Ok(())).expect("the caller is awaiting");
       }
       _ => panic!("expected a CreateGroup"),
@@ -238,7 +243,7 @@ fn disconnected_driver_is_shutting_down_everywhere() {
       Err(DriverError::ShuttingDown) => {}
       other => panic!("expected ShuttingDown, got {other:?}"),
     }
-    match handle.create_group(2, config(), 2, CountSm).await {
+    match handle.create_group(2, config(), 2, CountSm, 0).await {
       Err(DriverError::ShuttingDown) => {}
       other => panic!("expected ShuttingDown, got {other:?}"),
     }

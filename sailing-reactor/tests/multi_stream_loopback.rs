@@ -114,7 +114,7 @@ where
 {
   for (i, h) in handles.iter().enumerate() {
     let id = i as u64 + 1;
-    h.create_group(gid, config(id, voters.to_vec()), id, F::default())
+    h.create_group(gid, config(id, voters.to_vec()), id, F::default(), 0)
       .await
       .expect("group admission");
   }
@@ -270,11 +270,11 @@ async fn engine_barrier_amortizes_ops_across_groups() {
   tokio::spawn(driver.run());
 
   handle
-    .create_group(100, config(1, vec![1]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted");
   handle
-    .create_group(200, config(1, vec![1]), 2, CountSm::default())
+    .create_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
     .await
     .expect("group 200 admitted");
   let g100 = handle.group(100);
@@ -407,11 +407,11 @@ async fn a_poisoned_group_leaves_co_hosted_groups_committing() {
   tokio::spawn(driver.run());
 
   handle
-    .create_group(100, config(1, vec![1]), 1, TrapSm::default())
+    .create_group(100, config(1, vec![1]), 1, TrapSm::default(), 0)
     .await
     .expect("group 100 admitted");
   handle
-    .create_group(200, config(1, vec![1]), 2, TrapSm::default())
+    .create_group(200, config(1, vec![1]), 2, TrapSm::default(), 0)
     .await
     .expect("group 200 admitted");
   let g100 = handle.group(100);
@@ -731,7 +731,7 @@ async fn a_lagging_learner_blocks_quiescence() {
   // all-voter sibling on nodes 1 and 2 only.
   for id in 1u64..=2 {
     handles[(id - 1) as usize]
-      .create_group(100, config(id, vec![1, 2]), id, CountSm::default())
+      .create_group(100, config(id, vec![1, 2]), id, CountSm::default(), 0)
       .await
       .expect("group admission");
   }
@@ -741,6 +741,7 @@ async fn a_lagging_learner_blocks_quiescence() {
       Config::try_new_observer(3u64, vec![1, 2], ELECTION, HEARTBEAT).unwrap(),
       3,
       CountSm::default(),
+      0,
     )
     .await
     .expect("the observer replica admits");
@@ -814,13 +815,13 @@ async fn lifecycle_admission_errors_are_typed() {
   tokio::spawn(driver.run());
 
   handle
-    .create_group(100, config(1, vec![1]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
     .await
     .expect("first admission latches the host identity");
 
   // Duplicate group id.
   match handle
-    .create_group(100, config(1, vec![1]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
     .await
   {
     Err(DriverError::Rejected { reason }) => {
@@ -831,7 +832,7 @@ async fn lifecycle_admission_errors_are_typed() {
 
   // A config whose node id contradicts the latched host identity.
   match handle
-    .create_group(500, config(9, vec![9]), 1, CountSm::default())
+    .create_group(500, config(9, vec![9]), 1, CountSm::default(), 0)
     .await
   {
     Err(DriverError::Rejected { reason }) => {
@@ -848,7 +849,7 @@ async fn lifecycle_admission_errors_are_typed() {
     .with_clock_drift_bound(Duration::from_millis(2))
     .with_bounded_clock_uncertainty(Duration::from_millis(5));
   match handle
-    .create_group(600, failover, 1, CountSm::default())
+    .create_group(600, failover, 1, CountSm::default(), 0)
     .await
   {
     Err(DriverError::Rejected { reason }) => {
@@ -862,7 +863,7 @@ async fn lifecycle_admission_errors_are_typed() {
   assert!(!handle.remove_group(999).await.expect("remove resolves"));
   assert!(handle.remove_group(100).await.expect("remove resolves"));
   match handle
-    .create_group(100, config(1, vec![1]), 3, CountSm::default())
+    .create_group(100, config(1, vec![1]), 3, CountSm::default(), 0)
     .await
   {
     Err(DriverError::Rejected { reason }) => {
@@ -875,7 +876,7 @@ async fn lifecycle_admission_errors_are_typed() {
     "a tombstone existed"
   );
   handle
-    .create_group(100, config(1, vec![1]), 3, CountSm::default())
+    .create_group(100, config(1, vec![1]), 3, CountSm::default(), 0)
     .await
     .expect("a cleared id is re-admittable under the latched identity");
   assert_eq!(
@@ -910,7 +911,7 @@ async fn unknown_group_event_drives_creation() {
 
   // Group 100 exists ONLY on node 1; its campaign solicits node 2 over the shared mesh.
   handles[0]
-    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 1");
   await_lifecycle(handles[1].lifecycle(), "node 2 unknown-group", |ev| {
@@ -927,7 +928,7 @@ async fn unknown_group_event_drives_creation() {
   // The test IS the placement brain: create the solicited group on node 2. The campaigner's
   // next retry then finds its quorum, and the joined group commits and reads on both sides.
   handles[1]
-    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 2");
   let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
@@ -966,7 +967,7 @@ async fn stale_unknown_group_event_cannot_resurrect() {
   // Group 100 exists only on node 1; its campaign solicits node 2. Wait for the UnknownGroup
   // observation to LAND on node 2's lifecycle tail — but do not consume it yet.
   handles[0]
-    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 1");
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
@@ -999,7 +1000,7 @@ async fn stale_unknown_group_event_cannot_resurrect() {
   })
   .await;
   match handles[1]
-    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default(), 0)
     .await
   {
     Err(DriverError::Rejected { reason }) => {
@@ -1022,7 +1023,7 @@ async fn stale_unknown_group_event_cannot_resurrect() {
     "a tombstone existed"
   );
   handles[1]
-    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 2 after the explicit clear");
   let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
@@ -1166,6 +1167,7 @@ async fn removed_follower_learns_via_farewell_and_tears_down() {
           .with_check_quorum(true),
         id,
         CountSm::default(),
+        0,
       )
       .await
       .expect("group admission");
@@ -1179,6 +1181,7 @@ async fn removed_follower_learns_via_farewell_and_tears_down() {
         .with_check_quorum(true),
       3,
       CountSm::default(),
+      0,
     )
     .await
     .expect("the observer replica admits");
@@ -1462,6 +1465,7 @@ async fn never_caught_up_removed_replica_learns_from_zero_via_farewell() {
         .with_max_size_per_msg(1),
       1,
       CountSm::default(),
+      0,
     )
     .await
     .expect("group admission");
@@ -1473,6 +1477,7 @@ async fn never_caught_up_removed_replica_learns_from_zero_via_farewell() {
         .with_max_size_per_msg(1),
       2,
       CountSm::default(),
+      0,
     )
     .await
     .expect("the observer replica admits");
@@ -1666,6 +1671,7 @@ async fn tombstoned_id_recreates_cleanly() {
       config(follower_at as u64 + 1, vec![1, 2, 3]),
       9,
       CountSm::default(),
+      0,
     )
     .await
     .expect("the cleared id re-admits");
@@ -1729,7 +1735,7 @@ async fn co_hosted_groups_serve_heterogeneous_read_modes() {
   let handles = bind_pair(44_540).await;
   for id in 1u64..=2 {
     handles[(id - 1) as usize]
-      .create_group(100, config(id, vec![1, 2]), id, CountSm::default())
+      .create_group(100, config(id, vec![1, 2]), id, CountSm::default(), 0)
       .await
       .expect("the Safe group admits");
     // The wider election window admits a lease window roomy enough for the partition pin below
@@ -1745,6 +1751,7 @@ async fn co_hosted_groups_serve_heterogeneous_read_modes() {
           .with_clock_drift_bound(Duration::from_millis(2)),
         id,
         CountSm::default(),
+        0,
       )
       .await
       .expect("the plain LeaseGuard tier admits on the monotonic-only host");
@@ -1857,6 +1864,7 @@ async fn set_read_mode_migrates_one_group_only() {
             .with_check_quorum(true),
           id * 10 + gid,
           CountSm::default(),
+          0,
         )
         .await
         .expect("group admission");
@@ -2023,7 +2031,7 @@ async fn factory_materializes_solicited_group_hands_free() {
   // Group 100 exists only on node 1; its campaign solicits node 2, whose factory materializes
   // the replica hands-free — no create_group is ever issued for 100 on node 2.
   handles[0]
-    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 1");
   let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
@@ -2090,7 +2098,7 @@ async fn factory_decline_falls_through_to_lifecycle_tail() {
   // Group 100 exists only on node 1; node 2's factory declines it, so the signal falls through
   // to the lifecycle tail — the factory-less flow, with the factory consulted first.
   handles[0]
-    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 1");
   await_lifecycle(handles[1].lifecycle(), "the declined solicitation", |ev| {
@@ -2115,7 +2123,7 @@ async fn factory_decline_falls_through_to_lifecycle_tail() {
 
   // The placement brain can still place the declined group manually — exactly today's flow.
   handles[1]
-    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 2");
   let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
@@ -2185,7 +2193,7 @@ async fn refused_blueprint_not_naming_solicitor_falls_to_lifecycle_tail() {
   // blueprint and the driver refuses it — the signal falls through to the lifecycle tail
   // exactly like a decline.
   handles[0]
-    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 1");
   await_lifecycle(handles[1].lifecycle(), "the refused blueprint", |ev| {
@@ -2304,6 +2312,7 @@ async fn factory_never_overrides_a_tombstone() {
         .with_check_quorum(true),
       1,
       CountSm::default(),
+      0,
     )
     .await
     .expect("group 100 admitted on node 1");

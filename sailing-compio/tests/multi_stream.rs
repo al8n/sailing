@@ -145,6 +145,7 @@ async fn two_node_multi_host_commits_and_removes() {
         config(id, vec![1, 2]),
         id * 10 + gid,
         CountSm::default(),
+        0,
       )
       .await
       .expect("group admission");

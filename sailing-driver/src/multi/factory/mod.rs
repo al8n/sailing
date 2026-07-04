@@ -20,13 +20,37 @@ use sailing_proto::Config;
 pub struct GroupBlueprint<I> {
   config: Config<I>,
   seed: u64,
+  generation: u64,
 }
 
 impl<I> GroupBlueprint<I> {
-  /// Assemble a blueprint from the group's consensus config and its election-jitter seed.
+  /// Assemble a blueprint from the group's consensus config and its election-jitter seed. The
+  /// incarnation defaults to 0 — every factory that never reshapes ids is a gen-0 world; a
+  /// reshaping embedder's catalog supplies the real incarnation via
+  /// [`with_gen`](Self::with_gen).
   #[inline(always)]
   pub const fn new(config: Config<I>, seed: u64) -> Self {
-    Self { config, seed }
+    Self {
+      config,
+      seed,
+      generation: 0,
+    }
+  }
+
+  /// Set the id's incarnation under the single-incarnation contract — the catalog-supplied
+  /// generation the driver checks against the id's persisted admission floor before building
+  /// anything, and records in its engine on admission.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_gen(mut self, generation: u64) -> Self {
+    self.generation = generation;
+    self
+  }
+
+  /// The id's incarnation this blueprint materializes (0 unless the embedder reshapes ids).
+  #[inline(always)]
+  pub const fn generation(&self) -> u64 {
+    self.generation
   }
 
   /// Borrow the group's consensus config.
