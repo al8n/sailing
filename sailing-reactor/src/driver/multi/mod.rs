@@ -84,6 +84,25 @@ pub(crate) fn blueprint_names<I: PartialEq>(
   blueprint.config_ref().voters().contains(from)
 }
 
+/// A pre-read copy of ONE id's lineage, taken from the engine BEFORE its stores are lent out:
+/// the coordinator's restore-time floor check and the engine's `(log, stable)` handles cannot
+/// borrow the engine simultaneously, and the copy is exact for the single id the call admits
+/// (monotone lineage cannot move under a serial driver task).
+pub(crate) struct FloorSnapshot {
+  pub(crate) floor: u64,
+  pub(crate) lineage: u64,
+}
+
+impl<G> sailing_proto::FloorStore<G> for FloorSnapshot {
+  fn floor(&self, _gid: &G) -> u64 {
+    self.floor
+  }
+
+  fn lineage(&self, _gid: &G) -> u64 {
+    self.lineage
+  }
+}
+
 /// A group's last OBSERVED consensus state and the instant it last changed — the idle clock the
 /// quiesce sweep reads. State observation (rather than dispatch counting) is the activity signal
 /// because an idle group's heartbeat exchange dispatches forever without changing any of these.

@@ -203,6 +203,7 @@ fn sharded_host_commits_and_isolates_planes() {
         config(id, vec![1, 2]),
         id * 1000 + gid,
         TrapSm::default(),
+        0,
       ))
       .expect("group admission through the routed surface");
     }
@@ -335,7 +336,7 @@ fn sharded_factory_materializes_on_the_mapped_plane() {
   // Both groups exist only on node 1; each campaign solicits node 2 on its own plane, whose
   // factory materializes the replica hands-free — no create_group is ever issued on node 2.
   for gid in [gid_a, gid_b] {
-    bo(node1.create_group(gid, config(1, vec![1, 2]), gid, CountSm::default()))
+    bo(node1.create_group(gid, config(1, vec![1, 2]), gid, CountSm::default(), 0))
       .expect("group admission on node 1");
   }
   let ga = [node1.group(gid_a), node2.group(gid_a)];
@@ -433,7 +434,7 @@ fn skewed_maps_fail_closed_instead_of_materializing_on_the_wrong_plane() {
     .spawn()
     .expect("the factory-armed host spawns");
 
-  bo(node1.create_group(gid, config(1, vec![1, 2]), gid, CountSm::default()))
+  bo(node1.create_group(gid, config(1, vec![1, 2]), gid, CountSm::default(), 0))
     .expect("group admission on node 1");
 
   // Drive the solicitation window: node 1's campaign keeps soliciting node 2's wrong plane.
@@ -481,7 +482,7 @@ fn skewed_maps_fail_closed_instead_of_materializing_on_the_wrong_plane() {
     let local = (200u64..)
       .find(|g| inverted.shard(g) == plane)
       .expect("some id maps to this plane");
-    bo(node2.create_group(local, config(2, vec![2]), local, CountSm::default()))
+    bo(node2.create_group(local, config(2, vec![2]), local, CountSm::default(), 0))
       .expect("node 2 admits its own group");
     let handle = [node2.group(local)];
     assert_eq!(

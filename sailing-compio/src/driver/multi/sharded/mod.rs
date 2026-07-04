@@ -615,31 +615,37 @@ where
 
   /// Create a fresh group ON ITS MAPPED PLANE and await the admission verdict (the per-plane
   /// [`MultiHandle::create_group`] contract; the host identity latches per plane from its first
-  /// admitted group).
+  /// admitted group). `generation` forwards to the plane command unchanged — each plane's
+  /// engine carries its own lineage records, so the floor check runs at exactly the plane the
+  /// shard map routes the id to (per-plane grain, no cross-plane state).
   pub async fn create_group(
     &self,
     gid: G,
     config: Config<I>,
     seed: u64,
     fsm: F,
+    generation: u64,
   ) -> Result<(), DriverError<I>> {
     let shard = self.map.shard(&gid);
     self.shards[shard]
-      .create_group(gid, config, seed, fsm)
+      .create_group(gid, config, seed, fsm, generation)
       .await
   }
 
   /// Recover a group from ITS MAPPED PLANE's engine and await the admission verdict.
+  /// `generation` forwards to the plane command unchanged, as on
+  /// [`create_group`](Self::create_group).
   pub async fn restore_group(
     &self,
     gid: G,
     config: Config<I>,
     seed: u64,
     fsm: F,
+    generation: u64,
   ) -> Result<(), DriverError<I>> {
     let shard = self.map.shard(&gid);
     self.shards[shard]
-      .restore_group(gid, config, seed, fsm)
+      .restore_group(gid, config, seed, fsm, generation)
       .await
   }
 

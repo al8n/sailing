@@ -32,8 +32,8 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  Config, ConnId, Event, GroupControl, GroupEngine, GroupId, Instant, MultiStreamCoordinator,
-  NoFloors, Now, RecordIo, StateMachine, StorageProgress,
+  Config, ConnId, Event, FloorStore, GroupControl, GroupEngine, GroupId, Instant,
+  MultiStreamCoordinator, Now, RecordIo, StateMachine, StorageProgress,
 };
 
 use sailing_driver::{
@@ -56,8 +56,8 @@ use crate::{
 };
 
 use super::{
-  EngineMetrics, GroupActivity, STORAGE_REDRIVES, blueprint_names, conf_names, group_idle,
-  no_such_group, rejected,
+  EngineMetrics, FloorSnapshot, GroupActivity, STORAGE_REDRIVES, blueprint_names, conf_names,
+  group_idle, no_such_group, rejected,
 };
 
 /// Backoff before re-arming `accept()` after an accept error (see the single-group driver — the
@@ -777,7 +777,9 @@ where
   }
 
   /// Create a fresh group: engine storage + coordinator endpoint + driver routing, admitted
-  /// together (engine admission rolled back if the coordinator refuses).
+  /// together (engine admission rolled back if the coordinator refuses). The coordinator's
+  /// admission consults THE ENGINE as its floor store — the driver is seam wiring plus
+  /// persistence: it records the admitted incarnation after the `Ok`.
   fn create_group(
     &mut self,
     now: Now,
@@ -785,17 +787,28 @@ where
     config: Config<I>,
     seed: u64,
     fsm: F,
+    generation: u64,
   ) -> Result<(), DriverError<I>> {
     // The single drivers validate the Config — and loudly reject a walled failover tier on a
     // monotonic host — at bind; group admission is the same gate, per group.
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
     let election = config.election_timeout();
     let added = self.engine.add_group(gid.cheap_clone());
-    match self
-      .coord
-      .create_group(gid.cheap_clone(), config, now, seed, fsm, 0, &NoFloors)
-    {
+    match self.coord.create_group(
+      gid.cheap_clone(),
+      config,
+      now,
+      seed,
+      fsm,
+      generation,
+      &self.engine,
+    ) {
       Ok(()) => {
+        self.engine.set_group_gen(&gid, generation);
+        if generation > 0 {
+          // The staged lineage record rides the next barrier like any stable write.
+          self.flush_pending = true;
+        }
         self.election.insert(gid.cheap_clone(), election);
         self.admit_group(gid);
         Ok(())
@@ -811,7 +824,8 @@ where
   }
 
   /// Recover a group from the engine's storage, the driver deriving the boot epoch from the
-  /// engine's per-group counter.
+  /// engine's per-group counter. The floor check reads a pre-call [`FloorSnapshot`] of the
+  /// engine's lineage (the engine itself is lent to the restore as `(log, stable)`).
   fn restore_group(
     &mut self,
     now: Now,
@@ -819,9 +833,14 @@ where
     config: Config<I>,
     seed: u64,
     fsm: F,
+    generation: u64,
   ) -> Result<(), DriverError<I>> {
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
     let election = config.election_timeout();
+    let lineage = FloorSnapshot {
+      floor: self.engine.group_floor(&gid),
+      lineage: self.engine.group_gen(&gid),
+    };
     let added = self.engine.add_group(gid.cheap_clone());
     let epoch = self
       .engine
@@ -836,14 +855,15 @@ where
         seed,
         fsm,
         epoch,
-        0,
-        &NoFloors,
+        generation,
+        &lineage,
         log,
         stable,
       )
     };
     match result {
       Ok(()) => {
+        self.engine.set_group_gen(&gid, generation);
         // The restore may leave one staged stable write (a recovered lease floor): barrier it.
         self.flush_pending = true;
         self.election.insert(gid.cheap_clone(), election);
@@ -863,6 +883,15 @@ where
   /// the group's parked work fails with the group-scoped teardown verdict. Returns whether the
   /// group was hosted.
   fn remove_group(&mut self, gid: &G) -> bool {
+    // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin;
+    // a reshaped id is fenced below its next incarnation forever.
+    let generation = self.engine.group_gen(gid);
+    if generation > 0 {
+      self
+        .engine
+        .set_group_floor(gid, generation.saturating_add(1));
+      self.flush_pending = true;
+    }
     let existed = self.coord.remove_group(gid).is_some();
     let had_storage = self.engine.remove_group(gid);
     self.was_leader.remove(gid);
@@ -1109,10 +1138,11 @@ where
         config,
         seed,
         fsm,
+        generation,
         reply,
         reservation,
       } => {
-        let _ = reply.send(self.create_group(now, gid, config, seed, fsm));
+        let _ = reply.send(self.create_group(now, gid, config, seed, fsm, generation));
         drop(reservation);
       }
       MultiCommand::RestoreGroup {
@@ -1120,10 +1150,11 @@ where
         config,
         seed,
         fsm,
+        generation,
         reply,
         reservation,
       } => {
-        let _ = reply.send(self.restore_group(now, gid, config, seed, fsm));
+        let _ = reply.send(self.restore_group(now, gid, config, seed, fsm, generation));
         drop(reservation);
       }
       MultiCommand::RemoveGroup {
@@ -1284,11 +1315,16 @@ where
       if let Some(factory) = self.factory.as_mut()
         && let Some(blueprint) = factory.materialize(&group, &from)
         && blueprint_names(&blueprint, &from)
+        // The floors gate, on the same seam the create below consults authoritatively: the
+        // cheap PRE-BUILD refusal keeps the resource-phase ordering — a fenced id is refused
+        // before the factory's build phase can be asked for a state machine.
+        && self.engine.floor(&group) <= blueprint.generation()
         && let Some(fsm) = factory.build(&group)
       {
+        let generation = blueprint.generation();
         let (config, seed) = blueprint.into_parts();
         if self
-          .create_group(now, group.cheap_clone(), config, seed, fsm)
+          .create_group(now, group.cheap_clone(), config, seed, fsm, generation)
           .is_ok()
         {
           continue;

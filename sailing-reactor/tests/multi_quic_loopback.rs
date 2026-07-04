@@ -71,7 +71,7 @@ where
 {
   for (i, h) in handles.iter().enumerate() {
     let id = i as u64 + 1;
-    h.create_group(gid, config(id, voters.to_vec()), id, F::default())
+    h.create_group(gid, config(id, voters.to_vec()), id, F::default(), 0)
       .await
       .expect("group admission");
   }
@@ -226,11 +226,11 @@ async fn engine_barrier_amortizes_ops_across_groups() {
   tokio::spawn(driver.run());
 
   handle
-    .create_group(100, config(1, vec![1]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted");
   handle
-    .create_group(200, config(1, vec![1]), 2, CountSm::default())
+    .create_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
     .await
     .expect("group 200 admitted");
   let g100 = handle.group(100);
@@ -524,11 +524,11 @@ async fn a_poisoned_group_leaves_co_hosted_groups_committing() {
   tokio::spawn(driver.run());
 
   handle
-    .create_group(100, config(1, vec![1]), 1, TrapSm::default())
+    .create_group(100, config(1, vec![1]), 1, TrapSm::default(), 0)
     .await
     .expect("group 100 admitted");
   handle
-    .create_group(200, config(1, vec![1]), 2, TrapSm::default())
+    .create_group(200, config(1, vec![1]), 2, TrapSm::default(), 0)
     .await
     .expect("group 200 admitted");
   let g100 = handle.group(100);
@@ -587,7 +587,7 @@ async fn unknown_group_event_drives_creation() {
 
   // Group 100 exists ONLY on node 1; its campaign solicits node 2 over the shared mesh.
   handles[0]
-    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 1");
   await_lifecycle(handles[1].lifecycle(), "node 2 unknown-group", |ev| {
@@ -604,7 +604,7 @@ async fn unknown_group_event_drives_creation() {
   // The test IS the placement brain: create the solicited group on node 2 and watch the join
   // complete.
   handles[1]
-    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 2");
   let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
@@ -732,6 +732,7 @@ async fn removed_follower_learns_via_farewell_and_tears_down() {
           .with_check_quorum(true),
         id,
         CountSm::default(),
+        0,
       )
       .await
       .expect("group admission");
@@ -745,6 +746,7 @@ async fn removed_follower_learns_via_farewell_and_tears_down() {
         .with_check_quorum(true),
       3,
       CountSm::default(),
+      0,
     )
     .await
     .expect("the observer replica admits");
@@ -983,6 +985,7 @@ async fn never_caught_up_removed_replica_learns_from_zero_via_farewell() {
         .with_max_size_per_msg(1),
       1,
       CountSm::default(),
+      0,
     )
     .await
     .expect("group admission");
@@ -994,6 +997,7 @@ async fn never_caught_up_removed_replica_learns_from_zero_via_farewell() {
         .with_max_size_per_msg(1),
       2,
       CountSm::default(),
+      0,
     )
     .await
     .expect("the observer replica admits");
@@ -1184,6 +1188,7 @@ async fn tombstoned_id_recreates_cleanly() {
       config(follower_at as u64 + 1, vec![1, 2, 3]),
       9,
       CountSm::default(),
+      0,
     )
     .await
     .expect("the cleared id re-admits");
@@ -1237,7 +1242,7 @@ async fn factory_materializes_solicited_group_hands_free() {
   // Group 100 exists only on node 1; its campaign solicits node 2, whose factory materializes
   // the replica hands-free.
   handles[0]
-    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
     .expect("group 100 admitted on node 1");
   let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();

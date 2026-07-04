@@ -93,6 +93,15 @@ fn the_boxed_slot_drives_both_phases() {
   );
 }
 
+/// The blueprint's incarnation defaults to 0 — `new` keeps its signature, so every existing
+/// factory is a gen-0 world — and `with_gen` carries the catalog-supplied incarnation of a
+/// reshaping embedder.
+#[test]
+fn blueprint_generation_defaults_to_zero() {
+  assert_eq!(GroupBlueprint::new(config(), 9).generation(), 0);
+  assert_eq!(GroupBlueprint::new(config(), 9).with_gen(3).generation(), 3);
+}
+
 /// `Debug` is the plain derived form now that the blueprint is exactly config + seed — there is
 /// no state machine to elide.
 #[test]

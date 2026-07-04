@@ -313,6 +313,12 @@ where
   where
     G: Clone,
   {
+    // A zero write is the absent default: monotone-max makes it unobservable through every
+    // read, so staging it would only manufacture a phantom record (and arm the barrier) in a
+    // world that never reshaped the id.
+    if floor == 0 {
+      return;
+    }
     let rec = self.lineage_staged.entry(gid.clone()).or_default();
     rec.floor = rec.floor.max(floor);
   }
@@ -323,6 +329,10 @@ where
   where
     G: Clone,
   {
+    // Zero-write skip as on `set_group_floor`: a gen-0 world stays record-free.
+    if generation == 0 {
+      return;
+    }
     let rec = self.lineage_staged.entry(gid.clone()).or_default();
     rec.generation = rec.generation.max(generation);
   }
