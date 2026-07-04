@@ -20,6 +20,11 @@
 //! one compio `Runtime` per thread, each driver binding its own socket/port and forming its own
 //! cluster mesh. Groups share nothing — separate endpoints, separate stores, separate sockets.
 //!
+//! For MANY co-located groups, [`CompioMultiStreamDriver`] hosts N groups on ONE task instead:
+//! one shared connection per peer carries every group's traffic, and one
+//! [`GroupEngine`](sailing_proto::GroupEngine) barrier per crank amortizes durability across the
+//! groups — the compio port of the reactor multi driver, feature-complete on one core.
+//!
 //! [`Handle`]s are the only objects meant to cross threads: a `Handle` is `Send + Sync` and
 //! O(1) to clone, so any thread may submit to any group and await the committed reply — the
 //! bounded command channel and the per-submit reply channel do the crossing.
@@ -93,11 +98,15 @@
 mod bridge;
 mod driver;
 
-pub use driver::{AcceptorFactory, CompioQuicDriver, CompioStreamDriver, DialerFactory};
+pub use driver::{
+  AcceptorFactory, CompioMultiStreamDriver, CompioQuicDriver, CompioStreamDriver, DialerFactory,
+  EngineMetrics,
+};
 #[cfg(feature = "unverified-wall-clock")]
 pub use sailing_driver::UnverifiedSystemClock;
 pub use sailing_driver::{
-  BindError, Clock, DriverConfig, DriverConfigError, DriverError, Handle, MAX_BOUNDED_QUEUE_DEPTH,
-  MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic, Node, NtpDisciplinedClock, Status,
-  WallClock, WallReading,
+  BindError, BoxedGroupFactory, Clock, DriverConfig, DriverConfigError, DriverError, FnFactory,
+  GroupBlueprint, GroupFactory, GroupHandle, Handle, LifecycleEvent, MAX_BOUNDED_QUEUE_DEPTH,
+  MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic, MultiCommand, MultiHandle, Node,
+  NtpDisciplinedClock, Status, WallClock, WallReading, factory_fn,
 };

@@ -35,8 +35,9 @@ pub type AcceptorFactory<R> = Rc<dyn Fn() -> std::io::Result<R>>;
 /// bounded channel the run loop selects on. A full channel parks the task — further connections
 /// queue in (then overflow) the kernel listen backlog, which is exactly TCP accept backpressure.
 /// An accept error is transient (a refused/reset in-flight connection); the loop keeps accepting
-/// after a paced backoff.
-async fn accept_conns(
+/// after a paced backoff. Shared with the multi-group driver (`pub(crate)`): accepting is
+/// group-agnostic.
+pub(crate) async fn accept_conns(
   listener: TcpListener,
   accepted: lochan::mpsc::Sender<(TcpStream, SocketAddr)>,
 ) {
@@ -55,8 +56,9 @@ async fn accept_conns(
 /// The live task(s) the driver holds for one connection. Dropping it cancels whatever runs:
 /// compio aborts a non-detached task when its `JoinHandle` drops, so dropping a `Connecting`
 /// cancels the dial and dropping a `Bridged` cancels BOTH split-half tasks — aborting a stuck
-/// write and dropping the socket. The handles are held ONLY for that drop-cancel.
-enum ConnTask {
+/// write and dropping the socket. The handles are held ONLY for that drop-cancel. Shared with
+/// the multi-group driver (`pub(crate)`): connections are group-agnostic.
+pub(crate) enum ConnTask {
   /// The dial/connect task, until it completes.
   #[allow(dead_code)]
   Connecting(compio::runtime::JoinHandle<()>),
@@ -74,29 +76,30 @@ enum ConnTask {
 /// that merely EXISTS for a moment proves nothing: the symmetric mutual-dial race produces
 /// validated, bound survivors that die within an RTT, and resetting the backoff on sight of
 /// one would restart every round from base, erasing the doubling that makes the race converge.
-struct Redial {
+pub(crate) struct Redial {
   /// The next dial attempt may fire at/after this instant.
-  at: std::time::Instant,
+  pub(crate) at: std::time::Instant,
   /// The un-jittered delay the NEXT attempt will wait (doubles per attempt, capped).
-  backoff: Duration,
+  pub(crate) backoff: Duration,
   /// When the current binding was first observed, while one exists. Observation runs at loop
   /// cadence (a bound peer means consensus traffic, so passes run at least per heartbeat); a
   /// binding observed bound for `redial_base` is stable and clears the entry.
-  bound_since: Option<std::time::Instant>,
+  pub(crate) bound_since: Option<std::time::Instant>,
 }
 
 /// Everything the driver owns for one connection. Dropping it tears the connection down:
 /// the task drop cancels the live compio task(s), and dropping `out_tx` signals a still-running
-/// writer to flush-then-exit.
-struct Conn<I> {
-  tasks: ConnTask,
+/// writer to flush-then-exit. Shared with the multi-group driver (`pub(crate)`): one connection
+/// carries every co-located group's traffic, so the conn state is group-agnostic.
+pub(crate) struct Conn<I> {
+  pub(crate) tasks: ConnTask,
   /// Outbound wire bytes to the writer (the per-conn FIFO).
-  out_tx: lochan::mpsc::Sender<BridgeOut>,
+  pub(crate) out_tx: lochan::mpsc::Sender<BridgeOut>,
   /// Bytes enqueued toward the socket and not yet written — the per-conn memory bound.
-  queued_bytes: Rc<Cell<usize>>,
+  pub(crate) queued_bytes: Rc<Cell<usize>>,
   /// `Some(peer)` for a dialed conn — the reconciler's dial-in-flight marker — and `None` for
   /// an accepted one. Repair scheduling itself lives in the reconciler, never on the conn.
-  dialed_to: Option<I>,
+  pub(crate) dialed_to: Option<I>,
 }
 
 /// A consensus node over framed reliable streams on compio. `R` is the record layer the
