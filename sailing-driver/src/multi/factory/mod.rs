@@ -126,3 +126,6 @@ where
 /// migrates across a work-stealing runtime's threads (the factory is only ever CALLED from the
 /// one driver task, so no `Sync` is required), `'static` because the driver task owns it.
 pub type BoxedGroupFactory<G, I, F> = Box<dyn GroupFactory<G, I, F> + Send>;
+
+#[cfg(test)]
+mod tests;

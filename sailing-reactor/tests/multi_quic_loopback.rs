@@ -14,7 +14,8 @@ use bytes::Bytes;
 use common::{CountSm, TestCa, TrapSm};
 use sailing_proto::{ClusterId, ConfChange, ConfChangeType, Config, Data, Role};
 use sailing_reactor::{
-  DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle, MultiReactorQuicDriver, Node,
+  DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
+  MultiReactorQuicDriver, Node,
 };
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -902,4 +903,67 @@ async fn tombstoned_id_recreates_cleanly() {
     .expect("the cleared id re-admits");
   assert_eq!(submit_anywhere(&g100, b"rejoined").await, 3);
   assert_eq!(submit_anywhere(&g900, b"still").await, 3);
+}
+
+/// The hands-free materialization flow over QUIC (the stream suite's money test): node 2
+/// registers a group FACTORY recognizing group 100 and never calls `create_group` for it; node
+/// 1 creates 100 (voters {1,2}) and campaigns over the shared mTLS mesh; node 2's driver
+/// materializes the replica inside the crank that polled the solicitation and the campaigner's
+/// retry completes the election — both sides commit and read, the consumed signal never reaches
+/// node 2's lifecycle tail, and the manually-created sibling (which also latched both hosts'
+/// transport identities) is untouched.
+#[tokio::test(flavor = "multi_thread")]
+async fn factory_materializes_solicited_group_hands_free() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_600, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      // The factory IS the embedder's catalog check: recognize exactly group 100, decline
+      // everything else.
+      let driver = driver.with_group_factory(|group: &u64, _from: &u64| {
+        (*group == 100).then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
+      });
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group exists everywhere: it latches both hosts' transport identities (a
+  // zero-group QUIC host cannot bind) and pins that a factory-bearing host still admits
+  // ordinary lifecycle-command groups.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its campaign solicits node 2, whose factory materializes
+  // the replica hands-free.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 1");
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
+  assert_eq!(query_anywhere(&g100).await, 1);
+  assert!(
+    handles[1].group(100).status().await.is_ok(),
+    "node 2 hosts the materialized replica"
+  );
+
+  // The factory CONSUMED the solicitation: node 2's lifecycle tail never surfaced group 100.
+  while let Ok(ev) = handles[1].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
+      "a factory-consumed signal must not reach the tail: {ev:?}"
+    );
+  }
+
+  // The manually-created sibling is unaffected by the factory churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
 }
