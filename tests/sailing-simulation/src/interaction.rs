@@ -137,9 +137,10 @@ pub fn run_interaction_file(path: &std::path::Path) {
   }
 }
 
-// Split by concern; re-export the free helpers for the root and siblings.
+// Split by concern; re-export the free helpers for the root and siblings (the multi runner
+// reuses the same directive parser and renderers over its own environment).
 mod exec;
-mod parse;
-mod render;
+pub(crate) mod parse;
+pub(crate) mod render;
 use parse::*;
 use render::*;

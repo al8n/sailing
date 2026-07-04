@@ -16,3 +16,6 @@ mod oracles;
 
 mod vopr;
 pub use vopr::{MultiAction, MultiProfile, MultiVoprReport, run_multi_vopr};
+
+mod interaction;
+pub use interaction::{MultiInteractionEnv, run_multi_interaction_file};
