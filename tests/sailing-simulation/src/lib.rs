@@ -22,3 +22,6 @@ pub use vopr::{VoprReport, run_vopr};
 
 mod interaction;
 pub use interaction::{InteractionEnv, run_interaction_file};
+
+mod multi;
+pub use multi::MultiWorld;
