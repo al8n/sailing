@@ -9,7 +9,10 @@ mod multi;
 mod quic;
 mod stream;
 
-pub use multi::{CompioMultiStreamDriver, EngineMetrics};
+pub use multi::{
+  CompioMultiStreamDriver, EngineMetrics, ShardMap, ShardRecordLayers, ShardedCompioHost,
+  ShardedMultiHandle, SpawnError,
+};
 pub use quic::CompioQuicDriver;
 pub use stream::{AcceptorFactory, CompioStreamDriver, DialerFactory};
 

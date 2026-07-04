@@ -22,10 +22,12 @@
 //! EDGE into the driver crank — a solicited group the factory recognizes materializes
 //! hands-free — while the decisions stay wherever the embedder's policy lives.
 
+mod sharded;
 mod stream;
 #[cfg(test)]
 mod tests;
 
+pub use sharded::{ShardMap, ShardRecordLayers, ShardedCompioHost, ShardedMultiHandle, SpawnError};
 pub use stream::CompioMultiStreamDriver;
 
 use std::sync::{
