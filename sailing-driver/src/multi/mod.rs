@@ -1,5 +1,6 @@
 //! The multi-group cross-thread submission surface: [`MultiHandle`], its per-group
-//! [`GroupHandle`] projection, and the [`MultiCommand`]s they send a multi-group driver.
+//! [`GroupHandle`] projection, the [`MultiCommand`]s they send a multi-group driver, and the
+//! [`GroupFactory`] auto-materialization hook a driver consults on unknown-group solicitations.
 //!
 //! The single-group [`Handle`](crate::Handle)/[`Command`](crate::Command) pair is untouched (it is
 //! shared with every single-group driver); this module is the ADDITIVE group-keyed sibling. Every
@@ -12,6 +13,10 @@
 //! groups share the host's memory, so they share its in-flight bound), one shutdown flag dedups the
 //! request across every clone, and one shared teardown receiver fans the driver's fd-release signal
 //! out to every waiter.
+
+mod factory;
+
+pub use factory::{BoxedGroupFactory, GroupBlueprint, GroupFactory};
 
 use std::sync::{
   Arc,

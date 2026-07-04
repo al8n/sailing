@@ -20,7 +20,10 @@ pub use clock::{Clock, jittered, validate_and_capture_eps};
 pub use config::{DriverConfig, MAX_BOUNDED_QUEUE_DEPTH, MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF};
 pub use error::{BindError, DriverConfigError, DriverError};
 pub use handle::{Command, Handle, Status};
-pub use multi::{GroupHandle, LifecycleEvent, MultiCommand, MultiHandle};
+pub use multi::{
+  BoxedGroupFactory, GroupBlueprint, GroupFactory, GroupHandle, LifecycleEvent, MultiCommand,
+  MultiHandle,
+};
 pub use node::Node;
 #[cfg(feature = "unverified-wall-clock")]
 pub use wall_clock::UnverifiedSystemClock;
