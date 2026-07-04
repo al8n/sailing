@@ -4,13 +4,23 @@
 //! shards elect and commit through one routing [`ShardedMultiHandle`] each, replication flows
 //! shard(g) ↔ shard(g) (a group is hosted on exactly its mapped plane), the per-plane barriers
 //! run independently, one plane's poisoned group leaves the other plane committing, factories
-//! materialize solicited groups on the RIGHT plane hands-free, and shutdown releases every
-//! plane. The test thread drives the `Send` handles with a plain futures executor — no compio
-//! runtime on the caller side, exactly the embedder shape.
+//! materialize solicited groups on the RIGHT plane hands-free, a skewed peer's wrong-plane
+//! solicitations are refused fail-closed (never materialized, surfaced as unknown-group), and
+//! shutdown releases every plane. The test thread drives the `Send` handles with a plain
+//! futures executor — no compio runtime on the caller side, exactly the embedder shape.
 
 mod common;
 
-use std::{future::Future, net::SocketAddr, rc::Rc, sync::Arc, time::Duration};
+use std::{
+  future::Future,
+  net::SocketAddr,
+  rc::Rc,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  time::Duration,
+};
 
 use bytes::Bytes;
 use common::{CountSm, TrapSm};
@@ -355,6 +365,141 @@ fn sharded_factory_materializes_on_the_mapped_plane() {
       !matches!(ev, LifecycleEvent::UnknownGroup { group, .. } if group == gid_a || group == gid_b),
       "a factory-consumed signal must not reach the tail: {ev:?}"
     );
+  }
+
+  for h in [&node1, &node2] {
+    bo(h.shutdown()).expect("the sharded host tears down");
+  }
+}
+
+/// THE fail-closed guard under map skew: node 1 runs the uniform map, node 2 a DELIBERATELY
+/// inverted one, so node 1 dials group `g`'s traffic to the plane node 2's own map does NOT
+/// assign `g`. Node 2 is factory-armed on every plane with a catalog that vouches for `g`
+/// (catalogs are not plane-aware — exactly the shape that would split the group without the
+/// guard: a wrong-plane replica now, a correctly-routed one later, both acking under node 2's
+/// ONE identity). The host's shard guard must refuse: the receiving plane never hosts `g`, its
+/// embedder factory is never even consulted (the guard declines first), the skew surfaces as
+/// `UnknownGroup` on node 2's lifecycle tail, NO plane of node 2 ever hosts `g` (the group
+/// simply cannot form there until the config is fixed), and node 2's own groups on both planes
+/// keep electing and committing throughout.
+#[test]
+fn skewed_maps_fail_closed_instead_of_materializing_on_the_wrong_plane() {
+  let base1: SocketAddr = "127.0.0.1:45200".parse().unwrap();
+  let base2: SocketAddr = "127.0.0.1:45210".parse().unwrap();
+
+  let uniform = ShardMap::<u64>::uniform(2);
+  let gid = 100u64;
+  // Node 1 dials g toward THIS plane index on node 2 — which node 2's inverted map does not
+  // assign g, making it node 2's wrong plane.
+  let wrong_plane = uniform.shard(&gid);
+  let inverted = {
+    let u = ShardMap::<u64>::uniform(2);
+    ShardMap::with_mapping(2, move |g: &u64| u.shard(g) + 1)
+  };
+  assert_ne!(
+    inverted.shard(&gid),
+    wrong_plane,
+    "the maps disagree on g by construction"
+  );
+
+  // Node 1: the uniform map, no factory — it creates g and campaigns toward node 2.
+  let node1: ShardedMultiHandle<u64, u64, CountSm> = spawn_host(1, base1, Some((2, base2)));
+
+  // Node 2: the inverted map + a catalog factory on EVERY plane, each instrumented with a
+  // per-plane consultation counter.
+  let consults: [Arc<AtomicUsize>; 2] = [Arc::default(), Arc::default()];
+  let node2: ShardedMultiHandle<u64, u64, CountSm> =
+    ShardedCompioHost::<u64, u64, CountSm, Labeled<Passthrough>>::new(
+      inverted.clone(),
+      base2,
+      vec![Node::new(1u64, base1)],
+      plain_records(2),
+      DriverConfig::default(),
+    )
+    .with_group_factories({
+      let consults = consults.clone();
+      move |shard| {
+        let consulted = consults[shard].clone();
+        let factory: BoxedGroupFactory<u64, u64, CountSm> = Box::new(factory_fn(
+          move |group: &u64, _from: &u64| {
+            consulted.fetch_add(1, Ordering::SeqCst);
+            (*group == gid).then(|| GroupBlueprint::new(config(2, vec![1, 2]), *group))
+          },
+          |_group: &u64| Some(CountSm::default()),
+        ));
+        Some(factory)
+      }
+    })
+    .spawn()
+    .expect("the factory-armed host spawns");
+
+  bo(node1.create_group(gid, config(1, vec![1, 2]), gid, CountSm::default()))
+    .expect("group admission on node 1");
+
+  // Drive the solicitation window: node 1's campaign keeps soliciting node 2's wrong plane.
+  // The guard holding is OBSERVABLE as UnknownGroup on node 2's shared tail; the guard failing
+  // is observable as g hosted on the wrong plane — poll for both, sharpest failure first.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let mut observed = false;
+  while !observed {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the skew never surfaced on the lifecycle tail"
+    );
+    match bo(node2.shard_handle(wrong_plane).unwrap().group(gid).status()) {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(reason.contains("no such group"), "got: {reason}");
+      }
+      other => panic!("the wrong plane must never host g, got {other:?}"),
+    }
+    while let Ok(ev) = node2.lifecycle().try_recv() {
+      if let LifecycleEvent::UnknownGroup { group, from } = ev
+        && group == gid
+      {
+        assert_eq!(from, 1, "the mis-routed solicitation came from node 1");
+        observed = true;
+      }
+    }
+    if !observed {
+      std::thread::sleep(Duration::from_millis(50));
+    }
+  }
+
+  // The guard declined BEFORE the embedder's catalog: no plane's factory was ever consulted
+  // (g's solicitations all landed on the wrong plane, and nothing solicits the other plane).
+  for (plane, counter) in consults.iter().enumerate() {
+    assert_eq!(
+      counter.load(Ordering::SeqCst),
+      0,
+      "plane {plane}'s factory must never be consulted for wrong-plane traffic"
+    );
+  }
+
+  // Isolation: node 2's OWN groups keep working on BOTH planes throughout the skew
+  // (single-voter groups, so no cross-node traffic rides the broken g mesh).
+  for plane in 0..2usize {
+    let local = (200u64..)
+      .find(|g| inverted.shard(g) == plane)
+      .expect("some id maps to this plane");
+    bo(node2.create_group(local, config(2, vec![2]), local, CountSm::default()))
+      .expect("node 2 admits its own group");
+    let handle = [node2.group(local)];
+    assert_eq!(
+      submit_anywhere(&handle, b"local"),
+      1,
+      "node 2's plane {plane} commits during the skew"
+    );
+  }
+
+  // Fail closed CLUSTER-WIDE: at the end NO plane of node 2 hosts g — under the skew the group
+  // cannot form on node 2 at all, which beats a second replica acking under one node id.
+  for plane in 0..2usize {
+    match bo(node2.shard_handle(plane).unwrap().group(gid).status()) {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(reason.contains("no such group"), "got: {reason}");
+      }
+      other => panic!("no plane of node 2 may host g under the skew, got {other:?}"),
+    }
   }
 
   for h in [&node1, &node2] {
