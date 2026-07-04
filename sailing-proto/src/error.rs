@@ -89,12 +89,22 @@ pub enum CreateGroupError {
   Retired,
   /// The requested incarnation is below the id's persisted admission floor — a removal or merge
   /// fenced it. Unlike [`Retired`](Self::Retired), no consent call cures this; only a
-  /// catalog-supplied incarnation at or above the floor can ever be admitted.
+  /// catalog-supplied incarnation at or above the floor — and below the reserved `u64::MAX`
+  /// sentinel — can ever be admitted, so a floor of
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) admits nothing and is the terminal verdict this
+  /// variant then reports at every generation, the sentinel itself included.
   #[error("the group id's incarnation is below its admission floor ({floor})")]
   BelowFloor {
     /// The id's persisted admission floor: the smallest incarnation that may ever be admitted.
     floor: u64,
   },
+  /// The requested incarnation is `u64::MAX` — the merged-tombstone sentinel
+  /// ([`MERGED_FLOOR`](crate::MERGED_FLOOR)), never a working incarnation. Admission reserves
+  /// it because the floor predicate fences by `generation < floor`: were the sentinel a legal
+  /// generation, it would clear even the terminal `MERGED_FLOOR` fence (`u64::MAX < u64::MAX`
+  /// is false) and a buggy catalog could resurrect a merged-away id.
+  #[error("the group id's incarnation is the reserved merged-floor sentinel (u64::MAX)")]
+  ReservedGeneration,
 }
 
 /// Why a leader-transfer request was rejected.

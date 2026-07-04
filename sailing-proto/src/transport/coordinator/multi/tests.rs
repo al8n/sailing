@@ -1135,8 +1135,9 @@ fn admission_checks_floor_first_then_consent_then_existence() {
 }
 
 /// `restore_group` walks the same floor-first gate as `create_group` — the catalog-supplied
-/// incarnation is what passes or fails the durable fence — and `MERGED_FLOOR` fences every
-/// usable incarnation (only the reserved `u64::MAX` itself is not below it).
+/// incarnation is what passes or fails the durable fence — and `MERGED_FLOOR` refuses EVERY
+/// generation: the reserved `u64::MAX` sentinel is not numerically below the fence, but it is
+/// never a working incarnation, so admission refuses it too.
 #[test]
 fn restore_admission_walks_the_same_floor_gate() {
   struct Floors(u64);
@@ -1185,6 +1186,42 @@ fn restore_admission_walks_the_same_floor_gate() {
     e,
     CreateGroupError::BelowFloor { floor: u64::MAX }
   ));
+  // The terminal fence refuses its OWN generation too: `u64::MAX` is the one value the
+  // `generation < floor` leg alone would wave through, and it must not be.
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      u64::MAX,
+      &Floors(MERGED_FLOOR),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(
+    e,
+    CreateGroupError::BelowFloor { floor: u64::MAX }
+  ));
+  // Under a lower floor the sentinel reports its reservation, not the floor.
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      u64::MAX,
+      &Floors(2),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::ReservedGeneration));
   c.restore_group(
     100,
     single_voter(1),
@@ -1198,6 +1235,68 @@ fn restore_admission_walks_the_same_floor_gate() {
     &mut stable,
   )
   .expect("at-floor restore admitted");
+}
+
+/// The reserved sentinel is refused at its OWN generation on the create path: `u64::MAX` is the
+/// merged-tombstone fence, never a working incarnation, so a buggy catalog supplying it is
+/// refused under ANY floor — a lower floor (or none at all) reports the reservation, and the
+/// terminal `MERGED_FLOOR` fence keeps reporting itself, so it refuses every generation.
+#[test]
+fn merged_floor_sentinel_generation_is_reserved() {
+  struct Floors(u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      self.0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      0
+    }
+  }
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      u64::MAX,
+      &Floors(2),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::ReservedGeneration));
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      u64::MAX,
+      &NoFloors,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::ReservedGeneration),
+    "the sentinel is reserved even in a never-floored world"
+  );
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      u64::MAX,
+      &Floors(MERGED_FLOOR),
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::BelowFloor { floor: u64::MAX }),
+    "under the terminal fence the truthful verdict stays the fence itself"
+  );
 }
 
 /// A vote request for a group this host neither hosts nor has tombstoned surfaces ONCE via

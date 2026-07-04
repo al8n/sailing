@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  FloorStore, NoFloors, Term,
+  FloorStore, MERGED_FLOOR, NoFloors, Term,
   testkit::{AsyncStable, CountSm, VecLog},
   transport::quic::{QuicTuning, crypto::tests::TestClusterCa},
 };
@@ -911,4 +911,67 @@ fn admission_checks_floor_first_then_consent_then_existence() {
   let mut p5 = multi_coord(&ca, 1, cluster);
   p5.create_group(7, single_voter(1), now, 1, CountSm::default(), 0, &NoFloors)
     .expect("gen-0 verbatim");
+}
+
+/// The QUIC twin of the reserved-sentinel refusal: `u64::MAX` is the merged-tombstone fence,
+/// never a working incarnation, so create refuses it under ANY floor — the reservation under a
+/// lower floor, the terminal fence's own verdict under `MERGED_FLOOR`.
+#[test]
+fn merged_floor_sentinel_generation_is_reserved() {
+  struct Floors(u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      self.0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      0
+    }
+  }
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut c = multi_coord(&ca, 1, cluster);
+  let now = Instant::ORIGIN;
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      u64::MAX,
+      &Floors(2),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::ReservedGeneration));
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      u64::MAX,
+      &NoFloors,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::ReservedGeneration),
+    "the sentinel is reserved even in a never-floored world"
+  );
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      u64::MAX,
+      &Floors(MERGED_FLOOR),
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::BelowFloor { floor: u64::MAX }),
+    "under the terminal fence the truthful verdict stays the fence itself"
+  );
 }

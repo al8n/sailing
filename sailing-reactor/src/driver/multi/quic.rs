@@ -26,7 +26,7 @@ use agnostic::{
 use bytes::Bytes;
 use sailing_proto::{
   ClusterId, Config, Event, FloorStore, GroupControl, GroupEngine, GroupId, Instant,
-  MultiQuicCoordinator, Now, StateMachine, StorageProgress, quic::QuicOptions,
+  MultiQuicCoordinator, Now, StateMachine, StorageProgress, floor_admits, quic::QuicOptions,
 };
 
 use sailing_driver::{
@@ -1037,9 +1037,10 @@ where
         && let Some(blueprint) = factory.materialize(&group, &from)
         && blueprint_names(&blueprint, &from)
         // The floors gate, on the same seam the create below consults authoritatively: the
-        // cheap PRE-BUILD refusal keeps the resource-phase ordering — a fenced id is refused
-        // before the factory's build phase can be asked for a state machine.
-        && self.engine.floor(&group) <= blueprint.generation()
+        // cheap PRE-BUILD refusal keeps the resource-phase ordering — a fenced id (or the
+        // reserved `u64::MAX` sentinel, never a working incarnation) is refused before the
+        // factory's build phase can be asked for a state machine.
+        && floor_admits(self.engine.floor(&group), blueprint.generation())
         && let Some(fsm) = factory.build(&group)
       {
         let generation = blueprint.generation();

@@ -39,7 +39,9 @@ impl<I> GroupBlueprint<I> {
 
   /// Set the id's incarnation under the single-incarnation contract — the catalog-supplied
   /// generation the driver checks against the id's persisted admission floor before building
-  /// anything, and records in its engine on admission.
+  /// anything, and records in its engine on admission. `u64::MAX` is NOT a working incarnation
+  /// — it is the reserved merged-tombstone sentinel (`sailing_proto::MERGED_FLOOR`), and the
+  /// driver's pre-build gate refuses a blueprint carrying it at any floor.
   #[inline(always)]
   #[must_use]
   pub const fn with_gen(mut self, generation: u64) -> Self {
