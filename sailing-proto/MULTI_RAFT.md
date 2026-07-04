@@ -164,6 +164,16 @@ holds). Rejoin instead goes through membership: conf-change the node OUT and bac
 recreates its leader-side progress at zero and catches it up by snapshot — the membership-level
 analogue of the references' new-replica-ID rule.
 
+**Deployment note (membership churn).** Hosts whose groups perform membership changes should
+enable BOTH `pre_vote` and `check_quorum` in each group's `Config` (they are per-group knobs on a
+multi-group host). A removed or partitioned member whose election timer fires campaigns at a
+higher term and, with an up-to-date log, deposes a live leader — the Raft-thesis §4.2.3
+disruptive-server problem, multiplied across co-hosted groups. `check_quorum` makes members
+ignore vote requests while they observe a live leader, and `pre_vote` stops the term inflation.
+The removal path's window is narrow (the leader's farewell append delivers the excising commit to
+the pruned peer), but partitioned members remain, and the defaults stay OFF for etcd-raft library
+parity. The removed-follower lifecycle e2es model the pair.
+
 Split/merge is deferred hard: it couples the state machine's key range to Raft-group
 identity and needs a transactional handoff. It must not shape the Phase-0 container.
 
