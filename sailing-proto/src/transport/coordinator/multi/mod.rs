@@ -265,6 +265,9 @@ where
   /// the ONLY way a retired id becomes creatable again (a subsequent create/restore then admits
   /// it): admission itself never lifts a tombstone, so consenting is always a deliberate act of
   /// the embedder's placement brain, never the side effect of replaying a stale advisory.
+  /// Clearing lifts ONLY this volatile consent gate: the id's persisted admission floor (if a
+  /// reshaping removal wrote one through the caller's [`FloorStore`] seam) is untouched — no
+  /// consent call ever re-admits an under-floor incarnation.
   pub fn clear_tombstone(&mut self, gid: &G) -> bool {
     self.retired.remove(gid)
   }

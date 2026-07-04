@@ -8,11 +8,17 @@
 //! into that group's poll FIFO. One flush is one fsync-equivalent covering ALL groups' staged
 //! writes: the cross-group fsync amortization the multi-Raft design exists for. This is the
 //! Sans-I/O reference implementation of the Phase-2 storage contract in `MULTI_RAFT.md`; a disk
-//! engine mirrors these semantics over group-prefixed keys and a real write batch.
+//! engine mirrors these semantics over group-prefixed keys and a real write batch — INCLUDING
+//! the per-group lineage records (incarnation gen + admission floor), which outlive
+//! `remove_group` and fold at the same barrier.
 //!
 //! The per-group storage invariants hold BY CONSTRUCTION under a barrier: log durability is
 //! prefix-ordered because everything staged becomes durable together, and stable completions
 //! release in submit order because each group's staging is a FIFO.
+//!
+//! **Floors survive exactly what the engine survives.** This engine is in-memory, so its
+//! admission floors die with it: durable floors are the disk-engine mirror's obligation, and
+//! the embedder's catalog remains the cross-restart incarnation authority until one is in use.
 
 use crate::{
   EntriesRead, Entry, HardState, Index, LogDone, LogStore, MaybeOwned, NodeId, OpId,
