@@ -639,6 +639,15 @@ impl<I> Config<I> {
   ///
   /// When `true`, a node probes for a quorum of "would-grant" responses before
   /// incrementing its term, preventing a partitioned node from inflating the cluster term.
+  ///
+  /// **Deployment recommendation**: clusters that perform membership changes should enable
+  /// BOTH `pre_vote` and [`check_quorum`](Config::check_quorum). A removed or partitioned
+  /// member whose election timer fires campaigns at a higher term and, with an up-to-date
+  /// log, deposes a live leader — the Raft-thesis §4.2.3 disruptive-server problem.
+  /// `check_quorum` makes members ignore vote requests while they observe a live leader, and
+  /// `pre_vote` stops the term inflation. The removal-path window is narrow (the farewell
+  /// append normally delivers the excising commit to a pruned peer), but partitioned members
+  /// remain. Both default OFF for etcd-raft library parity.
   #[inline(always)]
   pub const fn pre_vote(&self) -> bool {
     self.pre_vote
@@ -663,6 +672,12 @@ impl<I> Config<I> {
   ///
   /// When `true`, a leader that does not hear from a quorum of peers within an election
   /// timeout steps down. Required by [`ReadOnlyOption::LeaseBased`].
+  ///
+  /// **Deployment recommendation**: clusters that perform membership changes should enable
+  /// BOTH `check_quorum` and [`pre_vote`](Config::pre_vote) — see
+  /// [`pre_vote`](Config::pre_vote) for the disruptive-server rationale (a member observing
+  /// a live leader then refuses to help depose it, and pre-vote keeps the disruptor's term
+  /// from inflating). Both default OFF for etcd-raft library parity.
   #[inline(always)]
   pub const fn check_quorum(&self) -> bool {
     self.check_quorum
