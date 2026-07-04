@@ -26,9 +26,9 @@ use super::{
   sni_for,
 };
 use crate::{
-  CheapClone, Config, CreateGroupError, Data, Endpoint, Event, GroupControl, GroupId, GroupStores,
-  Index, Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError, StableStore,
-  StateMachine, StorageProgress,
+  CheapClone, Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupControl, GroupId,
+  GroupStores, Index, Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError,
+  StableStore, StateMachine, StorageProgress,
   transport::{
     ClusterId, CoalescedEntry,
     coordinator::{UNKNOWN_GROUP_SIGNAL_CAP, is_initial_shaped},
@@ -198,14 +198,26 @@ where
     }
   }
 
-  /// Create a fresh group (see [`MultiRaft::create_group`]). A tombstoned id REFUSES creation
-  /// until an explicit [`clear_tombstone`](Self::clear_tombstone) consents to re-admission — the
-  /// clear-then-create pair is the supported rejoin path (see
-  /// [`remove_group`](Self::remove_group)).
+  /// Create a fresh group (see [`MultiRaft::create_group`]). Admission checks run FLOOR FIRST,
+  /// then the tombstone, then the container: `generation` — the id's incarnation under the
+  /// single-incarnation contract, 0 unless the embedder reshapes ids — is compared against the
+  /// persisted admission floor read through `floors`, and an under-floor incarnation is refused
+  /// before anything volatile is consulted (the durable fence outranks in-session state; the
+  /// coordinator itself does not otherwise consume `generation` yet — the driver records it
+  /// after the `Ok`, and the split milestone consumes it at this layer). The driver hands its
+  /// engine as `floors`; the deterministic sim and proto-level embedders hand their own store —
+  /// durability is the store-owner's job. A tombstoned id still REFUSES creation at ANY
+  /// generation until an explicit [`clear_tombstone`](Self::clear_tombstone) consents to
+  /// re-admission — the clear-then-create pair is the supported rejoin path (see
+  /// [`remove_group`](Self::remove_group)); the floor narrows what MAY be admitted, never
+  /// widens it.
   ///
   /// # Errors
-  /// [`CreateGroupError::Retired`] when the id is tombstoned by a removal; otherwise the
-  /// admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
+  /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor
+  /// (terminal for that incarnation — no consent call cures it), [`CreateGroupError::Retired`]
+  /// when the id is tombstoned by a removal; otherwise the admission checks of
+  /// [`MultiRaft::create_group`] — see [`CreateGroupError`].
+  #[allow(clippy::too_many_arguments)]
   pub fn create_group(
     &mut self,
     gid: G,
@@ -213,7 +225,13 @@ where
     now: impl Into<Now>,
     seed: u64,
     fsm: F,
+    generation: u64,
+    floors: &impl FloorStore<G>,
   ) -> Result<(), CreateGroupError> {
+    let floor = floors.floor(&gid);
+    if generation < floor {
+      return Err(CreateGroupError::BelowFloor { floor });
+    }
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
     }
@@ -226,11 +244,15 @@ where
     Ok(())
   }
 
-  /// Recover a group from durable storage (see [`MultiRaft::restore_group`]). A tombstoned id
-  /// refuses restoration exactly as [`create_group`](Self::create_group) refuses creation: an
-  /// explicit [`clear_tombstone`](Self::clear_tombstone) must precede re-admission.
+  /// Recover a group from durable storage (see [`MultiRaft::restore_group`]). Admission is
+  /// gated exactly as [`create_group`](Self::create_group): floor first (via the caller's
+  /// `floors` seam), then the tombstone, then the container. The embedder's catalog supplies
+  /// `generation` — the cross-restart incarnation authority: a restore that lies about it
+  /// collapses two incarnations into one identity for every gen-keyed observer (the multi-VOPR
+  /// one-identity oracle keys on it), voiding what the fence exists to distinguish.
   ///
   /// # Errors
+  /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor,
   /// [`CreateGroupError::Retired`] when the id is tombstoned by a removal; otherwise the
   /// admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
@@ -242,6 +264,8 @@ where
     seed: u64,
     fsm: F,
     boot_epoch: u64,
+    generation: u64,
+    floors: &impl FloorStore<G>,
     log: &mut L,
     stable: &mut S,
   ) -> Result<(), CreateGroupError>
@@ -250,6 +274,10 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
+    let floor = floors.floor(&gid);
+    if generation < floor {
+      return Err(CreateGroupError::BelowFloor { floor });
+    }
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
     }

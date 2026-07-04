@@ -29,8 +29,8 @@ use std::{
 use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
 use sailing_proto::{
-  Config, ConnId, Event, GroupControl, GroupEngine, GroupId, Instant, MultiStreamCoordinator, Now,
-  RecordIo, StateMachine, StorageProgress,
+  Config, ConnId, Event, GroupControl, GroupEngine, GroupId, Instant, MultiStreamCoordinator,
+  NoFloors, Now, RecordIo, StateMachine, StorageProgress,
 };
 
 use sailing_driver::{
@@ -809,7 +809,7 @@ where
     let added = self.engine.add_group(gid.cheap_clone());
     match self
       .coord
-      .create_group(gid.cheap_clone(), config, now, seed, fsm)
+      .create_group(gid.cheap_clone(), config, now, seed, fsm, 0, &NoFloors)
     {
       Ok(()) => {
         self.election.insert(gid.cheap_clone(), election);
@@ -852,6 +852,8 @@ where
         seed,
         fsm,
         epoch,
+        0,
+        &NoFloors,
         log,
         stable,
       )

@@ -25,8 +25,8 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  ClusterId, Config, Event, GroupControl, GroupEngine, GroupId, Instant, MultiQuicCoordinator, Now,
-  StateMachine, StorageProgress, quic::QuicOptions,
+  ClusterId, Config, Event, GroupControl, GroupEngine, GroupId, Instant, MultiQuicCoordinator,
+  NoFloors, Now, StateMachine, StorageProgress, quic::QuicOptions,
 };
 
 use sailing_driver::{
@@ -542,7 +542,7 @@ where
     let added = self.engine.add_group(gid.cheap_clone());
     match self
       .coord
-      .create_group(gid.cheap_clone(), config, now, seed, fsm)
+      .create_group(gid.cheap_clone(), config, now, seed, fsm, 0, &NoFloors)
     {
       Ok(()) => {
         self.election.insert(gid.cheap_clone(), election);
@@ -583,6 +583,8 @@ where
         seed,
         fsm,
         epoch,
+        0,
+        &NoFloors,
         log,
         stable,
       )

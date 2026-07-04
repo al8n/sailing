@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  Term,
+  FloorStore, NoFloors, Term,
   testkit::{AsyncStable, CountSm, VecLog},
   transport::quic::{QuicTuning, crypto::tests::TestClusterCa},
 };
@@ -59,10 +59,26 @@ fn coordinator_drives_isolated_groups() {
   let mut coord =
     MultiQuicCoordinator::<u64, u64, CountSm>::with_identity(opts, Some(seed), cluster);
   coord
-    .create_group(100, single_voter(1), Instant::ORIGIN, 1, CountSm::default())
+    .create_group(
+      100,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
     .unwrap();
   coord
-    .create_group(200, single_voter(1), Instant::ORIGIN, 1, CountSm::default())
+    .create_group(
+      200,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
     .unwrap();
 
   let mut stores = Stores {
@@ -219,10 +235,26 @@ fn demuxes_two_groups_over_one_quic_connection() {
   let mut a = multi_coord(&ca, 1, cluster);
   let mut b = multi_coord(&ca, 2, cluster);
   for g in [100u64, 200] {
-    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-      .unwrap();
-    b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
-      .unwrap();
+    a.create_group(
+      g,
+      two_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+    b.create_group(
+      g,
+      two_voter(2),
+      Instant::ORIGIN,
+      2,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
   }
   let mut sa = group_stores(&[100, 200]);
   let mut sb = group_stores(&[100, 200]);
@@ -264,8 +296,16 @@ fn zero_group_host_never_binds() {
   let cluster = ClusterId([7u8; 16]);
   let mut a = multi_coord(&ca, 1, cluster);
   let mut b = multi_coord(&ca, 2, cluster); // hosts NO groups yet
-  a.create_group(100, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-    .unwrap();
+  a.create_group(
+    100,
+    two_voter(1),
+    Instant::ORIGIN,
+    1,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
   let mut sa = group_stores(&[100]);
   let mut sb = group_stores(&[]);
   let mut now = Instant::ORIGIN;
@@ -289,7 +329,7 @@ fn zero_group_host_never_binds() {
   settle(&mut a, &mut b, &mut sa, &mut sb, now);
 
   // Give b its group; a FRESH dial then authenticates and binds both ways.
-  b.create_group(100, two_voter(2), now, 2, CountSm::default())
+  b.create_group(100, two_voter(2), now, 2, CountSm::default(), 0, &NoFloors)
     .unwrap();
   sb.map
     .insert(100, (VecLog::default(), AsyncStable::default()));
@@ -329,10 +369,26 @@ fn quiesce_flag_round_trips_over_quic() {
   let mut a = multi_coord(&ca, 1, cluster);
   let mut b = multi_coord(&ca, 2, cluster);
   for g in [100u64, 200] {
-    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-      .unwrap();
-    b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
-      .unwrap();
+    a.create_group(
+      g,
+      two_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+    b.create_group(
+      g,
+      two_voter(2),
+      Instant::ORIGIN,
+      2,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
   }
   let mut sa = group_stores(&[100, 200]);
   let mut sb = group_stores(&[100, 200]);
@@ -436,10 +492,26 @@ fn unhosted_coalesced_entry_drops_over_quic() {
   let mut a = multi_coord(&ca, 1, cluster);
   let mut b = multi_coord(&ca, 2, cluster);
   for g in [100u64, 200] {
-    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-      .unwrap();
-    b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
-      .unwrap();
+    a.create_group(
+      g,
+      two_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+    b.create_group(
+      g,
+      two_voter(2),
+      Instant::ORIGIN,
+      2,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
   }
   let mut sa = group_stores(&[100, 200]);
   let mut sb = group_stores(&[100, 200]);
@@ -490,10 +562,26 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   let mut a = multi_coord(&ca, 1, cluster);
   let mut b = multi_coord(&ca, 2, cluster);
   for g in [100u64, 200] {
-    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-      .unwrap();
-    b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
-      .unwrap();
+    a.create_group(
+      g,
+      two_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
+    b.create_group(
+      g,
+      two_voter(2),
+      Instant::ORIGIN,
+      2,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
+    .unwrap();
   }
   let mut sa = group_stores(&[100, 200]);
   let mut sb = group_stores(&[100, 200]);
@@ -537,7 +625,7 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   // A tombstoned id REFUSES re-creation — a stale unknown-group advisory replayed into a naive
   // create can never resurrect it; only the explicit clear consents to re-admission.
   assert_eq!(
-    b.create_group(100, two_voter(2), now, 2, CountSm::default())
+    b.create_group(100, two_voter(2), now, 2, CountSm::default(), 0, &NoFloors)
       .unwrap_err(),
     CreateGroupError::Retired,
     "create refuses a tombstoned id"
@@ -553,7 +641,7 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   // leader again.
   sb.map
     .insert(100, (VecLog::default(), AsyncStable::default()));
-  b.create_group(100, two_voter(2), now, 2, CountSm::default())
+  b.create_group(100, two_voter(2), now, 2, CountSm::default(), 0, &NoFloors)
     .unwrap();
   let d = a.group(&100).unwrap().poll_timeout().unwrap();
   now = now.max(d);
@@ -598,11 +686,27 @@ fn unknown_group_traffic_surfaces_over_quic() {
   let mut a = multi_coord(&ca, 1, cluster);
   let mut b = multi_coord(&ca, 2, cluster);
   for g in [100u64, 200] {
-    a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-      .unwrap();
-  }
-  b.create_group(100, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
+    a.create_group(
+      g,
+      two_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
     .unwrap();
+  }
+  b.create_group(
+    100,
+    two_voter(2),
+    Instant::ORIGIN,
+    2,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
   let mut sa = group_stores(&[100, 200]);
   let mut sb = group_stores(&[100]);
   let mut now = Instant::ORIGIN;
@@ -666,8 +770,16 @@ fn group_admitted_before_auth_deadline_recovers() {
   let cluster = ClusterId([7u8; 16]);
   let mut a = multi_coord(&ca, 1, cluster);
   let mut b = multi_coord(&ca, 2, cluster); // hosts NO groups yet
-  a.create_group(100, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-    .unwrap();
+  a.create_group(
+    100,
+    two_voter(1),
+    Instant::ORIGIN,
+    1,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
   let mut sa = group_stores(&[100]);
   let mut sb = group_stores(&[]);
   let now = Instant::ORIGIN;
@@ -680,7 +792,7 @@ fn group_admitted_before_auth_deadline_recovers() {
   );
 
   // No time passes: the group appears and a fresh dial binds long before the 5s deadline.
-  b.create_group(100, two_voter(2), now, 2, CountSm::default())
+  b.create_group(100, two_voter(2), now, 2, CountSm::default(), 0, &NoFloors)
     .unwrap();
   sb.map
     .insert(100, (VecLog::default(), AsyncStable::default()));
@@ -697,4 +809,106 @@ fn group_admitted_before_auth_deadline_recovers() {
     a.has_bound_conn(&2u64) && b.has_bound_conn(&1u64),
     "both bind with zero elapsed time"
   );
+}
+
+/// The QUIC twin of the stream coordinator's 5-cell admission matrix: floor first, the volatile
+/// consent gate at every gen, container existence last — and a NoFloors world is P5 verbatim.
+#[test]
+fn admission_checks_floor_first_then_consent_then_existence() {
+  struct Floors(u64, u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      self.0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.1
+    }
+  }
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut c = multi_coord(&ca, 1, cluster);
+  let now = Instant::ORIGIN;
+  // cell 1: below the floor — terminal, consent cannot cure
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::BelowFloor { floor: 2 }));
+  // cell 4: at the floor — admitted
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    2,
+    &Floors(2, 0),
+  )
+  .expect("at-floor admitted");
+  // cell 1 under floor-first ordering: hosted + below-floor reports the fence, not Exists
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::BelowFloor { .. }),
+    "floor precedes existence"
+  );
+  // cell 3: hosted at a passing gen
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      2,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::Exists));
+  // cell 2 (the subtlest): tombstoned + HIGHER gen → Retired (consent gate holds at any gen)
+  assert!(c.remove_group(&100).is_some());
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      9,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::Retired));
+  assert!(c.clear_tombstone(&100));
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    9,
+    &Floors(2, 0),
+  )
+  .expect("two-act rejoin");
+  // cell 5: NoFloors = the P5 world
+  let mut p5 = multi_coord(&ca, 1, cluster);
+  p5.create_group(7, single_voter(1), now, 1, CountSm::default(), 0, &NoFloors)
+    .expect("gen-0 verbatim");
 }
