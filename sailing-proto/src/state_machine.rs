@@ -28,6 +28,40 @@ pub trait StateMachine {
   fn snapshot(&self) -> Result<Self::Snapshot, Self::Error>;
   /// Install a snapshot, replacing all state.
   fn restore(&mut self, snapshot: Self::Snapshot) -> Result<(), Self::Error>;
+
+  /// Split support (the group-split milestone). Default: unsupported (`None`) — an embedder that
+  /// never proposes splits never sees a call, and every existing implementation compiles
+  /// untouched.
+  ///
+  /// A supporting FSM partitions ITSELF by the opaque `instruction` (sailing never reads it) and
+  /// returns the CHILD's half; `self` continues as the parent's. Runs at the deterministic apply
+  /// point of a committed `Split` entry, so it carries `apply`'s determinism contract verbatim:
+  /// the same `(instruction, state)` must produce the same partition on every replica — divergent
+  /// implementations diverge replicas exactly as a non-deterministic `apply` would. Like `apply`
+  /// it must be TOTAL (never panic on a committed input); `None` is the "unsupported /
+  /// ill-formed instruction" verdict, not an error channel — a default body cannot mint an
+  /// arbitrary `Self::Error`, which is why the signature is `Option`, and a COMMITTED `Split`
+  /// entry applied against an FSM that returns `None` POISONS the replica
+  /// (`PoisonReason::SplitUnsupported`): fail-stop, never silent divergence.
+  fn split(&mut self, instruction: &[u8]) -> Option<Self>
+  where
+    Self: Sized,
+  {
+    let _ = instruction;
+    None
+  }
+
+  /// Merge-absorb support (the group-merge milestone). Default: unsupported (`false`) — the same
+  /// contract as [`split`](Self::split): deterministic at the committed apply point, total, and
+  /// `bool` rather than `Result` because a default body cannot mint `Self::Error`. A supporting
+  /// FSM folds the absorbed `source` into itself and returns `true`.
+  fn absorb(&mut self, source: Self) -> bool
+  where
+    Self: Sized,
+  {
+    let _ = source;
+    false
+  }
 }
 
 #[cfg(test)]
@@ -60,5 +94,61 @@ mod tests {
   #[test]
   fn noop_is_a_state_machine() {
     assert_sm::<Noop>();
+  }
+
+  #[test]
+  fn split_and_absorb_default_to_unsupported() {
+    // The zero-breakage proof: `Noop` predates the reshaping seams and overrides neither, so the
+    // defaults answer for it — no split half, no absorb.
+    let mut sm = Noop;
+    assert_eq!(sm.split(b"anything").map(|_| ()), None);
+    assert!(!sm.absorb(Noop));
+  }
+
+  /// A partitioned counter: `split` moves `give` units into the returned half; `absorb` folds a
+  /// source's units back in. The minimal FSM proving the defaulted seams are overridable.
+  struct Partitioned {
+    units: u64,
+  }
+
+  impl StateMachine for Partitioned {
+    type Command = ();
+    type Response = ();
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+
+    fn apply(&mut self, _: crate::Index, _: ()) -> Result<(), Self::Error> {
+      Ok(())
+    }
+
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.units)
+    }
+
+    fn restore(&mut self, units: u64) -> Result<(), Self::Error> {
+      self.units = units;
+      Ok(())
+    }
+
+    fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+      let give = u64::from(*instruction.first()?);
+      let give = give.min(self.units);
+      self.units -= give;
+      Some(Self { units: give })
+    }
+
+    fn absorb(&mut self, source: Self) -> bool {
+      self.units += source.units;
+      true
+    }
+  }
+
+  #[test]
+  fn overridden_split_partitions_and_absorb_reunites() {
+    let mut sm = Partitioned { units: 10 };
+    let half = sm.split(&[4]).expect("supported");
+    assert_eq!((sm.units, half.units), (6, 4));
+    assert!(sm.absorb(half));
+    assert_eq!(sm.units, 10);
   }
 }

@@ -1017,6 +1017,8 @@ fn poison_reason_as_str_covers_all_variants() {
     (SnapshotCapture, "snapshot_capture"),
     (ConfChangeDecode, "conf_change_decode"),
     (SetReadModeDecode, "set_read_mode_decode"),
+    (SplitDecode, "split_decode"),
+    (SplitUnsupported, "split_unsupported"),
     (ConfChangeApply, "conf_change_apply"),
     (SnapshotDecode, "snapshot_decode"),
     (SnapshotRestore, "snapshot_restore"),
