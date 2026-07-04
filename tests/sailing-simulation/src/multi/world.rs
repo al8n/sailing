@@ -7,9 +7,10 @@
 //! timestamp. Per-node clock drift and the failover wall are deliberately absent in v1 — the
 //! single-group VOPR retains that coverage; the hooks stay reserved here.
 
-use crate::{AppliedLog, LogSm, MemLog, MemStable};
+use super::oracles::{self, GrantKey};
+use crate::{AppliedLog, Checker, DurableEntry, LogSm, MemLog, MemStable, checker};
 use core::time::Duration;
-use sailing_proto::{Config, Instant, Message, MultiRaft, Outgoing};
+use sailing_proto::{Config, Event, Instant, LogStore, Message, MultiRaft, Outgoing, StableStore};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 /// An in-flight group-tagged typed message: `(deliver_at, gid, from, to, message)`.
@@ -45,6 +46,25 @@ pub struct MultiWorld {
   isolated: BTreeSet<u64>,
   /// Completed [`tick`](Self::tick)s (threaded into oracle panics for replay).
   tick_count: u64,
+  /// One safety-oracle suite PER GROUP — unchanged oracle code, parameterized by the per-group
+  /// [`ClusterView`](crate::ClusterView) assembled from the group's hosting nodes.
+  checkers: BTreeMap<u64, Checker>,
+  /// The one-identity tripwire: `(granter, gid, gen, term) → grantee` over every REAL-vote grant
+  /// any replica ever sends (see [`oracles::note_grant`]).
+  grants: BTreeMap<GrantKey, u64>,
+  /// Per-`(node, gid)` count of applied entries already cross-talk-swept (the sweep high-water).
+  swept: BTreeMap<(u64, u64), usize>,
+  /// Per-`(node, gid)` count of `Event::ConfChanged` drained (the [`NodeView`](crate::NodeView)
+  /// `conf_changed` feed and the per-group conf-change settle signal).
+  conf_changed: BTreeMap<(u64, u64), u64>,
+  /// `(node, gid)` replicas whose membership is SNAPSHOT-DERIVED (a transferred snapshot
+  /// installed) — sticky, mirroring the single-group lineage flag.
+  snapshot_lineage: BTreeSet<(u64, u64)>,
+  /// Per-group committed conf-change transitions observed since the last check (fed to the
+  /// membership oracle exactly as `Cluster::pending_transitions` is, then cleared).
+  pending_transitions: BTreeMap<u64, Vec<(u64, u64, checker::ConfSnapshot)>>,
+  /// Per-group new transfer-snapshot installs observed since the last check (then cleared).
+  pending_new_installs: BTreeMap<u64, Vec<(u64, u64, checker::ConfSnapshot)>>,
 }
 
 impl MultiWorld {
@@ -60,6 +80,13 @@ impl MultiWorld {
       bus: VecDeque::new(),
       isolated: BTreeSet::new(),
       tick_count: 0,
+      checkers: BTreeMap::new(),
+      grants: BTreeMap::new(),
+      swept: BTreeMap::new(),
+      conf_changed: BTreeMap::new(),
+      snapshot_lineage: BTreeSet::new(),
+      pending_transitions: BTreeMap::new(),
+      pending_new_installs: BTreeMap::new(),
     }
   }
 
@@ -77,6 +104,10 @@ impl MultiWorld {
   /// container folds `gid` in, so per-group election jitter is decorrelated for free). Panics on
   /// any admission error — a world-construction bug, not weather.
   pub fn create_group(&mut self, gid: u64, voters: &BTreeSet<u64>) {
+    assert!(
+      self.checkers.insert(gid, Checker::new()).is_none(),
+      "create_group: group {gid} already exists (ids are single-incarnation)"
+    );
     let voter_vec: Vec<u64> = voters.iter().copied().collect();
     for &node in voters {
       let config = Config::try_new(
@@ -267,7 +298,165 @@ impl MultiWorld {
     }
 
     self.tick_count += 1;
+    // The world is quiescent at this timestamp — a consistent observable state. Run the whole
+    // per-group oracle suite plus the cross-talk sweep; a violation panics with seed + tick.
+    self.check_now();
     progressed
+  }
+
+  /// Run the per-group safety-oracle suites and the cross-group cross-talk sweep against the
+  /// current state, panicking with the oracle name + seed + tick on a violation. Called at the
+  /// end of every [`tick`](Self::tick); exposed so tests can also invoke it at a chosen point.
+  pub fn check_now(&mut self) {
+    let gids: Vec<u64> = self.checkers.keys().copied().collect();
+    for gid in gids {
+      let view = self.group_view(gid);
+      self
+        .checkers
+        .get_mut(&gid)
+        .expect("checker exists")
+        .check_or_panic(&view);
+      // The checker folded this view's transitions/installs; clear so the next batch is fresh.
+      self.pending_transitions.entry(gid).or_default().clear();
+      self.pending_new_installs.entry(gid).or_default().clear();
+      self.cross_talk_sweep(gid);
+    }
+  }
+
+  /// Assert every NEWLY applied entry on every replica of `gid` decodes (when gid-tagged) to
+  /// `gid` itself — the O(1)-per-apply cross-group isolation oracle.
+  fn cross_talk_sweep(&mut self, gid: u64) {
+    for node in self.node_ids.clone() {
+      if !self.hosts[&node].contains_group(&gid) {
+        continue;
+      }
+      let applied = self.applied_of(node, gid);
+      let hw = self.swept.entry((node, gid)).or_insert(0);
+      // A crash-restore can legitimately SHRINK the applied prefix (apply outruns the batched
+      // commit persist); clamp, and re-sweeping a replayed suffix is harmless (same entries).
+      let start = (*hw).min(applied.len());
+      oracles::assert_no_cross_talk(self.seed, self.tick_count, node, gid, &applied[start..]);
+      *hw = applied.len();
+    }
+  }
+
+  /// The group's incarnation (gen) for the one-identity grant key. Fixed at 0 until the
+  /// lifecycle registry lands (recreation is what moves it).
+  fn gen_of(&self, _gid: u64) -> u64 {
+    0
+  }
+
+  /// Assemble the per-group [`ClusterView`](crate::ClusterView) from `gid`'s hosting nodes —
+  /// field-for-field the shape `Cluster::view` builds, scoped to one group's replicas and their
+  /// `(node, gid)` stores, so the UNCHANGED oracle suite judges each group independently.
+  fn group_view(&self, gid: u64) -> checker::ClusterView {
+    let mut nodes = Vec::new();
+    for &node in &self.node_ids {
+      let Some(ep) = self.hosts[&node].group(&gid) else {
+        continue;
+      };
+      let log = &self.logs[&(node, gid)];
+      let stable = &self.stables[&(node, gid)];
+      let durable_first = log.durable_first_index().get();
+      let durable_last = log.durable_last_index().get();
+      let visible_last = log.last_index().get();
+      let durable_entries: Vec<DurableEntry> = log
+        .durable_entries()
+        .iter()
+        .map(|e| DurableEntry {
+          index: e.index().get(),
+          term: e.term().get(),
+          data: e.data().to_vec(),
+          is_conf_change: e.kind().is_conf_change(),
+        })
+        .collect();
+      let (snapshot_last_index, snapshot_last_term) = match stable.durable_snapshot() {
+        Some(meta) => (meta.last_index().get(), meta.last_term().get()),
+        None => (0, 0),
+      };
+      let applied_log: Vec<(u64, Vec<u8>)> = ep
+        .state_machine()
+        .applied()
+        .iter()
+        .map(|(idx, cmd)| (idx.get(), cmd.to_vec()))
+        .collect();
+      let cs = ep.conf_state();
+      nodes.push(checker::NodeView {
+        id: node,
+        removed: false,
+        is_voter: cs.is_voter(&node),
+        poisoned: ep.is_poisoned(),
+        is_leader: ep.role().is_leader(),
+        term: ep.term().get(),
+        commit: ep.commit_index().get(),
+        applied: ep.applied_index().get(),
+        applied_log,
+        durable_first,
+        durable_last,
+        visible_last,
+        durable_entries,
+        snapshot_last_index,
+        snapshot_last_term,
+        installed_snapshot: self.snapshot_lineage.contains(&(node, gid)),
+        conf_voters: cs.voters().clone(),
+        conf_voters_outgoing: cs.voters_outgoing().clone(),
+        conf_learners: cs.learners().clone(),
+        conf_learners_next: cs.learners_next().clone(),
+        conf_auto_leave: cs.auto_leave(),
+        conf_changed: self.conf_changed.get(&(node, gid)).copied().unwrap_or(0),
+        hardstate_commit: stable.hard_state().commit().get(),
+        inflight_staged: usize::from(log.has_inflight()) + usize::from(stable.has_inflight()),
+        incarnation: 0,
+      });
+    }
+    checker::ClusterView {
+      seed: self.seed,
+      tick: self.tick_count,
+      committed_voters: {
+        let v = self.committed_voters_of(gid);
+        if v.is_empty() { None } else { Some(v) }
+      },
+      committed_transitions: self
+        .pending_transitions
+        .get(&gid)
+        .cloned()
+        .unwrap_or_default(),
+      new_installs: self
+        .pending_new_installs
+        .get(&gid)
+        .cloned()
+        .unwrap_or_default(),
+      nodes,
+    }
+  }
+
+  /// The group's REAL committed VOTER set, read exactly as `Cluster::committed_voters` reads it:
+  /// the HIGHEST-TERM leader among the group's hosting replicas is authoritative; leaderless,
+  /// the most common committed voter set across hosting replicas (ties to the first-sorting
+  /// set), so the result is a pure function of world state.
+  fn committed_voters_of(&self, gid: u64) -> BTreeSet<u64> {
+    let authoritative = self
+      .node_ids
+      .iter()
+      .filter_map(|&n| self.hosts[&n].group(&gid).map(|ep| (n, ep)))
+      .filter(|(_, ep)| ep.role().is_leader())
+      .max_by_key(|(_, ep)| ep.term());
+    if let Some((_, ep)) = authoritative {
+      return ep.conf_state().voters().iter().copied().collect();
+    }
+    let mut tally: BTreeMap<BTreeSet<u64>, usize> = BTreeMap::new();
+    for &n in &self.node_ids {
+      let Some(ep) = self.hosts[&n].group(&gid) else {
+        continue;
+      };
+      let voters: BTreeSet<u64> = ep.conf_state().voters().iter().copied().collect();
+      *tally.entry(voters).or_insert(0) += 1;
+    }
+    tally
+      .into_iter()
+      .max_by(|(a_set, a_n), (b_set, b_n)| a_n.cmp(b_n).then_with(|| b_set.cmp(a_set)))
+      .map(|(set, _)| set)
+      .unwrap_or_default()
   }
 
   /// Drain every host's outgoing `(gid, message)` queue onto the bus (isolated hosts drain to the
@@ -297,15 +486,95 @@ impl MultiWorld {
     any_new
   }
 
-  /// Drain (and for now discard) node `node`'s aggregated `(gid, event)` queue so it stays
-  /// bounded. The oracle layer grows observers here.
+  /// THE single event-drain for node `node`'s container: every drain site routes here so no
+  /// tracked event is cherry-picked or dropped on any path (the single-group harness's rule).
+  ///   - `SnapshotInstalled` → the sticky per-`(node, gid)` snapshot-membership lineage AND the
+  ///     group's new-install feed for the membership oracle.
+  ///   - `ConfChanged` → the per-`(node, gid)` counter AND (from a LOG-BUILT replica only) the
+  ///     group's committed-config transition at its exact index, tagged with the conf-change
+  ///     ENTRY's term (a non-faulting log lookup — not the replica's current term).
   fn drain_host_events(&mut self, node: u64) {
-    let host = self.hosts.get_mut(&node).expect("host exists");
-    while host.poll_event().is_some() {}
+    loop {
+      let host = self.hosts.get_mut(&node).expect("host exists");
+      let Some((gid, ev)) = host.poll_event() else {
+        break;
+      };
+      match ev {
+        Event::SnapshotInstalled(meta) => {
+          self.snapshot_lineage.insert((node, gid));
+          self.pending_new_installs.entry(gid).or_default().push((
+            node,
+            meta.last_index().get(),
+            checker::ConfSnapshot::from_conf_state(meta.conf()),
+          ));
+        }
+        Event::ConfChanged(cc) => {
+          *self.conf_changed.entry((node, gid)).or_insert(0) += 1;
+          if !self.snapshot_lineage.contains(&(node, gid)) {
+            let idx = cc.index();
+            let entry_term = {
+              let commit = self.hosts[&node]
+                .group(&gid)
+                .expect("event source is hosted")
+                .commit_index();
+              self.logs[&(node, gid)]
+                .committed_entries_no_fault(commit)
+                .iter()
+                .find(|e| e.index() == idx)
+                .map(|e| e.term().get())
+                .unwrap_or(0)
+            };
+            self.pending_transitions.entry(gid).or_default().push((
+              idx.get(),
+              entry_term,
+              checker::ConfSnapshot::from_conf_state(cc.conf()),
+            ));
+          }
+        }
+        _ => {}
+      }
+    }
   }
 
-  /// Push one group-tagged message onto the bus (fault-free: zero latency, FIFO, exactly once).
+  /// Run the structural send-point oracles on a message `from` is sending for `gid`, then push
+  /// it onto the bus (fault-free for now: zero latency, FIFO, exactly once).
+  ///
+  /// The tripwires run on every SENT message, BEFORE any future drop/duplicate roll, so a
+  /// dropped message can never bypass an oracle (the single-group ordering rule):
+  ///   (a) append-before-ack — a success `AppendResponse` must not outrun the replica's
+  ///       readable `(node, gid)` log;
+  ///   (b) one-identity — a REAL-vote grant binds `(granter, gid, gen, term)` to one candidate
+  ///       across every replica object this node ever hosts for the group.
   fn schedule_send(&mut self, from: u64, gid: u64, to: u64, message: Message<u64>) {
+    if let Message::AppendResponse(a) = &message
+      && !a.reject()
+    {
+      let log = &self.logs[&(from, gid)];
+      assert!(
+        log.last_index() >= a.match_index(),
+        "append-before-ack violated: node {from} group {gid} acked {:?} but last_index is {:?} \
+         (durable_last={:?} inflight={})\n  seed={} tick={}",
+        a.match_index(),
+        log.last_index(),
+        log.durable_last_index(),
+        log.has_inflight(),
+        self.seed,
+        self.tick_count,
+      );
+    }
+    if let Message::VoteResponse(vr) = &message
+      && !vr.reject()
+      && !vr.pre_vote()
+    {
+      let generation = self.gen_of(gid);
+      oracles::note_grant(
+        &mut self.grants,
+        self.seed,
+        self.tick_count,
+        (from, gid, generation, vr.term()),
+        to,
+      );
+    }
     self.bus.push_back(GInFlight {
       deliver_at: self.now,
       gid,
