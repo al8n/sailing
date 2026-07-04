@@ -16,7 +16,7 @@
 
 mod factory;
 
-pub use factory::{BoxedGroupFactory, GroupBlueprint, GroupFactory};
+pub use factory::{BoxedGroupFactory, FnFactory, GroupBlueprint, GroupFactory, factory_fn};
 
 use std::sync::{
   Arc,

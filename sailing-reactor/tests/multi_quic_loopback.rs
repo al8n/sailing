@@ -15,7 +15,7 @@ use common::{CountSm, TestCa, TrapSm};
 use sailing_proto::{ClusterId, ConfChange, ConfChangeType, Config, Data, Role};
 use sailing_reactor::{
   DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
-  MultiReactorQuicDriver, Node,
+  MultiReactorQuicDriver, Node, factory_fn,
 };
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -926,11 +926,15 @@ async fn factory_materializes_solicited_group_hands_free() {
     if id == 2 {
       // The factory IS the embedder's catalog check, on both legs: the group id against the
       // catalog AND the solicitor against the group's replica set (the driver refuses a
-      // blueprint that fails the second leg anyway).
-      let driver = driver.with_group_factory(|group: &u64, from: &u64| {
-        (*group == 100 && [1u64, 2].contains(from))
-          .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
-      });
+      // blueprint that fails the second leg anyway). The state machine lives in the separate
+      // build phase, invoked only after the driver admits the blueprint.
+      let driver = driver.with_group_factory(factory_fn(
+        |group: &u64, from: &u64| {
+          (*group == 100 && [1u64, 2].contains(from))
+            .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2))
+        },
+        |_group: &u64| Some(CountSm::default()),
+      ));
       tokio::spawn(driver.run());
     } else {
       tokio::spawn(driver.run());

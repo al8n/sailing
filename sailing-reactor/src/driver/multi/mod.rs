@@ -65,8 +65,9 @@ pub(crate) fn conf_names<I: Ord>(conf: &sailing_proto::ConfState<I>, me: &I) -> 
 }
 
 /// Whether a factory blueprint's seed config names the soliciting peer `from` — the SENDER leg
-/// of the factory admission edge, enforced by the drivers fail-closed. A legitimate solicitation
-/// is INITIAL-SHAPED consensus traffic — a campaigner's vote request or a leader's first-contact
+/// of the factory admission edge, enforced by the drivers fail-closed BEFORE the factory's
+/// build (resource) phase is asked for a state machine. A legitimate solicitation is
+/// INITIAL-SHAPED consensus traffic — a campaigner's vote request or a leader's first-contact
 /// heartbeat — so its sender is by construction a member of the group it solicits; a blueprint
 /// that does not name the solicitor is either a stale catalog view (membership moved on: refuse
 /// here, the signal falls to the lifecycle tail for the embedder's manual path) or an
@@ -76,8 +77,8 @@ pub(crate) fn conf_names<I: Ord>(conf: &sailing_proto::ConfState<I>, me: &I) -> 
 /// learner shape is its OWN id's absence from the voters (`try_new_observer`), never a remote
 /// learner list, and only voters campaign or lead — so "names" is exactly voter-list
 /// containment.
-pub(crate) fn blueprint_names<I: PartialEq, F>(
-  blueprint: &sailing_driver::GroupBlueprint<I, F>,
+pub(crate) fn blueprint_names<I: PartialEq>(
+  blueprint: &sailing_driver::GroupBlueprint<I>,
   from: &I,
 ) -> bool {
   blueprint.config_ref().voters().contains(from)

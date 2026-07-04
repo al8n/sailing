@@ -1,8 +1,8 @@
 use super::*;
 
-/// The blueprint's state-machine slot is deliberately bound-free (it is a dumb admission
-/// payload), so a plain non-`Debug`, non-`StateMachine` type exercises it — any tighter bound on
-/// the factory surface is a compile error here.
+/// The build phase's state-machine slot is deliberately bound-free (it is a dumb admission
+/// payload), so a plain non-`Debug`, non-`StateMachine` type exercises it — any tighter bound
+/// on the factory surface is a compile error here.
 struct OpaqueSm(u8);
 
 fn config() -> Config<u64> {
@@ -25,49 +25,58 @@ const _: fn() = || {
 
 #[test]
 fn blueprint_carries_and_returns_its_parts() {
-  let blueprint = GroupBlueprint::new(config(), 7, OpaqueSm(42));
+  let blueprint = GroupBlueprint::new(config(), 7);
   assert_eq!(blueprint.config_ref().id(), 1);
   assert_eq!(blueprint.seed(), 7);
-  assert_eq!(blueprint.fsm_ref().0, 42);
 
-  // `into_parts` hands back exactly the admission triple the drivers' create path takes.
-  let (config, seed, fsm) = blueprint.into_parts();
+  // `into_parts` hands back exactly the blueprint's contribution to the drivers' create path
+  // (the state machine arrives separately, from the build phase).
+  let (config, seed) = blueprint.into_parts();
   assert_eq!(config.id(), 1);
   assert_eq!(seed, 7);
-  assert_eq!(fsm.0, 42);
 }
 
-/// The blanket impl: a plain `FnMut(&G, &I) -> Option<GroupBlueprint>` closure IS a factory —
-/// recognizing exactly one catalog id and DECLINING everything else, the admission-edge contract
-/// in miniature.
+/// The [`factory_fn`] combinator round-trip: two plain closures ARE a factory — the seed
+/// (materialize) closure recognizing exactly one catalog id and DECLINING everything else, the
+/// build closure constructing the state machine only when asked. The admission-edge contract
+/// in miniature, in its two-phase shape.
 #[test]
-fn a_closure_is_a_factory_and_none_declines() {
-  let mut factory = |group: &u64, from: &u64| {
-    (*group == 7).then(|| GroupBlueprint::new(config(), *from, OpaqueSm(1)))
-  };
+fn factory_fn_round_trips_both_phases() {
+  let mut factory = factory_fn(
+    |group: &u64, from: &u64| (*group == 7).then(|| GroupBlueprint::new(config(), *from)),
+    |group: &u64| (*group == 7).then_some(OpaqueSm(1)),
+  );
 
   let blueprint =
     GroupFactory::materialize(&mut factory, &7, &3).expect("the recognized id materializes");
   assert_eq!(
     blueprint.seed(),
     3,
-    "the solicitor's id reached the closure"
+    "the solicitor's id reached the seed closure"
   );
   assert!(
     GroupFactory::materialize(&mut factory, &9, &3).is_none(),
     "an unrecognized id declines"
   );
+
+  let fsm = GroupFactory::build(&mut factory, &7).expect("the recognized id builds");
+  assert_eq!(fsm.0, 1);
+  assert!(
+    GroupFactory::build(&mut factory, &9).is_none(),
+    "a build abort plumbs through the combinator"
+  );
 }
 
-/// The exact trait-object form the drivers store: the same closure boxed as a
-/// [`BoxedGroupFactory`], with the decline plumbing intact through `dyn` dispatch — checking
-/// both legs a factory can check (the catalog id AND the solicitor against the group's replica
-/// set).
+/// The exact trait-object form the drivers store: the same combinator boxed as a
+/// [`BoxedGroupFactory`], with both phases — and both phases' decline/abort plumbing — intact
+/// through `dyn` dispatch, checking both legs a factory can check (the catalog id AND the
+/// solicitor against the group's replica set).
 #[test]
-fn the_boxed_slot_drives_the_same_closure() {
-  let mut boxed: BoxedGroupFactory<u64, u64, OpaqueSm> = Box::new(|group: &u64, from: &u64| {
-    (*group == 7 && *from == 1).then(|| GroupBlueprint::new(config(), 1, OpaqueSm(1)))
-  });
+fn the_boxed_slot_drives_both_phases() {
+  let mut boxed: BoxedGroupFactory<u64, u64, OpaqueSm> = Box::new(factory_fn(
+    |group: &u64, from: &u64| (*group == 7 && *from == 1).then(|| GroupBlueprint::new(config(), 1)),
+    |group: &u64| (*group == 7).then_some(OpaqueSm(1)),
+  ));
   assert!(boxed.materialize(&7, &1).is_some());
   assert!(
     boxed.materialize(&9, &1).is_none(),
@@ -77,15 +86,18 @@ fn the_boxed_slot_drives_the_same_closure() {
     boxed.materialize(&7, &2).is_none(),
     "a solicitor outside the replica set declines"
   );
+  assert!(boxed.build(&7).is_some());
+  assert!(
+    boxed.build(&9).is_none(),
+    "a build abort plumbs through the trait object"
+  );
 }
 
-/// `Debug` requires only `I: Debug`: `OpaqueSm` is deliberately not `Debug` (that this compiles
-/// is the pin), and the state machine renders as the `..` elision beside the identifying
-/// config + seed.
+/// `Debug` is the plain derived form now that the blueprint is exactly config + seed — there is
+/// no state machine to elide.
 #[test]
-fn debug_elides_the_state_machine() {
-  let rendered = format!("{:?}", GroupBlueprint::new(config(), 7, OpaqueSm(0)));
+fn debug_renders_config_and_seed() {
+  let rendered = format!("{:?}", GroupBlueprint::new(config(), 7));
   assert!(rendered.contains("GroupBlueprint"), "got: {rendered}");
   assert!(rendered.contains("seed: 7"), "got: {rendered}");
-  assert!(rendered.contains(".."), "got: {rendered}");
 }
