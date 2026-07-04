@@ -23,7 +23,11 @@
 //! For MANY co-located groups, [`CompioMultiStreamDriver`] hosts N groups on ONE task instead:
 //! one shared connection per peer carries every group's traffic, and one
 //! [`GroupEngine`](sailing_proto::GroupEngine) barrier per crank amortizes durability across the
-//! groups — the compio port of the reactor multi driver, feature-complete on one core.
+//! groups — the compio port of the reactor multi driver, feature-complete on one core. And to
+//! scale a multi-group HOST across cores, [`ShardedCompioHost`] runs K of those drivers as
+//! parallel PLANES — one per core, each with its own engine barrier and per-shard listener,
+//! groups partitioned by a cluster-wide [`ShardMap`] — behind one routing
+//! [`ShardedMultiHandle`].
 //!
 //! [`Handle`]s are the only objects meant to cross threads: a `Handle` is `Send + Sync` and
 //! O(1) to clone, so any thread may submit to any group and await the committed reply — the
@@ -100,7 +104,7 @@ mod driver;
 
 pub use driver::{
   AcceptorFactory, CompioMultiStreamDriver, CompioQuicDriver, CompioStreamDriver, DialerFactory,
-  EngineMetrics,
+  EngineMetrics, ShardMap, ShardRecordLayers, ShardedCompioHost, ShardedMultiHandle, SpawnError,
 };
 #[cfg(feature = "unverified-wall-clock")]
 pub use sailing_driver::UnverifiedSystemClock;
