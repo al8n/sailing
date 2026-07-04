@@ -150,6 +150,15 @@ pub enum PoisonReason {
   ConfChangeDecode,
   /// A committed `SetReadMode` entry's payload failed to decode as a `ReadOnlyOption`.
   SetReadModeDecode,
+  /// A committed `Split` entry's payload failed to decode as a `SplitPayload` — or its child id
+  /// bytes failed to decode as the container's group-id type. Committed-corrupt, mirroring
+  /// `ConfChangeDecode`.
+  SplitDecode,
+  /// A committed `Split` entry was applied against a state machine whose `split` returned `None`
+  /// (the defaulted unsupported verdict, or an instruction the FSM refuses). Every replica folds
+  /// the same entry against the same FSM, so this is a deterministic cluster-wide fail-stop —
+  /// never silent divergence between replicas that forked and replicas that did not.
+  SplitUnsupported,
   /// The `Changer` rejected a committed, validly-decoded `ConfChange`.
   ConfChangeApply,
   /// A snapshot blob failed to decode as `F::Snapshot` (install or restart).
@@ -242,6 +251,8 @@ impl PoisonReason {
       Self::SnapshotCapture => "snapshot_capture",
       Self::ConfChangeDecode => "conf_change_decode",
       Self::SetReadModeDecode => "set_read_mode_decode",
+      Self::SplitDecode => "split_decode",
+      Self::SplitUnsupported => "split_unsupported",
       Self::ConfChangeApply => "conf_change_apply",
       Self::SnapshotDecode => "snapshot_decode",
       Self::SnapshotRestore => "snapshot_restore",
