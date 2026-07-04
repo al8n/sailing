@@ -90,8 +90,8 @@ pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 
 mod multi;
 pub use multi::{
-  EngineLog, EngineStable, EngineStorageError, FloorStore, GroupEngine, GroupId, MERGED_FLOOR,
-  MultiRaft, NoFloors, floor_admits,
+  EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
+  GroupEngine, GroupId, MERGED_FLOOR, MultiRaft, NoFloors, floor_admits,
 };
 
 mod tracker;
