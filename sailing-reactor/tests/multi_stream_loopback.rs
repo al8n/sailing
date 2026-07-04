@@ -2732,3 +2732,103 @@ async fn fork_rollback_leaves_no_engine_residue() {
     3
   );
 }
+
+/// THE fork-then-join flow, end to end: nodes 1+2 each fork child 300 from the SAME preloaded
+/// blob (voters {1,2}), the child elects and commits a live tail on top of the baseline, and
+/// node 3 — whose factory materializes an EMPTY replica on the leader's post-AddNode
+/// solicitation — catches up BY SNAPSHOT: the persisted fork blob plus the tail land on its
+/// replica (an empty-booted joiner replaying only the tail would sit at 2, not 9). The
+/// co-hosted sibling group is untouched throughout.
+#[tokio::test(flavor = "multi_thread")]
+async fn forked_group_serves_and_snapshots_a_late_joiner() {
+  let addrs = addrs(44_960, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 3 {
+      // Node 3's catalog knows child 300 and its replica set; the factory materializes an
+      // EMPTY replica when the leader's post-AddNode contact solicits it.
+      let driver = driver.with_group_factory(factory_fn(
+        |group: &u64, from: &u64| {
+          (*group == 300 && [1u64, 2].contains(from))
+            .then(|| GroupBlueprint::new(config(3, vec![1, 2, 3]), 3))
+        },
+        |_group: &u64| Some(CountSm::default()),
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh on all three nodes.
+  create_group_everywhere(&handles, 900, &[1, 2, 3]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Nodes 1 and 2 fork the child from the SAME blob: a preloaded count of 7.
+  let blob: Bytes = encoded(7).into();
+  for (i, h) in handles[..2].iter().enumerate() {
+    let id = i as u64 + 1;
+    h.create_group_from_fork(
+      300,
+      config(id, vec![1, 2]),
+      id,
+      CountSm::default(),
+      blob.clone(),
+      0,
+    )
+    .await
+    .expect("fork admission");
+  }
+  let g300: Vec<_> = handles.iter().map(|h| h.group(300)).collect();
+
+  // The forked pair elects and commits a live tail ON TOP of the preloaded baseline.
+  assert_eq!(
+    submit_anywhere(&g300[..2], b"t1").await,
+    8,
+    "7 preloaded + 1"
+  );
+  assert_eq!(submit_anywhere(&g300[..2], b"t2").await, 9);
+
+  // The leader adds node 3, whose replica exists nowhere yet: the factory materializes it
+  // EMPTY, and the fork baseline forces the leader onto the snapshot path toward it.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed AddNode in time"
+    );
+    let at = find_leader(&g300[..2], "child pre-add").await;
+    let cc = ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new());
+    match g300[at].conf_change(cc).await {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(50)).await,
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  }
+
+  // FSM equality across ALL THREE replicas: the preloaded state AND the tail are everywhere.
+  for (i, g) in g300.iter().enumerate() {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "node {} never served the joined count",
+        i + 1
+      );
+      if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
+        assert_eq!(c, 9, "node {}'s replica equals preloaded + tail", i + 1);
+        break;
+      }
+      tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+  }
+
+  // The sibling group is unaffected by the fork/join churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
