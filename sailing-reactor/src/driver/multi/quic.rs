@@ -30,7 +30,8 @@ use sailing_proto::{
 };
 
 use sailing_driver::{
-  LifecycleEvent, MultiCommand, MultiHandle, Node, Status, jittered,
+  BoxedGroupFactory, GroupFactory, LifecycleEvent, MultiCommand, MultiHandle, Node, Status,
+  jittered,
   shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
@@ -85,6 +86,10 @@ where
   /// The driver-owned lifecycle tail: unknown-group placement signals and removed-self
   /// notifications (see [`LifecycleEvent`]), bounded and best-effort like the events tail.
   lifecycle_tx: flume::Sender<LifecycleEvent<G, I>>,
+  /// The registered auto-materialization hook (see [`GroupFactory`]), consulted on each polled
+  /// unknown-group signal BEFORE the lifecycle tail. `None` = every signal falls through to the
+  /// tail — the factory-less driver, byte for byte.
+  factory: Option<BoxedGroupFactory<G, I, F>>,
   storage_ready: flume::Receiver<()>,
   _storage_ready_keepalive: Option<flume::Sender<()>>,
   peers: Vec<Node<I, SocketAddr>>,
@@ -194,6 +199,7 @@ where
         events_tx: event_tx,
         stub_events_tx,
         lifecycle_tx,
+        factory: None,
         storage_ready,
         _storage_ready_keepalive: keepalive,
         peers,
@@ -222,6 +228,20 @@ where
   #[must_use]
   pub fn engine_metrics(&self) -> EngineMetrics {
     self.metrics.clone()
+  }
+
+  /// Register a [`GroupFactory`] — the auto-materialization hook consulted on every polled
+  /// unknown-group signal (see the trait for the full admission-edge contract). Set between
+  /// `bind` and `run()`; without it the driver forwards every signal to the lifecycle tail
+  /// exactly as before. `Send + 'static` because the factory rides the `Send` `run()` future
+  /// across a work-stealing runtime's threads.
+  #[must_use]
+  pub fn with_group_factory<Fac>(mut self, factory: Fac) -> Self
+  where
+    Fac: GroupFactory<G, I, F> + Send + 'static,
+  {
+    self.factory = Some(Box::new(factory));
+    self
   }
 
   /// Drive every hosted group until shutdown (or until every `MultiHandle` clone has dropped and
@@ -966,10 +986,25 @@ where
         _ => {}
       }
     }
-    // UNKNOWN-GROUP placement signals into the lifecycle tail: the embedder's trigger to create
-    // or restore the group on this host — or to ignore it (the coordinator keeps dropping the
-    // group's entries either way).
+    // UNKNOWN-GROUP placement signals: a registered factory is consulted FIRST, in THIS crank —
+    // poll, materialize, admit run synchronously with every lifecycle mutation (one driver task),
+    // so no removal or tombstone can interleave between the signal and the admission (see the
+    // stream sibling). A `Some(blueprint)` runs the exact CreateGroup command path and consumes
+    // the signal; a decline or a create refusal falls through to the lifecycle tail as before.
     while let Some((group, from)) = self.coord.poll_unknown_group() {
+      let blueprint = self
+        .factory
+        .as_mut()
+        .and_then(|factory| factory.materialize(&group, &from));
+      if let Some(blueprint) = blueprint {
+        let (config, seed, fsm) = blueprint.into_parts();
+        if self
+          .create_group(now, group.cheap_clone(), config, seed, fsm)
+          .is_ok()
+        {
+          continue;
+        }
+      }
       let _ = self
         .lifecycle_tx
         .try_send(LifecycleEvent::UnknownGroup { group, from });

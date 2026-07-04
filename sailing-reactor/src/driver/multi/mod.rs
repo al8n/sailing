@@ -12,7 +12,11 @@
 //! solicitations, removed-self conf changes) on the
 //! [`MultiHandle::lifecycle`](sailing_driver::MultiHandle::lifecycle) tail: the placement policy
 //! itself — where a group should live, when to tear a removed replica down — is explicitly the
-//! embedder's, whether a PD-style external placer or a Cockroach-style local one.
+//! embedder's, whether a PD-style external placer or a Cockroach-style local one. A registered
+//! [`GroupFactory`](sailing_driver::GroupFactory) (`with_group_factory`) moves the admission
+//! EDGE into the driver crank — a solicited group the factory recognizes materializes
+//! hands-free, CockroachDB's `getOrCreateReplica` shape — while the decisions stay wherever the
+//! embedder's policy lives.
 
 mod quic;
 mod stream;
