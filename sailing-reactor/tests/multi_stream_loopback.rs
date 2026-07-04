@@ -2387,3 +2387,193 @@ async fn factory_never_overrides_a_tombstone() {
   assert_eq!(submit_anywhere(&g100, b"rejoined").await, 2);
   assert_eq!(submit_anywhere(&g900, b"still").await, 2);
 }
+
+/// The full-stack cell-1/cell-4 walk: a gen-1 group's removal floors the id at 2 in the host's
+/// engine, so even after the explicit tombstone clear the SAME incarnation is refused with the
+/// admission-floor rejection — consent cures a tombstone, never the durable fence — while the
+/// NEXT incarnation admits cleanly and serves.
+#[tokio::test(flavor = "multi_thread")]
+async fn removal_at_gen_floors_the_id() {
+  let addr: SocketAddr = "127.0.0.1:44860".parse().unwrap();
+  let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 1)
+    .await
+    .expect("the gen-1 incarnation admits");
+  assert!(handle.remove_group(100).await.expect("remove resolves"));
+  assert!(
+    handle.clear_tombstone(100).await.expect("clear resolves"),
+    "a tombstone existed"
+  );
+
+  // The tombstone consent is spent — and still the SAME incarnation is refused: the removal
+  // floored the id at gen 2, and the fence outranks the (now-cleared) volatile gate.
+  match handle
+    .create_group(100, config(1, vec![1]), 2, CountSm::default(), 1)
+    .await
+  {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(reason.contains("admission floor"), "got: {reason}");
+    }
+    other => panic!("expected the below-floor rejection, got {other:?}"),
+  }
+
+  // The next incarnation is exactly what the floor admits.
+  handle
+    .create_group(100, config(1, vec![1]), 2, CountSm::default(), 2)
+    .await
+    .expect("the gen-2 incarnation admits");
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle.group(100)), b"x").await,
+    1,
+    "the re-admitted incarnation is fresh and functional"
+  );
+}
+
+/// A floored id never re-materializes through the factory: node 2 hosted group 100 at gen 1 and
+/// removed it (floor 2 persisted in its engine), the tombstone is explicitly cleared — so the
+/// solicitation stream REACHES the factory — and the factory's stale gen-0 blueprint is then
+/// refused by the pre-build floor gate: the cheap materialize phase runs, the build (resource)
+/// phase NEVER does, and the solicitation surfaces on the lifecycle tail as unplaceable.
+#[tokio::test(flavor = "multi_thread")]
+async fn floored_id_never_rematerializes_via_factory() {
+  let addrs = addrs(44_880, 2);
+  let blueprinted = Arc::new(AtomicUsize::new(0));
+  let built = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let blueprinted = blueprinted.clone();
+      let built = built.clone();
+      // The stale catalog view: the factory still vouches for group 100 at its ORIGINAL
+      // incarnation (`GroupBlueprint::new` defaults to gen 0) — exactly the advisory replay the
+      // floor exists to fence.
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, _from: &u64| {
+          (*group == 100).then(|| {
+            blueprinted.fetch_add(1, Ordering::SeqCst);
+            GroupBlueprint::new(config(2, vec![1, 2]), 2)
+          })
+        },
+        move |_group: &u64| {
+          built.fetch_add(1, Ordering::SeqCst);
+          Some(CountSm::default())
+        },
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh (and pins driver survival through the refusals below).
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Node 2 hosts group 100's gen-1 incarnation, then retires it: the removal floors the id at
+  // 2 in node 2's engine, and the explicit clear spends the tombstone so ONLY the floor stands
+  // between the id and the factory below.
+  handles[1]
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default(), 1)
+    .await
+    .expect("the gen-1 incarnation admits on node 2");
+  assert!(handles[1].remove_group(100).await.expect("remove resolves"));
+  assert!(
+    handles[1]
+      .clear_tombstone(100)
+      .await
+      .expect("clear resolves"),
+    "a tombstone existed"
+  );
+
+  // Node 1 solicits the id (campaigning into the void); node 2's factory vouches — and the
+  // pre-build floor gate refuses the stale incarnation, so the signal falls to the tail.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 2)
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(handles[1].lifecycle(), "the floored solicitation", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::UnknownGroup {
+        group: 100,
+        from: 1
+      }
+    )
+  })
+  .await;
+  assert!(
+    blueprinted.load(Ordering::SeqCst) >= 1,
+    "the factory vouched — the FLOOR gate refused it"
+  );
+  assert_eq!(
+    built.load(Ordering::SeqCst),
+    0,
+    "a floored id must never reach the build phase — no state machine constructed"
+  );
+  // Nothing materialized; the group stays un-hosted on node 2.
+  match handles[1].group(100).status().await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("a floored id must leave the group un-hosted, got {other:?}"),
+  }
+  // The co-hosted sibling rides out the refusal churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
+
+/// The HONESTY pin: floors survive exactly what the engine survives. In-session the fence holds
+/// across remove + clear; a FRESH driver on the same address (the in-memory reference engine's
+/// restart) admits gen 0 again — durable floors are the disk-engine mirror's obligation, and the
+/// embedder's catalog remains the cross-restart authority until one is in use.
+#[tokio::test(flavor = "multi_thread")]
+async fn floors_survive_what_the_engine_survives() {
+  let addr: SocketAddr = "127.0.0.1:44900".parse().unwrap();
+  let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 1)
+    .await
+    .expect("the gen-1 incarnation admits");
+  assert!(handle.remove_group(100).await.expect("remove resolves"));
+  assert!(
+    handle.clear_tombstone(100).await.expect("clear resolves"),
+    "a tombstone existed"
+  );
+  // In-session: the fence holds through the spent consent.
+  match handle
+    .create_group(100, config(1, vec![1]), 2, CountSm::default(), 1)
+    .await
+  {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(reason.contains("admission floor"), "got: {reason}");
+    }
+    other => panic!("expected the below-floor rejection, got {other:?}"),
+  }
+
+  // "Restart": tear the host down (releasing the port) and bind a FRESH driver on the same
+  // address — a new in-memory engine, as a process restart produces.
+  handle.shutdown().await.expect("teardown completes");
+  let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  // The DOCUMENTED volatility: the in-memory reference engine's floors died with it, so the
+  // stale gen-0 advisory admits again. A disk engine mirroring the lineage contract would
+  // refuse this — that refusal is its obligation, not this host's.
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("a fresh engine has no floors — gen 0 admits (the documented volatility)");
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle.group(100)), b"x").await,
+    1,
+    "the post-restart incarnation serves"
+  );
+}
