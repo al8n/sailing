@@ -159,6 +159,28 @@ where
     /// other operation so handle clones cannot amplify unbudgeted commands into the channel.
     reservation: ReservationGuard,
   },
+  /// Create a group born from LOCALLY-FORKED state — a manufactured snapshot install over the
+  /// engine's fresh stores (see `MultiRaft::create_group_from_fork`). The DRIVER supplies the
+  /// boot epoch, exactly as on [`RestoreGroup`](Self::RestoreGroup).
+  CreateGroupFromFork {
+    /// The new group's id.
+    gid: G,
+    /// The group's consensus config.
+    config: Config<I>,
+    /// The group's election-jitter seed.
+    seed: u64,
+    /// The restore vessel: the state machine the authoritative `snapshot` blob is decoded into.
+    fsm: F,
+    /// The authoritative preloaded-state blob, persisted as the group's baseline snapshot.
+    snapshot: bytes::Bytes,
+    /// The id's incarnation under the single-incarnation contract; 0 unless the embedder
+    /// reshapes ids.
+    generation: u64,
+    /// Answered with the admission verdict.
+    reply: oneshot::Sender<Result<(), DriverError<I>>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
   /// Recover a group from the host's shared storage engine. The DRIVER supplies the boot epoch
   /// (the engine's per-group monotonic counter), so the caller passes none.
   RestoreGroup {
@@ -358,6 +380,38 @@ where
       config,
       seed,
       fsm,
+      generation,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Create a group born from LOCALLY-FORKED state and await the admission verdict: the driver
+  /// manufactures the snapshot baseline — `snapshot` is the AUTHORITATIVE preloaded-state blob,
+  /// `fsm` the vessel it is decoded into — in the group's fresh engine stores and boots through
+  /// the restart path, so a later zero-progress joiner is forced onto the snapshot path (never
+  /// a log walk over its empty state machine). The boot epoch comes from the engine, as on
+  /// [`restore_group`](Self::restore_group); admission (tombstone, floor, `generation`) and the
+  /// refusal surface are exactly [`create_group`](Self::create_group)'s. A fork is a local act
+  /// by an already-authorized replica — never solicited over the wire, never factory-built.
+  pub async fn create_group_from_fork(
+    &self,
+    gid: G,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    snapshot: bytes::Bytes,
+    generation: u64,
+  ) -> Result<(), DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::CreateGroupFromFork {
+      gid,
+      config,
+      seed,
+      fsm,
+      snapshot,
       generation,
       reply: tx,
       reservation,

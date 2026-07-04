@@ -279,3 +279,37 @@ fn lifecycle_tail_delivers_signals_to_any_clone() {
     LifecycleEvent::RemovedSelf { group: 9 }
   );
 }
+
+/// The fork lifecycle command round-trips its typed payload — the snapshot bytes and the vessel
+/// FSM move through the channel intact — and its reply resolves the awaiting caller, flattened
+/// exactly like the other lifecycle verbs.
+#[test]
+fn fork_command_round_trips_its_payload_and_reply() {
+  futures_executor::block_on(async {
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
+    let blob = Bytes::from_static(b"forkblob");
+    let mut fork =
+      Box::pin(handle.create_group_from_fork(300, config(), 9, CountSm, blob.clone(), 4));
+    assert!(matches!(futures_util::poll!(fork.as_mut()), Poll::Pending));
+    match cmd_rx.try_recv().expect("the fork was enqueued") {
+      MultiCommand::CreateGroupFromFork {
+        gid,
+        seed,
+        generation,
+        snapshot,
+        fsm: _fsm,
+        reply,
+        ..
+      } => {
+        assert_eq!(gid, 300);
+        assert_eq!(seed, 9);
+        assert_eq!(generation, 4, "the incarnation rides the command");
+        assert_eq!(snapshot, blob, "the blob moves through intact");
+        reply.send(Ok(())).expect("the caller is awaiting");
+      }
+      _ => panic!("expected a CreateGroupFromFork"),
+    }
+    fork.await.expect("the admission verdict resolves");
+  });
+}
