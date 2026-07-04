@@ -2270,6 +2270,90 @@ where
     last.checked_next().filter(|i| i.get() != u64::MAX)
   }
 
+  /// The `match < removal` half of the conf-change farewell (see the emission site in
+  /// [`Self::apply_committed`]'s fold): deliver the removal commit to a pruned peer as ONE
+  /// prev-checked `AppendEntries` carrying the peer's missing suffix `(matched, removal]` with
+  /// `commit = removal`. The prev-check anchors at `matched` — the leader's proven-replicated
+  /// floor for the peer — so the peer accepts it by construction and applies its own removal;
+  /// unlike the clamped farewell Heartbeat, this closes the ack-in-flight ignorance window
+  /// (an ignorant removed voter otherwise campaigns at a higher term once its election timer
+  /// fires and, with an up-to-date log, briefly deposes the live leader before self-removing).
+  ///
+  /// Returns whether the append was sent. `false` — the caller falls back to the clamped
+  /// farewell Heartbeat — when the suffix cannot make ONE bounded frame: part of it is
+  /// compacted below `first_index` (the append prev/entry range cannot cross the boundary,
+  /// mirroring `maybe_send_append`'s snapshot hand-off — and a pruned peer gets no snapshot),
+  /// the read is cold (single-shot: no later pump re-drives a pruned peer), the range is wider
+  /// than one `MAX_READ_BATCH_ENTRIES` read batch (the send path's materialization bound), or
+  /// the entries exceed the live append path's one-frame sizer (`entry_frame_cost` against
+  /// `APPEND_FRAME_ENTRY_BUDGET`). Also `false` after a FATAL log read (`Err`), which poisons
+  /// exactly like every committed-range read — the caller checks and fail-stops.
+  fn send_farewell_append<L: LogStore>(
+    &mut self,
+    log: &L,
+    peer: I,
+    matched: Index,
+    removal: Index,
+  ) -> bool {
+    let next = matched.next();
+    if next < log.first_index() {
+      return false;
+    }
+    // `prev = matched` is readable: `matched >= first_index - 1`, and the boundary index keeps
+    // its term across compaction. `Index::ZERO` prev needs no term (unconditionally consistent).
+    let prev_term = if matched == Index::ZERO {
+      Term::ZERO
+    } else {
+      match self.log_term(log, matched) {
+        Some(t) => t,
+        None => return false, // poisoned (fatal term read)
+      }
+    };
+    // ONE bounded read: the range width is capped like every send/apply read, and the store's
+    // advisory byte cap is set to the frame entry budget — a store that trims below `removal`
+    // only does so when the suffix already cannot fit one frame.
+    let read_end = removal.next().min(Index::new(
+      next.get().saturating_add(MAX_READ_BATCH_ENTRIES),
+    ));
+    let read = match log.entries(
+      next..read_end,
+      crate::wire::APPEND_FRAME_ENTRY_BUDGET as u64,
+    ) {
+      Ok(EntriesRead::Ready(e)) => e,
+      Ok(EntriesRead::Pending) => return false,
+      Err(_) => {
+        self.poison(PoisonReason::LogRead);
+        return false;
+      }
+    };
+    let suffix: &[crate::Entry] = &read;
+    // The suffix must COVER the removal (a short read means trimmed or capped) and FIT one
+    // frame under the live append path's sizer.
+    if suffix.last().is_none_or(|e| e.index() != removal) {
+      return false;
+    }
+    let mut frame_used = 0usize;
+    for e in suffix {
+      frame_used = frame_used.saturating_add(crate::wire::entry_frame_cost(e));
+    }
+    if frame_used > crate::wire::APPEND_FRAME_ENTRY_BUDGET {
+      return false;
+    }
+    let (term, me) = (self.term, self.config.id());
+    self.send(
+      peer,
+      Message::AppendEntries(crate::AppendEntries::new_shared(
+        term,
+        me,
+        matched,
+        prev_term,
+        std::sync::Arc::from(suffix),
+        removal,
+      )),
+    );
+    true
+  }
+
   /// Apply all entries that have been committed but not yet applied.
   ///
   /// Every unrecoverable fault here POISONS the node (it does not silently stall): a poisoned
@@ -2433,17 +2517,33 @@ where
                 // later send targets only tracked peers — so without it the removed node never
                 // learns the removal committed (`maybe_advance_commit` does not broadcast, and
                 // this fused apply prunes in the same pass). etcd avoids the gap by ordering
-                // bcastAppend (maybeCommit) before the async application; sailing's equivalent
-                // is one Heartbeat per pruned peer carrying the broadcast rule's per-peer clamp
-                // `min(commit, match)`, read from the OLD tracker while the Progress is still
-                // resolvable. The clamp delivers the removal commit iff the leader has PROCESSED
-                // the peer's ack of the conf entry (`match >= its index`); a peer whose ack the
-                // leader has not seen — a true straggler, or one whose ack is still in flight
-                // when another voter's completes the quorum — gets a beat clamped at/below its
-                // match: safe by the same rule (it cannot be told to commit past what it has
-                // proven), it merely stays ignorant, a residual the embedder catalog covers (the
-                // references handle it with lazy GC; etcd's unclamped prev-checked bcastAppend
-                // also covers the in-flight-ack shape, at the cost of the append machinery here).
+                // bcastAppend (maybeCommit) before the async application; sailing's farewell
+                // is the same single best-effort shot, read from the OLD tracker while the
+                // Progress is still resolvable, in two shapes keyed on the peer's proven match:
+                //
+                //  - `match >= removal index`: the peer already HOLDS every entry through the
+                //    removal, so one Heartbeat carrying the broadcast rule's per-peer clamp
+                //    `min(commit, match)` delivers the commit (a heartbeat has no prev-log
+                //    check, so the clamp is the safety rule: a peer may only be told to commit
+                //    what it has proven to hold).
+                //  - `match < removal index` — a true straggler, or a peer whose ack of the
+                //    conf entry is still in flight when another voter completes the quorum —
+                //    gets one AppendEntries carrying its missing suffix `(match, removal]`
+                //    with `prev = match` and `commit = removal index`. The prev-check passes
+                //    on the peer BY CONSTRUCTION (`match` is the leader's proven-replicated
+                //    floor for it), so delivery is deterministic up to message loss; a
+                //    conflicting unacked tail above `match` is overwritten by the normal §5.3
+                //    append rules, and any truncation lands strictly above the peer's commit
+                //    (its commit never passed its proven match). Single-shot and BOUNDED
+                //    (`send_farewell_append`): when the suffix is compacted, cold, wider than
+                //    one read batch, or over the one-frame budget, fall back to the clamped
+                //    Heartbeat — such a peer needed snapshot-level catch-up anyway, and there
+                //    is no multi-frame or snapshot farewell for a peer being pruned.
+                //
+                // Residual: the removed peer stays ignorant only when the farewell is LOST in
+                // flight, or its missing suffix is beyond one frame / one read batch or
+                // compacted — the embedder's catalog covers it (the references' lazy GC; the
+                // same floor as etcd's unretried bcastAppend-before-prune).
                 // Leader-only: followers fold the same change without send authority. Fires
                 // exactly once per removal by construction: a joint removal keeps the outgoing
                 // voter's Progress until the final single-config application (leave_joint), so
@@ -2461,20 +2561,37 @@ where
                     if *peer == me || new_tracker.progress(peer).is_some() {
                       continue;
                     }
-                    peers.push((peer.cheap_clone(), core::cmp::min(commit, pr.match_index())));
+                    peers.push((peer.cheap_clone(), pr.match_index()));
                   }
-                  for (peer, peer_commit) in peers.drain(..) {
+                  for (peer, matched) in peers.drain(..) {
+                    // A fatal farewell log read poisoned the node — no further sends.
+                    if self.poison.poisoned {
+                      break;
+                    }
+                    if matched < idx
+                      && self.send_farewell_append(log, peer.cheap_clone(), matched, idx)
+                    {
+                      continue;
+                    }
+                    if self.poison.poisoned {
+                      break;
+                    }
                     self.send(
                       peer,
                       Message::Heartbeat(crate::Heartbeat::new(
                         term,
                         me.cheap_clone(),
-                        peer_commit,
+                        core::cmp::min(commit, matched),
                         Bytes::new(),
                       )),
                     );
                   }
                   self.peers_scratch = peers;
+                  // A farewell read fault is the same fatal class as any committed-range read:
+                  // fail-stop before the fold mutates further state (the node is inert).
+                  if self.poison.poisoned {
+                    break;
+                  }
                 }
                 self.tracker = new_tracker;
                 // Membership-change lease revocation: the LeaseBased read lease is safe only because
