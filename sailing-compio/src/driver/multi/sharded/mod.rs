@@ -14,7 +14,10 @@
 //! anywhere on the hot path — a frame lands on the plane that owns its group, and
 //! conn → consensus → storage all stay core-local. Every multi feature (heartbeat coalescing,
 //! quiescence, tombstones, the lifecycle tail, the group factory) works per-plane UNCHANGED,
-//! because a plane IS a full multi driver; a connection loss wakes exactly the one plane that
+//! because a plane IS a full multi driver — with ONE host-added gate: each plane's factory is
+//! shard-guarded, so a group the map assigns to a different plane can never materialize on it
+//! (mis-routed solicitations surface as unknown-group on the shared tail; mis-routed
+//! non-initial frames drop as unhosted). A connection loss wakes exactly the one plane that
 //! owned the connection.
 //!
 //! What is shared is only the CLIENT surface: one events tail, one lifecycle tail, and one
@@ -30,7 +33,8 @@ use std::{net::SocketAddr, sync::Arc};
 use sailing_proto::{Config, Event, GroupId, RecordIo, StateMachine};
 
 use sailing_driver::{
-  BindError, BoxedGroupFactory, DriverConfigError, GroupHandle, LifecycleEvent, MultiHandle, Node,
+  BindError, BoxedGroupFactory, DriverConfigError, GroupBlueprint, GroupFactory, GroupHandle,
+  LifecycleEvent, MultiHandle, Node,
 };
 
 use crate::{
@@ -70,10 +74,14 @@ fn fnv1a(bytes: &[u8]) -> u64 {
 /// The cluster-wide group → plane assignment. **The contract: every node of the cluster runs the
 /// SAME map — same shard count, same mapping.** Replication traffic for group `g` flows only
 /// between the planes named `shard(g)` on each node (plane `i` listens on and dials per-shard
-/// ports), so two nodes disagreeing on the map would dial each other's WRONG planes and the
-/// group's frames would be dropped as unhosted. The default mapping is uniform FNV-1a over the
-/// group id's canonical `Data` encoding — a fixed algorithm with no per-process state — and a
-/// custom mapping must be equally deterministic and deployed cluster-wide.
+/// ports), so two nodes disagreeing on the map would dial each other's WRONG planes. The host
+/// enforces the contract fail-closed on the automatic path: a plane consults its
+/// [`GroupFactory`] only for groups this map assigns to it, so a mis-routed solicitation
+/// surfaces as [`LifecycleEvent::UnknownGroup`] on the lifecycle tail (and a mis-routed
+/// non-initial frame drops as unhosted) instead of materializing a replica on a plane no
+/// correctly-configured peer ever dials. The default mapping is uniform FNV-1a over the group
+/// id's canonical `Data` encoding — a fixed algorithm with no per-process state — and a custom
+/// mapping must be equally deterministic and deployed cluster-wide.
 pub struct ShardMap<G> {
   shards: usize,
   mapping: Mapping<G>,
@@ -142,6 +150,49 @@ where
       }
       Mapping::Custom(f) => f(group) % self.shards,
     }
+  }
+}
+
+/// The host-installed guard around one plane's embedder factory: [`materialize`] consults the
+/// [`ShardMap`] FIRST and declines — without ever asking the inner factory — any group the map
+/// assigns to a different plane. [`ShardedCompioHost::spawn`] wraps every factory the per-shard
+/// slots yield, OUTSIDE the embedder's code, so nothing a factory implementation does can
+/// bypass it. The hazard it closes: under a K/map/addressing skew between nodes, a peer's
+/// solicitation for a group lands on the WRONG plane here, and a catalog-backed factory (the
+/// natural embedder shape — catalogs are not plane-aware) would materialize it there; a later
+/// correctly-routed create then leaves TWO local replicas of the group under this node's ONE
+/// identity, on independent WAL barriers — one voter that can ack and vote twice. With the
+/// guard the decline falls into the driver's ordinary path: no build, no create, and the
+/// solicitation surfaces as [`LifecycleEvent::UnknownGroup`] on the shared tail, so the
+/// embedder OBSERVES the skew instead of the cluster silently splitting a group. The contract
+/// this hands the embedder: a plane's factory only ever sees its own plane's groups, so a
+/// catalog-backed factory needs no shard awareness of its own.
+///
+/// [`materialize`]: GroupFactory::materialize
+struct ShardGuardedFactory<G, I, F> {
+  inner: BoxedGroupFactory<G, I, F>,
+  map: ShardMap<G>,
+  plane: usize,
+}
+
+impl<G, I, F> GroupFactory<G, I, F> for ShardGuardedFactory<G, I, F>
+where
+  G: GroupId,
+{
+  fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I>> {
+    if self.map.shard(group) != self.plane {
+      // Fail closed BEFORE the embedder's catalog is even asked: a group that does not belong
+      // to this plane must never materialize here, whatever the inner factory would say.
+      return None;
+    }
+    self.inner.materialize(group, from)
+  }
+
+  fn build(&mut self, group: &G) -> Option<F> {
+    // Delegating without a re-check is sound: the drivers' two-phase protocol calls `build`
+    // only immediately after a `Some` from `materialize` for the same group within the same
+    // drain step, and the guard above already scoped that `Some` to this plane.
+    self.inner.build(group)
   }
 }
 
@@ -237,6 +288,12 @@ fn shard_addr(base: SocketAddr, shard: usize) -> Option<SocketAddr> {
 /// - Per-plane multi semantics unchanged: coalescing, quiescence, tombstones, lifecycle
 ///   surfacing, and factories all run inside each plane exactly as on a single multi driver;
 ///   a connection loss wakes only the plane that owned the connection.
+/// - Fail closed under skew: every registered factory is wrapped in a host-installed shard
+///   guard, so traffic for a group the [`ShardMap`] assigns to a DIFFERENT plane (a peer
+///   running a different K, map, or addressing) can never materialize state on the plane it
+///   mistakenly reached — the uniform-map contract is ENFORCED on the automatic path, not
+///   merely documented. The skew surfaces as [`LifecycleEvent::UnknownGroup`] on the shared
+///   tail instead of a second local replica acking under this node's one identity.
 /// - Shared client surface: ONE events tail, ONE lifecycle tail, ONE in-flight budget across
 ///   all planes (co-located planes share the host's memory, so they share its bound).
 ///
@@ -312,8 +369,12 @@ where
   /// [`spawn`](Self::spawn) (on the spawning thread), and each `Some` factory moves into its
   /// plane — one INSTANCE per plane, because a factory is stateful and a plane must never share
   /// one. A plane given `None` runs factory-less (its solicitations fall through to the shared
-  /// lifecycle tail). Each plane's factory sees only the solicitations for groups the shard map
-  /// routes to that plane, so a catalog-backed factory needs no shard filtering of its own.
+  /// lifecycle tail). Every installed factory sits behind a host-owned shard guard: a plane
+  /// consults its factory only for groups the [`ShardMap`] assigns to that plane and declines
+  /// the rest before the factory is even asked — so a catalog-backed factory needs no shard
+  /// filtering of its own, and a skewed peer's mis-routed solicitation can never trick a plane
+  /// into materializing a group the map places elsewhere (it surfaces as
+  /// [`LifecycleEvent::UnknownGroup`] instead).
   #[must_use]
   pub fn with_group_factories<Fac>(mut self, per_shard: Fac) -> Self
   where
@@ -386,7 +447,20 @@ where
       let record_layers = self.record_layers.clone();
       let tails = tails.clone();
       let driver_cfg = self.driver_cfg.clone();
-      let factory = self.factories.as_mut().and_then(|slots| slots(shard));
+      // Every factory the slots yield is wrapped in the shard guard HERE, outside the
+      // embedder's code: the plane refuses to materialize groups the map assigns elsewhere.
+      // The map clone is cheap — a count plus, for a custom mapping, one shared `Arc`'d fn.
+      let factory = self
+        .factories
+        .as_mut()
+        .and_then(|slots| slots(shard))
+        .map(|inner| {
+          Box::new(ShardGuardedFactory {
+            inner,
+            map: self.map.clone(),
+            plane: shard,
+          }) as BoxedGroupFactory<G, I, F>
+        });
       let staging_cap = self.snapshot_staging_cap;
       let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict<G, I, F>>();
       let thread = std::thread::spawn(move || {
@@ -600,7 +674,8 @@ where
   /// a known plane, plane-local shutdown in tests). Group-keyed operations issued here bypass
   /// the shard map: a create on the wrong plane would host a replica no other node ever dials,
   /// so lifecycle mutations should ride the sharded surface unless the caller re-derives the
-  /// map itself.
+  /// map itself. Manual creates also bypass the shard guard — it covers only factory
+  /// materialization, and this handle is the deliberate opt-out.
   #[must_use]
   pub fn shard_handle(&self, shard: usize) -> Option<&MultiHandle<G, I, F>> {
     self.shards.get(shard)
