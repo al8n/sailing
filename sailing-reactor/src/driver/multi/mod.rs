@@ -20,6 +20,8 @@
 
 mod quic;
 mod stream;
+#[cfg(test)]
+mod tests;
 
 pub use quic::MultiReactorQuicDriver;
 pub use stream::MultiReactorStreamDriver;
@@ -60,6 +62,25 @@ pub(crate) fn conf_names<I: Ord>(conf: &sailing_proto::ConfState<I>, me: &I) -> 
     || conf.voters_outgoing().contains(me)
     || conf.learners().contains(me)
     || conf.learners_next().contains(me)
+}
+
+/// Whether a factory blueprint's seed config names the soliciting peer `from` — the SENDER leg
+/// of the factory admission edge, enforced by the drivers fail-closed. A legitimate solicitation
+/// is INITIAL-SHAPED consensus traffic — a campaigner's vote request or a leader's first-contact
+/// heartbeat — so its sender is by construction a member of the group it solicits; a blueprint
+/// that does not name the solicitor is either a stale catalog view (membership moved on: refuse
+/// here, the signal falls to the lifecycle tail for the embedder's manual path) or an
+/// unauthorized cross-domain solicitation from a peer that merely shares transport
+/// authentication (refuse, period). The seed [`Config`](sailing_proto::Config) is a simple
+/// single configuration whose only membership set is the voter list — a joining host's own
+/// learner shape is its OWN id's absence from the voters (`try_new_observer`), never a remote
+/// learner list, and only voters campaign or lead — so "names" is exactly voter-list
+/// containment.
+pub(crate) fn blueprint_names<I: PartialEq, F>(
+  blueprint: &sailing_driver::GroupBlueprint<I, F>,
+  from: &I,
+) -> bool {
+  blueprint.config_ref().voters().contains(from)
 }
 
 /// A group's last OBSERVED consensus state and the instant it last changed — the idle clock the

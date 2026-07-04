@@ -11,7 +11,7 @@ use std::{
   net::SocketAddr,
   sync::{
     Arc,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
   },
   time::Duration,
 };
@@ -1683,10 +1683,13 @@ async fn factory_materializes_solicited_group_hands_free() {
       .collect();
     let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
     if id == 2 {
-      // The factory IS the embedder's catalog check: recognize exactly group 100, decline
-      // everything else (a declined id falls through to the lifecycle tail as before).
-      let driver = driver.with_group_factory(|group: &u64, _from: &u64| {
-        (*group == 100).then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
+      // The factory IS the embedder's catalog check, on both legs: the group id against the
+      // catalog AND the solicitor against the group's replica set (the driver refuses a
+      // blueprint that fails the second leg anyway — checking it here declines instead of
+      // burning a doomed materialization).
+      let driver = driver.with_group_factory(|group: &u64, from: &u64| {
+        (*group == 100 && [1u64, 2].contains(from))
+          .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
       });
       tokio::spawn(driver.run());
     } else {
@@ -1746,11 +1749,12 @@ async fn factory_decline_falls_through_to_lifecycle_tail() {
     let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
     if id == 2 {
       let consulted = consulted.clone();
-      let driver = driver.with_group_factory(move |group: &u64, _from: &u64| {
+      let driver = driver.with_group_factory(move |group: &u64, from: &u64| {
         if *group == 100 {
           consulted.fetch_add(1, Ordering::SeqCst);
         }
-        (*group == 555).then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
+        (*group == 555 && [1u64, 2].contains(from))
+          .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
       });
       tokio::spawn(driver.run());
     } else {
@@ -1798,6 +1802,97 @@ async fn factory_decline_falls_through_to_lifecycle_tail() {
   assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
 }
 
+/// The driver's sender-membership gate on factory blueprints, end to end: node 2's factory
+/// RECOGNIZES group 100 but its catalog view seeds voters {2, 3} — the actual solicitor (node
+/// 1) is absent — so the driver REFUSES the returned blueprint. Nothing materializes on node 2,
+/// the solicitation surfaces on the lifecycle tail as unplaceable (the embedder's manual path),
+/// and the co-hosted sibling group keeps serving. Correcting the catalog view to name the
+/// solicitor lets the very next solicitation materialize through the SAME factory — the gate
+/// refused the blueprint's shape, not the flow.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_blueprint_not_naming_solicitor_falls_to_lifecycle_tail() {
+  let addrs = addrs(44_720, 2);
+  let corrected = Arc::new(AtomicBool::new(false));
+  let blueprinted = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let corrected = corrected.clone();
+      let blueprinted = blueprinted.clone();
+      // Deliberately `from`-blind: the point is the DRIVER's gate, not a factory-side decline.
+      let driver = driver.with_group_factory(move |group: &u64, _from: &u64| {
+        (*group == 100).then(|| {
+          blueprinted.fetch_add(1, Ordering::SeqCst);
+          // The stale catalog view first: the group is real, but the seed voters name a
+          // would-be peer (node 3) instead of the actual solicitor (node 1).
+          let voters = if corrected.load(Ordering::SeqCst) {
+            vec![1, 2]
+          } else {
+            vec![2, 3]
+          };
+          GroupBlueprint::new(config(2, voters), 2, CountSm::default())
+        })
+      });
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh (and pins driver survival through the refusals below).
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its campaign solicits node 2. The factory RETURNS a
+  // blueprint and the driver refuses it — the signal falls through to the lifecycle tail
+  // exactly like a decline.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(handles[1].lifecycle(), "the refused blueprint", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::UnknownGroup {
+        group: 100,
+        from: 1
+      }
+    )
+  })
+  .await;
+  assert!(
+    blueprinted.load(Ordering::SeqCst) >= 1,
+    "the factory returned a blueprint — the DRIVER refused it"
+  );
+  // The refusal materialized nothing.
+  match handles[1].group(100).status().await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("a refused blueprint must leave the group un-hosted, got {other:?}"),
+  }
+  // The co-hosted sibling rides out the refusal churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+
+  // Correct the catalog view: the next solicitation's blueprint names the solicitor, and the
+  // same factory + gate materialize hands-free.
+  corrected.store(true, Ordering::SeqCst);
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while handles[1].group(100).status().await.is_err() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the corrected blueprint never materialized"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
+}
+
 /// The factory never overrides a tombstone, end to end. Node 2 hosts group 100 THROUGH its
 /// factory, then de-hosts it (`remove_group` → tombstoned) while node 1 keeps soliciting —
 /// pre-vote + check-quorum make the solicitation stream unconditional (whichever side led, the
@@ -1821,8 +1916,8 @@ async fn factory_never_overrides_a_tombstone() {
     let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
     if id == 2 {
       let materialized = materialized.clone();
-      let driver = driver.with_group_factory(move |group: &u64, _from: &u64| {
-        (*group == 100).then(|| {
+      let driver = driver.with_group_factory(move |group: &u64, from: &u64| {
+        (*group == 100 && [1u64, 2].contains(from)).then(|| {
           materialized.fetch_add(1, Ordering::SeqCst);
           GroupBlueprint::new(
             config(2, vec![1, 2])
