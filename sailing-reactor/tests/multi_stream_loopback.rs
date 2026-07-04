@@ -7,7 +7,14 @@
 
 mod common;
 
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+  net::SocketAddr,
+  sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+  },
+  time::Duration,
+};
 
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
@@ -17,8 +24,8 @@ use sailing_proto::{
   ReadOnlyOption, Role,
 };
 use sailing_reactor::{
-  DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle, MultiReactorStreamDriver,
-  Node,
+  DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
+  MultiReactorStreamDriver, Node,
 };
 
 const ELECTION: Duration = Duration::from_millis(300);
@@ -1657,4 +1664,252 @@ async fn set_read_mode_migrates_one_group_only() {
     !matches!(parked, Ok(Ok(_))),
     "a Safe read must not serve on the unreachable quorum, got {parked:?}"
   );
+}
+
+/// THE hands-free materialization flow: node 2 registers a group FACTORY recognizing group 100
+/// and never calls `create_group` for it; node 1 creates 100 (voters {1,2}) and campaigns; node
+/// 2's driver materializes the replica INSIDE the crank that polled the solicitation and the
+/// campaigner's retry completes the election — both sides commit and read. The consumed signal
+/// never reaches node 2's lifecycle tail, and the manually-created sibling group is untouched:
+/// factory-admitted and command-admitted groups host side by side.
+#[tokio::test(flavor = "multi_thread")]
+async fn factory_materializes_solicited_group_hands_free() {
+  let addrs = addrs(44_660, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      // The factory IS the embedder's catalog check: recognize exactly group 100, decline
+      // everything else (a declined id falls through to the lifecycle tail as before).
+      let driver = driver.with_group_factory(|group: &u64, _from: &u64| {
+        (*group == 100).then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
+      });
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group is created manually everywhere: it binds the mesh and pins that a
+  // factory-bearing host still admits ordinary lifecycle-command groups.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its campaign solicits node 2, whose factory materializes
+  // the replica hands-free — no create_group is ever issued for 100 on node 2.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 1");
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
+  assert_eq!(query_anywhere(&g100).await, 1);
+  assert!(
+    handles[1].group(100).status().await.is_ok(),
+    "node 2 hosts the materialized replica"
+  );
+
+  // The factory CONSUMED the solicitation: node 2's lifecycle tail never surfaced group 100
+  // (on a factory-less driver the same solicitation lands there — see
+  // `unknown_group_event_drives_creation`).
+  while let Ok(ev) = handles[1].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
+      "a factory-consumed signal must not reach the tail: {ev:?}"
+    );
+  }
+
+  // The manually-created sibling is unaffected by the factory churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
+
+/// A factory DECLINE falls through byte for byte: node 2's factory recognizes only group 555,
+/// so node 1's group-100 solicitation is declined — the `UnknownGroup` event surfaces on the
+/// lifecycle tail exactly as on a factory-less driver, nothing materializes, and the embedder's
+/// manual `create_group` (the placement brain overruling its own catalog) still completes the
+/// join.
+#[tokio::test(flavor = "multi_thread")]
+async fn factory_decline_falls_through_to_lifecycle_tail() {
+  let addrs = addrs(44_680, 2);
+  let consulted = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let consulted = consulted.clone();
+      let driver = driver.with_group_factory(move |group: &u64, _from: &u64| {
+        if *group == 100 {
+          consulted.fetch_add(1, Ordering::SeqCst);
+        }
+        (*group == 555).then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
+      });
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; node 2's factory declines it, so the signal falls through
+  // to the lifecycle tail — the factory-less flow, with the factory consulted first.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(handles[1].lifecycle(), "the declined solicitation", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::UnknownGroup {
+        group: 100,
+        from: 1
+      }
+    )
+  })
+  .await;
+  assert!(
+    consulted.load(Ordering::SeqCst) >= 1,
+    "the factory was consulted before the tail"
+  );
+  // A decline materializes nothing.
+  match handles[1].group(100).status().await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("a declined group must stay un-hosted, got {other:?}"),
+  }
+
+  // The placement brain can still place the declined group manually — exactly today's flow.
+  handles[1]
+    .create_group(100, config(2, vec![1, 2]), 2, CountSm::default())
+    .await
+    .expect("group 100 admitted on node 2");
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
+}
+
+/// The factory never overrides a tombstone, end to end. Node 2 hosts group 100 THROUGH its
+/// factory, then de-hosts it (`remove_group` → tombstoned) while node 1 keeps soliciting —
+/// pre-vote + check-quorum make the solicitation stream unconditional (whichever side led, the
+/// survivor ends up a follower pre-campaigning into the void forever). The tombstoned id is
+/// never enqueued: the factory is NOT consulted again, nothing surfaces on the lifecycle tail,
+/// and the group stays dead. `clear_tombstone` is the explicit re-admission consent, after
+/// which the very next solicitation re-materializes through the factory and the group commits
+/// again — every rejoin rides a FRESH election (the deposed side can never keep leading without
+/// its peer), so the recreated replica's catch-up starts from reset leader-side progress, never
+/// a stale match.
+#[tokio::test(flavor = "multi_thread")]
+async fn factory_never_overrides_a_tombstone() {
+  let addrs = addrs(44_700, 2);
+  let materialized = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let materialized = materialized.clone();
+      let driver = driver.with_group_factory(move |group: &u64, _from: &u64| {
+        (*group == 100).then(|| {
+          materialized.fetch_add(1, Ordering::SeqCst);
+          GroupBlueprint::new(
+            config(2, vec![1, 2])
+              .with_pre_vote(true)
+              .with_check_quorum(true),
+            2,
+            CountSm::default(),
+          )
+        })
+      });
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh (and proves it stays clean through the churn below).
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Act 1: the hands-free join (exactly one materialization — the signal is deduped until
+  // polled, and once hosted the group's frames route normally).
+  handles[0]
+    .create_group(
+      100,
+      config(1, vec![1, 2])
+        .with_pre_vote(true)
+        .with_check_quorum(true),
+      1,
+      CountSm::default(),
+    )
+    .await
+    .expect("group 100 admitted on node 1");
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  assert_eq!(submit_anywhere(&g100, b"joined").await, 1);
+  assert_eq!(materialized.load(Ordering::SeqCst), 1, "one clean join");
+
+  // Act 2: node 2 de-hosts its replica — the id is tombstoned. Node 1 keeps soliciting (its
+  // leader steps down by check-quorum without the peer, then pre-campaigns every election
+  // timeout), and every solicitation dies against the tombstone BEFORE the factory: never
+  // enqueued, never consulted, nothing on the tail.
+  assert!(
+    handles[1].remove_group(100).await.expect("remove resolves"),
+    "node 2 hosted the materialized replica"
+  );
+  tokio::time::sleep(ELECTION * 4).await;
+  assert_eq!(
+    materialized.load(Ordering::SeqCst),
+    1,
+    "a tombstoned id never reaches the factory"
+  );
+  match handles[1].group(100).status().await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("the tombstoned group must stay dead, got {other:?}"),
+  }
+  while let Ok(ev) = handles[1].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
+      "a tombstoned id must never re-solicit placement: {ev:?}"
+    );
+  }
+
+  // Act 3: the explicit two-act rejoin — clear the tombstone, and the NEXT solicitation
+  // re-materializes through the factory (no manual create).
+  assert!(
+    handles[1]
+      .clear_tombstone(100)
+      .await
+      .expect("clear resolves"),
+    "a tombstone existed"
+  );
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while handles[1].group(100).status().await.is_err() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the cleared id never re-materialized through the factory"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  assert_eq!(
+    materialized.load(Ordering::SeqCst),
+    2,
+    "re-materialization went through the factory"
+  );
+  // The rejoined group commits (the fresh replica caught up from reset progress), and the
+  // sibling group rode out the whole churn untouched.
+  assert_eq!(submit_anywhere(&g100, b"rejoined").await, 2);
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
 }
