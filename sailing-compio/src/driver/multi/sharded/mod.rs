@@ -632,6 +632,27 @@ where
       .await
   }
 
+  /// Create a group from LOCALLY-FORKED state ON ITS MAPPED PLANE and await the admission
+  /// verdict (the per-plane [`MultiHandle::create_group_from_fork`] contract): the manufactured
+  /// baseline lands in exactly the plane the shard map routes the id to, so an embedder fork —
+  /// like the split milestone's in-apply fork, which is plane-local by construction — never
+  /// hosts a replica on a plane no peer would ever dial. `generation` forwards unchanged, as on
+  /// [`create_group`](Self::create_group).
+  pub async fn create_group_from_fork(
+    &self,
+    gid: G,
+    config: Config<I>,
+    seed: u64,
+    fsm: F,
+    snapshot: bytes::Bytes,
+    generation: u64,
+  ) -> Result<(), DriverError<I>> {
+    let shard = self.map.shard(&gid);
+    self.shards[shard]
+      .create_group_from_fork(gid, config, seed, fsm, snapshot, generation)
+      .await
+  }
+
   /// Recover a group from ITS MAPPED PLANE's engine and await the admission verdict.
   /// `generation` forwards to the plane command unchanged, as on
   /// [`create_group`](Self::create_group).

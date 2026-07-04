@@ -111,3 +111,100 @@ fn shard_addr_advances_the_port_and_refuses_overflow() {
   assert_eq!(shard_addr(near_top, 0), Some(near_top));
   assert_eq!(shard_addr(near_top, 1), None, "u16 overflow is refused");
 }
+
+/// The sharded handle routes a FORK by the shard map, exactly like every other lifecycle verb:
+/// the command lands on the mapped plane's channel — payload intact — and the wrong plane never
+/// sees anything.
+#[test]
+fn fork_routes_to_its_owning_plane() {
+  use core::time::Duration;
+
+  use sailing_driver::{MultiCommand, MultiHandle, shared::InflightBudget};
+
+  use super::ShardedMultiHandle;
+
+  struct NoopSm;
+  impl sailing_proto::StateMachine for NoopSm {
+    type Command = bytes::Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = std::convert::Infallible;
+
+    fn apply(&mut self, _i: sailing_proto::Index, _c: bytes::Bytes) -> Result<u64, Self::Error> {
+      Ok(0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(0)
+    }
+    fn restore(&mut self, _s: u64) -> Result<(), Self::Error> {
+      Ok(())
+    }
+  }
+
+  // Two stub planes: each MultiHandle's command receiver is held so the routing is observable.
+  let mut plane_rx = Vec::new();
+  let mut shards = Vec::new();
+  for _ in 0..2 {
+    let (cmd_tx, cmd_rx) = flume::unbounded::<MultiCommand<u64, u64, NoopSm>>();
+    let (_event_tx, event_rx) = flume::bounded(4);
+    let (_lifecycle_tx, lifecycle_rx) = flume::bounded(4);
+    let (teardown_tx, teardown_rx) = futures_channel::oneshot::channel();
+    std::mem::forget(teardown_tx);
+    shards.push(MultiHandle::new(
+      cmd_tx,
+      event_rx,
+      lifecycle_rx,
+      InflightBudget::new(8, 1024),
+      teardown_rx,
+    ));
+    plane_rx.push(cmd_rx);
+  }
+  let (_ev_tx, events) = flume::bounded(4);
+  let (_lc_tx, lifecycle) = flume::bounded(4);
+  // The identity map over 2 planes: group 0 → plane 0, group 1 → plane 1.
+  let sharded = ShardedMultiHandle {
+    shards,
+    map: ShardMap::with_mapping(2, |g: &u64| *g as usize),
+    events,
+    lifecycle,
+    metrics: Vec::new(),
+  };
+
+  let config = sailing_proto::Config::try_new(
+    1u64,
+    vec![1],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let blob = bytes::Bytes::from_static(b"forkblob");
+  // One poll enqueues the command; the future then parks on the (never-answered) reply.
+  let fork = sharded.create_group_from_fork(1, config, 9, NoopSm, blob.clone(), 3);
+  assert!(
+    futures_util::FutureExt::now_or_never(fork).is_none(),
+    "the fork parks awaiting its admission verdict"
+  );
+
+  match plane_rx[1]
+    .try_recv()
+    .expect("the mapped plane got the fork")
+  {
+    MultiCommand::CreateGroupFromFork {
+      gid,
+      seed,
+      generation,
+      snapshot,
+      ..
+    } => {
+      assert_eq!(gid, 1);
+      assert_eq!(seed, 9);
+      assert_eq!(generation, 3);
+      assert_eq!(snapshot, blob, "the blob rides to the owning plane intact");
+    }
+    _ => panic!("expected a CreateGroupFromFork on the mapped plane"),
+  }
+  assert!(
+    plane_rx[0].try_recv().is_err(),
+    "the wrong plane never sees the fork"
+  );
+}
