@@ -1178,6 +1178,38 @@ fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
   );
 }
 
+/// The QUIC twin of the fork boot-epoch guard: `boot_epoch == 0` would issue the manufactured
+/// baseline's completions in the child's own first live epoch, so the delegator surfaces the
+/// container's refusal before any store write — the caller's fresh stores stay pristine.
+#[test]
+fn fork_refuses_boot_epoch_zero() {
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut c = multi_coord(&ca, 1, cluster);
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let e = c
+    .create_group_from_fork(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      fork_blob(3),
+      0,
+      0,
+      &NoFloors,
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::InvalidBootEpoch));
+  assert_eq!(log.first_index().get(), 1, "the refusal wrote nothing");
+  assert!(stable.snapshot().is_none());
+  assert!(!stable.has_pending(), "no completion was ever queued");
+  assert!(c.group(&100).is_none());
+}
+
 /// A successful fork PURGES a queued unknown-group signal for its id on the QUIC coordinator
 /// too — polling after the admission must not surface a stale "unknown" claim.
 #[test]

@@ -105,6 +105,18 @@ pub enum CreateGroupError {
   /// is false) and a buggy catalog could resurrect a merged-away id.
   #[error("the group id's incarnation is the reserved merged-floor sentinel (u64::MAX)")]
   ReservedGeneration,
+  /// A fork constructor was given `boot_epoch == 0`. The manufactured baseline issues its store
+  /// writes in the PRIOR boot epoch (`boot_epoch - 1`) so their completions can never alias the
+  /// child's own ops; epoch 0 has no prior epoch — the baseline would collapse into epoch 0,
+  /// the very epoch the child's op-id counter is seeded with, and a queued baseline write
+  /// acknowledgment could then release a live vote or campaign action whose durability it does
+  /// not prove. Forks boot at epoch >= 1 so the baseline occupies the prior epoch exclusively,
+  /// mirroring the restart contract (boot epochs strictly increase). Refused BEFORE any store
+  /// write — the caller's fresh stores are untouched.
+  #[error(
+    "a fork must boot at epoch >= 1 (epoch 0 would alias the baseline's completions with the child's first live ops)"
+  )]
+  InvalidBootEpoch,
 }
 
 /// Why a leader-transfer request was rejected.

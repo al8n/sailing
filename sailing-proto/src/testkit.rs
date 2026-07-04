@@ -611,6 +611,12 @@ pub(crate) struct AsyncStable {
   /// the submit-visible one. Models a conforming store, exposing writers that rebuild HardState from
   /// `hard_state()` while a floor write is in flight.
   last_durable_reads: bool,
+  /// When set, `submit_write` makes the HardState VISIBLE but HOLDS the `Wrote` completion (models a
+  /// write whose fsync is still in flight); `flush_held_writes()` releases them in submit order. The
+  /// stable-side mirror of [`VecLog::hold_appends`] — lets a test separate an EARLIER, already-queued
+  /// completion from a LATER write whose durability has not landed.
+  hold_writes: bool,
+  held_writes: VecDeque<StableDone>,
   /// The `lease_support` of every HardState actually handed to `submit_write` (post choke-point
   /// stamp). Lets a test assert the durable floor is monotone non-decreasing across all writes.
   submitted_lease: Vec<Option<Duration>>,
@@ -639,6 +645,8 @@ impl Default for AsyncStable {
       drop_next_snapshot_completion: false,
       fail_next_snapshot_durability: false,
       last_durable_reads: false,
+      hold_writes: false,
+      held_writes: VecDeque::new(),
       submitted_lease: Vec::new(),
       snapshot_staging: None,
       cold_snapshot: false,
@@ -674,6 +682,8 @@ impl AsyncStable {
     self.hard_state = self.durable_hard_state;
     self.snapshot.clone_from(&self.durable_snapshot);
     self.completions.clear();
+    // A held (un-fsync'd) write is the crash's canonical casualty.
+    self.held_writes.clear();
     // An in-RAM store loses chunk staging on a crash — the transfer restarts from offset 0.
     self.snapshot_staging = None;
   }
@@ -683,6 +693,25 @@ impl AsyncStable {
   /// flight — the exact condition Finding 2 needs.
   pub(crate) fn set_last_durable_reads(&mut self, on: bool) {
     self.last_durable_reads = on;
+  }
+
+  /// Hold the `Wrote` completion of every subsequent `submit_write` (a deferred fsync) until
+  /// [`flush_held_writes`](Self::flush_held_writes). The written HardState is still VISIBLE
+  /// immediately; only its durability acknowledgment is withheld.
+  pub(crate) fn hold_writes(&mut self, on: bool) {
+    self.hold_writes = on;
+  }
+
+  /// Release all held `Wrote` completions in submit order (the deferred fsyncs land).
+  pub(crate) fn flush_held_writes(&mut self) {
+    while let Some(done) = self.held_writes.pop_front() {
+      self.completions.push_back(done);
+    }
+  }
+
+  /// How many `submit_write`s currently have their completion held (fsync still in flight).
+  pub(crate) fn held_write_count(&self) -> usize {
+    self.held_writes.len()
   }
 
   /// The `lease_support` of every HardState handed to `submit_write`, in order.
@@ -733,7 +762,12 @@ impl StableStore for AsyncStable {
       .submitted_lease
       .push(hard_state.promised_lease_support());
     self.hard_state = hard_state;
-    self.completions.push_back(StableDone::Wrote(id));
+    if self.hold_writes {
+      // Visible now, but the `Wrote` completion is HELD (deferred fsync) — see `flush_held_writes`.
+      self.held_writes.push_back(StableDone::Wrote(id));
+    } else {
+      self.completions.push_back(StableDone::Wrote(id));
+    }
   }
 
   fn submit_snapshot(&mut self, id: OpId, meta: SnapshotMeta<u64>, data: Bytes) {

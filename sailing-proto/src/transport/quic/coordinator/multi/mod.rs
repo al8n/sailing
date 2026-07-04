@@ -304,7 +304,9 @@ where
   /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
   /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
   /// otherwise the admission checks of [`MultiRaft::create_group_from_fork`] — see
-  /// [`CreateGroupError`]. Refusal happens BEFORE any store write.
+  /// [`CreateGroupError`] — including [`CreateGroupError::InvalidBootEpoch`] when
+  /// `boot_epoch == 0` (a fork's manufactured baseline needs the prior epoch to itself).
+  /// Refusal happens BEFORE any store write.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork<L, S>(
     &mut self,
