@@ -1,0 +1,244 @@
+# Retire a group everywhere, then re-admit the SAME gid: the pure container has no tombstones
+# (the coordinator-layer tombstone gate is Tier B's to pin), so after remove-group the id admits
+# fresh replicas that elect from term 0 again — while the sibling group keeps serving across the
+# removal, untouched.
+create-group g=100 voters=(1,2,3)
+----
+n1: created g100 voters={1,2,3}
+n2: created g100 voters={1,2,3}
+n3: created g100 voters={1,2,3}
+
+create-group g=200 voters=(1,2,3)
+----
+n1: created g200 voters={1,2,3}
+n2: created g200 voters={1,2,3}
+n3: created g200 voters={1,2,3}
+
+campaign g=100 1
+----
+g100 n1 candidate term=1
+g100 RequestVote term=1 last=0/0 prevote=false
+g100 RequestVote term=1 last=0/0 prevote=false
+
+stabilize g=100
+----
+> n2 recv g100 RequestVote term=1 last=0/0 prevote=false
+> n3 recv g100 RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  g100 VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  g100 VoteResponse term=1 prevote=false reject=false
+> n1 recv g100 VoteResponse term=1 prevote=false reject=false
+> n1 recv g100 VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  g100 Heartbeat term=1 commit=0
+  g100 Heartbeat term=1 commit=0
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 n1 leader-changed term=1 lead=1
+> n2 recv g100 Heartbeat term=1 commit=0
+> n3 recv g100 Heartbeat term=1 commit=0
+> n2 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  g100 HeartbeatResponse term=1
+  g100 AppendResponse term=1 match=1
+  g100 n2 leader-changed term=1 lead=1
+> n3 ready
+  g100 HeartbeatResponse term=1
+  g100 AppendResponse term=1 match=1
+  g100 n3 leader-changed term=1 lead=1
+> n1 recv g100 HeartbeatResponse term=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 HeartbeatResponse term=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 ready
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  g100 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv g100 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  g100 AppendResponse term=1 match=1
+  g100 AppendResponse term=1 match=1
+> n3 ready
+  g100 AppendResponse term=1 match=1
+  g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+
+campaign g=200 3
+----
+g200 n3 candidate term=1
+g200 RequestVote term=1 last=0/0 prevote=false
+g200 RequestVote term=1 last=0/0 prevote=false
+
+stabilize g=200
+----
+> n1 recv g200 RequestVote term=1 last=0/0 prevote=false
+> n2 recv g200 RequestVote term=1 last=0/0 prevote=false
+> n1 ready
+  g200 VoteResponse term=1 prevote=false reject=false
+> n2 ready
+  g200 VoteResponse term=1 prevote=false reject=false
+> n3 recv g200 VoteResponse term=1 prevote=false reject=false
+> n3 recv g200 VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  g200 Heartbeat term=1 commit=0
+  g200 Heartbeat term=1 commit=0
+  g200 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g200 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g200 n3 leader-changed term=1 lead=3
+> n1 recv g200 Heartbeat term=1 commit=0
+> n2 recv g200 Heartbeat term=1 commit=0
+> n1 recv g200 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv g200 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n1 ready
+  g200 HeartbeatResponse term=1
+  g200 AppendResponse term=1 match=1
+  g200 n1 leader-changed term=1 lead=3
+> n2 ready
+  g200 HeartbeatResponse term=1
+  g200 AppendResponse term=1 match=1
+  g200 n2 leader-changed term=1 lead=3
+> n3 recv g200 HeartbeatResponse term=1
+> n3 recv g200 AppendResponse term=1 match=1
+> n3 recv g200 HeartbeatResponse term=1
+> n3 recv g200 AppendResponse term=1 match=1
+> n3 ready
+  g200 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g200 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  g200 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  g200 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n1 recv g200 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n1 recv g200 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv g200 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n2 recv g200 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n1 ready
+  g200 AppendResponse term=1 match=1
+  g200 AppendResponse term=1 match=1
+> n2 ready
+  g200 AppendResponse term=1 match=1
+  g200 AppendResponse term=1 match=1
+> n3 recv g200 AppendResponse term=1 match=1
+> n3 recv g200 AppendResponse term=1 match=1
+> n3 recv g200 AppendResponse term=1 match=1
+> n3 recv g200 AppendResponse term=1 match=1
+
+remove-group g=100
+----
+g100 removed on {1,2,3} (0 in-flight dropped)
+
+# The sibling keeps committing across the sibling's retirement.
+propose g=200 3 data=alive
+----
+g200 n3 proposed index=2
+g200 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x0500000000000000616c697665]
+g200 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x0500000000000000616c697665]
+
+stabilize g=200
+----
+> n1 recv g200 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x0500000000000000616c697665]
+> n2 recv g200 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x0500000000000000616c697665]
+> n1 ready
+  g200 AppendResponse term=1 match=2
+> n2 ready
+  g200 AppendResponse term=1 match=2
+> n3 recv g200 AppendResponse term=1 match=2
+> n3 recv g200 AppendResponse term=1 match=2
+> n3 ready
+  g200 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  g200 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  g200 n3 applied index=2
+> n1 recv g200 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 recv g200 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n1 ready
+  g200 AppendResponse term=1 match=2
+  g200 n1 applied index=2
+> n2 ready
+  g200 AppendResponse term=1 match=2
+  g200 n2 applied index=2
+> n3 recv g200 AppendResponse term=1 match=2
+> n3 recv g200 AppendResponse term=1 match=2
+
+create-group g=100 voters=(1,2,3)
+----
+n1: created g100 voters={1,2,3}
+n2: created g100 voters={1,2,3}
+n3: created g100 voters={1,2,3}
+
+campaign g=100 2
+----
+g100 n2 candidate term=1
+g100 RequestVote term=1 last=0/0 prevote=false
+g100 RequestVote term=1 last=0/0 prevote=false
+
+stabilize g=100
+----
+> n1 recv g100 RequestVote term=1 last=0/0 prevote=false
+> n3 recv g100 RequestVote term=1 last=0/0 prevote=false
+> n1 ready
+  g100 VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  g100 VoteResponse term=1 prevote=false reject=false
+> n2 recv g100 VoteResponse term=1 prevote=false reject=false
+> n2 recv g100 VoteResponse term=1 prevote=false reject=false
+> n2 ready
+  g100 Heartbeat term=1 commit=0
+  g100 Heartbeat term=1 commit=0
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 n2 leader-changed term=1 lead=2
+> n1 recv g100 Heartbeat term=1 commit=0
+> n3 recv g100 Heartbeat term=1 commit=0
+> n1 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n1 ready
+  g100 HeartbeatResponse term=1
+  g100 AppendResponse term=1 match=1
+  g100 n1 leader-changed term=1 lead=2
+> n3 ready
+  g100 HeartbeatResponse term=1
+  g100 AppendResponse term=1 match=1
+  g100 n3 leader-changed term=1 lead=2
+> n2 recv g100 HeartbeatResponse term=1
+> n2 recv g100 AppendResponse term=1 match=1
+> n2 recv g100 HeartbeatResponse term=1
+> n2 recv g100 AppendResponse term=1 match=1
+> n2 ready
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  g100 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n1 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n1 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv g100 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n1 ready
+  g100 AppendResponse term=1 match=1
+  g100 AppendResponse term=1 match=1
+> n3 ready
+  g100 AppendResponse term=1 match=1
+  g100 AppendResponse term=1 match=1
+> n2 recv g100 AppendResponse term=1 match=1
+> n2 recv g100 AppendResponse term=1 match=1
+> n2 recv g100 AppendResponse term=1 match=1
+> n2 recv g100 AppendResponse term=1 match=1
+
+raft-state g=100
+----
+n1: follower term=1 lead=2
+n2: leader term=1 lead=2
+n3: follower term=1 lead=2
+
+raft-state g=200
+----
+n1: follower term=1 lead=3
+n2: follower term=1 lead=3
+n3: leader term=1 lead=3
+

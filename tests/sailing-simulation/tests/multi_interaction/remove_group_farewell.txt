@@ -1,0 +1,141 @@
+# A 3-voter group removes one voter. The conf change commits on the survivors, and the leader's
+# single-shot farewell append carries the removal to the victim itself: n3's own conf-changed
+# event shows a config without n3 — the removed replica LEARNS its removal instead of lingering
+# ignorant (the lost-farewell residual's delivered path, at multi grain).
+create-group g=100 voters=(1,2,3)
+----
+n1: created g100 voters={1,2,3}
+n2: created g100 voters={1,2,3}
+n3: created g100 voters={1,2,3}
+
+campaign g=100 1
+----
+g100 n1 candidate term=1
+g100 RequestVote term=1 last=0/0 prevote=false
+g100 RequestVote term=1 last=0/0 prevote=false
+
+stabilize g=100
+----
+> n2 recv g100 RequestVote term=1 last=0/0 prevote=false
+> n3 recv g100 RequestVote term=1 last=0/0 prevote=false
+> n2 ready
+  g100 VoteResponse term=1 prevote=false reject=false
+> n3 ready
+  g100 VoteResponse term=1 prevote=false reject=false
+> n1 recv g100 VoteResponse term=1 prevote=false reject=false
+> n1 recv g100 VoteResponse term=1 prevote=false reject=false
+> n1 ready
+  g100 Heartbeat term=1 commit=0
+  g100 Heartbeat term=1 commit=0
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 n1 leader-changed term=1 lead=1
+> n2 recv g100 Heartbeat term=1 commit=0
+> n3 recv g100 Heartbeat term=1 commit=0
+> n2 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n3 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 ready
+  g100 HeartbeatResponse term=1
+  g100 AppendResponse term=1 match=1
+  g100 n2 leader-changed term=1 lead=1
+> n3 ready
+  g100 HeartbeatResponse term=1
+  g100 AppendResponse term=1 match=1
+  g100 n3 leader-changed term=1 lead=1
+> n1 recv g100 HeartbeatResponse term=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 HeartbeatResponse term=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 ready
+  g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+  g100 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+  g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 recv g100 AppendEntries term=1 prev=0/0 commit=0 entries=[1/1 empty]
+> n2 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n3 recv g100 AppendEntries term=1 prev=0/0 commit=1 entries=[1/1 empty]
+> n3 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[]
+> n2 ready
+  g100 AppendResponse term=1 match=1
+  g100 AppendResponse term=1 match=1
+> n3 ready
+  g100 AppendResponse term=1 match=1
+  g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+> n1 recv g100 AppendResponse term=1 match=1
+
+propose g=100 1 data=x
+----
+g100 n1 proposed index=2
+g100 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+g100 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+
+stabilize g=100
+----
+> n2 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+> n3 recv g100 AppendEntries term=1 prev=1/1 commit=1 entries=[1/2 normal 0x010000000000000078]
+> n2 ready
+  g100 AppendResponse term=1 match=2
+> n3 ready
+  g100 AppendResponse term=1 match=2
+> n1 recv g100 AppendResponse term=1 match=2
+> n1 recv g100 AppendResponse term=1 match=2
+> n1 ready
+  g100 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  g100 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+  g100 n1 applied index=2
+> n2 recv g100 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n3 recv g100 AppendEntries term=1 prev=1/2 commit=2 entries=[]
+> n2 ready
+  g100 AppendResponse term=1 match=2
+  g100 n2 applied index=2
+> n3 ready
+  g100 AppendResponse term=1 match=2
+  g100 n3 applied index=2
+> n1 recv g100 AppendResponse term=1 match=2
+> n1 recv g100 AppendResponse term=1 match=2
+
+propose-conf-change g=100 1 remove 3
+----
+g100 n1 proposed conf-change remove n3 at index 3
+g100 AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120c080112080300000000000000]
+g100 AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120c080112080300000000000000]
+
+stabilize g=100
+----
+> n2 recv g100 AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120c080112080300000000000000]
+> n3 recv g100 AppendEntries term=1 prev=1/2 commit=2 entries=[1/3 conf-change 0x120c080112080300000000000000]
+> n2 ready
+  g100 AppendResponse term=1 match=3
+> n3 ready
+  g100 AppendResponse term=1 match=3
+> n1 recv g100 AppendResponse term=1 match=3
+> n1 recv g100 AppendResponse term=1 match=3
+> n1 ready
+  g100 AppendEntries term=1 prev=1/2 commit=3 entries=[1/3 conf-change 0x120c080112080300000000000000]
+  g100 AppendEntries term=1 prev=1/3 commit=3 entries=[]
+  g100 n1 conf-changed index=3 voters={1,2}
+> n3 recv g100 AppendEntries term=1 prev=1/2 commit=3 entries=[1/3 conf-change 0x120c080112080300000000000000]
+> n2 recv g100 AppendEntries term=1 prev=1/3 commit=3 entries=[]
+> n2 ready
+  g100 AppendResponse term=1 match=3
+  g100 n2 conf-changed index=3 voters={1,2}
+> n3 ready
+  g100 AppendResponse term=1 match=3
+  g100 n3 conf-changed index=3 voters={1,2}
+> n1 recv g100 AppendResponse term=1 match=3
+> n1 recv g100 AppendResponse term=1 match=3
+
+raft-state g=100
+----
+n1: leader term=1 lead=1
+n2: follower term=1 lead=1
+n3: follower term=1 lead=1
+
+# The leader's progress view now tracks only n2.
+status g=100 1
+----
+n2: match=3 next=4 replicate
+
