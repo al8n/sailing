@@ -75,22 +75,34 @@ where
 /// changes proposed wherever the embedder's policy lives.
 ///
 /// A multi-group driver with a registered factory consults it on every polled unknown-group
-/// signal, BEFORE the signal reaches the lifecycle tail. `Some(blueprint)` admits the group on
-/// this host in the same crank — engine storage + coordinator endpoint + driver routing, the
-/// exact `create_group` command path — and consumes the signal (no
+/// signal, BEFORE the signal reaches the lifecycle tail. `Some(blueprint)` — provided its seed
+/// config names the soliciting peer (the sender leg below) — admits the group on this host in
+/// the same crank: engine storage + coordinator endpoint + driver routing, the exact
+/// `create_group` command path, and consumes the signal (no
 /// [`LifecycleEvent::UnknownGroup`](crate::LifecycleEvent::UnknownGroup) is emitted; the
 /// soliciting peer's retry completes the join). `None` DECLINES: the signal falls through to
 /// the lifecycle tail exactly as on a factory-less driver. A driver with no factory registered
 /// behaves exactly as before, byte for byte.
 ///
-/// **The factory IS the placement brain's admission edge.** The driver's only pre-filters are
-/// the coordinator's: initial-shaped kinds (a vote request, pre-vote included, or a
-/// first-contact heartbeat carrying commit 0), an authenticated sender, a group neither hosted
-/// nor tombstoned, and the 64-group signal cap. The factory MUST therefore validate the group
-/// id against the embedder's catalog and decline ids it cannot vouch for: a `Some` is a real
-/// resource commitment (storage, an endpoint, routing state), so a factory that admits
-/// unrecognized ids lets a single buggy valid-cert peer soliciting garbage ids materialize
-/// unbounded groups across cranks.
+/// **The factory IS the placement brain's admission edge — and admission has two legs.** The
+/// coordinator's pre-filters are shape-only: initial-shaped kinds (a vote request, pre-vote
+/// included, or a first-contact heartbeat carrying commit 0), an authenticated sender, a group
+/// neither hosted nor tombstoned, and the 64-group signal cap. The GROUP-ID leg is the
+/// factory's: validate the id against the embedder's catalog and decline ids it cannot vouch
+/// for — a `Some` is a real resource commitment (storage, an endpoint, routing state), so a
+/// factory that admits unrecognized ids lets a single buggy valid-cert peer soliciting garbage
+/// ids materialize unbounded groups across cranks. The SENDER leg is the driver's, enforced
+/// fail-closed on every returned blueprint: a legitimate solicitation is initial-shaped
+/// consensus traffic — a campaigner's vote request or a leader's first-contact heartbeat — so
+/// its sender is by construction a member of the group it solicits, and a blueprint whose seed
+/// config does not name the solicitor in its voter list is REFUSED (no create; the signal
+/// falls to the lifecycle tail for the embedder's manual path). A blueprint failing that check
+/// is either a stale catalog view (membership moved on) or an unauthorized cross-domain
+/// solicitation from a peer that merely shares transport authentication — in a deployment
+/// where authentication spans more than one placement domain, any valid-cert peer could
+/// otherwise solicit catalog-known ids and force allocation on hosts its groups do not touch.
+/// A factory may additionally consult `from` to decline early (skipping a doomed
+/// materialization), but the driver's refusal never depends on it.
 ///
 /// **CREATE-only.** A blueprint materializes a FRESH replica: the state machine is the initial
 /// one, and the replica learns state via the ordinary snapshot/append catch-up. Recovering a
@@ -108,8 +120,10 @@ where
 /// overrides a tombstone.
 pub trait GroupFactory<G, I, F> {
   /// Decide whether to materialize `group`, solicited by the authenticated peer `from`.
-  /// `Some(blueprint)` commits this host to admitting the group; `None` declines and the
-  /// signal surfaces on the lifecycle tail as today.
+  /// `Some(blueprint)` commits this host to admitting the group, provided the blueprint's seed
+  /// config names `from` among its voters — the driver refuses one that does not (the sender
+  /// leg of the admission edge) and surfaces the signal on the lifecycle tail instead. `None`
+  /// declines and the signal surfaces on the lifecycle tail as today.
   fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I, F>>;
 }
 

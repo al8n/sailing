@@ -44,7 +44,8 @@ use crate::{
 use crate::driver::{map_propose_err, map_read_err, map_transfer_err};
 
 use super::{
-  EngineMetrics, GroupActivity, STORAGE_REDRIVES, conf_names, group_idle, no_such_group, rejected,
+  EngineMetrics, GroupActivity, STORAGE_REDRIVES, blueprint_names, conf_names, group_idle,
+  no_such_group, rejected,
 };
 
 /// Backstop wake cadence while configured peers exist (the link reconciler's pacing on an
@@ -989,14 +990,18 @@ where
     // UNKNOWN-GROUP placement signals: a registered factory is consulted FIRST, in THIS crank —
     // poll, materialize, admit run synchronously with every lifecycle mutation (one driver task),
     // so no removal or tombstone can interleave between the signal and the admission (see the
-    // stream sibling). A `Some(blueprint)` runs the exact CreateGroup command path and consumes
-    // the signal; a decline or a create refusal falls through to the lifecycle tail as before.
+    // stream sibling). A `Some(blueprint)` naming the soliciting peer runs the exact CreateGroup
+    // command path and consumes the signal; a decline, a blueprint that does NOT name the
+    // solicitor (refused before any resource commitment — see [`blueprint_names`]), or a create
+    // refusal falls through to the lifecycle tail as before.
     while let Some((group, from)) = self.coord.poll_unknown_group() {
       let blueprint = self
         .factory
         .as_mut()
         .and_then(|factory| factory.materialize(&group, &from));
-      if let Some(blueprint) = blueprint {
+      if let Some(blueprint) = blueprint
+        && blueprint_names(&blueprint, &from)
+      {
         let (config, seed, fsm) = blueprint.into_parts();
         if self
           .create_group(now, group.cheap_clone(), config, seed, fsm)

@@ -924,10 +924,12 @@ async fn factory_materializes_solicited_group_hands_free() {
       .collect();
     let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
     if id == 2 {
-      // The factory IS the embedder's catalog check: recognize exactly group 100, decline
-      // everything else.
-      let driver = driver.with_group_factory(|group: &u64, _from: &u64| {
-        (*group == 100).then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
+      // The factory IS the embedder's catalog check, on both legs: the group id against the
+      // catalog AND the solicitor against the group's replica set (the driver refuses a
+      // blueprint that fails the second leg anyway).
+      let driver = driver.with_group_factory(|group: &u64, from: &u64| {
+        (*group == 100 && [1u64, 2].contains(from))
+          .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2, CountSm::default()))
       });
       tokio::spawn(driver.run());
     } else {

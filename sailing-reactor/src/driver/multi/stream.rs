@@ -56,7 +56,8 @@ use crate::{
 };
 
 use super::{
-  EngineMetrics, GroupActivity, STORAGE_REDRIVES, conf_names, group_idle, no_such_group, rejected,
+  EngineMetrics, GroupActivity, STORAGE_REDRIVES, blueprint_names, conf_names, group_idle,
+  no_such_group, rejected,
 };
 
 /// Backoff before re-arming `accept()` after an accept error (see the single-group driver — the
@@ -1264,18 +1265,22 @@ where
     // UNKNOWN-GROUP placement signals: a registered factory is consulted FIRST, in THIS crank —
     // poll, materialize, admit run synchronously with every lifecycle mutation (one driver task),
     // so no removal or tombstone can interleave between the signal and the admission. A
-    // `Some(blueprint)` runs the exact CreateGroup command path (engine + coordinator + routing,
-    // same rollback) and consumes the signal — the soliciting peer's retry completes the join. A
-    // decline, or a create REFUSAL (the admission gate applies to factory blueprints too —
-    // identity mismatch, invalid config, the tombstone fail-closed), falls through to the
-    // lifecycle tail, so the embedder sees what the factory could not place; without a factory
-    // every signal falls through, exactly as before.
+    // `Some(blueprint)` naming the soliciting peer runs the exact CreateGroup command path
+    // (engine + coordinator + routing, same rollback) and consumes the signal — the soliciting
+    // peer's retry completes the join. A decline, a blueprint that does NOT name the solicitor
+    // (refused before any resource commitment — see [`blueprint_names`]), or a create REFUSAL
+    // (the admission gate applies to factory blueprints too — identity mismatch, invalid config,
+    // the tombstone fail-closed) falls through to the lifecycle tail, so the embedder sees what
+    // the factory could not place; without a factory every signal falls through, exactly as
+    // before.
     while let Some((group, from)) = self.coord.poll_unknown_group() {
       let blueprint = self
         .factory
         .as_mut()
         .and_then(|factory| factory.materialize(&group, &from));
-      if let Some(blueprint) = blueprint {
+      if let Some(blueprint) = blueprint
+        && blueprint_names(&blueprint, &from)
+      {
         let (config, seed, fsm) = blueprint.into_parts();
         if self
           .create_group(now, group.cheap_clone(), config, seed, fsm)

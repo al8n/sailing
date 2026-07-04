@@ -60,16 +60,22 @@ fn a_closure_is_a_factory_and_none_declines() {
 }
 
 /// The exact trait-object form the drivers store: the same closure boxed as a
-/// [`BoxedGroupFactory`], with the decline plumbing intact through `dyn` dispatch.
+/// [`BoxedGroupFactory`], with the decline plumbing intact through `dyn` dispatch — checking
+/// both legs a factory can check (the catalog id AND the solicitor against the group's replica
+/// set).
 #[test]
 fn the_boxed_slot_drives_the_same_closure() {
-  let mut boxed: BoxedGroupFactory<u64, u64, OpaqueSm> = Box::new(|group: &u64, _from: &u64| {
-    (*group == 7).then(|| GroupBlueprint::new(config(), 1, OpaqueSm(1)))
+  let mut boxed: BoxedGroupFactory<u64, u64, OpaqueSm> = Box::new(|group: &u64, from: &u64| {
+    (*group == 7 && *from == 1).then(|| GroupBlueprint::new(config(), 1, OpaqueSm(1)))
   });
   assert!(boxed.materialize(&7, &1).is_some());
   assert!(
     boxed.materialize(&9, &1).is_none(),
     "the decline plumbs through the trait object"
+  );
+  assert!(
+    boxed.materialize(&7, &2).is_none(),
+    "a solicitor outside the replica set declines"
   );
 }
 
