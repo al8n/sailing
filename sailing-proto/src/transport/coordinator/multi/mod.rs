@@ -15,6 +15,7 @@ use crate::{
   Message, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
   multi::validate_floor,
 };
+use bytes::Bytes;
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   vec::Vec,
@@ -230,6 +231,53 @@ where
     self
       .multi
       .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
+    self.purge_unknown_signal(&key);
+    Ok(())
+  }
+
+  /// Create a group from locally forked state (see [`MultiRaft::create_group_from_fork`] for
+  /// the manufactured-snapshot-install contract). Admission is gated exactly as
+  /// [`create_group`](Self::create_group): floor first (via the caller's `floors` seam), then
+  /// the tombstone, then the container — a fork NEVER clears a tombstone, and it is never
+  /// factory-reachable (a local act by an already-authorized replica, never solicited over the
+  /// wire). A successful fork purges any queued unknown-group signal for the id, as every
+  /// admission does.
+  ///
+  /// # Errors
+  /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor (a
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) fence refuses every generation),
+  /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
+  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
+  /// otherwise the admission checks of [`MultiRaft::create_group_from_fork`] — see
+  /// [`CreateGroupError`]. Refusal happens BEFORE any store write.
+  #[allow(clippy::too_many_arguments)]
+  pub fn create_group_from_fork<L, S>(
+    &mut self,
+    gid: G,
+    config: Config<I>,
+    now: impl Into<Now>,
+    seed: u64,
+    fsm: F,
+    snapshot: Bytes,
+    boot_epoch: u64,
+    generation: u64,
+    floors: &impl FloorStore<G>,
+    log: &mut L,
+    stable: &mut S,
+  ) -> Result<(), CreateGroupError>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    I: Data,
+  {
+    validate_floor(floors.floor(&gid), generation)?;
+    if self.retired.contains(&gid) {
+      return Err(CreateGroupError::Retired);
+    }
+    let key = gid.cheap_clone();
+    self.multi.create_group_from_fork(
+      gid, config, now, seed, fsm, snapshot, boot_epoch, log, stable,
+    )?;
     self.purge_unknown_signal(&key);
     Ok(())
   }

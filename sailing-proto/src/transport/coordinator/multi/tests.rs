@@ -1498,3 +1498,236 @@ fn unknown_group_signals_cap_and_recover_on_poll() {
     .handle_conn_data(ConnId(1), &framed, false, w.now, &mut w.sb);
   assert_eq!(w.b.poll_unknown_group(), Some((2000, 1)));
 }
+
+/// Encode `n` as a CountSm snapshot blob for the fork-admission tests.
+fn fork_blob(n: u64) -> bytes::Bytes {
+  let mut v = Vec::new();
+  crate::Data::encode(&n, &mut v);
+  bytes::Bytes::from(v)
+}
+
+/// A fork NEVER clears a tombstone: the coordinator's Retired gate refuses it exactly as
+/// create/restore, the refusal writes nothing into the caller's fresh stores, and the two
+/// deliberate acts — clear, then fork — admit a group booted at the manufactured baseline.
+#[test]
+fn fork_refuses_a_tombstoned_id_until_cleared() {
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  assert!(c.remove_group(&100).is_some());
+
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let e = c
+    .create_group_from_fork(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      fork_blob(3),
+      1,
+      0,
+      &NoFloors,
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::Retired),
+    "a fork never clears a tombstone"
+  );
+  assert_eq!(log.first_index().get(), 1, "the refusal wrote nothing");
+  assert!(stable.snapshot().is_none());
+  assert!(c.is_retired(&100), "a refused fork lifts nothing");
+
+  assert!(c.clear_tombstone(&100));
+  c.create_group_from_fork(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    fork_blob(3),
+    1,
+    0,
+    &NoFloors,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let ep = c.group(&100).unwrap();
+  assert_eq!(ep.applied_index(), crate::FORK_BASE_INDEX);
+  assert_eq!(ep.state_machine().count(), 3, "booted from the fork blob");
+}
+
+/// Fork admission walks the SAME floor-first gate as create/restore — the durable fence
+/// precedes the volatile consent gate and the container — and the reserved `u64::MAX`
+/// sentinel is refused at every floor.
+#[test]
+fn fork_admission_walks_the_floor_gate_and_reserves_the_sentinel() {
+  struct Floors(u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      self.0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      0
+    }
+  }
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let e = c
+    .create_group_from_fork(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      fork_blob(3),
+      1,
+      1,
+      &Floors(2),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::BelowFloor { floor: 2 }));
+  let e = c
+    .create_group_from_fork(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      fork_blob(3),
+      1,
+      u64::MAX,
+      &Floors(2),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::ReservedGeneration));
+  let e = c
+    .create_group_from_fork(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      fork_blob(3),
+      1,
+      u64::MAX,
+      &NoFloors,
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::ReservedGeneration),
+    "the sentinel is reserved even in a never-floored world"
+  );
+  let e = c
+    .create_group_from_fork(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      fork_blob(3),
+      1,
+      u64::MAX - 1,
+      &Floors(MERGED_FLOOR),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(
+    e,
+    CreateGroupError::BelowFloor { floor: u64::MAX }
+  ));
+  let e = c
+    .create_group_from_fork(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      fork_blob(3),
+      1,
+      u64::MAX,
+      &Floors(MERGED_FLOOR),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::BelowFloor { floor: u64::MAX }),
+    "under the terminal fence the truthful verdict stays the fence itself"
+  );
+  assert_eq!(log.first_index().get(), 1, "refusals wrote nothing");
+  assert!(stable.snapshot().is_none());
+
+  c.create_group_from_fork(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    fork_blob(3),
+    1,
+    2,
+    &Floors(2),
+    &mut log,
+    &mut stable,
+  )
+  .expect("at-floor fork admitted");
+  assert_eq!(
+    c.group(&100).unwrap().applied_index(),
+    crate::FORK_BASE_INDEX
+  );
+}
+
+/// A successful fork PURGES a queued unknown-group signal for its id, exactly as create does:
+/// polling after the admission must not hand the placement brain a stale "unknown" claim.
+#[test]
+fn fork_purges_a_queued_unknown_group_signal() {
+  let mut w = World::new(&[100, 200], &[100]);
+  w.settle();
+  w.fire_a(200);
+  w.sb
+    .map
+    .insert(200, (VecLog::default(), AsyncStable::default()));
+  let (l, s) = w.sb.map.get_mut(&200).unwrap();
+  w.b
+    .create_group_from_fork(
+      200,
+      two_voter(2),
+      w.now,
+      2,
+      CountSm::default(),
+      fork_blob(3),
+      1,
+      0,
+      &NoFloors,
+      l,
+      s,
+    )
+    .unwrap();
+  assert_eq!(
+    w.b.poll_unknown_group(),
+    None,
+    "the stale signal died with the fork admission"
+  );
+}
