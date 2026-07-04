@@ -73,6 +73,24 @@ enum StagedLog {
   Compacted(Index),
 }
 
+/// One group id's lineage: the unified incarnation/shape counter and the admission floor. Kept
+/// per id, NOT per hosted group — a record must outlive [`GroupEngine::remove_group`], because
+/// fencing a removed incarnation's return is the whole point of a floor.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct LineageRecord {
+  generation: u64,
+  floor: u64,
+}
+
+impl LineageRecord {
+  /// Fold `other` in field-wise by `max` — the one merge that keeps both staging and durable
+  /// slots monotone.
+  fn fold(&mut self, other: Self) {
+    self.generation = self.generation.max(other.generation);
+    self.floor = self.floor.max(other.floor);
+  }
+}
+
 /// A shared in-memory storage engine: ONE engine hosts EVERY co-located group's replicated log
 /// and stable state, keyed by group id, with a single batched durability barrier
 /// ([`flush`](Self::flush)) spanning all of them.
@@ -87,6 +105,13 @@ enum StagedLog {
 #[derive(Debug)]
 pub struct GroupEngine<G, I> {
   groups: BTreeMap<G, GroupStorage<I>>,
+  /// Durable lineage records, deliberately SEPARATE from `groups` so they survive
+  /// [`remove_group`](Self::remove_group) (floors must be readable before a group exists and
+  /// after it is gone).
+  lineage: BTreeMap<G, LineageRecord>,
+  /// Lineage writes staged since the last barrier, monotone-max folded into `lineage` by
+  /// [`flush`](Self::flush).
+  lineage_staged: BTreeMap<G, LineageRecord>,
   flushes: u64,
   ops_flushed: u64,
   /// The per-group snapshot-staging byte cap (see
@@ -94,14 +119,17 @@ pub struct GroupEngine<G, I> {
   staging_cap: usize,
 }
 
-// No `G` bound: nothing here keys the map. `flush` alone needs `I: Clone` (folding the visible
-// stable slots into the durable ones), carried on the method rather than the block.
+// No `G` bound: nothing here keys the map. `flush` alone needs `G: Ord + I: Clone` (folding the
+// staged lineage records and the visible stable slots into the durable ones), carried on the
+// method rather than the block.
 impl<G, I> GroupEngine<G, I> {
   /// An empty engine hosting no groups.
   #[must_use]
   pub fn new() -> Self {
     Self {
       groups: BTreeMap::new(),
+      lineage: BTreeMap::new(),
+      lineage_staged: BTreeMap::new(),
       flushes: 0,
       ops_flushed: 0,
       staging_cap: usize::MAX,
@@ -156,13 +184,16 @@ impl<G, I> GroupEngine<G, I> {
   /// its barrier schedule from `has_pending` — or from a prior flush's release count — would miss
   /// writes staged DURING a completion drain (the core's storage tail submits, e.g., the
   /// commit-watermark HardState write while draining an append completion). Poll this AFTER the
-  /// per-group drains: `true` means schedule another barrier immediately.
+  /// per-group drains: `true` means schedule another barrier immediately. Pending lineage writes
+  /// ([`set_group_floor`](Self::set_group_floor)/[`set_group_gen`](Self::set_group_gen)) count
+  /// too — a staged floor must reach the barrier like any stable write.
   #[must_use]
   pub fn has_staged(&self) -> bool {
     self
       .groups
       .values()
       .any(|s| s.log.has_staged() || s.stable.has_staged())
+      || !self.lineage_staged.is_empty()
   }
 
   /// THE durability barrier: make every group's staged log appends/compactions and stable
@@ -175,15 +206,21 @@ impl<G, I> GroupEngine<G, I> {
   /// barrier: log durability is prefix-ordered (everything staged becomes durable together), and
   /// stable completions release in submit order (each group's staging is a FIFO). Log completions
   /// release in submit order too — the trait permits any order; submit order is the simplest
-  /// conforming one.
+  /// conforming one. Staged lineage records fold into their durable slots here as well
+  /// (field-wise max), one op per folded record.
   pub fn flush(&mut self) -> usize
   where
+    G: Ord,
     I: Clone,
   {
     let mut released = 0;
     for storage in self.groups.values_mut() {
       released += storage.log.release_staged();
       released += storage.stable.release_staged();
+    }
+    while let Some((gid, staged)) = self.lineage_staged.pop_first() {
+      self.lineage.entry(gid).or_default().fold(staged);
+      released += 1;
     }
     self.flushes += 1;
     self.ops_flushed += released as u64;
@@ -212,7 +249,9 @@ where
   }
 
   /// Drop `gid`'s storage — log, stable state, staged and released completions, and its
-  /// boot-epoch counter (the Phase-5 teardown seam). Returns `false` if no such group.
+  /// boot-epoch counter (the Phase-5 teardown seam). The id's LINEAGE record (gen + floor) is
+  /// deliberately retained: a floor exists precisely to outlive the group it fences. Returns
+  /// `false` if no such group.
   pub fn remove_group(&mut self, gid: &G) -> bool {
     self.groups.remove(gid).is_some()
   }
@@ -242,6 +281,50 @@ where
     let storage = self.groups.get_mut(gid)?;
     storage.boot_epochs += 1;
     Some(storage.boot_epochs)
+  }
+
+  /// `gid`'s admission floor (0 = never floored) — the FRESHEST value, `max(durable, staged)`.
+  /// Reading ahead of the barrier is safe because staging is monotone: a floor only ever grows,
+  /// so early visibility can only refuse admissions that durability would refuse too, never
+  /// admit what it would fence.
+  #[must_use]
+  pub fn group_floor(&self, gid: &G) -> u64 {
+    let durable = self.lineage.get(gid).map_or(0, |r| r.floor);
+    let staged = self.lineage_staged.get(gid).map_or(0, |r| r.floor);
+    durable.max(staged)
+  }
+
+  /// `gid`'s lineage counter — the unified incarnation/shape generation (0 = never reshaped).
+  /// Freshest value, `max(durable, staged)`, on the same monotonicity argument as
+  /// [`group_floor`](Self::group_floor).
+  #[must_use]
+  pub fn group_gen(&self, gid: &G) -> u64 {
+    let durable = self.lineage.get(gid).map_or(0, |r| r.generation);
+    let staged = self.lineage_staged.get(gid).map_or(0, |r| r.generation);
+    durable.max(staged)
+  }
+
+  /// Stage `gid`'s admission floor at `floor`. Monotone: the staged slot keeps the MAX of every
+  /// write (and [`flush`](Self::flush) folds by max again), so a belated lower write can never
+  /// soften the fence, which is what makes the pre-barrier reads above safe. Durability is the
+  /// NEXT flush — in the removal-to-flush window the floor is volatile, and the coordinator's
+  /// volatile tombstone is what covers that gap.
+  pub fn set_group_floor(&mut self, gid: &G, floor: u64)
+  where
+    G: Clone,
+  {
+    let rec = self.lineage_staged.entry(gid.clone()).or_default();
+    rec.floor = rec.floor.max(floor);
+  }
+
+  /// Stage `gid`'s lineage counter at `generation` — staged, monotone-max, freshest-read, and
+  /// barrier-durable exactly as [`set_group_floor`](Self::set_group_floor).
+  pub fn set_group_gen(&mut self, gid: &G, generation: u64)
+  where
+    G: Clone,
+  {
+    let rec = self.lineage_staged.entry(gid.clone()).or_default();
+    rec.generation = rec.generation.max(generation);
   }
 }
 

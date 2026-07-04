@@ -87,6 +87,14 @@ pub enum CreateGroupError {
   /// `RaftGroupDeletedError`, CockroachDB's tombstone check): re-admission is never implicit.
   #[error("the group id is tombstoned by a removal; clear the tombstone to re-admit it")]
   Retired,
+  /// The requested incarnation is below the id's persisted admission floor — a removal or merge
+  /// fenced it. Unlike [`Retired`](Self::Retired), no consent call cures this; only a
+  /// catalog-supplied incarnation at or above the floor can ever be admitted.
+  #[error("the group id's incarnation is below its admission floor ({floor})")]
+  BelowFloor {
+    /// The id's persisted admission floor: the smallest incarnation that may ever be admitted.
+    floor: u64,
+  },
 }
 
 /// Why a leader-transfer request was rejected.

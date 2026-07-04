@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ConfState, EntryKind};
+use crate::{ConfState, EntryKind, FloorStore, NoFloors};
 
 fn empty_entry(term: u64, index: u64) -> Entry {
   Entry::new(
@@ -563,6 +563,47 @@ fn remove_group_drops_storage() {
     log.last_index(),
     Index::ZERO,
     "re-admission starts from EMPTY storage"
+  );
+}
+
+/// Lineage records (incarnation gen + admission floor) are the reshaping fence's storage: staged
+/// writes read back immediately (monotone-max makes early visibility safe), they arm the barrier,
+/// they fold at flush as one op per record — and they deliberately OUTLIVE `remove_group`, which
+/// is the whole point of a floor.
+#[test]
+fn lineage_records_stage_read_fresh_and_survive_removal() {
+  let mut eng: GroupEngine<u64, u64> = GroupEngine::new();
+  assert_eq!(eng.group_floor(&7), 0, "never floored");
+  eng.add_group(7);
+  eng.set_group_gen(&7, 3);
+  assert_eq!(eng.group_gen(&7), 3, "staged writes read immediately");
+  assert!(eng.has_staged(), "pending lineage arms the barrier");
+  assert_eq!(eng.flush(), 1, "one folded record = one op");
+  assert!(!eng.has_staged());
+  eng.set_group_floor(&7, 4);
+  eng.set_group_floor(&7, 2); // monotone: lower write ignored
+  assert_eq!(eng.group_floor(&7), 4);
+  eng.flush();
+  assert!(eng.remove_group(&7));
+  assert_eq!(
+    (eng.group_floor(&7), eng.group_gen(&7)),
+    (4, 3),
+    "lineage OUTLIVES the group"
+  );
+  eng.add_group(7);
+  assert_eq!(
+    eng.group_floor(&7),
+    4,
+    "re-admission does not reset lineage"
+  );
+  fn floors<G, S: FloorStore<G>>(s: &S, g: &G) -> (u64, u64) {
+    (s.floor(g), s.lineage(g))
+  }
+  assert_eq!(floors(&eng, &7), (4, 3), "the engine IS the seam");
+  assert_eq!(
+    floors(&NoFloors, &7u64),
+    (0, 0),
+    "NoFloors is the gen-0 world"
   );
 }
 
