@@ -669,11 +669,27 @@ mod engine_backed_cluster {
       let mut ea = Engine::new();
       let mut eb = Engine::new();
       for g in [100u64, 200] {
-        a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-          .unwrap();
+        a.create_group(
+          g,
+          two_voter(1),
+          Instant::ORIGIN,
+          1,
+          CountSm::default(),
+          0,
+          &NoFloors,
+        )
+        .unwrap();
         assert!(ea.add_group(g));
-        b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
-          .unwrap();
+        b.create_group(
+          g,
+          two_voter(2),
+          Instant::ORIGIN,
+          2,
+          CountSm::default(),
+          0,
+          &NoFloors,
+        )
+        .unwrap();
         assert!(eb.add_group(g));
       }
       let ca = a.on_conn_open(label(1, true), Instant::ORIGIN);

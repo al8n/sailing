@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  Config, Message, Term, TimeoutNow,
+  Config, FloorStore, MERGED_FLOOR, Message, NoFloors, Term, TimeoutNow,
   testkit::{AsyncStable, CountSm, VecLog},
   transport::{ClusterId, Labeled, Passthrough, labeled::LabelOptions},
 };
@@ -34,10 +34,26 @@ fn single_voter(id: u64) -> Config<u64> {
 fn coordinator_drives_isolated_groups() {
   let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
   coord
-    .create_group(100, single_voter(1), Instant::ORIGIN, 1, CountSm::default())
+    .create_group(
+      100,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
     .unwrap();
   coord
-    .create_group(200, single_voter(1), Instant::ORIGIN, 1, CountSm::default())
+    .create_group(
+      200,
+      single_voter(1),
+      Instant::ORIGIN,
+      1,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
     .unwrap();
 
   let mut stores = Stores {
@@ -142,14 +158,30 @@ impl World {
       map: BTreeMap::new(),
     };
     for &g in a_groups {
-      a.create_group(g, two_voter(1), Instant::ORIGIN, 1, CountSm::default())
-        .unwrap();
+      a.create_group(
+        g,
+        two_voter(1),
+        Instant::ORIGIN,
+        1,
+        CountSm::default(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
       sa.map
         .insert(g, (VecLog::default(), AsyncStable::default()));
     }
     for &g in b_groups {
-      b.create_group(g, two_voter(2), Instant::ORIGIN, 2, CountSm::default())
-        .unwrap();
+      b.create_group(
+        g,
+        two_voter(2),
+        Instant::ORIGIN,
+        2,
+        CountSm::default(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
       sb.map
         .insert(g, (VecLog::default(), AsyncStable::default()));
     }
@@ -935,7 +967,15 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   // a naive create can never resurrect the id — only an explicit clear consents.
   assert_eq!(
     w.b
-      .create_group(100, two_voter(2), w.now, 2, CountSm::default())
+      .create_group(
+        100,
+        two_voter(2),
+        w.now,
+        2,
+        CountSm::default(),
+        0,
+        &NoFloors
+      )
       .unwrap_err(),
     CreateGroupError::Retired,
     "create refuses a tombstoned id"
@@ -950,6 +990,8 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
         2,
         CountSm::default(),
         1,
+        0,
+        &NoFloors,
         &mut log,
         &mut stable,
       )
@@ -974,13 +1016,188 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
     .map
     .insert(100, (VecLog::default(), AsyncStable::default()));
   w.b
-    .create_group(100, two_voter(2), w.now, 2, CountSm::default())
+    .create_group(
+      100,
+      two_voter(2),
+      w.now,
+      2,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
     .unwrap();
   w.fire_a(100);
   assert!(
     w.b.group(&100).unwrap().term() >= Term::new(1),
     "traffic flows to the re-created group"
   );
+}
+
+/// The M2 spec's 5-cell admission matrix, walked directly against coordinator admission with an
+/// in-memory seam: the durable fence is consulted first, the volatile consent gate still applies
+/// at every gen, and a NoFloors world is P5 verbatim.
+#[test]
+fn admission_checks_floor_first_then_consent_then_existence() {
+  struct Floors(u64, u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      self.0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.1
+    }
+  }
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  // cell 1: below the floor — terminal, consent cannot cure
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::BelowFloor { floor: 2 }));
+  // cell 4: at the floor — admitted
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    2,
+    &Floors(2, 0),
+  )
+  .expect("at-floor admitted");
+  // cell 1 under floor-first ordering: hosted + below-floor reports the fence, not Exists
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(
+    matches!(e, CreateGroupError::BelowFloor { .. }),
+    "floor precedes existence"
+  );
+  // cell 3: hosted at a passing gen
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      2,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::Exists));
+  // cell 2 (the subtlest): tombstoned + HIGHER gen → Retired (consent gate holds at any gen)
+  assert!(c.remove_group(&100).is_some());
+  let e = c
+    .create_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      9,
+      &Floors(2, 0),
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::Retired));
+  assert!(c.clear_tombstone(&100));
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    9,
+    &Floors(2, 0),
+  )
+  .expect("two-act rejoin");
+  // cell 5: NoFloors = the P5 world
+  let mut p5 = MultiCoord::new();
+  p5.create_group(7, single_voter(1), now, 1, CountSm::default(), 0, &NoFloors)
+    .expect("gen-0 verbatim");
+}
+
+/// `restore_group` walks the same floor-first gate as `create_group` — the catalog-supplied
+/// incarnation is what passes or fails the durable fence — and `MERGED_FLOOR` fences every
+/// usable incarnation (only the reserved `u64::MAX` itself is not below it).
+#[test]
+fn restore_admission_walks_the_same_floor_gate() {
+  struct Floors(u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      self.0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      0
+    }
+  }
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      1,
+      &Floors(2),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(e, CreateGroupError::BelowFloor { floor: 2 }));
+  let e = c
+    .restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      CountSm::default(),
+      1,
+      u64::MAX - 1,
+      &Floors(MERGED_FLOOR),
+      &mut log,
+      &mut stable,
+    )
+    .unwrap_err();
+  assert!(matches!(
+    e,
+    CreateGroupError::BelowFloor { floor: u64::MAX }
+  ));
+  c.restore_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    1,
+    2,
+    &Floors(2),
+    &mut log,
+    &mut stable,
+  )
+  .expect("at-floor restore admitted");
 }
 
 /// A vote request for a group this host neither hosts nor has tombstoned surfaces ONCE via
@@ -1018,7 +1235,15 @@ fn unknown_group_traffic_surfaces_once_until_polled() {
     .map
     .insert(200, (VecLog::default(), AsyncStable::default()));
   w.b
-    .create_group(200, two_voter(2), w.now, 2, CountSm::default())
+    .create_group(
+      200,
+      two_voter(2),
+      w.now,
+      2,
+      CountSm::default(),
+      0,
+      &NoFloors,
+    )
     .unwrap();
   assert_eq!(
     w.b.poll_unknown_group(),
