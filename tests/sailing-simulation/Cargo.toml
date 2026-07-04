@@ -22,6 +22,9 @@ derive_more.workspace = true
 [dev-dependencies]
 # Bench-only: criterion without plotters/rayon (lean dep tree; `cargo bench` + CI compile-check).
 criterion = { version = "0.8", default-features = false, features = ["cargo_bench_support"] }
+# The Tier B coordinator scenarios drive the REAL multi stream coordinator; scoping the `tcp`
+# feature to dev-dependencies keeps the library target's dependency footprint std-only.
+sailing-proto = { workspace = true, features = ["std", "tcp"] }
 
 [[bench]]
 name = "endpoint"
