@@ -21,8 +21,8 @@ pub use config::{DriverConfig, MAX_BOUNDED_QUEUE_DEPTH, MAX_CHANNEL_CAPACITY, MA
 pub use error::{BindError, DriverConfigError, DriverError};
 pub use handle::{Command, Handle, Status};
 pub use multi::{
-  BoxedGroupFactory, GroupBlueprint, GroupFactory, GroupHandle, LifecycleEvent, MultiCommand,
-  MultiHandle,
+  BoxedGroupFactory, FnFactory, GroupBlueprint, GroupFactory, GroupHandle, LifecycleEvent,
+  MultiCommand, MultiHandle, factory_fn,
 };
 pub use node::Node;
 #[cfg(feature = "unverified-wall-clock")]

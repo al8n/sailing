@@ -1,30 +1,32 @@
 //! Driver-side auto-materialization of solicited groups: the embedder registers a
-//! [`GroupFactory`] with a multi-group driver, and the driver materializes a fresh replica —
-//! a [`GroupBlueprint`]: config + seed + state machine — whenever gated unknown-group traffic
-//! solicits a group id the factory recognizes.
-
-use core::fmt;
+//! [`GroupFactory`] with a multi-group driver, and the driver materializes a fresh replica
+//! whenever gated unknown-group traffic solicits a group id the factory recognizes — in two
+//! phases. The cheap [`materialize`](GroupFactory::materialize) consultation yields a
+//! [`GroupBlueprint`] (config + seed); only after the driver's sender gate admits that
+//! blueprint does [`build`](GroupFactory::build) construct the group's initial state machine.
+//! [`factory_fn`] assembles a factory from the two phases as plain closures.
 
 use sailing_proto::Config;
 
-/// What a [`GroupFactory`] materializes: the complete admission payload for ONE fresh replica —
-/// the group's consensus [`Config`] (its node id must be the host identity latched by the first
-/// admitted group), its election-jitter seed, and its INITIAL state machine. The replica learns
-/// replicated state through the ordinary catch-up path (append or snapshot) from the soliciting
-/// group's leader; a blueprint never carries recovered state (see the CREATE-only rule on
-/// [`GroupFactory`]).
-pub struct GroupBlueprint<I, F> {
+/// What [`GroupFactory::materialize`] returns: the CHEAP half of the admission payload for one
+/// fresh replica — the group's consensus [`Config`] (its node id must be the host identity
+/// latched by the first admitted group) and its election-jitter seed. The initial state machine
+/// is deliberately absent: the driver requests it from [`GroupFactory::build`] only after this
+/// blueprint passed the sender gate, so a refused or declined solicitation never constructs
+/// one. The replica learns replicated state through the ordinary catch-up path (append or
+/// snapshot) from the soliciting group's leader; a blueprint never carries recovered state (see
+/// the CREATE-only rule on [`GroupFactory`]).
+#[derive(Debug)]
+pub struct GroupBlueprint<I> {
   config: Config<I>,
   seed: u64,
-  fsm: F,
 }
 
-impl<I, F> GroupBlueprint<I, F> {
-  /// Assemble a blueprint from the group's consensus config, its election-jitter seed, and its
-  /// initial state machine.
+impl<I> GroupBlueprint<I> {
+  /// Assemble a blueprint from the group's consensus config and its election-jitter seed.
   #[inline(always)]
-  pub const fn new(config: Config<I>, seed: u64, fsm: F) -> Self {
-    Self { config, seed, fsm }
+  pub const fn new(config: Config<I>, seed: u64) -> Self {
+    Self { config, seed }
   }
 
   /// Borrow the group's consensus config.
@@ -40,32 +42,12 @@ impl<I, F> GroupBlueprint<I, F> {
     self.seed
   }
 
-  /// Borrow the group's initial state machine.
+  /// Consume and return the `(config, seed)` pair — the blueprint's contribution to the
+  /// drivers' create path (the state machine arrives separately, from
+  /// [`GroupFactory::build`]).
   #[inline(always)]
-  pub const fn fsm_ref(&self) -> &F {
-    &self.fsm
-  }
-
-  /// Consume and return the `(config, seed, fsm)` triple — the exact argument shape of the
-  /// drivers' create path.
-  #[inline(always)]
-  pub fn into_parts(self) -> (Config<I>, u64, F) {
-    (self.config, self.seed, self.fsm)
-  }
-}
-
-// Hand-written so debuggability never hinges on the state machine: an FSM is rarely `Debug`,
-// and the blueprint's identifying content is the config + seed anyway (the elided field renders
-// as `..`).
-impl<I, F> fmt::Debug for GroupBlueprint<I, F>
-where
-  I: fmt::Debug,
-{
-  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-    f.debug_struct("GroupBlueprint")
-      .field("config", &self.config)
-      .field("seed", &self.seed)
-      .finish_non_exhaustive()
+  pub fn into_parts(self) -> (Config<I>, u64) {
+    (self.config, self.seed)
   }
 }
 
@@ -76,13 +58,13 @@ where
 ///
 /// A multi-group driver with a registered factory consults it on every polled unknown-group
 /// signal, BEFORE the signal reaches the lifecycle tail. `Some(blueprint)` — provided its seed
-/// config names the soliciting peer (the sender leg below) — admits the group on this host in
-/// the same crank: engine storage + coordinator endpoint + driver routing, the exact
-/// `create_group` command path, and consumes the signal (no
-/// [`LifecycleEvent::UnknownGroup`](crate::LifecycleEvent::UnknownGroup) is emitted; the
-/// soliciting peer's retry completes the join). `None` DECLINES: the signal falls through to
-/// the lifecycle tail exactly as on a factory-less driver. A driver with no factory registered
-/// behaves exactly as before, byte for byte.
+/// config names the soliciting peer (the sender leg below) and [`build`](Self::build) then
+/// yields the initial state machine — admits the group on this host in the same crank: engine
+/// storage + coordinator endpoint + driver routing, the exact `create_group` command path, and
+/// consumes the signal (no [`LifecycleEvent::UnknownGroup`](crate::LifecycleEvent::UnknownGroup)
+/// is emitted; the soliciting peer's retry completes the join). `None` DECLINES: the signal
+/// falls through to the lifecycle tail exactly as on a factory-less driver. A driver with no
+/// factory registered behaves exactly as before, byte for byte.
 ///
 /// **The factory IS the placement brain's admission edge — and admission has two legs.** The
 /// coordinator's pre-filters are shape-only: initial-shaped kinds (a vote request, pre-vote
@@ -102,7 +84,11 @@ where
 /// where authentication spans more than one placement domain, any valid-cert peer could
 /// otherwise solicit catalog-known ids and force allocation on hosts its groups do not touch.
 /// A factory may additionally consult `from` to decline early (skipping a doomed
-/// materialization), but the driver's refusal never depends on it.
+/// materialization), but the driver's refusal never depends on it. **The legs order around the
+/// resource phase:** the driver enforces the sender leg on the blueprint BEFORE it calls
+/// [`build`](Self::build), so even a `from`-blind factory cannot be made to construct a state
+/// machine (or open the resources one carries) for an unauthorized solicitor — the most a
+/// refused solicitation can extract, at its retry cadence, is the cheap catalog consultation.
 ///
 /// **CREATE-only.** A blueprint materializes a FRESH replica: the state machine is the initial
 /// one, and the replica learns state via the ordinary snapshot/append catch-up. Recovering a
@@ -119,20 +105,82 @@ where
 /// [`clear_tombstone`](crate::MultiHandle::clear_tombstone) + create: the factory never
 /// overrides a tombstone.
 pub trait GroupFactory<G, I, F> {
-  /// Decide whether to materialize `group`, solicited by the authenticated peer `from`.
-  /// `Some(blueprint)` commits this host to admitting the group, provided the blueprint's seed
-  /// config names `from` among its voters — the driver refuses one that does not (the sender
+  /// The CHEAP phase: decide whether to admit `group`, solicited by the authenticated peer
+  /// `from`, returning the blueprint (config + seed) if the embedder's catalog vouches for the
+  /// id. This phase must do no expensive work — no I/O, no resource acquisition, no
+  /// state-machine construction (that is [`build`](Self::build)) — because it runs for every
+  /// polled solicitation, admitted or not. A `Some` commits nothing by itself: the driver
+  /// refuses a blueprint whose seed config does not name `from` among its voters (the sender
   /// leg of the admission edge) and surfaces the signal on the lifecycle tail instead. `None`
   /// declines and the signal surfaces on the lifecycle tail as today.
-  fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I, F>>;
+  fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I>>;
+
+  /// The RESOURCE phase: construct `group`'s initial state machine. The driver calls this at
+  /// most once per accepted solicitation, immediately after a `Some` from
+  /// [`materialize`](Self::materialize) for the same group within the same drain step, and
+  /// never for a refused or declined solicitation — expensive work (opening storage, catalog
+  /// I/O, large allocation) belongs here, structurally unreachable to a solicitor the sender
+  /// gate turned away. `None` aborts the materialization: the driver surfaces the solicitation
+  /// on the lifecycle tail exactly like a create failure and survives.
+  fn build(&mut self, group: &G) -> Option<F>;
 }
 
-impl<G, I, F, T> GroupFactory<G, I, F> for T
+/// Assemble a [`GroupFactory`] from its two phases as plain closures: `seed` backs
+/// [`GroupFactory::materialize`] — the cheap catalog consultation returning the blueprint —
+/// and `build` backs [`GroupFactory::build`] — the resource phase, which the driver invokes
+/// only after its sender gate admitted the blueprint `seed` returned.
+///
+/// # Example
+///
+/// ```
+/// use core::time::Duration;
+///
+/// use sailing_driver::{GroupBlueprint, GroupFactory, factory_fn};
+/// use sailing_proto::Config;
+///
+/// let mut factory = factory_fn(
+///   // The cheap phase: consult the catalog, return config + seed.
+///   |group: &u64, _from: &u64| {
+///     (*group == 7).then(|| {
+///       let config = Config::try_new(
+///         2u64,
+///         vec![1, 2],
+///         Duration::from_millis(1000),
+///         Duration::from_millis(100),
+///       )
+///       .expect("a valid seed config");
+///       GroupBlueprint::new(config, 0x5eed)
+///     })
+///   },
+///   // The resource phase: runs only for solicitations the driver admitted.
+///   |_group: &u64| Some(Vec::<u8>::new()),
+/// );
+/// assert!(factory.materialize(&7, &1).is_some());
+/// assert!(factory.build(&7).is_some());
+/// ```
+#[inline(always)]
+pub const fn factory_fn<S, B>(seed: S, build: B) -> FnFactory<S, B> {
+  FnFactory { seed, build }
+}
+
+/// The closure-backed [`GroupFactory`] returned by [`factory_fn`]: `S` is the cheap
+/// materialize phase, `B` the driver-gated build phase.
+pub struct FnFactory<S, B> {
+  seed: S,
+  build: B,
+}
+
+impl<G, I, F, S, B> GroupFactory<G, I, F> for FnFactory<S, B>
 where
-  T: FnMut(&G, &I) -> Option<GroupBlueprint<I, F>>,
+  S: FnMut(&G, &I) -> Option<GroupBlueprint<I>>,
+  B: FnMut(&G) -> Option<F>,
 {
-  fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I, F>> {
-    self(group, from)
+  fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I>> {
+    (self.seed)(group, from)
+  }
+
+  fn build(&mut self, group: &G) -> Option<F> {
+    (self.build)(group)
   }
 }
 

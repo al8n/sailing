@@ -232,10 +232,13 @@ where
   }
 
   /// Register a [`GroupFactory`] — the auto-materialization hook consulted on every polled
-  /// unknown-group signal (see the trait for the full admission-edge contract). Set between
-  /// `bind` and `run()`; without it the driver forwards every signal to the lifecycle tail
-  /// exactly as before. `Send + 'static` because the factory rides the `Send` `run()` future
-  /// across a work-stealing runtime's threads.
+  /// unknown-group signal (see the trait for the full admission-edge contract; assemble one
+  /// from its two phases as closures with [`factory_fn`](sailing_driver::factory_fn)). The
+  /// driver builds the state machine ([`GroupFactory::build`]) only AFTER the sender gate
+  /// admitted the materialized blueprint. Set between `bind` and `run()`; without it the
+  /// driver forwards every signal to the lifecycle tail exactly as before. `Send + 'static`
+  /// because the factory rides the `Send` `run()` future across a work-stealing runtime's
+  /// threads.
   #[must_use]
   pub fn with_group_factory<Fac>(mut self, factory: Fac) -> Self
   where
@@ -990,19 +993,19 @@ where
     // UNKNOWN-GROUP placement signals: a registered factory is consulted FIRST, in THIS crank —
     // poll, materialize, admit run synchronously with every lifecycle mutation (one driver task),
     // so no removal or tombstone can interleave between the signal and the admission (see the
-    // stream sibling). A `Some(blueprint)` naming the soliciting peer runs the exact CreateGroup
-    // command path and consumes the signal; a decline, a blueprint that does NOT name the
-    // solicitor (refused before any resource commitment — see [`blueprint_names`]), or a create
-    // refusal falls through to the lifecycle tail as before.
+    // stream sibling). The order within one signal is the resource-safety line: materialize (the
+    // cheap catalog phase) → the sender gate ([`blueprint_names`], enforced BEFORE build so an
+    // unauthorized valid-cert solicitor can never force state-machine construction) → build →
+    // the exact CreateGroup command path. An admitted build consumes the signal; a decline, a
+    // refused blueprint, a build abort (`None`), or a create refusal falls through to the
+    // lifecycle tail as before.
     while let Some((group, from)) = self.coord.poll_unknown_group() {
-      let blueprint = self
-        .factory
-        .as_mut()
-        .and_then(|factory| factory.materialize(&group, &from));
-      if let Some(blueprint) = blueprint
+      if let Some(factory) = self.factory.as_mut()
+        && let Some(blueprint) = factory.materialize(&group, &from)
         && blueprint_names(&blueprint, &from)
+        && let Some(fsm) = factory.build(&group)
       {
-        let (config, seed, fsm) = blueprint.into_parts();
+        let (config, seed) = blueprint.into_parts();
         if self
           .create_group(now, group.cheap_clone(), config, seed, fsm)
           .is_ok()

@@ -22,8 +22,8 @@ pub use driver::{
 #[cfg(feature = "unverified-wall-clock")]
 pub use sailing_driver::UnverifiedSystemClock;
 pub use sailing_driver::{
-  BindError, BoxedGroupFactory, Clock, DriverConfig, DriverConfigError, DriverError,
+  BindError, BoxedGroupFactory, Clock, DriverConfig, DriverConfigError, DriverError, FnFactory,
   GroupBlueprint, GroupFactory, GroupHandle, Handle, LifecycleEvent, MAX_BOUNDED_QUEUE_DEPTH,
   MAX_CHANNEL_CAPACITY, MAX_REDIAL_BACKOFF, Monotonic, MultiCommand, MultiHandle, Node,
-  NtpDisciplinedClock, Status, WallClock, WallReading,
+  NtpDisciplinedClock, Status, WallClock, WallReading, factory_fn,
 };

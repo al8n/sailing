@@ -15,7 +15,6 @@ fn a_blueprint_names_exactly_its_seed_voters() {
   let blueprint = GroupBlueprint::new(
     Config::try_new(2u64, vec![1, 2], ELECTION, HEARTBEAT).unwrap(),
     0,
-    (),
   );
   assert!(blueprint_names(&blueprint, &1));
   assert!(blueprint_names(&blueprint, &2));
@@ -33,7 +32,6 @@ fn an_observer_seed_names_the_remote_voters_not_its_own_id() {
   let blueprint = GroupBlueprint::new(
     Config::try_new_observer(3u64, vec![1, 2], ELECTION, HEARTBEAT).unwrap(),
     0,
-    (),
   );
   assert!(
     blueprint_names(&blueprint, &1),
