@@ -70,8 +70,37 @@ impl<G> FloorStore<G> for NoFloors {
 
 /// The admission floor a merge writes for the absorbed id (the merge milestone is its ONLY
 /// writer): `u64::MAX` fences every future incarnation, so a merged-away id never returns.
-/// Consequently `u64::MAX` is NOT a usable working generation — it is reserved as this fence.
+/// Consequently `u64::MAX` is NOT a usable working generation — it is reserved as this fence,
+/// and [`floor_admits`] refuses it at ANY floor. That reservation is what makes this fence
+/// terminal BY CONSTRUCTION: the floor leg alone (`generation >= floor`) would wave the
+/// sentinel generation through its own fence, since `u64::MAX < u64::MAX` is false.
 pub const MERGED_FLOOR: u64 = u64::MAX;
+
+/// The floor-admission predicate every admission gate applies — the multi coordinators'
+/// create/restore checks and the drivers' factory pre-build gate: `generation` is admissible
+/// against `floor` iff it clears the floor AND is not the reserved [`MERGED_FLOOR`] sentinel
+/// (never a working incarnation). The second leg makes a `MERGED_FLOOR` fence refuse EVERY
+/// generation, the sentinel itself included.
+pub const fn floor_admits(floor: u64, generation: u64) -> bool {
+  generation < MERGED_FLOOR && generation >= floor
+}
+
+/// The refusing form of [`floor_admits`] the coordinators' admission methods report through:
+/// the reserved sentinel under a lower floor maps to [`CreateGroupError::ReservedGeneration`]
+/// (the caller supplied a generation that can never work), everything else to
+/// [`CreateGroupError::BelowFloor`] — under a `MERGED_FLOOR` fence the fence itself stays the
+/// truthful terminal verdict at every generation, sentinel included. Gated with its only
+/// consumers, the transport coordinators (`quic` implies `tcp`).
+#[cfg(feature = "tcp")]
+pub(crate) const fn validate_floor(floor: u64, generation: u64) -> Result<(), CreateGroupError> {
+  if floor_admits(floor, generation) {
+    Ok(())
+  } else if generation == MERGED_FLOOR && floor < MERGED_FLOOR {
+    Err(CreateGroupError::ReservedGeneration)
+  } else {
+    Err(CreateGroupError::BelowFloor { floor })
+  }
+}
 
 /// The engine IS the drivers' floor store: lookups delegate to the freshest-read lineage
 /// accessors, so a floor staged this crank already fences before the barrier lands (monotone-max

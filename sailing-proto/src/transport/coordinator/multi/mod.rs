@@ -13,6 +13,7 @@ use super::super::{
 use crate::{
   Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupId, Index, Instant, LogStore,
   Message, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
+  multi::validate_floor,
 };
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
@@ -163,9 +164,11 @@ where
   ///
   /// # Errors
   /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor
-  /// (terminal for that incarnation — no consent call cures it), [`CreateGroupError::Retired`]
-  /// when the id is tombstoned by a removal; otherwise the admission checks of
-  /// [`MultiRaft::create_group`] — see [`CreateGroupError`].
+  /// (terminal for that incarnation — no consent call cures it; a
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) fence refuses every generation),
+  /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
+  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
+  /// otherwise the admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn create_group(
     &mut self,
@@ -177,10 +180,7 @@ where
     generation: u64,
     floors: &impl FloorStore<G>,
   ) -> Result<(), CreateGroupError> {
-    let floor = floors.floor(&gid);
-    if generation < floor {
-      return Err(CreateGroupError::BelowFloor { floor });
-    }
+    validate_floor(floors.floor(&gid), generation)?;
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
     }
@@ -198,9 +198,11 @@ where
   /// one-identity oracle keys on it), voiding what the fence exists to distinguish.
   ///
   /// # Errors
-  /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor,
-  /// [`CreateGroupError::Retired`] when the id is tombstoned by a removal; otherwise the
-  /// admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
+  /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor (a
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) fence refuses every generation),
+  /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
+  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
+  /// otherwise the admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn restore_group<L, S>(
     &mut self,
@@ -220,10 +222,7 @@ where
     S: StableStore<NodeId = I>,
     I: Data,
   {
-    let floor = floors.floor(&gid);
-    if generation < floor {
-      return Err(CreateGroupError::BelowFloor { floor });
-    }
+    validate_floor(floors.floor(&gid), generation)?;
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
     }

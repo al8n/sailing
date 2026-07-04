@@ -91,7 +91,7 @@ pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 mod multi;
 pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FloorStore, GroupEngine, GroupId, MERGED_FLOOR,
-  MultiRaft, NoFloors,
+  MultiRaft, NoFloors, floor_admits,
 };
 
 mod tracker;

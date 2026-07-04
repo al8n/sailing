@@ -2528,6 +2528,83 @@ async fn floored_id_never_rematerializes_via_factory() {
   assert_eq!(submit_anywhere(&g900, b"still").await, 2);
 }
 
+/// The reserved sentinel never materializes through the factory: a buggy catalog vouches for
+/// group 100 at `u64::MAX` — the merged-tombstone sentinel, never a working incarnation — with
+/// NO fence in the way (the id was never hosted, removed, or floored on node 2), and the
+/// pre-build gate still refuses it: the cheap materialize phase runs, the build (resource)
+/// phase NEVER does, and the solicitation surfaces on the lifecycle tail as unplaceable.
+#[tokio::test(flavor = "multi_thread")]
+async fn sentinel_generation_never_materializes_via_factory() {
+  let addrs = addrs(44_920, 2);
+  let blueprinted = Arc::new(AtomicUsize::new(0));
+  let built = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let blueprinted = blueprinted.clone();
+      let built = built.clone();
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, _from: &u64| {
+          (*group == 100).then(|| {
+            blueprinted.fetch_add(1, Ordering::SeqCst);
+            GroupBlueprint::new(config(2, vec![1, 2]), 2).with_gen(u64::MAX)
+          })
+        },
+        move |_group: &u64| {
+          built.fetch_add(1, Ordering::SeqCst);
+          Some(CountSm::default())
+        },
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh (and pins driver survival through the refusals below).
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Node 1 solicits the id (campaigning into the void); node 2's factory vouches at the
+  // sentinel — and the pre-build gate refuses it, so the signal falls to the tail.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(handles[1].lifecycle(), "the sentinel solicitation", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::UnknownGroup {
+        group: 100,
+        from: 1
+      }
+    )
+  })
+  .await;
+  assert!(
+    blueprinted.load(Ordering::SeqCst) >= 1,
+    "the factory vouched — the RESERVED-generation gate refused it"
+  );
+  assert_eq!(
+    built.load(Ordering::SeqCst),
+    0,
+    "the sentinel must never reach the build phase — no state machine constructed"
+  );
+  // Nothing materialized; the group stays un-hosted on node 2.
+  match handles[1].group(100).status().await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("the sentinel must leave the group un-hosted, got {other:?}"),
+  }
+  // The co-hosted sibling rides out the refusal churn.
+  assert_eq!(submit_anywhere(&g900, b"still").await, 2);
+}
+
 /// The HONESTY pin: floors survive exactly what the engine survives. In-session the fence holds
 /// across remove + clear; a FRESH driver on the same address (the in-memory reference engine's
 /// restart) admits gen 0 again — durable floors are the disk-engine mirror's obligation, and the
