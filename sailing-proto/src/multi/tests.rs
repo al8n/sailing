@@ -197,6 +197,157 @@ fn fork_admission_matches_create_group() {
   }
 }
 
+/// A fork refuses `boot_epoch == 0` — on BOTH constructor variants — before touching anything:
+/// the manufactured baseline's writes ride the prior epoch, which epoch 0 does not have, so
+/// admitting it would issue the baseline's completions in the child's own first live epoch (see
+/// the aliasing regression below for the wrongness that releases). The refusal precedes every
+/// store write AND every container mutation: the stores stay byte-pristine (no queued
+/// completion) and the host identity is never latched.
+#[test]
+fn fork_refuses_boot_epoch_zero() {
+  let pristine = |log: &VecLog, stable: &AsyncStable| {
+    assert_eq!(log.first_index().get(), 1, "log untouched on refusal");
+    assert_eq!(log.last_index().get(), 0);
+    assert!(!log.has_pending(), "no log completion was ever queued");
+    assert!(stable.snapshot().is_none(), "snapshot slot untouched");
+    assert_eq!(stable.hard_state().term(), Term::ZERO);
+    assert!(
+      !stable.has_pending(),
+      "no stable completion was ever queued"
+    );
+  };
+
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    m.create_group_from_fork(
+      7,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      preloaded_sm(3),
+      fork_blob(3),
+      0,
+      &mut log,
+      &mut stable,
+    ),
+    Err(CreateGroupError::InvalidBootEpoch)
+  );
+  pristine(&log, &stable);
+  assert!(m.is_empty(), "nothing was admitted");
+  assert!(m.host_id().is_none(), "the refusal precedes the id latch");
+
+  assert_eq!(
+    m.create_group_from_fork_with_rng(
+      7,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      Prng::new(42),
+      preloaded_sm(3),
+      fork_blob(3),
+      0,
+      &mut log,
+      &mut stable,
+    ),
+    Err(CreateGroupError::InvalidBootEpoch)
+  );
+  pristine(&log, &stable);
+  assert!(m.is_empty());
+
+  // The floor itself admits: the SAME stores and container accept the fork at epoch 1.
+  m.create_group_from_fork(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    preloaded_sm(3),
+    fork_blob(3),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(m.group(&7).unwrap().applied_index(), FORK_BASE_INDEX);
+}
+
+/// WHY the guard exists, demonstrated at the endpoint level. The pre-guard fork shape at
+/// `boot_epoch = 0` — reproduced by calling `write_fork_baseline` directly, exactly what
+/// `create_group_from_fork` did before refusing 0 — collapses the baseline's prior-epoch write
+/// ids into epoch 0, the same epoch the child's op counter is seeded with. Observed pre-fix
+/// failure mode (the red proof this test pins): the campaign's self-vote write is minted at
+/// `(0, 0)` — the id of the QUEUED baseline HardState write — so draining the BASELINE's
+/// `Wrote(0, 0)` matched the pending `Campaign` action and fired `become_leader` while the
+/// self-vote's own fsync was still in flight: leadership on a phantom durable self-vote (a
+/// crash in that window forgets the vote, and a revote could grant the same term elsewhere).
+/// At the enforced floor (`boot_epoch >= 1`) the identical drive stays a candidate until the
+/// REAL completion lands — the baseline's completions release nothing.
+#[test]
+fn epoch_zero_baseline_completions_alias_the_childs_first_live_ops() {
+  // The collision, stated on the ids themselves: at boot epoch 0 the "prior epoch" the baseline
+  // rides IS the child's own first epoch.
+  assert_eq!(
+    OpId::first_of_epoch(0u64.saturating_sub(1)),
+    OpId::first_of_epoch(0)
+  );
+
+  // The pre-guard shape: baseline manufactured at epoch 0, its completions still queued; every
+  // write the child itself submits from here has its fsync in flight (completion held).
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  write_fork_baseline(&single_node_cfg(1), fork_blob(3), 0, &mut log, &mut stable);
+  let mut ep = Endpoint::restart(
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+    0,
+    &mut log,
+    &mut stable,
+  );
+  stable.hold_writes(true);
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  assert!(ep.role().is_candidate(), "the self-vote is not yet durable");
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    stable.held_write_count(),
+    1,
+    "the self-vote's own completion never arrived"
+  );
+  assert!(
+    ep.role().is_leader(),
+    "the aliased baseline Wrote(0,0) released become_leader without the vote's durability — \
+     the wrongness the fork constructors' epoch guard forecloses"
+  );
+
+  // The enforced floor: the identical drive at boot_epoch 1 keeps the persist-before-act gate —
+  // the baseline's epoch-0 completions miss every live pending op and every >= watermark.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  write_fork_baseline(&single_node_cfg(1), fork_blob(3), 1, &mut log, &mut stable);
+  let mut ep = Endpoint::restart(
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  stable.hold_writes(true);
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.role().is_candidate(),
+    "the baseline's completions release nothing at epoch >= 1"
+  );
+  stable.flush_held_writes();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.role().is_leader(),
+    "leadership waits for the vote write's OWN durability"
+  );
+}
+
 #[test]
 fn fork_blob_is_authoritative_over_the_vessel() {
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();

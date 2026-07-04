@@ -143,7 +143,10 @@ pub const FORK_BASE_TERM: Term = Term::new(1);
 /// epoch-strictly-below every id the child ever mints — it can never alias a live op in the
 /// pending maps or falsely satisfy a `>=` durability watermark (the OpId epoch-major contract).
 /// Same-epoch ids would collide with the child's first ops: a vote write pending at
-/// `(boot_epoch, 0)` would see OUR completion and ack a not-yet-durable vote.
+/// `(boot_epoch, 0)` would see OUR completion and ack a not-yet-durable vote. That is exactly
+/// what `boot_epoch == 0` would produce — the saturating subtraction has no prior epoch to land
+/// in — so the fork constructors refuse it ([`validate_fork_boot_epoch`]) before reaching here;
+/// the subtraction never actually saturates.
 fn write_fork_baseline<I, L, S>(
   config: &Config<I>,
   snapshot: Bytes,
@@ -169,6 +172,22 @@ fn write_fork_baseline<I, L, S>(
     snapshot,
   );
   log.restore(FORK_BASE_INDEX, FORK_BASE_TERM);
+}
+
+/// The fork constructors' boot-epoch admission check, run BEFORE any store write: a fork must
+/// boot at epoch >= 1 because [`write_fork_baseline`] issues the manufactured baseline's store
+/// writes at the PRIOR epoch. At `boot_epoch == 0` there is no prior epoch — the baseline ids
+/// would collapse into epoch 0, the very epoch [`Endpoint::restart`] seeds the child's own op
+/// counter with, so a queued baseline `Wrote(0, 0)` completion could release a live vote or
+/// campaign action whose durability it does not prove (leadership on a phantom durable
+/// self-vote). Restart already CONTRACTS epochs strictly above every prior incarnation; a fork
+/// additionally reserves the prior epoch for its baseline, so this floor is enforced, not
+/// merely documented.
+const fn validate_fork_boot_epoch(boot_epoch: u64) -> Result<(), CreateGroupError> {
+  if boot_epoch == 0 {
+    return Err(CreateGroupError::InvalidBootEpoch);
+  }
+  Ok(())
 }
 
 /// The create/restore admission check shared by every group constructor: group-id uniqueness, the
@@ -505,17 +524,22 @@ where
   /// A fork is a LOCAL act by an already-authorized replica: it is never solicited over the
   /// wire, and no factory path reaches it — a catalog that marks ids fork-born should DECLINE
   /// solicitations for them. Same `boot_epoch` contract as
-  /// [`restore_group`](Self::restore_group) (at least 1; strictly above every prior incarnation
-  /// of this group on this node — a re-fork after removal is a later incarnation). The stores
-  /// must be FRESH: the baseline overwrites whatever they hold. On a stable store whose
-  /// `hard_state()` lags submitted writes to a durability barrier, the child boots at the
-  /// store's PRIOR durable term (the baseline meta alone drives the applied/commit derivation,
-  /// so the boot is unchanged otherwise) and the manufactured term becomes durable at the next
-  /// barrier — the crash-recovery shape is the spec'd one either way.
+  /// [`restore_group`](Self::restore_group) (strictly above every prior incarnation of this
+  /// group on this node — a re-fork after removal is a later incarnation), with its floor
+  /// ENFORCED here: `boot_epoch == 0` is refused, because the manufactured baseline's store
+  /// writes ride the prior epoch and epoch 0 has none — the baseline's completions would land
+  /// in the child's own first live epoch and could release a vote/campaign action they do not
+  /// prove durable. The stores must be FRESH: the baseline overwrites whatever they hold. On a
+  /// stable store whose `hard_state()` lags submitted writes to a durability barrier, the child
+  /// boots at the store's PRIOR durable term (the baseline meta alone drives the applied/commit
+  /// derivation, so the boot is unchanged otherwise) and the manufactured term becomes durable
+  /// at the next barrier — the crash-recovery shape is the spec'd one either way.
   ///
   /// # Errors
   /// The same admission checks as [`create_group`](Self::create_group) — see
-  /// [`CreateGroupError`]. Refusal happens BEFORE any store write.
+  /// [`CreateGroupError`] — plus [`CreateGroupError::InvalidBootEpoch`] when `boot_epoch == 0`
+  /// (a fork's baseline needs the prior epoch to itself). Refusal happens BEFORE any store
+  /// write.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork<L, S>(
     &mut self,
@@ -537,6 +561,7 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
+    validate_fork_boot_epoch(boot_epoch)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
     write_fork_baseline(&config, snapshot, boot_epoch, log, stable);
@@ -666,7 +691,9 @@ where
   /// contract and [`Endpoint::restart_with_rng`] for the RNG one).
   ///
   /// # Errors
-  /// The admission checks of [`CreateGroupError`]; refusal happens BEFORE any store write.
+  /// The admission checks of [`CreateGroupError`], including
+  /// [`CreateGroupError::InvalidBootEpoch`] when `boot_epoch == 0` (a fork's baseline needs the
+  /// prior epoch to itself); refusal happens BEFORE any store write.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork_with_rng<L, S>(
     &mut self,
@@ -688,6 +715,7 @@ where
     F::Error: core::error::Error,
     I: Data,
   {
+    validate_fork_boot_epoch(boot_epoch)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
     write_fork_baseline(&config, snapshot, boot_epoch, log, stable);
