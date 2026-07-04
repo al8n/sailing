@@ -160,17 +160,26 @@ impl MultiWorld {
       .unwrap_or_else(|e| panic!("wire_replica: admission of group {gid} on node {node}: {e:?}"));
   }
 
-  /// The id of a node currently believing itself leader of `gid`, if any (first in node order).
+  /// The id of the node currently believing itself leader of `gid`, if any — anchored on the
+  /// HIGHEST term. A removed replica the farewell append never reached lingers in Leader role at
+  /// its stale term (at etcd-parity defaults higher-term peers silently ignore its beats, so
+  /// nothing ever deposes it), and a first-match scan in id order would let that zombie shadow
+  /// the live quorum's leader for every consumer that targets "the" leader. Every replica of a
+  /// gid shares the world's one generation for it (removal tears all replicas down before
+  /// recreation), so the term alone orders leader claims; the lowest-id tie-break is determinism
+  /// only (two same-term leaders cannot exist).
   pub fn leader_of(&self, gid: u64) -> Option<u64> {
     self
       .node_ids
       .iter()
-      .find(|&&n| {
+      .filter_map(|&n| {
         self.hosts[&n]
           .group(&gid)
-          .is_some_and(|ep| ep.role().is_leader())
+          .filter(|ep| ep.role().is_leader())
+          .map(|ep| (ep.term(), n))
       })
-      .copied()
+      .max_by(|(term_a, id_a), (term_b, id_b)| term_a.cmp(term_b).then_with(|| id_b.cmp(id_a)))
+      .map(|(_, n)| n)
   }
 
   /// Propose `cmd` on `gid`'s current leader; returns the assigned index (`None` when the group is
