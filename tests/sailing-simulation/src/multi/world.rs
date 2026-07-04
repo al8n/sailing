@@ -65,6 +65,12 @@ pub struct MultiWorld {
   pending_transitions: BTreeMap<u64, Vec<(u64, u64, checker::ConfSnapshot)>>,
   /// Per-group new transfer-snapshot installs observed since the last check (then cleared).
   pending_new_installs: BTreeMap<u64, Vec<(u64, u64, checker::ConfSnapshot)>>,
+  /// The harness-side group registry: one [`lifecycle::GroupMeta`] per logical group id, across
+  /// incarnations (retirement flips `retired`; recreation bumps `generation`).
+  groups: BTreeMap<u64, lifecycle::GroupMeta>,
+  /// Frozen checker archive for retired incarnations, keyed `(gid, generation)` — each ran one
+  /// final check at removal and keeps its cross-tick history inspectable.
+  retired: BTreeMap<(u64, u64), Checker>,
 }
 
 impl MultiWorld {
@@ -87,6 +93,8 @@ impl MultiWorld {
       snapshot_lineage: BTreeSet::new(),
       pending_transitions: BTreeMap::new(),
       pending_new_installs: BTreeMap::new(),
+      groups: BTreeMap::new(),
+      retired: BTreeMap::new(),
     }
   }
 
@@ -105,8 +113,20 @@ impl MultiWorld {
   /// any admission error — a world-construction bug, not weather.
   pub fn create_group(&mut self, gid: u64, voters: &BTreeSet<u64>) {
     assert!(
+      !self.groups.contains_key(&gid),
+      "create_group: group id {gid} was already used (ids are single-incarnation; a retired \
+       logical group rejoins via recreate_group)"
+    );
+    assert!(
       self.checkers.insert(gid, Checker::new()).is_none(),
-      "create_group: group {gid} already exists (ids are single-incarnation)"
+      "create_group: group {gid} already exists"
+    );
+    self.groups.insert(
+      gid,
+      lifecycle::GroupMeta {
+        voters: voters.clone(),
+        ..lifecycle::GroupMeta::default()
+      },
     );
     let voter_vec: Vec<u64> = voters.iter().copied().collect();
     for &node in voters {
@@ -340,10 +360,10 @@ impl MultiWorld {
     }
   }
 
-  /// The group's incarnation (gen) for the one-identity grant key. Fixed at 0 until the
-  /// lifecycle registry lands (recreation is what moves it).
-  fn gen_of(&self, _gid: u64) -> u64 {
-    0
+  /// The group's incarnation (gen) for the one-identity grant key, from the lifecycle registry
+  /// (recreation is what moves it).
+  fn gen_of(&self, gid: u64) -> u64 {
+    self.generation_of(gid)
   }
 
   /// Assemble the per-group [`ClusterView`](crate::ClusterView) from `gid`'s hosting nodes —
@@ -493,7 +513,11 @@ impl MultiWorld {
   ///   - `ConfChanged` → the per-`(node, gid)` counter AND (from a LOG-BUILT replica only) the
   ///     group's committed-config transition at its exact index, tagged with the conf-change
   ///     ENTRY's term (a non-faulting log lookup — not the replica's current term).
+  ///   - `ConfChanged` whose resulting config no longer lists the replica ITSELF → the replica
+  ///     applied its own removal (the farewell append landed): the embedder-on-RemovedSelf
+  ///     teardown drops it from the container after the drain.
   fn drain_host_events(&mut self, node: u64) {
+    let mut self_removed: Vec<u64> = Vec::new();
     loop {
       let host = self.hosts.get_mut(&node).expect("host exists");
       let Some((gid, ev)) = host.poll_event() else {
@@ -510,6 +534,16 @@ impl MultiWorld {
         }
         Event::ConfChanged(cc) => {
           *self.conf_changed.entry((node, gid)).or_insert(0) += 1;
+          {
+            let cs = cc.conf();
+            if !cs.voters().contains(&node)
+              && !cs.voters_outgoing().contains(&node)
+              && !cs.learners().contains(&node)
+              && !cs.learners_next().contains(&node)
+            {
+              self_removed.push(gid);
+            }
+          }
           if !self.snapshot_lineage.contains(&(node, gid)) {
             let idx = cc.index();
             let entry_term = {
@@ -532,6 +566,12 @@ impl MultiWorld {
           }
         }
         _ => {}
+      }
+    }
+    // Embedder-on-RemovedSelf teardown, after the drain so it never truncates the event pass.
+    for gid in self_removed {
+      if self.hosts[&node].contains_group(&gid) {
+        self.drop_group_replica(gid, node);
       }
     }
   }
@@ -645,3 +685,5 @@ impl MultiWorld {
 
 #[cfg(test)]
 mod tests;
+
+mod lifecycle;
