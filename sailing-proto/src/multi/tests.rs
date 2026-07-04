@@ -806,3 +806,160 @@ fn interleaved_groups_drain_in_group_batches() {
   assert_eq!(dests_100, [2, 3].into_iter().collect());
   assert_eq!(dests_200, [2, 3].into_iter().collect());
 }
+
+/// T2's shared drive: fork a single-voter group at a preloaded count of 3, commit a two-command
+/// tail above the baseline, AddNode(2), then replicate toward a FRESH zero-progress joiner until
+/// it catches the leader — returning both hosts and the full leader→joiner message transcript.
+struct ForkJoin {
+  a: MultiRaft<u64, u64, CountSm>,
+  b: MultiRaft<u64, u64, CountSm>,
+  transcript: Vec<Message<u64>>,
+}
+
+fn drive_forked_leader_and_fresh_joiner() -> ForkJoin {
+  use crate::{ConfChangeType, conf::ConfChange};
+
+  let mut a: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut la, mut sa) = (VecLog::default(), AsyncStable::default());
+  a.create_group_from_fork(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    preloaded_sm(3),
+    fork_blob(3),
+    1,
+    &mut la,
+    &mut sa,
+  )
+  .unwrap();
+
+  // Elect the single voter and commit a tail above the baseline, then add node 2.
+  let mut now = a.group(&7).unwrap().poll_timeout().unwrap();
+  a.handle_timeout(&7, now, &mut la, &mut sa).unwrap();
+  drain_storage(&mut a, 7, now, &mut la, &mut sa);
+  assert!(a.group(&7).unwrap().role().is_leader());
+  for payload in [&b"t1"[..], &b"t2"[..]] {
+    let cmd = Bytes::copy_from_slice(payload);
+    a.propose(&7, now, &mut la, &sa, &cmd).unwrap().unwrap();
+  }
+  a.flush_appends(&7, now, &la, &sa).unwrap();
+  drain_storage(&mut a, 7, now, &mut la, &mut sa);
+  a.propose_conf_change(
+    &7,
+    now,
+    &mut la,
+    &sa,
+    ConfChange::new(ConfChangeType::AddNode, 2u64, Bytes::new()),
+  )
+  .unwrap()
+  .unwrap();
+  a.flush_appends(&7, now, &la, &sa).unwrap();
+  drain_storage(&mut a, 7, now, &mut la, &mut sa);
+  let leader_applied = a.group(&7).unwrap().applied_index();
+
+  // The joiner materializes EMPTY (the factory shape): zero progress, nothing preloaded.
+  let mut b: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut lb, mut sb) = (VecLog::default(), AsyncStable::default());
+  b.create_group(
+    7,
+    Config::try_new(
+      2u64,
+      std::vec![1, 2],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap(),
+    Instant::ORIGIN,
+    43,
+    CountSm::default(),
+  )
+  .unwrap();
+
+  let mut transcript: Vec<Message<u64>> = Vec::new();
+  for _ in 0..300 {
+    route_until_quiescent(
+      &mut a,
+      1,
+      &mut la,
+      &mut sa,
+      &mut b,
+      2,
+      &mut lb,
+      &mut sb,
+      now,
+      7,
+      &mut |m| transcript.push(m.clone()),
+    );
+    if b.group(&7).unwrap().applied_index() >= leader_applied {
+      break;
+    }
+    now = a
+      .group(&7)
+      .unwrap()
+      .poll_timeout()
+      .expect("the leader keeps a heartbeat deadline armed");
+    a.handle_timeout(&7, now, &mut la, &mut sa).unwrap();
+    drain_storage(&mut a, 7, now, &mut la, &mut sa);
+  }
+  ForkJoin { a, b, transcript }
+}
+
+#[test]
+fn a_zero_progress_joiner_is_forced_onto_the_snapshot_path() {
+  let fj = drive_forked_leader_and_fresh_joiner();
+
+  // The first message that CAN land payload on a zero-progress joiner must be the snapshot. An
+  // AppendEntries attaches at match 0 only with prev_log_index 0 (the log walk the manufactured
+  // install exists to make structurally impossible); the leader's optimistic new-peer append of
+  // its freshest entry (prev at the tail) bounces off the empty log and is harmless.
+  let first_attachable = fj.transcript.iter().find(|m| match m {
+    Message::InstallSnapshot(_) => true,
+    Message::AppendEntries(ae) => ae.prev_log_index() == Index::ZERO,
+    _ => false,
+  });
+  assert!(
+    matches!(first_attachable, Some(Message::InstallSnapshot(_))),
+    "the first zero-progress-attachable payload must be InstallSnapshot, got {first_attachable:?}"
+  );
+
+  let mut installs = 0usize;
+  for m in &fj.transcript {
+    match m {
+      Message::AppendEntries(ae) => assert!(
+        ae.prev_log_index() >= FORK_BASE_INDEX,
+        "a forked leader must never serve the log below the baseline (prev {:?})",
+        ae.prev_log_index()
+      ),
+      Message::InstallSnapshot(is) => {
+        installs += 1;
+        assert!(is.snapshot().last_index() >= FORK_BASE_INDEX);
+        if !is.data().is_empty() {
+          assert_eq!(is.data(), &fork_blob(3), "the served blob IS the fork blob");
+        }
+      }
+      _ => {}
+    }
+  }
+  assert!(installs > 0, "the snapshot path was actually exercised");
+}
+
+#[test]
+fn the_joiner_lands_on_the_preloaded_state_plus_tail() {
+  let fj = drive_forked_leader_and_fresh_joiner();
+  let leader = fj.a.group(&7).unwrap();
+  let joiner = fj.b.group(&7).unwrap();
+  assert_eq!(
+    joiner.applied_index(),
+    leader.applied_index(),
+    "the joiner catches the leader"
+  );
+  // 3 preloaded + 2 tail commands: an empty-booted joiner replaying only the tail would sit at
+  // 2 — equality proves the preloaded baseline arrived through the snapshot.
+  assert_eq!(leader.state_machine().count(), 5);
+  assert_eq!(
+    joiner.state_machine().count(),
+    5,
+    "preloaded state AND the tail are both present on the joiner"
+  );
+}
