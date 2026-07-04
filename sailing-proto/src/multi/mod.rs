@@ -39,6 +39,56 @@ use std::{
   vec::Vec,
 };
 
+/// Read-only lineage lookup consulted at group admission (and, from M4/M5 on, at the
+/// split/merge propose-time gates). [`GroupEngine`] implements it over its lineage records — the
+/// driver hands its engine in at every admission call; the deterministic sim brings an in-memory
+/// impl; a coordinator-embedder that brings its own storage brings its own impl, whose
+/// durability is that storage's job. [`NoFloors`] is the gen-0 convenience: every lookup is 0,
+/// which makes admission behave exactly as it did before floors existed (no fence).
+pub trait FloorStore<G> {
+  /// The admission floor for `gid` (0 = never floored).
+  fn floor(&self, gid: &G) -> u64;
+  /// The id's current incarnation/shape counter (0 = unreshaped).
+  fn lineage(&self, gid: &G) -> u64;
+}
+
+/// The no-fence store: a gen-0 world (all of today's embedders and tests). Both lookups return
+/// 0, so no incarnation is ever below its floor and the volatile tombstone remains the only
+/// re-admission gate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct NoFloors;
+
+impl<G> FloorStore<G> for NoFloors {
+  fn floor(&self, _gid: &G) -> u64 {
+    0
+  }
+
+  fn lineage(&self, _gid: &G) -> u64 {
+    0
+  }
+}
+
+/// The admission floor a merge writes for the absorbed id (the merge milestone is its ONLY
+/// writer): `u64::MAX` fences every future incarnation, so a merged-away id never returns.
+/// Consequently `u64::MAX` is NOT a usable working generation — it is reserved as this fence.
+pub const MERGED_FLOOR: u64 = u64::MAX;
+
+/// The engine IS the drivers' floor store: lookups delegate to the freshest-read lineage
+/// accessors, so a floor staged this crank already fences before the barrier lands (monotone-max
+/// staging makes that early visibility safe).
+impl<G, I> FloorStore<G> for GroupEngine<G, I>
+where
+  G: Ord,
+{
+  fn floor(&self, gid: &G) -> u64 {
+    self.group_floor(gid)
+  }
+
+  fn lineage(&self, gid: &G) -> u64 {
+    self.group_gen(gid)
+  }
+}
+
 /// The create/restore admission check shared by every group constructor: group-id uniqueness, the
 /// wire bound on the encoded group id, and agreement with the LATCHED host identity (a multi-Raft
 /// host is one physical node for its whole lifetime — the transport authenticates exactly one
