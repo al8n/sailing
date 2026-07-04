@@ -12,7 +12,7 @@ use std::{net::SocketAddr, time::Duration};
 use agnostic::tokio::TokioRuntime;
 use bytes::Bytes;
 use common::{CountSm, TestCa, TrapSm};
-use sailing_proto::{ClusterId, ConfChange, ConfChangeType, Config, Data, Role};
+use sailing_proto::{ClusterId, ConfChange, ConfChangeType, Config, Data, Index, Role};
 use sailing_reactor::{
   DriverConfig, DriverError, GroupBlueprint, GroupHandle, LifecycleEvent, MultiHandle,
   MultiReactorQuicDriver, Node, factory_fn,
@@ -841,11 +841,14 @@ async fn removed_follower_learns_via_farewell_and_tears_down() {
 }
 
 /// The 3-voter removed-voter flow over QUIC (see the stream sibling for the full rationale):
-/// the removal commits on whichever follower ack the leader processes first, so the pruned
-/// voter's own ack is typically still in flight at the fold — the farewell APPEND delivers the
-/// excising commit regardless of the race. Pre-vote/check-quorum stay at their defaults (OFF):
-/// `RemovedSelf` on C's tail WITHOUT C driving the commit, and NO leadership churn — the
-/// leader's role and term hold from the removal commit to C's `RemovedSelf`.
+/// the removal commits on whichever follower ack the leader processes first, so WHICH farewell
+/// arm delivers — the commit-only heartbeat (`match >= removal`) or the suffix-carrying append
+/// (`match < removal`) — is a scheduler coin flip this test deliberately leaves OPEN; it pins
+/// that the removed voter learns and the live leader survives EITHER WAY (role and term fixed
+/// from the removal commit to `RemovedSelf`), with pre-vote/check-quorum at their defaults
+/// (OFF). The append arm's DETERMINISTIC pins are the endpoint farewell-append tests, the
+/// `confchange_remove` interaction golden, and this suite's learn-from-zero sibling
+/// (`never_caught_up_removed_replica_learns_from_zero_via_farewell`).
 #[tokio::test(flavor = "multi_thread")]
 async fn removed_voter_in_full_quorum_learns_via_farewell() {
   let ca = TestCa::new();
@@ -931,6 +934,190 @@ async fn removed_voter_in_full_quorum_learns_via_farewell() {
 
   // No resurrection prompt on the removed voter: the tombstone absorbs the stragglers.
   while let Ok(ev) = handles[removed_at].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
+      "a tombstoned group must never re-solicit placement: {ev:?}"
+    );
+  }
+}
+
+/// The learn-from-zero farewell-append flow over QUIC (see the stream sibling for the full
+/// rationale): node 2 pre-creates group 100 as a NON-MEMBER observer replica — hosted, so the
+/// farewell can land; untracked by the sole voter, so NOTHING ever replicates to it — and
+/// AddLearnerNode(2) / RemoveNode(2) commit back-to-back at the one-in-flight limit, BOTH on
+/// node 1's own in-memory durability barrier alone (a single-voter quorum), so the removal fold
+/// prunes node 2 at `match[2] = 0 < removal` before any node-2 response can be processed: the
+/// farewell can ONLY be the append arm (a heartbeat's commit clamp `min(commit, match)` is 0
+/// for a zero-match peer). The removed replica is deliberately a LEARNER: a never-caught-up
+/// VOTER's removal needs either its own ack (the heartbeat arm by construction) or another
+/// voter's NETWORK ack — a cross-connection scheduling race that QUIC demonstrably lets a
+/// probe-rejection walk-back resend win. `max_size_per_msg = 1` and the stretched beat keep
+/// even stray catch-up out of the window, and node 2's applied/commit are re-asserted ZERO
+/// before every remove attempt — a broken premise fails loudly instead of passing through the
+/// heartbeat arm. `RemovedSelf` fires on node 2's tail with its applied index carried from zero
+/// past the removal in ONE delivery, and the leader's role and term hold.
+#[tokio::test(flavor = "multi_thread")]
+async fn never_caught_up_removed_replica_learns_from_zero_via_farewell() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_860, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // Group 100: sole voter {1} with the 1-byte per-append cap and the stretched beat; node 2
+  // hosts the NON-MEMBER observer replica. The 2-node sibling group 500 needs BOTH drivers, so
+  // a post-teardown commit proves node 2's driver survived its group-scoped teardown.
+  let solo_election = Duration::from_secs(1);
+  let solo_heartbeat = Duration::from_millis(900);
+  handles[0]
+    .create_group(
+      100,
+      Config::try_new(1u64, vec![1], solo_election, solo_heartbeat)
+        .unwrap()
+        .with_max_size_per_msg(1),
+      1,
+      CountSm::default(),
+    )
+    .await
+    .expect("group admission");
+  handles[1]
+    .create_group(
+      100,
+      Config::try_new_observer(2u64, vec![1], solo_election, solo_heartbeat)
+        .unwrap()
+        .with_max_size_per_msg(1),
+      2,
+      CountSm::default(),
+    )
+    .await
+    .expect("the observer replica admits");
+  create_group_everywhere(&handles, 500, &[1, 2]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g500: Vec<_> = handles.iter().map(|h| h.group(500)).collect();
+  assert_eq!(submit_anywhere(&g100[0..1], b"seed").await, 1);
+  assert_eq!(submit_anywhere(&g500, b"seed").await, 1);
+
+  // The observer has learned NOTHING of the group: the sole voter tracks nobody.
+  let st = g100[1].status().await.expect("the observer's status");
+  assert_eq!(
+    st.applied_index,
+    Index::ZERO,
+    "the observer must start with an empty apply stream"
+  );
+  assert_eq!(
+    st.commit_index,
+    Index::ZERO,
+    "the observer must start with an empty commit"
+  );
+  assert!(
+    !st.conf_state.voters().contains(&2),
+    "the observer's bootstrap seed must not name it"
+  );
+
+  // AddLearnerNode(2), retried through the pre-election window (node 1 is the only possible
+  // leader of its single-voter group).
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed learner add in time"
+    );
+    let cc = ConfChange::new(ConfChangeType::AddLearnerNode, 2, Bytes::new());
+    match g100[0].conf_change(cc).await {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  }
+  // RemoveNode(2) IMMEDIATELY: the add resolved at ITS apply, the earliest instant the
+  // one-in-flight gate admits the remove. The premise is re-asserted before EVERY attempt:
+  // node 2 still holds NOTHING, so its match at the removal fold can only be 0 — the append
+  // arm. A trip here means the shape's assumption broke (something caught node 2 up first);
+  // fail loudly, never pass through the heartbeat arm.
+  let (removal_index, term_at_commit) = loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed learner removal in time"
+    );
+    let st = g100[1].status().await.expect("the observer's status");
+    assert_eq!(
+      st.applied_index,
+      Index::ZERO,
+      "the premise broke: node 2 caught up before the removal was proposed"
+    );
+    assert_eq!(
+      st.commit_index,
+      Index::ZERO,
+      "the premise broke: node 2 caught up before the removal was proposed"
+    );
+    let cc = ConfChange::new(ConfChangeType::RemoveNode, 2, Bytes::new());
+    match g100[0].conf_change(cc).await {
+      Ok(idx) => {
+        let st = g100[0].status().await.expect("leader status at the commit");
+        break (idx, st.term);
+      }
+      Err(DriverError::NotLeader { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  };
+
+  // Node 2 learns FROM ZERO: `RemovedSelf` on ITS lifecycle tail, without ever driving or
+  // holding a commit beforehand...
+  await_lifecycle(handles[1].lifecycle(), "removed-from-zero", |ev| {
+    matches!(ev, LifecycleEvent::RemovedSelf { group: 100 })
+  })
+  .await;
+  // ...with its applied index carried from the asserted zero past its own removal in that one
+  // farewell delivery — the learn-from-zero signature only the append arm can produce (a
+  // heartbeat's commit clamps to the proven match, 0).
+  let st = g100[1]
+    .status()
+    .await
+    .expect("the removed observer's status");
+  assert!(
+    st.applied_index >= removal_index,
+    "the farewell append must carry node 2 from zero past its removal: {:?} < {removal_index:?}",
+    st.applied_index
+  );
+
+  // NO leadership churn across the removal: the leader holds its role at the SAME term.
+  let st = g100[0].status().await.expect("leader status");
+  assert_eq!(
+    st.role,
+    Role::Leader,
+    "the removed replica must not depose the live leader"
+  );
+  assert_eq!(
+    st.term, term_at_commit,
+    "no term bump between the removal commit and the removed replica's RemovedSelf"
+  );
+
+  // The app tears the replica down; the survivor keeps committing the shrunk group.
+  assert!(
+    handles[1].remove_group(100).await.expect("remove resolves"),
+    "the removed replica hosted group 100"
+  );
+  assert!(
+    submit_anywhere(&g100[0..1], b"after").await >= 2,
+    "the shrunk group applied seed + after"
+  );
+
+  // The sibling group is untouched — and its quorum NEEDS node 2's driver, so a commit proves
+  // the driver survived the group-scoped teardown.
+  assert!(submit_anywhere(&g500, b"still").await >= 2);
+
+  // No resurrection prompt on the removed observer: the tombstone absorbs the stragglers.
+  while let Ok(ev) = handles[1].lifecycle().try_recv() {
     assert!(
       !matches!(ev, LifecycleEvent::UnknownGroup { group: 100, .. }),
       "a tombstoned group must never re-solicit placement: {ev:?}"
