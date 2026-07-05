@@ -1580,3 +1580,122 @@ fn quic_admission_refuses_an_in_flight_splits_child_id() {
     "every refusal wrote nothing"
   );
 }
+
+/// A floor store reporting the terminal MERGED_FLOOR for every id — the coordinator leg's
+/// refusal input.
+struct MaxFloors;
+
+impl FloorStore<u64> for MaxFloors {
+  fn floor(&self, _gid: &u64) -> u64 {
+    MERGED_FLOOR
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
+#[test]
+fn merge_verbs_ride_the_coordinator() {
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([9u8; 16]);
+  let opts = ca
+    .cluster_tls(&san(1, &cluster))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut seed = [0u8; 32];
+  seed[0] = 9;
+  let mut coord =
+    MultiQuicCoordinator::<u64, u64, CountSm>::with_identity(opts, Some(seed), cluster);
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+  };
+  for gid in [1u64, 2] {
+    stores
+      .map
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    coord
+      .create_group(
+        gid,
+        single_voter(1),
+        Instant::ORIGIN,
+        1,
+        CountSm::default(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
+    let d = coord.group(&gid).unwrap().poll_timeout().unwrap();
+    {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_timeout(&gid, d, l, s).unwrap();
+    }
+    for _ in 0..2 {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_storage(&gid, d, l, s).unwrap();
+    }
+    assert!(coord.group(&gid).unwrap().role().is_leader());
+  }
+  let now = Instant::ORIGIN;
+
+  // The coordinator's floor leg refuses a fenced participant BEFORE anything is appended.
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    assert!(matches!(
+      coord.prepare_merge(&1, now, l, s, &2, &MaxFloors).unwrap(),
+      Err(crate::MergeError::BelowFloor {
+        floor: MERGED_FLOOR
+      })
+    ));
+  }
+  // The container preconditions surface through the delegator verbatim.
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    assert!(matches!(
+      coord.prepare_merge(&1, now, l, s, &1, &NoFloors).unwrap(),
+      Err(crate::MergeError::SelfMerge)
+    ));
+  }
+
+  // Freeze, park, and resolve THROUGH the coordinator.
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .prepare_merge(&1, now, l, s, &2, &NoFloors)
+      .unwrap()
+      .unwrap();
+    coord.handle_storage(&1, now, l, s).unwrap();
+  }
+  assert!(coord.group(&1).unwrap().is_frozen());
+  {
+    let (l, s) = stores.stores(&2).unwrap();
+    coord
+      .commit_merge(&2, now, l, s, &1, &NoFloors)
+      .unwrap()
+      .unwrap();
+    coord.handle_storage(&2, now, l, s).unwrap();
+  }
+  assert!(coord.group(&2).unwrap().pending_merge().is_some());
+  let resolutions = coord.service_merge_applies(&mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![crate::MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }]
+  );
+  // The source id is TOMBSTONED at the coordinator: stragglers drop silently (the P5 wire
+  // story), and re-admission refuses until the explicit clear — while the terminal floor the
+  // DRIVER persists from the resolution outlives even that.
+  assert!(coord.group(&1).is_none());
+  assert!(coord.is_retired(&1), "resolved merge tombstones the source");
+
+  // The rollback delegator is reachable too (nothing frozen anymore: typed refusal).
+  {
+    let (l, s) = stores.stores(&2).unwrap();
+    assert!(matches!(
+      coord.rollback_merge(&2, now, l, s).unwrap(),
+      Err(crate::MergeError::NotFrozen)
+    ));
+  }
+}

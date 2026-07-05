@@ -730,6 +730,136 @@ where
     Some(r)
   }
 
+  /// Propose a merge FREEZE of `source` into `target` (see [`MultiRaft::prepare_merge`] for the
+  /// container gates), replicating immediately. The coordinator adds the merge's floor leg
+  /// through the caller's `floors` seam: a participant whose CURRENT incarnation sits below its
+  /// persisted admission floor is a stale survivor of a fenced incarnation — refused BEFORE
+  /// anything is appended, exactly as the split delegator fences its child. `None` if no group
+  /// `source` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn prepare_merge<L, S>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    target: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.multi.contains_group(source) {
+      return None;
+    }
+    if let Err(e) = self.merge_floor_check(source, target, floors) {
+      return Some(Err(e));
+    }
+    let now: Now = now.into();
+    let r = self.multi.prepare_merge(source, now, log, stable, target)?;
+    let _ = self.multi.flush_appends(source, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Propose the merge ABSORB on `target` (see [`MultiRaft::commit_merge`]), replicating
+  /// immediately, with the same per-call floor leg as
+  /// [`prepare_merge`](Self::prepare_merge). `None` if no group `target` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn commit_merge<L, S>(
+    &mut self,
+    target: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    source: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.multi.contains_group(target) {
+      return None;
+    }
+    if let Err(e) = self.merge_floor_check(source, target, floors) {
+      return Some(Err(e));
+    }
+    let now: Now = now.into();
+    let r = self.multi.commit_merge(target, now, log, stable, source)?;
+    let _ = self.multi.flush_appends(target, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Propose the merge ABORT on `source` (see [`MultiRaft::rollback_merge`]) — the release
+  /// valve, exempt from the freeze gates — replicating immediately. No floor leg: rolling back
+  /// is always legitimate on a group this host still runs. `None` if no group `source` is
+  /// hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn rollback_merge<L, S>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self.multi.rollback_merge(source, now, log, stable)?;
+    let _ = self.multi.flush_appends(source, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// The merge verbs' floor leg: BOTH participants' current incarnations must clear their
+  /// persisted admission floors — an under-floor participant is a fenced incarnation's stale
+  /// survivor, and anchoring a merge on it would resurrect exactly what the floor buried.
+  fn merge_floor_check(
+    &self,
+    source: &G,
+    target: &G,
+    floors: &impl FloorStore<G>,
+  ) -> Result<(), crate::MergeError<I>> {
+    for gid in [source, target] {
+      let floor = floors.floor(gid);
+      if !crate::floor_admits(floor, self.multi.group_gen(gid)) {
+        return Err(crate::MergeError::BelowFloor { floor });
+      }
+    }
+    Ok(())
+  }
+
+  /// Resolve every parked merge that local facts now decide (see
+  /// [`MultiRaft::service_merge_applies`]) — called once per crank by the driver after the
+  /// per-group storage drains. On a resolved ABSORB the coordinator TOMBSTONES the source id:
+  /// its straggler frames drop silently from here on (the P5 wire story, unchanged), while the
+  /// terminal floor the DRIVER persists from the returned resolutions is what makes the refusal
+  /// survive restarts. Aborted resolutions touch nothing here — the source group is still live.
+  pub fn service_merge_applies<L, S>(
+    &mut self,
+    stores: &mut impl crate::GroupStores<G, L, S>,
+  ) -> Vec<crate::MergeResolution<G>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let resolutions = self.multi.service_merge_applies(stores);
+    for r in &resolutions {
+      if let crate::MergeResolution::Merged { source, .. } = r {
+        self.quiesce_intents.remove(source);
+        self.controls.retain(|(g, _)| g != source);
+        self.retired.insert(source.cheap_clone());
+        self.purge_unknown_signal(source);
+      }
+    }
+    resolutions
+  }
+
   /// The next committed, relay-ready fork from any hosted group (see
   /// [`MultiRaft::poll_pending_fork`]) — the driver drains this every crank BEFORE its storage
   /// crank, so the same crank's engine flush covers the materialization.
