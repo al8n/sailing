@@ -403,7 +403,8 @@ pub struct Checker {
   /// committed under a prior config had its quorum defined by that config, so the current voter set
   /// need not durably hold it (a removed voter carried a copy; a freshly-added voter joined later).
   /// Those older entries' safety stays covered by [`agreement`], [`no_committed_rewrite`], and
-  /// [`durable_prefix`].
+  /// [`durable_prefix`]. A fork child's checker starts with the floor already at its manufactured
+  /// baseline index — see [`register_fork_baseline`](Self::register_fork_baseline).
   commit_floor: u64,
   /// The authoritative committed voter set observed on the previous tick — a change signals a
   /// reconfiguration and raises [`commit_floor`](Self::commit_floor).
@@ -480,6 +481,26 @@ impl Checker {
   /// A fresh checker with empty history.
   pub fn new() -> Self {
     Self::default()
+  }
+
+  /// Seed the quorum-durability floor at a FORK CHILD's manufactured snapshot baseline `index`,
+  /// so [`commit_is_quorum_durable`] judges only commits strictly above it. Called once at child
+  /// registration, before the first view is checked; a normally-created group's checker is never
+  /// seeded and keeps the full axiom from index 0.
+  ///
+  /// The baseline commit's durability is PARENT-quorum-anchored, which this child-scoped view
+  /// cannot witness: the split entry minting the baseline is quorum-committed in the PARENT's
+  /// log, every parent replica re-derives the identical baseline deterministically at its own
+  /// apply point, and the fork durability barrier fences parent compaction until the local child
+  /// baseline is durable. A freshly materialized replica therefore legitimately reports
+  /// `commit == baseline` while its sibling forks are still in flight — fewer durable copies
+  /// than a CHILD quorum — yet nothing unsafe is reachable there: below quorum existence the
+  /// child can neither elect a leader nor serve reads. ABOVE the baseline the axiom binds
+  /// unchanged: every materialized replica's durable state covers the baseline index by
+  /// construction, so the floor's denominator exclusion in `quorum_holds_committed` never
+  /// shrinks the child's effective voter set.
+  pub fn register_fork_baseline(&mut self, index: u64) {
+    self.commit_floor = self.commit_floor.max(index);
   }
 
   /// The number of membership-coherence comparisons the run-end final pass performed (see

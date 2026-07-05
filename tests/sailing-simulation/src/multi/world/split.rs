@@ -141,8 +141,9 @@ impl MultiWorld {
 
   /// Register a fork's child in the harness catalog on its FIRST materialization anywhere:
   /// registry entry (voters from the fork's boot config, population from the pending record),
-  /// a fresh checker, and the conservation pair. Later materializations of the same fork on
-  /// other nodes find the child registered and only wire their replica.
+  /// a fresh checker floored at the fork baseline, and the conservation pair. Later
+  /// materializations of the same fork on other nodes find the child registered and only wire
+  /// their replica.
   fn register_split_child(&mut self, fork: &sailing_proto::GroupFork<u64, u64, LogSm>) {
     if self.groups.contains_key(&fork.child) {
       return;
@@ -163,8 +164,15 @@ impl MultiWorld {
         ..lifecycle::GroupMeta::default()
       },
     );
+    // The child's checker anchors its quorum-durability floor at the manufactured baseline:
+    // the baseline's durable witnesses are the PARENT's quorum (see
+    // `Checker::register_fork_baseline`), so a child materialized ahead of its siblings must
+    // not be judged against its own not-yet-existing voter set. Normal creations keep the
+    // full axiom — only this fork-registration path seeds the floor.
+    let mut checker = Checker::new();
+    checker.register_fork_baseline(sailing_proto::FORK_BASE_INDEX.get());
     assert!(
-      self.checkers.insert(fork.child, Checker::new()).is_none(),
+      self.checkers.insert(fork.child, checker).is_none(),
       "register_split_child: child {} already had a checker",
       fork.child
     );
