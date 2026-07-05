@@ -3288,3 +3288,206 @@ async fn hosted_child_conflict_parks_then_heals_via_the_twin() {
     }
   }
 }
+
+/// The factory-race regression: while a split's child id is RESERVED on a host, the factory
+/// pre-build gate DECLINES solicitations for it — the local fork, never a factory-built empty
+/// squatter, is what materializes the id. The reserved window is held open deterministically:
+/// the parent (and so both fork children) runs a SLOW election tuning, node 2 squats fork #1's
+/// child so fork #2 sits staged-and-reserved behind the park (head-of-line), and — only once
+/// the park is observed — node 3 admits an EMPTY fast-cadence pre-vote squatter of the second
+/// child id whose solicitations hammer node 2 seconds before any slow child election can heal
+/// the park. Node 2's factory KNOWS the id and its blueprint names the solicitor, so the
+/// reservation is the ONE leg that refuses: consults reach the factory, zero builds pass, the
+/// id stays unhosted on node 2 — and when the park heals through the twin, fork #2
+/// materializes from its own staged blob (`SplitApplied`, the typed observable a factory build
+/// would have silently folded away). No abandonment, no second conflict, conserved totals.
+#[tokio::test(flavor = "multi_thread")]
+async fn factory_gate_declines_a_reserved_child_until_the_fork_lands() {
+  // Slow consensus for the parent — inherited by both fork children — so the parked window
+  // (healed only by a child election) outlasts the fast squatter's solicitations by seconds.
+  const SLOW_ELECTION: Duration = Duration::from_millis(2500);
+  const SLOW_HEARTBEAT: Duration = Duration::from_millis(500);
+  let slow =
+    |id: u64, voters: Vec<u64>| Config::try_new(id, voters, SLOW_ELECTION, SLOW_HEARTBEAT).unwrap();
+
+  let addrs = addrs(45_340, 3);
+  let consults = Arc::new(AtomicUsize::new(0));
+  let builds = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      // Node 2's catalog knows child 320 and would happily materialize it empty on a
+      // solicitation — exactly what the reservation gate must refuse while fork #2 is staged.
+      // `materialize` runs BEFORE the gate (consults count solicitations that reached the
+      // factory); `build` only ever runs behind it. The blueprint names the node-3 solicitor,
+      // so the sender leg passes and the reservation is the one refusing leg.
+      let consults_ = consults.clone();
+      let builds_ = builds.clone();
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, from: &u64| {
+          (*group == 320 && [1u64, 2, 3].contains(from)).then(|| {
+            consults_.fetch_add(1, Ordering::SeqCst);
+            GroupBlueprint::new(config(2, vec![1, 2, 3]), 0)
+          })
+        },
+        move |_group: &u64| {
+          builds_.fetch_add(1, Ordering::SeqCst);
+          Some(CountSm::default())
+        },
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The parent lives on nodes 1+2 (slow tuning); node 3 carries no parent replica.
+  for (i, h) in handles[..2].iter().enumerate() {
+    let id = i as u64 + 1;
+    h.create_group(100, slow(id, vec![1, 2]), id, CountSm::default(), 0)
+      .await
+      .expect("parent admission");
+  }
+  let g100: Vec<_> = handles[..2].iter().map(|h| h.group(100)).collect();
+  for i in 0..7u64 {
+    assert_eq!(submit_anywhere(&g100, b"load").await, i + 1);
+  }
+
+  // The squatter under fork #1's child id, on node 2 only (empty, zero progress).
+  handles[1]
+    .create_group(310, slow(2, vec![1, 2]), 9, CountSm::default(), 0)
+    .await
+    .expect("the squatter admits: no split names this id yet");
+
+  // Both splits are proposed on NODE 1 (whose gates see neither the squatter nor node 2's
+  // reservation): steer leadership there and ride out SplitInFlight between the two.
+  for (child, give) in [(310u64, b"\x02"), (320u64, b"\x03")] {
+    let deadline = std::time::Instant::now() + Duration::from_secs(20);
+    loop {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "split into {child} never proposed on node 1"
+      );
+      match g100[0]
+        .propose_split(child, 0, Bytes::from_static(give))
+        .await
+      {
+        Ok(_) => break,
+        Err(DriverError::NotLeader { .. }) => {
+          let _ = g100[1].transfer_leader(1).await;
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        // An earlier split still unapplied (or a transfer window): retry.
+        Err(DriverError::Rejected { .. }) => {
+          tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        Err(e) => panic!("unexpected split error: {e:?}"),
+      }
+    }
+  }
+
+  // Node 1 materializes both children; node 2 parks fork #1 on the squatter — fork #2 stays
+  // staged (and reserved) behind it, and nothing can heal the park before a SLOW child
+  // election fires.
+  for child in [310u64, 320] {
+    await_lifecycle(
+      handles[0].lifecycle(),
+      "node 1",
+      |ev| matches!(ev, LifecycleEvent::SplitApplied { parent: 100, child: c } if *c == child),
+    )
+    .await;
+  }
+  await_lifecycle(handles[1].lifecycle(), "node 2 (parked)", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitConflict {
+        parent: 100,
+        child: 310
+      }
+    )
+  })
+  .await;
+
+  // THE LIVE-WINDOW PIN. Only now — the park observed, fork #2 provably staged-and-reserved —
+  // node 3 admits an empty FAST pre-vote squatter of the second child id: its solicitations
+  // reach node 2 within ~an election (fast) while the heal is still seconds out (slow). Every
+  // consult that lands in the window must die at the gate: zero builds, the id unhosted.
+  handles[2]
+    .create_group(
+      320,
+      config(3, vec![2, 3]).with_pre_vote(true),
+      11,
+      CountSm::default(),
+      0,
+    )
+    .await
+    .expect("the fast solicitor admits on node 3");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while consults.load(Ordering::SeqCst) == 0 {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no solicitation for the reserved id reached node 2's factory in time"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  assert_eq!(
+    builds.load(Ordering::SeqCst),
+    0,
+    "a reserved child id must never reach the factory's build phase"
+  );
+  assert!(
+    handles[1].group(320).status().await.is_err(),
+    "node 2 must not host the reserved id while its fork is staged"
+  );
+
+  // The park heals through the twin (node 1's 310 replica elects and snapshots the squatter),
+  // fork #2 yields, and node 2's tail carries the typed SplitApplied — the fork, not the
+  // factory, materialized the id (a factory build would have folded it away silently).
+  await_lifecycle(handles[1].lifecycle(), "node 2 (fork #2 lands)", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitApplied {
+        parent: 100,
+        child: 320
+      }
+    )
+  })
+  .await;
+  eprintln!(
+    "factory race: {} consult(s) for 320 reached node 2's factory, {} build(s) passed the gate",
+    consults.load(Ordering::SeqCst),
+    builds.load(Ordering::SeqCst)
+  );
+  assert_eq!(builds.load(Ordering::SeqCst), 0);
+
+  // Both children serve with conserved totals; the parent kept 7 - 2 - 3. The node-3 squatter
+  // stays a harmless pre-vote candidate: its candidacy is refused on log freshness without
+  // ever bumping the live group's term.
+  let g310: Vec<_> = handles[..2].iter().map(|h| h.group(310)).collect();
+  let g320: Vec<_> = handles[..2].iter().map(|h| h.group(320)).collect();
+  assert_eq!(query_anywhere(&g100).await, 2);
+  assert_eq!(submit_anywhere(&g310, b"t").await, 3, "2 forked + 1 tail");
+  assert_eq!(submit_anywhere(&g320, b"t").await, 4, "3 forked + 1 tail");
+
+  // No fork was ever abandoned and fork #2 never conflicted: the gate refused the squatter
+  // the factory would have planted.
+  for (i, h) in handles.iter().enumerate() {
+    while let Ok(ev) = h.lifecycle().try_recv() {
+      assert!(
+        !matches!(ev, LifecycleEvent::SplitRefused { .. }),
+        "node {}: no fork may be abandoned here: {ev:?}",
+        i + 1
+      );
+      assert!(
+        !matches!(ev, LifecycleEvent::SplitConflict { child: 320, .. }),
+        "node {}: the reserved id must never grow a squatter: {ev:?}",
+        i + 1
+      );
+    }
+  }
+}

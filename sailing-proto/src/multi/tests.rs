@@ -2055,6 +2055,10 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
     fork_blob(2),
     "the partition's blob is retained while parked"
   );
+  assert!(
+    m.split_reserved(&200),
+    "a parked fork keeps its child id reserved at the coordinators' admission gates"
+  );
 
   // The fence does NOT lift while parked: the threshold (1) is long crossed and a post-split
   // entry commits, yet no capture lands at-or-past the split — the entry stays replayable, so
@@ -2076,6 +2080,10 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
   assert_eq!(fork.parent_gen_after, 1);
   assert_eq!(fork.fsm.units, 2, "the parked half materializes intact");
   assert_eq!(fork.blob, fork_blob(2));
+  assert!(
+    !m.split_reserved(&200),
+    "the yield releases the reservation — this fork is now the id's one admitted writer"
+  );
   // Conservation across the resolution: every unit is in exactly one of parent / child — the
   // pre-split 3 plus the one the fence probe committed while parked.
   assert_eq!(

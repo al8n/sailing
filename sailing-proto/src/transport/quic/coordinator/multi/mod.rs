@@ -218,8 +218,9 @@ where
   /// (terminal for that incarnation — no consent call cures it; a
   /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) fence refuses every generation),
   /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
-  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
-  /// otherwise the admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
+  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal,
+  /// [`CreateGroupError::SplitReserved`] when the id is reserved as an in-flight split's
+  /// child (self-releasing when the fork resolves); otherwise the admission checks of [`MultiRaft::create_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn create_group(
     &mut self,
@@ -234,6 +235,13 @@ where
     validate_floor(floors.floor(&gid), generation)?;
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
+    }
+    // The split reservation: an in-flight split's child id refuses admission from EVERY other
+    // path (embedder create/restore, a local fork, the factory's gate at the drivers), so the
+    // committed fork's materialization never finds its id occupied by a same-session admission.
+    // Derived from live consensus state — it releases on its own when the fork resolves.
+    if self.multi.split_reserved(&gid) {
+      return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
     self.multi.create_group(gid, config, now, seed, fsm)?;
@@ -261,8 +269,9 @@ where
   /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor (a
   /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) fence refuses every generation),
   /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
-  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
-  /// otherwise the admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
+  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal,
+  /// [`CreateGroupError::SplitReserved`] when the id is reserved as an in-flight split's
+  /// child (self-releasing when the fork resolves); otherwise the admission checks of [`MultiRaft::restore_group`] — see [`CreateGroupError`].
   #[allow(clippy::too_many_arguments)]
   pub fn restore_group<L, S>(
     &mut self,
@@ -285,6 +294,13 @@ where
     validate_floor(floors.floor(&gid), generation)?;
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
+    }
+    // The split reservation: an in-flight split's child id refuses admission from EVERY other
+    // path (embedder create/restore, a local fork, the factory's gate at the drivers), so the
+    // committed fork's materialization never finds its id occupied by a same-session admission.
+    // Derived from live consensus state — it releases on its own when the fork resolves.
+    if self.multi.split_reserved(&gid) {
+      return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
     self
@@ -310,8 +326,9 @@ where
   /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor (a
   /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) fence refuses every generation),
   /// [`CreateGroupError::ReservedGeneration`] when `generation` is the reserved `u64::MAX`
-  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
-  /// otherwise the admission checks of [`MultiRaft::create_group_from_fork`] — see
+  /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal,
+  /// [`CreateGroupError::SplitReserved`] when the id is reserved as an in-flight split's
+  /// child (self-releasing when the fork resolves); otherwise the admission checks of [`MultiRaft::create_group_from_fork`] — see
   /// [`CreateGroupError`] — including [`CreateGroupError::InvalidBootEpoch`] when
   /// `boot_epoch == 0` (a fork's manufactured baseline needs the prior epoch to itself) and
   /// [`CreateGroupError::StorageInUse`] when the handed stores already hold state (a fork
@@ -340,6 +357,13 @@ where
     validate_floor(floors.floor(&gid), generation)?;
     if self.retired.contains(&gid) {
       return Err(CreateGroupError::Retired);
+    }
+    // The split reservation: an in-flight split's child id refuses admission from EVERY other
+    // path (embedder create/restore, a local fork, the factory's gate at the drivers), so the
+    // committed fork's materialization never finds its id occupied by a same-session admission.
+    // Derived from live consensus state — it releases on its own when the fork resolves.
+    if self.multi.split_reserved(&gid) {
+      return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
     self.multi.create_group_from_fork(
@@ -385,6 +409,15 @@ where
   /// consent call ever re-admits an under-floor incarnation.
   pub fn clear_tombstone(&mut self, gid: &G) -> bool {
     self.retired.remove(gid)
+  }
+
+  /// Whether `gid` is currently RESERVED as the child id of a split in flight on this host
+  /// (see [`MultiRaft::split_reserved`]) — the predicate the admission methods refuse on
+  /// ([`CreateGroupError::SplitReserved`]) and a driver's factory pre-build gate declines on.
+  /// Self-releasing derived state: no clear call exists.
+  #[must_use]
+  pub fn is_split_reserved(&self, gid: &G) -> bool {
+    self.multi.split_reserved(gid)
   }
 
   /// Whether `gid` is TOMBSTONED: removed and not explicitly cleared since — its inbound entries
