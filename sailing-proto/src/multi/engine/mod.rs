@@ -350,9 +350,9 @@ impl<G, I> Default for GroupEngine<G, I> {
   }
 }
 
-/// Frame-demux resolution for the multi-group coordinators: stable and non-aliasing by
-/// construction (disjoint map entries); an unknown group is `None` — the unhosted-drop path.
-#[cfg(feature = "tcp")]
+/// Frame-demux resolution for the multi-group coordinators — and the per-crank merge service's
+/// store seam: stable and non-aliasing by construction (disjoint map entries); an unknown group
+/// is `None` — the unhosted-drop path.
 impl<G, I> crate::GroupStores<G, EngineLog, EngineStable<I>> for GroupEngine<G, I>
 where
   G: Ord,

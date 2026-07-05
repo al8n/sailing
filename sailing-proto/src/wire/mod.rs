@@ -483,9 +483,6 @@ pub(crate) fn decode_split_payload(mut data: Bytes) -> Result<SplitPayload, Deco
 }
 
 /// Encode a merge-prepare payload as an entry payload.
-// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
-// `expect` is a lint error), so it cannot outlive its reason.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn encode_prepare_merge_payload(p: &PrepareMergePayload, buf: &mut Vec<u8>) {
   pb::PrepareMergePayload {
     target: p.target_bytes(),
@@ -512,9 +509,6 @@ pub(crate) fn decode_prepare_merge_payload(
 }
 
 /// Encode a merge-commit payload as an entry payload.
-// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
-// `expect` is a lint error), so it cannot outlive its reason.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn encode_commit_merge_payload(p: &CommitMergePayload, buf: &mut Vec<u8>) {
   pb::CommitMergePayload {
     source: p.source_bytes(),
@@ -547,9 +541,6 @@ pub(crate) fn decode_commit_merge_payload(
 }
 
 /// Encode a merge-rollback payload as an entry payload.
-// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
-// `expect` is a lint error), so it cannot outlive its reason.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn encode_rollback_merge_payload(p: &RollbackMergePayload, buf: &mut Vec<u8>) {
   pb::RollbackMergePayload {
     source_gen_after: p.source_gen_after(),

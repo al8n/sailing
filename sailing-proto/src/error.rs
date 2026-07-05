@@ -225,6 +225,93 @@ pub enum SplitError<I> {
   Propose(#[from] ProposeError<I>),
 }
 
+/// Why a merge verb — [`MultiRaft::prepare_merge`](crate::MultiRaft::prepare_merge),
+/// [`commit_merge`](crate::MultiRaft::commit_merge), or
+/// [`rollback_merge`](crate::MultiRaft::rollback_merge), or a coordinator/driver delegator
+/// around them — refused to propose. One enum, three producer layers, the [`SplitError`]
+/// precedent verbatim: the container produces the consensus-shaped refusals, a coordinator's
+/// delegator produces the floor refusals through its per-call seam, and a sharded host's handle
+/// produces `CrossPlane` before any command crosses a plane. Nothing is appended in every case.
+/// There is deliberately NO `Unsupported` variant: absorb support is knowable only at apply
+/// (the FSM seam is a defaulted method), where an unsupporting state machine fail-stops
+/// deterministically rather than diverging.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum MergeError<I> {
+  /// This node is not the mutated group's leader; redirect to `leader` if known. Each merge verb
+  /// rides exactly one group's log — `prepare_merge`/`rollback_merge` the source's,
+  /// `commit_merge` the target's — so only that group's leader can propose it.
+  #[error("not the mutated group's leader")]
+  NotLeader {
+    /// The believed current leader of the mutated group, if known.
+    leader: Option<I>,
+  },
+  /// The source and target are the same group. A group cannot absorb itself.
+  #[error("a group cannot merge into itself")]
+  SelfMerge,
+  /// `prepare_merge`'s target group is not hosted by this container. The preconditions compare
+  /// the two groups' LOCAL replicas (voter sets, read modes), so the target must live here —
+  /// which colocation guarantees for every legitimate pairing.
+  #[error("the merge target is not hosted locally")]
+  TargetMissing,
+  /// `commit_merge`'s source group is not hosted by this container: there is no local frozen
+  /// replica to gate on (or absorb). Same colocation contract as [`TargetMissing`](Self::TargetMissing).
+  #[error("the merge source is not hosted locally")]
+  SourceMissing,
+  /// The two groups' VOTER sets are not identical node sets. Colocation is what makes the
+  /// absorb a purely local hand-off on every replica; merge the memberships first.
+  #[error("the source and target voter sets differ")]
+  VoterSetsDiffer,
+  /// One of the groups is mid-joint-configuration; its effective voter set is ambiguous for the
+  /// colocation comparison. Finish (or leave) the joint change first.
+  #[error("a merge participant is in a joint configuration")]
+  JointConfig,
+  /// The groups run different ACTIVE read modes. A merged group serves under one mode's
+  /// guarantees; migrate one side first (the shipped `SetReadMode` machinery).
+  #[error("the source and target read modes differ")]
+  ReadModesDiffer,
+  /// A membership change is still in flight (appended, not yet applied) on a participant. The
+  /// voter-set comparison would race its apply — and a conf entry committing above the freeze
+  /// strands the changed membership outside the merge. Re-propose after it applies.
+  #[error("a merge participant has a membership change in flight")]
+  ConfChangeInFlight,
+  /// The source is already frozen (or its freeze is pending in the log). One merge at a time
+  /// per source; the standing freeze must resolve or roll back first.
+  #[error("the source group is already frozen or freezing")]
+  AlreadyFrozen,
+  /// A `CommitMerge` is already in flight or parked on the target. One absorb at a time; the
+  /// standing one must resolve first.
+  #[error("a merge into this target is already in flight or parked")]
+  AlreadyPending,
+  /// `commit_merge`'s LOCAL source replica is not yet frozen-applied at its freeze boundary —
+  /// not frozen at all, or still applying toward it. The propose gate is deliberately local and
+  /// cheap (every replica's parked apply re-checks the same facts); retry after the local
+  /// source catches up, or roll the merge back.
+  #[error("the local source replica is not frozen-applied at its freeze boundary")]
+  SourceNotReady,
+  /// A participant's CURRENT incarnation is below its persisted admission floor (a
+  /// coordinator-layer refusal through its floor seam): this replica belongs to a fenced
+  /// incarnation — a stale survivor that must not anchor a merge.
+  #[error("a merge participant's incarnation is below its admission floor ({floor})")]
+  BelowFloor {
+    /// The persisted admission floor that fenced the participant.
+    floor: u64,
+  },
+  /// The source and target map to different planes on a sharded (K-plane) host. A merge is a
+  /// same-plane operation (the absorb is an in-container hand-off); cross-plane merges are the
+  /// same explicit non-goal as cross-plane splits.
+  #[error("the source and target map to different planes")]
+  CrossPlane,
+  /// `rollback_merge`'s source is neither frozen nor freezing — there is nothing to roll back.
+  #[error("the source group is not frozen or freezing")]
+  NotFrozen,
+  /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
+  /// entry too large). The merge-specific gates all passed; the failure is the ordinary
+  /// admin-append class, surfaced verbatim.
+  #[error(transparent)]
+  Propose(#[from] ProposeError<I>),
+}
+
 /// Why a leader-transfer request was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

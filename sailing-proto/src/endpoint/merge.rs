@@ -241,9 +241,6 @@ where
   /// shares `maybe_snapshot`'s busy/fence set (a capture or install already staged, or a fork
   /// barrier at-or-below the absorb point). The container's resolve arm holds the park while
   /// this is true, so the absorb and its durability capture always land in the SAME crank.
-  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
-  // `expect` is a lint error), so it cannot outlive its reason.
-  #[cfg_attr(not(test), expect(dead_code))]
   pub(crate) fn absorb_capture_blocked(&self) -> bool {
     let Some(pending) = self.merge.pending_apply.as_ref() else {
       return false;
@@ -267,9 +264,6 @@ where
   /// An FSM whose `absorb` returns `false` (the defaulted unsupported verdict) poisons —
   /// deterministic on every replica, mirroring `SplitUnsupported`: never a silent skip that
   /// diverges absorbed replicas from refusing ones.
-  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
-  // `expect` is a lint error), so it cannot outlive its reason.
-  #[cfg_attr(not(test), expect(dead_code))]
   pub(crate) fn resolve_pending_merge(&mut self, source_fsm: F) {
     let Some(pending) = self.merge.pending_apply.take() else {
       debug_assert!(false, "resolve without a parked CommitMerge");
@@ -296,9 +290,6 @@ where
   /// entry is a replayed/duplicate commit for an already-absorbed source. Advances past the
   /// parked entry WITHOUT touching the state machine or the lineage and surfaces
   /// `Event::MergeAborted`; the drain resumes on the next storage crank.
-  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
-  // `expect` is a lint error), so it cannot outlive its reason.
-  #[cfg_attr(not(test), expect(dead_code))]
   pub(crate) fn resolve_pending_merge_aborted(&mut self) {
     let Some(pending) = self.merge.pending_apply.take() else {
       debug_assert!(false, "abort-resolve without a parked CommitMerge");
@@ -312,6 +303,18 @@ where
         pending.at(),
         pending.source_bytes(),
       )));
+  }
+
+  /// Whether a membership change is still in flight (appended, not yet applied) — the merge
+  /// verbs' precondition read (the propose gate itself lives in `propose_conf_change_v2`).
+  pub(crate) fn conf_change_in_flight(&self) -> bool {
+    self.pending_conf_index > self.applied
+  }
+
+  /// Whether a `CommitMerge` proposed by THIS leader is still unapplied — the target-side
+  /// one-at-a-time gate's in-flight leg (the parked leg is `pending_merge()`).
+  pub(crate) fn commit_merge_in_flight(&self) -> bool {
+    self.merge.pending_commit_index > self.applied
   }
 
   /// The target-side membership fence: whether a conf change must refuse because a merge is in
@@ -346,9 +349,6 @@ where
   /// rewinds to re-park (nothing durable moved) or restarts the target at a boundary past the
   /// absorb (never a parked apply whose source was already destroyed). The caller checked
   /// [`absorb_capture_blocked`](Self::absorb_capture_blocked) before resolving.
-  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
-  // `expect` is a lint error), so it cannot outlive its reason.
-  #[cfg_attr(not(test), expect(dead_code))]
   pub(crate) fn capture_absorb_snapshot<L, S>(&mut self, log: &L, stable: &mut S)
   where
     L: LogStore,
@@ -396,9 +396,6 @@ where
   /// uniformity). A `PrepareMerge` sets the append-observed lease kill HERE — the leader appends
   /// before it replicates, which is what puts `append(freeze)` after every lease read this
   /// leader ever served.
-  // The expectation self-expires the moment the container's merge verbs land (an unfulfilled
-  // `expect` is a lint error), so it cannot outlive its reason.
-  #[cfg_attr(not(test), expect(dead_code))]
   pub(crate) fn propose_merge_entry<L>(
     &mut self,
     now: impl Into<Now>,

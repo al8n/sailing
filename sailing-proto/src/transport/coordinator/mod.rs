@@ -13,7 +13,7 @@ use bytes::Bytes;
 use std::vec::Vec;
 
 mod multi;
-pub use multi::{GroupControl, GroupStores, MultiStreamCoordinator};
+pub use multi::{GroupControl, MultiStreamCoordinator};
 // Shared with the QUIC multi coordinator alone (the stream one reaches them as module siblings),
 // so the re-export is dead weight in a tcp-without-quic build.
 #[cfg(feature = "quic")]

@@ -4,35 +4,23 @@
 //! demuxed by their group tag and fed to the owning group's endpoint, and each group's outbound
 //! messages are routed back stamped with that group's id. One connection per peer carries every
 //! co-located group's traffic. Storage is per group: [`handle_conn_data`](MultiStreamCoordinator::handle_conn_data)
-//! resolves each decoded frame's group store through a caller-supplied [`GroupStores`], while the
+//! resolves each decoded frame's group store through a caller-supplied
+//! [`GroupStores`](crate::GroupStores), while the
 //! single-group driving methods take the target group's store directly.
 use super::super::{
   CoalescedEntry, ConnId, TransportError, frame::COALESCED_FLAG_QUIESCE, router::PeerRouter,
   stream::RecordIo,
 };
 use crate::{
-  Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupId, Index, Instant, LogStore,
-  Message, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine, StorageProgress,
-  multi::validate_floor,
+  Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupId, GroupStores, Index,
+  Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine,
+  StorageProgress, multi::validate_floor,
 };
 use bytes::Bytes;
 use std::{
   collections::{BTreeMap, BTreeSet, VecDeque},
   vec::Vec,
 };
-
-/// Per-group storage a [`MultiStreamCoordinator`] uses to drive each group's endpoint when inbound
-/// bytes span multiple groups. The caller implements it over its own per-group store table.
-///
-/// CONTRACT: resolution must be STABLE (the same group always resolves to the same stores) and
-/// NON-ALIASING (two groups must never share a store — a shared log is a safety violation).
-/// Returning `Some` for a group the `MultiRaft` does not host is a harmless per-message drop;
-/// returning `None` for a hosted group starves it.
-pub trait GroupStores<G, L, S> {
-  /// The `(log, stable)` stores for `group`, or `None` if this host has no storage for it — an
-  /// inbound message for an unknown group is then dropped (the sender retries on its own cadence).
-  fn stores(&mut self, group: &G) -> Option<(&mut L, &mut S)>;
-}
 
 /// A group-scoped scheduling signal a multi-group coordinator surfaces to its driver (drained via
 /// `poll_group_control`, like `poll_event`). The queue preserves DISPATCH ORDER, so a driver that

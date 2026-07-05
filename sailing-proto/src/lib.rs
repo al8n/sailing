@@ -69,7 +69,8 @@ pub use storage::{
 
 mod error;
 pub use error::{
-  ConfigError, CreateGroupError, ProposeError, ReadIndexError, SplitError, TransferError,
+  ConfigError, CreateGroupError, MergeError, ProposeError, ReadIndexError, SplitError,
+  TransferError,
 };
 
 mod inflights;
@@ -98,7 +99,7 @@ pub use endpoint::{Endpoint, PeerProgress, PendingMergeApply, PoisonReason, Role
 mod multi;
 pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
-  GroupEngine, GroupFork, GroupId, MERGED_FLOOR, MultiRaft, NoFloors, floor_admits,
+  GroupEngine, GroupFork, GroupId, GroupStores, MERGED_FLOOR, MultiRaft, NoFloors, floor_admits,
 };
 
 mod tracker;
@@ -160,8 +161,8 @@ pub use transport::quic::MultiQuicCoordinator;
 pub use transport::{ClusterId, ConnId, ConnRole, Peer, TransportError};
 #[cfg(feature = "tcp")]
 pub use transport::{
-  GroupControl, GroupStores, Intake, LabelOptions, Labeled, MultiStreamCoordinator, Passthrough,
-  RecordIo, StreamCoordinator, StreamTransport,
+  GroupControl, Intake, LabelOptions, Labeled, MultiStreamCoordinator, Passthrough, RecordIo,
+  StreamCoordinator, StreamTransport,
 };
 
 #[cfg(test)]

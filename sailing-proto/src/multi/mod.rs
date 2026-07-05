@@ -27,9 +27,10 @@ mod group_id;
 pub use group_id::GroupId;
 
 use crate::{
-  ConfChange, ConfChangeV2, ConfState, Config, CreateGroupError, Data, Endpoint, Event, HardState,
-  Index, Instant, LogStore, Message, NodeId, Now, OpId, Outgoing, PoisonReason, Prng, ProposeError,
-  ReadIndexError, ReadOnlyOption, SnapshotMeta, SplitError, SplitPayload, StableStore,
+  CommitMergePayload, ConfChange, ConfChangeV2, ConfState, Config, CreateGroupError, Data,
+  Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore, MergeError, Message, NodeId,
+  Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng, ProposeError, ReadIndexError,
+  ReadOnlyOption, RollbackMergePayload, SnapshotMeta, SplitError, SplitPayload, StableStore,
   StateMachine, StorageProgress, Term, TransferError,
 };
 use bytes::Bytes;
@@ -67,6 +68,19 @@ impl<G> FloorStore<G> for NoFloors {
   fn lineage(&self, _gid: &G) -> u64 {
     0
   }
+}
+
+/// Per-group storage a [`MultiStreamCoordinator`] uses to drive each group's endpoint when inbound
+/// bytes span multiple groups. The caller implements it over its own per-group store table.
+///
+/// CONTRACT: resolution must be STABLE (the same group always resolves to the same stores) and
+/// NON-ALIASING (two groups must never share a store — a shared log is a safety violation).
+/// Returning `Some` for a group the `MultiRaft` does not host is a harmless per-message drop;
+/// returning `None` for a hosted group starves it.
+pub trait GroupStores<G, L, S> {
+  /// The `(log, stable)` stores for `group`, or `None` if this host has no storage for it — an
+  /// inbound message for an unknown group is then dropped (the sender retries on its own cadence).
+  fn stores(&mut self, group: &G) -> Option<(&mut L, &mut S)>;
 }
 
 /// The admission floor a merge writes for the absorbed id (the merge milestone is its ONLY
@@ -250,6 +264,33 @@ pub struct GroupFork<G, I, F> {
   /// The split entry's index in the PARENT's log — the fork durability barrier's anchor, handed
   /// back through [`MultiRaft::lift_fork_barrier`] once the child's baseline is flush-durable.
   pub split_index: Index,
+}
+
+/// One resolved parked merge from a [`MultiRaft::service_merge_applies`] crank — what the
+/// DRIVER folds into its storage engine and lifecycle teardown. The container already did the
+/// consensus-side work (the absorb or the deterministic abort, the events, the source
+/// endpoint's removal on a merge); the driver owns the storage half: persist
+/// `floor(source) = `[`MERGED_FLOOR`] and drop the source's stores for a `Merged`, nothing for
+/// an `Aborted` (the source group is still live — its log settled the race).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MergeResolution<G> {
+  /// The target ABSORBED the source: the source endpoint is gone from this container, the
+  /// target's forced absorb capture is staged, and the source id must now be floored terminally
+  /// and its stores dropped — behind the SAME barrier the capture rides.
+  Merged {
+    /// The absorbed source group.
+    source: G,
+    /// The absorbing target group.
+    target: G,
+  },
+  /// The parked commit resolved as a deterministic NO-OP (the source's log settled the race, or
+  /// the commit was a replayed duplicate). Both groups remain exactly as they were.
+  Aborted {
+    /// The named source group.
+    source: G,
+    /// The target group whose parked apply no-op'd.
+    target: G,
+  },
 }
 
 /// The outcome of one head-fork examination (see `MultiRaft::poll_pending_fork`): the parent's
@@ -1450,6 +1491,349 @@ where
       .map_err(SplitError::Propose);
     self.mark_dirty(gid);
     Some(result)
+  }
+
+  /// Propose a merge FREEZE on `source` (the group that will be absorbed): a committed
+  /// `PrepareMerge` freezes it on every replica so `target` can absorb it at the boundary.
+  /// Leader-proposed on the SOURCE's own log. The preconditions are checked against the LOCAL
+  /// replicas (colocation makes them representative; every parked apply re-checks the facts
+  /// that matter from its own log): identical voter sets, both non-joint, same active read
+  /// mode, no membership change in flight on either side, and the source not already frozen or
+  /// freezing. `None` if no group `source` is hosted.
+  ///
+  /// Floor refusals (`MergeError::BelowFloor`) are the COORDINATOR delegators' leg through
+  /// their per-call floor seam, and `CrossPlane` the sharded handle's — the container stays
+  /// floor- and plane-free, exactly as it is for splits.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn prepare_merge<L, S>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
+    _stable: &S,
+    target: &G,
+  ) -> Option<Result<Index, MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.groups.contains_key(source) {
+      return None;
+    }
+    if source == target {
+      return Some(Err(MergeError::SelfMerge));
+    }
+    let Some(tep) = self.groups.get(target) else {
+      return Some(Err(MergeError::TargetMissing));
+    };
+    let target_conf = tep.conf_state();
+    let target_mode = tep.active_read_mode();
+    let target_conf_in_flight = tep.conf_change_in_flight();
+    let sep = self.groups.get(source).expect("checked hosted above");
+    if sep.is_poisoned() {
+      return Some(Err(MergeError::Propose(ProposeError::Poisoned)));
+    }
+    if !sep.role().is_leader() {
+      return Some(Err(MergeError::NotLeader {
+        leader: sep.leader(),
+      }));
+    }
+    if sep.merge_freeze_active() {
+      return Some(Err(MergeError::AlreadyFrozen));
+    }
+    let source_conf = sep.conf_state();
+    if source_conf.is_joint() || target_conf.is_joint() {
+      return Some(Err(MergeError::JointConfig));
+    }
+    if sep.conf_change_in_flight() || target_conf_in_flight {
+      return Some(Err(MergeError::ConfChangeInFlight));
+    }
+    if source_conf.voters() != target_conf.voters() {
+      return Some(Err(MergeError::VoterSetsDiffer));
+    }
+    if sep.active_read_mode() != target_mode {
+      return Some(Err(MergeError::ReadModesDiffer));
+    }
+    // The mint reads the live counter; it bumps only when THIS freeze applies, and a second
+    // freeze cannot be proposed while this one is pending or applied (AlreadyFrozen above).
+    let source_gen_after = sep.shape_gen() + 1;
+    let mut target_bytes = Vec::new();
+    target.encode(&mut target_bytes);
+    let payload = PrepareMergePayload::new(Bytes::from(target_bytes), source_gen_after);
+    let mut buf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(&payload, &mut buf);
+    let ep = self.groups.get_mut(source).expect("checked hosted above");
+    let result = ep
+      .propose_merge_entry(now, log, EntryKind::PrepareMerge, Bytes::from(buf))
+      .map_err(MergeError::Propose);
+    self.mark_dirty(source);
+    Some(result)
+  }
+
+  /// Propose the merge ABSORB on `target`: a committed `CommitMerge` parks every target
+  /// replica's apply until its LOCAL source replica is frozen-applied at the boundary, then the
+  /// per-crank [`service_merge_applies`](Self::service_merge_applies) resolves it. Leader-
+  /// proposed on the TARGET's own log, only once the LOCAL source replica is already
+  /// frozen-applied (the cheap local gate; every replica's park re-checks the same facts). The
+  /// carried `source_gen_after` is read off the frozen source, so the parked applies' decision
+  /// inputs are fully log-determined. `None` if no group `target` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn commit_merge<L, S>(
+    &mut self,
+    target: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
+    _stable: &S,
+    source: &G,
+  ) -> Option<Result<Index, MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.groups.contains_key(target) {
+      return None;
+    }
+    if source == target {
+      return Some(Err(MergeError::SelfMerge));
+    }
+    let Some(sep) = self.groups.get(source) else {
+      return Some(Err(MergeError::SourceMissing));
+    };
+    let source_conf = sep.conf_state();
+    let source_mode = sep.active_read_mode();
+    let source_frozen_ready =
+      sep.is_frozen() && sep.freeze_index().is_some_and(|f| sep.applied_index() >= f);
+    let freeze_index = sep.freeze_index();
+    let source_gen_after = sep.shape_gen();
+    let tep = self.groups.get(target).expect("checked hosted above");
+    if tep.is_poisoned() {
+      return Some(Err(MergeError::Propose(ProposeError::Poisoned)));
+    }
+    if !tep.role().is_leader() {
+      return Some(Err(MergeError::NotLeader {
+        leader: tep.leader(),
+      }));
+    }
+    if tep.commit_merge_in_flight() || tep.pending_merge().is_some() {
+      return Some(Err(MergeError::AlreadyPending));
+    }
+    // The local readiness gate: the source must be frozen-applied at its boundary. `>=` rather
+    // than `==` deliberately — a post-freeze election lands an FSM-no-op above the boundary on
+    // every replica, and only FSM-no-ops can follow a surviving freeze, so applied-past-F is
+    // the SAME state as applied-at-F (an equality gate would wedge every merge whose source
+    // ever re-elected while frozen).
+    if !source_frozen_ready {
+      return Some(Err(MergeError::SourceNotReady));
+    }
+    let target_conf = tep.conf_state();
+    if source_conf.is_joint() || target_conf.is_joint() {
+      return Some(Err(MergeError::JointConfig));
+    }
+    if tep.conf_change_in_flight() {
+      return Some(Err(MergeError::ConfChangeInFlight));
+    }
+    if source_conf.voters() != target_conf.voters() {
+      return Some(Err(MergeError::VoterSetsDiffer));
+    }
+    if source_mode != tep.active_read_mode() {
+      return Some(Err(MergeError::ReadModesDiffer));
+    }
+    let target_gen_after = tep.shape_gen() + 1;
+    let mut source_bytes = Vec::new();
+    source.encode(&mut source_bytes);
+    let payload = CommitMergePayload::new(
+      Bytes::from(source_bytes),
+      freeze_index.expect("frozen-ready implies a boundary"),
+      source_gen_after,
+      target_gen_after,
+    );
+    let mut buf = Vec::new();
+    crate::wire::encode_commit_merge_payload(&payload, &mut buf);
+    let ep = self.groups.get_mut(target).expect("checked hosted above");
+    let result = ep
+      .propose_merge_entry(now, log, EntryKind::CommitMerge, Bytes::from(buf))
+      .map_err(MergeError::Propose);
+    self.mark_dirty(target);
+    Some(result)
+  }
+
+  /// Propose the merge ABORT on `source`: a committed `RollbackMerge` unfreezes it and moves
+  /// its lineage past the freeze generation, which deterministically aborts every parked
+  /// `CommitMerge` still naming the old freeze. The ONE entry proposable on a frozen group —
+  /// the release valve; there is deliberately no timeout-based auto-unfreeze. `None` if no
+  /// group `source` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn rollback_merge<L, S>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
+    _stable: &S,
+  ) -> Option<Result<Index, MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let ep = self.groups.get(source)?;
+    if ep.is_poisoned() {
+      return Some(Err(MergeError::Propose(ProposeError::Poisoned)));
+    }
+    if !ep.role().is_leader() {
+      return Some(Err(MergeError::NotLeader {
+        leader: ep.leader(),
+      }));
+    }
+    if !ep.merge_freeze_active() {
+      return Some(Err(MergeError::NotFrozen));
+    }
+    // The mint accounts for a freeze still PENDING in the log: that freeze will apply first and
+    // bump the counter once, so the rollback minted beside it takes the successor slot — and
+    // the two share truncation fate (the rollback sits above the freeze it undoes), so a lost
+    // freeze never strands an over-minted rollback.
+    let bump = if ep.is_frozen() { 1 } else { 2 };
+    let source_gen_after = ep.shape_gen() + bump;
+    let payload = RollbackMergePayload::new(source_gen_after);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&payload, &mut buf);
+    let ep = self.groups.get_mut(source).expect("checked hosted above");
+    let result = ep
+      .propose_merge_entry(now, log, EntryKind::RollbackMerge, Bytes::from(buf))
+      .map_err(MergeError::Propose);
+    self.mark_dirty(source);
+    Some(result)
+  }
+
+  /// Resolve every parked `CommitMerge` that local facts now decide — called ONCE PER CRANK by
+  /// every driver, after the per-group apply drains. For each parked target the arms are, in
+  /// order: **resolve** (source hosted, frozen at the expected gen, applied past the boundary,
+  /// and the target free to stage its absorb capture) — the source endpoint is removed, its
+  /// state machine absorbed, and the forced capture staged through `stores` so the union's
+  /// durability anchor rides the SAME barrier as the driver's floor/teardown; **abort** (source
+  /// hosted but its lineage moved PAST the expected gen — a rollback won the race on the
+  /// source's own log; or source absent — already merged away here, or this replica never
+  /// hosted one) — a deterministic no-op past the parked entry; **keep parked** otherwise (the
+  /// source is still catching up; its own replication keeps running while frozen, entirely
+  /// independent of this target). Every input is log-determined, so all replicas reach the same
+  /// resolution regardless of WHEN their cranks run it.
+  ///
+  /// Liveness needs exactly one guarantee from the driver: a parked target is never
+  /// quiesce-eligible, so this service keeps being reached. The park waits on a local monotone
+  /// condition (the local source's applied reaching a fixed committed index), and the gen
+  /// recheck bounds it against rollbacks — one of the two MUST eventually commit on the
+  /// source's log; a source wedged below its boundary forever is the group-is-dead liveness
+  /// class, resolvable by membership action or rollback, both explicitly available.
+  ///
+  /// Returns the crank's resolutions for the DRIVER to fold: floor + teardown for `Merged`,
+  /// nothing for `Aborted`.
+  pub fn service_merge_applies<L, S>(
+    &mut self,
+    stores: &mut impl crate::GroupStores<G, L, S>,
+  ) -> Vec<MergeResolution<G>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: Data,
+  {
+    let mut resolutions = Vec::new();
+    let parked: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.pending_merge().is_some())
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for tgid in parked {
+      let Some(tep) = self.groups.get(&tgid) else {
+        continue;
+      };
+      let Some(pending) = tep.pending_merge() else {
+        continue;
+      };
+      let expected = pending.source_gen_after();
+      let boundary = pending.freeze_index();
+      let source_bytes = pending.source_bytes();
+      let Ok(source) = G::decode_exact(source_bytes) else {
+        // A committed source id that does not decode as G is committed-corrupt — the split
+        // relay's own decode class, fail-stopped identically.
+        if let Some(tep) = self.groups.get_mut(&tgid) {
+          tep.poison(PoisonReason::MergeDecode);
+        }
+        continue;
+      };
+      enum Verdict {
+        Resolve,
+        Abort,
+        Wait,
+      }
+      let verdict = match self.groups.get(&source) {
+        Some(sep) => {
+          let seen = sep.shape_gen();
+          if seen == expected {
+            // gen == expected implies the freeze applied (that apply is the counter's only
+            // path to this value) — frozen and applied-past-boundary ride along; the explicit
+            // checks document the gate and catch a broken counter in debug.
+            debug_assert!(sep.is_frozen() && sep.applied_index() >= boundary);
+            Verdict::Resolve
+          } else if seen > expected {
+            Verdict::Abort
+          } else {
+            Verdict::Wait
+          }
+        }
+        // Absent: already merged away here (its floor is terminal), or this replica was
+        // restored/walked into a world where the source never existed locally — either way the
+        // union this commit describes is not materializable HERE and the entry no-ops; a
+        // replica that SHOULD have absorbed can never reach this arm, because the membership
+        // fence keeps every log-walk below the absorb point.
+        None => Verdict::Abort,
+      };
+      match verdict {
+        Verdict::Wait => {}
+        Verdict::Abort => {
+          if let Some(tep) = self.groups.get_mut(&tgid) {
+            tep.resolve_pending_merge_aborted();
+          }
+          self.mark_dirty(&tgid);
+          resolutions.push(MergeResolution::Aborted {
+            source,
+            target: tgid,
+          });
+        }
+        Verdict::Resolve => {
+          // The absorb capture must be stageable NOW: absorb + capture + (driver-side) floor
+          // and teardown ride one crank, one barrier. A busy target (a capture or install
+          // already staged, a fork barrier at the absorb point) stays parked this crank.
+          if self
+            .groups
+            .get(&tgid)
+            .is_some_and(Endpoint::absorb_capture_blocked)
+          {
+            continue;
+          }
+          let Some(sep) = self.remove_group(&source) else {
+            continue;
+          };
+          let fsm = sep.into_state_machine();
+          let Some(tep) = self.groups.get_mut(&tgid) else {
+            continue;
+          };
+          tep.resolve_pending_merge(fsm);
+          if let Some((log, stable)) = stores.stores(&tgid)
+            && let Some(tep) = self.groups.get_mut(&tgid)
+          {
+            tep.capture_absorb_snapshot(log, stable);
+          }
+          self.mark_dirty(&tgid);
+          resolutions.push(MergeResolution::Merged {
+            source,
+            target: tgid,
+          });
+        }
+      }
+    }
+    resolutions
   }
 
   /// Initiate a linearizable read on `gid`; the resulting `ReadState` surfaces via

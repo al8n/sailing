@@ -23,7 +23,7 @@ mod stream;
 mod tls;
 
 #[cfg(feature = "tcp")]
-pub use coordinator::{GroupControl, GroupStores, MultiStreamCoordinator, StreamCoordinator};
+pub use coordinator::{GroupControl, MultiStreamCoordinator, StreamCoordinator};
 #[cfg(feature = "tcp")]
 pub use labeled::{LabelOptions, Labeled};
 #[cfg(feature = "tcp")]
