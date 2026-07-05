@@ -116,6 +116,22 @@ impl<I> GroupBlueprint<I> {
 /// machine (or open the resources one carries) for an unauthorized solicitor — the most a
 /// refused solicitation can extract, at its retry cadence, is the cheap catalog consultation.
 ///
+/// **Fork-born ids materialize as observers, never voting empties.** A blueprint for an id the
+/// catalog knows to be FORK-BORN (a split child — any id whose authoritative baseline is a
+/// manufactured snapshot) MUST use the observer shape: the host's own id ABSENT from the seed
+/// config's voter list ([`Config::try_new_observer`]), so the materialized empty still GRANTS
+/// votes but cannot campaign — the fork holder's manufactured log wins the only possible
+/// election, the forced snapshot (the fork compacts through its baseline, so a zero-progress
+/// peer's catch-up is structurally an install) delivers the fork content, and its boundary
+/// configuration is what promotes the joiner to voter. WHY: a full-voter empty is promotable
+/// with a virgin election timer, and an empty quorum's first commit lands exactly on the
+/// manufactured baseline's coordinate — log-matching cannot distinguish the two histories, so
+/// divergent committed state fuses silently instead of failing loudly. The references'
+/// message-created replicas are structurally non-promotable until the log teaches them their
+/// own membership; this is sailing's equivalent rule. Fresh factory-BOOTSTRAPPED ids (day-0
+/// groups someone created explicitly) keep full-voter blueprints — the distinction is the
+/// CATALOG's to make, and the catalog is the split registry.
+///
 /// **CREATE-only.** A blueprint materializes a FRESH replica: the state machine is the initial
 /// one, and the replica learns state via the ordinary snapshot/append catch-up. Recovering a
 /// group that has durable local state is boot-time embedder work through
