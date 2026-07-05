@@ -160,6 +160,16 @@ pub enum PoisonReason {
   /// the same entry against the same FSM, so this is a deterministic cluster-wide fail-stop —
   /// never silent divergence between replicas that forked and replicas that did not.
   SplitUnsupported,
+  /// A committed merge entry's payload failed to decode — a `PrepareMerge`/`CommitMerge`/
+  /// `RollbackMerge` whose bytes won't parse, or whose group id is outside the wire bound.
+  /// Committed-corrupt, mirroring `SplitDecode`.
+  MergeDecode,
+  /// A committed `CommitMerge` entry was resolved against a state machine whose `absorb`
+  /// returned `false` (the defaulted unsupported verdict). Every replica folds the same entry
+  /// against the same FSM, so this is a deterministic cluster-wide fail-stop — never silent
+  /// divergence between replicas that absorbed and replicas that did not (mirror
+  /// [`SplitUnsupported`](Self::SplitUnsupported)).
+  MergeUnsupported,
   /// The `Changer` rejected a committed, validly-decoded `ConfChange`.
   ConfChangeApply,
   /// A snapshot blob failed to decode as `F::Snapshot` (install or restart).
@@ -254,6 +264,8 @@ impl PoisonReason {
       Self::SetReadModeDecode => "set_read_mode_decode",
       Self::SplitDecode => "split_decode",
       Self::SplitUnsupported => "split_unsupported",
+      Self::MergeDecode => "merge_decode",
+      Self::MergeUnsupported => "merge_unsupported",
       Self::ConfChangeApply => "conf_change_apply",
       Self::SnapshotDecode => "snapshot_decode",
       Self::SnapshotRestore => "snapshot_restore",
@@ -2577,6 +2589,40 @@ where
                 index: idx,
               });
             }
+          }
+          EntryKind::PrepareMerge => {
+            // A committed PrepareMerge whose payload won't decode is corrupt — mirror Split.
+            if crate::wire::decode_prepare_merge_payload(entry.data_bytes()).is_err() {
+              self.poison(PoisonReason::MergeDecode);
+              break;
+            }
+            // The freeze fold (frozen + the gate set) lands with the merge state machinery;
+            // until then a committed PrepareMerge reaching apply is an entry this core cannot
+            // fold — fail-stop, never a silent skip that would diverge from folding replicas.
+            self.poison(PoisonReason::MergeUnsupported);
+            break;
+          }
+          EntryKind::CommitMerge => {
+            // A committed CommitMerge whose payload won't decode is corrupt — mirror Split.
+            if crate::wire::decode_commit_merge_payload(entry.data_bytes()).is_err() {
+              self.poison(PoisonReason::MergeDecode);
+              break;
+            }
+            // The parked absorb lands with the merge state machinery; until then — fail-stop,
+            // never a silent skip.
+            self.poison(PoisonReason::MergeUnsupported);
+            break;
+          }
+          EntryKind::RollbackMerge => {
+            // A committed RollbackMerge whose payload won't decode is corrupt — mirror Split.
+            if crate::wire::decode_rollback_merge_payload(entry.data_bytes()).is_err() {
+              self.poison(PoisonReason::MergeDecode);
+              break;
+            }
+            // The unfreeze fold lands with the merge state machinery; until then — fail-stop,
+            // never a silent skip.
+            self.poison(PoisonReason::MergeUnsupported);
+            break;
           }
           EntryKind::SetReadMode => {
             // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison

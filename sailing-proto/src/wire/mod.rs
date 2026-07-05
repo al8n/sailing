@@ -34,8 +34,9 @@
 //!   (parity with the old unknown-tag reject).
 
 use crate::{
-  ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-  EntryKind, Index, InstallSnapshot, Message, NodeId, SnapshotMeta, SplitPayload, Term,
+  CommitMergePayload, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
+  ConfState, Entry, EntryKind, Index, InstallSnapshot, Message, NodeId, PrepareMergePayload,
+  RollbackMergePayload, SnapshotMeta, SplitPayload, Term,
   data::{Data, DecodeError},
 };
 use buffa::{EnumValue, Message as _};
@@ -481,6 +482,93 @@ pub(crate) fn decode_split_payload(mut data: Bytes) -> Result<SplitPayload, Deco
   ))
 }
 
+/// Encode a merge-prepare payload as an entry payload.
+// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
+// `expect` is a lint error), so it cannot outlive its reason.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn encode_prepare_merge_payload(p: &PrepareMergePayload, buf: &mut Vec<u8>) {
+  pb::PrepareMergePayload {
+    target: p.target_bytes(),
+    source_gen_after: p.source_gen_after(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a merge-prepare payload from an entry payload. The target id's encoding must satisfy
+/// the group-tag wire bound (1..=[`MAX_GROUP_ID_LEN`] bytes) — the propose side never appends one
+/// outside it, so a committed violation is corrupt, exactly like a split's child id.
+pub(crate) fn decode_prepare_merge_payload(
+  mut data: Bytes,
+) -> Result<PrepareMergePayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::PrepareMergePayload>(&mut data)
+    .map_err(map_err)?;
+  if w.target.is_empty() || w.target.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("PrepareMergePayload.target length"));
+  }
+  Ok(PrepareMergePayload::new(w.target, w.source_gen_after))
+}
+
+/// Encode a merge-commit payload as an entry payload.
+// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
+// `expect` is a lint error), so it cannot outlive its reason.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn encode_commit_merge_payload(p: &CommitMergePayload, buf: &mut Vec<u8>) {
+  pb::CommitMergePayload {
+    source: p.source_bytes(),
+    freeze_index: p.freeze_index().get(),
+    source_gen_after: p.source_gen_after(),
+    target_gen_after: p.target_gen_after(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a merge-commit payload from an entry payload, with the same group-tag bound on the
+/// source id as [`decode_prepare_merge_payload`] applies to the target.
+pub(crate) fn decode_commit_merge_payload(
+  mut data: Bytes,
+) -> Result<CommitMergePayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::CommitMergePayload>(&mut data)
+    .map_err(map_err)?;
+  if w.source.is_empty() || w.source.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("CommitMergePayload.source length"));
+  }
+  Ok(CommitMergePayload::new(
+    w.source,
+    Index::new(w.freeze_index),
+    w.source_gen_after,
+    w.target_gen_after,
+  ))
+}
+
+/// Encode a merge-rollback payload as an entry payload.
+// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
+// `expect` is a lint error), so it cannot outlive its reason.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn encode_rollback_merge_payload(p: &RollbackMergePayload, buf: &mut Vec<u8>) {
+  pb::RollbackMergePayload {
+    source_gen_after: p.source_gen_after(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a merge-rollback payload from an entry payload.
+pub(crate) fn decode_rollback_merge_payload(
+  mut data: Bytes,
+) -> Result<RollbackMergePayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::RollbackMergePayload>(&mut data)
+    .map_err(map_err)?;
+  Ok(RollbackMergePayload::new(w.source_gen_after))
+}
+
 /// Map buffa's structural decode errors onto the crate's error surface. The envelope
 /// rejects-and-closes at the transport either way; the distinction that matters to
 /// callers is truncation vs malformation.
@@ -566,6 +654,9 @@ fn pb_entry(e: &Entry) -> pb::Entry {
       EntryKind::Empty => pb::EntryKind::Empty,
       EntryKind::SetReadMode => pb::EntryKind::SetReadMode,
       EntryKind::Split => pb::EntryKind::Split,
+      EntryKind::PrepareMerge => pb::EntryKind::PrepareMerge,
+      EntryKind::CommitMerge => pb::EntryKind::CommitMerge,
+      EntryKind::RollbackMerge => pb::EntryKind::RollbackMerge,
     }),
     data: e.data_bytes(),
     timestamp: e.timestamp(),
@@ -582,13 +673,10 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
     EnumValue::Known(pb::EntryKind::Empty) => EntryKind::Empty,
     EnumValue::Known(pb::EntryKind::SetReadMode) => EntryKind::SetReadMode,
     EnumValue::Known(pb::EntryKind::Split) => EntryKind::Split,
-    // The merge kinds are RESERVED by this LABEL_VERSION (their pb values are pinned so the
-    // merge milestone adds no wire change) but nothing encodes them yet: reject like an unknown
-    // value until that milestone maps them. The version fence owns mixed-version peers.
-    EnumValue::Known(
-      pb::EntryKind::PrepareMerge | pb::EntryKind::CommitMerge | pb::EntryKind::RollbackMerge,
-    )
-    | EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
+    EnumValue::Known(pb::EntryKind::PrepareMerge) => EntryKind::PrepareMerge,
+    EnumValue::Known(pb::EntryKind::CommitMerge) => EntryKind::CommitMerge,
+    EnumValue::Known(pb::EntryKind::RollbackMerge) => EntryKind::RollbackMerge,
+    EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
   };
   Ok(
     Entry::new(Term::new(w.term), Index::new(w.index), kind, w.data)

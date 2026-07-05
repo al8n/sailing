@@ -32,7 +32,9 @@ mod data;
 pub use data::{ByteCursor, Data, DecodeError};
 
 mod entry;
-pub use entry::{Entry, EntryKind, SplitPayload};
+pub use entry::{
+  CommitMergePayload, Entry, EntryKind, PrepareMergePayload, RollbackMergePayload, SplitPayload,
+};
 
 mod maybe_owned;
 pub use maybe_owned::MaybeOwned;

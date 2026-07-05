@@ -50,9 +50,8 @@ message Entry {
 }
 
 // Entry discriminant. Zero = Normal so the dominant case is the proto3 default.
-// The three merge kinds (5..=7) are RESERVED by the split milestone's LABEL_VERSION 3 bump so
-// the merge milestone adds no wire change: nothing encodes them yet, and a frame carrying one
-// rejects at conversion until that milestone maps them.
+// The three merge kinds (5..=7) were RESERVED by the split milestone's LABEL_VERSION 3 bump and
+// are mapped by the merge milestone — no wire change, as the reservation promised.
 enum EntryKind {
   ENTRY_KIND_NORMAL = 0;
   ENTRY_KIND_CONF_CHANGE = 1;
@@ -76,6 +75,39 @@ message SplitPayload {
   uint64 child_gen = 2;
   uint64 parent_gen_after = 3;
   bytes instruction = 4;
+}
+
+// The payload of an ENTRY_KIND_PREPARE_MERGE entry (rides Entry.data), proposed on the SOURCE
+// group's log: freeze this group so `target` can absorb it. G-free like SplitPayload — `target`
+// is the embedder's group id encoded by its Data impl (1..=1024 bytes, decode_exact).
+// `source_gen_after` is the source's lineage counter after the freeze applies (the one unified
+// monotone per-id counter). Deliberately NO lease/clock field: the freeze kills lease serving at
+// APPEND observation of this entry, so the merge choreography is clock-free end to end.
+message PrepareMergePayload {
+  bytes target = 1;
+  uint64 source_gen_after = 2;
+}
+
+// The payload of an ENTRY_KIND_COMMIT_MERGE entry (rides Entry.data), proposed on the TARGET
+// group's log: absorb the frozen `source` at exactly `freeze_index`. The absorbed state itself
+// never rides the entry — every replica extracts its LOCAL source replica at the freeze boundary
+// — so the wire cost is independent of FSM size. `source_gen_after` is the gen the source's
+// PrepareMerge set (the parked apply's abort comparator: a RollbackMerge that won the race on
+// the source's log moved the counter past it); `target_gen_after` is the target's own lineage
+// after the absorb (replay idempotence).
+message CommitMergePayload {
+  bytes source = 1;
+  uint64 freeze_index = 2;
+  uint64 source_gen_after = 3;
+  uint64 target_gen_after = 4;
+}
+
+// The payload of an ENTRY_KIND_ROLLBACK_MERGE entry (rides Entry.data), proposed on the SOURCE
+// group's log: unfreeze — the merge's explicit abort. `source_gen_after` moves the source's
+// lineage past the freeze generation, which is what makes every parked CommitMerge for the OLD
+// freeze abort deterministically (the race is settled by the source's log order alone).
+message RollbackMergePayload {
+  uint64 source_gen_after = 1;
 }
 
 // Cluster membership. Each repeated field is a SET: elements are the embedder's

@@ -1240,9 +1240,7 @@ fn split_payload_rejects_out_of_bound_child() {
 }
 
 #[test]
-fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
-  use buffa::Message as _;
-
+fn split_entry_kind_round_trips_and_merge_kinds_map() {
   // A Split entry rides the ordinary AppendEntries envelope.
   let entry = Entry::new(
     Term::new(2),
@@ -1259,14 +1257,202 @@ fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
     Index::new(8),
   )));
 
-  // The merge entry kinds are RESERVED in this LABEL_VERSION bump (their pb values are pinned so
-  // the merge milestone adds no wire change), but nothing encodes them yet: a frame carrying one
-  // rejects at conversion exactly like an unknown kind, and the version fence owns mixed versions.
+  // The merge kinds were RESERVED by the split milestone's LABEL_VERSION bump (pb values 5..=7);
+  // the merge milestone maps them, so a merge entry rides AppendEntries exactly like Split — no
+  // wire change, as the reservation promised.
   for kind in [
-    pb::EntryKind::PrepareMerge,
-    pb::EntryKind::CommitMerge,
-    pb::EntryKind::RollbackMerge,
+    EntryKind::PrepareMerge,
+    EntryKind::CommitMerge,
+    EntryKind::RollbackMerge,
   ] {
+    let entry = Entry::new(
+      Term::new(2),
+      Index::new(9),
+      kind,
+      Bytes::from_static(b"payload"),
+    );
+    rt(Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1,
+      Index::new(8),
+      Term::new(2),
+      std::vec![entry],
+      Index::new(8),
+    )));
+  }
+}
+
+/// The pinned wire bytes of one `PrepareMergePayload` — proto3 fields in ascending order:
+/// `target` (1, bytes), `source_gen_after` (2, varint). Small and fixed-shape: the freeze rides
+/// the entry kind; no lease/clock field exists anywhere in the merge choreography (clock-free).
+const GOLDEN_PREPARE_MERGE_PAYLOAD: &[u8] = &[
+  0x0A, 0x01, 0x2B, // target = [0x2b]
+  0x10, 0x03, // source_gen_after = 3
+];
+
+/// The pinned wire bytes of one `CommitMergePayload` — proto3 fields in ascending order:
+/// `source` (1, bytes), `freeze_index` (2, varint), `source_gen_after` (3, varint),
+/// `target_gen_after` (4, varint). The absorbed state itself never rides the entry — every
+/// replica extracts its LOCAL source at the freeze boundary — so the wire cost is independent
+/// of FSM size, exactly like Split.
+const GOLDEN_COMMIT_MERGE_PAYLOAD: &[u8] = &[
+  0x0A, 0x01, 0x2A, // source = [0x2a]
+  0x10, 0x09, // freeze_index = 9
+  0x18, 0x03, // source_gen_after = 3
+  0x20, 0x05, // target_gen_after = 5
+];
+
+/// The pinned wire bytes of one `RollbackMergePayload`: `source_gen_after` (1, varint) alone.
+const GOLDEN_ROLLBACK_MERGE_PAYLOAD: &[u8] = &[
+  0x08, 0x04, // source_gen_after = 4
+];
+
+#[test]
+fn prepare_merge_payload_round_trips_and_pins_bytes() {
+  let p = PrepareMergePayload::new(Bytes::from_static(b"\x2b"), 3);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_PREPARE_MERGE_PAYLOAD, "wire bytes are pinned");
+  let d = decode_prepare_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_prepare_merge_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  // A truncated frame rejects rather than decoding a partial payload.
+  assert!(
+    decode_prepare_merge_payload(Bytes::from_static(&GOLDEN_PREPARE_MERGE_PAYLOAD[..2])).is_err(),
+    "a truncated payload rejects"
+  );
+}
+
+#[test]
+fn commit_merge_payload_round_trips_and_pins_bytes() {
+  let p = CommitMergePayload::new(Bytes::from_static(b"\x2a"), Index::new(9), 3, 5);
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_COMMIT_MERGE_PAYLOAD, "wire bytes are pinned");
+  let d = decode_commit_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_commit_merge_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  assert!(
+    decode_commit_merge_payload(Bytes::from_static(&GOLDEN_COMMIT_MERGE_PAYLOAD[..2])).is_err(),
+    "a truncated payload rejects"
+  );
+}
+
+#[test]
+fn rollback_merge_payload_round_trips_and_pins_bytes() {
+  let p = RollbackMergePayload::new(4);
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_ROLLBACK_MERGE_PAYLOAD, "wire bytes are pinned");
+  let d = decode_rollback_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_rollback_merge_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  // The one-field payload's truncation shape: a dangling tag with no varint body.
+  assert!(
+    decode_rollback_merge_payload(Bytes::from_static(&GOLDEN_ROLLBACK_MERGE_PAYLOAD[..1])).is_err(),
+    "a truncated payload rejects"
+  );
+}
+
+#[test]
+fn merge_payloads_reject_out_of_bound_group_ids() {
+  // An absent/empty group id is never a merge participant; over the group-tag wire bound rejects
+  // like any group tag (the propose side never encodes one, so a committed violation is corrupt).
+  let empty = PrepareMergePayload::new(Bytes::new(), 1);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(&empty, &mut buf);
+  assert!(
+    decode_prepare_merge_payload(Bytes::from(buf)).is_err(),
+    "an empty target rejects"
+  );
+  let oversized = PrepareMergePayload::new(Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]), 1);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(&oversized, &mut buf);
+  assert!(
+    decode_prepare_merge_payload(Bytes::from(buf)).is_err(),
+    "an over-bound target encoding rejects"
+  );
+
+  let empty = CommitMergePayload::new(Bytes::new(), Index::new(1), 1, 1);
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(&empty, &mut buf);
+  assert!(
+    decode_commit_merge_payload(Bytes::from(buf)).is_err(),
+    "an empty source rejects"
+  );
+  let oversized = CommitMergePayload::new(
+    Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]),
+    Index::new(1),
+    1,
+    1,
+  );
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(&oversized, &mut buf);
+  assert!(
+    decode_commit_merge_payload(Bytes::from(buf)).is_err(),
+    "an over-bound source encoding rejects"
+  );
+}
+
+#[test]
+fn merge_entries_fit_the_append_frame_budget() {
+  // The merge payloads are a handful of varints plus ONE bounded group tag, so a merge entry's
+  // frame cost is payload + ENTRY_WIRE_OVERHEAD_MAX — the existing accounting, unchanged, and
+  // far under the per-frame entry budget even at the maximum group-id encoding.
+  let worst_target = Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN]);
+  let mut buf = Vec::new();
+  encode_prepare_merge_payload(
+    &PrepareMergePayload::new(worst_target.clone(), u64::MAX),
+    &mut buf,
+  );
+  let prepare = Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::PrepareMerge,
+    Bytes::from(buf),
+  );
+  let mut buf = Vec::new();
+  encode_commit_merge_payload(
+    &CommitMergePayload::new(worst_target, Index::new(u64::MAX - 1), u64::MAX, u64::MAX),
+    &mut buf,
+  );
+  let commit = Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::CommitMerge,
+    Bytes::from(buf),
+  );
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(&RollbackMergePayload::new(u64::MAX), &mut buf);
+  let rollback = Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::RollbackMerge,
+    Bytes::from(buf),
+  );
+  for e in [prepare, commit, rollback] {
+    let cost = super::entry_frame_cost(&e);
+    assert_eq!(cost, e.data().len() + ENTRY_WIRE_OVERHEAD_MAX);
+    assert!(cost <= super::APPEND_FRAME_ENTRY_BUDGET);
+  }
+}
+
+#[test]
+fn unknown_entry_kind_rejects() {
+  use buffa::Message as _;
+
+  // An UNKNOWN pb kind value (beyond the mapped 0..=7) still rejects at conversion — the
+  // reservation arm is gone, the unknown-value fence is not.
+  for kind in [buffa::EnumValue::Unknown(8), buffa::EnumValue::Unknown(255)] {
     let ae = pb::AppendEntries {
       term: 2,
       leader_id: {
@@ -1279,7 +1465,7 @@ fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
       entries: std::vec![pb::Entry {
         term: 2,
         index: 9,
-        kind: buffa::EnumValue::Known(kind),
+        kind,
         ..Default::default()
       }],
       leader_commit: 8,
@@ -1293,7 +1479,7 @@ fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
     msg.encode(&mut buf);
     assert!(
       decode_message::<u64>(Bytes::from(buf)).is_err(),
-      "a reserved merge entry kind rejects at conversion until the merge milestone maps it"
+      "an unknown entry kind rejects at conversion"
     );
   }
 }

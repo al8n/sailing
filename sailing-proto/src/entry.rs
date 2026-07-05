@@ -23,6 +23,22 @@ pub enum EntryKind {
   /// every replica derives it locally at apply — so a split's wire cost is independent of state
   /// size.
   Split,
+  /// A committed merge FREEZE on the SOURCE group's log, applied by the core at apply-time: the
+  /// source stops accepting proposals/reads/transfers so the payload's `target` group can absorb
+  /// it. The lease SAFETY gate moves even earlier — to APPEND observation of this kind (see the
+  /// endpoint's `freeze_pending`) — which is what makes the merge clock-free. The payload is a
+  /// [`PrepareMergePayload`], G-free like [`Split`](Self::Split).
+  PrepareMerge,
+  /// A committed merge ABSORB on the TARGET group's log: fold the frozen source group's state
+  /// machine into this one at exactly the payload's `freeze_index`. The apply PARKS until the
+  /// container resolves it from local facts (the source caught-up-frozen, or the gen recheck
+  /// aborting) — the endpoint alone cannot apply it, because the absorbed half lives in another
+  /// group. The payload is a [`CommitMergePayload`]; the absorbed state never rides the entry.
+  CommitMerge,
+  /// A committed merge ABORT on the SOURCE group's log: unfreeze. The payload is a
+  /// [`RollbackMergePayload`], whose lineage bump is what deterministically aborts any parked
+  /// [`CommitMerge`](Self::CommitMerge) still naming the old freeze.
+  RollbackMerge,
 }
 
 impl EntryKind {
@@ -34,6 +50,9 @@ impl EntryKind {
       Self::Empty => "empty",
       Self::SetReadMode => "set_read_mode",
       Self::Split => "split",
+      Self::PrepareMerge => "prepare_merge",
+      Self::CommitMerge => "commit_merge",
+      Self::RollbackMerge => "rollback_merge",
     }
   }
 }
@@ -98,6 +117,123 @@ impl SplitPayload {
   #[inline(always)]
   pub fn instruction(&self) -> &[u8] {
     &self.instruction
+  }
+}
+
+/// The payload of an [`EntryKind::PrepareMerge`] entry: which group will absorb this one, and
+/// the source's lineage counter after the freeze applies. G-free by design, like
+/// [`SplitPayload`] — `target_bytes` is the canonical `Data` encoding of the embedder's group id.
+/// Deliberately NO lease/clock field: the lease kill is observed at APPEND of the carrying
+/// entry, so the merge choreography needs no cross-node clock anywhere.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PrepareMergePayload {
+  /// The absorbing (target) group id, `Data`-encoded (1..=1024 bytes, the group-tag bound).
+  target_bytes: Bytes,
+  /// The source's lineage counter AFTER this freeze applies — the monotone per-id value a parked
+  /// `CommitMerge` compares against (one unified counter for incarnation and shape).
+  source_gen_after: u64,
+}
+
+impl PrepareMergePayload {
+  /// Construct.
+  pub const fn new(target_bytes: Bytes, source_gen_after: u64) -> Self {
+    Self {
+      target_bytes,
+      source_gen_after,
+    }
+  }
+
+  /// The target group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn target_bytes(&self) -> Bytes {
+    self.target_bytes.clone()
+  }
+
+  /// The source's lineage counter after this freeze applies.
+  #[inline(always)]
+  pub const fn source_gen_after(&self) -> u64 {
+    self.source_gen_after
+  }
+}
+
+/// The payload of an [`EntryKind::CommitMerge`] entry: which frozen group to absorb, at which
+/// freeze boundary, and the lineage counters that settle every race log-side. The absorbed state
+/// itself NEVER rides the entry — each replica extracts its LOCAL source replica at the boundary
+/// — so a merge's wire cost is independent of state size, exactly like a split's.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitMergePayload {
+  /// The absorbed (source) group id, `Data`-encoded (1..=1024 bytes, the group-tag bound).
+  source_bytes: Bytes,
+  /// The source's `PrepareMerge` index — the boundary the local source replica must be
+  /// frozen-applied at before this entry's parked apply can resolve.
+  freeze_index: Index,
+  /// The gen the source's freeze set: the parked apply's comparator. A source whose live counter
+  /// moved PAST it was rolled back — the parked apply aborts deterministically.
+  source_gen_after: u64,
+  /// The target's lineage counter AFTER the absorb — the replay-idempotence anchor.
+  target_gen_after: u64,
+}
+
+impl CommitMergePayload {
+  /// Construct.
+  pub const fn new(
+    source_bytes: Bytes,
+    freeze_index: Index,
+    source_gen_after: u64,
+    target_gen_after: u64,
+  ) -> Self {
+    Self {
+      source_bytes,
+      freeze_index,
+      source_gen_after,
+      target_gen_after,
+    }
+  }
+
+  /// The source group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn source_bytes(&self) -> Bytes {
+    self.source_bytes.clone()
+  }
+
+  /// The source's `PrepareMerge` index (the absorb boundary).
+  #[inline(always)]
+  pub const fn freeze_index(&self) -> Index {
+    self.freeze_index
+  }
+
+  /// The gen the source's freeze set (the abort comparator).
+  #[inline(always)]
+  pub const fn source_gen_after(&self) -> u64 {
+    self.source_gen_after
+  }
+
+  /// The target's lineage counter after the absorb.
+  #[inline(always)]
+  pub const fn target_gen_after(&self) -> u64 {
+    self.target_gen_after
+  }
+}
+
+/// The payload of an [`EntryKind::RollbackMerge`] entry: unfreeze the source, moving its lineage
+/// to `source_gen_after` — past the freeze generation, so any parked `CommitMerge` naming the
+/// old freeze aborts deterministically on every replica.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RollbackMergePayload {
+  /// The source's lineage counter AFTER the rollback applies.
+  source_gen_after: u64,
+}
+
+impl RollbackMergePayload {
+  /// Construct.
+  pub const fn new(source_gen_after: u64) -> Self {
+    Self { source_gen_after }
+  }
+
+  /// The source's lineage counter after the rollback applies.
+  #[inline(always)]
+  pub const fn source_gen_after(&self) -> u64 {
+    self.source_gen_after
   }
 }
 
@@ -251,6 +387,9 @@ mod tests {
       (EntryKind::Empty, "empty"),
       (EntryKind::SetReadMode, "set_read_mode"),
       (EntryKind::Split, "split"),
+      (EntryKind::PrepareMerge, "prepare_merge"),
+      (EntryKind::CommitMerge, "commit_merge"),
+      (EntryKind::RollbackMerge, "rollback_merge"),
     ] {
       assert_eq!(kind.as_str(), name);
       assert_eq!(std::format!("{kind}"), name);
