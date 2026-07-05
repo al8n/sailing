@@ -223,6 +223,19 @@ impl MultiWorld {
     self.tick_count
   }
 
+  /// The `snapshot_threshold` the replica of `gid` on `node` was constructed under, read off the
+  /// retained per-replica config — the exact one handed to the container at admission and rebuilt
+  /// from on crash restore. `None` when `node` hosts no replica of `gid`. The seam's witness: it
+  /// pins that the profile's snapshot-threshold override actually reaches the replica config on
+  /// every construction path, which the group-shape non-vacuity counters cannot observe.
+  #[cfg(test)]
+  pub(crate) fn replica_snapshot_threshold(&self, node: u64, gid: u64) -> Option<usize> {
+    self
+      .configs
+      .get(&(node, gid))
+      .map(|config| config.snapshot_threshold())
+  }
+
   /// A one-line per-replica state dump for `gid` (the fuzzer's livelock panic format).
   pub(crate) fn dbg_group(&self, gid: u64) -> String {
     let per: Vec<String> = self
