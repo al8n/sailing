@@ -134,6 +134,25 @@ fn default_band_is_nonvacuous() {
   }
 }
 
+#[test]
+fn snapshot_band_smoke() {
+  // A fast smoke keeping [`MultiProfile::snapshot_heavy`] wired on the everyday gate: the default
+  // band's shape (groups created + committed load) under the snapshot profile. Deliberately NO
+  // membership-counter bounds — membership coverage physically requires soak-scale tick budgets.
+  // At fast budgets compaction cannot occur, so the oracle's comparisons are structurally near-zero
+  // (the measured curve: 0 comparisons @4k ticks, 1 @8k, 7 @40k) and the nonzero-comparisons bound
+  // would trip vacuously. The three band-scale bounds bind at the snapshot SOAK
+  // (soak_snapshot_heavy_profile). The per-checker finalize assert (skipped == 0,
+  // gid/generation-attributed) still runs inside every run of every profile, this one included.
+  for seed in 0..8u64 {
+    let r = run_multi_vopr(seed, 4_000, MultiProfile::snapshot_heavy(seed));
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+  }
+}
+
 /// Seed 2's schedule retires groups steadily while client load keeps committing (66 removals /
 /// 568 committed in the sweep) — the removal-during-load shape, with every oracle armed: the
 /// run completing IS the assertion that no cross-talk, one-identity, or per-group safety
