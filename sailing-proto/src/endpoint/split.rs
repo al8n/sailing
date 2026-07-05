@@ -136,8 +136,11 @@ where
     self.split.outstanding.remove(&index);
   }
 
-  /// The group's lineage counter (incarnation ⊔ shape), LIVE: includes every applied split.
-  pub(crate) fn shape_gen(&self) -> u64 {
+  /// The group's lineage counter (incarnation ⊔ shape), LIVE: one unified monotone per-id value,
+  /// bumped by every applied split and merge entry. Public so an embedder (and the absorbing
+  /// side of a merge) can read the counter the merge choreography's `*_gen_after` fields compare
+  /// against.
+  pub fn shape_gen(&self) -> u64 {
     self.split.shape_gen
   }
 

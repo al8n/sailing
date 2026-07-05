@@ -16,6 +16,7 @@ use std::{
 // `impl` blocks that operate on the `Endpoint` defined here.
 mod election;
 mod membership;
+mod merge;
 mod persistence;
 mod read_index;
 mod read_mode;
@@ -24,6 +25,8 @@ mod restart;
 mod snapshot;
 mod split;
 mod transfer;
+
+pub use merge::PendingMergeApply;
 
 /// The max ENTRY COUNT a single committed-range read requests (apply, replication, the restart scans).
 /// The store's byte cap is PAYLOAD-only, so a backlog of zero-payload entries (no-ops, empty/conf) would
@@ -1170,6 +1173,9 @@ where
   /// The committed-split state: staged pending forks (with their apply-derived blobs), the fork
   /// durability barrier over this endpoint's snapshots, and the group's lineage counter.
   split: split::SplitState<I, F>,
+  /// The merge state: the append-observed pending freeze, the applied `Frozen` fold, and the
+  /// parked `CommitMerge` awaiting the container's resolution.
+  merge: merge::MergeState,
   /// The leader's CheckQuorum read-lease (LeaseBased) round state.
   check_quorum_lease: CheckQuorumLease<I>,
   /// The leader-transfer state (forced-handoff flag + transferee target + abort deadline).
@@ -1317,6 +1323,7 @@ where
       },
       pending_conf_index: Index::ZERO,
       split: split::SplitState::new(0),
+      merge: merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
         // The active read mode starts as the genesis config default; a committed SetReadMode migrates it.

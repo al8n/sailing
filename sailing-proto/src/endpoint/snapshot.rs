@@ -834,6 +834,10 @@ where
     // snapshot present, log not-yet-re-baselined} — both of which `reconcile_restart_log` recovers
     // (None/Compact/Restore), NEVER the OrphanedLog poison.
     log.restore(meta.last_index(), meta.last_term());
+    // The re-baseline discarded every entry above the boundary — a pending merge freeze among
+    // them no longer exists in this log, so the append-observed kill releases (re-armed at
+    // accept if the freeze is still live and re-delivered).
+    self.note_freeze_rebaselined();
     // `restore` DISCARDS the prior tail, so the durable boundary IS exactly the snapshot's last index — a
     // hard RESET. `durable_index` and the re-baseline advance together, after the blob is durable, so the
     // boundary is recoverable (no stale-HIGH watermark, no orphan).

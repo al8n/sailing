@@ -525,6 +525,7 @@ where
         events: VecDeque::new(),
       },
       split: super::split::SplitState::new(snap_shape_gen),
+      merge: super::merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
         // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later
@@ -560,6 +561,20 @@ where
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
     if !ep.poison.poisoned {
       ep.apply_committed(log);
+    }
+    // Re-derive the append-observed lease kill from the UNAPPLIED suffix: a committed-but-
+    // unapplied PrepareMerge must re-arm `freeze_pending` BEFORE this replica can win an
+    // election and form a fresh lease (the replay above already re-froze any APPLIED freeze).
+    // Fail-stop on a read fault, like the lease-floor scans: an under-derived kill is a stale
+    // read, not a recoverable degradation.
+    if !ep.poison.poisoned {
+      match Self::scan_freeze_pending(log, ep.applied) {
+        Ok(fp) => ep.merge.freeze_pending = fp,
+        Err(reason) => {
+          ep.poison.poisoned = true;
+          ep.poison.poison_reason = Some(reason);
+        }
+      }
     }
     // if this incarnation's enforcement window GREW the durable floor (a config grow, or a legacy
     // record being recorded for the first time under an enforcing config), persist the raised floor ONCE

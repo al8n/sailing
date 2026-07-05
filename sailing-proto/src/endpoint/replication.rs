@@ -993,6 +993,10 @@ where
         // suffix and a conflicting AppendEntries (e.g. a reordered/duplicate one) truncates it before
         // the ack leaves the outgoing queue. The new suffix's own ack is registered below.
         let truncate_from = entries[i].index();
+        // A pending merge freeze whose entry lies in the overwritten range no longer exists in
+        // this log: release the append-observed lease kill (the new suffix's own PrepareMerge, if
+        // any, re-arms it below).
+        self.note_freeze_truncated(truncate_from);
         // boundary = truncate_from - 1, so `> boundary` is exactly `>= truncate_from`: scrub every
         // queued success ack / pending FollowerAck whose match index lies in the overwritten range.
         self.scrub_acks_above(Index::new(truncate_from.get() - 1));
@@ -1017,6 +1021,15 @@ where
         let opid = self.mint_op_id();
         self.submit_append(log, opid, &entries[i..]);
         appended_opid = Some(opid);
+        // The append-observed lease kill (follower-accept site): a PrepareMerge ENTERING the
+        // local log kills lease serving and formation from this moment. A KIND check only —
+        // never a payload decode on the hot path; the apply arm owns decoding.
+        for e in &entries[i..] {
+          if e.kind() == crate::EntryKind::PrepareMerge {
+            self.note_freeze_appended(e.index());
+            break;
+          }
+        }
         // Apply-time membership (etcd, spec §9): a follower does NOT fold appended ConfChanges into
         // its tracker. The configuration changes only when those entries commit-and-apply
         // (apply_committed), so the tracker is never ahead of the committed log — no truncation

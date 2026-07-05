@@ -92,7 +92,7 @@ pub use event::{
 };
 
 mod endpoint;
-pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
+pub use endpoint::{Endpoint, PeerProgress, PendingMergeApply, PoisonReason, Role, TimerKind};
 
 mod multi;
 pub use multi::{
