@@ -147,4 +147,3 @@ raft-state g=200
 n1: follower term=1 lead=2
 n2: leader term=1 lead=2
 n3: follower term=1 lead=2
-
