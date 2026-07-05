@@ -13,10 +13,7 @@
 //! same loop.
 
 use crate::{
-  multi::{
-    MultiWorld,
-    oracles::{decode_gkv, encode_gkv},
-  },
+  multi::{MultiWorld, decode_gkv, encode_gkv},
   store::FaultPrng,
 };
 use std::{
