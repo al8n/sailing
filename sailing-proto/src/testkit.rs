@@ -667,6 +667,13 @@ impl AsyncStable {
     self.durable_hard_state = hs;
   }
 
+  /// Seed the store with a DURABLE snapshot (both slots), as a crash-surviving store would hold
+  /// it. Used by restart tests that recover from a snapshot without modelling its write.
+  pub(crate) fn force_snapshot(&mut self, meta: SnapshotMeta<u64>, blob: Bytes) {
+    self.snapshot = Some((meta.clone(), blob.clone()));
+    self.durable_snapshot = Some((meta, blob));
+  }
+
   /// Seed the store with an arbitrary durable `HardState` (e.g. one carrying a `lease_support` floor).
   /// Used by the lease-promise restart tests.
   pub(crate) fn force_hard_state(&mut self, hs: HardState<u64>) {

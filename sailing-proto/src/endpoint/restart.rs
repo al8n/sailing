@@ -211,6 +211,13 @@ where
     // as an explicit migrate-to-Safe.
     let snap_read_only: Option<crate::ReadOnlyOption> =
       snapshot.as_ref().and_then(|(meta, _)| meta.read_only());
+    // The lineage counter this snapshot carries at its boundary — the DURABLE value the container
+    // seeds its replay guard from (the committed-tail replay below may re-bump the LIVE counter
+    // by re-staging a not-yet-materialized fork; the guard must not mistake that for a relayed one).
+    let snap_shape_gen: u64 = snapshot
+      .as_ref()
+      .map(|(meta, _)| meta.shape_gen())
+      .unwrap_or(0);
     // The failover release floor this snapshot carries over its compacted entries — combined below
     // with a scan of the live log to recompute `max_wall_plus_window` from durable state alone.
     let snap_max_wall_plus: u64 = snapshot
@@ -517,6 +524,7 @@ where
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
       },
+      split: super::split::SplitState::new(snap_shape_gen),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
         // Seeded from the genesis config default for now; recovered from snapshot ⊔ tail-replay in a later

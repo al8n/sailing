@@ -705,4 +705,5 @@ mod read_index;
 mod replication;
 mod restart;
 mod snapshot;
+mod split;
 mod transfer;

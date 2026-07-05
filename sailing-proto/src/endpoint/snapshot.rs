@@ -244,6 +244,18 @@ where
       // and about to re-baseline the log; don't start a leader-side snapshot over it.
       return;
     }
+    // THE FORK DURABILITY BARRIER: a staged fork's only recovery source is re-applying its Split
+    // entry, which dies the moment this endpoint snapshots at-or-past that index (the capture
+    // below is taken at `applied`, and its compaction discards the entry). Refuse until the
+    // driver lifts the cap — its fork materialization is then behind the local engine barrier —
+    // so a correlated crash can never lose the child's state outright. The window is ≈ one crank.
+    if self
+      .split
+      .snapshot_cap
+      .is_some_and(|cap| self.applied >= cap)
+    {
+      return;
+    }
     if self.applied == Index::ZERO {
       // Nothing has been applied yet — nothing to snapshot.
       return;
@@ -277,7 +289,10 @@ where
     let mut meta = SnapshotMeta::new(self.applied, last_term, self.conf_state())
       .with_max_lease_window(self.lease_guard.max_lease_window)
       .with_max_wall_plus_window(self.lease_guard.max_wall_plus_window)
-      .with_max_unwalled_lease_window(self.lease_guard.max_unwalled_lease_window);
+      .with_max_unwalled_lease_window(self.lease_guard.max_unwalled_lease_window)
+      // The lineage counter rides every meta (absent at 0), so a restore knows the group's
+      // shape/incarnation without replaying the compacted split entries.
+      .with_shape_gen(self.split.shape_gen);
     // Carry the read mode EXPLICITLY only if a committed SetReadMode has applied (provenance). A
     // non-migrated node leaves it absent, so a restart from this snapshot falls back to the static config
     // — the presence bit then means "a migration was compacted", not merely "whatever mode was active".
@@ -805,6 +820,10 @@ where
     // Adopt the snapshot's read-mode provenance (Some ⇒ a migration was compacted at/before the boundary);
     // a None/legacy snapshot keeps the current provenance, consistent with keeping the current mode above.
     self.reads.read_mode_migrated = meta.read_only().is_some() || self.reads.read_mode_migrated;
+    // Adopt the installed meta's lineage (monotone), so this replica's OWN later snapshots keep
+    // carrying it — a straggler that installed a post-split parent snapshot, then leads and
+    // compacts, must not drop the fold.
+    self.split.shape_gen = self.split.shape_gen.max(meta.shape_gen());
 
     // Step 4: re-baseline the log on the now-durable snapshot. Discards the follower's stale/short log;
     // after this call first_index == last_index + 1 and term(last_index) == last_term, so the next
@@ -871,6 +890,7 @@ where
   ) where
     L: LogStore,
     S: StableStore<NodeId = I>,
+    F::Snapshot: Data,
   {
     if self.poison.poisoned {
       return;
