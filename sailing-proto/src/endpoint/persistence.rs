@@ -691,7 +691,9 @@ where
     log: &mut L,
     stable: &S,
     opid: OpId,
-  ) {
+  ) where
+    F::Snapshot: Data,
+  {
     // Advance the persist-before-ack watermark for EVERY completed append, regardless of role,
     // term, or whether a `pending` action survived. `pending` is cleared on term changes, and a
     // same-term step-down routes a `LeaderAppend` completion to the `_` arm below — in both cases

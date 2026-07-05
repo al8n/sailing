@@ -774,6 +774,7 @@ where
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
+    F::Snapshot: Data,
   {
     self.groups.get_mut(gid)?.handle_timeout(now, log, stable);
     self.mark_dirty(gid);

@@ -1,5 +1,6 @@
 //! Application-facing outputs drained via `Endpoint::poll_event`.
 use crate::{CheapClone, ConfState, Index, ReadOnlyOption, ReadState, SnapshotMeta, Term};
+use bytes::Bytes;
 
 /// A committed `Normal` entry was applied; `response` is the `StateMachine::Response`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -123,6 +124,40 @@ impl ReadModeChanged {
   }
 }
 
+/// A `Split` entry was committed and applied: the state machine partitioned itself at the
+/// deterministic point and the forked half is STAGED for materialization (the multi container
+/// relays it; the fork durability barrier holds the parent's snapshots until the child's baseline
+/// is locally durable). G-FREE by design — `child` is the child group id's canonical `Data`
+/// encoding, because events are drained through the group-unaware core; the typed id surfaces on
+/// the drivers' lifecycle tail instead. A single-group embedder that never proposes splits never
+/// sees this event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitApplied {
+  /// The log index of the applied `Split` entry.
+  index: Index,
+  /// The child group id's canonical `Data` encoding (1..=1024 bytes, the group-tag bound).
+  child: Bytes,
+}
+
+impl SplitApplied {
+  /// Construct.
+  pub const fn new(index: Index, child: Bytes) -> Self {
+    Self { index, child }
+  }
+
+  /// The log index of the applied `Split` entry.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The child group id's canonical `Data` encoding (an O(1) shared handle).
+  #[inline(always)]
+  pub fn child(&self) -> Bytes {
+    self.child.clone()
+  }
+}
+
 /// Outputs the application observes.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
@@ -142,6 +177,9 @@ pub enum Event<I, R> {
   ConfChanged(ConfChanged<I>),
   /// A `SetReadMode` entry was committed and applied; the active read mode changed.
   ReadModeChanged(ReadModeChanged),
+  /// A `Split` entry was committed and applied; a forked child half is staged for
+  /// materialization.
+  SplitApplied(SplitApplied),
   /// A linearizable read index has been confirmed.  The application may serve the
   /// associated read once `applied >= ReadState.index`.
   ReadState(ReadState),

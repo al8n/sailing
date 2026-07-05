@@ -775,7 +775,10 @@ where
     Ok(index)
   }
 
-  pub(crate) fn on_heartbeat<L: LogStore>(&mut self, now: Now, log: &mut L, hb: Heartbeat<I>) {
+  pub(crate) fn on_heartbeat<L: LogStore>(&mut self, now: Now, log: &mut L, hb: Heartbeat<I>)
+  where
+    F::Snapshot: Data,
+  {
     self.role = Role::Follower;
     self.set_leader(Some(hb.leader()));
     self.arm_election_timer(now);
@@ -847,7 +850,9 @@ where
     log: &mut L,
     stable: &mut S,
     ae: AppendEntries<I>,
-  ) {
+  ) where
+    F::Snapshot: Data,
+  {
     self.role = Role::Follower;
     self.set_leader(Some(ae.leader()));
     self.arm_election_timer(now);
@@ -1329,7 +1334,9 @@ where
     stable: &S,
     from: I,
     response: AppendResponse<I>,
-  ) {
+  ) where
+    F::Snapshot: Data,
+  {
     if self.poison.poisoned {
       return;
     }
