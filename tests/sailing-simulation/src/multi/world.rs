@@ -621,9 +621,13 @@ impl MultiWorld {
   /// `gid` itself — the O(1)-per-apply cross-group isolation oracle.
   fn cross_talk_sweep(&mut self, gid: u64) {
     // The floor derives from the GROUP record, never the replica's wiring path: a fork-born
-    // group's inherited baseline cells carry the PARENT's tag legitimately (the handover), and
+    // group's inherited baseline cells carry an ANCESTOR's tag legitimately (the handover), and
     // every arrival path — fork materialization, a transferred snapshot into a fresh observer,
-    // a crash restore from the durable blob — presents them identically as the record's prefix.
+    // a crash restore from the durable blob — presents them as the record's leading prefix. An
+    // onward split a replica applied can only SHRINK that prefix below the recorded count
+    // (`LogSm::split` removes moved-key cells record-wide), so flooring at the full count never
+    // judges an inherited cell; the few own-tagged cells the floor may skip on a shrunk record
+    // would pass the tag assert anyway — under-coverage there, never a false positive.
     let baseline = self.groups.get(&gid).map_or(0, |m| m.fork_baseline);
     for node in self.node_ids.clone() {
       if !self.hosts[&node].contains_group(&gid) {
