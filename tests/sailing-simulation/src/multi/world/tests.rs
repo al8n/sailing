@@ -1273,3 +1273,172 @@ fn conservation_walk_records_cells_displaced_by_a_split_apply() {
   w.finalize_conservation_or_panic(23);
   w.finalize_membership_or_panic(23);
 }
+
+/// Propose a split of `parent` at `point` into `child`, ticking through transient refusals
+/// (leaderless instants, a not-yet-settled prior verb) until a leader accepts it.
+fn propose_split_until_accepted(w: &mut MultiWorld, parent: u64, child: u64, point: u16) {
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(parent, child, point) {
+      return;
+    }
+    w.tick();
+  }
+  panic!("the split of g{parent} at {point} was never accepted");
+}
+
+/// Drive g100 (3 voters, one write per key 0..8) into the ACCEPTED-BUT-LOST split shape: a
+/// fully isolated leader accepts a split at point 5, the survivors depose it, and healing
+/// truncates the entry away. The world's population stays conservatively shrunk — keys 5..8
+/// are PARKED, unroutable from then on — while their cells remain in every parent record.
+fn world_with_parked_keys(seed: u64) -> MultiWorld {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| {
+      (0..3).all(|n| {
+        w.applied_of(n, 100)
+          .iter()
+          .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+          .count()
+          >= 8
+      })
+    }),
+    "the keyed baseline never applied everywhere"
+  );
+
+  // The doomed split: accepted by a leader the world has just fully isolated, so the entry
+  // exists only in its log and can never commit.
+  let doomed = w.leader_of(100).expect("elected");
+  w.isolate(doomed);
+  assert!(matches!(w.propose_split(100, 900, 5), Some(Ok(_))));
+  assert_eq!(
+    w.group_keys_of(100),
+    std::vec![0, 1, 2, 3, 4],
+    "the population flips at accept"
+  );
+
+  // Depose and truncate: the survivors elect a higher term, then fresh committed load lands
+  // everywhere — including on the healed ex-leader, over the truncated entry's slot.
+  assert!(
+    w.run_until(4_000, |w| w.leader_of(100).is_some_and(|l| l != doomed)),
+    "the survivors never deposed the isolated leader"
+  );
+  w.heal(doomed);
+  propose_until_accepted(&mut w, 100, &crate::multi::encode_gkv(100, 0, 40));
+  assert!(
+    w.run_until(3_000, |w| {
+      (0..3).all(|n| {
+        w.applied_of(n, 100)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 0, 40)))
+      })
+    }),
+    "post-depose load never applied everywhere"
+  );
+  assert!((0..3).all(|n| !w.hosts_group(n, 900)));
+  assert_eq!(w.splits_applied(), 0, "a lost split must never register");
+  assert!(
+    w.pending_splits.contains_key(&900),
+    "the lost split's keys stay parked"
+  );
+  w
+}
+
+/// An accepted-but-lost split parks its keys, but their CELLS stay in the parent's record — and
+/// `LogSm::split` partitions the RECORD by the instruction, not by the propose-time population.
+/// A later split at a lower point therefore moves the parked cells into its child, and the
+/// registered assignment must follow that instruction rule: an assignment derived from the
+/// population slice alone misreads the parked handover as an unassigned key surfacing in the
+/// child (a false conservation verdict against a correct partition).
+#[test]
+fn split_assignment_follows_parked_keys_through_a_lost_entry() {
+  let mut w = world_with_parked_keys(29);
+
+  propose_split_until_accepted(&mut w, 100, 901, 2);
+  assert!(
+    w.run_until(3_000, |w| w.splits_applied() == 1),
+    "the later split never registered"
+  );
+  assert!(w.run_until(3_000, |w| w.leader_of(901).is_some()));
+
+  // Routing keeps the propose-time slices on both sides; the parked keys stay unroutable.
+  assert_eq!(w.group_keys_of(100), std::vec![0, 1]);
+  assert_eq!(w.group_keys_of(901), std::vec![2, 3, 4]);
+  // The conservation assignment covers every key whose cells the instruction moved.
+  assert_eq!(
+    w.splits[&901]
+      .child_keys
+      .iter()
+      .copied()
+      .collect::<Vec<u16>>(),
+    std::vec![2, 3, 4, 5, 6, 7],
+    "the assignment must include the parked keys the instruction moved"
+  );
+  // The parked cells genuinely rode the fork into the child's inherited baseline.
+  assert!(
+    w.applied_of(0, 901)
+      .iter()
+      .any(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 5, 5))),
+    "the parked key's cell must surface in the child's baseline"
+  );
+
+  w.check_now();
+  w.finalize_conservation_or_panic(29);
+  w.finalize_membership_or_panic(29);
+}
+
+/// Parked cells CASCADE: they ride the later child's record, so an onward split moves them
+/// AGAIN, and the grandchild's assignment must follow the instruction rule at every generation
+/// — the parked handover is re-derived from each fork's own record, never remembered one-shot.
+#[test]
+fn parked_keys_cascade_through_an_onward_split() {
+  let mut w = world_with_parked_keys(31);
+
+  propose_split_until_accepted(&mut w, 100, 901, 2);
+  assert!(
+    w.run_until(3_000, |w| w.splits_applied() == 1),
+    "the intermediate split never registered"
+  );
+  assert!(w.run_until(3_000, |w| w.leader_of(901).is_some()));
+
+  // Onward: the parked 5/6/7 cells sit at or above point 3 in 901's record, so they move a
+  // second time while 901's routing slice hands over {3, 4}.
+  propose_split_until_accepted(&mut w, 901, 902, 3);
+  assert!(
+    w.run_until(3_000, |w| w.splits_applied() == 2),
+    "the onward split never registered"
+  );
+  assert!(w.run_until(3_000, |w| w.leader_of(902).is_some()));
+
+  assert_eq!(w.group_keys_of(901), std::vec![2]);
+  assert_eq!(w.group_keys_of(902), std::vec![3, 4]);
+  assert_eq!(
+    w.splits[&902]
+      .child_keys
+      .iter()
+      .copied()
+      .collect::<Vec<u16>>(),
+    std::vec![3, 4, 5, 6, 7],
+    "the parked keys must flow through the onward assignment"
+  );
+  // The cascading cell itself: the grandparent-tagged parked write arrived two forks deep.
+  assert!(
+    w.applied_of(0, 902)
+      .iter()
+      .any(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 5, 5))),
+    "the parked key's cell must cascade into the grandchild's baseline"
+  );
+
+  w.check_now();
+  w.finalize_conservation_or_panic(31);
+  w.finalize_membership_or_panic(31);
+}
