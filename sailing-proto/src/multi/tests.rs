@@ -3275,3 +3275,71 @@ fn source_leader_host_resolves_last() {
   );
   assert!(!m.contains_group(&1));
 }
+
+/// The freeze gates cover the WHOLE admin propose family: a frozen (or freezing) group refuses
+/// a split (forking would mutate the FSM above the freeze boundary), refuses to be a merge
+/// TARGET (absorbing above its own boundary), and a source mid-absorb refuses a fresh freeze —
+/// every arm typed, nothing appended.
+#[test]
+fn freeze_gates_cover_split_and_target_verbs() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // Freeze group 1 (into 2, the ordinary pairing).
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen());
+  // A frozen parent refuses a split, typed as the propose family does.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert!(matches!(
+      m.propose_split(&1, now, log, stable, &7, 0, Bytes::new())
+        .unwrap(),
+      Err(SplitError::Propose(crate::ProposeError::Frozen))
+    ));
+  }
+  // A frozen group can be neither a prepare target nor a commit target.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(matches!(
+      m.prepare_merge(&2, now, log, stable, &1).unwrap(),
+      Err(MergeError::AlreadyFrozen)
+    ));
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert!(matches!(
+      m.commit_merge(&1, now, log, stable, &2).unwrap(),
+      Err(MergeError::AlreadyFrozen)
+    ));
+  }
+  // A target mid-absorb (parked) refuses a fresh freeze of ITSELF.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().pending_merge().is_some());
+  // A third, unfrozen group to name as the target: the mid-absorb SOURCE gate is what must
+  // fire (naming the frozen group 1 would trip its target-frozen gate first).
+  stores
+    .0
+    .insert(3, (VecLog::default(), AsyncStable::default()));
+  m.create_group(3, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    let d = m.group(&3).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&3, d, log, stable).unwrap();
+    drain_storage(&mut m, 3, d, log, stable);
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(matches!(
+      m.prepare_merge(&2, now, log, stable, &3).unwrap(),
+      Err(MergeError::AlreadyPending)
+    ));
+  }
+}

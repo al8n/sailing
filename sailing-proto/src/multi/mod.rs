@@ -1504,6 +1504,13 @@ where
           leader: ep.leader(),
         }));
       }
+      // A frozen (or freezing) parent must not fork: the split would mutate the FSM above the
+      // freeze boundary, breaking the absorb's nothing-above-the-freeze determinism — the same
+      // gate class as propose/conf-change/read, applied to the one admin verb that had slipped
+      // it (the split's own lineage guard already no-ops the pre-freeze in-flight shapes).
+      if ep.merge_freeze_active() {
+        return Some(Err(SplitError::Propose(ProposeError::Frozen)));
+      }
       // A joint parent would hand the child an ambiguous bootstrap voter set: refuse at
       // propose (the one-line rule that removes the hairiest interleaving).
       if ep.conf_state().is_joint() {
@@ -1585,6 +1592,10 @@ where
     let Some(tep) = self.groups.get(target) else {
       return Some(Err(MergeError::TargetMissing));
     };
+    // A frozen (or freezing) target is being dissolved itself — it can absorb nothing.
+    if tep.merge_freeze_active() {
+      return Some(Err(MergeError::AlreadyFrozen));
+    }
     let target_conf = tep.conf_state();
     let target_mode = tep.active_read_mode();
     let target_conf_in_flight = tep.conf_change_in_flight();
@@ -1599,6 +1610,12 @@ where
     }
     if sep.merge_freeze_active() {
       return Some(Err(MergeError::AlreadyFrozen));
+    }
+    // A source that is itself mid-ABSORB (a CommitMerge in flight or parked as a target)
+    // must finish that first: freezing it would mint a source generation the pending absorb
+    // is about to move, and the two verbs' entries would race on one counter.
+    if sep.commit_merge_in_flight() || sep.pending_merge().is_some() {
+      return Some(Err(MergeError::AlreadyPending));
     }
     let source_conf = sep.conf_state();
     if source_conf.is_joint() || target_conf.is_joint() {
@@ -1681,6 +1698,12 @@ where
     }
     if tep.commit_merge_in_flight() || tep.pending_merge().is_some() {
       return Some(Err(MergeError::AlreadyPending));
+    }
+    // A frozen (or freezing) target must not absorb: the CommitMerge would land above its own
+    // freeze boundary and mutate the FSM there — the absorb determinism its own merge's
+    // target depends on.
+    if tep.merge_freeze_active() {
+      return Some(Err(MergeError::AlreadyFrozen));
     }
     // The local readiness gate: the source must be frozen-applied at its boundary. `>=` rather
     // than `==` deliberately — a post-freeze election lands an FSM-no-op above the boundary on
