@@ -8,8 +8,9 @@
 //! tripwires run on every world tick (a violation panics with seed + tick); this loop adds the
 //! liveness assertions (calm windows and the final quiesce) and the non-vacuity report.
 //!
-//! The action menu is DATA — [`MultiProfile`] is a named weight table — which is the M6 seam:
-//! reshaping/storm profiles are weight overrides over the same loop.
+//! The action menu is DATA — [`MultiProfile`] is a named weight table plus per-replica config
+//! knobs — which is the M6 seam: reshaping/storm profiles are weight/knob overrides over the
+//! same loop.
 
 use crate::{
   multi::{
@@ -66,30 +67,60 @@ pub enum MultiAction {
   RecreateGroup,
 }
 
-/// A named action weight table — the profile seam M6's storm/reshape profiles override.
+/// A named action weight table plus per-replica config knobs — the profile seam M6's
+/// storm/reshape profiles override (weights AND knobs, e.g. reusing the snapshot-threshold
+/// field for their own compaction pressure).
 #[derive(Debug, Clone, Copy)]
-pub struct MultiProfile(pub &'static [(MultiAction, u32)]);
+pub struct MultiProfile {
+  /// The weighted action menu.
+  weights: &'static [(MultiAction, u32)],
+  /// A `Config::snapshot_threshold` override applied at EVERY replica construction the world
+  /// performs (bootstrap voters, recreations, observers, resurrections — and crash restores via
+  /// the retained per-replica config). `None` leaves the library's demand-driven default
+  /// untouched: construction is byte-identical to a world without the seam, so the default
+  /// profile's schedules (and its pinned regression seeds) cannot move.
+  snapshot_threshold: Option<usize>,
+}
 
 impl MultiProfile {
   /// The default M1 mix: client load dominates, faults are frequent, lifecycle churn is rare
   /// but steady (every band exercises removal and recreation).
   pub const fn default_multi() -> Self {
-    Self(&[
-      (MultiAction::ClientLoad, 50),
-      (MultiAction::ReadIndexLoad, 12),
-      (MultiAction::Partition, 8),
-      (MultiAction::Heal, 6),
-      (MultiAction::Crash, 5),
-      (MultiAction::MuteGroup, 6),
-      (MultiAction::UnmuteGroup, 4),
-      (MultiAction::ConfChange, 5),
-      (MultiAction::TransferLeader, 4),
-      (MultiAction::MigrateReadMode, 3),
-      (MultiAction::FaultReroll, 6),
-      (MultiAction::CreateGroup, 3),
-      (MultiAction::RemoveGroup, 2),
-      (MultiAction::RecreateGroup, 2),
-    ])
+    Self {
+      weights: &[
+        (MultiAction::ClientLoad, 50),
+        (MultiAction::ReadIndexLoad, 12),
+        (MultiAction::Partition, 8),
+        (MultiAction::Heal, 6),
+        (MultiAction::Crash, 5),
+        (MultiAction::MuteGroup, 6),
+        (MultiAction::UnmuteGroup, 4),
+        (MultiAction::ConfChange, 5),
+        (MultiAction::TransferLeader, 4),
+        (MultiAction::MigrateReadMode, 3),
+        (MultiAction::FaultReroll, 6),
+        (MultiAction::CreateGroup, 3),
+        (MultiAction::RemoveGroup, 2),
+        (MultiAction::RecreateGroup, 2),
+      ],
+      snapshot_threshold: None,
+    }
+  }
+
+  /// The snapshot-heavy band profile: the default menu (weights untouched — the single-group
+  /// snapshot runners bias no actions either; the default mix's lifecycle churn is already what
+  /// puts installs under removal/recreation) with `snapshot_threshold` lowered to a MODERATE
+  /// seed-derived value, so groups compact within a bounded run and a lagging replica
+  /// snapshot-installs — the coverage the demand-driven default (10_000) never reaches. The draw
+  /// copies the single-group compacting entries (`run_vopr_joint_snapshot`): 256..=511, from a
+  /// DEDICATED sub-stream so the master action/topology stream draws nothing of it.
+  pub fn snapshot_heavy(seed: u64) -> Self {
+    let mut p = FaultPrng::new(seed.rotate_left(28) ^ 0x4D53_4E50_5448_5231); // "MSNPTHR1"
+    let threshold = 256 + (p.next_u64() % 256) as usize; // 256..=511
+    Self {
+      snapshot_threshold: Some(threshold),
+      ..Self::default_multi()
+    }
   }
 }
 
@@ -180,6 +211,7 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   let mut prng = FaultPrng::new(seed ^ 0x4D56_4F50_525F_5631); // "MVOPR_V1"
   let nodes = 5 + (prng.next_u64() % 3); // 5..=7 hosts
   let mut w = MultiWorld::new(seed);
+  w.set_snapshot_threshold(profile.snapshot_threshold);
   for n in 0..nodes {
     w.add_node(n);
   }

@@ -117,6 +117,11 @@ pub struct MultiWorld {
   parked: BTreeSet<(u64, u64)>,
   /// Total gid-tagged applied entries the cross-talk sweep has decoded and judged (non-vacuity).
   cross_talk_checked: u64,
+  /// A `Config::snapshot_threshold` override applied to every replica the world wires from the
+  /// moment it is set (see [`set_snapshot_threshold`](Self::set_snapshot_threshold)). `None` —
+  /// the construction default — leaves the library's demand-driven threshold untouched, so a
+  /// world without the override is byte-identical to one predating the seam.
+  snapshot_threshold: Option<usize>,
 }
 
 impl MultiWorld {
@@ -155,7 +160,15 @@ impl MultiWorld {
       member_view: BTreeMap::new(),
       parked: BTreeSet::new(),
       cross_talk_checked: 0,
+      snapshot_threshold: None,
     }
+  }
+
+  /// Set the per-replica `Config::snapshot_threshold` override (`None` restores the library
+  /// default). Applies at replica CONSTRUCTION — call before creating groups; already-wired
+  /// replicas keep the config they were built under.
+  pub fn set_snapshot_threshold(&mut self, threshold: Option<usize>) {
+    self.snapshot_threshold = threshold;
   }
 
   /// Add node `id` as an empty container host (no groups). Panics if the id already exists.
@@ -206,6 +219,13 @@ impl MultiWorld {
   /// founding config lists it), `false` for a catching-up observer (its own AddNode is still
   /// ahead of it in the log).
   fn wire_replica(&mut self, node: u64, gid: u64, config: Config<u64>, is_member: bool) {
+    // The snapshot-threshold override lands HERE — the one chokepoint every replica-construction
+    // path funnels through (create/recreate/observer/resurrect), and crash restores inherit it
+    // via the retained `configs` entry. `None` leaves the built config untouched.
+    let config = match self.snapshot_threshold {
+      Some(t) => config.with_snapshot_threshold(t),
+      None => config,
+    };
     let host = self
       .hosts
       .get_mut(&node)
