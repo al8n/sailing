@@ -670,6 +670,30 @@ where
       .await
   }
 
+  /// Propose a group SPLIT on `parent`'s mapped plane. v1 CONSTRAINT, refused HERE — typed,
+  /// before any command crosses a channel: `shard(child) == shard(parent)`, because the fork
+  /// materializes inside one plane's driver (a cross-plane child would need a handoff seam
+  /// between plane threads that v1 deliberately lacks; the `ShardMap` override makes any child
+  /// id placeable by the embedder instead). Same-plane splits are the per-plane
+  /// [`GroupHandle::propose_split`] contract verbatim.
+  pub async fn propose_split(
+    &self,
+    parent: G,
+    child: G,
+    child_gen: u64,
+    instruction: bytes::Bytes,
+  ) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&parent);
+    if self.map.shard(&child) != plane {
+      return Err(DriverError::Rejected {
+        reason: sailing_proto::SplitError::<I>::CrossPlane.to_string(),
+      });
+    }
+    self.shards[plane]
+      .propose_split(parent, child, child_gen, instruction)
+      .await
+  }
+
   /// Remove a group from its mapped plane, awaiting whether it was hosted (the removal
   /// tombstones the id ON THAT PLANE, exactly the per-plane multi semantics).
   pub async fn remove_group(&self, gid: G) -> Result<bool, DriverError<I>> {

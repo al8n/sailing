@@ -556,3 +556,171 @@ fn spawn_rejects_bad_addressing() {
     "a peer-side port overflow is refused"
   );
 }
+
+/// The split milestone on a K-plane host (v1: same-plane only). A parent on plane A splits a
+/// SAME-plane child end to end — both halves elect, commit, and serve through the routed
+/// surface, the typed `SplitApplied` fires on every node's shared tail — while a CROSS-plane
+/// child id refuses at the HANDLE, typed, before any command is sent: nothing materializes on
+/// any plane, and the sibling plane's group commits undisturbed throughout. The row-9 factory
+/// interplay rides the same cluster: node 2 is factory-armed with a catalog that vouches for
+/// the child, yet its build phase is NEVER consulted — both members fork locally in their own
+/// drains (the drain front-runs the factory drain), so no solicitation for the child ever
+/// exists to consume.
+#[test]
+fn sharded_split_stays_in_plane_and_refuses_cross_plane() {
+  let base1: SocketAddr = "127.0.0.1:45240".parse().unwrap();
+  let base2: SocketAddr = "127.0.0.1:45250".parse().unwrap();
+  let map = ShardMap::<u64>::uniform(2);
+  let (parent, sibling) = distinct_shard_gids(&map);
+  let parent_plane = map.shard(&parent);
+  // A same-plane child for the split, and a DIFFERENT-plane child for the refusal leg.
+  let child = (3u64..100)
+    .map(|i| i * 100 + 1)
+    .find(|g| *g != parent && map.shard(g) == parent_plane)
+    .expect("some id lands on the parent's plane");
+  let cross_child = (3u64..100)
+    .map(|i| i * 100 + 1)
+    .find(|g| *g != sibling && map.shard(g) != parent_plane)
+    .expect("some id lands on the other plane");
+
+  let node1: ShardedMultiHandle<u64, u64, CountSm> = spawn_host(1, base1, Some((2, base2)));
+  // Node 2's factory vouches for the child — the row-9 catalog shape — with a build counter
+  // proving the fork path, not the factory, materializes it.
+  let builds = Arc::new(AtomicUsize::new(0));
+  let builds_probe = builds.clone();
+  let node2: ShardedMultiHandle<u64, u64, CountSm> =
+    ShardedCompioHost::<u64, u64, CountSm, Labeled<Passthrough>>::new(
+      ShardMap::uniform(2),
+      base2,
+      vec![Node::new(1u64, base1)],
+      plain_records(2),
+      DriverConfig::default(),
+    )
+    .with_group_factories(move |_shard| {
+      let builds = builds.clone();
+      let factory: BoxedGroupFactory<u64, u64, CountSm> = Box::new(factory_fn(
+        move |group: &u64, from: &u64| {
+          (*group == child && [1u64, 2].contains(from))
+            .then(|| GroupBlueprint::new(config(2, vec![1, 2]), *group))
+        },
+        move |_group: &u64| {
+          builds.fetch_add(1, Ordering::SeqCst);
+          Some(CountSm::default())
+        },
+      ));
+      Some(factory)
+    })
+    .spawn()
+    .expect("the factory-armed host spawns");
+
+  // The parent on its plane (both nodes), plus a sibling group on the OTHER plane.
+  for (h, id) in [(&node1, 1u64), (&node2, 2u64)] {
+    bo(h.create_group(parent, config(id, vec![1, 2]), id, CountSm::default(), 0))
+      .expect("parent admission");
+    bo(h.create_group(sibling, config(id, vec![1, 2]), id, CountSm::default(), 0))
+      .expect("sibling admission");
+  }
+  let gp = [node1.group(parent), node2.group(parent)];
+  let gs = [node1.group(sibling), node2.group(sibling)];
+  for i in 0..7u64 {
+    assert_eq!(submit_anywhere(&gp, b"load"), i + 1);
+  }
+  assert_eq!(submit_anywhere(&gs, b"s"), 1);
+
+  // The same-plane split: give 5 of the 7 units to the child.
+  {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    let handles = [&node1, &node2];
+    let mut at = 0usize;
+    loop {
+      assert!(
+        std::time::Instant::now() < deadline,
+        "no split accepted within the deadline"
+      );
+      match bo(handles[at].propose_split(parent, child, 0, Bytes::from_static(b"\x05"))) {
+        Ok(_) => break,
+        Err(DriverError::NotLeader { .. }) | Err(DriverError::Rejected { .. }) => {
+          at = (at + 1) % handles.len();
+          std::thread::sleep(Duration::from_millis(40));
+        }
+        Err(e) => panic!("unexpected split error: {e:?}"),
+      }
+    }
+  }
+  for (name, h) in [("node 1", &node1), ("node 2", &node2)] {
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+      let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+      assert!(
+        remaining > Duration::ZERO,
+        "{name}: no SplitApplied in time"
+      );
+      match h.lifecycle().recv_timeout(remaining) {
+        Ok(LifecycleEvent::SplitApplied {
+          parent: p,
+          child: c,
+        }) => {
+          assert_eq!((p, c), (parent, child), "{name}: the typed split event");
+          break;
+        }
+        Ok(_) => {}
+        Err(e) => panic!("{name}: the lifecycle tail closed: {e:?}"),
+      }
+    }
+  }
+
+  // Both halves live on the parent's plane; the totals conserve.
+  let gc = [node1.group(child), node2.group(child)];
+  assert_eq!(query_anywhere(&gp), 2, "the parent kept 7 - 5");
+  assert_eq!(submit_anywhere(&gc, b"tail"), 6, "the child preloaded 5");
+  assert!(
+    bo(
+      node1
+        .shard_handle(parent_plane)
+        .unwrap()
+        .group(child)
+        .status()
+    )
+    .is_ok(),
+    "the child lives on the parent's plane"
+  );
+  assert_eq!(
+    builds_probe.load(Ordering::SeqCst),
+    0,
+    "the fork drain front-runs the factory: no solicitation for the child ever existed"
+  );
+
+  // The cross-plane leg: typed refusal at the handle, nothing materialized anywhere, and the
+  // sibling plane undisturbed.
+  match bo(node1.propose_split(parent, cross_child, 0, Bytes::from_static(b"\x01"))) {
+    Err(DriverError::Rejected { reason }) => {
+      assert!(
+        reason.contains("plane"),
+        "the typed CrossPlane refusal: {reason}"
+      );
+    }
+    other => panic!("expected the cross-plane rejection, got {other:?}"),
+  }
+  for h in [&node1, &node2] {
+    for plane in 0..2 {
+      match bo(h.shard_handle(plane).unwrap().group(cross_child).status()) {
+        Err(DriverError::Rejected { .. }) => {}
+        other => panic!("the refused child must not exist on any plane, got {other:?}"),
+      }
+    }
+  }
+  assert_eq!(
+    submit_anywhere(&gs, b"after"),
+    2,
+    "the sibling plane is undisturbed"
+  );
+  assert_eq!(
+    query_anywhere(&gp),
+    2,
+    "the parent still serves post-refusal"
+  );
+
+  for h in [&node1, &node2] {
+    bo(h.shutdown()).expect("the sharded host tears down");
+  }
+}

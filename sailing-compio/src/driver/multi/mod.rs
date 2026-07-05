@@ -96,6 +96,36 @@ pub(crate) fn blueprint_names<I: PartialEq>(
 /// the coordinator's restore-time floor check and the engine's `(log, stable)` handles cannot
 /// borrow the engine simultaneously, and the copy is exact for the single id the call admits
 /// (monotone lineage cannot move under a serial driver task).
+/// Map the proto's split-propose error, preserving the redirect hint and the poison verdict
+/// exactly as `map_propose_err` does for plain proposals.
+pub(crate) fn map_split_err<I: core::fmt::Debug>(
+  e: sailing_proto::SplitError<I>,
+) -> DriverError<I> {
+  match e {
+    sailing_proto::SplitError::NotLeader { leader } => DriverError::NotLeader { leader },
+    sailing_proto::SplitError::Propose(inner) => crate::driver::map_propose_err(inner),
+    other => DriverError::Rejected {
+      reason: format!("{other:?}"),
+    },
+  }
+}
+
+/// The election-jitter seed a driver mints for a RELAYED fork's child (no embedder call supplies
+/// one): an FNV-1a fold of the host's node id, so co-located children fold further per group
+/// (the container's `group_seed`) while REPLICAS of one child draw distinct jitter — the same
+/// decorrelation embedders get by passing their node id as the seed.
+pub(crate) fn host_seed<I: sailing_proto::Data>(host: Option<&I>) -> u64 {
+  let Some(host) = host else { return 0 };
+  let mut buf = std::vec::Vec::new();
+  host.encode(&mut buf);
+  let mut h = 0xcbf2_9ce4_8422_2325_u64;
+  for b in &buf {
+    h ^= u64::from(*b);
+    h = h.wrapping_mul(0x0000_0100_0000_01b3);
+  }
+  h
+}
+
 pub(crate) struct FloorSnapshot {
   pub(crate) floor: u64,
   pub(crate) lineage: u64,
