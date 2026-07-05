@@ -145,6 +145,44 @@ where
     /// The owning budget reservation, sized to the instruction bytes.
     reservation: ReservationGuard,
   },
+  /// Propose a merge FREEZE of `source` into `target` (see `MultiRaft::prepare_merge`): a
+  /// committed `PrepareMerge` freezes the source on every replica so the target can absorb it.
+  /// Answer `reply` with the leader's immediate verdict (the proposed log index).
+  PrepareMerge {
+    /// The group to be absorbed (the freeze rides its log; leader-only).
+    source: G,
+    /// The group that will absorb it.
+    target: G,
+    /// Answered with the source leader's immediate verdict.
+    reply: oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
+  /// Propose the merge ABSORB on `target` (see `MultiRaft::commit_merge`): every target replica
+  /// parks at the entry until its local source is frozen-applied at the boundary, then the
+  /// driver's per-crank merge service resolves it — absorbing the source, flooring its id
+  /// terminally, and tearing its storage down behind one barrier. Answer `reply` with the
+  /// target leader's immediate verdict (the proposed log index).
+  CommitMerge {
+    /// The absorbing group (the commit rides its log; leader-only).
+    target: G,
+    /// The frozen group to absorb.
+    source: G,
+    /// Answered with the target leader's immediate verdict.
+    reply: oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
+  /// Propose the merge ABORT on `source` (see `MultiRaft::rollback_merge`): unfreeze — the one
+  /// entry proposable on a frozen group. Answer `reply` with the leader's immediate verdict.
+  RollbackMerge {
+    /// The frozen (or freezing) group to thaw.
+    source: G,
+    /// Answered with the source leader's immediate verdict.
+    reply: oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation (zero-byte).
+    reservation: ReservationGuard,
+  },
   /// Snapshot one group's runtime [`Status`]; answer `reply` with the status read off that group's
   /// live endpoint ON the driver thread. `Err(Rejected)` when no such group is hosted — the
   /// group-keyed surface has a miss case the single-group one does not.
@@ -569,6 +607,52 @@ where
       child,
       child_gen,
       instruction,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Propose a merge FREEZE of `source` into `target`, awaiting the source leader's IMMEDIATE
+  /// verdict (the proposed log index; the freeze takes effect apply-time on every replica, and
+  /// the lease kill from the entry's append). Refusals — not leader, differing voter sets or
+  /// read modes, an already-frozen source, a floored participant — resolve typed
+  /// [`DriverError::NotLeader`]/[`DriverError::Rejected`], with nothing appended.
+  pub async fn prepare_merge(&self, source: G, target: G) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::PrepareMerge {
+      source,
+      target,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Propose the merge ABSORB on `target`, awaiting the target leader's IMMEDIATE verdict. The
+  /// absorb itself resolves in the driver's storage crank once every replica's local source is
+  /// frozen-applied at the boundary; the merged-away source id is then floored terminally and
+  /// its straggler frames drop at the coordinator's tombstone.
+  pub async fn commit_merge(&self, target: G, source: G) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::CommitMerge {
+      target,
+      source,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Propose the merge ABORT on `source`, awaiting the leader's IMMEDIATE verdict — the release
+  /// valve: the ONE entry proposable on a frozen group; there is no timeout-based auto-unfreeze.
+  pub async fn rollback_merge(&self, source: G) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::RollbackMerge {
+      source,
       reply: tx,
       reservation,
     })?;

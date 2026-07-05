@@ -846,6 +846,8 @@ where
           is_poisoned: ep.is_poisoned(),
           precise_releases: ep.precise_releases(),
           unprovable_floor_holds: ep.unprovable_floor_holds(),
+          frozen: ep.is_frozen(),
+          shape_gen: ep.shape_gen(),
         };
         let _ = reply.send(status);
         drop(reservation);

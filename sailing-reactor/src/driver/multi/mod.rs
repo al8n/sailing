@@ -98,6 +98,20 @@ pub(crate) fn map_split_err<I: core::fmt::Debug>(
   }
 }
 
+/// Map the proto's merge-verb error — the split mapping's sibling, same redirect and poison
+/// preservation.
+pub(crate) fn map_merge_err<I: core::fmt::Debug>(
+  e: sailing_proto::MergeError<I>,
+) -> DriverError<I> {
+  match e {
+    sailing_proto::MergeError::NotLeader { leader } => DriverError::NotLeader { leader },
+    sailing_proto::MergeError::Propose(inner) => crate::driver::map_propose_err(inner),
+    other => DriverError::Rejected {
+      reason: format!("{other:?}"),
+    },
+  }
+}
+
 /// The election-jitter seed a driver mints for a RELAYED fork's child (no embedder call supplies
 /// one): an FNV-1a fold of the host's node id, so co-located children fold further per group
 /// (the container's `group_seed`) while REPLICAS of one child draw distinct jitter — the same
@@ -130,6 +144,51 @@ impl<G> sailing_proto::FloorStore<G> for FloorSnapshot {
 
   fn lineage(&self, _gid: &G) -> u64 {
     self.lineage
+  }
+}
+
+/// A pre-read copy of TWO ids' lineage records — the merge verbs' floor seam (the engine is
+/// lent to the propose as `(log, stable)`, so the coordinator's per-call floor reads come from
+/// this snapshot). Exact for the two ids a merge names; any other id answers the no-fence zero.
+pub(crate) struct PairFloors<G> {
+  entries: [(G, u64, u64); 2],
+}
+
+impl<G: sailing_proto::GroupId> PairFloors<G> {
+  /// Snapshot `source` and `target`'s floors + lineage off the engine.
+  pub(crate) fn snapshot<I>(
+    engine: &sailing_proto::GroupEngine<G, I>,
+    source: &G,
+    target: &G,
+  ) -> Self {
+    let read = |gid: &G| {
+      (
+        gid.cheap_clone(),
+        engine.group_floor(gid),
+        engine.group_gen(gid),
+      )
+    };
+    Self {
+      entries: [read(source), read(target)],
+    }
+  }
+}
+
+impl<G: PartialEq> sailing_proto::FloorStore<G> for PairFloors<G> {
+  fn floor(&self, gid: &G) -> u64 {
+    self
+      .entries
+      .iter()
+      .find(|(g, _, _)| g == gid)
+      .map_or(0, |(_, floor, _)| *floor)
+  }
+
+  fn lineage(&self, gid: &G) -> u64 {
+    self
+      .entries
+      .iter()
+      .find(|(g, _, _)| g == gid)
+      .map_or(0, |(_, _, lineage)| *lineage)
   }
 }
 
@@ -171,6 +230,11 @@ where
     || !ep.role().is_leader()
     || !matches!(ep.active_read_mode(), sailing_proto::ReadOnlyOption::Safe)
     || ep.has_lagging_peer()
+    // A parked merge is resolved by the per-crank service, which a quiesced group would never
+    // reach. Structurally redundant today (a park always leaves commit > applied, which the
+    // caught-up check below already refuses) — kept explicit so quiesce eligibility never
+    // silently inherits that coupling.
+    || ep.pending_merge().is_some()
   {
     return false;
   }

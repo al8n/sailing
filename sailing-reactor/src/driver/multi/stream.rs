@@ -57,8 +57,8 @@ use crate::{
 };
 
 use super::{
-  EngineMetrics, FloorSnapshot, GroupActivity, STORAGE_REDRIVES, blueprint_names, conf_names,
-  group_idle, host_seed, map_split_err, no_such_group, rejected,
+  EngineMetrics, FloorSnapshot, GroupActivity, PairFloors, STORAGE_REDRIVES, blueprint_names,
+  conf_names, group_idle, host_seed, map_merge_err, map_split_err, no_such_group, rejected,
 };
 
 /// Backoff before re-arming `accept()` after an accept error (see the single-group driver — the
@@ -649,6 +649,32 @@ where
             }
           }
           _ => break,
+        }
+      }
+    }
+    // Resolve every parked merge that local facts now decide, then fold each ABSORB's storage
+    // half: the terminal floor and the source teardown ride the SAME crank as the absorb and
+    // its forced capture, so the next barrier lands them together — a crash either rewinds to
+    // re-park or restarts the target past the absorb, never in between. (The coordinator
+    // already tombstoned the source, so stragglers drop at the wire; an Aborted resolution
+    // needs nothing here — the source group is still live.)
+    let resolutions = self.coord.service_merge_applies(&mut self.engine);
+    if !resolutions.is_empty() {
+      self.flush_pending = true;
+    }
+    for r in resolutions {
+      if let sailing_proto::MergeResolution::Merged { source, .. } = r {
+        self
+          .engine
+          .set_group_floor(&source, sailing_proto::MERGED_FLOOR);
+        self.engine.remove_group(&source);
+        self.was_leader.remove(&source);
+        self.quiesced.remove(&source);
+        self.quiesce_pending.remove(&source);
+        self.activity.remove(&source);
+        self.election.remove(&source);
+        if let Some(mut routing) = self.routing.remove(&source) {
+          routing.fail_all(&DriverError::ShuttingDown);
         }
       }
     }
@@ -1303,6 +1329,76 @@ where
         let _ = reply.send(verdict);
         drop(reservation);
       }
+      MultiCommand::PrepareMerge {
+        source,
+        target,
+        reply,
+        reservation,
+      } => {
+        // The merge floor leg reads a pre-call snapshot of BOTH participants' lineage (the
+        // engine is lent to the propose as `(log, stable)`).
+        let floors = PairFloors::snapshot(&self.engine, &source, &target);
+        let verdict = match self.engine.stores(&source) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => {
+            match self
+              .coord
+              .prepare_merge(&source, now, log, stable, &target, &floors)
+            {
+              Some(r) => r.map_err(map_merge_err),
+              None => Err(no_such_group()),
+            }
+          }
+        };
+        if verdict.is_ok() {
+          self.flush_pending = true;
+        }
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+      MultiCommand::CommitMerge {
+        target,
+        source,
+        reply,
+        reservation,
+      } => {
+        let floors = PairFloors::snapshot(&self.engine, &source, &target);
+        let verdict = match self.engine.stores(&target) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => {
+            match self
+              .coord
+              .commit_merge(&target, now, log, stable, &source, &floors)
+            {
+              Some(r) => r.map_err(map_merge_err),
+              None => Err(no_such_group()),
+            }
+          }
+        };
+        if verdict.is_ok() {
+          self.flush_pending = true;
+        }
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
+      MultiCommand::RollbackMerge {
+        source,
+        reply,
+        reservation,
+      } => {
+        let verdict = match self.engine.stores(&source) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => match self.coord.rollback_merge(&source, now, log, stable) {
+            Some(r) => r.map_err(map_merge_err),
+            None => Err(no_such_group()),
+          },
+        };
+        if verdict.is_ok() {
+          self.flush_pending = true;
+        }
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
       MultiCommand::Status {
         group,
         reply,
@@ -1319,6 +1415,8 @@ where
           is_poisoned: ep.is_poisoned(),
           precise_releases: ep.precise_releases(),
           unprovable_floor_holds: ep.unprovable_floor_holds(),
+          frozen: ep.is_frozen(),
+          shape_gen: ep.shape_gen(),
         });
         let _ = reply.send(status.ok_or_else(no_such_group));
         drop(reservation);

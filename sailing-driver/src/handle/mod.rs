@@ -132,6 +132,11 @@ pub struct Status<I> {
   pub precise_releases: u64,
   /// Failover-tier commit-waits HELD because the inherited walled-lease floor was unprovable.
   pub unprovable_floor_holds: u64,
+  /// Whether the group is FROZEN by an in-flight merge (refusing proposals, conf changes,
+  /// transfers, and reads until the merge resolves or rolls back).
+  pub frozen: bool,
+  /// The group's lineage counter (incarnation ⊔ shape): bumped by every applied split and merge.
+  pub shape_gen: u64,
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to submit operations and observe events.
