@@ -56,6 +56,18 @@ pub(crate) struct SplitState<I, F> {
   /// container seeds its replay guard from this, so a fork re-staged by restart replay is
   /// relayed again rather than dropped as a duplicate.
   pub(crate) restored_lineage: u64,
+  /// Log index of the most recently appended (not-yet-applied) `Split` entry — the ONE-IN-FLIGHT
+  /// propose gate (`> applied` ⇒ a split is in flight), mirroring `pending_conf_index` /
+  /// `pending_read_mode_index` exactly: `propose_split` mints `parent_gen_after` from the live
+  /// counter, which bumps only at apply, so a second mint before the first applies would carry
+  /// the SAME bump and lose at the apply-time lineage guard. Derived state, never a sticky flag:
+  /// `become_leader` re-seats it at the log's last index (an inherited unapplied split — or any
+  /// tail — conservatively holds the gate until applied absorbs the accession point), and a
+  /// deposed proposer's truncated entry cannot wedge anything because the gate is only ever
+  /// consulted on the leader path, behind that re-seat. On restart, ZERO is acceptable exactly
+  /// as on `pending_conf_index`: the gate turns permissive, and the apply-time lineage guard
+  /// remains the safety floor for a stale mint.
+  pub(crate) pending_split_index: Index,
 }
 
 impl<I, F> SplitState<I, F> {
@@ -66,6 +78,7 @@ impl<I, F> SplitState<I, F> {
       outstanding: BTreeSet::new(),
       shape_gen: lineage,
       restored_lineage: lineage,
+      pending_split_index: Index::ZERO,
     }
   }
 }
@@ -116,6 +129,12 @@ where
   /// live counter — the container's replay-guard seed.
   pub(crate) fn restored_lineage(&self) -> u64 {
     self.split.restored_lineage
+  }
+
+  /// Whether a proposed `Split` entry is still UNAPPLIED — the container's one-in-flight propose
+  /// gate (see [`SplitState::pending_split_index`] for the self-healing derivation).
+  pub(crate) fn split_in_flight(&self) -> bool {
+    self.split.pending_split_index > self.applied
   }
 }
 
@@ -178,6 +197,10 @@ where
     self.push_pending(opid, Pending::LeaderAppend { upto: index });
     // Stage the append for the next `flush_appends` (see `replication_pending`).
     self.replication_pending = true;
+    // One split in flight at a time (mirror `pending_read_mode_index`): the mint above read the
+    // live counter, which bumps only when THIS entry applies — a second mint before then would
+    // duplicate it and no-op at the apply-time lineage guard.
+    self.split.pending_split_index = index;
     // The entry was ALREADY appended (durable-pending) — Ok(index) even if a later flush
     // self-poisons, exactly as `propose` reasons: it WILL commit via the durable log.
     Ok(index)

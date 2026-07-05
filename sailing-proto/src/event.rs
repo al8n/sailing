@@ -158,6 +158,61 @@ impl SplitApplied {
   }
 }
 
+/// A committed `Split` entry applied as a DETERMINISTIC NO-OP: its minted lineage
+/// (`parent_gen_after`) is not the live counter's successor, so the mint was STALE — a second
+/// split proposed before an earlier one applied (both read the same pre-apply counter), or a
+/// replayed retry duplicate. The state machine is untouched (`split` is never invoked), no fork
+/// is staged, and no snapshot fence is armed; the guard's inputs are replicated state, so every
+/// replica no-ops the same entry identically. The embedder observes this and re-proposes the
+/// split if it still wants it — the propose-time one-in-flight gate makes the event rare.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitStale {
+  /// The log index of the no-op'd `Split` entry.
+  index: Index,
+  /// The child group id's canonical `Data` encoding, as the entry carried it.
+  child: Bytes,
+  /// The entry's minted parent lineage (`parent_gen_after`).
+  minted_gen: u64,
+  /// The live lineage counter at the apply point (the mint had to be exactly this + 1).
+  shape_gen: u64,
+}
+
+impl SplitStale {
+  /// Construct.
+  pub const fn new(index: Index, child: Bytes, minted_gen: u64, shape_gen: u64) -> Self {
+    Self {
+      index,
+      child,
+      minted_gen,
+      shape_gen,
+    }
+  }
+
+  /// The log index of the no-op'd `Split` entry.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The child group id's canonical `Data` encoding (an O(1) shared handle).
+  #[inline(always)]
+  pub fn child(&self) -> Bytes {
+    self.child.clone()
+  }
+
+  /// The entry's minted parent lineage.
+  #[inline(always)]
+  pub const fn minted_gen(&self) -> u64 {
+    self.minted_gen
+  }
+
+  /// The live lineage counter at the apply point.
+  #[inline(always)]
+  pub const fn shape_gen(&self) -> u64 {
+    self.shape_gen
+  }
+}
+
 /// Outputs the application observes.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
@@ -180,6 +235,9 @@ pub enum Event<I, R> {
   /// A `Split` entry was committed and applied; a forked child half is staged for
   /// materialization.
   SplitApplied(SplitApplied),
+  /// A committed `Split` entry no-op'd deterministically: its mint was stale against the live
+  /// lineage counter. Nothing forked; re-propose if the split is still wanted.
+  SplitStale(SplitStale),
   /// A linearizable read index has been confirmed.  The application may serve the
   /// associated read once `applied >= ReadState.index`.
   ReadState(ReadState),
@@ -221,6 +279,18 @@ mod tests {
     let rs2 = ev.unwrap_read_state_ref();
     assert_eq!(rs2.index(), Index::new(7));
     assert_eq!(rs2.context().as_ref(), b"ctx");
+  }
+
+  #[test]
+  fn split_stale_construct_and_classify() {
+    let s = SplitStale::new(Index::new(5), bytes::Bytes::from_static(b"\x07"), 1, 1);
+    assert_eq!(s.index(), Index::new(5));
+    assert_eq!(s.child().as_ref(), b"\x07");
+    assert_eq!(s.minted_gen(), 1);
+    assert_eq!(s.shape_gen(), 1);
+    let ev: Event<u64, u32> = Event::SplitStale(s);
+    assert!(ev.is_split_stale());
+    assert!(!ev.is_split_applied());
   }
 
   #[test]

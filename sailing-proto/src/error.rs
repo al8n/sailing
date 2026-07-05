@@ -140,6 +140,17 @@ pub enum SplitError<I> {
   /// the one-line rule is refuse-at-propose — finish (or leave) the joint change first.
   #[error("the parent group is in a joint configuration")]
   JointConfig,
+  /// An earlier split on this parent is still in flight (appended, not yet applied) — mirror of
+  /// [`ProposeError::ConfChangeInFlight`]. The mint (`parent_gen_after`) reads the live lineage
+  /// counter, which bumps only when a split APPLIES, so a second proposal before then would
+  /// carry the same mint and deterministically no-op at every replica's apply-time lineage
+  /// guard ([`SplitStale`](crate::SplitStale)) — refuse it here instead. Self-healing by
+  /// derivation, never a sticky flag: pending-ness is `last proposed split index > applied`,
+  /// re-seated at every leadership accession, so an applied split (or a deposed leader's
+  /// truncated entry) releases the gate on its own. Re-propose after the in-flight split
+  /// applies.
+  #[error("an earlier split is still in flight (not yet applied)")]
+  SplitInFlight,
   /// A group with the child id is already hosted HERE (including the parent's own id). The
   /// single-incarnation contract makes a hosted id unavailable as a fork target; a committed
   /// split against it would fold to a no-op on this host and a divergent surprise elsewhere.
