@@ -301,11 +301,14 @@ impl MultiWorld {
 
   /// The committed LEARNER set of `gid`, read like [`committed_voters_of`](Self::committed_voters_of)
   /// (the highest-term leader's `conf_state().learners()`; leaderless, the plurality config's
-  /// learners keyed by voter set so the two accessors agree on the chosen config).
-  fn committed_learners_of(&self, gid: u64) -> BTreeSet<u64> {
+  /// learners keyed by voter set so the two accessors agree on the chosen config). Parked
+  /// replicas are excluded from both paths for the same reason: a reaped zombie's stale config
+  /// must never define the group's committed membership.
+  pub(super) fn committed_learners_of(&self, gid: u64) -> BTreeSet<u64> {
     let authoritative = self
       .node_ids
       .iter()
+      .filter(|&&n| !self.parked.contains(&(n, gid)))
       .filter_map(|&n| self.hosts[&n].group(&gid))
       .filter(|ep| ep.role().is_leader())
       .max_by_key(|ep| ep.term());
@@ -314,6 +317,9 @@ impl MultiWorld {
     }
     let mut tally: BTreeMap<BTreeSet<u64>, (usize, BTreeSet<u64>)> = BTreeMap::new();
     for &n in &self.node_ids {
+      if self.parked.contains(&(n, gid)) {
+        continue;
+      }
       let Some(ep) = self.hosts[&n].group(&gid) else {
         continue;
       };

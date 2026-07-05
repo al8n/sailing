@@ -563,19 +563,27 @@ impl MultiWorld {
   /// The group's REAL committed VOTER set, read exactly as `Cluster::committed_voters` reads it:
   /// the HIGHEST-TERM leader among the group's hosting replicas is authoritative; leaderless,
   /// the most common committed voter set across hosting replicas (ties to the first-sorting
-  /// set), so the result is a pure function of world state.
+  /// set), so the result is a pure function of world state. Parked replicas are excluded from
+  /// BOTH paths — the [`leader_of`](Self::leader_of) rule: a reaped stale leader still wearing
+  /// Leader role would otherwise become the authoritative config source the moment the group is
+  /// between live leaders (and a parked stale config would keep voting in the leaderless tally),
+  /// handing the quorum-durability oracle a denominator anchored on a zombie's view.
   fn committed_voters_of(&self, gid: u64) -> BTreeSet<u64> {
     let authoritative = self
       .node_ids
       .iter()
-      .filter_map(|&n| self.hosts[&n].group(&gid).map(|ep| (n, ep)))
-      .filter(|(_, ep)| ep.role().is_leader())
-      .max_by_key(|(_, ep)| ep.term());
-    if let Some((_, ep)) = authoritative {
+      .filter(|&&n| !self.parked.contains(&(n, gid)))
+      .filter_map(|&n| self.hosts[&n].group(&gid))
+      .filter(|ep| ep.role().is_leader())
+      .max_by_key(|ep| ep.term());
+    if let Some(ep) = authoritative {
       return ep.conf_state().voters().iter().copied().collect();
     }
     let mut tally: BTreeMap<BTreeSet<u64>, usize> = BTreeMap::new();
     for &n in &self.node_ids {
+      if self.parked.contains(&(n, gid)) {
+        continue;
+      }
       let Some(ep) = self.hosts[&n].group(&gid) else {
         continue;
       };
