@@ -119,6 +119,61 @@ pub enum CreateGroupError {
   InvalidBootEpoch,
 }
 
+/// Why [`MultiRaft::propose_split`](crate::MultiRaft::propose_split) — or a coordinator/driver
+/// delegator around it — refused to propose a group split. One enum, three producer layers: the
+/// container produces the consensus-shaped refusals (`NotLeader`/`JointConfig`/`ChildExists`/
+/// `InvalidChild` and the `Propose` passthrough), a coordinator's propose delegator produces
+/// `BelowFloor` through its bind-configured floor seam, and a sharded host's handle produces
+/// `CrossPlane` before any command crosses a plane boundary. Nothing is appended in every case.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum SplitError<I> {
+  /// This node is not the parent group's leader; redirect to `leader` if known. A split rides
+  /// the parent's own log, so only its leader can propose one.
+  #[error("not the parent group's leader")]
+  NotLeader {
+    /// The believed current leader of the parent group, if known.
+    leader: Option<I>,
+  },
+  /// The parent is mid-joint-configuration. A split reads the parent's voter set AT its entry as
+  /// the child's bootstrap membership; a joint parent would hand the child an ambiguous set, so
+  /// the one-line rule is refuse-at-propose — finish (or leave) the joint change first.
+  #[error("the parent group is in a joint configuration")]
+  JointConfig,
+  /// A group with the child id is already hosted HERE (including the parent's own id). The
+  /// single-incarnation contract makes a hosted id unavailable as a fork target; a committed
+  /// split against it would fold to a no-op on this host and a divergent surprise elsewhere.
+  #[error("a group with the child id is already hosted")]
+  ChildExists,
+  /// The child id's `Data` encoding is outside the group-tag wire bound (1..=1024 bytes).
+  /// Refused at propose because a COMMITTED split whose child cannot decode poisons every
+  /// replica of the parent (`SplitDecode`) — a self-inflicted cluster-wide fail-stop.
+  #[error("the child group id's encoding is empty or exceeds the wire bound")]
+  InvalidChild,
+  /// The child incarnation is below the id's persisted admission floor (a coordinator-layer
+  /// refusal through its floor seam): a removal or merge fenced the id, so the fork could never
+  /// be admitted at materialization. Produced at propose so the entry is never appended.
+  #[error("the child id's incarnation is below its admission floor ({floor})")]
+  BelowFloor {
+    /// The child id's persisted admission floor.
+    floor: u64,
+  },
+  /// The child id maps to a different plane than the parent on a sharded (K-plane) host. The
+  /// fork must happen inside ONE plane's driver, so a cross-plane child is refused before any
+  /// command is sent (v1 constraint; the shard-map override makes any child placeable).
+  #[error("the child id maps to a different plane than the parent")]
+  CrossPlane,
+  /// The parent is frozen by an in-flight merge (dormant until the merge milestone lands: the
+  /// freeze machinery is its surface; nothing produces this today).
+  #[error("the parent group is frozen by an in-flight merge")]
+  Frozen,
+  /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
+  /// entry too large for one frame). The split-specific gates all passed; the failure is the
+  /// ordinary admin-append class, surfaced verbatim.
+  #[error(transparent)]
+  Propose(#[from] ProposeError<I>),
+}
+
 /// Why a leader-transfer request was rejected.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]

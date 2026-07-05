@@ -246,13 +246,15 @@ where
     }
     // THE FORK DURABILITY BARRIER: a staged fork's only recovery source is re-applying its Split
     // entry, which dies the moment this endpoint snapshots at-or-past that index (the capture
-    // below is taken at `applied`, and its compaction discards the entry). Refuse until the
-    // driver lifts the cap — its fork materialization is then behind the local engine barrier —
-    // so a correlated crash can never lose the child's state outright. The window is ≈ one crank.
+    // below is taken at `applied`, and its compaction discards the entry). Refuse until every
+    // such fork is RESOLVED (`resolve_fork`: flush-durable behind the driver's engine barrier,
+    // or dropped by the container's replay guard) — so a correlated crash can never lose the
+    // child's state outright. The window is ≈ one crank.
     if self
       .split
-      .snapshot_cap
-      .is_some_and(|cap| self.applied >= cap)
+      .outstanding
+      .first()
+      .is_some_and(|cap| self.applied >= *cap)
     {
       return;
     }

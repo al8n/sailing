@@ -452,6 +452,24 @@ impl<I: PartialEq> Config<I> {
   }
 }
 
+impl<I: Clone + PartialEq> Config<I> {
+  /// This config with its bootstrap voter set replaced and every other knob preserved — how a
+  /// forked child inherits its parent's LOCAL tuning (timeouts, thresholds, lease knobs) under
+  /// the child's own membership. Re-validates only what the swap can break: a non-empty set
+  /// containing `id` (the timeouts were validated when the parent's config was built).
+  pub(crate) fn with_voter_set(&self, voters: Vec<I>) -> Result<Self, ConfigError> {
+    if voters.is_empty() {
+      return Err(ConfigError::EmptyVoters);
+    }
+    if !voters.contains(&self.id) {
+      return Err(ConfigError::IdNotAVoter);
+    }
+    let mut cfg = self.clone();
+    cfg.voters = voters;
+    Ok(cfg)
+  }
+}
+
 impl<I: CheapClone> Config<I> {
   /// This node's id.
   #[inline(always)]

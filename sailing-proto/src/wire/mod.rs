@@ -450,9 +450,6 @@ pub(crate) fn decode_conf_change_v2<I: NodeId>(
 }
 
 /// Encode a split payload as an entry payload.
-// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
-// `expect` is a lint error), so it cannot outlive its reason.
-#[cfg_attr(not(test), expect(dead_code))]
 pub(crate) fn encode_split_payload(p: &SplitPayload, buf: &mut Vec<u8>) {
   pb::SplitPayload {
     child: p.child_bytes(),

@@ -66,7 +66,9 @@ pub use storage::{
 };
 
 mod error;
-pub use error::{ConfigError, CreateGroupError, ProposeError, ReadIndexError, TransferError};
+pub use error::{
+  ConfigError, CreateGroupError, ProposeError, ReadIndexError, SplitError, TransferError,
+};
 
 mod inflights;
 pub(crate) use inflights::Inflights;
@@ -91,7 +93,7 @@ pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};
 mod multi;
 pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
-  GroupEngine, GroupId, MERGED_FLOOR, MultiRaft, NoFloors, floor_admits,
+  GroupEngine, GroupFork, GroupId, MERGED_FLOOR, MultiRaft, NoFloors, floor_admits,
 };
 
 mod tracker;

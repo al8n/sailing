@@ -236,7 +236,8 @@ where
   }
 
   /// Create a group from locally forked state (see [`MultiRaft::create_group_from_fork`] for
-  /// the manufactured-snapshot-install contract). Admission is gated exactly as
+  /// the manufactured-snapshot-install contract; `generation` and `read_only` ride the baseline
+  /// meta as the child's lineage and inherited read-mode provenance). Admission is gated exactly as
   /// [`create_group`](Self::create_group): floor first (via the caller's `floors` seam), then
   /// the tombstone, then the container — a fork NEVER clears a tombstone, and it is never
   /// factory-reachable (a local act by an already-authorized replica, never solicited over the
@@ -261,6 +262,7 @@ where
     seed: u64,
     fsm: F,
     snapshot: Bytes,
+    read_only: Option<crate::ReadOnlyOption>,
     boot_epoch: u64,
     generation: u64,
     floors: &impl FloorStore<G>,
@@ -278,7 +280,7 @@ where
     }
     let key = gid.cheap_clone();
     self.multi.create_group_from_fork(
-      gid, config, now, seed, fsm, snapshot, boot_epoch, log, stable,
+      gid, generation, config, now, seed, fsm, snapshot, read_only, boot_epoch, log, stable,
     )?;
     self.purge_unknown_signal(&key);
     Ok(())
