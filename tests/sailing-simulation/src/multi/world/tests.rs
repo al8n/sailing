@@ -549,6 +549,438 @@ fn split_replay_after_crash_registers_once() {
   w.finalize_membership_or_panic(11);
 }
 
+/// Drive a 2-voter parent through a split whose fork materializes on the LEADER alone, then
+/// retire the parent with the fork un-propagated: the child is left registered with committed
+/// voters `{0, 1}` but hosted on one node — below quorum, leaderless, campaigning at its
+/// manufactured baseline forever.
+///
+/// The strand needs a LATENCIED bus: on the zero-latency bus the settle loop is a fixpoint, so
+/// the lagger's ack, the leader's commit advance, and the lagger's own apply all land within
+/// one tick — ack and commit-learn can only be separated while the commit-carrying response is
+/// still IN FLIGHT. With latency on, the leader applies (and forks) the tick the quorum ack
+/// lands, and both directions of the parent link are muted before the advanced commit index
+/// can be delivered (mutes swallow at delivery, so the in-flight response dies too; the
+/// lagger's own higher-term campaigns — its log carries the split entry — must not reach the
+/// leader either, or a handover would commit-and-fork on the lagger). Retirement then drops
+/// the lagger's parent replica with the fork never staged. Returns `(world, holder, lagger)`.
+fn world_with_stranded_child(seed: u64, child: u64) -> (MultiWorld, u64, u64) {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..2 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = (0..2).collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..2).all(|n| w.applied_of(n, 100).len() >= 8)),
+    "the keyed baseline never applied everywhere"
+  );
+  let leader = w.leader_of(100).expect("elected");
+  let lagger = 1 - leader;
+
+  w.set_network_faults(
+    crate::NetworkFaults {
+      latency: Duration::from_millis(20),
+      ..crate::NetworkFaults::none()
+    },
+    seed,
+  );
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(100, child, 4) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "the split was never accepted");
+  for _ in 0..2_000 {
+    w.tick();
+    if w.splits_applied() == 1 {
+      break;
+    }
+  }
+  assert_eq!(w.splits_applied(), 1, "the split never materialized");
+  assert_eq!(
+    w.hosting_nodes(child),
+    std::vec![leader],
+    "the fork must land on the leader alone"
+  );
+  w.mute_group(leader, lagger, 100);
+  w.mute_group(lagger, leader, 100);
+  for _ in 0..50 {
+    w.tick();
+  }
+  assert_eq!(
+    w.hosting_nodes(child),
+    std::vec![leader],
+    "the starved lagger must never materialize the fork"
+  );
+
+  w.remove_group(100);
+  w.unmute_all();
+  w.set_network_faults(crate::NetworkFaults::none(), seed);
+  assert_eq!(
+    w.hosting_nodes(child),
+    std::vec![leader],
+    "retirement tears down the un-forked parent replica with the fork unstaged"
+  );
+  (w, leader, lagger)
+}
+
+/// The stranded fork child completes like the embedder would: the leaderless completion arm
+/// wires the missing committed voter as an EMPTY catching-up OBSERVER (the product's
+/// solicitation edge under the factory contract's fork-born rule — the blueprint excludes self
+/// from the bootstrap voters), the holder's manufactured `(term 1, index 1)` log wins the ONLY
+/// possible election (an observer empty grants votes but cannot campaign), the zero-progress
+/// joiner arrives by SNAPSHOT carrying the inherited baseline plus the boundary config that
+/// promotes it, and the conservation + membership verdicts hold. Without the arm this shape is
+/// a permanent calm-window livelock: the only replica-creating repair (the resurrect arm) is
+/// leader-gated, and a sub-quorum group can never produce the leader.
+#[test]
+fn stranded_fork_child_completes_from_the_holder() {
+  let (mut w, holder, joiner) = world_with_stranded_child(13, 200);
+  assert_eq!(w.group_voters(200), (0..2).collect::<BTreeSet<u64>>());
+  assert!(w.leader_of(200).is_none(), "the wedge starts leaderless");
+
+  // One reconcile pass completes the hosting set: the missing voter is wired EMPTY as an
+  // OBSERVER (self absent from the bootstrap voters — the fork-born blueprint shape), able to
+  // grant the holder's election but never to mount one of its own against the baseline.
+  w.reconcile_membership(200);
+  assert_eq!(w.hosting_nodes(200), std::vec![0, 1]);
+  let (joiner_voters, _) = conf_of(&w, joiner, 200);
+  assert!(
+    !joiner_voters.contains(&joiner),
+    "the completion arm wires the fork-born observer blueprint, never a self-voting empty"
+  );
+  assert!(
+    w.applied_of(joiner, 200).is_empty(),
+    "the wired replica is empty — the baseline must arrive by replication"
+  );
+
+  let mut elected = false;
+  for _ in 0..4_000 {
+    w.reconcile_membership(200);
+    if w.leader_of(200).is_some() {
+      elected = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(
+    elected,
+    "the completed group must elect within the calm budget: {}",
+    w.dbg_group(200)
+  );
+  assert_eq!(
+    w.leader_of(200),
+    Some(holder),
+    "the holder's manufactured baseline wins the ONLY possible election — the observer empty \
+     cannot campaign"
+  );
+
+  // The joiner's catch-up is structurally a snapshot transfer (the fork baseline pushed
+  // first_index to 2), delivering the inherited parent-tagged record.
+  assert!(
+    w.run_until(4_000, |w| {
+      !w.applied_of(holder, 200).is_empty()
+        && w.applied_of(joiner, 200) == w.applied_of(holder, 200)
+    }),
+    "the joiner never converged on the holder's record: {}",
+    w.dbg_group(200)
+  );
+  assert!(
+    w.snapshot_lineage.contains(&(joiner, 200)),
+    "a zero-progress joiner must arrive by snapshot"
+  );
+  assert!(
+    w.applied_of(joiner, 200)
+      .iter()
+      .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+      .any(|(tag, _, _)| tag == 100),
+    "the snapshot must deliver the inherited parent-tagged baseline"
+  );
+  let (joiner_voters, _) = conf_of(&w, joiner, 200);
+  assert!(
+    joiner_voters.contains(&joiner),
+    "the snapshot's boundary config promotes the observer to voter"
+  );
+  assert!(w.agreement_holds(200));
+
+  // Fresh keyed load commits on the completed group, and the run-end verdicts hold.
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 5, 900));
+  assert!(w.run_until(2_000, |w| (0..2).all(|n| {
+    w.applied_of(n, 200)
+      .iter()
+      .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 5, 900)))
+  })));
+  w.check_now();
+  w.finalize_conservation_or_panic(13);
+  w.finalize_membership_or_panic(13);
+  assert_eq!(
+    w.splits_applied(),
+    1,
+    "completion never re-registers the split"
+  );
+}
+
+/// With a LIVE leader the completion arm is out of the path entirely: an under-hosted child
+/// that can elect (two of three voters materialized) heals its missing voter through the
+/// standing leader-gated resurrect arm — a catching-up OBSERVER whose bootstrap excludes
+/// itself, the same shape the completion arm wires under the fork-born rule, reached through
+/// the led branch of reconcile rather than the leaderless one. The lagger's own late fork then
+/// folds against the already-hosted replica without a second registration.
+#[test]
+fn under_hosted_group_with_a_live_leader_heals_via_the_observer_arm() {
+  let mut w = MultiWorld::new(19);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..3).all(|n| w.applied_of(n, 100).len() >= 8)),
+    "the keyed baseline never applied everywhere"
+  );
+  let leader = w.leader_of(100).expect("elected");
+  let straggler = (0..3).rev().find(|&n| n != leader).expect("a follower");
+
+  // Starve the straggler of the split entry entirely (muted both ways BEFORE the propose): the
+  // other two voters carry the quorum, apply, and fork, so the child elects on 2 of 3 while
+  // the straggler's parent replica never stages its fork.
+  w.mute_group(leader, straggler, 100);
+  w.mute_group(straggler, leader, 100);
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(100, 300, 4) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "the split was never accepted");
+  assert!(
+    w.run_until(3_000, |w| w.hosting_nodes(300).len() == 2
+      && w.leader_of(300).is_some()),
+    "the two materialized voters must elect: {}",
+    w.dbg_group(300)
+  );
+  assert_eq!(w.splits_applied(), 1, "one registration for the split");
+  assert!(!w.hosts_group(straggler, 300));
+
+  // The led reconcile path: the missing voter comes back as the resurrect arm's OBSERVER
+  // (bootstrap excludes itself — it cannot campaign until the log teaches it its own
+  // membership). The completion arm wires the same observer shape, but only ever from the
+  // LEADERLESS branch; a led group never consults it.
+  w.reconcile_membership(300);
+  assert!(w.hosts_group(straggler, 300));
+  let (wired_voters, _) = conf_of(&w, straggler, 300);
+  assert!(
+    !wired_voters.contains(&straggler),
+    "a led group heals through the observer resurrect arm"
+  );
+
+  // Heal the link: the straggler's parent replica applies the split late and its fork folds
+  // against the hosted replica — one registration for the run.
+  w.unmute_all();
+  assert!(
+    w.run_until(4_000, |w| {
+      !w.applied_of(leader, 300).is_empty()
+        && (0..3).all(|n| w.applied_of(n, 300) == w.applied_of(leader, 300))
+    }),
+    "the group never fully converged: {}",
+    w.dbg_group(300)
+  );
+  assert_eq!(
+    w.splits_applied(),
+    1,
+    "the late fork must fold, not re-register"
+  );
+  assert!(w.agreement_holds(300));
+  w.check_now();
+  w.finalize_conservation_or_panic(19);
+  w.finalize_membership_or_panic(19);
+}
+
+/// A fully-hosted leaderless group is ordinary election territory: reconcile passes during the
+/// window wire nothing and re-wire nothing (every replica keeps its founding incarnation), and
+/// the election completes without world help. The completion arm's missing-voter set is empty
+/// the moment every committed voter hosts, so the default profile — where no verb ever removes
+/// a hosting replica without removing its membership — can never reach the arm.
+#[test]
+fn fully_hosted_leaderless_group_elects_without_world_help() {
+  let mut w = MultiWorld::new(5);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+
+  // Freshly created: leaderless with every committed voter hosting.
+  assert!(w.leader_of(100).is_none());
+  for _ in 0..5 {
+    w.reconcile_membership(100);
+  }
+  assert_eq!(w.hosting_nodes(100), std::vec![0, 1, 2]);
+  assert!(
+    (0..3).all(|n| w.restarts.get(&(n, 100)) == Some(&1)),
+    "no replica may be re-wired while the group is merely electing"
+  );
+
+  let mut elected = false;
+  for _ in 0..3_000 {
+    w.reconcile_membership(100);
+    if w.leader_of(100).is_some() {
+      elected = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(elected, "the ordinary election must complete");
+  assert!(
+    (0..3).all(|n| w.restarts.get(&(n, 100)) == Some(&1)),
+    "the election ran entirely on the founding replicas"
+  );
+}
+
+/// A retired group is out of reconcile's reach entirely: no pass may ever re-wire a replica
+/// for it (recreation is the lifecycle verb that revives a retired gid, at gen+1).
+#[test]
+fn reconcile_never_rewires_a_retired_group() {
+  let mut w = MultiWorld::new(23);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  propose_until_accepted(&mut w, 100, &crate::multi::encode_gkv(100, 0, 1));
+  assert!(w.run_until(2_000, |w| w.agreement_holds(100)
+    && (0..3).all(|n| !w.applied_of(n, 100).is_empty())));
+
+  w.remove_group(100);
+  for _ in 0..5 {
+    w.reconcile_membership(100);
+    w.tick();
+  }
+  assert!(
+    w.hosting_nodes(100).is_empty(),
+    "reconcile must never resurrect a retired group's replicas"
+  );
+}
+
+/// No unparked solicitation witness, no completion: a parked holder is delivery-isolated — its
+/// campaigns reach nobody, so in the product nothing would ever materialize the missing
+/// replicas. The arm must hold off until the witness returns (here: the holder unparked, the
+/// exact moment solicitation becomes possible again).
+#[test]
+fn completion_arm_requires_an_unparked_solicitation_witness() {
+  let (mut w, holder, _joiner) = world_with_stranded_child(17, 200);
+
+  w.parked.insert((holder, 200));
+  for _ in 0..5 {
+    w.reconcile_membership(200);
+    w.tick();
+  }
+  assert_eq!(
+    w.hosting_nodes(200),
+    std::vec![holder],
+    "a parked holder solicits nothing — the arm must not fire"
+  );
+
+  w.parked.remove(&(holder, 200));
+  w.reconcile_membership(200);
+  assert_eq!(
+    w.hosting_nodes(200),
+    std::vec![0, 1],
+    "unparking restores the witness and the arm completes the group"
+  );
+}
+
+/// The completion arm is SHAPE-GENERIC: any under-hosted committed-voter group with a
+/// campaigning holder completes, fork-born or not — the product's solicitation edge does not
+/// distinguish (any voter-authenticated initial-shape solicitation triggers the factory). A
+/// plain group loses one voter's replica to an external teardown, the leader crashes into a
+/// leaderless window, and the arm wires the missing voter back as a catching-up OBSERVER
+/// (the uniform blueprint shape — an empty must never be able to campaign against state it
+/// does not carry) that catches up and converges while the two intact voters elect.
+#[test]
+fn completion_arm_is_shape_generic_beyond_fork_children() {
+  let mut w = MultiWorld::new(29);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..4 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| {
+      let lens: Vec<usize> = (0..3).map(|n| w.applied_of(n, 100).len()).collect();
+      lens[0] >= 4 && lens.iter().min() == lens.iter().max()
+    }),
+    "the baseline never equalized"
+  );
+
+  let leader = w.leader_of(100).expect("elected");
+  let victim = (0..3).rev().find(|&n| n != leader).expect("a follower");
+  w.drop_group_replica(100, victim);
+  w.crash(leader);
+  assert!(
+    w.leader_of(100).is_none(),
+    "the crashed leader restores as a follower — the group is leaderless"
+  );
+
+  w.reconcile_membership(100);
+  assert!(
+    w.hosts_group(victim, 100),
+    "the arm completes any under-hosted group, not only fork children"
+  );
+  let (wired_voters, _) = conf_of(&w, victim, 100);
+  assert!(
+    !wired_voters.contains(&victim),
+    "completed as a catching-up observer — the empty can grant but never campaign"
+  );
+
+  let mut elected = false;
+  for _ in 0..4_000 {
+    w.reconcile_membership(100);
+    if w.leader_of(100).is_some() {
+      elected = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(
+    elected,
+    "the completed group must elect: {}",
+    w.dbg_group(100)
+  );
+  assert!(
+    w.run_until(4_000, |w| {
+      !w.applied_of(0, 100).is_empty()
+        && (0..3).all(|n| w.applied_of(n, 100) == w.applied_of(0, 100))
+    }),
+    "the re-wired voter never converged: {}",
+    w.dbg_group(100)
+  );
+  assert!(w.agreement_holds(100));
+  w.check_now();
+  w.finalize_membership_or_panic(29);
+}
+
 /// A child replica that arrives by the product's OTHER legitimate path — a fresh observer
 /// caught up by snapshot transfer (`LogSm::snapshot()` carries the full record, inherited
 /// parent-tagged baseline included) — must yield an aligned record identical to a fork-wired

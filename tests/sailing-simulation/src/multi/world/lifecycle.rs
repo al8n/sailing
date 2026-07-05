@@ -180,7 +180,10 @@ impl MultiWorld {
   /// Reconcile `gid`'s registry entry from the group's REAL committed state (the leader's
   /// runtime `conf_state()`), never propose-time bookkeeping — the single-group `VoprState`
   /// reconciliation, scoped per group:
-  ///   - keep the last-known sets while leaderless (don't thrash on a transient election);
+  ///   - keep the last-known sets while leaderless (don't thrash on a transient election) —
+  ///     but first COMPLETE an under-hosted group (see [`complete_under_hosted`]
+  ///     (Self::complete_under_hosted)): the resurrect arm below is leader-gated, and a group
+  ///     whose hosting replicas sit below its voter quorum can never produce the leader;
   ///   - promote a wired joiner once it appears in the committed membership;
   ///   - sweep departed replicas: a hosting node absent from the committed membership for
   ///     [`DEPARTED_GRACE_PASSES`] settled passes is PARKED — delivery-isolated with state
@@ -198,6 +201,7 @@ impl MultiWorld {
       return;
     }
     if self.leader_of(gid).is_none() {
+      self.complete_under_hosted(gid);
       return;
     }
     let voters = self.committed_voters_of(gid);
@@ -264,6 +268,69 @@ impl MultiWorld {
       )
       .expect("valid observer config");
       self.wire_replica(member, gid, config, false);
+    }
+  }
+
+  /// Complete a LEADERLESS group whose hosting replicas do not cover its committed voter set:
+  /// wire each missing committed voter as an EMPTY catching-up OBSERVER — the world-side model
+  /// of the product's solicitation edge under the factory contract's fork-born rule. In
+  /// production a campaigner's vote solicitation reaching a node that does not host the group
+  /// triggers the coordinator's factory chain, so a group stranded below hosting quorum is
+  /// completed by its own election attempts; the world's bus instead drops unhosted deliveries
+  /// silently, and without this arm no repair exists — the resurrect arm above is leader-gated,
+  /// and a sub-quorum group can never elect the leader it needs (a fork-born child stranded
+  /// when its parent was retired inside the propagation window campaigns at its manufactured
+  /// baseline forever).
+  ///
+  /// The empties boot as OBSERVERS ([`Config::try_new_observer`], self absent from the
+  /// bootstrap voters — the resurrect arm's exact wiring): a conforming factory blueprints
+  /// fork-born ids this way BECAUSE a full-voter empty is promotable with a virgin election
+  /// timer, and an empty quorum's first commit lands on the manufactured `(term 1, index 1)`
+  /// baseline coordinate, where log-matching fuses the divergent histories silently. An
+  /// observer empty still grants votes, so the holder's manufactured log wins the ONLY possible
+  /// election, the zero-progress joiners are structurally forced onto the snapshot route, and
+  /// the snapshot's boundary config is what teaches them their own voterhood. Shape-generic on
+  /// purpose: the product's solicitation edge does not distinguish fork children from any other
+  /// under-hosted group, so neither does this arm.
+  ///
+  /// Gates, in order (the caller holds the live-registered + leaderless ones):
+  ///   - a SOLICITATION WITNESS must exist — an unparked hosting replica whose own config
+  ///     lists it as a voter (a campaigner whose solicitations would reach the missing peers);
+  ///     a parked holder is delivery-isolated and solicits nothing, so nothing materializes;
+  ///   - only committed voters missing from the HOSTING set are wired; a parked replica still
+  ///     hosts (state retained), so this arm can never overwrite one with an empty.
+  ///
+  /// Unreachable while every committed voter hosts: a fully-hosted leaderless group is
+  /// ordinary election territory and completes without world help.
+  fn complete_under_hosted(&mut self, gid: u64) {
+    let witness = self.node_ids.iter().any(|&n| {
+      !self.parked.contains(&(n, gid))
+        && self.hosts[&n]
+          .group(&gid)
+          .is_some_and(|ep| ep.conf_state().is_voter(&n))
+    });
+    if !witness {
+      return;
+    }
+    let voters = self.committed_voters_of(gid);
+    let missing: Vec<u64> = voters
+      .iter()
+      .copied()
+      .filter(|&v| self.hosts.contains_key(&v) && !self.hosts_group(v, gid))
+      .collect();
+    if missing.is_empty() {
+      return;
+    }
+    for node in missing {
+      let bootstrap: Vec<u64> = voters.iter().copied().filter(|&v| v != node).collect();
+      let config = Config::try_new_observer(
+        node,
+        bootstrap,
+        Duration::from_millis(1000),
+        Duration::from_millis(100),
+      )
+      .expect("valid observer config");
+      self.wire_replica(node, gid, config, false);
     }
   }
 
