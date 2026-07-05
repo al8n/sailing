@@ -247,6 +247,10 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
 
   quiesce(&mut w, &mut st, &mut report, seed);
   reads.scan(&w, &mut report, seed);
+  // Membership-oracle VERDICT: the per-tick checks only RECORD snapshot-install observations;
+  // the run-end final pass judges every one — across live groups AND retired archives — against
+  // its group's FINAL, now-stable committed-config history. Panics on a mismatch.
+  w.finalize_membership_or_panic(seed);
   report.final_groups = w.live_groups().len();
   report.cross_talk_checks = w.cross_talk_checked();
   report.max_term_seen = report.max_term_seen.max(w.max_term_all());
