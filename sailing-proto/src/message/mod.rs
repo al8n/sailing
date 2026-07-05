@@ -471,6 +471,14 @@ pub struct SnapshotMeta<I> {
   /// NOT misread as an explicit migrate-to-Safe. `None` ⇒ absent on the wire (byte-identical to a
   /// pre-migration peer); an explicit mode is PRESENT (the discriminant + 1), so Safe stays distinguishable.
   read_only: Option<ReadOnlyOption>,
+  /// The snapshotted group's LINEAGE counter at the boundary — the one unified monotone per-id
+  /// counter for incarnation and shape (a split's `parent_gen_after`, a fork child's `child_gen`,
+  /// a reshaping catalog's incarnation). Carried so a node restoring this snapshot knows its
+  /// lineage without replaying the split entries the snapshot subsumed. `0` (an unreshaped id) is
+  /// absent on the wire — byte-identical to a pre-P6 peer's meta. Like the lease/read-mode
+  /// bounds, EXCLUDED from [`identity_eq`](Self::identity_eq): boundary metadata, not transfer
+  /// identity.
+  shape_gen: u64,
 }
 
 impl<I> SnapshotMeta<I> {
@@ -485,6 +493,7 @@ impl<I> SnapshotMeta<I> {
       max_wall_plus_window: 0,
       max_unwalled_lease_window: 0,
       read_only: None,
+      shape_gen: 0,
     }
   }
 
@@ -524,6 +533,15 @@ impl<I> SnapshotMeta<I> {
   #[must_use]
   pub const fn with_read_only(mut self, read_only: ReadOnlyOption) -> Self {
     self.read_only = Some(read_only);
+    self
+  }
+
+  /// Set the snapshotted group's lineage counter at the boundary. A builder, so the common 3-arg
+  /// [`new`](Self::new) stays `0` (absent on the wire) for an unreshaped id.
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_shape_gen(mut self, shape_gen: u64) -> Self {
+    self.shape_gen = shape_gen;
     self
   }
 
@@ -584,6 +602,13 @@ impl<I> SnapshotMeta<I> {
   #[inline(always)]
   pub const fn max_unwalled_lease_window(&self) -> u64 {
     self.max_unwalled_lease_window
+  }
+
+  /// The snapshotted group's lineage counter at the boundary, or `0` for an unreshaped id (or a
+  /// pre-P6 snapshot).
+  #[inline(always)]
+  pub const fn shape_gen(&self) -> u64 {
+    self.shape_gen
   }
 }
 

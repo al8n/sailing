@@ -50,11 +50,32 @@ message Entry {
 }
 
 // Entry discriminant. Zero = Normal so the dominant case is the proto3 default.
+// The three merge kinds (5..=7) are RESERVED by the split milestone's LABEL_VERSION 3 bump so
+// the merge milestone adds no wire change: nothing encodes them yet, and a frame carrying one
+// rejects at conversion until that milestone maps them.
 enum EntryKind {
   ENTRY_KIND_NORMAL = 0;
   ENTRY_KIND_CONF_CHANGE = 1;
   ENTRY_KIND_EMPTY = 2;
   ENTRY_KIND_SET_READ_MODE = 3;
+  ENTRY_KIND_SPLIT = 4;
+  ENTRY_KIND_PREPARE_MERGE = 5;
+  ENTRY_KIND_COMMIT_MERGE = 6;
+  ENTRY_KIND_ROLLBACK_MERGE = 7;
+}
+
+// The payload of an ENTRY_KIND_SPLIT entry (rides Entry.data). G-free: `child` is the embedder's
+// group id encoded by its Data impl (1..=1024 bytes, decoded with decode_exact — the group-tag
+// bound), so the group-unaware consensus core can decode and apply the entry. `instruction` is
+// the embedder's opaque partition rule; sailing never reads it. The forked state itself never
+// rides the entry — every replica derives it locally at apply — so a split's wire cost is
+// independent of state size. child_gen / parent_gen_after are the ids' lineage counters (one
+// unified monotone per-id counter for incarnation and shape). Rides LABEL_VERSION 3.
+message SplitPayload {
+  bytes child = 1;
+  uint64 child_gen = 2;
+  uint64 parent_gen_after = 3;
+  bytes instruction = 4;
 }
 
 // Cluster membership. Each repeated field is a SET: elements are the embedder's
@@ -101,8 +122,16 @@ message SnapshotMeta {
   // ReadOnlyOption discriminant + 1 (1=Safe, 2=LeaseBased, 3=LeaseGuard). Carried so a restarting node
   // recovers its migrated mode from replicated state; an ABSENT (0) value falls back to the static config,
   // so a pre-migration snapshot is NOT misread as an explicit migrate-to-Safe. Zero is absent on the wire
-  // (byte-identical to a pre-migration peer); an explicit mode is present. Rides LABEL_VERSION 4.
+  // (byte-identical to a pre-migration peer); an explicit mode is present. Rides LABEL_VERSION 4
+  // of the PRE-GROUP wire sequence (the version byte restarted at 1 for the group-tagged wire).
   uint64 read_only = 7;
+  // The snapshotted group's lineage counter at the boundary — the ONE unified monotone per-id
+  // counter for incarnation and shape (a split's parent_gen_after, a fork child's child_gen, a
+  // reshaping catalog's incarnation). Carried so a node restoring this snapshot knows its
+  // lineage without replaying the split entries the snapshot subsumed; admission seeds the
+  // container's replay guard from it. Zero (an unreshaped id) is absent on the wire —
+  // byte-identical to a pre-P6 peer's meta. Rides LABEL_VERSION 3.
+  uint64 shape_gen = 8;
 }
 
 // Log replication / heartbeat-with-entries.

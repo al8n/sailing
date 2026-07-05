@@ -95,6 +95,32 @@ reference — this section pins the SEMANTICS:
   mode across the cluster — so a pre-migration peer is fenced by `LABEL_VERSION`:** the handshake fences it. (A
   node restarting from its OWN pre-migration durable log never sees a `SetReadMode`, so there is no
   divergence to fence — the same residual as the floors above.)
+- `Entry` kind `Split` (`ENTRY_KIND_SPLIT` = 4) carries a committed GROUP SPLIT, applied by the core
+  at apply-time (like `ConfChange`): the parent group's state machine partitions itself and the
+  returned half seeds a new group. Its payload is one `sailing.v1.SplitPayload`:
+
+  | field | type | meaning |
+  |---|---|---|
+  | `child` (1) | `bytes` | the child group id — the embedder `GroupId`'s `Data` encoding, **1..=1024 bytes** (the group-tag bound); an empty or over-bound field rejects at conversion, and the typed id is decoded (`decode_exact`) by the multi container, never the core |
+  | `child_gen` (2) | `uint64` | the child id's incarnation under the single-incarnation contract (`0` unless the embedder reshapes ids; admission floors fence it) |
+  | `parent_gen_after` (3) | `uint64` | the parent id's lineage counter AFTER this split — one unified monotone per-id counter for incarnation and shape; the replay-guard / idempotence anchor |
+  | `instruction` (4) | `bytes` | the embedder's OPAQUE partition rule, handed to `StateMachine::split` on every replica — sailing never reads it; bounded by the ordinary append frame sizer |
+
+  The payload is G-FREE by design — the child id rides as raw bytes — so the group-unaware consensus
+  core can decode and fold the entry at the deterministic apply point; and the forked state itself
+  NEVER rides the entry (every replica derives it locally at apply), so a split's wire cost is
+  independent of state size. The three MERGE entry kinds (`ENTRY_KIND_PREPARE_MERGE` = 5,
+  `ENTRY_KIND_COMMIT_MERGE` = 6, `ENTRY_KIND_ROLLBACK_MERGE` = 7) are RESERVED in the same
+  `LABEL_VERSION` bump — their pb values are pinned so the merge milestone adds no wire change,
+  nothing encodes them yet, and a frame carrying one rejects at conversion until that milestone maps
+  them. **A node predating the `Split` kind would reject a committed split's frame (an unknown
+  kind), black-holing replication to it, so a pre-split peer is fenced by `LABEL_VERSION`:** the
+  handshake fences it.
+- `SnapshotMeta.shape_gen` (8) carries the snapshotted group's LINEAGE counter at the boundary (the
+  same unified per-id counter `parent_gen_after` bumps), so a node restoring a post-split snapshot
+  knows its lineage without replaying the compacted split entries, and the multi container seeds its
+  replay guard from it. `0` (an unreshaped id) is absent on the wire — byte-identical to a pre-P6
+  meta.
 - `InstallSnapshot.offset` (5) and `total_len` (6), and `SnapshotResponse.acked_through` (5), carry
   CHUNKED snapshot transfer. `total_len == 0` is the legacy single-shot encoding (`data` is the whole
   blob — byte-identical to a pre-chunking message); `total_len != 0` means `data` is the chunk at
@@ -176,9 +202,10 @@ its payload opens with the `u16` big-endian marker `0xFFFF` followed by one or m
   bounded 0..=1024 — `0xFFFF` is outside that range, so the two payload forms are disjoint at the
   first two bytes: a pre-coalescing parser handed a coalesced frame errors (closing the connection)
   rather than mis-reading it, and §4's `LABEL_VERSION` fence rejects such a peer at the hello before
-  any frame flows. Version 2 of the hello is the coalescing baseline; ALL nodes of a cluster must be
-  upgraded together (the hello fences a mixed deployment into refusing connections, never
-  mis-decoding).
+  any frame flows. Version 2 of the hello is the coalescing baseline, and version 3 the reshaping
+  baseline (the `Split` entry kind + `SplitPayload`, the reserved merge kinds, and
+  `SnapshotMeta.shape_gen`); ALL nodes of a cluster must be upgraded together (the hello fences a
+  mixed deployment into refusing connections, never mis-decoding).
 - `flags` bit 0 is QUIESCE: the sender stops exchanging this group's heartbeats after this beat, and
   the receiver's driver may stop arming the group's timers until traffic or a connection loss wakes
   it. All other bits must be zero on encode and are ignored on decode (forward room).
@@ -200,7 +227,7 @@ its payload opens with the `u16` big-endian marker `0xFFFF` followed by one or m
 One-time, before any application frame, in each direction:
 
 ```text
-[ magic 0xCA ][ version 0x01 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
+[ magic 0xCA ][ version 0x03 ][ cluster id: 16 raw bytes ][ peer id length: u16 BIG-endian ][ peer id bytes ]
 ```
 
 The ENCODING is shared by both transports — one format, one parser family, one version byte

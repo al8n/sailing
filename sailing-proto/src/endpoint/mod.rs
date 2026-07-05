@@ -2453,6 +2453,18 @@ where
             }
           }
           EntryKind::Empty => {} // no-op: just advance applied
+          EntryKind::Split => {
+            // A committed Split whose payload won't decode is corrupt — mirror ConfChange.
+            if crate::wire::decode_split_payload(entry.data_bytes()).is_err() {
+              self.poison(PoisonReason::SplitDecode);
+              break;
+            }
+            // The split fold (fsm.split at the deterministic point) lands with the pending-fork
+            // pipeline; until then a committed Split reaching apply is an entry this core cannot
+            // fold — fail-stop, never a silent skip that would diverge from folding replicas.
+            self.poison(PoisonReason::SplitUnsupported);
+            break;
+          }
           EntryKind::SetReadMode => {
             // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison
             // (mirror ConfChange's exact decode). An empty, trailing-junk, or out-of-range payload is a

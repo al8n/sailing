@@ -15,6 +15,14 @@ pub enum EntryKind {
   /// A committed read-mode migration, applied by the core at apply-time (like `ConfChange`). The
   /// payload is the target [`crate::ReadOnlyOption`] as a canonical byte.
   SetReadMode,
+  /// A committed group split, applied by the core at apply-time (like `ConfChange`): the parent's
+  /// state machine partitions itself and the returned half seeds a NEW group. The payload is a
+  /// [`SplitPayload`] — deliberately G-FREE (the child group id rides as raw bytes) so the
+  /// group-unaware consensus core can decode and fold it; the multi container decodes the typed
+  /// child id when it relays the staged fork. The forked state itself NEVER rides the entry —
+  /// every replica derives it locally at apply — so a split's wire cost is independent of state
+  /// size.
+  Split,
 }
 
 impl EntryKind {
@@ -25,7 +33,71 @@ impl EntryKind {
       Self::ConfChange => "conf_change",
       Self::Empty => "empty",
       Self::SetReadMode => "set_read_mode",
+      Self::Split => "split",
     }
+  }
+}
+
+/// The payload of an [`EntryKind::Split`] entry: which child to fork, under which lineage
+/// numbers, and the opaque partition instruction the state machine's `split` receives.
+///
+/// G-free by design — `child_bytes` is the canonical `Data` encoding of the embedder's group id —
+/// so the ENDPOINT (which knows no group-id type) can decode and apply the entry at the
+/// deterministic point. Sailing never reads `instruction`: it is the embedder's partition rule
+/// (e.g. a key boundary), bounded only by the ordinary append frame sizer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SplitPayload {
+  /// The child group id, `Data`-encoded (1..=1024 bytes on the wire, like every group tag).
+  child_bytes: Bytes,
+  /// The child's incarnation under the single-incarnation contract (normally 0; a reshaping
+  /// embedder's catalog supplies it, and admission floors fence it).
+  child_gen: u64,
+  /// The parent's lineage counter AFTER this split — the monotone per-id value the container's
+  /// replay guard and the engine's lineage records key on (one unified counter for incarnation
+  /// and shape).
+  parent_gen_after: u64,
+  /// The opaque partition instruction handed to `StateMachine::split` on every replica.
+  instruction: Bytes,
+}
+
+impl SplitPayload {
+  /// Construct.
+  pub const fn new(
+    child_bytes: Bytes,
+    child_gen: u64,
+    parent_gen_after: u64,
+    instruction: Bytes,
+  ) -> Self {
+    Self {
+      child_bytes,
+      child_gen,
+      parent_gen_after,
+      instruction,
+    }
+  }
+
+  /// The child group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn child_bytes(&self) -> Bytes {
+    self.child_bytes.clone()
+  }
+
+  /// The child's incarnation.
+  #[inline(always)]
+  pub const fn child_gen(&self) -> u64 {
+    self.child_gen
+  }
+
+  /// The parent's lineage counter after this split.
+  #[inline(always)]
+  pub const fn parent_gen_after(&self) -> u64 {
+    self.parent_gen_after
+  }
+
+  /// The opaque partition instruction.
+  #[inline(always)]
+  pub fn instruction(&self) -> &[u8] {
+    &self.instruction
   }
 }
 
@@ -178,6 +250,7 @@ mod tests {
       (EntryKind::ConfChange, "conf_change"),
       (EntryKind::Empty, "empty"),
       (EntryKind::SetReadMode, "set_read_mode"),
+      (EntryKind::Split, "split"),
     ] {
       assert_eq!(kind.as_str(), name);
       assert_eq!(std::format!("{kind}"), name);

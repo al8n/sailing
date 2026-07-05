@@ -19,10 +19,14 @@ const LABEL_MAGIC: u8 = 0xCA;
 /// adds the coalesced control frame (payload marker 0xFFFF, then `[flags][group_len][group][msg_len]
 /// [msg]` entries — WIRE.md §3) and its per-entry QUIESCE flag: a version-1 peer would reject the
 /// marker as an over-bound group length frame-by-frame, so the fence keeps the failure at the hello.
+/// Version 3 adds the reshaping envelope: the `Split` entry kind + `SplitPayload` (with the three
+/// merge entry kinds' pb values RESERVED so the merge milestone needs no further bump) and the
+/// snapshot meta's `shape_gen` lineage field — a version-2 peer would skip the unknown meta field
+/// and mis-handle a split entry as an unknown kind, so the fence keeps the failure at the hello.
 /// The byte deliberately RESTARTED the sequence at 1 (the pre-group formats burned 1..=5) — a reuse
 /// permissible only while nothing is published; once any build ships, a version byte must never be
 /// reused.
-const LABEL_VERSION: u8 = 2;
+const LABEL_VERSION: u8 = 3;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
 /// The largest peer-id encoding accepted in a hello. Real `NodeId` encodings are a few bytes

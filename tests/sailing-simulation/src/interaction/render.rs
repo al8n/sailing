@@ -185,6 +185,7 @@ pub(crate) fn kind_str(k: EntryKind) -> &'static str {
     EntryKind::ConfChange => "conf-change",
     EntryKind::Empty => "empty",
     EntryKind::SetReadMode => "set-read-mode",
+    EntryKind::Split => "split",
   }
 }
 
