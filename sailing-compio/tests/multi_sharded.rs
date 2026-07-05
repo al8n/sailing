@@ -47,6 +47,13 @@ fn config(id: u64, voters: Vec<u64>) -> Config<u64> {
   Config::try_new(id, voters, ELECTION, HEARTBEAT).unwrap()
 }
 
+/// The OBSERVER boot shape — `id` absent from the seed voters, so the replica grants votes but
+/// cannot campaign until the log/snapshot teaches it its own membership. The mandatory factory
+/// blueprint shape for FORK-BORN ids (see the `GroupFactory` fork-born contract paragraph).
+fn observer_config(id: u64, current_voters: Vec<u64>) -> Config<u64> {
+  Config::try_new_observer(id, current_voters, ELECTION, HEARTBEAT).unwrap()
+}
+
 /// Drive one handle future to completion from the plain test thread (the handles are `Send`
 /// channel futures; no compio runtime is needed caller-side).
 fn bo<T>(fut: impl Future<Output = T>) -> T {
@@ -310,7 +317,9 @@ fn sharded_factory_materializes_on_the_mapped_plane() {
   let node1: ShardedMultiHandle<u64, u64, CountSm> = spawn_host(1, base1, Some((2, base2)));
   // Node 2 is factory-armed on every plane: each plane gets its OWN factory instance, and each
   // sees only the solicitations the shard map routes to it, so one catalog closure serves all
-  // planes without shard filtering.
+  // planes without shard filtering. Both gids are day-0 BOOTSTRAPPED ids (created explicitly
+  // on node 1), so the blueprints keep the full-voter shape — the observer rule binds
+  // fork-born ids only.
   let node2: ShardedMultiHandle<u64, u64, CountSm> =
     ShardedCompioHost::<u64, u64, CountSm, Labeled<Passthrough>>::new(
       ShardMap::uniform(2),
@@ -584,9 +593,9 @@ fn sharded_split_stays_in_plane_and_refuses_cross_plane() {
     .expect("some id lands on the other plane");
 
   let node1: ShardedMultiHandle<u64, u64, CountSm> = spawn_host(1, base1, Some((2, base2)));
-  // Node 2's factory vouches for the child — a catalog that also knows fork-born ids — with
-  // a build counter
-  // proving the fork path, not the factory, materializes it.
+  // Node 2's factory vouches for the child — a catalog that also knows fork-born ids, so its
+  // blueprint is the mandatory OBSERVER shape (self absent from the seed voters) — with a
+  // build counter proving the fork path, not the factory, materializes it.
   let builds = Arc::new(AtomicUsize::new(0));
   let builds_probe = builds.clone();
   let node2: ShardedMultiHandle<u64, u64, CountSm> =
@@ -602,7 +611,7 @@ fn sharded_split_stays_in_plane_and_refuses_cross_plane() {
       let factory: BoxedGroupFactory<u64, u64, CountSm> = Box::new(factory_fn(
         move |group: &u64, from: &u64| {
           (*group == child && [1u64, 2].contains(from))
-            .then(|| GroupBlueprint::new(config(2, vec![1, 2]), *group))
+            .then(|| GroupBlueprint::new(observer_config(2, vec![1]), *group))
         },
         move |_group: &u64| {
           builds.fetch_add(1, Ordering::SeqCst);

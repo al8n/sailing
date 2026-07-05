@@ -105,6 +105,13 @@ fn config(id: u64, voters: Vec<u64>) -> Config<u64> {
   Config::try_new(id, voters, ELECTION, HEARTBEAT).unwrap()
 }
 
+/// The OBSERVER boot shape — `id` absent from the seed voters, so the replica grants votes but
+/// cannot campaign until the log/snapshot teaches it its own membership. The mandatory factory
+/// blueprint shape for FORK-BORN ids (see the `GroupFactory` fork-born contract paragraph).
+fn observer_config(id: u64, current_voters: Vec<u64>) -> Config<u64> {
+  Config::try_new_observer(id, current_voters, ELECTION, HEARTBEAT).unwrap()
+}
+
 /// Create group `gid` with the given voters on every handle (node ids are 1-based positions).
 async fn create_group_everywhere<F>(handles: &[MultiHandle<u64, u64, F>], gid: u64, voters: &[u64])
 where
@@ -2008,7 +2015,9 @@ async fn factory_materializes_solicited_group_hands_free() {
       // catalog AND the solicitor against the group's replica set (the driver refuses a
       // blueprint that fails the second leg anyway — checking it here declines instead of
       // burning a doomed materialization). The state machine lives in the separate build
-      // phase, which the driver invokes only after admitting the blueprint.
+      // phase, which the driver invokes only after admitting the blueprint. Group 100 is a
+      // day-0 BOOTSTRAPPED id (created explicitly on node 1), so the blueprint keeps the
+      // full-voter shape — the observer rule binds fork-born ids only.
       let driver = driver.with_group_factory(factory_fn(
         |group: &u64, from: &u64| {
           (*group == 100 && [1u64, 2].contains(from))
@@ -2274,6 +2283,8 @@ async fn factory_never_overrides_a_tombstone() {
     if id == 2 {
       let blueprinted = blueprinted.clone();
       let built = built.clone();
+      // Group 100 is a day-0 BOOTSTRAPPED id (created explicitly on node 1), so the blueprint
+      // keeps the full-voter shape — the observer rule binds fork-born ids only.
       let driver = driver.with_group_factory(factory_fn(
         move |group: &u64, from: &u64| {
           (*group == 100 && [1u64, 2].contains(from)).then(|| {
@@ -2751,11 +2762,14 @@ async fn forked_group_serves_and_snapshots_a_late_joiner() {
     let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
     if id == 3 {
       // Node 3's catalog knows child 300 and its replica set; the factory materializes an
-      // EMPTY replica when the leader's post-AddNode contact solicits it.
+      // EMPTY replica when the leader's post-AddNode contact solicits it. Child 300 is
+      // FORK-BORN, so the blueprint is the mandatory OBSERVER shape (self absent from the
+      // seed voters): the empty can never campaign against the manufactured baseline, and
+      // the snapshot's boundary config is what promotes it.
       let driver = driver.with_group_factory(factory_fn(
         |group: &u64, from: &u64| {
           (*group == 300 && [1u64, 2].contains(from))
-            .then(|| GroupBlueprint::new(config(3, vec![1, 2, 3]), 3))
+            .then(|| GroupBlueprint::new(observer_config(3, vec![1, 2]), 3))
         },
         |_group: &u64| Some(CountSm::default()),
       ));
@@ -2813,6 +2827,8 @@ async fn forked_group_serves_and_snapshots_a_late_joiner() {
   }
 
   // FSM equality across ALL THREE replicas: the preloaded state AND the tail are everywhere.
+  // Throughout the joiner's catch-up its observer-booted replica must never campaign — the
+  // members hold every election until the snapshot converts it.
   for (i, g) in g300.iter().enumerate() {
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
@@ -2821,6 +2837,13 @@ async fn forked_group_serves_and_snapshots_a_late_joiner() {
         "node {} never served the joined count",
         i + 1
       );
+      if let Ok(st) = g300[2].status().await {
+        assert!(
+          st.role != Role::Candidate && st.role != Role::PreCandidate && st.role != Role::Leader,
+          "an observer-materialized empty must never campaign: {:?}",
+          st.role
+        );
+      }
       if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
         assert_eq!(c, 9, "node {}'s replica equals preloaded + tail", i + 1);
         break;
@@ -2828,6 +2851,14 @@ async fn forked_group_serves_and_snapshots_a_late_joiner() {
       tokio::time::sleep(Duration::from_millis(50)).await;
     }
   }
+  // The snapshot's boundary config converted the observer: node 3's own view now names it a
+  // VOTER, with the fork content intact (the count equality above).
+  let st = g300[2].status().await.expect("the joined replica answers");
+  assert!(
+    st.conf_state.voters().contains(&3),
+    "the snapshot boundary must promote the observer to voter: {:?}",
+    st.conf_state
+  );
 
   // The sibling group is unaffected by the fork/join churn.
   assert_eq!(submit_anywhere(&g900, b"still").await, 2);
@@ -2939,11 +2970,14 @@ async fn fresh_joiner_takes_the_snapshot_path() {
     let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
     if id == 3 {
       // Node 3's catalog knows the split-born child and its replica set; it declines nothing
-      // else. A fork-born id reaches a NON-member host only through this ordinary join path.
+      // else. A fork-born id reaches a NON-member host only through this ordinary join path,
+      // and its blueprint is the mandatory OBSERVER shape (self absent from the seed voters):
+      // the empty grants votes but cannot campaign, and the snapshot's boundary config is
+      // what promotes it.
       let driver = driver.with_group_factory(factory_fn(
         |group: &u64, from: &u64| {
           (*group == 200 && [1u64, 2].contains(from))
-            .then(|| GroupBlueprint::new(config(3, vec![1, 2, 3]), 3))
+            .then(|| GroupBlueprint::new(observer_config(3, vec![1, 2]), 3))
         },
         |_group: &u64| Some(CountSm::default()),
       ));
@@ -2997,6 +3031,8 @@ async fn fresh_joiner_takes_the_snapshot_path() {
 
   // The joiner lands on preloaded + tail: an empty-booted replica replaying only the tail
   // would sit at 1 — equality proves the persisted blob arrived through the snapshot path.
+  // Its observer-booted replica must never campaign along the way: the members hold every
+  // election until the snapshot converts it.
   let g200_joiner = handles[2].group(200);
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   loop {
@@ -3004,6 +3040,13 @@ async fn fresh_joiner_takes_the_snapshot_path() {
       std::time::Instant::now() < deadline,
       "the joiner never served the joined count"
     );
+    if let Ok(st) = g200_joiner.status().await {
+      assert!(
+        st.role != Role::Candidate && st.role != Role::PreCandidate && st.role != Role::Leader,
+        "an observer-materialized empty must never campaign: {:?}",
+        st.role
+      );
+    }
     if let Ok(c) = g200_joiner.query(|sm: &CountSm| sm.count()).await {
       assert_eq!(
         c, 6,
@@ -3013,6 +3056,13 @@ async fn fresh_joiner_takes_the_snapshot_path() {
     }
     tokio::time::sleep(Duration::from_millis(50)).await;
   }
+  // The snapshot's boundary config converted the observer to a VOTER, fork content intact.
+  let st = g200_joiner.status().await.expect("the joiner answers");
+  assert!(
+    st.conf_state.voters().contains(&3),
+    "the snapshot boundary must promote the observer to voter: {:?}",
+    st.conf_state
+  );
 }
 
 /// The late splitter: a replica DOWN through the split converges by the ordinary lifecycle
@@ -3020,8 +3070,9 @@ async fn fresh_joiner_takes_the_snapshot_path() {
 /// re-forking. Node 3 dies before the split; the surviving parent quorum splits, materializes
 /// the child, and compacts past the split entry. The reborn node 3 (fresh stores) receives the
 /// parent's POST-split snapshot — its lifecycle tail must never see a `SplitApplied` — and the
-/// child reaches it through solicitation → its factory → the child leader's chunked snapshot
-/// serving the PERSISTED blob.
+/// child reaches it through solicitation → its factory's OBSERVER blueprint (the fork-born
+/// rule: the empty cannot campaign, the holders elect) → the child leader's chunked snapshot
+/// serving the PERSISTED blob, whose boundary config promotes the joiner to voter.
 #[tokio::test(flavor = "multi_thread")]
 async fn late_splitter_converges_via_lifecycle() {
   let addrs = addrs(45_020, 3);
@@ -3084,6 +3135,10 @@ async fn late_splitter_converges_via_lifecycle() {
 
   // Node 3 is REBORN with fresh stores; its factory knows the child (and only the child — the
   // parent is re-created explicitly, the ordinary operator path for a re-provisioned node).
+  // The child is FORK-BORN, so the blueprint is the mandatory OBSERVER shape (self absent
+  // from the seed voters): the materialized empty cannot campaign against the manufactured
+  // baseline — the holders keep every election — and the chunked snapshot serving the
+  // persisted blob is what converts it to a voter.
   let peers3: Vec<_> = (1u64..=2)
     .map(|p| Node::new(p, addrs[(p - 1) as usize]))
     .collect();
@@ -3091,7 +3146,7 @@ async fn late_splitter_converges_via_lifecycle() {
   let driver3 = driver3.with_group_factory(factory_fn(
     |group: &u64, from: &u64| {
       (*group == 200 && [1u64, 2].contains(from))
-        .then(|| GroupBlueprint::new(config(3, vec![1, 2, 3]), 3))
+        .then(|| GroupBlueprint::new(observer_config(3, vec![1, 2]), 3))
     },
     |_group: &u64| Some(CountSm::default()),
   ));
@@ -3103,6 +3158,9 @@ async fn late_splitter_converges_via_lifecycle() {
 
   // The parent converges by INSTALL (the entry is compacted away), the child by the factory
   // path — and the reborn node NEVER re-forks: no SplitApplied may reach its lifecycle tail.
+  // Throughout the catch-up the child's observer-booted replica must never campaign (the
+  // holders keep the election; a promotable full-voter empty here is exactly the fusion
+  // hazard `full_voter_blueprint_for_a_fork_born_id_fuses_histories` demonstrates).
   let deadline = std::time::Instant::now() + Duration::from_secs(20);
   let g100_reborn = handle3.group(100);
   let g200_reborn = handle3.group(200);
@@ -3113,6 +3171,13 @@ async fn late_splitter_converges_via_lifecycle() {
       std::time::Instant::now() < deadline,
       "the late splitter never converged (parent {parent_ok}, child {child_ok})"
     );
+    if let Ok(st) = g200_reborn.status().await {
+      assert!(
+        st.role != Role::Candidate && st.role != Role::PreCandidate && st.role != Role::Leader,
+        "an observer-materialized empty must never campaign: {:?}",
+        st.role
+      );
+    }
     if !parent_ok && let Ok(c) = g100_reborn.query(|sm: &CountSm| sm.count()).await {
       // 5 pre + 6 post commits, minus the 3 units given away at the split.
       assert_eq!(c, 8, "the reborn parent replica is post-split");
@@ -3127,11 +3192,148 @@ async fn late_splitter_converges_via_lifecycle() {
     }
     tokio::time::sleep(Duration::from_millis(60)).await;
   }
+  // The chunked snapshot's boundary config converted the observer: the reborn node's own view
+  // names it a VOTER of the child, with the fork content intact (the count equality above).
+  let st = g200_reborn
+    .status()
+    .await
+    .expect("the reborn child answers");
+  assert!(
+    st.conf_state.voters().contains(&3),
+    "the snapshot boundary must promote the observer to voter: {:?}",
+    st.conf_state
+  );
   while let Ok(ev) = handle3.lifecycle().try_recv() {
     assert!(
       !matches!(ev, LifecycleEvent::SplitApplied { .. }),
       "a post-compaction rebirth must never re-fork: {ev:?}"
     );
+  }
+}
+
+/// THE HAZARD DEMONSTRATION — this test asserts the BAD outcome on purpose: it pins,
+/// executably, WHY the `GroupFactory` contract forbids full-voter blueprints for fork-born ids
+/// (the observer rule), by driving the divergence such a blueprint permits. If a structural
+/// product guard ever closes this shape, the test fails loudly and must be flipped into that
+/// guard's regression.
+///
+/// Node 1 forks child 200 (voters {1,2,3}) alone: a manufactured baseline at (index 1, term 1)
+/// carrying a preloaded count of 7 behind `first_index == 2`. Its campaign solicits nodes 2+3,
+/// whose factories vouch the fork-born id FULL-VOTER — self included, the contract violation —
+/// so the materialized empties are promotable with virgin election timers (the soliciting
+/// frame itself is consumed by the signal path, so no vote is ever cast from it). The holder's
+/// election timeout is slow and the empties' fast (and mutually disjoint, so their first round
+/// cannot split): the empty pair elects AMONG ITSELF and commits its no-op at index 1 — the
+/// manufactured baseline's exact coordinate — and log-matching fuses the divergent histories
+/// silently. The leader believes the holder fully matched, so no snapshot ever flows; the 7
+/// preloaded units survive on the holder's replica alone and are neither propagated nor
+/// erased. The pinned outcome: every replica applies the same committed tail, yet the holder's
+/// linearizable read exceeds the joiners' by exactly the fork baseline — permanently.
+#[tokio::test(flavor = "multi_thread")]
+async fn full_voter_blueprint_for_a_fork_born_id_fuses_histories() {
+  const SLOW_ELECTION: Duration = Duration::from_millis(2500);
+  const SLOW_HEARTBEAT: Duration = Duration::from_millis(500);
+  let addrs = addrs(45_360, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 1 {
+      tokio::spawn(driver.run());
+    } else {
+      // The contract violation under test: a fork-born id vouched with SELF IN THE VOTERS.
+      // Node 3's election window sits disjointly above node 2's so the empty pair's first
+      // election resolves in one round, deterministically inside the holder's slow-recampaign
+      // gap.
+      let election = if id == 2 {
+        ELECTION
+      } else {
+        Duration::from_millis(700)
+      };
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, from: &u64| {
+          (*group == 200 && [1u64, 2, 3].contains(from)).then(|| {
+            let full_voter = Config::try_new(id, vec![1, 2, 3], election, HEARTBEAT)
+              .expect("a valid full-voter config");
+            GroupBlueprint::new(full_voter, id)
+          })
+        },
+        |_group: &u64| Some(CountSm::default()),
+      ));
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling binds the mesh so the holder's solicitations flow immediately.
+  create_group_everywhere(&handles, 900, &[1, 2, 3]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // The fork holder: child 200 exists on node 1 alone, preloaded 7, slow election so its
+  // recampaign can never outrun the empties' first election.
+  let blob: Bytes = encoded(7).into();
+  let slow = Config::try_new(1u64, vec![1, 2, 3], SLOW_ELECTION, SLOW_HEARTBEAT).unwrap();
+  handles[0]
+    .create_group_from_fork(200, slow, 1, CountSm::default(), blob, 0)
+    .await
+    .expect("fork admission");
+
+  // The holder's campaign materializes both empties; the empty pair elects among itself and a
+  // live tail commits on the FUSED log (the submit resolves through whichever side leads).
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  submit_anywhere(&g200, b"tail").await;
+
+  // THE DIVERGENCE, observably: all three replicas serve the SAME committed log, yet the
+  // holder's linearizable read exceeds the empties' by exactly the preloaded baseline — the
+  // fork content neither propagated (the leader believes everyone matched) nor was erased.
+  let divergence = |q1: u64, q2: u64, q3: u64| q2 == q3 && q2 >= 1 && q1 == q2 + 7;
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  let mut last = None;
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the fusion hazard did not reproduce (last counts {last:?}): if a structural guard now \
+       forces fork-born empties onto the snapshot path, flip this regression to assert the \
+       HEALED outcome"
+    );
+    if let (Ok(q1), Ok(q2), Ok(q3)) = (
+      g200[0].query(|sm: &CountSm| sm.count()).await,
+      g200[1].query(|sm: &CountSm| sm.count()).await,
+      g200[2].query(|sm: &CountSm| sm.count()).await,
+    ) {
+      last = Some((q1, q2, q3));
+      if divergence(q1, q2, q3) {
+        break;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+  }
+
+  // And it is PERMANENT: log-matching sees every replica matched, so nothing ever heals it —
+  // a settle window (many heartbeats, ample snapshot room) later the fused histories still
+  // disagree by the whole baseline.
+  tokio::time::sleep(Duration::from_millis(1500)).await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "post-settle re-read never resolved"
+    );
+    if let (Ok(q1), Ok(q2), Ok(q3)) = (
+      g200[0].query(|sm: &CountSm| sm.count()).await,
+      g200[1].query(|sm: &CountSm| sm.count()).await,
+      g200[2].query(|sm: &CountSm| sm.count()).await,
+    ) {
+      assert!(
+        divergence(q1, q2, q3),
+        "the fused divergence must persist: ({q1}, {q2}, {q3})"
+      );
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
   }
 }
 
@@ -3324,15 +3526,16 @@ async fn factory_gate_declines_a_reserved_child_until_the_fork_lands() {
       // Node 2's catalog knows child 320 and would happily materialize it empty on a
       // solicitation — exactly what the reservation gate must refuse while fork #2 is staged.
       // `materialize` runs BEFORE the gate (consults count solicitations that reached the
-      // factory); `build` only ever runs behind it. The blueprint names the node-3 solicitor,
-      // so the sender leg passes and the reservation is the one refusing leg.
+      // factory); `build` only ever runs behind it. The blueprint is the fork-born OBSERVER
+      // shape (self absent from the seed voters) and names the node-3 solicitor, so the
+      // sender leg passes and the reservation is the one refusing leg.
       let consults_ = consults.clone();
       let builds_ = builds.clone();
       let driver = driver.with_group_factory(factory_fn(
         move |group: &u64, from: &u64| {
           (*group == 320 && [1u64, 2, 3].contains(from)).then(|| {
             consults_.fetch_add(1, Ordering::SeqCst);
-            GroupBlueprint::new(config(2, vec![1, 2, 3]), 0)
+            GroupBlueprint::new(observer_config(2, vec![1, 3]), 0)
           })
         },
         move |_group: &u64| {
