@@ -91,7 +91,7 @@ impl MultiWorld {
   /// The incarnation-qualified conservation-ledger id: `gid + generation * 1_000_000`. Injective
   /// for this harness's id space (monotone gids from 100, far below the band) and readable in a
   /// panic (generation 1 of g105 prints as 1000105).
-  fn ledger_id(generation: u64, gid: u64) -> u64 {
+  pub(super) fn ledger_id(generation: u64, gid: u64) -> u64 {
     debug_assert!(gid < 1_000_000, "gid {gid} escaped the ledger-id band");
     generation * 1_000_000 + gid
   }
@@ -214,11 +214,26 @@ impl MultiWorld {
         .filter(|key| *key >= pending.point)
     }));
     let voters: BTreeSet<u64> = fork.config.voters().iter().copied().collect();
+    // The child's TAG LINEAGE: its inherited baseline carries the parent's tag — and whatever
+    // foreign tags the parent itself legitimately carried (its own ancestry and absorbs). The
+    // baseline floor covers these cells positionally for the child's own sweep; the carried
+    // set is what keeps them legitimate when a LATER MERGE moves them above another group's
+    // floor (the arrival-path-independence rule, merge edition).
+    let carried_tags: BTreeSet<u64> = self
+      .groups
+      .get(&pending.parent)
+      .map(|m| {
+        let mut t = m.carried_tags.clone();
+        t.insert(pending.parent);
+        t
+      })
+      .unwrap_or_default();
     self.groups.insert(
       fork.child,
       lifecycle::GroupMeta {
         voters,
         generation: fork.child_gen,
+        carried_tags,
         keys: pending.child_keys.clone(),
         // Every replica of this incarnation opens with the same inherited record, whichever
         // path delivered it: every parent replica manufactures the fork at the same applied

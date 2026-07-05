@@ -294,6 +294,14 @@ pub struct ClusterView {
   pub seed: u64,
   /// The current tick/step number (for VOPR replay).
   pub tick: u64,
+  /// Whether the POSITIONAL applied-prefix agreement applies to this view (the default). A
+  /// group that has ABSORBED another via a merge sets `false`: an absorb re-introduces
+  /// own-tagged cells at replica-local resolution states, so no positional filter over the
+  /// records is lag-invariant any more — agreement is then judged as EQUAL-APPLIED ⇒
+  /// EQUAL-RECORD (states are a deterministic function of the applied index), with the absorb
+  /// point itself pinned byte-for-byte by the world's absorb-determinism check and convergence
+  /// pinned by the quiesce raw-record equality.
+  pub positional_agreement: bool,
   /// The cluster's REAL committed VOTER set — the authoritative quorum denominator for
   /// `commit_is_quorum_durable`, read from the leader's runtime `conf_state().voters()` (or the
   /// plurality committed config when leaderless). Threading the leader's view (rather than each
@@ -616,6 +624,9 @@ impl Checker {
 /// This is the core State Machine Safety property in prefix form. Removed nodes are skipped (their
 /// applied log stopped advancing at removal while the cluster continued).
 pub fn agreement(view: &ClusterView) -> Result<(), Violation> {
+  if !view.positional_agreement {
+    return equal_applied_agreement(view);
+  }
   let logs: Vec<&[(u64, Vec<u8>)]> = view.live().map(|n| n.applied_log.as_slice()).collect();
   let ids: Vec<u64> = view.live().map(|n| n.id).collect();
   let longest = logs.iter().map(|l| l.len()).max().unwrap_or(0);
@@ -669,6 +680,42 @@ pub fn agreement(view: &ClusterView) -> Result<(), Violation> {
 /// tail. Per-entry quorum durability of every committed index is enforced separately by
 /// [`commit_is_quorum_durable`]. (A snapshot-install follower has its applied watermark at the
 /// snapshot boundary with the entries compacted out of the log, so the snapshot boundary counts.)
+/// The merged-lineage agreement form: any two live replicas AT THE SAME APPLIED INDEX must
+/// hold the IDENTICAL applied cell MULTISET — the direct statement of apply determinism over
+/// what the product actually promises. The record's ORDER is a harness artifact there: a live
+/// fold appends each absorbed block at its resolution, while a crash-restore from the absorb
+/// capture replays around an already-embedded block, so equal states legitimately present
+/// their cells in different record orders. A replica that skipped a union outright still trips
+/// (its multiset lacks the absorbed cells); per-key ORDER stays enforced by the conservation
+/// walk's value-monotone histories.
+fn equal_applied_agreement(view: &ClusterView) -> Result<(), Violation> {
+  let sorted = |log: &[(u64, Vec<u8>)]| {
+    let mut v = log.to_vec();
+    v.sort();
+    v
+  };
+  let nodes: Vec<&NodeView> = view.live().collect();
+  for (i, a) in nodes.iter().enumerate() {
+    for b in nodes.iter().skip(i + 1) {
+      if a.applied == b.applied && sorted(&a.applied_log) != sorted(&b.applied_log) {
+        return Err(Violation::new(
+          "agreement",
+          std::format!(
+            "equal-applied divergence: node {} and node {} sit at applied={} with DIFFERENT \
+             records ({} vs {} cells)",
+            a.id,
+            b.id,
+            a.applied,
+            a.applied_log.len(),
+            b.applied_log.len(),
+          ),
+        ));
+      }
+    }
+  }
+  Ok(())
+}
+
 pub fn append_before_ack(view: &ClusterView) -> Result<(), Violation> {
   for n in view.nodes.iter() {
     let visible_high = n.visible_last.max(n.snapshot_last_index);
@@ -1343,6 +1390,16 @@ pub fn finalize_membership(checker: &mut Checker) -> Result<(), Violation> {
 /// any later DIFFERENT command applied at that index is a violation. Re-applying the SAME command
 /// (e.g. a follower replaying its durable log after restart) is fine.
 pub fn no_committed_rewrite(checker: &mut Checker, view: &ClusterView) -> Result<(), Violation> {
+  // The index-keyed high-water presumes each record position's `idx` is a coordinate in ONE
+  // log. An ABSORBED lineage's record interleaves the source's cells at SOURCE-log indexes
+  // (and a re-absorbed descendant can even return the group's own old indexes), so the keying
+  // is unsound there — the same class the fork milestone solved by aligning, which no filter
+  // survives once absorbs return own-tagged cells. The merged-lineage view ships raw and this
+  // leg stands down; the replacement set — equal-applied agreement, the absorb-determinism
+  // pin, union conservation, and the quiesce raw equality — carries the rewrite coverage.
+  if !view.positional_agreement {
+    return Ok(());
+  }
   // First pass: detect a conflict against the recorded high-water.
   for n in view.nodes.iter() {
     // A removed node's frozen applied log already agreed with the high-water while it was live;

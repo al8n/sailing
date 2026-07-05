@@ -168,6 +168,21 @@ pub struct MultiWorld {
   /// (the child id retired, or recreated past the fork's generation): no materialization, the
   /// parent's fence lifted, mirroring the product's `SplitRefused` resolution.
   split_refused: u64,
+  /// Every registered merge (first resolution anywhere), in registration order — the union
+  /// verdict's work list plus the absorb-determinism reference record (see
+  /// `multi/world/merge.rs`).
+  merges: Vec<merge::MergeRecord>,
+  /// Per-host TERMINAL merge floors `(node, source)` — recorded when a source's deferred
+  /// teardown lands (the world's engine-floor model; the service's absent-arm discriminator).
+  merge_floors: BTreeSet<(u64, u64)>,
+  /// Deferred merge-source teardowns `(node, source, target, capture boundary)` awaiting the
+  /// target capture's durability on that host (the one-barrier batch model; see
+  /// `sweep_merge_teardowns`).
+  pending_merge_teardowns: Vec<(u64, u64, u64, sailing_proto::Index)>,
+  /// Merged resolutions observed across all hosts (every per-host resolution counts).
+  merges_resolved: u64,
+  /// Aborted resolutions observed across all hosts.
+  merges_aborted: u64,
 }
 
 impl MultiWorld {
@@ -215,6 +230,11 @@ impl MultiWorld {
       split_stale: 0,
       split_conflicts: 0,
       split_refused: 0,
+      merges: Vec::new(),
+      merge_floors: BTreeSet::new(),
+      pending_merge_teardowns: Vec::new(),
+      merges_resolved: 0,
+      merges_aborted: 0,
     }
   }
 
@@ -369,6 +389,36 @@ impl MultiWorld {
   /// the moved cells mid-record while a lagging peer still holds them; a group that never split
   /// is compared byte-for-byte as before.
   pub fn agreement_holds(&self, gid: u64) -> bool {
+    // The merged-lineage form: equal-applied replicas must hold identical RAW records (see
+    // `ClusterView::positional_agreement` for why no positional filter survives an absorb).
+    if self.group_absorbed(gid) {
+      let replicas: Vec<(u64, AppliedLog)> = self
+        .node_ids
+        .iter()
+        .filter(|n| self.hosts[n].contains_group(&gid))
+        .map(|&n| {
+          (
+            self.hosts[&n]
+              .group(&gid)
+              .map_or(0, |ep| ep.applied_index().get()),
+            self.applied_of(n, gid),
+          )
+        })
+        .collect();
+      let sorted = |log: &AppliedLog| {
+        let mut v = log.clone();
+        v.sort();
+        v
+      };
+      for (i, a) in replicas.iter().enumerate() {
+        for b in replicas.iter().skip(i + 1) {
+          if a.0 == b.0 && sorted(&a.1) != sorted(&b.1) {
+            return false;
+          }
+        }
+      }
+      return true;
+    }
     let logs: Vec<AppliedLog> = self
       .node_ids
       .iter()
@@ -472,9 +522,10 @@ impl MultiWorld {
       let delivered = self.deliver_due();
       let storage_produced = self.drain_storage_all();
       let forked = self.pump_forks();
-      progressed |= any_new || delivered || storage_produced || forked;
+      let merged = self.pump_merges();
+      progressed |= any_new || delivered || storage_produced || forked || merged;
 
-      if !any_new && !delivered && !storage_produced && !forked {
+      if !any_new && !delivered && !storage_produced && !forked && !merged {
         break;
       }
     }
@@ -629,6 +680,11 @@ impl MultiWorld {
     // judges an inherited cell; the few own-tagged cells the floor may skip on a shrunk record
     // would pass the tag assert anyway — under-coverage there, never a false positive.
     let baseline = self.groups.get(&gid).map_or(0, |m| m.fork_baseline);
+    let carried = self
+      .groups
+      .get(&gid)
+      .map(|m| m.carried_tags.clone())
+      .unwrap_or_default();
     for node in self.node_ids.clone() {
       if !self.hosts[&node].contains_group(&gid) {
         continue;
@@ -638,8 +694,14 @@ impl MultiWorld {
       // A crash-restore can legitimately SHRINK the applied prefix (apply outruns the batched
       // commit persist); clamp, and re-sweeping a replayed suffix is harmless (same entries).
       let start = (*hw).max(baseline).min(applied.len());
-      let checked =
-        oracles::assert_no_cross_talk(self.seed, self.tick_count, node, gid, &applied[start..]);
+      let checked = oracles::assert_no_cross_talk(
+        self.seed,
+        self.tick_count,
+        node,
+        gid,
+        &carried,
+        &applied[start..],
+      );
       *hw = applied.len();
       self.cross_talk_checked += checked;
     }
@@ -681,8 +743,15 @@ impl MultiWorld {
       };
       // The checker's applied-record legs (positional agreement, the index-keyed rewrite
       // high-water) get the ORACLE-ALIGNED record — see `aligned_applied` for why the raw
-      // record stops fitting both notions once the group splits.
-      let applied_log = self.aligned_applied(node, gid);
+      // record stops fitting both notions once the group splits. A group that ABSORBED via a
+      // merge instead ships the RAW record under the equal-applied agreement form (see
+      // `ClusterView::positional_agreement`): an absorb re-introduces own-tagged cells at
+      // replica-local resolution states, so no positional filter stays lag-invariant.
+      let applied_log = if self.group_absorbed(gid) {
+        self.applied_of(node, gid)
+      } else {
+        self.aligned_applied(node, gid)
+      };
       let cs = ep.conf_state();
       nodes.push(checker::NodeView {
         id: node,
@@ -713,6 +782,7 @@ impl MultiWorld {
       });
     }
     checker::ClusterView {
+      positional_agreement: !self.group_absorbed(gid),
       seed: self.seed,
       tick: self.tick_count,
       committed_voters: {
@@ -1061,5 +1131,6 @@ mod tests;
 
 mod faults;
 mod lifecycle;
+mod merge;
 mod query;
 mod split;

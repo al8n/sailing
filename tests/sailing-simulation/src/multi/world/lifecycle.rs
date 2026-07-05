@@ -43,6 +43,17 @@ pub(crate) struct GroupMeta {
   /// keyspace again — its record is empty, so nothing overlaps a live child's inherited
   /// history, and the conservation ledger's incarnation-qualified ids keep old verdicts exact).
   pub(crate) keys: BTreeSet<u16>,
+  /// Whether this group was MERGED AWAY (absorbed into a target): terminal — the id's admission
+  /// floor is `u64::MAX` in the product, so recreation is refused forever (the harness catalog
+  /// mirrors that refusal at [`MultiWorld::recreate_group`]). Implies `retired`.
+  pub(crate) merged: bool,
+  /// The transitive set of FOREIGN group tags whose cells legitimately ride this group's
+  /// record — its tag lineage: a fork child inherits its parent's tag (the baseline cells carry
+  /// it) plus the parent's own carried set, and a merge target inherits the source's tag plus
+  /// the source's carried set (the absorbed record arrives whole, inherited cells included).
+  /// The cross-talk sweep admits exactly these tags; everything else is a leak. Reset at
+  /// recreation — a fresh incarnation inherits nothing.
+  pub(crate) carried_tags: BTreeSet<u64>,
   /// The length of the fork-inherited applied baseline every replica of THIS incarnation opens
   /// its record with (`0` for a group not born of a fork). GROUP-level on purpose: the baseline
   /// is a property of the incarnation, not of any wiring path — a replica carries it however it
@@ -108,12 +119,18 @@ impl MultiWorld {
       .groups
       .get_mut(&gid)
       .unwrap_or_else(|| panic!("recreate_group: unknown group {gid}"));
+    assert!(
+      !meta.merged,
+      "recreate_group: group {gid} was merged away — its floor is terminal (u64::MAX); \
+       the catalog never re-admits it"
+    );
     assert!(meta.retired, "recreate_group: group {gid} is not retired");
     meta.retired = false;
     meta.generation += 1;
     meta.learners.clear();
     meta.keys = (0..super::super::NUM_KEYS).collect();
     meta.fork_baseline = 0;
+    meta.carried_tags.clear();
     let voters = meta.voters.clone();
     assert!(
       self.checkers.insert(gid, Checker::new()).is_none(),

@@ -69,6 +69,17 @@ impl StateMachine for LogSm {
     Some(Self { applied: child })
   }
 
+  /// THE SIM'S UNION CONTRACT: append the absorbed source's record onto this one's tail —
+  /// order preserved, indices untouched (absorbed cells keep their SOURCE-log indices, exactly
+  /// as inherited fork cells keep parent indices). A pure append of two deterministic records
+  /// at a log-fixed boundary, so every replica resolving the same commit absorbs identically;
+  /// the conservation walk's per-(ledger, key) value dedupe re-admits the cells under the
+  /// TARGET's ledger id in this order, which is what `assert_union` judges.
+  fn absorb(&mut self, source: Self) -> bool {
+    self.applied.extend(source.applied);
+    true
+  }
+
   fn snapshot(&self) -> Result<Bytes, Self::Error> {
     let mut buf: Vec<u8> = Vec::new();
     // entry count

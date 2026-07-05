@@ -56,6 +56,7 @@ fn cv(seed: u64, tick: u64, nodes: Vec<NodeView>) -> ClusterView {
     .map(|n| n.id)
     .collect();
   ClusterView {
+    positional_agreement: true,
     seed,
     tick,
     committed_voters: if voters.is_empty() {
@@ -301,6 +302,7 @@ fn commit_is_quorum_durable_uses_authoritative_voter_set_not_self_view() {
   n3.is_voter = false;
   n3.is_leader = false;
   let view = ClusterView {
+    positional_agreement: true,
     seed: 4,
     tick: 336,
     committed_voters: Some(BTreeSet::from([0, 1, 2])),
@@ -334,6 +336,7 @@ fn commit_is_quorum_durable_keeps_teeth_with_authoritative_voter_set() {
   n3.is_voter = false;
   n3.is_leader = false;
   let view = ClusterView {
+    positional_agreement: true,
     seed: 4,
     tick: 1,
     committed_voters: Some(BTreeSet::from([0, 1, 2])),
@@ -388,6 +391,7 @@ fn fork_grown_node(id: u64) -> NodeView {
 /// only the given replicas materialized (absent siblings have no store pair yet, so no view).
 fn fork_view(nodes: Vec<NodeView>) -> ClusterView {
   ClusterView {
+    positional_agreement: true,
     seed: 7,
     tick: 95,
     committed_voters: Some(BTreeSet::from([3, 4, 5, 6])),

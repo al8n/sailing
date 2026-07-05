@@ -1478,6 +1478,7 @@ fn alignment_never_masks_a_genuine_value_divergence() {
     incarnation: 0,
   };
   let view = checker::ClusterView {
+    positional_agreement: true,
     seed: 0,
     tick: 0,
     committed_voters: None,
@@ -1873,4 +1874,251 @@ fn parked_keys_cascade_through_an_onward_split() {
   w.check_now();
   w.finalize_conservation_or_panic(31);
   w.finalize_membership_or_panic(31);
+}
+
+/// Tick until `verb` lands on some leader (transient refusals — leaderless instants, catch-up
+/// gates — are ticked through), panicking with `what` if the budget runs out.
+fn merge_verb_until_accepted(
+  w: &mut MultiWorld,
+  budget: u32,
+  what: &str,
+  mut verb: impl FnMut(
+    &mut MultiWorld,
+  ) -> Option<Result<sailing_proto::Index, sailing_proto::MergeError<u64>>>,
+) {
+  for _ in 0..budget {
+    if matches!(verb(w), Some(Ok(_))) {
+      return;
+    }
+    w.tick();
+  }
+  panic!("{what} was never accepted");
+}
+
+/// THE CROSS-HOST ROLLBACK RACE, distilled (the randomized band's committed-divergence shape):
+/// three hosts park a commit while one host's SOURCE replica is lagged behind the freeze; the
+/// abort races the commit. Because the abort rides the TARGET's log, every host reads the same
+/// committed coordinate and takes the SAME side — here the abort lands at the coordinate right
+/// after the parked commit (proposed before any seal could), so every park un-parks ABORTED,
+/// the relayed thaw unfreezes the source everywhere, and a fresh merge attempt then completes
+/// cleanly. Under a live read of the source's generation this exact shape split the hosts:
+/// caught-up hosts absorbed while the lagged host aborted — committed divergence.
+#[test]
+fn merge_rollback_race_decides_identically_across_hosts() {
+  let mut w = MultiWorld::new(9);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // source
+  w.create_group(11, &all); // target
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+  }));
+  for i in 0..2u8 {
+    assert!(w.run_until(500, |w| w.leader_of(10).is_some()));
+    let gid_cmd = [b's', i];
+    w.propose(10, &gid_cmd);
+    let gid_cmd = [b't', i];
+    w.propose(11, &gid_cmd);
+    w.run_until(200, |_| false);
+  }
+
+  // Lag one host's SOURCE replica only (a host leading neither group, so the freeze still
+  // commits and the target leader's local source still reaches the boundary): the freeze will
+  // not reach it until the heal.
+  let lagged = (0..3u64)
+    .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
+    .expect("three nodes, at most two leaders");
+  for n in 0..3 {
+    if n != lagged {
+      w.mute_group(n, lagged, 10);
+      w.mute_group(lagged, n, 10);
+    }
+  }
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(10, 11)
+  });
+  assert!(
+    w.run_until(4_000, |w| {
+      (0..3).filter(|&n| n != lagged).all(|n| {
+        w.hosts[&n]
+          .group(&10)
+          .is_some_and(sailing_proto::Endpoint::is_frozen)
+      })
+    }),
+    "the connected majority freezes; the lagged replica stays behind"
+  );
+  assert!(
+    !w.hosts[&lagged]
+      .group(&10)
+      .is_some_and(sailing_proto::Endpoint::is_frozen),
+    "the lagged source replica must not have seen the freeze"
+  );
+
+  // Commit, then race the abort onto the very next log slot BEFORE any tick can seal: the
+  // target leader accepted the commit, so its local source is frozen-applied and the abort's
+  // own gates pass on the same host.
+  merge_verb_until_accepted(&mut w, 2_000, "the commit", |w| {
+    w.propose_commit_merge(11, 10)
+  });
+  assert!(
+    matches!(w.propose_rollback_merge(11, 10), Some(Ok(_))),
+    "the abort races onto the coordinate right after the commit"
+  );
+
+  // Heal and settle: every park must take the ABORT side (one committed coordinate, one
+  // verdict), the relayed thaw must unfreeze the source everywhere, and nothing may absorb.
+  w.unmute_all();
+  assert!(
+    w.run_until(6_000, |w| {
+      (0..3).all(|n| {
+        w.hosts[&n]
+          .group(&10)
+          .is_some_and(|ep| !ep.is_frozen() && ep.shape_gen() == 2)
+          && w.hosts[&n]
+            .group(&11)
+            .is_some_and(|ep| ep.pending_merge().is_none() && ep.shape_gen() == 1)
+      })
+    }),
+    "every host un-parks aborted and the relayed thaw lands everywhere"
+  );
+  assert_eq!(w.merges_registered(), 0, "nothing absorbed anywhere");
+  assert!(w.agreement_holds(10) && w.agreement_holds(11));
+
+  // The state is clean enough to merge for real: the same pair completes end to end.
+  merge_verb_until_accepted(&mut w, 2_000, "the fresh freeze", |w| {
+    w.propose_prepare_merge(10, 11)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the fresh commit", |w| {
+    w.propose_commit_merge(11, 10)
+  });
+  assert!(
+    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 10))),
+    "the second attempt absorbs on every host"
+  );
+  assert_eq!(w.merges_registered(), 1);
+  assert!(w.is_merged(10), "the source id is terminally merged away");
+}
+
+/// The commit-first ordering pin, cross-host: once the window seals and the absorb begins
+/// anywhere, a late abort attempt changes NOTHING — every host converges on the absorb
+/// (including one whose source replica was lagged the whole time; the source leader's host
+/// resolves last, keeping the freeze feedable until the straggler catches up). Under a live
+/// read of the source's generation, a landed late abort split the hosts instead.
+#[test]
+fn merge_late_abort_no_ops_and_every_host_absorbs() {
+  let mut w = MultiWorld::new(11);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all);
+  w.create_group(11, &all);
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+  }));
+  w.propose(10, b"s0");
+  w.propose(11, b"t0");
+  w.run_until(200, |_| false);
+
+  let lagged = (0..3u64)
+    .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
+    .expect("three nodes, at most two leaders");
+  for n in 0..3 {
+    if n != lagged {
+      w.mute_group(n, lagged, 10);
+      w.mute_group(lagged, n, 10);
+    }
+  }
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(10, 11)
+  });
+  assert!(w.run_until(4_000, |w| {
+    (0..3).filter(|&n| n != lagged).all(|n| {
+      w.hosts[&n]
+        .group(&10)
+        .is_some_and(sailing_proto::Endpoint::is_frozen)
+    })
+  }));
+  merge_verb_until_accepted(&mut w, 2_000, "the commit", |w| {
+    w.propose_commit_merge(11, 10)
+  });
+  // Run until the absorb has begun somewhere (a first resolution registered): the window is
+  // sealed and the merge is past its last abortable coordinate.
+  assert!(
+    w.run_until(6_000, |w| w.merges_registered() >= 1),
+    "some host absorbs while the straggler lags"
+  );
+  // The late abort: wherever it is still proposable it lands ABOVE the seal and must no-op;
+  // where the local view already resolved, it refuses typed. Either way it changes nothing.
+  let late = w.propose_rollback_merge(11, 10);
+  assert!(late.is_some(), "the target group is still hosted somewhere");
+  w.unmute_all();
+  assert!(
+    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 10))),
+    "every host absorbs once the straggler catches up — the merge was irrevocable"
+  );
+  assert_eq!(w.merges_registered(), 1, "one absorb, registered once");
+  assert!(w.is_merged(10));
+  assert!(w.agreement_holds(11));
+}
+
+/// The lifecycle churn's "spoken for" predicate tracks a choreography end to end: the source
+/// reads active from the freeze's ACCEPTANCE (appended, not yet applied — the unapplied-suffix
+/// leg), the target from the commit's acceptance, both until the absorb resolves everywhere —
+/// and an uninvolved bystander never does. This is the remove/recreate draw filter's exact
+/// contract; the seed-0 band livelock was a removal drawn inside exactly this window.
+#[test]
+fn choreography_participants_read_active_until_resolution() {
+  let mut w = MultiWorld::new(13);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // source
+  w.create_group(11, &all); // target
+  w.create_group(12, &all); // bystander
+  assert!(w.run_until(3_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some() && w.leader_of(12).is_some()
+  }));
+  assert!(
+    !w.merge_choreography_active(10) && !w.merge_choreography_active(11),
+    "no choreography yet — everything is drawable"
+  );
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(10, 11)
+  });
+  assert!(
+    w.merge_choreography_active(10),
+    "an accepted (still unapplied) freeze already speaks for the source"
+  );
+  assert!(w.run_until(4_000, |w| w.group_frozen(10)));
+  assert!(
+    w.merge_choreography_active(10),
+    "a frozen source stays spoken for"
+  );
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(11, 10)
+  });
+  assert!(
+    w.merge_choreography_active(11),
+    "an accepted commit speaks for the target through park and resolution"
+  );
+  assert!(
+    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 10))),
+    "the merge resolves on every host"
+  );
+  assert!(
+    !w.merge_choreography_active(11),
+    "a fully resolved target is drawable again"
+  );
+  assert!(
+    !w.merge_choreography_active(10),
+    "an absorbed source is past its choreography (and terminally merged besides)"
+  );
+  assert!(
+    !w.merge_choreography_active(12),
+    "the bystander was never spoken for"
+  );
 }

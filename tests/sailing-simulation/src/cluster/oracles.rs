@@ -95,6 +95,7 @@ impl Cluster {
       })
       .collect();
     ClusterView {
+      positional_agreement: true,
       seed: self.seed,
       tick: self.tick_count,
       // The authoritative committed VOTER set (leader's `conf_state().voters()`, or the plurality

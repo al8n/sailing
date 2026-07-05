@@ -22,7 +22,7 @@ fn gkv_roundtrips_and_rejects_foreign_shapes() {
 #[should_panic(expected = "cross-group")]
 fn cross_talk_sweep_panics_on_a_foreign_gid_tag() {
   let forged = [(4u64, encode_gkv(200, 3, 9))]; // applied under group 100, tagged for 200
-  assert_no_cross_talk(7, 12, 0, 100, &forged);
+  assert_no_cross_talk(7, 12, 0, 100, &std::collections::BTreeSet::new(), &forged);
 }
 
 /// The sweep stays quiet on the group's own tag and on untagged (non-gkv) payloads.
@@ -33,7 +33,7 @@ fn cross_talk_sweep_accepts_own_tag_and_untagged_payloads() {
     (5u64, b"raw".to_vec()),
     (6u64, Vec::new()),
   ];
-  assert_no_cross_talk(7, 12, 0, 100, &own);
+  assert_no_cross_talk(7, 12, 0, 100, &std::collections::BTreeSet::new(), &own);
 }
 
 /// One-identity teeth: a second distinct grantee for the same (granter, gid, gen, term) is the

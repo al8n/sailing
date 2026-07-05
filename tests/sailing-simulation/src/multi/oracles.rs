@@ -38,21 +38,25 @@ pub(crate) fn decode_gkv(cmd: &[u8]) -> Option<(u64, u16, u64)> {
 }
 
 /// Assert that none of `new_entries` — the entries applied under `gid` on `node` since the last
-/// sweep — carries ANOTHER group's tag. A mismatch is a cross-group leak (wrong-group delivery
-/// or apply) and panics with the exact seed/tick/node/gid/index for replay. Returns how many
-/// entries carried a decodable tag and were judged (the oracle's non-vacuity count).
+/// sweep — carries a FOREIGN group's tag: not the group's own, and not in its TAG LINEAGE (a
+/// fork inherits parent-tagged baseline cells and a merge folds the source's whole record in,
+/// inherited cells included; `carried` is the registry's transitive carried-tag set over both).
+/// A mismatch is a cross-group leak (wrong-group delivery or apply) and panics with the exact
+/// seed/tick/node/gid/index for replay. Returns how many entries carried a decodable tag and
+/// were judged (the oracle's non-vacuity count).
 pub(crate) fn assert_no_cross_talk(
   seed: u64,
   tick: u64,
   node: u64,
   gid: u64,
+  carried: &std::collections::BTreeSet<u64>,
   new_entries: &[(u64, Vec<u8>)],
 ) -> u64 {
   let mut checked = 0;
   for (index, cmd) in new_entries {
     if let Some((tag, key, value)) = decode_gkv(cmd) {
       assert!(
-        tag == gid,
+        tag == gid || carried.contains(&tag),
         "cross-group leak: node {node} applied an entry tagged for group {tag} under group \
          {gid} (index={index} key={key} value={value})\n  seed={seed} tick={tick} \
          (replay: run_multi_vopr(seed, ticks) and inspect tick {tick})",

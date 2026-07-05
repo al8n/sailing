@@ -61,6 +61,17 @@ pub enum MultiAction {
   /// Propose a SPLIT of one live group at a seed-picked population split point (a fresh-minted
   /// child id). Absent from the default menu — the reshape profile weights it in.
   Split,
+  /// Propose a merge FREEZE of one live group into an equal-voter-set sibling (the harness
+  /// pairing filter keeps proposals mostly-admissible; every typed refusal is a legitimate
+  /// no-op tick). Absent from the default menu — the merge profile weights it in.
+  PrepareMerge,
+  /// Propose the merge ABSORB for a previously accepted freeze (picked from the fuzzer's
+  /// pending-merge book; refusals — leader churn, the local source still catching up — no-op
+  /// and a later draw retries).
+  CommitMerge,
+  /// Propose the merge ABORT for a previously accepted freeze — racing the commit is the
+  /// point: the source's log settles every race, and the parked applies must all agree.
+  RollbackMerge,
 }
 
 /// A named action weight table plus per-replica config knobs — the profile seam M6's
@@ -119,6 +130,37 @@ impl MultiProfile {
     }
   }
 
+  /// The merge-reshape profile: the reshape menu PLUS the three merge verbs, so freezes,
+  /// parked commits, rollback races, and resolutions land amid the full fault/lifecycle churn
+  /// — and split children (colocated by construction) keep minting equal-voter-set pairs for
+  /// the pairing filter to merge back. Commit outweighs prepare so accepted freezes usually
+  /// complete; rollback stays rare but steady (the race arm needs real draws).
+  pub const fn merge_reshape() -> Self {
+    Self {
+      weights: &[
+        (MultiAction::ClientLoad, 50),
+        (MultiAction::ReadIndexLoad, 12),
+        (MultiAction::Partition, 8),
+        (MultiAction::Heal, 6),
+        (MultiAction::Crash, 5),
+        (MultiAction::MuteGroup, 6),
+        (MultiAction::UnmuteGroup, 4),
+        (MultiAction::ConfChange, 5),
+        (MultiAction::TransferLeader, 4),
+        (MultiAction::MigrateReadMode, 3),
+        (MultiAction::FaultReroll, 6),
+        (MultiAction::CreateGroup, 3),
+        (MultiAction::RemoveGroup, 2),
+        (MultiAction::RecreateGroup, 2),
+        (MultiAction::Split, 8),
+        (MultiAction::PrepareMerge, 6),
+        (MultiAction::CommitMerge, 8),
+        (MultiAction::RollbackMerge, 2),
+      ],
+      snapshot_threshold: None,
+    }
+  }
+
   /// The reshape profile: the default menu PLUS a steady [`MultiAction::Split`] weight, so
   /// splits land amid the full fault/lifecycle churn. The split rides the default menu as an
   /// ADDED row rather than a re-weighting — the default mix's schedules stay the reference
@@ -174,6 +216,20 @@ pub struct MultiVoprReport {
   /// split) — the reshape coverage's non-vacuity witness: nonzero proves the run-end
   /// conservation verdict judged real parent/child handovers rather than an empty work list.
   pub splits_applied: u64,
+  /// Merge freezes ACCEPTED by a source leader across the run.
+  pub merges_prepared: u64,
+  /// Merge absorbs ACCEPTED by a target leader across the run.
+  pub merges_committed: u64,
+  /// Merge rollbacks ACCEPTED by a source leader across the run.
+  pub merges_rolled_back: u64,
+  /// Merges REGISTERED (a park resolved to an absorb somewhere, once per merge) — the merge
+  /// coverage's non-vacuity witness: nonzero proves the run-end union verdict judged real
+  /// absorbs rather than an empty work list.
+  pub merges_registered: u64,
+  /// Per-host absorb resolutions across the run (every host's park resolution counts).
+  pub merges_resolved: u64,
+  /// Per-host abort resolutions across the run (the race/duplicate no-op arm).
+  pub merges_aborted: u64,
   /// Live groups at run end.
   pub final_groups: usize,
   /// Client commands accepted by some leader (tracked per group for the quiesce check).
@@ -235,6 +291,10 @@ struct MState {
   /// The monotone group-id allocator (starts at 100; NEVER reused for a different logical
   /// group — `RecreateGroup` reuses a retired gid as the SAME logical group at gen+1).
   next_gid: u64,
+  /// Accepted merge freezes not yet observed resolved: source → target — the commit/rollback
+  /// actions' pick book (entries prune once the source stops being live: merged away, or its
+  /// freeze rolled back and later retired). Stale entries only produce typed refusals.
+  pending_merges: BTreeMap<u64, u64>,
   /// Per-group journal of every accepted client command (the quiesce expected set).
   expected: BTreeMap<u64, Vec<Vec<u8>>>,
   /// The global monotone client-command counter (distinct commands; per-key values increase).
@@ -254,6 +314,7 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
 
   let mut st = MState {
     next_gid: 100,
+    pending_merges: BTreeMap::new(),
     expected: BTreeMap::new(),
     cmd_counter: 0,
   };
@@ -314,6 +375,11 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
       MultiAction::RemoveGroup => remove_group_action(&mut w, &mut prng, &mut report),
       MultiAction::RecreateGroup => recreate_group_action(&mut w, &mut prng, &mut report),
       MultiAction::Split => split_group(&mut w, &mut st, &mut prng),
+      MultiAction::PrepareMerge => prepare_merge_action(&mut w, &mut st, &mut prng, &mut report),
+      MultiAction::CommitMerge => commit_merge_action(&mut w, &mut st, &mut prng, &mut report),
+      MultiAction::RollbackMerge => {
+        rollback_merge_action(&mut w, &mut st, &mut prng, &mut report);
+      }
     }
 
     let steps = 2 + (prng.next_u64() % 5) as usize; // 2..=6 ticks per iteration
@@ -346,6 +412,13 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   // recorder's independent observations (see `MultiWorld::finalize_conservation_or_panic`).
   // Vacuously green under profiles that never split — zero records, zero cost.
   w.finalize_conservation_or_panic(seed);
+  // The union VERDICT: every registered merge's source histories must open the target's copy
+  // (see `MultiWorld::finalize_merge_conservation_or_panic`). Vacuously green under profiles
+  // that never merge — zero records, zero cost.
+  w.finalize_merge_conservation_or_panic(seed);
+  report.merges_registered = w.merges_registered();
+  report.merges_resolved = w.merges_resolved();
+  report.merges_aborted = w.merges_aborted();
   report.membership_oracle_comparisons = w.membership_oracle_comparisons();
   report.skipped_unwitnessed_installs = w.skipped_unwitnessed_installs();
   report.kind_unobservable_installs = w.kind_unobservable_installs();
@@ -378,9 +451,18 @@ fn calm_window(
   }
 
   for gid in w.live_groups() {
+    // The window's own ticking resolves parked merges: a group absorbed mid-window leaves the
+    // live set (its replicas dismantle host by host) — demanding an election or fresh load
+    // from it would misread the designed teardown as a livelock.
+    if !w.live_groups().contains(&gid) {
+      continue;
+    }
     w.reconcile_membership(gid);
     let mut elected = false;
     for _ in 0..4_000 {
+      if !w.live_groups().contains(&gid) {
+        break;
+      }
       if w.leader_of(gid).is_some() {
         elected = true;
         break;
@@ -388,6 +470,9 @@ fn calm_window(
       w.tick();
       report.ticks_run += 1;
       w.reconcile_membership(gid);
+    }
+    if !w.live_groups().contains(&gid) {
+      continue;
     }
     assert!(
       elected,
@@ -408,6 +493,14 @@ fn calm_window(
     let target = quorum_applied(w) + 1 + (prng.next_u64() % 2) as usize;
     let mut budget = 6_000u32;
     while quorum_applied(w) < target {
+      // A group FROZEN by a merge refuses writes BY DESIGN — the calm window must not demand
+      // fresh progress from it (the refusal is the covered behavior; the merge's own liveness
+      // is the resolution/rollback path, not client load). A merely PENDING freeze settles
+      // into frozen (or thaws by truncation) within the healed window's ticking below; a group
+      // absorbed mid-loop leaves the live set entirely.
+      if w.group_frozen(gid) || !w.live_groups().contains(&gid) {
+        break;
+      }
       assert!(
         budget > 0,
         "MULTI VOPR LIVELOCK (calm window): group {gid} failed to commit fresh load within the \
@@ -438,10 +531,12 @@ fn calm_window(
       report.ticks_run += 1;
       budget -= 1;
     }
-    assert!(
-      w.agreement_holds(gid),
-      "MULTI VOPR: group {gid} agreement must hold at the calm-window progress point (seed={seed})"
-    );
+    if w.live_groups().contains(&gid) {
+      assert!(
+        w.agreement_holds(gid),
+        "MULTI VOPR: group {gid} agreement must hold at the calm-window progress point (seed={seed})"
+      );
+    }
   }
 }
 
@@ -460,7 +555,6 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     w.crash(node);
   }
 
-  let live = w.live_groups();
   let converged_group = |w: &MultiWorld, gid: u64| -> bool {
     if w.group_leader_count(gid) != 1 || !w.agreement_holds(gid) {
       return false;
@@ -480,8 +574,12 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     let caught_up = lens.iter().min() == lens.iter().max();
     caught_up && members.iter().all(|&n| w.hosts_group(n, gid))
   };
+  // Recomputed every pass: the quiesce ticking itself resolves parked merges, and an absorbed
+  // group leaves the live set as its replicas dismantle.
+  let mut live = w.live_groups();
   let mut converged = false;
   for pass in 0..20_000u32 {
+    live = w.live_groups();
     for &gid in &live {
       w.reconcile_membership(gid);
     }
@@ -492,6 +590,7 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     }
     w.tick();
     report.ticks_run += 1;
+    live = w.live_groups();
     if live.iter().all(|&gid| converged_group(w, gid)) {
       converged = true;
       break;
@@ -542,13 +641,20 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
       .collect();
     for member in members {
       let applied = w.applied_of(member, gid);
-      let cmds: Vec<&Vec<u8>> = applied
+      let mut cmds: Vec<&Vec<u8>> = applied
         .iter()
         .filter(|(_, cmd)| !cmd.is_empty())
         .map(|(_, cmd)| cmd)
         .collect();
+      let mut expected_cmds = leader_cmds.clone();
+      // A merged lineage's record ORDER varies by arrival path (live fold vs capture restore);
+      // the converged CONTENT is what the product promises — compare as multisets there.
+      if w.group_absorbed(gid) {
+        cmds.sort();
+        expected_cmds.sort();
+      }
       assert_eq!(
-        cmds, leader_cmds,
+        cmds, expected_cmds,
         "MULTI VOPR APPLY FAILURE: group {gid} member {member} applied a different committed \
          client history than leader {leader}\n  seed={seed}",
       );
