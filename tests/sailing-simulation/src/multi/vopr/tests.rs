@@ -10,7 +10,7 @@ fn pick_action_is_deterministic_and_covers_the_menu() {
   };
   assert_eq!(draw(7), draw(7), "same seed ⇒ same action stream");
   let stream = draw(7);
-  for (action, _) in profile.0 {
+  for (action, _) in profile.weights {
     assert!(
       stream.contains(action),
       "512 draws never hit {action:?} — the weights are broken"

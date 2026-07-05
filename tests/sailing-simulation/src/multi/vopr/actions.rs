@@ -5,9 +5,9 @@ use super::*;
 
 /// Draw a weighted action from `profile` (deterministic from the master PRNG).
 pub(super) fn pick_action(prng: &mut FaultPrng, profile: MultiProfile) -> MultiAction {
-  let total: u32 = profile.0.iter().map(|(_, w)| w).sum();
+  let total: u32 = profile.weights.iter().map(|(_, w)| w).sum();
   let mut pick = (prng.next_u64() % u64::from(total)) as u32;
-  for (action, weight) in profile.0 {
+  for (action, weight) in profile.weights {
     if pick < *weight {
       return *action;
     }
