@@ -1398,3 +1398,111 @@ async fn forked_group_serves_and_snapshots_a_late_joiner() {
   // The sibling group is unaffected by the fork/join churn.
   assert_eq!(submit_anywhere(&g900, b"still").await, 2);
 }
+
+/// The T11 QUIC merge gate — the stream suite's absorb shape over the QUIC transport: freeze,
+/// parked commit, per-crank resolution, the union served everywhere, the source id refused
+/// forever on its terminal floor, and no leadership churn on the target through the whole
+/// choreography.
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_absorbs_and_source_never_returns() {
+  let ca = TestCa::new();
+  let addrs = addrs(44_960, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(&ca, id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
+
+  let t_leader = find_leader(&g200, "target pre-merge").await;
+  let t_term = g200[t_leader].status().await.expect("status").term;
+
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  'freeze: loop {
+    assert!(std::time::Instant::now() < deadline, "no freeze accepted");
+    for h in &handles {
+      if h.prepare_merge(100, 200).await.is_ok() {
+        break 'freeze;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+  'commit: loop {
+    assert!(std::time::Instant::now() < deadline, "no commit accepted");
+    for h in &handles {
+      if h.commit_merge(200, 100).await.is_ok() {
+        break 'commit;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // Every node's crank resolves its park: the union serves from the target on ALL nodes.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served everywhere"
+    );
+    let mut counts = Vec::new();
+    for g in &g200 {
+      if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
+        counts.push(c);
+      }
+    }
+    if counts.len() == 3 && counts.iter().all(|&c| c == 5) {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // No leadership churn on the target: same leader, same term.
+  let status = g200[t_leader].status().await.expect("status");
+  assert_eq!(status.role, Role::Leader, "the target leader never moved");
+  assert_eq!(status.term, t_term, "the target's term never moved");
+
+  // The source id dies everywhere and its floor is terminal.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never tore down everywhere"
+    );
+    let mut gone = 0;
+    for g in &g100 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == 3 {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    match h
+      .create_group(100, config(id, vec![1, 2, 3]), 9, CountSm::default(), 9)
+      .await
+    {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(
+          reason.contains("floor"),
+          "node {id}: the refusal must be the terminal floor, got: {reason}"
+        );
+      }
+      other => panic!("node {id}: a merged-away id must never re-admit, got {other:?}"),
+    }
+  }
+}

@@ -3909,3 +3909,245 @@ async fn parked_conflict_survives_a_full_lifecycle_tail() {
     }
   }
 }
+
+/// Retry a leader-routed merge verb across nodes until some leader accepts it (transient
+/// refusals — routing, the local source still catching up to frozen-applied — no-op and retry).
+async fn merge_verb_anywhere<Fut>(what: &str, mut verb: impl FnMut(usize) -> Fut, n: usize) -> usize
+where
+  Fut: core::future::Future<Output = Result<sailing_proto::Index, DriverError<u64>>>,
+{
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what} never accepted"
+    );
+    for at in 0..n {
+      if verb(at).await.is_ok() {
+        return at;
+      }
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
+/// The T11 stream merge gate: 3 nodes, two loaded groups — freeze, parked commit, per-crank
+/// resolution — then the target serves the UNION, the source id refuses forever on its terminal
+/// floor, and the target saw NO leadership churn through the whole choreography (same leader,
+/// same term: the merge rides ordinary appends and the crank, never an election).
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_absorbs_and_source_never_returns() {
+  let addrs = addrs(44_880, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
+
+  // Pin the target's leadership through the whole choreography.
+  let t_leader = find_leader(&g200, "target pre-merge").await;
+  let t_term = g200[t_leader].status().await.expect("status").term;
+
+  merge_verb_anywhere(
+    "the freeze",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.prepare_merge(100, 200).await }
+    },
+    handles.len(),
+  )
+  .await;
+  merge_verb_anywhere(
+    "the commit",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.commit_merge(200, 100).await }
+    },
+    handles.len(),
+  )
+  .await;
+
+  // Every node's crank resolves its park: the union serves from the target on ALL nodes.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served everywhere"
+    );
+    let mut counts = Vec::new();
+    for g in &g200 {
+      if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
+        counts.push(c);
+      }
+    }
+    if counts.len() == 3 && counts.iter().all(|&c| c == 5) {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // No leadership churn on the target: same leader, same term.
+  let status = g200[t_leader].status().await.expect("status");
+  assert_eq!(status.role, Role::Leader, "the target leader never moved");
+  assert_eq!(status.term, t_term, "the target's term never moved");
+
+  // The source id dies everywhere and its floor is terminal: status refuses on every node and
+  // re-admission refuses at ANY generation, forever.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never tore down everywhere"
+    );
+    let mut gone = 0;
+    for g in &g100 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == 3 {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    match h
+      .create_group(100, config(id, vec![1, 2, 3]), 9, CountSm::default(), 9)
+      .await
+    {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(
+          reason.contains("floor"),
+          "node {id}: the refusal must be the terminal floor, got: {reason}"
+        );
+      }
+      other => panic!("node {id}: a merged-away id must never re-admit, got {other:?}"),
+    }
+  }
+}
+
+/// The T11 rollback gate: the TARGET-side abort abandons a standing freeze, and the DRIVER's
+/// relay drain proposes the source's thaw on its own log — the source serves fresh writes
+/// again, and a LATER merge of the same pair completes, proving the abort left a clean
+/// lineage. (The abort-vs-commit RACE itself is pinned deterministically at the container and
+/// world tiers, where log adjacency is controllable; over a real mesh the seal wins or loses
+/// by scheduling, so this gate exercises the surface, the relay, and the reuse.)
+#[tokio::test(flavor = "multi_thread")]
+async fn merge_rollback_unfreezes() {
+  let addrs = addrs(44_940, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+
+  merge_verb_anywhere(
+    "the freeze",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.prepare_merge(100, 200).await }
+    },
+    handles.len(),
+  )
+  .await;
+  // The frozen source refuses writes typed.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the freeze never took effect"
+    );
+    let mut frozen = false;
+    for g in &g100 {
+      if matches!(g.submit(Bytes::from_static(b"x")).await, Err(DriverError::Rejected { reason }) if reason.contains("Frozen"))
+      {
+        frozen = true;
+        break;
+      }
+    }
+    if frozen {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // Abort the standing freeze from the TARGET side (retrying across nodes for the target
+  // leader whose local source has applied the freeze).
+  merge_verb_anywhere(
+    "the abort",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.rollback_merge(200, 100).await }
+    },
+    handles.len(),
+  )
+  .await;
+
+  // The relayed thaw lands on the source's own log: it accepts fresh writes again everywhere.
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  // Both groups intact: nothing was absorbed.
+  assert_eq!(query_anywhere(&g200).await, 1, "no union — the merge died");
+
+  // A LATER merge of the same pair completes end to end: the abort left a clean lineage.
+  merge_verb_anywhere(
+    "the fresh freeze",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.prepare_merge(100, 200).await }
+    },
+    handles.len(),
+  )
+  .await;
+  merge_verb_anywhere(
+    "the fresh commit",
+    |at| {
+      let h = handles[at].clone();
+      async move { h.commit_merge(200, 100).await }
+    },
+    handles.len(),
+  )
+  .await;
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the second merge never completed"
+    );
+    let mut gone = 0;
+    for g in &g100 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == 3 && query_anywhere(&g200).await == 3 {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
