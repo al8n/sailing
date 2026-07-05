@@ -125,11 +125,26 @@ fn default_band_is_nonvacuous() {
   // comparisons are structurally zero — a dedicated lowered-threshold snapshot band owns that
   // policy, the single-group precedent. The per-checker finalize assert (skipped == 0,
   // gid/generation-attributed) still runs inside every run of every profile, this one included.
+  // The library default the untouched (`None`) override leaves in place, derived from a plain
+  // config so the witness assertion tracks the library rather than a pinned number.
+  let library_default = sailing_proto::Config::try_new(
+    0u64,
+    std::vec![0u64],
+    std::time::Duration::from_millis(1000),
+    std::time::Duration::from_millis(100),
+  )
+  .expect("a valid reference config")
+  .snapshot_threshold();
   for seed in 0..8u64 {
     let r = run_multi_vopr(seed, 4_000, MultiProfile::default_multi());
     assert!(
       r.groups_created >= 2 && r.committed > 0,
       "seed {seed} vacuous: {r:?}"
+    );
+    assert_eq!(
+      r.applied_snapshot_threshold,
+      Some(library_default),
+      "seed {seed}: the default profile must leave the library default threshold in place: {r:?}"
     );
   }
 }
@@ -149,6 +164,18 @@ fn snapshot_band_smoke() {
     assert!(
       r.groups_created >= 2 && r.committed > 0,
       "seed {seed} vacuous: {r:?}"
+    );
+    // The applied-threshold WITNESS: the runner pushed the snapshot-heavy override all the way to a
+    // constructed replica's config. Severing run_multi_vopr's set_snapshot_threshold leaves this at
+    // the library default and trips here — the everyday-gate detector the draw and construction-path
+    // unit tests, which drive the world directly and bypass the public runner, cannot provide.
+    let applied = r
+      .applied_snapshot_threshold
+      .expect("a completed run constructed at least one replica");
+    assert!(
+      (256..=511).contains(&applied),
+      "seed {seed}: the runner did not apply the snapshot-heavy threshold to a replica \
+       (witness {applied}, outside the 256..=511 band): {r:?}"
     );
   }
 }

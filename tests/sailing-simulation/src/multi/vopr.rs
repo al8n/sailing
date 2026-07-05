@@ -130,6 +130,13 @@ impl MultiProfile {
 pub struct MultiVoprReport {
   /// The world seed (echoed for replay).
   pub seed: u64,
+  /// The `snapshot_threshold` a genuinely constructed replica was built under, read back off the
+  /// retained per-replica config once the world seam applied the profile — the WITNESS that
+  /// [`run_multi_vopr`] pushed `MultiProfile`'s override through world construction rather than
+  /// leaving it inert in the profile. `None` only if the run wired no replica; a completed run
+  /// always creates a group, so it reports `Some`: the library default under the default profile,
+  /// a `256..=511` draw under [`MultiProfile::snapshot_heavy`].
+  pub applied_snapshot_threshold: Option<usize>,
   /// World ticks executed across the run (main loop + calm windows + quiesce).
   pub ticks_run: u64,
   /// Groups created (the two initial groups plus every `CreateGroup` action).
@@ -231,6 +238,10 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   // baseline faults install and the weighted loop takes over.
   create_group_action(&mut w, &mut st, &mut prng, &mut report);
   create_group_action(&mut w, &mut st, &mut prng, &mut report);
+  // Witness the applied threshold off a genuinely constructed replica now that the world seam has
+  // wired the initial groups. Read from a real replica config (not `profile.snapshot_threshold`)
+  // so severing the `set_snapshot_threshold` call above is caught — a profile read would tautologize.
+  report.applied_snapshot_threshold = w.applied_snapshot_threshold();
   for gid in w.live_groups() {
     assert!(
       w.run_until(3_000, |w| w.leader_of(gid).is_some()),
