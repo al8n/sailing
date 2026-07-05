@@ -2090,6 +2090,16 @@ where
             continue;
           };
           tep.resolve_pending_merge(fsm);
+          // An FSM that refuses the absorb POISONED the target (deterministic on every
+          // replica — MergeUnsupported is the SplitUnsupported class). Nothing was absorbed:
+          // surfacing `Merged` here would have the driver floor the source terminally and
+          // tear its stores down, destroying the union's only copy behind a fail-stop. The
+          // fail-stop stands alone instead — the source's stores and floor stay untouched,
+          // and a restart re-parks against the restored source deterministically.
+          if tep.is_poisoned() {
+            self.mark_dirty(&tgid);
+            continue;
+          }
           if let Some((log, stable)) = stores.stores(&tgid)
             && let Some(tep) = self.groups.get_mut(&tgid)
           {

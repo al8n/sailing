@@ -3343,3 +3343,96 @@ fn freeze_gates_cover_split_and_target_verbs() {
     ));
   }
 }
+
+/// An FSM that refuses the absorb POISONS the target (the deterministic fail-stop) — and the
+/// service must surface NO `Merged` resolution for it: the driver would otherwise floor the
+/// source terminally and tear its stores down behind the fail-stop, destroying the union's
+/// only copy. The fail-stop stands alone; the source's storage half stays untouched.
+#[test]
+fn poisoned_absorb_surfaces_no_resolution() {
+  #[derive(Default)]
+  struct NoAbsorbSm(usize);
+  impl crate::StateMachine for NoAbsorbSm {
+    type Command = Bytes;
+    type Response = usize;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+    fn apply(&mut self, _: Index, _: Bytes) -> Result<usize, Self::Error> {
+      self.0 += 1;
+      Ok(self.0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.0 as u64)
+    }
+    fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
+      self.0 = s as usize;
+      Ok(())
+    }
+  }
+  fn drain(
+    m: &mut MultiRaft<u64, u64, NoAbsorbSm>,
+    gid: u64,
+    now: Instant,
+    log: &mut VecLog,
+    stable: &mut AsyncStable,
+  ) {
+    while matches!(
+      m.handle_storage(&gid, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  let mut m: MultiRaft<u64, u64, NoAbsorbSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  for gid in [1u64, 2] {
+    stores
+      .0
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    m.create_group(
+      gid,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      7,
+      NoAbsorbSm::default(),
+    )
+    .unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+    drain(&mut m, gid, d, log, stable);
+    assert!(m.group(&gid).unwrap().role().is_leader());
+  }
+  let now = Instant::ORIGIN;
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain(&mut m, 1, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().pending_merge().is_some());
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the first pass only seals"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain(&mut m, 2, now, log, stable);
+  }
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert!(
+    resolutions.is_empty(),
+    "a poisoned absorb must not hand the driver a Merged to floor and tear down: {resolutions:?}"
+  );
+  let tep = m.group(&2).unwrap();
+  assert!(tep.is_poisoned(), "the deterministic fail-stop stands");
+  assert!(
+    !m.contains_group(&1),
+    "the extracted source endpoint is consumed either way (its stores are not)"
+  );
+}
