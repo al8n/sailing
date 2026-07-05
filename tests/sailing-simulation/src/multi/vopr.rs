@@ -170,6 +170,10 @@ pub struct MultiVoprReport {
   pub groups_removed: u64,
   /// Retired groups recreated at gen+1 via `RecreateGroup`.
   pub groups_recreated: u64,
+  /// Committed splits REGISTERED across the run (a child materialized somewhere, once per
+  /// split) — the reshape coverage's non-vacuity witness: nonzero proves the run-end
+  /// conservation verdict judged real parent/child handovers rather than an empty work list.
+  pub splits_applied: u64,
   /// Live groups at run end.
   pub final_groups: usize,
   /// Client commands accepted by some leader (tracked per group for the quiesce check).
@@ -345,6 +349,7 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   report.membership_oracle_comparisons = w.membership_oracle_comparisons();
   report.skipped_unwitnessed_installs = w.skipped_unwitnessed_installs();
   report.kind_unobservable_installs = w.kind_unobservable_installs();
+  report.splits_applied = w.splits_applied();
   report.final_groups = w.live_groups().len();
   report.cross_talk_checks = w.cross_talk_checked();
   report.max_term_seen = report.max_term_seen.max(w.max_term_all());
