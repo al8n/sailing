@@ -55,6 +55,59 @@ fn assert_membership_band_bounds(band: &str, reports: &[MultiVoprReport]) {
   );
 }
 
+/// The fold sums ACROSS reports: the first report alone carries the comparisons, the second
+/// alone the tolerated decline, and only their sum is the passing shape.
+#[test]
+fn membership_band_bounds_hold_on_the_tolerated_shape() {
+  let reports = [
+    MultiVoprReport {
+      membership_oracle_comparisons: 4,
+      ..MultiVoprReport::default()
+    },
+    MultiVoprReport {
+      kind_unobservable_installs: 1,
+      ..MultiVoprReport::default()
+    },
+  ];
+  assert_membership_band_bounds("fabricated tolerated", &reports);
+}
+
+#[test]
+#[should_panic(expected = "never COMPARED a snapshot-installed node")]
+fn membership_band_bounds_fire_on_zero_comparisons() {
+  assert_membership_band_bounds("fabricated vacuous", &[MultiVoprReport::default()]);
+}
+
+#[test]
+#[should_panic(expected = "HISTORY completeness gap")]
+fn membership_band_bounds_fire_on_a_skipped_install() {
+  let reports = [MultiVoprReport {
+    membership_oracle_comparisons: 10,
+    skipped_unwitnessed_installs: 1,
+    ..MultiVoprReport::default()
+  }];
+  assert_membership_band_bounds("fabricated skipped", &reports);
+}
+
+/// Declines at EXACTLY half the comparisons must fire (the bound is a strict minority), and the
+/// violation exists only in the cross-report sum — each fabricated report alone would trip a
+/// DIFFERENT assertion or none, so this also pins the fold summing both counters.
+#[test]
+#[should_panic(expected = "coverage collapsed")]
+fn membership_band_bounds_fire_when_declines_reach_half() {
+  let reports = [
+    MultiVoprReport {
+      membership_oracle_comparisons: 2,
+      ..MultiVoprReport::default()
+    },
+    MultiVoprReport {
+      kind_unobservable_installs: 1,
+      ..MultiVoprReport::default()
+    },
+  ];
+  assert_membership_band_bounds("fabricated collapsed", &reports);
+}
+
 #[test]
 fn same_seed_same_report() {
   let p = MultiProfile::default_multi();
