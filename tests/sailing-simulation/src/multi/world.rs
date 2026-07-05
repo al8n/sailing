@@ -61,6 +61,9 @@ pub struct MultiWorld {
   /// any replica ever sends (see [`oracles::note_grant`]).
   grants: BTreeMap<GrantKey, u64>,
   /// Per-`(node, gid)` count of applied entries already cross-talk-swept (the sweep high-water).
+  /// The sweep FLOORS its start at the group's fork-inherited baseline (see
+  /// [`lifecycle::GroupMeta::fork_baseline`]) at every pass, so inherited parent-tagged cells
+  /// are never judged as cross-talk no matter how a replica acquired them.
   swept: BTreeMap<(u64, u64), usize>,
   /// Per-`(node, gid)` count of `Event::ConfChanged` drained (the [`NodeView`](crate::NodeView)
   /// `conf_changed` feed and the per-group conf-change settle signal).
@@ -130,9 +133,9 @@ pub struct MultiWorld {
   /// [`finalize_conservation_or_panic`](Self::finalize_conservation_or_panic).
   conservation: ConservationLedger,
   /// Per-`(node, gid)` count of applied cells the conservation recorder has already walked.
-  /// DISTINCT from `swept`: a fork-born replica's cross-talk high-water is seeded PAST its
-  /// inherited baseline (parent-tagged cells are not cross-talk), while the recorder starts at
-  /// 0 so the baseline IS observed as the child's opening history.
+  /// DISTINCT from `swept`: the cross-talk sweep floors its start at the group's inherited
+  /// baseline (parent-tagged cells are not cross-talk), while the recorder starts at 0 so the
+  /// baseline IS observed as the child's opening history.
   cons_swept: BTreeMap<(u64, u64), usize>,
   /// Per-`(ledger id, key)` last recorded value — the recorder's dedupe. Values are globally
   /// unique and strictly increase per `(group, key)` (the fuzzer's monotone counter), so
@@ -148,11 +151,6 @@ pub struct MultiWorld {
   /// child never materializes, and the parent's population stays conservatively shrunk (the
   /// moved keys are parked; never a false conservation positive).
   pending_splits: BTreeMap<u64, split::PendingSplit>,
-  /// Per-`(node, gid)` length of the fork-inherited applied baseline. Feeds the ORACLE-ALIGNED
-  /// view record (`aligned_applied`): the baseline's cells carry PARENT-log indices, so the
-  /// child's checker judges only the child's own raft history and the exact-cell baseline
-  /// handover is the conservation ledger's to judge instead.
-  fork_baseline: BTreeMap<(u64, u64), usize>,
   /// Committed splits REGISTERED (one per split, however many replicas materialize) — the
   /// report's non-vacuity witness.
   splits_applied: u64,
@@ -209,7 +207,6 @@ impl MultiWorld {
       cons_last: BTreeMap::new(),
       splits: BTreeMap::new(),
       pending_splits: BTreeMap::new(),
-      fork_baseline: BTreeMap::new(),
       splits_applied: 0,
       split_stale: 0,
       split_conflicts: 0,
@@ -618,6 +615,11 @@ impl MultiWorld {
   /// Assert every NEWLY applied entry on every replica of `gid` decodes (when gid-tagged) to
   /// `gid` itself — the O(1)-per-apply cross-group isolation oracle.
   fn cross_talk_sweep(&mut self, gid: u64) {
+    // The floor derives from the GROUP record, never the replica's wiring path: a fork-born
+    // group's inherited baseline cells carry the PARENT's tag legitimately (the handover), and
+    // every arrival path — fork materialization, a transferred snapshot into a fresh observer,
+    // a crash restore from the durable blob — presents them identically as the record's prefix.
+    let baseline = self.groups.get(&gid).map_or(0, |m| m.fork_baseline);
     for node in self.node_ids.clone() {
       if !self.hosts[&node].contains_group(&gid) {
         continue;
@@ -626,7 +628,7 @@ impl MultiWorld {
       let hw = self.swept.entry((node, gid)).or_insert(0);
       // A crash-restore can legitimately SHRINK the applied prefix (apply outruns the batched
       // commit persist); clamp, and re-sweeping a replayed suffix is harmless (same entries).
-      let start = (*hw).min(applied.len());
+      let start = (*hw).max(baseline).min(applied.len());
       let checked =
         oracles::assert_no_cross_talk(self.seed, self.tick_count, node, gid, &applied[start..]);
       *hw = applied.len();

@@ -548,3 +548,117 @@ fn split_replay_after_crash_registers_once() {
   w.finalize_conservation_or_panic(11);
   w.finalize_membership_or_panic(11);
 }
+
+/// A child replica that arrives by the product's OTHER legitimate path — a fresh observer
+/// caught up by snapshot transfer (`LogSm::snapshot()` carries the full record, inherited
+/// parent-tagged baseline included) — must yield an aligned record identical to a fork-wired
+/// sibling's. The seeding is GROUP-level (the registration record), so the arrival path is
+/// irrelevant; seeding only on the fork-wired path left this twin unswept — its parent-tagged
+/// baseline cells were judged as cross-talk and its unskipped prefix misaligned the positional
+/// agreement leg.
+#[test]
+fn snapshot_wired_child_replica_aligns_with_fork_wired_siblings() {
+  let mut w = MultiWorld::new(7);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = [0, 1].into_iter().collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| {
+      let leader = w.leader_of(100);
+      leader.is_some_and(|l| w.applied_of(l, 100).len() >= 8)
+    }),
+    "the keyed baseline never applied"
+  );
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(100, 200, 4) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "the split was never accepted");
+  assert!(w.run_until(3_000, |w| w.leader_of(200).is_some()));
+  assert_eq!(
+    w.hosting_nodes(200),
+    std::vec![0, 1],
+    "the child forks only on the parent's voters"
+  );
+
+  // Child-own progress past the baseline, so the aligned comparison below is non-vacuous.
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 5, 900));
+
+  // The TWIN arrival: node 2 joins as a fresh observer. The fork-born log starts past the
+  // manufactured baseline (`first_index == 2`), so its catch-up is structurally a snapshot
+  // transfer carrying the full record.
+  w.wire_group_observer(200, 2);
+  propose_conf_change_until_accepted(&mut w, 200, sailing_proto::ConfChangeType::AddNode, 2);
+  assert!(
+    w.run_until(4_000, |w| {
+      !w.applied_of(0, 200).is_empty() && w.applied_of(2, 200).len() == w.applied_of(0, 200).len()
+    }),
+    "the snapshot-wired observer never caught up: {}",
+    w.dbg_group(200)
+  );
+
+  // The twin path genuinely delivered the inherited baseline (parent-tagged, parent-indexed)…
+  let raw = w.applied_of(2, 200);
+  assert!(
+    raw
+      .iter()
+      .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+      .any(|(tag, _, _)| tag == 100),
+    "the transferred snapshot must carry the parent-tagged inherited cells"
+  );
+  // …and the aligned view discounts it off the GROUP record: identical to a fork-wired
+  // sibling's, baseline excluded, agreement whole. (The ticks above already cross-talk-swept
+  // node 2's record — an unseeded view would have tripped the oracle before reaching here.)
+  assert_eq!(w.aligned_applied(2, 200), w.aligned_applied(0, 200));
+  assert!(!w.aligned_applied(2, 200).is_empty());
+  assert!(
+    raw.len() > w.aligned_applied(2, 200).len(),
+    "the raw record must exceed the aligned one by the inherited baseline"
+  );
+  assert!(w.agreement_holds(200));
+  w.check_now();
+  w.finalize_conservation_or_panic(7);
+  w.finalize_membership_or_panic(7);
+}
+
+/// The non-fork pin: a never-split group's oracle-aligned record is the raw record verbatim —
+/// the group-level baseline is 0 and the population is the full domain, so alignment is the
+/// identity on every node.
+#[test]
+fn aligned_view_is_the_raw_record_for_never_split_groups() {
+  let mut w = MultiWorld::new(3);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..4 {
+    let payload = crate::multi::encode_gkv(100, key, 40 + u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..3).all(|n| w.applied_of(n, 100).len() >= 4)),
+    "the keyed load never applied everywhere"
+  );
+  for n in 0..3 {
+    let raw = w.applied_of(n, 100);
+    assert!(!raw.is_empty());
+    assert_eq!(
+      w.aligned_applied(n, 100),
+      raw,
+      "node {n}: alignment must be the identity for a never-split group"
+    );
+  }
+}

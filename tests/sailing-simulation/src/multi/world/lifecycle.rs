@@ -43,6 +43,13 @@ pub(crate) struct GroupMeta {
   /// keyspace again — its record is empty, so nothing overlaps a live child's inherited
   /// history, and the conservation ledger's incarnation-qualified ids keep old verdicts exact).
   pub(crate) keys: BTreeSet<u16>,
+  /// The length of the fork-inherited applied baseline every replica of THIS incarnation opens
+  /// its record with (`0` for a group not born of a fork). GROUP-level on purpose: the baseline
+  /// is a property of the incarnation, not of any wiring path — a replica carries it however it
+  /// arrived (fork materialization, a transferred snapshot into a fresh observer, a crash
+  /// restore from the durable blob), so the oracle-aligned view and the cross-talk floor derive
+  /// from this registration record. Reset at recreation: a fresh incarnation inherits nothing.
+  pub(crate) fork_baseline: usize,
 }
 
 impl MultiWorld {
@@ -104,6 +111,7 @@ impl MultiWorld {
     meta.generation += 1;
     meta.learners.clear();
     meta.keys = (0..super::super::NUM_KEYS).collect();
+    meta.fork_baseline = 0;
     let voters = meta.voters.clone();
     assert!(
       self.checkers.insert(gid, Checker::new()).is_none(),
@@ -300,7 +308,6 @@ impl MultiWorld {
     self.configs.remove(&(node, gid));
     self.swept.remove(&(node, gid));
     self.cons_swept.remove(&(node, gid));
-    self.fork_baseline.remove(&(node, gid));
     self.conf_changed.remove(&(node, gid));
     self.snapshot_lineage.remove(&(node, gid));
     self.member_view.remove(&(node, gid));
