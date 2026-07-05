@@ -284,6 +284,103 @@ fn fork_refuses_boot_epoch_zero() {
   assert_eq!(m.group(&7).unwrap().applied_index(), FORK_BASE_INDEX);
 }
 
+#[test]
+fn fork_refuses_used_stores_before_any_write() {
+  // The manufactured baseline OVERWRITES whatever the stores hold, so a fork is only ever
+  // written over VIRGIN stores. Each leg of the used-storage probe refuses on its own — a
+  // visible hard state, an occupied snapshot slot, log content, and a compacted (re-baselined)
+  // log — and the refusal precedes every store write, so the held state survives untouched.
+  let fork = |m: &mut MultiRaft<u64, u64, CountSm>, log: &mut VecLog, stable: &mut AsyncStable| {
+    m.create_group_from_fork(
+      7,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      preloaded_sm(3),
+      fork_blob(3),
+      None,
+      1,
+      log,
+      stable,
+    )
+  };
+
+  // A visible hard state alone (term 1, nothing else).
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  stable.force_state(Term::new(1), None, Index::ZERO);
+  assert_eq!(
+    fork(&mut m, &mut log, &mut stable),
+    Err(CreateGroupError::StorageInUse)
+  );
+  assert_eq!(
+    stable.hard_state().term(),
+    Term::new(1),
+    "the held state survives the refusal"
+  );
+  assert!(m.is_empty(), "nothing was admitted");
+
+  // An occupied snapshot slot alone.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  stable.force_snapshot(
+    crate::SnapshotMeta::new(
+      Index::new(2),
+      Term::new(1),
+      crate::ConfState::from_voters(std::vec![1u64]),
+    ),
+    fork_blob(9),
+  );
+  assert_eq!(
+    fork(&mut m, &mut log, &mut stable),
+    Err(CreateGroupError::StorageInUse)
+  );
+  let (_, held) = stable.snapshot().expect("the held snapshot survives");
+  assert_eq!(held, fork_blob(9), "the refusal never touched the slot");
+
+  // Log content alone.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Normal,
+    Bytes::new(),
+  )]);
+  assert_eq!(
+    fork(&mut m, &mut log, &mut stable),
+    Err(CreateGroupError::StorageInUse)
+  );
+  assert_eq!(log.last_index().get(), 1, "the held log survives");
+
+  // A compacted (re-baselined) log alone, and the `_with_rng` twin walks the same gate.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  log.restore(Index::new(3), Term::new(1));
+  assert_eq!(
+    m.create_group_from_fork_with_rng(
+      7,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      Prng::new(42),
+      preloaded_sm(3),
+      fork_blob(3),
+      None,
+      1,
+      &mut log,
+      &mut stable
+    ),
+    Err(CreateGroupError::StorageInUse)
+  );
+  assert_eq!(log.first_index().get(), 4, "the held boundary survives");
+  assert!(m.is_empty(), "no leg admitted anything");
+
+  // The same container and shape over VIRGIN stores admits — the probe fences used storage
+  // only, so the legitimate crash-before-flush replay (nothing durable) re-forks freely.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  fork(&mut m, &mut log, &mut stable).unwrap();
+  assert_eq!(m.group(&7).unwrap().applied_index(), FORK_BASE_INDEX);
+}
+
 /// WHY the guard exists, demonstrated at the endpoint level. The pre-guard fork shape at
 /// `boot_epoch = 0` — reproduced by calling `write_fork_baseline` directly, exactly what
 /// `create_group_from_fork` did before refusing 0 — collapses the baseline's prior-epoch write

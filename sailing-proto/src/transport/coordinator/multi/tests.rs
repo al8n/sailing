@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  Config, FloorStore, MERGED_FLOOR, Message, NoFloors, SplitError, Term, TimeoutNow,
+  Config, FloorStore, GroupEngine, MERGED_FLOOR, Message, NoFloors, SplitError, Term, TimeoutNow,
   testkit::{AsyncStable, CountSm, VecLog},
   transport::{ClusterId, Labeled, Passthrough, labeled::LabelOptions},
 };
@@ -1839,4 +1839,323 @@ fn propose_split_gates_the_child_floor() {
     "the sentinel incarnation is refused as its own class"
   );
   assert_eq!(log.last_index(), last, "nothing was proposed");
+}
+
+/// A state machine whose `split` gives away `instruction[0]` units — the minimal partitionable
+/// FSM the crash-restore pins below need (self-contained, mirroring the container tests').
+#[derive(Default, Debug, PartialEq)]
+struct SplitSm {
+  units: u64,
+}
+
+impl crate::StateMachine for SplitSm {
+  type Command = Bytes;
+  type Response = u64;
+  type Snapshot = u64;
+  type Error = core::convert::Infallible;
+
+  fn apply(&mut self, _index: Index, _cmd: Bytes) -> Result<u64, Self::Error> {
+    self.units += 1;
+    Ok(self.units)
+  }
+
+  fn snapshot(&self) -> Result<u64, Self::Error> {
+    Ok(self.units)
+  }
+
+  fn restore(&mut self, snapshot: u64) -> Result<(), Self::Error> {
+    self.units = snapshot;
+    Ok(())
+  }
+
+  fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+    let give = u64::from(*instruction.first()?).min(self.units);
+    self.units -= give;
+    Some(Self { units: give })
+  }
+}
+
+type SplitCoord = MultiStreamCoordinator<u64, u64, SplitSm, TestRecord>;
+
+/// Flush the engine barrier and drain every listed group's completions until the host is quiet
+/// (no completion progress, nothing staged) — the driver's storage crank, inlined.
+fn settle_engine(c: &mut SplitCoord, e: &mut GroupEngine<u64, u64>, gids: &[u64], now: Instant) {
+  loop {
+    e.flush();
+    let mut more = false;
+    for g in gids {
+      let (l, s) = e.stores(g).expect("hosted storage");
+      if matches!(
+        c.handle_storage(g, now, l, s),
+        Some(StorageProgress::MorePending)
+      ) {
+        more = true;
+      }
+    }
+    if !more && !e.has_staged() {
+      break;
+    }
+  }
+}
+
+/// The restore-overwrite regression, end to end over ONE engine (the disk): a fork
+/// materializes and goes flush-durable, the child accrues post-fork progress, the host
+/// crashes, and the PARENT ALONE is restored — its un-compacted split entry replays and
+/// re-stages the fork. Pre-fix, the parent's own snapshot meta was the guard's ONLY seed
+/// (zero here: the parent never snapshotted), so the drain re-materialized the fork and the
+/// manufactured baseline overwrote the child's real durable progress (stores collapsed to the
+/// baseline: last_index 4 -> 1, units 4 -> 2). Both independent stops are pinned: the restore
+/// arm seeds the relay guard from the DURABLE engine lineage (the replayed fork folds to a
+/// resolved no-op), and — with that seed bypassed through a lineage-blind floor store — the
+/// materialization edge itself refuses to write over used storage.
+#[test]
+fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
+  let now = Instant::ORIGIN;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+
+  // Genesis: parent 100 leads (single voter) and commits 3 units of load.
+  let mut c1 = SplitCoord::new();
+  engine.add_group(100);
+  c1.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    SplitSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  let d = c1.group(&100).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c1.handle_timeout(&100, d, l, s).unwrap();
+  }
+  settle_engine(&mut c1, &mut engine, &[100], d);
+  assert!(c1.group(&100).unwrap().role().is_leader());
+  for _ in 0..3 {
+    let (l, s) = engine.stores(&100).unwrap();
+    c1.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+    settle_engine(&mut c1, &mut engine, &[100], d);
+  }
+  assert_eq!(c1.group(&100).unwrap().state_machine().units, 3);
+
+  // Split: child 300 takes 2 units; materialize EXACTLY as the drivers do — fork drain, child
+  // registration + baseline + the parent's lineage record all behind ONE engine barrier, then
+  // the fence lift.
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c1.propose_split(
+      &100,
+      d,
+      l,
+      s,
+      &300,
+      0,
+      Bytes::from_static(b"\x02"),
+      &NoFloors,
+    )
+    .expect("the parent is hosted")
+    .expect("the leader appends the split");
+  }
+  settle_engine(&mut c1, &mut engine, &[100], d);
+  let fork = c1.poll_pending_fork().expect("the committed split relays");
+  assert_eq!((fork.child, fork.parent_gen_after), (300, 1));
+  engine.add_group(300);
+  let epoch = engine.next_boot_epoch(&300).unwrap();
+  {
+    let (l, s) = engine.stores(&300).unwrap();
+    c1.create_group_from_fork(
+      300,
+      fork.config,
+      now,
+      1,
+      fork.fsm,
+      fork.blob,
+      fork.read_only,
+      epoch,
+      fork.child_gen,
+      &NoFloors,
+      l,
+      s,
+    )
+    .expect("the fork materializes over the fresh stores");
+  }
+  engine.set_group_gen(&100, fork.parent_gen_after);
+  engine.flush();
+  c1.lift_fork_barrier(&100, fork.split_index);
+
+  // The child accrues REAL post-fork progress: it elects and commits 2 entries of its own.
+  let dc = c1.group(&300).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = engine.stores(&300).unwrap();
+    c1.handle_timeout(&300, dc, l, s).unwrap();
+  }
+  settle_engine(&mut c1, &mut engine, &[100, 300], dc);
+  assert!(c1.group(&300).unwrap().role().is_leader());
+  for _ in 0..2 {
+    let (l, s) = engine.stores(&300).unwrap();
+    c1.submit_propose(&300, dc, l, s, &Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+    settle_engine(&mut c1, &mut engine, &[100, 300], dc);
+  }
+  assert_eq!(
+    c1.group(&300).unwrap().state_machine().units,
+    4,
+    "2 forked units + 2 live commits"
+  );
+  let used_last = {
+    let (l, _) = engine.stores(&300).unwrap();
+    l.last_index()
+  };
+  assert!(used_last > Index::new(1), "the child outgrew its baseline");
+
+  // CRASH. The engine is the disk; everything above was flushed and drained.
+  drop(c1);
+
+  // Leg 2 first, with leg 1 BYPASSED (a lineage-blind floor store, the pre-M2 world): the
+  // replayed fork relays, and the materialization edge must refuse to write over the child's
+  // USED stores — the driver's Err arm then resolves the fence and moves on.
+  let mut c2 = SplitCoord::new();
+  let epoch = engine.next_boot_epoch(&100).unwrap();
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c2.restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      SplitSm::default(),
+      epoch,
+      1,
+      &NoFloors,
+      l,
+      s,
+    )
+    .unwrap();
+  }
+  assert_eq!(
+    c2.group(&100).unwrap().state_machine().units,
+    1,
+    "the restored parent replays to its post-split half"
+  );
+  let fork = c2
+    .poll_pending_fork()
+    .expect("a lineage-blind guard seed relays the replayed fork");
+  assert!(
+    !engine.add_group(300),
+    "the child's storage is already hosted in the engine"
+  );
+  let epoch = engine.next_boot_epoch(&300).unwrap();
+  let refusal = {
+    let (l, s) = engine.stores(&300).unwrap();
+    c2.create_group_from_fork(
+      300,
+      fork.config,
+      now,
+      1,
+      fork.fsm,
+      fork.blob,
+      fork.read_only,
+      epoch,
+      fork.child_gen,
+      &NoFloors,
+      l,
+      s,
+    )
+  };
+  assert_eq!(
+    refusal,
+    Err(CreateGroupError::StorageInUse),
+    "a fork never overwrites used storage"
+  );
+  c2.lift_fork_barrier(&100, fork.split_index);
+  {
+    let (l, _) = engine.stores(&300).unwrap();
+    assert_eq!(l.last_index(), used_last, "the refusal wrote nothing");
+  }
+  drop(c2);
+
+  // Leg 1, the fix proper: the restore arm consumes the DURABLE engine lineage (the driver's
+  // pre-call floor snapshot), so the guard already covers the replayed fork and it folds to a
+  // resolved no-op — nothing is relayed at all.
+  struct Snapshot {
+    floor: u64,
+    lineage: u64,
+  }
+  impl FloorStore<u64> for Snapshot {
+    fn floor(&self, _: &u64) -> u64 {
+      self.floor
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.lineage
+    }
+  }
+  let mut c3 = SplitCoord::new();
+  let floors = Snapshot {
+    floor: engine.group_floor(&100),
+    lineage: engine.group_gen(&100),
+  };
+  assert_eq!(
+    floors.lineage, 1,
+    "the barrier made the fork's bump durable"
+  );
+  let epoch = engine.next_boot_epoch(&100).unwrap();
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c3.restore_group(
+      100,
+      single_voter(1),
+      now,
+      1,
+      SplitSm::default(),
+      epoch,
+      1,
+      &floors,
+      l,
+      s,
+    )
+    .unwrap();
+  }
+  assert!(
+    c3.poll_pending_fork().is_none(),
+    "the durable lineage already covers the replayed fork"
+  );
+
+  // The child restores from its own stores with every post-fork commit intact.
+  let floors = Snapshot {
+    floor: engine.group_floor(&300),
+    lineage: engine.group_gen(&300),
+  };
+  let epoch = engine.next_boot_epoch(&300).unwrap();
+  {
+    let (l, s) = engine.stores(&300).unwrap();
+    c3.restore_group(
+      300,
+      single_voter(1),
+      now,
+      1,
+      SplitSm::default(),
+      epoch,
+      0,
+      &floors,
+      l,
+      s,
+    )
+    .unwrap();
+  }
+  assert_eq!(
+    c3.group(&300).unwrap().state_machine().units,
+    4,
+    "the child keeps its post-fork progress across the parent-only restore"
+  );
+  assert_eq!(
+    c3.group(&100).unwrap().state_machine().units + c3.group(&300).unwrap().state_machine().units,
+    5,
+    "conservation: every unit lives in exactly one of parent / child"
+  );
 }

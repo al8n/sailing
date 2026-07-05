@@ -198,6 +198,12 @@ where
   /// collapses two incarnations into one identity for every gen-keyed observer (the multi-VOPR
   /// one-identity oracle keys on it), voiding what the fence exists to distinguish.
   ///
+  /// The `floors` seam feeds the fork replay guard too: the admitted group's guard is raised to
+  /// `floors.lineage(&gid)`, the DURABLE lineage record the driver flushed with each of this
+  /// id's materialized forks — the restored snapshot meta alone can lag it, and a meta-seeded
+  /// guard would re-relay a replayed fork whose child baseline is already durable (see
+  /// [`MultiRaft::raise_relay_guard`]).
+  ///
   /// # Errors
   /// [`CreateGroupError::BelowFloor`] when `generation` is below the id's admission floor (a
   /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) fence refuses every generation),
@@ -231,6 +237,7 @@ where
     self
       .multi
       .restore_group(gid, config, now, seed, fsm, boot_epoch, log, stable)?;
+    self.multi.raise_relay_guard(&key, floors.lineage(&key));
     self.purge_unknown_signal(&key);
     Ok(())
   }
@@ -251,8 +258,9 @@ where
   /// sentinel itself, [`CreateGroupError::Retired`] when the id is tombstoned by a removal;
   /// otherwise the admission checks of [`MultiRaft::create_group_from_fork`] — see
   /// [`CreateGroupError`] — including [`CreateGroupError::InvalidBootEpoch`] when
-  /// `boot_epoch == 0` (a fork's manufactured baseline needs the prior epoch to itself).
-  /// Refusal happens BEFORE any store write.
+  /// `boot_epoch == 0` (a fork's manufactured baseline needs the prior epoch to itself) and
+  /// [`CreateGroupError::StorageInUse`] when the handed stores already hold state (a fork
+  /// never overwrites used storage). Refusal happens BEFORE any store write.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork<L, S>(
     &mut self,

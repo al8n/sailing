@@ -1331,3 +1331,147 @@ fn propose_split_gates_the_child_floor() {
   );
   assert_eq!(log.last_index(), last, "nothing was proposed");
 }
+
+/// The QUIC delegator's restore feeds the fork replay guard from the `floors` seam exactly as
+/// the stream coordinator's does: a restored parent whose log replays an already-materialized
+/// split (its own snapshot meta lags — it never snapshotted) folds the re-staged fork to a
+/// resolved no-op when the durable engine lineage covers it, and relays it only under a
+/// lineage-blind floor store (the control leg proving the seam is what did it).
+#[test]
+fn quic_restore_seeds_the_replay_guard_from_the_floor_seam() {
+  #[derive(Default)]
+  struct SplitSm {
+    units: u64,
+  }
+
+  impl crate::StateMachine for SplitSm {
+    type Command = Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+
+    fn apply(&mut self, _index: Index, _cmd: Bytes) -> Result<u64, Self::Error> {
+      self.units += 1;
+      Ok(self.units)
+    }
+
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.units)
+    }
+
+    fn restore(&mut self, snapshot: u64) -> Result<(), Self::Error> {
+      self.units = snapshot;
+      Ok(())
+    }
+
+    fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+      let give = u64::from(*instruction.first()?).min(self.units);
+      self.units -= give;
+      Some(Self { units: give })
+    }
+  }
+
+  // A crash image whose split is durable in the LOG but not yet in any snapshot meta: two
+  // committed commands, then the committed split of child 300 minted at parent gen 1.
+  let stores = || {
+    let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+    let mut child_bytes = Vec::new();
+    crate::Data::encode(&300u64, &mut child_bytes);
+    let payload =
+      crate::SplitPayload::new(Bytes::from(child_bytes), 0, 1, Bytes::from_static(b"\x01"));
+    let mut buf = Vec::new();
+    crate::wire::encode_split_payload(&payload, &mut buf);
+    let cmd = {
+      let mut c = Vec::new();
+      crate::Data::encode(&Bytes::from_static(b"c"), &mut c);
+      Bytes::from(c)
+    };
+    log.force_append(&[
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(1),
+        crate::EntryKind::Normal,
+        cmd.clone(),
+      ),
+      crate::Entry::new(Term::new(1), Index::new(2), crate::EntryKind::Normal, cmd),
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(3),
+        crate::EntryKind::Split,
+        Bytes::from(buf),
+      ),
+    ]);
+    stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+    (log, stable)
+  };
+
+  struct Floors(u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      self.0
+    }
+  }
+
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([9u8; 16]);
+  let coord = |node: u64| {
+    let opts = ca
+      .cluster_tls(&san(node, &cluster))
+      .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+      .build();
+    let mut seed = [0u8; 32];
+    seed[0] = node as u8;
+    MultiQuicCoordinator::<u64, u64, SplitSm>::with_identity(opts, Some(seed), cluster)
+  };
+
+  // The durable engine lineage (1) covers the replayed fork: nothing relays, and the parent
+  // replayed to its post-split half with the fold having resolved the fork's own barrier.
+  let mut a = coord(1);
+  let (mut log, mut stable) = stores();
+  a.restore_group(
+    100,
+    single_voter(1),
+    Instant::ORIGIN,
+    1,
+    SplitSm::default(),
+    1,
+    1,
+    &Floors(1),
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert!(
+    a.poll_pending_fork().is_none(),
+    "the durable lineage already covers the replayed fork"
+  );
+  assert_eq!(a.group(&100).unwrap().state_machine().units, 1, "2 - 1");
+  assert!(a.group(&300).is_none(), "no child materialized from replay");
+
+  // The control: a lineage-blind floor store leaves the meta-seeded guard at 0 and the same
+  // replayed fork RELAYS — the floors seam, not the meta, is what folded it above.
+  let mut b = coord(2);
+  let (mut log, mut stable) = stores();
+  b.restore_group(
+    100,
+    single_voter(1),
+    Instant::ORIGIN,
+    1,
+    SplitSm::default(),
+    1,
+    1,
+    &NoFloors,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let fork = b
+    .poll_pending_fork()
+    .expect("a lineage-blind guard seed relays the replayed fork");
+  assert_eq!((fork.child, fork.parent_gen_after), (300, 1));
+  assert_eq!(fork.fsm.units, 1, "the re-forked half");
+}

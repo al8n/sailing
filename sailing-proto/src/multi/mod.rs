@@ -196,6 +196,30 @@ const fn validate_fork_boot_epoch(boot_epoch: u64) -> Result<(), CreateGroupErro
   Ok(())
 }
 
+/// The fork constructors' used-storage admission check, run BEFORE any store write:
+/// [`write_fork_baseline`] OVERWRITES whatever the stores hold, so a fork is only ever written
+/// over VIRGIN stores — no visible hard state, no snapshot slot, no log content (an empty,
+/// never-re-baselined log). A used incarnation's stores here mean a replayed fork raced the
+/// child's real durable progress (a crash restored the parent while the child stayed unhosted);
+/// overwriting would destroy that progress, so the fork refuses and the child reaches this host
+/// by restore instead. The legitimate crash-BEFORE-flush replay is untouched: nothing of the
+/// child ever became durable, the stores are virgin, and re-materialization stays idempotent.
+fn validate_virgin_stores<L, S>(log: &L, stable: &S) -> Result<(), CreateGroupError>
+where
+  L: LogStore,
+  S: StableStore,
+  S::NodeId: PartialEq,
+{
+  let used = stable.hard_state() != HardState::initial()
+    || stable.snapshot().is_some()
+    || log.last_index() > Index::ZERO
+    || log.first_index() > Index::new(1);
+  if used {
+    return Err(CreateGroupError::StorageInUse);
+  }
+  Ok(())
+}
+
 /// One committed, container-relayed fork: everything a driver needs to materialize the child
 /// group behind its engine barrier. Yielded by [`MultiRaft::poll_pending_fork`] after the typed
 /// child id decoded, the replay guard passed, and the child config was rebuilt from the parent's
@@ -535,6 +559,27 @@ where
       ep.resolve_fork(split_index);
     }
   }
+
+  /// Raise `gid`'s relay-time replay guard to at least `lineage` — the restore arms' seam for
+  /// the DURABLE lineage record the host's engine keeps beside the group's stores. The restore
+  /// constructors seed the guard from the restored snapshot meta alone, but that meta can LAG
+  /// what this host already materialized: a driver flushes the parent's lineage record together
+  /// with each fork's child baseline (one barrier), while the parent's next snapshot — the only
+  /// thing that folds the bump into the meta — may never have happened before the crash. A
+  /// parent restored in that window replays its split entries and re-stages their forks; under
+  /// the meta-only seed the container would relay them again, and materializing one against an
+  /// unhosted child would aim a manufactured baseline at the child's REAL durable progress.
+  /// Feeding the engine's record here folds those already-durable forks to resolved no-ops
+  /// instead. Monotone (never lowers) and a no-op for an unhosted `gid`, so a lineage-less
+  /// floor store leaves the snapshot-seeded guard exactly as it was.
+  pub fn raise_relay_guard(&mut self, gid: &G, lineage: u64) {
+    if !self.groups.contains_key(gid) {
+      return;
+    }
+    if let Some(guard) = self.lineage.get_mut(gid) {
+      *guard = (*guard).max(lineage);
+    }
+  }
 }
 
 // Default-`Prng` constructors, mirroring `Endpoint::new`/`restart` (which are `Prng`-only; the
@@ -698,17 +743,23 @@ where
   /// ENFORCED here: `boot_epoch == 0` is refused, because the manufactured baseline's store
   /// writes ride the prior epoch and epoch 0 has none — the baseline's completions would land
   /// in the child's own first live epoch and could release a vote/campaign action they do not
-  /// prove durable. The stores must be FRESH: the baseline overwrites whatever they hold. On a
-  /// stable store whose `hard_state()` lags submitted writes to a durability barrier, the child
-  /// boots at the store's PRIOR durable term (the baseline meta alone drives the applied/commit
-  /// derivation, so the boot is unchanged otherwise) and the manufactured term becomes durable
-  /// at the next barrier — the crash-recovery shape is the spec'd one either way.
+  /// prove durable. The stores must be VIRGIN, and that too is ENFORCED
+  /// ([`CreateGroupError::StorageInUse`]): the baseline overwrites whatever the stores hold, so
+  /// a fork over a used incarnation's storage — a replayed split racing the child's real
+  /// durable progress after a parent-only restore — would destroy that progress; only the
+  /// crash-before-flush replay, whose stores hold nothing durable, may re-fork (idempotently).
+  /// On a stable store whose `hard_state()` lags submitted writes to a durability barrier, the
+  /// child boots at the store's PRIOR durable term (the baseline meta alone drives the
+  /// applied/commit derivation, so the boot is unchanged otherwise) and the manufactured term
+  /// becomes durable at the next barrier — the crash-recovery shape is the spec'd one either
+  /// way.
   ///
   /// # Errors
   /// The same admission checks as [`create_group`](Self::create_group) — see
   /// [`CreateGroupError`] — plus [`CreateGroupError::InvalidBootEpoch`] when `boot_epoch == 0`
-  /// (a fork's baseline needs the prior epoch to itself). Refusal happens BEFORE any store
-  /// write.
+  /// (a fork's baseline needs the prior epoch to itself) and
+  /// [`CreateGroupError::StorageInUse`] when the stores already hold state (a fork never
+  /// overwrites used storage). Refusal happens BEFORE any store write.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork<L, S>(
     &mut self,
@@ -734,6 +785,7 @@ where
   {
     validate_fork_boot_epoch(boot_epoch)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    validate_virgin_stores(log, stable)?;
     self.host_id.get_or_insert(config.id());
     // `generation` (the child's incarnation under the unified lineage counter) and the
     // inherited `read_only` provenance ride the baseline meta, so the restart boot below — and
@@ -880,7 +932,8 @@ where
   /// # Errors
   /// The admission checks of [`CreateGroupError`], including
   /// [`CreateGroupError::InvalidBootEpoch`] when `boot_epoch == 0` (a fork's baseline needs the
-  /// prior epoch to itself); refusal happens BEFORE any store write.
+  /// prior epoch to itself) and [`CreateGroupError::StorageInUse`] over non-virgin stores;
+  /// refusal happens BEFORE any store write.
   #[allow(clippy::too_many_arguments)]
   pub fn create_group_from_fork_with_rng<L, S>(
     &mut self,
@@ -906,6 +959,7 @@ where
   {
     validate_fork_boot_epoch(boot_epoch)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    validate_virgin_stores(log, stable)?;
     self.host_id.get_or_insert(config.id());
     write_fork_baseline(
       &config, snapshot, generation, read_only, boot_epoch, log, stable,
