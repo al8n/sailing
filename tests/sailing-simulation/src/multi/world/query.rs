@@ -218,6 +218,44 @@ impl MultiWorld {
     self.cross_talk_checked
   }
 
+  /// Group `gid`'s LIVE key population, ascending (the keyed workload's pick set; empty for an
+  /// unknown gid).
+  pub(crate) fn group_keys_of(&self, gid: u64) -> Vec<u16> {
+    self
+      .groups
+      .get(&gid)
+      .map(|m| m.keys.iter().copied().collect())
+      .unwrap_or_default()
+  }
+
+  /// Whether `key` is currently in `gid`'s live population — false once a split moved it to a
+  /// child (the read ledger's moved-key drop predicate).
+  pub(crate) fn group_holds_key(&self, gid: u64, key: u16) -> bool {
+    self.groups.get(&gid).is_some_and(|m| m.keys.contains(&key))
+  }
+
+  /// Committed splits the world REGISTERED (child materialized) — the report's split witness.
+  #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the multi VOPR report wires this")
+  )]
+  pub(crate) fn splits_applied(&self) -> u64 {
+    self.splits_applied
+  }
+
+  /// `Event::SplitStale` observations drained across the run.
+  #[cfg(test)]
+  pub(crate) fn split_stale_observed(&self) -> u64 {
+    self.split_stale
+  }
+
+  /// Split-conflict signals drained across the run (unreachable under fresh-minted child ids;
+  /// counted so a future reachable path is visible, never silently swallowed).
+  #[cfg(test)]
+  pub(crate) fn split_conflicts_observed(&self) -> u64 {
+    self.split_conflicts
+  }
+
   /// Completed world ticks (for the fuzzer's panic messages).
   pub(crate) fn ticks(&self) -> u64 {
     self.tick_count

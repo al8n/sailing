@@ -32,16 +32,18 @@ mod oracles;
 // multi-private.
 pub(crate) use oracles::{decode_gkv, encode_gkv};
 
+/// The per-group gkv key DOMAIN: every group's keyed workload writes keys `0..NUM_KEYS`, a
+/// freshly created (or recreated) group owns the full domain, and a split partitions the
+/// owning group's live slice of it.
+pub(crate) const NUM_KEYS: u16 = 8;
+
 mod vopr;
 pub use vopr::{MultiAction, MultiProfile, MultiVoprReport, run_multi_vopr};
 
 mod interaction;
 pub use interaction::{MultiInteractionEnv, run_multi_interaction_file};
 
-// The P6 split/merge instruction-conservation seam: a pure ledger type M4/M5 wire to the real
-// split and merge actions; until then only its own teeth tests exercise it.
-#[cfg_attr(
-  not(test),
-  expect(dead_code, reason = "M4/M5 wire the split/merge actions to this seam")
-)]
+// The P6 split/merge instruction-conservation seam: a pure per-`(group, key)` history ledger.
+// The world's split wiring records into it and judges every registered split's partition; the
+// union (merge) assertion stays teeth-tests-only until the merge milestone wires it.
 mod conservation;

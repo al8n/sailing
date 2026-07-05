@@ -129,12 +129,14 @@ impl MultiInteractionEnv {
       "campaign" => self.campaign(gid, d),
       "propose" => self.propose(gid, d),
       "propose-conf-change" => self.propose_conf_change(gid, d),
+      "propose-split" => self.propose_split(gid, d),
       "tick-heartbeat" => self.tick(gid, d, HEARTBEAT_INTERVAL),
       "tick-election" => self.tick(gid, d, ELECTION_TIMEOUT),
       "stabilize" => self.stabilize(gid),
       "status" => self.status(gid, d),
       "raft-state" => self.raft_state(gid),
       "raft-log" => self.raft_log(gid, d),
+      "applied" => self.applied(gid, d),
       other => std::format!("unknown command: {other}\n"),
     }
   }
@@ -259,13 +261,20 @@ impl MultiInteractionEnv {
   }
 
   /// `propose g=<gid> <node> data=<bytes>` — the node proposes a normal command on its `gid`
-  /// replica, the replication batch flushes, and the node drains.
+  /// replica, the replication batch flushes, and the node drains. The keyed form
+  /// `key=<k> value=<v>` proposes the gkv payload instead — the keyed sim FSM's split domain,
+  /// so a split scenario's handover is visible through the `applied` directive.
   fn propose(&mut self, gid: u64, d: &Directive) -> String {
     let Some(id) = d.positional(0).and_then(|s| s.parse::<u64>().ok()) else {
       return "propose: missing node id\n".to_string();
     };
-    let data = d.value::<String>("data").unwrap_or_default();
-    let cmd = bytes::Bytes::from(data.into_bytes());
+    let cmd = match (d.value::<u16>("key"), d.value::<u64>("value")) {
+      (Some(key), Some(value)) => bytes::Bytes::from(super::encode_gkv(gid, key, value)),
+      _ => {
+        let data = d.value::<String>("data").unwrap_or_default();
+        bytes::Bytes::from(data.into_bytes())
+      }
+    };
     if !self.hosts.get(&id).is_some_and(|h| h.contains_group(&gid)) {
       return std::format!("n{id}: does not host g{gid}\n");
     }
@@ -352,6 +361,46 @@ impl MultiInteractionEnv {
         .expect("hosted group flushes");
     }
     self.drain_node(leader, &mut out);
+    out
+  }
+
+  /// `propose-split g=<gid> <leader> child=<cid> point=<key>` — the leader proposes forking the
+  /// keyed FSM's at-or-above-`point` slice into the fresh group `cid` (gen 0 — harness child ids
+  /// are never reused). Renders the accepted index or the typed refusal, then flushes and drains
+  /// exactly like `propose`; the committed entry's forks materialize in later drains (see
+  /// `drain_node`'s fork pump).
+  fn propose_split(&mut self, gid: u64, d: &Directive) -> String {
+    let Some(id) = d.positional(0).and_then(|s| s.parse::<u64>().ok()) else {
+      return "propose-split: missing node id\n".to_string();
+    };
+    let Some(child) = d.value::<u64>("child") else {
+      return "propose-split: missing child=<gid>\n".to_string();
+    };
+    let Some(point) = d.value::<u16>("point") else {
+      return "propose-split: missing point=<key>\n".to_string();
+    };
+    if !self.hosts.get(&id).is_some_and(|h| h.contains_group(&gid)) {
+      return std::format!("n{id}: does not host g{gid}\n");
+    }
+    let mut out = String::new();
+    {
+      let now = self.now;
+      let host = self.hosts.get_mut(&id).expect("host exists");
+      let (log, stable) = self.stores.get_mut(&(id, gid)).expect("replica stores");
+      let instruction = bytes::Bytes::copy_from_slice(&point.to_le_bytes());
+      match host.propose_split(&gid, now, log, stable, &child, 0, instruction) {
+        Some(Ok(idx)) => out.push_str(&std::format!(
+          "g{gid} n{id} proposed split child=g{child} point={point} index={}\n",
+          idx.get()
+        )),
+        Some(Err(e)) => out.push_str(&std::format!("g{gid} n{id} split rejected: {e:?}\n")),
+        None => out.push_str(&std::format!("n{id}: does not host g{gid}\n")),
+      }
+      host
+        .flush_appends(&gid, now, log, stable)
+        .expect("hosted group flushes");
+    }
+    self.drain_node(id, &mut out);
     out
   }
 
@@ -544,6 +593,30 @@ impl MultiInteractionEnv {
     out
   }
 
+  /// `applied g=<gid> <node>` — the replica's applied record, gkv cells decoded as
+  /// `g<tag> k<key>=<value>` (the tag names the group that ACCEPTED the write, so a fork-inherited
+  /// baseline renders parent-tagged) and any other command via the data formatter. The golden's
+  /// view of a split handover.
+  fn applied(&mut self, gid: u64, d: &Directive) -> String {
+    let Some(id) = d.positional(0).and_then(|s| s.parse::<u64>().ok()) else {
+      return "applied: missing node id\n".to_string();
+    };
+    let Some(ep) = self.hosts.get(&id).and_then(|h| h.group(&gid)) else {
+      return std::format!("n{id}: does not host g{gid}\n");
+    };
+    let cells = ep.state_machine().applied();
+    let mut out = std::format!("n{id}: applied={}\n", cells.len());
+    for (idx, cmd) in cells {
+      match super::decode_gkv(cmd) {
+        Some((tag, key, value)) => {
+          out.push_str(&std::format!("  {} g{tag} k{key}={value}\n", idx.get()));
+        }
+        None => out.push_str(&std::format!("  {}{}\n", idx.get(), fmt_data(cmd))),
+      }
+    }
+    out
+  }
+
   /// Process node `id`'s storage completions for EVERY hosted group, then drain its outgoing
   /// messages onto the bus and its events, rendering each with the owning group's tag. Returns
   /// whether anything was produced.
@@ -580,7 +653,62 @@ impl MultiInteractionEnv {
         produced = true;
         out.push_str(&std::format!("g{g} {}", render_event(id, &ev)));
       }
-      if !any {
+      // Materialize committed forks the drains above applied — the harness plays the driver's
+      // fork drain. Sync in-memory stores make the child's baseline durable at the call, so the
+      // parent's snapshot barrier lifts immediately (the one-crank engine-flush contract in its
+      // synchronous form); the env never restarts a node, so every fork is its replica's first
+      // boot (epoch 1). A materialization re-runs the loop: the child is a hosted group from
+      // this point on and drains like any other.
+      let mut forked = false;
+      loop {
+        let host = self.hosts.get_mut(&id).expect("host exists");
+        let Some(fork) = host.poll_pending_fork() else {
+          break;
+        };
+        forked = true;
+        produced = true;
+        let (parent, child, split_index) = (fork.parent, fork.child, fork.split_index);
+        self
+          .stores
+          .insert((id, child), (MemLog::new(), MemStable::new()));
+        let (log, stable) = self.stores.get_mut(&(id, child)).expect("fresh stores");
+        let host = self.hosts.get_mut(&id).expect("host exists");
+        host
+          .create_group_from_fork(
+            child,
+            fork.child_gen,
+            fork.config,
+            now,
+            id,
+            fork.fsm,
+            fork.blob,
+            fork.read_only,
+            1,
+            log,
+            stable,
+          )
+          .unwrap_or_else(|e| panic!("fork of g{child} on n{id}: {e:?}"));
+        host.lift_fork_barrier(&parent, split_index);
+        let inherited = host
+          .group(&child)
+          .map(|ep| ep.state_machine().applied().len())
+          .unwrap_or(0);
+        out.push_str(&std::format!(
+          "g{child} n{id} forked from g{parent} ({inherited} inherited)\n"
+        ));
+      }
+      while let Some((p, c)) = self
+        .hosts
+        .get_mut(&id)
+        .expect("host exists")
+        .poll_split_conflict()
+      {
+        produced = true;
+        out.push_str(&std::format!(
+          "n{id}: split conflict parent=g{p} child=g{c} (parked)\n"
+        ));
+      }
+      if !any && !forked {
         break;
       }
     }

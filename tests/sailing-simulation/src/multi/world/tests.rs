@@ -388,3 +388,163 @@ fn two_groups_elect_and_commit_independently() {
       .all(|(_, c)| c.ends_with(b"-100"))
   );
 }
+
+/// Propose `payload` on `gid`, ticking through transient leaderless windows until accepted.
+fn propose_until_accepted(w: &mut MultiWorld, gid: u64, payload: &[u8]) {
+  for _ in 0..2_000 {
+    if w.propose(gid, payload).is_some() {
+      return;
+    }
+    w.tick();
+  }
+  panic!("proposal on g{gid} was never accepted");
+}
+
+/// Drive g100 (3 voters, one write per key 0..8) through a split at point 4 into child `child`,
+/// to the point where the child is registered and elected. Returns the world.
+fn world_after_split(seed: u64, child: u64) -> MultiWorld {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  w.reconcile_membership(100);
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| {
+      let leader = w.leader_of(100);
+      leader.is_some_and(|l| w.applied_of(l, 100).len() >= 8)
+    }),
+    "the keyed baseline never applied"
+  );
+
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    match w.propose_split(100, child, 4) {
+      Some(Ok(_)) => {
+        accepted = true;
+        break;
+      }
+      _ => {
+        w.tick();
+      }
+    }
+  }
+  assert!(accepted, "the split was never accepted");
+  // The population flips AT PROPOSE: moved keys are parked before the entry even commits.
+  assert_eq!(w.group_keys_of(100), std::vec![0, 1, 2, 3]);
+
+  assert!(
+    w.run_until(3_000, |w| w.leader_of(child).is_some()),
+    "the forked child never elected: {}",
+    w.dbg_group(child)
+  );
+  w
+}
+
+/// The split lifecycle end-to-end in the world: propose → fork pump materialization on every
+/// parent voter → child registration (population, checker, catalog) → child election → fresh
+/// keyed load on BOTH sides — with the handover visible in the child's applied baseline and
+/// the conservation verdict green over independently recorded histories.
+#[test]
+fn split_reshapes_the_world_end_to_end() {
+  let mut w = world_after_split(9, 200);
+
+  assert_eq!(w.splits_applied(), 1);
+  assert_eq!(w.group_keys_of(200), std::vec![4, 5, 6, 7]);
+  assert_eq!(
+    w.hosting_nodes(200),
+    std::vec![0, 1, 2],
+    "the child bootstraps colocated on the parent's voters"
+  );
+  assert_eq!(w.generation_of(200), 0, "a forked child starts at gen 0");
+
+  // The handover is the child's OPENING record: the four moved cells, parent-tagged (the gkv
+  // tag names the group that ACCEPTED the write), with their parent-log indices intact.
+  let baseline: Vec<(u64, u16, u64)> = w
+    .applied_of(0, 200)
+    .iter()
+    .filter_map(|(_, cmd)| crate::multi::decode_gkv(cmd))
+    .collect();
+  assert_eq!(
+    baseline,
+    std::vec![(100, 4, 4), (100, 5, 5), (100, 6, 6), (100, 7, 7)],
+    "the fork baseline must carry exactly the moved keys' history"
+  );
+
+  // Both sides commit fresh keyed load post-split.
+  propose_until_accepted(&mut w, 100, &crate::multi::encode_gkv(100, 0, 100));
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 5, 101));
+  assert!(
+    w.run_until(2_000, |w| {
+      (0..3).all(|n| {
+        let parent_new = w
+          .applied_of(n, 100)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 0, 100)));
+        let child_new = w
+          .applied_of(n, 200)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 5, 101)));
+        parent_new && child_new
+      })
+    }),
+    "post-split load must commit on both sides"
+  );
+  assert!(w.agreement_holds(100) && w.agreement_holds(200));
+
+  assert_eq!(w.split_stale_observed(), 0);
+  assert_eq!(w.split_conflicts_observed(), 0);
+  w.check_now();
+  w.finalize_conservation_or_panic(9);
+  w.finalize_membership_or_panic(9);
+}
+
+/// Crash-replay idempotence: a crashed node restores BOTH sides from durable state, its parent
+/// replica's restart replays the committed split entry and re-stages the fork, and the relay
+/// folds it against the already-hosted child (the redundant-resolve arm) — never a second
+/// registration, never a re-materialization over the child's real durable progress.
+#[test]
+fn split_replay_after_crash_registers_once() {
+  let mut w = world_after_split(11, 200);
+  assert_eq!(w.splits_applied(), 1);
+
+  w.crash(0);
+  for _ in 0..200 {
+    w.tick();
+  }
+  assert_eq!(
+    w.splits_applied(),
+    1,
+    "a replayed fork against the hosted child must fold, not re-register"
+  );
+  assert!(
+    w.hosts_group(0, 200),
+    "the crashed node restores its child replica"
+  );
+
+  // Both sides stay live and committing after the replay.
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()
+    && w.leader_of(200).is_some()));
+  propose_until_accepted(&mut w, 100, &crate::multi::encode_gkv(100, 1, 200));
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 6, 201));
+  assert!(
+    w.run_until(2_000, |w| {
+      w.agreement_holds(100)
+        && w.agreement_holds(200)
+        && (0..3).all(|n| {
+          w.applied_of(n, 200)
+            .iter()
+            .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 6, 201)))
+        })
+    }),
+    "post-replay load must commit on both sides"
+  );
+  w.finalize_conservation_or_panic(11);
+  w.finalize_membership_or_panic(11);
+}

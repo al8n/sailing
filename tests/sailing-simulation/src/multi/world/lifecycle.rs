@@ -36,6 +36,13 @@ pub(crate) struct GroupMeta {
   /// Per-hosting-replica count of consecutive settled reconcile passes it has been absent from
   /// the committed membership — the departed/orphan grace counter.
   pub(crate) departed_streak: BTreeMap<u64, u32>,
+  /// The group's LIVE key population: the gkv keys it currently owns out of its per-group
+  /// domain. The keyed workload picks only from here, an accepted split moves the at-or-above
+  /// slice to the child at PROPOSE time, and the oracle-aligned view record keeps only these
+  /// keys' cells. Full domain at creation and recreation (a fresh incarnation owns its whole
+  /// keyspace again — its record is empty, so nothing overlaps a live child's inherited
+  /// history, and the conservation ledger's incarnation-qualified ids keep old verdicts exact).
+  pub(crate) keys: BTreeSet<u16>,
 }
 
 impl MultiWorld {
@@ -96,6 +103,7 @@ impl MultiWorld {
     meta.retired = false;
     meta.generation += 1;
     meta.learners.clear();
+    meta.keys = (0..super::super::NUM_KEYS).collect();
     let voters = meta.voters.clone();
     assert!(
       self.checkers.insert(gid, Checker::new()).is_none(),
@@ -291,6 +299,8 @@ impl MultiWorld {
     self.stables.remove(&(node, gid));
     self.configs.remove(&(node, gid));
     self.swept.remove(&(node, gid));
+    self.cons_swept.remove(&(node, gid));
+    self.fork_baseline.remove(&(node, gid));
     self.conf_changed.remove(&(node, gid));
     self.snapshot_lineage.remove(&(node, gid));
     self.member_view.remove(&(node, gid));

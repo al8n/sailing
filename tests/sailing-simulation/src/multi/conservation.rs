@@ -93,6 +93,10 @@ impl ConservationLedger {
   /// Assert the merge of `source` into `target` absorbed every source key's FULL history: the
   /// target's copy must start with the source's recorded history as a prefix (M5's shape).
   /// Panics with the group ids, the key, and both histories otherwise.
+  #[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the merge milestone wires assert_union")
+  )]
   pub(crate) fn assert_union(&self, target: u64, source: u64) {
     for k in self.keys_of(source) {
       let s = self.history(source, k);
