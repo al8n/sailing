@@ -249,6 +249,12 @@ impl MultiWorld {
     self.split_stale
   }
 
+  /// Late forks the pump refused against the catalog (retired or recreation-outpaced child id).
+  #[cfg(test)]
+  pub(crate) fn split_refused_observed(&self) -> u64 {
+    self.split_refused
+  }
+
   /// Split-conflict signals drained across the run (unreachable under fresh-minted child ids;
   /// counted so a future reachable path is visible, never silently swallowed).
   #[cfg(test)]
