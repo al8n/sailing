@@ -562,11 +562,13 @@ where
   /// `pump` can transmit anything for the child (a child that can solicit peers is therefore
   /// always locally blob-durable first, which is what makes the hosted-child no-op lift safe;
   /// it also front-runs the factory drain, so a local fork wins any same-id solicitation
-  /// race). A refused materialization — a floored or tombstoned child id, an invalid config —
-  /// abandons THIS fork: its barrier resolves (the parent must not stay fenced for a fork that
-  /// will never land here) and the driver survives; the child still reaches this host by the
-  /// ordinary lifecycle paths (solicitation → factory/embedder → snapshot from a live member,
-  /// whose own blob went durable before it could transmit).
+  /// race). A refused materialization — a floored or tombstoned child id, an invalid config,
+  /// used child storage (which a fork never overwrites) — abandons THIS fork: its barrier
+  /// resolves (the parent must not stay fenced for a fork that will never land here), the
+  /// refusal surfaces as [`LifecycleEvent::SplitRefused`] for the placement brain, and the
+  /// driver survives; the child still reaches this host by the ordinary lifecycle paths
+  /// (restore over its own storage, solicitation → factory/embedder → snapshot from a live
+  /// member, whose own blob went durable before it could transmit).
   fn fork_drain(&mut self, now: Now) {
     while let Some(fork) = self.coord.poll_pending_fork() {
       let parent = fork.parent;
@@ -591,6 +593,9 @@ where
         }
         Err(_) => {
           self.coord.lift_fork_barrier(&parent, split_index);
+          let _ = self
+            .lifecycle_tx
+            .try_send(LifecycleEvent::SplitRefused { parent, child });
         }
       }
     }

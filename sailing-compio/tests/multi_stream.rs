@@ -201,3 +201,73 @@ async fn two_node_multi_host_commits_and_removes() {
     h.shutdown().await.expect("the multi host tears down");
   }
 }
+
+/// An abandoned fork is VISIBLE on the compio plane too: a committed split whose child id is
+/// tombstoned on this host cannot materialize — the drain refuses it, resolves the parent's
+/// fence, and surfaces `LifecycleEvent::SplitRefused` on the lifecycle tail. The parent keeps
+/// serving on its shrunk half; the child stays unhosted until the embedder acts.
+#[compio::test]
+async fn refused_fork_surfaces_on_the_lifecycle_tail() {
+  use sailing_compio::LifecycleEvent;
+
+  let addr: SocketAddr = "127.0.0.1:45310".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+  )
+  .await
+  .expect("the empty multi host binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("group admission");
+  let g100 = handle.group(100);
+  for i in 0..3u64 {
+    assert_eq!(
+      submit_anywhere(std::slice::from_ref(&g100), b"load").await,
+      i + 1
+    );
+  }
+
+  // Tombstone the child id (an unhosted removal still tombstones), then split into it: the
+  // propose gate cannot see this host's removal history, so the entry commits and the refusal
+  // happens at the materialization edge.
+  assert!(!handle.remove_group(300).await.expect("remove resolves"));
+  g100
+    .propose_split(300, 0, Bytes::from_static(b"\x02"))
+    .await
+    .expect("the single-voter leader appends the split");
+
+  // The driver shares this thread's runtime: await the tail, never block it.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    assert!(remaining > Duration::ZERO, "no SplitRefused in time");
+    match compio::time::timeout(remaining, handle.lifecycle().recv_async()).await {
+      Ok(Ok(LifecycleEvent::SplitRefused { parent, child })) => {
+        assert_eq!((parent, child), (100, 300), "the typed refusal");
+        break;
+      }
+      Ok(Ok(_)) => {}
+      Ok(Err(e)) => panic!("the lifecycle tail closed: {e:?}"),
+      Err(_) => panic!("no SplitRefused in time"),
+    }
+  }
+
+  // The parent's half shrank exactly once and its fence resolved: it keeps committing.
+  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 1);
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&g100), b"after").await,
+    2
+  );
+  // The refused child never materialized here.
+  assert!(handle.group(300).status().await.is_err());
+
+  handle.shutdown().await.expect("the multi host tears down");
+}

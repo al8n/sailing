@@ -296,6 +296,19 @@ pub enum LifecycleEvent<G, I> {
     /// The freshly-materialized child group.
     child: G,
   },
+  /// A committed SPLIT's materialization was REFUSED on this host and the fork abandoned: the
+  /// child id is floored or tombstoned here, its config is invalid, or its engine storage
+  /// already holds a used incarnation's durable state (which a fork never overwrites — the
+  /// parent-only crash-restore replay). The parent's snapshot fence over the split index has
+  /// been resolved and the parent continues on its shrunk half; the child does NOT run here
+  /// until the embedder acts — restore it over its own storage, or place it elsewhere and let
+  /// the ordinary lifecycle paths (solicitation, snapshot from a live member) bring it back.
+  SplitRefused {
+    /// The parent group the split rode.
+    parent: G,
+    /// The child group whose materialization was refused here.
+    child: G,
+  },
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to a MULTI-GROUP driver: group lifecycle, the

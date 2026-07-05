@@ -3134,3 +3134,50 @@ async fn late_splitter_converges_via_lifecycle() {
     );
   }
 }
+
+/// An abandoned fork is VISIBLE: a committed split whose child id is tombstoned on this host
+/// cannot materialize — the drain refuses it, resolves the parent's fence, and surfaces
+/// `LifecycleEvent::SplitRefused` so the placement brain learns the child never landed here
+/// (pre-signal, the abandonment was silent). The parent keeps serving on its shrunk half and
+/// the child stays unhosted until the embedder acts.
+#[tokio::test(flavor = "multi_thread")]
+async fn refused_fork_surfaces_on_the_lifecycle_tail() {
+  let addr: SocketAddr = "127.0.0.1:45300".parse().unwrap();
+  let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  create_group_everywhere(std::slice::from_ref(&handle), 100, &[1]).await;
+  let g100 = handle.group(100);
+  for i in 0..3u64 {
+    assert_eq!(
+      submit_anywhere(std::slice::from_ref(&g100), b"load").await,
+      i + 1
+    );
+  }
+
+  // Tombstone the child id (an unhosted removal still tombstones), then split into it: the
+  // parent's propose gate cannot see this host's removal history, so the entry commits and the
+  // refusal happens at the materialization edge.
+  assert!(!handle.remove_group(300).await.expect("remove resolves"));
+  split_anywhere(std::slice::from_ref(&g100), 300, b"\x02").await;
+
+  await_lifecycle(handle.lifecycle(), "the refused fork", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitRefused {
+        parent: 100,
+        child: 300
+      }
+    )
+  })
+  .await;
+
+  // The parent's half shrank exactly once and its fence resolved: it keeps committing.
+  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 1);
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&g100), b"after").await,
+    2
+  );
+  // The refused child never materialized here.
+  assert!(handle.group(300).status().await.is_err());
+}

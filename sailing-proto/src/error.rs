@@ -117,6 +117,15 @@ pub enum CreateGroupError {
     "a fork must boot at epoch >= 1 (epoch 0 would alias the baseline's completions with the child's first live ops)"
   )]
   InvalidBootEpoch,
+  /// A fork constructor was handed stores that already hold state (a durable/visible hard state,
+  /// a snapshot slot, or log content). The manufactured baseline OVERWRITES whatever the stores
+  /// hold, so a fork over a used incarnation's storage would destroy its progress since the fork
+  /// — the crash-then-restore-the-parent replay would clobber the child's real durable state
+  /// with a fresh baseline. Refused BEFORE any store write; only VIRGIN stores (the legitimate
+  /// crash-before-flush replay, where nothing of the child ever became durable) are ever
+  /// written.
+  #[error("the fork's target stores already hold state; a fork never overwrites used storage")]
+  StorageInUse,
 }
 
 /// Why [`MultiRaft::propose_split`](crate::MultiRaft::propose_split) — or a coordinator/driver
