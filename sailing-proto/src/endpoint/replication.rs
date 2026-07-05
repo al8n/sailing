@@ -1131,8 +1131,12 @@ where
     // The lease deadline is bounded by the MIN support across the contributing quorum (`lease_min_support`,
     // min'd here, seeded to the leader's own election_timeout each round), so a voter with a SHORTER
     // election_timeout caps the lease at its real election window — the leader never out-lives a supporter.
+    // A pending or applied merge freeze stops the renewal re-arming `lease_valid_until`: the
+    // append-observed kill covers FORMATION as well as serving, so a frozen (or freezing) source
+    // can never accumulate a fresh lease to serve the moment a rollback lands.
     if response.lease_round() == self.check_quorum_lease.lease_round
       && response.lease_support() > Duration::ZERO
+      && !self.merge_lease_killed()
     {
       self
         .check_quorum_lease

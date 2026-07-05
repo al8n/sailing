@@ -2182,7 +2182,10 @@ where
         if heartbeat_due && self.lease_guard.lease_refresh_wanted {
           self.lease_guard.lease_refresh_wanted = false;
           let last = log.last_index();
+          // A pending or applied merge freeze suppresses the refresh: re-anchoring would re-arm
+          // lease serving on a group the freeze just killed it for (formation is killed too).
           if self.leaseguard_timing().is_some()
+            && !self.merge_lease_killed()
             && self.transfer.lead_transferee.is_none()
             && last == self.commit
             && !self.lease_guard_read_live(now, log)
@@ -2210,6 +2213,8 @@ where
           && mode != LeaseRefresh::Off
           && self.lease_guard.read_since_anchor
           && self.leaseguard_timing().is_some()
+          // The proactive refresh is lease FORMATION — a pending or applied freeze kills it.
+          && !self.merge_lease_killed()
           && self.transfer.lead_transferee.is_none()
           && log.last_index() == self.commit
         {

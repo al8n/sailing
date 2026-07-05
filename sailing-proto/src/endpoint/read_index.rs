@@ -121,9 +121,14 @@ where
   /// election timers, a follower could time out and elect a new leader before this lease expires.
   /// Deployments that cannot bound clock drift MUST use `ReadOnlyOption::Safe` (the default), whose
   /// per-read heartbeat round needs no timing assumption.
+  ///
+  /// A pending or applied merge FREEZE kills the lease unconditionally (`merge_lease_killed`):
+  /// the clock-free merge argument orders every lease read before the freeze's APPEND, so from
+  /// that observation on the leader must not serve off any lease, however fresh.
   #[inline]
   pub(crate) fn lease_read_available(&self, now: Now) -> bool {
     self.config.check_quorum()
+      && !self.merge_lease_killed()
       && self.transfer.lead_transferee.is_none()
       && !self.transfer.forced_handoff_this_term
       && self
@@ -153,6 +158,11 @@ where
   /// degrade to the safe heartbeat round — on an inactive/invalid config (see
   /// [`leaseguard_timing`](Self::leaseguard_timing)) or an unreadable/absent anchor.
   pub(crate) fn lease_guard_read_live<L: LogStore>(&mut self, now: Now, log: &L) -> bool {
+    // A pending or applied merge freeze kills the anchor serve outright — the same clock-free
+    // ordering as the LeaseBased gate: no lease read may follow the freeze's append observation.
+    if self.merge_lease_killed() {
+      return false;
+    }
     let Some((delta, _drift)) = self.leaseguard_timing() else {
       return false;
     };

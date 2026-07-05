@@ -352,3 +352,249 @@ fn snapshot_install_clears_a_discarded_freeze_pending() {
     "the discarded freeze releases the kill"
   );
 }
+
+/// The spec's `frozen_source_lease_dies_at_append` row, LeaseBased half: a leader with a LIVE,
+/// freshly-confirmed CheckQuorum lease stops lease-serving the moment it PROPOSES the freeze —
+/// before commit, before apply — and the read degrades to the Safe heartbeat round.
+#[test]
+fn pending_freeze_kills_the_leasebased_lease_at_propose() {
+  use crate::{AppendResponse, HeartbeatResponse, ReadOnlyOption};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseBased)
+  .with_check_quorum(true);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  // A fresh lease: heartbeat round + a quorum response echoing it with enforcement advertised.
+  let hb_at = ep.poll_timeout().expect("heartbeat timer armed");
+  ep.handle_timeout(hb_at, &mut log, &mut stable);
+  let lease_round = {
+    let mut lr = None;
+    while let Some(out) = ep.poll_message() {
+      if let Message::Heartbeat(hb) = out.message() {
+        lr = Some(hb.lease_round());
+      }
+    }
+    lr.expect("a heartbeat carrying a lease round")
+  };
+  ep.handle_message(
+    hb_at,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::HeartbeatResponse(
+      HeartbeatResponse::new(Term::new(1), 2u64, bytes::Bytes::new())
+        .with_lease_round(lease_round)
+        .with_lease_support(Duration::from_millis(1000)),
+    ),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  assert!(
+    ep.lease_read_available(hb_at.into()),
+    "the lease is live before the freeze"
+  );
+
+  let _ = ep
+    .propose_merge_entry(
+      hb_at,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .expect("the source leader appends the freeze");
+  assert!(
+    !ep.lease_read_available(hb_at.into()),
+    "the lease dies at the freeze's APPEND, not its commit or apply"
+  );
+  // Behavioral: the read is still ACCEPTED, but degrades to the Safe heartbeat round.
+  ep.read_index(hb_at, &log, &stable, bytes::Bytes::from_static(b"r"))
+    .expect("reads stay accepted while the freeze is pending");
+  assert!(
+    ep.poll_event().is_none(),
+    "no immediate ReadState — the lease shortcut is dead"
+  );
+  let mut read_hb = false;
+  while let Some(out) = ep.poll_message() {
+    if let Message::Heartbeat(hb) = out.message()
+      && !hb.context().is_empty()
+    {
+      read_hb = true;
+    }
+  }
+  assert!(read_hb, "the read degraded to the Safe heartbeat round");
+}
+
+/// The LeaseGuard half of the same row: a live committed current-term anchor stops serving the
+/// moment the freeze is proposed (the anchor gate fails closed), same clock-free ordering.
+#[test]
+fn pending_freeze_kills_the_leaseguard_anchor_at_propose() {
+  use crate::{AppendResponse, ReadOnlyOption};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(500))
+  .with_clock_drift_bound(Duration::from_millis(10));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  // Commit the stamped no-op: the current-term committed anchor the LeaseGuard serve keys on.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  assert!(
+    ep.lease_guard_read_live(d.into(), &log),
+    "the anchor is live before the freeze"
+  );
+
+  let _ = ep
+    .propose_merge_entry(
+      d,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .expect("the source leader appends the freeze");
+  assert!(
+    !ep.lease_guard_read_live(d.into(), &log),
+    "the anchor serve dies at the freeze's APPEND"
+  );
+}
+
+/// While a freeze is PENDING no refresh no-op is appended: the pending window's own guards and
+/// the merge kill overlap here (the freeze append leaves `last > commit`), so this pins the
+/// BEHAVIOR — nothing re-anchors the lease once the freeze enters the log; the frozen-phase
+/// variant (where the kill alone carries it) rides the freeze-apply suite.
+#[test]
+fn pending_freeze_appends_no_proactive_refresh() {
+  use crate::{AppendResponse, LeaseRefresh, ReadOnlyOption};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(500))
+  .with_clock_drift_bound(Duration::from_millis(10))
+  .with_lease_refresh(LeaseRefresh::Continuous);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  // A served read arms `read_since_anchor` (the proactive gate's demand signal).
+  ep.read_index(d, &log, &stable, bytes::Bytes::from_static(b"r"))
+    .expect("leaseguard read accepted");
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  let _ = ep
+    .propose_merge_entry(
+      d,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .expect("freeze appended");
+  let last_before = log.last_index();
+  // Fire the next heartbeat tick: with the freeze pending, Continuous must append NOTHING.
+  let hb_at = ep.poll_timeout().expect("heartbeat timer armed");
+  ep.handle_timeout(hb_at, &mut log, &mut stable);
+  assert_eq!(
+    log.last_index(),
+    last_before,
+    "no refresh no-op while a freeze is pending"
+  );
+  assert_eq!(ep.lease_refreshes(), 0, "the proactive counter never moved");
+}
