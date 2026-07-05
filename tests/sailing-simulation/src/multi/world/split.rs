@@ -187,8 +187,9 @@ impl MultiWorld {
         // path delivered it: every parent replica manufactures the fork at the same applied
         // prefix (the split entry's log position), and the blob is authoritative at
         // materialization while `LogSm::snapshot()` carries the full record to any
-        // snapshot-wired latecomer. Group-level here is what keeps the aligned view and the
-        // cross-talk floor independent of HOW a replica arrived.
+        // snapshot-wired latecomer. Group-level here is what keeps the cross-talk floor
+        // independent of HOW a replica arrived (see `cross_talk_sweep` for why the count
+        // stays sound once onward splits shrink the inherited prefix).
         fork_baseline: fork.fsm.applied().len(),
         ..lifecycle::GroupMeta::default()
       },
@@ -219,10 +220,11 @@ impl MultiWorld {
   /// Materialize one fork on `node`: fresh stores, the manufactured snapshot install through
   /// `create_group_from_fork`, the world's per-replica bookkeeping, and the barrier lift (sync
   /// stores make the baseline durable at the call). Deliberately NO oracle-view seeding here:
-  /// the aligned view and the cross-talk floor derive from the group registration record
-  /// (`GroupMeta::fork_baseline`), and the conservation recorder starts at 0 so the baseline is
-  /// observed as the child's opening history — a snapshot-wired latecomer gets the identical
-  /// treatment without ever passing through this path.
+  /// the aligned view is a pure content rule ([`align_record`](Self::align_record)), the
+  /// cross-talk floor derives from the group registration record (`GroupMeta::fork_baseline`),
+  /// and the conservation recorder starts at 0 so the baseline is observed as the child's
+  /// opening history — a snapshot-wired latecomer gets the identical treatment without ever
+  /// passing through this path.
   fn wire_fork_replica(&mut self, node: u64, fork: sailing_proto::GroupFork<u64, u64, LogSm>) {
     let child = fork.child;
     self.logs.insert((node, child), MemLog::new());
@@ -264,27 +266,48 @@ impl MultiWorld {
       .lift_fork_barrier(&fork.parent, fork.split_index);
   }
 
-  /// The ORACLE-ALIGNED applied record for `(node, gid)`: the raw record minus the
-  /// fork-inherited baseline (its cells carry PARENT-log indices — inside the child's index
-  /// space they would collide with the child's own entries and poison the index-keyed rewrite
-  /// high-water) and minus cells of GIVEN-AWAY keys (a split removes them from a parent replica
-  /// mid-record at ITS apply point, so two parent replicas at different split progress stop
-  /// being positionally prefix-related; filtering both sides restores the prefix notion). The
-  /// baseline comes off the GROUP record, so every replica view of a fork-born incarnation
-  /// aligns identically however it arrived. The dropped cells are not unjudged: the
-  /// conservation ledger compares them exact-cell across the handover, and quiesce equality
-  /// reads the raw records once every replica converged. For a group that never split this is
-  /// the raw record verbatim.
+  /// The ORACLE-ALIGNED applied record for `(node, gid)`:
+  /// [`align_record`](Self::align_record) over the raw record under the group's live key
+  /// population. The dropped cells are not unjudged: the conservation ledger compares inherited
+  /// cells exact-cell across the handover, and quiesce equality reads the raw records once
+  /// every replica converged. For a group that never split this is the raw record verbatim
+  /// (own-tagged cells, full domain); an unregistered gid aligns as itself.
   pub(super) fn aligned_applied(&self, node: u64, gid: u64) -> AppliedLog {
-    let baseline = self.groups.get(&gid).map_or(0, |m| m.fork_baseline);
-    let keys = self.groups.get(&gid).map(|m| &m.keys);
-    self
-      .applied_of(node, gid)
+    let raw = self.applied_of(node, gid);
+    match self.groups.get(&gid) {
+      Some(meta) => Self::align_record(raw, gid, &meta.keys),
+      None => raw,
+    }
+  }
+
+  /// Align one raw applied record into the oracle's comparison space: keep exactly the group's
+  /// OWN cells for keys it still owns. Per cell:
+  ///   - a gkv cell tagged with ANOTHER gid is fork-inherited — dropped. The tag test is exact:
+  ///     ids are single-incarnation and a child's id is minted strictly after every cell it
+  ///     inherits existed, so no ancestor tag can collide with `gid`, and the cross-talk oracle
+  ///     pins every own-applied gkv cell to `tag == gid`. (Inherited cells also carry
+  ///     PARENT-log indices, which would poison the index-keyed rewrite high-water.)
+  ///   - an own-tagged cell whose key left the live population is given away — dropped. The
+  ///     population flips at PROPOSE, before any replica can apply that split, so this drops
+  ///     from a lagging replica's view exactly the cells `LogSm::split` already removed from an
+  ///     ahead replica's record.
+  ///   - a non-gkv cell never moves in a split — kept.
+  ///
+  /// No positional state anywhere is what buys the invariance the agreement oracle needs: a
+  /// replica that applied split set S of this incarnation at applied index k holds
+  /// `remove_S(baseline) ++ remove_S(own(k))`. The tag test erases `remove_S(baseline)` for
+  /// any S, and the population test collapses `remove_S(own(k))` to `filter(own(k))` for any S
+  /// (every split in any replica's S flipped the population before that replica could apply
+  /// it), so every replica's aligned view is `filter(own(k))` — views differ across replicas
+  /// only by k, an exact prefix relation, whatever the arrival path, replication lag, or
+  /// number of onward splits on either side. A genuine divergence inside `own(k)` survives
+  /// untouched (live key, own tag) and still trips the oracle.
+  pub(super) fn align_record(raw: AppliedLog, gid: u64, population: &BTreeSet<u16>) -> AppliedLog {
+    raw
       .into_iter()
-      .skip(baseline)
-      .filter(|(_, cmd)| match (super::super::decode_gkv(cmd), keys) {
-        (Some((_, key, _)), Some(population)) => population.contains(&key),
-        _ => true,
+      .filter(|(_, cmd)| match super::super::decode_gkv(cmd) {
+        Some((tag, key, _)) => tag == gid && population.contains(&key),
+        None => true,
       })
       .collect()
   }

@@ -552,10 +552,10 @@ fn split_replay_after_crash_registers_once() {
 /// A child replica that arrives by the product's OTHER legitimate path — a fresh observer
 /// caught up by snapshot transfer (`LogSm::snapshot()` carries the full record, inherited
 /// parent-tagged baseline included) — must yield an aligned record identical to a fork-wired
-/// sibling's. The seeding is GROUP-level (the registration record), so the arrival path is
-/// irrelevant; seeding only on the fork-wired path left this twin unswept — its parent-tagged
-/// baseline cells were judged as cross-talk and its unskipped prefix misaligned the positional
-/// agreement leg.
+/// sibling's. Alignment is content-derived and the cross-talk floor is the group registration
+/// record, so the arrival path is irrelevant to both; deriving either from the fork-wired path
+/// alone left this twin unswept — its parent-tagged baseline cells were judged as cross-talk
+/// and its unskipped prefix misaligned the positional agreement leg.
 #[test]
 fn snapshot_wired_child_replica_aligns_with_fork_wired_siblings() {
   let mut w = MultiWorld::new(7);
@@ -617,9 +617,9 @@ fn snapshot_wired_child_replica_aligns_with_fork_wired_siblings() {
       .any(|(tag, _, _)| tag == 100),
     "the transferred snapshot must carry the parent-tagged inherited cells"
   );
-  // …and the aligned view discounts it off the GROUP record: identical to a fork-wired
-  // sibling's, baseline excluded, agreement whole. (The ticks above already cross-talk-swept
-  // node 2's record — an unseeded view would have tripped the oracle before reaching here.)
+  // …and the aligned view discounts it by CONTENT: identical to a fork-wired sibling's,
+  // baseline excluded, agreement whole. (The ticks above already cross-talk-swept node 2's
+  // record — an unfloored sweep would have tripped the oracle before reaching here.)
   assert_eq!(w.aligned_applied(2, 200), w.aligned_applied(0, 200));
   assert!(!w.aligned_applied(2, 200).is_empty());
   assert!(
@@ -661,6 +661,400 @@ fn aligned_view_is_the_raw_record_for_never_split_groups() {
       "node {n}: alignment must be the identity for a never-split group"
     );
   }
+}
+
+/// The reshape band's re-split mechanism, pinned deterministically: a fork-born group SPLITS
+/// ONWARD while one replica lags the split. `LogSm::split` removes moved-key cells from the
+/// WHOLE record — inherited baseline included — so the ahead replicas hold FEWER leading
+/// inherited cells than the laggard, and a positional discount of the recorded baseline count
+/// eats the ahead side's own cells (two honest replicas diverge at aligned position 0).
+/// Content alignment must keep the straddling pair prefix-related and converge them on heal.
+#[test]
+fn aligned_view_survives_a_lag_pair_straddling_an_onward_split() {
+  let mut w = world_after_split(13, 200); // 200 owns {4,5,6,7}, hosted on {0,1,2}
+
+  // Child-own load across kept AND moved keys, applied on every replica.
+  for (key, value) in [(4u16, 40u64), (5, 50), (6, 60), (7, 70)] {
+    propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, key, value));
+  }
+  assert!(
+    w.run_until(2_000, |w| {
+      (0..3).all(|n| {
+        w.applied_of(n, 200)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 7, 70)))
+      })
+    }),
+    "the child-own load never applied everywhere"
+  );
+
+  // Node 2 lags the whole onward split: isolate it, re-elect among the survivors, then move
+  // {6,7} — and with them the inherited k6/k7 cells — onward to 300.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(200).is_some_and(|l| l != 2)));
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(200, 300, 6) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "the onward split was never accepted");
+  assert!(
+    w.run_until(3_000, |w| w.hosts_group(0, 300) && w.hosts_group(1, 300)),
+    "the onward child never materialized on the survivors"
+  );
+  // One more live-key cell the laggard cannot have, so the ahead views are strictly longer.
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 4, 41));
+  assert!(
+    w.run_until(2_000, |w| {
+      [0u64, 1].iter().all(|&n| {
+        w.applied_of(n, 200)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 4, 41)))
+      })
+    }),
+    "the post-split load never applied on the survivors"
+  );
+
+  // The mechanism is genuinely present: the ahead record's inherited prefix SHRANK below the
+  // laggard's, and the laggard still holds a moved-key own cell the ahead record dropped.
+  let inherited = |w: &MultiWorld, n: u64| {
+    w.applied_of(n, 200)
+      .iter()
+      .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+      .filter(|(tag, _, _)| *tag == 100)
+      .count()
+  };
+  assert_eq!(inherited(&w, 0), 2, "the ahead prefix keeps only k4/k5");
+  assert_eq!(inherited(&w, 2), 4, "the laggard keeps the intact baseline");
+  let holds_moved_own = |w: &MultiWorld, n: u64| {
+    w.applied_of(n, 200)
+      .iter()
+      .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 6, 60)))
+  };
+  assert!(!holds_moved_own(&w, 0) && holds_moved_own(&w, 2));
+
+  // The straddling pair stays prefix-related: the laggard's aligned view is a strict prefix
+  // of the ahead view, and the full agreement predicate holds. (Every tick above already ran
+  // the checker's agreement leg over these views — a positional discount panics there before
+  // reaching this point.)
+  let ahead = w.aligned_applied(0, 200);
+  let lagging = w.aligned_applied(2, 200);
+  assert_eq!(w.aligned_applied(1, 200), ahead);
+  assert!(lagging.len() < ahead.len());
+  assert_eq!(&ahead[..lagging.len()], &lagging[..]);
+  assert!(w.agreement_holds(200));
+
+  // Heal: the laggard applies the onward split, its late fork materializes 300 on node 2, and
+  // all three views converge.
+  w.heal(2);
+  assert!(
+    w.run_until(4_000, |w| {
+      w.hosts_group(2, 300)
+        && (0..3).all(|n| w.aligned_applied(n, 200) == w.aligned_applied(0, 200))
+    }),
+    "the healed laggard never converged: {}",
+    w.dbg_group(200)
+  );
+  assert!(w.agreement_holds(200) && w.agreement_holds(300));
+  w.check_now();
+  w.finalize_conservation_or_panic(13);
+  w.finalize_membership_or_panic(13);
+}
+
+/// Two onward splits off one fork-born group, the second-generation child inheriting cells
+/// tagged by BOTH ancestors. Alignment must reduce every replica to its own live-population
+/// cells whatever the inheritance depth — a positional discount of the recorded baseline
+/// (4 cells) leaves NOTHING of the parent once both onward splits shrink its record below
+/// that count.
+#[test]
+fn aligned_view_survives_a_double_onward_split_chain() {
+  let mut w = world_after_split(17, 200); // 200 owns {4,5,6,7}
+
+  for (key, value) in [(4u16, 40u64), (5, 50), (6, 60), (7, 70)] {
+    propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, key, value));
+  }
+  assert!(
+    w.run_until(2_000, |w| {
+      (0..3).all(|n| {
+        w.applied_of(n, 200)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 7, 70)))
+      })
+    }),
+    "the child-own load never applied everywhere"
+  );
+
+  // Onward split #1: {6,7} → 300. The moved slice spans BOTH generations — the grandparent's
+  // inherited k6/k7 cells travel onward alongside 200's own.
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(200, 300, 6) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "onward split #1 was never accepted");
+  assert!(
+    w.run_until(3_000, |w| {
+      (0..3).all(|n| w.hosts_group(n, 300)) && w.leader_of(300).is_some()
+    }),
+    "the first onward child never materialized everywhere: {}",
+    w.dbg_group(300)
+  );
+  propose_until_accepted(&mut w, 300, &crate::multi::encode_gkv(300, 6, 600));
+
+  // Onward split #2 off the SAME fork-born parent: {5} → 400.
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(200, 400, 5) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "onward split #2 was never accepted");
+  assert!(
+    w.run_until(3_000, |w| {
+      (0..3).all(|n| w.hosts_group(n, 400)) && w.leader_of(400).is_some()
+    }),
+    "the second onward child never materialized everywhere: {}",
+    w.dbg_group(400)
+  );
+  assert_eq!(w.splits_applied(), 3);
+
+  // The grandchild's opening record carries BOTH ancestor tags with the exact moved history…
+  let opening: Vec<(u64, u16, u64)> = w
+    .applied_of(0, 300)
+    .iter()
+    .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+    .take(4)
+    .collect();
+  assert_eq!(
+    opening,
+    std::vec![(100, 6, 6), (100, 7, 7), (200, 6, 60), (200, 7, 70)],
+    "the double-inherited baseline must carry both generations' cells in record order"
+  );
+  // …and alignment drops the whole multi-generation inheritance on every replica.
+  assert!(
+    w.run_until(2_000, |w| {
+      (0..3).all(|n| {
+        w.applied_of(n, 300)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((300, 6, 600)))
+      })
+    }),
+    "the grandchild's own load never applied everywhere"
+  );
+  for n in 0..3 {
+    let cells: Vec<(u64, u16, u64)> = w
+      .aligned_applied(n, 300)
+      .iter()
+      .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+      .collect();
+    assert_eq!(
+      cells,
+      std::vec![(300, 6, 600)],
+      "node {n}: only own live-population cells survive alignment"
+    );
+  }
+
+  // The doubly-shrunk parent still aligns to its one remaining live-key own cell.
+  assert!(
+    w.run_until(2_000, |w| {
+      (0..3).all(|n| w.aligned_applied(n, 200) == w.aligned_applied(0, 200))
+    }),
+    "the parent replicas never converged: {}",
+    w.dbg_group(200)
+  );
+  let parent_cells: Vec<(u64, u16, u64)> = w
+    .aligned_applied(0, 200)
+    .iter()
+    .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+    .collect();
+  assert_eq!(parent_cells, std::vec![(200, 4, 40)]);
+  assert!(w.agreement_holds(200) && w.agreement_holds(300) && w.agreement_holds(400));
+  w.check_now();
+  w.finalize_conservation_or_panic(17);
+  w.finalize_membership_or_panic(17);
+}
+
+/// The arrival-path axis ACROSS an onward split: a fresh observer snapshot-catches-up on a
+/// fork-born group AFTER it re-split onward, so the transferred record arrives BORN-SHRUNK —
+/// its inherited prefix already below the registered baseline count on the very first sweep.
+/// Content alignment and the count-floored cross-talk sweep must both take that record as-is,
+/// and the twin must equal its fork-wired siblings, then lag as a strict prefix, never a
+/// divergence.
+#[test]
+fn snapshot_wired_replica_born_after_an_onward_split_aligns() {
+  let mut w = MultiWorld::new(19);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = [0, 1].into_iter().collect();
+  w.create_group(100, &voters);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| {
+      let leader = w.leader_of(100);
+      leader.is_some_and(|l| w.applied_of(l, 100).len() >= 8)
+    }),
+    "the keyed baseline never applied"
+  );
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(100, 200, 4) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "the split was never accepted");
+  assert!(w.run_until(3_000, |w| w.leader_of(200).is_some()));
+
+  // Child-own load, then the onward split that shrinks every existing record.
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 5, 50));
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 6, 60));
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(200, 300, 6) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "the onward split was never accepted");
+  assert!(
+    w.run_until(3_000, |w| w.hosts_group(0, 300) && w.hosts_group(1, 300)),
+    "the onward child never materialized"
+  );
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 4, 41));
+
+  // The twin arrives ONLY NOW: node 2 joins fresh, its record delivered by snapshot transfer.
+  w.wire_group_observer(200, 2);
+  propose_conf_change_until_accepted(&mut w, 200, sailing_proto::ConfChangeType::AddNode, 2);
+  assert!(
+    w.run_until(4_000, |w| {
+      !w.applied_of(0, 200).is_empty() && w.applied_of(2, 200).len() == w.applied_of(0, 200).len()
+    }),
+    "the snapshot-wired twin never caught up: {}",
+    w.dbg_group(200)
+  );
+  assert_eq!(w.groups[&200].fork_baseline, 4);
+  let inherited: Vec<(u64, u16, u64)> = w
+    .applied_of(2, 200)
+    .iter()
+    .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+    .filter(|(tag, _, _)| *tag == 100)
+    .collect();
+  assert_eq!(
+    inherited,
+    std::vec![(100, 4, 4), (100, 5, 5)],
+    "the transferred record must arrive already shrunk by the onward split"
+  );
+  assert_eq!(w.aligned_applied(2, 200), w.aligned_applied(0, 200));
+  assert!(!w.aligned_applied(2, 200).is_empty());
+
+  // A plain lag tail on top of the path axis: the twin misses one live-key cell and must
+  // become a strict prefix.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(200).is_some_and(|l| l != 2)));
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 4, 42));
+  assert!(
+    w.run_until(2_000, |w| {
+      [0u64, 1].iter().all(|&n| {
+        w.applied_of(n, 200)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 4, 42)))
+      })
+    }),
+    "the post-join load never applied on the survivors"
+  );
+  let ahead = w.aligned_applied(0, 200);
+  let lagging = w.aligned_applied(2, 200);
+  assert!(lagging.len() < ahead.len());
+  assert_eq!(&ahead[..lagging.len()], &lagging[..]);
+  assert!(w.agreement_holds(200));
+  w.heal(2);
+  assert!(
+    w.run_until(4_000, |w| w.aligned_applied(2, 200)
+      == w.aligned_applied(0, 200)),
+    "the healed twin never re-converged"
+  );
+  w.check_now();
+  w.finalize_conservation_or_panic(19);
+  w.finalize_membership_or_panic(19);
+}
+
+/// The line between modeling and weakening: alignment must never MASK a genuine value
+/// disagreement. Two records differing in one own-tagged live-key cell keep that divergence at
+/// the same aligned position, and the checker's agreement leg still trips on the aligned views.
+#[test]
+fn alignment_never_masks_a_genuine_value_divergence() {
+  let population: BTreeSet<u16> = [4, 5, 6, 7].into_iter().collect();
+  let record = |divergent_value: u64| -> AppliedLog {
+    std::vec![
+      // A fork-inherited ancestor cell (dropped by tag) alongside the genuine disagreement.
+      (9, crate::multi::encode_gkv(100, 4, 4)),
+      (2, crate::multi::encode_gkv(200, 5, 50)),
+      (3, crate::multi::encode_gkv(200, 4, divergent_value)),
+    ]
+  };
+  let a = MultiWorld::align_record(record(40), 200, &population);
+  let b = MultiWorld::align_record(record(41), 200, &population);
+  assert_eq!(a.len(), 2);
+  assert_eq!(b.len(), 2);
+  assert_eq!(a[0], b[0]);
+  assert_ne!(
+    a[1], b[1],
+    "the divergent cell must survive alignment on both sides"
+  );
+
+  // End-to-end through the oracle: the aligned views still trip the agreement leg.
+  let node = |id: u64, applied_log: AppliedLog| checker::NodeView {
+    id,
+    removed: false,
+    is_voter: true,
+    poisoned: false,
+    is_leader: id == 0,
+    term: 1,
+    commit: 3,
+    applied: 3,
+    applied_log,
+    durable_first: 1,
+    durable_last: 3,
+    visible_last: 3,
+    durable_entries: Vec::new(),
+    snapshot_last_index: 0,
+    snapshot_last_term: 0,
+    installed_snapshot: false,
+    conf_voters: BTreeSet::new(),
+    conf_voters_outgoing: BTreeSet::new(),
+    conf_learners: BTreeSet::new(),
+    conf_learners_next: BTreeSet::new(),
+    conf_auto_leave: false,
+    conf_changed: 0,
+    hardstate_commit: 3,
+    inflight_staged: 0,
+    incarnation: 0,
+  };
+  let view = checker::ClusterView {
+    seed: 0,
+    tick: 0,
+    committed_voters: None,
+    committed_transitions: Vec::new(),
+    new_installs: Vec::new(),
+    nodes: std::vec![node(0, a), node(1, b)],
+  };
+  let v = checker::agreement(&view).unwrap_err();
+  assert_eq!(v.oracle, "agreement");
 }
 
 /// A LATE fork — a lagging parent replica applying the committed split after the child's

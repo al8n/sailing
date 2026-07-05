@@ -47,8 +47,10 @@ pub(crate) struct GroupMeta {
   /// its record with (`0` for a group not born of a fork). GROUP-level on purpose: the baseline
   /// is a property of the incarnation, not of any wiring path — a replica carries it however it
   /// arrived (fork materialization, a transferred snapshot into a fresh observer, a crash
-  /// restore from the durable blob), so the oracle-aligned view and the cross-talk floor derive
-  /// from this registration record. Reset at recreation: a fresh incarnation inherits nothing.
+  /// restore from the durable blob). The cross-talk sweep floors its start here; an onward
+  /// split only ever SHRINKS the inherited prefix below this count, so the floor never judges
+  /// an inherited cell (see `MultiWorld::cross_talk_sweep`). Reset at recreation: a fresh
+  /// incarnation inherits nothing.
   pub(crate) fork_baseline: usize,
 }
 
