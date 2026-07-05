@@ -117,11 +117,12 @@ where
     self.merge.pending_apply.as_ref()
   }
 
-  /// Whether merge state kills lease serving and formation RIGHT NOW: a pending (append-observed)
-  /// freeze or the applied `Frozen` state. Folded into every lease-serve gate, the CheckQuorum
-  /// renewal, and the proactive-refresh triggers — one predicate, so the serve and formation
-  /// sides can never disagree about a freeze.
-  pub(crate) fn merge_lease_killed(&self) -> bool {
+  /// Whether a merge freeze is ACTIVE right now: a pending (append-observed) freeze or the
+  /// applied `Frozen` state. ONE predicate for both of the freeze's early gates — the lease
+  /// gates (serving and formation die at append observation) and the propose-family gates (an
+  /// entry accepted above the freeze would diverge or lose the absorbed union) — so no two
+  /// sites can ever disagree about a freeze.
+  pub(crate) fn merge_freeze_active(&self) -> bool {
     self.merge.freeze_pending.is_some() || self.merge.frozen
   }
 

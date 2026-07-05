@@ -598,3 +598,482 @@ fn pending_freeze_appends_no_proactive_refresh() {
   );
   assert_eq!(ep.lease_refreshes(), 0, "the proactive counter never moved");
 }
+
+/// Encode a `RollbackMerge` payload.
+fn rollback_payload(source_gen_after: u64) -> bytes::Bytes {
+  let p = crate::RollbackMergePayload::new(source_gen_after);
+  let mut buf = Vec::new();
+  crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+  bytes::Bytes::from(buf)
+}
+
+/// Commit-and-apply everything through `upto` on a 3-voter leader by acking from node 2.
+fn ack_through(
+  ep: &mut Endpoint<u64, CountSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  upto: Index,
+) {
+  use crate::AppendResponse;
+  ep.handle_storage(Instant::ORIGIN, log, stable);
+  ep.handle_message(
+    Instant::ORIGIN,
+    log,
+    stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      upto,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, log, stable);
+}
+
+/// The freeze fold: a committed `PrepareMerge` applies as full `Frozen` — the boundary recorded,
+/// the lineage bumped to the minted gen, the pending kill subsumed, `Event::Frozen` emitted.
+#[test]
+fn prepare_merge_apply_freezes_and_bumps_gen() {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  let f = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, f);
+  assert!(ep.is_frozen(), "the committed freeze applied");
+  assert_eq!(ep.freeze_index(), Some(f));
+  assert_eq!(ep.shape_gen(), 1, "lineage bumped to the minted gen");
+  assert_eq!(
+    ep.merge.freeze_pending, None,
+    "pending subsumed into frozen"
+  );
+  let mut saw_frozen = false;
+  while let Some(ev) = ep.poll_event() {
+    saw_frozen |= matches!(ev, crate::Event::Frozen);
+  }
+  assert!(saw_frozen, "Event::Frozen surfaced");
+}
+
+/// The spec's §4 gate table: every typed surface refuses on a FROZEN group — proposals, conf
+/// changes (the `conf_change_frozen_rejected` row's source half), read-mode migrations, leader
+/// transfers, and reads on both roles; forwarded reads draw a REJECTING reply, not a black hole.
+#[test]
+fn conf_change_frozen_rejected() {
+  use crate::{ConfChange, ConfChangeType, ProposeError, ReadIndexError, TransferError};
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  let f = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, f);
+  assert!(ep.is_frozen());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  let cmd = bytes::Bytes::from_static(b"w");
+  assert!(matches!(
+    ep.propose(Instant::ORIGIN, &mut log, &stable, &cmd),
+    Err(ProposeError::Frozen)
+  ));
+  assert!(matches!(
+    ep.propose_conf_change(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
+    ),
+    Err(ProposeError::Frozen)
+  ));
+  assert!(matches!(
+    ep.propose_read_mode_change(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      crate::ReadOnlyOption::Safe
+    ),
+    Err(ProposeError::Frozen)
+  ));
+  assert!(matches!(
+    ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64),
+    Err(TransferError::Frozen)
+  ));
+  assert!(matches!(
+    ep.read_index(
+      Instant::ORIGIN,
+      &log,
+      &stable,
+      bytes::Bytes::from_static(b"r")
+    ),
+    Err(ReadIndexError::Frozen)
+  ));
+  // A forwarded read draws a rejecting ReadIndexResponse (never a silent drop).
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::ReadIndex(crate::ReadIndex::new(
+      Term::new(1),
+      2u64,
+      bytes::Bytes::from_static(b"tok"),
+    )),
+  );
+  let mut rejected = false;
+  while let Some(out) = ep.poll_message() {
+    if let Message::ReadIndexResponse(r) = out.message() {
+      rejected |= r.reject();
+    }
+  }
+  assert!(rejected, "a frozen leader rejects forwarded reads typed");
+
+  // A frozen FOLLOWER fails local reads closed too.
+  let (mut fep, mut flog, mut fstable) = make_merge_follower();
+  fep.handle_message(
+    Instant::ORIGIN,
+    &mut flog,
+    &mut fstable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::PrepareMerge,
+        prepare_payload(b"\x2b", 1),
+      )],
+      Index::new(1),
+    )),
+  );
+  assert!(
+    fep.is_frozen(),
+    "the committed freeze applied on the follower"
+  );
+  assert!(matches!(
+    fep.read_index(
+      Instant::ORIGIN,
+      &flog,
+      &fstable,
+      bytes::Bytes::from_static(b"r")
+    ),
+    Err(ReadIndexError::Frozen)
+  ));
+}
+
+/// The absorb-determinism gate: proposals refuse from the freeze's APPEND, not only its apply.
+/// Every target replica absorbs its LOCAL source at its own apply progress, so an entry accepted
+/// in the append→apply window would ride above the freeze on every log — present in some hosts'
+/// absorbed state, missing from others' — or vanish from the union outright.
+#[test]
+fn pending_freeze_blocks_proposals_before_apply() {
+  use crate::ProposeError;
+  let (mut ep, mut log, _stable) = make_three_voter_leader();
+  let stable = NoopStable::default();
+  let _ = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  assert!(!ep.is_frozen(), "still only pending");
+  let cmd = bytes::Bytes::from_static(b"w");
+  assert!(
+    matches!(
+      ep.propose(Instant::ORIGIN, &mut log, &stable, &cmd),
+      Err(ProposeError::Frozen)
+    ),
+    "the append-window gate holds before apply"
+  );
+}
+
+/// The spec's §4 "UNCHANGED" half: a frozen group stays LIVE — its leader heartbeats and pumps
+/// a behind follower the freeze suffix (catch-up to the boundary), and a frozen node still
+/// grants votes (leader crashes survive the freeze).
+#[test]
+fn frozen_replication_and_elections_run_unchanged() {
+  use crate::{HeartbeatResponse, RequestVote};
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  let f = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, f);
+  assert!(ep.is_frozen());
+  while ep.poll_message().is_some() {}
+
+  // Heartbeats still broadcast on the frozen leader.
+  let hb_at = ep.poll_timeout().expect("heartbeat timer armed");
+  ep.handle_timeout(hb_at, &mut log, &mut stable);
+  let mut beats = 0;
+  while let Some(out) = ep.poll_message() {
+    if matches!(out.message(), Message::Heartbeat(_)) {
+      beats += 1;
+    }
+  }
+  assert!(beats >= 2, "a frozen leader keeps heartbeating its peers");
+
+  // A behind responder (node 3, match 0) still draws the catch-up append carrying the freeze.
+  ep.handle_message(
+    hb_at,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::HeartbeatResponse(HeartbeatResponse::new(
+      Term::new(1),
+      3u64,
+      bytes::Bytes::new(),
+    )),
+  );
+  let mut freeze_pumped = false;
+  while let Some(out) = ep.poll_message() {
+    if let Message::AppendEntries(ae) = out.message() {
+      freeze_pumped |= ae
+        .entries()
+        .iter()
+        .any(|e| e.kind() == EntryKind::PrepareMerge);
+    }
+  }
+  assert!(
+    freeze_pumped,
+    "a frozen leader still replicates the freeze suffix to a behind peer"
+  );
+
+  // A frozen FOLLOWER still grants a legitimate higher-term vote.
+  let (mut fep, mut flog, mut fstable) = make_merge_follower();
+  fep.handle_message(
+    Instant::ORIGIN,
+    &mut flog,
+    &mut fstable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![Entry::new(
+        Term::new(1),
+        Index::new(1),
+        EntryKind::PrepareMerge,
+        prepare_payload(b"\x2b", 1),
+      )],
+      Index::new(1),
+    )),
+  );
+  assert!(fep.is_frozen());
+  fep.handle_message(
+    Instant::ORIGIN,
+    &mut flog,
+    &mut fstable,
+    3u64,
+    Message::RequestVote(RequestVote::new(
+      Term::new(5),
+      3u64,
+      Index::new(9),
+      Term::new(4),
+      false,
+      false,
+    )),
+  );
+  fep.handle_storage(Instant::ORIGIN, &mut flog, &mut fstable);
+  let mut granted = false;
+  while let Some(out) = fep.poll_message() {
+    if let Message::VoteResponse(v) = out.message() {
+      granted |= !v.reject();
+    }
+  }
+  assert!(granted, "a frozen follower still votes");
+}
+
+/// `RollbackMerge` is the release valve: it applies as unfreeze (gen moved past the freeze,
+/// `Event::MergeRolledBack`), proposals resume, and leases are NOT resurrected — the lease
+/// machinery re-forms from live traffic.
+#[test]
+fn rollback_merge_apply_unfreezes() {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  let f = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, f);
+  assert!(ep.is_frozen());
+  let r = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      rollback_payload(2),
+    )
+    .expect("RollbackMerge is the one proposable entry while frozen");
+  ack_through(&mut ep, &mut log, &mut stable, r);
+  assert!(!ep.is_frozen(), "the rollback thawed the group");
+  assert_eq!(ep.freeze_index(), None);
+  assert_eq!(ep.shape_gen(), 2, "gen moved PAST the freeze generation");
+  assert!(!ep.merge_freeze_active(), "lease formation may resume");
+  let mut saw = false;
+  while let Some(ev) = ep.poll_event() {
+    saw |= matches!(ev, crate::Event::MergeRolledBack);
+  }
+  assert!(saw, "Event::MergeRolledBack surfaced");
+  // Proposals resume.
+  let cmd = bytes::Bytes::from_static(b"w");
+  assert!(ep.propose(Instant::ORIGIN, &mut log, &stable, &cmd).is_ok());
+}
+
+/// A rollback's clear is a RE-DERIVATION, not a flag drop: a LATER freeze already appended
+/// above the rollback keeps the append-observed kill armed through the thaw.
+#[test]
+fn rollback_rederives_a_later_pending_freeze() {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  let f1 = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, f1);
+  assert!(ep.is_frozen());
+  let r = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      rollback_payload(2),
+    )
+    .unwrap();
+  // A SECOND freeze lands above the rollback before the rollback commits (the entry plumbing
+  // permits it; the container's verb gates make it rare). Fold order is total either way.
+  let f2 = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 3),
+    )
+    .unwrap();
+  // Commit through the ROLLBACK only: the thaw must re-arm the pending kill at f2.
+  ack_through(&mut ep, &mut log, &mut stable, r);
+  assert!(!ep.is_frozen(), "thawed at the rollback");
+  assert_eq!(
+    ep.merge.freeze_pending,
+    Some(f2),
+    "the rollback re-derived the LATER pending freeze"
+  );
+  assert!(ep.merge_freeze_active(), "the kill never lapsed");
+}
+
+/// Replay idempotence: a restart whose durable log holds the committed freeze re-applies it to
+/// the identical fold — same frozen state, same boundary, same lineage — however many times.
+#[test]
+fn freeze_replay_is_idempotent_across_restart() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  log.force_append(&[Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::PrepareMerge,
+    prepare_payload(b"\x2b", 1),
+  )]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  for boot in 1..=2u64 {
+    let ep = Endpoint::restart(
+      cfg.clone(),
+      Instant::ORIGIN,
+      7,
+      CountSm::default(),
+      boot,
+      &mut log,
+      &mut stable,
+    );
+    assert!(!ep.is_poisoned());
+    assert!(ep.is_frozen(), "replay re-froze (boot {boot})");
+    assert_eq!(ep.freeze_index(), Some(Index::new(1)));
+    assert_eq!(ep.shape_gen(), 1, "gen max-fold is idempotent");
+    assert_eq!(ep.merge.freeze_pending, None);
+  }
+}
+
+/// THE MERGE REPLAY FENCE: a frozen (or freezing) endpoint captures NO snapshot — a capture at
+/// or past the freeze would compact the very entry whose replay re-derives `frozen` at restart,
+/// and the replica would come back thawed while a target still holds a parked absorb of it. The
+/// fence lifts with an explicit rollback.
+#[test]
+fn frozen_source_captures_no_snapshot() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable); // single voter: leader, no-op@1 commits+applies
+  assert!(ep.role().is_leader());
+  let f = ep
+    .propose_merge_entry(
+      d,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  ep.handle_storage(d, &mut log, &mut stable); // commits + applies the freeze (quorum of one)
+  assert!(ep.is_frozen());
+  assert_eq!(f, Index::new(2));
+  // applied(2) - first_index(1) >= threshold(1): the capture WOULD fire — the fence refuses.
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    stable.snapshot().is_none(),
+    "no capture while frozen: the freeze entry must stay replayable"
+  );
+  // The rollback lifts the fence; the very next crank captures.
+  let r = ep
+    .propose_merge_entry(d, &mut log, EntryKind::RollbackMerge, rollback_payload(2))
+    .unwrap();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(!ep.is_frozen());
+  assert_eq!(r, Index::new(3));
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    stable.snapshot().is_some(),
+    "the fence lifted with the rollback"
+  );
+}

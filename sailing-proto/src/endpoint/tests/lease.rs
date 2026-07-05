@@ -986,7 +986,7 @@ fn lease_based_expired_lease_degrades_to_safe() {
 /// sits in the leader's log — formation is killed with serving, so a frozen-in-progress source
 /// can never bank a lease to serve the instant a rollback lands.
 ///
-/// MUTATION: drop the `!self.merge_lease_killed()` conjunct from the renewal arm in
+/// MUTATION: drop the `!self.merge_freeze_active()` conjunct from the renewal arm in
 /// `on_heartbeat_response` → the response arms the lease and this fails.
 #[test]
 fn pending_freeze_stops_lease_renewal() {

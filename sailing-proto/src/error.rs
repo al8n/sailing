@@ -44,6 +44,14 @@ pub enum ProposeError<I> {
   #[error("the log index space is exhausted")]
   LogIndexExhausted,
 
+  /// The group is FROZEN by a merge — a `PrepareMerge` has entered its log (append-observed) or
+  /// applied — and accepts no new entries: anything appended above the freeze would either
+  /// diverge the absorbed state across target replicas (each absorbs its LOCAL source at its own
+  /// apply progress) or be silently dropped from the union. The freeze is released only by the
+  /// merge completing (the group is then absorbed and gone) or an explicit `RollbackMerge` — the
+  /// ONE entry proposable while frozen. Nothing was appended.
+  #[error("the group is frozen by an in-flight merge")]
+  Frozen,
   /// The proposed entry is too large to ever fit in one transport frame. Accepting it would append a
   /// committed log entry that no `AppendEntries` could carry, so every follower's connection would
   /// close on each resend and replication would wedge cluster-wide. `size` is the entry's worst-case
@@ -227,6 +235,11 @@ pub enum TransferError<I> {
   /// The target node is the current leader — no transfer needed.
   #[error("transfer target is already the leader")]
   AlreadyLeader,
+  /// The group is FROZEN by an in-flight merge: its leadership is about to be dissolved into the
+  /// absorbing target, so handing it off is refused (a transferee would inherit the same frozen
+  /// group). Roll the merge back first if the transfer genuinely matters.
+  #[error("the group is frozen by an in-flight merge")]
+  Frozen,
   /// The node has entered the permanent poisoned state and accepts no new work. The transfer was
   /// NOT initiated; inspect `poison_reason()`.
   #[error("the node is poisoned and cannot initiate a transfer")]
@@ -270,6 +283,11 @@ pub enum ReadIndexError {
   /// rather than silently accepted onto a path that never completes.
   #[error("node is poisoned; reads cannot be confirmed")]
   Poisoned,
+  /// The group is FROZEN by an applied merge freeze: it fails reads CLOSED, typed, rather than
+  /// parking them forever — sailing sits below routing, so the embedder re-routes the query to
+  /// the absorbing target once the merge resolves (or rolls the merge back).
+  #[error("the group is frozen by an in-flight merge; reads fail closed")]
+  Frozen,
 }
 
 /// Why constructing a [`crate::Config`] failed.

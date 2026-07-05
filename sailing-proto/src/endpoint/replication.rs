@@ -733,6 +733,16 @@ where
     if self.transfer.lead_transferee.is_some() {
       return Err(ProposeError::LeaderTransferInProgress);
     }
+    // A pending OR applied merge freeze refuses new entries. The gate moves to APPEND
+    // observation (not just apply) because every target replica absorbs its LOCAL source at its
+    // own apply progress: an entry accepted above the freeze would be included in some hosts'
+    // absorbed state and missing from others' — silent union divergence — or dropped from the
+    // union outright. Above a surviving freeze the log may carry only FSM-no-ops (election
+    // no-ops, conf folds, RollbackMerge), which is exactly what makes absorb-at-or-past-the-
+    // boundary deterministic.
+    if self.merge_freeze_active() {
+      return Err(ProposeError::Frozen);
+    }
     // Allocate a fresh, usable log index (see `next_log_index`): refuse rather than alias-and-truncate
     // at the saturated ceiling or allocate the unreadable sentinel `u64::MAX`.
     let Some(index) = Self::next_log_index(log.last_index()) else {
@@ -1136,7 +1146,7 @@ where
     // can never accumulate a fresh lease to serve the moment a rollback lands.
     if response.lease_round() == self.check_quorum_lease.lease_round
       && response.lease_support() > Duration::ZERO
-      && !self.merge_lease_killed()
+      && !self.merge_freeze_active()
     {
       self
         .check_quorum_lease

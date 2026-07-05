@@ -1571,6 +1571,12 @@ where
           "stale-minted split no-op'd"
         );
       }
+      Event::Frozen => {
+        tracing::info!(target: "sailing::consensus", "group frozen by a merge");
+      }
+      Event::MergeRolledBack => {
+        tracing::info!(target: "sailing::consensus", "merge rolled back; group thawed");
+      }
     }
   }
 
@@ -2185,7 +2191,7 @@ where
           // A pending or applied merge freeze suppresses the refresh: re-anchoring would re-arm
           // lease serving on a group the freeze just killed it for (formation is killed too).
           if self.leaseguard_timing().is_some()
-            && !self.merge_lease_killed()
+            && !self.merge_freeze_active()
             && self.transfer.lead_transferee.is_none()
             && last == self.commit
             && !self.lease_guard_read_live(now, log)
@@ -2214,7 +2220,7 @@ where
           && self.lease_guard.read_since_anchor
           && self.leaseguard_timing().is_some()
           // The proactive refresh is lease FORMATION — a pending or applied freeze kills it.
-          && !self.merge_lease_killed()
+          && !self.merge_freeze_active()
           && self.transfer.lead_transferee.is_none()
           && log.last_index() == self.commit
         {
@@ -2604,15 +2610,24 @@ where
           }
           EntryKind::PrepareMerge => {
             // A committed PrepareMerge whose payload won't decode is corrupt — mirror Split.
-            if crate::wire::decode_prepare_merge_payload(entry.data_bytes()).is_err() {
-              self.poison(PoisonReason::MergeDecode);
-              break;
-            }
-            // The freeze fold (frozen + the gate set) lands with the merge state machinery;
-            // until then a committed PrepareMerge reaching apply is an entry this core cannot
-            // fold — fail-stop, never a silent skip that would diverge from folding replicas.
-            self.poison(PoisonReason::MergeUnsupported);
-            break;
+            let payload = match crate::wire::decode_prepare_merge_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            // The freeze fold: full Frozen semantics start HERE (apply-time, the membership
+            // doctrine's shape); the lease kill has been live since this entry's APPEND. The
+            // gen bump is a max-fold so a restart replay re-walks the same values idempotently;
+            // no lineage guard mirrors SplitStale here — a second freeze cannot be proposed
+            // while one is pending or applied (the propose gates), so a committed PrepareMerge
+            // is never a stale mint.
+            self.merge.frozen = true;
+            self.merge.freeze_index = Some(idx);
+            self.merge.freeze_pending = None;
+            self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
+            self.outputs.events.push_back(Event::Frozen);
           }
           EntryKind::CommitMerge => {
             // A committed CommitMerge whose payload won't decode is corrupt — mirror Split.
@@ -2627,14 +2642,31 @@ where
           }
           EntryKind::RollbackMerge => {
             // A committed RollbackMerge whose payload won't decode is corrupt — mirror Split.
-            if crate::wire::decode_rollback_merge_payload(entry.data_bytes()).is_err() {
-              self.poison(PoisonReason::MergeDecode);
-              break;
+            let payload = match crate::wire::decode_rollback_merge_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            // The unfreeze fold. The gen bump past the freeze generation is the abort signal
+            // every parked CommitMerge keys on (deterministic on every replica — the comparison
+            // inputs are log-determined). Leases are NOT resurrected: they re-form from live
+            // traffic. The pending kill is RE-DERIVED rather than cleared: a rollback proposed
+            // while a freeze was still pending shares its fate through truncation, but a LATER
+            // freeze may already sit above this entry in the suffix — scanning keeps the
+            // append-observed invariant exact instead of trusting a single-flag lifecycle.
+            self.merge.frozen = false;
+            self.merge.freeze_index = None;
+            self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
+            match Self::scan_freeze_pending(log, idx) {
+              Ok(fp) => self.merge.freeze_pending = fp,
+              Err(reason) => {
+                self.poison(reason);
+                break;
+              }
             }
-            // The unfreeze fold lands with the merge state machinery; until then — fail-stop,
-            // never a silent skip.
-            self.poison(PoisonReason::MergeUnsupported);
-            break;
+            self.outputs.events.push_back(Event::MergeRolledBack);
           }
           EntryKind::SetReadMode => {
             // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison

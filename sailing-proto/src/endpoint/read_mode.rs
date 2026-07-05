@@ -47,6 +47,11 @@ where
     if self.transfer.lead_transferee.is_some() {
       return Err(ProposeError::LeaderTransferInProgress);
     }
+    // A pending or applied merge freeze refuses migrations: the merge preconditions compared
+    // the two groups' read modes, and a flip above the freeze would invalidate them silently.
+    if self.merge_freeze_active() {
+      return Err(ProposeError::Frozen);
+    }
     // One migration in flight at a time: refuse if a SetReadMode entry is not yet applied (mirror
     // `pending_conf_index`). Two stacked flips would otherwise race their apply-time effects.
     if self.reads.pending_read_mode_index > self.applied {

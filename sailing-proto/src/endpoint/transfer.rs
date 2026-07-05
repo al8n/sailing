@@ -39,6 +39,11 @@ where
         leader: self.leader.cheap_clone(),
       });
     }
+    // A frozen group's leadership is about to dissolve into the absorbing target — refuse the
+    // handoff rather than seat a transferee on a group that accepts nothing.
+    if self.merge.frozen {
+      return Err(TransferError::Frozen);
+    }
     if to == self.config.id() {
       return Err(TransferError::AlreadyLeader);
     }

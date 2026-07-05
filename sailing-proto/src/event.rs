@@ -238,6 +238,16 @@ pub enum Event<I, R> {
   /// A committed `Split` entry no-op'd deterministically: its mint was stale against the live
   /// lineage counter. Nothing forked; re-propose if the split is still wanted.
   SplitStale(SplitStale),
+  /// A `PrepareMerge` entry was committed and applied: this group is now FROZEN — it refuses
+  /// proposals, conf changes, transfers, and reads (typed) until the merge resolves (the group
+  /// is absorbed and removed) or an explicit rollback lands. Replication, elections, and
+  /// snapshot sends run unchanged, so the freeze itself propagates and survives leader crashes.
+  Frozen,
+  /// A `RollbackMerge` entry was committed and applied: the freeze is undone, proposals and
+  /// reads resume, and any parked `CommitMerge` naming the old freeze aborts deterministically
+  /// (the rollback moved the lineage counter past it). Leases are NOT resurrected — they re-form
+  /// from live traffic.
+  MergeRolledBack,
   /// A linearizable read index has been confirmed.  The application may serve the
   /// associated read once `applied >= ReadState.index`.
   ReadState(ReadState),

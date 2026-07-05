@@ -122,13 +122,13 @@ where
   /// Deployments that cannot bound clock drift MUST use `ReadOnlyOption::Safe` (the default), whose
   /// per-read heartbeat round needs no timing assumption.
   ///
-  /// A pending or applied merge FREEZE kills the lease unconditionally (`merge_lease_killed`):
+  /// A pending or applied merge FREEZE kills the lease unconditionally (`merge_freeze_active`):
   /// the clock-free merge argument orders every lease read before the freeze's APPEND, so from
   /// that observation on the leader must not serve off any lease, however fresh.
   #[inline]
   pub(crate) fn lease_read_available(&self, now: Now) -> bool {
     self.config.check_quorum()
-      && !self.merge_lease_killed()
+      && !self.merge_freeze_active()
       && self.transfer.lead_transferee.is_none()
       && !self.transfer.forced_handoff_this_term
       && self
@@ -160,7 +160,7 @@ where
   pub(crate) fn lease_guard_read_live<L: LogStore>(&mut self, now: Now, log: &L) -> bool {
     // A pending or applied merge freeze kills the anchor serve outright — the same clock-free
     // ordering as the LeaseBased gate: no lease read may follow the freeze's append observation.
-    if self.merge_lease_killed() {
+    if self.merge_freeze_active() {
       return false;
     }
     let Some((delta, _drift)) = self.leaseguard_timing() else {
@@ -529,6 +529,13 @@ where
     if self.poison.poisoned {
       return Err(ReadIndexError::Poisoned);
     }
+    // A FROZEN group fails reads closed, typed, on every role: the group is being absorbed, so
+    // parking the read would leak queries forever — the embedder re-routes to the target once
+    // the merge resolves. (A merely PENDING freeze keeps serving via the Safe round: reads do
+    // not mutate, and every pre-apply read still orders before the absorb.)
+    if self.merge.frozen {
+      return Err(ReadIndexError::Frozen);
+    }
     match self.role {
       Role::Leader => {
         // Reject a context that is already in flight (deferred or registered) so the caller
@@ -629,6 +636,18 @@ where
     ri: ReadIndex<I>,
   ) {
     if !self.role.is_leader() {
+      return;
+    }
+    // A frozen leader declines forwarded reads with a REJECTING reply (the at-capacity shape):
+    // a bare drop would strand the follower's forwarded-read slot until a term change, while
+    // the reject lets it clear the entry and surface the failure to its caller.
+    if self.merge.frozen {
+      let context = Bytes::copy_from_slice(ri.context());
+      let (term, me) = (self.term, self.config.id());
+      self.send(
+        ri.from(),
+        Message::ReadIndexResponse(ReadIndexResponse::new(term, me, Index::ZERO, context, true)),
+      );
       return;
     }
     // `ri.context()` is the forwarding follower's per-read TOKEN (not a user context); the leader keeps

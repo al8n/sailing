@@ -258,6 +258,16 @@ where
     {
       return;
     }
+    // THE MERGE REPLAY FENCE: while a freeze is pending or applied, this endpoint captures no
+    // snapshot. A capture at applied >= the freeze would compact the PrepareMerge entry, and a
+    // crash then restarts this replica UNFROZEN (frozen is derived by replaying that entry) —
+    // it could serve reads and accept writes while a target still holds a parked absorb of it.
+    // The fence guarantees every restart re-derives the freeze from the (snapshot ⊔ log) replay
+    // range for as long as the merge is live; the window is bounded by the merge's own explicit
+    // resolution (absorb removes the group; rollback lifts the fence).
+    if self.merge_freeze_active() {
+      return;
+    }
     if self.applied == Index::ZERO {
       // Nothing has been applied yet — nothing to snapshot.
       return;

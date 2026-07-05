@@ -133,6 +133,12 @@ where
     if self.transfer.lead_transferee.is_some() {
       return Err(ProposeError::LeaderTransferInProgress);
     }
+    // A pending or applied merge freeze pins the voter set: the merge preconditions compared
+    // the source and target sets, and a membership change slipping in above the freeze would
+    // strand replicas outside the target (a frozen zombie no resolution ever reaches).
+    if self.merge_freeze_active() {
+      return Err(ProposeError::Frozen);
+    }
     // One change in flight at a time: refuse if a ConfChange entry is not yet applied.
     if self.pending_conf_index > self.applied {
       return Err(ProposeError::ConfChangeInFlight);
