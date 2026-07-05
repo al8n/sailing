@@ -662,3 +662,107 @@ fn aligned_view_is_the_raw_record_for_never_split_groups() {
     );
   }
 }
+
+/// A LATE fork — a lagging parent replica applying the committed split after the child's
+/// incarnation was retired — must resolve REFUSED at the world's materialization edge, exactly
+/// as the product's coordinator admission (floor → tombstone) refuses it at the driver's
+/// fork-drain: no materialization, the parent's fence lifted, and the id left to the ordinary
+/// lifecycle. Materializing instead squats a replica under a retired gid, and the next
+/// recreation trips container admission with `Exists` on that node.
+#[test]
+fn late_fork_for_a_retired_child_refuses_and_recreation_admits() {
+  let mut w = MultiWorld::new(5);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  assert!(
+    w.run_until(2_000, |w| (0..3).all(|n| w.applied_of(n, 100).len() >= 8)),
+    "the keyed baseline never applied everywhere"
+  );
+
+  // Node 2's parent replica lags the whole split: isolate it, then commit the split on {0,1}.
+  w.isolate(2);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some_and(|l| l != 2)));
+  let mut accepted = false;
+  for _ in 0..2_000 {
+    if let Some(Ok(_)) = w.propose_split(100, 300, 4) {
+      accepted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(accepted, "the split was never accepted");
+  assert!(
+    w.run_until(3_000, |w| w.leader_of(300).is_some()),
+    "the forked child never elected: {}",
+    w.dbg_group(300)
+  );
+  assert_eq!(
+    w.hosting_nodes(300),
+    std::vec![0, 1],
+    "the isolated straggler must not have materialized yet"
+  );
+  assert_eq!(w.splits_applied(), 1);
+
+  // Retire the child while the straggler still has the split entry ahead of it.
+  w.remove_group(300);
+
+  // Heal: the straggler catches up, applies the split, and its late fork refuses against the
+  // tombstone.
+  w.heal(2);
+  assert!(
+    w.run_until(4_000, |w| w.split_refused_observed() == 1),
+    "the late fork never resolved refused"
+  );
+  assert!(
+    !w.hosts_group(2, 300),
+    "a refused fork must not materialize"
+  );
+  assert_eq!(w.splits_applied(), 1, "a refused fork registers nothing");
+
+  // The straggler's fence resolved with the refusal: fresh parent load applies EVERYWHERE.
+  propose_until_accepted(&mut w, 100, &crate::multi::encode_gkv(100, 0, 500));
+  assert!(
+    w.run_until(3_000, |w| {
+      (0..3).all(|n| {
+        w.applied_of(n, 100)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 0, 500)))
+      })
+    }),
+    "the parent must keep applying past a refused fork on every replica"
+  );
+
+  // The lifecycle keeps the id: recreation admits cleanly on EVERY voter (a materialized late
+  // fork would trip container admission with Exists on the straggler here) and the recreated
+  // incarnation elects and commits.
+  w.recreate_group(300);
+  assert_eq!(w.generation_of(300), 1);
+  assert!(
+    w.run_until(4_000, |w| w.leader_of(300).is_some()),
+    "the recreated child never elected: {}",
+    w.dbg_group(300)
+  );
+  propose_until_accepted(&mut w, 300, &crate::multi::encode_gkv(300, 0, 600));
+  assert!(
+    w.run_until(3_000, |w| {
+      let leader = w.leader_of(300);
+      leader.is_some_and(|l| {
+        w.applied_of(l, 300)
+          .iter()
+          .any(|(_, c)| crate::multi::decode_gkv(c) == Some((300, 0, 600)))
+      })
+    }),
+    "the recreated incarnation must commit fresh load"
+  );
+  w.check_now();
+  w.finalize_conservation_or_panic(5);
+  w.finalize_membership_or_panic(5);
+}

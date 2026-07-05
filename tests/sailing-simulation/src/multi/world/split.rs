@@ -112,7 +112,9 @@ impl MultiWorld {
   }
 
   /// Drain every host's committed, relay-ready forks into materializations — the driver's
-  /// fork-drain, played by the world. Returns whether anything materialized.
+  /// fork-drain, played by the world, INCLUDING the coordinator-admission gate the product
+  /// runs at this edge (floor, then tombstone): a late fork whose child id the catalog has
+  /// retired — or outpaced by recreation — resolves REFUSED. Returns whether anything happened.
   pub(super) fn pump_forks(&mut self) -> bool {
     let mut progressed = false;
     for node in self.node_ids.clone() {
@@ -122,6 +124,26 @@ impl MultiWorld {
           break;
         };
         progressed = true;
+        // The pure container cannot see retirement — the coordinators own that refusal, and
+        // this catalog check models it. A lagging parent replica can apply the split AFTER the
+        // child's registered incarnation was retired (or recreated past the fork's
+        // generation); materializing then would squat a replica the lifecycle verbs rightly
+        // assume gone. Refusal is the product's arm verbatim: no materialization, the parent's
+        // fence lifts (a fork that will never land here must not pin the parent), and the id
+        // stays with the ordinary lifecycle — a later recreation admits cleanly.
+        if self
+          .groups
+          .get(&fork.child)
+          .is_some_and(|m| m.retired || fork.child_gen < m.generation)
+        {
+          self.split_refused += 1;
+          self
+            .hosts
+            .get_mut(&node)
+            .expect("host exists")
+            .lift_fork_barrier(&fork.parent, fork.split_index);
+          continue;
+        }
         self.register_split_child(&fork);
         self.wire_fork_replica(node, fork);
       }

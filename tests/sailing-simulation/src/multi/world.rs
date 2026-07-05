@@ -163,6 +163,10 @@ pub struct MultiWorld {
   /// by a forced teardown. Fresh child ids make the signal unreachable today; the counter keeps
   /// it visible if that ever changes.
   split_conflicts: u64,
+  /// Late forks the fork pump REFUSED at materialization — the coordinator-admission model
+  /// (the child id retired, or recreated past the fork's generation): no materialization, the
+  /// parent's fence lifted, mirroring the product's `SplitRefused` resolution.
+  split_refused: u64,
 }
 
 impl MultiWorld {
@@ -210,6 +214,7 @@ impl MultiWorld {
       splits_applied: 0,
       split_stale: 0,
       split_conflicts: 0,
+      split_refused: 0,
     }
   }
 
