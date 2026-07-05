@@ -84,11 +84,13 @@ fn fork_boots_at_the_synthetic_baseline() {
   let blob = fork_blob(3);
   m.create_group_from_fork(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
     preloaded_sm(3),
     blob.clone(),
+    None,
     1,
     &mut log,
     &mut stable,
@@ -148,14 +150,16 @@ fn fork_admission_matches_create_group() {
   assert_eq!(
     m.create_group_from_fork(
       1,
+      0,
       single_node_cfg(1),
       Instant::ORIGIN,
       42,
       preloaded_sm(3),
       fork_blob(3),
+      None,
       1,
       &mut log,
-      &mut stable,
+      &mut stable
     ),
     Err(CreateGroupError::Exists)
   );
@@ -164,14 +168,16 @@ fn fork_admission_matches_create_group() {
   assert_eq!(
     m.create_group_from_fork(
       2,
+      0,
       single_node_cfg(2),
       Instant::ORIGIN,
       42,
       preloaded_sm(3),
       fork_blob(3),
+      None,
       1,
       &mut log,
-      &mut stable,
+      &mut stable
     ),
     Err(CreateGroupError::NodeIdMismatch)
   );
@@ -182,14 +188,16 @@ fn fork_admission_matches_create_group() {
     assert_eq!(
       sized.create_group_from_fork(
         bad,
+        0,
         single_node_cfg(1),
         Instant::ORIGIN,
         42,
         preloaded_sm(3),
         fork_blob(3),
+        None,
         1,
         &mut log,
-        &mut stable,
+        &mut stable
       ),
       Err(CreateGroupError::InvalidGroupId)
     );
@@ -222,14 +230,16 @@ fn fork_refuses_boot_epoch_zero() {
   assert_eq!(
     m.create_group_from_fork(
       7,
+      0,
       single_node_cfg(1),
       Instant::ORIGIN,
       42,
       preloaded_sm(3),
       fork_blob(3),
+      None,
       0,
       &mut log,
-      &mut stable,
+      &mut stable
     ),
     Err(CreateGroupError::InvalidBootEpoch)
   );
@@ -240,14 +250,16 @@ fn fork_refuses_boot_epoch_zero() {
   assert_eq!(
     m.create_group_from_fork_with_rng(
       7,
+      0,
       single_node_cfg(1),
       Instant::ORIGIN,
       Prng::new(42),
       preloaded_sm(3),
       fork_blob(3),
+      None,
       0,
       &mut log,
-      &mut stable,
+      &mut stable
     ),
     Err(CreateGroupError::InvalidBootEpoch)
   );
@@ -257,11 +269,13 @@ fn fork_refuses_boot_epoch_zero() {
   // The floor itself admits: the SAME stores and container accept the fork at epoch 1.
   m.create_group_from_fork(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
     preloaded_sm(3),
     fork_blob(3),
+    None,
     1,
     &mut log,
     &mut stable,
@@ -293,7 +307,15 @@ fn epoch_zero_baseline_completions_alias_the_childs_first_live_ops() {
   // The pre-guard shape: baseline manufactured at epoch 0, its completions still queued; every
   // write the child itself submits from here has its fsync in flight (completion held).
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
-  write_fork_baseline(&single_node_cfg(1), fork_blob(3), 0, &mut log, &mut stable);
+  write_fork_baseline(
+    &single_node_cfg(1),
+    fork_blob(3),
+    0,
+    None,
+    0,
+    &mut log,
+    &mut stable,
+  );
   let mut ep = Endpoint::restart(
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -322,7 +344,15 @@ fn epoch_zero_baseline_completions_alias_the_childs_first_live_ops() {
   // The enforced floor: the identical drive at boot_epoch 1 keeps the persist-before-act gate —
   // the baseline's epoch-0 completions miss every live pending op and every >= watermark.
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
-  write_fork_baseline(&single_node_cfg(1), fork_blob(3), 1, &mut log, &mut stable);
+  write_fork_baseline(
+    &single_node_cfg(1),
+    fork_blob(3),
+    0,
+    None,
+    1,
+    &mut log,
+    &mut stable,
+  );
   let mut ep = Endpoint::restart(
     single_node_cfg(1),
     Instant::ORIGIN,
@@ -355,11 +385,13 @@ fn fork_blob_is_authoritative_over_the_vessel() {
   // The vessel disagrees with the blob: the blob must win identically everywhere.
   m.create_group_from_fork(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
     preloaded_sm(5),
     fork_blob(9),
+    None,
     1,
     &mut log,
     &mut stable,
@@ -401,11 +433,13 @@ fn fork_with_a_corrupt_blob_poisons_only_that_group() {
   let (mut log7, mut stable7) = (VecLog::default(), AsyncStable::default());
   m.create_group_from_fork(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
     CountSm::default(),
     Bytes::from_static(&[1, 2, 3]),
+    None,
     1,
     &mut log7,
     &mut stable7,
@@ -448,11 +482,13 @@ fn forked_group_elects_off_the_baseline() {
   // Both replicas fork the SAME blob — the fork contract for a multi-replica child.
   a.create_group_from_fork(
     7,
+    0,
     voter_pair_cfg(1),
     Instant::ORIGIN,
     42,
     preloaded_sm(4),
     fork_blob(4),
+    None,
     1,
     &mut la,
     &mut sa,
@@ -460,11 +496,13 @@ fn forked_group_elects_off_the_baseline() {
   .unwrap();
   b.create_group_from_fork(
     7,
+    0,
     voter_pair_cfg(2),
     Instant::ORIGIN,
     43,
     preloaded_sm(4),
     fork_blob(4),
+    None,
     1,
     &mut lb,
     &mut sb,
@@ -531,11 +569,13 @@ fn fork_then_store_roundtrip_equals_restore() {
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   m.create_group_from_fork(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
     preloaded_sm(6),
     fork_blob(6),
+    None,
     1,
     &mut log,
     &mut stable,
@@ -974,11 +1014,13 @@ fn drive_forked_leader_and_fresh_joiner() -> ForkJoin {
   let (mut la, mut sa) = (VecLog::default(), AsyncStable::default());
   a.create_group_from_fork(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
     preloaded_sm(3),
     fork_blob(3),
+    None,
     1,
     &mut la,
     &mut sa,
@@ -1113,4 +1155,691 @@ fn the_joiner_lands_on_the_preloaded_state_plus_tail() {
     5,
     "preloaded state AND the tail are both present on the joiner"
   );
+}
+
+// ───────────────────────────── committed splits: propose gates + the fork relay ──────────────
+
+/// A splitting counter: `split` gives away `min(units, instruction[0])` units as the child half;
+/// `apply` adds one unit per command. `Snapshot = u64` keeps the blob the `Data` encoding the
+/// container relay round-trips.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct SplitSm {
+  units: u64,
+}
+
+impl crate::StateMachine for SplitSm {
+  type Command = Bytes;
+  type Response = u64;
+  type Snapshot = u64;
+  type Error = core::convert::Infallible;
+
+  fn apply(&mut self, _index: crate::Index, _cmd: Bytes) -> Result<u64, Self::Error> {
+    self.units += 1;
+    Ok(self.units)
+  }
+
+  fn snapshot(&self) -> Result<u64, Self::Error> {
+    Ok(self.units)
+  }
+
+  fn restore(&mut self, snapshot: u64) -> Result<(), Self::Error> {
+    self.units = snapshot;
+    Ok(())
+  }
+
+  fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+    let give = u64::from(*instruction.first()?).min(self.units);
+    self.units -= give;
+    Some(Self { units: give })
+  }
+}
+
+/// Drive `gid` (single voter) to leadership on `m` under one fixed instant.
+fn lead_single_split(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  gid: u64,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+) -> Instant {
+  let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&gid, d, log, stable).unwrap();
+  m.handle_storage(&gid, d, log, stable).unwrap();
+  m.handle_storage(&gid, d, log, stable).unwrap();
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  assert!(m.group(&gid).unwrap().role().is_leader());
+  d
+}
+
+/// Commit one command on a single-voter leader (append + flush + storage drain).
+fn commit_one_split(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  gid: u64,
+  d: Instant,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+) {
+  let cmd = Bytes::from_static(b"c");
+  m.propose(&gid, d, log, stable, &cmd).unwrap().unwrap();
+  m.flush_appends(&gid, d, log, stable).unwrap();
+  while matches!(
+    m.handle_storage(&gid, d, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+}
+
+/// The `Data` encoding of a committed `Split` entry's payload, as `propose_split` would build it.
+fn split_entry_bytes(child: u64, child_gen: u64, parent_gen_after: u64, give: u8) -> Bytes {
+  let mut child_bytes = Vec::new();
+  Data::encode(&child, &mut child_bytes);
+  let payload = crate::SplitPayload::new(
+    Bytes::from(child_bytes),
+    child_gen,
+    parent_gen_after,
+    Bytes::copy_from_slice(&[give]),
+  );
+  let mut buf = Vec::new();
+  crate::wire::encode_split_payload(&payload, &mut buf);
+  Bytes::from(buf)
+}
+
+#[test]
+fn propose_split_delegator_gates() {
+  // Unknown gid → None (the house delegator shape).
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  assert!(
+    m.propose_split(
+      &99,
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x01")
+    )
+    .is_none()
+  );
+
+  // A follower refuses with the leader hint (none known here).
+  let two_voters = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  m.create_group(7, two_voters, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  assert_eq!(
+    m.propose_split(
+      &7,
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x01")
+    ),
+    Some(Err(SplitError::NotLeader { leader: None }))
+  );
+
+  // A hosted child id refuses (the parent itself is hosted, so `child == gid` is covered too).
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m.create_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.create_group(
+    8,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  assert_eq!(
+    m.propose_split(&7, d, &mut log, &stable, &8, 0, Bytes::from_static(b"\x01")),
+    Some(Err(SplitError::ChildExists))
+  );
+  assert_eq!(
+    m.propose_split(&7, d, &mut log, &stable, &7, 0, Bytes::from_static(b"\x01")),
+    Some(Err(SplitError::ChildExists)),
+    "the parent id itself is a hosted child id"
+  );
+}
+
+#[test]
+fn propose_split_refuses_a_joint_parent() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(
+    7,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+
+  // Enter an EXPLICIT joint config (add voter 2; no auto-leave), committed by the single voter.
+  let ccv2 = crate::ConfChangeV2::new(
+    crate::ConfChangeTransition::Explicit,
+    std::vec![crate::ConfChangeSingle::new(
+      crate::ConfChangeType::AddNode,
+      2u64
+    )],
+    Bytes::new(),
+  );
+  m.propose_conf_change_v2(&7, d, &mut log, &stable, ccv2)
+    .unwrap()
+    .unwrap();
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  assert!(
+    m.group(&7).unwrap().conf_state().is_joint(),
+    "the parent is mid-joint"
+  );
+
+  assert_eq!(
+    m.propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x01")
+    ),
+    Some(Err(SplitError::JointConfig)),
+    "a joint-config parent refuses to split (one-line rule: no joint interleaving)"
+  );
+}
+
+#[test]
+fn propose_split_refuses_an_over_bound_child_id() {
+  /// A group id whose encoding length is its value — `1` is a valid 1-byte tag, `2000` is over
+  /// the 1024-byte wire bound.
+  #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+  struct WideId(usize);
+  impl core::fmt::Display for WideId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+      write!(f, "{}", self.0)
+    }
+  }
+  impl cheap_clone::CheapClone for WideId {}
+  impl Data for WideId {
+    fn encode(&self, buf: &mut Vec<u8>) {
+      buf.extend(core::iter::repeat_n(7u8, self.0));
+    }
+
+    fn decode(cursor: &mut crate::ByteCursor) -> Result<Self, crate::DecodeError> {
+      let n = cursor.remaining();
+      cursor.take_bytes(n)?;
+      Ok(Self(n))
+    }
+  }
+
+  let mut m: MultiRaft<WideId, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(
+    WideId(1),
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d = m.group(&WideId(1)).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&WideId(1), d, &mut log, &mut stable)
+    .unwrap();
+  m.handle_storage(&WideId(1), d, &mut log, &mut stable)
+    .unwrap();
+  m.handle_storage(&WideId(1), d, &mut log, &mut stable)
+    .unwrap();
+  assert!(m.group(&WideId(1)).unwrap().role().is_leader());
+
+  // An over-bound child id refuses AT PROPOSE: were it appended, every replica's relay decode
+  // would poison the parent on a committed entry — a self-inflicted cluster-wide fail-stop.
+  assert_eq!(
+    m.propose_split(
+      &WideId(1),
+      d,
+      &mut log,
+      &stable,
+      &WideId(2000),
+      0,
+      Bytes::from_static(b"\x01")
+    ),
+    Some(Err(SplitError::InvalidChild))
+  );
+}
+
+#[test]
+fn committed_split_relays_a_group_fork() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  // A distinctive knob (snapshot_threshold 1) proves the child inherits the parent's LOCAL
+  // config, and arms the parent's own snapshot cadence for the barrier assertions below.
+  let cfg = single_node_cfg(1)
+    .with_snapshot_threshold(1)
+    .with_pre_vote(true);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  assert_eq!(m.group(&7).unwrap().state_machine().units, 3);
+
+  // Propose the split: give 2 of the 3 units to child 200.
+  let idx = m
+    .propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+
+  // The G-free event surfaced through the container drain, stamped with the PARENT group.
+  let mut saw = false;
+  while let Some((g, ev)) = m.poll_event() {
+    if let Event::SplitApplied(sa) = ev {
+      assert_eq!(g, 7);
+      assert_eq!(sa.index(), idx);
+      saw = true;
+    }
+  }
+  assert!(saw, "Event::SplitApplied surfaced through poll_event");
+
+  // The relay: a typed GroupFork with the parent's voters remapped and the apply-derived blob.
+  let fork = m.poll_pending_fork().expect("one fork relayed");
+  assert_eq!(fork.parent, 7);
+  assert_eq!(fork.child, 200);
+  assert_eq!(fork.child_gen, 0);
+  assert_eq!(
+    fork.parent_gen_after, 1,
+    "first split bumps the lineage to 1"
+  );
+  assert_eq!(fork.split_index, idx);
+  assert_eq!(fork.fsm.units, 2, "the forked half");
+  assert_eq!(
+    fork.blob,
+    fork_blob(2),
+    "the apply-derived blob matches the half"
+  );
+  assert_eq!(fork.config.id(), 1);
+  assert_eq!(fork.config.voters(), &[1u64]);
+  assert_eq!(
+    fork.config.snapshot_threshold(),
+    1,
+    "the child inherits the parent's local knobs"
+  );
+  assert!(fork.config.pre_vote());
+  assert_eq!(
+    fork.read_only, None,
+    "a never-migrated parent hands the child no explicit mode"
+  );
+  assert!(m.poll_pending_fork().is_none(), "exactly one fork");
+  assert_eq!(m.group_gen(&7), 1, "the container's lineage view bumped");
+
+  // THE FORK DURABILITY BARRIER, container-to-endpoint: the threshold (1) is long crossed and a
+  // post-split entry commits, yet no capture lands AT-OR-PAST the split until the driver reports
+  // the fork behind its engine barrier (the pre-split capture, below the split index, stands).
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  let pre = stable.snapshot().map(|(m2, _)| m2.last_index());
+  assert!(
+    pre.is_none_or(|boundary| boundary < idx),
+    "no capture at-or-past the unresolved split (boundary {pre:?}, split {idx:?})"
+  );
+  m.lift_fork_barrier(&7, idx);
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  let (meta, _blob) = stable
+    .snapshot()
+    .expect("the lifted parent snapshots again");
+  assert!(
+    meta.last_index() > idx,
+    "the lifted parent's capture crosses the split boundary"
+  );
+  assert_eq!(
+    meta.shape_gen(),
+    1,
+    "the parent's meta carries the bumped lineage"
+  );
+}
+
+#[test]
+fn duplicate_gen_fork_drops_and_resolves_only_itself() {
+  // A follower container receives TWO committed splits carrying the SAME parent_gen_after (a
+  // retry duplicate): the relay yields the first and drops the second — and dropping the second
+  // must resolve ONLY the second's barrier contribution, never the first's (its fork is still
+  // un-flushed; lifting it early would let the parent compact the child's only recovery source).
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+
+  let entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Split,
+      split_entry_bytes(200, 0, 1, 0),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Split,
+      split_entry_bytes(201, 0, 1, 0),
+    ),
+  ];
+  m.handle_message(
+    &7,
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(2),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+
+  let fork = m.poll_pending_fork().expect("the first fork relays");
+  assert_eq!((fork.child, fork.parent_gen_after), (200, 1));
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "the same-gen duplicate is dropped by the replay guard"
+  );
+
+  // The dropped duplicate resolved ITS OWN barrier only: the first fork still fences snapshots.
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(
+    stable.snapshot().is_none(),
+    "the first fork's barrier survives the duplicate's resolution"
+  );
+  m.lift_fork_barrier(&7, Index::new(1));
+  m.handle_message(
+    &7,
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(
+      Term::new(1),
+      2u64,
+      Index::new(2),
+      Bytes::new(),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(
+    stable.snapshot().is_some(),
+    "resolving the real fork frees the parent's snapshot cadence"
+  );
+}
+
+#[test]
+fn hosted_child_fork_drops_and_resolves() {
+  // The committed split names a child THIS host already hosts (the factory raced the fork, or a
+  // replay after a partial flush): the relay drops it as ChildExists and resolves its barrier —
+  // the no-op lift is safe because any solicitation that materialized the child can only have
+  // come from an already-forked member whose blob was flush-durable before it could transmit.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  m.create_group(
+    200,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+  )
+  .unwrap();
+
+  m.handle_message(
+    &7,
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![crate::Entry::new(
+        Term::new(1),
+        Index::new(1),
+        crate::EntryKind::Split,
+        split_entry_bytes(200, 0, 1, 0),
+      )],
+      Index::new(1),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "a hosted child id short-circuits to a no-op"
+  );
+  assert_eq!(
+    m.group_gen(&7),
+    1,
+    "the lineage still bumped (the split IS applied)"
+  );
+  // Its barrier resolved with the drop: once the threshold is crossed by the next committed
+  // entry, the parent captures a snapshot AT-OR-PAST the dropped split — no orphaned fence.
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"x").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  m.handle_message(
+    &7,
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::new(1),
+      Term::new(1),
+      std::vec![crate::Entry::new(
+        Term::new(1),
+        Index::new(2),
+        crate::EntryKind::Normal,
+        cmd,
+      )],
+      Index::new(2),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  let (meta, _blob) = stable
+    .snapshot()
+    .expect("no orphaned barrier after the ChildExists drop");
+  assert!(
+    meta.last_index() >= Index::new(1),
+    "the capture crosses the dropped split"
+  );
+  assert_eq!(meta.shape_gen(), 1, "and carries the bumped lineage");
+}
+
+#[test]
+fn restore_seeds_the_replay_guard_from_durable_lineage() {
+  // Crash shape A (row 1): the durable snapshot PRECEDES the split (shape_gen 0); the tail
+  // replays it. The re-staged fork must relay again — the child may never have flushed.
+  let cfg = || {
+    Config::try_new(
+      1u64,
+      std::vec![1u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Split,
+    split_entry_bytes(200, 0, 1, 0),
+  )]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m.restore_group(
+    7,
+    cfg(),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  let fork = m
+    .poll_pending_fork()
+    .expect("a replayed, never-relayed fork relays again");
+  assert_eq!((fork.child, fork.parent_gen_after), (200, 1));
+
+  // Crash shape B (row 4): the durable snapshot ALREADY CARRIES the split's bump (shape_gen 1
+  // at a boundary past it), and the tail replays a stale same-gen retry duplicate: the guard,
+  // seeded from the DURABLE lineage, drops it — and resolves its barrier so the parent is free.
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let meta = crate::SnapshotMeta::new(
+    Index::new(2),
+    Term::new(1),
+    crate::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_shape_gen(1);
+  stable.force_snapshot(meta, fork_blob(1));
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  log.restore(Index::new(2), Term::new(1));
+  log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(3),
+    crate::EntryKind::Split,
+    split_entry_bytes(201, 0, 1, 0),
+  )]);
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m.restore_group(
+    7,
+    cfg().with_snapshot_threshold(1),
+    Instant::ORIGIN,
+    42,
+    SplitSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(m.group_gen(&7), 1);
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "a replayed duplicate below the durable lineage is dropped"
+  );
+}
+
+#[test]
+fn fork_baseline_meta_carries_lineage_and_read_mode() {
+  // The manufactured install stamps the child's incarnation and its inherited read mode into
+  // the baseline meta, so the child boots knowing both (exactly as a restart recovers them).
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group_from_fork(
+    7,
+    3,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    preloaded_sm(5),
+    fork_blob(5),
+    Some(crate::ReadOnlyOption::Safe),
+    1,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+
+  let (meta, _) = stable.snapshot().expect("baseline persisted");
+  assert_eq!(
+    meta.shape_gen(),
+    3,
+    "the child's incarnation rides its baseline meta"
+  );
+  assert_eq!(
+    meta.read_only(),
+    Some(crate::ReadOnlyOption::Safe),
+    "the inherited mode rides the baseline meta (explicit-Safe stays distinguishable)"
+  );
+  assert_eq!(m.group_gen(&7), 3);
+  assert!(!m.group(&7).unwrap().is_poisoned());
 }

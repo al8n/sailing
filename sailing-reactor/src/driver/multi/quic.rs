@@ -659,6 +659,9 @@ where
         seed,
         fsm,
         snapshot,
+        // An embedder-driven fork inherits no parent mode: the child's config supplies it,
+        // which is exactly the absent-provenance meaning of `None`.
+        None,
         epoch,
         generation,
         &lineage,

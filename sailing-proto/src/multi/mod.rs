@@ -28,9 +28,9 @@ pub use group_id::GroupId;
 
 use crate::{
   ConfChange, ConfChangeV2, ConfState, Config, CreateGroupError, Data, Endpoint, Event, HardState,
-  Index, Instant, LogStore, Message, NodeId, Now, OpId, Outgoing, Prng, ProposeError,
-  ReadIndexError, ReadOnlyOption, SnapshotMeta, StableStore, StateMachine, StorageProgress, Term,
-  TransferError,
+  Index, Instant, LogStore, Message, NodeId, Now, OpId, Outgoing, PoisonReason, Prng, ProposeError,
+  ReadIndexError, ReadOnlyOption, SnapshotMeta, SplitError, SplitPayload, StableStore,
+  StateMachine, StorageProgress, Term, TransferError,
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
@@ -150,6 +150,8 @@ pub const FORK_BASE_TERM: Term = Term::new(1);
 fn write_fork_baseline<I, L, S>(
   config: &Config<I>,
   snapshot: Bytes,
+  generation: u64,
+  read_only: Option<ReadOnlyOption>,
   boot_epoch: u64,
   log: &mut L,
   stable: &mut S,
@@ -166,11 +168,15 @@ fn write_fork_baseline<I, L, S>(
       .with_commit(FORK_BASE_INDEX),
   );
   let conf = ConfState::from_voters(config.voters().iter().map(CheapClone::cheap_clone));
-  stable.submit_snapshot(
-    opid.next(),
-    SnapshotMeta::new(FORK_BASE_INDEX, FORK_BASE_TERM, conf),
-    snapshot,
-  );
+  // The baseline meta carries the child's own lineage (its incarnation under the unified
+  // counter, absent at 0) and — when the parent had a committed migration — the inherited read
+  // mode, exactly as a real install's meta would: the restart boot below then recovers both.
+  let mut meta =
+    SnapshotMeta::new(FORK_BASE_INDEX, FORK_BASE_TERM, conf).with_shape_gen(generation);
+  if let Some(mode) = read_only {
+    meta = meta.with_read_only(mode);
+  }
+  stable.submit_snapshot(opid.next(), meta, snapshot);
   log.restore(FORK_BASE_INDEX, FORK_BASE_TERM);
 }
 
@@ -188,6 +194,38 @@ const fn validate_fork_boot_epoch(boot_epoch: u64) -> Result<(), CreateGroupErro
     return Err(CreateGroupError::InvalidBootEpoch);
   }
   Ok(())
+}
+
+/// One committed, container-relayed fork: everything a driver needs to materialize the child
+/// group behind its engine barrier. Yielded by [`MultiRaft::poll_pending_fork`] after the typed
+/// child id decoded, the replay guard passed, and the child config was rebuilt from the parent's
+/// local tuning under the fork's voter set. The fields are deliberately public — this is a
+/// transfer record the driver destructures into
+/// [`create_group_from_fork`](MultiRaft::create_group_from_fork).
+pub struct GroupFork<G, I, F> {
+  /// The parent group (the split entry rode its log).
+  pub parent: G,
+  /// The child group id, decoded from the committed payload.
+  pub child: G,
+  /// The child's incarnation under the unified lineage counter (normally 0).
+  pub child_gen: u64,
+  /// The parent's lineage counter after this split — already folded into the container's relay
+  /// guard when this fork is yielded.
+  pub parent_gen_after: u64,
+  /// The child's boot config: the parent's LOCAL tuning with voters := the parent's voter set
+  /// at the split entry (this host keeps its own node id).
+  pub config: Config<I>,
+  /// The forked state-machine half, handed to the child as its restore vessel.
+  pub fsm: F,
+  /// The child's authoritative recovery blob, derived at the parent's apply point
+  /// (`encode(fsm.snapshot())` of the half — the two correspond by construction).
+  pub blob: Bytes,
+  /// The read mode the child inherits through its baseline meta (`None` for a never-migrated
+  /// parent: the child falls back to its config, exactly as a restart would).
+  pub read_only: Option<ReadOnlyOption>,
+  /// The split entry's index in the PARENT's log — the fork durability barrier's anchor, handed
+  /// back through [`MultiRaft::lift_fork_barrier`] once the child's baseline is flush-durable.
+  pub split_index: Index,
 }
 
 /// The create/restore admission check shared by every group constructor: group-id uniqueness, the
@@ -237,6 +275,17 @@ where
   dirty_msgs: VecDeque<G>,
   /// Groups that may have a pending event to drain (see [`poll_event`](Self::poll_event)).
   dirty_events: VecDeque<G>,
+  /// Groups that may have a staged pending fork to relay (see
+  /// [`poll_pending_fork`](Self::poll_pending_fork)).
+  dirty_forks: VecDeque<G>,
+  /// The RELAY-TIME lineage view, one entry per admitted id: seeded at every admission (0 at
+  /// genesis create, the DURABLE restored lineage at restore/fork) and bumped to
+  /// `parent_gen_after` when a fork is relayed. This is the replay guard: a fork whose bump is
+  /// at-or-below this view was already relayed (a same-gen retry duplicate, or a tail replayed
+  /// under a snapshot that already carries the bump) and folds to a resolved no-op. Deliberately
+  /// DISTINCT from the endpoints' live `shape_gen` (bumped at APPLY, before the relay — guarding
+  /// on it would drop every first relay).
+  lineage: BTreeMap<G, u64>,
   /// The host's node identity, latched by the FIRST admitted group and retained for the
   /// container's whole lifetime — including across [`remove_group`](Self::remove_group) emptying
   /// the map. A multi-Raft host is one physical node: live transport connections stay
@@ -259,6 +308,8 @@ where
       groups: BTreeMap::new(),
       dirty_msgs: VecDeque::new(),
       dirty_events: VecDeque::new(),
+      dirty_forks: VecDeque::new(),
+      lineage: BTreeMap::new(),
       host_id: None,
     }
   }
@@ -347,6 +398,20 @@ where
     if self.dirty_events.back() != Some(gid) {
       self.dirty_events.push_back(gid.cheap_clone());
     }
+    if self.dirty_forks.back() != Some(gid) {
+      self.dirty_forks.push_back(gid.cheap_clone());
+    }
+  }
+
+  /// The group's lineage counter under the unified per-id scheme (incarnation ⊔ shape), as this
+  /// container knows it: the LIVE endpoint counter when hosted (it includes every applied
+  /// split), else the relay-time view (a removed id's last relayed bump). `0` for an id never
+  /// admitted or reshaped.
+  #[must_use]
+  pub fn group_gen(&self, gid: &G) -> u64 {
+    let live = self.groups.get(gid).map(Endpoint::shape_gen).unwrap_or(0);
+    let relayed = self.lineage.get(gid).copied().unwrap_or(0);
+    live.max(relayed)
   }
 }
 
@@ -377,6 +442,98 @@ where
       .groups
       .iter()
       .filter_map(|(gid, ep)| ep.poll_timeout().map(|d| (gid.cheap_clone(), d)))
+  }
+
+  /// The next committed, relay-ready fork from any group — the driver drains this every crank
+  /// (BEFORE its storage crank, so the same crank's engine flush covers the materialization).
+  /// Decodes the typed child id, applies the replay guard, rebuilds the child's config from the
+  /// parent's local tuning, and yields a [`GroupFork`]. Folded to a RESOLVED no-op (the fork's
+  /// barrier contribution is released, nothing yielded) when: the bump is at-or-below the relay
+  /// guard (a retry duplicate / an already-covered replay), the child id is already hosted (the
+  /// factory raced the fork — safe because any solicitation that materialized it can only have
+  /// come from an already-forked member whose blob was flush-durable before it could transmit),
+  /// or this host is not in the fork's voter set (a parent LEARNER applies the split — its
+  /// parent half shrinks identically — but does not place the child; the embedder adds it by
+  /// conf change later if wanted). A committed child id that does not decode as `G` poisons the
+  /// parent (`SplitDecode` — committed-corrupt, the apply-arm's own decode class) and drops its
+  /// remaining staged forks.
+  pub fn poll_pending_fork(&mut self) -> Option<GroupFork<G, I, F>> {
+    while let Some(gid) = self.dirty_forks.front().map(CheapClone::cheap_clone) {
+      let Some(ep) = self.groups.get_mut(&gid) else {
+        self.dirty_forks.pop_front();
+        continue;
+      };
+      let Some((fork, fsm)) = ep.pop_pending_fork() else {
+        self.dirty_forks.pop_front();
+        continue;
+      };
+      let Ok(child) = G::decode_exact(fork.child_bytes.clone()) else {
+        ep.poison(PoisonReason::SplitDecode);
+        while ep.pop_pending_fork().is_some() {}
+        self.dirty_forks.pop_front();
+        continue;
+      };
+      let in_voters = self
+        .host_id
+        .as_ref()
+        .is_some_and(|host| fork.voters.contains(host));
+      if !in_voters {
+        if let Some(ep) = self.groups.get_mut(&gid) {
+          ep.resolve_fork(fork.index);
+        }
+        continue;
+      }
+      if fork.parent_gen_after <= self.lineage.get(&gid).copied().unwrap_or(0) {
+        if let Some(ep) = self.groups.get_mut(&gid) {
+          ep.resolve_fork(fork.index);
+        }
+        continue;
+      }
+      self
+        .lineage
+        .insert(gid.cheap_clone(), fork.parent_gen_after);
+      if self.groups.contains_key(&child) {
+        if let Some(ep) = self.groups.get_mut(&gid) {
+          ep.resolve_fork(fork.index);
+        }
+        continue;
+      }
+      // Rebuild the child's boot config: the parent's local tuning under the fork's voter set.
+      // The voter-membership check above makes `IdNotAVoter` unreachable; the arm is defensive
+      // (resolve rather than wedge the queue).
+      let Some(config) = self
+        .groups
+        .get(&gid)
+        .and_then(|ep| ep.config().with_voter_set(fork.voters.clone()).ok())
+      else {
+        if let Some(ep) = self.groups.get_mut(&gid) {
+          ep.resolve_fork(fork.index);
+        }
+        continue;
+      };
+      return Some(GroupFork {
+        parent: gid,
+        child,
+        child_gen: fork.child_gen,
+        parent_gen_after: fork.parent_gen_after,
+        config,
+        fsm,
+        blob: fork.blob,
+        read_only: fork.read_only,
+        split_index: fork.index,
+      });
+    }
+    None
+  }
+
+  /// Resolve the fork staged at exactly `split_index` on `parent`: the driver reports the
+  /// child's baseline flush-durable behind its engine barrier (or a relayed fork it abandoned),
+  /// and the parent's snapshot fence over that index releases. Exact-index semantics — see
+  /// [`GroupFork::split_index`]; resolving one fork never frees an older, still-pending one.
+  pub fn lift_fork_barrier(&mut self, parent: &G, split_index: Index) {
+    if let Some(ep) = self.groups.get_mut(parent) {
+      ep.resolve_fork(split_index);
+    }
   }
 }
 
@@ -409,6 +566,9 @@ where
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
     let ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
+    // Genesis: reset the relay-time lineage view (a stale entry from an earlier same-uptime
+    // incarnation must not shadow this admission — every admission reseeds it).
+    self.lineage.insert(gid.cheap_clone(), 0);
     self.groups.insert(gid, ep);
     Ok(())
   }
@@ -453,9 +613,15 @@ where
       log,
       stable,
     );
+    // Seed the relay guard from the DURABLE lineage (the restored snapshot meta's `shape_gen`),
+    // NOT the live counter: the restart replay may have re-staged a not-yet-materialized fork,
+    // re-bumping the live counter — the guard must relay that fork again, not drop it.
+    self
+      .lineage
+      .insert(gid.cheap_clone(), ep.restored_lineage());
     self.groups.insert(gid.cheap_clone(), ep);
-    // Defensive only: `Endpoint::restart` currently surfaces no output (replay events are
-    // deliberately cleared), so this marks an empty queue. The restore variants below mirror it.
+    // The dirty marks cover the replayed forks (message/event replay is deliberately cleared by
+    // `Endpoint::restart`, so those two queues mark empty).
     self.mark_dirty(&gid);
     Ok(())
   }
@@ -500,6 +666,9 @@ where
       log,
       stable,
     );
+    self
+      .lineage
+      .insert(gid.cheap_clone(), ep.restored_lineage());
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -544,11 +713,13 @@ where
   pub fn create_group_from_fork<L, S>(
     &mut self,
     gid: G,
+    generation: u64,
     config: Config<I>,
     now: impl Into<Now>,
     seed: u64,
     fsm: F,
     snapshot: Bytes,
+    read_only: Option<ReadOnlyOption>,
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
@@ -564,7 +735,13 @@ where
     validate_fork_boot_epoch(boot_epoch)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
-    write_fork_baseline(&config, snapshot, boot_epoch, log, stable);
+    // `generation` (the child's incarnation under the unified lineage counter) and the
+    // inherited `read_only` provenance ride the baseline meta, so the restart boot below — and
+    // every later restart from the child's own stores — recovers both exactly as it would from
+    // a real install (absent at 0 / `None`: byte-identical to the pre-reshaping baseline).
+    write_fork_baseline(
+      &config, snapshot, generation, read_only, boot_epoch, log, stable,
+    );
     let ep = Endpoint::restart(
       config,
       now,
@@ -574,6 +751,9 @@ where
       log,
       stable,
     );
+    self
+      .lineage
+      .insert(gid.cheap_clone(), ep.restored_lineage());
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -606,6 +786,7 @@ where
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
     let ep = Endpoint::new_with_rng(config, now, rng, fsm);
+    self.lineage.insert(gid.cheap_clone(), 0);
     self.groups.insert(gid, ep);
     Ok(())
   }
@@ -638,6 +819,9 @@ where
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
     let ep = Endpoint::restart_with_rng(config, now, rng, fsm, boot_epoch, log, stable);
+    self
+      .lineage
+      .insert(gid.cheap_clone(), ep.restored_lineage());
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -681,6 +865,9 @@ where
       log,
       stable,
     );
+    self
+      .lineage
+      .insert(gid.cheap_clone(), ep.restored_lineage());
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -698,11 +885,13 @@ where
   pub fn create_group_from_fork_with_rng<L, S>(
     &mut self,
     gid: G,
+    generation: u64,
     config: Config<I>,
     now: impl Into<Now>,
     rng: R,
     fsm: F,
     snapshot: Bytes,
+    read_only: Option<ReadOnlyOption>,
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
@@ -718,8 +907,13 @@ where
     validate_fork_boot_epoch(boot_epoch)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
-    write_fork_baseline(&config, snapshot, boot_epoch, log, stable);
+    write_fork_baseline(
+      &config, snapshot, generation, read_only, boot_epoch, log, stable,
+    );
     let ep = Endpoint::restart_with_rng(config, now, rng, fsm, boot_epoch, log, stable);
+    self
+      .lineage
+      .insert(gid.cheap_clone(), ep.restored_lineage());
     self.groups.insert(gid.cheap_clone(), ep);
     self.mark_dirty(&gid);
     Ok(())
@@ -909,6 +1103,81 @@ where
       .groups
       .get_mut(gid)?
       .propose_read_mode_change(now, log, stable, mode);
+    self.mark_dirty(gid);
+    Some(result)
+  }
+
+  /// Propose a group SPLIT on `gid` (the parent): a committed `Split` entry deterministically
+  /// forks `child` out of the parent's state machine on every replica. Leader-only, on the
+  /// parent's own log; the payload carries the child id (G-free on the wire), `child_gen` (the
+  /// child's incarnation — normally 0), the parent's bumped lineage (computed here: the live
+  /// counter + 1, the replay-guard/idempotence anchor), and the embedder's opaque
+  /// `instruction`, bounded by the single-frame append check. `None` if no such group.
+  ///
+  /// Gate order: poisoned → leader → joint config → hosted child → child-id wire bound → the
+  /// ordinary admin append (whose refusals pass through as [`SplitError::Propose`]).
+  /// `BelowFloor` is produced by the COORDINATOR delegators through their floor seam, and
+  /// `CrossPlane` by a sharded host's handle — the container stays floor- and plane-free.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  #[allow(clippy::too_many_arguments)]
+  pub fn propose_split<L, S>(
+    &mut self,
+    gid: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
+    _stable: &S,
+    child: &G,
+    child_gen: u64,
+    instruction: Bytes,
+  ) -> Option<Result<Index, SplitError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    {
+      let ep = self.groups.get(gid)?;
+      if ep.is_poisoned() {
+        return Some(Err(SplitError::Propose(ProposeError::Poisoned)));
+      }
+      if !ep.role().is_leader() {
+        return Some(Err(SplitError::NotLeader {
+          leader: ep.leader(),
+        }));
+      }
+      // A joint parent would hand the child an ambiguous bootstrap voter set: refuse at
+      // propose (the one-line rule that removes the hairiest interleaving).
+      if ep.conf_state().is_joint() {
+        return Some(Err(SplitError::JointConfig));
+      }
+    }
+    // A hosted child id (the parent's own included) can never be forked into existence here.
+    if self.groups.contains_key(child) {
+      return Some(Err(SplitError::ChildExists));
+    }
+    // Refuse an out-of-bound child encoding BEFORE it can be committed: every replica's relay
+    // decode would otherwise poison the parent on a committed entry.
+    let mut child_bytes = Vec::new();
+    child.encode(&mut child_bytes);
+    if child_bytes.is_empty() || child_bytes.len() > crate::wire::MAX_GROUP_ID_LEN {
+      return Some(Err(SplitError::InvalidChild));
+    }
+    let ep = self.groups.get_mut(gid)?;
+    // The bump is computed from the LIVE counter so back-to-back splits chain (each apply
+    // bumps it before the next propose reads it). Lineage exhaustion is unreachable before
+    // log-index exhaustion — every bump consumes a log index — so no ceiling check rides here.
+    let parent_gen_after = ep.shape_gen() + 1;
+    let payload = SplitPayload::new(
+      Bytes::from(child_bytes),
+      child_gen,
+      parent_gen_after,
+      instruction,
+    );
+    let mut buf = Vec::new();
+    crate::wire::encode_split_payload(&payload, &mut buf);
+    let result = ep
+      .propose_split_entry(now, log, Bytes::from(buf))
+      .map_err(SplitError::Propose);
     self.mark_dirty(gid);
     Some(result)
   }

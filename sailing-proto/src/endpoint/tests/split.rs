@@ -1,5 +1,5 @@
 //! The committed-split apply arm: `fsm.split` at the deterministic point, the staged pending
-//! fork with its apply-derived blob, the fork durability barrier (`snapshot_cap`), the G-free
+//! fork with its apply-derived blob, the fork durability barrier (the outstanding split indexes), the G-free
 //! `SplitApplied` event, and the lineage (`shape_gen`) fold into snapshot meta.
 use super::*;
 use crate::{Config, Data, SplitPayload, wire::encode_split_payload};
@@ -238,9 +238,9 @@ fn committed_split_forks_at_apply_and_caps_snapshots() {
     "no snapshot may be captured at/past an unlifted split index"
   );
 
-  // Lifting at the split index clears the cap (no earlier fork remains queued) and the ordinary
-  // snapshot cadence resumes, stamping the bumped lineage into the meta.
-  ep.lift_snapshot_cap(Index::new(3));
+  // Resolving the fork at its exact split index frees the barrier and the ordinary snapshot
+  // cadence resumes, stamping the bumped lineage into the meta.
+  ep.resolve_fork(Index::new(3));
   ep.maybe_snapshot(&log, &mut stable);
   let (meta, _blob) = stable.snapshot().expect("the lifted parent snapshots");
   assert_eq!(meta.last_index(), Index::new(4));

@@ -1351,6 +1351,13 @@ where
     self.role
   }
 
+  /// The group's construction config — the immutable local-tuning seed (a forked child's boot
+  /// config is rebuilt from it under the fork's voter set).
+  #[inline(always)]
+  pub(crate) const fn config(&self) -> &Config<I> {
+    &self.config
+  }
+
   /// The current term.
   #[inline(always)]
   pub const fn term(&self) -> Term {
@@ -1587,7 +1594,7 @@ where
   /// `reason` records the CLASS of failure. First-cause-wins: if the node was already
   /// poisoned, the original `reason` is preserved so the diagnosis is not clobbered by a
   /// downstream failure.
-  fn poison(&mut self, reason: PoisonReason) {
+  pub(crate) fn poison(&mut self, reason: PoisonReason) {
     self.poison.poisoned = true;
     self.poison.poison_reason.get_or_insert(reason);
   }
@@ -2515,11 +2522,12 @@ where
               .read_mode_migrated
               .then_some(self.reads.active_read_mode);
             self.split.shape_gen = self.split.shape_gen.max(payload.parent_gen_after());
-            // THE FORK DURABILITY BARRIER: hold this endpoint's snapshots at the OLDEST staged
-            // split index until the fork's baseline is behind the local engine barrier — a
-            // parent snapshot past an undurable fork would compact the child's only recovery
-            // source (see `maybe_snapshot`). Apply itself continues past the entry.
-            self.split.snapshot_cap.get_or_insert(idx);
+            // THE FORK DURABILITY BARRIER: hold this endpoint's snapshots at the oldest
+            // OUTSTANDING split index until each fork's baseline is behind the local engine
+            // barrier (each is resolved individually — see `resolve_fork`) — a parent snapshot
+            // past an undurable fork would compact the child's only recovery source (see
+            // `maybe_snapshot`). Apply itself continues past the entry.
+            self.split.outstanding.insert(idx);
             self
               .outputs
               .events
