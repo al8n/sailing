@@ -223,6 +223,20 @@ impl MultiWorld {
     self.tick_count
   }
 
+  /// The `snapshot_threshold` a genuinely constructed replica was built under, read off the
+  /// retained per-replica config surface — any one witnesses it, since the world applies a single
+  /// uniform override at construction. `None` only when no replica has ever been wired. The
+  /// non-`cfg(test)` twin of `replica_snapshot_threshold`, callable from the VOPR runner so the
+  /// report's applied-threshold witness comes from a config a replica ACTUALLY received, not the
+  /// value the profile requested.
+  pub(crate) fn applied_snapshot_threshold(&self) -> Option<usize> {
+    self
+      .configs
+      .values()
+      .next()
+      .map(|config| config.snapshot_threshold())
+  }
+
   /// The `snapshot_threshold` the replica of `gid` on `node` was constructed under, read off the
   /// retained per-replica config — the exact one handed to the container at admission and rebuilt
   /// from on crash restore. `None` when `node` hosts no replica of `gid`. The seam's witness: it
