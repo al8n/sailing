@@ -25,8 +25,9 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  ClusterId, Config, Event, FloorStore, GroupControl, GroupEngine, GroupId, Instant,
-  MultiQuicCoordinator, Now, StateMachine, StorageProgress, floor_admits, quic::QuicOptions,
+  ClusterId, Config, Event, FloorStore, GroupControl, GroupEngine, GroupId, Index, Instant,
+  MultiQuicCoordinator, Now, ReadOnlyOption, StateMachine, StorageProgress, floor_admits,
+  quic::QuicOptions,
 };
 
 use sailing_driver::{
@@ -45,7 +46,7 @@ use crate::driver::{map_propose_err, map_read_err, map_transfer_err};
 
 use super::{
   EngineMetrics, FloorSnapshot, GroupActivity, STORAGE_REDRIVES, blueprint_names, conf_names,
-  group_idle, no_such_group, rejected,
+  group_idle, host_seed, map_split_err, no_such_group, rejected,
 };
 
 /// Backstop wake cadence while configured peers exist (the link reconciler's pacing on an
@@ -91,6 +92,11 @@ where
   /// unknown-group signal BEFORE the lifecycle tail. `None` = every signal falls through to the
   /// tail — the factory-less driver, byte for byte.
   factory: Option<BoxedGroupFactory<G, I, F>>,
+  /// Relayed forks materialized THIS crank, awaiting the engine barrier: after `engine.flush()`
+  /// covers their staged baselines, each lifts its parent's fork barrier and surfaces the typed
+  /// `LifecycleEvent::SplitApplied` — registration, blob, and lineage become durable atomically
+  /// before any lift.
+  forks_pending_flush: Vec<(G, Index, G)>,
   storage_ready: flume::Receiver<()>,
   _storage_ready_keepalive: Option<flume::Sender<()>>,
   peers: Vec<Node<I, SocketAddr>>,
@@ -201,6 +207,7 @@ where
         stub_events_tx,
         lifecycle_tx,
         factory: None,
+        forks_pending_flush: Vec::new(),
         storage_ready,
         _storage_ready_keepalive: keepalive,
         peers,
@@ -450,9 +457,57 @@ where
 
   /// The per-crank storage step (the stream sibling's verbatim): one gated engine barrier, then
   /// every hosted group's bounded completion drain.
+  /// Drain the container's committed, relay-ready forks into materializations — BEFORE the
+  /// barrier below, so the SAME crank's `engine.flush()` covers every staged baseline before
+  /// `pump` can transmit anything for the child (a child that can solicit peers is therefore
+  /// always locally blob-durable first, which is what makes the hosted-child no-op lift safe;
+  /// it also front-runs the factory drain, so a local fork wins any same-id solicitation
+  /// race). A refused materialization — a floored or tombstoned child id, an invalid config —
+  /// abandons THIS fork: its barrier resolves (the parent must not stay fenced for a fork that
+  /// will never land here) and the driver survives; the child still reaches this host by the
+  /// ordinary lifecycle paths (solicitation → factory/embedder → snapshot from a live member,
+  /// whose own blob went durable before it could transmit).
+  fn fork_drain(&mut self, now: Now) {
+    while let Some(fork) = self.coord.poll_pending_fork() {
+      let parent = fork.parent;
+      let split_index = fork.split_index;
+      let child = fork.child.cheap_clone();
+      let seed = host_seed(self.coord.host_id());
+      match self.create_group_from_fork(
+        now,
+        fork.child,
+        fork.config,
+        seed,
+        fork.fsm,
+        fork.blob,
+        fork.read_only,
+        fork.child_gen,
+      ) {
+        Ok(()) => {
+          // The parent's lineage record advances with the child's registration, all behind the
+          // ONE barrier the pending-flush entry below waits on.
+          self.engine.set_group_gen(&parent, fork.parent_gen_after);
+          self.forks_pending_flush.push((parent, split_index, child));
+        }
+        Err(_) => {
+          self.coord.lift_fork_barrier(&parent, split_index);
+        }
+      }
+    }
+  }
+
   fn storage_crank(&mut self, now: Now) {
+    self.fork_drain(now);
     if self.flush_pending {
       self.engine.flush();
+    }
+    // Registration + blob + lineage became durable in the flush above (ONE barrier): only now
+    // may each fork's parent barrier lift and the typed lifecycle event fire.
+    for (parent, split_index, child) in self.forks_pending_flush.drain(..) {
+      self.coord.lift_fork_barrier(&parent, split_index);
+      let _ = self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::SplitApplied { parent, child });
     }
     let mut more = false;
     let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
@@ -637,6 +692,7 @@ where
     seed: u64,
     fsm: F,
     snapshot: Bytes,
+    read_only: Option<ReadOnlyOption>,
     generation: u64,
   ) -> Result<(), DriverError<I>> {
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
@@ -659,9 +715,7 @@ where
         seed,
         fsm,
         snapshot,
-        // An embedder-driven fork inherits no parent mode: the child's config supplies it,
-        // which is exactly the absent-provenance meaning of `None`.
-        None,
+        read_only,
         epoch,
         generation,
         &lineage,
@@ -725,7 +779,8 @@ where
       | MultiCommand::Query { group, .. }
       | MultiCommand::FailoverWindow { group, .. }
       | MultiCommand::Transfer { group, .. }
-      | MultiCommand::SetReadMode { group, .. } => {
+      | MultiCommand::SetReadMode { group, .. }
+      | MultiCommand::ProposeSplit { group, .. } => {
         let group = group.cheap_clone();
         self.wake_group(&group);
       }
@@ -920,6 +975,45 @@ where
         let _ = reply.send(verdict);
         drop(reservation);
       }
+      MultiCommand::ProposeSplit {
+        group,
+        child,
+        child_gen,
+        instruction,
+        reply,
+        reservation,
+      } => {
+        // The propose-time floor leg reads a pre-call snapshot of the CHILD id's lineage (the
+        // engine is lent to the propose as `(log, stable)`); the drain above keeps the
+        // authoritative materialization-edge recheck.
+        let floors = FloorSnapshot {
+          floor: self.engine.group_floor(&child),
+          lineage: self.engine.group_gen(&child),
+        };
+        let verdict = match self.engine.stores(&group) {
+          None => Err(no_such_group()),
+          Some((log, stable)) => {
+            match self.coord.propose_split(
+              &group,
+              now,
+              log,
+              stable,
+              &child,
+              child_gen,
+              instruction,
+              &floors,
+            ) {
+              Some(r) => r.map_err(map_split_err),
+              None => Err(no_such_group()),
+            }
+          }
+        };
+        if verdict.is_ok() {
+          self.flush_pending = true;
+        }
+        let _ = reply.send(verdict);
+        drop(reservation);
+      }
       MultiCommand::Status {
         group,
         reply,
@@ -962,8 +1056,12 @@ where
         reply,
         reservation,
       } => {
-        let _ = reply
-          .send(self.create_group_from_fork(now, gid, config, seed, fsm, snapshot, generation));
+        let _ = reply.send(self.create_group_from_fork(
+          now, gid, config, seed, fsm, snapshot,
+          // An embedder-driven fork inherits no parent mode: the child's config supplies
+          // it, which is exactly the absent-provenance meaning of `None`.
+          None, generation,
+        ));
         drop(reservation);
       }
       MultiCommand::RestoreGroup {

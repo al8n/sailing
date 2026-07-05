@@ -193,6 +193,44 @@ fn lifecycle_commands_round_trip_their_replies() {
   });
 }
 
+/// `propose_split` rides the shared channel with its typed payload — parent, child, the child's
+/// incarnation, the opaque instruction — and its reply resolves the awaiting caller with the
+/// proposed index; the group projection addresses its own group as the parent.
+#[test]
+fn propose_split_round_trips_its_reply() {
+  futures_executor::block_on(async {
+    let (handle, cmd_rx, _event_tx, _lifecycle_tx, _teardown_tx) =
+      test_handle(InflightBudget::new(8, 64));
+
+    let g100 = handle.group(100);
+    let mut split = Box::pin(g100.propose_split(200, 3, bytes::Bytes::from_static(b"k<=m")));
+    assert!(matches!(futures_util::poll!(split.as_mut()), Poll::Pending));
+    match cmd_rx.try_recv().expect("the split was enqueued") {
+      MultiCommand::ProposeSplit {
+        group,
+        child,
+        child_gen,
+        instruction,
+        reply,
+        ..
+      } => {
+        assert_eq!(group, 100);
+        assert_eq!(child, 200);
+        assert_eq!(child_gen, 3, "the child's incarnation rides the command");
+        assert_eq!(instruction.as_ref(), b"k<=m");
+        reply
+          .send(Ok(sailing_proto::Index::new(9)))
+          .expect("the caller is awaiting");
+      }
+      _ => panic!("expected a ProposeSplit"),
+    }
+    assert_eq!(
+      split.await.expect("the verdict resolves"),
+      sailing_proto::Index::new(9)
+    );
+  });
+}
+
 /// The multi handle inherits the single-group shutdown contract: many clones' `shutdown()`s
 /// coalesce to ONE enqueued `Shutdown`, and every caller resolves only once the shared teardown
 /// signal fires.

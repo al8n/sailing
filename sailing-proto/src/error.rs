@@ -158,6 +158,11 @@ pub enum SplitError<I> {
     /// The child id's persisted admission floor.
     floor: u64,
   },
+  /// The child incarnation is the reserved `u64::MAX` merged-floor sentinel — never a working
+  /// incarnation (see [`CreateGroupError::ReservedGeneration`]); a coordinator's floor seam
+  /// refuses it at propose exactly as admission would at materialization.
+  #[error("the child id's incarnation is the reserved merged-floor sentinel (u64::MAX)")]
+  ReservedGeneration,
   /// The child id maps to a different plane than the parent on a sharded (K-plane) host. The
   /// fork must happen inside ONE plane's driver, so a cross-plane child is refused before any
   /// command is sent (v1 constraint; the shard-map override makes any child placeable).

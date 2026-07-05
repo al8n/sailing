@@ -2832,3 +2832,304 @@ async fn forked_group_serves_and_snapshots_a_late_joiner() {
   // The sibling group is unaffected by the fork/join churn.
   assert_eq!(submit_anywhere(&g900, b"still").await, 2);
 }
+
+/// Propose a split through whichever node leads the parent (redirect-following, like
+/// `submit_anywhere`), returning the proposed index.
+async fn split_anywhere(
+  groups: &[GroupHandle<u64, u64, CountSm>],
+  child: u64,
+  instruction: &'static [u8],
+) -> Index {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let mut at = 0usize;
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no split accepted within the deadline"
+    );
+    match groups[at]
+      .propose_split(child, 0, Bytes::from_static(instruction))
+      .await
+    {
+      Ok(idx) => return idx,
+      Err(DriverError::NotLeader { .. }) | Err(DriverError::Rejected { .. }) => {
+        at = (at + 1) % groups.len();
+        tokio::time::sleep(Duration::from_millis(40)).await;
+      }
+      Err(e) => panic!("unexpected split error: {e:?}"),
+    }
+  }
+}
+
+/// THE split flow, end to end on three live nodes: group 100 commits load, its leader proposes
+/// a split of child 200, and EVERY node's drain materializes the child behind its engine
+/// barrier — surfacing the typed `LifecycleEvent::SplitApplied` on all three tails — after
+/// which BOTH halves elect, commit, and serve linearizable reads with conserved totals.
+#[tokio::test(flavor = "multi_thread")]
+async fn split_forks_both_halves_live() {
+  let addrs = addrs(45_000, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2, 3]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+
+  // Load: seven committed commands on the parent.
+  for i in 0..7u64 {
+    assert_eq!(submit_anywhere(&g100, b"load").await, i + 1);
+  }
+
+  // Split: give 5 of the 7 units to child 200.
+  split_anywhere(&g100, 200, b"\x05").await;
+
+  // The typed lifecycle event fires on EVERY node's tail — each replica materialized the fork
+  // locally behind its own engine barrier.
+  for (i, h) in handles.iter().enumerate() {
+    await_lifecycle(h.lifecycle(), &format!("node {}", i + 1), |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::SplitApplied {
+          parent: 100,
+          child: 200
+        }
+      )
+    })
+    .await;
+  }
+
+  // Both halves serve: the parent shrank to 2 everywhere, the child preloaded 5 and commits a
+  // live tail on top of it.
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(query_anywhere(&g100).await, 2, "the parent kept 7 - 5");
+  assert_eq!(
+    submit_anywhere(&g200, b"tail").await,
+    6,
+    "the child preloaded 5 and committed 1 more"
+  );
+  assert_eq!(query_anywhere(&g200).await, 6);
+  // Conservation: post-split parent + pre-tail child == the pre-split total.
+  assert_eq!(
+    submit_anywhere(&g100, b"more").await,
+    3,
+    "the parent keeps committing on its own log"
+  );
+}
+
+/// Row 2b's integration pin: a split-born child's manufactured baseline (`first_index == 2`)
+/// structurally forces a zero-progress joiner onto the SNAPSHOT path — the persisted blob plus
+/// the child's live tail land on the joiner's replica, never an empty log walk. The parent
+/// lives on nodes 1+2 only; node 3's factory materializes the EMPTY child replica when the
+/// child leader's post-AddNode contact solicits it.
+#[tokio::test(flavor = "multi_thread")]
+async fn fresh_joiner_takes_the_snapshot_path() {
+  let addrs = addrs(45_010, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 3 {
+      // Node 3's catalog knows the split-born child and its replica set; it declines nothing
+      // else. A fork-born id reaches a NON-member host only through this ordinary join path.
+      let driver = driver.with_group_factory(factory_fn(
+        |group: &u64, from: &u64| {
+          (*group == 200 && [1u64, 2].contains(from))
+            .then(|| GroupBlueprint::new(config(3, vec![1, 2, 3]), 3))
+        },
+        |_group: &u64| Some(CountSm::default()),
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The parent lives on nodes 1+2 only, so the split-born child does too.
+  create_group_everywhere(&handles[..2], 100, &[1, 2]).await;
+  let g100: Vec<_> = handles[..2].iter().map(|h| h.group(100)).collect();
+  for i in 0..7u64 {
+    assert_eq!(submit_anywhere(&g100, b"load").await, i + 1);
+  }
+  split_anywhere(&g100, 200, b"\x05").await;
+  for (i, h) in handles[..2].iter().enumerate() {
+    await_lifecycle(h.lifecycle(), &format!("member {}", i + 1), |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::SplitApplied {
+          parent: 100,
+          child: 200
+        }
+      )
+    })
+    .await;
+  }
+
+  // The child commits a live tail on top of its preloaded half.
+  let g200_members: Vec<_> = handles[..2].iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g200_members, b"t1").await, 6);
+
+  // AddNode 3: the joiner's replica exists nowhere — the factory materializes it EMPTY, and the
+  // manufactured baseline (first_index == 2 > the joiner's next == 1) forces the child leader
+  // onto the snapshot path toward it.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "no committed AddNode in time"
+    );
+    let at = find_leader(&g200_members, "child pre-add").await;
+    let cc = ConfChange::new(ConfChangeType::AddNode, 3u64, Bytes::new());
+    match g200_members[at].conf_change(cc).await {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => tokio::time::sleep(Duration::from_millis(50)).await,
+      Err(e) => panic!("unexpected conf-change error: {e:?}"),
+    }
+  }
+
+  // The joiner lands on preloaded + tail: an empty-booted replica replaying only the tail
+  // would sit at 1 — equality proves the persisted blob arrived through the snapshot path.
+  let g200_joiner = handles[2].group(200);
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the joiner never served the joined count"
+    );
+    if let Ok(c) = g200_joiner.query(|sm: &CountSm| sm.count()).await {
+      assert_eq!(
+        c, 6,
+        "preloaded 5 + the 1-entry tail, via the snapshot path"
+      );
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+}
+
+/// Row 2: a replica DOWN through the split converges by the ordinary lifecycle paths, never by
+/// re-forking. Node 3 dies before the split; the surviving parent quorum splits, materializes
+/// the child, and compacts past the split entry. The reborn node 3 (fresh stores) receives the
+/// parent's POST-split snapshot — its lifecycle tail must never see a `SplitApplied` — and the
+/// child reaches it through solicitation → its factory → the child leader's chunked snapshot
+/// serving the PERSISTED blob.
+#[tokio::test(flavor = "multi_thread")]
+async fn late_splitter_converges_via_lifecycle() {
+  let addrs = addrs(45_020, 3);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  // A tight snapshot threshold so the parent compacts past the split while node 3 is away.
+  let parent_cfg = |id: u64| config(id, vec![1, 2, 3]).with_snapshot_threshold(4);
+  for (i, h) in handles.iter().enumerate() {
+    h.create_group(
+      100,
+      parent_cfg(i as u64 + 1),
+      i as u64 + 1,
+      CountSm::default(),
+      0,
+    )
+    .await
+    .expect("parent admission");
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  for i in 0..5u64 {
+    assert_eq!(submit_anywhere(&g100, b"pre").await, i + 1);
+  }
+
+  // Node 3 dies before the split.
+  handles[2].shutdown().await.expect("node 3 shuts down");
+  let survivors: Vec<_> = handles[..2].iter().map(|h| h.group(100)).collect();
+
+  // The surviving quorum splits (child voters = the parent's full set, INCLUDING the dead
+  // node) and materializes the child; more load drives the parent's capture past the split.
+  split_anywhere(&survivors, 200, b"\x03").await;
+  for (i, h) in handles[..2].iter().enumerate() {
+    await_lifecycle(h.lifecycle(), &format!("survivor {}", i + 1), |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::SplitApplied {
+          parent: 100,
+          child: 200
+        }
+      )
+    })
+    .await;
+  }
+  for _ in 0..6u64 {
+    submit_anywhere(&survivors, b"post").await;
+  }
+  let g200_members: Vec<_> = handles[..2].iter().map(|h| h.group(200)).collect();
+  assert_eq!(
+    submit_anywhere(&g200_members, b"t1").await,
+    4,
+    "3 preloaded + 1"
+  );
+
+  // Node 3 is REBORN with fresh stores; its factory knows the child (and only the child — the
+  // parent is re-created explicitly, the ordinary operator path for a re-provisioned node).
+  let peers3: Vec<_> = (1u64..=2)
+    .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+    .collect();
+  let (driver3, handle3) = bind_node::<CountSm>(3, addrs[2], peers3).await;
+  let driver3 = driver3.with_group_factory(factory_fn(
+    |group: &u64, from: &u64| {
+      (*group == 200 && [1u64, 2].contains(from))
+        .then(|| GroupBlueprint::new(config(3, vec![1, 2, 3]), 3))
+    },
+    |_group: &u64| Some(CountSm::default()),
+  ));
+  tokio::spawn(driver3.run());
+  handle3
+    .create_group(100, parent_cfg(3), 3, CountSm::default(), 0)
+    .await
+    .expect("the reborn node re-admits the parent");
+
+  // The parent converges by INSTALL (the entry is compacted away), the child by the factory
+  // path — and the reborn node NEVER re-forks: no SplitApplied may reach its lifecycle tail.
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  let g100_reborn = handle3.group(100);
+  let g200_reborn = handle3.group(200);
+  let mut parent_ok = false;
+  let mut child_ok = false;
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the late splitter never converged (parent {parent_ok}, child {child_ok})"
+    );
+    if !parent_ok && let Ok(c) = g100_reborn.query(|sm: &CountSm| sm.count()).await {
+      // 5 pre + 6 post commits, minus the 3 units given away at the split.
+      assert_eq!(c, 8, "the reborn parent replica is post-split");
+      parent_ok = true;
+    }
+    if !child_ok && let Ok(c) = g200_reborn.query(|sm: &CountSm| sm.count()).await {
+      assert_eq!(c, 4, "the persisted blob + tail reached the late splitter");
+      child_ok = true;
+    }
+    if parent_ok && child_ok {
+      break;
+    }
+    tokio::time::sleep(Duration::from_millis(60)).await;
+  }
+  while let Ok(ev) = handle3.lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::SplitApplied { .. }),
+      "a post-compaction rebirth must never re-fork: {ev:?}"
+    );
+  }
+}

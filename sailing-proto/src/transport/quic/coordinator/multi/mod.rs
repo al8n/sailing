@@ -647,6 +647,62 @@ where
     Some(r)
   }
 
+  /// Propose a group SPLIT on `group` (the parent), replicating immediately (see
+  /// [`MultiRaft::propose_split`] for the container gates). The coordinator adds the
+  /// PROPOSE-TIME leg of the two-point floor check through the caller's `floors` seam: a child
+  /// incarnation below its persisted admission floor — or the reserved `u64::MAX` sentinel —
+  /// refuses BEFORE anything is appended (the drivers' materialization edge keeps the
+  /// authoritative recheck, where a follower's local removal history may differ). `None` if no
+  /// such group.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  #[allow(clippy::too_many_arguments)]
+  pub fn propose_split<L, S>(
+    &mut self,
+    group: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    child: &G,
+    child_gen: u64,
+    instruction: bytes::Bytes,
+    floors: &impl FloorStore<G>,
+  ) -> Option<Result<Index, crate::SplitError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.multi.contains_group(group) {
+      return None;
+    }
+    if let Err(e) = validate_floor(floors.floor(child), child_gen) {
+      return Some(Err(match e {
+        CreateGroupError::BelowFloor { floor } => crate::SplitError::BelowFloor { floor },
+        _ => crate::SplitError::ReservedGeneration,
+      }));
+    }
+    let now: Now = now.into();
+    let r = self
+      .multi
+      .propose_split(group, now, log, stable, child, child_gen, instruction)?;
+    let _ = self.multi.flush_appends(group, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// The next committed, relay-ready fork from any hosted group (see
+  /// [`MultiRaft::poll_pending_fork`]) — the driver drains this every crank BEFORE its storage
+  /// crank, so the same crank's engine flush covers the materialization.
+  pub fn poll_pending_fork(&mut self) -> Option<crate::GroupFork<G, I, F>> {
+    self.multi.poll_pending_fork()
+  }
+
+  /// Resolve the fork staged at exactly `split_index` on `parent` (see
+  /// [`MultiRaft::lift_fork_barrier`]): the driver reports the child's baseline flush-durable,
+  /// and the parent's snapshot fence over that index releases.
+  pub fn lift_fork_barrier(&mut self, parent: &G, split_index: Index) {
+    self.multi.lift_fork_barrier(parent, split_index);
+  }
+
   /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
   /// [`poll_event`](Self::poll_event) stamped with the group. `None` if no such group.
   #[must_use = "`None` means no group with this id is hosted — the call did nothing"]

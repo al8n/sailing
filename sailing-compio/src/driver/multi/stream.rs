@@ -1196,6 +1196,17 @@ where
         let _ = reply.send(verdict);
         drop(reservation);
       }
+      MultiCommand::ProposeSplit {
+        reply, reservation, ..
+      } => {
+        // The compio port of the split drain lands with the sharded milestone task; until then
+        // a compio host refuses to PROPOSE a split (nothing is appended), so no fork can be
+        // staged that this driver does not yet materialize.
+        let _ = reply.send(Err(DriverError::Rejected {
+          reason: "split is not yet wired on this host".into(),
+        }));
+        drop(reservation);
+      }
       MultiCommand::Status {
         group,
         reply,
