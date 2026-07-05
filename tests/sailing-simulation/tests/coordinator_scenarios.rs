@@ -14,7 +14,7 @@
 use core::time::Duration;
 use sailing_proto::{
   Config, ConnId, CreateGroupError, Data as _, GroupControl, GroupStores, Instant, LabelOptions,
-  Labeled, MultiStreamCoordinator, Passthrough, Term,
+  Labeled, MultiStreamCoordinator, NoFloors, Passthrough, Term,
 };
 use sailing_simulation::{LogSm, MemLog, MemStable};
 use std::collections::BTreeMap;
@@ -86,14 +86,30 @@ impl World {
     };
     let mut groups = Vec::new();
     for &g in a_groups {
-      a.create_group(g, two_voter(1), Instant::ORIGIN, 1, LogSm::new())
-        .unwrap();
+      a.create_group(
+        g,
+        two_voter(1),
+        Instant::ORIGIN,
+        1,
+        LogSm::new(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
       sa.fresh(g);
       groups.push(g);
     }
     for &g in b_groups {
-      b.create_group(g, two_voter(2), Instant::ORIGIN, 2, LogSm::new())
-        .unwrap();
+      b.create_group(
+        g,
+        two_voter(2),
+        Instant::ORIGIN,
+        2,
+        LogSm::new(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
       sb.fresh(g);
       if !groups.contains(&g) {
         groups.push(g);
@@ -273,7 +289,7 @@ fn tombstone_refusal_chain() {
   // A tombstoned id refuses re-admission until the explicit clear consents.
   assert_eq!(
     w.b
-      .create_group(100, two_voter(2), w.now, 2, LogSm::new())
+      .create_group(100, two_voter(2), w.now, 2, LogSm::new(), 0, &NoFloors)
       .unwrap_err(),
     CreateGroupError::Retired,
     "create refuses a tombstoned id"
@@ -286,7 +302,7 @@ fn tombstone_refusal_chain() {
   );
   w.sb.fresh(100);
   w.b
-    .create_group(100, two_voter(2), w.now, 2, LogSm::new())
+    .create_group(100, two_voter(2), w.now, 2, LogSm::new(), 0, &NoFloors)
     .unwrap();
   w.fire_a(100);
   assert!(
@@ -374,7 +390,7 @@ fn unknown_group_gate_is_initial_shaped() {
   // there, exactly the state a destroyed group's stragglers meet.
   w.sb.fresh(300);
   w.b
-    .create_group(300, two_voter(2), w.now, 2, LogSm::new())
+    .create_group(300, two_voter(2), w.now, 2, LogSm::new(), 0, &NoFloors)
     .unwrap();
   w.track(300);
   w.elect_a(300);
