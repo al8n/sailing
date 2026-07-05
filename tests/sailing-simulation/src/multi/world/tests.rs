@@ -56,6 +56,84 @@ fn leader_of_prefers_the_highest_term_leader() {
   );
 }
 
+/// Propose `ty(node)` on `gid`, ticking through transient refusals (no leader this instant, the
+/// leader's own-term commit gate) until a leader accepts it.
+fn propose_conf_change_until_accepted(
+  w: &mut MultiWorld,
+  gid: u64,
+  ty: sailing_proto::ConfChangeType,
+  node: u64,
+) {
+  for _ in 0..2_000 {
+    let cc = sailing_proto::ConfChange::new(ty, node, bytes::Bytes::new());
+    if w.propose_conf_change(gid, cc).is_some() {
+      return;
+    }
+    w.tick();
+  }
+  panic!("conf-change {ty:?}({node}) was never accepted");
+}
+
+/// Drive group 100 to a committed post-genesis config, then FABRICATE the cheapest corrupt
+/// membership observation the checker records: a snapshot install claiming the CURRENT
+/// (post-removal) membership at a boundary where the committed config was still the genesis —
+/// exactly the phantom/missing-voter ConfState a corrupted snapshot would carry.
+fn world_with_corrupt_install() -> MultiWorld {
+  let mut w = MultiWorld::new(2);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(600, |w| w.leader_of(100).is_some()));
+  propose_conf_change_until_accepted(&mut w, 100, sailing_proto::ConfChangeType::RemoveNode, 2);
+  assert!(
+    w.run_until(2_000, |w| {
+      [0u64, 1].iter().all(|n| {
+        w.hosts[n]
+          .group(&100)
+          .is_some_and(|ep| !ep.conf_state().voters().contains(&2))
+      })
+    }),
+    "the removal never applied on the survivors"
+  );
+  let post_removal =
+    checker::ConfSnapshot::from_conf_state(&w.hosts[&0].group(&100).expect("hosted").conf_state());
+  // Boundary 1 predates the conf-change entry, so the committed config in effect there is the
+  // genesis {0,1,2}; an install claiming {0,1} at that boundary is a corrupt ConfState.
+  w.pending_new_installs
+    .entry(100)
+    .or_default()
+    .push((1, 1, post_removal));
+  w
+}
+
+/// The per-tick suite only RECORDS membership observations (`check_or_panic` defers the
+/// verdict), so a corrupt snapshot install must TRIP at the run-end finalize pass — here on a
+/// LIVE group's checker.
+#[test]
+#[should_panic(expected = "snapshot_membership_coherent")]
+fn finalize_membership_trips_a_corrupt_install_on_a_live_group() {
+  let mut w = world_with_corrupt_install();
+  // Record-only: the per-tick pass folds the corrupt observation without judging it.
+  w.check_now();
+  w.finalize_membership_or_panic(2);
+}
+
+/// Retirement archives a checker after one more RECORD-ONLY check, so a corrupt install on a
+/// since-removed group must still face the run-end verdict through the retired archive.
+#[test]
+#[should_panic(expected = "snapshot_membership_coherent")]
+fn finalize_membership_trips_a_corrupt_install_archived_by_retirement() {
+  let mut w = world_with_corrupt_install();
+  // The at-removal check folds the pending corrupt observation, then freezes the checker into
+  // the (gid, generation) archive.
+  w.remove_group(100);
+  assert!(w.checkers.is_empty());
+  assert_eq!(w.retired.len(), 1);
+  w.finalize_membership_or_panic(2);
+}
+
 #[test]
 fn two_groups_elect_and_commit_independently() {
   let mut w = MultiWorld::new(7);

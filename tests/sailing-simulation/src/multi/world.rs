@@ -422,6 +422,35 @@ impl MultiWorld {
     }
   }
 
+  /// Render the membership oracle's run-end VERDICT for every checker this world ever built:
+  /// the live per-group suites AND the frozen archives of retired incarnations. The per-tick
+  /// [`check_now`](Self::check_now) only RECORDS snapshot-install observations — the verdict
+  /// must wait until each group's committed-config history is FINAL (a later higher-term
+  /// overwrite/ambiguation can supersede the reference a mid-run judgment would use) — and
+  /// [`remove_group`](Self::remove_group) archives a checker after one more record-only check,
+  /// so without this pass a corrupt install on a removed or recreated group would never face
+  /// the verdict at all. Panics with the oracle name + seed for exact replay.
+  pub fn finalize_membership_or_panic(&mut self, seed: u64) {
+    for (&gid, ck) in self.checkers.iter_mut() {
+      if let Err(v) = checker::finalize_membership(ck) {
+        panic!(
+          "SAFETY ORACLE VIOLATION (run-end final pass): {v}\n  group={gid} seed={seed}\n  \
+           (replay: run_multi_vopr for this seed and inspect the snapshot install at the \
+           reported boundary)",
+        );
+      }
+    }
+    for (&(gid, generation), ck) in self.retired.iter_mut() {
+      if let Err(v) = checker::finalize_membership(ck) {
+        panic!(
+          "SAFETY ORACLE VIOLATION (run-end final pass, retired group): {v}\n  group={gid} \
+           gen={generation} seed={seed}\n  (replay: run_multi_vopr for this seed and inspect \
+           the snapshot install at the reported boundary)",
+        );
+      }
+    }
+  }
+
   /// Assert every NEWLY applied entry on every replica of `gid` decodes (when gid-tagged) to
   /// `gid` itself — the O(1)-per-apply cross-group isolation oracle.
   fn cross_talk_sweep(&mut self, gid: u64) {
