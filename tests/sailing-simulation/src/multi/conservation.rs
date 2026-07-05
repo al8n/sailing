@@ -35,8 +35,9 @@ impl ConservationLedger {
       .push((index, value));
   }
 
-  /// The recorded history for `(gid, key)` (empty if never recorded).
-  fn history(&self, gid: u64, key: u16) -> &[(u64, u64)] {
+  /// The recorded history for `(gid, key)` (empty if never recorded). `pub(crate)` so the
+  /// world's recorder tests can assert exact recorded contents, not just the verdict.
+  pub(crate) fn history(&self, gid: u64, key: u16) -> &[(u64, u64)] {
     self
       .histories
       .get(&(gid, key))

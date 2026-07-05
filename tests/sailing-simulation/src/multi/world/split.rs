@@ -20,15 +20,20 @@
 //! judging the PRODUCT rather than the workload. A lost split entry (deposed leader) leaves the
 //! parent's population conservatively shrunk: parked keys, never a false positive.
 //!
-//! The recorder observes every replica's RAW applied record past a per-`(node, gid)` high-water
-//! and appends each gkv cell once — values are globally unique and strictly increase per
-//! `(group, key)`, so "strictly above the last recorded value" dedupes across replicas, crash
-//! re-walks, and the child's inherited baseline alike. Histories are keyed by an
-//! INCARNATION-QUALIFIED ledger id, so a recreated gid's fresh history can never pollute a
-//! recorded split pair's verdict. The child's opening history is recorded from its OWN
-//! materialized record (the fork blob) — never copied from the parent's — which is what gives
-//! [`ConservationLedger::assert_partition`] teeth: a partition bug in the FSM shows up as a
-//! parent/child history mismatch, not a tautology.
+//! The recorder walks every replica's FULL RAW applied record each sweep and appends each gkv
+//! cell once — values are globally unique and strictly increase per `(group, key)`, so
+//! "strictly above the last recorded value" dedupes across replicas, crash re-walks, and the
+//! child's inherited baseline alike. The walk trusts VALUES, never positions: `LogSm::split`
+//! mutates the record non-append-only (moved-key cells vanish record-wide) and a crash restore
+//! can resurrect a pre-split state, so a cell can sit BELOW any position an earlier sweep
+//! reached — a positional resume watermark skips it forever, punching an interior hole in the
+//! recorded history that a later fork baseline exposes as a false conservation verdict. The
+//! value dedupe needs no resume state at all: a full re-walk re-presents only cells the ledger
+//! already admitted. Histories are keyed by an INCARNATION-QUALIFIED ledger id, so a recreated
+//! gid's fresh history can never pollute a recorded split pair's verdict. The child's opening
+//! history is recorded from its OWN materialized record (the fork blob) — never copied from the
+//! parent's — which is what gives [`ConservationLedger::assert_partition`] teeth: a partition
+//! bug in the FSM shows up as a parent/child history mismatch, not a tautology.
 
 use super::*;
 
@@ -312,9 +317,18 @@ impl MultiWorld {
       .collect()
   }
 
-  /// Record every replica's newly-applied gkv cells into the conservation ledger (see the
-  /// module docs for the dedupe and ordering argument). Cells are recorded under the group
-  /// HOLDING them — the payload's gid tag is the cross-talk oracle's business.
+  /// Record every replica's applied gkv cells into the conservation ledger (see the module
+  /// docs for the dedupe and ordering argument). Cells are recorded under the group HOLDING
+  /// them — the payload's gid tag is the cross-talk oracle's business.
+  ///
+  /// A FULL walk every sweep, on purpose: within one record values are monotone with position
+  /// (one global counter, accepted in log order), so the per-`(ledger, key)` value dedupe
+  /// admits each cell exactly once and a re-walk is pure no-op re-presentation. Any positional
+  /// (or value-anchored) resume shortcut has a hole this oracle cannot afford: a split-apply
+  /// shifts kept cells below the watermark within one settle window, and a crash restore
+  /// resurrects moved cells a pre-crash sweep never met — both skip real cells forever. The
+  /// world already pays O(record) per replica sweep to clone the record, so the walk adds no
+  /// asymptotic cost.
   pub(super) fn conserve_sweep(&mut self, gid: u64) {
     let led = Self::ledger_id(self.generation_of(gid), gid);
     for node in self.node_ids.clone() {
@@ -322,9 +336,7 @@ impl MultiWorld {
         continue;
       }
       let applied = self.applied_of(node, gid);
-      let hw = self.cons_swept.entry((node, gid)).or_insert(0);
-      let start = (*hw).min(applied.len());
-      for (index, cmd) in &applied[start..] {
+      for (index, cmd) in &applied {
         if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
           match self.cons_last.get(&(led, key)) {
             Some(&last) if value <= last => {}
@@ -335,7 +347,6 @@ impl MultiWorld {
           }
         }
       }
-      *hw = applied.len();
     }
   }
 

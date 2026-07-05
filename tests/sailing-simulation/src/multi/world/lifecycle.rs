@@ -309,7 +309,6 @@ impl MultiWorld {
     self.stables.remove(&(node, gid));
     self.configs.remove(&(node, gid));
     self.swept.remove(&(node, gid));
-    self.cons_swept.remove(&(node, gid));
     self.conf_changed.remove(&(node, gid));
     self.snapshot_lineage.remove(&(node, gid));
     self.member_view.remove(&(node, gid));
