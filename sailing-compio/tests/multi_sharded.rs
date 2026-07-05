@@ -561,7 +561,7 @@ fn spawn_rejects_bad_addressing() {
 /// SAME-plane child end to end — both halves elect, commit, and serve through the routed
 /// surface, the typed `SplitApplied` fires on every node's shared tail — while a CROSS-plane
 /// child id refuses at the HANDLE, typed, before any command is sent: nothing materializes on
-/// any plane, and the sibling plane's group commits undisturbed throughout. The row-9 factory
+/// any plane, and the sibling plane's group commits undisturbed throughout. The factory
 /// interplay rides the same cluster: node 2 is factory-armed with a catalog that vouches for
 /// the child, yet its build phase is NEVER consulted — both members fork locally in their own
 /// drains (the drain front-runs the factory drain), so no solicitation for the child ever
@@ -584,7 +584,8 @@ fn sharded_split_stays_in_plane_and_refuses_cross_plane() {
     .expect("some id lands on the other plane");
 
   let node1: ShardedMultiHandle<u64, u64, CountSm> = spawn_host(1, base1, Some((2, base2)));
-  // Node 2's factory vouches for the child — the row-9 catalog shape — with a build counter
+  // Node 2's factory vouches for the child — a catalog that also knows fork-born ids — with
+  // a build counter
   // proving the fork path, not the factory, materializes it.
   let builds = Arc::new(AtomicUsize::new(0));
   let builds_probe = builds.clone();
