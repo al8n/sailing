@@ -1889,14 +1889,220 @@ fn back_to_back_split_proposals_are_gated_until_apply() {
   assert_eq!(meta.shape_gen(), 2);
 }
 
+/// Feed follower group 7 (peer 2 leading at term 1) three units of load and a NONZERO split
+/// giving 2 of them to `child`, then drain storage to the applied state. `commit` covers the
+/// whole batch. Returns the split entry's index.
+fn follower_load_and_split(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  child: u64,
+) -> Index {
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  let entries = std::vec![
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone()
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone()
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::Split,
+      split_entry_bytes(child, 0, 1, 2),
+    ),
+  ];
+  m.handle_message(
+    &7,
+    Instant::ORIGIN,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(4),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  Index::new(4)
+}
+
+/// Deliver one committed Normal entry to follower group 7 at `index` (prev = `index - 1`,
+/// term 1 throughout) and drain storage — the fence probes' commit source.
+fn follower_commit_next(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+  index: u64,
+) {
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"x").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  m.handle_message(
+    &7,
+    Instant::ORIGIN,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::new(index - 1),
+      Term::new(1),
+      std::vec![crate::Entry::new(
+        Term::new(1),
+        Index::new(index),
+        crate::EntryKind::Normal,
+        cmd,
+      )],
+      Index::new(index),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&7, Instant::ORIGIN, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+}
+
 #[test]
-fn hosted_child_fork_drops_and_resolves() {
-  // The committed split names a child THIS host already hosts (the factory raced the fork, or a
-  // replay after a partial flush): the relay drops it as ChildExists and resolves its barrier —
-  // the no-op lift is safe because any solicitation that materialized the child can only have
-  // come from an already-forked member whose blob was flush-durable before it could transmit.
+fn hosted_child_fork_parks_and_materializes_after_removal() {
+  // The committed split names a child THIS host already hosts, and the split is NONZERO — the
+  // parent gave up real state at apply, so the staged blob is the partition's only local copy.
+  // The relay must PARK the fork (blob held, guard unmoved, fence standing, one conflict
+  // signal), never resolve it as a no-op: the pre-park drop arm silently lost the partition.
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  // The squatter: hosted under the child id, zero progress (its timers never fire here).
+  m.create_group(
+    200,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+  )
+  .unwrap();
+
+  let idx = follower_load_and_split(&mut m, &mut log, &mut stable, 200);
+
+  // PARKED: nothing yields, nothing resolves — and the conflict surfaces exactly once.
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "a hosted child id parks the fork instead of yielding it"
+  );
+  assert_eq!(
+    m.poll_split_conflict(),
+    Some((7, 200)),
+    "the park surfaces one (parent, child) conflict signal"
+  );
+  assert_eq!(
+    m.poll_split_conflict(),
+    None,
+    "the signal is deduped until the park resolves"
+  );
+  assert!(m.poll_pending_fork().is_none(), "still parked");
+  assert_eq!(
+    m.poll_split_conflict(),
+    None,
+    "re-examination does not re-emit the conflict"
+  );
+
+  // Conservation WHILE PARKED: the parent shrank exactly once and the given-up half survives
+  // in the staged fork's blob — nothing is lost, it is merely not yet placeable.
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units,
+    1,
+    "3 - 2: fsm.split ran at apply on every replica identically"
+  );
+  assert_eq!(
+    m.group(&7)
+      .unwrap()
+      .peek_pending_fork()
+      .expect("the parked fork stays staged")
+      .blob,
+    fork_blob(2),
+    "the partition's blob is retained while parked"
+  );
+
+  // The fence does NOT lift while parked: the threshold (1) is long crossed and a post-split
+  // entry commits, yet no capture lands at-or-past the split — the entry stays replayable, so
+  // recovery survives arbitrarily late embedder action.
+  follower_commit_next(&mut m, &mut log, &mut stable, 5);
+  let pre = stable.snapshot().map(|(meta, _)| meta.last_index());
+  assert!(
+    pre.is_none_or(|boundary| boundary < idx),
+    "the parked fork's fence holds (boundary {pre:?}, split {idx:?})"
+  );
+
+  // Arm (a): the squatter is removed — the fork now materializes NORMALLY, with the full half.
+  m.remove_group(&200);
+  let fork = m
+    .poll_pending_fork()
+    .expect("removal unparks the fork for materialization");
+  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert_eq!(fork.split_index, idx);
+  assert_eq!(fork.parent_gen_after, 1);
+  assert_eq!(fork.fsm.units, 2, "the parked half materializes intact");
+  assert_eq!(fork.blob, fork_blob(2));
+  // Conservation across the resolution: every unit is in exactly one of parent / child — the
+  // pre-split 3 plus the one the fence probe committed while parked.
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units + fork.fsm.units,
+    4
+  );
+
+  // The driver reports the child durable; the fence releases and the cadence resumes.
+  m.lift_fork_barrier(&7, idx);
+  follower_commit_next(&mut m, &mut log, &mut stable, 6);
+  let (meta, _blob) = stable.snapshot().expect("the resolved parent captures");
+  assert!(
+    meta.last_index() >= idx,
+    "the capture crosses the resolved split"
+  );
+  assert_eq!(meta.shape_gen(), 1, "and carries the bumped lineage");
+}
+
+#[test]
+fn parked_fork_resolves_redundant_when_the_twin_catches_up() {
+  // Arm (b), post-park: the hosted child reaches applied >= FORK_BASE_INDEX under the fork's
+  // own lineage — under single-incarnation ids that IS this fork (a twin materialized from a
+  // sibling whose blob was flush-durable before it could transmit) — so the parked fork
+  // resolves as redundant: fence lifts, guard advances, the local blob is discarded safely.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
   let cfg = Config::try_new(
     1u64,
     std::vec![1u64, 2],
@@ -1915,82 +2121,164 @@ fn hosted_child_fork_drops_and_resolves() {
     SplitSm::default(),
   )
   .unwrap();
+  let idx = follower_load_and_split(&mut m, &mut log, &mut stable, 200);
+  assert!(m.poll_pending_fork().is_none(), "parked on the conflict");
+  assert_eq!(m.poll_split_conflict(), Some((7, 200)));
 
-  m.handle_message(
-    &7,
+  // The hosted child advances to applied >= the fork baseline at lineage 0 == child_gen.
+  let d = lead_single_split(&mut m, 200, &mut log200, &mut stable200);
+  commit_one_split(&mut m, 200, d, &mut log200, &mut stable200);
+  assert!(m.group(&200).unwrap().applied_index() >= FORK_BASE_INDEX);
+
+  // The next drain resolves the park as REDUNDANT: nothing yields, the staged fork is gone,
+  // and the fence releases without any lift call.
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "a caught-up twin resolves the park without yielding"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the redundant fork is consumed"
+  );
+  follower_commit_next(&mut m, &mut log, &mut stable, 5);
+  let (meta, _blob) = stable
+    .snapshot()
+    .expect("the redundant resolution released the fence");
+  assert!(meta.last_index() >= idx, "the capture crosses the split");
+  assert_eq!(meta.shape_gen(), 1);
+}
+
+#[test]
+fn pre_hosted_twin_resolves_redundant_without_parking() {
+  // Arm (b) at FIRST examination: the twin was already hosted at-or-past the baseline under
+  // the fork's lineage when the split relayed (the factory materialized it from a sibling
+  // before this replica's own fork drained), so the relay resolves it as redundant outright —
+  // no park episode, no conflict signal — and the twin's state carries the partition.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  // The twin: fork-born at the manufactured baseline (applied == FORK_BASE_INDEX, lineage 0)
+  // holding exactly the half the split gives away.
+  m.create_group_from_fork(
+    200,
+    0,
+    single_node_cfg(1),
     Instant::ORIGIN,
-    &mut log,
-    &mut stable,
-    2u64,
-    Message::AppendEntries(crate::AppendEntries::new(
-      Term::new(1),
-      2u64,
-      Index::ZERO,
-      Term::ZERO,
-      std::vec![crate::Entry::new(
-        Term::new(1),
-        Index::new(1),
-        crate::EntryKind::Split,
-        split_entry_bytes(200, 0, 1, 0),
-      )],
-      Index::new(1),
-    )),
+    43,
+    SplitSm::default(),
+    fork_blob(2),
+    None,
+    1,
+    &mut log200,
+    &mut stable200,
   )
   .unwrap();
-  while matches!(
-    m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
-    Some(StorageProgress::MorePending)
-  ) {}
+
+  let idx = follower_load_and_split(&mut m, &mut log, &mut stable, 200);
 
   assert!(
     m.poll_pending_fork().is_none(),
-    "a hosted child id short-circuits to a no-op"
+    "the redundant fork never yields"
   );
   assert_eq!(
-    m.group_gen(&7),
-    1,
-    "the lineage still bumped (the split IS applied)"
+    m.poll_split_conflict(),
+    None,
+    "an already-caught-up twin is no conflict — nothing parked"
   );
-  // Its barrier resolved with the drop: once the threshold is crossed by the next committed
-  // entry, the parent captures a snapshot AT-OR-PAST the dropped split — no orphaned fence.
-  let cmd = {
-    let mut buf = Vec::new();
-    Bytes::from_static(b"x").encode(&mut buf);
-    Bytes::from(buf)
-  };
-  m.handle_message(
-    &7,
-    Instant::ORIGIN,
-    &mut log,
-    &mut stable,
-    2u64,
-    Message::AppendEntries(crate::AppendEntries::new(
-      Term::new(1),
-      2u64,
-      Index::new(1),
-      Term::new(1),
-      std::vec![crate::Entry::new(
-        Term::new(1),
-        Index::new(2),
-        crate::EntryKind::Normal,
-        cmd,
-      )],
-      Index::new(2),
-    )),
-  )
-  .unwrap();
-  while matches!(
-    m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
-    Some(StorageProgress::MorePending)
-  ) {}
+  assert_eq!(m.group_gen(&7), 1, "the relay guard advanced");
+  // Conservation THROUGH the twin: parent half + twin's preloaded half == the original units.
+  assert_eq!(m.group(&7).unwrap().state_machine().units, 1);
+  assert_eq!(
+    m.group(&200).unwrap().state_machine().units,
+    2,
+    "the twin carries the partition, so discarding the local blob loses nothing"
+  );
+  // The fence resolved with the redundant fold: the cadence resumes unaided.
+  follower_commit_next(&mut m, &mut log, &mut stable, 5);
   let (meta, _blob) = stable
     .snapshot()
-    .expect("no orphaned barrier after the ChildExists drop");
-  assert!(
-    meta.last_index() >= Index::new(1),
-    "the capture crosses the dropped split"
+    .expect("no orphaned fence from the redundant fold");
+  assert!(meta.last_index() >= idx);
+  assert_eq!(meta.shape_gen(), 1);
+}
+
+#[test]
+fn split_admission_race_parks_instead_of_dropping() {
+  // THE propose-window race, leader-shaped: propose_split's ChildExists gate passes (200 is
+  // not hosted), the child id is then admitted BEFORE the entry applies (at the pure container
+  // there is no reservation — this is exactly the coordinator-level pre-reservation window),
+  // and the split commits against a now-hosted child. Pre-park this was the data-loss shape:
+  // the parent shrank at apply and the relay dropped the fork — the partition vanished. Now it
+  // parks: conserved while parked, surfaced, and materialized once the squatter leaves.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cfg = single_node_cfg(1).with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  for _ in 0..3 {
+    commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  }
+  assert_eq!(m.group(&7).unwrap().state_machine().units, 3);
+
+  // Propose (gate passes: 200 unhosted), THEN admit 200 in the propose→apply window.
+  let idx = m
+    .propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  m.create_group(200, single_node_cfg(1), d, 43, SplitSm::default())
+    .unwrap();
+
+  // Apply the split: the parent shrinks deterministically (apply is replica-identical and
+  // cannot consult hosted-ness), and the relay PARKS the fork against the squatter.
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(m.poll_pending_fork().is_none(), "parked, not dropped");
+  assert_eq!(m.poll_split_conflict(), Some((7, 200)));
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units,
+    1,
+    "the parent gave the half up at apply"
   );
-  assert_eq!(meta.shape_gen(), 1, "and carries the bumped lineage");
+  assert_eq!(
+    m.group(&7)
+      .unwrap()
+      .peek_pending_fork()
+      .expect("the half is staged, not lost")
+      .blob,
+    fork_blob(2)
+  );
+
+  // No silent drop: removing the squatter materializes the full half — conservation exact.
+  m.remove_group(&200);
+  let fork = m.poll_pending_fork().expect("the fork survives the race");
+  assert_eq!((fork.parent, fork.child, fork.split_index), (7, 200, idx));
+  assert_eq!(fork.fsm.units, 2);
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units + fork.fsm.units,
+    3
+  );
 }
 
 #[test]

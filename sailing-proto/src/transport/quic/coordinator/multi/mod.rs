@@ -711,6 +711,13 @@ where
     self.multi.lift_fork_barrier(parent, split_index);
   }
 
+  /// Drain the next `(parent, child)` SPLIT-CONFLICT signal — a committed fork parked because
+  /// its child id is already hosted (see [`MultiRaft::poll_split_conflict`]); the driver
+  /// surfaces it on its lifecycle tail for the placement brain.
+  pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
+    self.multi.poll_split_conflict()
+  }
+
   /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
   /// [`poll_event`](Self::poll_event) stamped with the group. `None` if no such group.
   #[must_use = "`None` means no group with this id is hosted — the call did nothing"]

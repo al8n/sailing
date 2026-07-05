@@ -3181,3 +3181,110 @@ async fn refused_fork_surfaces_on_the_lifecycle_tail() {
   // The refused child never materialized here.
   assert!(handle.group(300).status().await.is_err());
 }
+
+/// A hosted-child conflict on a live host PARKS the fork and HEALS: node 2 hosts an empty
+/// squatter under the child id before the split (the leader's propose gate cannot see a remote
+/// host's groups), so node 2's drain parks the committed fork and surfaces
+/// `LifecycleEvent::SplitConflict` — pre-fix this replica silently discarded the child's half
+/// and lifted the fence. Node 1 materializes normally; its child replica then leads and
+/// snapshots the squatter up to the fork baseline (the manufactured `first_index == 2` forces
+/// the install path), at which point node 2's parked fork resolves as REDUNDANT — the twin
+/// provably carries the partition — the fence lifts on its own, and both halves serve with
+/// conserved totals. No `SplitRefused` may ever fire: the fork was never abandoned.
+#[tokio::test(flavor = "multi_thread")]
+async fn hosted_child_conflict_parks_then_heals_via_the_twin() {
+  let addrs = addrs(45_320, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere(&handles, 100, &[1, 2]).await;
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  for i in 0..7u64 {
+    assert_eq!(submit_anywhere(&g100, b"load").await, i + 1);
+  }
+
+  // The squatter: node 2 hosts an EMPTY group under the child id (same voter set as the child
+  // will boot with, zero progress). Admitted before any split is in flight anywhere.
+  handles[1]
+    .create_group(300, config(2, vec![1, 2]), 9, CountSm::default(), 0)
+    .await
+    .expect("the squatter admits: no split names this id yet");
+
+  // Propose the split on NODE 1, whose gate cannot see node 2's squatter. Node 2 may hold the
+  // parent lease; steer leadership to node 1 until the propose lands there.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the split never proposed on node 1"
+    );
+    match g100[0]
+      .propose_split(300, 0, Bytes::from_static(b"\x05"))
+      .await
+    {
+      Ok(_) => break,
+      Err(DriverError::NotLeader { .. }) => {
+        let _ = g100[1].transfer_leader(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected split error: {e:?}"),
+    }
+  }
+
+  // Node 1 materializes its fork normally; node 2 PARKS and surfaces the typed conflict —
+  // pre-fix, node 2 dropped the fork here with no signal at all.
+  await_lifecycle(handles[0].lifecycle(), "node 1", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitApplied {
+        parent: 100,
+        child: 300
+      }
+    )
+  })
+  .await;
+  await_lifecycle(handles[1].lifecycle(), "node 2 (parked)", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitConflict {
+        parent: 100,
+        child: 300
+      }
+    )
+  })
+  .await;
+
+  // The parent shrank once per replica (apply is replica-identical) and keeps serving.
+  assert_eq!(query_anywhere(&g100).await, 2, "7 - 5 everywhere");
+
+  // HEAL: node 1's child replica leads {1,2} and the manufactured baseline forces the empty
+  // squatter onto the snapshot path — it becomes the twin (applied >= baseline at the fork's
+  // lineage), node 2's parked fork resolves as redundant, and BOTH replicas serve the half.
+  let g300: Vec<_> = handles.iter().map(|h| h.group(300)).collect();
+  assert_eq!(
+    submit_anywhere(&g300, b"tail").await,
+    6,
+    "the child preloaded 5 and committed 1 more"
+  );
+  assert_eq!(query_anywhere(&g300).await, 6);
+
+  // The redundant fold released node 2's fence silently: the parent commits on, and the fork
+  // was never abandoned — no SplitRefused may have reached either tail.
+  assert_eq!(submit_anywhere(&g100, b"after").await, 3);
+  for (i, h) in handles.iter().enumerate() {
+    while let Ok(ev) = h.lifecycle().try_recv() {
+      assert!(
+        !matches!(ev, LifecycleEvent::SplitRefused { .. }),
+        "node {}: a parked fork must resolve, never abandon: {ev:?}",
+        i + 1
+      );
+    }
+  }
+}

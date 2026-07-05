@@ -309,6 +309,25 @@ pub enum LifecycleEvent<G, I> {
     /// The child group whose materialization was refused here.
     child: G,
   },
+  /// A committed SPLIT's fork is PARKED on this host: a group with the child id is already
+  /// hosted here (admitted between the leader's propose-time `ChildExists` gate and this
+  /// replica's apply — the coordinators' split reservation narrows that window locally, but
+  /// cannot see an admission that preceded the split's arrival). Nothing is lost: the parent
+  /// already shrank at apply, so the drain HOLDS the fork — blob staged, the parent's snapshot
+  /// fence standing (the split entry stays replayable, so recovery survives arbitrarily late
+  /// action) — instead of dropping the partition's only local copy. Fired ONCE per conflict.
+  /// The embedder resolves it: remove the hosted child (the fork then materializes and
+  /// [`SplitApplied`](Self::SplitApplied) fires — removal tombstones the id, so pair it with
+  /// [`MultiHandle::clear_tombstone`] before the next drain, or the abandoned fork surfaces as
+  /// [`SplitRefused`](Self::SplitRefused) and the child rejoins by the ordinary lifecycle
+  /// paths), or let the hosted replica catch up from a sibling — once it carries the fork's
+  /// own lineage at-or-past the manufactured baseline, the parked fork resolves as redundant.
+  SplitConflict {
+    /// The parent group whose committed split is parked.
+    parent: G,
+    /// The child group id both the fork and a hosted group claim.
+    child: G,
+  },
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to a MULTI-GROUP driver: group lifecycle, the

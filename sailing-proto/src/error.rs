@@ -162,7 +162,8 @@ pub enum SplitError<I> {
   SplitInFlight,
   /// A group with the child id is already hosted HERE (including the parent's own id). The
   /// single-incarnation contract makes a hosted id unavailable as a fork target; a committed
-  /// split against it would fold to a no-op on this host and a divergent surprise elsewhere.
+  /// split against it would PARK at this host's relay (the fork blob held, the parent fenced)
+  /// until the conflict resolves — refuse at propose instead of manufacturing that conflict.
   #[error("a group with the child id is already hosted")]
   ChildExists,
   /// The child id's `Data` encoding is outside the group-tag wire bound (1..=1024 bytes).

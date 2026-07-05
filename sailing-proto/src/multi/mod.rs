@@ -36,7 +36,7 @@ use bytes::Bytes;
 use cheap_clone::CheapClone;
 use core::time::Duration;
 use std::{
-  collections::{BTreeMap, VecDeque},
+  collections::{BTreeMap, BTreeSet, VecDeque},
   vec::Vec,
 };
 
@@ -252,6 +252,20 @@ pub struct GroupFork<G, I, F> {
   pub split_index: Index,
 }
 
+/// The outcome of one head-fork examination (see `MultiRaft::poll_pending_fork`): the parent's
+/// queue was empty (or the parent gone / poisoned on a corrupt child id), the head fork was
+/// consumed by a resolution arm, it parked on a hosted-child conflict, or it yielded for
+/// materialization.
+// Transient: matched and consumed on the stack within one drain step, never stored — the
+// unit-vs-`GroupFork` size spread costs nothing, and boxing would allocate per relayed fork.
+#[allow(clippy::large_enum_variant)]
+enum HeadFork<G, I, F> {
+  Empty,
+  Resolved,
+  Parked,
+  Yield(GroupFork<G, I, F>),
+}
+
 /// The create/restore admission check shared by every group constructor: group-id uniqueness, the
 /// wire bound on the encoded group id, and agreement with the LATCHED host identity (a multi-Raft
 /// host is one physical node for its whole lifetime — the transport authenticates exactly one
@@ -302,6 +316,16 @@ where
   /// Groups that may have a staged pending fork to relay (see
   /// [`poll_pending_fork`](Self::poll_pending_fork)).
   dirty_forks: VecDeque<G>,
+  /// Parents whose HEAD fork is PARKED on a hosted-child conflict (see
+  /// [`poll_pending_fork`](Self::poll_pending_fork)): the fork stays staged (blob retained, the
+  /// snapshot fence armed, the relay guard unmoved) and is re-examined at the top of every relay
+  /// drain — the resolution triggers are CHILD-side (removal, catch-up), so no parent dispatch
+  /// re-marks these. Membership doubles as the conflict-signal dedupe: one
+  /// [`poll_split_conflict`](Self::poll_split_conflict) signal per park episode.
+  parked: BTreeSet<G>,
+  /// Pending `(parent, child)` split-conflict signals, pushed once per park episode (see
+  /// [`poll_split_conflict`](Self::poll_split_conflict)).
+  conflicts: VecDeque<(G, G)>,
   /// The RELAY-TIME lineage view, one entry per admitted id: seeded at every admission (0 at
   /// genesis create, the DURABLE restored lineage at restore/fork) and bumped to
   /// `parent_gen_after` when a fork is relayed. This is the replay guard: a fork whose bump is
@@ -333,6 +357,8 @@ where
       dirty_msgs: VecDeque::new(),
       dirty_events: VecDeque::new(),
       dirty_forks: VecDeque::new(),
+      parked: BTreeSet::new(),
+      conflicts: VecDeque::new(),
       lineage: BTreeMap::new(),
       host_id: None,
     }
@@ -383,6 +409,10 @@ where
   /// latched, so a re-created group must carry the same node id (live transport connections stay
   /// authenticated under it).
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
+    // A parked PARENT's staged forks die with its endpoint (removal is the embedder's explicit
+    // destruction of this replica), so the park bookkeeping dies too. Removing a parked fork's
+    // CHILD needs nothing here: the next relay drain re-examines the park and materializes.
+    self.parked.remove(gid);
     self.groups.remove(gid)
   }
 
@@ -473,81 +503,201 @@ where
   /// Decodes the typed child id, applies the replay guard, rebuilds the child's config from the
   /// parent's local tuning, and yields a [`GroupFork`]. Folded to a RESOLVED no-op (the fork's
   /// barrier contribution is released, nothing yielded) when: the bump is at-or-below the relay
-  /// guard (a retry duplicate / an already-covered replay), the child id is already hosted (the
-  /// factory raced the fork — safe because any solicitation that materialized it can only have
-  /// come from an already-forked member whose blob was flush-durable before it could transmit),
-  /// or this host is not in the fork's voter set (a parent LEARNER applies the split — its
-  /// parent half shrinks identically — but does not place the child; the embedder adds it by
-  /// conf change later if wanted). A committed child id that does not decode as `G` poisons the
-  /// parent (`SplitDecode` — committed-corrupt, the apply-arm's own decode class) and drops its
-  /// remaining staged forks.
+  /// guard (a retry duplicate / an already-covered replay), or this host is not in the fork's
+  /// voter set (a parent LEARNER applies the split — its parent half shrinks identically — but
+  /// does not place the child; the embedder adds it by conf change later if wanted). A committed
+  /// child id that does not decode as `G` poisons the parent (`SplitDecode` — committed-corrupt,
+  /// the apply-arm's own decode class) and drops its remaining staged forks.
+  ///
+  /// A fork whose child id is ALREADY HOSTED here is PARKED, never dropped: the parent's
+  /// `fsm.split` already ran at apply — the parent SHRANK — so the staged blob is the
+  /// partition's only local copy, and the pre-park behavior (resolve as a no-op) silently lost
+  /// it whenever the child was admitted between the propose-time `ChildExists` gate and this
+  /// relay (the coordinators' reservation narrows that window, but a child admitted BEFORE the
+  /// split applied remains reachable). Parked means: the fork stays queued at the head (its
+  /// parent's later forks wait behind it — relaying past it would advance the replay guard over
+  /// it and fold it to a duplicate), the relay guard does not advance, the snapshot fence does
+  /// not lift, and one `(parent, child)` conflict signal surfaces via
+  /// [`poll_split_conflict`](Self::poll_split_conflict). Every drain re-examines parked forks
+  /// first and resolves by exactly one of: (a) the hosted child is REMOVED — the fork
+  /// materializes normally; (b) the hosted child reaches `applied >=` [`FORK_BASE_INDEX`] with
+  /// lineage equal to the fork's `child_gen` — the same-logical-fork twin (materialized from a
+  /// sibling replica whose own blob was flush-durable before it could transmit), so the fork
+  /// data provably exists cluster-wide and this fork resolves as redundant (fence lifts, guard
+  /// advances, blob discarded — now safe); (c) otherwise it stays parked. Parking cannot
+  /// deadlock recovery: the conflict signal is the embedder's cue, and the standing fence means
+  /// the parent cannot compact past the split entry while parked — the fork's replay source
+  /// survives indefinitely, so resolution stays possible no matter how late the embedder acts.
   pub fn poll_pending_fork(&mut self) -> Option<GroupFork<G, I, F>> {
+    // Parked parents first: their resolution triggers are child-side, so the dirty queue —
+    // marked only by parent dispatches — cannot be relied on to revisit them.
+    let parked: Vec<G> = self.parked.iter().map(CheapClone::cheap_clone).collect();
+    for gid in parked {
+      match self.examine_head_fork(&gid) {
+        HeadFork::Empty => {
+          self.parked.remove(&gid);
+        }
+        HeadFork::Resolved => {
+          // Arm (b): the head fork resolved as redundant — later forks of this parent flow
+          // through the ordinary drain below.
+          self.parked.remove(&gid);
+          self.dirty_forks.push_back(gid);
+        }
+        HeadFork::Parked => {}
+        HeadFork::Yield(fork) => {
+          // Arm (a): the squatter is gone and the fork materializes normally.
+          self.parked.remove(&gid);
+          self.dirty_forks.push_back(gid);
+          return Some(fork);
+        }
+      }
+    }
     while let Some(gid) = self.dirty_forks.front().map(CheapClone::cheap_clone) {
-      let Some(ep) = self.groups.get_mut(&gid) else {
+      // A parked parent's queue is owned by the sweep above (head-of-line by design).
+      if self.parked.contains(&gid) {
         self.dirty_forks.pop_front();
         continue;
-      };
-      let Some((fork, fsm)) = ep.pop_pending_fork() else {
-        self.dirty_forks.pop_front();
-        continue;
-      };
-      let Ok(child) = G::decode_exact(fork.child_bytes.clone()) else {
-        ep.poison(PoisonReason::SplitDecode);
-        while ep.pop_pending_fork().is_some() {}
-        self.dirty_forks.pop_front();
-        continue;
-      };
-      let in_voters = self
-        .host_id
-        .as_ref()
-        .is_some_and(|host| fork.voters.contains(host));
-      if !in_voters {
-        if let Some(ep) = self.groups.get_mut(&gid) {
-          ep.resolve_fork(fork.index);
-        }
-        continue;
       }
-      if fork.parent_gen_after <= self.lineage.get(&gid).copied().unwrap_or(0) {
-        if let Some(ep) = self.groups.get_mut(&gid) {
-          ep.resolve_fork(fork.index);
+      match self.examine_head_fork(&gid) {
+        HeadFork::Empty | HeadFork::Parked => {
+          self.dirty_forks.pop_front();
         }
-        continue;
+        // Re-examine the same parent: its next staged fork (if any) is now at the head.
+        HeadFork::Resolved => {}
+        HeadFork::Yield(fork) => return Some(fork),
       }
-      self
-        .lineage
-        .insert(gid.cheap_clone(), fork.parent_gen_after);
-      if self.groups.contains_key(&child) {
-        if let Some(ep) = self.groups.get_mut(&gid) {
-          ep.resolve_fork(fork.index);
-        }
-        continue;
-      }
-      // Rebuild the child's boot config: the parent's local tuning under the fork's voter set.
-      // The voter-membership check above makes `IdNotAVoter` unreachable; the arm is defensive
-      // (resolve rather than wedge the queue).
-      let Some(config) = self
-        .groups
-        .get(&gid)
-        .and_then(|ep| ep.config().with_voter_set(fork.voters.clone()).ok())
-      else {
-        if let Some(ep) = self.groups.get_mut(&gid) {
-          ep.resolve_fork(fork.index);
-        }
-        continue;
-      };
-      return Some(GroupFork {
-        parent: gid,
-        child,
-        child_gen: fork.child_gen,
-        parent_gen_after: fork.parent_gen_after,
-        config,
-        fsm,
-        blob: fork.blob,
-        read_only: fork.read_only,
-        split_index: fork.index,
-      });
     }
     None
+  }
+
+  /// Examine (and where possible resolve or yield) `gid`'s HEAD staged fork — the one shared
+  /// arm evaluation both [`poll_pending_fork`](Self::poll_pending_fork) phases run. The head
+  /// fork is consumed only on a resolution or a yield; a park leaves it staged untouched.
+  fn examine_head_fork(&mut self, gid: &G) -> HeadFork<G, I, F> {
+    enum Verdict<G> {
+      Poison,
+      /// Resolve the head fork's barrier and consume it (duplicate / non-member arms).
+      Resolve,
+      /// Park on a hosted-child conflict (arm (c)), surfacing the signal on a fresh park.
+      Park(G),
+      /// Resolve as redundant — the hosted twin provably carries the fork data (arm (b)).
+      Redundant,
+      /// No conflict: advance the guard and yield (the config rebuild may still refuse).
+      Yield(G),
+    }
+    let verdict = {
+      let Some(ep) = self.groups.get(gid) else {
+        return HeadFork::Empty;
+      };
+      let Some(fork) = ep.peek_pending_fork() else {
+        return HeadFork::Empty;
+      };
+      if let Ok(child) = G::decode_exact(fork.child_bytes.clone()) {
+        let in_voters = self
+          .host_id
+          .as_ref()
+          .is_some_and(|host| fork.voters.contains(host));
+        if !in_voters || fork.parent_gen_after <= self.lineage.get(gid).copied().unwrap_or(0) {
+          Verdict::Resolve
+        } else if let Some(hosted) = self.groups.get(&child) {
+          // Arm (b): a twin at-or-past the manufactured baseline under the fork's own lineage
+          // IS this fork (single-incarnation ids), materialized from a sibling whose blob was
+          // flush-durable before it could transmit — discarding the local copy loses nothing.
+          if hosted.applied_index() >= FORK_BASE_INDEX && hosted.shape_gen() == fork.child_gen {
+            Verdict::Redundant
+          } else {
+            Verdict::Park(child)
+          }
+        } else {
+          Verdict::Yield(child)
+        }
+      } else {
+        Verdict::Poison
+      }
+    };
+    match verdict {
+      Verdict::Poison => {
+        if let Some(ep) = self.groups.get_mut(gid) {
+          ep.poison(PoisonReason::SplitDecode);
+          while ep.pop_pending_fork().is_some() {}
+        }
+        HeadFork::Empty
+      }
+      Verdict::Resolve => {
+        if let Some(ep) = self.groups.get_mut(gid)
+          && let Some((fork, _fsm)) = ep.pop_pending_fork()
+        {
+          ep.resolve_fork(fork.index);
+        }
+        HeadFork::Resolved
+      }
+      Verdict::Redundant => {
+        if let Some(ep) = self.groups.get_mut(gid)
+          && let Some((fork, _fsm)) = ep.pop_pending_fork()
+        {
+          ep.resolve_fork(fork.index);
+          self
+            .lineage
+            .insert(gid.cheap_clone(), fork.parent_gen_after);
+        }
+        HeadFork::Resolved
+      }
+      Verdict::Park(child) => {
+        // Set-insert is the dedupe: one conflict signal per park episode, re-armed only after
+        // a resolution removes the parent from the parked set.
+        if self.parked.insert(gid.cheap_clone()) {
+          self.conflicts.push_back((gid.cheap_clone(), child));
+        }
+        HeadFork::Parked
+      }
+      Verdict::Yield(child) => {
+        // Rebuild the child's boot config: the parent's local tuning under the fork's voter
+        // set. The voter-membership check above makes `IdNotAVoter` unreachable; the arm is
+        // defensive (resolve rather than wedge the queue).
+        let config = self.groups.get(gid).and_then(|ep| {
+          let voters = ep.peek_pending_fork()?.voters.clone();
+          ep.config().with_voter_set(voters).ok()
+        });
+        let Some(ep) = self.groups.get_mut(gid) else {
+          return HeadFork::Empty;
+        };
+        let Some((fork, fsm)) = ep.pop_pending_fork() else {
+          return HeadFork::Empty;
+        };
+        let Some(config) = config else {
+          ep.resolve_fork(fork.index);
+          self
+            .lineage
+            .insert(gid.cheap_clone(), fork.parent_gen_after);
+          return HeadFork::Resolved;
+        };
+        self
+          .lineage
+          .insert(gid.cheap_clone(), fork.parent_gen_after);
+        HeadFork::Yield(GroupFork {
+          parent: gid.cheap_clone(),
+          child,
+          child_gen: fork.child_gen,
+          parent_gen_after: fork.parent_gen_after,
+          config,
+          fsm,
+          blob: fork.blob,
+          read_only: fork.read_only,
+          split_index: fork.index,
+        })
+      }
+    }
+  }
+
+  /// Drain the next `(parent, child)` SPLIT-CONFLICT signal: a committed fork PARKED because
+  /// its child id is already hosted here (see [`poll_pending_fork`](Self::poll_pending_fork)).
+  /// One signal per park episode — deduped until the park resolves, exactly one consumption per
+  /// conflict — and best-effort in the same sense as every placement signal: the parked fork
+  /// itself, not this signal, is the load-bearing state. The embedder resolves by removing the
+  /// hosted child (the fork then materializes) or by letting the twin catch up (the fork then
+  /// resolves as redundant); until then the parent's snapshot fence holds its replay source.
+  pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
+    self.conflicts.pop_front()
   }
 
   /// Resolve the fork staged at exactly `split_index` on `parent`: the driver reports the

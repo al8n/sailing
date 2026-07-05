@@ -98,6 +98,13 @@ impl<I, F, R> Endpoint<I, F, R>
 where
   F: StateMachine,
 {
+  /// The oldest staged fork, without consuming it — the container's examine-before-take seam:
+  /// a fork whose child id is already hosted PARKS at the head of this queue (re-examined every
+  /// relay crank, never popped) so its blob survives until the conflict resolves.
+  pub(crate) fn peek_pending_fork(&self) -> Option<&PendingFork<I>> {
+    self.split.pending_forks.front()
+  }
+
   /// Pop the oldest staged fork with its forked state-machine half (apply order — the FIFO the
   /// container's replay guard relies on). The two queues are pushed together at the apply arm,
   /// so they pop together. Popping does NOT resolve the fork's durability barrier — only
