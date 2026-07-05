@@ -239,8 +239,9 @@ pub enum SplitError<I> {
 #[non_exhaustive]
 pub enum MergeError<I> {
   /// This node is not the mutated group's leader; redirect to `leader` if known. Each merge verb
-  /// rides exactly one group's log — `prepare_merge`/`rollback_merge` the source's,
-  /// `commit_merge` the target's — so only that group's leader can propose it.
+  /// rides exactly one group's log — `prepare_merge` the source's, `commit_merge` and
+  /// `rollback_merge` the TARGET's (the abort must be totally ordered against the commit),
+  /// the relayed thaw the source's — so only that group's leader can propose it.
   #[error("not the mutated group's leader")]
   NotLeader {
     /// The believed current leader of the mutated group, if known.
@@ -302,9 +303,17 @@ pub enum MergeError<I> {
   /// same explicit non-goal as cross-plane splits.
   #[error("the source and target map to different planes")]
   CrossPlane,
-  /// `rollback_merge`'s source is neither frozen nor freezing — there is nothing to roll back.
-  #[error("the source group is not frozen or freezing")]
+  /// `rollback_merge`'s local source replica holds no APPLIED freeze — there is nothing to
+  /// abort. A merely pending freeze also refuses (its generation and claim are unreadable
+  /// until it applies; a freeze that never commits self-heals through truncation instead).
+  #[error("the local source replica holds no applied freeze")]
   NotFrozen,
+  /// The source's freeze names a DIFFERENT target: the freeze is a CLAIM by exactly one
+  /// target, pinned on the source's log for the freeze's whole generation — only that target
+  /// may absorb it or abort it (the claim is what makes two targets naming one frozen source
+  /// resolve identically on every replica).
+  #[error("the source's freeze names a different target")]
+  SourceClaimed,
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large). The merge-specific gates all passed; the failure is the ordinary
   /// admin-append class, surfaced verbatim.

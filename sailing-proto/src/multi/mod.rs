@@ -31,7 +31,7 @@ use crate::{
   Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore, MergeError, Message, NodeId,
   Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng, ProposeError, ReadIndexError,
   ReadOnlyOption, RollbackMergePayload, SnapshotMeta, SplitError, SplitPayload, StableStore,
-  StateMachine, StorageProgress, Term, TransferError,
+  StateMachine, StorageProgress, Term, TransferError, endpoint::MergeWindow,
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
@@ -266,6 +266,24 @@ pub struct GroupFork<G, I, F> {
   pub split_index: Index,
 }
 
+/// One committed, container-relayed merge ABORT: a target-side abort entry applied on `target`,
+/// and the frozen `source` it names must now be THAWED on its own log — the driver proposes the
+/// source-side `RollbackMerge` there ([`MultiRaft::propose_merge_unfreeze`]), so the thaw stays
+/// log-borne for restart re-derivation. Yielded by
+/// [`MultiRaft::poll_pending_merge_abort`] once per abort apply per host; the relay is
+/// best-effort BY DESIGN (only the host whose local source replica leads can propose — every
+/// other host's attempt dies typed at the source's own gates), and a relay lost to lifecycle
+/// churn is recovered by re-proposing the target-side abort (a fresh entry, a fresh relay).
+pub struct MergeAbortRelay<G> {
+  /// The target group whose log carried the abort entry.
+  pub target: G,
+  /// The frozen source group to thaw, decoded from the abort's payload.
+  pub source: G,
+  /// The freeze generation the abort abandoned (observability; the thaw's own mint re-reads
+  /// the live frozen state at propose).
+  pub source_gen_after: u64,
+}
+
 /// One resolved parked merge from a [`MultiRaft::service_merge_applies`] crank — what the
 /// DRIVER folds into its storage engine and lifecycle teardown. The container already did the
 /// consensus-side work (the absorb or the deterministic abort, the events, the source
@@ -357,6 +375,9 @@ where
   /// Groups that may have a staged pending fork to relay (see
   /// [`poll_pending_fork`](Self::poll_pending_fork)).
   dirty_forks: VecDeque<G>,
+  /// TARGETS that may have a staged source-unfreeze relay to drain (see
+  /// [`poll_pending_merge_abort`](Self::poll_pending_merge_abort)).
+  dirty_aborts: VecDeque<G>,
   /// Parents whose HEAD fork is PARKED on a hosted-child conflict (see
   /// [`poll_pending_fork`](Self::poll_pending_fork)): the fork stays staged (blob retained, the
   /// snapshot fence armed, the relay guard unmoved) and is re-examined at the top of every relay
@@ -403,6 +424,7 @@ where
       dirty_msgs: VecDeque::new(),
       dirty_events: VecDeque::new(),
       dirty_forks: VecDeque::new(),
+      dirty_aborts: VecDeque::new(),
       parked: BTreeSet::new(),
       conflicts: VecDeque::new(),
       lineage: BTreeMap::new(),
@@ -514,6 +536,9 @@ where
     }
     if self.dirty_forks.back() != Some(gid) {
       self.dirty_forks.push_back(gid.cheap_clone());
+    }
+    if self.dirty_aborts.back() != Some(gid) {
+      self.dirty_aborts.push_back(gid.cheap_clone());
     }
   }
 
@@ -804,6 +829,39 @@ where
     if let Some(ep) = self.groups.get_mut(parent) {
       ep.resolve_fork(split_index);
     }
+  }
+
+  /// The next committed, relay-ready merge ABORT from any target (see [`MergeAbortRelay`]):
+  /// drained by the driver every crank, which then proposes the SOURCE-side thaw via
+  /// [`propose_merge_unfreeze`](Self::propose_merge_unfreeze) over the source's own stores.
+  /// Restart replay re-stages these (an already-thawed source refuses the duplicate typed); a
+  /// committed source id that does not decode as `G` poisons the target — the committed-corrupt
+  /// class every relay decode shares.
+  pub fn poll_pending_merge_abort(&mut self) -> Option<MergeAbortRelay<G>> {
+    while let Some(gid) = self.dirty_aborts.front().map(CheapClone::cheap_clone) {
+      let Some(ep) = self.groups.get_mut(&gid) else {
+        self.dirty_aborts.pop_front();
+        continue;
+      };
+      let Some(relay) = ep.pop_pending_abort() else {
+        self.dirty_aborts.pop_front();
+        continue;
+      };
+      match G::decode_exact(relay.source_bytes.clone()) {
+        Ok(source) => {
+          return Some(MergeAbortRelay {
+            target: gid,
+            source,
+            source_gen_after: relay.source_gen_after,
+          });
+        }
+        Err(_) => {
+          ep.poison(PoisonReason::MergeDecode);
+          while ep.pop_pending_abort().is_some() {}
+        }
+      }
+    }
+    None
   }
 
   /// Raise `gid`'s relay-time replay guard to at least `lineage` — the restore arms' seam for
@@ -1605,6 +1663,11 @@ where
     let source_mode = sep.active_read_mode();
     let source_frozen_ready =
       sep.is_frozen() && sep.freeze_index().is_some_and(|f| sep.applied_index() >= f);
+    let source_claim_mismatch = {
+      let mut target_bytes = Vec::new();
+      target.encode(&mut target_bytes);
+      sep.frozen_for().is_none_or(|t| *t != target_bytes)
+    };
     let freeze_index = sep.freeze_index();
     let source_gen_after = sep.shape_gen();
     let tep = self.groups.get(target).expect("checked hosted above");
@@ -1626,6 +1689,12 @@ where
     // ever re-elected while frozen).
     if !source_frozen_ready {
       return Some(Err(MergeError::SourceNotReady));
+    }
+    if source_claim_mismatch {
+      // The freeze names ONE absorbing target for its whole generation; a commit from any
+      // other target could only park and abort at the service's claim leg — refuse it here
+      // with the truthful verdict instead.
+      return Some(Err(MergeError::SourceClaimed));
     }
     let target_conf = tep.conf_state();
     if source_conf.is_joint() || target_conf.is_joint() {
@@ -1659,19 +1728,113 @@ where
     Some(result)
   }
 
-  /// Propose the merge ABORT on `source`: a committed `RollbackMerge` unfreezes it and moves
-  /// its lineage past the freeze generation, which deterministically aborts every parked
-  /// `CommitMerge` still naming the old freeze. The ONE entry proposable on a frozen group —
-  /// the release valve; there is deliberately no timeout-based auto-unfreeze. `None` if no
-  /// group `source` is hosted.
+  /// Propose the merge ABORT on `target`: a committed target-side `RollbackMerge` abandons the
+  /// merge of `source` into it, TOTALLY ORDERED against `CommitMerge` on the target's own log —
+  /// landing below the commit it kills it at the commit's own lineage guard (parks never form);
+  /// landing at the coordinate right after a parked commit it un-parks every replica aborted;
+  /// landing later it no-ops (the merge already resolved — the abort's mint is stale by then).
+  /// The applied abort then RELAYS the source's thaw
+  /// ([`poll_pending_merge_abort`](Self::poll_pending_merge_abort)): the driver proposes the
+  /// source-side `RollbackMerge` on the source's own log, and a relay lost to churn is
+  /// recovered by simply re-proposing this abort. The release valve — there is deliberately no
+  /// timeout-based auto-unfreeze. `None` if no group `target` is hosted.
+  ///
+  /// The gates are best-effort truthfulness (the apply-time lineage guard is the decider): the
+  /// TARGET leader proposes; the LOCAL source must exist and be frozen or freezing (the mint
+  /// names its freeze generation); a frozen target refuses (its own dissolution outranks —
+  /// aborting through it would bump its lineage above its own boundary).
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn rollback_merge<L, S>(
+    &mut self,
+    target: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
+    _stable: &S,
+    source: &G,
+  ) -> Option<Result<Index, MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    if !self.groups.contains_key(target) {
+      return None;
+    }
+    if source == target {
+      return Some(Err(MergeError::SelfMerge));
+    }
+    if !self.groups.contains_key(source) {
+      return Some(Err(MergeError::SourceMissing));
+    }
+    let tep = self.groups.get(target).expect("checked hosted above");
+    if tep.is_poisoned() {
+      return Some(Err(MergeError::Propose(ProposeError::Poisoned)));
+    }
+    if !tep.role().is_leader() {
+      return Some(Err(MergeError::NotLeader {
+        leader: tep.leader(),
+      }));
+    }
+    if tep.merge_freeze_active() {
+      return Some(Err(MergeError::AlreadyFrozen));
+    }
+    // The abort names an APPLIED freeze: its generation and claim are read off the frozen
+    // source. A merely pending freeze refuses — unreadable claim, and a freeze that never
+    // commits self-heals through truncation rather than through an abort.
+    let sep = self.groups.get(source).expect("checked hosted above");
+    if !sep.is_frozen() {
+      return Some(Err(MergeError::NotFrozen));
+    }
+    let mut target_bytes = Vec::new();
+    target.encode(&mut target_bytes);
+    if sep.frozen_for().is_none_or(|t| *t != target_bytes) {
+      // Only the claimed target may abort the merge — a foreign abort's relayed thaw would
+      // move the source's counter under the claimed target's parked commit (the wedge the
+      // claim exists to prevent).
+      return Some(Err(MergeError::SourceClaimed));
+    }
+    let source_gen_after = sep.shape_gen();
+    let mut source_bytes = Vec::new();
+    source.encode(&mut source_bytes);
+    // The mint reads the target's live counter — deliberately NOT gated on an in-flight or
+    // parked commit: racing one is this verb's whole purpose, and the shared base is exactly
+    // what makes the race resolve to one log-ordered winner.
+    let target_gen_after = tep.shape_gen() + 1;
+    let payload = RollbackMergePayload::abort(
+      Bytes::from(source_bytes),
+      source_gen_after,
+      target_gen_after,
+    );
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&payload, &mut buf);
+    let ep = self.groups.get_mut(target).expect("checked hosted above");
+    let result = ep
+      .propose_merge_entry(now, log, EntryKind::RollbackMerge, Bytes::from(buf))
+      .map_err(MergeError::Propose);
+    self.mark_dirty(target);
+    Some(result)
+  }
+
+  /// Propose the SOURCE-side thaw on `source` — the relay leg of a committed target-side abort
+  /// (see [`poll_pending_merge_abort`](Self::poll_pending_merge_abort)): invoked by the
+  /// DRIVER's relay drain with the relay's own target as `claimed_by`, and by NOTHING else —
+  /// the embedder's verb is [`rollback_merge`](Self::rollback_merge). A direct thaw that
+  /// bypasses the abort would move the source's counter under the claimed target's parked
+  /// commit, wedging it (debug builds assert; release builds hold the park rather than
+  /// diverge). The ONE entry proposable on a frozen group. Refusals are the relay's dedupe: an
+  /// already-thawed source answers `NotFrozen`, a non-leader replica `NotLeader`, a claim
+  /// mismatch `SourceClaimed` — every host relays once per abort apply, and exactly the host
+  /// whose local source replica leads under the matching claim can land the thaw. `None` if no
+  /// group `source` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn propose_merge_unfreeze<L, S>(
     &mut self,
     source: &G,
     now: impl Into<Now>,
     log: &mut L,
     // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
     _stable: &S,
+    claimed_by: &G,
   ) -> Option<Result<Index, MergeError<I>>>
   where
     L: LogStore,
@@ -1686,15 +1849,19 @@ where
         leader: ep.leader(),
       }));
     }
-    if !ep.merge_freeze_active() {
+    // An APPLIED freeze only: a pending one's claim is unreadable (and a freeze that never
+    // commits self-heals through truncation, not through a thaw).
+    if !ep.is_frozen() {
       return Some(Err(MergeError::NotFrozen));
     }
-    // The mint accounts for a freeze still PENDING in the log: that freeze will apply first and
-    // bump the counter once, so the rollback minted beside it takes the successor slot — and
-    // the two share truncation fate (the rollback sits above the freeze it undoes), so a lost
-    // freeze never strands an over-minted rollback.
-    let bump = if ep.is_frozen() { 1 } else { 2 };
-    let source_gen_after = ep.shape_gen() + bump;
+    let mut claimed_bytes = Vec::new();
+    claimed_by.encode(&mut claimed_bytes);
+    if ep.frozen_for().is_none_or(|t| *t != claimed_bytes) {
+      // A relay riding a foreign target's abort must not thaw a source claimed elsewhere —
+      // the claimed target's parked commit gates on this counter staying put.
+      return Some(Err(MergeError::SourceClaimed));
+    }
+    let source_gen_after = ep.shape_gen() + 1;
     let payload = RollbackMergePayload::unfreeze(source_gen_after);
     let mut buf = Vec::new();
     crate::wire::encode_rollback_merge_payload(&payload, &mut buf);
@@ -1706,35 +1873,52 @@ where
     Some(result)
   }
 
-  /// Resolve every parked `CommitMerge` that local facts now decide — called ONCE PER CRANK by
-  /// every driver, after the per-group apply drains. For each parked target the arms are, in
-  /// order: **resolve** (source hosted, frozen at the expected gen, applied past the boundary,
-  /// and the target free to stage its absorb capture) — the source endpoint is removed, its
-  /// state machine absorbed, and the forced capture staged through `stores` so the union's
-  /// durability anchor rides the SAME barrier as the driver's floor/teardown; **abort** (source
-  /// hosted but its lineage moved PAST the expected gen — a rollback won the race on the
-  /// source's own log; or source absent — already merged away here, or this replica never
-  /// hosted one) — a deterministic no-op past the parked entry; **keep parked** otherwise (the
-  /// source is still catching up; its own replication keeps running while frozen, entirely
-  /// independent of this target). Every input is log-determined, so all replicas reach the same
-  /// resolution regardless of WHEN their cranks run it.
+  /// Resolve every parked `CommitMerge` that the TARGET's log and local facts now decide —
+  /// called ONCE PER CRANK by every driver, after the per-group apply drains.
+  ///
+  /// The ABORT side is decided by target-log order alone: the park's **abort window** is the
+  /// single committed coordinate `k + 1` right after the parked entry. Until something commits
+  /// there EVERY arm holds (resolving while the coordinate is undecided would race an abort
+  /// landing at it — one host absorbed, another aborted, committed divergence; the proven
+  /// cross-log race, one log removed), and the target LEADER seals a quiet window with a no-op
+  /// so it cannot stay open forever. A committed matching abort there un-parks ABORTED on
+  /// every replica; anything else closes the window for good — from then on the park waits
+  /// only on the local source gate. NEVER a live read of the source's mutable state on the
+  /// abort side: the source's counter cannot move while the park stands (the thaw is relayed
+  /// by the abort itself, which this very park blocks above `k`).
+  ///
+  /// With the window closed the arms are: **resolve** (source hosted, frozen at the expected
+  /// gen FOR THIS TARGET, applied past the boundary, and the target free to stage its absorb
+  /// capture) — the source endpoint is removed, its state machine absorbed, and the forced
+  /// capture staged through `stores` so the union's durability anchor rides the SAME barrier
+  /// as the driver's floor/teardown; **abort** (the frozen source's claim names a DIFFERENT
+  /// target — log-pinned for the freeze's whole generation, so identical on every replica; or
+  /// source absent WITH the terminal floor — a replayed duplicate, the union already here);
+  /// **keep parked** otherwise (a behind source keeps replicating while frozen, entirely
+  /// independent of this target; an absent source without the floor waits for the resolved
+  /// quorum's post-merge snapshot, whose install supersedes the park).
   ///
   /// Liveness needs exactly one guarantee from the driver: a parked target is never
   /// quiesce-eligible, so this service keeps being reached. The park waits on a local monotone
-  /// condition (the local source's applied reaching a fixed committed index), and the gen
-  /// recheck bounds it against rollbacks — one of the two MUST eventually commit on the
-  /// source's log; a source wedged below its boundary forever is the group-is-dead liveness
-  /// class, resolvable by membership action or rollback, both explicitly available.
+  /// condition (the local source's applied reaching a fixed committed index); the abort valve
+  /// races the seal for the window, and once sealed the merge is as decided as any committed
+  /// entry — a source wedged below its boundary forever is the group-is-dead liveness class,
+  /// recovered at the embedder's catalog like any dead group.
   ///
   /// Returns the crank's resolutions for the DRIVER to fold: floor + teardown for `Merged`,
   /// nothing for `Aborted`.
-  pub fn service_merge_applies<L, S, St>(&mut self, stores: &mut St) -> Vec<MergeResolution<G>>
+  pub fn service_merge_applies<L, S, St>(
+    &mut self,
+    now: impl Into<Now>,
+    stores: &mut St,
+  ) -> Vec<MergeResolution<G>>
   where
     St: crate::GroupStores<G, L, S> + FloorStore<G>,
     L: LogStore,
     S: StableStore<NodeId = I>,
     F::Snapshot: Data,
   {
+    let now: Now = now.into();
     let mut resolutions = Vec::new();
     let parked: Vec<G> = self
       .groups
@@ -1765,50 +1949,92 @@ where
         Abort,
         Wait,
       }
-      let verdict = match self.groups.get(&source) {
-        Some(sep) => {
-          let seen = sep.shape_gen();
-          if seen == expected {
-            // gen == expected implies the freeze applied (that apply is the counter's only
-            // path to this value) — frozen and applied-past-boundary ride along; the explicit
-            // checks document the gate and catch a broken counter in debug.
-            debug_assert!(sep.is_frozen() && sep.applied_index() >= boundary);
-            // waitForApplication, container-local: the host whose local source replica LEADS
-            // the source resolves LAST. Resolving would consume (and tear down) the source
-            // leader while slow source followers still sit below the boundary — with no leader
-            // left to feed them the freeze, their hosts' parks wedge forever. Holding THIS park
-            // keeps the source leader alive and replicating exactly until every peer provably
-            // matched through the boundary (the capture fence keeps the freeze replayable, so
-            // catch-up below it never needs a snapshot the source cannot send). A source peer
-            // that never catches up (dead, unreachable) holds only this one host's park — and
-            // the rollback valve stays proposable on the still-live source the whole time.
-            if sep.role().is_leader() && !sep.peers_matched_through(boundary) {
-              Verdict::Wait
-            } else {
-              Verdict::Resolve
+      // THE ABORT WINDOW, first and unconditionally: no arm below may fire until the target's
+      // own log has decided the `k + 1` coordinate (see the method doc). The read is of this
+      // group's committed content — identical bytes on every replica.
+      let window = match stores.stores(&tgid) {
+        Some((log, stable)) => {
+          let w = tep.merge_abort_window(&*log);
+          if w == MergeWindow::Open {
+            // Seal a quiet window (leader-only, idempotent per park), flushing the fan-out
+            // inline so sealing rides this crank rather than the next heartbeat cadence.
+            if let Some(tep) = self.groups.get_mut(&tgid)
+              && tep.ensure_merge_seal(now, log)
+            {
+              tep.flush_appends(now, &*log, &*stable);
+              self.mark_dirty(&tgid);
             }
-          } else if seen > expected {
-            Verdict::Abort
-          } else {
-            Verdict::Wait
           }
+          w
         }
-        // Absent WITH the terminal floor: this host already absorbed the source (the floor
-        // lands in the same barrier as an absorb) — the commit is a replayed duplicate and the
-        // union is already in the target; no-op past it. Absent WITHOUT the floor: this
-        // replica never held the source (lifecycle churn tore it down, or the replica joined
-        // after the source dissolved) and the union is NOT materializable here — it must WAIT
-        // for the resolved quorum's post-merge snapshot, whose install supersedes the park
-        // (the forced capture compacts the leader through the absorb, so a parked straggler is
-        // structurally on the snapshot path). Aborting instead would skip the union on this
-        // replica alone — silent, permanent divergence from every replica that absorbed.
-        None => {
-          if stores.floor(&source) == crate::MERGED_FLOOR {
-            Verdict::Abort
-          } else {
-            Verdict::Wait
+        None => continue,
+      };
+      let verdict = match window {
+        MergeWindow::Abort => Verdict::Abort,
+        MergeWindow::Open | MergeWindow::Stall => Verdict::Wait,
+        MergeWindow::Closed => match self.groups.get(&source) {
+          Some(sep) => {
+            let seen = sep.shape_gen();
+            if seen == expected {
+              // gen == expected implies the freeze applied (that apply is the counter's only
+              // path to this value) — frozen and applied-past-boundary ride along; the explicit
+              // checks document the gate and catch a broken counter in debug.
+              debug_assert!(sep.is_frozen() && sep.applied_index() >= boundary);
+              let mut tgid_bytes = Vec::new();
+              tgid.encode(&mut tgid_bytes);
+              if sep.frozen_for().is_none_or(|t| *t != tgid_bytes) {
+                // The freeze is a CLAIM by exactly one target, pinned for this whole
+                // generation on the source's log: a park under a foreign claim can never
+                // absorb, and every replica sees the same claim — abort deterministically
+                // (two targets naming one frozen source is the same committed-divergence
+                // class as the cross-log rollback, and the claim is what closes it).
+                Verdict::Abort
+              } else if sep.role().is_leader() && !sep.peers_matched_through(boundary) {
+                // waitForApplication, container-local: the host whose local source replica
+                // LEADS the source resolves LAST. Resolving would consume (and tear down) the
+                // source leader while slow source followers still sit below the boundary —
+                // with no leader left to feed them the freeze, their hosts' parks wedge
+                // forever. Holding THIS park keeps the source leader alive and replicating
+                // exactly until every peer provably matched through the boundary (the capture
+                // fence keeps the freeze replayable, so catch-up below it never needs a
+                // snapshot the source cannot send). A source peer that never catches up
+                // (dead, unreachable) holds only this one host's park.
+                Verdict::Wait
+              } else {
+                Verdict::Resolve
+              }
+            } else {
+              // Behind the expectation: still catching up (its own replication keeps running
+              // while frozen). PAST it is structurally unreachable while parked — the thaw is
+              // relayed only by the abort entry this park blocks above `k`, and a replayed
+              // commit against an already-moved counter no-ops at its own lineage guard
+              // before ever parking — so a moved counter here is a broken-counter bug, not an
+              // abort signal: hold rather than diverge.
+              debug_assert!(
+                seen < expected,
+                "a parked commit observed the source PAST its freeze generation"
+              );
+              Verdict::Wait
+            }
           }
-        }
+          // Absent WITH the terminal floor: this host already absorbed the source (the floor
+          // lands in the same barrier as an absorb) — the commit is a replayed duplicate and
+          // the union is already in the target; no-op past it. Absent WITHOUT the floor: this
+          // replica never held the source (lifecycle churn tore it down, or the replica
+          // joined after the source dissolved) and the union is NOT materializable here — it
+          // must WAIT for the resolved quorum's post-merge snapshot, whose install supersedes
+          // the park (the forced capture compacts the leader through the absorb, so a parked
+          // straggler is structurally on the snapshot path). Aborting instead would skip the
+          // union on this replica alone — silent, permanent divergence from every replica
+          // that absorbed.
+          None => {
+            if stores.floor(&source) == crate::MERGED_FLOOR {
+              Verdict::Abort
+            } else {
+              Verdict::Wait
+            }
+          }
+        },
       };
       match verdict {
         Verdict::Wait => {}

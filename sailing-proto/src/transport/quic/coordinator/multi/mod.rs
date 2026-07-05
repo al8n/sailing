@@ -793,24 +793,53 @@ where
     Some(r)
   }
 
-  /// Propose the merge ABORT on `source` (see [`MultiRaft::rollback_merge`]) — the release
-  /// valve, exempt from the freeze gates — replicating immediately. No floor leg: rolling back
-  /// is always legitimate on a group this host still runs. `None` if no group `source` is
-  /// hosted.
+  /// Propose the merge ABORT on `target` (see [`MultiRaft::rollback_merge`]): the target-side
+  /// abort entry, totally ordered against `CommitMerge` on the target's own log, replicating
+  /// immediately. No floor leg: aborting is always legitimate on groups this host still runs.
+  /// `None` if no group `target` is hosted.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn rollback_merge<L, S>(
     &mut self,
-    source: &G,
+    target: &G,
     now: impl Into<Now>,
     log: &mut L,
     stable: &S,
+    source: &G,
   ) -> Option<Result<Index, crate::MergeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
     let now: Now = now.into();
-    let r = self.multi.rollback_merge(source, now, log, stable)?;
+    let r = self
+      .multi
+      .rollback_merge(target, now, log, stable, source)?;
+    let _ = self.multi.flush_appends(target, now, log, stable);
+    self.pump(now.mono());
+    Some(r)
+  }
+
+  /// Propose the SOURCE-side thaw on `source` (see [`MultiRaft::propose_merge_unfreeze`]) —
+  /// the relay leg of a committed target-side abort, normally invoked by the DRIVER's relay
+  /// drain rather than the embedder. The one entry proposable on a frozen group; refusals are
+  /// the relay's dedupe.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  pub fn propose_merge_unfreeze<L, S>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    stable: &S,
+    claimed_by: &G,
+  ) -> Option<Result<Index, crate::MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let now: Now = now.into();
+    let r = self
+      .multi
+      .propose_merge_unfreeze(source, now, log, stable, claimed_by)?;
     let _ = self.multi.flush_appends(source, now, log, stable);
     self.pump(now.mono());
     Some(r)
@@ -842,6 +871,7 @@ where
   /// survive restarts. Aborted resolutions touch nothing here — the source group is still live.
   pub fn service_merge_applies<L, S, St>(
     &mut self,
+    now: impl Into<Now>,
     stores: &mut St,
   ) -> Vec<crate::MergeResolution<G>>
   where
@@ -849,7 +879,7 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    let resolutions = self.multi.service_merge_applies(stores);
+    let resolutions = self.multi.service_merge_applies(now, stores);
     for r in &resolutions {
       if let crate::MergeResolution::Merged { source, .. } = r {
         self.quiesce_intents.remove(source);
@@ -866,6 +896,13 @@ where
   /// crank, so the same crank's engine flush covers the materialization.
   pub fn poll_pending_fork(&mut self) -> Option<crate::GroupFork<G, I, F>> {
     self.multi.poll_pending_fork()
+  }
+
+  /// The next committed, relay-ready merge ABORT from any hosted target (see
+  /// [`MultiRaft::poll_pending_merge_abort`]) — the driver drains this every crank after its
+  /// merge service and proposes the source-side thaw over the source's own stores.
+  pub fn poll_pending_merge_abort(&mut self) -> Option<crate::MergeAbortRelay<G>> {
+    self.multi.poll_pending_merge_abort()
   }
 
   /// Resolve the fork staged at exactly `split_index` on `parent` (see

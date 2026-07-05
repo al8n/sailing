@@ -137,8 +137,16 @@ fn a_parked_merge_blocks_quiescence() {
     "a parked merge is never quiesce-eligible"
   );
 
-  // The service resolves it; once the resumed drain settles, the merged target is idle again.
-  let resolved = multi.service_merge_applies(&mut engine);
+  // The service resolves it: the first pass seals the park's abort window (a leader no-op at
+  // the coordinate after the parked entry), the drain commits the seal, the next pass absorbs;
+  // once the resumed drain settles, the merged target is idle again.
+  let mut resolved = multi.service_merge_applies(now, &mut engine);
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&2).unwrap();
+    let _ = multi.handle_storage(&2, now, log, stable).unwrap();
+  }
+  resolved.extend(multi.service_merge_applies(now, &mut engine));
   assert_eq!(resolved.len(), 1);
   for _ in 0..4 {
     engine.flush();

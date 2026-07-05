@@ -26,6 +26,7 @@ mod snapshot;
 mod split;
 mod transfer;
 
+pub(crate) use merge::MergeWindow;
 pub use merge::PendingMergeApply;
 
 /// The max ENTRY COUNT a single committed-range read requests (apply, replication, the restart scans).
@@ -2635,10 +2636,12 @@ where
             // gen bump is a max-fold so a restart replay re-walks the same values idempotently;
             // no lineage guard mirrors SplitStale here — a second freeze cannot be proposed
             // while one is pending or applied (the propose gates), so a committed PrepareMerge
-            // is never a stale mint.
+            // is never a stale mint. The named target is RETAINED as the freeze's claim: only
+            // that target's commit may ever absorb this generation (the resolve arm verifies).
             self.merge.frozen = true;
             self.merge.freeze_index = Some(idx);
             self.merge.freeze_pending = None;
+            self.merge.frozen_for = Some(payload.target_bytes());
             self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
             self.outputs.events.push_back(Event::Frozen);
           }
@@ -2651,20 +2654,38 @@ where
                 break;
               }
             };
-            // PARK: the endpoint cannot apply this entry alone — the absorbed half lives in
-            // another group's endpoint, which only the container holds. Record the pending
-            // apply and STOP the drain at `idx - 1` (`applied` last advanced to the previous
-            // entry); the container's per-crank service resolves it from local facts and the
-            // drain resumes on the next call. Volatile by design: a restart re-encounters the
-            // entry and re-parks deterministically.
-            self.merge.pending_apply = Some(merge::PendingMergeApply::new_parked(
-              payload.source_bytes(),
-              payload.freeze_index(),
-              payload.source_gen_after(),
-              payload.target_gen_after(),
-              idx,
-            ));
-            return;
+            // THE LINEAGE GUARD (the SplitStale shape): a commit applies only at exactly its
+            // minted target generation. A stale mint means a same-base competitor won the log
+            // race below this entry — a target-side abort (the merge is abandoned; parks never
+            // form), an earlier absorb (a replayed duplicate), or a concurrent target split —
+            // and the guard inputs are the target's own log-determined counter, so every
+            // replica no-ops the same entry identically. Snapshot-compaction-safe by the same
+            // token: `shape_gen` rides the snapshot meta, so a replica restored past the
+            // competitor still sees the moved counter.
+            if Some(payload.target_gen_after()) != self.split.shape_gen.checked_add(1) {
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeAborted(crate::MergeAborted::new(
+                  idx,
+                  payload.source_bytes(),
+                )));
+            } else {
+              // PARK: the endpoint cannot apply this entry alone — the absorbed half lives in
+              // another group's endpoint, which only the container holds. Record the pending
+              // apply and STOP the drain at `idx - 1` (`applied` last advanced to the previous
+              // entry); the container's per-crank service resolves it from local facts and the
+              // drain resumes on the next call. Volatile by design: a restart re-encounters the
+              // entry and re-parks deterministically.
+              self.merge.pending_apply = Some(merge::PendingMergeApply::new_parked(
+                payload.source_bytes(),
+                payload.freeze_index(),
+                payload.source_gen_after(),
+                payload.target_gen_after(),
+                idx,
+              ));
+              return;
+            }
           }
           EntryKind::RollbackMerge => {
             // A committed RollbackMerge whose payload won't decode is corrupt — mirror Split.
@@ -2675,24 +2696,54 @@ where
                 break;
               }
             };
-            // The unfreeze fold. The gen bump past the freeze generation is the abort signal
-            // every parked CommitMerge keys on (deterministic on every replica — the comparison
-            // inputs are log-determined). Leases are NOT resurrected: they re-form from live
-            // traffic. The pending kill is RE-DERIVED rather than cleared: a rollback proposed
-            // while a freeze was still pending shares its fate through truncation, but a LATER
-            // freeze may already sit above this entry in the suffix — scanning keeps the
-            // append-observed invariant exact instead of trusting a single-flag lifecycle.
-            self.merge.frozen = false;
-            self.merge.freeze_index = None;
-            self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
-            match Self::scan_freeze_pending(log, idx) {
-              Ok(fp) => self.merge.freeze_pending = fp,
-              Err(reason) => {
-                self.poison(reason);
-                break;
+            if payload.is_unfreeze() {
+              // The SOURCE-role thaw (this group was the frozen source; the entry rides its
+              // own log as the container-relayed consequence of the target-side abort).
+              // Leases are NOT resurrected: they re-form from live traffic. The pending kill
+              // is RE-DERIVED rather than cleared: a thaw proposed while a freeze was still
+              // pending shares its fate through truncation, but a LATER freeze may already
+              // sit above this entry in the suffix — scanning keeps the append-observed
+              // invariant exact instead of trusting a single-flag lifecycle.
+              self.merge.frozen = false;
+              self.merge.freeze_index = None;
+              self.merge.frozen_for = None;
+              self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
+              match Self::scan_freeze_pending(log, idx) {
+                Ok(fp) => self.merge.freeze_pending = fp,
+                Err(reason) => {
+                  self.poison(reason);
+                  break;
+                }
               }
+              self.outputs.events.push_back(Event::MergeRolledBack);
+            } else if Some(payload.target_gen_after()) == self.split.shape_gen.checked_add(1) {
+              // The TARGET-role abort at its live mint: the merge attempt named in the payload
+              // is dead on THIS log, totally ordered against its CommitMerge — a later commit
+              // from the same base no-ops at its own lineage guard, everywhere identically.
+              // The bump is that guard's kill; it rides the snapshot meta like every lineage
+              // move, so compaction cannot resurrect the aborted attempt. The source's thaw is
+              // a RELAYED consequence: staged here, drained by the container, proposed by the
+              // driver on the source's own log (log-borne there for restart re-derivation).
+              // A park cannot be pending here — a parked commit stops this drain below us, so
+              // an abort entry only ever applies once the park resolved.
+              debug_assert!(self.merge.pending_apply.is_none());
+              self.split.shape_gen = self.split.shape_gen.max(payload.target_gen_after());
+              self.merge.pending_aborts.push_back(merge::AbortRelay {
+                source_bytes: payload.source_bytes(),
+                source_gen_after: payload.source_gen_after(),
+              });
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeAborted(crate::MergeAborted::new(
+                  idx,
+                  payload.source_bytes(),
+                )));
             }
-            self.outputs.events.push_back(Event::MergeRolledBack);
+            // A TARGET-role abort with a stale mint lost its race (the merge resolved, or a
+            // competing reshape won the base): a silent deterministic no-op — the winner
+            // already surfaced the definitive event, and no thaw is relayed (an absorbed
+            // source no longer exists to thaw; a live one is covered by re-proposing).
           }
           EntryKind::SetReadMode => {
             // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison

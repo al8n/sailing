@@ -2432,7 +2432,17 @@ fn merge_verbs_ride_the_coordinator() {
     coord.handle_storage(&2, now, l, s).unwrap();
   }
   assert!(coord.group(&2).unwrap().pending_merge().is_some());
-  let resolutions = coord.service_merge_applies(&mut stores);
+  // The first pass seals the park's abort window; the drain commits the seal; the next pass
+  // absorbs.
+  assert!(
+    coord.service_merge_applies(now, &mut stores).is_empty(),
+    "the first pass only seals"
+  );
+  {
+    let (l, s) = stores.stores(&2).unwrap();
+    coord.handle_storage(&2, now, l, s).unwrap();
+  }
+  let resolutions = coord.service_merge_applies(now, &mut stores);
   assert_eq!(
     resolutions,
     std::vec![crate::MergeResolution::Merged {
@@ -2446,12 +2456,20 @@ fn merge_verbs_ride_the_coordinator() {
   assert!(coord.group(&1).is_none());
   assert!(coord.is_retired(&1), "resolved merge tombstones the source");
 
-  // The rollback delegator is reachable too (nothing frozen anymore: typed refusal).
+  // The abort and thaw delegators are reachable too (the source is gone: typed refusals).
   {
     let (l, s) = stores.stores(&2).unwrap();
     assert!(matches!(
-      coord.rollback_merge(&2, now, l, s).unwrap(),
+      coord.rollback_merge(&2, now, l, s, &1).unwrap(),
+      Err(crate::MergeError::SourceMissing)
+    ));
+    assert!(matches!(
+      coord.propose_merge_unfreeze(&2, now, l, s, &2).unwrap(),
       Err(crate::MergeError::NotFrozen)
     ));
   }
+  assert!(
+    coord.poll_pending_merge_abort().is_none(),
+    "no abort applied, nothing relays"
+  );
 }

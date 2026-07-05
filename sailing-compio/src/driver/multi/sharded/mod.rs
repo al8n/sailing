@@ -730,11 +730,21 @@ where
     self.shards[plane].commit_merge(target, source).await
   }
 
-  /// Propose the merge ABORT on `source`'s mapped plane (no pairing to check — the rollback
-  /// names one group).
-  pub async fn rollback_merge(&self, source: G) -> Result<sailing_proto::Index, DriverError<I>> {
-    let plane = self.map.shard(&source);
-    self.shards[plane].rollback_merge(source).await
+  /// Propose the merge ABORT on `target`'s plane — the abort rides the TARGET's log — with the
+  /// same cross-plane refusal as the other merge verbs (the abort's relay must reach the
+  /// source inside the same plane's container).
+  pub async fn rollback_merge(
+    &self,
+    target: G,
+    source: G,
+  ) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&target);
+    if self.map.shard(&source) != plane {
+      return Err(DriverError::Rejected {
+        reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
+      });
+    }
+    self.shards[plane].rollback_merge(target, source).await
   }
 
   /// Remove a group from its mapped plane, awaiting whether it was hosted (the removal

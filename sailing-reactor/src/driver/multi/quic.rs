@@ -561,7 +561,7 @@ where
     // re-park or restarts the target past the absorb, never in between. (The coordinator
     // already tombstoned the source, so stragglers drop at the wire; an Aborted resolution
     // needs nothing here — the source group is still live.)
-    let resolutions = self.coord.service_merge_applies(&mut self.engine);
+    let resolutions = self.coord.service_merge_applies(now, &mut self.engine);
     if !resolutions.is_empty() {
       self.flush_pending = true;
     }
@@ -579,6 +579,19 @@ where
         if let Some(mut routing) = self.routing.remove(&source) {
           routing.fail_all(&DriverError::ShuttingDown);
         }
+      }
+    }
+    // The abort-relay drain: a target-side abort applied this crank must thaw its named
+    // source ON THE SOURCE'S OWN LOG (log-borne for restart re-derivation). Best-effort by
+    // design — only the host whose local source replica leads can land the thaw; everyone
+    // else's attempt dies typed at the source's own gates, and a relay lost to churn is
+    // recovered by re-proposing the abort.
+    while let Some(relay) = self.coord.poll_pending_merge_abort() {
+      if let Some((log, stable)) = self.engine.stores(&relay.source) {
+        let _ = self
+          .coord
+          .propose_merge_unfreeze(&relay.source, now, log, stable, &relay.target);
+        self.flush_pending = true;
       }
     }
     self.flush_pending = self.engine.has_staged() || more;
@@ -1119,16 +1132,22 @@ where
         drop(reservation);
       }
       MultiCommand::RollbackMerge {
+        target,
         source,
         reply,
         reservation,
       } => {
-        let verdict = match self.engine.stores(&source) {
+        let verdict = match self.engine.stores(&target) {
           None => Err(no_such_group()),
-          Some((log, stable)) => match self.coord.rollback_merge(&source, now, log, stable) {
-            Some(r) => r.map_err(map_merge_err),
-            None => Err(no_such_group()),
-          },
+          Some((log, stable)) => {
+            match self
+              .coord
+              .rollback_merge(&target, now, log, stable, &source)
+            {
+              Some(r) => r.map_err(map_merge_err),
+              None => Err(no_such_group()),
+            }
+          }
         };
         if verdict.is_ok() {
           self.flush_pending = true;

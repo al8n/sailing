@@ -173,12 +173,16 @@ where
     /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
-  /// Propose the merge ABORT on `source` (see `MultiRaft::rollback_merge`): unfreeze — the one
-  /// entry proposable on a frozen group. Answer `reply` with the leader's immediate verdict.
+  /// Propose the merge ABORT on `target` (see `MultiRaft::rollback_merge`): the target-side
+  /// abort entry, totally ordered against the commit on the target's own log; the applied
+  /// abort then relays the source's thaw through the driver's per-crank drain. Answer `reply`
+  /// with the target leader's immediate verdict.
   RollbackMerge {
-    /// The frozen (or freezing) group to thaw.
+    /// The absorbing group whose log carries the abort (leader-only).
+    target: G,
+    /// The frozen (or freezing) group whose merge is being abandoned.
     source: G,
-    /// Answered with the source leader's immediate verdict.
+    /// Answered with the target leader's immediate verdict.
     reply: oneshot::Sender<Result<Index, DriverError<I>>>,
     /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
@@ -646,12 +650,18 @@ where
     rx.await.map_err(|_| DriverError::ShuttingDown)?
   }
 
-  /// Propose the merge ABORT on `source`, awaiting the leader's IMMEDIATE verdict — the release
-  /// valve: the ONE entry proposable on a frozen group; there is no timeout-based auto-unfreeze.
-  pub async fn rollback_merge(&self, source: G) -> Result<Index, DriverError<I>> {
+  /// Propose the merge ABORT on `target`, awaiting the target leader's IMMEDIATE verdict — the
+  /// release valve, riding the TARGET's log so it is totally ordered against the commit it
+  /// races: landing below the commit kills it before any park forms; landing right after a
+  /// parked one un-parks every replica aborted; landing later no-ops (the merge resolved).
+  /// The applied abort relays the source's thaw (the driver proposes the source-side entry per
+  /// crank); a relay lost to churn is recovered by calling this again. No timeout-based
+  /// auto-unfreeze exists.
+  pub async fn rollback_merge(&self, target: G, source: G) -> Result<Index, DriverError<I>> {
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     self.send(MultiCommand::RollbackMerge {
+      target,
       source,
       reply: tx,
       reservation,

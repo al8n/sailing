@@ -104,6 +104,15 @@ pub(crate) struct MergeState {
   /// The applied `PrepareMerge` entry's index while frozen — the boundary the absorbing target
   /// gates on. `None` exactly when `frozen` is false.
   pub(crate) freeze_index: Option<Index>,
+  /// The TARGET id the applied freeze named (its `Data` encoding, from the `PrepareMerge`
+  /// payload), retained while frozen: the freeze is a CLAIM by exactly one target, and both the
+  /// `commit_merge` propose gate and the park's resolve arm compare against it — without the
+  /// claim, two targets naming one frozen source would race per host for the absorb (the same
+  /// committed-divergence class as the cross-log rollback). Immutable for the freeze's whole
+  /// generation, so reading it off the live source is host-order-independent; `None` exactly
+  /// when `frozen` is false. Re-derived by replay like `frozen` itself (the merge replay fence
+  /// keeps the freeze entry replayable for as long as the freeze lives).
+  pub(crate) frozen_for: Option<Bytes>,
   /// The parked `CommitMerge` (target side), `Some` while the apply drain is stopped at
   /// `at - 1`. Written ONLY by the park arm and the two container resolutions.
   pub(crate) pending_apply: Option<PendingMergeApply>,
@@ -120,6 +129,94 @@ pub(crate) struct MergeState {
   /// Never cleared: the check compares against the live `first_index`, so it self-releases
   /// permanently once the capture's compaction lands.
   pub(crate) absorb_index: Option<Index>,
+  /// Source-unfreeze relays staged by TARGET-side abort applies, drained by the container
+  /// (mirroring the fork relay): each records the abort entry's named source, and the driver
+  /// proposes the SOURCE-side `RollbackMerge` on that group's own log. Replay re-stages them
+  /// (the relay's restart derivation); a duplicate proposal dies at the source's own
+  /// `NotFrozen` gate, and a relay lost to lifecycle churn is recovered by re-proposing the
+  /// target-side abort (a fresh entry, a fresh relay) — documented on `rollback_merge`.
+  pub(crate) pending_aborts: VecDeque<AbortRelay>,
+}
+
+/// One staged source-unfreeze relay: a TARGET-side abort applied here, and the source it names
+/// must now be thawed on its own log. G-free like the entry (the container decodes the typed id
+/// when it relays).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct AbortRelay {
+  /// The frozen source group id's canonical `Data` encoding.
+  pub(crate) source_bytes: Bytes,
+  /// The freeze generation the abort abandoned (observability; the source-side mint re-reads
+  /// the live frozen state at propose).
+  pub(crate) source_gen_after: u64,
+}
+
+/// A parked commit's ABORT-WINDOW verdict — the target-log half of the park's resolution rule.
+/// The window is the single log coordinate `k + 1` (the entry after the parked commit): until
+/// something COMMITS there the merge outcome is still contestable and no arm may resolve (an
+/// absorb taken while the coordinate is undecided would race an abort landing at it — one host
+/// absorbed, another aborted, committed divergence); once committed, the coordinate's content
+/// is immutable and identical on every replica, so the verdict below is a pure log function.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeWindow {
+  /// Nothing committed at `k + 1` yet: hold every arm; the leader seals the window with a
+  /// no-op so a quiet target cannot hold it open forever.
+  Open,
+  /// The committed `k + 1` is THIS merge's abort: the park resolves aborted — on every
+  /// replica, because the coordinate is committed-log content.
+  Abort,
+  /// The committed `k + 1` is anything else: no abort can ever contest this merge again (a
+  /// later abort no-ops at its lineage guard once the absorb bumps the counter), so the park
+  /// may wait on the source gate and resolve.
+  Closed,
+  /// The coordinate is committed but not readable this crank (a cold store, a benign
+  /// not-yet-visible read): hold, retry next crank.
+  Stall,
+}
+
+impl<I, F, R> Endpoint<I, F, R>
+where
+  F: StateMachine,
+{
+  /// Evaluate the parked commit's abort window (see [`MergeWindow`]). Reads only THIS group's
+  /// committed log — never the source's mutable state — so every replica evaluates the same
+  /// bytes. The coordinate cannot have been compacted while parked: compaction happens at
+  /// applied indexes, the park holds `applied` at `k - 1`, and an install past the park
+  /// supersedes it entirely.
+  pub(crate) fn merge_abort_window<L: LogStore>(&self, log: &L) -> MergeWindow {
+    let Some(pending) = self.merge.pending_apply.as_ref() else {
+      debug_assert!(false, "window read without a parked CommitMerge");
+      return MergeWindow::Stall;
+    };
+    let coord = pending.at().next();
+    if self.commit < coord {
+      return MergeWindow::Open;
+    }
+    let read = match log.entries(coord..coord.next(), 1 << 20) {
+      Ok(EntriesRead::Ready(e)) if !e.is_empty() => e,
+      // Committed but not readable this pass (cold or briefly invisible): benign, retried —
+      // exactly the apply drain's own treatment of the same read. A genuinely faulted store
+      // is poisoned by that drain when it reaches the coordinate; the window never poisons.
+      _ => return MergeWindow::Stall,
+    };
+    let entry = &read[0];
+    if entry.kind() != EntryKind::RollbackMerge {
+      return MergeWindow::Closed;
+    }
+    match crate::wire::decode_rollback_merge_payload(entry.data_bytes()) {
+      Ok(p)
+        if !p.is_unfreeze()
+          && p.source_bytes() == pending.source_bytes()
+          && p.source_gen_after() == pending.source_gen_after() =>
+      {
+        MergeWindow::Abort
+      }
+      // A different merge's abort (or the source-role shape, unreachable on a target's log)
+      // closes the window like any other entry; a corrupt payload is the apply drain's poison
+      // to raise when it reaches the coordinate — the window's verdict is still deterministic
+      // (same committed bytes everywhere).
+      _ => MergeWindow::Closed,
+    }
+  }
 }
 
 impl<I, F, R> Endpoint<I, F, R>
@@ -145,6 +242,19 @@ where
   /// group would never reach).
   pub fn pending_merge(&self) -> Option<&PendingMergeApply> {
     self.merge.pending_apply.as_ref()
+  }
+
+  /// The TARGET id this frozen source's freeze named (`None` when not frozen) — the claim the
+  /// `commit_merge` gate and the park's resolve arm verify, so exactly one target can ever
+  /// absorb a given freeze generation.
+  pub(crate) fn frozen_for(&self) -> Option<&Bytes> {
+    self.merge.frozen_for.as_ref()
+  }
+
+  /// Pop the next staged source-unfreeze relay (a TARGET-side abort applied on this endpoint),
+  /// for the container's relay drain.
+  pub(crate) fn pop_pending_abort(&mut self) -> Option<AbortRelay> {
+    self.merge.pending_aborts.pop_front()
   }
 
   /// Whether a merge freeze is ACTIVE right now: a pending (append-observed) freeze or the
@@ -386,6 +496,26 @@ where
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     self.snapshot.pending_compact = Some((opid, self.applied));
+  }
+
+  /// Seal a parked commit's abort window: while the window is OPEN and this leader's log still
+  /// ENDS at the parked entry, append one no-op so the `k + 1` coordinate gets decided — a
+  /// quiet target would otherwise hold every replica's park open forever (client traffic and
+  /// election no-ops seal it incidentally; this is the guaranteed leg). Idempotent per park:
+  /// once anything sits above `k` the append is skipped, and a truncated seal is replaced by
+  /// the successor leader's own election no-op. Returns whether a no-op was appended (the
+  /// caller flushes the fan-out inline so sealing never waits on heartbeat cadence).
+  pub(crate) fn ensure_merge_seal<L: LogStore>(&mut self, now: Now, log: &mut L) -> bool {
+    if !self.role.is_leader() {
+      return false;
+    }
+    let Some(pending) = self.merge.pending_apply.as_ref() else {
+      return false;
+    };
+    if log.last_index() != pending.at() {
+      return false;
+    }
+    self.append_leader_noop(now, log, pending.at()).is_some()
   }
 
   /// Whether every tracked peer (voters AND learners, both joint halves) has MATCHED the log

@@ -599,9 +599,25 @@ fn pending_freeze_appends_no_proactive_refresh() {
   assert_eq!(ep.lease_refreshes(), 0, "the proactive counter never moved");
 }
 
-/// Encode a `RollbackMerge` payload.
+/// Encode a SOURCE-role `RollbackMerge` payload (the relayed thaw).
 fn rollback_payload(source_gen_after: u64) -> bytes::Bytes {
   let p = crate::RollbackMergePayload::unfreeze(source_gen_after);
+  let mut buf = Vec::new();
+  crate::wire::encode_rollback_merge_payload(&p, &mut buf);
+  bytes::Bytes::from(buf)
+}
+
+/// Encode a TARGET-role `RollbackMerge` payload (the abort).
+fn abort_payload(
+  source: &'static [u8],
+  source_gen_after: u64,
+  target_gen_after: u64,
+) -> bytes::Bytes {
+  let p = crate::RollbackMergePayload::abort(
+    bytes::Bytes::from_static(source),
+    source_gen_after,
+    target_gen_after,
+  );
   let mut buf = Vec::new();
   crate::wire::encode_rollback_merge_payload(&p, &mut buf);
   bytes::Bytes::from(buf)
@@ -1284,7 +1300,9 @@ fn restart_reparks_a_committed_commit_merge() {
       Term::new(1),
       Index::new(2),
       EntryKind::CommitMerge,
-      commit_payload(b"\x2a", Index::new(7), 3, 4),
+      // A LIVE mint: the replayed counter walks to 0 here, so only target_gen_after 1 parks
+      // (a replayed stale mint no-ops at the lineage guard instead of re-parking).
+      commit_payload(b"\x2a", Index::new(7), 3, 1),
     ),
   ]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(2));
@@ -1303,7 +1321,7 @@ fn restart_reparks_a_committed_commit_merge() {
   assert_eq!(pending.at(), Index::new(2));
   assert_eq!(pending.freeze_index(), Index::new(7));
   assert_eq!(pending.source_gen_after(), 3);
-  assert_eq!(pending.target_gen_after(), 4);
+  assert_eq!(pending.target_gen_after(), 1);
 }
 
 /// An FSM without `absorb` support poisons at resolve — deterministic on every replica, never a
@@ -1490,4 +1508,179 @@ fn snapshot_install_supersedes_a_parked_commit_merge() {
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(ep.applied_index(), Index::new(11), "the drain resumed");
+}
+
+/// The freeze retains its CLAIM (the named target) for the whole frozen generation, and only
+/// the thaw clears it — the claim is what lets exactly one target absorb or abort this freeze,
+/// read host-order-independently off the frozen source.
+#[test]
+fn freeze_retains_its_claim_until_the_thaw() {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  assert_eq!(ep.frozen_for(), None);
+  let f = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::PrepareMerge,
+      prepare_payload(b"\x2b", 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, f);
+  assert!(ep.is_frozen());
+  assert_eq!(
+    ep.frozen_for().map(|t| t.as_ref().to_vec()),
+    Some(b"\x2b".to_vec()),
+    "the claim is the freeze's named target"
+  );
+  let r = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      rollback_payload(2),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, r);
+  assert!(!ep.is_frozen());
+  assert_eq!(ep.frozen_for(), None, "the thaw clears the claim");
+}
+
+/// Abort-before-commit, one log: the abort applies first (bumping the target's lineage), so
+/// the later commit's mint is STALE at its own apply — it no-ops with `Event::MergeAborted`
+/// and NO PARK EVER FORMS. The core "parks never form" ordering pin.
+#[test]
+fn abort_below_a_commit_kills_it_at_apply() {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  // Both minted against base 0 (target_gen_after = 1): the log orders the abort first.
+  let a = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      abort_payload(b"\x2a", 1, 1),
+    )
+    .unwrap();
+  let k = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 1),
+    )
+    .unwrap();
+  assert_eq!(k, a.next());
+  ack_through(&mut ep, &mut log, &mut stable, k);
+  assert!(
+    ep.pending_merge().is_none(),
+    "the killed commit never parks"
+  );
+  assert_eq!(ep.applied_index(), k, "the drain ran straight through");
+  assert_eq!(
+    ep.shape_gen(),
+    1,
+    "exactly the abort's bump, not the commit's"
+  );
+  let aborted = std::iter::from_fn(|| ep.poll_event())
+    .filter(|ev| matches!(ev, Event::MergeAborted(_)))
+    .count();
+  assert_eq!(
+    aborted, 2,
+    "the abort's own signal plus the killed commit's"
+  );
+  // Exactly one thaw relay — the applied abort's.
+  assert!(ep.pop_pending_abort().is_some());
+  assert!(ep.pop_pending_abort().is_none());
+}
+
+/// A TARGET-role abort with a STALE mint is a silent deterministic no-op: no lineage move, no
+/// thaw relay, no event — the winner of its base already surfaced the definitive signal.
+#[test]
+fn stale_abort_is_a_silent_no_op() {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  // Minted against base 2 (target_gen_after = 3) while the live counter sits at 0.
+  let a = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      abort_payload(b"\x2a", 1, 3),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, a);
+  assert_eq!(ep.applied_index(), a, "applied as a no-op");
+  assert_eq!(ep.shape_gen(), 0, "no lineage move");
+  assert!(ep.pop_pending_abort().is_none(), "no thaw relay");
+  assert!(
+    !std::iter::from_fn(|| ep.poll_event()).any(|ev| matches!(ev, Event::MergeAborted(_))),
+    "no signal — the base's winner already spoke"
+  );
+}
+
+/// The abort window reads the ONE committed coordinate after the parked entry: OPEN while
+/// nothing committed there, ABORT on this merge's own abort, CLOSED on anything else
+/// (including another merge's abort).
+#[test]
+fn merge_abort_window_reads_the_coordinate() {
+  use crate::endpoint::MergeWindow;
+  // Open: the parked entry is the last committed thing.
+  let (ep, log, _stable, _k) = make_parked_target(1);
+  assert_eq!(ep.merge_abort_window(&log), MergeWindow::Open);
+
+  // Abort: the coordinate holds THIS merge's abort (same source, same freeze generation).
+  let (mut ep, mut log, mut stable, k) = make_parked_target(1);
+  let a = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      abort_payload(b"\x2a", 1, 1),
+    )
+    .unwrap();
+  assert_eq!(a, k.next());
+  ack_through(&mut ep, &mut log, &mut stable, a);
+  assert!(
+    ep.pending_merge().is_some(),
+    "the park still blocks the drain"
+  );
+  assert_eq!(ep.merge_abort_window(&log), MergeWindow::Abort);
+
+  // Closed: a DIFFERENT merge's abort at the coordinate is just another window-closing entry.
+  let (mut ep, mut log, mut stable, k) = make_parked_target(1);
+  let a = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      abort_payload(b"\x2c", 9, 1),
+    )
+    .unwrap();
+  assert_eq!(a, k.next());
+  ack_through(&mut ep, &mut log, &mut stable, a);
+  assert_eq!(ep.merge_abort_window(&log), MergeWindow::Closed);
+
+  // Closed: an ordinary entry at the coordinate.
+  let (mut ep, mut log, mut stable, k) = make_parked_target(1);
+  let cmd = bytes::Bytes::from_static(b"w");
+  let w = ep
+    .propose(Instant::ORIGIN, &mut log, &stable, &cmd)
+    .unwrap();
+  assert_eq!(w, k.next());
+  ack_through(&mut ep, &mut log, &mut stable, w);
+  assert_eq!(ep.merge_abort_window(&log), MergeWindow::Closed);
+}
+
+/// The seal: a parked LEADER whose log still ENDS at the parked entry appends exactly one
+/// no-op at the coordinate (idempotent per park; anything already above `k` skips it), so a
+/// quiet target cannot hold every replica's window open forever.
+#[test]
+fn merge_seal_appends_once_on_the_leader() {
+  let (mut ep, mut log, _stable, k) = make_parked_target(0);
+  assert_eq!(log.last_index(), k);
+  assert!(ep.ensure_merge_seal(Instant::ORIGIN.into(), &mut log));
+  assert_eq!(log.last_index(), k.next(), "one no-op at the coordinate");
+  assert!(
+    !ep.ensure_merge_seal(Instant::ORIGIN.into(), &mut log),
+    "already sealed: idempotent per park"
+  );
+  assert_eq!(log.last_index(), k.next());
 }

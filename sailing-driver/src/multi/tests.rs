@@ -460,14 +460,19 @@ fn merge_verbs_round_trip_their_replies() {
     }
     assert_eq!(commit.await.unwrap(), sailing_proto::Index::new(9));
 
-    let mut rollback = Box::pin(handle.rollback_merge(100));
+    let mut rollback = Box::pin(handle.rollback_merge(200, 100));
     assert!(matches!(
       futures_util::poll!(rollback.as_mut()),
       Poll::Pending
     ));
     match cmd_rx.try_recv().expect("the rollback was enqueued") {
-      MultiCommand::RollbackMerge { source, reply, .. } => {
-        assert_eq!(source, 100);
+      MultiCommand::RollbackMerge {
+        target,
+        source,
+        reply,
+        ..
+      } => {
+        assert_eq!((target, source), (200, 100));
         reply
           .send(Err(DriverError::Rejected {
             reason: "not frozen".into(),

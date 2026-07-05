@@ -2636,6 +2636,18 @@ fn freeze_and_park(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores)
   k
 }
 
+/// Close the parked commit's abort window: the first service pass resolves nothing — it
+/// appends the leader's seal no-op at the coordinate after the parked entry — and the drain
+/// commits it (single-voter shape: commit advances at the local storage drain).
+fn seal_window(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores) {
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  let (log, stable) = stores.0.get_mut(&2).unwrap();
+  drain_storage(m, 2, Instant::ORIGIN, log, stable);
+}
+
 /// Arm 1 end-to-end inside one container: freeze → park → resolve. The source endpoint is
 /// extracted and absorbed, the target serves the union, the forced absorb capture is staged
 /// through the store seam, and the resolution surfaces for the driver's floor/teardown fold.
@@ -2643,7 +2655,8 @@ fn freeze_and_park(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores)
 fn service_resolves_a_ready_merge() {
   let (mut m, mut stores) = merge_host(2, 3);
   let k = freeze_and_park(&mut m, &mut stores);
-  let resolutions = m.service_merge_applies(&mut stores);
+  seal_window(&mut m, &mut stores);
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
   assert_eq!(
     resolutions,
     std::vec![MergeResolution::Merged {
@@ -2679,26 +2692,35 @@ fn service_resolves_a_ready_merge() {
     assert!(log.first_index() > k, "compacted through the absorb");
   }
   // The park is consumed: the next crank has nothing to service.
-  assert!(m.service_merge_applies(&mut stores).is_empty());
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty()
+  );
 }
 
-/// Arm 2: a rollback commits on the source AFTER the target parked — the source's log settled
-/// the race, the source's lineage moved past the expectation, and the parked commit aborts
-/// deterministically. Never a half-merge: both groups remain live and untouched.
+/// The abort races the parked commit ON THE TARGET'S OWN LOG and lands at the coordinate right
+/// after it: every replica's park un-parks ABORTED off that one committed coordinate — never
+/// off observation timing of the source's mutable state (the proven cross-log divergence). The
+/// drain then applies the abort itself (the target's lineage bumps — the guard that kills any
+/// same-base commit) and the relayed thaw unfreezes the source. Never a half-merge.
 #[test]
 fn rollback_races_commit() {
   let (mut m, mut stores) = merge_host(2, 3);
   let k = freeze_and_park(&mut m, &mut stores);
   {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.rollback_merge(&1, Instant::ORIGIN, log, stable)
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let a = m
+      .rollback_merge(&2, Instant::ORIGIN, log, stable, &1)
       .unwrap()
       .unwrap();
-    drain_storage(&mut m, 1, Instant::ORIGIN, log, stable);
+    assert_eq!(
+      a,
+      k.next(),
+      "the abort is the window's next resolution input"
+    );
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
   }
-  assert!(!m.group(&1).unwrap().is_frozen(), "rolled back");
-  assert_eq!(m.group(&1).unwrap().shape_gen(), 2, "lineage moved past");
-  let resolutions = m.service_merge_applies(&mut stores);
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
   assert_eq!(
     resolutions,
     std::vec![MergeResolution::Aborted {
@@ -2706,16 +2728,76 @@ fn rollback_races_commit() {
       target: 2
     }]
   );
+  // The resumed drain applies the abort entry: lineage bump + the staged thaw relay.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
+  }
   assert!(m.contains_group(&1), "the source lives on");
   let tep = m.group(&2).unwrap();
-  assert_eq!(tep.applied_index(), k, "the target no-op'd past the park");
+  assert!(tep.pending_merge().is_none());
+  assert_eq!(tep.applied_index(), k.next(), "past the park and the abort");
   assert_eq!(tep.state_machine().count(), 3, "nothing absorbed");
-  assert_eq!(tep.shape_gen(), 0, "no target lineage bump on abort");
+  assert_eq!(tep.shape_gen(), 1, "the abort bumped the target's lineage");
   let mut aborted = false;
   while let Some((gid, ev)) = m.poll_event() {
     aborted |= gid == 2 && matches!(ev, Event::MergeAborted(_));
   }
   assert!(aborted, "Event::MergeAborted surfaced");
+  // Exactly one relayed thaw, and it lands on the source's own log.
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("one relay per abort apply");
+  assert_eq!((relay.target, relay.source), (2, 1));
+  assert_eq!(relay.source_gen_after, 1);
+  assert!(m.poll_pending_merge_abort().is_none(), "exactly once");
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, Instant::ORIGIN, log, stable, &2)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 1, Instant::ORIGIN, log, stable);
+  }
+  let sep = m.group(&1).unwrap();
+  assert!(!sep.is_frozen(), "the relayed thaw unfroze the source");
+  assert_eq!(sep.shape_gen(), 2, "0 -> 1 (freeze) -> 2 (thaw)");
+}
+
+/// A LATE abort — proposed after the window sealed — no-ops at its stale mint once the merge
+/// resolves: nothing un-merges, no thaw relays. The "commit first" ordering pin: whichever of
+/// the two rides the target's log first wins on every replica.
+#[test]
+fn late_abort_no_ops_after_the_merge_resolved() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let _k = freeze_and_park(&mut m, &mut stores);
+  seal_window(&mut m, &mut stores);
+  // Proposed while the source is still frozen (the verb accepts) but ABOVE the seal: by the
+  // time it applies, the resolved absorb has moved the target's counter past its mint.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, Instant::ORIGIN, log, stable, &1)
+      .unwrap()
+      .unwrap();
+  }
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }]
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
+  }
+  let tep = m.group(&2).unwrap();
+  assert_eq!(tep.state_machine().count(), 5, "the union stands");
+  assert_eq!(tep.shape_gen(), 1, "the stale abort moved nothing");
+  assert!(
+    m.poll_pending_merge_abort().is_none(),
+    "a stale abort relays no thaw"
+  );
 }
 
 /// The absent arms, floor-discriminated: with the TERMINAL floor the commit is a replayed
@@ -2727,15 +2809,17 @@ fn absent_source_aborts_only_under_the_terminal_floor() {
   let (mut m, mut stores) = merge_host(2, 3);
   let k = freeze_and_park(&mut m, &mut stores);
   assert!(m.remove_group(&1).is_some());
+  seal_window(&mut m, &mut stores);
   // No floor: never-held — the park holds for the snapshot route.
   assert!(
-    m.service_merge_applies(&mut stores).is_empty(),
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty(),
     "absent without the floor must WAIT, not skip the union"
   );
   assert!(m.group(&2).unwrap().pending_merge().is_some());
   // The terminal floor lands (this host absorbed in a prior incarnation of the park): no-op.
   stores.1.insert(1);
-  let resolutions = m.service_merge_applies(&mut stores);
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
   assert_eq!(
     resolutions,
     std::vec![MergeResolution::Aborted {
@@ -2805,8 +2889,11 @@ fn park_waits_for_the_source_then_resolves() {
   .unwrap();
   assert!(m.group(&2).unwrap().pending_merge().is_some(), "re-parked");
 
-  // The source is behind the expectation (gen 0 < 1): the park WAITS.
-  assert!(m.service_merge_applies(&mut stores).is_empty());
+  // The source is behind the expectation (gen 0 < 1) AND the window is open: the park WAITS.
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty()
+  );
   assert!(
     m.group(&2).unwrap().pending_merge().is_some(),
     "still parked"
@@ -2822,7 +2909,16 @@ fn park_waits_for_the_source_then_resolves() {
   }
   // Group 2's own stores must be reachable through the seam for the absorb capture.
   stores.0.insert(2, (log2, AsyncStable::default()));
-  let resolutions = m.service_merge_applies(&mut stores);
+  // The restored target elects; its election no-op is the window's seal (any committed entry
+  // at the coordinate that is not a matching abort closes the window for good).
+  {
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.handle_timeout(&2, d, log, stable).unwrap();
+    drain_storage(&mut m, 2, d, log, stable);
+    assert!(m.group(&2).unwrap().role().is_leader());
+  }
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
   assert_eq!(
     resolutions,
     std::vec![MergeResolution::Merged {
@@ -2894,14 +2990,19 @@ fn merge_verb_preconditions_refuse_typed() {
     assert!(m.prepare_merge(&9, now, log, stable, &2).is_none());
   }
   {
-    // NotLeader: group 3 never elected.
+    // NotLeader: group 3 never elected — as the freeze's proposer, as the abort's target
+    // leader, and as the relayed thaw's source leader.
     let (log, stable) = stores.0.get_mut(&3).map(|(l, s)| (l, s)).unwrap();
     assert!(matches!(
       m.prepare_merge(&3, now, log, stable, &1).unwrap(),
       Err(MergeError::NotLeader { .. })
     ));
     assert!(matches!(
-      m.rollback_merge(&3, now, log, stable).unwrap(),
+      m.rollback_merge(&3, now, log, stable, &1).unwrap(),
+      Err(MergeError::NotLeader { .. })
+    ));
+    assert!(matches!(
+      m.propose_merge_unfreeze(&3, now, log, stable, &1).unwrap(),
       Err(MergeError::NotLeader { .. })
     ));
   }
@@ -2959,31 +3060,96 @@ fn merge_verb_preconditions_refuse_typed() {
     ));
   }
   {
-    // NotFrozen: rollback on a group with no freeze anywhere (group 4 is idle).
+    // The abort's own gates, off group 4's leader: self-abort, an unhosted source, an
+    // unfrozen source, and — with group 1 frozen FOR group 2 — the claim refusal (only the
+    // claimed target may abort or thaw the merge; a foreign thaw would move the source's
+    // counter under the claimed target's parked commit).
     let (log, stable) = stores.0.get_mut(&4).map(|(l, s)| (l, s)).unwrap();
     assert!(matches!(
-      m.rollback_merge(&4, now, log, stable).unwrap(),
+      m.rollback_merge(&4, now, log, stable, &4).unwrap(),
+      Err(MergeError::SelfMerge)
+    ));
+    assert!(matches!(
+      m.rollback_merge(&4, now, log, stable, &9).unwrap(),
+      Err(MergeError::SourceMissing)
+    ));
+    assert!(matches!(
+      m.rollback_merge(&4, now, log, stable, &3).unwrap(),
       Err(MergeError::NotFrozen)
+    ));
+    assert!(matches!(
+      m.rollback_merge(&4, now, log, stable, &1).unwrap(),
+      Err(MergeError::SourceClaimed)
+    ));
+    assert!(matches!(
+      m.propose_merge_unfreeze(&4, now, log, stable, &2).unwrap(),
+      Err(MergeError::NotFrozen)
+    ));
+    assert!(matches!(
+      m.commit_merge(&4, now, log, stable, &1).unwrap(),
+      Err(MergeError::SourceClaimed)
+    ));
+  }
+  {
+    // The claim gate on the thaw itself: group 1 is frozen for 2, so a thaw riding any other
+    // target's abort refuses.
+    let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
+    assert!(matches!(
+      m.propose_merge_unfreeze(&1, now, log, stable, &4).unwrap(),
+      Err(MergeError::SourceClaimed)
     ));
   }
 }
 
-/// A rollback proposed while the freeze is still PENDING (appended, unapplied) mints PAST the
-/// in-flight freeze's bump, so the fold walks gen 0 → 1 (freeze) → 2 (rollback) and any parked
-/// commit naming gen 1 still aborts — the race is settled even when the two race in one term.
+/// The abort names an APPLIED freeze: while the freeze is only PENDING (appended, unapplied)
+/// the rollback refuses typed — its generation and claim are unreadable until it applies, and
+/// a freeze that never commits self-heals through truncation instead. Once applied, the abort
+/// lands on the target and the relayed thaw walks the source's counter past the freeze.
 #[test]
-fn rollback_while_freeze_pending_mints_past_it() {
+fn rollback_refuses_a_pending_freeze_then_lands() {
   let (mut m, mut stores) = merge_host(1, 1);
   let now = Instant::ORIGIN;
-  let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
-  m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
-  // No drain: the freeze is pending, not applied. The rollback must still be proposable and
-  // must mint the successor of the PENDING bump.
-  m.rollback_merge(&1, now, log, stable).unwrap().unwrap();
-  drain_storage(&mut m, 1, now, log, stable);
+  {
+    let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+  }
+  // No drain: the freeze is pending, not applied — the abort refuses.
+  {
+    let (log, stable) = stores.0.get_mut(&2).map(|(l, s)| (l, s)).unwrap();
+    assert!(matches!(
+      m.rollback_merge(&2, now, log, stable, &1).unwrap(),
+      Err(MergeError::NotFrozen)
+    ));
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen());
+  // Applied: the abort lands on the target's log and stages exactly one thaw relay.
+  {
+    let (log, stable) = stores.0.get_mut(&2).map(|(l, s)| (l, s)).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert_eq!(m.group(&2).unwrap().shape_gen(), 1, "the abort bumped");
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("the abort relays the thaw");
+  assert_eq!(
+    (relay.target, relay.source, relay.source_gen_after),
+    (2, 1, 1)
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
   let ep = m.group(&1).unwrap();
-  assert!(!ep.is_frozen(), "frozen then immediately thawed");
-  assert_eq!(ep.shape_gen(), 2, "0 → 1 (freeze) → 2 (rollback)");
+  assert!(!ep.is_frozen(), "thawed");
+  assert_eq!(ep.shape_gen(), 2, "0 -> 1 (freeze) -> 2 (thaw)");
   assert!(!ep.merge_freeze_active());
 }
 
@@ -3081,10 +3247,17 @@ fn source_leader_host_resolves_last() {
   ack(&mut m, &mut stores, 2, 2, k);
   assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
 
-  // Peer 3's SOURCE match sits below the boundary: the source-leader host must WAIT — park
-  // intact, source leader alive and still able to feed the straggler.
+  // First pass: the window is open — the target leader seals it (a no-op at k+1) and waits.
   assert!(
-    m.service_merge_applies(&mut stores).is_empty(),
+    m.service_merge_applies(now, &mut stores).is_empty(),
+    "the open window seals and holds"
+  );
+  // Peer 2's ack commits the seal; peer 3's SOURCE match still sits below the boundary: the
+  // source-leader host must keep WAITING — park intact, source leader alive and still able to
+  // feed the straggler.
+  ack(&mut m, &mut stores, 2, 2, k.next());
+  assert!(
+    m.service_merge_applies(now, &mut stores).is_empty(),
     "the source leader's host waits for its peers to match the boundary"
   );
   assert!(m.contains_group(&1), "the source leader survives the wait");
@@ -3092,7 +3265,7 @@ fn source_leader_host_resolves_last() {
 
   // The straggler catches up (its ack reaches F): the wait releases and the host resolves.
   ack(&mut m, &mut stores, 1, 3, f);
-  let resolutions = m.service_merge_applies(&mut stores);
+  let resolutions = m.service_merge_applies(now, &mut stores);
   assert_eq!(
     resolutions,
     std::vec![MergeResolution::Merged {
