@@ -85,7 +85,9 @@ pub(crate) use read_only::ReadOnly;
 pub use read_only::{FailoverReadWindow, ReadState};
 
 mod event;
-pub use event::{Applied, ConfChanged, Event, LeaderChanged, ReadModeChanged, SplitApplied};
+pub use event::{
+  Applied, ConfChanged, Event, LeaderChanged, ReadModeChanged, SplitApplied, SplitStale,
+};
 
 mod endpoint;
 pub use endpoint::{Endpoint, PeerProgress, PoisonReason, Role, TimerKind};

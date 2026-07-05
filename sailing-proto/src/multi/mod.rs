@@ -1114,10 +1114,11 @@ where
   /// counter + 1, the replay-guard/idempotence anchor), and the embedder's opaque
   /// `instruction`, bounded by the single-frame append check. `None` if no such group.
   ///
-  /// Gate order: poisoned → leader → joint config → hosted child → child-id wire bound → the
-  /// ordinary admin append (whose refusals pass through as [`SplitError::Propose`]).
-  /// `BelowFloor` is produced by the COORDINATOR delegators through their floor seam, and
-  /// `CrossPlane` by a sharded host's handle — the container stays floor- and plane-free.
+  /// Gate order: poisoned → leader → joint config → split in flight → hosted child → child-id
+  /// wire bound → the ordinary admin append (whose refusals pass through as
+  /// [`SplitError::Propose`]). `BelowFloor` is produced by the COORDINATOR delegators through
+  /// their floor seam, and `CrossPlane` by a sharded host's handle — the container stays floor-
+  /// and plane-free.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   #[allow(clippy::too_many_arguments)]
   pub fn propose_split<L, S>(
@@ -1150,6 +1151,14 @@ where
       if ep.conf_state().is_joint() {
         return Some(Err(SplitError::JointConfig));
       }
+      // One split in flight at a time: the mint below reads the LIVE counter, which bumps only
+      // when the earlier split APPLIES — a second mint before then duplicates it, and the
+      // duplicate can only no-op at the apply-time lineage guard (its child's half would
+      // otherwise be given up by the parent and never materialized). See
+      // [`SplitError::SplitInFlight`] for the self-healing derivation.
+      if ep.split_in_flight() {
+        return Some(Err(SplitError::SplitInFlight));
+      }
     }
     // A hosted child id (the parent's own included) can never be forked into existence here.
     if self.groups.contains_key(child) {
@@ -1163,9 +1172,10 @@ where
       return Some(Err(SplitError::InvalidChild));
     }
     let ep = self.groups.get_mut(gid)?;
-    // The bump is computed from the LIVE counter so back-to-back splits chain (each apply
-    // bumps it before the next propose reads it). Lineage exhaustion is unreachable before
-    // log-index exhaustion — every bump consumes a log index — so no ceiling check rides here.
+    // The bump is computed from the LIVE counter, whose sole bump site is the earlier split's
+    // APPLY — the in-flight gate above holds new proposals until then, so consecutive mints
+    // chain instead of duplicating. Lineage exhaustion is unreachable before log-index
+    // exhaustion — every bump consumes a log index — so no ceiling check rides here.
     let parent_gen_after = ep.shape_gen() + 1;
     let payload = SplitPayload::new(
       Bytes::from(child_bytes),

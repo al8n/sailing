@@ -1532,11 +1532,14 @@ fn committed_split_relays_a_group_fork() {
 }
 
 #[test]
-fn duplicate_gen_fork_drops_and_resolves_only_itself() {
-  // A follower container receives TWO committed splits carrying the SAME parent_gen_after (a
-  // retry duplicate): the relay yields the first and drops the second — and dropping the second
-  // must resolve ONLY the second's barrier contribution, never the first's (its fork is still
-  // un-flushed; lifting it early would let the parent compact the child's only recovery source).
+fn same_mint_split_noops_at_apply_and_conserves_state() {
+  // A follower container receives TWO NONZERO committed splits carrying the SAME
+  // parent_gen_after (a stale mint forced past the propose gate — a deposed leader's retry, or
+  // a crafted entry). Pre-guard this was the DATA-LOSS shape: fsm.split ran for BOTH (the
+  // parent gave up two halves) while the relay dropped the second fork as a same-gen duplicate
+  // — the second child's partition was given up and never materialized. The apply-time lineage
+  // guard now no-ops the stale entry BEFORE fsm.split: zero parent mutation, nothing staged, no
+  // snapshot fence, and the `SplitStale` event surfaces for the embedder to re-propose.
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let cfg = Config::try_new(
@@ -1550,18 +1553,37 @@ fn duplicate_gen_fork_drops_and_resolves_only_itself() {
   m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
 
+  // Three units of load, then the two same-mint splits, each giving 2 units away.
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
   let entries = std::vec![
     crate::Entry::new(
       Term::new(1),
       Index::new(1),
-      crate::EntryKind::Split,
-      split_entry_bytes(200, 0, 1, 0),
+      crate::EntryKind::Normal,
+      cmd.clone()
     ),
     crate::Entry::new(
       Term::new(1),
       Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone()
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
       crate::EntryKind::Split,
-      split_entry_bytes(201, 0, 1, 0),
+      split_entry_bytes(200, 0, 1, 2),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(5),
+      crate::EntryKind::Split,
+      split_entry_bytes(201, 0, 1, 2),
     ),
   ];
   m.handle_message(
@@ -1576,7 +1598,7 @@ fn duplicate_gen_fork_drops_and_resolves_only_itself() {
       Index::ZERO,
       Term::ZERO,
       entries,
-      Index::new(2),
+      Index::new(5),
     )),
   )
   .unwrap();
@@ -1585,23 +1607,56 @@ fn duplicate_gen_fork_drops_and_resolves_only_itself() {
     Some(StorageProgress::MorePending)
   ) {}
 
+  // ZERO parent mutation on the stale entry: the parent gave up exactly ONE half.
+  assert!(
+    !m.group(&7).unwrap().is_poisoned(),
+    "a stale mint never poisons"
+  );
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units,
+    1,
+    "3 - 2: the parent shrank ONCE (the stale mint must not shrink it again)"
+  );
   let fork = m.poll_pending_fork().expect("the first fork relays");
   assert_eq!((fork.child, fork.parent_gen_after), (200, 1));
+  assert_eq!(fork.fsm.units, 2, "child 1 holds the single given-up half");
   assert!(
     m.poll_pending_fork().is_none(),
-    "the same-gen duplicate is dropped by the replay guard"
+    "the stale mint staged NO fork"
+  );
+  // Conservation: every unit is in exactly one of parent / child 1.
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units + fork.fsm.units,
+    3
   );
 
-  // The dropped duplicate resolved ITS OWN barrier only: the first fork still fences snapshots.
+  // The stale entry surfaced as the deterministic no-op event (the embedder's re-propose cue).
+  let mut stale = None;
+  while let Some((g, ev)) = m.poll_event() {
+    if let Event::SplitStale(s) = ev {
+      assert_eq!(g, 7);
+      stale = Some(s);
+    }
+  }
+  let stale = stale.expect("Event::SplitStale surfaced through poll_event");
+  assert_eq!(stale.index(), Index::new(5));
+  assert_eq!(
+    u64::decode_exact(stale.child()).expect("child id decodes"),
+    201
+  );
+  assert_eq!((stale.minted_gen(), stale.shape_gen()), (1, 1));
+
+  // The real fork still fences snapshots; the stale entry contributed NO fence: lifting the
+  // real split index alone frees the cadence, and the capture crosses the stale index.
   while matches!(
     m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
     Some(StorageProgress::MorePending)
   ) {}
   assert!(
     stable.snapshot().is_none(),
-    "the first fork's barrier survives the duplicate's resolution"
+    "the real fork's barrier holds until the driver reports it durable"
   );
-  m.lift_fork_barrier(&7, Index::new(1));
+  m.lift_fork_barrier(&7, Index::new(4));
   m.handle_message(
     &7,
     Instant::ORIGIN,
@@ -1611,7 +1666,7 @@ fn duplicate_gen_fork_drops_and_resolves_only_itself() {
     Message::Heartbeat(crate::Heartbeat::new(
       Term::new(1),
       2u64,
-      Index::new(2),
+      Index::new(5),
       Bytes::new(),
     )),
   )
@@ -1620,10 +1675,121 @@ fn duplicate_gen_fork_drops_and_resolves_only_itself() {
     m.handle_storage(&7, Instant::ORIGIN, &mut log, &mut stable),
     Some(StorageProgress::MorePending)
   ) {}
-  assert!(
-    stable.snapshot().is_some(),
-    "resolving the real fork frees the parent's snapshot cadence"
+  let (meta, _blob) = stable
+    .snapshot()
+    .expect("no orphaned fence from the no-op'd stale entry");
+  assert_eq!(
+    meta.last_index(),
+    Index::new(5),
+    "the capture crosses the stale index"
   );
+}
+
+#[test]
+fn back_to_back_split_proposals_are_gated_until_apply() {
+  // The propose-time UX leg of the same defect: a leader appending two splits before the first
+  // APPLIES would mint the same parent_gen_after twice (the mint reads the live counter, whose
+  // sole bump site is apply). Pre-gate, both entries committed, the parent shrank twice, and
+  // the relay dropped the second fork as a same-gen duplicate — the second child's half was
+  // LOST. The gate refuses the second proposal while the first is unapplied and self-heals by
+  // derivation (index-vs-applied), so the retry after apply chains onto the bumped counter.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let cfg = single_node_cfg(1).with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  for _ in 0..5 {
+    commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  }
+  assert_eq!(m.group(&7).unwrap().state_machine().units, 5);
+
+  // First split appended (durable-pending, NOT yet applied) …
+  let idx1 = m
+    .propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  // … so a second split must refuse NOW: its mint would duplicate the first's.
+  assert_eq!(
+    m.propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &201,
+      0,
+      Bytes::from_static(b"\x02")
+    ),
+    Some(Err(SplitError::SplitInFlight)),
+    "a second split is refused while the first is unapplied"
+  );
+
+  // Apply the first: the gate opens by derivation (applied caught up) and the counter bumped.
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  let fork1 = m.poll_pending_fork().expect("the first fork relays");
+  assert_eq!((fork1.child, fork1.parent_gen_after), (200, 1));
+  assert_eq!(fork1.fsm.units, 2);
+  assert_eq!(fork1.split_index, idx1);
+
+  // The retry now chains onto the bumped lineage instead of duplicating the first mint.
+  let idx2 = m
+    .propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &201,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .expect("the gate self-heals once the first split applied");
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  let fork2 = m.poll_pending_fork().expect("the second fork relays");
+  assert_eq!((fork2.child, fork2.parent_gen_after), (201, 2));
+  assert_eq!(fork2.fsm.units, 2);
+  assert_eq!(fork2.split_index, idx2);
+
+  // Conservation across the chained pair: every unit lives in exactly one of the three.
+  assert_eq!(m.group(&7).unwrap().state_machine().units, 1);
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units + fork1.fsm.units + fork2.fsm.units,
+    5
+  );
+  assert_eq!(m.group_gen(&7), 2, "the lineage chained 0 → 1 → 2");
+
+  // Exact-index barrier semantics on the CHAINED pair: resolving the NEWER fork must not free
+  // the older, still-unflushed one — the snapshot fence is the minimum outstanding index.
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  m.lift_fork_barrier(&7, idx2);
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  assert!(
+    stable.snapshot().map(|(m2, _)| m2.last_index()) < Some(idx1),
+    "resolving the newer fork leaves the older fork's fence standing"
+  );
+  m.lift_fork_barrier(&7, idx1);
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  let (meta, _blob) = stable
+    .snapshot()
+    .expect("both forks resolved: cadence resumes");
+  assert!(meta.last_index() > idx2, "the capture crosses both splits");
+  assert_eq!(meta.shape_gen(), 2);
 }
 
 #[test]
@@ -1770,8 +1936,10 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
   assert_eq!((fork.child, fork.parent_gen_after), (200, 1));
 
   // Crash shape B (row 4): the durable snapshot ALREADY CARRIES the split's bump (shape_gen 1
-  // at a boundary past it), and the tail replays a stale same-gen retry duplicate: the guard,
-  // seeded from the DURABLE lineage, drops it — and resolves its barrier so the parent is free.
+  // at a boundary past it), and the tail replays a stale same-gen retry duplicate. The
+  // recovered lineage seeds the live counter at 1, so replay's APPLY-TIME lineage guard no-ops
+  // the entry outright — nothing is staged (no barrier to resolve), and the restored parent's
+  // state is untouched by the duplicate.
   let mut log = VecLog::default();
   let mut stable = AsyncStable::default();
   let meta = crate::SnapshotMeta::new(
@@ -1787,7 +1955,7 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
     Term::new(1),
     Index::new(3),
     crate::EntryKind::Split,
-    split_entry_bytes(201, 0, 1, 0),
+    split_entry_bytes(201, 0, 1, 1),
   )]);
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   m.restore_group(
@@ -1805,6 +1973,11 @@ fn restore_seeds_the_replay_guard_from_durable_lineage() {
   assert!(
     m.poll_pending_fork().is_none(),
     "a replayed duplicate below the durable lineage is dropped"
+  );
+  assert_eq!(
+    m.group(&7).unwrap().state_machine().units,
+    1,
+    "the no-op'd duplicate gave nothing away from the restored parent"
   );
 }
 

@@ -252,6 +252,78 @@ fn committed_split_forks_at_apply_and_caps_snapshots() {
 }
 
 #[test]
+fn stale_minted_split_noops_with_event_and_conserves_keys() {
+  // Two committed splits carrying the SAME mint (parent_gen_after 1): the second is a STALE
+  // MINT — pre-guard, fsm.split ran for it too (here: threshold 0 moves EVERY key), the parent
+  // was emptied, and the relay would drop its fork as a same-gen duplicate — the second child's
+  // keys lost. The lineage guard no-ops it BEFORE fsm.split: zero parent mutation, no staged
+  // fork, no snapshot fence, and the `SplitStale` event carries the mismatch.
+  let (mut ep, mut log, mut stable) = follower_cfg(KeyedSm::default());
+  let entries = std::vec![
+    Entry::new(Term::new(1), Index::new(1), EntryKind::Normal, key_cmd(3)),
+    Entry::new(Term::new(1), Index::new(2), EntryKind::Normal, key_cmd(9)),
+    Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::Split,
+      split_entry_data(77, 0, 1, 5),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(4),
+      EntryKind::Split,
+      split_entry_data(78, 0, 1, 0),
+    ),
+  ];
+  deliver_committed(&mut ep, &mut log, &mut stable, entries);
+
+  assert!(!ep.is_poisoned(), "a stale mint never poisons");
+  assert_eq!(
+    ep.applied_index(),
+    Index::new(4),
+    "apply continues past the no-op'd entry"
+  );
+  // Every key lives in exactly one of parent / child 1 — the stale entry moved NOTHING.
+  assert_eq!(ep.state_machine().map, BTreeMap::from([(3, 1)]));
+  let (fork, child_fsm) = ep.pop_pending_fork().expect("only the first fork staged");
+  assert_eq!(fork.parent_gen_after, 1);
+  assert_eq!(child_fsm.map, BTreeMap::from([(9, 1)]));
+  assert!(
+    ep.pop_pending_fork().is_none(),
+    "the stale mint staged nothing"
+  );
+
+  // The event names the mismatch: minted 1 against a live counter already at 1.
+  let mut stale = None;
+  while let Some(ev) = ep.poll_event() {
+    if let Event::SplitStale(s) = ev {
+      stale = Some(s);
+    }
+  }
+  let stale = stale.expect("Event::SplitStale surfaced");
+  assert_eq!(stale.index(), Index::new(4));
+  assert_eq!(
+    u64::decode_exact(stale.child()).expect("event child id decodes"),
+    78
+  );
+  assert_eq!((stale.minted_gen(), stale.shape_gen()), (1, 1));
+
+  // No fence from the no-op: resolving the REAL split index alone frees the cadence, and the
+  // capture crosses the stale index.
+  ep.maybe_snapshot(&log, &mut stable);
+  assert!(stable.snapshot().is_none(), "the real fork still fences");
+  ep.resolve_fork(Index::new(3));
+  ep.maybe_snapshot(&log, &mut stable);
+  let (meta, _blob) = stable.snapshot().expect("cadence resumed");
+  assert_eq!(meta.last_index(), Index::new(4));
+  assert_eq!(
+    meta.shape_gen(),
+    1,
+    "the stale mint never folded into the lineage"
+  );
+}
+
+#[test]
 fn split_on_default_fsm_poisons_unsupported() {
   // CountSm never overrides `split`: a committed Split against it is a deterministic fail-stop.
   let (mut ep, mut log, mut stable) = follower_cfg(CountSm::default());
@@ -334,7 +406,9 @@ fn staged_blob_corresponds_to_the_forked_half() {
 fn replay_after_restart_re_forks_deterministically() {
   // Crash after apply, before the fork's baseline flushed (row 1): restart from a PRE-split
   // store replays the entry, re-runs fsm.split, and re-derives the SAME blob and half — the
-  // re-staged fork is byte-identical, so re-materialization converges.
+  // re-staged fork is byte-identical, so re-materialization converges. The entry's mint is the
+  // counter's successor (1 over the recovered 0), as every entry a leader can append is: the
+  // lineage guard pins replay to exactly the values the original apply walked.
   fn boot() -> (Endpoint<u64, KeyedSm>, VecLog, AsyncStable) {
     use core::time::Duration;
     let cfg = Config::try_new(
@@ -354,7 +428,7 @@ fn replay_after_restart_re_forks_deterministically() {
         Term::new(1),
         Index::new(3),
         EntryKind::Split,
-        split_entry_data(42, 3, 9, 5),
+        split_entry_data(42, 3, 1, 5),
       ),
     ]);
     stable.force_state(Term::new(1), Some(1u64), Index::new(3));
@@ -381,7 +455,7 @@ fn replay_after_restart_re_forks_deterministically() {
   assert_eq!(fork_a.blob, fork_b.blob, "identical re-derived blob bytes");
   assert_eq!(
     (fork_a.child_gen, fork_a.parent_gen_after, fork_a.index),
-    (3, 9, Index::new(3))
+    (3, 1, Index::new(3))
   );
   assert_eq!(fsm_a, fsm_b, "identical re-forked halves");
   assert_eq!(fsm_a.map, BTreeMap::from([(7, 1)]));
@@ -391,7 +465,7 @@ fn replay_after_restart_re_forks_deterministically() {
   // live counter already folded the replayed split: the container seeds its replay guard from
   // the former, so a re-staged fork is never mistaken for an already-relayed one.
   assert_eq!(a.restored_lineage(), 0);
-  assert_eq!(a.shape_gen(), 9);
+  assert_eq!(a.shape_gen(), 1);
 
   // The re-staged fork re-arms the durability barrier: threshold long crossed, yet no capture.
   a.maybe_snapshot(&la, &mut sa);

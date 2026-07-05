@@ -1543,6 +1543,15 @@ where
       Event::SplitApplied(e) => {
         tracing::info!(target: "sailing::consensus", index = e.index().get(), "split applied");
       }
+      Event::SplitStale(e) => {
+        tracing::warn!(
+          target: "sailing::consensus",
+          index = e.index().get(),
+          minted_gen = e.minted_gen(),
+          shape_gen = e.shape_gen(),
+          "stale-minted split no-op'd"
+        );
+      }
     }
   }
 
@@ -2481,70 +2490,93 @@ where
                 break;
               }
             };
-            // The deterministic point: the state machine partitions itself HERE (the
-            // SetReadMode/ConfChange precedent — a core-applied entry kind), so every replica's
-            // parent continues on the identically-shrunk half and later entries apply to it. An
-            // FSM that does not support splits returns None: a committed Split against it is a
-            // deterministic cluster-wide fail-stop, never a silent skip that would diverge from
-            // the replicas that forked.
-            let Some(child) = self.fsm.split(payload.instruction()) else {
-              self.poison(PoisonReason::SplitUnsupported);
-              break;
-            };
-            // Derive the child's recovery blob AT APPLY, from the just-forked half: blob and
-            // half correspond BY CONSTRUCTION (the entry never carries it, so a split's wire
-            // cost is independent of state size). A committed split whose blob cannot be
-            // captured has no recovery source to persist — the same fail-stop class as any
-            // snapshot capture on a committed boundary.
-            let blob = match child.snapshot() {
-              Ok(snap) => {
-                let mut buf = std::vec::Vec::new();
-                snap.encode(&mut buf);
-                Bytes::from(buf)
-              }
-              Err(_) => {
-                self.poison(PoisonReason::SnapshotCapture);
+            // THE LINEAGE GUARD: a split applies ONLY at its minted generation — the mint read
+            // the live counter at propose, so a legal entry carries exactly `shape_gen + 1`
+            // here (replay included: the counter re-walks the same values). A mismatch is a
+            // STALE MINT — a second split proposed before an earlier one applied, or a retry
+            // duplicate — and forking on it would shrink the parent AGAIN while the relay drops
+            // the same-gen fork as a duplicate: the second child's half would be given up and
+            // never materialized. No-op deterministically instead (guard inputs are replicated
+            // state, so every replica skips the same entry identically): the FSM is untouched,
+            // nothing is staged, no snapshot fence arms, and the event surfaces so the embedder
+            // can re-propose. `checked_add` also parks a counter already at the reserved
+            // `u64::MAX` (never a working generation) on this arm instead of overflowing.
+            if Some(payload.parent_gen_after()) != self.split.shape_gen.checked_add(1) {
+              self
+                .outputs
+                .events
+                .push_back(Event::SplitStale(crate::SplitStale::new(
+                  idx,
+                  payload.child_bytes(),
+                  payload.parent_gen_after(),
+                  self.split.shape_gen,
+                )));
+            } else {
+              // The deterministic point: the state machine partitions itself HERE (the
+              // SetReadMode/ConfChange precedent — a core-applied entry kind), so every replica's
+              // parent continues on the identically-shrunk half and later entries apply to it. An
+              // FSM that does not support splits returns None: a committed Split against it is a
+              // deterministic cluster-wide fail-stop, never a silent skip that would diverge from
+              // the replicas that forked.
+              let Some(child) = self.fsm.split(payload.instruction()) else {
+                self.poison(PoisonReason::SplitUnsupported);
                 break;
-              }
-            };
-            // The child's bootstrap membership is the parent's VOTER set AT this entry —
-            // colocated by construction, identical on every replica because conf changes and
-            // the split ride the same totally-ordered log (the ConfChanged arm's source).
-            let conf = self.tracker.conf_state();
-            let voters: std::vec::Vec<I> =
-              conf.voters().iter().map(CheapClone::cheap_clone).collect();
-            // The child inherits the parent's ACTIVE read mode at this entry — deterministic
-            // (SetReadMode rides the same log) — through its baseline snapshot meta, exactly as
-            // a restart recovers a migrated mode from replicated state; a never-migrated parent
-            // leaves it absent so the child falls back to its own config.
-            let read_only = self
-              .reads
-              .read_mode_migrated
-              .then_some(self.reads.active_read_mode);
-            self.split.shape_gen = self.split.shape_gen.max(payload.parent_gen_after());
-            // THE FORK DURABILITY BARRIER: hold this endpoint's snapshots at the oldest
-            // OUTSTANDING split index until each fork's baseline is behind the local engine
-            // barrier (each is resolved individually — see `resolve_fork`) — a parent snapshot
-            // past an undurable fork would compact the child's only recovery source (see
-            // `maybe_snapshot`). Apply itself continues past the entry.
-            self.split.outstanding.insert(idx);
-            self
-              .outputs
-              .events
-              .push_back(Event::SplitApplied(crate::SplitApplied::new(
-                idx,
-                payload.child_bytes(),
-              )));
-            self.split.forked_fsms.push_back(child);
-            self.split.pending_forks.push_back(split::PendingFork {
-              child_bytes: payload.child_bytes(),
-              child_gen: payload.child_gen(),
-              parent_gen_after: payload.parent_gen_after(),
-              blob,
-              voters,
-              read_only,
-              index: idx,
-            });
+              };
+              // Derive the child's recovery blob AT APPLY, from the just-forked half: blob and
+              // half correspond BY CONSTRUCTION (the entry never carries it, so a split's wire
+              // cost is independent of state size). A committed split whose blob cannot be
+              // captured has no recovery source to persist — the same fail-stop class as any
+              // snapshot capture on a committed boundary.
+              let blob = match child.snapshot() {
+                Ok(snap) => {
+                  let mut buf = std::vec::Vec::new();
+                  snap.encode(&mut buf);
+                  Bytes::from(buf)
+                }
+                Err(_) => {
+                  self.poison(PoisonReason::SnapshotCapture);
+                  break;
+                }
+              };
+              // The child's bootstrap membership is the parent's VOTER set AT this entry —
+              // colocated by construction, identical on every replica because conf changes and
+              // the split ride the same totally-ordered log (the ConfChanged arm's source).
+              let conf = self.tracker.conf_state();
+              let voters: std::vec::Vec<I> =
+                conf.voters().iter().map(CheapClone::cheap_clone).collect();
+              // The child inherits the parent's ACTIVE read mode at this entry — deterministic
+              // (SetReadMode rides the same log) — through its baseline snapshot meta, exactly as
+              // a restart recovers a migrated mode from replicated state; a never-migrated parent
+              // leaves it absent so the child falls back to its own config.
+              let read_only = self
+                .reads
+                .read_mode_migrated
+                .then_some(self.reads.active_read_mode);
+              self.split.shape_gen = self.split.shape_gen.max(payload.parent_gen_after());
+              // THE FORK DURABILITY BARRIER: hold this endpoint's snapshots at the oldest
+              // OUTSTANDING split index until each fork's baseline is behind the local engine
+              // barrier (each is resolved individually — see `resolve_fork`) — a parent snapshot
+              // past an undurable fork would compact the child's only recovery source (see
+              // `maybe_snapshot`). Apply itself continues past the entry.
+              self.split.outstanding.insert(idx);
+              self
+                .outputs
+                .events
+                .push_back(Event::SplitApplied(crate::SplitApplied::new(
+                  idx,
+                  payload.child_bytes(),
+                )));
+              self.split.forked_fsms.push_back(child);
+              self.split.pending_forks.push_back(split::PendingFork {
+                child_bytes: payload.child_bytes(),
+                child_gen: payload.child_gen(),
+                parent_gen_after: payload.parent_gen_after(),
+                blob,
+                voters,
+                read_only,
+                index: idx,
+              });
+            }
           }
           EntryKind::SetReadMode => {
             // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison

@@ -602,6 +602,10 @@ where
     // Mirror for read-mode migrations: a fresh leader may inherit an uncommitted SetReadMode in its tail;
     // block a new mode proposal until the whole inherited tail commits-and-applies (spec §9).
     self.reads.pending_read_mode_index = last;
+    // Mirror for splits: an inherited unapplied Split in the tail holds the same pre-apply
+    // lineage bump a fresh mint would read — stacking a new split onto it mints a duplicate
+    // that can only no-op at the apply-time lineage guard, so block until the tail applies.
+    self.split.pending_split_index = last;
     self.tracker.reset_progress(
       last.next(),
       self.config.max_inflight_msgs(),
