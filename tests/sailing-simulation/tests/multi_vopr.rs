@@ -180,6 +180,35 @@ fn snapshot_band_smoke() {
   }
 }
 
+/// The reshape band smoke: the default menu plus a steady `Split` weight at the fast budget.
+/// Beyond the standing non-vacuity floor the band must actually RESHAPE — the `splits_applied`
+/// witness proves committed splits materialized children, so the conservation verdict inside
+/// every run judged real parent/child handovers rather than an empty work list. Deliberately NO
+/// membership-counter bounds (the default band's parity): the per-checker finalize assert
+/// (skipped == 0, gid/generation-attributed) still runs inside every run.
+#[test]
+fn reshape_band_smoke() {
+  let mut total_splits = 0u64;
+  for seed in 0..8u64 {
+    let r = run_multi_vopr(seed, 4_000, MultiProfile::reshape());
+    std::eprintln!(
+      "reshape seed {seed}: splits_applied={} groups_created={} committed={}",
+      r.splits_applied,
+      r.groups_created,
+      r.committed
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    total_splits += r.splits_applied;
+  }
+  assert!(
+    total_splits > 0,
+    "the reshape band never materialized a split — the Split action is inert"
+  );
+}
+
 /// Seed 2's schedule retires groups steadily while client load keeps committing (66 removals /
 /// 568 committed in the sweep) — the removal-during-load shape, with every oracle armed: the
 /// run completing IS the assertion that no cross-talk, one-identity, or per-group safety
@@ -292,4 +321,55 @@ fn soak_snapshot_heavy_profile() {
   // whole-band bound: nonzero comparisons and zero skipped sum across slices, and adding the
   // strict per-slice `declines*2 < comparisons` inequalities yields the band's.
   assert_membership_band_bounds(&std::format!("snapshot {start}..{end} @{ticks}"), &reports);
+}
+
+/// The reshape soak: the [`soak_default_profile`] shape under [`MultiProfile::reshape`], so
+/// splits land amid soak-scale fault/lifecycle churn and every run's conservation verdict
+/// judges the accumulated handovers. Each slice additionally requires the split witness
+/// (`splits_applied` nonzero over the slice) — a soak that never reshaped proves nothing about
+/// reshaping. `#[ignore]` so the everyday gate stays fast; ALWAYS run it `--release`:
+///
+/// ```text
+/// cargo test --release -p sailing-simulation --test multi_vopr -- --ignored soak_reshape_profile
+/// ```
+///
+/// Shardable via its own env vars (`MULTI_VOPR_RESHAPE_SEED_{START,END}` +
+/// `MULTI_VOPR_RESHAPE_TICKS`), distinct from the other soaks' so CI can slice each
+/// independently. Deterministic per (seed, ticks): failures replay anywhere.
+#[test]
+#[ignore = "the reshape soak — run explicitly, --release. Shard via MULTI_VOPR_RESHAPE_SEED_{START,END} + MULTI_VOPR_RESHAPE_TICKS."]
+fn soak_reshape_profile() {
+  fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(default)
+  }
+  let start = env_u64("MULTI_VOPR_RESHAPE_SEED_START", 0);
+  let end = env_u64("MULTI_VOPR_RESHAPE_SEED_END", 64);
+  let ticks = env_u64("MULTI_VOPR_RESHAPE_TICKS", 40_000) as usize;
+  assert!(end > start, "empty band: {start} >= {end}");
+  let mut total_splits = 0u64;
+  for seed in start..end {
+    let r = run_multi_vopr(seed, ticks, MultiProfile::reshape());
+    std::eprintln!(
+      "reshape soak seed {seed}: splits_applied={} groups_created={} groups_removed={} \
+       groups_recreated={} committed={}",
+      r.splits_applied,
+      r.groups_created,
+      r.groups_removed,
+      r.groups_recreated,
+      r.committed
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    total_splits += r.splits_applied;
+  }
+  std::eprintln!("reshape soak {start}..{end} @{ticks}: total splits_applied={total_splits}");
+  assert!(
+    total_splits > 0,
+    "the reshape soak slice {start}..{end} never materialized a split"
+  );
 }

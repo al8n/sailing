@@ -235,10 +235,6 @@ impl MultiWorld {
   }
 
   /// Committed splits the world REGISTERED (child materialized) — the report's split witness.
-  #[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the multi VOPR report wires this")
-  )]
   pub(crate) fn splits_applied(&self) -> u64 {
     self.splits_applied
   }
