@@ -1094,7 +1094,8 @@ fn frozen_source_captures_no_snapshot() {
   );
 }
 
-/// Encode a `CommitMerge` payload.
+/// Encode a `CommitMerge` payload (freeze term pinned at 1 — the endpoint alone never reads
+/// the identity pair; the container's service does).
 fn commit_payload(
   source: &'static [u8],
   freeze_index: Index,
@@ -1104,6 +1105,7 @@ fn commit_payload(
   let p = crate::CommitMergePayload::new(
     bytes::Bytes::from_static(source),
     freeze_index,
+    Term::new(1),
     source_gen_after,
     target_gen_after,
   );

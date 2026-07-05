@@ -21,6 +21,10 @@ pub struct PendingMergeApply {
   /// The source's freeze boundary: the local source replica must be frozen-applied at (or past —
   /// only FSM-no-ops can follow a surviving freeze) this index before the absorb can resolve.
   freeze_index: Index,
+  /// The freeze entry's TERM — with `freeze_index`, the committed freeze's log identity (the
+  /// carried [`CommitMergePayload::freeze_term`](crate::CommitMergePayload::freeze_term); zero
+  /// when the entry carried none).
+  freeze_term: Term,
   /// The gen the source's freeze set — the resolution's comparator: a source whose live counter
   /// moved PAST it was rolled back, and the parked apply aborts deterministically.
   source_gen_after: u64,
@@ -35,6 +39,7 @@ impl PendingMergeApply {
   pub(crate) const fn new_parked(
     source_bytes: Bytes,
     freeze_index: Index,
+    freeze_term: Term,
     source_gen_after: u64,
     target_gen_after: u64,
     at: Index,
@@ -42,6 +47,7 @@ impl PendingMergeApply {
     Self {
       source_bytes,
       freeze_index,
+      freeze_term,
       source_gen_after,
       target_gen_after,
       at,
@@ -58,6 +64,12 @@ impl PendingMergeApply {
   #[inline(always)]
   pub const fn freeze_index(&self) -> Index {
     self.freeze_index
+  }
+
+  /// The freeze entry's term (the boundary's log identity; zero when the entry carried none).
+  #[inline(always)]
+  pub const fn freeze_term(&self) -> Term {
+    self.freeze_term
   }
 
   /// The gen the source's freeze set (the resolution comparator).
@@ -104,6 +116,13 @@ pub(crate) struct MergeState {
   /// The applied `PrepareMerge` entry's index while frozen — the boundary the absorbing target
   /// gates on. `None` exactly when `frozen` is false.
   pub(crate) freeze_index: Option<Index>,
+  /// The applied `PrepareMerge` entry's TERM while frozen — with `freeze_index`, the freeze's
+  /// log identity. Stamped into `CommitMergePayload` at the target's propose so a parked host
+  /// can later prove its local source log holds the committed freeze (see
+  /// [`Endpoint::advance_commit_on_freeze_identity`]). Same lifecycle as `freeze_index`: set at
+  /// apply, cleared by the thaw, re-derived by replay (the capture fence keeps the freeze entry
+  /// replayable for as long as the freeze lives).
+  pub(crate) freeze_term: Option<Term>,
   /// The TARGET id the applied freeze named (its `Data` encoding, from the `PrepareMerge`
   /// payload), retained while frozen: the freeze is a CLAIM by exactly one target, and both the
   /// `commit_merge` propose gate and the park's resolve arm compare against it — without the
@@ -234,6 +253,12 @@ where
   /// boundary an absorbing target's parked `CommitMerge` gates on.
   pub fn freeze_index(&self) -> Option<Index> {
     self.merge.freeze_index
+  }
+
+  /// The applied `PrepareMerge` entry's term while frozen (`None` when not frozen) — the
+  /// boundary's log identity, stamped into the `CommitMerge` the absorbing target proposes.
+  pub(crate) fn freeze_term(&self) -> Option<Term> {
+    self.merge.freeze_term
   }
 
   /// The parked `CommitMerge` awaiting the container's resolution, if any. While `Some`, the
@@ -516,6 +541,55 @@ where
       return false;
     }
     self.append_leader_noop(now, log, pending.at()).is_some()
+  }
+
+  /// Advance this SOURCE replica's commit (and apply) to the freeze boundary on LOG IDENTITY —
+  /// the parked-target service's leaderless-source leg. Returns whether the local log proved
+  /// the identity (idempotently true once past the boundary); on any miss it changes nothing.
+  ///
+  /// Soundness: the caller holds a COMMITTED `CommitMerge` carrying `(boundary, freeze_term)`,
+  /// and its proposer stamped that pair from a source it observed frozen-applied at the
+  /// boundary — so the freeze entry `(boundary, freeze_term)` is committed in the source group.
+  /// If this replica's log holds an entry with that exact index and term, the Log Matching
+  /// property makes it (and its whole prefix) byte-identical to the committed one, so raising
+  /// `commit` here is the same knowledge transfer as a leader's commit index riding an
+  /// AppendEntries — with the dead source leader's say-so carried by the target's log instead
+  /// of a heartbeat that may never come: match alone is not commit KNOWLEDGE, and a source
+  /// follower stranded at `commit < boundary` after the absorb consumed the rest of the quorum
+  /// (leaderless, under-hosted, unelectable) would otherwise park its host forever. Never on
+  /// index alone: a divergent entry at the boundary (wrong term) proves nothing about the
+  /// prefix and MUST keep waiting. A LeaseGuard commit-wait needs no re-check here: the freeze
+  /// in the advanced range kills lease serving itself, so the early advance can never surface
+  /// a lease read.
+  pub(crate) fn advance_commit_on_freeze_identity<L>(
+    &mut self,
+    log: &L,
+    boundary: Index,
+    freeze_term: Term,
+  ) -> bool
+  where
+    L: LogStore,
+    F::Snapshot: crate::Data,
+  {
+    if self.poison.poisoned || freeze_term == Term::ZERO {
+      return false;
+    }
+    if log.last_index() < boundary {
+      return false;
+    }
+    let Some(t) = self.log_term(log, boundary) else {
+      return false;
+    };
+    if t != freeze_term {
+      return false;
+    }
+    if self.commit < boundary {
+      self.commit = boundary;
+    }
+    if self.applied < self.commit {
+      self.apply_committed(log);
+    }
+    true
   }
 
   /// Whether every tracked peer (voters AND learners, both joint halves) has MATCHED the log

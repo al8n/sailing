@@ -94,12 +94,16 @@ message PrepareMergePayload {
 // — so the wire cost is independent of FSM size. `source_gen_after` is the gen the source's
 // PrepareMerge set (the parked apply's abort comparator: a RollbackMerge that won the race on
 // the source's log moved the counter past it); `target_gen_after` is the target's own lineage
-// after the absorb (replay idempotence).
+// after the absorb (replay idempotence). `freeze_term` is the term of the source's PrepareMerge
+// entry: with `freeze_index` it names the freeze's LOG IDENTITY, so a parked host whose local
+// source log provably contains the committed freeze can advance that source's commit to the
+// boundary without a live source leader (0 = no identity carried; never advance).
 message CommitMergePayload {
   bytes source = 1;
   uint64 freeze_index = 2;
   uint64 source_gen_after = 3;
   uint64 target_gen_after = 4;
+  uint64 freeze_term = 5;
 }
 
 // The payload of an ENTRY_KIND_ROLLBACK_MERGE entry (rides Entry.data) — the merge's explicit

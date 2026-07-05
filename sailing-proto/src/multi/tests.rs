@@ -2864,7 +2864,8 @@ fn park_waits_for_the_source_then_resolves() {
   // the park re-derives at restore replay, expecting the source at gen 1.
   let mut source_bytes = Vec::new();
   Data::encode(&1u64, &mut source_bytes);
-  let payload = crate::CommitMergePayload::new(Bytes::from(source_bytes), Index::new(2), 1, 1);
+  let payload =
+    crate::CommitMergePayload::new(Bytes::from(source_bytes), Index::new(2), Term::new(1), 1, 1);
   let mut buf = Vec::new();
   crate::wire::encode_commit_merge_payload(&payload, &mut buf);
   let mut log2 = VecLog::default();
@@ -2928,6 +2929,202 @@ fn park_waits_for_the_source_then_resolves() {
   );
   assert!(!m.contains_group(&1));
   assert!(m.group(&2).unwrap().pending_merge().is_none());
+}
+
+/// Restore a host holding a parked single-voter TARGET (its committed log carries a
+/// `CommitMerge` naming the freeze identity `(2, boundary_term)` on source group 1, sealed by
+/// its own election no-op) and a 3-voter FOLLOWER source replica whose durable log ends with
+/// `(boundary_entry)` at index 2 while its commit floor stops at 1 — the lost-final-heartbeat
+/// shape's deciding host, distilled: the replica MATCHED the freeze (it holds the entry) but
+/// was never TOLD it committed, and no source leader exists anywhere to tell it.
+fn wedged_host(boundary_entry: crate::Entry) -> (MultiRaft<u64, u64, CountSm>, MapStores, Index) {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  let mut src_log = VecLog::default();
+  let mut cmd_buf = Vec::new();
+  Data::encode(&Bytes::from_static(&[7u8]), &mut cmd_buf);
+  src_log.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      Bytes::from(cmd_buf),
+    ),
+    boundary_entry,
+  ]);
+  let mut src_stable = crate::testkit::NoopStable::<u64>::default();
+  src_stable.force_state(Term::new(2), None, Index::new(1));
+  let three = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  m.restore_group(
+    1,
+    three,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut src_log,
+    &mut src_stable,
+  )
+  .unwrap();
+  {
+    let sep = m.group(&1).unwrap();
+    assert!(!sep.is_frozen(), "nothing above the commit floor applied");
+    assert_eq!(sep.applied_index(), Index::new(1));
+  }
+  stores.0.insert(1, (src_log, AsyncStable::default()));
+
+  let mut source_bytes = Vec::new();
+  Data::encode(&1u64, &mut source_bytes);
+  let payload =
+    crate::CommitMergePayload::new(Bytes::from(source_bytes), Index::new(2), Term::new(1), 1, 1);
+  let mut buf = Vec::new();
+  crate::wire::encode_commit_merge_payload(&payload, &mut buf);
+  let mut tgt_log = VecLog::default();
+  tgt_log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::CommitMerge,
+    Bytes::from(buf),
+  )]);
+  let mut tgt_stable = crate::testkit::NoopStable::<u64>::default();
+  tgt_stable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group(
+    2,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut tgt_log,
+    &mut tgt_stable,
+  )
+  .unwrap();
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "re-parked");
+  stores.0.insert(2, (tgt_log, AsyncStable::default()));
+  // The target elects; its election no-op is the abort window's seal.
+  let d = m.group(&2).unwrap().poll_timeout().unwrap();
+  let (log, stable) = stores.0.get_mut(&2).unwrap();
+  m.handle_timeout(&2, d, log, stable).unwrap();
+  drain_storage(&mut m, 2, d, log, stable);
+  assert!(m.group(&2).unwrap().role().is_leader());
+  (m, stores, Index::new(1))
+}
+
+/// THE LOST-FINAL-HEARTBEAT WEDGE: a source follower at match = F but commit < F is legally
+/// stranded once the absorb consumes the rest of the source's quorum (the leader-last
+/// discipline tears the source leader down only after every peer MATCHED the boundary — match
+/// is not commit KNOWLEDGE, and the heartbeat that would have carried the commit index can be
+/// lost). Under a pace-only arm this host's park waited forever: leaderless, under-hosted,
+/// unelectable, nobody left to raise the stranded replica's commit. The identity leg breaks
+/// the wedge: the committed `CommitMerge` proves `(F, freeze_term)` committed in the source,
+/// the local log CONTAINS that exact entry, so the host advances its source to the boundary
+/// locally and absorbs — the union intact.
+#[test]
+fn parked_host_advances_a_wedged_source_on_freeze_identity() {
+  let mut prep = Vec::new();
+  {
+    let mut tbytes = Vec::new();
+    Data::encode(&2u64, &mut tbytes);
+    let p = crate::PrepareMergePayload::new(Bytes::from(tbytes), 1);
+    crate::wire::encode_prepare_merge_payload(&p, &mut prep);
+  }
+  let freeze = crate::Entry::new(
+    Term::new(1),
+    Index::new(2),
+    crate::EntryKind::PrepareMerge,
+    Bytes::from(prep),
+  );
+  let (mut m, mut stores, k) = wedged_host(freeze);
+
+  // First pass: the identity leg advances the stranded source through its own log — commit and
+  // apply reach the boundary, the freeze folds, nothing resolves yet.
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty(),
+    "the advance pass resolves nothing yet"
+  );
+  {
+    let sep = m.group(&1).unwrap();
+    assert!(
+      sep.is_frozen(),
+      "the identity leg advanced the stranded source to its boundary"
+    );
+    assert_eq!(sep.applied_index(), Index::new(2));
+    assert_eq!(sep.shape_gen(), 1);
+  }
+  // Second pass: the ordinary resolve arm absorbs (follower-hosted source — no pace leg).
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }]
+  );
+  assert!(!m.contains_group(&1), "the source replica was extracted");
+  let tep = m.group(&2).unwrap();
+  assert!(tep.pending_merge().is_none());
+  assert_eq!(tep.applied_index(), k, "the parked entry applied");
+  assert_eq!(
+    tep.state_machine().count(),
+    1,
+    "the union carries the source's one committed command"
+  );
+  assert_eq!(tep.shape_gen(), 1);
+  let mut merged = false;
+  while let Some((gid, ev)) = m.poll_event() {
+    assert!(
+      !matches!(ev, Event::MergeAborted(_)),
+      "the wedge must resolve to the union, never an abort"
+    );
+    merged |= gid == 2 && matches!(ev, Event::Merged(_));
+  }
+  assert!(merged, "Event::Merged surfaced");
+}
+
+/// THE NEGATIVE PIN: the identity leg advances on `(index, term)` — never on index alone. A
+/// source whose log holds a DIFFERENT entry at the boundary (a divergent uncommitted suffix
+/// from a dead leader) proves nothing about its prefix: the park must WAIT (the resolved
+/// quorum's post-merge snapshot is its route), and the divergent replica's commit/apply must
+/// not move an inch.
+#[test]
+fn a_divergent_source_boundary_never_advances_on_index_alone() {
+  let mut cmd_buf = Vec::new();
+  Data::encode(&Bytes::from_static(&[9u8]), &mut cmd_buf);
+  let divergent = crate::Entry::new(
+    Term::new(2),
+    Index::new(2),
+    crate::EntryKind::Normal,
+    Bytes::from(cmd_buf),
+  );
+  let (mut m, mut stores, _k) = wedged_host(divergent);
+  for _ in 0..5 {
+    assert!(
+      m.service_merge_applies(Instant::ORIGIN, &mut stores)
+        .is_empty(),
+      "a divergent boundary entry keeps the park waiting"
+    );
+  }
+  let sep = m.group(&1).unwrap();
+  assert!(!sep.is_frozen());
+  assert_eq!(
+    sep.applied_index(),
+    Index::new(1),
+    "commit/apply never advanced on index alone"
+  );
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_some(),
+    "still parked"
+  );
 }
 
 /// Every propose-time precondition maps to its typed refusal, with nothing appended.

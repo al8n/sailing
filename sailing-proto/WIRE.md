@@ -137,6 +137,7 @@ reference — this section pins the SEMANTICS:
   | `freeze_index` (2) | `uint64` | the source's `PrepareMerge` index — the boundary the local source must be frozen-applied at before the parked apply can resolve |
   | `source_gen_after` (3) | `uint64` | the generation the source's freeze set (the park's log-determined comparator) |
   | `target_gen_after` (4) | `uint64` | the target's own lineage mint: the commit applies only at exactly this generation — a stale mint (an abort or competing reshape won the base) no-ops deterministically on every replica |
+  | `freeze_term` (5) | `uint64` | the `PrepareMerge` entry's term — with `freeze_index`, the freeze's LOG IDENTITY: a parked host whose local source log contains the pair may advance that source's commit to the boundary (log matching carries the committed prefix), so a source follower stranded below the boundary by a lost final heartbeat cannot wedge the park after the absorb consumed the source's quorum (0 = no identity; the park only waits) |
 
   `sailing.v1.RollbackMergePayload` — the merge's explicit abort, in one of two log roles told
   apart by `source`:

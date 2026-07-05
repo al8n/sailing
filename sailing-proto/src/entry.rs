@@ -169,6 +169,12 @@ pub struct CommitMergePayload {
   /// The source's `PrepareMerge` index — the boundary the local source replica must be
   /// frozen-applied at before this entry's parked apply can resolve.
   freeze_index: Index,
+  /// The `PrepareMerge` entry's TERM: with `freeze_index` it is the freeze's LOG IDENTITY. A
+  /// parked host whose local source log contains `(freeze_index, freeze_term)` holds — by log
+  /// matching — the exact committed freeze and its whole prefix, and may advance that source's
+  /// commit to the boundary with no live source leader left to tell it (`Term::ZERO` = no
+  /// identity carried; the park then only ever waits).
+  freeze_term: Term,
   /// The gen the source's freeze set: the parked apply's comparator. A source whose live counter
   /// moved PAST it was rolled back — the parked apply aborts deterministically.
   source_gen_after: u64,
@@ -181,12 +187,14 @@ impl CommitMergePayload {
   pub const fn new(
     source_bytes: Bytes,
     freeze_index: Index,
+    freeze_term: Term,
     source_gen_after: u64,
     target_gen_after: u64,
   ) -> Self {
     Self {
       source_bytes,
       freeze_index,
+      freeze_term,
       source_gen_after,
       target_gen_after,
     }
@@ -202,6 +210,12 @@ impl CommitMergePayload {
   #[inline(always)]
   pub const fn freeze_index(&self) -> Index {
     self.freeze_index
+  }
+
+  /// The source's `PrepareMerge` term (with the index, the freeze's log identity).
+  #[inline(always)]
+  pub const fn freeze_term(&self) -> Term {
+    self.freeze_term
   }
 
   /// The gen the source's freeze set (the abort comparator).

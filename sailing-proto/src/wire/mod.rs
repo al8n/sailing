@@ -515,6 +515,7 @@ pub(crate) fn encode_commit_merge_payload(p: &CommitMergePayload, buf: &mut Vec<
     freeze_index: p.freeze_index().get(),
     source_gen_after: p.source_gen_after(),
     target_gen_after: p.target_gen_after(),
+    freeze_term: p.freeze_term().get(),
     ..Default::default()
   }
   .encode(buf);
@@ -535,6 +536,7 @@ pub(crate) fn decode_commit_merge_payload(
   Ok(CommitMergePayload::new(
     w.source,
     Index::new(w.freeze_index),
+    Term::new(w.freeze_term),
     w.source_gen_after,
     w.target_gen_after,
   ))

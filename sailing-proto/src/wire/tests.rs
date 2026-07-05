@@ -1292,14 +1292,16 @@ const GOLDEN_PREPARE_MERGE_PAYLOAD: &[u8] = &[
 
 /// The pinned wire bytes of one `CommitMergePayload` — proto3 fields in ascending order:
 /// `source` (1, bytes), `freeze_index` (2, varint), `source_gen_after` (3, varint),
-/// `target_gen_after` (4, varint). The absorbed state itself never rides the entry — every
-/// replica extracts its LOCAL source at the freeze boundary — so the wire cost is independent
-/// of FSM size, exactly like Split.
+/// `target_gen_after` (4, varint), `freeze_term` (5, varint — with `freeze_index`, the freeze's
+/// log identity; an additive tail, so the pre-identity prefix is byte-identical). The absorbed
+/// state itself never rides the entry — every replica extracts its LOCAL source at the freeze
+/// boundary — so the wire cost is independent of FSM size, exactly like Split.
 const GOLDEN_COMMIT_MERGE_PAYLOAD: &[u8] = &[
   0x0A, 0x01, 0x2A, // source = [0x2a]
   0x10, 0x09, // freeze_index = 9
   0x18, 0x03, // source_gen_after = 3
   0x20, 0x05, // target_gen_after = 5
+  0x28, 0x02, // freeze_term = 2
 ];
 
 /// The pinned wire bytes of one SOURCE-role `RollbackMergePayload` (the relayed unfreeze):
@@ -1339,7 +1341,13 @@ fn prepare_merge_payload_round_trips_and_pins_bytes() {
 
 #[test]
 fn commit_merge_payload_round_trips_and_pins_bytes() {
-  let p = CommitMergePayload::new(Bytes::from_static(b"\x2a"), Index::new(9), 3, 5);
+  let p = CommitMergePayload::new(
+    Bytes::from_static(b"\x2a"),
+    Index::new(9),
+    Term::new(2),
+    3,
+    5,
+  );
   let mut buf = Vec::new();
   encode_commit_merge_payload(&p, &mut buf);
   assert_eq!(buf, GOLDEN_COMMIT_MERGE_PAYLOAD, "wire bytes are pinned");
@@ -1425,7 +1433,7 @@ fn merge_payloads_reject_out_of_bound_group_ids() {
     "an over-bound target encoding rejects"
   );
 
-  let empty = CommitMergePayload::new(Bytes::new(), Index::new(1), 1, 1);
+  let empty = CommitMergePayload::new(Bytes::new(), Index::new(1), Term::new(1), 1, 1);
   let mut buf = Vec::new();
   encode_commit_merge_payload(&empty, &mut buf);
   assert!(
@@ -1435,6 +1443,7 @@ fn merge_payloads_reject_out_of_bound_group_ids() {
   let oversized = CommitMergePayload::new(
     Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]),
     Index::new(1),
+    Term::new(1),
     1,
     1,
   );
@@ -1465,7 +1474,13 @@ fn merge_entries_fit_the_append_frame_budget() {
   );
   let mut buf = Vec::new();
   encode_commit_merge_payload(
-    &CommitMergePayload::new(worst_target, Index::new(u64::MAX - 1), u64::MAX, u64::MAX),
+    &CommitMergePayload::new(
+      worst_target,
+      Index::new(u64::MAX - 1),
+      Term::new(u64::MAX),
+      u64::MAX,
+      u64::MAX,
+    ),
     &mut buf,
   );
   let commit = Entry::new(

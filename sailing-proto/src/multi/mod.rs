@@ -1686,6 +1686,7 @@ where
       sep.frozen_for().is_none_or(|t| *t != target_bytes)
     };
     let freeze_index = sep.freeze_index();
+    let freeze_term = sep.freeze_term();
     let source_gen_after = sep.shape_gen();
     let tep = self.groups.get(target).expect("checked hosted above");
     if tep.is_poisoned() {
@@ -1738,6 +1739,10 @@ where
     let payload = CommitMergePayload::new(
       Bytes::from(source_bytes),
       freeze_index.expect("frozen-ready implies a boundary"),
+      // The boundary's log identity, read off the SAME frozen-applied observation that gated
+      // this propose: it certifies (freeze_index, freeze_term) committed in the source, which
+      // is what lets a parked host later advance a stranded local source replica on identity.
+      freeze_term.expect("frozen-ready implies a recorded freeze term"),
       source_gen_after,
       target_gen_after,
     );
@@ -1958,6 +1963,7 @@ where
       };
       let expected = pending.source_gen_after();
       let boundary = pending.freeze_index();
+      let freeze_term = pending.freeze_term();
       let source_bytes = pending.source_bytes();
       let Ok(source) = G::decode_exact(source_bytes) else {
         // A committed source id that does not decode as G is committed-corrupt — the split
@@ -1971,6 +1977,10 @@ where
         Resolve,
         Abort,
         Wait,
+        /// The source sits below its freeze generation: wait, but first try THE IDENTITY LEG —
+        /// if the local source log contains `(freeze_index, freeze_term)`, advance its
+        /// commit/apply to the boundary so a later crank resolves.
+        AdvanceSource,
       }
       // THE ABORT WINDOW, first and unconditionally: no arm below may fire until the target's
       // own log has decided the `k + 1` coordinate (see the method doc). The read is of this
@@ -2032,12 +2042,19 @@ where
               // relayed only by the abort entry this park blocks above `k`, and a replayed
               // commit against an already-moved counter no-ops at its own lineage guard
               // before ever parking — so a moved counter here is a broken-counter bug, not an
-              // abort signal: hold rather than diverge.
+              // abort signal: hold rather than diverge. Waiting is not always enough, though:
+              // replication only catches this replica up WHILE THE SOURCE HAS A LEADER, and
+              // the boundary MATCH the pace leg waited for is not commit KNOWLEDGE — a lost
+              // final heartbeat legally strands a source follower with the freeze in its log
+              // but `commit` below it, right as the last absorb consumes the source's quorum
+              // (leaderless, under-hosted, unelectable). The identity leg is that shape's only
+              // exit, and it is sound on log identity alone (see
+              // `advance_commit_on_freeze_identity` for the argument).
               debug_assert!(
                 seen < expected,
                 "a parked commit observed the source PAST its freeze generation"
               );
-              Verdict::Wait
+              Verdict::AdvanceSource
             }
           }
           // Absent WITH the terminal floor: this host already absorbed the source (the floor
@@ -2061,6 +2078,23 @@ where
       };
       match verdict {
         Verdict::Wait => {}
+        Verdict::AdvanceSource => {
+          // The committed CommitMerge proves `(boundary, freeze_term)` committed in the source
+          // — its proposer stamped the pair from a source observed frozen-applied AT the
+          // boundary — and log matching carries that identity: a local source log CONTAINING
+          // the pair holds the committed freeze and its exact prefix, so raising its commit to
+          // the boundary is the ordinary leader-to-follower knowledge transfer with the
+          // (possibly dead) source leader's say-so riding this target's log instead. The
+          // endpoint method verifies the pair against the LOCAL log and refuses everything
+          // else — a divergent or short log keeps waiting; never an advance on index alone.
+          // The freeze then applies through the normal drain and the NEXT crank resolves.
+          if let Some((slog, _)) = stores.stores(&source)
+            && let Some(sep) = self.groups.get_mut(&source)
+            && sep.advance_commit_on_freeze_identity(&*slog, boundary, freeze_term)
+          {
+            self.mark_dirty(&source);
+          }
+        }
         Verdict::Abort => {
           if let Some(tep) = self.groups.get_mut(&tgid) {
             tep.resolve_pending_merge_aborted();

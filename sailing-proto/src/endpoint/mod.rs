@@ -2640,6 +2640,7 @@ where
             // that target's commit may ever absorb this generation (the resolve arm verifies).
             self.merge.frozen = true;
             self.merge.freeze_index = Some(idx);
+            self.merge.freeze_term = Some(entry.term());
             self.merge.freeze_pending = None;
             self.merge.frozen_for = Some(payload.target_bytes());
             self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
@@ -2680,6 +2681,7 @@ where
               self.merge.pending_apply = Some(merge::PendingMergeApply::new_parked(
                 payload.source_bytes(),
                 payload.freeze_index(),
+                payload.freeze_term(),
                 payload.source_gen_after(),
                 payload.target_gen_after(),
                 idx,
@@ -2706,6 +2708,7 @@ where
               // invariant exact instead of trusting a single-flag lifecycle.
               self.merge.frozen = false;
               self.merge.freeze_index = None;
+              self.merge.freeze_term = None;
               self.merge.frozen_for = None;
               self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
               match Self::scan_freeze_pending(log, idx) {
