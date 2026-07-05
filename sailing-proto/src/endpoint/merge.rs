@@ -388,6 +388,22 @@ where
     self.snapshot.pending_compact = Some((opid, self.applied));
   }
 
+  /// Whether every tracked peer (voters AND learners, both joint halves) has MATCHED the log
+  /// through `boundary` — meaningful on the LEADER (its tracker holds the peers' proven match).
+  /// The merge service's waitForApplication leg reads it off a frozen SOURCE leader: the host
+  /// whose local source replica leads resolves LAST, keeping that leader alive and replicating
+  /// the freeze until every source peer provably holds it — otherwise the early teardown of the
+  /// source leader strands slow source followers below the boundary forever, and their hosts'
+  /// parked absorbs with them.
+  pub(crate) fn peers_matched_through(&self, boundary: Index) -> bool {
+    let me = self.config.id();
+    self
+      .tracker
+      .progress_map()
+      .iter()
+      .all(|(peer, pr)| *peer == me || pr.match_index() >= boundary)
+  }
+
   /// Append one merge admin entry (`PrepareMerge`/`CommitMerge`/`RollbackMerge`) on the leader —
   /// the container's merge verbs call this after their merge-specific gates pass. Mirrors
   /// `propose_split_entry`: appended durable-pending under the current term with the standard

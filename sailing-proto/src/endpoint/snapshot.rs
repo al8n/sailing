@@ -848,6 +848,12 @@ where
     // them no longer exists in this log, so the append-observed kill releases (re-armed at
     // accept if the freeze is still live and re-delivered).
     self.note_freeze_rebaselined();
+    // A parked CommitMerge is SUPERSEDED by the install: at-or-below the boundary, the blob IS
+    // the union (the target leader's forced absorb capture sits past every resolution, so a
+    // log-behind straggler is caught up wholesale without ever touching its local source);
+    // above the boundary, the replay re-encounters the entry and re-parks from log-fixed data.
+    // A stale park kept here would wedge the drain forever below a boundary it cannot re-reach.
+    self.merge.pending_apply = None;
     // `restore` DISCARDS the prior tail, so the durable boundary IS exactly the snapshot's last index — a
     // hard RESET. `durable_index` and the re-baseline advance together, after the blob is durable, so the
     // boundary is recoverable (no stale-HIGH watermark, no orphan).

@@ -1400,3 +1400,94 @@ fn merge_conf_fence_releases_with_the_capture() {
     "the fence releases once no log walk can cross the absorb"
   );
 }
+
+/// A snapshot install at-or-past the parked entry SUPERSEDES the park: the union state arrives
+/// wholesale in the blob (the target leader's forced absorb capture guarantees one exists past
+/// every resolution), so a log-behind straggler that parked is caught up without ever touching
+/// its local source. An install below the park clears it too — the replay re-encounters the
+/// entry and re-parks from log-fixed data. Without the clear, the stale park wedges the apply
+/// drain forever below a boundary it can never reach again.
+#[test]
+fn snapshot_install_supersedes_a_parked_commit_merge() {
+  use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  // The follower parks: CommitMerge@2 committed (leader_commit = 2).
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Normal,
+          encode_cmd(b"a")
+        ),
+        Entry::new(
+          Term::new(1),
+          Index::new(2),
+          EntryKind::CommitMerge,
+          commit_payload(b"\x2a", Index::new(7), 1, 1),
+        ),
+      ],
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(ep.pending_merge().is_some(), "parked at k-1");
+  assert_eq!(ep.applied_index(), Index::new(1));
+
+  // The target leader's post-merge snapshot lands (boundary 10 >= k): the union arrives
+  // wholesale — the park must clear and the boundary must apply.
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1u64,
+      meta,
+      encode_snapshot(42),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(ep.applied_index(), Index::new(10), "the install landed");
+  assert!(
+    ep.pending_merge().is_none(),
+    "the park is superseded by the installed union"
+  );
+  // The drain runs again: a later committed entry applies normally.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(4),
+      1u64,
+      Index::new(10),
+      Term::new(4),
+      std::vec![Entry::new(
+        Term::new(4),
+        Index::new(11),
+        EntryKind::Normal,
+        encode_cmd(b"b"),
+      )],
+      Index::new(11),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(ep.applied_index(), Index::new(11), "the drain resumed");
+}

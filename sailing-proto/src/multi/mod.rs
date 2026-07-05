@@ -1728,11 +1728,9 @@ where
   ///
   /// Returns the crank's resolutions for the DRIVER to fold: floor + teardown for `Merged`,
   /// nothing for `Aborted`.
-  pub fn service_merge_applies<L, S>(
-    &mut self,
-    stores: &mut impl crate::GroupStores<G, L, S>,
-  ) -> Vec<MergeResolution<G>>
+  pub fn service_merge_applies<L, S, St>(&mut self, stores: &mut St) -> Vec<MergeResolution<G>>
   where
+    St: crate::GroupStores<G, L, S> + FloorStore<G>,
     L: LogStore,
     S: StableStore<NodeId = I>,
     F::Snapshot: Data,
@@ -1775,19 +1773,42 @@ where
             // path to this value) — frozen and applied-past-boundary ride along; the explicit
             // checks document the gate and catch a broken counter in debug.
             debug_assert!(sep.is_frozen() && sep.applied_index() >= boundary);
-            Verdict::Resolve
+            // waitForApplication, container-local: the host whose local source replica LEADS
+            // the source resolves LAST. Resolving would consume (and tear down) the source
+            // leader while slow source followers still sit below the boundary — with no leader
+            // left to feed them the freeze, their hosts' parks wedge forever. Holding THIS park
+            // keeps the source leader alive and replicating exactly until every peer provably
+            // matched through the boundary (the capture fence keeps the freeze replayable, so
+            // catch-up below it never needs a snapshot the source cannot send). A source peer
+            // that never catches up (dead, unreachable) holds only this one host's park — and
+            // the rollback valve stays proposable on the still-live source the whole time.
+            if sep.role().is_leader() && !sep.peers_matched_through(boundary) {
+              Verdict::Wait
+            } else {
+              Verdict::Resolve
+            }
           } else if seen > expected {
             Verdict::Abort
           } else {
             Verdict::Wait
           }
         }
-        // Absent: already merged away here (its floor is terminal), or this replica was
-        // restored/walked into a world where the source never existed locally — either way the
-        // union this commit describes is not materializable HERE and the entry no-ops; a
-        // replica that SHOULD have absorbed can never reach this arm, because the membership
-        // fence keeps every log-walk below the absorb point.
-        None => Verdict::Abort,
+        // Absent WITH the terminal floor: this host already absorbed the source (the floor
+        // lands in the same barrier as an absorb) — the commit is a replayed duplicate and the
+        // union is already in the target; no-op past it. Absent WITHOUT the floor: this
+        // replica never held the source (lifecycle churn tore it down, or the replica joined
+        // after the source dissolved) and the union is NOT materializable here — it must WAIT
+        // for the resolved quorum's post-merge snapshot, whose install supersedes the park
+        // (the forced capture compacts the leader through the absorb, so a parked straggler is
+        // structurally on the snapshot path). Aborting instead would skip the union on this
+        // replica alone — silent, permanent divergence from every replica that absorbed.
+        None => {
+          if stores.floor(&source) == crate::MERGED_FLOOR {
+            Verdict::Abort
+          } else {
+            Verdict::Wait
+          }
+        }
       };
       match verdict {
         Verdict::Wait => {}

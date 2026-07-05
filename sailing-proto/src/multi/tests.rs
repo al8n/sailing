@@ -2553,8 +2553,12 @@ fn fork_baseline_meta_carries_lineage_and_read_mode() {
 
 // ───────────────────────────── merge verbs + the per-crank service ─────────────────────────────
 
-/// Per-group `(VecLog, AsyncStable)` pairs behind the service's store seam.
-struct MapStores(std::collections::BTreeMap<u64, (VecLog, AsyncStable)>);
+/// Per-group `(VecLog, AsyncStable)` pairs behind the service's store seam, with the host's
+/// terminal merge floors beside them (the absent arm's discriminator).
+struct MapStores(
+  std::collections::BTreeMap<u64, (VecLog, AsyncStable)>,
+  std::collections::BTreeSet<u64>,
+);
 
 impl crate::GroupStores<u64, VecLog, AsyncStable> for MapStores {
   fn stores(&mut self, group: &u64) -> Option<(&mut VecLog, &mut AsyncStable)> {
@@ -2562,11 +2566,28 @@ impl crate::GroupStores<u64, VecLog, AsyncStable> for MapStores {
   }
 }
 
+impl crate::FloorStore<u64> for MapStores {
+  fn floor(&self, gid: &u64) -> u64 {
+    if self.1.contains(gid) {
+      MERGED_FLOOR
+    } else {
+      0
+    }
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
 /// A host with two single-voter groups (1 = source with `src_count` applied commands, 2 = target
 /// with `tgt_count`), each elected and fully drained.
 fn merge_host(src_count: usize, tgt_count: usize) -> (MultiRaft<u64, u64, CountSm>, MapStores) {
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
-  let mut stores = MapStores(std::collections::BTreeMap::new());
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
   for (gid, n) in [(1u64, src_count), (2u64, tgt_count)] {
     stores
       .0
@@ -2697,15 +2718,23 @@ fn rollback_races_commit() {
   assert!(aborted, "Event::MergeAborted surfaced");
 }
 
-/// Arms 3/4 (mechanically one arm): the parked commit's source is ABSENT — already merged away
-/// here (a replayed duplicate commit) or never locally hosted — and the entry no-ops past.
+/// The absent arms, floor-discriminated: with the TERMINAL floor the commit is a replayed
+/// duplicate for an already-absorbed source — a no-op past the park; WITHOUT the floor the
+/// union was never materialized here, and aborting would silently skip it on this replica
+/// alone — the park WAITS instead (the resolved quorum's post-merge snapshot supersedes it).
 #[test]
-fn absent_source_resolves_as_a_no_op() {
+fn absent_source_aborts_only_under_the_terminal_floor() {
   let (mut m, mut stores) = merge_host(2, 3);
   let k = freeze_and_park(&mut m, &mut stores);
-  // The source vanishes before the service crank (the replayed-commit shape: a restart replays
-  // the commit after the source was already absorbed and torn down).
   assert!(m.remove_group(&1).is_some());
+  // No floor: never-held — the park holds for the snapshot route.
+  assert!(
+    m.service_merge_applies(&mut stores).is_empty(),
+    "absent without the floor must WAIT, not skip the union"
+  );
+  assert!(m.group(&2).unwrap().pending_merge().is_some());
+  // The terminal floor lands (this host absorbed in a prior incarnation of the park): no-op.
+  stores.1.insert(1);
   let resolutions = m.service_merge_applies(&mut stores);
   assert_eq!(
     resolutions,
@@ -2725,7 +2754,10 @@ fn absent_source_resolves_as_a_no_op() {
 #[test]
 fn park_waits_for_the_source_then_resolves() {
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
-  let mut stores = MapStores(std::collections::BTreeMap::new());
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
   // Group 1: a fresh, UNFROZEN single-voter source (gen 0).
   stores
     .0
@@ -2953,4 +2985,120 @@ fn rollback_while_freeze_pending_mints_past_it() {
   assert!(!ep.is_frozen(), "frozen then immediately thawed");
   assert_eq!(ep.shape_gen(), 2, "0 → 1 (freeze) → 2 (rollback)");
   assert!(!ep.merge_freeze_active());
+}
+
+/// The source LEADER's host resolves LAST — waitForApplication, container-local: while any
+/// source peer's match sits below the freeze boundary, the host whose local source replica IS
+/// the source leader keeps its park (and thereby keeps the source leader alive and feeding F
+/// to the stragglers); it resolves only once every peer matched through the boundary. Without
+/// this leg, the early teardown of the source leader strands every slow source follower below
+/// F forever — and their hosts' parks with them.
+#[test]
+fn source_leader_host_resolves_last() {
+  use crate::{AppendResponse, Message, VoteResponse};
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  let three_voters = || {
+    Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+  // Feed one peer ack for `upto` on `gid` from `peer`.
+  fn ack(
+    m: &mut MultiRaft<u64, u64, CountSm>,
+    stores: &mut MapStores,
+    gid: u64,
+    peer: u64,
+    upto: Index,
+  ) {
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    m.handle_message(
+      &gid,
+      Instant::ORIGIN,
+      log,
+      stable,
+      peer,
+      Message::AppendResponse(AppendResponse::new(
+        Term::new(1),
+        peer,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        upto,
+      )),
+    )
+    .unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    drain_storage(m, gid, Instant::ORIGIN, log, stable);
+  }
+  // Source (1) and target (2): 3-voter groups led locally (peer 2's vote elects; peer 3 lags).
+  for gid in [1u64, 2] {
+    stores
+      .0
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    m.create_group(gid, three_voters(), Instant::ORIGIN, 7, CountSm::default())
+      .unwrap();
+    let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+    drain_storage(&mut m, gid, d, log, stable);
+    m.handle_message(
+      &gid,
+      d,
+      log,
+      stable,
+      2u64,
+      Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+    )
+    .unwrap();
+    drain_storage(&mut m, gid, d, log, stable);
+    assert!(m.group(&gid).unwrap().role().is_leader());
+    // Commit the no-op via peer 2's ack (quorum 2 of 3); peer 3 never acks anything.
+    ack(&mut m, &mut stores, gid, 2, Index::new(1));
+  }
+  let now = Instant::ORIGIN;
+
+  // Freeze the source: peer 2's ack commits the PrepareMerge; peer 3's match stays at 0.
+  let f = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap()
+  };
+  ack(&mut m, &mut stores, 1, 2, f);
+  assert!(m.group(&1).unwrap().is_frozen());
+
+  // Park the target the same way.
+  let k = {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap()
+  };
+  ack(&mut m, &mut stores, 2, 2, k);
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
+
+  // Peer 3's SOURCE match sits below the boundary: the source-leader host must WAIT — park
+  // intact, source leader alive and still able to feed the straggler.
+  assert!(
+    m.service_merge_applies(&mut stores).is_empty(),
+    "the source leader's host waits for its peers to match the boundary"
+  );
+  assert!(m.contains_group(&1), "the source leader survives the wait");
+  assert!(m.group(&2).unwrap().pending_merge().is_some());
+
+  // The straggler catches up (its ack reaches F): the wait releases and the host resolves.
+  ack(&mut m, &mut stores, 1, 3, f);
+  let resolutions = m.service_merge_applies(&mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }]
+  );
+  assert!(!m.contains_group(&1));
 }

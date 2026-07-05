@@ -37,6 +37,16 @@ impl GroupStores<u64, VecLog, AsyncStable> for Stores {
   }
 }
 
+impl FloorStore<u64> for Stores {
+  fn floor(&self, _gid: &u64) -> u64 {
+    0
+  }
+
+  fn lineage(&self, _gid: &u64) -> u64 {
+    0
+  }
+}
+
 fn single_voter(id: u64) -> Config<u64> {
   Config::try_new(
     id,

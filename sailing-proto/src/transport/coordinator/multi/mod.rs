@@ -821,11 +821,12 @@ where
   /// its straggler frames drop silently from here on (the P5 wire story, unchanged), while the
   /// terminal floor the DRIVER persists from the returned resolutions is what makes the refusal
   /// survive restarts. Aborted resolutions touch nothing here — the source group is still live.
-  pub fn service_merge_applies<L, S>(
+  pub fn service_merge_applies<L, S, St>(
     &mut self,
-    stores: &mut impl crate::GroupStores<G, L, S>,
+    stores: &mut St,
   ) -> Vec<crate::MergeResolution<G>>
   where
+    St: crate::GroupStores<G, L, S> + FloorStore<G>,
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
