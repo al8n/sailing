@@ -1160,3 +1160,116 @@ fn late_fork_for_a_retired_child_refuses_and_recreation_admits() {
   w.finalize_conservation_or_panic(5);
   w.finalize_membership_or_panic(5);
 }
+
+/// One settle window exactly as [`MultiWorld::tick`] runs it — flush the coalesced replication
+/// batches, then drain outgoing/deliveries/storage/forks until quiescent — WITHOUT the
+/// end-of-tick oracle pass, so a test can stage a multi-apply window and observe what the FIRST
+/// sweep after it sees.
+fn settle_without_sweeping(w: &mut MultiWorld) {
+  for node in w.node_list() {
+    let host = w.hosts.get_mut(&node).expect("host exists");
+    let gids: Vec<u64> = host.group_ids().copied().collect();
+    for gid in gids {
+      let host = w.hosts.get_mut(&node).expect("host exists");
+      let log = w.logs.get(&(node, gid)).expect("replica log");
+      let stable = w.stables.get(&(node, gid)).expect("replica stable");
+      host
+        .flush_appends(&gid, w.now, log, stable)
+        .expect("hosted group flushes");
+    }
+  }
+  loop {
+    let any_new = w.drain_outgoing_all();
+    let delivered = w.deliver_due();
+    let storage = w.drain_storage_all();
+    let forked = w.pump_forks();
+    if !(any_new || delivered || storage || forked) {
+      break;
+    }
+  }
+}
+
+/// The conservation walk trusts VALUES, never positions — the reshape band's displaced-cell
+/// mechanism pinned deterministically. `LogSm::split` removes moved-key cells record-wide, so a
+/// kept-key burst applied in the SAME settle window as the split-apply lands at positions an
+/// earlier sweep already passed. A positional resume watermark (even one clamped to the record
+/// length) skips those cells forever — an interior hole in the parent's recorded history that a
+/// later fork baseline exposes as a false conservation verdict; the full value-deduped walk
+/// records them completely.
+#[test]
+fn conservation_walk_records_cells_displaced_by_a_split_apply() {
+  let mut w = MultiWorld::new(23);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  for key in 0u16..8 {
+    let payload = crate::multi::encode_gkv(100, key, u64::from(key));
+    propose_until_accepted(&mut w, 100, &payload);
+  }
+  // Converge every replica onto the identical record so the pre-window length is one number.
+  assert!(
+    w.run_until(2_000, |w| {
+      let a0 = w.applied_of(0, 100);
+      let full = a0
+        .iter()
+        .filter_map(|(_, c)| crate::multi::decode_gkv(c))
+        .count()
+        >= 8;
+      full && (1..3).all(|n| w.applied_of(n, 100) == a0)
+    }),
+    "the keyed baseline never applied identically everywhere"
+  );
+  let pre_len = w.applied_of(0, 100).len();
+
+  // ONE window, no sweep inside: the split entry and a kept-key burst behind it commit and
+  // apply everywhere before the next sweep looks. Every sweep so far ended at `pre_len`.
+  assert!(matches!(w.propose_split(100, 200, 4), Some(Ok(_))));
+  for value in 100..104u64 {
+    let payload = crate::multi::encode_gkv(100, 0, value);
+    assert!(w.propose(100, &payload).is_some(), "burst propose refused");
+  }
+  for _ in 0..50 {
+    settle_without_sweeping(&mut w);
+    let burst_applied = |n: u64| {
+      w.applied_of(n, 100)
+        .iter()
+        .any(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 0, 103)))
+    };
+    if (0..3).all(burst_applied) {
+      break;
+    }
+  }
+
+  // The mechanism armed: on every replica the burst sits BELOW the pre-window record length —
+  // the split-apply vacated the moved cells' span and the burst landed inside it.
+  for n in 0..3 {
+    let applied = w.applied_of(n, 100);
+    let pos = applied
+      .iter()
+      .position(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 0, 100)))
+      .unwrap_or_else(|| panic!("node {n}: the burst never applied in the window"));
+    assert!(
+      pos < pre_len,
+      "node {n}: the displaced-burst mechanism did not arm (pos {pos} >= pre_len {pre_len})"
+    );
+  }
+
+  // The first sweep after the window must record the displaced burst COMPLETELY.
+  w.check_now();
+  let values: Vec<u64> = w
+    .conservation
+    .history(100, 0)
+    .iter()
+    .map(|(_, v)| *v)
+    .collect();
+  assert_eq!(
+    values,
+    std::vec![0, 100, 101, 102, 103],
+    "key 0's recorded history must hold the full displaced burst"
+  );
+  w.finalize_conservation_or_panic(23);
+  w.finalize_membership_or_panic(23);
+}

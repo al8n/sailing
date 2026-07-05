@@ -132,15 +132,12 @@ pub struct MultiWorld {
   /// the replicas' RAW applied records (see `conserve_sweep`), judged per recorded split by
   /// [`finalize_conservation_or_panic`](Self::finalize_conservation_or_panic).
   conservation: ConservationLedger,
-  /// Per-`(node, gid)` count of applied cells the conservation recorder has already walked.
-  /// DISTINCT from `swept`: the cross-talk sweep floors its start at the group's inherited
-  /// baseline (parent-tagged cells are not cross-talk), while the recorder starts at 0 so the
-  /// baseline IS observed as the child's opening history.
-  cons_swept: BTreeMap<(u64, u64), usize>,
-  /// Per-`(ledger id, key)` last recorded value — the recorder's dedupe. Values are globally
-  /// unique and strictly increase per `(group, key)` (the fuzzer's monotone counter), so
-  /// "strictly above the last recorded" admits each cell exactly once, in write order, no
-  /// matter how many replicas' walks present it or how often a crash-shrunk record re-walks.
+  /// Per-`(ledger id, key)` last recorded value — the recorder's dedupe AND its ONLY walk
+  /// state. Values are globally unique and strictly increase per `(group, key)` (the fuzzer's
+  /// monotone counter), so "strictly above the last recorded" admits each cell exactly once, in
+  /// write order, no matter how many replicas' full re-walks present it. Deliberately NO
+  /// positional resume watermark rides beside it: `LogSm::split` and a crash restore both move
+  /// cells to positions an earlier sweep already passed (see `conserve_sweep`).
   cons_last: BTreeMap<(u64, u16), u64>,
   /// Every committed split the world REGISTERED (child materialized), in registration order —
   /// the conservation verdict's work list.
@@ -207,7 +204,6 @@ impl MultiWorld {
       cross_talk_checked: 0,
       snapshot_threshold: None,
       conservation: ConservationLedger::new(),
-      cons_swept: BTreeMap::new(),
       cons_last: BTreeMap::new(),
       splits: BTreeMap::new(),
       pending_splits: BTreeMap::new(),
