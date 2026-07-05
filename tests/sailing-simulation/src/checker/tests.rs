@@ -350,6 +350,132 @@ fn commit_is_quorum_durable_keeps_teeth_with_authoritative_voter_set() {
   );
 }
 
+/// A freshly fork-materialized child replica: the manufactured `(1, 1)` snapshot install —
+/// `commit = 1` covered only by the snapshot boundary, an EMPTY re-baselined log
+/// (`durable_first = 2`, `durable_last = 1`), and an empty applied record (the oracle-aligned
+/// view strips the fork-inherited baseline cells, which carry parent-log indices).
+fn fork_birth_node(id: u64) -> NodeView {
+  let mut n = healthy_node(id, 1, 0);
+  n.applied_log = Vec::new();
+  n.durable_first = 2;
+  n.durable_last = 1;
+  n.visible_last = 1;
+  n.snapshot_last_index = 1;
+  n.snapshot_last_term = 1;
+  n
+}
+
+/// Grow a fork-birth replica past the baseline: it committed, applied, and durably holds the
+/// child's OWN first entry `(index 2, term 1)`.
+fn fork_grown_node(id: u64) -> NodeView {
+  let mut n = fork_birth_node(id);
+  n.commit = 2;
+  n.applied = 2;
+  n.applied_log = std::vec![(2, std::vec![9])];
+  n.durable_last = 2;
+  n.visible_last = 2;
+  n.durable_entries = std::vec![DurableEntry {
+    index: 2,
+    term: 1,
+    data: std::vec![9],
+    is_conf_change: false,
+  }];
+  n.hardstate_commit = 2;
+  n
+}
+
+/// The fork-birth topology as [`ClusterView`]: the child's committed 4-voter boot config with
+/// only the given replicas materialized (absent siblings have no store pair yet, so no view).
+fn fork_view(nodes: Vec<NodeView>) -> ClusterView {
+  ClusterView {
+    seed: 7,
+    tick: 95,
+    committed_voters: Some(BTreeSet::from([3, 4, 5, 6])),
+    committed_transitions: Vec::new(),
+    new_installs: Vec::new(),
+    nodes,
+  }
+}
+
+#[test]
+fn fork_baseline_floor_admits_the_manufactured_install_at_birth() {
+  // The fork-birth shape: the child's boot config is a committed 4-voter set, but only ONE
+  // replica has materialized — commit=1 (the manufactured baseline) with a single durable
+  // holder. An UNSEEDED checker rightly trips the full axiom on it, which is also the pin that
+  // a normally-created group (whose registration inserts exactly `Checker::new()`) keeps the
+  // full axiom from index 0.
+  let view = fork_view(std::vec![fork_birth_node(6)]);
+  let v = Checker::new().check(&view).unwrap_err();
+  assert_eq!(v.oracle, "commit_is_quorum_durable");
+  assert!(
+    v.detail.contains("no term holds a durable quorum"),
+    "{}",
+    v.detail
+  );
+
+  // Seeded at the baseline — what fork registration does — the same view is admitted: the
+  // baseline's durable witnesses are the PARENT's quorum, invisible to the child-scoped view.
+  let mut ck = Checker::new();
+  ck.register_fork_baseline(1);
+  ck.check(&view)
+    .expect("the manufactured baseline is parent-quorum-anchored");
+
+  // And a later, genuinely child-quorum-durable commit above the baseline still passes: all
+  // four replicas materialized and 3 of 4 durably hold the child's own entry at index 2.
+  let mut nodes: Vec<NodeView> = std::vec![
+    fork_grown_node(3),
+    fork_grown_node(4),
+    fork_grown_node(5),
+    fork_birth_node(6),
+  ];
+  nodes[0].is_leader = true;
+  ck.check(&fork_view(nodes))
+    .expect("a child-quorum-durable commit above the baseline");
+}
+
+#[test]
+fn fork_baseline_floor_keeps_teeth_above_the_baseline() {
+  // The seeded floor exempts ONLY the baseline. A child whose commit advances past it without
+  // child-quorum-durable coverage must still trip — here at the fork-birth topology itself:
+  // the sole materialized replica solo-commits index 2 (1 durable copy vs the boot config's
+  // quorum of 3).
+  let mut ck = Checker::new();
+  ck.register_fork_baseline(1);
+  let v = ck
+    .check(&fork_view(std::vec![fork_grown_node(6)]))
+    .unwrap_err();
+  assert_eq!(v.oracle, "commit_is_quorum_durable");
+  assert!(
+    v.detail.contains("only 1 of 4 voter durable logs"),
+    "{}",
+    v.detail
+  );
+}
+
+#[test]
+fn fork_baseline_floor_keeps_teeth_after_all_replicas_materialize() {
+  // All four replicas materialized (each durably at the baseline), one solo-commits index 2.
+  // The trip's "1 of 4" pins that the floor's denominator exclusion cannot shrink the child's
+  // effective voter set: every materialized replica covers the baseline index by construction
+  // (durable_last >= floor), so all four stay in the denominator and 1 < quorum(3) fires.
+  let mut ck = Checker::new();
+  ck.register_fork_baseline(1);
+  let mut nodes: Vec<NodeView> = std::vec![
+    fork_grown_node(3),
+    fork_birth_node(4),
+    fork_birth_node(5),
+    fork_birth_node(6),
+  ];
+  nodes[0].is_leader = true;
+  let v = ck.check(&fork_view(nodes)).unwrap_err();
+  assert_eq!(v.oracle, "commit_is_quorum_durable");
+  assert!(
+    v.detail.contains("only 1 of 4 voter durable logs"),
+    "{}",
+    v.detail
+  );
+}
+
 #[test]
 fn monotonic_commit_detects_regression() {
   let mut ck = Checker::new();
