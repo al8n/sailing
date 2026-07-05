@@ -2156,6 +2156,147 @@ fn parked_fork_resolves_redundant_when_the_twin_catches_up() {
   assert_eq!(meta.shape_gen(), 1);
 }
 
+/// Build the standard park shape shared by the conflict-signal tests: two-voter group 7 as a
+/// follower, a zero-progress squatter hosted under child id 200, and a committed split into
+/// 200 — parked, with the one conflict signal queued and deliberately NOT consumed.
+fn park_with_queued_conflict(
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+) -> MultiRaft<u64, u64, SplitSm> {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  m.create_group(
+    200,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+  )
+  .unwrap();
+  follower_load_and_split(&mut m, log, stable, 200);
+  assert!(m.poll_pending_fork().is_none(), "parked on the conflict");
+  m
+}
+
+#[test]
+fn peek_split_conflict_leaves_the_signal_queued() {
+  // The DELIVERED-BEFORE-CONSUMED half: a driver publishing on a bounded lifecycle tail peeks,
+  // publishes, and consumes only on acceptance — so a refused send must find the one-shot cue
+  // still queued on the next drain, and a successful one must consume it exactly once.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let mut m = park_with_queued_conflict(&mut log, &mut stable);
+
+  assert_eq!(m.peek_split_conflict(), Some((7, 200)));
+  assert_eq!(
+    m.peek_split_conflict(),
+    Some((7, 200)),
+    "peek repeats until a successful publish consumes — a full tail loses nothing"
+  );
+  assert_eq!(m.poll_split_conflict(), Some((7, 200)));
+  assert_eq!(
+    m.peek_split_conflict(),
+    None,
+    "consumption empties the queue"
+  );
+  assert_eq!(m.poll_split_conflict(), None, "one signal per park episode");
+  assert!(m.poll_pending_fork().is_none(), "still parked");
+  assert_eq!(
+    m.peek_split_conflict(),
+    None,
+    "re-examination does not re-arm a consumed episode"
+  );
+}
+
+#[test]
+fn squatter_removal_purges_an_undelivered_conflict() {
+  // Arm (a) with the signal still QUEUED (a full driver tail had deferred it): the squatter's
+  // removal materializes the fork and the episode is over, so the queued signal dies with it —
+  // delivered later it would be stale, capable of goading the embedder into removing the very
+  // child the resolution just materialized.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let mut m = park_with_queued_conflict(&mut log, &mut stable);
+  assert_eq!(
+    m.peek_split_conflict(),
+    Some((7, 200)),
+    "queued, undelivered"
+  );
+
+  m.remove_group(&200);
+  let fork = m
+    .poll_pending_fork()
+    .expect("removal unparks the fork for materialization");
+  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert_eq!(
+    m.peek_split_conflict(),
+    None,
+    "the resolved episode purged its undelivered signal"
+  );
+  assert_eq!(m.poll_split_conflict(), None);
+}
+
+#[test]
+fn twin_catch_up_purges_an_undelivered_conflict() {
+  // Arm (b) with the signal still queued: the hosted twin catches up, the parked fork resolves
+  // as redundant, and the stale cue must not surface after the episode silently healed.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+  let mut m = park_with_queued_conflict(&mut log, &mut stable);
+  assert_eq!(
+    m.peek_split_conflict(),
+    Some((7, 200)),
+    "queued, undelivered"
+  );
+
+  let d = lead_single_split(&mut m, 200, &mut log200, &mut stable200);
+  commit_one_split(&mut m, 200, d, &mut log200, &mut stable200);
+  assert!(m.group(&200).unwrap().applied_index() >= FORK_BASE_INDEX);
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "a caught-up twin resolves the park without yielding"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the redundant fork is consumed"
+  );
+  assert_eq!(
+    m.peek_split_conflict(),
+    None,
+    "the silently-healed episode purged its undelivered signal"
+  );
+  assert_eq!(m.poll_split_conflict(), None);
+}
+
+#[test]
+fn removing_the_parked_parent_purges_its_undelivered_conflict() {
+  // The parent's removal is the embedder's explicit destruction of this replica: the staged
+  // forks die with the endpoint, so the park bookkeeping — a still-queued conflict signal a
+  // full driver tail had deferred included — dies too, never surfacing for a group that no
+  // longer exists here.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let mut m = park_with_queued_conflict(&mut log, &mut stable);
+  assert_eq!(
+    m.peek_split_conflict(),
+    Some((7, 200)),
+    "queued, undelivered"
+  );
+
+  assert!(m.remove_group(&7).is_some());
+  assert_eq!(
+    m.peek_split_conflict(),
+    None,
+    "the park bookkeeping died with the endpoint"
+  );
+  assert_eq!(m.poll_split_conflict(), None);
+}
+
 #[test]
 fn pre_hosted_twin_resolves_redundant_without_parking() {
   // Arm (b) at FIRST examination: the twin was already hosted at-or-past the baseline under

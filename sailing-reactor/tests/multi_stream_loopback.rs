@@ -95,8 +95,26 @@ where
   F::Response: Clone + Send,
   F::Error: core::error::Error,
 {
+  bind_node_with::<F>(id, addr, peers, DriverConfig::default()).await
+}
+
+/// Bind one EMPTY multi-group host with a caller-tuned driver config (the lifecycle
+/// backpressure test shrinks the tail to a single slot).
+async fn bind_node_with<F>(
+  id: u64,
+  addr: SocketAddr,
+  peers: Vec<Node<u64, SocketAddr>>,
+  cfg: DriverConfig,
+) -> (MDriver<F>, MultiHandle<u64, u64, F>)
+where
+  F: sailing_proto::StateMachine + Send,
+  F::Command: Data + Send,
+  F::Snapshot: Data,
+  F::Response: Clone + Send,
+  F::Error: core::error::Error,
+{
   let (dialer, acceptor) = plain_factories(id);
-  MDriver::<F>::bind(addr, peers, dialer, acceptor, DriverConfig::default())
+  MDriver::<F>::bind(addr, peers, dialer, acceptor, cfg)
     .await
     .expect("the empty multi host binds")
 }
@@ -3689,6 +3707,203 @@ async fn factory_gate_declines_a_reserved_child_until_the_fork_lands() {
       assert!(
         !matches!(ev, LifecycleEvent::SplitConflict { child: 320, .. }),
         "node {}: the reserved id must never grow a squatter: {ev:?}",
+        i + 1
+      );
+    }
+  }
+}
+
+/// Steer a split proposal to node 1 (whose gates cannot see node 2's groups), riding out
+/// leadership on the other node and a still-unresolved earlier split; returns the split
+/// entry's log index.
+async fn steer_split_to_node1(
+  g100: &[GroupHandle<u64, u64, CountSm>],
+  child: u64,
+  give: &'static [u8],
+) -> Index {
+  let deadline = std::time::Instant::now() + Duration::from_secs(20);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "split into {child} never proposed on node 1"
+    );
+    match g100[0]
+      .propose_split(child, 0, Bytes::from_static(give))
+      .await
+    {
+      Ok(idx) => return idx,
+      Err(DriverError::NotLeader { .. }) => {
+        let _ = g100[1].transfer_leader(1).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(DriverError::Rejected { .. }) => {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+      }
+      Err(e) => panic!("unexpected split error: {e:?}"),
+    }
+  }
+}
+
+/// THE BACKPRESSURE PIN: a park's conflict signal survives a momentarily-full lifecycle tail.
+/// Node 2 runs a CAPACITY-1 lifecycle tail, pre-filled by split #1's own `SplitApplied` and
+/// deliberately not drained. Split #2 then parks on node 2's squatter while the tail is still
+/// full — pre-fix the drain popped the coordinator's one-shot signal and `try_send` dropped it,
+/// erasing the embedder's only cue for the episode (parent fence standing, child id reserved,
+/// fork parked — invisibly and indefinitely); this await timed out with no conflict ever
+/// delivered. Post-fix the signal stays queued at the coordinator until the tail has room:
+/// draining the stale event must surface the conflict, exactly once for the episode, and the
+/// park then heals through the twin exactly as with an unbounded tail. The parent (and so both
+/// fork children) runs the SLOW tuning so the twin heal — which would purge an undelivered
+/// signal — stays seconds behind the heartbeat-paced delivery.
+#[tokio::test(flavor = "multi_thread")]
+async fn parked_conflict_survives_a_full_lifecycle_tail() {
+  const SLOW_ELECTION: Duration = Duration::from_millis(2500);
+  const SLOW_HEARTBEAT: Duration = Duration::from_millis(500);
+  let slow =
+    |id: u64, voters: Vec<u64>| Config::try_new(id, voters, SLOW_ELECTION, SLOW_HEARTBEAT).unwrap();
+
+  let addrs = addrs(45_380, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    // Node 2 (the parking host): ONE lifecycle slot, so a single undrained event is a full
+    // tail at the park instant.
+    let cfg = if id == 2 {
+      DriverConfig {
+        events_cap: 1,
+        ..DriverConfig::default()
+      }
+    } else {
+      DriverConfig::default()
+    };
+    let (driver, handle) =
+      bind_node_with::<CountSm>(id, addrs[(id - 1) as usize], peers, cfg).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    h.create_group(100, slow(id, vec![1, 2]), id, CountSm::default(), 0)
+      .await
+      .expect("parent admission");
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  for i in 0..7u64 {
+    assert_eq!(submit_anywhere(&g100, b"load").await, i + 1);
+  }
+
+  // Split #1 (clean, both nodes materialize): node 2's `SplitApplied` fills its one-slot tail.
+  let _ = steer_split_to_node1(&g100, 310, b"\x02").await;
+  await_lifecycle(handles[0].lifecycle(), "node 1 (split #1)", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitApplied {
+        parent: 100,
+        child: 310
+      }
+    )
+  })
+  .await;
+  // Node 2's materialization is observed through STATUS, never its tail: the event that fired
+  // with it must stay queued so the tail is provably full from here on.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  while handles[1].group(310).status().await.is_err() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "node 2 never materialized split #1"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+
+  // The squatter under split #2's child id, then the split: node 2 parks with a FULL tail.
+  handles[1]
+    .create_group(320, slow(2, vec![1, 2]), 9, CountSm::default(), 0)
+    .await
+    .expect("the squatter admits: no split names this id yet");
+  let split2 = steer_split_to_node1(&g100, 320, b"\x03").await;
+  await_lifecycle(handles[0].lifecycle(), "node 1 (split #2)", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitApplied {
+        parent: 100,
+        child: 320
+      }
+    )
+  })
+  .await;
+
+  // The tail must still be FULL at the park instant, so the park is confirmed WITHOUT touching
+  // it: node 2's parent replica reports the split applied (the fork is staged), and each of the
+  // follow-up status commands drives a full loop pass — a storage crank whose fork drain
+  // examines the staged fork, parks it, and publishes the conflict against the full tail.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    let status = handles[1]
+      .group(100)
+      .status()
+      .await
+      .expect("node 2 hosts the parent");
+    if status.applied_index >= split2 {
+      break;
+    }
+    assert!(
+      std::time::Instant::now() < deadline,
+      "node 2 never applied split #2"
+    );
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+  for _ in 0..3 {
+    let _ = handles[1].group(100).status().await;
+  }
+
+  // Free the slot and the deferred conflict must land — the lost-signal regression.
+  await_lifecycle(handles[1].lifecycle(), "node 2 (deferred conflict)", |ev| {
+    matches!(
+      ev,
+      LifecycleEvent::SplitConflict {
+        parent: 100,
+        child: 320
+      }
+    )
+  })
+  .await;
+
+  // Exactly one signal per episode: consuming the delivered cue re-arms nothing, whether the
+  // park still stands or has just healed silently through the twin.
+  tokio::time::sleep(SLOW_HEARTBEAT * 2).await;
+  while let Ok(ev) = handles[1].lifecycle().try_recv() {
+    assert!(
+      !matches!(ev, LifecycleEvent::SplitConflict { .. }),
+      "duplicate conflict within the episode: {ev:?}"
+    );
+  }
+
+  // The park heals through the twin as usual; both halves and the parent serve, and no fork
+  // was ever abandoned or re-conflicted on either node.
+  let g320: Vec<_> = handles.iter().map(|h| h.group(320)).collect();
+  assert_eq!(
+    submit_anywhere(&g320, b"tail").await,
+    4,
+    "3 forked + 1 tail"
+  );
+  let g310: Vec<_> = handles.iter().map(|h| h.group(310)).collect();
+  assert_eq!(
+    submit_anywhere(&g310, b"tail").await,
+    3,
+    "2 forked + 1 tail"
+  );
+  assert_eq!(submit_anywhere(&g100, b"after").await, 3, "7 - 2 - 3 + 1");
+  for (i, h) in handles.iter().enumerate() {
+    while let Ok(ev) = h.lifecycle().try_recv() {
+      assert!(
+        !matches!(
+          ev,
+          LifecycleEvent::SplitRefused { .. } | LifecycleEvent::SplitConflict { .. }
+        ),
+        "node {}: the episode delivered its one cue and healed: {ev:?}",
         i + 1
       );
     }
