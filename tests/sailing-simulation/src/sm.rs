@@ -48,6 +48,27 @@ impl StateMachine for LogSm {
     Ok(len)
   }
 
+  /// THE SIM'S PARTITION CONTRACT: the instruction is a split point — EXACTLY 2 bytes, a `u16`
+  /// LE key `p` over the gkv key space. Every applied cell whose command decodes as a gkv
+  /// payload with `key >= p` MOVES to the returned child (order and indices preserved); gkv
+  /// cells below `p` and every non-gkv command STAY with the parent (an un-keyed command has no
+  /// side to move to, and the conservation oracle judges keyed histories only). Any other
+  /// instruction length is malformed ⇒ `None`, state untouched — the trait's unsupported arm,
+  /// which a committed `Split` entry then converts into a deterministic
+  /// `PoisonReason::SplitUnsupported` fail-stop on every replica.
+  ///
+  /// A pure function of `(state, instruction)`: both sides are order-preserving subsequences of
+  /// the applied record, so every replica applying the same committed entry partitions
+  /// identically — the `apply`-grade determinism the seam's contract demands.
+  fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+    let point = u16::from_le_bytes(instruction.try_into().ok()?);
+    let (child, parent) = core::mem::take(&mut self.applied)
+      .into_iter()
+      .partition(|(_, cmd)| crate::multi::decode_gkv(cmd).is_some_and(|(_, key, _)| key >= point));
+    self.applied = parent;
+    Some(Self { applied: child })
+  }
+
   fn snapshot(&self) -> Result<Bytes, Self::Error> {
     let mut buf: Vec<u8> = Vec::new();
     // entry count
@@ -83,85 +104,4 @@ impl StateMachine for LogSm {
 }
 
 #[cfg(test)]
-mod tests {
-  use super::*;
-  use sailing_proto::StateMachine;
-
-  #[test]
-  fn log_sm_records_applies_in_order() {
-    let mut sm = LogSm::new();
-    let r1 = sm
-      .apply(Index::new(1), bytes::Bytes::from_static(b"a"))
-      .unwrap();
-    let r2 = sm
-      .apply(Index::new(2), bytes::Bytes::from_static(b"bb"))
-      .unwrap();
-    assert_eq!(r1, 1); // response = applied byte length
-    assert_eq!(r2, 2);
-    assert_eq!(
-      sm.applied(),
-      &[
-        (Index::new(1), bytes::Bytes::from_static(b"a")),
-        (Index::new(2), bytes::Bytes::from_static(b"bb"))
-      ]
-    );
-  }
-
-  #[test]
-  fn log_sm_snapshot_restore_roundtrip() {
-    let mut sm = LogSm::new();
-    sm.apply(Index::new(1), bytes::Bytes::from_static(b"alpha"))
-      .unwrap();
-    sm.apply(Index::new(2), bytes::Bytes::from_static(b"beta"))
-      .unwrap();
-    sm.apply(Index::new(3), bytes::Bytes::from_static(b"gamma"))
-      .unwrap();
-
-    let snap = sm.snapshot().unwrap();
-    let mut sm2 = LogSm::new();
-    sm2.restore(snap).unwrap();
-    assert_eq!(
-      sm.applied(),
-      sm2.applied(),
-      "restore must reproduce exact state"
-    );
-  }
-
-  #[test]
-  fn log_sm_empty_snapshot_roundtrip() {
-    let sm = LogSm::new();
-    let snap = sm.snapshot().unwrap();
-    let mut sm2 = LogSm::new();
-    sm2.restore(snap).unwrap();
-    assert!(sm2.applied().is_empty());
-  }
-
-  #[test]
-  fn restore_malformed_returns_err_never_panics() {
-    // empty buffer — can't read the count
-    let mut sm = LogSm::new();
-    assert!(sm.restore(bytes::Bytes::new()).is_err());
-
-    // declared count=1 but no body follows
-    let mut buf: Vec<u8> = Vec::new();
-    (1u64).encode(&mut buf); // count = 1
-    assert!(sm.restore(bytes::Bytes::from(buf)).is_err());
-
-    // declared count=1 with index+len present but payload absent (len says 100, buf empty after)
-    let mut buf2: Vec<u8> = Vec::new();
-    (1u64).encode(&mut buf2); // count = 1
-    (42u64).encode(&mut buf2); // index = 42
-    (100u64).encode(&mut buf2); // payload len = 100, but no payload bytes follow
-    assert!(sm.restore(bytes::Bytes::from(buf2)).is_err());
-
-    // absurd length prefix (u64::MAX) — must not overflow/panic
-    let mut buf3: Vec<u8> = Vec::new();
-    (1u64).encode(&mut buf3); // count = 1
-    (1u64).encode(&mut buf3); // index = 1
-    (u64::MAX).encode(&mut buf3); // payload len = u64::MAX
-    assert!(sm.restore(bytes::Bytes::from(buf3)).is_err());
-
-    // state must be untouched after failed restores
-    assert!(sm.applied().is_empty());
-  }
-}
+mod tests;

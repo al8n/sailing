@@ -27,6 +27,10 @@ mod world;
 pub use world::MultiWorld;
 
 mod oracles;
+// The gkv keyed-payload codec is the SIM-WIDE keyed workload contract: the shared `LogSm`
+// partitions by it (`StateMachine::split`), so the codec is crate-visible rather than
+// multi-private.
+pub(crate) use oracles::{decode_gkv, encode_gkv};
 
 mod vopr;
 pub use vopr::{MultiAction, MultiProfile, MultiVoprReport, run_multi_vopr};
