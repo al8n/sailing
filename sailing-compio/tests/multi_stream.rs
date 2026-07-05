@@ -271,3 +271,134 @@ async fn refused_fork_surfaces_on_the_lifecycle_tail() {
 
   handle.shutdown().await.expect("the multi host tears down");
 }
+
+/// The compio single-plane merge, end to end: two loaded groups on one 2-node mesh — freeze,
+/// parked commit, per-crank resolution — then the target serves the union, the source id
+/// answers no-such-group everywhere, and re-admission at any generation refuses on the terminal
+/// floor. The clock-free choreography needs nothing from the harness but patience: every
+/// resolution input is log-determined, so both nodes converge on their own cranks.
+#[compio::test]
+async fn merge_absorbs_and_source_never_returns() {
+  let addrs: Vec<SocketAddr> = (0..2)
+    .map(|i| format!("127.0.0.1:{}", 45_620 + i).parse().unwrap())
+    .collect();
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (dialer, acceptor) = plain_factories(id);
+    let (driver, handle) = CompioMultiStreamDriver::bind(
+      addrs[(id - 1) as usize],
+      peers,
+      dialer,
+      acceptor,
+      DriverConfig::default(),
+    )
+    .await
+    .expect("the empty multi host binds");
+    compio::runtime::spawn(driver.run()).detach();
+    handles.push(handle);
+  }
+  for gid in [100u64, 200] {
+    for (i, h) in handles.iter().enumerate() {
+      let id = i as u64 + 1;
+      h.create_group(
+        gid,
+        config(id, vec![1, 2]),
+        id * 10 + gid,
+        CountSm::default(),
+        0,
+      )
+      .await
+      .expect("group admission");
+    }
+  }
+  let g100: Vec<_> = handles.iter().map(|h| h.group(100)).collect();
+  let g200: Vec<_> = handles.iter().map(|h| h.group(200)).collect();
+  assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
+  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
+  assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
+
+  // Freeze 100 into 200 (retry across nodes for the source leader).
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  'freeze: loop {
+    assert!(std::time::Instant::now() < deadline, "no freeze accepted");
+    for h in &handles {
+      if h.prepare_merge(100, 200).await.is_ok() {
+        break 'freeze;
+      }
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+  // Commit the absorb (retries ride out both leader routing and the local source still
+  // catching up to frozen-applied on the target leader's node).
+  'commit: loop {
+    assert!(std::time::Instant::now() < deadline, "no commit accepted");
+    for h in &handles {
+      if h.commit_merge(200, 100).await.is_ok() {
+        break 'commit;
+      }
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // The union serves from the target once each node's crank resolves its park.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the union never served"
+    );
+    let mut counts = Vec::new();
+    for g in &g200 {
+      if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
+        counts.push(c);
+      }
+    }
+    if counts.contains(&5) {
+      break;
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+
+  // The source id dies everywhere: status answers no-such-group on both nodes, and
+  // re-admission refuses at ANY generation — the floor is terminal.
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the source never tore down everywhere"
+    );
+    let mut gone = 0;
+    for g in &g100 {
+      if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
+        gone += 1;
+      }
+    }
+    if gone == handles.len() {
+      break;
+    }
+    compio::time::sleep(Duration::from_millis(40)).await;
+  }
+  for (i, h) in handles.iter().enumerate() {
+    let id = i as u64 + 1;
+    match h
+      .create_group(100, config(id, vec![1, 2]), 9, CountSm::default(), 9)
+      .await
+    {
+      Err(DriverError::Rejected { reason }) => {
+        assert!(
+          reason.contains("floor"),
+          "node {id}: the refusal must be the terminal floor, got: {reason}"
+        );
+      }
+      other => panic!("node {id}: a merged-away id must never re-admit, got {other:?}"),
+    }
+  }
+
+  for h in &handles {
+    h.shutdown().await.expect("the multi host tears down");
+  }
+}

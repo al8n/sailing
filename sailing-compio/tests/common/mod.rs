@@ -53,6 +53,13 @@ impl StateMachine for CountSm {
     self.count -= give;
     Some(Self { count: give })
   }
+
+  /// Absorb support for the merge suites: fold the source's units back in — the union's total
+  /// is exactly the two counters' sum, which is what the merge assertions pin.
+  fn absorb(&mut self, source: Self) -> bool {
+    self.count += source.count;
+    true
+  }
 }
 
 /// A counting state machine whose apply FAILS on the magic `b"BOOM"` payload. An FSM apply error

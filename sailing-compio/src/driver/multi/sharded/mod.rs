@@ -694,6 +694,49 @@ where
       .await
   }
 
+  /// Propose a merge FREEZE of `source` into `target` on THEIR SHARED PLANE. v1 constraint,
+  /// refused HERE — typed, before any command crosses a channel: `shard(source) ==
+  /// shard(target)`, because the absorb is an in-container hand-off inside one plane's driver
+  /// (the plane cannot even see the other group). Same-plane merges are the per-plane
+  /// [`MultiHandle::prepare_merge`] contract verbatim.
+  pub async fn prepare_merge(
+    &self,
+    source: G,
+    target: G,
+  ) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&source);
+    if self.map.shard(&target) != plane {
+      return Err(DriverError::Rejected {
+        reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
+      });
+    }
+    self.shards[plane].prepare_merge(source, target).await
+  }
+
+  /// Propose the merge ABSORB on `target`'s plane, with the same cross-plane refusal as
+  /// [`prepare_merge`](Self::prepare_merge) — checked before any propose, on every verb, so no
+  /// half of the choreography can ever land on a plane the other half cannot reach.
+  pub async fn commit_merge(
+    &self,
+    target: G,
+    source: G,
+  ) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&target);
+    if self.map.shard(&source) != plane {
+      return Err(DriverError::Rejected {
+        reason: sailing_proto::MergeError::<I>::CrossPlane.to_string(),
+      });
+    }
+    self.shards[plane].commit_merge(target, source).await
+  }
+
+  /// Propose the merge ABORT on `source`'s mapped plane (no pairing to check — the rollback
+  /// names one group).
+  pub async fn rollback_merge(&self, source: G) -> Result<sailing_proto::Index, DriverError<I>> {
+    let plane = self.map.shard(&source);
+    self.shards[plane].rollback_merge(source).await
+  }
+
   /// Remove a group from its mapped plane, awaiting whether it was hosted (the removal
   /// tombstones the id ON THAT PLANE, exactly the per-plane multi semantics).
   pub async fn remove_group(&self, gid: G) -> Result<bool, DriverError<I>> {
