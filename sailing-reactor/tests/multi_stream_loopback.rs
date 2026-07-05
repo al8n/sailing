@@ -2922,7 +2922,7 @@ async fn split_forks_both_halves_live() {
   );
 }
 
-/// Row 2b's integration pin: a split-born child's manufactured baseline (`first_index == 2`)
+/// The fresh-joiner pin: a split-born child's manufactured baseline (`first_index == 2`)
 /// structurally forces a zero-progress joiner onto the SNAPSHOT path — the persisted blob plus
 /// the child's live tail land on the joiner's replica, never an empty log walk. The parent
 /// lives on nodes 1+2 only; node 3's factory materializes the EMPTY child replica when the
@@ -3015,7 +3015,8 @@ async fn fresh_joiner_takes_the_snapshot_path() {
   }
 }
 
-/// Row 2: a replica DOWN through the split converges by the ordinary lifecycle paths, never by
+/// The late splitter: a replica DOWN through the split converges by the ordinary lifecycle
+/// paths, never by
 /// re-forking. Node 3 dies before the split; the surviving parent quorum splits, materializes
 /// the child, and compacts past the split entry. The reborn node 3 (fresh stores) receives the
 /// parent's POST-split snapshot — its lifecycle tail must never see a `SplitApplied` — and the
