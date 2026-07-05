@@ -102,12 +102,24 @@ message CommitMergePayload {
   uint64 target_gen_after = 4;
 }
 
-// The payload of an ENTRY_KIND_ROLLBACK_MERGE entry (rides Entry.data), proposed on the SOURCE
-// group's log: unfreeze — the merge's explicit abort. `source_gen_after` moves the source's
-// lineage past the freeze generation, which is what makes every parked CommitMerge for the OLD
-// freeze abort deterministically (the race is settled by the source's log order alone).
+// The payload of an ENTRY_KIND_ROLLBACK_MERGE entry (rides Entry.data) — the merge's explicit
+// abort, in one of two log roles told apart by `source`:
+//
+//   - `source` PRESENT: the TARGET-side abort, proposed on the TARGET group's log so it is
+//     totally ordered against CommitMerge on ONE log (a source-side abort has no cross-log
+//     order against the target's commit, so observation timing would decide the race per
+//     host). `source_gen_after` names the freeze generation being abandoned;
+//     `target_gen_after` is the target's own lineage mint (the optimistic guard a split
+//     carries): the abort applies only at exactly its minted generation, so aborts and
+//     commits racing from one base resolve to one log-ordered winner on every replica.
+//   - `source` ABSENT: the SOURCE-side unfreeze, proposed on the source's own log as the
+//     container-relayed consequence of the target-side abort applying (log-borne so a restart
+//     re-derives the thaw). `source_gen_after` moves the source's lineage past the freeze
+//     generation; `target_gen_after` is 0 (absent). Byte-identical to the pre-abort encoding.
 message RollbackMergePayload {
   uint64 source_gen_after = 1;
+  bytes source = 2;
+  uint64 target_gen_after = 3;
 }
 
 // Cluster membership. Each repeated field is a SET: elements are the embedder's

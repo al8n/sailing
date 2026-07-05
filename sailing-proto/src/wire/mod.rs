@@ -540,16 +540,22 @@ pub(crate) fn decode_commit_merge_payload(
   ))
 }
 
-/// Encode a merge-rollback payload as an entry payload.
+/// Encode a merge-rollback payload as an entry payload. The source-side unfreeze role leaves
+/// `source` empty and `target_gen_after` 0 — both proto-absent, so that role's bytes are
+/// unchanged from before the target-side abort existed.
 pub(crate) fn encode_rollback_merge_payload(p: &RollbackMergePayload, buf: &mut Vec<u8>) {
   pb::RollbackMergePayload {
     source_gen_after: p.source_gen_after(),
+    source: p.source_bytes(),
+    target_gen_after: p.target_gen_after(),
     ..Default::default()
   }
   .encode(buf);
 }
 
-/// Decode a merge-rollback payload from an entry payload.
+/// Decode a merge-rollback payload from an entry payload. Unlike the other merge payloads the
+/// source id may be ABSENT (the source-side unfreeze role names no group); a PRESENT one obeys
+/// the same group-tag bound.
 pub(crate) fn decode_rollback_merge_payload(
   mut data: Bytes,
 ) -> Result<RollbackMergePayload, DecodeError> {
@@ -557,7 +563,14 @@ pub(crate) fn decode_rollback_merge_payload(
     .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
     .decode::<pb::RollbackMergePayload>(&mut data)
     .map_err(map_err)?;
-  Ok(RollbackMergePayload::new(w.source_gen_after))
+  if w.source.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("RollbackMergePayload.source length"));
+  }
+  Ok(if w.source.is_empty() {
+    RollbackMergePayload::unfreeze(w.source_gen_after)
+  } else {
+    RollbackMergePayload::abort(w.source, w.source_gen_after, w.target_gen_after)
+  })
 }
 
 /// Map buffa's structural decode errors onto the crate's error surface. The envelope

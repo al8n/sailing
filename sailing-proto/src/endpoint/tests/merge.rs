@@ -601,7 +601,7 @@ fn pending_freeze_appends_no_proactive_refresh() {
 
 /// Encode a `RollbackMerge` payload.
 fn rollback_payload(source_gen_after: u64) -> bytes::Bytes {
-  let p = crate::RollbackMergePayload::new(source_gen_after);
+  let p = crate::RollbackMergePayload::unfreeze(source_gen_after);
   let mut buf = Vec::new();
   crate::wire::encode_rollback_merge_payload(&p, &mut buf);
   bytes::Bytes::from(buf)

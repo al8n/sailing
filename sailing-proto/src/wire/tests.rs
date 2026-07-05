@@ -1302,9 +1302,20 @@ const GOLDEN_COMMIT_MERGE_PAYLOAD: &[u8] = &[
   0x20, 0x05, // target_gen_after = 5
 ];
 
-/// The pinned wire bytes of one `RollbackMergePayload`: `source_gen_after` (1, varint) alone.
+/// The pinned wire bytes of one SOURCE-role `RollbackMergePayload` (the relayed unfreeze):
+/// `source_gen_after` (1, varint) alone — `source` and `target_gen_after` are proto-absent, so
+/// this role's bytes are IDENTICAL to before the target-side abort role existed.
 const GOLDEN_ROLLBACK_MERGE_PAYLOAD: &[u8] = &[
   0x08, 0x04, // source_gen_after = 4
+];
+
+/// The pinned wire bytes of one TARGET-role `RollbackMergePayload` (the abort): proto3 fields in
+/// ascending order — `source_gen_after` (1, varint), `source` (2, bytes), `target_gen_after`
+/// (3, varint).
+const GOLDEN_ROLLBACK_MERGE_ABORT_PAYLOAD: &[u8] = &[
+  0x08, 0x03, // source_gen_after = 3
+  0x12, 0x01, 0x2A, // source = [0x2a]
+  0x18, 0x05, // target_gen_after = 5
 ];
 
 #[test]
@@ -1346,7 +1357,9 @@ fn commit_merge_payload_round_trips_and_pins_bytes() {
 
 #[test]
 fn rollback_merge_payload_round_trips_and_pins_bytes() {
-  let p = RollbackMergePayload::new(4);
+  // The SOURCE role (the relayed unfreeze): bytes unchanged from before the abort role existed.
+  let p = RollbackMergePayload::unfreeze(4);
+  assert!(p.is_unfreeze());
   let mut buf = Vec::new();
   encode_rollback_merge_payload(&p, &mut buf);
   assert_eq!(buf, GOLDEN_ROLLBACK_MERGE_PAYLOAD, "wire bytes are pinned");
@@ -1360,6 +1373,36 @@ fn rollback_merge_payload_round_trips_and_pins_bytes() {
   assert!(
     decode_rollback_merge_payload(Bytes::from_static(&GOLDEN_ROLLBACK_MERGE_PAYLOAD[..1])).is_err(),
     "a truncated payload rejects"
+  );
+
+  // The TARGET role (the abort): names its source and carries the target's lineage mint.
+  let p = RollbackMergePayload::abort(Bytes::from_static(b"\x2a"), 3, 5);
+  assert!(!p.is_unfreeze());
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(&p, &mut buf);
+  assert_eq!(
+    buf, GOLDEN_ROLLBACK_MERGE_ABORT_PAYLOAD,
+    "wire bytes are pinned"
+  );
+  let d = decode_rollback_merge_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  // Truncating inside the source field's bytes rejects rather than yielding a partial id.
+  assert!(
+    decode_rollback_merge_payload(Bytes::from_static(
+      &GOLDEN_ROLLBACK_MERGE_ABORT_PAYLOAD[..4]
+    ))
+    .is_err(),
+    "a truncated payload rejects"
+  );
+  // An over-bound source encoding rejects like every group tag; EMPTY is the source role, so
+  // only the upper bound applies here.
+  let oversized =
+    RollbackMergePayload::abort(Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]), 1, 1);
+  let mut buf = Vec::new();
+  encode_rollback_merge_payload(&oversized, &mut buf);
+  assert!(
+    decode_rollback_merge_payload(Bytes::from(buf)).is_err(),
+    "an over-bound source encoding rejects"
   );
 }
 
@@ -1432,7 +1475,14 @@ fn merge_entries_fit_the_append_frame_budget() {
     Bytes::from(buf),
   );
   let mut buf = Vec::new();
-  encode_rollback_merge_payload(&RollbackMergePayload::new(u64::MAX), &mut buf);
+  encode_rollback_merge_payload(
+    &RollbackMergePayload::abort(
+      Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN]),
+      u64::MAX,
+      u64::MAX,
+    ),
+    &mut buf,
+  );
   let rollback = Entry::new(
     Term::new(1),
     Index::new(1),

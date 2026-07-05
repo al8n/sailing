@@ -1695,7 +1695,7 @@ where
     // freeze never strands an over-minted rollback.
     let bump = if ep.is_frozen() { 1 } else { 2 };
     let source_gen_after = ep.shape_gen() + bump;
-    let payload = RollbackMergePayload::new(source_gen_after);
+    let payload = RollbackMergePayload::unfreeze(source_gen_after);
     let mut buf = Vec::new();
     crate::wire::encode_rollback_merge_payload(&payload, &mut buf);
     let ep = self.groups.get_mut(source).expect("checked hosted above");

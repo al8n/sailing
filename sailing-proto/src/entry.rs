@@ -30,14 +30,16 @@ pub enum EntryKind {
   /// [`PrepareMergePayload`], G-free like [`Split`](Self::Split).
   PrepareMerge,
   /// A committed merge ABSORB on the TARGET group's log: fold the frozen source group's state
-  /// machine into this one at exactly the payload's `freeze_index`. The apply PARKS until the
-  /// container resolves it from local facts (the source caught-up-frozen, or the gen recheck
-  /// aborting) — the endpoint alone cannot apply it, because the absorbed half lives in another
-  /// group. The payload is a [`CommitMergePayload`]; the absorbed state never rides the entry.
+  /// machine into this one at exactly the payload's `freeze_index`. Applies only at its minted
+  /// target generation (a stale mint — an abort or competing reshape won the base — no-ops
+  /// deterministically); a live mint PARKS until the container resolves it from local facts —
+  /// the endpoint alone cannot apply it, because the absorbed half lives in another group. The
+  /// payload is a [`CommitMergePayload`]; the absorbed state never rides the entry.
   CommitMerge,
-  /// A committed merge ABORT on the SOURCE group's log: unfreeze. The payload is a
-  /// [`RollbackMergePayload`], whose lineage bump is what deterministically aborts any parked
-  /// [`CommitMerge`](Self::CommitMerge) still naming the old freeze.
+  /// A committed merge ABORT, in one of two roles told apart by the payload (a
+  /// [`RollbackMergePayload`]): on the TARGET's log — source named — it abandons the merge,
+  /// totally ordered against [`CommitMerge`](Self::CommitMerge) on that one log; on the
+  /// SOURCE's log — source empty — it is the container-relayed unfreeze that follows.
   RollbackMerge,
 }
 
@@ -215,25 +217,76 @@ impl CommitMergePayload {
   }
 }
 
-/// The payload of an [`EntryKind::RollbackMerge`] entry: unfreeze the source, moving its lineage
-/// to `source_gen_after` — past the freeze generation, so any parked `CommitMerge` naming the
-/// old freeze aborts deterministically on every replica.
+/// The payload of an [`EntryKind::RollbackMerge`] entry — the merge's explicit abort, in one of
+/// two log roles told apart by `source_bytes`:
+///
+/// - **Non-empty — the TARGET-side abort**, proposed on the TARGET's log so it is totally
+///   ordered against [`CommitMerge`](EntryKind::CommitMerge) on ONE log (a source-side abort
+///   has no cross-log order against the target's commit, so observation timing would decide
+///   the race per host). `source_gen_after` names the freeze generation being abandoned;
+///   `target_gen_after` is the target's own lineage mint — the same optimistic guard a split
+///   carries: the abort applies only at exactly its minted generation, so aborts and commits
+///   racing from one base resolve to one log-ordered winner on every replica.
+/// - **Empty — the SOURCE-side unfreeze**, proposed on the source's own log as the
+///   container-relayed consequence of the target-side abort applying (log-borne so a restart
+///   re-derives the thaw). `source_gen_after` moves the source's lineage past the freeze
+///   generation; `target_gen_after` is 0. Byte-identical on the wire to the pre-abort shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RollbackMergePayload {
-  /// The source's lineage counter AFTER the rollback applies.
+  /// The absorbed-to-be (source) group id's canonical `Data` encoding for the target-side
+  /// abort role, or EMPTY for the source-side unfreeze role (the entry rides the source's own
+  /// log there — naming itself would be redundant and the empty form keeps the unfreeze
+  /// byte-identical to the pre-abort encoding).
+  source_bytes: Bytes,
+  /// The freeze generation this abort abandons (target role), or the source's lineage counter
+  /// AFTER the thaw applies (source role).
   source_gen_after: u64,
+  /// The target's lineage mint (target role only; 0 in the source role): the abort applies
+  /// only when the target's live counter is exactly `target_gen_after - 1`.
+  target_gen_after: u64,
 }
 
 impl RollbackMergePayload {
-  /// Construct.
-  pub const fn new(source_gen_after: u64) -> Self {
-    Self { source_gen_after }
+  /// Construct the SOURCE-side unfreeze role (empty source, no target mint).
+  pub const fn unfreeze(source_gen_after: u64) -> Self {
+    Self {
+      source_bytes: Bytes::new(),
+      source_gen_after,
+      target_gen_after: 0,
+    }
   }
 
-  /// The source's lineage counter after the rollback applies.
+  /// Construct the TARGET-side abort role.
+  pub const fn abort(source_bytes: Bytes, source_gen_after: u64, target_gen_after: u64) -> Self {
+    Self {
+      source_bytes,
+      source_gen_after,
+      target_gen_after,
+    }
+  }
+
+  /// Whether this is the SOURCE-side unfreeze role (empty source encoding).
+  #[inline(always)]
+  pub fn is_unfreeze(&self) -> bool {
+    self.source_bytes.is_empty()
+  }
+
+  /// The source group id's canonical `Data` encoding (target role), or empty (source role).
+  #[inline(always)]
+  pub fn source_bytes(&self) -> Bytes {
+    self.source_bytes.clone()
+  }
+
+  /// The freeze generation abandoned (target role) / the post-thaw lineage (source role).
   #[inline(always)]
   pub const fn source_gen_after(&self) -> u64 {
     self.source_gen_after
+  }
+
+  /// The target's lineage mint (target role only; 0 in the source role).
+  #[inline(always)]
+  pub const fn target_gen_after(&self) -> u64 {
+    self.target_gen_after
   }
 }
 
