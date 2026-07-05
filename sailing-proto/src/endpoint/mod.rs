@@ -1574,6 +1574,12 @@ where
       Event::Frozen => {
         tracing::info!(target: "sailing::consensus", "group frozen by a merge");
       }
+      Event::Merged(e) => {
+        tracing::info!(target: "sailing::consensus", index = e.index().get(), "merge absorbed");
+      }
+      Event::MergeAborted(e) => {
+        tracing::info!(target: "sailing::consensus", index = e.index().get(), "merge aborted");
+      }
       Event::MergeRolledBack => {
         tracing::info!(target: "sailing::consensus", "merge rolled back; group thawed");
       }
@@ -2434,6 +2440,13 @@ where
     if self.poison.poisoned {
       return;
     }
+    // A PARKED CommitMerge holds the whole drain at its entry: the absorb needs another group's
+    // state machine, which only the container holds — the per-crank merge service resolves it
+    // and the drain resumes on the next call. Nothing else about the node stops (elections,
+    // replication, read confirmation all continue); only apply waits.
+    if self.merge.pending_apply.is_some() {
+      return;
+    }
     // Bound BOTH the per-pass payload bytes AND the entry COUNT so a COLD/disk store returning
     // `Ready(Owned(..))` materializes a bounded amount per call instead of the whole unapplied backlog (a
     // panic-OOM for a node catching up). The byte cap alone is INSUFFICIENT: it charges PAYLOAD bytes, so a
@@ -2631,14 +2644,27 @@ where
           }
           EntryKind::CommitMerge => {
             // A committed CommitMerge whose payload won't decode is corrupt — mirror Split.
-            if crate::wire::decode_commit_merge_payload(entry.data_bytes()).is_err() {
-              self.poison(PoisonReason::MergeDecode);
-              break;
-            }
-            // The parked absorb lands with the merge state machinery; until then — fail-stop,
-            // never a silent skip.
-            self.poison(PoisonReason::MergeUnsupported);
-            break;
+            let payload = match crate::wire::decode_commit_merge_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            // PARK: the endpoint cannot apply this entry alone — the absorbed half lives in
+            // another group's endpoint, which only the container holds. Record the pending
+            // apply and STOP the drain at `idx - 1` (`applied` last advanced to the previous
+            // entry); the container's per-crank service resolves it from local facts and the
+            // drain resumes on the next call. Volatile by design: a restart re-encounters the
+            // entry and re-parks deterministically.
+            self.merge.pending_apply = Some(merge::PendingMergeApply::new_parked(
+              payload.source_bytes(),
+              payload.freeze_index(),
+              payload.source_gen_after(),
+              payload.target_gen_after(),
+              idx,
+            ));
+            return;
           }
           EntryKind::RollbackMerge => {
             // A committed RollbackMerge whose payload won't decode is corrupt — mirror Split.

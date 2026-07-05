@@ -143,6 +143,16 @@ where
     if self.pending_conf_index > self.applied {
       return Err(ProposeError::ConfChangeInFlight);
     }
+    // The TARGET side's membership fence: no conf change while a CommitMerge is in flight,
+    // parked, or absorbed-but-not-yet-compacted. A replica added in those windows can be
+    // LOG-WALKED across the absorb point — it parks there with no local source to absorb and
+    // no floor, no-ops past the union, and silently diverges from every replica that absorbed.
+    // The fence's three legs release on their own within a crank of the resolution. Checked
+    // AFTER the one-in-flight gate: a fresh leader's conservative re-seats arm both, and the
+    // established conf-in-flight verdict is the truthful one there.
+    if self.merge_conf_fence(log) {
+      return Err(ProposeError::MergeInFlight);
+    }
     // Every id entering the LOG must satisfy the wire bound (1..=1024-byte encoding):
     // the apply path decodes committed conf changes through the envelope, whose id
     // validation would otherwise reject the entry and POISON every node that applies

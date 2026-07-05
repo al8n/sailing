@@ -1077,3 +1077,326 @@ fn frozen_source_captures_no_snapshot() {
     "the fence lifted with the rollback"
   );
 }
+
+/// Encode a `CommitMerge` payload.
+fn commit_payload(
+  source: &'static [u8],
+  freeze_index: Index,
+  source_gen_after: u64,
+  target_gen_after: u64,
+) -> bytes::Bytes {
+  let p = crate::CommitMergePayload::new(
+    bytes::Bytes::from_static(source),
+    freeze_index,
+    source_gen_after,
+    target_gen_after,
+  );
+  let mut buf = Vec::new();
+  crate::wire::encode_commit_merge_payload(&p, &mut buf);
+  bytes::Bytes::from(buf)
+}
+
+/// A parked 3-voter target leader: no-op@1 + N normal entries + CommitMerge@k, all committed —
+/// the drain stops at k−1. Returns `(ep, log, stable, k)`.
+fn make_parked_target(n: usize) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, Index) {
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  for i in 0..n {
+    let cmd = bytes::Bytes::copy_from_slice(&[i as u8]);
+    let _ = ep
+      .propose(Instant::ORIGIN, &mut log, &stable, &cmd)
+      .unwrap();
+  }
+  let k = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, k);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable, k)
+}
+
+/// The park: a committed `CommitMerge` at k stops the drain at k−1 and stays parked across
+/// storage cranks — while replication, reads, and ordinary proposals keep running (the target
+/// is not frozen; entries land above k and apply after the resolution).
+#[test]
+fn commit_merge_apply_parks_at_k_minus_1() {
+  use crate::ProposeError;
+  let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+  assert_eq!(ep.applied_index(), Index::new(k.get() - 1), "parked at k-1");
+  let pending = ep.pending_merge().expect("the park is recorded");
+  assert_eq!(pending.at(), k);
+  assert_eq!(pending.freeze_index(), Index::new(5));
+  assert_eq!(pending.source_gen_after(), 1);
+  assert_eq!(pending.source_bytes().as_ref(), b"\x2a");
+  // The park holds across cranks (no busy-loop re-park, no progress).
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(ep.applied_index(), Index::new(k.get() - 1));
+  assert!(ep.pending_merge().is_some());
+  // The target is NOT frozen: reads confirm and proposals land (above k).
+  assert!(
+    ep.read_index(
+      Instant::ORIGIN,
+      &log,
+      &stable,
+      bytes::Bytes::from_static(b"r")
+    )
+    .is_ok(),
+    "reads confirm while parked"
+  );
+  let cmd = bytes::Bytes::from_static(b"w");
+  assert!(
+    ep.propose(Instant::ORIGIN, &mut log, &stable, &cmd).is_ok(),
+    "ordinary proposals keep landing above the park"
+  );
+  // But membership is FENCED while parked (the log-walk hazard).
+  assert!(matches!(
+    ep.propose_conf_change(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      crate::ConfChange::new(crate::ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
+    ),
+    Err(ProposeError::MergeInFlight)
+  ));
+}
+
+/// The membership fence's IN-FLIGHT leg: a proposed-but-uncommitted CommitMerge already fences
+/// conf changes on its proposer (nothing else marks the window before the park exists).
+#[test]
+fn in_flight_commit_merge_fences_membership() {
+  use crate::ProposeError;
+  let (mut ep, mut log, _stable) = make_three_voter_leader();
+  let stable = NoopStable::default();
+  let _ = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(5), 1, 1),
+    )
+    .unwrap();
+  assert!(ep.pending_merge().is_none(), "not yet committed, no park");
+  assert!(matches!(
+    ep.propose_conf_change(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      crate::ConfChange::new(crate::ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
+    ),
+    Err(ProposeError::MergeInFlight)
+  ));
+}
+
+/// The resolve: absorbing the extracted source FSM applies the parked entry — state folded,
+/// lineage bumped, `Event::Merged` surfaced — and the drain resumes on the next crank.
+#[test]
+fn resolve_pending_merge_absorbs_and_resumes() {
+  let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+  let before = ep.state_machine().count();
+  let mut source = CountSm::default();
+  for i in 0..3 {
+    let _ = crate::StateMachine::apply(&mut source, Index::new(i + 1), bytes::Bytes::new());
+  }
+  ep.resolve_pending_merge(source);
+  assert!(!ep.is_poisoned());
+  assert_eq!(ep.applied_index(), k, "the parked entry applied");
+  assert!(ep.pending_merge().is_none());
+  assert_eq!(
+    ep.state_machine().count(),
+    before + 3,
+    "the union folded in"
+  );
+  assert_eq!(ep.shape_gen(), 1, "lineage bumped to target_gen_after");
+  let mut merged = false;
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::Merged(m) = ev {
+      merged = true;
+      assert_eq!(m.index(), k);
+      assert_eq!(m.source().as_ref(), b"\x2a");
+    }
+  }
+  assert!(merged, "Event::Merged surfaced");
+  // The drain RESUMES: a later committed entry applies on the next crank.
+  let cmd = bytes::Bytes::from_static(b"after");
+  let idx = ep
+    .propose(Instant::ORIGIN, &mut log, &stable, &cmd)
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, idx);
+  assert_eq!(ep.applied_index(), idx, "post-merge entries apply normally");
+}
+
+/// The abort resolution: a no-op past k — FSM untouched, lineage untouched,
+/// `Event::MergeAborted` surfaced.
+#[test]
+fn resolve_pending_merge_aborted_no_ops_past_k() {
+  let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+  let before = ep.state_machine().count();
+  ep.resolve_pending_merge_aborted();
+  assert_eq!(ep.applied_index(), k);
+  assert!(ep.pending_merge().is_none());
+  assert_eq!(ep.state_machine().count(), before, "no absorb on abort");
+  assert_eq!(ep.shape_gen(), 0, "no lineage bump on abort");
+  let mut aborted = false;
+  while let Some(ev) = ep.poll_event() {
+    if let crate::Event::MergeAborted(a) = ev {
+      aborted = true;
+      assert_eq!(a.index(), k);
+      assert_eq!(a.source().as_ref(), b"\x2a");
+    }
+  }
+  assert!(aborted, "Event::MergeAborted surfaced");
+  // The drain resumes here too.
+  let cmd = bytes::Bytes::from_static(b"after");
+  let idx = ep
+    .propose(Instant::ORIGIN, &mut log, &stable, &cmd)
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, idx);
+  assert_eq!(ep.applied_index(), idx);
+}
+
+/// A restart with the commit-merge committed re-parks deterministically: the entry is
+/// re-encountered by the replay drain and the pending apply is rebuilt from its payload.
+#[test]
+fn restart_reparks_a_committed_commit_merge() {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Normal,
+      encode_cmd(b"a"),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(7), 3, 4),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(2));
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.is_poisoned());
+  assert_eq!(ep.applied_index(), Index::new(1), "re-parked at k-1");
+  let pending = ep.pending_merge().expect("the park re-derived");
+  assert_eq!(pending.at(), Index::new(2));
+  assert_eq!(pending.freeze_index(), Index::new(7));
+  assert_eq!(pending.source_gen_after(), 3);
+  assert_eq!(pending.target_gen_after(), 4);
+}
+
+/// An FSM without `absorb` support poisons at resolve — deterministic on every replica, never a
+/// silent skip that diverges absorbed replicas from refusing ones (mirror `SplitUnsupported`).
+#[test]
+fn absorb_unsupported_poisons() {
+  struct NoAbsorbSm(usize);
+  impl crate::StateMachine for NoAbsorbSm {
+    type Command = bytes::Bytes;
+    type Response = usize;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+    fn apply(&mut self, _: Index, _: bytes::Bytes) -> Result<usize, Self::Error> {
+      self.0 += 1;
+      Ok(self.0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.0 as u64)
+    }
+    fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
+      self.0 = s as usize;
+      Ok(())
+    }
+  }
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  log.force_append(&[Entry::new(
+    Term::new(1),
+    Index::new(1),
+    EntryKind::CommitMerge,
+    commit_payload(b"\x2a", Index::new(7), 1, 1),
+  )]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    NoAbsorbSm(0),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(ep.pending_merge().is_some(), "parked");
+  ep.resolve_pending_merge(NoAbsorbSm(9));
+  assert!(ep.is_poisoned(), "unsupported absorb fail-stops");
+  assert_eq!(
+    ep.poison_reason(),
+    Some(crate::PoisonReason::MergeUnsupported)
+  );
+}
+
+/// The membership fence's COMPACTION leg: after the resolve, conf changes stay fenced until the
+/// forced absorb capture's compaction moves `first_index` past the absorb point — from then on
+/// no replica can ever be log-walked across it (a fresh joiner is structurally snapshot-forced).
+#[test]
+fn merge_conf_fence_releases_with_the_capture() {
+  use crate::ProposeError;
+  let (mut ep, mut log, mut stable, k) = make_parked_target(1);
+  assert!(!ep.absorb_capture_blocked(), "nothing else is staged");
+  ep.resolve_pending_merge(CountSm::default());
+  ep.capture_absorb_snapshot(&log, &mut stable);
+  // Absorbed but not yet compacted: still fenced.
+  assert!(matches!(
+    ep.propose_conf_change(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      crate::ConfChange::new(crate::ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
+    ),
+    Err(ProposeError::MergeInFlight)
+  ));
+  // Drain the capture completion: blob durable → deferred compact runs → first_index > k.
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(
+    log.first_index() > k,
+    "the absorb capture compacted through the parked entry"
+  );
+  assert!(
+    ep.propose_conf_change(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      crate::ConfChange::new(crate::ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
+    )
+    .is_ok(),
+    "the fence releases once no log walk can cross the absorb"
+  );
+}

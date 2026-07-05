@@ -44,6 +44,13 @@ pub enum ProposeError<I> {
   #[error("the log index space is exhausted")]
   LogIndexExhausted,
 
+  /// A merge naming this group as its TARGET is in flight (a `CommitMerge` proposed, parked, or
+  /// absorbed with its compaction still landing), and membership changes are fenced until it
+  /// settles: a replica added inside the window could be log-walked across the absorb point and
+  /// silently miss the union. The fence releases on its own within a storage crank of the
+  /// resolution; re-propose then.
+  #[error("a merge into this group is in flight; membership changes are fenced until it settles")]
+  MergeInFlight,
   /// The group is FROZEN by a merge — a `PrepareMerge` has entered its log (append-observed) or
   /// applied — and accepts no new entries: anything appended above the freeze would either
   /// diverge the absorbed state across target replicas (each absorbs its LOCAL source at its own

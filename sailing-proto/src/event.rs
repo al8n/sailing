@@ -213,6 +213,69 @@ impl SplitStale {
   }
 }
 
+/// A `CommitMerge` entry RESOLVED: the frozen source group's state machine was absorbed into
+/// this group at the parked entry, and this group now serves the union. G-FREE like
+/// [`SplitApplied`] — `source` is the absorbed group id's canonical `Data` encoding; the typed id
+/// surfaces on the drivers' lifecycle tail. The source group's endpoint is gone the moment this
+/// fires (its id is floored terminally at the storage layer).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Merged {
+  /// The log index of the resolved `CommitMerge` entry.
+  index: Index,
+  /// The absorbed (source) group id's canonical `Data` encoding.
+  source: Bytes,
+}
+
+impl Merged {
+  /// Construct.
+  pub const fn new(index: Index, source: Bytes) -> Self {
+    Self { index, source }
+  }
+
+  /// The log index of the resolved `CommitMerge` entry.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The absorbed (source) group id's canonical `Data` encoding (an O(1) shared handle).
+  #[inline(always)]
+  pub fn source(&self) -> Bytes {
+    self.source.clone()
+  }
+}
+
+/// A `CommitMerge` entry resolved as a deterministic NO-OP: the source's log settled the race
+/// against it (a rollback moved the lineage past the committed expectation), or the entry is a
+/// replayed/duplicate commit for an already-absorbed source. Nothing was absorbed; the group's
+/// state machine and lineage are untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MergeAborted {
+  /// The log index of the no-op'd `CommitMerge` entry.
+  index: Index,
+  /// The named (source) group id's canonical `Data` encoding.
+  source: Bytes,
+}
+
+impl MergeAborted {
+  /// Construct.
+  pub const fn new(index: Index, source: Bytes) -> Self {
+    Self { index, source }
+  }
+
+  /// The log index of the no-op'd `CommitMerge` entry.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The named (source) group id's canonical `Data` encoding (an O(1) shared handle).
+  #[inline(always)]
+  pub fn source(&self) -> Bytes {
+    self.source.clone()
+  }
+}
+
 /// Outputs the application observes.
 #[derive(
   Debug, Clone, PartialEq, Eq, derive_more::IsVariant, derive_more::Unwrap, derive_more::TryUnwrap,
@@ -248,6 +311,12 @@ pub enum Event<I, R> {
   /// (the rollback moved the lineage counter past it). Leases are NOT resurrected — they re-form
   /// from live traffic.
   MergeRolledBack,
+  /// A parked `CommitMerge` RESOLVED: the source group was absorbed and this group serves the
+  /// union from the resolved index on.
+  Merged(Merged),
+  /// A parked `CommitMerge` resolved as a deterministic no-op (the source's log settled the
+  /// race, or the commit was a replayed duplicate). Nothing was absorbed.
+  MergeAborted(MergeAborted),
   /// A linearizable read index has been confirmed.  The application may serve the
   /// associated read once `applied >= ReadState.index`.
   ReadState(ReadState),

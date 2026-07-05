@@ -31,6 +31,23 @@ pub struct PendingMergeApply {
 }
 
 impl PendingMergeApply {
+  /// Record a park (the apply arm's constructor).
+  pub(crate) const fn new_parked(
+    source_bytes: Bytes,
+    freeze_index: Index,
+    source_gen_after: u64,
+    target_gen_after: u64,
+    at: Index,
+  ) -> Self {
+    Self {
+      source_bytes,
+      freeze_index,
+      source_gen_after,
+      target_gen_after,
+      at,
+    }
+  }
+
   /// The absorbed (source) group id's canonical `Data` encoding (an O(1) shared handle).
   #[inline(always)]
   pub fn source_bytes(&self) -> Bytes {
@@ -90,6 +107,19 @@ pub(crate) struct MergeState {
   /// The parked `CommitMerge` (target side), `Some` while the apply drain is stopped at
   /// `at - 1`. Written ONLY by the park arm and the two container resolutions.
   pub(crate) pending_apply: Option<PendingMergeApply>,
+  /// Log index of the most recently appended (not-yet-applied) `CommitMerge` on THIS leader —
+  /// the in-flight leg of the target's membership fence (`> applied` ⇒ a commit-merge is in
+  /// flight), mirroring `pending_split_index` exactly: derived state, re-seated conservatively
+  /// at `become_leader`, never a sticky flag.
+  pub(crate) pending_commit_index: Index,
+  /// The resolved absorb's `CommitMerge` index, set by `resolve_pending_merge` — the membership
+  /// fence's compaction leg: the target refuses conf changes until `first_index` passes it (the
+  /// forced absorb capture compacts through it within a crank), so a replica added post-merge
+  /// can never be LOG-WALKED across the absorb (it would park with no local source and no
+  /// floor, and no-op past the union — silent divergence; the fork milestone's (1,1) lesson).
+  /// Never cleared: the check compares against the live `first_index`, so it self-releases
+  /// permanently once the capture's compaction lands.
+  pub(crate) absorb_index: Option<Index>,
 }
 
 impl<I, F, R> Endpoint<I, F, R>
@@ -196,12 +226,168 @@ where
 
 impl<I, F, R> Endpoint<I, F, R>
 where
+  F: StateMachine,
+{
+  /// Consume this endpoint into its state machine — the absorb extraction: the container
+  /// removes the frozen source from its map and hands the FSM to the target's
+  /// [`resolve_pending_merge`](Self::resolve_pending_merge). Everything else about the endpoint
+  /// (its stores outlive it until the driver's teardown) is dropped; the log-derived state is
+  /// re-derivable should a crash rewind the resolution.
+  pub fn into_state_machine(self) -> F {
+    self.fsm
+  }
+
+  /// Whether the absorb's forced snapshot capture would be REFUSED right now — the capture
+  /// shares `maybe_snapshot`'s busy/fence set (a capture or install already staged, or a fork
+  /// barrier at-or-below the absorb point). The container's resolve arm holds the park while
+  /// this is true, so the absorb and its durability capture always land in the SAME crank.
+  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
+  // `expect` is a lint error), so it cannot outlive its reason.
+  #[cfg_attr(not(test), expect(dead_code))]
+  pub(crate) fn absorb_capture_blocked(&self) -> bool {
+    let Some(pending) = self.merge.pending_apply.as_ref() else {
+      return false;
+    };
+    self.snapshot.pending_compact.is_some()
+      || self.snapshot.pending_install.is_some()
+      || self
+        .split
+        .outstanding
+        .first()
+        .is_some_and(|cap| *cap <= pending.at())
+  }
+
+  /// Resolve the parked `CommitMerge` by ABSORBING the extracted source state machine: fold it
+  /// in, mark the parked entry applied, bump the lineage, and surface `Event::Merged`. The
+  /// ONLY writer of a successful resolution; the caller (the container's per-crank service)
+  /// verified the source was frozen-applied at the boundary with the expected gen, so the
+  /// absorbed state is identical on every replica — log-matching plus deterministic apply up
+  /// to the boundary, with nothing FSM-mutating above a surviving freeze.
+  ///
+  /// An FSM whose `absorb` returns `false` (the defaulted unsupported verdict) poisons —
+  /// deterministic on every replica, mirroring `SplitUnsupported`: never a silent skip that
+  /// diverges absorbed replicas from refusing ones.
+  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
+  // `expect` is a lint error), so it cannot outlive its reason.
+  #[cfg_attr(not(test), expect(dead_code))]
+  pub(crate) fn resolve_pending_merge(&mut self, source_fsm: F) {
+    let Some(pending) = self.merge.pending_apply.take() else {
+      debug_assert!(false, "resolve without a parked CommitMerge");
+      return;
+    };
+    if !self.fsm.absorb(source_fsm) {
+      self.poison(PoisonReason::MergeUnsupported);
+      return;
+    }
+    self.applied = pending.at();
+    self.split.shape_gen = self.split.shape_gen.max(pending.target_gen_after());
+    self.merge.absorb_index = Some(pending.at());
+    self
+      .outputs
+      .events
+      .push_back(crate::Event::Merged(crate::Merged::new(
+        pending.at(),
+        pending.source_bytes(),
+      )));
+  }
+
+  /// Resolve the parked `CommitMerge` as a deterministic NO-OP: the source's log settled the
+  /// race against this commit (a rollback moved its lineage past the expected gen), or the
+  /// entry is a replayed/duplicate commit for an already-absorbed source. Advances past the
+  /// parked entry WITHOUT touching the state machine or the lineage and surfaces
+  /// `Event::MergeAborted`; the drain resumes on the next storage crank.
+  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
+  // `expect` is a lint error), so it cannot outlive its reason.
+  #[cfg_attr(not(test), expect(dead_code))]
+  pub(crate) fn resolve_pending_merge_aborted(&mut self) {
+    let Some(pending) = self.merge.pending_apply.take() else {
+      debug_assert!(false, "abort-resolve without a parked CommitMerge");
+      return;
+    };
+    self.applied = pending.at();
+    self
+      .outputs
+      .events
+      .push_back(crate::Event::MergeAborted(crate::MergeAborted::new(
+        pending.at(),
+        pending.source_bytes(),
+      )));
+  }
+
+  /// The target-side membership fence: whether a conf change must refuse because a merge is in
+  /// flight (proposed, parked, or absorbed-but-not-yet-compacted). Adding a replica in any of
+  /// those windows lets it be LOG-WALKED across the absorb point — it parks there with no local
+  /// source and no floor, no-ops past the union, and silently diverges (the fork milestone's
+  /// log-walk lesson). The three legs release on their own: apply absorbs the in-flight index,
+  /// resolution consumes the park, and the absorb capture's compaction moves `first_index`
+  /// past the absorb point within a crank.
+  pub(crate) fn merge_conf_fence<L: LogStore>(&self, log: &L) -> bool {
+    self.merge.pending_commit_index > self.applied
+      || self.merge.pending_apply.is_some()
+      || self
+        .merge
+        .absorb_index
+        .is_some_and(|k| log.first_index() <= k)
+  }
+}
+
+impl<I, F, R> Endpoint<I, F, R>
+where
   I: NodeId,
   F: StateMachine,
   R: rand::Rng,
   F::Command: crate::Data,
   F::Error: core::error::Error,
 {
+  /// The absorb's FORCED snapshot capture, run by the container immediately after
+  /// [`resolve_pending_merge`](Self::resolve_pending_merge) with the target's stores in hand:
+  /// capture at `applied` (the absorb point) regardless of the snapshot threshold, so the
+  /// union's durability anchor and the source's teardown ride the SAME barrier — a crash either
+  /// rewinds to re-park (nothing durable moved) or restarts the target at a boundary past the
+  /// absorb (never a parked apply whose source was already destroyed). The caller checked
+  /// [`absorb_capture_blocked`](Self::absorb_capture_blocked) before resolving.
+  // The expectation self-expires the moment the container's merge service lands (an unfulfilled
+  // `expect` is a lint error), so it cannot outlive its reason.
+  #[cfg_attr(not(test), expect(dead_code))]
+  pub(crate) fn capture_absorb_snapshot<L, S>(&mut self, log: &L, stable: &mut S)
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+    F::Snapshot: crate::Data,
+  {
+    if self.poison.poisoned {
+      return;
+    }
+    debug_assert!(
+      self.snapshot.pending_compact.is_none() && self.snapshot.pending_install.is_none(),
+      "the resolve arm holds the park while a capture/install is staged"
+    );
+    let snap = match self.fsm.snapshot() {
+      Ok(s) => s,
+      Err(_) => {
+        self.poison(PoisonReason::SnapshotCapture);
+        return;
+      }
+    };
+    use crate::Data as _;
+    let mut data = std::vec::Vec::new();
+    snap.encode(&mut data);
+    let Some(last_term) = self.log_term(log, self.applied) else {
+      return;
+    };
+    let mut meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
+      .with_max_lease_window(self.lease_guard.max_lease_window)
+      .with_max_wall_plus_window(self.lease_guard.max_wall_plus_window)
+      .with_max_unwalled_lease_window(self.lease_guard.max_unwalled_lease_window)
+      .with_shape_gen(self.split.shape_gen);
+    if self.reads.read_mode_migrated {
+      meta = meta.with_read_only(self.reads.active_read_mode);
+    }
+    let opid = self.mint_op_id();
+    self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
+    self.snapshot.pending_compact = Some((opid, self.applied));
+  }
+
   /// Append one merge admin entry (`PrepareMerge`/`CommitMerge`/`RollbackMerge`) on the leader —
   /// the container's merge verbs call this after their merge-specific gates pass. Mirrors
   /// `propose_split_entry`: appended durable-pending under the current term with the standard
@@ -260,6 +446,9 @@ where
     self.replication_pending = true;
     if kind == EntryKind::PrepareMerge {
       self.note_freeze_appended(index);
+    }
+    if kind == EntryKind::CommitMerge {
+      self.merge.pending_commit_index = index;
     }
     Ok(index)
   }

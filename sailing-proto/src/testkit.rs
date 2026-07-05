@@ -451,6 +451,11 @@ impl crate::StateMachine for CountSm {
     self.count = snapshot as usize;
     Ok(())
   }
+
+  fn absorb(&mut self, source: Self) -> bool {
+    self.count += source.count;
+    true
+  }
 }
 
 /// A synchronous in-memory stable store: `submit_write` persists `HardState<u64>` immediately AND

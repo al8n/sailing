@@ -609,6 +609,9 @@ where
     // must reserve none — the tail's own apply stages (and reserves) the forks it carries.
     self.split.pending_split_index = last;
     self.split.pending_split_child = Bytes::new();
+    // Mirror for commit-merges: an inherited unapplied CommitMerge in the tail will PARK this
+    // leader's apply when it commits; hold the membership fence until the tail applies.
+    self.merge.pending_commit_index = last;
     self.tracker.reset_progress(
       last.next(),
       self.config.max_inflight_msgs(),
