@@ -737,9 +737,19 @@ where
     self.multi.lift_fork_barrier(parent, split_index);
   }
 
+  /// The next `(parent, child)` SPLIT-CONFLICT signal, left queued (see
+  /// [`MultiRaft::peek_split_conflict`]): the driver publishes it on its bounded lifecycle
+  /// tail and consumes via [`poll_split_conflict`](Self::poll_split_conflict) only once the
+  /// tail accepts — a full tail must defer the one-shot cue, never erase it.
+  #[must_use]
+  pub fn peek_split_conflict(&self) -> Option<(G, G)> {
+    self.multi.peek_split_conflict()
+  }
+
   /// Drain the next `(parent, child)` SPLIT-CONFLICT signal — a committed fork parked because
   /// its child id is already hosted (see [`MultiRaft::poll_split_conflict`]); the driver
-  /// surfaces it on its lifecycle tail for the placement brain.
+  /// surfaces it on its lifecycle tail for the placement brain, consuming here only after the
+  /// tail accepted the peeked event.
   pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
     self.multi.poll_split_conflict()
   }

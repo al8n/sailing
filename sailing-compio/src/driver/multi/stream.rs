@@ -592,7 +592,9 @@ where
   /// went durable before it could transmit). A fork whose child id is ALREADY HOSTED is
   /// neither yielded nor abandoned: the container PARKS it (blob held, the parent's fence
   /// standing, re-examined every crank) and the conflict pump below relays the one-shot
-  /// [`LifecycleEvent::SplitConflict`] to the embedder, whose removal/catch-up resolves it.
+  /// [`LifecycleEvent::SplitConflict`] to the embedder — consumed from the coordinator only
+  /// once the bounded lifecycle tail accepts it, so backpressure defers the cue instead of
+  /// erasing it — whose removal/catch-up resolves the park.
   fn fork_drain(&mut self, now: Now) {
     while let Some(fork) = self.coord.poll_pending_fork() {
       let parent = fork.parent;
@@ -623,10 +625,21 @@ where
         }
       }
     }
-    while let Some((parent, child)) = self.coord.poll_split_conflict() {
-      let _ = self
+    // DELIVERED-BEFORE-CONSUMED: unlike its best-effort siblings, the conflict signal is
+    // one-shot per park episode, so popping it ahead of a refusable send would let a
+    // momentarily-full tail erase the embedder's only cue while the parent fence stands and
+    // the child id stays reserved. Consume only on acceptance; on a full tail the signal
+    // stays queued at the coordinator (the fork stays parked) and this drain retries next
+    // crank — a park that resolves first purges it there, so nothing stale ever surfaces.
+    while let Some((parent, child)) = self.coord.peek_split_conflict() {
+      if self
         .lifecycle_tx
-        .try_send(LifecycleEvent::SplitConflict { parent, child });
+        .try_send(LifecycleEvent::SplitConflict { parent, child })
+        .is_err()
+      {
+        break;
+      }
+      let _ = self.coord.poll_split_conflict();
     }
   }
 

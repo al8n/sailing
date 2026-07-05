@@ -323,8 +323,13 @@ where
   /// re-marks these. Membership doubles as the conflict-signal dedupe: one
   /// [`poll_split_conflict`](Self::poll_split_conflict) signal per park episode.
   parked: BTreeSet<G>,
-  /// Pending `(parent, child)` split-conflict signals, pushed once per park episode (see
-  /// [`poll_split_conflict`](Self::poll_split_conflict)).
+  /// Pending `(parent, child)` split-conflict signals, pushed once per park episode and HELD
+  /// until consumed: a driver publishing on a bounded tail peeks
+  /// ([`peek_split_conflict`](Self::peek_split_conflict)), publishes, and consumes only on
+  /// acceptance ([`poll_split_conflict`](Self::poll_split_conflict)), so backpressure defers
+  /// the episode's only cue instead of erasing it. Every arm that ends a park purges its
+  /// still-queued signal ([`unpark`](Self::unpark)) — delivered after resolution it would be
+  /// stale — so queued signals always name currently-parked parents.
   conflicts: VecDeque<(G, G)>,
   /// The RELAY-TIME lineage view, one entry per admitted id: seeded at every admission (0 at
   /// genesis create, the DURABLE restored lineage at restore/fork) and bumped to
@@ -410,10 +415,24 @@ where
   /// authenticated under it).
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
     // A parked PARENT's staged forks die with its endpoint (removal is the embedder's explicit
-    // destruction of this replica), so the park bookkeeping dies too. Removing a parked fork's
-    // CHILD needs nothing here: the next relay drain re-examines the park and materializes.
-    self.parked.remove(gid);
+    // destruction of this replica), so the park bookkeeping — a still-queued conflict signal
+    // included — dies too. Removing a parked fork's CHILD needs nothing here: the next relay
+    // drain re-examines the park and materializes.
+    self.unpark(gid);
     self.groups.remove(gid)
+  }
+
+  /// End `gid`'s park episode: leave the parked set and purge any still-queued conflict
+  /// signal. Every arm that resolves a park routes through here, so an UNDELIVERED signal (one
+  /// a full driver tail deferred) dies with its episode — delivered afterwards it would be
+  /// stale, capable of goading the embedder into removing the very child the resolution just
+  /// materialized or blessed.
+  fn unpark(&mut self, gid: &G) {
+    // Signals are queued only while their parent is parked (the queue invariant this helper
+    // maintains), so a no-op removal proves there is nothing to purge.
+    if self.parked.remove(gid) {
+      self.conflicts.retain(|(parent, _)| parent != gid);
+    }
   }
 
   /// The next outbound message from any group, stamped with its group id. Drain fully between
@@ -553,18 +572,18 @@ where
     for gid in parked {
       match self.examine_head_fork(&gid) {
         HeadFork::Empty => {
-          self.parked.remove(&gid);
+          self.unpark(&gid);
         }
         HeadFork::Resolved => {
           // Arm (b): the head fork resolved as redundant — later forks of this parent flow
           // through the ordinary drain below.
-          self.parked.remove(&gid);
+          self.unpark(&gid);
           self.dirty_forks.push_back(gid);
         }
         HeadFork::Parked => {}
         HeadFork::Yield(fork) => {
           // Arm (a): the squatter is gone and the fork materializes normally.
-          self.parked.remove(&gid);
+          self.unpark(&gid);
           self.dirty_forks.push_back(gid);
           return Some(fork);
         }
@@ -707,13 +726,31 @@ where
     }
   }
 
+  /// The next `(parent, child)` SPLIT-CONFLICT signal, left queued — the DELIVERED-BEFORE-
+  /// CONSUMED half for a driver publishing on a bounded tail: peek, publish, and only on
+  /// acceptance consume via [`poll_split_conflict`](Self::poll_split_conflict). The signal is
+  /// one-shot per park episode, so consuming it ahead of a refusable send would let a
+  /// momentarily-full tail erase the embedder's only cue while the fence stands and the child
+  /// id stays reserved; peeking leaves it queued for the next drain instead.
+  #[must_use]
+  pub fn peek_split_conflict(&self) -> Option<(G, G)> {
+    self
+      .conflicts
+      .front()
+      .map(|(parent, child)| (parent.cheap_clone(), child.cheap_clone()))
+  }
+
   /// Drain the next `(parent, child)` SPLIT-CONFLICT signal: a committed fork PARKED because
   /// its child id is already hosted here (see [`poll_pending_fork`](Self::poll_pending_fork)).
-  /// One signal per park episode — deduped until the park resolves, exactly one consumption per
-  /// conflict — and best-effort in the same sense as every placement signal: the parked fork
-  /// itself, not this signal, is the load-bearing state. The embedder resolves by removing the
-  /// hosted child (the fork then materializes) or by letting the twin catch up (the fork then
-  /// resolves as redundant); until then the parent's snapshot fence holds its replay source.
+  /// One signal per park episode, held until consumed HERE. A synchronous embedder (the sim
+  /// worlds) consumes directly — its consumption IS delivery; a driver publishing on a BOUNDED
+  /// tail must [`peek_split_conflict`](Self::peek_split_conflict) first and consume only after
+  /// the tail accepts, so backpressure defers the one-shot cue rather than erasing it. A park
+  /// that resolves before consumption purges its queued signal (a later delivery would be
+  /// stale); the parked fork itself, not this signal, is the load-bearing state. The embedder
+  /// resolves by removing the hosted child (the fork then materializes) or by letting the twin
+  /// catch up (the fork then resolves as redundant); until then the parent's snapshot fence
+  /// holds its replay source.
   pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
     self.conflicts.pop_front()
   }

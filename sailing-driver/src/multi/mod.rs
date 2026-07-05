@@ -315,7 +315,11 @@ pub enum LifecycleEvent<G, I> {
   /// cannot see an admission that preceded the split's arrival). Nothing is lost: the parent
   /// already shrank at apply, so the drain HOLDS the fork — blob staged, the parent's snapshot
   /// fence standing (the split entry stays replayable, so recovery survives arbitrarily late
-  /// action) — instead of dropping the partition's only local copy. Fired ONCE per conflict.
+  /// action) — instead of dropping the partition's only local copy. Fired ONCE per conflict,
+  /// and — uniquely on this best-effort tail — never lost to backpressure: the driver consumes
+  /// the coordinator's one-shot signal only after the tail accepts this event, so a full tail
+  /// defers the cue to a later drain (a park that resolves before delivery drops it with the
+  /// episode — the cue would be stale).
   /// The embedder resolves it: remove the hosted child (the fork then materializes and
   /// [`SplitApplied`](Self::SplitApplied) fires — removal tombstones the id, so pair it with
   /// [`MultiHandle::clear_tombstone`] before the next drain, or the abandoned fork surfaces as
