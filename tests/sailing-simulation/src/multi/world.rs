@@ -143,10 +143,14 @@ pub struct MultiWorld {
   /// the conservation verdict's work list.
   splits: BTreeMap<u64, split::SplitRecord>,
   /// Splits proposed through [`propose_split`](Self::propose_split) whose child has not yet
-  /// registered: child gid → the parent and the key set the instruction assigned to it. An
-  /// entry whose split entry is lost (deposed leader, truncated tail) lingers harmlessly — the
-  /// child never materializes, and the parent's population stays conservatively shrunk (the
-  /// moved keys are parked; never a false conservation positive).
+  /// registered: child gid → the parent, the split point, and the population slice assigned at
+  /// propose. An entry whose split entry is lost (deposed leader, truncated tail) lingers
+  /// harmlessly — the child never materializes and the parent's population stays conservatively
+  /// shrunk: the moved keys are PARKED and unroutable, but their CELLS remain in the parent's
+  /// record, and a later split whose point covers them hands them to ITS child —
+  /// `register_split_child` derives that child's conservation assignment from the fork's own
+  /// record, so the parked handover is judged rather than misread as an unassigned key
+  /// surfacing.
   pending_splits: BTreeMap<u64, split::PendingSplit>,
   /// Committed splits REGISTERED (one per split, however many replicas materialize) — the
   /// report's non-vacuity witness.

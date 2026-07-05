@@ -18,7 +18,12 @@
 //! index and the apply-derived blob carries all of them; a fuzzer write of a moved key after the
 //! entry would land above it and falsify the handover, so the flip is what keeps the oracle
 //! judging the PRODUCT rather than the workload. A lost split entry (deposed leader) leaves the
-//! parent's population conservatively shrunk: parked keys, never a false positive.
+//! parent's population conservatively shrunk: the moved keys are PARKED, unroutable from then
+//! on, while their cells remain in the parent's record — so a LATER accepted split whose point
+//! sits at or below them moves those cells like any others. The conservation ASSIGNMENT
+//! therefore follows the instruction rule, not the population snapshot: a registered split's
+//! `child_keys` derive from the fork's own record (see `register_split_child`), so a parked
+//! key surfacing in a later child is judged as the handover it is.
 //!
 //! The recorder walks every replica's FULL RAW applied record each sweep and appends each gkv
 //! cell once — values are globally unique and strictly increase per `(group, key)`, so
@@ -37,10 +42,14 @@
 
 use super::*;
 
-/// A proposed-but-not-yet-registered split: the parent and the key set its instruction assigned
-/// to the child.
+/// A proposed-but-not-yet-registered split: the parent, the instruction's split point, and the
+/// population slice the propose-time flip assigned to the child.
 pub(super) struct PendingSplit {
   pub(super) parent: u64,
+  /// The instruction's split point — kept so registration can re-derive the ASSIGNED set from
+  /// the fork's own record (`>= point`), which the population slice alone under-counts when an
+  /// earlier accepted-but-lost split parked keys.
+  pub(super) point: u16,
   pub(super) child_keys: BTreeSet<u16>,
 }
 
@@ -50,7 +59,9 @@ pub(super) struct SplitRecord {
   pub(super) parent_led: u64,
   /// The child's incarnation-qualified ledger id (its fork generation).
   pub(super) child_led: u64,
-  /// The keys the instruction assigned to the child.
+  /// The keys the INSTRUCTION assigned to the child: the propose-time population slice plus
+  /// every at-or-above-point key present in the fork's own record (parked keys a lost earlier
+  /// split left behind travel with their cells; see `register_split_child`).
   pub(super) child_keys: BTreeSet<u16>,
 }
 
@@ -109,9 +120,14 @@ impl MultiWorld {
     if result.is_ok() {
       let meta = self.groups.get_mut(&parent).expect("registered group");
       let child_keys = meta.keys.split_off(&point);
-      self
-        .pending_splits
-        .insert(child, PendingSplit { parent, child_keys });
+      self.pending_splits.insert(
+        child,
+        PendingSplit {
+          parent,
+          point,
+          child_keys,
+        },
+      );
     }
     Some(result)
   }
@@ -181,6 +197,22 @@ impl MultiWorld {
       .unwrap_or_else(|| panic!("fork for child {} without a proposed split", fork.child));
     let parent_led = Self::ledger_id(self.generation_of(pending.parent), pending.parent);
     let child_led = Self::ledger_id(fork.child_gen, fork.child);
+    // The conservation ASSIGNMENT follows the instruction rule, not the population snapshot:
+    // `LogSm::split` moves EXACTLY the at-or-above-point cells of the parent's record, which
+    // can include keys the propose-time population no longer carried — an earlier
+    // accepted-but-lost split parks its keys, and this split's instruction moves their cells
+    // anyway (cascades included: parked cells ride THIS child's record, so an onward fork
+    // re-derives them for free; a refused earlier fork took its cells with it, so they never
+    // inflate a later assignment). The below-point filter is the arm's teeth — a cell the FSM
+    // wrongly moved from below the point stays unassigned and still trips the verdict — and
+    // the population slice keeps assigned-but-never-written keys judged. The WRITABLE
+    // population stays the propose-time slice: parked keys remain unroutable.
+    let mut assigned = pending.child_keys.clone();
+    assigned.extend(fork.fsm.applied().iter().filter_map(|(_, cmd)| {
+      super::super::decode_gkv(cmd)
+        .map(|(_, key, _)| key)
+        .filter(|key| *key >= pending.point)
+    }));
     let voters: BTreeSet<u64> = fork.config.voters().iter().copied().collect();
     self.groups.insert(
       fork.child,
@@ -217,7 +249,7 @@ impl MultiWorld {
       SplitRecord {
         parent_led,
         child_led,
-        child_keys: pending.child_keys,
+        child_keys: assigned,
       },
     );
   }
