@@ -167,6 +167,13 @@ impl MultiReadLedger {
       if !w.hosts_group(p.node, p.inv.gid) {
         continue; // the replica was torn down before serving — never-served, not wrong
       }
+      if !w.group_holds_key(p.inv.gid, p.inv.key) {
+        // The key was handed to a child between invocation and serve: the invoked group's
+        // applied record legitimately no longer carries it (the split moved the cells), so the
+        // serve point is unjudgeable HERE — the retired-replica rule's key-grained twin. The
+        // handover itself is the conservation ledger's to judge.
+        continue;
+      }
       if w.applied_index_of(p.node, p.inv.gid) < p.index {
         still_pending.push(p);
         continue;

@@ -7,7 +7,10 @@
 //! timestamp. Per-node clock drift and the failover wall are deliberately absent in v1 — the
 //! single-group VOPR retains that coverage; the hooks stay reserved here.
 
-use super::oracles::{self, GrantKey};
+use super::{
+  conservation::ConservationLedger,
+  oracles::{self, GrantKey},
+};
 use crate::{
   AppliedLog, Checker, DurableEntry, LogSm, MemLog, MemStable, NetworkFaults, StorageFaults,
   checker, network::NetPrng,
@@ -122,6 +125,46 @@ pub struct MultiWorld {
   /// the construction default — leaves the library's demand-driven threshold untouched, so a
   /// world without the override is byte-identical to one predating the seam.
   snapshot_threshold: Option<usize>,
+  /// The instruction-conservation ledger: per-`(ledger id, key)` write histories recorded from
+  /// the replicas' RAW applied records (see `conserve_sweep`), judged per recorded split by
+  /// [`finalize_conservation_or_panic`](Self::finalize_conservation_or_panic).
+  conservation: ConservationLedger,
+  /// Per-`(node, gid)` count of applied cells the conservation recorder has already walked.
+  /// DISTINCT from `swept`: a fork-born replica's cross-talk high-water is seeded PAST its
+  /// inherited baseline (parent-tagged cells are not cross-talk), while the recorder starts at
+  /// 0 so the baseline IS observed as the child's opening history.
+  cons_swept: BTreeMap<(u64, u64), usize>,
+  /// Per-`(ledger id, key)` last recorded value — the recorder's dedupe. Values are globally
+  /// unique and strictly increase per `(group, key)` (the fuzzer's monotone counter), so
+  /// "strictly above the last recorded" admits each cell exactly once, in write order, no
+  /// matter how many replicas' walks present it or how often a crash-shrunk record re-walks.
+  cons_last: BTreeMap<(u64, u16), u64>,
+  /// Every committed split the world REGISTERED (child materialized), in registration order —
+  /// the conservation verdict's work list.
+  splits: BTreeMap<u64, split::SplitRecord>,
+  /// Splits proposed through [`propose_split`](Self::propose_split) whose child has not yet
+  /// registered: child gid → the parent and the key set the instruction assigned to it. An
+  /// entry whose split entry is lost (deposed leader, truncated tail) lingers harmlessly — the
+  /// child never materializes, and the parent's population stays conservatively shrunk (the
+  /// moved keys are parked; never a false conservation positive).
+  pending_splits: BTreeMap<u64, split::PendingSplit>,
+  /// Per-`(node, gid)` length of the fork-inherited applied baseline. Feeds the ORACLE-ALIGNED
+  /// view record (`aligned_applied`): the baseline's cells carry PARENT-log indices, so the
+  /// child's checker judges only the child's own raft history and the exact-cell baseline
+  /// handover is the conservation ledger's to judge instead.
+  fork_baseline: BTreeMap<(u64, u64), usize>,
+  /// Committed splits REGISTERED (one per split, however many replicas materialize) — the
+  /// report's non-vacuity witness.
+  splits_applied: u64,
+  /// `Event::SplitStale` observations drained (a stale mint no-op'd deterministically).
+  split_stale: u64,
+  /// `(parent, child)` split-conflict signals drained. The world leaves a parked fork's
+  /// squatter in place — its embedder model is patient observation (the departed sweep's
+  /// pattern), the standing snapshot fence keeps the parked fork replayable indefinitely, and a
+  /// park that never resolves surfaces as a quiesce/finalize failure rather than being masked
+  /// by a forced teardown. Fresh child ids make the signal unreachable today; the counter keeps
+  /// it visible if that ever changes.
+  split_conflicts: u64,
 }
 
 impl MultiWorld {
@@ -161,6 +204,15 @@ impl MultiWorld {
       parked: BTreeSet::new(),
       cross_talk_checked: 0,
       snapshot_threshold: None,
+      conservation: ConservationLedger::new(),
+      cons_swept: BTreeMap::new(),
+      cons_last: BTreeMap::new(),
+      splits: BTreeMap::new(),
+      pending_splits: BTreeMap::new(),
+      fork_baseline: BTreeMap::new(),
+      splits_applied: 0,
+      split_stale: 0,
+      split_conflicts: 0,
     }
   }
 
@@ -198,6 +250,7 @@ impl MultiWorld {
       gid,
       lifecycle::GroupMeta {
         voters: voters.clone(),
+        keys: (0..super::NUM_KEYS).collect(),
         ..lifecycle::GroupMeta::default()
       },
     );
@@ -307,18 +360,22 @@ impl MultiWorld {
       .unwrap_or_default()
   }
 
-  /// True if every hosting node's applied sequence for `gid` agrees as a prefix of the longest —
-  /// the State Machine Safety core, scoped to one group.
+  /// True if every hosting node's ORACLE-ALIGNED applied sequence for `gid` agrees as a prefix
+  /// of the longest — the State Machine Safety core, scoped to one group. Alignment (see
+  /// [`aligned_applied`](Self::aligned_applied)) is what keeps the prefix NOTION valid across a
+  /// split: raw records stop being prefix-related the moment one replica's `fsm.split` removes
+  /// the moved cells mid-record while a lagging peer still holds them; a group that never split
+  /// is compared byte-for-byte as before.
   pub fn agreement_holds(&self, gid: u64) -> bool {
-    let logs: Vec<&[(sailing_proto::Index, bytes::Bytes)]> = self
+    let logs: Vec<AppliedLog> = self
       .node_ids
       .iter()
-      .filter_map(|n| self.hosts[n].group(&gid))
-      .map(|ep| ep.state_machine().applied())
+      .filter(|n| self.hosts[n].contains_group(&gid))
+      .map(|&n| self.aligned_applied(n, gid))
       .collect();
-    let longest = logs.iter().map(|l| l.len()).max().unwrap_or(0);
+    let longest = logs.iter().map(Vec::len).max().unwrap_or(0);
     for k in 0..longest {
-      let mut seen: Option<&(sailing_proto::Index, bytes::Bytes)> = None;
+      let mut seen: Option<&(u64, Vec<u8>)> = None;
       for l in &logs {
         if let Some(cell) = l.get(k) {
           match seen {
@@ -397,7 +454,10 @@ impl MultiWorld {
       }
     }
 
-    // Step c: drain outgoing → deliver due → drain storage, until quiescent at this timestamp.
+    // Step c: drain outgoing → deliver due → drain storage → materialize committed forks, until
+    // quiescent at this timestamp. The fork pump sits INSIDE the settle loop so a split applied
+    // by a delivery in this very tick materializes its child (and the child's election timer
+    // arms) before the tick's oracle pass runs — the driver's drain-every-crank cadence.
     let mut iters = 0u32;
     loop {
       iters += 1;
@@ -409,9 +469,10 @@ impl MultiWorld {
       let any_new = self.drain_outgoing_all();
       let delivered = self.deliver_due();
       let storage_produced = self.drain_storage_all();
-      progressed |= any_new || delivered || storage_produced;
+      let forked = self.pump_forks();
+      progressed |= any_new || delivered || storage_produced || forked;
 
-      if !any_new && !delivered && !storage_produced {
+      if !any_new && !delivered && !storage_produced && !forked {
         break;
       }
     }
@@ -439,6 +500,7 @@ impl MultiWorld {
       self.pending_transitions.entry(gid).or_default().clear();
       self.pending_new_installs.entry(gid).or_default().clear();
       self.cross_talk_sweep(gid);
+      self.conserve_sweep(gid);
     }
   }
 
@@ -606,12 +668,10 @@ impl MultiWorld {
         Some(meta) => (meta.last_index().get(), meta.last_term().get()),
         None => (0, 0),
       };
-      let applied_log: Vec<(u64, Vec<u8>)> = ep
-        .state_machine()
-        .applied()
-        .iter()
-        .map(|(idx, cmd)| (idx.get(), cmd.to_vec()))
-        .collect();
+      // The checker's applied-record legs (positional agreement, the index-keyed rewrite
+      // high-water) get the ORACLE-ALIGNED record — see `aligned_applied` for why the raw
+      // record stops fitting both notions once the group splits.
+      let applied_log = self.aligned_applied(node, gid);
       let cs = ep.conf_state();
       nodes.push(checker::NodeView {
         id: node,
@@ -806,6 +866,13 @@ impl MultiWorld {
         Event::ReadState(rs) => {
           self.read_states.entry((node, gid)).or_default().push(rs);
         }
+        // Registration and per-node wiring ride the FORK PUMP (the committed fork carries the
+        // voters/blob/index this per-replica notification does not), so the apply-point event
+        // needs no world-side action here.
+        Event::SplitApplied(_) => {}
+        Event::SplitStale(_) => {
+          self.split_stale += 1;
+        }
         _ => {}
       }
     }
@@ -984,3 +1051,4 @@ mod tests;
 mod faults;
 mod lifecycle;
 mod query;
+mod split;

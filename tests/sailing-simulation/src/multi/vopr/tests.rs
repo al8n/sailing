@@ -198,3 +198,52 @@ fn snapshot_threshold_override_reaches_every_construction_path() {
     );
   }
 }
+
+/// The reshape menu is the default menu plus ONE added row: same actions at the same weights
+/// (the default mix stays the reference point), `Split` present only here, no knob overrides.
+/// The default table gaining a `Split` row would break the menu-coverage invariant (every
+/// listed row drawable), so its absence there is asserted too.
+#[test]
+fn reshape_extends_the_default_menu_by_the_split_row() {
+  let d = MultiProfile::default_multi();
+  let r = MultiProfile::reshape();
+  for (action, weight) in d.weights {
+    assert!(
+      r.weights.contains(&(*action, *weight)),
+      "reshape must keep the default row {action:?}@{weight}",
+    );
+  }
+  assert_eq!(r.weights.len(), d.weights.len() + 1);
+  assert!(
+    r.weights
+      .iter()
+      .any(|(a, w)| *a == MultiAction::Split && *w > 0),
+    "reshape must weight Split in",
+  );
+  assert!(
+    !d.weights.iter().any(|(a, _)| *a == MultiAction::Split),
+    "the default menu must NOT list Split (absence is weight zero)",
+  );
+  assert_eq!(
+    r.snapshot_threshold, None,
+    "reshape overrides weights only — construction stays library-default",
+  );
+}
+
+/// The reshape draw covers its whole menu — Split included — deterministically.
+#[test]
+fn reshape_pick_covers_the_menu() {
+  let profile = MultiProfile::reshape();
+  let draw = |seed: u64| -> Vec<MultiAction> {
+    let mut p = FaultPrng::new(seed);
+    (0..512).map(|_| pick_action(&mut p, profile)).collect()
+  };
+  assert_eq!(draw(7), draw(7), "same seed ⇒ same action stream");
+  let stream = draw(7);
+  for (action, _) in profile.weights {
+    assert!(
+      stream.contains(action),
+      "512 draws never hit {action:?} — the reshape weights are broken"
+    );
+  }
+}

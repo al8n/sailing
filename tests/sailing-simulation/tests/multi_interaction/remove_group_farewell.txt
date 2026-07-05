@@ -138,3 +138,4 @@ n3: follower term=1 lead=1
 status g=100 1
 ----
 n2: match=3 next=4 replicate
+

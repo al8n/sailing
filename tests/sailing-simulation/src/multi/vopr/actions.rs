@@ -67,7 +67,9 @@ pub(super) fn group_has_viable_quorum(
   false
 }
 
-/// Propose 1..=4 gid-tagged keyed-value commands on a live group's leader.
+/// Propose 1..=4 gid-tagged keyed-value commands on a live group's leader, keyed from the
+/// group's LIVE population (the full domain until a split moves a slice to a child; identical
+/// picks to the pre-population form while full).
 pub(super) fn client_load(
   w: &mut MultiWorld,
   st: &mut MState,
@@ -78,8 +80,12 @@ pub(super) fn client_load(
     return;
   };
   let k = 1 + (prng.next_u64() % 4) as usize;
+  let keys = w.group_keys_of(gid);
+  if keys.is_empty() {
+    return; // every key handed away — nothing keyed to write here
+  }
   for _ in 0..k {
-    let key = (st.cmd_counter % u64::from(NUM_KEYS)) as u16;
+    let key = keys[(st.cmd_counter % keys.len() as u64) as usize];
     let payload = encode_gkv(gid, key, st.cmd_counter);
     if w.propose(gid, &payload).is_some() {
       st.expected.entry(gid).or_default().push(payload);
@@ -117,7 +123,11 @@ pub(super) fn read_index_load(
       leader
     };
     let Some(target) = target else { return };
-    let key = (prng.next_u64() % u64::from(NUM_KEYS)) as u16;
+    let keys = w.group_keys_of(gid);
+    if keys.is_empty() {
+      return; // every key handed away — no keyed floor to read
+    }
+    let key = keys[(prng.next_u64() % keys.len() as u64) as usize];
     reads.issue(w, gid, target, key, report);
   }
 }
@@ -364,6 +374,48 @@ pub(super) fn remove_group_action(
   };
   w.remove_group(gid);
   report.groups_removed += 1;
+}
+
+/// Propose a SPLIT of a seed-picked live group: mint a fresh child id, pick a split point
+/// strictly inside the group's live key population (both sides keep at least one key), and
+/// call the world's real `propose_split`. Every landed refusal arm — `NotLeader`,
+/// `SplitInFlight`, `JointConfig`, `ChildExists`, `InvalidChild`, a coordinator-tier
+/// `SplitReserved`/`BelowFloor`, or a `Propose` passthrough — is a legitimate no-op this tick:
+/// the draw stays deterministic and a later iteration retries. The minted id burns
+/// unconditionally (single-incarnation ids are never re-offered, accepted or not).
+pub(super) fn split_group(w: &mut MultiWorld, st: &mut MState, prng: &mut FaultPrng) {
+  let Some(gid) = pick_live_group(w, prng) else {
+    return;
+  };
+  if w.live_groups().len() >= MAX_LIVE_GROUPS {
+    return; // the child would push the working set past the cap
+  }
+  let keys = w.group_keys_of(gid);
+  if keys.len() < 2 {
+    return; // an interior split point needs at least two live keys
+  }
+  let j = 1 + (prng.next_u64() % (keys.len() as u64 - 1)) as usize;
+  let point = keys[j];
+  let child = st.next_gid;
+  st.next_gid += 1;
+  if let Some(Ok(_)) = w.propose_split(gid, child, point) {
+    // The child's integrity expectation: every accepted parent payload for a moved key is
+    // reachable in the child's applied record through the fork baseline (filtered by KEY, not
+    // tag — a re-split moves a grandparent's cells onward too).
+    let moved: Vec<Vec<u8>> = st
+      .expected
+      .get(&gid)
+      .map(|v| {
+        v.iter()
+          .filter(|p| decode_gkv(p).is_some_and(|(_, k, _)| k >= point))
+          .cloned()
+          .collect()
+      })
+      .unwrap_or_default();
+    if !moved.is_empty() {
+      st.expected.entry(child).or_default().extend(moved);
+    }
+  }
 }
 
 /// Recreate a seed-picked retired gid as the SAME logical group at gen+1.

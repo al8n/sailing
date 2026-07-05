@@ -124,7 +124,34 @@ pub(crate) fn render_event(id: u64, ev: &sailing_proto::Event<u64, usize>) -> St
       }
     }
     Event::ReadState(rs) => std::format!("n{id} read-state index={}\n", rs.index().get()),
+    Event::SplitApplied(sa) => std::format!(
+      "n{id} split-applied index={} child={}\n",
+      sa.index().get(),
+      fmt_group_id(&sa.child()),
+    ),
+    Event::SplitStale(ss) => std::format!(
+      "n{id} split-stale index={} child={} minted={} live={}\n",
+      ss.index().get(),
+      fmt_group_id(&ss.child()),
+      ss.minted_gen(),
+      ss.shape_gen(),
+    ),
     _ => std::format!("n{id} ?unknown-event\n"),
+  }
+}
+
+/// Format an encoded group id: the harness's `u64` decode when it fits, else raw hex.
+pub(crate) fn fmt_group_id(encoded: &bytes::Bytes) -> String {
+  use sailing_proto::Data as _;
+  match u64::decode_exact(encoded.clone()) {
+    Ok(gid) => std::format!("g{gid}"),
+    Err(_) => std::format!(
+      "0x{}",
+      encoded
+        .iter()
+        .map(|b| std::format!("{b:02x}"))
+        .collect::<String>()
+    ),
   }
 }
 

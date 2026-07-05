@@ -21,10 +21,6 @@ use std::{
   vec::Vec,
 };
 
-/// The number of distinct KEYS the per-group keyed-value workload writes (values ride the global
-/// monotone counter, so per-`(group, key)` values strictly increase).
-const NUM_KEYS: u16 = 8;
-
 /// The smallest voter set a group may be shrunk to via `RemoveNode`.
 const MIN_VOTERS: usize = 2;
 
@@ -62,6 +58,9 @@ pub enum MultiAction {
   RemoveGroup,
   /// Recreate a retired gid as the SAME logical group at gen+1.
   RecreateGroup,
+  /// Propose a SPLIT of one live group at a seed-picked population split point (a fresh-minted
+  /// child id). Absent from the default menu — the reshape profile weights it in.
+  Split,
 }
 
 /// A named action weight table plus per-replica config knobs — the profile seam M6's
@@ -117,6 +116,35 @@ impl MultiProfile {
     Self {
       snapshot_threshold: Some(threshold),
       ..Self::default_multi()
+    }
+  }
+
+  /// The reshape profile: the default menu PLUS a steady [`MultiAction::Split`] weight, so
+  /// splits land amid the full fault/lifecycle churn. The split rides the default menu as an
+  /// ADDED row rather than a re-weighting — the default mix's schedules stay the reference
+  /// point, and the default profile itself stays byte-identical because its own table never
+  /// gains the row (an absent action IS weight zero, and the menu-coverage test keeps every
+  /// listed row genuinely drawable).
+  pub const fn reshape() -> Self {
+    Self {
+      weights: &[
+        (MultiAction::ClientLoad, 50),
+        (MultiAction::ReadIndexLoad, 12),
+        (MultiAction::Partition, 8),
+        (MultiAction::Heal, 6),
+        (MultiAction::Crash, 5),
+        (MultiAction::MuteGroup, 6),
+        (MultiAction::UnmuteGroup, 4),
+        (MultiAction::ConfChange, 5),
+        (MultiAction::TransferLeader, 4),
+        (MultiAction::MigrateReadMode, 3),
+        (MultiAction::FaultReroll, 6),
+        (MultiAction::CreateGroup, 3),
+        (MultiAction::RemoveGroup, 2),
+        (MultiAction::RecreateGroup, 2),
+        (MultiAction::Split, 8),
+      ],
+      snapshot_threshold: None,
     }
   }
 }
@@ -281,6 +309,7 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
       MultiAction::CreateGroup => create_group_action(&mut w, &mut st, &mut prng, &mut report),
       MultiAction::RemoveGroup => remove_group_action(&mut w, &mut prng, &mut report),
       MultiAction::RecreateGroup => recreate_group_action(&mut w, &mut prng, &mut report),
+      MultiAction::Split => split_group(&mut w, &mut st, &mut prng),
     }
 
     let steps = 2 + (prng.next_u64() % 5) as usize; // 2..=6 ticks per iteration
@@ -309,6 +338,10 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   // per checker with gid/generation attribution); kind-unobservable declines are the tolerated
   // compaction class and only surface in the report.
   w.finalize_membership_or_panic(seed);
+  // The conservation VERDICT: every registered split's key histories, judged against the
+  // recorder's independent observations (see `MultiWorld::finalize_conservation_or_panic`).
+  // Vacuously green under profiles that never split — zero records, zero cost.
+  w.finalize_conservation_or_panic(seed);
   report.membership_oracle_comparisons = w.membership_oracle_comparisons();
   report.skipped_unwitnessed_installs = w.skipped_unwitnessed_installs();
   report.kind_unobservable_installs = w.kind_unobservable_installs();
@@ -379,8 +412,17 @@ fn calm_window(
       );
       w.reconcile_membership(gid);
       if w.leader_of(gid).is_some() {
-        let key = (st.cmd_counter % NUM_KEYS as u64) as u16;
-        let payload = encode_gkv(gid, key, st.cmd_counter);
+        // Keyed load from the group's LIVE population (identical to the pre-population pick
+        // while it is the full domain). A population emptied by an embedder-driven world verb
+        // would still need committable calm load, so it falls back to an un-keyed marker —
+        // unreachable under the action, whose split point always leaves both sides a key.
+        let keys = w.group_keys_of(gid);
+        let payload = if keys.is_empty() {
+          st.cmd_counter.to_le_bytes().to_vec()
+        } else {
+          let key = keys[(st.cmd_counter % keys.len() as u64) as usize];
+          encode_gkv(gid, key, st.cmd_counter)
+        };
         if w.propose(gid, &payload).is_some() {
           st.expected.entry(gid).or_default().push(payload);
           st.cmd_counter += 1;
