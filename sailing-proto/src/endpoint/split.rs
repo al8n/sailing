@@ -68,6 +68,14 @@ pub(crate) struct SplitState<I, F> {
   /// as on `pending_conf_index`: the gate turns permissive, and the apply-time lineage guard
   /// remains the safety floor for a stale mint.
   pub(crate) pending_split_index: Index,
+  /// The encoded child id of the split this leader proposed and has not yet applied — the
+  /// PROPOSE-window leg of [`Endpoint::split_reserves`]. Empty ⇔ no id reserved (an empty
+  /// encoding is never a legal group id): cleared by `become_leader`'s conservative re-seat,
+  /// whose inherited tail holds the propose GATE without knowing any child id — the tail's own
+  /// apply stages (and thereby reserves) whatever forks it carries. Self-releasing like the
+  /// index it rides beside: once `applied` absorbs `pending_split_index`, the window is over
+  /// and these bytes are inert.
+  pub(crate) pending_split_child: Bytes,
 }
 
 impl<I, F> SplitState<I, F> {
@@ -79,6 +87,7 @@ impl<I, F> SplitState<I, F> {
       shape_gen: lineage,
       restored_lineage: lineage,
       pending_split_index: Index::ZERO,
+      pending_split_child: Bytes::new(),
     }
   }
 }
@@ -143,6 +152,25 @@ where
   pub(crate) fn split_in_flight(&self) -> bool {
     self.split.pending_split_index > self.applied
   }
+
+  /// Whether THIS endpoint's in-flight split machinery reserves the encoded child id
+  /// `child_bytes` — the per-group leg of the coordinators' split reservation. Two windows,
+  /// both derived state (releasing needs no bookkeeping): the PROPOSE window (this leader
+  /// appended a split naming the id and has not applied it — over as soon as `applied` absorbs
+  /// the entry, stale-mint no-op included) and the STAGED window (a committed fork naming the
+  /// id sits in the relay queue, parked forks included — over when the relay pops it: a
+  /// resolution arm consumes it, or a yield hands it to the driver, whose materialization runs
+  /// under this very predicate and must not be refused by its own fork).
+  pub(crate) fn split_reserves(&self, child_bytes: &[u8]) -> bool {
+    (self.split_in_flight()
+      && !self.split.pending_split_child.is_empty()
+      && self.split.pending_split_child.as_ref() == child_bytes)
+      || self
+        .split
+        .pending_forks
+        .iter()
+        .any(|f| f.child_bytes.as_ref() == child_bytes)
+  }
 }
 
 impl<I, F, R> Endpoint<I, F, R>
@@ -163,6 +191,7 @@ where
     &mut self,
     now: impl Into<Now>,
     log: &mut L,
+    child_bytes: Bytes,
     payload: Bytes,
   ) -> Result<Index, crate::ProposeError<I>>
   where
@@ -206,8 +235,10 @@ where
     self.replication_pending = true;
     // One split in flight at a time (mirror `pending_read_mode_index`): the mint above read the
     // live counter, which bumps only when THIS entry applies — a second mint before then would
-    // duplicate it and no-op at the apply-time lineage guard.
+    // duplicate it and no-op at the apply-time lineage guard. The child id rides beside the
+    // index so admission can refuse it for exactly as long as the gate holds (`split_reserves`).
     self.split.pending_split_index = index;
+    self.split.pending_split_child = child_bytes;
     // The entry was ALREADY appended (durable-pending) — Ok(index) even if a later flush
     // self-poisons, exactly as `propose` reasons: it WILL commit via the durable log.
     Ok(index)

@@ -605,7 +605,10 @@ where
     // Mirror for splits: an inherited unapplied Split in the tail holds the same pre-apply
     // lineage bump a fresh mint would read — stacking a new split onto it mints a duplicate
     // that can only no-op at the apply-time lineage guard, so block until the tail applies.
+    // The child bytes clear with the re-seat: this conservative hold knows no child id, so it
+    // must reserve none — the tail's own apply stages (and reserves) the forks it carries.
     self.split.pending_split_index = last;
+    self.split.pending_split_child = Bytes::new();
     self.tracker.reset_progress(
       last.next(),
       self.config.max_inflight_msgs(),

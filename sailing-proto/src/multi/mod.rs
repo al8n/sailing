@@ -467,6 +467,24 @@ where
     let relayed = self.lineage.get(gid).copied().unwrap_or(0);
     live.max(relayed)
   }
+
+  /// Whether a split IN FLIGHT on this host reserves `gid` as its child id: some hosted group
+  /// has a proposed-but-unapplied split naming it (the leader's propose→apply window), or a
+  /// committed fork naming it staged in the relay queue — parked conflicts included. The
+  /// coordinators refuse create/restore/fork admission of a reserved id and the drivers'
+  /// factory pre-build gate declines it, closing the window the propose-time `ChildExists`
+  /// check cannot see; an id admitted anyway (before the split arrived) is the parked-conflict
+  /// case [`poll_pending_fork`](Self::poll_pending_fork) holds safe. Purely derived from live
+  /// consensus state, so it releases by construction at every resolution: a stale-mint apply
+  /// ends the propose window, a resolution arm consumes the staged fork, a yield hands it to
+  /// the driver — whose materialization of that very fork therefore passes this predicate —
+  /// and a park keeps it held until the conflict resolves.
+  #[must_use]
+  pub fn split_reserved(&self, gid: &G) -> bool {
+    let mut bytes = Vec::new();
+    gid.encode(&mut bytes);
+    self.groups.values().any(|ep| ep.split_reserves(&bytes))
+  }
 }
 
 // The aggregate scheduling surface, split from the block above because `Endpoint::poll_timeout`
@@ -1381,8 +1399,9 @@ where
     // chain instead of duplicating. Lineage exhaustion is unreachable before log-index
     // exhaustion — every bump consumes a log index — so no ceiling check rides here.
     let parent_gen_after = ep.shape_gen() + 1;
+    let child_bytes = Bytes::from(child_bytes);
     let payload = SplitPayload::new(
-      Bytes::from(child_bytes),
+      child_bytes.clone(),
       child_gen,
       parent_gen_after,
       instruction,
@@ -1390,7 +1409,7 @@ where
     let mut buf = Vec::new();
     crate::wire::encode_split_payload(&payload, &mut buf);
     let result = ep
-      .propose_split_entry(now, log, Bytes::from(buf))
+      .propose_split_entry(now, log, child_bytes, Bytes::from(buf))
       .map_err(SplitError::Propose);
     self.mark_dirty(gid);
     Some(result)

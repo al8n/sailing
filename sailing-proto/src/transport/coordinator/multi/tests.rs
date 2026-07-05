@@ -2159,3 +2159,179 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
     "conservation: every unit lives in exactly one of parent / child"
   );
 }
+
+/// The split reservation walks the whole fork lifecycle at the admission edge: from the
+/// leader's propose (window A) through the staged fork (window B), every admission path —
+/// create, restore, fork — refuses the child id with the typed verdict, and the factory-gate
+/// predicate reads true; the reservation releases exactly when the relay yields the fork to
+/// the driver, which is why the fork's OWN materialization passes the very gate that refused
+/// everyone else; thereafter the id refuses as plain `Exists`. Pre-fix, every one of these
+/// admissions succeeded — planting the squatter whose conflict the relay must then park around.
+#[test]
+fn admission_refuses_an_in_flight_splits_child_id() {
+  let now = Instant::ORIGIN;
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut c = SplitCoord::new();
+  engine.add_group(100);
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    SplitSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  let d = c.group(&100).unwrap().poll_timeout().unwrap();
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.handle_timeout(&100, d, l, s).unwrap();
+  }
+  settle_engine(&mut c, &mut engine, &[100], d);
+  assert!(c.group(&100).unwrap().role().is_leader());
+  for _ in 0..3 {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.submit_propose(&100, d, l, s, &Bytes::from_static(b"c"))
+      .unwrap()
+      .unwrap();
+    settle_engine(&mut c, &mut engine, &[100], d);
+  }
+
+  // WINDOW A: the split is proposed (appended, durable-pending) and deliberately NOT settled.
+  {
+    let (l, s) = engine.stores(&100).unwrap();
+    c.propose_split(
+      &100,
+      d,
+      l,
+      s,
+      &300,
+      0,
+      Bytes::from_static(b"\x02"),
+      &NoFloors,
+    )
+    .expect("the parent is hosted")
+    .expect("the leader appends the split");
+  }
+  assert!(c.is_split_reserved(&300), "reserved from the propose on");
+  assert!(
+    !c.is_split_reserved(&301),
+    "only the named child is reserved"
+  );
+  let (mut scratch_l, mut scratch_s) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    c.create_group(
+      300,
+      single_voter(1),
+      now,
+      9,
+      SplitSm::default(),
+      0,
+      &NoFloors
+    ),
+    Err(CreateGroupError::SplitReserved)
+  );
+  assert_eq!(
+    c.restore_group(
+      300,
+      single_voter(1),
+      now,
+      9,
+      SplitSm::default(),
+      1,
+      0,
+      &NoFloors,
+      &mut scratch_l,
+      &mut scratch_s,
+    ),
+    Err(CreateGroupError::SplitReserved)
+  );
+  assert_eq!(
+    c.create_group_from_fork(
+      300,
+      single_voter(1),
+      now,
+      9,
+      SplitSm::default(),
+      fork_blob(1),
+      None,
+      1,
+      0,
+      &NoFloors,
+      &mut scratch_l,
+      &mut scratch_s,
+    ),
+    Err(CreateGroupError::SplitReserved)
+  );
+  assert_eq!(
+    scratch_l.last_index(),
+    Index::ZERO,
+    "every refusal wrote nothing"
+  );
+
+  // WINDOW B: the split applies and its fork is STAGED — the reservation carries over.
+  settle_engine(&mut c, &mut engine, &[100], d);
+  assert!(c.is_split_reserved(&300), "reserved while staged");
+  assert_eq!(
+    c.create_group(
+      300,
+      single_voter(1),
+      now,
+      9,
+      SplitSm::default(),
+      0,
+      &NoFloors
+    ),
+    Err(CreateGroupError::SplitReserved)
+  );
+
+  // YIELD releases the reservation — the fork's own materialization must pass the gate.
+  let fork = c.poll_pending_fork().expect("the committed split relays");
+  assert!(
+    !c.is_split_reserved(&300),
+    "yielded to the driver: the fork is now the id's one admitted writer"
+  );
+  engine.add_group(300);
+  let epoch = engine.next_boot_epoch(&300).unwrap();
+  {
+    let (l, s) = engine.stores(&300).unwrap();
+    c.create_group_from_fork(
+      300,
+      fork.config,
+      now,
+      1,
+      fork.fsm,
+      fork.blob,
+      fork.read_only,
+      epoch,
+      fork.child_gen,
+      &NoFloors,
+      l,
+      s,
+    )
+    .expect("the yielded fork materializes through the same admission path");
+  }
+  engine.set_group_gen(&100, fork.parent_gen_after);
+  engine.flush();
+  c.lift_fork_barrier(&100, fork.split_index);
+
+  // Post-resolution the id is simply hosted: the refusal class hands over to `Exists`.
+  assert_eq!(
+    c.create_group(
+      300,
+      single_voter(1),
+      now,
+      9,
+      SplitSm::default(),
+      0,
+      &NoFloors
+    ),
+    Err(CreateGroupError::Exists)
+  );
+  assert_eq!(
+    c.group(&300).unwrap().state_machine().units,
+    2,
+    "the materialized child carries the partition"
+  );
+}

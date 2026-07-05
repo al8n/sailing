@@ -105,6 +105,16 @@ pub enum CreateGroupError {
   /// is false) and a buggy catalog could resurrect a merged-away id.
   #[error("the group id's incarnation is the reserved merged-floor sentinel (u64::MAX)")]
   ReservedGeneration,
+  /// The id is RESERVED as the child of a split in flight on this host (a coordinator-level
+  /// refusal): a proposed-but-unapplied split names it, or a committed fork naming it is
+  /// staged awaiting materialization — parked conflicts included. Admitting it now would
+  /// manufacture the very conflict the relay must then park around (the committed fork cannot
+  /// land while a group occupies its id), so admission fails closed until the fork resolves;
+  /// the reservation is derived from live consensus state and releases on its own — no
+  /// consent call exists or is needed. Retry after the split materializes (the id then refuses
+  /// as [`Exists`](Self::Exists)) or is otherwise resolved.
+  #[error("the group id is reserved by an in-flight split; retry after the fork resolves")]
+  SplitReserved,
   /// A fork constructor was given `boot_epoch == 0`. The manufactured baseline issues its store
   /// writes in the PRIOR boot epoch (`boot_epoch - 1`) so their completions can never alias the
   /// child's own ops; epoch 0 has no prior epoch — the baseline would collapse into epoch 0,

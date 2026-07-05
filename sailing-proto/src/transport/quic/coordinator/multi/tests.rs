@@ -1475,3 +1475,108 @@ fn quic_restore_seeds_the_replay_guard_from_the_floor_seam() {
   assert_eq!((fork.child, fork.parent_gen_after), (300, 1));
   assert_eq!(fork.fsm.units, 1, "the re-forked half");
 }
+
+/// The QUIC twin of the split-reservation admission gate (window A — the leader's
+/// propose→apply window; the full lifecycle walk lives in the stream coordinator's test over
+/// the shared container predicate): once a split naming the child id is appended, create,
+/// restore, and fork all refuse it with the typed verdict, the factory-gate predicate reads
+/// true, and only the named id is reserved. Nothing is applied here, so the reservation is
+/// pure derived propose-state.
+#[test]
+fn quic_admission_refuses_an_in_flight_splits_child_id() {
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([13u8; 16]);
+  let opts = ca
+    .cluster_tls(&san(1, &cluster))
+    .tuning(QuicTuning::new().with_keep_alive_interval_millis(0))
+    .build();
+  let mut seed = [0u8; 32];
+  seed[0] = 1;
+  let mut c = MultiQuicCoordinator::<u64, u64, CountSm>::with_identity(opts, Some(seed), cluster);
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group(
+    100,
+    single_voter(1),
+    Instant::ORIGIN,
+    1,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  let d = c.group(&100).unwrap().poll_timeout().unwrap();
+  c.handle_timeout(&100, d, &mut log, &mut stable).unwrap();
+  for _ in 0..2 {
+    c.handle_storage(&100, d, &mut log, &mut stable).unwrap();
+  }
+  assert!(c.group(&100).unwrap().role().is_leader());
+
+  c.propose_split(
+    &100,
+    d,
+    &mut log,
+    &stable,
+    &300,
+    0,
+    Bytes::from_static(b"\x02"),
+    &NoFloors,
+  )
+  .expect("the parent is hosted")
+  .expect("the leader appends the split");
+
+  assert!(c.is_split_reserved(&300), "reserved from the propose on");
+  assert!(
+    !c.is_split_reserved(&301),
+    "only the named child is reserved"
+  );
+  let (mut scratch_l, mut scratch_s) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    c.create_group(
+      300,
+      single_voter(1),
+      Instant::ORIGIN,
+      9,
+      CountSm::default(),
+      0,
+      &NoFloors
+    ),
+    Err(CreateGroupError::SplitReserved)
+  );
+  assert_eq!(
+    c.restore_group(
+      300,
+      single_voter(1),
+      Instant::ORIGIN,
+      9,
+      CountSm::default(),
+      1,
+      0,
+      &NoFloors,
+      &mut scratch_l,
+      &mut scratch_s,
+    ),
+    Err(CreateGroupError::SplitReserved)
+  );
+  assert_eq!(
+    c.create_group_from_fork(
+      300,
+      single_voter(1),
+      Instant::ORIGIN,
+      9,
+      CountSm::default(),
+      fork_blob(1),
+      None,
+      1,
+      0,
+      &NoFloors,
+      &mut scratch_l,
+      &mut scratch_s,
+    ),
+    Err(CreateGroupError::SplitReserved)
+  );
+  assert_eq!(
+    scratch_l.last_index(),
+    Index::ZERO,
+    "every refusal wrote nothing"
+  );
+}

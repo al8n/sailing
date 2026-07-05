@@ -1530,6 +1530,10 @@ where
         // reserved `u64::MAX` sentinel, never a working incarnation) is refused before the
         // factory's build phase can be asked for a state machine.
         && floor_admits(self.engine.floor(&group), blueprint.generation())
+        // The split-reservation gate, same seam: a solicited id that an in-flight split
+        // reserves declines BEFORE build, so the local fork stays the id's one materializer
+        // (the solicitation falls to the lifecycle tail and the sender retries).
+        && !self.coord.is_split_reserved(&group)
         && let Some(fsm) = factory.build(&group)
       {
         let generation = blueprint.generation();
