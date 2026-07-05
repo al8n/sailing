@@ -124,6 +124,27 @@ where
     /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
+  /// Propose a group SPLIT on one parent group (see `MultiRaft::propose_split`): a committed
+  /// `Split` entry deterministically forks `child` out of the parent's state machine on every
+  /// replica, and the drivers materialize the staged forks behind their engine barriers. Answer
+  /// `reply` with the leader's immediate verdict (the proposed log index).
+  ProposeSplit {
+    /// The parent group (the split rides its log; leader-only).
+    group: G,
+    /// The child group id to fork out.
+    child: G,
+    /// The child id's incarnation under the single-incarnation contract (0 unless the embedder
+    /// reshapes ids; checked against the child id's persisted admission floor at propose AND at
+    /// every replica's materialization edge).
+    child_gen: u64,
+    /// The embedder's opaque partition instruction, handed to `StateMachine::split` on every
+    /// replica; bounded by the single-frame append check.
+    instruction: bytes::Bytes,
+    /// Answered with the leader's immediate verdict: the proposed log index, or the rejection.
+    reply: oneshot::Sender<Result<Index, DriverError<I>>>,
+    /// The owning budget reservation, sized to the instruction bytes.
+    reservation: ReservationGuard,
+  },
   /// Snapshot one group's runtime [`Status`]; answer `reply` with the status read off that group's
   /// live endpoint ON the driver thread. `Err(Rejected)` when no such group is hosted — the
   /// group-keyed surface has a miss case the single-group one does not.
@@ -264,6 +285,16 @@ pub enum LifecycleEvent<G, I> {
   RemovedSelf {
     /// The group whose committed membership no longer names this host.
     group: G,
+  },
+  /// A committed SPLIT materialized on this host: `child` was forked out of `parent`, its
+  /// baseline is flush-durable behind the engine barrier, and the parent's snapshot fence over
+  /// the split index has been lifted. Fired on EVERY replica that materializes the fork (the
+  /// typed-G surface of the proto's G-free `Event::SplitApplied`).
+  SplitApplied {
+    /// The parent group the split rode.
+    parent: G,
+    /// The freshly-materialized child group.
+    child: G,
   },
 }
 
@@ -485,6 +516,29 @@ where
     rx.await.map_err(|_| DriverError::ShuttingDown)
   }
 
+  /// Propose a SPLIT of `parent`: fork `child` out of its state machine (see
+  /// [`GroupHandle::propose_split`] — this is the same command addressed without minting a
+  /// projection).
+  pub async fn propose_split(
+    &self,
+    parent: G,
+    child: G,
+    child_gen: u64,
+    instruction: bytes::Bytes,
+  ) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(instruction.len())?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::ProposeSplit {
+      group: parent,
+      child,
+      child_gen,
+      instruction,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
   /// The best-effort events tail, every event stamped with its originating group. Bounded and
   /// dropped-on-full: an observer that falls behind loses events, never slows consensus.
   pub fn events(&self) -> &flume::Receiver<(G, Event<I, F::Response>)> {
@@ -697,6 +751,31 @@ where
     self.send(MultiCommand::SetReadMode {
       group: self.group.cheap_clone(),
       mode,
+      reply: tx,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Propose a SPLIT of this group: fork `child` out of its state machine by the embedder's
+  /// opaque `instruction`, awaiting the leader's IMMEDIATE verdict (the proposed log index; the
+  /// fork itself materializes on every replica when the entry commits, surfacing as
+  /// [`LifecycleEvent::SplitApplied`]). Refusals — not leader, a joint-config parent, a hosted
+  /// or floored child id, an out-of-bound child encoding — resolve typed
+  /// [`DriverError::NotLeader`]/[`DriverError::Rejected`], with nothing appended.
+  pub async fn propose_split(
+    &self,
+    child: G,
+    child_gen: u64,
+    instruction: bytes::Bytes,
+  ) -> Result<Index, DriverError<I>> {
+    let reservation = self.budget.try_reserve(instruction.len())?;
+    let (tx, rx) = oneshot::channel();
+    self.send(MultiCommand::ProposeSplit {
+      group: self.group.cheap_clone(),
+      child,
+      child_gen,
+      instruction,
       reply: tx,
       reservation,
     })?;

@@ -45,6 +45,14 @@ impl StateMachine for CountSm {
     self.count = snapshot;
     Ok(())
   }
+
+  /// Split support for the reshaping suites: give away `min(count, instruction[0])` units as
+  /// the child half — a deterministic partition of the counter, so both halves' totals conserve.
+  fn split(&mut self, instruction: &[u8]) -> Option<Self> {
+    let give = u64::from(*instruction.first()?).min(self.count);
+    self.count -= give;
+    Some(Self { count: give })
+  }
 }
 
 /// A counting state machine whose apply FAILS on the magic `b"BOOM"` payload. An FSM apply error

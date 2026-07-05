@@ -1,9 +1,10 @@
 use super::*;
 use crate::{
-  FloorStore, MERGED_FLOOR, NoFloors, Term,
+  FloorStore, MERGED_FLOOR, NoFloors, SplitError, Term,
   testkit::{AsyncStable, CountSm, VecLog},
   transport::quic::{QuicTuning, crypto::tests::TestClusterCa},
 };
+use bytes::Bytes;
 use core::time::Duration;
 use std::{collections::BTreeMap, string::String};
 
@@ -1259,4 +1260,74 @@ fn fork_purges_a_queued_unknown_group_signal() {
     None,
     "the stale signal died with the fork admission"
   );
+}
+
+/// The coordinator's propose-time floor gate for splits (the ratified two-point BelowFloor:
+/// this fail-fast leg + the drivers' authoritative materialization-edge recheck): a floored
+/// child id refuses with the typed verdict and NOTHING is appended to the parent's log; the
+/// reserved `u64::MAX` incarnation refuses as its own class at any floor.
+#[test]
+fn propose_split_gates_the_child_floor() {
+  struct Floors(u64);
+  impl FloorStore<u64> for Floors {
+    fn floor(&self, _: &u64) -> u64 {
+      self.0
+    }
+
+    fn lineage(&self, _: &u64) -> u64 {
+      0
+    }
+  }
+  let ca = TestClusterCa::generate();
+  let cluster = ClusterId([7u8; 16]);
+  let mut c = multi_coord(&ca, 1, cluster);
+  let now = Instant::ORIGIN;
+  let (mut log, stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  let last = log.last_index();
+
+  let e = c
+    .propose_split(
+      &100,
+      now,
+      &mut log,
+      &stable,
+      &200,
+      1,
+      Bytes::from_static(b"i"),
+      &Floors(2),
+    )
+    .expect("the parent is hosted")
+    .unwrap_err();
+  assert_eq!(e, SplitError::BelowFloor { floor: 2 });
+  assert_eq!(log.last_index(), last, "nothing was proposed");
+
+  let e = c
+    .propose_split(
+      &100,
+      now,
+      &mut log,
+      &stable,
+      &200,
+      u64::MAX,
+      Bytes::from_static(b"i"),
+      &Floors(0),
+    )
+    .expect("the parent is hosted")
+    .unwrap_err();
+  assert_eq!(
+    e,
+    SplitError::ReservedGeneration,
+    "the sentinel incarnation is refused as its own class"
+  );
+  assert_eq!(log.last_index(), last, "nothing was proposed");
 }
