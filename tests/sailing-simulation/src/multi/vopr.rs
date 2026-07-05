@@ -146,6 +146,21 @@ pub struct MultiVoprReport {
   /// gid-tagged applied entries the cross-talk sweep judged (the isolation oracle's
   /// non-vacuity witness).
   pub cross_talk_checks: u64,
+  /// Membership-coherence comparisons the run-end final pass performed, summed over every
+  /// checker the run built (live groups + the retired archive) — how many observed snapshot
+  /// installs actually faced the committed-config history verdict.
+  pub membership_oracle_comparisons: u64,
+  /// Observed installs the run-end final pass could NOT judge due to an incomplete
+  /// committed-config HISTORY, summed over live + retired checkers. The finalize policy panics
+  /// (with gid/generation attribution) on any nonzero per-checker count — the single-group
+  /// sweep's `skipped == 0` policy — so a completed run always reports `0`.
+  pub skipped_unwitnessed_installs: u64,
+  /// Observed installs the run-end final pass SOUNDLY DECLINED because the resolved conf-change
+  /// index is committed-final but its committed-log KIND was compacted before any tick observed
+  /// it. Tolerated, exactly as the single-group policy tolerates the class: a bounded coverage
+  /// limitation of compaction, not a soundness hole — the net never trusts a possibly-stale
+  /// ConfChange.
+  pub kind_unobservable_installs: u64,
 }
 
 /// The fuzzer's deterministic bookkeeping threaded through the run.
@@ -249,8 +264,14 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   reads.scan(&w, &mut report, seed);
   // Membership-oracle VERDICT: the per-tick checks only RECORD snapshot-install observations;
   // the run-end final pass judges every one — across live groups AND retired archives — against
-  // its group's FINAL, now-stable committed-config history. Panics on a mismatch.
+  // its group's FINAL, now-stable committed-config history. Panics on a mismatch AND on any
+  // observation left without a verdict (skipped == 0, the single-group sweep's policy, enforced
+  // per checker with gid/generation attribution); kind-unobservable declines are the tolerated
+  // compaction class and only surface in the report.
   w.finalize_membership_or_panic(seed);
+  report.membership_oracle_comparisons = w.membership_oracle_comparisons();
+  report.skipped_unwitnessed_installs = w.skipped_unwitnessed_installs();
+  report.kind_unobservable_installs = w.kind_unobservable_installs();
   report.final_groups = w.live_groups().len();
   report.cross_talk_checks = w.cross_talk_checked();
   report.max_term_seen = report.max_term_seen.max(w.max_term_all());

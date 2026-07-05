@@ -134,6 +134,71 @@ fn finalize_membership_trips_a_corrupt_install_archived_by_retirement() {
   w.finalize_membership_or_panic(2);
 }
 
+/// Build the accounting-gap shape: a RECORDED install observation whose boundary lies beyond
+/// the committed-config history's completeness watermark, so `checker::finalize_membership`
+/// returns `Ok` while counting the install skipped-unwitnessed — never compared. Only the
+/// finalize pass's accounting leg stands between this and a run that ends without a membership
+/// verdict for the install.
+fn world_with_unjudgeable_install() -> MultiWorld {
+  let mut w = MultiWorld::new(2);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(600, |w| w.leader_of(100).is_some()));
+  let conf =
+    checker::ConfSnapshot::from_conf_state(&w.hosts[&0].group(&100).expect("hosted").conf_state());
+  // No log-built replica is anywhere near applied 1_000_000, so the history is never certified
+  // at that boundary and the observation can never be judged.
+  w.pending_new_installs
+    .entry(100)
+    .or_default()
+    .push((1, 1_000_000, conf));
+  w
+}
+
+/// `finalize_membership` returns `Ok` for an install it could not judge; the multi run's
+/// finalize policy must still refuse the run — on a LIVE group, with the gid attributed.
+#[test]
+fn finalize_membership_flags_an_unjudged_install_on_a_live_group() {
+  let mut w = world_with_unjudgeable_install();
+  // Record-only: the per-tick pass folds the observation without judging it.
+  w.check_now();
+  let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    w.finalize_membership_or_panic(2)
+  }))
+  .expect_err("an unjudged install must fail the run")
+  .downcast::<String>()
+  .map(|s| *s)
+  .unwrap_or_default();
+  assert!(msg.contains("MEMBERSHIP ACCOUNTING FAILURE"), "{msg}");
+  assert!(msg.contains("group=100 gen=0"), "{msg}");
+}
+
+/// The frozen-history case: the group is REMOVED first, so the archived checker's history can
+/// never advance to cover the boundary. The accounting policy must trip through the retired
+/// leg, attributing gid AND generation.
+#[test]
+fn finalize_membership_flags_an_unjudged_install_archived_by_retirement() {
+  let mut w = world_with_unjudgeable_install();
+  // The at-removal check folds the pending observation, then freezes the checker into the
+  // (gid, generation) archive.
+  w.remove_group(100);
+  assert!(w.checkers.is_empty());
+  assert_eq!(w.retired.len(), 1);
+  let msg = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    w.finalize_membership_or_panic(2)
+  }))
+  .expect_err("an unjudged install on a retired group must fail the run")
+  .downcast::<String>()
+  .map(|s| *s)
+  .unwrap_or_default();
+  assert!(msg.contains("MEMBERSHIP ACCOUNTING FAILURE"), "{msg}");
+  assert!(msg.contains("retired group"), "{msg}");
+  assert!(msg.contains("group=100 gen=0"), "{msg}");
+}
+
 /// Replica `(node, gid)`'s active `(voters, learners)` pair, for membership asserts.
 fn conf_of(w: &MultiWorld, node: u64, gid: u64) -> (BTreeSet<u64>, BTreeSet<u64>) {
   let cs = w.hosts[&node].group(&gid).expect("hosted").conf_state();

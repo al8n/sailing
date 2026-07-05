@@ -430,8 +430,19 @@ impl MultiWorld {
   /// [`remove_group`](Self::remove_group) archives a checker after one more record-only check,
   /// so without this pass a corrupt install on a removed or recreated group would never face
   /// the verdict at all. Panics with the oracle name + seed for exact replay.
+  ///
+  /// A clean `Ok` from the finalizer is NOT the whole verdict: the pass can return `Ok` while
+  /// RECORDING installs it could not judge. So each leg also enforces the single-group sweep's
+  /// accounting policy — `skipped_unwitnessed_installs == 0` per checker (a nonzero count is a
+  /// committed-config history completeness gap, and on a retired group the frozen history can
+  /// NEVER catch up, so the silence would be permanent) — panicking with gid/generation
+  /// attribution. Kind-unobservable declines are tolerated, exactly as the single-group policy
+  /// tolerates them (see [`kind_unobservable_installs`](Self::kind_unobservable_installs)).
   pub fn finalize_membership_or_panic(&mut self, seed: u64) {
-    for (&gid, ck) in self.checkers.iter_mut() {
+    let gids: Vec<u64> = self.checkers.keys().copied().collect();
+    for gid in gids {
+      let generation = self.generation_of(gid);
+      let ck = self.checkers.get_mut(&gid).expect("checker exists");
       if let Err(v) = checker::finalize_membership(ck) {
         panic!(
           "SAFETY ORACLE VIOLATION (run-end final pass): {v}\n  group={gid} seed={seed}\n  \
@@ -439,6 +450,7 @@ impl MultiWorld {
            reported boundary)",
         );
       }
+      Self::assert_installs_accounted(gid, generation, false, ck, seed);
     }
     for (&(gid, generation), ck) in self.retired.iter_mut() {
       if let Err(v) = checker::finalize_membership(ck) {
@@ -448,7 +460,77 @@ impl MultiWorld {
            the snapshot install at the reported boundary)",
         );
       }
+      Self::assert_installs_accounted(gid, generation, true, ck, seed);
     }
+  }
+
+  /// The finalize pass's ACCOUNTING leg: an `Ok` verdict with a nonzero skipped counter means an
+  /// observed install never faced the membership verdict at all. The single-group sweep asserts
+  /// that counter is `0` across its whole band; the multi run enforces the same zero-tolerance
+  /// per checker, where the gid/generation attribution a band total cannot carry is still known.
+  ///
+  /// `kind_unobservable_installs` is deliberately NOT enforced, matching the single-group
+  /// policy: some installs resolve to a conf-change whose committed-log entry was compacted
+  /// before any tick observed it, so the oracle has no EXACT-term ConfChange proof and SOUNDLY
+  /// DECLINES (never trust a possibly-stale ConfChange) rather than risk a false verdict — a
+  /// bounded coverage limitation of compaction, NOT a soundness hole. The aggregate is surfaced
+  /// through [`kind_unobservable_installs`](Self::kind_unobservable_installs) for sweep-level
+  /// coverage bounds.
+  fn assert_installs_accounted(gid: u64, generation: u64, retired: bool, ck: &Checker, seed: u64) {
+    let skipped = ck.skipped_unwitnessed_installs();
+    if skipped == 0 {
+      return;
+    }
+    let leg = if retired { ", retired group" } else { "" };
+    panic!(
+      "MEMBERSHIP ACCOUNTING FAILURE (run-end final pass{leg}): {skipped} observed snapshot \
+       install(s) never faced a membership verdict — a committed-config HISTORY completeness \
+       gap (a boundary beyond the watermark or an unresolved divergence that did not converge); \
+       the history must cover every committed index an install lands on\n  group={gid} \
+       gen={generation} seed={seed}\n  (replay: run_multi_vopr for this seed and inspect the \
+       group's observed installs)",
+    );
+  }
+
+  /// Membership-coherence comparisons the run-end final pass performed, summed over every
+  /// checker this world ever built (live groups + the retired archive); `0` until
+  /// [`finalize_membership_or_panic`](Self::finalize_membership_or_panic) runs. A sweep reads
+  /// this to prove the membership oracle genuinely judged installs rather than skipping them.
+  pub fn membership_oracle_comparisons(&self) -> u64 {
+    self
+      .checkers
+      .values()
+      .chain(self.retired.values())
+      .map(Checker::membership_comparisons)
+      .sum()
+  }
+
+  /// Observed installs the run-end final pass could NOT judge due to an incomplete
+  /// committed-config HISTORY, summed over live + retired checkers.
+  /// [`finalize_membership_or_panic`](Self::finalize_membership_or_panic) enforces `0` per
+  /// checker (the single-group sweep's policy), so a completed run always reports `0` —
+  /// surfaced so sweeps can pin exactly that.
+  pub fn skipped_unwitnessed_installs(&self) -> u64 {
+    self
+      .checkers
+      .values()
+      .chain(self.retired.values())
+      .map(Checker::skipped_unwitnessed_installs)
+      .sum()
+  }
+
+  /// Observed installs the run-end final pass SOUNDLY declined because the resolved conf-change
+  /// index is committed-final but its committed-log KIND was compacted before any tick observed
+  /// it, summed over live + retired checkers. Tolerated (never enforced), matching the
+  /// single-group policy: the net declines rather than risk a stale verdict — a bounded
+  /// coverage limitation of compaction, not a soundness hole.
+  pub fn kind_unobservable_installs(&self) -> u64 {
+    self
+      .checkers
+      .values()
+      .chain(self.retired.values())
+      .map(Checker::kind_unobservable_installs)
+      .sum()
   }
 
   /// Assert every NEWLY applied entry on every replica of `gid` decodes (when gid-tagged) to
