@@ -35,7 +35,7 @@
 
 use crate::{
   ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState, Entry,
-  EntryKind, Index, InstallSnapshot, Message, NodeId, SnapshotMeta, Term,
+  EntryKind, Index, InstallSnapshot, Message, NodeId, SnapshotMeta, SplitPayload, Term,
   data::{Data, DecodeError},
 };
 use buffa::{EnumValue, Message as _};
@@ -163,6 +163,7 @@ pub(crate) fn install_snapshot_encoded_len<I: NodeId>(
   meta_size += present_uint64(meta.max_wall_plus_window());
   meta_size += present_uint64(meta.max_unwalled_lease_window());
   meta_size += present_uint64(meta.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1));
+  meta_size += present_uint64(meta.shape_gen());
 
   // InstallSnapshot: term/offset/total_len ride only when non-zero; the leader id is always present
   // (1..=1024 bytes); the snapshot sub-message is always set; the data field rides only when non-empty.
@@ -448,6 +449,41 @@ pub(crate) fn decode_conf_change_v2<I: NodeId>(
   Ok(ConfChangeV2::new(transition, changes, w.context))
 }
 
+/// Encode a split payload as an entry payload.
+// The expectation self-expires the moment the propose-side consumer lands (an unfulfilled
+// `expect` is a lint error), so it cannot outlive its reason.
+#[cfg_attr(not(test), expect(dead_code))]
+pub(crate) fn encode_split_payload(p: &SplitPayload, buf: &mut Vec<u8>) {
+  pb::SplitPayload {
+    child: p.child_bytes(),
+    child_gen: p.child_gen(),
+    parent_gen_after: p.parent_gen_after(),
+    instruction: Bytes::copy_from_slice(p.instruction()),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a split payload from an entry payload. The child id's encoding must satisfy the
+/// group-tag wire bound (1..=[`MAX_GROUP_ID_LEN`] bytes) — the propose side never appends one
+/// outside it, so a committed violation is corrupt, exactly like an out-of-bound node id in a
+/// conf change.
+pub(crate) fn decode_split_payload(mut data: Bytes) -> Result<SplitPayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::SplitPayload>(&mut data)
+    .map_err(map_err)?;
+  if w.child.is_empty() || w.child.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("SplitPayload.child length"));
+  }
+  Ok(SplitPayload::new(
+    w.child,
+    w.child_gen,
+    w.parent_gen_after,
+    w.instruction,
+  ))
+}
+
 /// Map buffa's structural decode errors onto the crate's error surface. The envelope
 /// rejects-and-closes at the transport either way; the distinction that matters to
 /// callers is truncation vs malformation.
@@ -532,6 +568,7 @@ fn pb_entry(e: &Entry) -> pb::Entry {
       EntryKind::ConfChange => pb::EntryKind::ConfChange,
       EntryKind::Empty => pb::EntryKind::Empty,
       EntryKind::SetReadMode => pb::EntryKind::SetReadMode,
+      EntryKind::Split => pb::EntryKind::Split,
     }),
     data: e.data_bytes(),
     timestamp: e.timestamp(),
@@ -547,7 +584,14 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
     EnumValue::Known(pb::EntryKind::ConfChange) => EntryKind::ConfChange,
     EnumValue::Known(pb::EntryKind::Empty) => EntryKind::Empty,
     EnumValue::Known(pb::EntryKind::SetReadMode) => EntryKind::SetReadMode,
-    EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
+    EnumValue::Known(pb::EntryKind::Split) => EntryKind::Split,
+    // The merge kinds are RESERVED by this LABEL_VERSION (their pb values are pinned so the
+    // merge milestone adds no wire change) but nothing encodes them yet: reject like an unknown
+    // value until that milestone maps them. The version fence owns mixed-version peers.
+    EnumValue::Known(
+      pb::EntryKind::PrepareMerge | pb::EntryKind::CommitMerge | pb::EntryKind::RollbackMerge,
+    )
+    | EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
   };
   Ok(
     Entry::new(Term::new(w.term), Index::new(w.index), kind, w.data)
@@ -587,6 +631,7 @@ fn pb_snapshot_meta<I: Data>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
     max_wall_plus_window: m.max_wall_plus_window(),
     max_unwalled_lease_window: m.max_unwalled_lease_window(),
     read_only: m.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1),
+    shape_gen: m.shape_gen(),
     ..Default::default()
   }
 }
@@ -615,7 +660,8 @@ fn snapshot_meta_from<I: NodeId>(w: &pb::SnapshotMeta) -> Result<SnapshotMeta<I>
   )
   .with_max_lease_window(w.max_lease_window)
   .with_max_wall_plus_window(w.max_wall_plus_window)
-  .with_max_unwalled_lease_window(w.max_unwalled_lease_window);
+  .with_max_unwalled_lease_window(w.max_unwalled_lease_window)
+  .with_shape_gen(w.shape_gen);
   Ok(match read_only {
     Some(mode) => meta.with_read_only(mode),
     None => meta,

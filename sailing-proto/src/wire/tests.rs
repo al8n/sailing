@@ -900,7 +900,8 @@ fn install_snapshot_encoded_len_agrees_with_encoder() {
       .with_max_lease_window(1_234_567)
       .with_max_wall_plus_window(2_000_000_000)
       .with_max_unwalled_lease_window(50_000)
-      .with_read_only(ReadOnlyOption::Safe),
+      .with_read_only(ReadOnlyOption::Safe)
+      .with_shape_gen(3),
     ),
     (
       "lease scalars set (LeaseGuard read mode)",
@@ -912,7 +913,8 @@ fn install_snapshot_encoded_len_agrees_with_encoder() {
       .with_max_lease_window(u64::MAX)
       .with_max_wall_plus_window(u64::MAX)
       .with_max_unwalled_lease_window(u64::MAX)
-      .with_read_only(ReadOnlyOption::LeaseGuard),
+      .with_read_only(ReadOnlyOption::LeaseGuard)
+      .with_shape_gen(u64::MAX),
     ),
   ];
 
@@ -1178,5 +1180,167 @@ fn decode_rejects_a_frame_stuffed_with_unknown_fields() {
   assert!(
     r.is_err(),
     "a frame with more than MAX_UNKNOWN_FIELDS unknown fields must be rejected"
+  );
+}
+
+/// The pinned wire bytes of one `SplitPayload` — proto3 fields in ascending order: `child` (1,
+/// bytes), `child_gen` (2, varint), `parent_gen_after` (3, varint), `instruction` (4, bytes).
+/// Pinning the byte vector (not just the round-trip) makes the entry's wire cost visibly
+/// INDEPENDENT of FSM size: the split entry never carries the forked state blob.
+const GOLDEN_SPLIT_PAYLOAD: &[u8] = &[
+  0x0A, 0x01, 0x2A, // child = [0x2a]
+  0x10, 0x01, // child_gen = 1
+  0x18, 0x07, // parent_gen_after = 7
+  0x22, 0x04, 0x6B, 0x3C, 0x3D, 0x6D, // instruction = "k<=m"
+];
+
+#[test]
+fn split_payload_round_trips_and_pins_bytes() {
+  let p = SplitPayload::new(
+    Bytes::from_static(b"\x2a"),
+    1,
+    7,
+    Bytes::from_static(b"k<=m"),
+  );
+  let mut buf = Vec::new();
+  encode_split_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_SPLIT_PAYLOAD, "wire bytes are pinned");
+  let d = decode_split_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_split_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+}
+
+#[test]
+fn split_payload_rejects_out_of_bound_child() {
+  // An absent/empty child is not a split target; over the group-id wire bound rejects like any
+  // group tag would (the propose side never encodes one, so a committed oversized child is corrupt).
+  let empty = SplitPayload::new(Bytes::new(), 0, 1, Bytes::new());
+  let mut buf = Vec::new();
+  encode_split_payload(&empty, &mut buf);
+  assert!(
+    decode_split_payload(Bytes::from(buf)).is_err(),
+    "empty child rejects"
+  );
+
+  let oversized = SplitPayload::new(
+    Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]),
+    0,
+    1,
+    Bytes::new(),
+  );
+  let mut buf = Vec::new();
+  encode_split_payload(&oversized, &mut buf);
+  assert!(
+    decode_split_payload(Bytes::from(buf)).is_err(),
+    "an over-bound child encoding rejects"
+  );
+}
+
+#[test]
+fn split_entry_kind_round_trips_and_merge_kinds_stay_reserved() {
+  use buffa::Message as _;
+
+  // A Split entry rides the ordinary AppendEntries envelope.
+  let entry = Entry::new(
+    Term::new(2),
+    Index::new(9),
+    EntryKind::Split,
+    Bytes::from_static(GOLDEN_SPLIT_PAYLOAD),
+  );
+  rt(Message::AppendEntries(AppendEntries::new(
+    Term::new(2),
+    1,
+    Index::new(8),
+    Term::new(2),
+    std::vec![entry],
+    Index::new(8),
+  )));
+
+  // The merge entry kinds are RESERVED in this LABEL_VERSION bump (their pb values are pinned so
+  // the merge milestone adds no wire change), but nothing encodes them yet: a frame carrying one
+  // rejects at conversion exactly like an unknown kind, and the version fence owns mixed versions.
+  for kind in [
+    pb::EntryKind::PrepareMerge,
+    pb::EntryKind::CommitMerge,
+    pb::EntryKind::RollbackMerge,
+  ] {
+    let ae = pb::AppendEntries {
+      term: 2,
+      leader_id: {
+        let mut v = Vec::new();
+        Data::encode(&1u64, &mut v);
+        Bytes::from(v)
+      },
+      prev_log_index: 8,
+      prev_log_term: 2,
+      entries: std::vec![pb::Entry {
+        term: 2,
+        index: 9,
+        kind: buffa::EnumValue::Known(kind),
+        ..Default::default()
+      }],
+      leader_commit: 8,
+      ..Default::default()
+    };
+    let msg = pb::Message {
+      body: Some(pb::message::Body::from(ae)),
+      ..Default::default()
+    };
+    let mut buf = Vec::new();
+    msg.encode(&mut buf);
+    assert!(
+      decode_message::<u64>(Bytes::from(buf)).is_err(),
+      "a reserved merge entry kind rejects at conversion until the merge milestone maps it"
+    );
+  }
+}
+
+#[test]
+fn snapshot_meta_shape_gen_round_trips() {
+  let conf = ConfState::from_voters(std::vec![1u64, 2, 3]);
+  let meta = SnapshotMeta::new(Index::new(10), Term::new(4), conf.clone()).with_shape_gen(7);
+  assert_eq!(meta.shape_gen(), 7);
+  let m = Message::InstallSnapshot(InstallSnapshot::new(
+    Term::new(4),
+    1,
+    meta,
+    Bytes::from_static(b"blob"),
+  ));
+  let mut buf = Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(back.snapshot().shape_gen(), 7, "shape_gen round-trips");
+
+  // shape_gen 0 (an unreshaped id) is ABSENT on the wire: byte-identical to a pre-P6 peer's meta.
+  let plain = SnapshotMeta::new(Index::new(10), Term::new(4), conf);
+  let mut a = Vec::new();
+  let mut b = Vec::new();
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.clone(),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut a,
+  );
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1,
+      plain.with_shape_gen(0),
+      Bytes::from_static(b"blob"),
+    )),
+    &mut b,
+  );
+  assert_eq!(
+    a, b,
+    "shape_gen 0 encodes absent (byte-identical to before)"
   );
 }

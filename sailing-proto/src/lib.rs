@@ -32,7 +32,7 @@ mod data;
 pub use data::{ByteCursor, Data, DecodeError};
 
 mod entry;
-pub use entry::{Entry, EntryKind};
+pub use entry::{Entry, EntryKind, SplitPayload};
 
 mod maybe_owned;
 pub use maybe_owned::MaybeOwned;
