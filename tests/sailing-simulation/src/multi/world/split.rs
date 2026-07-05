@@ -140,10 +140,10 @@ impl MultiWorld {
   }
 
   /// Register a fork's child in the harness catalog on its FIRST materialization anywhere:
-  /// registry entry (voters from the fork's boot config, population from the pending record),
-  /// a fresh checker floored at the fork baseline, and the conservation pair. Later
-  /// materializations of the same fork on other nodes find the child registered and only wire
-  /// their replica.
+  /// registry entry (voters from the fork's boot config, population from the pending record,
+  /// the inherited-baseline length off the fork's own manufactured half), a fresh checker
+  /// floored at the fork baseline, and the conservation pair. Later materializations of the
+  /// same fork on other nodes find the child registered and only wire their replica.
   fn register_split_child(&mut self, fork: &sailing_proto::GroupFork<u64, u64, LogSm>) {
     if self.groups.contains_key(&fork.child) {
       return;
@@ -161,6 +161,13 @@ impl MultiWorld {
         voters,
         generation: fork.child_gen,
         keys: pending.child_keys.clone(),
+        // Every replica of this incarnation opens with the same inherited record, whichever
+        // path delivered it: every parent replica manufactures the fork at the same applied
+        // prefix (the split entry's log position), and the blob is authoritative at
+        // materialization while `LogSm::snapshot()` carries the full record to any
+        // snapshot-wired latecomer. Group-level here is what keeps the aligned view and the
+        // cross-talk floor independent of HOW a replica arrived.
+        fork_baseline: fork.fsm.applied().len(),
         ..lifecycle::GroupMeta::default()
       },
     );
@@ -189,10 +196,11 @@ impl MultiWorld {
 
   /// Materialize one fork on `node`: fresh stores, the manufactured snapshot install through
   /// `create_group_from_fork`, the world's per-replica bookkeeping, and the barrier lift (sync
-  /// stores make the baseline durable at the call). The cross-talk high-water is seeded PAST
-  /// the inherited baseline — its cells carry the PARENT's tag legitimately (the handover) —
-  /// while the conservation recorder's starts at 0 so the baseline is observed as the child's
-  /// opening history.
+  /// stores make the baseline durable at the call). Deliberately NO oracle-view seeding here:
+  /// the aligned view and the cross-talk floor derive from the group registration record
+  /// (`GroupMeta::fork_baseline`), and the conservation recorder starts at 0 so the baseline is
+  /// observed as the child's opening history — a snapshot-wired latecomer gets the identical
+  /// treatment without ever passing through this path.
   fn wire_fork_replica(&mut self, node: u64, fork: sailing_proto::GroupFork<u64, u64, LogSm>) {
     let child = fork.child;
     self.logs.insert((node, child), MemLog::new());
@@ -227,10 +235,6 @@ impl MultiWorld {
         stable,
       )
       .unwrap_or_else(|e| panic!("fork of group {child} on node {node}: {e:?}"));
-    let inherited = self.applied_of(node, child).len();
-    self.fork_baseline.insert((node, child), inherited);
-    self.swept.insert((node, child), inherited);
-    self.cons_swept.remove(&(node, child));
     self
       .hosts
       .get_mut(&node)
@@ -244,11 +248,13 @@ impl MultiWorld {
   /// high-water) and minus cells of GIVEN-AWAY keys (a split removes them from a parent replica
   /// mid-record at ITS apply point, so two parent replicas at different split progress stop
   /// being positionally prefix-related; filtering both sides restores the prefix notion). The
-  /// dropped cells are not unjudged: the conservation ledger compares them exact-cell across
-  /// the handover, and quiesce equality reads the raw records once every replica converged. For
-  /// a group that never split this is the raw record verbatim.
+  /// baseline comes off the GROUP record, so every replica view of a fork-born incarnation
+  /// aligns identically however it arrived. The dropped cells are not unjudged: the
+  /// conservation ledger compares them exact-cell across the handover, and quiesce equality
+  /// reads the raw records once every replica converged. For a group that never split this is
+  /// the raw record verbatim.
   pub(super) fn aligned_applied(&self, node: u64, gid: u64) -> AppliedLog {
-    let baseline = self.fork_baseline.get(&(node, gid)).copied().unwrap_or(0);
+    let baseline = self.groups.get(&gid).map_or(0, |m| m.fork_baseline);
     let keys = self.groups.get(&gid).map(|m| &m.keys);
     self
       .applied_of(node, gid)
