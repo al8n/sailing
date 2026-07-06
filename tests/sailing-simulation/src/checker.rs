@@ -1208,6 +1208,96 @@ pub fn record_membership_observation(checker: &mut Checker, view: &ClusterView) 
   }
 }
 
+/// A retiring group's committed-config history FREEZES at archival, so an install whose boundary sits beyond
+/// [`complete_up_to`](Checker::complete_up_to) could never be witnessed by a later apply — a PERMANENT
+/// `skipped_unwitnessed` even when the truth is knowable. This one last exact-term walk of the retiring replicas'
+/// DURABLE logs certifies completeness through those boundaries, in two SOUND moves — neither folds a conf-change
+/// (the world has no decoder), and neither can FALSELY witness:
+///
+///   1. RECORD each retiring replica's CURRENT folded config at its last committed conf-change index, at that
+///      entry's exact term. `conf_state()` is the fold of every conf-change the replica applied, so it is the
+///      config in effect from that index onward — the piece a snapshot-installed observers-only replica (the
+///      absorb→observers→retire shape) emits no `ConfChanged` for, so the event-sourced history never saw it.
+///      Highest-term-wins / same-term-divergence ambiguation is applied exactly as the per-tick recorder does.
+///   2. RAISE `complete_up_to` across the GAP-FREE recorded prefix. A durable committed log proves commit reached
+///      its extent, so the step-function reference is complete up to the first index carrying an UNRECORDED
+///      conf-change. Only logs that CONNECT to the current frontier (`durable_first <= complete_up_to + 1`, no
+///      invisible hole below the log's first durable index) contribute, and the walk STOPS just before the first
+///      unrecorded conf-change — a genuine history gap the frozen archive rightly keeps as unwitnessed.
+///
+/// A pure observer of the archived checker: no PRNG, no node mutation.
+pub fn certify_retiring_history(checker: &mut Checker, view: &ClusterView) {
+  // 1. Record the final folded config at each unparked retiring replica's last committed conf-change.
+  for n in view.nodes.iter() {
+    if n.removed {
+      continue; // a parked replica carries a stale config — never the retiring truth
+    }
+    let Some(last_cc) = n
+      .durable_entries
+      .iter()
+      .filter(|e| e.is_conf_change && e.index <= n.commit)
+      .max_by_key(|e| e.index)
+    else {
+      continue;
+    };
+    let conf = n.conf_snapshot();
+    match checker.committed_config_history.get_mut(&last_cc.index) {
+      Some((et, ec, amb)) => {
+        if last_cc.term > *et {
+          *et = last_cc.term;
+          *ec = conf;
+          *amb = false;
+        } else if last_cc.term == *et && *ec != conf {
+          *amb = true;
+        }
+      }
+      None => {
+        checker
+          .committed_config_history
+          .insert(last_cc.index, (last_cc.term, conf, false));
+      }
+    }
+  }
+
+  // 2. Raise `complete_up_to` across the gap-free prefix the connecting durable logs prove.
+  let base = checker.complete_up_to;
+  let connects =
+    |n: &NodeView| !n.removed && !n.durable_entries.is_empty() && n.durable_first <= base + 1;
+  let extent = view
+    .nodes
+    .iter()
+    .filter(|n| connects(n))
+    .map(|n| n.commit.min(n.durable_last))
+    .max()
+    .unwrap_or(0);
+  if extent <= base {
+    return;
+  }
+  let mut conf_indices: Vec<u64> = view
+    .nodes
+    .iter()
+    .filter(|n| connects(n))
+    .flat_map(|n| {
+      let commit = n.commit;
+      n.durable_entries
+        .iter()
+        .filter(move |e| e.is_conf_change && e.index <= commit)
+        .map(|e| e.index)
+    })
+    .filter(|i| *i > base && *i <= extent)
+    .collect();
+  conf_indices.sort_unstable();
+  conf_indices.dedup();
+  let mut frontier = extent;
+  for idx in conf_indices {
+    if !checker.committed_config_history.contains_key(&idx) {
+      frontier = idx.saturating_sub(1);
+      break;
+    }
+  }
+  checker.complete_up_to = base.max(frontier);
+}
+
 /// **snapshot-membership-coherent (VERDICT step)**: the run-end final pass. Compare EVERY observed install's
 /// INSTALL-TIME ConfState against the FINAL committed config in effect at its boundary, exactly once. Run once
 /// after the last tick (see [`record_membership_observation`] for the per-tick recording it consumes).

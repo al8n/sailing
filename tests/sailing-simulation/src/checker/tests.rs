@@ -1505,3 +1505,104 @@ fn check_or_panic_message_contains_seed_tick() {
   assert!(msg.contains("seed=2882343476"), "{msg}"); // 0xABCD_1234
   assert!(msg.contains("tick=999"), "{msg}");
 }
+
+/// The absorb→observers-only→retire shape (seed-2 class): a group absorbs via a forced snapshot,
+/// shrinks to observers through a conf-change its snapshot-installed replicas emit no
+/// `ConfChanged` for, then retires. The observers-only install lands beyond the completeness
+/// watermark against a history that never recorded its config, so the frozen archive counts it
+/// unwitnessed forever. `certify_retiring_history` — the one last exact-term walk of the retiring
+/// durable logs at archival — records the folded config and raises the watermark through the
+/// boundary, so the install is JUDGED (compared), not silently skipped.
+#[test]
+fn certify_retiring_history_witnesses_the_absorb_observers_retire_install() {
+  let mut ck = Checker::new();
+  // Pre-absorb: log-built voters {0,1,2}, genesis captured, complete_up_to raised to 5.
+  let pre: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 5, 5);
+      n.conf_voters = [0, 1, 2].into_iter().collect();
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(2, 1, pre));
+
+  // The observers-only install: a snapshot lands at boundary 8 with the shrunk config {0}. Its
+  // removing conf-change at index 8 was applied only by snapshot-installed replicas, so the
+  // event-sourced history never recorded it, and the boundary sits beyond complete_up_to (5).
+  let install_view = with_install(cv(2, 2, std::vec![]), 0, 8, conf(&[0], &[]));
+  record_membership_observation(&mut ck, &install_view);
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "the install lands beyond the completeness watermark against an unrecorded config"
+  );
+
+  // Retire: the retiring replicas' durable logs are committed through 8, carrying the
+  // observers-only conf-change at index 8, their folded conf_state() = {0}. The world records the
+  // committed-log kind, then the retire walk records the config and raises the watermark.
+  let retiring: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 8, 8);
+      n.durable_entries[7].is_conf_change = true; // index 8: the observers-only change
+      n.conf_voters = [0].into_iter().collect();
+      n.conf_changed = 1;
+      n.installed_snapshot = true; // post-absorb: emits no ConfChanged, so record raises nothing
+      n
+    })
+    .collect();
+  let retire_view = cv(2, 3, retiring);
+  record_membership_observation(&mut ck, &retire_view);
+  certify_retiring_history(&mut ck, &retire_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "the retire walk certified the history through the boundary"
+  );
+  assert!(
+    ck.membership_comparisons() >= 1,
+    "the install was JUDGED against the folded config {{0}}, not merely un-counted"
+  );
+}
+
+/// Zero-tolerance stays: the retire walk certifies ONLY the gap-free prefix. An install beyond the
+/// retiring replicas' durable committed extent has no proof, so it remains unwitnessed — the walk
+/// never blanket-blesses, it extends completeness exactly as far as the durable logs prove.
+#[test]
+fn certify_retiring_history_leaves_a_genuine_gap_unwitnessed() {
+  let mut ck = Checker::new();
+  let pre: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 5, 5);
+      n.conf_voters = [0, 1, 2].into_iter().collect();
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(7, 1, pre));
+
+  // An install at boundary 30 — far beyond anything the retiring replicas commit.
+  let install_view = with_install(cv(7, 2, std::vec![]), 0, 30, conf(&[0], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  // The retiring replicas commit only through 8: the walk can prove no more.
+  let retiring: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 8, 8);
+      n.conf_voters = [0].into_iter().collect();
+      n.installed_snapshot = true;
+      n
+    })
+    .collect();
+  let retire_view = cv(7, 3, retiring);
+  record_membership_observation(&mut ck, &retire_view);
+  certify_retiring_history(&mut ck, &retire_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "an install beyond the durable committed extent stays unwitnessed — no false witness"
+  );
+}

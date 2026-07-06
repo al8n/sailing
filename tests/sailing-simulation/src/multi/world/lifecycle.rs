@@ -94,6 +94,10 @@ impl MultiWorld {
       .remove(&gid)
       .expect("a live group has a checker");
     checker.check_or_panic(&view);
+    // One last exact-term walk of the retiring replicas' durable logs extends the committed-config
+    // history through any install boundary the frozen archive could otherwise never witness (the
+    // absorb→observers-only→retire shape, where snapshot-installed replicas emit no ConfChanged).
+    crate::checker::certify_retiring_history(&mut checker, &view);
     self.retired.insert((gid, generation), checker);
     self.pending_transitions.remove(&gid);
     self.pending_new_installs.remove(&gid);
