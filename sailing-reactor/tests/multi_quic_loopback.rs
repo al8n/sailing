@@ -173,6 +173,28 @@ async fn find_leader(groups: &[GroupHandle<u64, u64, CountSm>], what: &str) -> u
   }
 }
 
+/// Colocate `groups`' leadership onto node `to_node`, waiting until it settles there. The merge's
+/// all-source-voters barrier is observable only on the source LEADER's tracker, so `commit_merge`
+/// can only certify it when the absorbing target's leader also leads the source — the CRDB
+/// colocate-then-merge discipline. Transfer the source onto the target leader BEFORE freezing:
+/// a frozen source refuses a transfer, and moving the source (not the target) leaves the target's
+/// leadership pinned through the choreography.
+async fn colocate_onto(groups: &[GroupHandle<u64, u64, CountSm>], to_node: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: colocation never settled onto node {to_node}"
+    );
+    let at = find_leader(groups, what).await;
+    if at as u64 + 1 == to_node {
+      return;
+    }
+    let _ = groups[at].transfer_leader(to_node).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
 /// The gate: a 3-node QUIC host carries groups 100 and 200 over ONE shared mTLS mesh; each group
 /// elects, commits through redirects, and serves linearizable reads, with the two groups' state
 /// machines strictly isolated. Groups are created immediately after spawn — the identity latch —
@@ -1429,6 +1451,9 @@ async fn merge_absorbs_and_source_never_returns() {
 
   let t_leader = find_leader(&g200, "target pre-merge").await;
   let t_term = g200[t_leader].status().await.expect("status").term;
+  // Colocate the source's leadership onto the target's leader so the absorb can certify the
+  // all-source-voters freeze barrier (the source is moved, so the target leader never churns).
+  colocate_onto(&g100, t_leader as u64 + 1, "source onto target leader").await;
 
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   'freeze: loop {

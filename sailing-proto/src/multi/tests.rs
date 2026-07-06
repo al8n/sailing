@@ -3431,6 +3431,107 @@ fn a_divergent_source_boundary_never_advances_on_index_alone() {
   );
 }
 
+/// THE WEDGE THE ADMISSION BARRIER PREVENTS (the log-behind dual of the freeze-identity
+/// red-proof): a source replica whose LOG never reached the freeze boundary, cut off from any
+/// source leader, can neither advance on identity (its log lacks the boundary entry) nor be
+/// snapshotted past it here — so its co-located, log-complete parked target wedges FOREVER. This
+/// state is exactly what `commit_merge`'s all-source-voters barrier makes unconstructible: the
+/// `CommitMerge` is never proposed while any voter sits below the boundary, so a legitimately
+/// admitted merge can never leave a voter in this shape.
+#[test]
+fn a_log_behind_source_park_never_self_resolves() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  // A 3-voter source whose log ENDS at index 1 — below the freeze boundary at index 2, which it
+  // never received. Leaderless (restored, no incoming replication), so it can never catch up.
+  let mut src_log = VecLog::default();
+  let mut cmd_buf = Vec::new();
+  Data::encode(&Bytes::from_static(&[7u8]), &mut cmd_buf);
+  src_log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Normal,
+    Bytes::from(cmd_buf),
+  )]);
+  let mut src_stable = crate::testkit::NoopStable::<u64>::default();
+  src_stable.force_state(Term::new(1), None, Index::new(1));
+  let three = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  m.restore_group(
+    1,
+    three,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut src_log,
+    &mut src_stable,
+  )
+  .unwrap();
+  assert_eq!(m.group(&1).unwrap().applied_index(), Index::new(1));
+  stores.0.insert(1, (src_log, AsyncStable::default()));
+
+  // A target parked at a CommitMerge naming the source's boundary at index 2, term 1.
+  let mut source_bytes = Vec::new();
+  Data::encode(&1u64, &mut source_bytes);
+  let payload =
+    crate::CommitMergePayload::new(Bytes::from(source_bytes), Index::new(2), Term::new(1), 1, 1);
+  let mut buf = Vec::new();
+  crate::wire::encode_commit_merge_payload(&payload, &mut buf);
+  let mut tgt_log = VecLog::default();
+  tgt_log.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::CommitMerge,
+    Bytes::from(buf),
+  )]);
+  let mut tgt_stable = crate::testkit::NoopStable::<u64>::default();
+  tgt_stable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group(
+    2,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut tgt_log,
+    &mut tgt_stable,
+  )
+  .unwrap();
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
+  stores.0.insert(2, (tgt_log, AsyncStable::default()));
+  let d = m.group(&2).unwrap().poll_timeout().unwrap();
+  let (log, stable) = stores.0.get_mut(&2).unwrap();
+  m.handle_timeout(&2, d, log, stable).unwrap();
+  drain_storage(&mut m, 2, d, log, stable);
+
+  // The identity leg cannot advance a log that never reached the boundary; nothing ever resolves.
+  for _ in 0..8 {
+    assert!(
+      m.service_merge_applies(Instant::ORIGIN, &mut stores)
+        .is_empty(),
+      "a log-behind source can never be advanced or absorbed locally"
+    );
+  }
+  assert_eq!(
+    m.group(&1).unwrap().applied_index(),
+    Index::new(1),
+    "the source stayed below the boundary"
+  );
+  assert!(
+    m.contains_group(&1) && m.group(&2).unwrap().pending_merge().is_some(),
+    "the target is wedged: parked forever with an unadvanceable local source"
+  );
+}
+
 /// Every propose-time precondition maps to its typed refusal, with nothing appended.
 #[test]
 fn merge_verb_preconditions_refuse_typed() {
@@ -3890,15 +3991,138 @@ fn rollback_refuses_a_pending_freeze_then_lands() {
   assert!(!ep.merge_freeze_active());
 }
 
-/// The source LEADER's host resolves LAST — waitForApplication, container-local: while any
-/// source peer's match sits below the freeze boundary, the host whose local source replica IS
-/// the source leader keeps its park (and thereby keeps the source leader alive and feeding F
-/// to the stragglers); it resolves only once every peer matched through the boundary. Without
-/// this leg, the early teardown of the source leader strands every slow source follower below
-/// F forever — and their hosts' parks with them.
+/// THE MERGE-ORPHAN WEDGE, PREVENTED AT ADMISSION (the dual of the freeze-identity red-proof):
+/// `commit_merge` must not dissolve a source until EVERY source voter has matched the freeze
+/// boundary. A source voter left log-behind below the boundary while the source leader is later
+/// lost is orphaned — the other hosts floor+dismantle the source out from under it (the
+/// leader-local resolve-last discipline is defeated by source-leader loss), and its co-located,
+/// log-complete TARGET LEADER parks forever with a local source it can neither advance nor be
+/// snapshotted past. Admitting the `CommitMerge` while a voter lags is what seeds that wedge, so
+/// the barrier refuses here: the committed `CommitMerge` then certifies the whole voter set holds
+/// the freeze, and dissolution rides it safely on every host.
 #[test]
-fn source_leader_host_resolves_last() {
+fn commit_merge_refuses_until_every_source_voter_reaches_the_freeze() {
   use crate::{AppendResponse, Message, VoteResponse};
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  let three_voters = || {
+    Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+  fn ack(
+    m: &mut MultiRaft<u64, u64, CountSm>,
+    stores: &mut MapStores,
+    gid: u64,
+    peer: u64,
+    upto: Index,
+  ) {
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    m.handle_message(
+      &gid,
+      Instant::ORIGIN,
+      log,
+      stable,
+      peer,
+      Message::AppendResponse(AppendResponse::new(
+        Term::new(1),
+        peer,
+        false,
+        Index::ZERO,
+        Term::ZERO,
+        upto,
+      )),
+    )
+    .unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    drain_storage(m, gid, Instant::ORIGIN, log, stable);
+  }
+  // Source (1) and target (2) both led locally by node 1; peer 2 acks (quorum), peer 3 lags.
+  for gid in [1u64, 2] {
+    stores
+      .0
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    m.create_group(gid, three_voters(), Instant::ORIGIN, 7, CountSm::default())
+      .unwrap();
+    let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+    drain_storage(&mut m, gid, d, log, stable);
+    m.handle_message(
+      &gid,
+      d,
+      log,
+      stable,
+      2u64,
+      Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+    )
+    .unwrap();
+    drain_storage(&mut m, gid, d, log, stable);
+    assert!(m.group(&gid).unwrap().role().is_leader());
+    ack(&mut m, &mut stores, gid, 2, Index::new(1));
+  }
+  let now = Instant::ORIGIN;
+
+  // Freeze the source: peer 2's ack commits and applies the PrepareMerge; peer 3's match stays
+  // at 0 — log-behind, below the freeze boundary F.
+  let f = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap()
+  };
+  ack(&mut m, &mut stores, 1, 2, f);
+  assert!(m.group(&1).unwrap().is_frozen());
+  assert!(
+    !m.group(&1).unwrap().peers_matched_through(f),
+    "peer 3 has NOT reached the freeze boundary"
+  );
+
+  // The barrier refuses: admitting now would seed the wedge (source-leader loss orphans peer 3).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(
+        m.commit_merge(&2, now, log, stable, &1).unwrap(),
+        Err(MergeError::SourceBarrierPending)
+      ),
+      "a lagging source voter must block the absorb at admission"
+    );
+  }
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_none(),
+    "nothing parked — no CommitMerge was proposed"
+  );
+
+  // Peer 3 catches up to the boundary: the barrier clears and the absorb admits, its committed
+  // CommitMerge now a certificate that every source voter holds the freeze.
+  ack(&mut m, &mut stores, 1, 3, f);
+  assert!(m.group(&1).unwrap().peers_matched_through(f));
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      m.commit_merge(&2, now, log, stable, &1).unwrap().is_ok(),
+      "with every voter at the boundary the absorb admits"
+    );
+  }
+}
+
+/// Dissolution rides the committed `CommitMerge`, uniformly on every host — there is no
+/// resolve-last discipline. The all-source-voters barrier at admission already proved every
+/// voter holds the freeze, so once the `CommitMerge` commits and its abort window closes the
+/// host resolves straight away; it never waits on a peer's match at resolve time. To make the
+/// leader-loss resilience concrete the source LEADER is stepped down before the resolve: the
+/// old discipline hinged on the source leader staying alive to feed stragglers, and its early
+/// loss is exactly what orphaned them — now the resolve completes regardless, because the
+/// barrier put the freeze in every voter's own log before the `CommitMerge` was ever proposed.
+#[test]
+fn dissolution_rides_the_committed_commit_merge_after_source_leader_loss() {
+  use crate::{AppendResponse, Message, RequestVote, VoteResponse};
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
   let mut stores = MapStores(
     std::collections::BTreeMap::new(),
@@ -3941,7 +4165,7 @@ fn source_leader_host_resolves_last() {
     let (log, stable) = stores.0.get_mut(&gid).unwrap();
     drain_storage(m, gid, Instant::ORIGIN, log, stable);
   }
-  // Source (1) and target (2): 3-voter groups led locally (peer 2's vote elects; peer 3 lags).
+  // Source (1) and target (2): 3-voter groups led locally (peer 2's vote elects).
   for gid in [1u64, 2] {
     stores
       .0
@@ -3963,20 +4187,24 @@ fn source_leader_host_resolves_last() {
     .unwrap();
     drain_storage(&mut m, gid, d, log, stable);
     assert!(m.group(&gid).unwrap().role().is_leader());
-    // Commit the no-op via peer 2's ack (quorum 2 of 3); peer 3 never acks anything.
     ack(&mut m, &mut stores, gid, 2, Index::new(1));
   }
   let now = Instant::ORIGIN;
 
-  // Freeze the source: peer 2's ack commits the PrepareMerge; peer 3's match stays at 0.
+  // Freeze the source, then bring EVERY source voter to the boundary — the admission barrier.
   let f = {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
     m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap()
   };
   ack(&mut m, &mut stores, 1, 2, f);
+  ack(&mut m, &mut stores, 1, 3, f);
   assert!(m.group(&1).unwrap().is_frozen());
+  assert!(
+    m.group(&1).unwrap().peers_matched_through(f),
+    "every source voter matched the boundary — the barrier is met"
+  );
 
-  // Park the target the same way.
+  // The barrier admits the absorb; peer 2's ack commits it and the target parks.
   let k = {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap()
@@ -3984,24 +4212,40 @@ fn source_leader_host_resolves_last() {
   ack(&mut m, &mut stores, 2, 2, k);
   assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
 
-  // First pass: the window is open — the target leader seals it (a no-op at k+1) and waits.
+  // The source LEADER is lost: a higher-term vote request steps node 1's source down to a
+  // follower. Under the old resolve-last discipline this loss is what stranded stragglers.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      3u64,
+      Message::RequestVote(RequestVote::new(
+        Term::new(2),
+        3u64,
+        f,
+        Term::new(1),
+        false,
+        false,
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    !m.group(&1).unwrap().role().is_leader(),
+    "the source leader stepped down"
+  );
+
+  // Seal and resolve: dissolution completes on this host even though the source is no longer
+  // led here — the committed CommitMerge is the certificate, not a live source leader.
   assert!(
     m.service_merge_applies(now, &mut stores).is_empty(),
     "the open window seals and holds"
   );
-  // Peer 2's ack commits the seal; peer 3's SOURCE match still sits below the boundary: the
-  // source-leader host must keep WAITING — park intact, source leader alive and still able to
-  // feed the straggler.
   ack(&mut m, &mut stores, 2, 2, k.next());
-  assert!(
-    m.service_merge_applies(now, &mut stores).is_empty(),
-    "the source leader's host waits for its peers to match the boundary"
-  );
-  assert!(m.contains_group(&1), "the source leader survives the wait");
-  assert!(m.group(&2).unwrap().pending_merge().is_some());
-
-  // The straggler catches up (its ack reaches F): the wait releases and the host resolves.
-  ack(&mut m, &mut stores, 1, 3, f);
   let resolutions = m.service_merge_applies(now, &mut stores);
   assert_eq!(
     resolutions,

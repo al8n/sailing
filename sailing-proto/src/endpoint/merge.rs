@@ -630,11 +630,13 @@ where
 
   /// Whether every tracked peer (voters AND learners, both joint halves) has MATCHED the log
   /// through `boundary` — meaningful on the LEADER (its tracker holds the peers' proven match).
-  /// The merge service's waitForApplication leg reads it off a frozen SOURCE leader: the host
-  /// whose local source replica leads resolves LAST, keeping that leader alive and replicating
-  /// the freeze until every source peer provably holds it — otherwise the early teardown of the
-  /// source leader strands slow source followers below the boundary forever, and their hosts'
-  /// parked absorbs with them.
+  /// The merge's all-source-voters freeze barrier (the CRDB `waitForApplication` shape) reads it
+  /// off the frozen SOURCE leader at `commit_merge` admission: the absorb is not proposed until
+  /// every source voter provably holds the freeze, so the committed `CommitMerge` that dissolves
+  /// the source certifies the whole voter set already has it. A voter left below the boundary
+  /// would otherwise be orphaned once the source leader is lost — the other hosts floor and
+  /// dismantle the source around it, and its co-located target parks with no way to advance or
+  /// be snapshotted past its local source.
   pub(crate) fn peers_matched_through(&self, boundary: Index) -> bool {
     let me = self.config.id();
     self

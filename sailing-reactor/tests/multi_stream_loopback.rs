@@ -3931,6 +3931,27 @@ where
   }
 }
 
+/// Colocate `groups`' leadership onto node `to_node`, waiting until it settles there. The merge's
+/// all-source-voters barrier is observable only on the source LEADER's tracker, so `commit_merge`
+/// certifies it only when the absorbing target's leader also leads the source — the CRDB
+/// colocate-then-merge discipline. Move the source onto the target leader BEFORE freezing (a
+/// frozen source refuses a transfer; moving the source leaves the target's leadership pinned).
+async fn colocate_onto(groups: &[GroupHandle<u64, u64, CountSm>], to_node: u64, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: colocation never settled onto node {to_node}"
+    );
+    let at = find_leader(groups, what).await;
+    if at as u64 + 1 == to_node {
+      return;
+    }
+    let _ = groups[at].transfer_leader(to_node).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
 /// The T11 stream merge gate: 3 nodes, two loaded groups — freeze, parked commit, per-crank
 /// resolution — then the target serves the UNION, the source id refuses forever on its terminal
 /// floor, and the target saw NO leadership churn through the whole choreography (same leader,
@@ -3961,6 +3982,8 @@ async fn merge_absorbs_and_source_never_returns() {
   // Pin the target's leadership through the whole choreography.
   let t_leader = find_leader(&g200, "target pre-merge").await;
   let t_term = g200[t_leader].status().await.expect("status").term;
+  // Colocate the source onto the target leader so the absorb can certify the freeze barrier.
+  colocate_onto(&g100, t_leader as u64 + 1, "source onto target leader").await;
 
   merge_verb_anywhere(
     "the freeze",
@@ -4114,7 +4137,15 @@ async fn merge_rollback_unfreezes() {
   // Both groups intact: nothing was absorbed.
   assert_eq!(query_anywhere(&g200).await, 1, "no union — the merge died");
 
-  // A LATER merge of the same pair completes end to end: the abort left a clean lineage.
+  // A LATER merge of the same pair completes end to end: the abort left a clean lineage. Colocate
+  // the (now thawed) source onto the target leader again so the fresh absorb can certify the barrier.
+  let t2_leader = find_leader(&g200, "target pre-second-merge").await;
+  colocate_onto(
+    &g100,
+    t2_leader as u64 + 1,
+    "source onto target leader (second)",
+  )
+  .await;
   merge_verb_anywhere(
     "the fresh freeze",
     |at| {

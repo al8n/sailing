@@ -1705,6 +1705,19 @@ where
     let source_mode = sep.active_read_mode();
     let source_frozen_ready =
       sep.is_frozen() && sep.freeze_index().is_some_and(|f| sep.applied_index() >= f);
+    // The all-source-voters freeze barrier (the CRDB `waitForApplication` shape). Dissolution
+    // rides the committed `CommitMerge` uniformly on every host, so it must not be proposed until
+    // EVERY source voter has MATCHED the freeze boundary. A committed `CommitMerge` then certifies
+    // the whole voter set holds the freeze `(F, freeze_term)` in its own log; a straggler later
+    // cut off from the source leader self-advances on that identity (the parked-service leg)
+    // instead of being orphaned when the other hosts floor and dismantle the source around it.
+    // The barrier is observable only on the source LEADER's tracker (a follower's holds no peer
+    // match), so a non-leader local source defers here as well — colocation puts the source
+    // leader on the absorbing target's leader, exactly as it certifies the barrier at propose.
+    let source_barrier_met = sep.role().is_leader()
+      && sep
+        .freeze_index()
+        .is_some_and(|f| sep.peers_matched_through(f));
     let source_claim_mismatch = {
       let mut target_bytes = Vec::new();
       target.encode(&mut target_bytes);
@@ -1763,6 +1776,14 @@ where
     }
     if source_mode != tep.active_read_mode() {
       return Some(Err(MergeError::ReadModesDiffer));
+    }
+    // The all-source-voters freeze barrier fires LAST, after the structural gates: a malformed
+    // merge earns its structural refusal, while this transient one clears as the frozen source
+    // replicates. Dissolving before every voter matches the boundary would orphan a lagging voter
+    // once the source leader is lost (the committed CommitMerge must certify the whole voter set
+    // holds the freeze); retry once it catches up, or roll the merge back if a voter is gone.
+    if !source_barrier_met {
+      return Some(Err(MergeError::SourceBarrierPending));
     }
     let target_gen_after = tep.shape_gen() + 1;
     let mut source_bytes = Vec::new();
@@ -2053,18 +2074,14 @@ where
                 // (two targets naming one frozen source is the same committed-divergence
                 // class as the cross-log rollback, and the claim is what closes it).
                 Verdict::Abort
-              } else if sep.role().is_leader() && !sep.peers_matched_through(boundary) {
-                // waitForApplication, container-local: the host whose local source replica
-                // LEADS the source resolves LAST. Resolving would consume (and tear down) the
-                // source leader while slow source followers still sit below the boundary —
-                // with no leader left to feed them the freeze, their hosts' parks wedge
-                // forever. Holding THIS park keeps the source leader alive and replicating
-                // exactly until every peer provably matched through the boundary (the capture
-                // fence keeps the freeze replayable, so catch-up below it never needs a
-                // snapshot the source cannot send). A source peer that never catches up
-                // (dead, unreachable) holds only this one host's park.
-                Verdict::Wait
               } else {
+                // Dissolve. No resolve-last discipline is needed here: `commit_merge` only
+                // proposes the `CommitMerge` once EVERY source voter has matched the freeze
+                // boundary (the admission barrier), so a committed `CommitMerge` certifies the
+                // whole voter set holds the freeze in its own log. Tearing down this host's
+                // source can therefore never orphan a straggler — a peer cut off from the
+                // source leader self-advances on the freeze identity (the `AdvanceSource` leg)
+                // from its own log, needing neither a live source leader nor a quorum.
                 Verdict::Resolve
               }
             } else {

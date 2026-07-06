@@ -300,6 +300,16 @@ pub enum MergeError<I> {
   /// source catches up, or roll the merge back.
   #[error("the local source replica is not frozen-applied at its freeze boundary")]
   SourceNotReady,
+  /// The all-source-voters freeze barrier is not yet observably met. `commit_merge` refuses to
+  /// dissolve the source until EVERY source voter has matched the freeze boundary, so a
+  /// committed `CommitMerge` certifies that the whole voter set already holds the freeze — the
+  /// dissolution that rides it can then run on every host with no straggler orphaned, even if the
+  /// source leader is lost. The barrier is observable only on the source LEADER's tracker, so this
+  /// refuses when the local source is a follower (colocate the target's leadership onto the source
+  /// leader first) or when a voter still lags the boundary (the frozen source keeps replicating —
+  /// retry once it catches up, or roll the merge back if a voter is permanently gone).
+  #[error("not every source voter has reached the freeze boundary yet")]
+  SourceBarrierPending,
   /// A participant's CURRENT incarnation is below its persisted admission floor (a
   /// coordinator-layer refusal through its floor seam): this replica belongs to a fenced
   /// incarnation — a stale survivor that must not anchor a merge.
