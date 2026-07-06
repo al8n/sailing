@@ -1289,6 +1289,11 @@ impl crate::StateMachine for SplitSm {
     self.units -= give;
     Some(Self { units: give })
   }
+
+  fn absorb(&mut self, source: Self) -> bool {
+    self.units += source.units;
+    true
+  }
 }
 
 /// Drive `gid` (single voter) to leadership on `m` under one fixed instant.
@@ -2549,6 +2554,305 @@ fn fork_baseline_meta_carries_lineage_and_read_mode() {
   );
   assert_eq!(m.group_gen(&7), 3);
   assert!(!m.group(&7).unwrap().is_poisoned());
+}
+
+#[test]
+fn reshaped_twin_breaks_the_fork_merge_capture_cycle() {
+  // Arm (b) at-or-past lineage, the reshape-cycle shape: the parent's crash-replay re-stages a
+  // committed fork whose child is hosted AND has reshaped since birth (here: the child froze
+  // for a merge, bumping its lineage past the fork's `child_gen`). Under lineage EQUALITY the
+  // fork parked forever, and the park's standing fence closed a true dependency cycle — arm
+  // (a) needed the child gone, the child leaves only when the merge into the parent resolves,
+  // the resolve arm needs the parent's absorb capture, and the capture is exactly what the
+  // fence blocks (fence → child-gone → merge → capture → fence). At-or-past lineage is the
+  // cycle's one breakable link: a hosted twin past the baseline under the fork's own lineage
+  // EVOLVED is still this fork's data, so the blob is redundant and the fence lifts.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut clog, mut cstable) = (VecLog::default(), AsyncStable::default());
+  let (mut plog, mut pstable) = (VecLog::default(), AsyncStable::default());
+  let now = Instant::ORIGIN;
+  let drain =
+    |m: &mut MultiRaft<u64, u64, SplitSm>, gid: u64, log: &mut VecLog, stable: &mut AsyncStable| {
+      while matches!(
+        m.handle_storage(&gid, now, log, stable),
+        Some(StorageProgress::MorePending)
+      ) {}
+    };
+
+  // The child (gid 1), hosted BEFORE the parent's replay re-stages the fork naming it.
+  m.create_group(1, single_node_cfg(1), now, 43, SplitSm::default())
+    .unwrap();
+
+  // The parent (gid 2) restores from a durable log whose committed tail holds the split naming
+  // child 1 — the crash-replay staging: the pre-crash relay never resolved, so it relays again.
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  plog.force_append(&[
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(1),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(2),
+      crate::EntryKind::Normal,
+      cmd.clone(),
+    ),
+    crate::Entry::new(Term::new(1), Index::new(3), crate::EntryKind::Normal, cmd),
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(4),
+      crate::EntryKind::Split,
+      split_entry_bytes(1, 0, 1, 2),
+    ),
+  ]);
+  pstable.force_state(Term::new(1), Some(1u64), Index::new(4));
+  m.restore_group(
+    2,
+    single_node_cfg(1),
+    now,
+    42,
+    SplitSm::default(),
+    1,
+    &mut plog,
+    &mut pstable,
+  )
+  .unwrap();
+  assert_eq!(
+    m.group(&2).unwrap().state_machine().units,
+    1,
+    "the replayed split gave the half up again"
+  );
+
+  // The child reshapes AFTER birth: it leads, applies load past the manufactured baseline, and
+  // freezes for the merge into the parent — the freeze apply bumps its lineage to 1 > child_gen.
+  let d = lead_single_split(&mut m, 1, &mut clog, &mut cstable);
+  commit_one_split(&mut m, 1, d, &mut clog, &mut cstable);
+  m.prepare_merge(&1, d, &mut clog, &cstable, &2)
+    .unwrap()
+    .unwrap();
+  drain(&mut m, 1, &mut clog, &mut cstable);
+  assert!(m.group(&1).unwrap().is_frozen());
+  assert_eq!(m.group(&1).unwrap().shape_gen(), 1);
+  assert!(m.group(&1).unwrap().applied_index() >= FORK_BASE_INDEX);
+
+  // The reshaped twin resolves the fork as redundant at FIRST examination: no park, no
+  // conflict signal, the staged blob discarded, the fence gone.
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "a reshaped twin resolves the fork without yielding"
+  );
+  assert!(
+    m.group(&2).unwrap().peek_pending_fork().is_none(),
+    "the redundant fork is consumed — lineage equality parked here forever"
+  );
+  assert_eq!(m.peek_split_conflict(), None, "nothing parked, no cue");
+  assert_eq!(m.group_gen(&2), 1, "the relay guard advanced");
+
+  // The dependent merge now completes: park, seal, resolve — the absorb capture the fence was
+  // blocking lands, the child departs, and the parent serves the union.
+  let dp = lead_single_split(&mut m, 2, &mut plog, &mut pstable);
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (clog, cstable));
+  stores.0.insert(2, (plog, pstable));
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, dp, log, stable, &1).unwrap().unwrap();
+    while matches!(
+      m.handle_storage(&2, dp, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
+  assert!(
+    m.service_merge_applies(dp, &mut stores).is_empty(),
+    "the first pass only seals the window"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    while matches!(
+      m.handle_storage(&2, dp, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  let resolutions = m.service_merge_applies(dp, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }],
+    "the cycle is broken: the absorb capture is no longer fence-blocked"
+  );
+  assert!(!m.contains_group(&1), "the child departed via the merge");
+  assert_eq!(
+    m.group(&2).unwrap().state_machine().units,
+    2,
+    "the parent serves the union (its own half plus the absorbed twin)"
+  );
+}
+
+#[test]
+fn recreated_squatter_at_higher_lineage_resolves_redundant() {
+  // Arm (b) above equality, the recreated-squatter shape: the id under the staged fork is
+  // hosted by an incarnation that has MOVED PAST the fork's lineage (here it reshaped with its
+  // own split). Under single-incarnation ids and the two-act rejoin — an id returns only
+  // through retire-then-recreate, and retirement certifies the fork's incarnation was
+  // registered somewhere first — same-id-at-higher-lineage means the gen-0 fork is superseded
+  // history: its blob is redundant, and holding the park (as equality did) deadlocks the
+  // parent's fence instead of protecting anything.
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+  let cfg = single_node_cfg(1).with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  for _ in 0..3 {
+    commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  }
+
+  // Propose (gate passes: 200 unhosted), then the squatter arrives in the propose→apply
+  // window and lives a life of its own: load past the baseline, then its OWN split — the
+  // lineage bump that broke equality.
+  let idx = m
+    .propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  m.create_group(200, single_node_cfg(1), d, 43, SplitSm::default())
+    .unwrap();
+  let d200 = lead_single_split(&mut m, 200, &mut log200, &mut stable200);
+  commit_one_split(&mut m, 200, d200, &mut log200, &mut stable200);
+  m.propose_split(
+    &200,
+    d200,
+    &mut log200,
+    &stable200,
+    &300,
+    0,
+    Bytes::from_static(b"\x01"),
+  )
+  .unwrap()
+  .unwrap();
+  while matches!(
+    m.handle_storage(&200, d200, &mut log200, &mut stable200),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert_eq!(m.group(&200).unwrap().shape_gen(), 1);
+
+  // Apply the parent's split against the now-hosted, now-reshaped squatter.
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+
+  // The drain resolves the parent's fork as redundant and flows on to the squatter's own
+  // staged fork — later forks are not wedged behind superseded history.
+  let fork = m
+    .poll_pending_fork()
+    .expect("the squatter's own fork still yields");
+  assert_eq!((fork.parent, fork.child), (200, 300));
+  assert!(m.poll_pending_fork().is_none());
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the superseded fork is consumed — lineage equality parked here forever"
+  );
+  assert_eq!(m.peek_split_conflict(), None, "nothing parked, no cue");
+  assert_eq!(m.group_gen(&7), 1, "the relay guard advanced");
+
+  // The fence lifted with the redundant fold: the next committed entry captures past the split.
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  let (meta, _blob) = stable
+    .snapshot()
+    .expect("no orphaned fence from the redundant fold");
+  assert!(meta.last_index() >= idx, "the capture crosses the split");
+}
+
+#[test]
+fn below_lineage_squatter_stays_parked() {
+  // The negative pin on arm (b)'s lower edge: a hosted child BELOW the fork's `child_gen`
+  // parks — never resolves redundant. That state predates the fork's mint, so it cannot
+  // contain the handover; discarding the blob against it would lose the partition's only
+  // local copy. The shape needs a skewed catalog to exist at all — the fork minted at a
+  // floor the squatting host never learned (its stale incarnation survived a retirement it
+  // was partitioned through) — so the coordinators make it remote, but the floor-free
+  // container must hold the conservative park and let the embedder resolve it through arm (a).
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+  let cfg = single_node_cfg(1).with_snapshot_threshold(1);
+  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  for _ in 0..3 {
+    commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  }
+
+  // The fork mints at child_gen 1; the squatter arrives at lineage 0 and catches up past the
+  // baseline, so the applied gate passes and lineage alone decides.
+  let idx = m
+    .propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      1,
+      Bytes::from_static(b"\x02"),
+    )
+    .unwrap()
+    .unwrap();
+  m.create_group(200, single_node_cfg(1), d, 43, SplitSm::default())
+    .unwrap();
+  let d200 = lead_single_split(&mut m, 200, &mut log200, &mut stable200);
+  commit_one_split(&mut m, 200, d200, &mut log200, &mut stable200);
+  assert!(m.group(&200).unwrap().applied_index() >= FORK_BASE_INDEX);
+  assert_eq!(m.group(&200).unwrap().shape_gen(), 0);
+
+  m.flush_appends(&7, d, &log, &stable).unwrap();
+  while matches!(
+    m.handle_storage(&7, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+
+  assert!(m.poll_pending_fork().is_none(), "parked, not resolved");
+  assert_eq!(m.poll_split_conflict(), Some((7, 200)));
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_some(),
+    "the below-lineage hold keeps the blob staged"
+  );
+  // The fence stands while parked: committed load past the threshold captures nothing at or
+  // past the split.
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  let pre = stable.snapshot().map(|(meta, _)| meta.last_index());
+  assert!(
+    pre.is_none_or(|boundary| boundary < idx),
+    "the parked fork's fence holds (boundary {pre:?}, split {idx:?})"
+  );
+
+  // Arm (a) is the shape's designed exit: the embedder removes the stale squatter and the
+  // fork materializes with its minted lineage intact.
+  m.remove_group(&200);
+  let fork = m
+    .poll_pending_fork()
+    .expect("removal unparks the fork for materialization");
+  assert_eq!((fork.parent, fork.child), (7, 200));
+  assert_eq!(fork.child_gen, 1, "the minted lineage rides the yield");
+  assert_eq!(fork.fsm.units, 2, "the held half materializes intact");
 }
 
 // ───────────────────────────── merge verbs + the per-crank service ─────────────────────────────

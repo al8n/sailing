@@ -1582,7 +1582,7 @@ fn abort_below_a_commit_kills_it_at_apply() {
     1,
     "exactly the abort's bump, not the commit's"
   );
-  let aborted = std::iter::from_fn(|| ep.poll_event())
+  let aborted = core::iter::from_fn(|| ep.poll_event())
     .filter(|ev| matches!(ev, Event::MergeAborted(_)))
     .count();
   assert_eq!(
@@ -1613,7 +1613,7 @@ fn stale_abort_is_a_silent_no_op() {
   assert_eq!(ep.shape_gen(), 0, "no lineage move");
   assert!(ep.pop_pending_abort().is_none(), "no thaw relay");
   assert!(
-    !std::iter::from_fn(|| ep.poll_event()).any(|ev| matches!(ev, Event::MergeAborted(_))),
+    !core::iter::from_fn(|| ep.poll_event()).any(|ev| matches!(ev, Event::MergeAborted(_))),
     "no signal — the base's winner already spoke"
   );
 }
