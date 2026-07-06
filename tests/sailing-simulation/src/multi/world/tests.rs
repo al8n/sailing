@@ -1914,7 +1914,9 @@ fn partition_exempts_an_owned_unwritten_key_a_union_carried_into_the_child() {
   assert_eq!(w.group_keys_of(200), std::vec![4, 5, 6, 7]);
 
   // The parent MERGES BACK into its own child (voter sets align by construction): the child
-  // absorbs the whole parent population, key 0 included.
+  // absorbs the whole parent population, key 0 included. Colocate the parent's leadership onto
+  // the child's leader first, so the commit barrier reads the source off the target's leader.
+  colocate_source_onto_target(&mut w, 100, 200);
   merge_verb_until_accepted(&mut w, 3_000, "the freeze", |w| {
     w.propose_prepare_merge(100, 200)
   });
@@ -1961,14 +1963,34 @@ fn merge_verb_until_accepted(
   panic!("{what} was never accepted");
 }
 
-/// THE CROSS-HOST ROLLBACK RACE, distilled (the randomized band's committed-divergence shape):
-/// three hosts park a commit while one host's SOURCE replica is lagged behind the freeze; the
-/// abort races the commit. Because the abort rides the TARGET's log, every host reads the same
-/// committed coordinate and takes the SAME side — here the abort lands at the coordinate right
-/// after the parked commit (proposed before any seal could), so every park un-parks ABORTED,
-/// the relayed thaw unfreezes the source everywhere, and a fresh merge attempt then completes
-/// cleanly. Under a live read of the source's generation this exact shape split the hosts:
-/// caught-up hosts absorbed while the lagged host aborted — committed divergence.
+/// Colocate `source`'s leadership onto `target`'s current leader. The commit barrier is
+/// observable only on the source LEADER's tracker, so `commit_merge` — proposed on the target's
+/// leader — demands that host also lead the source; the band's mergeable pairs are split children
+/// colocated by construction, and the standalone teeth arrange it with an explicit transfer. The
+/// catch-up to every source voter matching the freeze then rides the commit verb's own retry
+/// loop. Idempotent (returns at once when already colocated); panics if the transfer never lands.
+fn colocate_source_onto_target(w: &mut MultiWorld, source: u64, target: u64) {
+  let host = w
+    .leader_of(target)
+    .expect("target has a leader to colocate onto");
+  for _ in 0..2_000 {
+    if w.leader_of(source) == Some(host) {
+      return;
+    }
+    w.transfer_group_leader(source, host);
+    w.tick();
+  }
+  panic!("g{source} leadership never colocated onto g{target}'s leader");
+}
+
+/// THE COMMIT BARRIER ELIMINATES THE CROSS-HOST ROLLBACK RACE. The source cannot dissolve until
+/// every source voter has matched the freeze, so a commit is never admitted while a voter lags —
+/// the exact window a live generation read once used to SPLIT the hosts (caught-up hosts absorbed
+/// while the lagged host aborted — committed divergence) is now unreachable. The teeth: with a
+/// voter lagged the commit is HELD (refused), so no committed coordinate exists for the hosts to
+/// diverge over; once it heals the commit admits and, racing an abort onto the very next slot,
+/// every host reads that one coordinate and un-parks on the SAME side (aborted), after which the
+/// relayed thaw unfreezes the source everywhere and a fresh attempt merges for real.
 #[test]
 fn merge_rollback_race_decides_identically_across_hosts() {
   let mut w = MultiWorld::new(9);
@@ -1989,10 +2011,12 @@ fn merge_rollback_race_decides_identically_across_hosts() {
     w.propose(11, &gid_cmd);
     w.run_until(200, |_| false);
   }
+  // The barrier is read off the source LEADER, which must sit on the target's leader.
+  colocate_source_onto_target(&mut w, 10, 11);
 
-  // Lag one host's SOURCE replica only (a host leading neither group, so the freeze still
-  // commits and the target leader's local source still reaches the boundary): the freeze will
-  // not reach it until the heal.
+  // Lag one host's SOURCE replica only (a host leading neither group, so the freeze still commits
+  // and the colocated leader still reaches the boundary): the freeze will not reach it until the
+  // heal. Only group 10 is muted, so the target's leadership — the colocation anchor — never moves.
   let lagged = (0..3u64)
     .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
     .expect("three nodes, at most two leaders");
@@ -2022,10 +2046,23 @@ fn merge_rollback_race_decides_identically_across_hosts() {
     "the lagged source replica must not have seen the freeze"
   );
 
-  // Commit, then race the abort onto the very next log slot BEFORE any tick can seal: the
-  // target leader accepted the commit, so its local source is frozen-applied and the abort's
-  // own gates pass on the same host.
-  merge_verb_until_accepted(&mut w, 2_000, "the commit", |w| {
+  // THE NEW GUARANTEE that retires the race: with a source voter short of the boundary the commit
+  // is HELD — refused on the colocated, frozen-applied leader — so the source can never dissolve
+  // with a voter still behind, and there is no committed coordinate for the hosts to split over.
+  assert!(
+    matches!(
+      w.propose_commit_merge(11, 10),
+      Some(Err(sailing_proto::MergeError::SourceBarrierPending))
+    ),
+    "the commit is refused while a source voter lags the freeze"
+  );
+
+  // Heal: the lagged voter catches up, the (idempotent) colocation re-settles group 10 onto the
+  // still-stable target leader, and the commit admits — then the abort races onto the very next
+  // slot BEFORE any tick can seal (the leader accepted the commit, so its gates pass here too).
+  w.unmute_all();
+  colocate_source_onto_target(&mut w, 10, 11);
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
     w.propose_commit_merge(11, 10)
   });
   assert!(
@@ -2033,9 +2070,8 @@ fn merge_rollback_race_decides_identically_across_hosts() {
     "the abort races onto the coordinate right after the commit"
   );
 
-  // Heal and settle: every park must take the ABORT side (one committed coordinate, one
-  // verdict), the relayed thaw must unfreeze the source everywhere, and nothing may absorb.
-  w.unmute_all();
+  // Settle: every park must take the ABORT side (one committed coordinate, one verdict), the
+  // relayed thaw must unfreeze the source everywhere, and nothing may absorb.
   assert!(
     w.run_until(6_000, |w| {
       (0..3).all(|n| {
@@ -2053,6 +2089,7 @@ fn merge_rollback_race_decides_identically_across_hosts() {
   assert!(w.agreement_holds(10) && w.agreement_holds(11));
 
   // The state is clean enough to merge for real: the same pair completes end to end.
+  colocate_source_onto_target(&mut w, 10, 11);
   merge_verb_until_accepted(&mut w, 2_000, "the fresh freeze", |w| {
     w.propose_prepare_merge(10, 11)
   });
@@ -2067,11 +2104,11 @@ fn merge_rollback_race_decides_identically_across_hosts() {
   assert!(w.is_merged(10), "the source id is terminally merged away");
 }
 
-/// The commit-first ordering pin, cross-host: once the window seals and the absorb begins
-/// anywhere, a late abort attempt changes NOTHING — every host converges on the absorb
-/// (including one whose source replica was lagged the whole time; the source leader's host
-/// resolves last, keeping the freeze feedable until the straggler catches up). Under a live
-/// read of the source's generation, a landed late abort split the hosts instead.
+/// THE LATE ABORT NO-OPS AFTER THE SEAL, and the barrier keeps the seal honest. A source voter
+/// held below the freeze can no longer let the absorb begin — the commit is HELD until it catches
+/// up — so once the commit finally admits and a first host resolves, the window is sealed: a late
+/// abort proposed past it changes NOTHING and every host converges on the absorb. Under the old
+/// live-generation read a landed late abort could still split the hosts; the barrier forecloses it.
 #[test]
 fn merge_late_abort_no_ops_and_every_host_absorbs() {
   let mut w = MultiWorld::new(11);
@@ -2087,6 +2124,7 @@ fn merge_late_abort_no_ops_and_every_host_absorbs() {
   w.propose(10, b"s0");
   w.propose(11, b"t0");
   w.run_until(200, |_| false);
+  colocate_source_onto_target(&mut w, 10, 11);
 
   let lagged = (0..3u64)
     .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
@@ -2107,23 +2145,34 @@ fn merge_late_abort_no_ops_and_every_host_absorbs() {
         .is_some_and(sailing_proto::Endpoint::is_frozen)
     })
   }));
-  merge_verb_until_accepted(&mut w, 2_000, "the commit", |w| {
+  // The barrier HOLDS the commit while a source voter lags: the absorb cannot begin behind a
+  // straggler, so no half-sealed window exists for a late abort to race into divergence.
+  assert!(
+    matches!(
+      w.propose_commit_merge(11, 10),
+      Some(Err(sailing_proto::MergeError::SourceBarrierPending))
+    ),
+    "the commit is refused while a source voter lags the freeze"
+  );
+
+  // Heal, re-colocate, and let the commit admit; run until the absorb has begun somewhere (a
+  // first resolution) — the window is sealed and the merge is past its last abortable coordinate.
+  w.unmute_all();
+  colocate_source_onto_target(&mut w, 10, 11);
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
     w.propose_commit_merge(11, 10)
   });
-  // Run until the absorb has begun somewhere (a first resolution registered): the window is
-  // sealed and the merge is past its last abortable coordinate.
   assert!(
     w.run_until(6_000, |w| w.merges_registered() >= 1),
-    "some host absorbs while the straggler lags"
+    "some host absorbs once the barrier admits the commit"
   );
   // The late abort: wherever it is still proposable it lands ABOVE the seal and must no-op;
   // where the local view already resolved, it refuses typed. Either way it changes nothing.
   let late = w.propose_rollback_merge(11, 10);
   assert!(late.is_some(), "the target group is still hosted somewhere");
-  w.unmute_all();
   assert!(
     w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 10))),
-    "every host absorbs once the straggler catches up — the merge was irrevocable"
+    "every host absorbs — the sealed merge was irrevocable"
   );
   assert_eq!(w.merges_registered(), 1, "one absorb, registered once");
   assert!(w.is_merged(10));
@@ -2152,6 +2201,9 @@ fn choreography_participants_read_active_until_resolution() {
     !w.merge_choreography_active(10) && !w.merge_choreography_active(11),
     "no choreography yet — everything is drawable"
   );
+  // Colocate before the freeze so the commit barrier reads the source off the target's leader; a
+  // bare leadership transfer speaks for nobody, so the choreography predicate stays quiet.
+  colocate_source_onto_target(&mut w, 10, 11);
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
     w.propose_prepare_merge(10, 11)
   });
@@ -2254,6 +2306,8 @@ fn drive_merge_to_full_resolution(seed: u64, source: u64, target: u64) -> MultiW
   w.propose(source, b"s0");
   w.propose(target, b"t0");
   w.run_until(200, |_| false);
+  // The commit barrier reads the source leader off the target's leader — colocate them.
+  colocate_source_onto_target(&mut w, source, target);
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
     w.propose_prepare_merge(source, target)
   });
@@ -2373,6 +2427,9 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
   w.propose(10, b"s0");
   w.propose(11, b"t0");
   w.run_until(200, |_| false);
+  // Colocate before the freeze so the commit barrier reads the source off the target's leader;
+  // the follower picked below is then a non-leader of both, its target capture free to lag.
+  colocate_source_onto_target(&mut w, 10, 11);
   let follower = (0..3u64)
     .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
     .expect("three nodes, at most two leaders");
