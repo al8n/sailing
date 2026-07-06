@@ -1259,38 +1259,31 @@ pub fn certify_retiring_history(checker: &mut Checker, view: &ClusterView) {
     }
   }
 
-  // 2. Raise `complete_up_to` across the gap-free prefix the connecting durable logs prove.
+  // 2. Raise `complete_up_to` across the gap-free prefix the DURABLE-COMMITTED log proves. The
+  //    per-tick recorder captured `committed_log_kind` at EVERY committed index before compaction
+  //    removed it, so it retains a boundary that only snapshot-built replicas reach — at retire
+  //    time their current durable logs have compacted past it, so a walk of the live logs (their
+  //    `durable_first` now above the boundary) would never connect to it and would leave the
+  //    committed-final install one past the applied frontier permanently unwitnessed. A gap-free
+  //    committed prefix proves commit reached its extent; the walk still STOPS just before the
+  //    first index whose folded config the frozen history never recorded (a genuine gap the
+  //    archive rightly keeps unwitnessed) — including a conf-change only snapshot-built replicas
+  //    hold, which emits no `ConfChanged` and so may never have entered the config history.
   let base = checker.complete_up_to;
-  let connects =
-    |n: &NodeView| !n.removed && !n.durable_entries.is_empty() && n.durable_first <= base + 1;
-  let extent = view
-    .nodes
-    .iter()
-    .filter(|n| connects(n))
-    .map(|n| n.commit.min(n.durable_last))
-    .max()
-    .unwrap_or(0);
+  let mut extent = base;
+  while checker.committed_log_kind.contains_key(&(extent + 1)) {
+    extent += 1;
+  }
   if extent <= base {
     return;
   }
-  let mut conf_indices: Vec<u64> = view
-    .nodes
-    .iter()
-    .filter(|n| connects(n))
-    .flat_map(|n| {
-      let commit = n.commit;
-      n.durable_entries
-        .iter()
-        .filter(move |e| e.is_conf_change && e.index <= commit)
-        .map(|e| e.index)
-    })
-    .filter(|i| *i > base && *i <= extent)
-    .collect();
-  conf_indices.sort_unstable();
-  conf_indices.dedup();
   let mut frontier = extent;
-  for idx in conf_indices {
-    if !checker.committed_config_history.contains_key(&idx) {
+  for idx in (base + 1)..=extent {
+    let unrecorded_conf = matches!(
+      checker.committed_log_kind.get(&idx),
+      Some((_, CommittedKind::ConfChange))
+    ) && !checker.committed_config_history.contains_key(&idx);
+    if unrecorded_conf {
       frontier = idx.saturating_sub(1);
       break;
     }
