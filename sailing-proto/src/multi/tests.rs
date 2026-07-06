@@ -2960,8 +2960,12 @@ where
 /// phantom peer at a strictly higher term — the source-leader loss the delivery-based retirement
 /// must tolerate. Term adoption is unconditional, so the applied state and `shape_gen` are
 /// untouched (a heartbeat truncates nothing); the group re-campaigns on its next timeout.
-fn step_down<F>(m: &mut MultiRaft<u64, u64, F>, gid: u64, log: &mut VecLog, stable: &mut AsyncStable)
-where
+fn step_down<F>(
+  m: &mut MultiRaft<u64, u64, F>,
+  gid: u64,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+) where
   F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
   F::Error: core::error::Error,
 {
@@ -2973,7 +2977,12 @@ where
     log,
     stable,
     2u64,
-    Message::Heartbeat(crate::Heartbeat::new(higher, 2u64, Index::ZERO, Bytes::new())),
+    Message::Heartbeat(crate::Heartbeat::new(
+      higher,
+      2u64,
+      Index::ZERO,
+      Bytes::new(),
+    )),
   )
   .unwrap();
   drain_storage(m, gid, now, log, stable);
@@ -3920,7 +3929,10 @@ fn a_truncated_thaw_is_retained_and_re_driven() {
     let r = m.propose_merge_unfreeze(&1, now, log, stable, &2, 1);
     (log.last_index(), r)
   };
-  assert!(matches!(appended, Some(Ok(_))), "the thaw appended: {appended:?}");
+  assert!(
+    matches!(appended, Some(Ok(_))),
+    "the thaw appended: {appended:?}"
+  );
   // RED (pre-redesign the accept is terminal → the relay drops): an appended-but-uncommitted thaw
   // is only a LEG of delivery, so the relay must be RETAINED — a leadership loss can still truncate
   // it before it commits.
@@ -3977,7 +3989,8 @@ fn a_truncated_thaw_is_retained_and_re_driven() {
     m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
   };
   assert!(
-    matches!(as_follower, Some(Err(MergeError::NotLeader { .. }))) && merge_unfreeze_retry(&as_follower),
+    matches!(as_follower, Some(Err(MergeError::NotLeader { .. })))
+      && merge_unfreeze_retry(&as_follower),
     "the follower retains the relay: {as_follower:?}"
   );
 
