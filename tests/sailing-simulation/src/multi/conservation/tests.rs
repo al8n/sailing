@@ -102,6 +102,40 @@ fn union_ignores_a_key_the_source_split_away_before_merging() {
   l.assert_union(400, 300, &keyset(&[5]));
 }
 
+/// The seed-7 cross-incarnation shape: a recreated source (its own ledger id) hands the target
+/// key 5 = [(2, 85)], but the target already recorded key 5 up to value 105 from a PRIOR
+/// incarnation it absorbed — so the absorbed cell (value 85, below the target's own max) trails
+/// the target's own run rather than leading it. The union finds it as an ordered subsequence and
+/// holds; a strict-prefix check (or a value-watermark recorder that dropped the cell) false-trips.
+#[test]
+fn union_finds_an_absorbed_cell_below_the_targets_own_max() {
+  let mut l = ConservationLedger::new();
+  l.record(1_000_101, 5, 2, 85); // the recreated source's key 5
+  // The target's own key-5 run from a prior incarnation, maxed at 105 ...
+  for (index, value) in [(3, 5), (11, 75), (18, 93), (24, 99), (30, 105)] {
+    l.record(103, 5, index, value);
+  }
+  l.record(103, 5, 2, 85); // ... then the absorbed cell, trailing below that max
+  l.assert_union(103, 1_000_101, &keyset(&[5]));
+}
+
+/// The cross-incarnation union still catches a genuine drop: the source handed key 5 =
+/// [(2, 85), (6, 120)], the target absorbed only (2, 85) (below its own max) and never the later
+/// (6, 120). The subsequence match fails on the missing cell — a dropped source cell trips even
+/// when an earlier absorbed cell is present.
+#[test]
+#[should_panic(expected = "not absorbed")]
+fn union_trips_on_a_dropped_cell_in_a_cross_incarnation_merge() {
+  let mut l = ConservationLedger::new();
+  l.record(1_000_101, 5, 2, 85);
+  l.record(1_000_101, 5, 6, 120); // the source wrote this too ...
+  for (index, value) in [(3, 5), (11, 75), (30, 105)] {
+    l.record(103, 5, index, value);
+  }
+  l.record(103, 5, 2, 85); // ... but the target absorbed only (2, 85), never (6, 120)
+  l.assert_union(103, 1_000_101, &keyset(&[5]));
+}
+
 /// The seed-4 shape: a child that later becomes a merge TARGET carries in the source's keys. The
 /// split never assigned them, but a REGISTERED union covers them, so the partition exempts them
 /// instead of false-tripping its never-assigned cross-talk leg (the merge's union verdict judges

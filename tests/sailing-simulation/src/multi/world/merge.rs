@@ -314,7 +314,7 @@ impl MultiWorld {
   }
 
   /// Judge every registered merge's union conservation: the target's recorded history for each
-  /// source key must open with the source's full recorded history (the absorbed baseline).
+  /// source key must CONTAIN the source's full recorded history in order (the absorbed run).
   /// Sound at any quiescent point; the multi VOPR runs it at run end beside the split verdict.
   pub fn finalize_merge_conservation_or_panic(&self, seed: u64) {
     for rec in &self.merges {

@@ -73,8 +73,8 @@ impl StateMachine for LogSm {
   /// order preserved, indices untouched (absorbed cells keep their SOURCE-log indices, exactly
   /// as inherited fork cells keep parent indices). A pure append of two deterministic records
   /// at a log-fixed boundary, so every replica resolving the same commit absorbs identically;
-  /// the conservation walk's per-(ledger, key) value dedupe re-admits the cells under the
-  /// TARGET's ledger id in this order, which is what `assert_union` judges.
+  /// the conservation walk re-admits the cells under the TARGET's ledger id in this order (a
+  /// contiguous run trailing the target's own cells), which is what `assert_union` judges.
   fn absorb(&mut self, source: Self) -> bool {
     self.applied.extend(source.applied);
     true

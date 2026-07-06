@@ -114,7 +114,12 @@ impl ConservationLedger {
   }
 
   /// Assert the merge of `source` into `target` absorbed every OWNED source key's FULL history:
-  /// the target's copy must start with the source's recorded history as a prefix (M5's shape).
+  /// the target's recorded history for the key must CONTAIN the source's, in order (an ordered
+  /// subsequence). Not a leading prefix: a cross-incarnation merge folds the source's cells under
+  /// the target's ledger id where a PRIOR incarnation's cells for that key already sit, so the
+  /// absorbed run trails the target's own. The state machine's `absorb` appends the source record
+  /// intact, so a faithful absorb leaves those cells as a contiguous in-order run the subsequence
+  /// check finds; a dropped, altered, or reordered source cell breaks the match and still trips.
   /// `absorbed_keys` is the source's key POPULATION at the merge — the keys this union actually
   /// handed over. A key the source WROTE but then SPLIT AWAY before merging is NOT here (it rode
   /// that split, whose partition verdict judges the handover), so it is not demanded of the
@@ -125,7 +130,8 @@ impl ConservationLedger {
     for &k in absorbed_keys {
       let s = self.history(source, k);
       let t = self.history(target, k);
-      let absorbed = t.len() >= s.len() && &t[..s.len()] == s;
+      let mut ti = t.iter();
+      let absorbed = s.iter().all(|cell| ti.by_ref().any(|tc| tc == cell));
       assert!(
         absorbed,
         "[conservation] merge g{source}->g{target}: key {k} source history not absorbed\n  \

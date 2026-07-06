@@ -132,13 +132,16 @@ pub struct MultiWorld {
   /// the replicas' RAW applied records (see `conserve_sweep`), judged per recorded split by
   /// [`finalize_conservation_or_panic`](Self::finalize_conservation_or_panic).
   conservation: ConservationLedger,
-  /// Per-`(ledger id, key)` last recorded value — the recorder's dedupe AND its ONLY walk
-  /// state. Values are globally unique and strictly increase per `(group, key)` (the fuzzer's
-  /// monotone counter), so "strictly above the last recorded" admits each cell exactly once, in
-  /// write order, no matter how many replicas' full re-walks present it. Deliberately NO
-  /// positional resume watermark rides beside it: `LogSm::split` and a crash restore both move
-  /// cells to positions an earlier sweep already passed (see `conserve_sweep`).
-  cons_last: BTreeMap<(u64, u16), u64>,
+  /// Per-`(ledger id, key)` the SET of recorded values — the recorder's dedupe AND its ONLY walk
+  /// state. Values are globally unique, so a value already in the set is a re-presentation to
+  /// skip and a fresh one is a new cell to record, in first-encounter order, no matter how many
+  /// replicas' full re-walks present it. A SET rather than a monotone high-water mark because a
+  /// MERGE folds a source's cells under the TARGET's ledger id, and an absorbed cell's value can
+  /// sit BELOW the target's own — a mark would drop it as stale though it is a distinct cell of a
+  /// different lineage (see `conserve_sweep`). Deliberately NO positional resume watermark rides
+  /// beside it: `LogSm::split` and a crash restore both move cells to positions an earlier sweep
+  /// already passed.
+  cons_recorded: BTreeMap<(u64, u16), BTreeSet<u64>>,
   /// Every committed split the world REGISTERED (child materialized), in registration order —
   /// the conservation verdict's work list.
   splits: BTreeMap<u64, split::SplitRecord>,
@@ -223,7 +226,7 @@ impl MultiWorld {
       cross_talk_checked: 0,
       snapshot_threshold: None,
       conservation: ConservationLedger::new(),
-      cons_last: BTreeMap::new(),
+      cons_recorded: BTreeMap::new(),
       splits: BTreeMap::new(),
       pending_splits: BTreeMap::new(),
       splits_applied: 0,

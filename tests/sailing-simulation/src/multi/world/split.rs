@@ -26,19 +26,21 @@
 //! key surfacing in a later child is judged as the handover it is.
 //!
 //! The recorder walks every replica's FULL RAW applied record each sweep and appends each gkv
-//! cell once — values are globally unique and strictly increase per `(group, key)`, so
-//! "strictly above the last recorded value" dedupes across replicas, crash re-walks, and the
-//! child's inherited baseline alike. The walk trusts VALUES, never positions: `LogSm::split`
-//! mutates the record non-append-only (moved-key cells vanish record-wide) and a crash restore
-//! can resurrect a pre-split state, so a cell can sit BELOW any position an earlier sweep
-//! reached — a positional resume watermark skips it forever, punching an interior hole in the
-//! recorded history that a later fork baseline exposes as a false conservation verdict. The
-//! value dedupe needs no resume state at all: a full re-walk re-presents only cells the ledger
-//! already admitted. Histories are keyed by an INCARNATION-QUALIFIED ledger id, so a recreated
-//! gid's fresh history can never pollute a recorded split pair's verdict. The child's opening
-//! history is recorded from its OWN materialized record (the fork blob) — never copied from the
-//! parent's — which is what gives [`ConservationLedger::assert_partition`] teeth: a partition
-//! bug in the FSM shows up as a parent/child history mismatch, not a tautology.
+//! cell once — values are globally unique, so the per-`(group, key)` SET of recorded values
+//! dedupes across replicas, crash re-walks, and the child's inherited baseline alike. A set, not
+//! a monotone high-water mark: a MERGE folds a source's cells under the TARGET's ledger id where
+//! they can sit BELOW the target's own values, and a mark would drop each as stale though it is a
+//! distinct cell of a different lineage. The walk trusts membership, never positions either:
+//! `LogSm::split` mutates the record non-append-only (moved-key cells vanish record-wide) and a
+//! crash restore can resurrect a pre-split state, so a cell can sit below any position an earlier
+//! sweep reached — a positional resume watermark skips it forever, punching an interior hole in
+//! the recorded history that a later fork baseline exposes as a false conservation verdict. The
+//! set needs no resume state at all: a full re-walk re-presents only cells the ledger already
+//! admitted. Histories are keyed by an INCARNATION-QUALIFIED ledger id, so a recreated gid's
+//! fresh history can never pollute a recorded split pair's verdict. The child's opening history
+//! is recorded from its OWN materialized record (the fork blob) — never copied from the parent's
+//! — which is what gives [`ConservationLedger::assert_partition`] teeth: a partition bug in the
+//! FSM shows up as a parent/child history mismatch, not a tautology.
 
 use super::*;
 
@@ -368,14 +370,15 @@ impl MultiWorld {
   /// docs for the dedupe and ordering argument). Cells are recorded under the group HOLDING
   /// them — the payload's gid tag is the cross-talk oracle's business.
   ///
-  /// A FULL walk every sweep, on purpose: within one record values are monotone with position
-  /// (one global counter, accepted in log order), so the per-`(ledger, key)` value dedupe
-  /// admits each cell exactly once and a re-walk is pure no-op re-presentation. Any positional
-  /// (or value-anchored) resume shortcut has a hole this oracle cannot afford: a split-apply
-  /// shifts kept cells below the watermark within one settle window, and a crash restore
-  /// resurrects moved cells a pre-crash sweep never met — both skip real cells forever. The
-  /// world already pays O(record) per replica sweep to clone the record, so the walk adds no
-  /// asymptotic cost.
+  /// A FULL walk every sweep, on purpose: each value is globally unique, so the per-`(ledger,
+  /// key)` recorded-value SET admits each cell exactly once and a re-walk is pure no-op
+  /// re-presentation. A set rather than a value watermark because a merge folds a source's cells
+  /// under the target's ledger id BELOW the target's own values — a watermark would drop them as
+  /// stale though each is a distinct cell of a different lineage. Any positional resume shortcut
+  /// has a hole this oracle cannot afford either: a split-apply shifts kept cells below where a
+  /// watermark sat within one settle window, and a crash restore resurrects moved cells a
+  /// pre-crash sweep never met — both skip real cells forever. The world already pays O(record)
+  /// per replica sweep to clone the record, so the walk adds no asymptotic cost.
   pub(super) fn conserve_sweep(&mut self, gid: u64) {
     let led = Self::ledger_id(self.generation_of(gid), gid);
     for node in self.node_ids.clone() {
@@ -385,12 +388,16 @@ impl MultiWorld {
       let applied = self.applied_of(node, gid);
       for (index, cmd) in &applied {
         if let Some((_, key, value)) = super::super::decode_gkv(cmd) {
-          match self.cons_last.get(&(led, key)) {
-            Some(&last) if value <= last => {}
-            _ => {
-              self.conservation.record(led, key, *index, value);
-              self.cons_last.insert((led, key), value);
-            }
+          // Record each distinct value once, in first-encounter order: `insert` is true only the
+          // first time a value is seen, so full re-walks re-present cells harmlessly, and an
+          // absorbed cell folded below the target's own values is recorded rather than shadowed.
+          if self
+            .cons_recorded
+            .entry((led, key))
+            .or_default()
+            .insert(value)
+          {
+            self.conservation.record(led, key, *index, value);
           }
         }
       }
