@@ -2734,6 +2734,10 @@ where
               self.merge.pending_aborts.push_back(merge::AbortRelay {
                 source_bytes: payload.source_bytes(),
                 source_gen_after: payload.source_gen_after(),
+                // The abort entry's own index — the target-compaction fence boundary: this relay
+                // re-derives ONLY by replaying this entry, so `maybe_snapshot` must not compact
+                // past it until the relay retires.
+                abort_index: idx,
               });
               self
                 .outputs

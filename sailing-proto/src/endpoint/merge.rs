@@ -158,12 +158,17 @@ pub(crate) struct MergeState {
   /// permanently once the capture's compaction lands.
   pub(crate) absorb_index: Option<Index>,
   /// Source-unfreeze relays staged by TARGET-side abort applies, drained by the container
-  /// (mirroring the fork relay): each records the abort entry's named source, and the driver
-  /// proposes the SOURCE-side `RollbackMerge` on that group's own log. Replay re-stages them
-  /// (the relay's restart derivation); a duplicate proposal dies at the source's own incarnation
-  /// gate (`StaleThaw` once the source has thawed past the recorded generation), and a relay lost
-  /// to lifecycle churn is recovered by re-proposing the target-side abort (a fresh entry, a fresh
-  /// relay) — documented on `rollback_merge`.
+  /// (mirroring the fork relay): each records the abort entry's named source AND its own log
+  /// index, and the driver proposes the SOURCE-side `RollbackMerge` on that group's own log.
+  /// Replay re-stages them (the relay's restart derivation); a duplicate proposal dies at the
+  /// source's own incarnation gate (`StaleThaw` once the source has thawed past the recorded
+  /// generation), and a relay lost to lifecycle churn is recovered by re-proposing the
+  /// target-side abort (a fresh entry, a fresh relay) — documented on `rollback_merge`. Because
+  /// this restart derivation is the ONLY recovery source, EVERY target capture FENCES against
+  /// compacting past an outstanding relay's `abort_index` through the shared `abort_relay_fences`
+  /// (both `maybe_snapshot` and the forced absorb capture), mirroring the fork durability barrier
+  /// — a capture past the abort entry would erase the relay from a restart with the source still
+  /// frozen, a permanent frozen-source wedge.
   pub(crate) pending_aborts: VecDeque<AbortRelay>,
 }
 
@@ -177,6 +182,12 @@ pub(crate) struct AbortRelay {
   /// The freeze generation the abort abandoned (observability; the source-side mint re-reads
   /// the live frozen state at propose).
   pub(crate) source_gen_after: u64,
+  /// The abort entry's OWN log index — the target-capture fence boundary (`abort_relay_fences`,
+  /// shared by `maybe_snapshot` and the forced absorb capture): this relay is re-derivable only by
+  /// replaying that entry, so a capture at-or-past it would compact the entry and lose the relay
+  /// across restart. Carried through the container relay ([`crate::MergeAbortRelay`]) so a requeue
+  /// restores it, keeping the fence alive across the drain until the relay retires.
+  pub(crate) abort_index: Index,
 }
 
 /// A parked commit's ABORT-WINDOW verdict — the target-log half of the park's resolution rule.
@@ -297,10 +308,16 @@ where
   /// with any others still queued; the container re-marks this target for the next abort drain, so
   /// a committed abort keeps thawing its source across source-leader churn instead of being lost
   /// to the one consume the old drain allowed.
-  pub(crate) fn stage_abort_relay(&mut self, source_bytes: Bytes, source_gen_after: u64) {
+  pub(crate) fn stage_abort_relay(
+    &mut self,
+    source_bytes: Bytes,
+    source_gen_after: u64,
+    abort_index: Index,
+  ) {
     self.merge.pending_aborts.push_back(AbortRelay {
       source_bytes,
       source_gen_after,
+      abort_index,
     });
   }
 
@@ -345,6 +362,26 @@ where
   /// node whose freeze entry no longer exists.)
   pub(crate) fn note_freeze_rebaselined(&mut self) {
     self.merge.freeze_pending = None;
+  }
+
+  /// A snapshot install re-baselined the log to `boundary`, discarding every abort entry at-or-below
+  /// it: retire each source-unfreeze relay the boundary COVERS. The installed snapshot sits past a
+  /// committed-and-applied abort (a non-redundant install re-baselines strictly above `commit`, and
+  /// an abort relay is staged at apply, so `abort_index <= applied <= commit < boundary`), so the
+  /// leader that captured it proved the source thawed past the abandoned freeze — the leader's own
+  /// relay drives that thaw. The relay here is MOOT, and its ONLY restart re-derivation (replaying
+  /// the abort entry) was just discarded: keeping it would strand `abort_relay_fences` on a boundary
+  /// the install already crossed — a permanent target-capture wedge with the relay's log source gone
+  /// (`resolve_merge_abort` can never retire it when the source is unhosted here, `None` → requeue).
+  /// A relay ABOVE the boundary is RETAINED: the install does not prove the source past THAT freeze
+  /// (symmetric with the fence's own `abort_index <= boundary` test). Mirrors the restart path, whose
+  /// volatile `pending_aborts` re-derives only from surviving entries — a below-boundary abort is
+  /// equally absent there, so runtime install and restart agree.
+  pub(crate) fn note_aborts_rebaselined(&mut self, boundary: Index) {
+    self
+      .merge
+      .pending_aborts
+      .retain(|relay| relay.abort_index > boundary);
   }
 
   /// One bounded, kind-only pass over the UNAPPLIED suffix `(applied, last]` for the lowest
@@ -394,10 +431,36 @@ where
     self.fsm
   }
 
+  /// Whether an outstanding source-unfreeze relay FENCES a TARGET capture/compaction at `boundary`
+  /// — true when any relay's abort entry sits at-or-below it. That entry's replay is the relay's
+  /// ONLY restart re-derivation (`AbortRelay::abort_index`), so a capture at-or-past it would
+  /// compact the entry and lose the relay across a restart with the source still frozen — a
+  /// permanent frozen-source wedge. The SINGLE predicate every target-capture site shares so none
+  /// can drift: `maybe_snapshot` checks it at `applied`, the forced `capture_absorb_snapshot` at
+  /// the absorb boundary `pending.at()` (via `absorb_capture_blocked`). A snapshot INSTALL is the
+  /// one floor-advance that can cross an abort entry NO local fenced capture produced — it
+  /// re-baselines to a LEADER's boundary — so it does not lean on the fence: it RETIRES every
+  /// covered relay (`note_aborts_rebaselined`), sound because that boundary proves the source thawed
+  /// past the abandoned freeze. Every other floor-advance is covered transitively — the deferred
+  /// `log.compact` and the restart reconciliation only reach a boundary a fenced capture (or a
+  /// retiring install) already produced — so an abort entry leaves the durable log only with its
+  /// relay either fenced or retired. The fence lifts when the relay RETIRES — a terminal
+  /// `resolve_merge_abort`, or a covered install — by then the source is thawed or provably gone,
+  /// so the erased entry's replay is moot.
+  pub(crate) fn abort_relay_fences(&self, boundary: Index) -> bool {
+    self
+      .merge
+      .pending_aborts
+      .iter()
+      .any(|relay| relay.abort_index <= boundary)
+  }
+
   /// Whether the absorb's forced snapshot capture would be REFUSED right now — the capture
-  /// shares `maybe_snapshot`'s busy/fence set (a capture or install already staged, or a fork
-  /// barrier at-or-below the absorb point). The container's resolve arm holds the park while
-  /// this is true, so the absorb and its durability capture always land in the SAME crank.
+  /// shares `maybe_snapshot`'s busy/fence set (a capture or install already staged, a fork barrier
+  /// at-or-below the absorb point, or an abort relay whose entry the capture would compact). The
+  /// capture compacts at `pending.at()`, so the abort-relay leg fences on that boundary. The
+  /// container's resolve arm holds the park while this is true, so the absorb and its durability
+  /// capture always land in the SAME crank.
   pub(crate) fn absorb_capture_blocked(&self) -> bool {
     let Some(pending) = self.merge.pending_apply.as_ref() else {
       return false;
@@ -409,6 +472,7 @@ where
         .outstanding
         .first()
         .is_some_and(|cap| *cap <= pending.at())
+      || self.abort_relay_fences(pending.at())
   }
 
   /// Resolve the parked `CommitMerge` by ABSORBING the extracted source state machine: fold it

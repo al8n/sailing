@@ -282,6 +282,11 @@ pub struct MergeAbortRelay<G> {
   /// The freeze generation the abort abandoned (observability; the thaw's own mint re-reads
   /// the live frozen state at propose).
   pub source_gen_after: u64,
+  /// The abort entry's index on `target` — the target's compaction fence boundary
+  /// ([`Endpoint::maybe_snapshot`] holds the target's captures past it while this relay is
+  /// outstanding). Threaded back through a requeue ([`MultiRaft::resolve_merge_abort`]) so the
+  /// fence survives the drain until a terminal outcome retires the relay.
+  pub abort_index: Index,
 }
 
 /// Whether a relayed source-unfreeze outcome ([`MultiRaft::propose_merge_unfreeze`]) must be
@@ -900,6 +905,7 @@ where
             target: gid,
             source,
             source_gen_after: relay.source_gen_after,
+            abort_index: relay.abort_index,
           });
         }
         Err(_) => {
@@ -923,6 +929,12 @@ where
   /// appended-then-truncated would leave the committed abort with no path to thaw and wedge the
   /// source frozen forever. Requeues re-stage onto the target for a LATER crank; call this AFTER
   /// draining the relay queue so a requeue never re-drives within the same drain.
+  ///
+  /// This is also what LIFTS the target's compaction fence: `maybe_snapshot` holds the target's
+  /// captures past the abort entry while the relay is outstanding (so the entry stays replayable),
+  /// and a TERMINAL outcome here — the only path that does NOT requeue — empties `pending_aborts`,
+  /// releasing the fence. By then the source is thawed (the terminal `StaleThaw` proves it), so the
+  /// relay the compaction erases is no longer needed.
   pub fn resolve_merge_abort(
     &mut self,
     relay: MergeAbortRelay<G>,
@@ -942,7 +954,11 @@ where
     let Some(ep) = self.groups.get_mut(&relay.target) else {
       return;
     };
-    ep.stage_abort_relay(Bytes::from(source_bytes), relay.source_gen_after);
+    ep.stage_abort_relay(
+      Bytes::from(source_bytes),
+      relay.source_gen_after,
+      relay.abort_index,
+    );
     if self.dirty_aborts.back() != Some(&relay.target) {
       self.dirty_aborts.push_back(relay.target);
     }

@@ -3301,11 +3301,19 @@ fn abort_relay_survives_a_leaderless_source() {
     .poll_pending_merge_abort()
     .expect("the abort staged a thaw relay");
   assert_eq!((relay.target, relay.source), (2, 1));
+  let abort_index = relay.abort_index;
   m.resolve_merge_abort(relay, Some(Err(MergeError::NotLeader { leader: None })));
   let relay = m
     .poll_pending_merge_abort()
     .expect("a NotLeader outcome RETAINS the relay for a later crank");
   assert_eq!((relay.target, relay.source), (2, 1));
+  // The compaction fence boundary survives the requeue: without it the target's `maybe_snapshot`
+  // could compact past the abort while the relay is still in flight (the fence lifts only on the
+  // TERMINAL resolve below).
+  assert_eq!(
+    relay.abort_index, abort_index,
+    "the requeue preserves the abort-index fence boundary"
+  );
 
   // A source leader now exists: the real thaw lands (appended + applied). The accept RETAINS —
   // retirement is delivery-based, so the relay is dropped only once the advance is OBSERVED.
