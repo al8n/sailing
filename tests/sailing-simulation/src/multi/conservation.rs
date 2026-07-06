@@ -66,12 +66,13 @@ impl ConservationLedger {
   ///     are exempted here; the merge's own [`assert_union`](Self::assert_union) judges any
   ///     absorbed HISTORY.
   ///   - `reacquired` — keys a union re-introduced INTO the parent (the parent became a merge
-  ///     TARGET). An assigned key's child history normally must cover the parent's FULL recorded
-  ///     history (a shorter child is LOSS), but once the parent RE-ACQUIRES that key via a merge
-  ///     it writes past what the child inherited — its history legitimately grows longer. The
-  ///     DUP leg still guards against the two sides DIVERGING (a genuine double-claim trips
-  ///     regardless), so the relaxation only forgives the parent extending a prefix the child
-  ///     opened; the merge's union verdict judges the re-introduced history.
+  ///     TARGET). The parent's copy of such a key is the ABSORBED lineage, not a continuation of
+  ///     the split's assignment, so it need not relate to the child's inherited copy at all: it
+  ///     may extend the child's history (which the LOSS leg reads as truncation) or descend from
+  ///     a DIFFERENT source entirely (which the DUP leg reads as a double-claim). Both legs
+  ///     exempt a re-acquired key; the merge's own [`assert_union`](Self::assert_union) judges the
+  ///     re-introduced history. A key no union re-acquired still trips both legs, so a genuine
+  ///     double-claim — two sides past a common prefix with no re-acquiring union — is caught.
   ///
   /// Panics with the group ids, the key, and both histories on any violation.
   pub(crate) fn assert_partition(
@@ -100,7 +101,7 @@ impl ConservationLedger {
       }
       let common = p.iter().zip(c.iter()).take_while(|(a, b)| a == b).count();
       assert!(
-        !(common < p.len() && common < c.len()),
+        !(common < p.len() && common < c.len()) || reacquired.contains(&k),
         "[conservation] split g{parent}->g{child}: key {k} continued on BOTH sides past their \
          common prefix ({common} cells)\n  parent={p:?}\n  child={c:?}",
       );

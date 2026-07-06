@@ -149,16 +149,20 @@ fn partition_exempts_a_key_a_union_re_acquired_into_the_parent() {
   l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &keyset(&[2]));
 }
 
-/// The re-acquisition relaxation is EXACT: it forgives the parent EXTENDING a prefix the child
-/// opened, never the two sides DIVERGING. Both write key 2 past their common cell — a genuine
-/// double-continuation — so even with key 2 marked re-acquired the DUP leg still trips.
+/// The seed-3 DUP shape closed: the split hands key 3 to the child, then the PARENT re-acquires
+/// key 3 by absorbing a DIFFERENT source. The parent's copy is that source's lineage, disjoint
+/// from the child's inherited one (common prefix ZERO), so both sides carry cells past their
+/// (empty) common prefix — the DUP shape. Marked re-acquired, the leg exempts it: the two copies
+/// are the child's inheritance and the parent's re-acquisition, not a split leak, and the merge's
+/// union verdict judges the re-introduced history. The genuine-DUP pin above
+/// ([`partition_panics_on_a_double_continuation`], no re-acquiring union) still trips.
 #[test]
-#[should_panic(expected = "BOTH sides")]
-fn partition_still_trips_on_divergence_even_when_re_acquired() {
+fn partition_exempts_a_divergent_key_a_union_re_acquired_into_the_parent() {
   let mut l = ConservationLedger::new();
-  l.record(100, 2, 2, 11);
-  l.record(200, 2, 2, 11);
-  l.record(100, 2, 6, 17); // parent continues key 2
-  l.record(200, 2, 5, 16); // child ALSO continues key 2 — a divergence, not a clean extension
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &keyset(&[2]));
+  // The split hands key 3 to the child, which writes its own cell.
+  l.record(178, 3, 3, 1353);
+  // The parent re-acquires key 3 by absorbing a different source — a disjoint lineage.
+  l.record(175, 3, 2, 1563);
+  l.record(175, 3, 55, 1579);
+  l.assert_partition(175, 178, &keyset(&[3]), &BTreeSet::new(), &keyset(&[3]));
 }
