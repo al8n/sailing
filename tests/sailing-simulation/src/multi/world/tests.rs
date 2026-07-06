@@ -2122,3 +2122,251 @@ fn choreography_participants_read_active_until_resolution() {
     "the bystander was never spoken for"
   );
 }
+
+/// Drive `source → target` on a fresh 3-node world through freeze, commit, and every host's
+/// resolution (the merge-test preamble shared by the teardown pins).
+fn drive_merge_to_full_resolution(seed: u64, source: u64, target: u64) -> MultiWorld {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(source, &all);
+  w.create_group(target, &all);
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(source).is_some() && w.leader_of(target).is_some()
+  }));
+  w.propose(source, b"s0");
+  w.propose(target, b"t0");
+  w.run_until(200, |_| false);
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(source, target)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(target, source)
+  });
+  assert!(
+    w.run_until(8_000, |w| w.merges_resolved() >= 3),
+    "every host resolves the absorb"
+  );
+  w
+}
+
+/// The teardown sweep RECORDS what the resolver extracted: once a host's absorb capture is
+/// durable, its `(node, source)` terminal floor and the source store drop land together — on
+/// EVERY resolved host. The sweep must decide completion from the resolutions it was handed
+/// (the world's floor state), never from post-resolution hosting: the resolver itself extracts
+/// the source endpoint, so a hosting check is always false by then and silently drops the
+/// whole batch — zero floors recorded, zero source stores dropped, the absorbed source left
+/// restorable on every host forever.
+#[test]
+fn merge_teardown_records_floors_and_drops_source_stores() {
+  let mut w = drive_merge_to_full_resolution(17, 10, 11);
+  assert!(
+    w.run_until(2_000, |w| w.pending_merge_teardowns.is_empty()),
+    "every staged teardown completes"
+  );
+  for n in 0..3u64 {
+    assert!(
+      w.merge_floors.contains(&(n, 10)),
+      "node {n}: the terminal merge floor is recorded"
+    );
+    assert!(
+      !w.logs.contains_key(&(n, 10)) && !w.stables.contains_key(&(n, 10)),
+      "node {n}: the absorbed source's stores are dropped"
+    );
+    assert!(!w.hosts_group(n, 10));
+  }
+  assert_eq!(w.merges_resolved(), 3);
+  assert_eq!(w.merges_registered(), 1);
+  assert!(w.is_merged(10));
+  w.check_now();
+  w.finalize_merge_conservation_or_panic(17);
+}
+
+/// A crash AFTER the absorb's barrier landed must not bring the source back in any form: the
+/// floor and store drop are terminal, so the restored host rebuilds the target alone and no
+/// frozen source replica reappears anywhere. Under the dead hosting-check sweep the source's
+/// durable stores lingered on every host — absorbed state held restorable forever, one
+/// registry walk away from a zombie frozen replica.
+#[test]
+fn crash_after_full_absorb_does_not_restore_the_source() {
+  let mut w = drive_merge_to_full_resolution(17, 10, 11);
+  assert!(
+    w.run_until(2_000, |w| w.pending_merge_teardowns.is_empty()),
+    "every staged teardown completes"
+  );
+  for n in 0..3u64 {
+    w.crash(n);
+    assert!(
+      !w.hosts_group(n, 10),
+      "node {n}: the crash must not rebuild the absorbed source"
+    );
+    assert!(
+      !w.logs.contains_key(&(n, 10)) && !w.stables.contains_key(&(n, 10)),
+      "node {n}: no source stores survive to restore from"
+    );
+    assert!(w.hosts_group(n, 11), "node {n}: the target restores");
+  }
+  assert!(!w.group_frozen(10), "no zombie frozen source replica");
+  // The restored union keeps serving: fresh load commits and applies on every host.
+  assert!(w.run_until(4_000, |w| w.leader_of(11).is_some()));
+  let mut idx = None;
+  for _ in 0..2_000 {
+    if let Some(i) = w.propose(11, b"t9") {
+      idx = Some(i);
+      break;
+    }
+    w.tick();
+  }
+  let idx = idx.expect("the restored target accepts fresh load");
+  assert!(
+    w.run_until(4_000, |w| {
+      (0..3).all(|n| {
+        w.hosts[&n]
+          .group(&11)
+          .is_some_and(|ep| ep.applied_index() >= idx)
+      })
+    }),
+    "post-crash load applies on every restored host"
+  );
+}
+
+/// The absent-source park discrimination on a GENUINE replayed park: a follower's target
+/// stable gets a real fsync window, so its absorb capture dies in a crash and the restored
+/// replica replays the commit and re-parks. The floor gate must hold BOTH ways: the durable
+/// hosts' floors are already recorded (the sweep landed their barriers at resolution), while
+/// the follower's floor stays honestly ABSENT — its barrier never landed — so the replayed
+/// park WAITS for the snapshot route instead of skipping the union it does not have. The
+/// floor-present half of the discrimination lives at the service seam
+/// ([`recorded_floors_reach_the_service_as_the_terminal_sentinel`] plus the product's own
+/// absent-arm test): in the world's one-barrier model a durable floor implies a durable
+/// capture, which restores PAST the commit — floor-with-replay cannot conformingly coexist,
+/// and the agreement oracle convicts the divergent union-skip within a tick if it is forced.
+#[test]
+fn replayed_park_holds_while_the_capture_barrier_is_open() {
+  let mut w = MultiWorld::new(19);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all);
+  w.create_group(11, &all);
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+  }));
+  w.propose(10, b"s0");
+  w.propose(11, b"t0");
+  w.run_until(200, |_| false);
+  let follower = (0..3u64)
+    .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
+    .expect("three nodes, at most two leaders");
+  // A real fsync window on the follower's TARGET stable only: the absorb capture will sit in
+  // flight there while the (sync) log keeps the parked commit itself durable.
+  w.stables
+    .get_mut(&(follower, 11))
+    .expect("target stable")
+    .set_mode(crate::StoreMode::Async);
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(10, 11)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(11, 10)
+  });
+  assert!(
+    w.run_until(8_000, |w| w.merges_resolved() >= 3),
+    "every host resolves the absorb"
+  );
+  // The sync hosts' barriers landed at resolution; the follower's capture honestly pends.
+  for n in (0..3u64).filter(|n| *n != follower) {
+    assert!(
+      w.merge_floors.contains(&(n, 10)),
+      "node {n}: the durable hosts' floors are recorded"
+    );
+  }
+  assert!(
+    w.stables[&(follower, 11)].has_inflight(),
+    "the follower's capture sits in the fsync window"
+  );
+  assert!(
+    !w.merge_floors.contains(&(follower, 10)),
+    "no floor may be recorded ahead of the capture's durability"
+  );
+
+  // The crash collapses the window: the capture is lost, the durable log still holds the
+  // commit — the restored target replays it and re-parks.
+  w.crash(follower);
+  assert!(
+    w.run_until(4_000, |w| {
+      w.hosts[&follower]
+        .group(&11)
+        .is_some_and(|ep| ep.pending_merge().is_some())
+    }),
+    "the restored target replays the commit and re-parks"
+  );
+  for _ in 0..50 {
+    w.tick();
+  }
+  assert!(
+    w.hosts[&follower]
+      .group(&11)
+      .is_some_and(|ep| ep.pending_merge().is_some()),
+    "without the floor the replayed park holds for the snapshot route"
+  );
+  assert_eq!(w.merges_aborted(), 0);
+  // The open barrier keeps the whole batch honest: no floor, the extracted source's stores
+  // retained for the pending teardown, and the entry itself still staged.
+  assert!(
+    !w.merge_floors.contains(&(follower, 10)),
+    "the floor may not land while the capture is unrecoverable"
+  );
+  assert!(
+    w.logs.contains_key(&(follower, 10)),
+    "the pending teardown retains the source stores until the barrier lands"
+  );
+  assert!(
+    w.pending_merge_teardowns
+      .iter()
+      .any(|(n, s, _, _)| *n == follower && *s == 10),
+    "the follower's teardown entry stays staged"
+  );
+}
+
+/// The world-side floor plumbing the sweep now feeds: a recorded `(node, source)` floor
+/// reaches [`sailing_proto::FloorStore::floor`] as the terminal [`sailing_proto::MERGED_FLOOR`]
+/// sentinel — the absent-arm discriminator `service_merge_applies` reads — while every
+/// unfloored id stays at the working floor. The arm's verdict on the sentinel (a replayed
+/// duplicate no-ops past the park) is pinned in the product's own service tests; this seam is
+/// what the dead hosting-check sweep left permanently empty, making that arm unreachable from
+/// the world.
+#[test]
+fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
+  use sailing_proto::FloorStore as _;
+  let mut logs: BTreeMap<(u64, u64), MemLog> = BTreeMap::new();
+  let mut stables: BTreeMap<(u64, u64), MemStable<u64>> = BTreeMap::new();
+  let mut floored: BTreeSet<(u64, u64)> = BTreeSet::new();
+  floored.insert((1, 10));
+  let stores = super::merge::NodeStores {
+    node: 1,
+    logs: &mut logs,
+    stables: &mut stables,
+    floored: &floored,
+  };
+  assert_eq!(stores.floor(&10), sailing_proto::MERGED_FLOOR);
+  assert_eq!(
+    stores.floor(&11),
+    0,
+    "an unfloored id keeps the working floor"
+  );
+  let other = super::merge::NodeStores {
+    node: 2,
+    logs: &mut logs,
+    stables: &mut stables,
+    floored: &floored,
+  };
+  assert_eq!(
+    other.floor(&10),
+    0,
+    "floors are per-host: another node's teardown does not floor this one"
+  );
+}

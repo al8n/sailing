@@ -42,12 +42,12 @@ pub(super) struct MergeRecord {
 
 /// Per-node `(log, stable)` resolution over the world's split store maps — the driver's
 /// `GroupStores` seam, borrowed for one host's service call.
-struct NodeStores<'a> {
-  node: u64,
-  logs: &'a mut BTreeMap<(u64, u64), MemLog>,
-  stables: &'a mut BTreeMap<(u64, u64), MemStable<u64>>,
+pub(super) struct NodeStores<'a> {
+  pub(super) node: u64,
+  pub(super) logs: &'a mut BTreeMap<(u64, u64), MemLog>,
+  pub(super) stables: &'a mut BTreeMap<(u64, u64), MemStable<u64>>,
   /// The host's terminal merge floors (recorded when a source's deferred teardown lands).
-  floored: &'a BTreeSet<(u64, u64)>,
+  pub(super) floored: &'a BTreeSet<(u64, u64)>,
 }
 
 impl sailing_proto::GroupStores<u64, MemLog, MemStable<u64>> for NodeStores<'_> {
@@ -147,7 +147,9 @@ impl MultiWorld {
             // and a crash inside the capture's fsync window would then restart the target
             // parked with its source unrestorable — the abort arm would skip the union and
             // silently diverge. Kept pending until the target's durable snapshot covers the
-            // absorb; a crash before that restores BOTH groups and re-resolves determinately.
+            // absorb; a crash before that re-parks the restored target, which waits on its
+            // extracted source until the resolved quorum's post-merge install supersedes the
+            // park — the same install's durability then completes this entry.
             let boundary = self
               .hosts
               .get(&node)
@@ -189,20 +191,28 @@ impl MultiWorld {
   }
 
   /// Complete deferred source teardowns whose target capture is now DURABLE on that host — the
-  /// world's rendering of the driver's one-barrier batch (see `pump_merges`). A crashed host's
-  /// entries clear on their own: the crash restored both groups, the target re-parked, and the
-  /// re-resolution stages a fresh teardown.
+  /// world's rendering of the driver's one-barrier batch (see `pump_merges`). Every entry here
+  /// came off a `Merged` resolution, and the resolver itself already EXTRACTED the source
+  /// endpoint from the host — so completion is decided from the world's own teardown state
+  /// (the floor this sweep records), exactly as the product drivers fold the resolutions they
+  /// were handed. Re-deriving hosting here instead would always read false post-extraction and
+  /// silently drop the whole batch: no floor ever recorded, no source store ever dropped —
+  /// absorbed sources left restorable forever and the service's absent-WITH-floor duplicate
+  /// arm unreachable.
   fn sweep_merge_teardowns(&mut self) {
     let pending = core::mem::take(&mut self.pending_merge_teardowns);
     for (node, source, target, boundary) in pending {
-      if !self.hosts_group(node, source) {
-        continue; // already gone (a crash-window restart re-resolved and re-tore it down)
+      if self.merge_floors.contains(&(node, source)) {
+        continue; // already landed — a re-staged teardown completes at most once
       }
-      let durable = self
-        .stables
-        .get(&(node, target))
-        .and_then(sailing_proto::StableStore::durable_snapshot)
-        .is_some_and(|meta| meta.last_index() >= boundary);
+      let durable = match self.stables.get(&(node, target)) {
+        Some(stable) => sailing_proto::StableStore::durable_snapshot(stable)
+          .is_some_and(|meta| meta.last_index() >= boundary),
+        // The target replica itself was torn down on this host: the barrier this entry waits
+        // on can never land, and holding the extracted source's stores hostage to it would
+        // leave restorable zombie state behind — complete now (the floor is terminal anyway).
+        None => true,
+      };
       if durable {
         // The barrier landed: capture + floor + teardown together (the engine batch model).
         self.merge_floors.insert((node, source));
