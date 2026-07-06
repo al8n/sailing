@@ -1392,7 +1392,10 @@ fn merge_conf_fence_releases_with_the_capture() {
   let (mut ep, mut log, mut stable, k) = make_parked_target(1);
   assert!(!ep.absorb_capture_blocked(), "nothing else is staged");
   ep.resolve_pending_merge(CountSm::default());
-  ep.capture_absorb_snapshot(&log, &mut stable);
+  assert!(
+    ep.capture_absorb_snapshot(&log, &mut stable),
+    "the capture stages the durable anchor"
+  );
   // Absorbed but not yet compacted: still fenced.
   assert!(matches!(
     ep.propose_conf_change(

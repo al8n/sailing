@@ -484,14 +484,21 @@ where
   /// rewinds to re-park (nothing durable moved) or restarts the target at a boundary past the
   /// absorb (never a parked apply whose source was already destroyed). The caller checked
   /// [`absorb_capture_blocked`](Self::absorb_capture_blocked) before resolving.
-  pub(crate) fn capture_absorb_snapshot<L, S>(&mut self, log: &L, stable: &mut S)
+  ///
+  /// Returns whether the capture actually STAGED `pending_compact` — the union's durable anchor.
+  /// The container's resolve arm emits `Merged` (the driver's permission to floor the source and
+  /// drop its stores) ONLY on `true`: a `snapshot()` or log fault poisons and returns `false`, so
+  /// an absorb whose union could not be anchored fail-stops with the source's stores intact rather
+  /// than authorizing a teardown over a union no durable target snapshot covers.
+  #[must_use]
+  pub(crate) fn capture_absorb_snapshot<L, S>(&mut self, log: &L, stable: &mut S) -> bool
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
     F::Snapshot: crate::Data,
   {
     if self.poison.poisoned {
-      return;
+      return false;
     }
     debug_assert!(
       self.snapshot.pending_compact.is_none() && self.snapshot.pending_install.is_none(),
@@ -501,14 +508,17 @@ where
       Ok(s) => s,
       Err(_) => {
         self.poison(PoisonReason::SnapshotCapture);
-        return;
+        return false;
       }
     };
     use crate::Data as _;
     let mut data = std::vec::Vec::new();
     snap.encode(&mut data);
     let Some(last_term) = self.log_term(log, self.applied) else {
-      return;
+      // The absorb point must be readable to stamp the snapshot meta; a fault here leaves the
+      // union unanchored — fail-stop rather than stage nothing and let the caller emit Merged.
+      self.poison(PoisonReason::LogRead);
+      return false;
     };
     let mut meta = crate::SnapshotMeta::new(self.applied, last_term, self.conf_state())
       .with_max_lease_window(self.lease_guard.max_lease_window)
@@ -521,6 +531,7 @@ where
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     self.snapshot.pending_compact = Some((opid, self.applied));
+    true
   }
 
   /// Seal a parked commit's abort window: while the window is OPEN and this leader's log still

@@ -2182,16 +2182,33 @@ where
             self.mark_dirty(&tgid);
             continue;
           }
-          if let Some((log, stable)) = stores.stores(&tgid)
-            && let Some(tep) = self.groups.get_mut(&tgid)
-          {
-            tep.capture_absorb_snapshot(log, stable);
-          }
+          // The absorb happened in memory; the union is durable ONLY once the forced capture
+          // STAGES its snapshot/compaction. Emit `Merged` — the driver's permission to floor the
+          // source terminally and drop its stores — solely on a staged capture. A `snapshot()` or
+          // log fault poisons and stages nothing: fail-stop with the source's stores untouched, so
+          // a restart re-parks against the restored source rather than losing the union behind a
+          // floored, torn-down source no durable target snapshot covers. A store gone between the
+          // window read and here (unreachable through a stable seam within one crank) fail-stops
+          // the same way — never a teardown resolution without a proven staged capture.
+          let staged = match stores.stores(&tgid) {
+            Some((log, stable)) => self
+              .groups
+              .get_mut(&tgid)
+              .is_some_and(|tep| tep.capture_absorb_snapshot(log, stable)),
+            None => {
+              if let Some(tep) = self.groups.get_mut(&tgid) {
+                tep.poison(PoisonReason::SnapshotCapture);
+              }
+              false
+            }
+          };
           self.mark_dirty(&tgid);
-          resolutions.push(MergeResolution::Merged {
-            source,
-            target: tgid,
-          });
+          if staged {
+            resolutions.push(MergeResolution::Merged {
+              source,
+              target: tgid,
+            });
+          }
         }
       }
     }

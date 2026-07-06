@@ -21,13 +21,16 @@ fn preloaded_sm(n: u64) -> CountSm {
 }
 
 /// Drain `gid`'s storage completions to quiescence on one host.
-fn drain_storage(
-  m: &mut MultiRaft<u64, u64, CountSm>,
+fn drain_storage<F>(
+  m: &mut MultiRaft<u64, u64, F>,
   gid: u64,
   now: Instant,
   log: &mut VecLog,
   stable: &mut AsyncStable,
-) {
+) where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
   while matches!(
     m.handle_storage(&gid, now, log, stable),
     Some(StorageProgress::MorePending)
@@ -2885,25 +2888,28 @@ impl crate::FloorStore<u64> for MapStores {
 }
 
 /// A host with two single-voter groups (1 = source with `src_count` applied commands, 2 = target
-/// with `tgt_count`), each elected and fully drained.
-fn merge_host(src_count: usize, tgt_count: usize) -> (MultiRaft<u64, u64, CountSm>, MapStores) {
-  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+/// with `tgt_count`), each seeded with the given state machine, elected and fully drained.
+fn merge_host_with<F>(
+  src_fsm: F,
+  src_count: usize,
+  tgt_fsm: F,
+  tgt_count: usize,
+) -> (MultiRaft<u64, u64, F>, MapStores)
+where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
+  let mut m: MultiRaft<u64, u64, F> = MultiRaft::new();
   let mut stores = MapStores(
     std::collections::BTreeMap::new(),
     std::collections::BTreeSet::new(),
   );
-  for (gid, n) in [(1u64, src_count), (2u64, tgt_count)] {
+  for (gid, n, fsm) in [(1u64, src_count, src_fsm), (2u64, tgt_count, tgt_fsm)] {
     stores
       .0
       .insert(gid, (VecLog::default(), AsyncStable::default()));
-    m.create_group(
-      gid,
-      single_node_cfg(1),
-      Instant::ORIGIN,
-      7,
-      CountSm::default(),
-    )
-    .unwrap();
+    m.create_group(gid, single_node_cfg(1), Instant::ORIGIN, 7, fsm)
+      .unwrap();
     let (log, stable) = stores.0.get_mut(&gid).unwrap();
     let d = m.group(&gid).unwrap().poll_timeout().unwrap();
     m.handle_timeout(&gid, d, log, stable).unwrap();
@@ -2920,9 +2926,19 @@ fn merge_host(src_count: usize, tgt_count: usize) -> (MultiRaft<u64, u64, CountS
   (m, stores)
 }
 
+/// A host with two single-voter [`CountSm`] groups (1 = source with `src_count` applied commands,
+/// 2 = target with `tgt_count`), each elected and fully drained.
+fn merge_host(src_count: usize, tgt_count: usize) -> (MultiRaft<u64, u64, CountSm>, MapStores) {
+  merge_host_with(CountSm::default(), src_count, CountSm::default(), tgt_count)
+}
+
 /// Freeze group 1 into group 2 and park group 2's commit, fully drained: the state every
 /// resolution arm starts from. Returns the parked index k.
-fn freeze_and_park(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores) -> Index {
+fn freeze_and_park<F>(m: &mut MultiRaft<u64, u64, F>, stores: &mut MapStores) -> Index
+where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
   let now = Instant::ORIGIN;
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
@@ -2943,7 +2959,11 @@ fn freeze_and_park(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores)
 /// Close the parked commit's abort window: the first service pass resolves nothing — it
 /// appends the leader's seal no-op at the coordinate after the parked entry — and the drain
 /// commits it (single-voter shape: commit advances at the local storage drain).
-fn seal_window(m: &mut MultiRaft<u64, u64, CountSm>, stores: &mut MapStores) {
+fn seal_window<F>(m: &mut MultiRaft<u64, u64, F>, stores: &mut MapStores)
+where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
   assert!(
     m.service_merge_applies(Instant::ORIGIN, stores).is_empty(),
     "the first pass only seals the window"
@@ -2999,6 +3019,128 @@ fn service_resolves_a_ready_merge() {
   assert!(
     m.service_merge_applies(Instant::ORIGIN, &mut stores)
       .is_empty()
+  );
+}
+
+/// A concrete, `core::error::Error` snapshot failure for [`SnapFailSm`].
+#[derive(Debug)]
+struct SnapErr;
+
+impl core::fmt::Display for SnapErr {
+  fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+    f.write_str("snapshot capture failed")
+  }
+}
+
+impl core::error::Error for SnapErr {}
+
+/// A counting state machine whose `snapshot()` fails once its shared flag is armed — the
+/// absorb-SUCCEEDED-but-capture-FAILED shape. `absorb` always folds and returns `true`; arming the
+/// flag makes the forced absorb capture's `snapshot()` error, so `pending_compact` can never stage.
+/// The flag is shared so a test arms it AFTER the merge parks, leaving the drive's own snapshots
+/// (if any) succeeding and failing only the resolve arm's forced capture.
+#[derive(Debug, Default)]
+struct SnapFailSm {
+  count: u64,
+  fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl crate::StateMachine for SnapFailSm {
+  type Command = Bytes;
+  type Response = u64;
+  type Snapshot = u64;
+  type Error = SnapErr;
+
+  fn apply(&mut self, _index: Index, _cmd: Bytes) -> Result<u64, Self::Error> {
+    self.count += 1;
+    Ok(self.count)
+  }
+
+  fn snapshot(&self) -> Result<u64, Self::Error> {
+    if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+      Err(SnapErr)
+    } else {
+      Ok(self.count)
+    }
+  }
+
+  fn restore(&mut self, snapshot: u64) -> Result<(), Self::Error> {
+    self.count = snapshot;
+    Ok(())
+  }
+
+  fn absorb(&mut self, source: Self) -> bool {
+    self.count += source.count;
+    true
+  }
+}
+
+/// The absorb SUCCEEDS but the forced durable capture FAILS (`snapshot()` errors): the resolve arm
+/// must NOT surface `Merged` — the driver's permission to floor the source terminally and drop its
+/// stores — over a union no durable target snapshot covers. Without the guard the source would be
+/// floored and torn down with no absorbed anchor, and a restart would find neither a re-absorbable
+/// source nor a durable absorbed target (data loss). The target fail-stops instead; the source's
+/// stores stay untouched so a restart re-parks against them.
+#[test]
+fn capture_failure_withholds_merged_and_keeps_the_source_recoverable() {
+  let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let (mut m, mut stores) = merge_host_with(
+    SnapFailSm::default(),
+    2,
+    SnapFailSm {
+      count: 0,
+      fail: fail.clone(),
+    },
+    3,
+  );
+  let _k = freeze_and_park(&mut m, &mut stores);
+  seal_window(&mut m, &mut stores);
+  // Arm the target's forced capture to fail: the absorb still folds, but snapshot() errors, so no
+  // durable anchor for the union can ever stage.
+  fail.store(true, std::sync::atomic::Ordering::Relaxed);
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
+  assert!(
+    resolutions.is_empty(),
+    "a failed absorb capture must not surface a Merged teardown resolution: {resolutions:?}"
+  );
+  let tep = m.group(&2).unwrap();
+  assert!(
+    tep.is_poisoned(),
+    "the failed capture fail-stops the target rather than advertising a phantom merge"
+  );
+  assert_eq!(tep.poison_reason(), Some(PoisonReason::SnapshotCapture));
+  // The source stays recoverable: its stores are untouched and its id was never floored, so a
+  // restart re-parks against the restored source and the merge re-resolves.
+  assert!(stores.0.contains_key(&1), "the source's stores are intact");
+  assert_eq!(stores.floor(&1), 0, "the source id was never floored");
+}
+
+/// The negative pin: with the forced capture SUCCEEDING, the resolve arm still emits exactly one
+/// `Merged` and stages the durable anchor — the withholding fires ONLY on a failed capture.
+#[test]
+fn capture_success_still_emits_merged_once() {
+  let (mut m, mut stores) = merge_host_with(SnapFailSm::default(), 2, SnapFailSm::default(), 3);
+  let k = freeze_and_park(&mut m, &mut stores);
+  seal_window(&mut m, &mut stores);
+  let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }]
+  );
+  assert!(!m.group(&2).unwrap().is_poisoned());
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
+    assert!(stable.snapshot().is_some(), "absorb capture persisted");
+    assert!(log.first_index() > k, "compacted through the absorb");
+  }
+  assert!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores)
+      .is_empty(),
+    "the resolution fires exactly once"
   );
 }
 
