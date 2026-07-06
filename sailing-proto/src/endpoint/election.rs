@@ -627,6 +627,13 @@ where
     // Mirror for commit-merges: an inherited unapplied CommitMerge in the tail will PARK this
     // leader's apply when it commits; hold the membership fence until the tail applies.
     self.merge.pending_commit_index = last;
+    // The abort-relay thaw guard re-seats the OPPOSITE way — to ZERO, not to `last`. The fences
+    // above hold an inherited tail (assume-in-flight is the SAFE bias); a thaw guard biased that
+    // way would refuse to re-append and leave a source wedged if the previous leader's thaw was
+    // appended then truncated before it committed. A fresh source leader must be free to re-drive
+    // the thaw, so it starts with none in flight — the guard suppresses only this leader's own
+    // duplicate, never an inherited one.
+    self.merge.thaw_pending_index = Index::ZERO;
     self.tracker.reset_progress(
       last.next(),
       self.config.max_inflight_msgs(),

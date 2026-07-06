@@ -334,6 +334,31 @@ pub enum MergeError<I> {
   /// resolve identically on every replica).
   #[error("the source's freeze names a different target")]
   SourceClaimed,
+  /// The relayed thaw names freeze generation `expected`, but this source leader's applied
+  /// lineage `seen` has not reached it yet — the freeze is committed but not yet folded on a
+  /// freshly elected leader. TRANSIENT: the relay retries once the source's apply catches up.
+  #[error(
+    "the source has not applied the thaw's freeze generation yet (expected {expected}, at {seen})"
+  )]
+  SourceBehindFreeze {
+    /// The freeze generation the relay authorizes a thaw for.
+    expected: u64,
+    /// The source's current applied lineage, still short of it.
+    seen: u64,
+  },
+  /// The relayed thaw names freeze generation `expected`, but the source's lineage `seen` has
+  /// already advanced past it — the freeze was thawed, and the same source→target pair may have
+  /// re-frozen for a NEW merge. A relay retained across source-leader churn must bind to the
+  /// incarnation it abandoned, never the source's live counter, or it would thaw that later
+  /// freeze with no matching target-side abort — aborting the new merge out of order. TERMINAL:
+  /// the relay is a spent authorization and is dropped.
+  #[error("the thaw's freeze generation is stale (expected {expected}, source at {seen})")]
+  StaleThaw {
+    /// The freeze generation the relay authorized a thaw for.
+    expected: u64,
+    /// The source's current lineage, already past it.
+    seen: u64,
+  },
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large). The merge-specific gates all passed; the failure is the ordinary
   /// admin-append class, surfaced verbatim.

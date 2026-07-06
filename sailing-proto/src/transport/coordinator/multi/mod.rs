@@ -802,8 +802,8 @@ where
 
   /// Propose the SOURCE-side thaw on `source` (see [`MultiRaft::propose_merge_unfreeze`]) —
   /// the relay leg of a committed target-side abort, normally invoked by the DRIVER's relay
-  /// drain rather than the embedder. The one entry proposable on a frozen group; refusals are
-  /// the relay's dedupe.
+  /// drain rather than the embedder with the relay's recorded freeze generation as `expected_gen`.
+  /// The one entry proposable on a frozen group; refusals are the relay's dedupe.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn propose_merge_unfreeze<L, S>(
     &mut self,
@@ -812,15 +812,17 @@ where
     log: &mut L,
     stable: &S,
     claimed_by: &G,
+    expected_gen: u64,
   ) -> Option<Result<Index, crate::MergeError<I>>>
   where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
     let now: Now = now.into();
-    let r = self
-      .multi
-      .propose_merge_unfreeze(source, now, log, stable, claimed_by)?;
+    let r =
+      self
+        .multi
+        .propose_merge_unfreeze(source, now, log, stable, claimed_by, expected_gen)?;
     let _ = self.multi.flush_appends(source, now, log, stable);
     self.flush();
     Some(r)
@@ -884,6 +886,18 @@ where
   /// merge service and proposes the source-side thaw over the source's own stores.
   pub fn poll_pending_merge_abort(&mut self) -> Option<crate::MergeAbortRelay<G>> {
     self.multi.poll_pending_merge_abort()
+  }
+
+  /// Fold the driver's [`propose_merge_unfreeze`](Self::propose_merge_unfreeze) outcome for a relay
+  /// drained by [`poll_pending_merge_abort`](Self::poll_pending_merge_abort) (see
+  /// [`MultiRaft::resolve_merge_abort`]): a transient failure (no source leader yet, or the source
+  /// unreachable this crank) requeues the relay for a later crank; a terminal result drops it.
+  pub fn resolve_merge_abort(
+    &mut self,
+    relay: crate::MergeAbortRelay<G>,
+    result: Option<Result<Index, crate::MergeError<I>>>,
+  ) {
+    self.multi.resolve_merge_abort(relay, result);
   }
 
   /// Resolve the fork staged at exactly `split_index` on `parent` (see

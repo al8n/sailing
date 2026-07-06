@@ -2456,7 +2456,9 @@ fn merge_verbs_ride_the_coordinator() {
   assert!(coord.group(&1).is_none());
   assert!(coord.is_retired(&1), "resolved merge tombstones the source");
 
-  // The abort and thaw delegators are reachable too (the source is gone: typed refusals).
+  // The abort and thaw delegators are reachable too, each with a typed refusal: the merged-away
+  // source is gone (`SourceMissing`), and a gen-0 thaw of the surviving target — whose lineage the
+  // absorb advanced to 1 — is past that incarnation (`StaleThaw`).
   {
     let (l, s) = stores.stores(&2).unwrap();
     assert!(matches!(
@@ -2464,8 +2466,11 @@ fn merge_verbs_ride_the_coordinator() {
       Err(crate::MergeError::SourceMissing)
     ));
     assert!(matches!(
-      coord.propose_merge_unfreeze(&2, now, l, s, &2).unwrap(),
-      Err(crate::MergeError::NotFrozen)
+      coord.propose_merge_unfreeze(&2, now, l, s, &2, 0).unwrap(),
+      Err(crate::MergeError::StaleThaw {
+        expected: 0,
+        seen: 1
+      })
     ));
   }
   assert!(

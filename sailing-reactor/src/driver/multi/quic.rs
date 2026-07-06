@@ -581,18 +581,33 @@ where
         }
       }
     }
-    // The abort-relay drain: a target-side abort applied this crank must thaw its named
-    // source ON THE SOURCE'S OWN LOG (log-borne for restart re-derivation). Best-effort by
-    // design — only the host whose local source replica leads can land the thaw; everyone
-    // else's attempt dies typed at the source's own gates, and a relay lost to churn is
-    // recovered by re-proposing the abort.
+    // The abort-relay drain: a target-side abort applied this crank must thaw its named source ON
+    // THE SOURCE'S OWN LOG (log-borne for restart re-derivation). Drain the whole queue FIRST, then
+    // fold each outcome: a transient failure (no source leader yet, or the source unreachable this
+    // crank) REQUEUES the relay for a later crank, so a committed abort still thaws its source once
+    // a source leader is elected; a terminal result drops it. Requeues land after this drain, so
+    // they wait for the next crank rather than re-driving here.
+    let mut relays = Vec::new();
     while let Some(relay) = self.coord.poll_pending_merge_abort() {
-      if let Some((log, stable)) = self.engine.stores(&relay.source) {
-        let _ = self
-          .coord
-          .propose_merge_unfreeze(&relay.source, now, log, stable, &relay.target);
-        self.flush_pending = true;
-      }
+      relays.push(relay);
+    }
+    for relay in relays {
+      let result = match self.engine.stores(&relay.source) {
+        Some((log, stable)) => {
+          let r = self.coord.propose_merge_unfreeze(
+            &relay.source,
+            now,
+            log,
+            stable,
+            &relay.target,
+            relay.source_gen_after,
+          );
+          self.flush_pending = true;
+          r
+        }
+        None => None,
+      };
+      self.coord.resolve_merge_abort(relay, result);
     }
     self.flush_pending = self.engine.has_staged() || more;
     self

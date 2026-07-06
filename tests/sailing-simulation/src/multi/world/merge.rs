@@ -187,7 +187,14 @@ impl MultiWorld {
           continue;
         };
         if host
-          .propose_merge_unfreeze(&relay.source, now, log, stable, &relay.target)
+          .propose_merge_unfreeze(
+            &relay.source,
+            now,
+            log,
+            stable,
+            &relay.target,
+            relay.source_gen_after,
+          )
           .is_some()
         {
           progressed = true;

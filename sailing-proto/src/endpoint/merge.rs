@@ -140,6 +140,15 @@ pub(crate) struct MergeState {
   /// flight), mirroring `pending_split_index` exactly: derived state, re-seated conservatively
   /// at `become_leader`, never a sticky flag.
   pub(crate) pending_commit_index: Index,
+  /// Log index of the SOURCE-role `RollbackMerge` (thaw) this leader last appended and not yet
+  /// applied (`> applied` ⇒ a thaw is in flight) — the abort-relay's IDEMPOTENT-APPEND guard:
+  /// the relay is retained across cranks until the source lineage is observed past the freeze,
+  /// so without this the accept arm would append a fresh thaw every crank until the first
+  /// commits. Derived, self-releasing via `> applied`. Unlike the fences above it re-seats to
+  /// ZERO at `become_leader`, NOT to `last`: a fresh source leader must be free to re-drive a
+  /// thaw the previous leader appended but never committed (a truncated thaw would otherwise
+  /// wedge the source frozen forever); the guard only suppresses THIS leader's own duplicate.
+  pub(crate) thaw_pending_index: Index,
   /// The resolved absorb's `CommitMerge` index, set by `resolve_pending_merge` — the membership
   /// fence's compaction leg: the target refuses conf changes until `first_index` passes it (the
   /// forced absorb capture compacts through it within a crank), so a replica added post-merge
@@ -151,9 +160,10 @@ pub(crate) struct MergeState {
   /// Source-unfreeze relays staged by TARGET-side abort applies, drained by the container
   /// (mirroring the fork relay): each records the abort entry's named source, and the driver
   /// proposes the SOURCE-side `RollbackMerge` on that group's own log. Replay re-stages them
-  /// (the relay's restart derivation); a duplicate proposal dies at the source's own
-  /// `NotFrozen` gate, and a relay lost to lifecycle churn is recovered by re-proposing the
-  /// target-side abort (a fresh entry, a fresh relay) — documented on `rollback_merge`.
+  /// (the relay's restart derivation); a duplicate proposal dies at the source's own incarnation
+  /// gate (`StaleThaw` once the source has thawed past the recorded generation), and a relay lost
+  /// to lifecycle churn is recovered by re-proposing the target-side abort (a fresh entry, a fresh
+  /// relay) — documented on `rollback_merge`.
   pub(crate) pending_aborts: VecDeque<AbortRelay>,
 }
 
@@ -280,6 +290,18 @@ where
   /// for the container's relay drain.
   pub(crate) fn pop_pending_abort(&mut self) -> Option<AbortRelay> {
     self.merge.pending_aborts.pop_front()
+  }
+
+  /// Re-stage a source-unfreeze relay onto this target's queue — the container's REQUEUE of a
+  /// relay whose thaw could not land yet (a leaderless source, or one unreachable this crank). FIFO
+  /// with any others still queued; the container re-marks this target for the next abort drain, so
+  /// a committed abort keeps thawing its source across source-leader churn instead of being lost
+  /// to the one consume the old drain allowed.
+  pub(crate) fn stage_abort_relay(&mut self, source_bytes: Bytes, source_gen_after: u64) {
+    self.merge.pending_aborts.push_back(AbortRelay {
+      source_bytes,
+      source_gen_after,
+    });
   }
 
   /// Whether a merge freeze is ACTIVE right now: a pending (append-observed) freeze or the
@@ -450,6 +472,21 @@ where
   /// one-at-a-time gate's in-flight leg (the parked leg is `pending_merge()`).
   pub(crate) fn commit_merge_in_flight(&self) -> bool {
     self.merge.pending_commit_index > self.applied
+  }
+
+  /// The index of a SOURCE-role `RollbackMerge` (thaw) this leader has appended but not yet
+  /// applied, if any — the abort-relay's idempotent-append guard. `Some` means the accept arm
+  /// must RETAIN and wait rather than append a duplicate; the retained relay retires only once
+  /// the thaw commits, applies, and the source lineage is observed past the freeze.
+  pub(crate) fn thaw_in_flight(&self) -> Option<Index> {
+    (self.merge.thaw_pending_index > self.applied).then_some(self.merge.thaw_pending_index)
+  }
+
+  /// Record a SOURCE-role thaw this leader just appended at `index` — arms
+  /// [`thaw_in_flight`](Self::thaw_in_flight) so the relay's next crank does not pile on a
+  /// duplicate `RollbackMerge` while this one is in flight.
+  pub(crate) fn note_thaw_appended(&mut self, index: Index) {
+    self.merge.thaw_pending_index = index;
   }
 
   /// The target-side membership fence: whether a conf change must refuse because a merge is in

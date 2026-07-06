@@ -2956,6 +2956,52 @@ where
   k
 }
 
+/// Step the leader of single-voter group `gid` down to a follower by injecting a heartbeat from a
+/// phantom peer at a strictly higher term — the source-leader loss the delivery-based retirement
+/// must tolerate. Term adoption is unconditional, so the applied state and `shape_gen` are
+/// untouched (a heartbeat truncates nothing); the group re-campaigns on its next timeout.
+fn step_down<F>(m: &mut MultiRaft<u64, u64, F>, gid: u64, log: &mut VecLog, stable: &mut AsyncStable)
+where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
+  let now = Instant::ORIGIN;
+  let higher = Term::new(m.group(&gid).unwrap().term().get() + 5);
+  m.handle_message(
+    &gid,
+    now,
+    log,
+    stable,
+    2u64,
+    Message::Heartbeat(crate::Heartbeat::new(higher, 2u64, Index::ZERO, Bytes::new())),
+  )
+  .unwrap();
+  drain_storage(m, gid, now, log, stable);
+  assert!(
+    m.group(&gid).unwrap().role().is_follower(),
+    "the higher term stepped the leader down"
+  );
+}
+
+/// Re-elect single-voter group `gid` (a follower after [`step_down`]) back to leader — its next
+/// campaign self-votes and wins.
+fn re_elect<F>(m: &mut MultiRaft<u64, u64, F>, gid: u64, log: &mut VecLog, stable: &mut AsyncStable)
+where
+  F: crate::StateMachine<Command = Bytes, Snapshot = u64>,
+  F::Error: core::error::Error,
+{
+  let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&gid, d, log, stable).unwrap();
+  while matches!(
+    m.handle_storage(&gid, d, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(
+    m.group(&gid).unwrap().role().is_leader(),
+    "the single voter re-elects"
+  );
+}
+
 /// Close the parked commit's abort window: the first service pass resolves nothing — it
 /// appends the leader's seal no-op at the coordinate after the parked entry — and the drain
 /// commits it (single-voter shape: commit advances at the local storage drain).
@@ -3199,7 +3245,7 @@ fn rollback_races_commit() {
   assert!(m.poll_pending_merge_abort().is_none(), "exactly once");
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.propose_merge_unfreeze(&1, Instant::ORIGIN, log, stable, &2)
+    m.propose_merge_unfreeze(&1, Instant::ORIGIN, log, stable, &2, relay.source_gen_after)
       .unwrap()
       .unwrap();
     drain_storage(&mut m, 1, Instant::ORIGIN, log, stable);
@@ -3207,6 +3253,774 @@ fn rollback_races_commit() {
   let sep = m.group(&1).unwrap();
   assert!(!sep.is_frozen(), "the relayed thaw unfroze the source");
   assert_eq!(sep.shape_gen(), 2, "0 -> 1 (freeze) -> 2 (thaw)");
+}
+
+/// A committed abort must thaw its frozen source even across source-leader churn. If the relay is
+/// drained while the source has NO leader (`NotLeader`), dropping it wedges the source frozen
+/// forever — once a source leader is later elected there is no queued relay left to thaw it.
+/// Retaining it lets the later leader land the thaw.
+#[test]
+fn abort_relay_survives_a_leaderless_source() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let _k = freeze_and_park(&mut m, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, Instant::ORIGIN, log, stable, &1)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
+  }
+  assert_eq!(
+    m.service_merge_applies(Instant::ORIGIN, &mut stores),
+    std::vec![MergeResolution::Aborted {
+      source: 1,
+      target: 2
+    }]
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "the source is still frozen"
+  );
+
+  // Drain the relay while the source has NO leader: fold the driver's NotLeader outcome. The relay
+  // must be RETAINED for a later crank, not consumed-and-lost.
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("the abort staged a thaw relay");
+  assert_eq!((relay.target, relay.source), (2, 1));
+  m.resolve_merge_abort(relay, Some(Err(MergeError::NotLeader { leader: None })));
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("a NotLeader outcome RETAINS the relay for a later crank");
+  assert_eq!((relay.target, relay.source), (2, 1));
+
+  // A source leader now exists: the real thaw lands (appended + applied). The accept RETAINS —
+  // retirement is delivery-based, so the relay is dropped only once the advance is OBSERVED.
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let r = m.propose_merge_unfreeze(&1, Instant::ORIGIN, log, stable, &2, relay.source_gen_after);
+    drain_storage(&mut m, 1, Instant::ORIGIN, log, stable);
+    r
+  };
+  assert!(
+    matches!(result, Some(Ok(_))),
+    "the source leader accepts the thaw: {result:?}"
+  );
+  m.resolve_merge_abort(relay, result);
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "the retained relay's thaw unfroze the source — not permanently wedged"
+  );
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("an accepted (appended) thaw RETAINS the relay until the advance is observed");
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, Instant::ORIGIN, log, stable, &2, relay.source_gen_after)
+  };
+  assert!(
+    matches!(result, Some(Err(MergeError::StaleThaw { .. }))),
+    "the delivered thaw is now observed past the freeze: {result:?}"
+  );
+  m.resolve_merge_abort(relay, result);
+  assert!(
+    m.poll_pending_merge_abort().is_none(),
+    "the observed source advance retires the relay terminally"
+  );
+}
+
+/// The negative pin: a normal abort with a LIVE source leader thaws, and retirement is
+/// DELIVERY-BASED — the accept RETAINS (the thaw is only appended), and the SUBSEQUENT crank that
+/// observes the source past the freeze drops the relay. No infinite retry: the observed advance is
+/// terminal.
+#[test]
+fn accepted_thaw_retires_on_the_observed_advance() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let _k = freeze_and_park(&mut m, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, Instant::ORIGIN, log, stable, &1)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
+  }
+  m.service_merge_applies(Instant::ORIGIN, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, Instant::ORIGIN, log, stable);
+  }
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("the abort staged a thaw relay");
+  // Accept: the live source leader appends the thaw and it applies (single-voter self-commit).
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let r = m.propose_merge_unfreeze(&1, Instant::ORIGIN, log, stable, &2, relay.source_gen_after);
+    drain_storage(&mut m, 1, Instant::ORIGIN, log, stable);
+    r
+  };
+  assert!(matches!(result, Some(Ok(_))));
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "thawed on the first fold"
+  );
+  // The accept RETAINS: retirement waits on the observed advance, not the append.
+  m.resolve_merge_abort(relay, result);
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("the accepted (appended) thaw RETAINS the relay");
+  // The next crank observes the delivered thaw (seen > expected) and retires the relay.
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, Instant::ORIGIN, log, stable, &2, relay.source_gen_after)
+  };
+  assert!(matches!(
+    result,
+    Some(Err(MergeError::StaleThaw {
+      expected: 1,
+      seen: 2
+    }))
+  ));
+  m.resolve_merge_abort(relay, result);
+  assert!(
+    m.poll_pending_merge_abort().is_none(),
+    "the observed advance drops the relay — no infinite requeue"
+  );
+}
+
+/// THE INCARNATION GATE (the retained-relay hazard): a relay RETAINED across source-leader churn
+/// must bind to the freeze generation it abandoned, never the source's live counter. Here the
+/// original thaw lands (modelling a peer host) and the SAME source→target pair FREEZES AGAIN at a
+/// new generation with its own parked commit — then the stale relay is drained. It must be TERMINAL
+/// (`StaleThaw`) and thaw NOTHING: the new freeze stands and the source is not moved past the new
+/// park's expected generation. Neuter the `seen > expected` guard and this regresses — the stale
+/// relay thaws the new freeze (`is_frozen()` flips), aborting the new merge out of order.
+#[test]
+fn stale_abort_relay_does_not_thaw_a_refrozen_source() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  freeze_and_park(&mut m, &mut stores);
+  // Abort the first merge: the target's log lands the abort in the park's window, the park
+  // resolves aborted, and the resumed drain stages the source's thaw relay.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert_eq!(
+    m.service_merge_applies(now, &mut stores),
+    std::vec![MergeResolution::Aborted {
+      source: 1,
+      target: 2
+    }]
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  // A host drains the relay but cannot land its thaw yet (leaderless source): hold it retained.
+  let stale = m
+    .poll_pending_merge_abort()
+    .expect("the abort staged a thaw relay");
+  assert_eq!(
+    (stale.target, stale.source, stale.source_gen_after),
+    (2, 1, 1)
+  );
+
+  // THE NEGATIVE PIN: another host's thaw lands here at the recorded generation (expected == the
+  // current frozen gen) and unfreezes the source normally.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "the original thaw landed"
+  );
+  assert_eq!(
+    m.group(&1).unwrap().shape_gen(),
+    2,
+    "0 -> 1 freeze -> 2 thaw"
+  );
+
+  // The SAME pair freezes AGAIN — a brand-new merge with its own parked commit at a new gen.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "re-frozen for a new merge"
+  );
+  assert_eq!(m.group(&1).unwrap().shape_gen(), 3, "2 -> 3 re-freeze");
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_some(),
+    "the new merge parks a commit expecting the new generation"
+  );
+
+  // Now the stale relay (recorded gen 1) is finally drained against a source at gen 3. It is
+  // TERMINAL and thaws nothing — the new freeze must survive.
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let r = m.propose_merge_unfreeze(&1, now, log, stable, &2, stale.source_gen_after);
+    drain_storage(&mut m, 1, now, log, stable);
+    r
+  };
+  assert!(
+    matches!(
+      result,
+      Some(Err(MergeError::StaleThaw {
+        expected: 1,
+        seen: 3
+      }))
+    ),
+    "the stale relay is a spent authorization, not a thaw: {result:?}"
+  );
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "the new freeze still stands — the stale relay did not thaw it"
+  );
+  assert_eq!(
+    m.group(&1).unwrap().shape_gen(),
+    3,
+    "the source is not moved past the new park's expected generation"
+  );
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_some(),
+    "the new merge's park is intact"
+  );
+  // Terminal folds drop the relay: no requeue.
+  m.resolve_merge_abort(stale, result);
+  assert!(
+    m.poll_pending_merge_abort().is_none(),
+    "a StaleThaw outcome drops the relay terminally"
+  );
+}
+
+/// The incarnation gate's TRANSIENT arm: a relay naming a freeze generation the local source leader
+/// has not APPLIED yet (its lineage sits below the recorded generation — a fresh leader mid-catch-up)
+/// refuses with `SourceBehindFreeze` and appends nothing, and the relay classifier REQUEUES it
+/// rather than dropping it. Distinguished from the terminal `StaleThaw` the sibling test pins.
+#[test]
+fn thaw_behind_freeze_generation_is_transient() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  freeze_and_park(&mut m, &mut stores);
+  // The source leads, frozen at gen 1; a relay naming gen 2 sits ahead of its applied lineage.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let r = m.propose_merge_unfreeze(&1, now, log, stable, &2, 2);
+    assert!(
+      matches!(
+        r,
+        Some(Err(MergeError::SourceBehindFreeze {
+          expected: 2,
+          seen: 1
+        }))
+      ),
+      "behind the recorded freeze generation: {r:?}"
+    );
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "nothing appended while behind the generation"
+  );
+  // Fold a SourceBehindFreeze outcome for a real relay: it REQUEUES (transient), unlike StaleThaw.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  let relay = m
+    .poll_pending_merge_abort()
+    .expect("the abort staged a relay");
+  m.resolve_merge_abort(
+    relay,
+    Some(Err(MergeError::SourceBehindFreeze {
+      expected: 1,
+      seen: 0,
+    })),
+  );
+  assert!(
+    m.poll_pending_merge_abort().is_some(),
+    "a SourceBehindFreeze outcome retains the relay for a later crank"
+  );
+}
+
+/// THE COMMITTED-BUT-UNAPPLIED WEDGE: a relay drained while the source LEADER holds its freeze
+/// committed but NOT yet applied (`freeze_pending` armed at append, `is_frozen() == false`, the
+/// lineage still below the abort's recorded generation). The abort was minted off a colocated
+/// replica that already applied the freeze, so the recorded generation is `1` while this fresh
+/// leader still reads `0`. It must classify as TRANSIENT `SourceBehindFreeze` and be RETAINED —
+/// the prior gate read only the applied bit and dropped it as terminal `NotFrozen`, after which
+/// the leader applied the freeze and stayed frozen with no leader-local relay to thaw it (a
+/// permanent frozen-source wedge). Then the leader applies the freeze and a later thaw lands.
+#[test]
+fn committed_but_unapplied_freeze_thaw_is_retained_not_dropped() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // Drive the source into the committed-but-unapplied SIGNATURE: the `PrepareMerge` is on the
+  // leader's log (the append arms `freeze_pending`) but deliberately NOT drained, so it has not
+  // folded — `is_frozen() == false`, the lineage still pre-freeze. The relay classifier reads
+  // exactly these predicates; it never consults commit or persistence, so this is the endpoint a
+  // freshly elected source leader presents while its apply trails the abort's recorded freeze.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+  }
+  {
+    let src = m.group(&1).unwrap();
+    assert!(
+      src.merge_freeze_active(),
+      "the freeze is pending on the log"
+    );
+    assert!(!src.is_frozen(), "but not yet applied");
+    assert_eq!(
+      src.shape_gen(),
+      0,
+      "the lineage has not reached the freeze gen"
+    );
+  }
+
+  // RED (pre-fix): the relay is dropped as terminal `NotFrozen`; it must instead retain as
+  // transient `SourceBehindFreeze` so the committed abort can still thaw the source later.
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(
+      result,
+      Some(Err(MergeError::SourceBehindFreeze {
+        expected: 1,
+        seen: 0
+      }))
+    ),
+    "a committed-but-unapplied freeze at gen < expected is behind, not NotFrozen: {result:?}"
+  );
+  assert!(
+    merge_unfreeze_retry(&result),
+    "the relay classifier RETAINS a SourceBehindFreeze outcome — it is not dropped"
+  );
+  {
+    // Nothing was appended while behind — the freeze signature is unchanged.
+    let src = m.group(&1).unwrap();
+    assert!(src.merge_freeze_active() && !src.is_frozen());
+    assert_eq!(src.shape_gen(), 0);
+  }
+
+  // GREEN: the leader applies the freeze, and the retained relay's thaw now lands.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "the freeze folded");
+  assert_eq!(
+    m.group(&1).unwrap().shape_gen(),
+    1,
+    "the lineage is now at the freeze gen"
+  );
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let r = m.propose_merge_unfreeze(&1, now, log, stable, &2, 1);
+    drain_storage(&mut m, 1, now, log, stable);
+    r
+  };
+  assert!(
+    matches!(result, Some(Ok(_))),
+    "the thaw lands once the freeze is applied: {result:?}"
+  );
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "the source thawed — never permanently wedged"
+  );
+  assert_eq!(
+    m.group(&1).unwrap().shape_gen(),
+    2,
+    "0 -> 1 freeze -> 2 thaw"
+  );
+}
+
+/// The relay classification is EXHAUSTIVE over every frozen-source state, pinning each row of the
+/// generation-bound table to its bucket (accept-retain / transient-requeue / terminal-drop).
+/// Completeness is the property under test — no reachable frozen-source or freeze-pending state may
+/// map to the wrong bucket — so this walks the whole table in the DELIVERY-BASED order: the
+/// terminal-dedupe (`StaleThaw`, `NotFrozen`) precedes the leadership gate, and the accept arm is
+/// RETAIN (appended, not delivered) until the source is observed past the freeze.
+#[test]
+fn frozen_source_relay_classification_is_exhaustive() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+
+  // --- transient: unhosted source (`None`) ---
+  let unhosted = {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.propose_merge_unfreeze(&999, now, log, stable, &1, 1)
+  };
+  assert!(unhosted.is_none(), "an unhosted source is None");
+  assert!(merge_unfreeze_retry(&unhosted), "None requeues");
+
+  // --- terminal: a never-frozen source is NotFrozen at and below the named gen, BEFORE the
+  //     leadership gate — a leader (group 2) and an un-elected follower (group 3) both answer
+  //     NotFrozen, since the terminal-dedupe does not depend on role. ---
+  m.create_group(3, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  for (gid, expected, why) in [
+    (2u64, 0u64, "leader, seen == expected, not frozen"),
+    (2, 5, "leader, seen < expected, no freeze"),
+    (3, 1, "un-elected follower, seen < expected, no freeze"),
+  ] {
+    let r = {
+      let (log, stable) = stores.0.get_mut(&2).unwrap();
+      m.propose_merge_unfreeze(&gid, now, log, stable, &1, expected)
+    };
+    assert!(
+      matches!(r, Some(Err(MergeError::NotFrozen))),
+      "never-frozen ({why}) is NotFrozen: {r:?}"
+    );
+    assert!(
+      !merge_unfreeze_retry(&r),
+      "NotFrozen drops terminally ({why})"
+    );
+  }
+
+  // --- transient: the committed-but-unapplied freeze (freeze-pending, seen < expected) ---
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+  }
+  let pending_behind = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(
+      pending_behind,
+      Some(Err(MergeError::SourceBehindFreeze {
+        expected: 1,
+        seen: 0
+      }))
+    ),
+    "freeze-pending below the gen is SourceBehindFreeze: {pending_behind:?}"
+  );
+  assert!(
+    merge_unfreeze_retry(&pending_behind),
+    "SourceBehindFreeze requeues (freeze-pending)"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+
+  // Group 1 is now frozen-applied at gen 1 for target 2.
+  assert!(m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 1);
+
+  // --- transient: applied freeze BELOW a later-named gen (mid-catch-up) ---
+  let applied_behind = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 2)
+  };
+  assert!(
+    matches!(
+      applied_behind,
+      Some(Err(MergeError::SourceBehindFreeze {
+        expected: 2,
+        seen: 1
+      }))
+    ),
+    "applied freeze below the gen is SourceBehindFreeze: {applied_behind:?}"
+  );
+  assert!(
+    merge_unfreeze_retry(&applied_behind),
+    "SourceBehindFreeze requeues (applied)"
+  );
+
+  // --- transient: frozen at the EXACT incarnation but NOT the leader — the genuine NotLeader row
+  //     the reorder exposes (a follower frozen at `expected` reaches the leadership gate, having
+  //     passed the terminal-dedupe). Step group 1 down, then re-elect it for the rows below. ---
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    step_down(&mut m, 1, log, stable);
+  }
+  let not_leader = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(not_leader, Some(Err(MergeError::NotLeader { .. }))),
+    "a follower frozen at the exact incarnation is NotLeader: {not_leader:?}"
+  );
+  assert!(merge_unfreeze_retry(&not_leader), "NotLeader requeues");
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    re_elect(&mut m, 1, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 1);
+
+  // --- terminal: the exact incarnation claimed by a DIFFERENT target ---
+  let claimed = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &9, 1)
+  };
+  assert!(
+    matches!(claimed, Some(Err(MergeError::SourceClaimed))),
+    "the exact incarnation claimed elsewhere is SourceClaimed: {claimed:?}"
+  );
+  assert!(
+    !merge_unfreeze_retry(&claimed),
+    "SourceClaimed drops terminally"
+  );
+
+  // --- accept-RETAIN: the exact incarnation with the matching claim appends the thaw but is NOT
+  //     retired by the append — the relay retains until the advance is observed. IDEMPOTENT: a
+  //     second drain while the thaw is in flight retains WITHOUT appending a duplicate. ---
+  let accepted = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(accepted, Some(Ok(_))),
+    "the exact incarnation with the matching claim appends the thaw: {accepted:?}"
+  );
+  assert!(
+    merge_unfreeze_retry(&accepted),
+    "an appended (not yet delivered) thaw RETAINS the relay"
+  );
+  let after_append = stores.0.get(&1).unwrap().0.last_index();
+  let in_flight = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(in_flight, Some(Ok(_))) && merge_unfreeze_retry(&in_flight),
+    "a thaw already in flight RETAINS: {in_flight:?}"
+  );
+  assert_eq!(
+    stores.0.get(&1).unwrap().0.last_index(),
+    after_append,
+    "the idempotent guard appended no duplicate RollbackMerge"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 2);
+
+  // --- terminal: advanced PAST the named incarnation (the delivered thaw is OBSERVED) — the
+  //     retirement, terminal on every host. ---
+  let stale = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(
+      stale,
+      Some(Err(MergeError::StaleThaw {
+        expected: 1,
+        seen: 2
+      }))
+    ),
+    "a source advanced past the gen is StaleThaw: {stale:?}"
+  );
+  assert!(!merge_unfreeze_retry(&stale), "StaleThaw drops terminally");
+}
+
+/// RED-first for the [MEDIUM] finding: a FOLLOWER host that OBSERVES the source past the freeze must
+/// retire its own relay — as terminal `StaleThaw` — WITHOUT ever leading. The source is thawed here
+/// (modelling another host's leader delivering the thaw, `seen == 2`), then this host's source
+/// replica is stepped down to a follower. Pre-reorder the `NotLeader` check shadowed the lineage
+/// dedupe, so a follower answered `NotLeader` (transient) forever and never dropped its stale relay;
+/// the reorder puts the observed-advance retirement BEFORE the leadership gate.
+#[test]
+fn a_follower_retires_the_relay_on_the_observed_advance() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // Freeze group 1 for target 2 (seen == 1), then thaw it as leader so the source lineage advances
+  // PAST the freeze (seen == 2) — the delivery this host will merely OBSERVE.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 2);
+  // This host's source replica is now a FOLLOWER; it never leads the thaw.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    step_down(&mut m, 1, log, stable);
+  }
+  let result = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    m.group(&1).unwrap().role().is_follower(),
+    "the host never led"
+  );
+  assert!(
+    matches!(
+      result,
+      Some(Err(MergeError::StaleThaw {
+        expected: 1,
+        seen: 2
+      }))
+    ),
+    "a follower observing the advance is StaleThaw, not NotLeader: {result:?}"
+  );
+  assert!(
+    !merge_unfreeze_retry(&result),
+    "the follower retires its stale relay without ever leading"
+  );
+}
+
+/// RED-first for the [HIGH] finding: an accepted thaw is only APPENDED, not delivered — a source
+/// leader that appends the thaw then loses leadership before it commits has that entry TRUNCATED by
+/// the next leader. Pre-redesign the accept was terminal, so the relay was already dropped and the
+/// committed abort had no path left to thaw — the source wedged frozen. The redesign RETAINS across
+/// the truncation, a new source leader re-appends (the `become_leader` guard reset frees it), the
+/// thaw commits and the lineage advances, and only THEN — on the observed advance — is the relay
+/// retired on every host.
+#[test]
+fn a_truncated_thaw_is_retained_and_re_driven() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // Freeze group 1 for target 2 (seen == 1), leader.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 1);
+  let leader_term = m.group(&1).unwrap().term();
+
+  // ACCEPT: append the thaw but do NOT commit it (leave it durable-pending, uncommitted).
+  let (thaw_index, appended) = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let r = m.propose_merge_unfreeze(&1, now, log, stable, &2, 1);
+    (log.last_index(), r)
+  };
+  assert!(matches!(appended, Some(Ok(_))), "the thaw appended: {appended:?}");
+  // RED (pre-redesign the accept is terminal → the relay drops): an appended-but-uncommitted thaw
+  // is only a LEG of delivery, so the relay must be RETAINED — a leadership loss can still truncate
+  // it before it commits.
+  assert!(
+    merge_unfreeze_retry(&appended),
+    "an appended-but-uncommitted thaw RETAINS the relay (delivery is not yet observed)"
+  );
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "still frozen — the thaw has not committed"
+  );
+
+  // LEADERSHIP LOSS + §5.3 TRUNCATION: a new leader at a higher term overwrites the uncommitted
+  // thaw at its index. The applied freeze below it survives (seen stays 1).
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let higher = Term::new(leader_term.get() + 5);
+    let prev = Index::new(thaw_index.get() - 1);
+    let replace = crate::Entry::new(higher, thaw_index, crate::EntryKind::Normal, {
+      let mut b = Vec::new();
+      Bytes::from_static(b"x").encode(&mut b);
+      Bytes::from(b)
+    });
+    m.handle_message(
+      &1,
+      now,
+      log,
+      stable,
+      2u64,
+      Message::AppendEntries(crate::AppendEntries::new(
+        higher,
+        2u64,
+        prev,
+        leader_term,
+        std::vec![replace],
+        Index::ZERO,
+      )),
+    )
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().role().is_follower(),
+    "the higher term stepped the leader down"
+  );
+  assert!(
+    m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 1,
+    "the freeze survived the truncation; the thaw is gone"
+  );
+
+  // As a follower, the retained relay is transient `NotLeader` — held, not delivered.
+  let as_follower = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(as_follower, Some(Err(MergeError::NotLeader { .. }))) && merge_unfreeze_retry(&as_follower),
+    "the follower retains the relay: {as_follower:?}"
+  );
+
+  // A NEW source leader re-appends the thaw (the `become_leader` reset frees the guard) and commits
+  // it: the lineage advances past the freeze.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    re_elect(&mut m, 1, log, stable);
+  }
+  let reappended = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    let r = m.propose_merge_unfreeze(&1, now, log, stable, &2, 1);
+    drain_storage(&mut m, 1, now, log, stable);
+    r
+  };
+  assert!(
+    matches!(reappended, Some(Ok(_))) && merge_unfreeze_retry(&reappended),
+    "the new leader re-appends the thaw and retains: {reappended:?}"
+  );
+  assert!(
+    !m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 2,
+    "the re-driven thaw committed and delivered — the source is not wedged"
+  );
+
+  // Every host now OBSERVES the advance and retires the relay terminally.
+  let retired = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(
+      retired,
+      Some(Err(MergeError::StaleThaw {
+        expected: 1,
+        seen: 2
+      }))
+    ),
+    "the observed advance is StaleThaw: {retired:?}"
+  );
+  assert!(
+    !merge_unfreeze_retry(&retired),
+    "the observed advance retires the relay"
+  );
 }
 
 /// A LATE abort — proposed after the window sealed — no-ops at its stale mint once the merge
@@ -3734,8 +4548,9 @@ fn merge_verb_preconditions_refuse_typed() {
     assert!(m.prepare_merge(&9, now, log, stable, &2).is_none());
   }
   {
-    // NotLeader: group 3 never elected — as the freeze's proposer, as the abort's target
-    // leader, and as the relayed thaw's source leader.
+    // NotLeader: group 3 never elected — as the freeze's proposer and as the abort's target
+    // leader. The relayed thaw refuses EARLIER: its terminal-dedupe precedes the leadership gate,
+    // so a never-frozen source (seen == expected, not frozen) is NotFrozen regardless of role.
     let (log, stable) = stores.0.get_mut(&3).map(|(l, s)| (l, s)).unwrap();
     assert!(matches!(
       m.prepare_merge(&3, now, log, stable, &1).unwrap(),
@@ -3746,8 +4561,9 @@ fn merge_verb_preconditions_refuse_typed() {
       Err(MergeError::NotLeader { .. })
     ));
     assert!(matches!(
-      m.propose_merge_unfreeze(&3, now, log, stable, &1).unwrap(),
-      Err(MergeError::NotLeader { .. })
+      m.propose_merge_unfreeze(&3, now, log, stable, &1, 0)
+        .unwrap(),
+      Err(MergeError::NotFrozen)
     ));
   }
   {
@@ -3839,7 +4655,8 @@ fn merge_verb_preconditions_refuse_typed() {
       Err(MergeError::SourceClaimed)
     ));
     assert!(matches!(
-      m.propose_merge_unfreeze(&4, now, log, stable, &2).unwrap(),
+      m.propose_merge_unfreeze(&4, now, log, stable, &2, 0)
+        .unwrap(),
       Err(MergeError::NotFrozen)
     ));
     assert!(matches!(
@@ -3852,7 +4669,8 @@ fn merge_verb_preconditions_refuse_typed() {
     // target's abort refuses.
     let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
     assert!(matches!(
-      m.propose_merge_unfreeze(&1, now, log, stable, &4).unwrap(),
+      m.propose_merge_unfreeze(&1, now, log, stable, &4, 1)
+        .unwrap(),
       Err(MergeError::SourceClaimed)
     ));
   }
@@ -4122,7 +4940,7 @@ fn rollback_refuses_a_pending_freeze_then_lands() {
   );
   {
     let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
-    m.propose_merge_unfreeze(&1, now, log, stable, &2)
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, relay.source_gen_after)
       .unwrap()
       .unwrap();
     drain_storage(&mut m, 1, now, log, stable);

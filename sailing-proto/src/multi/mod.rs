@@ -284,6 +284,34 @@ pub struct MergeAbortRelay<G> {
   pub source_gen_after: u64,
 }
 
+/// Whether a relayed source-unfreeze outcome ([`MultiRaft::propose_merge_unfreeze`]) must be
+/// RETAINED — requeued and retried on a later crank — rather than dropped. Retirement is
+/// DELIVERY-BASED, not append-based: an accepted `Ok` means the thaw was only APPENDED (or one is
+/// already in flight), which a leadership loss can still truncate before it commits, so it RETAINS
+/// — the relay is dropped only once the source lineage is OBSERVED past the freeze (a terminal
+/// `StaleThaw`). Also retained: `None` (unhosted source or missing store this crank); `NotLeader`
+/// and the transfer/merge-in-flight append refusals that settle on their own; `SourceBehindFreeze`
+/// while the source is still catching up to the abandoned freeze. Terminal — dropping the relay —
+/// are exactly the DELIVERY-or-dedupe verdicts: the source already thawed / re-froze past this
+/// incarnation (`StaleThaw`), a foreign claim (`SourceClaimed`), a never-frozen source (`NotFrozen`),
+/// or a determinate append refusal (poisoned, index exhausted, entry too large).
+fn merge_unfreeze_retry<I>(result: &Option<Result<Index, MergeError<I>>>) -> bool {
+  match result {
+    None => true,
+    // The thaw was APPENDED (or already in flight), not delivered — retain until the source lineage
+    // is observed past the freeze, so a truncated thaw is always re-attempted by a new source leader.
+    Some(Ok(_)) => true,
+    Some(Err(e)) => matches!(
+      e,
+      MergeError::NotLeader { .. }
+        | MergeError::Propose(ProposeError::NotLeader { .. })
+        | MergeError::Propose(ProposeError::LeaderTransferInProgress)
+        | MergeError::Propose(ProposeError::MergeInFlight)
+        | MergeError::SourceBehindFreeze { .. }
+    ),
+  }
+}
+
 /// One resolved parked merge from a [`MultiRaft::service_merge_applies`] crank — what the
 /// DRIVER folds into its storage engine and lifecycle teardown. The container already did the
 /// consensus-side work (the absorb or the deterministic abort, the events, the source
@@ -881,6 +909,43 @@ where
       }
     }
     None
+  }
+
+  /// Fold the driver's [`propose_merge_unfreeze`](Self::propose_merge_unfreeze) outcome for a relay
+  /// drained by [`poll_pending_merge_abort`](Self::poll_pending_merge_abort). Retirement is
+  /// DELIVERY-BASED: a relay is dropped only by a TERMINAL outcome that PROVES the thaw is delivered
+  /// or will never be needed — the source observed past the frozen incarnation (`StaleThaw`), a
+  /// foreign claim (`SourceClaimed`), a never-frozen source (`NotFrozen`), or a poisoned/determinate
+  /// append refusal. Everything else REQUEUES: an accepted `Ok` (the thaw was only APPENDED — a
+  /// leadership loss can still truncate it before it commits, so a new source leader must be free to
+  /// re-append), no source leader yet (`NotLeader`), the source unreachable this crank (`None`), or a
+  /// source still catching up (`SourceBehindFreeze`). Without the delivery-based hold a thaw
+  /// appended-then-truncated would leave the committed abort with no path to thaw and wedge the
+  /// source frozen forever. Requeues re-stage onto the target for a LATER crank; call this AFTER
+  /// draining the relay queue so a requeue never re-drives within the same drain.
+  pub fn resolve_merge_abort(
+    &mut self,
+    relay: MergeAbortRelay<G>,
+    result: Option<Result<Index, MergeError<I>>>,
+  ) {
+    if merge_unfreeze_retry(&result) {
+      self.requeue_merge_abort(relay);
+    }
+  }
+
+  /// Re-stage a transient relay onto its target endpoint for a later crank (source id re-encoded
+  /// onto the queue, the target re-marked dirty). A no-op if the target endpoint is gone — its
+  /// abort cannot re-fire either, the group-is-dead liveness class the module doc describes.
+  fn requeue_merge_abort(&mut self, relay: MergeAbortRelay<G>) {
+    let mut source_bytes = Vec::new();
+    relay.source.encode(&mut source_bytes);
+    let Some(ep) = self.groups.get_mut(&relay.target) else {
+      return;
+    };
+    ep.stage_abort_relay(Bytes::from(source_bytes), relay.source_gen_after);
+    if self.dirty_aborts.back() != Some(&relay.target) {
+      self.dirty_aborts.push_back(relay.target);
+    }
   }
 
   /// Raise `gid`'s relay-time replay guard to at least `lineage` — the restore arms' seam for
@@ -1897,15 +1962,36 @@ where
 
   /// Propose the SOURCE-side thaw on `source` — the relay leg of a committed target-side abort
   /// (see [`poll_pending_merge_abort`](Self::poll_pending_merge_abort)): invoked by the
-  /// DRIVER's relay drain with the relay's own target as `claimed_by`, and by NOTHING else —
-  /// the embedder's verb is [`rollback_merge`](Self::rollback_merge). A direct thaw that
-  /// bypasses the abort would move the source's counter under the claimed target's parked
-  /// commit, wedging it (debug builds assert; release builds hold the park rather than
-  /// diverge). The ONE entry proposable on a frozen group. Refusals are the relay's dedupe: an
-  /// already-thawed source answers `NotFrozen`, a non-leader replica `NotLeader`, a claim
-  /// mismatch `SourceClaimed` — every host relays once per abort apply, and exactly the host
-  /// whose local source replica leads under the matching claim can land the thaw. `None` if no
-  /// group `source` is hosted.
+  /// DRIVER's relay drain with the relay's own target as `claimed_by` and its recorded freeze
+  /// generation as `expected_gen`, and by NOTHING else — the embedder's verb is
+  /// [`rollback_merge`](Self::rollback_merge). A direct thaw that bypasses the abort would move
+  /// the source's counter under the claimed target's parked commit, wedging it (debug builds
+  /// assert; release builds hold the park rather than diverge). The ONE entry proposable on a
+  /// frozen group. Retirement is DELIVERY-BASED, not append-based: the accept arm APPENDS the thaw
+  /// but returns a non-terminal `Ok`, and the relay is retired only once the source lineage is
+  /// OBSERVED past the freeze (`StaleThaw`, `seen > expected`) — a thaw appended then truncated by a
+  /// leadership loss leaves `seen == expected`, so the relay is RETAINED and a new source leader
+  /// re-appends until it commits. The terminal-dedupe (`StaleThaw` and the never-frozen/foreign-claim
+  /// verdicts) is checked BEFORE leadership, so EVERY host retires on the observed advance — including
+  /// a follower that never leads (closing the stale-relay-forever hazard). Other verdicts retain and
+  /// requeue: a source still catching up answers `SourceBehindFreeze` (INCLUDING a committed-but-
+  /// unapplied freeze, `is_frozen() == false` yet not thawed); a non-leader replica `NotLeader`. The
+  /// accept arm is IDEMPOTENT — a thaw already appended-and-unapplied on this leader RETAINS without
+  /// re-appending. `None` if no group `source` is hosted.
+  ///
+  /// THE INCARNATION GATE (`expected_gen`): because a relay is RETAINED and requeued across
+  /// source-leader churn (a `NotLeader`/`None` outcome), it can survive while another host lands
+  /// the original thaw and the same source→target pair FREEZES AGAIN at a new generation. Minting
+  /// the thaw from the source's live `shape_gen` would then let the stale relay thaw that new
+  /// freeze — one with no matching target-side abort — aborting the new merge out of order (or
+  /// moving the source past the new parked commit's expected generation, which the service path
+  /// only debug-asserts before wedging). So the thaw is bound to the freeze generation the abort
+  /// abandoned: it appends only when the source's current lineage EQUALS `expected_gen` (`<` is a
+  /// source leader still SHORT of the abandoned freeze — a committed-but-unapplied freeze, or an
+  /// older one its apply has not rolled through yet — `SourceBehindFreeze`, retried while a freeze
+  /// is active; `>` is a source already advanced past this incarnation — `StaleThaw`, terminally
+  /// dropped). The `frozen_for == claimed_by` claim identifies the source→target PAIR; `expected_gen`
+  /// identifies the INCARNATION within it.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn propose_merge_unfreeze<L, S>(
     &mut self,
@@ -1915,6 +2001,7 @@ where
     // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
     _stable: &S,
     claimed_by: &G,
+    expected_gen: u64,
   ) -> Option<Result<Index, MergeError<I>>>
   where
     L: LogStore,
@@ -1924,24 +2011,102 @@ where
     if ep.is_poisoned() {
       return Some(Err(MergeError::Propose(ProposeError::Poisoned)));
     }
+    // EXHAUSTIVE relay classification over every frozen-source state this (source, claimed_by,
+    // expected_gen) relay can observe. `seen` is the source's live lineage; `expected_gen` is the
+    // freeze incarnation the abort abandoned. The whole prefix is LEADERSHIP-INDEPENDENT — it runs
+    // identically on a leader or a follower — and leadership is required ONLY to append the thaw or
+    // read the claim, LAST. INCARNATION is decided FIRST (a pure `shape_gen` compare, readable
+    // without the claim, which only an APPLIED freeze exposes):
+    //
+    //   poisoned                                                -> Poisoned           (terminal)
+    //   seen >  expected                                        -> StaleThaw          (terminal)
+    //   unhosted (no endpoint)                                  -> None               (transient)
+    //   seen <  expected & a freeze is active (pending|applied) -> SourceBehindFreeze  (transient)
+    //   seen <  expected & no freeze active                     -> NotFrozen           (terminal)
+    //   seen == expected & not frozen-applied                   -> NotFrozen           (terminal)
+    //   -- require leadership from here --
+    //   not leader                                              -> NotLeader          (transient)
+    //   seen == expected & frozen-applied & claim mismatch      -> SourceClaimed       (terminal)
+    //   seen == expected & frozen-applied & claim match         -> APPEND, then RETAIN (non-terminal)
+    //
+    // Terminal-dedupe precedes the leadership check so retirement is DELIVERY-BASED, not
+    // append-based: a relay is retired ONLY by observing the source past the frozen incarnation
+    // (`seen > expected` — the thaw committed+applied, or a re-freeze moved past). Every host that
+    // observes the delivered thaw drops its own relay, INCLUDING a follower that never leads (the
+    // stale-relay-forever hazard when `NotLeader` shadowed the dedupe); and the accept arm's append
+    // is only an ATTEMPT — a thaw appended then truncated leaves `seen == expected`, so the relay is
+    // RETAINED and a new source leader re-appends until it commits.
+    //
+    // A source LEADER always holds the committed freeze (a leader has every committed entry), so
+    // while its apply trails `expected` it is freeze-active (`merge_freeze_active`) at an EARLIER
+    // incarnation and WILL reach `expected`; reading the freeze-pending signal keeps a
+    // committed-but-unapplied leader (`freeze_pending` set, `is_frozen() == false`, `seen < expected`)
+    // transient `SourceBehindFreeze` rather than dropping it into a permanent frozen-source wedge.
+    let seen = ep.shape_gen();
+    if seen > expected_gen {
+      // THE RETIREMENT. Advanced past the abandoned incarnation — the thaw is durably delivered
+      // (committed+applied) or the source re-froze the SAME pair for a fresh merge. A spent
+      // authorization, terminal even with a new freeze active now (thawing that one would abort the
+      // fresh merge out of order). Leadership-independent: a follower that applied the committed
+      // thaw retires its relay here without ever leading.
+      return Some(Err(MergeError::StaleThaw {
+        expected: expected_gen,
+        seen,
+      }));
+    }
+    if seen < expected_gen {
+      if ep.merge_freeze_active() {
+        // Behind the abandoned incarnation with a freeze active: a committed-but-unapplied freeze
+        // at `expected` (the wedge above), or an OLDER freeze the apply drain rolls through on the
+        // way to `expected`. The source will catch up — retain and retry (transient).
+        return Some(Err(MergeError::SourceBehindFreeze {
+          expected: expected_gen,
+          seen,
+        }));
+      }
+      // Behind with NO freeze pending and none applied: genuinely nothing to thaw. Unreachable for
+      // a source leader holding the committed freeze; a defensive terminal drop, recovered by
+      // re-proposing the target-side abort.
+      return Some(Err(MergeError::NotFrozen));
+    }
+    // seen == expected_gen: the exact abandoned incarnation. `shape_gen` reaches `expected` ONLY by
+    // applying that freeze, so a group AT this lineage that is NOT frozen-applied has already
+    // thawed it (or never froze) — terminal `NotFrozen`, never a catch-up (a re-freeze mints
+    // strictly above `expected`, landing in the `seen > expected` arm).
+    if !ep.is_frozen() {
+      return Some(Err(MergeError::NotFrozen));
+    }
+    // Frozen-applied at exactly `expected`. Only a leader appends the thaw or reads the claim as
+    // authoritative — so the leadership gate sits HERE, after the terminal-dedupe above. A follower
+    // frozen at the exact incarnation retains (transient) and later retires by OBSERVING the leader's
+    // committed thaw (the `seen > expected` arm), never by leading.
     if !ep.role().is_leader() {
       return Some(Err(MergeError::NotLeader {
         leader: ep.leader(),
       }));
     }
-    // An APPLIED freeze only: a pending one's claim is unreadable (and a freeze that never
-    // commits self-heals through truncation, not through a thaw).
-    if !ep.is_frozen() {
-      return Some(Err(MergeError::NotFrozen));
-    }
+    // The claim is authoritative for THIS incarnation. A claim mismatch at an EARLIER incarnation
+    // fell into `SourceBehindFreeze` above (a catch-up, not a foreign claim on the abandoned
+    // freeze), so this compares the right generation's claim.
     let mut claimed_bytes = Vec::new();
     claimed_by.encode(&mut claimed_bytes);
     if ep.frozen_for().is_none_or(|t| *t != claimed_bytes) {
-      // A relay riding a foreign target's abort must not thaw a source claimed elsewhere —
-      // the claimed target's parked commit gates on this counter staying put.
+      // The exact incarnation is claimed by a DIFFERENT target — a relay riding a foreign target's
+      // abort must not thaw it; the claimed target's parked commit gates on this counter staying
+      // put.
       return Some(Err(MergeError::SourceClaimed));
     }
-    let source_gen_after = ep.shape_gen() + 1;
+    // ACCEPT: frozen at exactly `expected`, claimed by this relay's target, and this host leads. The
+    // append is a BEST-EFFORT ATTEMPT, NOT the retirement — this returns a non-terminal `Ok` and the
+    // relay is retained until the source lineage is OBSERVED past the freeze (the `seen > expected`
+    // arm). IDEMPOTENT: if a thaw is already appended-and-unapplied on this leader, RETAIN and wait
+    // rather than append a duplicate every crank until the first commits.
+    if let Some(idx) = ep.thaw_in_flight() {
+      return Some(Ok(idx));
+    }
+    // The thaw is minted at `expected_gen + 1` — written against the BOUND incarnation, not the live
+    // counter — so it advances exactly the abandoned freeze's generation.
+    let source_gen_after = expected_gen + 1;
     let payload = RollbackMergePayload::unfreeze(source_gen_after);
     let mut buf = Vec::new();
     crate::wire::encode_rollback_merge_payload(&payload, &mut buf);
@@ -1949,6 +2114,9 @@ where
     let result = ep
       .propose_merge_entry(now, log, EntryKind::RollbackMerge, Bytes::from(buf))
       .map_err(MergeError::Propose);
+    if let Ok(index) = &result {
+      ep.note_thaw_appended(*index);
+    }
     self.mark_dirty(source);
     Some(result)
   }
