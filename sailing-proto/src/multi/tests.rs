@@ -3525,6 +3525,8 @@ fn merge_verb_preconditions_refuse_typed() {
   }
   {
     // A conf change in flight on the source refuses the freeze (the comparison would race it).
+    // The applied learner is then removed again: a source that still carried it would refuse
+    // the freeze with `LearnersPresent`, which the next block exercises the clean path of.
     let (log, stable) = src!();
     m.propose_conf_change(
       &1,
@@ -3540,6 +3542,17 @@ fn merge_verb_preconditions_refuse_typed() {
       Err(MergeError::ConfChangeInFlight)
     ));
     drain_storage(&mut m, 1, now, log, stable);
+    m.propose_conf_change(
+      &1,
+      now,
+      log,
+      stable,
+      crate::ConfChange::new(crate::ConfChangeType::RemoveNode, 5u64, Bytes::new()),
+    )
+    .unwrap()
+    .unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+    assert!(m.group(&1).unwrap().conf_state().learners().is_empty());
   }
   {
     // Freeze, then: a second freeze refuses; a parked commit refuses a second commit.
@@ -3599,6 +3612,229 @@ fn merge_verb_preconditions_refuse_typed() {
       m.propose_merge_unfreeze(&1, now, log, stable, &4).unwrap(),
       Err(MergeError::SourceClaimed)
     ));
+  }
+}
+
+/// A learner on EITHER participant refuses the FREEZE gate. A merge hands off on VOTER replicas
+/// only and the relay never parks a live absorb on a learner host, so aligned replica sets are a
+/// precondition — promote or remove the learners first (the CRDB doctrine). Voter sets still
+/// match here; the learner alone is the refusal.
+#[test]
+fn merge_propose_refuses_learner_carrying_participants() {
+  let now = Instant::ORIGIN;
+  // The TARGET grew a learner: freezing a clean source into it refuses.
+  {
+    let (mut m, mut stores) = merge_host(1, 1);
+    {
+      let (log, stable) = stores.0.get_mut(&2).unwrap();
+      m.propose_conf_change(
+        &2,
+        now,
+        log,
+        stable,
+        crate::ConfChange::new(crate::ConfChangeType::AddLearnerNode, 3u64, Bytes::new()),
+      )
+      .unwrap()
+      .unwrap();
+      drain_storage(&mut m, 2, now, log, stable);
+    }
+    assert!(
+      m.group(&2).unwrap().conf_state().learners().contains(&3),
+      "the learner applied on the target"
+    );
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert!(matches!(
+      m.prepare_merge(&1, now, log, stable, &2).unwrap(),
+      Err(MergeError::LearnersPresent)
+    ));
+  }
+  // The SOURCE carries a learner: freezing it refuses too (a frozen learner host could never
+  // hand its half off).
+  {
+    let (mut m, mut stores) = merge_host(1, 1);
+    {
+      let (log, stable) = stores.0.get_mut(&1).unwrap();
+      m.propose_conf_change(
+        &1,
+        now,
+        log,
+        stable,
+        crate::ConfChange::new(crate::ConfChangeType::AddLearnerNode, 3u64, Bytes::new()),
+      )
+      .unwrap()
+      .unwrap();
+      drain_storage(&mut m, 1, now, log, stable);
+    }
+    assert!(
+      m.group(&1).unwrap().role().is_leader(),
+      "the sole voter still leads"
+    );
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert!(matches!(
+      m.prepare_merge(&1, now, log, stable, &2).unwrap(),
+      Err(MergeError::LearnersPresent)
+    ));
+  }
+}
+
+/// The VOPR seed-0 shape, distilled: a target whose committed configuration lists learners
+/// {1, 3}. The freeze is refused at propose — the randomized reshape band would otherwise place
+/// a live absorb on a learner host that parks forever.
+#[test]
+fn seed0_target_learner_pair_refused_at_propose() {
+  let now = Instant::ORIGIN;
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut slog, mut sstable) = (VecLog::default(), AsyncStable::default());
+  let (mut tlog, mut tstable) = (VecLog::default(), AsyncStable::default());
+  // Source (10) and target (11), both single-voter {2}, colocated on host 2.
+  m.create_group(10, single_node_cfg(2), now, 7, CountSm::default())
+    .unwrap();
+  m.create_group(11, single_node_cfg(2), now, 7, CountSm::default())
+    .unwrap();
+  let ds = m.group(&10).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&10, ds, &mut slog, &mut sstable).unwrap();
+  drain_storage(&mut m, 10, ds, &mut slog, &mut sstable);
+  let dt = m.group(&11).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&11, dt, &mut tlog, &mut tstable).unwrap();
+  drain_storage(&mut m, 11, dt, &mut tlog, &mut tstable);
+  assert!(m.group(&10).unwrap().role().is_leader() && m.group(&11).unwrap().role().is_leader());
+  // The target grows learners 1 and 3, one committed change at a time.
+  for learner in [1u64, 3u64] {
+    m.propose_conf_change(
+      &11,
+      dt,
+      &mut tlog,
+      &tstable,
+      crate::ConfChange::new(crate::ConfChangeType::AddLearnerNode, learner, Bytes::new()),
+    )
+    .unwrap()
+    .unwrap();
+    drain_storage(&mut m, 11, dt, &mut tlog, &mut tstable);
+  }
+  let learners = m.group(&11).unwrap().conf_state().learners().clone();
+  assert!(
+    learners.contains(&1) && learners.contains(&3),
+    "the committed conf lists learners {{1, 3}}"
+  );
+  assert!(matches!(
+    m.prepare_merge(&10, ds, &mut slog, &sstable, &11).unwrap(),
+    Err(MergeError::LearnersPresent)
+  ));
+}
+
+/// The COMMIT gate re-checks the alignment defensively — a learner that lands on either side
+/// after the freeze would strand the absorb on a learner host. The target case is the real race
+/// (the absorbing target is a live leader that can still take conf changes); the source case is
+/// belt-and-suspenders, reached here by restoring a frozen source whose replayed log already
+/// carries the learner.
+#[test]
+fn merge_commit_refuses_learner_carrying_participants() {
+  let now = Instant::ORIGIN;
+  // The target grows a learner AFTER the freeze applied, then the absorb refuses.
+  {
+    let (mut m, mut stores) = merge_host(1, 1);
+    {
+      let (log, stable) = stores.0.get_mut(&1).unwrap();
+      m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+      drain_storage(&mut m, 1, now, log, stable);
+    }
+    assert!(m.group(&1).unwrap().is_frozen(), "the source froze");
+    {
+      let (log, stable) = stores.0.get_mut(&2).unwrap();
+      m.propose_conf_change(
+        &2,
+        now,
+        log,
+        stable,
+        crate::ConfChange::new(crate::ConfChangeType::AddLearnerNode, 3u64, Bytes::new()),
+      )
+      .unwrap()
+      .unwrap();
+      drain_storage(&mut m, 2, now, log, stable);
+    }
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(
+        m.commit_merge(&2, now, log, stable, &1).unwrap(),
+        Err(MergeError::LearnersPresent)
+      ),
+      "the source is frozen-ready and claims 2, but 2 grew a learner"
+    );
+  }
+  // A frozen source that carries a learner (restore-crafted: a ConfChange then the freeze in its
+  // durable log) is refused at the absorb too.
+  {
+    let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+    let mut cc_buf = Vec::new();
+    crate::wire::encode_conf_change_v2(
+      &crate::ConfChange::new(crate::ConfChangeType::AddLearnerNode, 3u64, Bytes::new()).into_v2(),
+      &mut cc_buf,
+    );
+    let mut prep = Vec::new();
+    {
+      let mut tb = Vec::new();
+      Data::encode(&2u64, &mut tb);
+      crate::wire::encode_prepare_merge_payload(
+        &crate::PrepareMergePayload::new(Bytes::from(tb), 1),
+        &mut prep,
+      );
+    }
+    let mut slog = VecLog::default();
+    slog.force_append(&[
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(1),
+        crate::EntryKind::ConfChange,
+        Bytes::from(cc_buf),
+      ),
+      crate::Entry::new(
+        Term::new(1),
+        Index::new(2),
+        crate::EntryKind::PrepareMerge,
+        Bytes::from(prep),
+      ),
+    ]);
+    let mut sstable = AsyncStable::default();
+    sstable.force_state(Term::new(1), Some(1u64), Index::new(2));
+    m.restore_group(
+      1,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      7,
+      CountSm::default(),
+      1,
+      &mut slog,
+      &mut sstable,
+    )
+    .unwrap();
+    assert!(
+      m.group(&1).unwrap().is_frozen(),
+      "the crafted freeze applied on restore"
+    );
+    assert!(
+      m.group(&1).unwrap().conf_state().learners().contains(&3),
+      "the crafted learner applied on restore"
+    );
+    let (mut tlog, mut tstable) = (VecLog::default(), AsyncStable::default());
+    m.create_group(
+      2,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      7,
+      CountSm::default(),
+    )
+    .unwrap();
+    let d = m.group(&2).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&2, d, &mut tlog, &mut tstable).unwrap();
+    drain_storage(&mut m, 2, d, &mut tlog, &mut tstable);
+    assert!(m.group(&2).unwrap().role().is_leader());
+    assert!(
+      matches!(
+        m.commit_merge(&2, d, &mut tlog, &tstable, &1).unwrap(),
+        Err(MergeError::LearnersPresent)
+      ),
+      "the frozen source claims 2 and is ready, but carries a learner"
+    );
   }
 }
 

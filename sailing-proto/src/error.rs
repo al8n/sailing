@@ -263,6 +263,16 @@ pub enum MergeError<I> {
   /// absorb a purely local hand-off on every replica; merge the memberships first.
   #[error("the source and target voter sets differ")]
   VoterSetsDiffer,
+  /// A participant's committed configuration still carries LEARNERS. A merge is a purely local
+  /// hand-off on every replica, and the driver's relay places children only on VOTER hosts and
+  /// parks a live `CommitMerge` only on the target's VOTER hosts — so a target-learner host, even
+  /// one that later becomes leader, would park its absorb at `k − 1` forever. Align the replica
+  /// sets first: promote or remove the learners on both sides (the CRDB doctrine). Boot-config
+  /// observers never enter a committed configuration, so they are unaffected; and the non-joint
+  /// gate this refusal sits behind already empties `learners_next`, leaving the stable learner
+  /// set as the whole of it.
+  #[error("a merge participant's configuration carries learners")]
+  LearnersPresent,
   /// One of the groups is mid-joint-configuration; its effective voter set is ambiguous for the
   /// colocation comparison. Finish (or leave) the joint change first.
   #[error("a merge participant is in a joint configuration")]

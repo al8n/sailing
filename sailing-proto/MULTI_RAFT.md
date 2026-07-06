@@ -179,8 +179,14 @@ relays, the drivers materialize; the container stayed the pure routing layer.
 
 ## Merge (as shipped)
 
-Two colocated groups (identical voter sets, both non-joint, same active read mode) become one
-through two entries plus an explicit abort, with **no clock anywhere**:
+Two colocated groups (identical voter sets, neither carrying learners, both non-joint, same
+active read mode) become one through two entries plus an explicit abort, with **no clock
+anywhere**. The learner precondition is the same replica-set-alignment doctrine as CRDB: the
+relay places children only on VOTER hosts and parks a live absorb only on the target's voter
+hosts, so a target-learner host — even one that became leader — would park forever; promote or
+remove the learners on both sides first. Boot-config observers never enter a committed
+configuration, so they are exempt. Both `prepare_merge` and `commit_merge` refuse with
+`MergeError::LearnersPresent`.
 
 - **`PrepareMerge` (the source's log)** freezes the source. The lease SAFETY gate moves even
   earlier than apply — to APPEND observation of the entry (`freeze_pending`, a kind check on

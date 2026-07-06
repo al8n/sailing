@@ -1581,9 +1581,9 @@ where
   /// `PrepareMerge` freezes it on every replica so `target` can absorb it at the boundary.
   /// Leader-proposed on the SOURCE's own log. The preconditions are checked against the LOCAL
   /// replicas (colocation makes them representative; every parked apply re-checks the facts
-  /// that matter from its own log): identical voter sets, both non-joint, same active read
-  /// mode, no membership change in flight on either side, and the source not already frozen or
-  /// freezing. `None` if no group `source` is hosted.
+  /// that matter from its own log): identical voter sets, neither carrying learners, both
+  /// non-joint, same active read mode, no membership change in flight on either side, and the
+  /// source not already frozen or freezing. `None` if no group `source` is hosted.
   ///
   /// Floor refusals (`MergeError::BelowFloor`) are the COORDINATOR delegators' leg through
   /// their per-call floor seam, and `CrossPlane` the sharded handle's — the container stays
@@ -1645,6 +1645,12 @@ where
     }
     if source_conf.voters() != target_conf.voters() {
       return Some(Err(MergeError::VoterSetsDiffer));
+    }
+    // Aligned replica sets, learners included: the absorb hands off on VOTER replicas only, and a
+    // live merge parks on the target's voter hosts — a target-learner host would park forever. The
+    // non-joint gate above empties `learners_next`, so the stable learner set is the whole of it.
+    if !source_conf.learners().is_empty() || !target_conf.learners().is_empty() {
+      return Some(Err(MergeError::LearnersPresent));
     }
     if sep.active_read_mode() != target_mode {
       return Some(Err(MergeError::ReadModesDiffer));
@@ -1748,6 +1754,12 @@ where
     }
     if source_conf.voters() != target_conf.voters() {
       return Some(Err(MergeError::VoterSetsDiffer));
+    }
+    // The same replica-set-alignment gate as `prepare_merge`, re-checked defensively at the
+    // absorb: a learner that landed on either side after the freeze would strand this merge on a
+    // learner host. Non-joint above empties `learners_next`, so the stable learner set is all of it.
+    if !source_conf.learners().is_empty() || !target_conf.learners().is_empty() {
+      return Some(Err(MergeError::LearnersPresent));
     }
     if source_mode != tep.active_read_mode() {
       return Some(Err(MergeError::ReadModesDiffer));
