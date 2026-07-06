@@ -45,8 +45,9 @@ impl ConservationLedger {
       .unwrap_or(&[])
   }
 
-  /// Every key recorded under `gid`, ascending.
-  fn keys_of(&self, gid: u64) -> BTreeSet<u16> {
+  /// Every key recorded under `gid`, ascending. `pub(crate)` so the world can assemble the set of
+  /// keys a registered union carried into a group (the split partition's absorb exemption).
+  pub(crate) fn keys_of(&self, gid: u64) -> BTreeSet<u16> {
     self
       .histories
       .keys()
@@ -60,16 +61,29 @@ impl ConservationLedger {
   ///   - an assigned key's child history must start with the parent's FULL recorded history (the
   ///     transferred baseline; anything shorter or diverging is LOSS);
   ///   - once both sides extend past their common prefix the key continued on BOTH sides (DUP);
-  ///   - an unassigned key must never surface in the child at all (CROSS-TALK).
+  ///   - an unassigned key must never surface in the child at all (CROSS-TALK) — UNLESS it was
+  ///     carried in by a registered union into the child (`absorbed`): a child that later becomes
+  ///     a merge TARGET legitimately gains the source's keys, which the merge's own
+  ///     [`assert_union`](Self::assert_union) judges. The split partition never assigned them, so
+  ///     it exempts them here rather than false-tripping the never-assigned cross-talk leg.
   ///
   /// Panics with the group ids, the key, and both histories on any violation.
-  pub(crate) fn assert_partition(&self, parent: u64, child: u64, child_keys: &BTreeSet<u16>) {
+  pub(crate) fn assert_partition(
+    &self,
+    parent: u64,
+    child: u64,
+    child_keys: &BTreeSet<u16>,
+    absorbed: &BTreeSet<u16>,
+  ) {
     let mut keys = self.keys_of(parent);
     keys.extend(self.keys_of(child));
     for k in keys {
       let p = self.history(parent, k);
       let c = self.history(child, k);
       if !child_keys.contains(&k) {
+        if absorbed.contains(&k) {
+          continue; // carried in by a registered union — the merge's assert_union judges it
+        }
         assert!(
           c.is_empty(),
           "[conservation] split g{parent}->g{child}: key {k} was never assigned to the child \

@@ -410,9 +410,18 @@ impl MultiWorld {
         parent_led: rec.parent_led,
         child_led: rec.child_led,
       };
+      // Keys a registered union carried INTO this child (the child later became a merge target):
+      // the split never assigned them, so the partition exempts them from its cross-talk leg —
+      // the merge's own union verdict judges those histories.
+      let absorbed: BTreeSet<u16> = self
+        .merges
+        .iter()
+        .filter(|m| m.target_led == rec.child_led)
+        .flat_map(|m| self.conservation.keys_of(m.source_led))
+        .collect();
       self
         .conservation
-        .assert_partition(rec.parent_led, rec.child_led, &rec.child_keys);
+        .assert_partition(rec.parent_led, rec.child_led, &rec.child_keys, &absorbed);
       drop(ctx); // no panic: disarm silently
     }
   }
