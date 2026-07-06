@@ -592,6 +592,42 @@ where
     true
   }
 
+  /// THE MERGE-PARK SAFETY PIN: whether a parked apply has left this replica's voter set
+  /// SUPERSEDED — a committed `ConfChange` sits above the parked `CommitMerge`, unapplied. The
+  /// park freezes apply at `k - 1` while the committed log races ahead; membership is apply-time,
+  /// so the tracker this replica would count a quorum (or an election) against is the STALE
+  /// pre-park configuration. Winning a campaign on that superseded set — or advancing commit
+  /// against it as a leader — truncates entries the real (shrunk/grown) configuration already
+  /// committed (a below-floor read). Callers must refuse to campaign / count quorum when this
+  /// holds. Returns false when NOT parked (apply tracks commit tracks membership — current by
+  /// construction) or when nothing committed-but-unapplied changes the voter set. Fail-closed on
+  /// an unreadable range: a config that cannot be proven current is treated as superseded.
+  pub(crate) fn merge_park_membership_superseded<L: LogStore>(&self, log: &L) -> bool {
+    if self.merge.pending_apply.is_none() {
+      return false;
+    }
+    let end = self.commit.next();
+    let mut cursor = self.applied.next();
+    while cursor < end {
+      let batch = match log.entries(cursor..end, 1 << 20) {
+        Ok(EntriesRead::Ready(b)) if !b.is_empty() => b,
+        // A cold/short/empty read cannot prove the committed-unapplied range holds no config
+        // change → fail closed (refuse to campaign this pass; a warm retry re-evaluates).
+        _ => return true,
+      };
+      for entry in &*batch {
+        if entry.kind() == EntryKind::ConfChange {
+          return true;
+        }
+      }
+      cursor = match batch.last() {
+        Some(e) => e.index().next(),
+        None => return true,
+      };
+    }
+    false
+  }
+
   /// Whether every tracked peer (voters AND learners, both joint halves) has MATCHED the log
   /// through `boundary` — meaningful on the LEADER (its tracker holds the peers' proven match).
   /// The merge service's waitForApplication leg reads it off a frozen SOURCE leader: the host

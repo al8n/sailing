@@ -294,6 +294,16 @@ where
     if !self.tracker.is_voter(&self.config.id()) {
       return;
     }
+    // THE MERGE-PARK SAFETY PIN: a replica whose parked apply has left its voter set superseded
+    // by a committed-unapplied `ConfChange` must never campaign — a win on that stale
+    // configuration truncates committed entries (a below-floor read). Stay a follower and defer
+    // leadership to a peer whose apply is current; the park resolves (absorb or snapshot-
+    // supersede) and this node campaigns normally after. A park over plain entries (no config
+    // change above it) leaves membership current, so this does NOT wedge a group whose only
+    // up-to-date replicas are parked mid-merge — they still elect.
+    if self.merge_park_membership_superseded(log) {
+      return;
+    }
     // Election safety at term exhaustion: `Term::next()` SATURATES at u64::MAX, so a node already at the
     // maximum term cannot advance. Campaigning anyway would clear `voted_for` and record a self-vote in
     // the SAME term — a SECOND vote in a term we may already have voted in — breaking one-vote-per-term
@@ -376,6 +386,11 @@ where
   pub(crate) fn become_pre_candidate<L: LogStore>(&mut self, now: Now, log: &L) -> bool {
     // Non-voter guard (mirrors become_candidate for defense-in-depth).
     if !self.tracker.is_voter(&self.config.id()) {
+      return false;
+    }
+    // The merge-park safety pin (mirrors become_candidate): a parked replica whose voter set is
+    // superseded by a committed-unapplied `ConfChange` must not even probe — it must never lead.
+    if self.merge_park_membership_superseded(log) {
       return false;
     }
     // Term exhaustion (mirrors become_candidate): a pre-vote advertises `self.term.next()`, which
