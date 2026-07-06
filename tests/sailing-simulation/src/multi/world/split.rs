@@ -410,18 +410,36 @@ impl MultiWorld {
         parent_led: rec.parent_led,
         child_led: rec.child_led,
       };
-      // Keys a registered union carried INTO this child (the child later became a merge target):
-      // the split never assigned them, so the partition exempts them from its cross-talk leg —
-      // the merge's own union verdict judges those histories.
+      // The split-merge algebra reunifies sides through registered unions; the two exemption
+      // sets are the keys a merge re-routed, read off the merge records' transferred POPULATION
+      // (`absorbed_keys`). A written-history set would miss a key the absorbing side owned but
+      // never wrote and only writes post-absorb — the cross-talk leg's parent-merged-into-child
+      // gap. Both are one-hop: a source folds every earlier absorb into the population it hands
+      // on, so the transferred set is already transitive.
+      //
+      // `absorbed` — keys a union carried INTO this child (the child became a merge target): the
+      // cross-talk exemption.
       let absorbed: BTreeSet<u16> = self
         .merges
         .iter()
         .filter(|m| m.target_led == rec.child_led)
-        .flat_map(|m| self.conservation.keys_of(m.source_led))
+        .flat_map(|m| m.absorbed_keys.iter().copied())
         .collect();
-      self
-        .conservation
-        .assert_partition(rec.parent_led, rec.child_led, &rec.child_keys, &absorbed);
+      // `reacquired` — keys a union re-introduced INTO this parent (the parent became a merge
+      // target): the LOSS exemption, symmetric to `absorbed`.
+      let reacquired: BTreeSet<u16> = self
+        .merges
+        .iter()
+        .filter(|m| m.target_led == rec.parent_led)
+        .flat_map(|m| m.absorbed_keys.iter().copied())
+        .collect();
+      self.conservation.assert_partition(
+        rec.parent_led,
+        rec.child_led,
+        &rec.child_keys,
+        &absorbed,
+        &reacquired,
+      );
       drop(ctx); // no panic: disarm silently
     }
   }

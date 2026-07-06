@@ -1876,6 +1876,72 @@ fn parked_keys_cascade_through_an_onward_split() {
   w.finalize_membership_or_panic(31);
 }
 
+/// The cross-talk leg closes over the parent-merged-into-child REUNION — specifically over a key
+/// the source OWNED but never WROTE. The parent keeps keys 0..=3 (never writing key 0), splits
+/// keys 4..=7 to the child, then MERGES BACK INTO that child; the child now owns key 0 and
+/// writes it for the first time anywhere. The split never assigned key 0, but the union handed
+/// the child the parent's whole POPULATION, so the never-assigned leg exempts it. The exemption
+/// reads the merge's transferred population, not its written history: a `keys_of` set would MISS
+/// key 0 (no ancestor ever wrote it) and false-trip — this run is green only because the closure
+/// reads populations, so a revert to a written-history exemption re-reddens it here.
+#[test]
+fn partition_exempts_an_owned_unwritten_key_a_union_carried_into_the_child() {
+  let mut w = MultiWorld::new(41);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(100, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  w.reconcile_membership(100);
+  // Write ONLY keys 4..=7 — the parent keeps 0..=3 in its population but never writes key 0.
+  for key in 4u16..8 {
+    propose_until_accepted(
+      &mut w,
+      100,
+      &crate::multi::encode_gkv(100, key, u64::from(key)),
+    );
+  }
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(100)
+      .is_some_and(|l| w.applied_of(l, 100).len() >= 4)
+  }));
+
+  // Split keys 4..=7 to the child; 0..=3 stay on the parent, key 0 still unwritten.
+  propose_split_until_accepted(&mut w, 100, 200, 4);
+  assert_eq!(w.group_keys_of(100), std::vec![0, 1, 2, 3]);
+  assert!(w.run_until(3_000, |w| w.leader_of(200).is_some()));
+  assert_eq!(w.group_keys_of(200), std::vec![4, 5, 6, 7]);
+
+  // The parent MERGES BACK into its own child (voter sets align by construction): the child
+  // absorbs the whole parent population, key 0 included.
+  merge_verb_until_accepted(&mut w, 3_000, "the freeze", |w| {
+    w.propose_prepare_merge(100, 200)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
+    w.propose_commit_merge(200, 100)
+  });
+  assert!(
+    w.run_until(8_000, |w| !w.live_groups().contains(&100)),
+    "the parent absorbs into its child"
+  );
+  assert_eq!(w.merges_registered(), 1);
+
+  // The child now OWNS key 0 and writes it for the first time anywhere.
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 0, 900));
+  assert!(w.run_until(2_000, |w| {
+    w.leader_of(200).is_some_and(|l| {
+      w.applied_of(l, 200)
+        .iter()
+        .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 0, 900)))
+    })
+  }));
+
+  w.check_now();
+  w.finalize_conservation_or_panic(41);
+  w.finalize_merge_conservation_or_panic(41);
+}
+
 /// Tick until `verb` lands on some leader (transient refusals — leaderless instants, catch-up
 /// gates — are ticked through), panicking with `what` if the budget runs out.
 fn merge_verb_until_accepted(

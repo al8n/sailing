@@ -35,6 +35,14 @@ pub(super) struct MergeRecord {
   pub(super) target_led: u64,
   /// The target group id (the union side judged at finalize).
   pub(super) target: u64,
+  /// The source's key POPULATION at the merge — the keys this union handed to the target. This
+  /// is the target's absorbed-key ENTITLEMENT the conservation partition verdict reads, and it
+  /// is what the written-history set (`ConservationLedger::keys_of`) cannot supply: the source
+  /// can OWN a key it never wrote, and the target then writes that key for the first time
+  /// post-absorb — legitimate, but invisible to a history-only exemption. Already transitive: a
+  /// source that itself absorbed earlier merges folded their keys into its population, so this
+  /// carries them too (no per-hop walk needed).
+  pub(super) absorbed_keys: BTreeSet<u16>,
   /// The target's FULL applied record at the FIRST resolution — the absorb-determinism
   /// reference every later host's resolution is compared against.
   pub(super) resolved_record: AppliedLog,
@@ -276,6 +284,7 @@ impl MultiWorld {
         core::mem::take(&mut meta.carried_tags),
       )
     };
+    let absorbed_keys = source_keys.clone();
     {
       let meta = self
         .groups
@@ -299,6 +308,7 @@ impl MultiWorld {
       source_led,
       target_led,
       target,
+      absorbed_keys,
       resolved_record: record,
     });
   }
@@ -313,9 +323,14 @@ impl MultiWorld {
         source_led: rec.source_led,
         target_led: rec.target_led,
       };
+      // Judge the keys the source still OWNED at the merge (the transferred population), not
+      // every key it ever wrote: a key the source split away BEFORE merging left with that split
+      // (its own partition verdict judges the handover) and never rode this union, so the
+      // target rightly lacks it — `keys_of` (ledger-retained written keys) would demand it and
+      // false-trip. Owned-but-unwritten keys judge vacuously (empty source history).
       self
         .conservation
-        .assert_union(rec.target_led, rec.source_led);
+        .assert_union(rec.target_led, rec.source_led, &rec.absorbed_keys);
       drop(ctx); // no panic: disarm silently
     }
   }

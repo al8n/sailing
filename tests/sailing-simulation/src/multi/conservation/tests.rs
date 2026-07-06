@@ -17,7 +17,13 @@ fn partition_holds_for_a_clean_handover() {
   l.record(100, 2, 2, 11);
   l.record(200, 2, 2, 11);
   l.record(200, 2, 9, 20);
-  l.assert_partition(100, 200, &keyset(&[2, 7]), &BTreeSet::new());
+  l.assert_partition(
+    100,
+    200,
+    &keyset(&[2, 7]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+  );
 }
 
 /// LOSS: the child's copy of an assigned key stops short of the parent's recorded history — the
@@ -29,7 +35,7 @@ fn partition_panics_on_lost_history() {
   l.record(100, 2, 2, 11);
   l.record(100, 2, 4, 15);
   l.record(200, 2, 2, 11);
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new());
+  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &BTreeSet::new());
 }
 
 /// DUP: after the handover both sides extend the common baseline — the key's history continued
@@ -42,7 +48,7 @@ fn partition_panics_on_a_double_continuation() {
   l.record(100, 2, 6, 17);
   l.record(200, 2, 2, 11);
   l.record(200, 2, 5, 16);
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new());
+  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &BTreeSet::new());
 }
 
 /// CROSS-TALK: a key the instruction never assigned surfaces in the child.
@@ -52,7 +58,7 @@ fn partition_panics_on_an_unassigned_key_in_the_child() {
   let mut l = ConservationLedger::new();
   l.record(100, 1, 1, 10);
   l.record(200, 1, 3, 9);
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new());
+  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &BTreeSet::new());
 }
 
 /// The green union shape (M5's merge): the target absorbed every source key's full history as a
@@ -66,11 +72,12 @@ fn union_holds_when_the_target_absorbs_the_source() {
   l.record(400, 4, 5, 9);
   l.record(400, 4, 11, 14);
   l.record(400, 6, 1, 3); // a target-only key asserts nothing
-  l.assert_union(400, 300);
+  l.assert_union(400, 300, &keyset(&[4]));
 }
 
 /// Union LOSS: the target's copy of a source key diverges from (or stops short of) the source's
-/// recorded history.
+/// recorded history. The key IS in the transferred population (owned at merge), so a target that
+/// dropped its history is a genuine absorb failure — it still trips.
 #[test]
 #[should_panic(expected = "not absorbed")]
 fn union_panics_when_source_history_is_dropped() {
@@ -78,7 +85,21 @@ fn union_panics_when_source_history_is_dropped() {
   l.record(300, 4, 2, 8);
   l.record(300, 4, 5, 9);
   l.record(400, 4, 2, 8);
-  l.assert_union(400, 300);
+  l.assert_union(400, 300, &keyset(&[4]));
+}
+
+/// The union judges the transferred POPULATION, not every key the source ever wrote. Key 4 was
+/// written long ago then SPLIT AWAY before the merge, so the target legitimately never had it
+/// (that split's partition verdict judged the handover) and it is absent from the absorbed set —
+/// the union holds. A written-history (`keys_of`) sweep would demand key 4 of the target and
+/// false-trip.
+#[test]
+fn union_ignores_a_key_the_source_split_away_before_merging() {
+  let mut l = ConservationLedger::new();
+  l.record(300, 4, 1, 5); // written, then split away before the merge
+  l.record(300, 5, 2, 8); // still owned at the merge
+  l.record(400, 5, 2, 8); // the target absorbed only the owned key
+  l.assert_union(400, 300, &keyset(&[5]));
 }
 
 /// The seed-4 shape: a child that later becomes a merge TARGET carries in the source's keys. The
@@ -94,7 +115,7 @@ fn partition_exempts_a_key_a_registered_union_carried_in() {
   // Post-birth the child absorbs a source, so its key 5 now surfaces in the child's history.
   l.record(200, 5, 7, 30);
   // Key 5 registered as absorbed ⇒ the partition holds; without the exemption it would trip.
-  l.assert_partition(100, 200, &keyset(&[2]), &keyset(&[5]));
+  l.assert_partition(100, 200, &keyset(&[2]), &keyset(&[5]), &BTreeSet::new());
 }
 
 /// The negative pin: the exemption is EXACT. A key that surfaces in the child but was neither
@@ -108,5 +129,36 @@ fn partition_still_trips_on_a_key_no_union_carried() {
   l.record(200, 2, 2, 11);
   l.record(200, 5, 7, 30); // absorbed via a union — exempt
   l.record(200, 8, 9, 40); // NOT assigned and NOT absorbed — a real cross-talk leak
-  l.assert_partition(100, 200, &keyset(&[2]), &keyset(&[5]));
+  l.assert_partition(100, 200, &keyset(&[2]), &keyset(&[5]), &BTreeSet::new());
+}
+
+/// The seed-0 LOSS shape closed: the split hands key 2 to the child, then the child MERGES BACK
+/// into the parent, which re-acquires key 2 and writes past the child's inherited copy. The
+/// child's history is now a PREFIX of the parent's — a registered union re-introduced the key —
+/// so the partition holds instead of false-tripping its LOSS leg (the merge's union verdict
+/// judges the re-introduced history).
+#[test]
+fn partition_exempts_a_key_a_union_re_acquired_into_the_parent() {
+  let mut l = ConservationLedger::new();
+  l.record(100, 2, 2, 11);
+  l.record(200, 2, 2, 11);
+  // The parent writes key 2 anew after re-absorbing the child: its history grows past the
+  // child's inherited copy.
+  l.record(100, 2, 9, 20);
+  l.record(100, 2, 12, 25);
+  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &keyset(&[2]));
+}
+
+/// The re-acquisition relaxation is EXACT: it forgives the parent EXTENDING a prefix the child
+/// opened, never the two sides DIVERGING. Both write key 2 past their common cell — a genuine
+/// double-continuation — so even with key 2 marked re-acquired the DUP leg still trips.
+#[test]
+#[should_panic(expected = "BOTH sides")]
+fn partition_still_trips_on_divergence_even_when_re_acquired() {
+  let mut l = ConservationLedger::new();
+  l.record(100, 2, 2, 11);
+  l.record(200, 2, 2, 11);
+  l.record(100, 2, 6, 17); // parent continues key 2
+  l.record(200, 2, 5, 16); // child ALSO continues key 2 — a divergence, not a clean extension
+  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &keyset(&[2]));
 }

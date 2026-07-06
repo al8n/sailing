@@ -57,15 +57,21 @@ impl ConservationLedger {
   }
 
   /// Assert the split of `parent` that assigned `child_keys` to `child` CONSERVED every key's
-  /// history — each continues in exactly one side:
-  ///   - an assigned key's child history must start with the parent's FULL recorded history (the
-  ///     transferred baseline; anything shorter or diverging is LOSS);
-  ///   - once both sides extend past their common prefix the key continued on BOTH sides (DUP);
-  ///   - an unassigned key must never surface in the child at all (CROSS-TALK) — UNLESS it was
-  ///     carried in by a registered union into the child (`absorbed`): a child that later becomes
-  ///     a merge TARGET legitimately gains the source's keys, which the merge's own
-  ///     [`assert_union`](Self::assert_union) judges. The split partition never assigned them, so
-  ///     it exempts them here rather than false-tripping the never-assigned cross-talk leg.
+  /// history — each continues in exactly one side. The split-merge algebra reunifies sides, so
+  /// the two closure sets exempt exactly the keys a REGISTERED union re-routed, symmetrically:
+  ///   - `absorbed` — keys a union carried INTO the child (the child became a merge TARGET). An
+  ///     unassigned key normally may never surface in the child (CROSS-TALK), but a child that
+  ///     absorbs a source legitimately gains the source's whole population — including keys the
+  ///     source OWNED but never wrote, which the child then writes for the first time. Those keys
+  ///     are exempted here; the merge's own [`assert_union`](Self::assert_union) judges any
+  ///     absorbed HISTORY.
+  ///   - `reacquired` — keys a union re-introduced INTO the parent (the parent became a merge
+  ///     TARGET). An assigned key's child history normally must cover the parent's FULL recorded
+  ///     history (a shorter child is LOSS), but once the parent RE-ACQUIRES that key via a merge
+  ///     it writes past what the child inherited — its history legitimately grows longer. The
+  ///     DUP leg still guards against the two sides DIVERGING (a genuine double-claim trips
+  ///     regardless), so the relaxation only forgives the parent extending a prefix the child
+  ///     opened; the merge's union verdict judges the re-introduced history.
   ///
   /// Panics with the group ids, the key, and both histories on any violation.
   pub(crate) fn assert_partition(
@@ -74,6 +80,7 @@ impl ConservationLedger {
     child: u64,
     child_keys: &BTreeSet<u16>,
     absorbed: &BTreeSet<u16>,
+    reacquired: &BTreeSet<u16>,
   ) {
     let mut keys = self.keys_of(parent);
     keys.extend(self.keys_of(child));
@@ -98,18 +105,23 @@ impl ConservationLedger {
          common prefix ({common} cells)\n  parent={p:?}\n  child={c:?}",
       );
       assert!(
-        common == p.len(),
+        common == p.len() || reacquired.contains(&k),
         "[conservation] split g{parent}->g{child}: key {k} history LOST — the child's copy \
          stops short of the parent's recorded history\n  parent={p:?}\n  child={c:?}",
       );
     }
   }
 
-  /// Assert the merge of `source` into `target` absorbed every source key's FULL history: the
-  /// target's copy must start with the source's recorded history as a prefix (M5's shape).
-  /// Panics with the group ids, the key, and both histories otherwise.
-  pub(crate) fn assert_union(&self, target: u64, source: u64) {
-    for k in self.keys_of(source) {
+  /// Assert the merge of `source` into `target` absorbed every OWNED source key's FULL history:
+  /// the target's copy must start with the source's recorded history as a prefix (M5's shape).
+  /// `absorbed_keys` is the source's key POPULATION at the merge — the keys this union actually
+  /// handed over. A key the source WROTE but then SPLIT AWAY before merging is NOT here (it rode
+  /// that split, whose partition verdict judges the handover), so it is not demanded of the
+  /// target — a written-history (`keys_of`) sweep would false-trip it. An owned key the source
+  /// never wrote judges vacuously (its source history is empty). Panics with the group ids, the
+  /// key, and both histories otherwise.
+  pub(crate) fn assert_union(&self, target: u64, source: u64, absorbed_keys: &BTreeSet<u16>) {
+    for &k in absorbed_keys {
       let s = self.history(source, k);
       let t = self.history(target, k);
       let absorbed = t.len() >= s.len() && &t[..s.len()] == s;
