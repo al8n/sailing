@@ -244,20 +244,29 @@ pub(super) fn conf_change(w: &mut MultiWorld, prng: &mut FaultPrng, report: &mut
   let did = match roll {
     0 | 1 if !joinable.is_empty() => {
       let node = pick_from(&joinable, prng).expect("non-empty");
-      let ty = if roll == 0 {
-        sailing_proto::ConfChangeType::AddNode
-      } else {
-        sailing_proto::ConfChangeType::AddLearnerNode
-      };
-      w.wire_group_observer(gid, node);
-      let cc = sailing_proto::ConfChange::new(ty, node, bytes::Bytes::new());
-      if w.propose_conf_change(gid, cc).is_some() {
-        true
-      } else {
-        // Refused (a racing step-down / in-flight gate): abandon the orphan replica at once so
-        // it can never pin the group's quiesce.
-        w.abandon_wired(gid, node);
+      if w.merge_choreography_active(gid) {
+        // A merge participant must not grow mid-choreography: a virgin observer wired onto a
+        // frozen source or a parked target strands behind the held apply and WORLD-PARKS for the
+        // window (the lifecycle-churn discipline, extended from the remove/recreate draws to the
+        // grow draw). The node was still drawn off the prng, so non-merge profiles — which never
+        // see the predicate true — keep byte-identical schedules.
         false
+      } else {
+        let ty = if roll == 0 {
+          sailing_proto::ConfChangeType::AddNode
+        } else {
+          sailing_proto::ConfChangeType::AddLearnerNode
+        };
+        w.wire_group_observer(gid, node);
+        let cc = sailing_proto::ConfChange::new(ty, node, bytes::Bytes::new());
+        if w.propose_conf_change(gid, cc).is_some() {
+          true
+        } else {
+          // Refused (a racing step-down / in-flight gate): abandon the orphan replica at once so
+          // it can never pin the group's quiesce.
+          w.abandon_wired(gid, node);
+          false
+        }
       }
     }
     _ => match pick_from(&removable, prng) {

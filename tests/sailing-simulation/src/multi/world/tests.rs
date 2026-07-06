@@ -2123,6 +2123,55 @@ fn choreography_participants_read_active_until_resolution() {
   );
 }
 
+/// The world-park the grow draw's choreography gate exists to prevent. A virgin non-member wired
+/// onto a merge participant has no applied membership — the product refuses its conf change for
+/// the whole window (a frozen source, a parked target) — so the departed sweep PARKS it after the
+/// grace passes. The `conf_change` grow draw now reads `merge_choreography_active` (true across
+/// this window) and skips the observer-wire entirely: the harness models the embedder contract
+/// that keeps a choreography's participants in place, rather than wiring a replica the product
+/// only refuses and the sweep only parks — the remove/recreate discipline, extended to the grow.
+#[test]
+fn a_virgin_non_member_on_a_frozen_participant_world_parks() {
+  let mut w = MultiWorld::new(7);
+  for n in 0..4 {
+    w.add_node(n);
+  }
+  let voters: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &voters); // the merge source
+  w.create_group(11, &voters); // its target
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
+    && w.leader_of(11).is_some()));
+  merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
+    w.propose_prepare_merge(10, 11)
+  });
+  assert!(w.run_until(4_000, |w| w.group_frozen(10)));
+  assert!(
+    w.merge_choreography_active(10),
+    "the grow draw's gate reads the source active across this whole window"
+  );
+  // Wire the virgin non-member the ungated grow draw would have added.
+  w.wire_group_observer(10, 3);
+  assert!(
+    !w.parked.contains(&(3, 10)),
+    "freshly wired, not yet judged"
+  );
+  // The departed sweep parks a hosting non-member once its absent-streak passes the grace.
+  for _ in 0..8 {
+    w.reconcile_membership(10);
+    if w.parked.contains(&(3, 10)) {
+      break;
+    }
+  }
+  assert!(
+    w.parked.contains(&(3, 10)),
+    "with no applied membership, the departed sweep world-parks the virgin non-member"
+  );
+  assert!(
+    w.merge_choreography_active(10),
+    "the window is still open — the gate would have skipped the wire for all of it"
+  );
+}
+
 /// Drive `source → target` on a fresh 3-node world through freeze, commit, and every host's
 /// resolution (the merge-test preamble shared by the teardown pins).
 fn drive_merge_to_full_resolution(seed: u64, source: u64, target: u64) -> MultiWorld {
