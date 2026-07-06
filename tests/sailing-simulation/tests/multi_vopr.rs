@@ -373,3 +373,96 @@ fn soak_reshape_profile() {
     "the reshape soak slice {start}..{end} never materialized a split"
   );
 }
+
+/// The merge band smoke: the reshape menu plus the three merge verbs at the fast budget.
+/// Beyond the standing non-vacuity floor the band must actually MERGE — the `merges_registered`
+/// witness proves parked commits resolved to real absorbs, so the union verdict inside every
+/// run judged real source→target handovers rather than an empty work list (and the rollback
+/// witness proves the race arm drew).
+#[test]
+fn merge_band_smoke() {
+  let mut total_registered = 0u64;
+  let mut total_rollbacks = 0u64;
+  let mut total_aborted = 0u64;
+  for seed in 0..8u64 {
+    let r = run_multi_vopr(seed, 4_000, MultiProfile::merge_reshape());
+    std::eprintln!(
+      "merge seed {seed}: prepared={} committed={} rolled_back={} registered={} resolved={} \
+       aborted={} splits={} committed_load={}",
+      r.merges_prepared,
+      r.merges_committed,
+      r.merges_rolled_back,
+      r.merges_registered,
+      r.merges_resolved,
+      r.merges_aborted,
+      r.splits_applied,
+      r.committed
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    total_registered += r.merges_registered;
+    total_rollbacks += r.merges_rolled_back;
+    total_aborted += r.merges_aborted;
+  }
+  assert!(
+    total_registered > 0,
+    "the merge band never resolved an absorb — the merge verbs are inert"
+  );
+  assert!(
+    total_rollbacks + total_aborted > 0,
+    "the merge band never exercised the abort side (no rollback accepted, no parked abort)"
+  );
+}
+
+/// Determinism holds under the merge profile too: the same (seed, ticks, profile) replays to
+/// the identical report, merge counters included.
+#[test]
+fn merge_profile_same_seed_same_report() {
+  assert_eq!(
+    run_multi_vopr(43, 3_000, MultiProfile::merge_reshape()),
+    run_multi_vopr(43, 3_000, MultiProfile::merge_reshape()),
+    "run_multi_vopr must be a pure function of (seed, ticks, profile)"
+  );
+}
+
+/// The merge soak: the [`soak_default_profile`] shape under [`MultiProfile::merge_reshape`],
+/// so freezes, parked commits, rollback races, and resolutions land amid soak-scale
+/// fault/lifecycle churn, with every run's union verdict judging the accumulated absorbs. Each
+/// slice additionally requires the merge witness (`merges_registered` nonzero over the slice).
+/// `#[ignore]` so the everyday gate stays fast; ALWAYS run it `--release`:
+///
+/// ```text
+/// cargo test --release -p sailing-simulation --test multi_vopr -- --ignored soak_merge_profile
+/// ```
+///
+/// Shardable via its own env vars (`MULTI_VOPR_MERGE_SEED_{START,END}` +
+/// `MULTI_VOPR_MERGE_TICKS`). Deterministic per (seed, ticks): failures replay anywhere.
+#[test]
+#[ignore = "the merge soak — run explicitly, --release. Shard via MULTI_VOPR_MERGE_SEED_{START,END} + MULTI_VOPR_MERGE_TICKS."]
+fn soak_merge_profile() {
+  fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(default)
+  }
+  let start = env_u64("MULTI_VOPR_MERGE_SEED_START", 0);
+  let end = env_u64("MULTI_VOPR_MERGE_SEED_END", 64);
+  let ticks = env_u64("MULTI_VOPR_MERGE_TICKS", 40_000) as usize;
+  assert!(end > start, "empty band: {start} >= {end}");
+  let mut registered = 0u64;
+  for seed in start..end {
+    let r = run_multi_vopr(seed, ticks, MultiProfile::merge_reshape());
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    registered += r.merges_registered;
+  }
+  assert!(
+    registered > 0,
+    "the merge soak slice {start}..{end} never resolved an absorb"
+  );
+}
