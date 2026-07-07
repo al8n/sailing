@@ -1073,9 +1073,14 @@ where
   }
 
   /// Remove a group: coordinator endpoint, engine storage, and driver routing torn down together;
-  /// the group's parked work fails with the group-scoped teardown verdict. Returns whether the
-  /// group was hosted.
-  fn remove_group(&mut self, gid: &G) -> bool {
+  /// the group's parked work fails with the group-scoped teardown verdict. `Ok` carries whether the
+  /// group was hosted; a group still owing an aborted merge its thaw refuses TRANSIENTLY
+  /// ([`DriverError::Rejected`], the coordinator's inherited `OwesThaw`), tearing nothing down.
+  fn remove_group(&mut self, gid: &G) -> Result<bool, DriverError<I>> {
+    // THE TEARDOWN GATE FIRST: the coordinator inherits the container's refusal of a group that
+    // still owes a thaw, so gate here BEFORE any floor write or teardown — a refusal must leave the
+    // group, its floor, its stores, and its routing untouched. Self-clearing off the thaw pass.
+    let existed = self.coord.remove_group(gid).map_err(rejected)?.is_some();
     // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin;
     // a reshaped id is fenced one past its removal CEILING — every generation this incarnation
     // could have minted rides the unified counter the lineage mirrors track, so the floor
@@ -1086,7 +1091,6 @@ where
       self.engine.set_group_floor(gid, floor);
       self.flush_pending = true;
     }
-    let existed = self.coord.remove_group(gid).is_some();
     let had_storage = self.engine.remove_group(gid);
     self.was_leader.remove(gid);
     self.quiesced.remove(gid);
@@ -1096,7 +1100,7 @@ where
     if let Some(mut routing) = self.routing.remove(gid) {
       routing.fail_all(&DriverError::ShuttingDown);
     }
-    existed || had_storage
+    Ok(existed || had_storage)
   }
 
   /// Handle one command. Returns `true` when the loop should exit (a `Shutdown`).

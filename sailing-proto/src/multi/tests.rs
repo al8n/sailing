@@ -739,7 +739,7 @@ fn host_identity_is_latched_across_group_removal() {
 
   // Removing the LAST group must not un-latch the identity: live transport connections stay
   // authenticated under it, so a re-created group with a different id would silently wedge.
-  assert!(mr.remove_group(&1).is_some());
+  assert!(mr.remove_group(&1).unwrap().is_some());
   assert!(mr.is_empty());
   assert_eq!(mr.host_id(), Some(&1), "identity survives an empty host");
   assert_eq!(
@@ -861,9 +861,9 @@ fn create_dup_errors_and_remove_returns_the_group() {
     Err(CreateGroupError::Exists)
   );
   assert_eq!(mr.len(), 1);
-  assert!(mr.remove_group(&1).is_some());
+  assert!(mr.remove_group(&1).unwrap().is_some());
   assert!(mr.is_empty());
-  assert!(mr.remove_group(&1).is_none());
+  assert!(mr.remove_group(&1).unwrap().is_none());
 }
 
 #[test]
@@ -1024,7 +1024,7 @@ fn remove_group_with_queued_output_is_safe() {
   let d = mr.group(&1).unwrap().poll_timeout().unwrap();
   mr.handle_timeout(&1, d, &mut log, &mut stable).unwrap();
 
-  let mut ep = mr.remove_group(&1).expect("the group is returned");
+  let mut ep = mr.remove_group(&1).unwrap().expect("the group is returned");
   assert!(
     ep.poll_message().is_some(),
     "output WAS queued at removal (the dirty entry is genuinely stale)"
@@ -1034,7 +1034,7 @@ fn remove_group_with_queued_output_is_safe() {
     "the stale dirty entry is skipped"
   );
   assert!(mr.poll_event().is_none());
-  assert!(mr.remove_group(&1).is_none());
+  assert!(mr.remove_group(&1).unwrap().is_none());
 
   // The same gid is admissible again.
   mr.create_group(
@@ -2115,7 +2115,7 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
   );
 
   // Arm (a): the squatter is removed — the fork now materializes NORMALLY, with the full half.
-  m.remove_group(&200);
+  m.remove_group(&200).unwrap();
   let fork = m
     .poll_pending_fork()
     .expect("removal unparks the fork for materialization");
@@ -2275,7 +2275,7 @@ fn squatter_removal_purges_an_undelivered_conflict() {
     "queued, undelivered"
   );
 
-  m.remove_group(&200);
+  m.remove_group(&200).unwrap();
   let fork = m
     .poll_pending_fork()
     .expect("removal unparks the fork for materialization");
@@ -2334,7 +2334,7 @@ fn removing_the_parked_parent_purges_its_undelivered_conflict() {
     "queued, undelivered"
   );
 
-  assert!(m.remove_group(&7).is_some());
+  assert!(m.remove_group(&7).unwrap().is_some());
   assert_eq!(
     m.peek_split_conflict(),
     None,
@@ -2466,7 +2466,7 @@ fn split_admission_race_parks_instead_of_dropping() {
   );
 
   // No silent drop: removing the squatter materializes the full half — conservation exact.
-  m.remove_group(&200);
+  m.remove_group(&200).unwrap();
   let fork = m.poll_pending_fork().expect("the fork survives the race");
   assert_eq!((fork.parent, fork.child, fork.split_index), (7, 200, idx));
   assert_eq!(fork.fsm.units, 2);
@@ -2887,7 +2887,7 @@ fn below_lineage_squatter_stays_parked() {
 
   // Arm (a) is the shape's designed exit: the embedder removes the stale squatter and the
   // fork materializes with its minted lineage intact.
-  m.remove_group(&200);
+  m.remove_group(&200).unwrap();
   let fork = m
     .poll_pending_fork()
     .expect("removal unparks the fork for materialization");
@@ -3521,6 +3521,78 @@ fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
   assert!(m.group(&2).unwrap().is_frozen(), "2 froze into 3");
 }
 
+/// The EXPLICIT-TEARDOWN door twin of `a_source_owing_a_thaw_cannot_freeze_as_a_source`: the public
+/// `remove_group` refuses a hosted group that still owes an aborted upstream source its thaw. Group
+/// 2 is the TARGET of a 1 -> 2 merge that 2 aborts (recording `abandoned[1]`), still undischarged.
+/// RED current: `remove_group(&2)` SUCCEEDS, 2's endpoint + stores drop, and 1 is stranded frozen
+/// forever with no holder left to run the thaw pass. GREEN: the removal is REFUSED `OwesThaw`,
+/// tearing nothing down; once the thaw pass discharges 1 the SAME `remove_group(&2)` admits (the
+/// self-clearing pin). Removing a group that owes nothing (3) is unchanged — `Ok(Some(endpoint))`.
+#[test]
+fn teardown_refuses_a_group_that_still_owes_a_thaw() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  // 1 freezes into 2, then 2 aborts the merge and APPLIES it: 2 now owes 1 a thaw.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "source 1 froze into 2");
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "2 recorded its target-role abort obligation for 1"
+  );
+
+  // NEGATIVE PIN: removing a group that owes nothing is unchanged — Ok(Some(endpoint)).
+  assert!(
+    m.remove_group(&3).unwrap().is_some(),
+    "a group with no thaw obligation tears down exactly as before"
+  );
+
+  // THE GATE: 2 cannot be torn down while it still owes 1 a thaw.
+  assert!(
+    matches!(m.remove_group(&2), Err(RemoveError::OwesThaw)),
+    "a holder of an undischarged thaw is refused OwesThaw — never torn down"
+  );
+  // The refusal tore NOTHING down — the strand the RED path would have created is absent: 2 is still
+  // hosted with its obligation, and 1 is still frozen but still HAS a holder (2) to run the thaw.
+  assert!(m.contains_group(&2), "the refused removal left 2 hosted");
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "2 still owes 1 the thaw"
+  );
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "1 is still frozen, but 2 survives to thaw it"
+  );
+
+  // Drive the thaw pass: it unfreezes 1 from 2's obligation; the next pass discharges it.
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().is_frozen(), "the thaw unfroze 1");
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the observed advance discharged 2's obligation"
+  );
+
+  // SELF-CLEARING PIN: with the obligation discharged, the SAME removal now admits.
+  assert!(
+    m.remove_group(&2).unwrap().is_some(),
+    "once the thaw discharges, 2 tears down exactly as a clean group would"
+  );
+  assert!(!m.contains_group(&2), "2 is gone");
+}
+
 /// LEG beta (liveness, the residual window `prepare_merge`'s gate cannot see): an abort committed on
 /// 2 BELOW its own freeze materializes `abandoned[1]` only AFTER `prepare_merge(2 -> 3)` already
 /// admitted — the gate saw no applied obligation, and the freeze fold is an unguarded max, so 2
@@ -3752,7 +3824,7 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
 
   // REMOVE source 1, non-terminally (no `MERGED_FLOOR`), and drop its store. The choke point purges
   // the obligation — RED here without the purge: the removed source's record strands on the target.
-  assert!(m.remove_group(&1).is_some());
+  assert!(m.remove_group(&1).unwrap().is_some());
   stores.0.remove(&1);
   assert!(
     !m.group(&2).unwrap().has_abandoned(),
@@ -3845,7 +3917,7 @@ fn a_floored_sources_rederived_obligation_discharges() {
   // Tear the source down (non-terminal) and drop its store. The removal purges the obligation (the
   // race-free leg), so re-INSERT it to model the restart replay that re-derives it from the surviving
   // abort entry while the source is gone.
-  assert!(m.remove_group(&1).is_some());
+  assert!(m.remove_group(&1).unwrap().is_some());
   base.0.remove(&1);
   let mut key = Vec::new();
   Data::encode(&1u64, &mut key);
@@ -3921,7 +3993,7 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
     "the frozen source's own lineage fences one past the freeze gen (1) it owes 2 a thaw for"
   );
   stores.floors.insert(1, fence);
-  assert!(m.remove_group(&1).is_some());
+  assert!(m.remove_group(&1).unwrap().is_some());
   stores.inner.0.remove(&1);
 
   // RESTART REPLAY: the still-durable abort entry re-derives the purged obligation while the source
@@ -4048,7 +4120,7 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
     "the frozen source's own lineage covers the obligation"
   );
   stores.floors.insert(1, floor);
-  assert!(m.remove_group(&1).is_some());
+  assert!(m.remove_group(&1).unwrap().is_some());
   stores.inner.0.remove(&1);
 
   // Crash-replay: the target's surviving abort entry re-derives the purged obligation.
@@ -4131,18 +4203,19 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
   );
 }
 
-/// THE SOURCE-LINEAGE FLOOR NEEDS NO TARGET (the unhosted-target escape): an obligation lives in
-/// its TARGET's endpoint, so any removal floor derived by scanning hosted targets misses every
-/// obligation whose target is UNHOSTED at the source's removal — restored later, the target
-/// replays its abort entry, re-derives the obligation, and a recreated source that re-freezes the
-/// pair at the repeated gen finds it still backing a thaw (the codex-R4 critical). Under the
-/// unified counter the removal floor comes from the SOURCE'S OWN lineage (`group_gen + 1` — the
-/// freeze rode the same counter), so it covers every minted `expected` with no knowledge of any
-/// target, and the re-derived obligation discharges off the persisted floor.
+/// THE SOURCE-LINEAGE FLOOR NEEDS NO TARGET (the re-derived-obligation escape): an obligation
+/// lives in its TARGET's endpoint and is re-derived by replaying that target's durable abort entry
+/// after a restore — so once the source is gone, a floor derived by scanning hosted targets is the
+/// wrong tool. Under the unified counter the source's removal floor comes from its OWN lineage
+/// (`group_gen + 1` — the freeze rode the same counter), so it covers every minted `expected` with
+/// no knowledge of any target, and a re-derived obligation with no live source discharges off it.
+/// (The teardown gate also forbids tearing the target down WHILE it owes, so this scenario reaches
+/// an unhosted-then-restored target only after the obligation is off the holder — see below.)
 ///
-/// RED under the old target-scan discipline (no hosted target owes anything at the removal → no
-/// floor): the re-derived obligation survives, the gen-0 recreate re-mints the repeated gen, and
-/// the service's own drive thaws the new incarnation's freeze off the dead incarnation's abort.
+/// RED under the old target-scan discipline (no hosted target owes the freeze's gen once the source
+/// is gone → no floor): the re-derived obligation survives, the gen-0 recreate re-mints the
+/// repeated gen, and the service's own drive thaws the new incarnation's freeze off the dead
+/// incarnation's abort (the codex-R4 critical).
 #[test]
 fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor() {
   let (mut m, base) = merge_host(2, 3);
@@ -4165,18 +4238,24 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
   }
   assert!(m.group(&2).unwrap().has_abandoned());
 
-  // The TARGET goes UNHOSTED first (lifecycle churn; its durable stores survive). No hosted
-  // endpoint carries the obligation now — a target-scan removal floor would find NOTHING.
-  assert!(m.remove_group(&2).is_some());
-
-  // Remove the SOURCE with the unified-counter discipline: its OWN lineage covers the freeze.
+  // Remove the SOURCE with the unified-counter discipline: its OWN lineage covers the freeze — the
+  // removal floor is derived with NO knowledge of any target. Removing the source also PURGES the
+  // still-hosted target's LIVE obligation for it (the synchronous fast path), but the target's
+  // durable abort entry survives to re-derive it after a restore.
   let fence = m.group_gen(&1).saturating_add(1);
   assert_eq!(fence, 2, "the source's own counter carries the freeze");
   stores.floors.insert(1, fence);
-  assert!(m.remove_group(&1).is_some());
+  assert!(m.remove_group(&1).unwrap().is_some());
   stores.inner.0.remove(&1);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "removing the source purged the target's live obligation for it"
+  );
 
-  // RESTORE the target later: replaying its committed abort entry RE-DERIVES the obligation.
+  // The target now owes nothing, so the teardown gate admits it (self-cleared); its durable stores
+  // survive. RESTORE it later: replaying the committed abort entry RE-DERIVES the obligation, now
+  // with NO live source anywhere to observe a thaw.
+  assert!(m.remove_group(&2).unwrap().is_some());
   {
     let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
     m.restore_group(
@@ -5304,7 +5383,7 @@ fn late_abort_no_ops_after_the_merge_resolved() {
 fn absent_source_aborts_only_under_the_terminal_floor() {
   let (mut m, mut stores) = merge_host(2, 3);
   let k = freeze_and_park(&mut m, &mut stores);
-  assert!(m.remove_group(&1).is_some());
+  assert!(m.remove_group(&1).unwrap().is_some());
   seal_window(&mut m, &mut stores);
   // No floor: never-held — the park holds for the snapshot route.
   assert!(

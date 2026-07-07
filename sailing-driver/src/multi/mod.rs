@@ -265,12 +265,13 @@ where
     reservation: ReservationGuard,
   },
   /// Remove a group: its endpoint, its storage, and its parked client work (failed with the
-  /// teardown error) are torn down together. Answer `reply` with whether the group was hosted.
+  /// teardown error) are torn down together. Answer `reply` with whether the group was hosted, or a
+  /// TRANSIENT refusal when the group still owes an aborted merge its thaw (nothing torn down).
   RemoveGroup {
     /// The removed group's id.
     gid: G,
-    /// Answered with whether a group with this id was hosted.
-    reply: oneshot::Sender<bool>,
+    /// Answered with whether a group with this id was hosted, or the transient teardown refusal.
+    reply: oneshot::Sender<Result<bool, DriverError<I>>>,
     /// The owning budget reservation (zero-byte).
     reservation: ReservationGuard,
   },
@@ -567,6 +568,10 @@ where
   /// untouched. The removal TOMBSTONES the id: straggler frames drop silently and a
   /// create/restore of the id is rejected until [`clear_tombstone`](Self::clear_tombstone)
   /// explicitly consents to re-admission.
+  ///
+  /// A group still owing an aborted merge its thaw refuses TRANSIENTLY ([`DriverError::Rejected`])
+  /// with NOTHING torn down and the id NOT tombstoned: retry once the driver's per-crank thaw pass
+  /// discharges the obligation (a few cranks), or floor the owed source through the catalog.
   pub async fn remove_group(&self, gid: G) -> Result<bool, DriverError<I>> {
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
@@ -575,7 +580,7 @@ where
       reply: tx,
       reservation,
     })?;
-    rx.await.map_err(|_| DriverError::ShuttingDown)
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
   }
 
   /// Lift `gid`'s tombstone, awaiting whether one existed — the EXPLICIT re-admission consent,

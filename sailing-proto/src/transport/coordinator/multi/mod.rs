@@ -13,8 +13,8 @@ use super::super::{
 };
 use crate::{
   Config, CreateGroupError, Data, Endpoint, Event, FloorStore, GroupId, GroupStores, Index,
-  Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError, StableStore, StateMachine,
-  StorageProgress, multi::validate_floor,
+  Instant, LogStore, Message, MultiRaft, NodeId, Now, ProposeError, RemoveError, StableStore,
+  StateMachine, StorageProgress, multi::validate_floor,
 };
 use bytes::Bytes;
 use std::{
@@ -327,12 +327,19 @@ where
   /// group is unsound without epochs (matching the NodeId reuse rules). Across a restart the
   /// tombstone is gone; the embedder's placement catalog is the persistent record of what must
   /// not live here.
-  pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F>> {
+  ///
+  /// REFUSES [`RemoveError::OwesThaw`] (inherited from the container's teardown gate) when the
+  /// group still owes an aborted upstream merge its thaw — nothing is torn down and, crucially,
+  /// the id is NOT tombstoned, so a refused removal is a clean no-op the caller retries once the
+  /// per-crank thaw pass discharges the obligation. The gate runs FIRST, before any side-state is
+  /// cleared, so the refusal leaves the group and this coordinator's bookkeeping fully intact.
+  pub fn remove_group(&mut self, gid: &G) -> Result<Option<Endpoint<I, F>>, RemoveError> {
+    let removed = self.multi.remove_group(gid)?;
     self.quiesce_intents.remove(gid);
     self.controls.retain(|(g, _)| g != gid);
     self.retired.insert(gid.cheap_clone());
     self.purge_unknown_signal(gid);
-    self.multi.remove_group(gid)
+    Ok(removed)
   }
 
   /// Lift `gid`'s tombstone, returning whether one existed. The EXPLICIT re-admission consent —

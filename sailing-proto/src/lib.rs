@@ -69,7 +69,7 @@ pub use storage::{
 
 mod error;
 pub use error::{
-  ConfigError, CreateGroupError, MergeError, ProposeError, ReadIndexError, SplitError,
+  ConfigError, CreateGroupError, MergeError, ProposeError, ReadIndexError, RemoveError, SplitError,
   TransferError,
 };
 

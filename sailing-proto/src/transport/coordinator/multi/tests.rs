@@ -952,7 +952,7 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   while w.b.poll_group_control().is_some() {}
 
   assert!(!w.b.is_retired(&100), "a hosted group is not tombstoned");
-  assert!(w.b.remove_group(&100).is_some());
+  assert!(w.b.remove_group(&100).unwrap().is_some());
   assert!(w.b.is_retired(&100), "removal tombstones the id");
 
   // The unaware leader keeps beating group 100; b's tombstone absorbs every frame silently.
@@ -1115,7 +1115,7 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::Exists));
   // cell 2 (the subtlest): tombstoned + HIGHER gen → Retired (consent gate holds at any gen)
-  assert!(c.remove_group(&100).is_some());
+  assert!(c.remove_group(&100).unwrap().is_some());
   let e = c
     .create_group(
       100,
@@ -1400,7 +1400,7 @@ fn unknown_group_traffic_surfaces_once_until_polled() {
   );
 
   // A tombstoned id never signals — even for initial-shaped traffic.
-  assert!(w.b.remove_group(&100).is_some());
+  assert!(w.b.remove_group(&100).unwrap().is_some());
   let mut tag = Vec::new();
   sailing_encode_u64(100, &mut tag);
   let rv = Message::RequestVote(crate::RequestVote::new(
@@ -1564,7 +1564,7 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
     &NoFloors,
   )
   .unwrap();
-  assert!(c.remove_group(&100).is_some());
+  assert!(c.remove_group(&100).unwrap().is_some());
 
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let e = c

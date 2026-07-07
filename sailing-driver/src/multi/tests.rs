@@ -174,7 +174,7 @@ fn lifecycle_commands_round_trip_their_replies() {
     match cmd_rx.try_recv().expect("the remove was enqueued") {
       MultiCommand::RemoveGroup { gid, reply, .. } => {
         assert_eq!(gid, 100);
-        reply.send(true).expect("the caller is awaiting");
+        reply.send(Ok(true)).expect("the caller is awaiting");
       }
       _ => panic!("expected a RemoveGroup"),
     }

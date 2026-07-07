@@ -202,7 +202,8 @@ impl MultiInteractionEnv {
         .hosts
         .get_mut(&id)
         .expect("host exists")
-        .remove_group(&gid);
+        .remove_group(&gid)
+        .expect("a scenario never tears down a group that still owes a thaw");
       self.stores.remove(&(id, gid));
     }
     let before = self.bus.len();

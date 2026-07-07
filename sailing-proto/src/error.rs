@@ -153,6 +153,27 @@ pub enum CreateGroupError {
   StorageInUse,
 }
 
+/// Why [`MultiRaft::remove_group`](crate::MultiRaft::remove_group) — or a multi coordinator's
+/// tombstone-aware wrapper of it — refused to tear a group down. The group is left FULLY intact
+/// (endpoint, stores, obligations, and the coordinator's tombstone/side state) in the refusal; a
+/// refused removal is a no-op the caller retries, never a partial teardown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum RemoveError {
+  /// The group still owes an aborted upstream merge its thaw: a merge it applied as a TARGET was
+  /// aborted, recording a durable `abandoned` obligation its per-crank thaw pass has not yet
+  /// discharged. Tearing it down would destroy that obligation's ONLY replay source — the holder's
+  /// own log — leaving the upstream source frozen forever with no holder left to run the thaw. The
+  /// teardown-door sibling of [`MergeError::SourceOwesThaw`](crate::MergeError::SourceOwesThaw):
+  /// that gate guards the merge-absorb door (a source dissolving), this one guards the EXPLICIT
+  /// teardown door (a hosted group removed). TRANSIENT and self-clearing, exactly like it: the thaw pass
+  /// discharges each obligation within a few cranks, after which the SAME removal admits. The
+  /// escape for a genuinely-dead holder is the catalog — flooring the OWED SOURCE discharges the
+  /// obligation (the thaw pass's `!floor_admits` arm), after which removal admits.
+  #[error("the group still owes an aborted merge its thaw and cannot be torn down")]
+  OwesThaw,
+}
+
 /// Why [`MultiRaft::propose_split`](crate::MultiRaft::propose_split) — or a coordinator/driver
 /// delegator around it — refused to propose a group split. One enum, three producer layers: the
 /// container produces the consensus-shaped refusals (`NotLeader`/`JointConfig`/`ChildExists`/

@@ -30,8 +30,8 @@ use crate::{
   CommitMergePayload, ConfChange, ConfChangeV2, ConfState, Config, CreateGroupError, Data,
   Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore, MergeError, Message, NodeId,
   Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng, ProposeError, ReadIndexError,
-  ReadOnlyOption, RollbackMergePayload, SnapshotMeta, SplitError, SplitPayload, StableStore,
-  StateMachine, StorageProgress, Term, TransferError, endpoint::MergeWindow,
+  ReadOnlyOption, RemoveError, RollbackMergePayload, SnapshotMeta, SplitError, SplitPayload,
+  StableStore, StateMachine, StorageProgress, Term, TransferError, endpoint::MergeWindow,
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
@@ -474,7 +474,23 @@ where
   ///
   /// This is also the SINGLE choke point where a merge SOURCE leaves the container, so it PURGES
   /// the removed id's outstanding thaw obligation from every target — see the inline note.
-  pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
+  ///
+  /// REFUSES [`RemoveError::OwesThaw`] when the hosted group still owes an aborted upstream source
+  /// its thaw ([`Endpoint::has_abandoned`]): tearing down the holder would destroy the obligation's
+  /// only replay source — its own log — stranding the owed source frozen forever with no holder
+  /// left to run the thaw pass (the teardown-door twin of the merge-absorb `SourceOwesThaw` gate).
+  /// The refusal is TRANSIENT and self-clearing: the per-crank thaw pass discharges the obligation,
+  /// then the same removal admits; the escape for a genuinely-dead holder is the catalog — flooring
+  /// the OWED SOURCE discharges the obligation (the thaw pass's `!floor_admits` arm), after which
+  /// removal admits. `Ok(None)` when no such group is hosted (removing an absent id is a no-op).
+  pub fn remove_group(&mut self, gid: &G) -> Result<Option<Endpoint<I, F, R>>, RemoveError> {
+    // THE TEARDOWN GATE, refused BEFORE any teardown so the group stays fully intact: a hosted
+    // holder of an undischarged target-role thaw obligation cannot leave — its log is the sole
+    // replay source that runs the outstanding thaw, so destroying it wedges the owed source frozen
+    // forever. Self-clearing off the per-crank thaw pass (or a floor on the owed source).
+    if self.groups.get(gid).is_some_and(Endpoint::has_abandoned) {
+      return Err(RemoveError::OwesThaw);
+    }
     // A parked PARENT's staged forks die with its endpoint (removal is the embedder's explicit
     // destruction of this replica), so the park bookkeeping — a still-queued conflict signal
     // included — dies too. Removing a parked fork's CHILD needs nothing here: the next relay
@@ -504,7 +520,7 @@ where
         ep.clear_abandoned(&source_key);
       }
     }
-    removed
+    Ok(removed)
   }
 
   /// End `gid`'s park episode: leave the parked set and purge any still-queued conflict
@@ -2339,7 +2355,10 @@ where
           {
             continue;
           }
-          let Some(sep) = self.remove_group(&source) else {
+          // The β hold above proved the source owes nothing, so `remove_group`'s `OwesThaw` gate is
+          // unreachable here — `Err` would `continue` (hold the park) exactly as a busy target does,
+          // never dissolving a holder; `Ok(None)` (a source already gone) likewise holds.
+          let Ok(Some(sep)) = self.remove_group(&source) else {
             continue;
           };
           let fsm = sep.into_state_machine();

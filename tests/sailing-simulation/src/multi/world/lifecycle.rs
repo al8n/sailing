@@ -411,7 +411,13 @@ impl MultiWorld {
   /// The embedder acting on RemovedSelf / the catalog — the group itself lives on elsewhere.
   pub(crate) fn drop_group_replica(&mut self, gid: u64, node: u64) {
     let host = self.hosts.get_mut(&node).expect("host exists");
-    host.remove_group(&gid);
+    // The world plays the embedder, whose contract keeps a merge choreography's participants put
+    // until it resolves — the removal draws exclude any group with an undischarged thaw obligation
+    // (`merge_choreography_active`). So the container's `OwesThaw` teardown gate is never tripped
+    // here; asserting it makes that exclusion STRUCTURAL rather than a silent precondition.
+    host
+      .remove_group(&gid)
+      .expect("the world never tears down a group that still owes a thaw");
     self.logs.remove(&(node, gid));
     self.stables.remove(&(node, gid));
     self.configs.remove(&(node, gid));
