@@ -3165,7 +3165,7 @@ impl core::error::Error for SnapErr {}
 #[derive(Debug, Default)]
 struct SnapFailSm {
   count: u64,
-  fail: std::sync::Arc<std::sync::atomic::AtomicBool>,
+  fail: std::sync::Arc<core::sync::atomic::AtomicBool>,
 }
 
 impl crate::StateMachine for SnapFailSm {
@@ -3180,7 +3180,7 @@ impl crate::StateMachine for SnapFailSm {
   }
 
   fn snapshot(&self) -> Result<u64, Self::Error> {
-    if self.fail.load(std::sync::atomic::Ordering::Relaxed) {
+    if self.fail.load(core::sync::atomic::Ordering::Relaxed) {
       Err(SnapErr)
     } else {
       Ok(self.count)
@@ -3206,7 +3206,7 @@ impl crate::StateMachine for SnapFailSm {
 /// stores stay untouched so a restart re-parks against them.
 #[test]
 fn capture_failure_withholds_merged_and_keeps_the_source_recoverable() {
-  let fail = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+  let fail = std::sync::Arc::new(core::sync::atomic::AtomicBool::new(false));
   let (mut m, mut stores) = merge_host_with(
     SnapFailSm::default(),
     2,
@@ -3220,7 +3220,7 @@ fn capture_failure_withholds_merged_and_keeps_the_source_recoverable() {
   seal_window(&mut m, &mut stores);
   // Arm the target's forced capture to fail: the absorb still folds, but snapshot() errors, so no
   // durable anchor for the union can ever stage.
-  fail.store(true, std::sync::atomic::Ordering::Relaxed);
+  fail.store(true, core::sync::atomic::Ordering::Relaxed);
   let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
   assert!(
     resolutions.is_empty(),
