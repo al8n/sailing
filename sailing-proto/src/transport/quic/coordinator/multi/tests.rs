@@ -47,6 +47,14 @@ impl FloorStore<u64> for Stores {
   }
 }
 
+/// An empty store seam for a coordinator teardown whose participant gate resolves on in-memory
+/// state alone (no freeze-pending source to scan for the `Claimed` leg).
+fn empty_stores() -> Stores {
+  Stores {
+    map: BTreeMap::new(),
+  }
+}
+
 fn single_voter(id: u64) -> Config<u64> {
   Config::try_new(
     id,
@@ -535,7 +543,7 @@ fn unhosted_coalesced_entry_drops_over_quic() {
   let _ = drain_controls(&mut b);
 
   // b de-hosts group 200; a (unaware) keeps beating both groups in one coalesced frame.
-  assert!(b.remove_group(&200).unwrap().is_some());
+  assert!(b.remove_group(&200, &mut empty_stores()).unwrap().is_some());
   let d100 = a.group(&100).unwrap().poll_timeout().unwrap();
   let d200 = a.group(&200).unwrap().poll_timeout().unwrap();
   now = now.max(d100).max(d200);
@@ -605,7 +613,7 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   let _ = drain_controls(&mut b);
 
   assert!(!b.is_retired(&100), "a hosted group is not tombstoned");
-  assert!(b.remove_group(&100).unwrap().is_some());
+  assert!(b.remove_group(&100, &mut empty_stores()).unwrap().is_some());
   assert!(b.is_retired(&100), "removal tombstones the id");
 
   // Both leaders beat in one crank: the coalesced frame carries a tombstoned entry (100) beside
@@ -748,7 +756,7 @@ fn unknown_group_traffic_surfaces_over_quic() {
   // Tombstoning the id silences the solicitations entirely (an unhosted removal still
   // tombstones: the embedder declared the id retired).
   assert!(
-    b.remove_group(&200).unwrap().is_none(),
+    b.remove_group(&200, &mut empty_stores()).unwrap().is_none(),
     "b never hosted 200"
   );
   assert!(b.is_retired(&200));
@@ -897,7 +905,7 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::Exists));
   // cell 2 (the subtlest): tombstoned + HIGHER gen → Retired (consent gate holds at any gen)
-  assert!(c.remove_group(&100).unwrap().is_some());
+  assert!(c.remove_group(&100, &mut empty_stores()).unwrap().is_some());
   let e = c
     .create_group(
       100,
@@ -1015,7 +1023,7 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
     &NoFloors,
   )
   .unwrap();
-  assert!(c.remove_group(&100).unwrap().is_some());
+  assert!(c.remove_group(&100, &mut empty_stores()).unwrap().is_some());
 
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let e = c

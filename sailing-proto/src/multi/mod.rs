@@ -475,22 +475,122 @@ where
   /// This is also the SINGLE choke point where a merge SOURCE leaves the container, so it PURGES
   /// the removed id's outstanding thaw obligation from every target — see the inline note.
   ///
-  /// REFUSES [`RemoveError::OwesThaw`] when the hosted group still owes an aborted upstream source
-  /// its thaw ([`Endpoint::has_abandoned`]): tearing down the holder would destroy the obligation's
-  /// only replay source — its own log — stranding the owed source frozen forever with no holder
-  /// left to run the thaw pass (the teardown-door twin of the merge-absorb `SourceOwesThaw` gate).
-  /// The refusal is TRANSIENT and self-clearing: the per-crank thaw pass discharges the obligation,
-  /// then the same removal admits; the escape for a genuinely-dead holder is the catalog — flooring
-  /// the OWED SOURCE discharges the obligation (the thaw pass's `!floor_admits` arm), after which
-  /// removal admits. `Ok(None)` when no such group is hosted (removing an absent id is a no-op).
-  pub fn remove_group(&mut self, gid: &G) -> Result<Option<Endpoint<I, F, R>>, RemoveError> {
-    // THE TEARDOWN GATE, refused BEFORE any teardown so the group stays fully intact: a hosted
-    // holder of an undischarged target-role thaw obligation cannot leave — its log is the sole
-    // replay source that runs the outstanding thaw, so destroying it wedges the owed source frozen
-    // forever. Self-clearing off the per-crank thaw pass (or a floor on the owed source).
+  /// REFUSES every UNRESOLVED merge participant, making the "do not remove a merge participant"
+  /// contract STRUCTURAL: the group is left FULLY intact (endpoint, stores, obligations) and the
+  /// refusal is a no-op the caller retries. Each refusal is self-clearing once the merge resolves.
+  /// The five legs are the CLOSED product of the choreography's participant states — the set
+  /// `{holder} ∪ {source: freeze-pending | frozen} ∪ {target: parked | claimed-applied |
+  /// claimed-pending} ∪ {named-as-source-by-a-park}` — so no in-flight role can slip the gate (the
+  /// pending-`CommitMerge` windows need no leg of their own: the barrier holds the source `Frozen`
+  /// and the park `MergeParked` throughout):
+  ///
+  /// - [`OwesThaw`](RemoveError::OwesThaw) — the group owes an aborted upstream source its thaw
+  ///   ([`has_abandoned`](Endpoint::has_abandoned)); its own log is that obligation's only replay
+  ///   source. Discharged by the per-crank thaw pass (or a floor on the owed source).
+  /// - [`Frozen`](RemoveError::Frozen) — the group is a merge SOURCE mid-freeze
+  ///   ([`merge_freeze_active`](Endpoint::merge_freeze_active)); its target parks against this exact
+  ///   freeze, so tearing it down strands the park. Roll the merge back first (abort → thaw).
+  /// - [`MergeParked`](RemoveError::MergeParked) — the group is a TARGET parked on a `CommitMerge`
+  ///   ([`pending_merge`](Endpoint::pending_merge)); removing the decider strands the frozen source.
+  ///   Let the merge resolve (absorb or abort) first.
+  /// - [`SpokenFor`](RemoveError::SpokenFor) — another hosted endpoint's park names this group as
+  ///   its source (scanned as the thaw pass scans), covering the window before this group's own
+  ///   replica has observed its freeze.
+  /// - [`Claimed`](RemoveError::Claimed) — another hosted SOURCE names this group as its TARGET
+  ///   (applied `frozen_for`, or an append-pending `PrepareMerge` decoded from the source's log)
+  ///   before this group has parked its `CommitMerge` — the mirror of `SpokenFor`, covering the
+  ///   pre-park window `MergeParked` cannot. Roll the naming merge back first (this group is hosted
+  ///   pre-park, so `rollback_merge` on it thaws the source), then the removal admits.
+  ///
+  /// The DESIGNED CATALOG ESCAPE is deliberately NOT gated: removing an OWED source (a frozen source
+  /// a hosted target still owes a thaw AT the generation the source is live at) ADMITS — the purge
+  /// below binds every holder's obligation to this incarnation and the driver floors the id, the
+  /// recovery path for a genuinely-dead frozen participant. `Frozen` steps aside for exactly it, and
+  /// GENERATION-EXACTLY: a spent obligation the source already thawed past and re-froze above names
+  /// a dead incarnation, so it can never carry a newly-frozen source out from under its new target.
+  ///
+  /// The container stays PURE (no tombstone here — the multi coordinators tombstone the id). The
+  /// host identity is NOT cleared — even removing the last group leaves it latched, so a re-created
+  /// group must carry the same node id (live transport connections stay authenticated under it).
+  /// This is also the SINGLE choke point where a merge SOURCE leaves the container, so it PURGES the
+  /// removed id's outstanding thaw obligation from every target — see [`remove_group_inner`]. `Ok(None)`
+  /// when no such group is hosted (removing an absent id is a no-op).
+  ///
+  /// [`remove_group_inner`]: Self::remove_group_inner
+  pub fn remove_group<L, S, St>(
+    &mut self,
+    gid: &G,
+    stores: &mut St,
+  ) -> Result<Option<Endpoint<I, F, R>>, RemoveError>
+  where
+    St: GroupStores<G, L, S>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    // THE PARTICIPANT GATE, refused BEFORE any teardown so the group stays fully intact. Leg 1: a
+    // hosted holder of an undischarged target-role thaw obligation cannot leave — its log is the
+    // sole replay source that runs the outstanding thaw, so destroying it wedges the owed source
+    // frozen forever. Self-clearing off the per-crank thaw pass (or a floor on the owed source).
     if self.groups.get(gid).is_some_and(Endpoint::has_abandoned) {
       return Err(RemoveError::OwesThaw);
     }
+    // An OWED source — one a hosted target still owes a thaw AT the generation this source is live
+    // at — is the designed catalog escape: the purge in `remove_group_inner` binds the obligation
+    // to this incarnation and the driver floors the id, so a genuinely-dead frozen source stays
+    // removable. Leg 2 steps aside for exactly it. GENERATION-EXACT by the campaign rule: a
+    // cross-referenced authorization holds only for the precise incarnation it names — a spent
+    // obligation the source already thawed past and re-froze above escapes NOTHING, so a freshly
+    // frozen source cannot ride a stale record out from under its new target's forming park.
+    let owed_source = self.some_target_owes_thaw_to(gid);
+    // Leg 2: a merge SOURCE whose freeze is ACTIVE (applied `Frozen`, or an appended-but-unapplied
+    // `PrepareMerge`) — its claimed target parks against this exact freeze, so tearing it down
+    // strands the park with no source left to absorb or abort against. Suppressed for the escape.
+    if !owed_source
+      && self
+        .groups
+        .get(gid)
+        .is_some_and(Endpoint::merge_freeze_active)
+    {
+      return Err(RemoveError::Frozen);
+    }
+    // Leg 3: a TARGET parked on a committed `CommitMerge` — removing the decider strands the frozen
+    // source it claims, with no park left to complete the absorb or relay the abort.
+    if self
+      .groups
+      .get(gid)
+      .is_some_and(|ep| ep.pending_merge().is_some())
+    {
+      return Err(RemoveError::MergeParked);
+    }
+    // Leg 4: any OTHER hosted endpoint's park names gid as its source — the cross-endpoint leg,
+    // covering the window where gid's own replica has not observed its own freeze yet.
+    if self.park_names_source(gid) {
+      return Err(RemoveError::SpokenFor);
+    }
+    // Leg 5: a CLAIMED TARGET pre-park — the last leg of the participant lattice. Another hosted
+    // SOURCE names gid as its merge target (applied-frozen `frozen_for`, or an append-pending
+    // `PrepareMerge` whose decoded claim is gid) while gid has NOT parked its own `CommitMerge` yet,
+    // so legs 3/4 both miss it. Removing gid strands that source frozen for a missing target: its
+    // absorb AND its abort both ride gid's log, so neither can be proposed once gid is gone, and the
+    // source's own removal then refuses `Frozen` (it owes no thaw). Roll the naming merge back first
+    // (gid is hosted pre-park, so `rollback_merge(gid, source)` rides gid's log and thaws the
+    // source), after which this removal admits. Gated on gid being HOSTED, like legs 1-3: this leg
+    // protects a live TARGET replica from teardown, so an absent gid is a plain `Ok(None)` no-op —
+    // the merge Resolve arm's own ungated source removal has already left, and re-refusing that
+    // cleanup would wedge the resolution. (Leg 4 is the sole unhosted-gid refusal: it guards a
+    // departed SOURCE's id from tombstoning while a park still names it.)
+    if self.groups.contains_key(gid) && self.some_source_claims_target(gid, stores) {
+      return Err(RemoveError::Claimed);
+    }
+    Ok(self.remove_group_inner(gid))
+  }
+
+  /// The UNGATED teardown behind [`remove_group`](Self::remove_group)'s participant gate: unpark,
+  /// remove, and PURGE the removed source's outstanding thaw obligation from every target. The
+  /// merge-absorb Resolve arm calls this DIRECTLY — that path IS the choreography resolving, so the
+  /// public gate's participant refusals (a frozen source, a park naming it) all describe the very
+  /// in-flight merge and would wedge the absorb they exist to protect.
+  fn remove_group_inner(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
     // A parked PARENT's staged forks die with its endpoint (removal is the embedder's explicit
     // destruction of this replica), so the park bookkeeping — a still-queued conflict signal
     // included — dies too. Removing a parked fork's CHILD needs nothing here: the next relay
@@ -520,7 +620,92 @@ where
         ep.clear_abandoned(&source_key);
       }
     }
-    Ok(removed)
+    removed
+  }
+
+  /// Whether any OTHER hosted target owes `gid` (a merge source) a thaw for the EXACT freeze
+  /// incarnation `gid` is live at — the teardown gate's read for recognizing an OWED FROZEN source
+  /// (the designed escape `Frozen` steps aside for). GENERATION-EXACT: a holder's obligation
+  /// abandons one specific freeze generation, and the escape holds ONLY while `gid`'s live
+  /// `shape_gen` still equals it. A delivered-but-undischarged obligation (the thaw already minted
+  /// past it, so `expected < shape_gen`) — or one whose source has since re-frozen ABOVE it for a
+  /// fresh merge — names a spent incarnation, not the freeze under removal, and must not suppress
+  /// `Frozen` over the newly-frozen source. An unhosted `gid` has no live generation to escape and
+  /// answers `false` (leg 2 is a no-op for it anyway). The purge in `remove_group_inner` stays
+  /// id-wide by contrast: a departing incarnation voids ALL its obligations, stale ones included.
+  fn some_target_owes_thaw_to(&self, gid: &G) -> bool {
+    let Some(live_gen) = self.groups.get(gid).map(Endpoint::shape_gen) else {
+      return false;
+    };
+    let mut key = Vec::new();
+    gid.encode(&mut key);
+    let key = Bytes::from(key);
+    self
+      .groups
+      .iter()
+      .any(|(g, ep)| g != gid && ep.owes_thaw_for(&key) == Some(live_gen))
+  }
+
+  /// Whether any OTHER hosted endpoint's parked `CommitMerge` names `gid` as its source — scanned
+  /// exactly as the thaw pass scans hosted parks. The cross-endpoint teardown leg (`SpokenFor`).
+  fn park_names_source(&self, gid: &G) -> bool {
+    let mut key = Vec::new();
+    gid.encode(&mut key);
+    let key = Bytes::from(key);
+    self
+      .groups
+      .iter()
+      .any(|(g, ep)| g != gid && ep.pending_merge().is_some_and(|p| p.source_bytes() == key))
+  }
+
+  /// Whether any OTHER hosted endpoint is a merge SOURCE that names `gid` as its TARGET — the
+  /// claimed-target teardown leg (`Claimed`), covering the pre-park window where a source has frozen
+  /// toward `gid` but `gid` has not yet parked its `CommitMerge` (legs 3/4 read `gid`'s own park; a
+  /// park-naming-source read the mirror direction). Two sub-legs, one per freeze phase:
+  ///
+  /// - APPLIED — the source's [`frozen_for`](Endpoint::frozen_for) claim decodes to `gid`. A pure
+  ///   in-memory read, exact once the freeze applies.
+  /// - APPEND-PENDING — the source's freeze is only append-observed (freeze-pending, not yet
+  ///   applied), so its claim is still undecoded in-memory; decode it from the source's own log with
+  ///   [`scan_freeze_claim`](Endpoint::scan_freeze_claim). Gated on freeze-pending so the bounded
+  ///   walk runs ONLY for a source mid-freeze, never on an idle group's suffix. A read/decode fault
+  ///   REFUSES (returns `true`): the gate treats a claim it cannot rule out as present rather than
+  ///   risk removing a target out from under a source it could not inspect. Off the append hot path —
+  ///   this decode is paid per (rare) removal, not per append.
+  fn some_source_claims_target<L, S, St>(&self, gid: &G, stores: &mut St) -> bool
+  where
+    St: GroupStores<G, L, S>,
+    L: LogStore,
+  {
+    let mut target_key = Vec::new();
+    gid.encode(&mut target_key);
+    let target_key = Bytes::from(target_key);
+    for (g, ep) in self.groups.iter() {
+      if g == gid {
+        continue;
+      }
+      // Applied leg: the freeze folded, so its target claim is decoded in-memory.
+      if ep.frozen_for().is_some_and(|t| *t == target_key) {
+        return true;
+      }
+      // Append-pending leg: the freeze is observed only at append (its payload undecoded until
+      // apply), so read the claim off the source's log. A faulted scan/decode fails closed.
+      if ep.merge_freeze_active() && !ep.is_frozen() {
+        let Some((log, _)) = stores.stores(g) else {
+          continue;
+        };
+        match Endpoint::<I, F, R>::scan_freeze_claim(&*log, ep.applied_index()) {
+          Ok(Some(claim)) => {
+            if claim == target_key {
+              return true;
+            }
+          }
+          Ok(None) => {}
+          Err(_) => return true,
+        }
+      }
+    }
+    false
   }
 
   /// End `gid`'s park episode: leave the parked set and purge any still-queued conflict
@@ -2355,10 +2540,12 @@ where
           {
             continue;
           }
-          // The β hold above proved the source owes nothing, so `remove_group`'s `OwesThaw` gate is
-          // unreachable here — `Err` would `continue` (hold the park) exactly as a busy target does,
-          // never dissolving a holder; `Ok(None)` (a source already gone) likewise holds.
-          let Ok(Some(sep)) = self.remove_group(&source) else {
+          // The β hold above proved the source owes no thaw; this absorb IS the merge resolving, so
+          // it dissolves the source through the UNGATED inner teardown. The public gate's participant
+          // refusals — the source is `Frozen`, and this target's own park names it (`SpokenFor`) —
+          // all describe THIS in-flight merge and would wedge the absorb they exist to protect.
+          // `None` (a source already gone) holds the park exactly as a busy target does.
+          let Some(sep) = self.remove_group_inner(&source) else {
             continue;
           };
           let fsm = sep.into_state_machine();

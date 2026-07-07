@@ -1062,13 +1062,18 @@ where
 
   /// Remove a group: coordinator endpoint, engine storage, and driver routing torn down together;
   /// the group's parked work fails with the group-scoped teardown verdict. `Ok` carries whether the
-  /// group was hosted; a group still owing an aborted merge its thaw refuses TRANSIENTLY
-  /// ([`DriverError::Rejected`], the coordinator's inherited `OwesThaw`), tearing nothing down.
+  /// group was hosted; an UNRESOLVED merge participant refuses TRANSIENTLY ([`DriverError::Rejected`],
+  /// the coordinator's inherited container gate — a thaw owed, a frozen source, a parked target, or a
+  /// group a park names), tearing nothing down.
   fn remove_group(&mut self, gid: &G) -> Result<bool, DriverError<I>> {
     // THE TEARDOWN GATE FIRST: the coordinator inherits the container's refusal of a group that
     // still owes a thaw, so gate here BEFORE any floor write or teardown — a refusal must leave the
     // group, its floor, its stores, and its routing untouched. Self-clearing off the thaw pass.
-    let existed = self.coord.remove_group(gid).map_err(rejected)?.is_some();
+    let existed = self
+      .coord
+      .remove_group(gid, &mut self.engine)
+      .map_err(rejected)?
+      .is_some();
     // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin; a
     // reshaped id is fenced below its next incarnation forever. The floor is one past the id's
     // removal CEILING — every generation this incarnation could have minted (splits and merge

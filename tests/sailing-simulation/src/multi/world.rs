@@ -189,6 +189,13 @@ pub struct MultiWorld {
   /// target capture's durability on that host (the one-barrier batch model; see
   /// `sweep_merge_teardowns`).
   pending_merge_teardowns: Vec<(u64, u64, u64, sailing_proto::Index)>,
+  /// The embedder's own record of every freeze it has proposed: `source -> target`, set at each
+  /// accepted `prepare_merge` (last-wins, since one source freezes toward one target at a time). The
+  /// world plays the embedder, which knows its merge intentions, so this is the truthful source of a
+  /// frozen source's CLAIMED TARGET — the mirror the `merge_choreography_active` predicate reads to
+  /// keep a claimed target off the removal draws (the container's `Claimed` gate). Never cleared:
+  /// a stale entry is inert, filtered at read by whether the named source's freeze is still active.
+  active_freezes: BTreeMap<u64, u64>,
   /// Merged resolutions observed across all hosts (every per-host resolution counts).
   merges_resolved: u64,
   /// Aborted resolutions observed across all hosts.
@@ -244,6 +251,7 @@ impl MultiWorld {
       merge_floors: BTreeSet::new(),
       removal_floors: BTreeMap::new(),
       pending_merge_teardowns: Vec::new(),
+      active_freezes: BTreeMap::new(),
       merges_resolved: 0,
       merges_aborted: 0,
     }

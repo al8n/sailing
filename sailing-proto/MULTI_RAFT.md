@@ -229,16 +229,45 @@ configuration, so they are exempt. Both `prepare_merge` and `commit_merge` refus
   target's abort can never thaw a source claimed elsewhere. A relay lost to churn is recovered
   by re-proposing the abort.
 
-Residual, by contract: **do not remove a merge participant mid-choreography.** Removing the
-TARGET while its source is frozen strands the source's unfreeze (the abort and its relay ride
-the target's log); recovery is the embedder's catalog, exactly like any dead group. A group still
-**owing an aborted source its thaw** (its target-role `abandoned` obligation undischarged) is
-likewise a participant — do not remove it: the container refuses to dissolve it as a fresh merge's
-source (`SourceOwesThaw`) and HOLDS any absorb of it until the thaw pass discharges the obligation,
-and catalog recovery applies if it is torn down. The freeze gates cover the whole admin propose
-family (a frozen group refuses splits and refuses to be a merge target; a mid-absorb source refuses
-a fresh freeze), and `pre_vote`/`check_quorum` recommendations are unaffected by the freeze — a
-frozen group elects normally.
+**Do not remove a merge participant mid-choreography** — and this is now a TYPED GUARANTEE, not
+advice: `remove_group` (and every coordinator/driver door that threads it) REFUSES each unresolved
+participant, leaving the group fully intact, and each refusal self-clears once the merge resolves.
+The five legs are the CLOSED product of the choreography's participant states — `{holder} ∪
+{source: freeze-pending | frozen} ∪ {target: parked | claimed-pre-park} ∪ {named-as-source-by-a-park}`
+— so no in-flight role slips the gate:
+
+- a **frozen source** (`RemoveError::Frozen`, an active freeze — applied or append-observed): its
+  target parks against this exact freeze. Roll the merge back first (abort → thaw), then removal
+  admits.
+- a **parked target** (`RemoveError::MergeParked`, holding its apply drain on a committed
+  `CommitMerge`): removing the decider strands the frozen source. Let the merge resolve (absorb or
+  abort), then removal admits.
+- a **claimed target BEFORE it parks** (`RemoveError::Claimed`, the mirror of `SpokenFor`): another
+  hosted source names this group as its merge target — applied (`frozen_for`) or an append-pending
+  `PrepareMerge` DECODED from that source's own log — while this group has not yet proposed its
+  `CommitMerge`. Removing it would strand that source frozen for a target that no longer exists (its
+  absorb AND its abort both ride this group's log). Roll the naming merge back first (this group is
+  hosted pre-park, so `rollback_merge` on it thaws the source), then removal admits. This is the ONLY
+  leg that reads a peer group's log; every other leg is an in-memory read, and the decode is paid per
+  (rare) removal so appends stay kind-only.
+- a **group a park names as its source** (`RemoveError::SpokenFor`, the cross-endpoint leg): even
+  before this group's own replica has observed its freeze, a hosted target's park names it.
+- a group still **owing an aborted source its thaw** (`RemoveError::OwesThaw`, an undischarged
+  target-role `abandoned` obligation): its log is that obligation's only replay source. The
+  container also refuses to dissolve it as a fresh merge's source (`SourceOwesThaw`) and HOLDS any
+  absorb of it until the thaw pass discharges the obligation.
+
+The pending-`CommitMerge` windows need no leg of their own: the absorb barrier holds the source
+`Frozen` and the target `MergeParked` throughout.
+
+Recovery for a genuinely-DEAD participant is the embedder's catalog, exactly like any dead group:
+a frozen source or parked target is restored (or floored), and the ONE deliberate escape is an
+**OWED source** (a frozen source a hosted target already owes a thaw) — removing it ADMITS, because
+the container's removal purge binds every holder's obligation to the departing incarnation and the
+driver floors the id. The freeze gates cover the whole admin propose family (a frozen group refuses
+splits and refuses to be a merge target; a mid-absorb source refuses a fresh freeze), and
+`pre_vote`/`check_quorum` recommendations are unaffected by the freeze — a frozen group elects
+normally.
 
 ## The `multi` container (as built)
 

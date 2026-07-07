@@ -172,6 +172,45 @@ pub enum RemoveError {
   /// obligation (the thaw pass's `!floor_admits` arm), after which removal admits.
   #[error("the group still owes an aborted merge its thaw and cannot be torn down")]
   OwesThaw,
+  /// The group is a merge SOURCE whose freeze is ACTIVE — an applied `PrepareMerge` (`Frozen`), or
+  /// an appended-but-unapplied one (freeze-pending). Its claimed target parks its `CommitMerge`
+  /// against exactly this freeze, so tearing the source down strands that park with nothing left to
+  /// absorb or abort against. Roll the merge back first (abort → thaw): once the source thaws the
+  /// SAME removal admits. NOT produced for an OWED source (one a hosted target already owes a thaw):
+  /// that abort has already resolved the choreography, and the teardown purge plus the driver floor
+  /// discharge the obligation — the designed catalog escape, so a genuinely-dead frozen source is
+  /// still removable.
+  #[error("the group is a frozen merge source mid-choreography and cannot be torn down")]
+  Frozen,
+  /// The group is a merge TARGET parked on a committed `CommitMerge`, holding its apply drain at the
+  /// freeze boundary while the container resolves the absorb-or-abort. Removing the decider strands
+  /// the frozen source it names — no park is left to complete the absorb or relay the abort. Let the
+  /// merge resolve first (the per-crank service absorbs or aborts it), after which the SAME removal
+  /// admits.
+  #[error("the group is a target parked on a merge commit and cannot be torn down")]
+  MergeParked,
+  /// Another hosted group's parked `CommitMerge` names THIS group as its merge source — the
+  /// cross-endpoint leg, which fires even before this group's own replica has observed its freeze.
+  /// Removing it strands that park (its replicas are log-complete, so the install-supersede route
+  /// never fires). Resolve or roll back the naming merge first; recovery for a genuinely-dead
+  /// participant is the embedder's catalog, exactly like any dead group.
+  #[error("a parked merge names this group as its source and it cannot be torn down")]
+  SpokenFor,
+  /// Another hosted endpoint is a merge SOURCE that names THIS group as its TARGET — either
+  /// applied-frozen (its `frozen_for` claim is this group) or with an append-pending `PrepareMerge`
+  /// in its unapplied suffix whose decoded claim is this group — while this group has not yet parked
+  /// its own `CommitMerge`. The pre-park leg the other participant refusals miss: the source is not
+  /// yet `SpokenFor` by any park (this group never proposed one), and this group is neither `Frozen`
+  /// nor `MergeParked`. Removing it strands that source frozen for a target that no longer exists —
+  /// both the absorb (`CommitMerge`) and the abort (`RollbackMerge`) ride THIS group's log, so
+  /// tearing it down leaves the source with no log left to propose either against, and the source's
+  /// own removal then refuses `Frozen` (it owes no thaw). Roll the naming merge back first
+  /// (`rollback_merge` on this group names the source — this group is still hosted pre-park, so the
+  /// abort rides its log and thaws the source), after which this group's removal admits; or let the
+  /// merge complete. Recovery for a genuinely-dead target is the embedder's catalog, like any dead
+  /// group.
+  #[error("a merge source claims this group as its target and it cannot be torn down")]
+  Claimed,
 }
 
 /// Why [`MultiRaft::propose_split`](crate::MultiRaft::propose_split) — or a coordinator/driver

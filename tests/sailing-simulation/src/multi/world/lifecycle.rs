@@ -410,14 +410,25 @@ impl MultiWorld {
   /// Tear down node `node`'s replica of `gid`: container removal + store/bookkeeping teardown.
   /// The embedder acting on RemovedSelf / the catalog — the group itself lives on elsewhere.
   pub(crate) fn drop_group_replica(&mut self, gid: u64, node: u64) {
-    let host = self.hosts.get_mut(&node).expect("host exists");
     // The world plays the embedder, whose contract keeps a merge choreography's participants put
-    // until it resolves — the removal draws exclude any group with an undischarged thaw obligation
-    // (`merge_choreography_active`). So the container's `OwesThaw` teardown gate is never tripped
-    // here; asserting it makes that exclusion STRUCTURAL rather than a silent precondition.
-    host
-      .remove_group(&gid)
-      .expect("the world never tears down a group that still owes a thaw");
+    // until it resolves — the removal draws exclude EVERY unresolved participant
+    // (`merge_choreography_active`, a superset of the container's whole teardown gate). So no
+    // participant refusal is ever tripped here; asserting success makes that exclusion STRUCTURAL
+    // rather than a silent precondition. `stores` is the seam the `Claimed` leg reads a freeze-pending
+    // source's log through, threaded exactly as the merge pump threads it.
+    {
+      let host = self.hosts.get_mut(&node).expect("host exists");
+      let mut stores = super::merge::NodeStores {
+        node,
+        logs: &mut self.logs,
+        stables: &mut self.stables,
+        floored: &self.merge_floors,
+        removal_floors: &self.removal_floors,
+      };
+      host
+        .remove_group(&gid, &mut stores)
+        .expect("the world never tears down an unresolved merge participant");
+    }
     self.logs.remove(&(node, gid));
     self.stables.remove(&(node, gid));
     self.configs.remove(&(node, gid));

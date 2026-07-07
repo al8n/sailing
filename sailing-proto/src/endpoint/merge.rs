@@ -346,12 +346,32 @@ where
     self.merge.abandoned.remove(source);
   }
 
-  /// Whether a merge freeze is ACTIVE right now: a pending (append-observed) freeze or the
-  /// applied `Frozen` state. ONE predicate for both of the freeze's early gates — the lease
-  /// gates (serving and formation die at append observation) and the propose-family gates (an
-  /// entry accepted above the freeze would diverge or lose the absorbed union) — so no two
-  /// sites can ever disagree about a freeze.
-  pub(crate) fn merge_freeze_active(&self) -> bool {
+  /// The abandoned freeze generation this target owes `source` a thaw for, or `None` when it holds
+  /// no such obligation — the value of its `abandoned` entry keyed by exactly that source id (the
+  /// freeze INCARNATION the target-role abort abandoned). The container's teardown gate reads it
+  /// across hosted endpoints and compares it GENERATION-EXACTLY against the candidate source's live
+  /// `shape_gen`: removing an OWED source still frozen AT the abandoned generation is the designed
+  /// catalog escape (the removal purge clears every holder's obligation), so the freeze gate steps
+  /// aside for exactly it — never for a spent obligation the source has already thawed past and
+  /// re-frozen above (that record names a DEAD incarnation, not the live freeze being removed).
+  pub(crate) fn owes_thaw_for(&self, source: &Bytes) -> Option<u64> {
+    self
+      .merge
+      .abandoned
+      .get(source)
+      .map(|(generation, _)| *generation)
+  }
+
+  /// Whether a merge freeze is ACTIVE right now: an appended-but-unapplied `PrepareMerge`
+  /// (freeze-pending, observed at append) OR the applied [`Frozen`](Self::is_frozen) state. The
+  /// superset of [`is_frozen`](Self::is_frozen) that also covers the committed-but-unapplied
+  /// window, and the ONE predicate every freeze gate reads — the lease gates (serving and
+  /// formation die at append observation), the propose-family gates (an entry accepted above the
+  /// freeze would diverge or lose the absorbed union), and the container's teardown gate (a
+  /// merge-source removal is refused while its target's park still needs it) — so no two sites can
+  /// ever disagree about a freeze.
+  #[must_use]
+  pub fn merge_freeze_active(&self) -> bool {
     self.merge.freeze_pending.is_some() || self.merge.frozen
   }
 
@@ -433,6 +453,44 @@ where
       for e in chunk.iter() {
         if e.kind() == EntryKind::PrepareMerge {
           return Ok(Some(e.index()));
+        }
+      }
+      idx = chunk
+        .last()
+        .map(|e| e.index().next())
+        .ok_or(PoisonReason::LogRead)?;
+    }
+    Ok(None)
+  }
+
+  /// The TARGET claim of the lowest `PrepareMerge` in the UNAPPLIED suffix `(applied, last]`, decoded
+  /// — the [`scan_freeze_pending`](Self::scan_freeze_pending) walk carried one step further, from the
+  /// entry's index to its payload's `target_bytes`. The container's teardown gate runs it against a
+  /// freeze-pending SOURCE to learn which target that not-yet-applied freeze claims, closing the
+  /// pre-park window an applied [`frozen_for`](Self::frozen_for) read cannot see (the payload is
+  /// undecoded until the freeze applies). FAIL-STOP on any read fault, and on a payload that will not
+  /// decode (a committed-corrupt freeze, mirrored from the apply arm's own `MergeDecode`): the gate
+  /// reads a fault as a claim it cannot rule out and REFUSES, never risking a stranded source. Off
+  /// the hot path — appends stay kind-only, and this pays a decode only per (rare) removal.
+  pub(crate) fn scan_freeze_claim<L: LogStore>(
+    log: &L,
+    applied: Index,
+  ) -> Result<Option<Bytes>, PoisonReason> {
+    let last = log.last_index();
+    let mut idx = applied.next();
+    while idx <= last {
+      let read_end = last
+        .next()
+        .min(Index::new(idx.get().saturating_add(MAX_READ_BATCH_ENTRIES)));
+      let chunk = match log.entries(idx..read_end, 1 << 20) {
+        Ok(EntriesRead::Ready(c)) if !c.is_empty() => c,
+        _ => return Err(PoisonReason::LogRead),
+      };
+      for e in chunk.iter() {
+        if e.kind() == EntryKind::PrepareMerge {
+          let payload = crate::wire::decode_prepare_merge_payload(e.data_bytes())
+            .map_err(|_| PoisonReason::MergeDecode)?;
+          return Ok(Some(payload.target_bytes()));
         }
       }
       idx = chunk

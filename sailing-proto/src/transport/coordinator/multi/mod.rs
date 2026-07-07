@@ -328,13 +328,26 @@ where
   /// tombstone is gone; the embedder's placement catalog is the persistent record of what must
   /// not live here.
   ///
-  /// REFUSES [`RemoveError::OwesThaw`] (inherited from the container's teardown gate) when the
-  /// group still owes an aborted upstream merge its thaw — nothing is torn down and, crucially,
-  /// the id is NOT tombstoned, so a refused removal is a clean no-op the caller retries once the
-  /// per-crank thaw pass discharges the obligation. The gate runs FIRST, before any side-state is
-  /// cleared, so the refusal leaves the group and this coordinator's bookkeeping fully intact.
-  pub fn remove_group(&mut self, gid: &G) -> Result<Option<Endpoint<I, F>>, RemoveError> {
-    let removed = self.multi.remove_group(gid)?;
+  /// REFUSES every UNRESOLVED merge participant (inherited verbatim from the container's teardown
+  /// gate: [`OwesThaw`](RemoveError::OwesThaw), [`Frozen`](RemoveError::Frozen),
+  /// [`MergeParked`](RemoveError::MergeParked), [`SpokenFor`](RemoveError::SpokenFor),
+  /// [`Claimed`](RemoveError::Claimed)) — nothing is torn down and, crucially, the id is NOT
+  /// tombstoned, so a refused removal is a clean no-op the caller retries once the choreography
+  /// resolves. The gate runs FIRST, before any side-state is cleared, so the refusal leaves the
+  /// group and this coordinator's bookkeeping fully intact. `stores` is the per-group seam the
+  /// container reads a freeze-pending source's log through (the `Claimed` leg's append-pending
+  /// window); a refusal touches nothing through it.
+  pub fn remove_group<L, S, St>(
+    &mut self,
+    gid: &G,
+    stores: &mut St,
+  ) -> Result<Option<Endpoint<I, F>>, RemoveError>
+  where
+    St: GroupStores<G, L, S>,
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let removed = self.multi.remove_group(gid, stores)?;
     self.quiesce_intents.remove(gid);
     self.controls.retain(|(g, _)| g != gid);
     self.retired.insert(gid.cheap_clone());

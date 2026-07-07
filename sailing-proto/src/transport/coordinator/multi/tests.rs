@@ -31,6 +31,14 @@ impl FloorStore<u64> for Stores {
   }
 }
 
+/// An empty store seam for a coordinator teardown whose participant gate resolves on in-memory
+/// state alone (no freeze-pending source to scan for the `Claimed` leg).
+fn empty_stores() -> Stores {
+  Stores {
+    map: BTreeMap::new(),
+  }
+}
+
 fn single_voter(id: u64) -> Config<u64> {
   Config::try_new(
     id,
@@ -952,7 +960,12 @@ fn tombstoned_group_refuses_recreation_until_cleared() {
   while w.b.poll_group_control().is_some() {}
 
   assert!(!w.b.is_retired(&100), "a hosted group is not tombstoned");
-  assert!(w.b.remove_group(&100).unwrap().is_some());
+  assert!(
+    w.b
+      .remove_group(&100, &mut empty_stores())
+      .unwrap()
+      .is_some()
+  );
   assert!(w.b.is_retired(&100), "removal tombstones the id");
 
   // The unaware leader keeps beating group 100; b's tombstone absorbs every frame silently.
@@ -1115,7 +1128,7 @@ fn admission_checks_floor_first_then_consent_then_existence() {
     .unwrap_err();
   assert!(matches!(e, CreateGroupError::Exists));
   // cell 2 (the subtlest): tombstoned + HIGHER gen → Retired (consent gate holds at any gen)
-  assert!(c.remove_group(&100).unwrap().is_some());
+  assert!(c.remove_group(&100, &mut empty_stores()).unwrap().is_some());
   let e = c
     .create_group(
       100,
@@ -1400,7 +1413,12 @@ fn unknown_group_traffic_surfaces_once_until_polled() {
   );
 
   // A tombstoned id never signals — even for initial-shaped traffic.
-  assert!(w.b.remove_group(&100).unwrap().is_some());
+  assert!(
+    w.b
+      .remove_group(&100, &mut empty_stores())
+      .unwrap()
+      .is_some()
+  );
   let mut tag = Vec::new();
   sailing_encode_u64(100, &mut tag);
   let rv = Message::RequestVote(crate::RequestVote::new(
@@ -1564,7 +1582,7 @@ fn fork_refuses_a_tombstoned_id_until_cleared() {
     &NoFloors,
   )
   .unwrap();
-  assert!(c.remove_group(&100).unwrap().is_some());
+  assert!(c.remove_group(&100, &mut empty_stores()).unwrap().is_some());
 
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let e = c
@@ -2499,5 +2517,83 @@ fn merge_verbs_ride_the_coordinator() {
   assert!(
     coord.group(&2).is_some_and(|ep| !ep.has_abandoned()),
     "no abort applied — the target records no thaw obligation"
+  );
+}
+
+/// The container's participant teardown gate is INHERITED verbatim by the coordinator door, and a
+/// refusal writes NO side state: the id is left hosted, UN-tombstoned (`retired`), and freely
+/// retryable. A frozen source refuses `Frozen` through the delegator; its parked target
+/// `MergeParked`. Proves the door threads the new variants (not just `OwesThaw`) and that its
+/// tombstone insert stays UNREACHABLE behind the gate's `?`.
+#[test]
+fn coordinator_teardown_inherits_the_participant_gate_without_tombstoning() {
+  let mut coord = MultiStreamCoordinator::<u64, u64, CountSm, TestRecord>::new();
+  let mut stores = Stores {
+    map: BTreeMap::new(),
+  };
+  for gid in [1u64, 2] {
+    stores
+      .map
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    coord
+      .create_group(
+        gid,
+        single_voter(1),
+        Instant::ORIGIN,
+        1,
+        CountSm::default(),
+        0,
+        &NoFloors,
+      )
+      .unwrap();
+    let d = coord.group(&gid).unwrap().poll_timeout().unwrap();
+    {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_timeout(&gid, d, l, s).unwrap();
+    }
+    for _ in 0..2 {
+      let (l, s) = stores.stores(&gid).unwrap();
+      coord.handle_storage(&gid, d, l, s).unwrap();
+    }
+    assert!(coord.group(&gid).unwrap().role().is_leader());
+  }
+  let now = Instant::ORIGIN;
+  // Freeze 1 into 2 and park 2 THROUGH the coordinator.
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .prepare_merge(&1, now, l, s, &2, &NoFloors)
+      .unwrap()
+      .unwrap();
+    coord.handle_storage(&1, now, l, s).unwrap();
+  }
+  assert!(coord.group(&1).unwrap().is_frozen());
+  {
+    let (l, s) = stores.stores(&2).unwrap();
+    coord
+      .commit_merge(&2, now, l, s, &1, &NoFloors)
+      .unwrap()
+      .unwrap();
+    coord.handle_storage(&2, now, l, s).unwrap();
+  }
+  assert!(coord.group(&2).unwrap().pending_merge().is_some());
+
+  // THE DOOR inherits the container gate verbatim — the new variants surface through the delegator.
+  assert!(matches!(
+    coord.remove_group(&1, &mut stores),
+    Err(crate::RemoveError::Frozen)
+  ));
+  assert!(matches!(
+    coord.remove_group(&2, &mut stores),
+    Err(crate::RemoveError::MergeParked)
+  ));
+  // NO SIDE STATE: neither id was tombstoned, and both stay hosted for the retry.
+  assert!(
+    coord.group(&1).is_some() && !coord.is_retired(&1),
+    "the frozen source is left intact and un-tombstoned"
+  );
+  assert!(
+    coord.group(&2).is_some() && !coord.is_retired(&2),
+    "the parked target is left intact and un-tombstoned"
   );
 }

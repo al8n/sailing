@@ -98,7 +98,13 @@ impl MultiWorld {
     let host = self.hosts.get_mut(&leader).expect("leader host exists");
     let log = self.logs.get_mut(&(leader, source)).expect("leader log");
     let stable = self.stables.get(&(leader, source)).expect("leader stable");
-    host.prepare_merge(&source, self.now, log, stable, &target)
+    let verdict = host.prepare_merge(&source, self.now, log, stable, &target);
+    // Record the embedder's freeze intent on acceptance: this source now claims this target, so the
+    // choreography predicate keeps the target off the removal draws (the container's `Claimed` gate).
+    if matches!(verdict, Some(Ok(_))) {
+      self.active_freezes.insert(source, target);
+    }
+    verdict
   }
 
   /// Propose the merge ABSORB on the target's current leader; returns the container verdict
@@ -410,18 +416,26 @@ impl MultiWorld {
   /// ride. Mirrors the fork pump's coordinator-refusal modeling and the removal purge: layers
   /// above the pure container, played truthfully by the world.
   ///
-  /// The legs, cheapest truthful reads of the world's own surfaces: a hosting replica frozen
-  /// (a source from freeze-apply until absorbed or thawed) or parked (a target mid-resolution)
-  /// or still OWING an aborted source its thaw (a former target whose `abandoned` obligation the
-  /// container's thaw pass has not discharged — tearing it down drops the obligation and strands
-  /// the upstream source frozen); a merge admin entry still in a hosting replica's UNAPPLIED
-  /// durable-log suffix (the accepted-but-not-yet-folded window — read off the store's raw durable
-  /// view, so the predicate never touches the faultable read path and is schedule-inert for every
-  /// profile that never merges); or any live park anywhere NAMING `gid` as its source.
+  /// The legs, cheapest truthful reads of the world's own surfaces, kept a SUPERSET of the product
+  /// teardown gate so a drawn removal can never trip a refusal the `.expect` would panic on: a
+  /// hosting replica with an ACTIVE merge freeze (`merge_freeze_active` — a source from the freeze's
+  /// APPEND observation, the exact in-memory state the product's `Frozen` gate reads, until absorbed
+  /// or thawed) or parked (a target mid-resolution) or still OWING an aborted source its thaw (a
+  /// former target whose `abandoned` obligation the container's thaw pass has not discharged —
+  /// tearing it down drops the obligation and strands the upstream source frozen); a merge admin
+  /// entry still in a hosting replica's UNAPPLIED durable-log suffix (the accepted-but-not-yet-folded
+  /// window — read off the store's raw durable view, so the predicate never touches the faultable
+  /// read path and is schedule-inert for every profile that never merges); any live park anywhere
+  /// NAMING `gid` as its source; or any still-active freeze CLAIMING `gid` as its target (the
+  /// embedder's `active_freezes` record, filtered by whether the source's freeze is still live — the
+  /// pre-park mirror of the park-names-source scan, and a superset of the container's `Claimed` gate
+  /// across BOTH its windows, applied and append-pending). The world over-excludes an OWED source the
+  /// product would ADMIT (its designed catalog escape) — a superset is sound; the world simply never
+  /// draws that removal.
   pub fn merge_choreography_active(&self, gid: u64) -> bool {
     for node in &self.node_ids {
       if let Some(ep) = self.hosts[node].group(&gid) {
-        if ep.is_frozen() || ep.pending_merge().is_some() || ep.has_abandoned() {
+        if ep.merge_freeze_active() || ep.pending_merge().is_some() || ep.has_abandoned() {
           return true;
         }
         if let Some(log) = self.logs.get(&(*node, gid))
@@ -442,6 +456,25 @@ impl MultiWorld {
         {
           return true;
         }
+      }
+    }
+    // The CLAIMED-TARGET leg (the mirror of the park-names-source scan above): some other source
+    // names `gid` as its merge target and its freeze is still ACTIVE — the pre-park window the
+    // container's `Claimed` gate refuses. The embedder's own `active_freezes` record supplies the
+    // target of each freeze (a park has not formed yet, so nothing in the log points here); the
+    // `merge_freeze_active` filter drops a spent record whose source has since thawed or absorbed.
+    // Covers BOTH product legs — applied and append-pending — because `merge_freeze_active` is the
+    // superset of `frozen` and freeze-pending, so this stays a superset of the product gate.
+    for (&src, &tgt) in &self.active_freezes {
+      if tgt == gid
+        && src != gid
+        && self.node_ids.iter().any(|n| {
+          self.hosts[n]
+            .group(&src)
+            .is_some_and(|ep| ep.merge_freeze_active())
+        })
+      {
+        return true;
       }
     }
     false

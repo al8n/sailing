@@ -2211,10 +2211,23 @@ fn choreography_participants_read_active_until_resolution() {
     w.merge_choreography_active(10),
     "an accepted (still unapplied) freeze already speaks for the source"
   );
+  assert!(
+    w.merge_choreography_active(11),
+    "the freeze already CLAIMS target 11 (pre-park, append-pending) — the mirror leg keeps it \
+     undrawable, so a removal never trips the container's Claimed gate"
+  );
+  assert!(
+    !w.merge_choreography_active(12),
+    "the bystander 12 is claimed by no freeze"
+  );
   assert!(w.run_until(4_000, |w| w.group_frozen(10)));
   assert!(
     w.merge_choreography_active(10),
     "a frozen source stays spoken for"
+  );
+  assert!(
+    w.merge_choreography_active(11),
+    "the APPLIED freeze still claims 11 through to the commit — no gap in the mirror leg"
   );
   merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
     w.propose_commit_merge(11, 10)

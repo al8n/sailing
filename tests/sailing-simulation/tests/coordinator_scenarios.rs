@@ -255,7 +255,7 @@ fn tombstone_refusal_chain() {
   assert!(applied_contains(&w.b, 100, b"pin"), "follower applied");
 
   assert!(!w.b.is_retired(&100), "a hosted group is not tombstoned");
-  assert!(w.b.remove_group(&100).unwrap().is_some());
+  assert!(w.b.remove_group(&100, &mut w.sb).unwrap().is_some());
   assert!(w.b.is_retired(&100), "removal tombstones the id");
   let _ = w.drain_controls_b();
 
@@ -397,7 +397,7 @@ fn unknown_group_gate_is_initial_shaped() {
   w.propose_a(300, b"est");
   w.fire_a(300);
   assert!(applied_contains(&w.b, 300, b"est"), "established on b");
-  assert!(w.b.remove_group(&300).unwrap().is_some());
+  assert!(w.b.remove_group(&300, &mut w.sb).unwrap().is_some());
   assert!(w.b.clear_tombstone(&300), "clear leaves 300 truly unknown");
   let _ = w.drain_controls_b();
 
