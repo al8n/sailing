@@ -1259,16 +1259,26 @@ pub fn certify_retiring_history(checker: &mut Checker, view: &ClusterView) {
     }
   }
 
-  // 2. Raise `complete_up_to` across the gap-free prefix the DURABLE-COMMITTED log proves. The
-  //    per-tick recorder captured `committed_log_kind` at EVERY committed index before compaction
-  //    removed it, so it retains a boundary that only snapshot-built replicas reach — at retire
-  //    time their current durable logs have compacted past it, so a walk of the live logs (their
-  //    `durable_first` now above the boundary) would never connect to it and would leave the
-  //    committed-final install one past the applied frontier permanently unwitnessed. A gap-free
-  //    committed prefix proves commit reached its extent; the walk still STOPS just before the
-  //    first index whose folded config the frozen history never recorded (a genuine gap the
-  //    archive rightly keeps unwitnessed) — including a conf-change only snapshot-built replicas
-  //    hold, which emits no `ConfChanged` and so may never have entered the config history.
+  // 2. Raise the completeness frontier across the gap-free committed prefix, now that the retiring
+  //    replicas' freshly-recorded configs help certify it.
+  certify_committed_prefix(checker);
+}
+
+/// Raise [`complete_up_to`](Checker::complete_up_to) across the GAP-FREE prefix the DURABLE-COMMITTED log
+/// (`committed_log_kind`) proves committed, stopping just before the first index carrying an UNRECORDED
+/// conf-change — a genuine history gap the oracle rightly keeps unwitnessed (including a conf-change only
+/// snapshot-built replicas hold, which emits no `ConfChanged` and so may never have entered the config
+/// history). The per-tick recorder captured `committed_log_kind` at EVERY committed index before compaction
+/// removed it, so it retains a boundary only snapshot-built replicas reach — a walk of the live logs (their
+/// `durable_first` now above the boundary) would never connect to it and would leave the committed-final
+/// install one past the APPLIED frontier permanently unwitnessed. A gap-free committed prefix proves commit
+/// reached its extent, so the step-function reference is complete up to the first unrecorded conf-change.
+///
+/// SOUND for a LIVE checker too: the frontier rises ONLY across the gap-free committed prefix and STOPS at
+/// the first unrecorded conf-change, so a boundary beyond that extent stays unwitnessed and a genuine
+/// divergence at a witnessed index still trips — the frontier never blanket-widens. Monotone and idempotent
+/// (`complete_up_to` only rises). A pure observer: no PRNG, no node mutation.
+fn certify_committed_prefix(checker: &mut Checker) {
   let base = checker.complete_up_to;
   let mut extent = base;
   while checker.committed_log_kind.contains_key(&(extent + 1)) {
@@ -1347,6 +1357,13 @@ pub fn certify_retiring_history(checker: &mut Checker, view: &ClusterView) {
 /// soundness hole). Idempotent: recomputes from the current history each call. A pure observer — no PRNG, no
 /// node mutation.
 pub fn finalize_membership(checker: &mut Checker) -> Result<(), Violation> {
+  // Extend the completeness frontier across the gap-free durable-committed prefix BEFORE judging, so a LIVE
+  // all-snapshot group — a merge target whose log-built witnesses have all departed, freezing `complete_up_to`
+  // below its committed extent — still witnesses an install whose boundary is committed-final. This is the
+  // same walk retirement runs, here for a group that never retires (so the retirement walk never fires). Sound:
+  // the frontier rises only across the gap-free prefix, so a boundary beyond it, or a divergence at a shared
+  // index, still fails.
+  certify_committed_prefix(checker);
   // Snapshot the observed installs so the loop can write the checker's counters without holding a borrow of
   // `observed_installs`. Sorted by (node, boundary) ⇒ a deterministic first-violation choice.
   let observed: Vec<((u64, u64), ConfSnapshot)> = checker

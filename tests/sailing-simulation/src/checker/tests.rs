@@ -1606,3 +1606,81 @@ fn certify_retiring_history_leaves_a_genuine_gap_unwitnessed() {
     "an install beyond the durable committed extent stays unwitnessed — no false witness"
   );
 }
+
+/// A LIVE all-snapshot-derived group (the merge-target shape, group 110): its log-built witnesses
+/// all departed before applying far, freezing `complete_up_to` below the durable-committed extent,
+/// so an install whose boundary is committed-final but past the applied frontier was silently
+/// skipped and the run-end accounting tripped though the config CONVERGED. `finalize_membership`
+/// now runs the gap-free committed-prefix walk itself (retirement is not the only caller), raising
+/// the frontier across the committed extent so the install is WITNESSED against the config there.
+#[test]
+fn finalize_witnesses_a_live_all_snapshot_install_within_the_committed_extent() {
+  let mut ck = Checker::new();
+  // An early log-built voter set genesis {0,1,2} and the committed-config prefix, but its APPLIED
+  // frontier froze at 5 (it departed / became snapshot-derived before applying further). Its durable
+  // COMMITTED log still reached 15, so the per-tick recorder persisted committed_log_kind gap-free
+  // 1..=15 (all Normal). `complete_up_to` stays 5.
+  let mut early = healthy_node(0, 15, 15);
+  early.applied = 5;
+  early.conf_voters = [0, 1, 2].into_iter().collect();
+  record_membership_observation(&mut ck, &cv(6, 1, std::vec![early]));
+
+  // The install: a snapshot lands at boundary 10 embedding the genesis {0,1,2} — beyond the applied
+  // watermark (5) but WITHIN the gap-free committed extent (15).
+  let install_view = with_install(cv(6, 2, std::vec![]), 1, 10, conf(&[0, 1, 2], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "the live-finalize walk certifies the committed prefix through the boundary — witnessed, not skipped"
+  );
+  assert!(
+    ck.membership_comparisons() >= 1,
+    "the install is JUDGED against the genesis {{0,1,2}}, not merely un-counted"
+  );
+}
+
+/// Zero-tolerance stays for a live group too: the live walk certifies ONLY the gap-free committed
+/// prefix. An install one index PAST the durable-committed extent has no proof, so it remains
+/// unwitnessed — the frontier stops at the extent, never blanket-widens.
+#[test]
+fn finalize_leaves_a_live_boundary_past_the_committed_extent_unwitnessed() {
+  let mut ck = Checker::new();
+  let mut early = healthy_node(0, 15, 15);
+  early.applied = 5;
+  early.conf_voters = [0, 1, 2].into_iter().collect();
+  record_membership_observation(&mut ck, &cv(6, 1, std::vec![early]));
+
+  // Boundary 16 — one past the gap-free committed extent (15). The walk proves no more than 15.
+  let install_view = with_install(cv(6, 2, std::vec![]), 1, 16, conf(&[0, 1, 2], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    1,
+    "a boundary one past the durable committed extent stays unwitnessed — the frontier stops at the extent"
+  );
+}
+
+/// The widened frontier must not paper over a real corruption: an install WITHIN the newly-certified
+/// committed extent whose ConfState DIVERGES from the config in effect there still trips the verdict.
+#[test]
+fn finalize_still_trips_a_divergent_live_install_within_the_committed_extent() {
+  let mut ck = Checker::new();
+  let mut early = healthy_node(0, 15, 15);
+  early.applied = 5;
+  early.conf_voters = [0, 1, 2].into_iter().collect();
+  record_membership_observation(&mut ck, &cv(6, 1, std::vec![early]));
+
+  // The install at boundary 10 (witnessed by the widened frontier) carries a phantom voter 3 the
+  // committed genesis {0,1,2} never had — a genuine divergence the walk must still catch.
+  let install_view = with_install(cv(6, 2, std::vec![]), 1, 10, conf(&[0, 1, 2, 3], &[]));
+  record_membership_observation(&mut ck, &install_view);
+
+  let v = finalize_membership(&mut ck).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(v.detail.contains("phantom voters {3}"), "{}", v.detail);
+}
