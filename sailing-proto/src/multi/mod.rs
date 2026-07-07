@@ -266,57 +266,6 @@ pub struct GroupFork<G, I, F> {
   pub split_index: Index,
 }
 
-/// One committed, container-relayed merge ABORT: a target-side abort entry applied on `target`,
-/// and the frozen `source` it names must now be THAWED on its own log — the driver proposes the
-/// source-side `RollbackMerge` there ([`MultiRaft::propose_merge_unfreeze`]), so the thaw stays
-/// log-borne for restart re-derivation. Yielded by
-/// [`MultiRaft::poll_pending_merge_abort`] once per abort apply per host; the relay is
-/// best-effort BY DESIGN (only the host whose local source replica leads can propose — every
-/// other host's attempt dies typed at the source's own gates), and a relay lost to lifecycle
-/// churn is recovered by re-proposing the target-side abort (a fresh entry, a fresh relay).
-pub struct MergeAbortRelay<G> {
-  /// The target group whose log carried the abort entry.
-  pub target: G,
-  /// The frozen source group to thaw, decoded from the abort's payload.
-  pub source: G,
-  /// The freeze generation the abort abandoned (observability; the thaw's own mint re-reads
-  /// the live frozen state at propose).
-  pub source_gen_after: u64,
-  /// The abort entry's index on `target` — the target's compaction fence boundary
-  /// ([`Endpoint::maybe_snapshot`] holds the target's captures past it while this relay is
-  /// outstanding). Threaded back through a requeue ([`MultiRaft::resolve_merge_abort`]) so the
-  /// fence survives the drain until a terminal outcome retires the relay.
-  pub abort_index: Index,
-}
-
-/// Whether a relayed source-unfreeze outcome ([`MultiRaft::propose_merge_unfreeze`]) must be
-/// RETAINED — requeued and retried on a later crank — rather than dropped. Retirement is
-/// DELIVERY-BASED, not append-based: an accepted `Ok` means the thaw was only APPENDED (or one is
-/// already in flight), which a leadership loss can still truncate before it commits, so it RETAINS
-/// — the relay is dropped only once the source lineage is OBSERVED past the freeze (a terminal
-/// `StaleThaw`). Also retained: `None` (unhosted source or missing store this crank); `NotLeader`
-/// and the transfer/merge-in-flight append refusals that settle on their own; `SourceBehindFreeze`
-/// while the source is still catching up to the abandoned freeze. Terminal — dropping the relay —
-/// are exactly the DELIVERY-or-dedupe verdicts: the source already thawed / re-froze past this
-/// incarnation (`StaleThaw`), a foreign claim (`SourceClaimed`), a never-frozen source (`NotFrozen`),
-/// or a determinate append refusal (poisoned, index exhausted, entry too large).
-fn merge_unfreeze_retry<I>(result: &Option<Result<Index, MergeError<I>>>) -> bool {
-  match result {
-    None => true,
-    // The thaw was APPENDED (or already in flight), not delivered — retain until the source lineage
-    // is observed past the freeze, so a truncated thaw is always re-attempted by a new source leader.
-    Some(Ok(_)) => true,
-    Some(Err(e)) => matches!(
-      e,
-      MergeError::NotLeader { .. }
-        | MergeError::Propose(ProposeError::NotLeader { .. })
-        | MergeError::Propose(ProposeError::LeaderTransferInProgress)
-        | MergeError::Propose(ProposeError::MergeInFlight)
-        | MergeError::SourceBehindFreeze { .. }
-    ),
-  }
-}
-
 /// One resolved parked merge from a [`MultiRaft::service_merge_applies`] crank — what the
 /// DRIVER folds into its storage engine and lifecycle teardown. The container already did the
 /// consensus-side work (the absorb or the deterministic abort, the events, the source
@@ -408,9 +357,6 @@ where
   /// Groups that may have a staged pending fork to relay (see
   /// [`poll_pending_fork`](Self::poll_pending_fork)).
   dirty_forks: VecDeque<G>,
-  /// TARGETS that may have a staged source-unfreeze relay to drain (see
-  /// [`poll_pending_merge_abort`](Self::poll_pending_merge_abort)).
-  dirty_aborts: VecDeque<G>,
   /// Parents whose HEAD fork is PARKED on a hosted-child conflict (see
   /// [`poll_pending_fork`](Self::poll_pending_fork)): the fork stays staged (blob retained, the
   /// snapshot fence armed, the relay guard unmoved) and is re-examined at the top of every relay
@@ -457,7 +403,6 @@ where
       dirty_msgs: VecDeque::new(),
       dirty_events: VecDeque::new(),
       dirty_forks: VecDeque::new(),
-      dirty_aborts: VecDeque::new(),
       parked: BTreeSet::new(),
       conflicts: VecDeque::new(),
       lineage: BTreeMap::new(),
@@ -498,6 +443,13 @@ where
     self.groups.get(gid)
   }
 
+  /// A mutable reference to one group's [`Endpoint`] — test-only, for reconstructing durable-derived
+  /// endpoint state (e.g. a replay-re-derived merge obligation) a unit test cannot otherwise reach.
+  #[cfg(test)]
+  pub(crate) fn group_mut(&mut self, gid: &G) -> Option<&mut Endpoint<I, F, R>> {
+    self.groups.get_mut(gid)
+  }
+
   /// The hosted group ids, ascending.
   pub fn group_ids(&self) -> impl Iterator<Item = &G> {
     self.groups.keys()
@@ -509,13 +461,68 @@ where
   /// silently). The host identity is NOT cleared — even removing the last group leaves it
   /// latched, so a re-created group must carry the same node id (live transport connections stay
   /// authenticated under it).
+  ///
+  /// This is also the SINGLE choke point where a merge SOURCE leaves the container, so it PURGES
+  /// the removed id's outstanding thaw obligation from every target — see the inline note.
   pub fn remove_group(&mut self, gid: &G) -> Option<Endpoint<I, F, R>> {
     // A parked PARENT's staged forks die with its endpoint (removal is the embedder's explicit
     // destruction of this replica), so the park bookkeeping — a still-queued conflict signal
     // included — dies too. Removing a parked fork's CHILD needs nothing here: the next relay
     // drain re-examines the park and materializes.
     self.unpark(gid);
-    self.groups.remove(gid)
+    let removed = self.groups.remove(gid);
+    // PURGE-ON-REMOVAL: a source leaving the container takes every target's outstanding thaw
+    // obligation for it along with it. An obligation's `expected` gen is the source's LOCAL
+    // `shape_gen`, which a P5 remove/recreate RESETS — so an obligation left behind could be
+    // reused by a fresh incarnation that re-froze the same pair at the same repeated gen, backing
+    // a thaw the target never aborted for THIS incarnation (the #22 cross-log race, reopened across
+    // incarnations). Clearing it here binds the obligation to the incarnation by construction: no
+    // removed source's authorization outlives it, race-free (synchronous with the removal) and
+    // independent of whatever floor the embedder does or does not set. The merge Resolve arm removes
+    // a source too, but a dissolving source holds no live FOREIGN obligation (it thawed past any
+    // earlier abort before becoming free to merge), so the purge is a no-op there.
+    if removed.is_some() && self.groups.values().any(Endpoint::has_abandoned) {
+      let mut source_key = Vec::new();
+      gid.encode(&mut source_key);
+      let source_key = Bytes::from(source_key);
+      for ep in self.groups.values_mut() {
+        ep.clear_abandoned(&source_key);
+      }
+    }
+    removed
+  }
+
+  /// The durable admission floor a REMOVAL of `source` must persist so an outstanding merge-abort
+  /// thaw obligation cannot outlive the incarnation: `Some(expected + 1)`, strictly above the
+  /// highest freeze generation any hosted target still owes `source` a thaw for, or `None` when no
+  /// target owes one. The caller (a driver's [`remove_group`](Self::remove_group) wiring) writes it
+  /// through its [`FloorStore`] BEFORE the removal purges the obligation.
+  ///
+  /// This is the DURABLE backstop to the in-memory purge on removal. The purge binds the obligation
+  /// to the incarnation synchronously, but the obligation is RE-DERIVED from the target's still-durable
+  /// committed abort entry on a restart that has not yet compacted past it — so a crash between the
+  /// removal and that compaction resurrects it. The reshape floor (`generation + 1`) does NOT cover
+  /// this: a merge freeze bumps the source endpoint's shape generation, never the driver's engine
+  /// lineage, so a source frozen-then-aborted at engine-lineage 0 is removed with no reshape floor at
+  /// all. Persisting `expected + 1` makes the re-derived obligation discharge off the floor
+  /// (`!floor_admits(floor, expected)`) AND forces a recreate to admit strictly above `expected`
+  /// (`validate_floor`), closing crash-replay resurrection and recreate reuse by construction.
+  ///
+  /// An embedder driving [`MultiRaft`] directly owes the same discipline against its own real
+  /// `FloorStore`; a [`NoFloors`] world keeps only the volatile purge (no durable fence), so a
+  /// crash-replay-then-recreate there can still reuse the incarnation — the documented cost of
+  /// opting out of floors.
+  #[must_use]
+  pub fn abort_thaw_floor(&self, source: &G) -> Option<u64> {
+    let mut source_key = Vec::new();
+    source.encode(&mut source_key);
+    let source_key = Bytes::from(source_key);
+    self
+      .groups
+      .values()
+      .filter_map(|ep| ep.abandoned_gen(&source_key))
+      .max()
+      .map(|expected| expected.saturating_add(1))
   }
 
   /// End `gid`'s park episode: leave the parked set and purge any still-queued conflict
@@ -569,9 +576,6 @@ where
     }
     if self.dirty_forks.back() != Some(gid) {
       self.dirty_forks.push_back(gid.cheap_clone());
-    }
-    if self.dirty_aborts.back() != Some(gid) {
-      self.dirty_aborts.push_back(gid.cheap_clone());
     }
   }
 
@@ -880,87 +884,6 @@ where
   pub fn lift_fork_barrier(&mut self, parent: &G, split_index: Index) {
     if let Some(ep) = self.groups.get_mut(parent) {
       ep.resolve_fork(split_index);
-    }
-  }
-
-  /// The next committed, relay-ready merge ABORT from any target (see [`MergeAbortRelay`]):
-  /// drained by the driver every crank, which then proposes the SOURCE-side thaw via
-  /// [`propose_merge_unfreeze`](Self::propose_merge_unfreeze) over the source's own stores.
-  /// Restart replay re-stages these (an already-thawed source refuses the duplicate typed); a
-  /// committed source id that does not decode as `G` poisons the target — the committed-corrupt
-  /// class every relay decode shares.
-  pub fn poll_pending_merge_abort(&mut self) -> Option<MergeAbortRelay<G>> {
-    while let Some(gid) = self.dirty_aborts.front().map(CheapClone::cheap_clone) {
-      let Some(ep) = self.groups.get_mut(&gid) else {
-        self.dirty_aborts.pop_front();
-        continue;
-      };
-      let Some(relay) = ep.pop_pending_abort() else {
-        self.dirty_aborts.pop_front();
-        continue;
-      };
-      match G::decode_exact(relay.source_bytes.clone()) {
-        Ok(source) => {
-          return Some(MergeAbortRelay {
-            target: gid,
-            source,
-            source_gen_after: relay.source_gen_after,
-            abort_index: relay.abort_index,
-          });
-        }
-        Err(_) => {
-          ep.poison(PoisonReason::MergeDecode);
-          while ep.pop_pending_abort().is_some() {}
-        }
-      }
-    }
-    None
-  }
-
-  /// Fold the driver's [`propose_merge_unfreeze`](Self::propose_merge_unfreeze) outcome for a relay
-  /// drained by [`poll_pending_merge_abort`](Self::poll_pending_merge_abort). Retirement is
-  /// DELIVERY-BASED: a relay is dropped only by a TERMINAL outcome that PROVES the thaw is delivered
-  /// or will never be needed — the source observed past the frozen incarnation (`StaleThaw`), a
-  /// foreign claim (`SourceClaimed`), a never-frozen source (`NotFrozen`), or a poisoned/determinate
-  /// append refusal. Everything else REQUEUES: an accepted `Ok` (the thaw was only APPENDED — a
-  /// leadership loss can still truncate it before it commits, so a new source leader must be free to
-  /// re-append), no source leader yet (`NotLeader`), the source unreachable this crank (`None`), or a
-  /// source still catching up (`SourceBehindFreeze`). Without the delivery-based hold a thaw
-  /// appended-then-truncated would leave the committed abort with no path to thaw and wedge the
-  /// source frozen forever. Requeues re-stage onto the target for a LATER crank; call this AFTER
-  /// draining the relay queue so a requeue never re-drives within the same drain.
-  ///
-  /// This is also what LIFTS the target's compaction fence: `maybe_snapshot` holds the target's
-  /// captures past the abort entry while the relay is outstanding (so the entry stays replayable),
-  /// and a TERMINAL outcome here — the only path that does NOT requeue — empties `pending_aborts`,
-  /// releasing the fence. By then the source is thawed (the terminal `StaleThaw` proves it), so the
-  /// relay the compaction erases is no longer needed.
-  pub fn resolve_merge_abort(
-    &mut self,
-    relay: MergeAbortRelay<G>,
-    result: Option<Result<Index, MergeError<I>>>,
-  ) {
-    if merge_unfreeze_retry(&result) {
-      self.requeue_merge_abort(relay);
-    }
-  }
-
-  /// Re-stage a transient relay onto its target endpoint for a later crank (source id re-encoded
-  /// onto the queue, the target re-marked dirty). A no-op if the target endpoint is gone — its
-  /// abort cannot re-fire either, the group-is-dead liveness class the module doc describes.
-  fn requeue_merge_abort(&mut self, relay: MergeAbortRelay<G>) {
-    let mut source_bytes = Vec::new();
-    relay.source.encode(&mut source_bytes);
-    let Some(ep) = self.groups.get_mut(&relay.target) else {
-      return;
-    };
-    ep.stage_abort_relay(
-      Bytes::from(source_bytes),
-      relay.source_gen_after,
-      relay.abort_index,
-    );
-    if self.dirty_aborts.back() != Some(&relay.target) {
-      self.dirty_aborts.push_back(relay.target);
     }
   }
 
@@ -1696,6 +1619,10 @@ where
     if tep.merge_freeze_active() {
       return Some(Err(MergeError::AlreadyFrozen));
     }
+    // A target owing outstanding thaws to already-aborted sources is NOT refused here: `abandoned`
+    // is a per-source collection, so a fresh freeze toward this target adds an independent obligation
+    // (fan-in) that its own later abort records under its own key — nothing is dropped. The absorb
+    // itself is still serialized by `AlreadyPending` (one `CommitMerge` in flight/parked at a time).
     let target_conf = tep.conf_state();
     let target_mode = tep.active_read_mode();
     let target_conf_in_flight = tep.conf_change_in_flight();
@@ -1894,11 +1821,12 @@ where
   /// landing below the commit it kills it at the commit's own lineage guard (parks never form);
   /// landing at the coordinate right after a parked commit it un-parks every replica aborted;
   /// landing later it no-ops (the merge already resolved — the abort's mint is stale by then).
-  /// The applied abort then RELAYS the source's thaw
-  /// ([`poll_pending_merge_abort`](Self::poll_pending_merge_abort)): the driver proposes the
-  /// source-side `RollbackMerge` on the source's own log, and a relay lost to churn is
-  /// recovered by simply re-proposing this abort. The release valve — there is deliberately no
-  /// timeout-based auto-unfreeze. `None` if no group `target` is hosted.
+  /// The applied abort records a durable `abandoned` obligation, and the per-crank container
+  /// service ([`service_merge_applies`](Self::service_merge_applies)) DERIVES the source-side
+  /// `RollbackMerge` from it on the source's own log — never an independent source decision, and a
+  /// drive lost to churn is re-derived from the still-committed obligation (crash-durable via the
+  /// abort entry's replay). The release valve — there is deliberately no timeout-based
+  /// auto-unfreeze. `None` if no group `target` is hosted.
   ///
   /// The gates are best-effort truthfulness (the apply-time lineage guard is the decider): the
   /// TARGET leader proposes; the LOCAL source must exist and be frozen or freezing (the mint
@@ -1976,14 +1904,15 @@ where
     Some(result)
   }
 
-  /// Propose the SOURCE-side thaw on `source` — the relay leg of a committed target-side abort
-  /// (see [`poll_pending_merge_abort`](Self::poll_pending_merge_abort)): invoked by the
-  /// DRIVER's relay drain with the relay's own target as `claimed_by` and its recorded freeze
-  /// generation as `expected_gen`, and by NOTHING else — the embedder's verb is
-  /// [`rollback_merge`](Self::rollback_merge). A direct thaw that bypasses the abort would move
-  /// the source's counter under the claimed target's parked commit, wedging it (debug builds
-  /// assert; release builds hold the park rather than diverge). The ONE entry proposable on a
-  /// frozen group. Retirement is DELIVERY-BASED, not append-based: the accept arm APPENDS the thaw
+  /// Propose the SOURCE-side thaw on `source` — the relay leg of a committed target-side abort,
+  /// an INTERNAL helper driven ONLY by [`service_merge_applies`](Self::service_merge_applies) from
+  /// a target's durable `abandoned` obligation. It is deliberately NOT public and has no coordinator
+  /// delegator: the thaw is fully service-driven, so there is no external path that could move a
+  /// frozen source's counter out from under a target that never abandoned it (the #22 cross-log
+  /// race). Belt-and-suspenders, the invariant is also baked in below: the append is REFUSED unless
+  /// the `claimed_by` target hosts a matching `abandoned` obligation for `(source, expected_gen)`,
+  /// so `unfreeze(source) ⟹ ∃ committed target-abort(source, expected_gen)` holds structurally.
+  /// Retirement is DELIVERY-BASED, not append-based: the accept arm APPENDS the thaw
   /// but returns a non-terminal `Ok`, and the relay is retired only once the source lineage is
   /// OBSERVED past the freeze (`StaleThaw`, `seen > expected`) — a thaw appended then truncated by a
   /// leadership loss leaves `seen == expected`, so the relay is RETAINED and a new source leader
@@ -2009,12 +1938,12 @@ where
   /// dropped). The `frozen_for == claimed_by` claim identifies the source→target PAIR; `expected_gen`
   /// identifies the INCARNATION within it.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
-  pub fn propose_merge_unfreeze<L, S>(
+  fn propose_merge_unfreeze<L, S>(
     &mut self,
     source: &G,
     now: impl Into<Now>,
     log: &mut L,
-    // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
+    // Vestigial, as on the whole propose family: kept so the service threads `&stable`.
     _stable: &S,
     claimed_by: &G,
     expected_gen: u64,
@@ -2111,6 +2040,25 @@ where
       // abort must not thaw it; the claimed target's parked commit gates on this counter staying
       // put.
       return Some(Err(MergeError::SourceClaimed));
+    }
+    // THE DERIVED-FROM-ABORT GATE (structural safety): a source thaw is legal ONLY as the downstream
+    // consequence of a committed target-side abort. REQUIRE the claimed target to host a matching
+    // `abandoned` obligation for exactly `(source, expected_gen)` before appending; absent it, refuse
+    // with NO append — so a frozen source's counter can never move out from under a target that never
+    // abandoned it (the #22 cross-log race). The source-side claim above proves the freeze names this
+    // target; this proves the target OWES this freeze's thaw — the two legs together make the
+    // invariant `unfreeze(source) ⟹ ∃ committed target-abort(source, expected_gen)` intrinsic.
+    // Structurally satisfied whenever the container service issues the drive (it derives the call FROM
+    // this obligation), so this never fires in production; the belt to the private-only helper.
+    let mut source_key = Vec::new();
+    source.encode(&mut source_key);
+    let source_key = Bytes::from(source_key);
+    if self
+      .groups
+      .get(claimed_by)
+      .is_none_or(|t| !t.abandoned_matches(&source_key, expected_gen))
+    {
+      return Some(Err(MergeError::UnbackedThaw));
     }
     // ACCEPT: frozen at exactly `expected`, claimed by this relay's target, and this host leads. The
     // append is a BEST-EFFORT ATTEMPT, NOT the retirement — this returns a non-terminal `Ok` and the
@@ -2393,6 +2341,77 @@ where
               target: tgid,
             });
           }
+        }
+      }
+    }
+    // THE MERGE-ABORT THAW PASS: drive every hosted target's durable `abandoned` obligations to
+    // thaw their named sources — the durable-derived mirror of the commit side above (both re-derive
+    // resolution from committed endpoint state each crank, no volatile relay). The source rollback
+    // is a DOWNSTREAM CONSEQUENCE of the target's committed abort, NEVER a source-local decision:
+    // a frozen source with a live leader but NO committed target-abort naming it is never reached
+    // here (nothing sets its target's obligation), so it stays frozen and waits. Each obligation is
+    // driven and discharged INDEPENDENTLY (per source key), so a target that aborted a fan-in of
+    // sources thaws every one of them — none is dropped.
+    let abandoned_targets: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.has_abandoned())
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for tgid in abandoned_targets {
+      // Snapshot the target's obligations before mutating the container: the drive below re-borrows
+      // `self` mutably, and a per-source discharge removes only its own key, so the snapshot stays a
+      // faithful worklist for this crank.
+      let obligations = match self.groups.get(&tgid) {
+        Some(tep) => tep.abandoned_obligations(),
+        None => continue,
+      };
+      for (source_bytes, expected, _abort_index) in obligations {
+        let source_key = source_bytes.clone();
+        let Ok(source) = G::decode_exact(source_bytes) else {
+          // A committed source id that does not decode as G is committed-corrupt — the park
+          // decode's fail-stop class. The target is poisoned; stop draining its obligations.
+          if let Some(tep) = self.groups.get_mut(&tgid) {
+            tep.poison(PoisonReason::MergeDecode);
+          }
+          break;
+        };
+        // DISCHARGE by OBSERVING the source's lineage, never by classifying the thaw's append
+        // outcome: the abandoned freeze is gen `expected` and the thaw mints `expected + 1`, so a
+        // source whose lineage advanced PAST `expected` has committed+applied its unfreeze (or
+        // re-froze past it) — the obligation is delivered. HOSTED reads the live counter. UNHOSTED
+        // consults the PERSISTED lineage/floor `stores` exposes, the durable record that OUTLIVES the
+        // source's teardown: a lineage past `expected`, OR a floor that no longer admits `expected`
+        // (a non-terminal teardown of a reshaped source floors it ABOVE its own gen, and the terminal
+        // `MERGED_FLOOR` fences every gen) each prove the frozen-at-`expected` incarnation is gone —
+        // a recreate lands at a strictly higher incarnation this obligation never named. Binding the
+        // unhosted discharge to the persisted record — not only the volatile local counter — is what
+        // keeps a re-derived obligation (replayed from the abort entry after a restart) from fencing
+        // that abort entry FOREVER once its source was torn down and floored rather than terminally
+        // merged. Clearing lifts the target's compaction fence over THIS abort entry, so the fence
+        // releases only once the source is proven past `expected` — the discharge-gated durability
+        // of the abort, crash-durable via the abort entry's replay.
+        let discharged = match self.groups.get(&source) {
+          Some(sep) => sep.shape_gen() > expected,
+          None => {
+            stores.lineage(&source) > expected
+              || !crate::floor_admits(stores.floor(&source), expected)
+          }
+        };
+        if discharged {
+          if let Some(tep) = self.groups.get_mut(&tgid) {
+            tep.clear_abandoned(&source_key);
+          }
+          continue;
+        }
+        // Not discharged: DRIVE the source-side thaw, best-effort and idempotent per crank. Only the
+        // source LEADER appends (others answer a transient refusal and later retire by OBSERVING the
+        // committed thaw); the incarnation gate binds the mint to `expected`, so a stale re-derivation
+        // cannot thaw a re-frozen pair, and the derived-from-abort gate re-verifies THIS obligation
+        // still backs it. The return is DISCARDED — discharge is decided by the direct observation
+        // above on a later crank, not by this append's outcome.
+        if let Some((slog, sstable)) = stores.stores(&source) {
+          let _ = self.propose_merge_unfreeze(&source, now, slog, sstable, &tgid, expected);
         }
       }
     }

@@ -2725,20 +2725,15 @@ where
               // from the same base no-ops at its own lineage guard, everywhere identically.
               // The bump is that guard's kill; it rides the snapshot meta like every lineage
               // move, so compaction cannot resurrect the aborted attempt. The source's thaw is
-              // a RELAYED consequence: staged here, drained by the container, proposed by the
-              // driver on the source's own log (log-borne there for restart re-derivation).
-              // A park cannot be pending here — a parked commit stops this drain below us, so
-              // an abort entry only ever applies once the park resolved.
+              // a DERIVED consequence: this records the abandoned merge durably (re-set by this
+              // very entry's replay, exactly like `frozen_for`), and the container's per-crank
+              // service drives the source-side `RollbackMerge` on the source's own log from it —
+              // never an independent source decision. A park cannot be pending here — a parked
+              // commit stops this drain below us, so an abort entry only ever applies once the
+              // park resolved.
               debug_assert!(self.merge.pending_apply.is_none());
               self.split.shape_gen = self.split.shape_gen.max(payload.target_gen_after());
-              self.merge.pending_aborts.push_back(merge::AbortRelay {
-                source_bytes: payload.source_bytes(),
-                source_gen_after: payload.source_gen_after(),
-                // The abort entry's own index — the target-compaction fence boundary: this relay
-                // re-derives ONLY by replaying this entry, so `maybe_snapshot` must not compact
-                // past it until the relay retires.
-                abort_index: idx,
-              });
+              self.note_abandoned(payload.source_bytes(), payload.source_gen_after(), idx);
               self
                 .outputs
                 .events

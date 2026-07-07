@@ -173,34 +173,11 @@ impl MultiWorld {
         }
       }
     }
-    // The abort-relay drain, the driver's crank leg verbatim: a target-side abort applied on
-    // this host must thaw its named source ON THE SOURCE'S OWN LOG. Best-effort per host —
-    // only the source-leader host's proposal lands; the rest die typed at the source's gates.
-    for node in self.node_ids.clone() {
-      let now = self.now;
-      let host = self.hosts.get_mut(&node).expect("host exists");
-      while let Some(relay) = host.poll_pending_merge_abort() {
-        let (Some(log), Some(stable)) = (
-          self.logs.get_mut(&(node, relay.source)),
-          self.stables.get(&(node, relay.source)),
-        ) else {
-          continue;
-        };
-        if host
-          .propose_merge_unfreeze(
-            &relay.source,
-            now,
-            log,
-            stable,
-            &relay.target,
-            relay.source_gen_after,
-          )
-          .is_some()
-        {
-          progressed = true;
-        }
-      }
-    }
+    // The source thaw now rides `service_merge_applies` above (the per-crank container service
+    // derives it from each target's durable `abandoned` record and appends the source-side
+    // RollbackMerge on the source's own log) — no separate relay drain. The append rides the next
+    // tick's `flush_appends` and settles like any other, and the durable obligation re-drives it
+    // each crank until the source is observed thawed past the abandoned freeze.
     self.sweep_merge_teardowns();
     progressed
   }

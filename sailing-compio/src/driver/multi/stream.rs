@@ -705,34 +705,6 @@ where
         }
       }
     }
-    // The abort-relay drain: a target-side abort applied this crank must thaw its named source ON
-    // THE SOURCE'S OWN LOG (log-borne for restart re-derivation). Drain the whole queue FIRST, then
-    // fold each outcome: a transient failure (no source leader yet, or the source unreachable this
-    // crank) REQUEUES the relay for a later crank, so a committed abort still thaws its source once
-    // a source leader is elected; a terminal result drops it. Requeues land after this drain, so
-    // they wait for the next crank rather than re-driving here.
-    let mut relays = Vec::new();
-    while let Some(relay) = self.coord.poll_pending_merge_abort() {
-      relays.push(relay);
-    }
-    for relay in relays {
-      let result = match self.engine.stores(&relay.source) {
-        Some((log, stable)) => {
-          let r = self.coord.propose_merge_unfreeze(
-            &relay.source,
-            now,
-            log,
-            stable,
-            &relay.target,
-            relay.source_gen_after,
-          );
-          self.flush_pending = true;
-          r
-        }
-        None => None,
-      };
-      self.coord.resolve_merge_abort(relay, result);
-    }
     self.flush_pending = self.engine.has_staged() || more;
     self
       .metrics
@@ -1101,13 +1073,25 @@ where
   /// the group's parked work fails with the group-scoped teardown verdict. Returns whether the
   /// group was hosted.
   fn remove_group(&mut self, gid: &G) -> bool {
-    // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin;
-    // a reshaped id is fenced below its next incarnation forever.
+    // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin; a
+    // reshaped id is fenced below its next incarnation forever. A source a target still owes a
+    // merge-abort thaw is floored above that obligation's freeze generation too — the DURABLE
+    // backstop to the container's in-memory purge, so a crash-replay re-derivation discharges off
+    // the floor and a recreate can never repeat the frozen incarnation. The reshape floor alone
+    // misses it: a freeze bumps the endpoint shape gen, never this engine lineage, so a
+    // frozen-then-aborted source is removed at lineage 0 with no reshape floor. Queried BEFORE the
+    // removal below purges the obligation.
     let generation = self.engine.group_gen(gid);
-    if generation > 0 {
-      self
-        .engine
-        .set_group_floor(gid, generation.saturating_add(1));
+    let mut floor = if generation > 0 {
+      generation.saturating_add(1)
+    } else {
+      0
+    };
+    if let Some(owed) = self.coord.abort_thaw_floor(gid) {
+      floor = floor.max(owed);
+    }
+    if floor > 0 {
+      self.engine.set_group_floor(gid, floor);
       self.flush_pending = true;
     }
     let existed = self.coord.remove_group(gid).is_some();

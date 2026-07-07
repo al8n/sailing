@@ -1094,15 +1094,15 @@ fn frozen_source_captures_no_snapshot() {
   );
 }
 
-/// THE ABORT-RELAY REPLAY FENCE (the merge/split fence family, abort edition): a TARGET-side abort
-/// stages its source-unfreeze relay ONLY in volatile `pending_aborts`, re-derivable solely by
-/// replaying the abort entry. A capture at-or-past that entry compacts it, and a restart from the
-/// snapshot then finds no relay with the source possibly still frozen — a permanent frozen-source
-/// wedge. `maybe_snapshot` refuses while any abort relay is outstanding; the fence lifts once the
-/// relay retires (the container's terminal `resolve_merge_abort`, modeled here by draining it).
+/// THE ABORT REPLAY FENCE (the merge/split fence family, abort edition): a TARGET-side abort records
+/// its `abandoned` obligation durable-derived from the abort entry, re-derivable solely by replaying
+/// it. A capture at-or-past that entry compacts it, and a restart from the snapshot then re-derives
+/// no obligation with the source possibly still frozen — a permanent frozen-source wedge.
+/// `maybe_snapshot` refuses while the obligation is outstanding; the fence lifts once the service
+/// discharges it (the source observed thawed, modeled here by `clear_abandoned`).
 ///
 /// RED without the fence: the capture below lands, compaction erases the abort entry, and a later
-/// restart finds `pending_aborts` empty — the frozen-source wedge.
+/// restart re-derives no `abandoned` — the frozen-source wedge.
 #[test]
 fn outstanding_abort_relay_captures_no_snapshot() {
   use core::time::Duration;
@@ -1122,7 +1122,7 @@ fn outstanding_abort_relay_captures_no_snapshot() {
   ep.handle_storage(d, &mut log, &mut stable); // single voter: leader, no-op@1 commits+applies
   assert!(ep.role().is_leader());
   // A TARGET-side abort at the live mint (target_gen_after = 1 against base 0): it applies, bumps
-  // the lineage, and stages exactly one source-unfreeze relay in volatile pending_aborts.
+  // the lineage, and records exactly one `abandoned` obligation durable-derived from the entry.
   let a = ep
     .propose_merge_entry(
       d,
@@ -1135,29 +1135,30 @@ fn outstanding_abort_relay_captures_no_snapshot() {
   assert_eq!(a, Index::new(2));
   assert_eq!(ep.shape_gen(), 1, "the abort bumped the lineage");
   // applied(2) - first_index(1) >= threshold(1): the capture WOULD fire — the fence refuses while
-  // the abort relay is outstanding, so the abort entry stays replayable.
+  // the abort obligation is outstanding, so the abort entry stays replayable.
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
     stable.snapshot().is_none(),
-    "no capture while an abort relay is outstanding: the abort entry must stay replayable"
+    "no capture while an abort obligation is outstanding: the abort entry must stay replayable"
   );
-  // The relay retires (the source thaw was delivered → the container's terminal resolve drops it,
-  // modeled by draining it here). THE NEGATIVE PIN: with no outstanding abort the fence does not
+  // The service discharges it (the source observed thawed past the abandoned freeze), modeled by
+  // clearing it here. THE NEGATIVE PIN: with no outstanding obligation the fence does not
   // over-block — the very next crank captures.
-  assert!(ep.pop_pending_abort().is_some());
-  assert!(ep.pop_pending_abort().is_none());
+  assert!(ep.has_abandoned());
+  ep.clear_abandoned(&bytes::Bytes::from_static(b"\x2a"));
+  assert!(!ep.has_abandoned());
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
     stable.snapshot().is_some(),
-    "the fence lifted once the relay retired — compaction proceeds normally"
+    "the fence lifted once the obligation discharged — compaction proceeds normally"
   );
 }
 
-/// The abort relay's restart derivation — the recovery the fence PROTECTS. A restart whose durable
-/// log still holds the committed abort entry re-applies it and RE-STAGES the source-unfreeze relay
-/// (with its abandoned freeze generation intact), so the source can still be thawed. Had a capture
-/// compacted past the abort — which the fence forbids — the entry would be gone and this relay lost:
-/// the permanent frozen-source wedge.
+/// The `abandoned` obligation's restart derivation — the recovery the fence PROTECTS. A restart whose
+/// durable log still holds the committed abort entry re-applies it and RE-DERIVES `abandoned` (with
+/// its abandoned freeze generation intact), exactly like `frozen_for`, so the source can still be
+/// thawed. Had a capture compacted past the abort — which the fence forbids — the entry would be gone
+/// and the obligation lost: the permanent frozen-source wedge.
 #[test]
 fn restart_re_derives_the_abort_relay() {
   use core::time::Duration;
@@ -1179,7 +1180,7 @@ fn restart_re_derives_the_abort_relay() {
     abort_payload(b"\x2a", 4, 1),
   )]);
   stable.force_state(Term::new(1), Some(1u64), Index::new(1));
-  let mut ep = Endpoint::restart(
+  let ep = Endpoint::restart(
     cfg,
     Instant::ORIGIN,
     7,
@@ -1190,35 +1191,36 @@ fn restart_re_derives_the_abort_relay() {
   );
   assert!(!ep.is_poisoned());
   assert_eq!(ep.shape_gen(), 1, "replay re-bumped the abort's lineage");
-  // The relay is BACK: replaying the surviving abort entry re-staged it, so the container can
+  // The obligation is BACK: replaying the surviving abort entry re-derived it, so the service can
   // re-drive the source thaw — the source is never wedged frozen.
-  let relay = ep
-    .pop_pending_abort()
-    .expect("replay re-staged the abort relay from the surviving entry");
+  let (_source, source_gen_after, abort_index) = ep
+    .abandoned_obligations()
+    .first()
+    .cloned()
+    .expect("replay re-derived the abandoned obligation from the surviving entry");
   assert_eq!(
-    relay.source_gen_after, 4,
+    source_gen_after, 4,
     "the abandoned freeze generation survived the restart"
   );
   assert_eq!(
-    relay.abort_index,
+    abort_index,
     Index::new(1),
     "the fence boundary re-derives to the replayed entry's index"
   );
-  assert!(ep.pop_pending_abort().is_none(), "exactly one relay");
 }
 
-/// THE ABORT-RELAY INSTALL RETIREMENT (the fence family, install edition): a snapshot install
-/// re-baselines a follower's log to a LEADER's boundary — a floor-advance NO local fenced capture
-/// produced — discarding an abort entry at-or-below it. That entry is a source-unfreeze relay's ONLY
-/// restart re-derivation, and with the source unhosted here the container's `resolve_merge_abort`
-/// can never retire the relay (`None` → requeue forever). So the install RETIRES every relay its
-/// boundary covers: the boundary sits past the committed+applied abort, proving the source thawed
-/// past the abandoned freeze (the capturing leader's own relay drives it). Without the retirement the
-/// stranded relay pins `abort_relay_fences` on a boundary the install already crossed — a permanent
-/// target-capture wedge with the abort entry gone.
+/// THE ABORT INSTALL CLEAR (the fence family, install edition): a snapshot install re-baselines a
+/// follower's log to a LEADER's boundary — a floor-advance NO local fenced capture produced —
+/// discarding an abort entry at-or-below it. That entry is the `abandoned` obligation's ONLY restart
+/// re-derivation, and with the source thawed and gone the service can never observe it advance to
+/// discharge it. So the install CLEARS an obligation its boundary covers: the boundary sits past the
+/// committed+applied abort, proving the source thawed past the abandoned freeze (the capturing
+/// leader's own service drove it). Without the clear the stranded obligation pins `abort_relay_fences`
+/// on a boundary the install already crossed — a permanent target-capture wedge with the abort entry
+/// gone.
 ///
-/// RED without the retire: after the install the relay stays in `pending_aborts` with its entry
-/// compacted, so a LATER `maybe_snapshot` is fenced forever and never captures.
+/// RED without the clear: after the install `abandoned` stays set with its entry compacted, so a
+/// LATER `maybe_snapshot` is fenced forever and never captures.
 #[test]
 fn snapshot_install_retires_the_covered_abort_relay() {
   use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};
@@ -1234,8 +1236,8 @@ fn snapshot_install_retires_the_covered_abort_relay() {
   let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
   let mut log = VecLog::default();
   let mut stable = AsyncStable::default();
-  // The follower applies a TARGET-side abort at index 2 (mint 1 against base 0): it stages exactly
-  // one source-unfreeze relay in volatile pending_aborts (abort_index = 2) and bumps the lineage.
+  // The follower applies a TARGET-side abort at index 2 (mint 1 against base 0): it records exactly
+  // one `abandoned` obligation (abort_index = 2) and bumps the lineage.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -1268,12 +1270,12 @@ fn snapshot_install_retires_the_covered_abort_relay() {
   assert_eq!(ep.shape_gen(), 1, "the abort bumped the lineage");
   assert!(
     ep.abort_relay_fences(ep.applied_index()),
-    "the outstanding abort relay fences target compaction"
+    "the outstanding abort obligation fences target compaction"
   );
 
   // The target leader's post-abort snapshot lands (boundary 5 > commit 2 — a non-redundant install),
-  // the source ABSENT (this endpoint hosts none to thaw the relay). The re-baseline discards the
-  // abort entry AND must retire the now-moot relay.
+  // the source ABSENT (this endpoint hosts none to thaw). The re-baseline discards the abort entry
+  // AND must clear the now-moot obligation.
   let meta = SnapshotMeta::new(
     Index::new(5),
     Term::new(4),
@@ -1293,11 +1295,11 @@ fn snapshot_install_retires_the_covered_abort_relay() {
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(ep.applied_index(), Index::new(5), "the install landed");
-  // GREEN: the boundary (5 >= abort_index 2) retired the relay — the fence lifts for every later
-  // boundary. RED (no retire): the relay is stranded with its entry compacted, so this stays true.
+  // GREEN: the boundary (5 >= abort_index 2) cleared the obligation — the fence lifts for every later
+  // boundary. RED (no clear): the obligation is stranded with its entry compacted, so this stays true.
   assert!(
     !ep.abort_relay_fences(Index::new(1_000)),
-    "the covering install retired the relay — the fence lifts"
+    "the covering install cleared the obligation — the fence lifts"
   );
 
   // END TO END: the fence really is gone — a LATER maybe_snapshot captures. Append and apply two
@@ -1338,42 +1340,88 @@ fn snapshot_install_retires_the_covered_abort_relay() {
   );
   assert!(
     stable.snapshot().is_some(),
-    "the retired relay no longer fences — the later capture proceeds"
+    "the cleared obligation no longer fences — the later capture proceeds"
   );
 }
 
-/// SYMMETRY (the negative pin): a covering install retires ONLY the relays its boundary spans. A
-/// relay whose abort entry sits ABOVE the boundary is RETAINED — the install does not prove the
-/// source past THAT freeze, so its fence correctly still holds (mirroring `abort_relay_fences`'
-/// `abort_index <= boundary` test). The real install path never carries an above-boundary relay (a
+/// SYMMETRY (the negative pin): a covering install CLEARS `abandoned` only when its boundary spans
+/// the abort entry. An obligation whose abort entry sits ABOVE the boundary is RETAINED — the install
+/// does not prove the source past THAT freeze, so its fence correctly still holds (the
+/// `abort_index <= boundary` test). The real install path never carries an above-boundary abort (a
 /// non-redundant install re-baselines strictly above `commit >= applied >= abort_index`); this pins
-/// the retire predicate directly so a refactor cannot silently retire an uncovered relay.
+/// the clear predicate directly so a refactor cannot silently clear an uncovered obligation.
 #[test]
 fn install_retires_only_the_covered_abort_relays() {
   let (mut ep, _log, _stable) = make_merge_follower();
-  ep.stage_abort_relay(bytes::Bytes::from_static(b"\x2a"), 1, Index::new(3));
-  ep.stage_abort_relay(bytes::Bytes::from_static(b"\x2b"), 1, Index::new(8));
-  // Boundary 5 covers the relay at 3 (retire) but not the one at 8 (retain).
-  ep.note_aborts_rebaselined(Index::new(5));
+  // COVERED: boundary 5 spans the abort entry at 3 → cleared, the fence lifts.
+  ep.note_abandoned(bytes::Bytes::from_static(b"\x2a"), 1, Index::new(3));
+  ep.note_abort_rebaselined(Index::new(5));
+  assert!(
+    !ep.has_abandoned(),
+    "the covered obligation (abort_index 3) cleared"
+  );
   assert!(
     !ep.abort_relay_fences(Index::new(4)),
-    "the covered relay (abort_index 3) retired — nothing fences at/above it"
+    "nothing fences once the covered obligation cleared"
+  );
+  // UNCOVERED: boundary 5 does NOT span the abort entry at 8 → retained, the fence still holds.
+  ep.note_abandoned(bytes::Bytes::from_static(b"\x2b"), 1, Index::new(8));
+  ep.note_abort_rebaselined(Index::new(5));
+  assert_eq!(
+    ep.abandoned_obligations().first().map(|(_, _, at)| *at),
+    Some(Index::new(8)),
+    "the uncovered obligation (abort_index 8) is retained"
   );
   assert!(
     ep.abort_relay_fences(Index::new(8)),
-    "the uncovered relay (abort_index 8) is retained — its fence still holds"
+    "the uncovered obligation still fences"
   );
-  let relay = ep
-    .pop_pending_abort()
-    .expect("the uncovered relay survives");
+}
+
+/// The `abandoned` COLLECTION's per-source semantics — the concurrent-fan-in fix and its replay
+/// idempotence, pinned at the endpoint. A target that aborts several sources keeps ONE obligation per
+/// source (a single-slot record silently dropped all but one, wedging the rest frozen), and a replayed
+/// abort — the same source and generation re-applied on restart — must NOT double-insert, while a
+/// re-freeze of that source (a higher generation) replaces the spent obligation LAST-WINS.
+#[test]
+fn note_abandoned_is_per_source_and_replay_idempotent() {
+  let (mut ep, _log, _stable) = make_merge_follower();
+  // Two DISTINCT sources abort into this one target — both obligations coexist (fan-in).
+  ep.note_abandoned(bytes::Bytes::from_static(b"\x2a"), 1, Index::new(3));
+  ep.note_abandoned(bytes::Bytes::from_static(b"\x2b"), 1, Index::new(4));
   assert_eq!(
-    relay.abort_index,
-    Index::new(8),
-    "exactly the uncovered relay remains"
+    ep.abandoned_obligations().len(),
+    2,
+    "each source keeps its own obligation — neither dropped"
   );
+  // NEGATIVE PIN — replay idempotence: re-applying the SAME source's abort (same generation, same
+  // entry index, as a restart replay would) does NOT grow the collection.
+  ep.note_abandoned(bytes::Bytes::from_static(b"\x2a"), 1, Index::new(3));
+  assert_eq!(
+    ep.abandoned_obligations().len(),
+    2,
+    "a replayed duplicate abort does not double-insert"
+  );
+  // LAST-WINS on a re-freeze: the same source, a HIGHER generation and a later entry, replaces the
+  // spent obligation in place (its earlier one was discharged before the re-freeze could exist).
+  ep.note_abandoned(bytes::Bytes::from_static(b"\x2a"), 3, Index::new(9));
+  let obligations = ep.abandoned_obligations();
+  assert_eq!(obligations.len(), 2, "still one obligation per source");
+  let a = obligations
+    .iter()
+    .find(|(s, ..)| *s == bytes::Bytes::from_static(b"\x2a"))
+    .expect("source 2a still tracked");
+  assert_eq!(
+    (a.1, a.2),
+    (3, Index::new(9)),
+    "the re-freeze's generation and abort index won last"
+  );
+  // Discharge is per-source: clearing one leaves the other's obligation and fence intact.
+  ep.clear_abandoned(&bytes::Bytes::from_static(b"\x2a"));
+  assert_eq!(ep.abandoned_obligations().len(), 1, "only 2a discharged");
   assert!(
-    ep.pop_pending_abort().is_none(),
-    "the covered relay is gone"
+    ep.abort_relay_fences(Index::new(4)),
+    "source 2b's obligation still fences its abort entry"
   );
 }
 
@@ -1707,9 +1755,9 @@ fn merge_conf_fence_releases_with_the_capture() {
   );
 }
 
-/// A parked 3-voter target leader that ALSO carries an OUTSTANDING source-unfreeze relay from a
+/// A parked 3-voter target leader that ALSO carries an OUTSTANDING `abandoned` obligation from a
 /// DIFFERENT merge's abort committed BELOW the park: no-op@1, a TARGET-side abort@2 (applied below
-/// the park, relay staged), a CommitMerge@3 for another source (parked at k−1). Returns
+/// the park, `abandoned` recorded), a CommitMerge@3 for another source (parked at k−1). Returns
 /// `(ep, log, stable, abort_at, k)`.
 fn make_parked_target_with_pending_abort()
 -> (Endpoint<u64, CountSm>, VecLog, AsyncStable, Index, Index) {
@@ -1736,18 +1784,18 @@ fn make_parked_target_with_pending_abort()
   (ep, log, stable, abort_at, k)
 }
 
-/// THE FORCED-ABSORB COMPACTION FENCE (the abort-relay fence, absorb-capture edition — the site
-/// `maybe_snapshot`'s fence alone missed): a target holding an OUTSTANDING abort relay from one
-/// merge, then resolving a DIFFERENT parked merge into the SAME target, runs the forced absorb
+/// THE FORCED-ABSORB COMPACTION FENCE (the abort fence, absorb-capture edition — the site
+/// `maybe_snapshot`'s fence alone missed): a target holding an OUTSTANDING `abandoned` obligation from
+/// one merge, then resolving a DIFFERENT parked merge into the SAME target, runs the forced absorb
 /// capture OUTSIDE `maybe_snapshot`. That capture stages `pending_compact` at the absorb boundary
 /// `pending.at()` — PAST the earlier abort entry — so with no fence here it compacts the abort
-/// entry while its relay is still outstanding, erasing the relay's only restart source and wedging
-/// the source frozen forever. The absorb capture shares `maybe_snapshot`'s abort-relay fence via
-/// `abort_relay_fences`, so `absorb_capture_blocked` holds the park until the relay retires.
+/// entry while its obligation is still outstanding, erasing the obligation's only restart source and
+/// wedging the source frozen forever. The absorb capture shares `maybe_snapshot`'s abort fence via
+/// `abort_relay_fences`, so `absorb_capture_blocked` holds the park until the obligation discharges.
 ///
 /// RED without the leg: `absorb_capture_blocked` returns false, the container's resolve arm captures,
-/// and the deferred compaction moves `first_index` PAST the abort entry with the relay live — the
-/// entry (its only restart re-derivation) is gone and the park is consumed.
+/// and the deferred compaction moves `first_index` PAST the abort entry with the obligation live —
+/// the entry (its only restart re-derivation) is gone and the park is consumed.
 #[test]
 fn outstanding_abort_relay_blocks_the_forced_absorb_capture() {
   let (mut ep, mut log, mut stable, abort_at, k) = make_parked_target_with_pending_abort();
@@ -1762,26 +1810,26 @@ fn outstanding_abort_relay_blocks_the_forced_absorb_capture() {
   }
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   // GREEN: the fence held the park, nothing compacted — the abort entry is RETAINED, so a
-  // crash-restart re-derives the relay (see `restart_re_derives_the_abort_relay`) and the source
+  // crash-restart re-derives `abandoned` (see `restart_re_derives_the_abort_relay`) and the source
   // stays thawable. RED (no leg): the arm resolved+captured and the deferred compaction crossed
-  // `abort_at`, erasing the relay's only restart source and consuming the park.
+  // `abort_at`, erasing the obligation's only restart source and consuming the park.
   assert!(
     log.first_index() <= abort_at,
-    "the abort entry must survive: an absorb capture past it erases the relay's only restart source"
+    "the abort entry must survive: an absorb capture past it erases the obligation's restart source"
   );
   assert!(
     ep.pending_merge().is_some(),
-    "the park is still held — the absorb waits for the relay to retire"
+    "the park is still held — the absorb waits for the obligation to discharge"
   );
 
-  // NEGATIVE PIN: retire the relay (the container drops it terminally once the source is thawed,
-  // modeled by draining it). The fence lifts and the forced absorb capture proceeds and compacts
+  // NEGATIVE PIN: discharge the obligation (the service clears it once the source is observed
+  // thawed, modeled here). The fence lifts and the forced absorb capture proceeds and compacts
   // through the park — exactly as it does for a target with no outstanding abort (no over-block).
-  assert!(ep.pop_pending_abort().is_some());
-  assert!(ep.pop_pending_abort().is_none());
+  assert!(ep.has_abandoned());
+  ep.clear_abandoned(&bytes::Bytes::from_static(b"\x2b"));
   assert!(
     !ep.absorb_capture_blocked(),
-    "the fence lifts once the relay retires — no over-block"
+    "the fence lifts once the obligation discharges — no over-block"
   );
   ep.resolve_pending_merge(CountSm::default());
   assert!(
@@ -1963,13 +2011,12 @@ fn abort_below_a_commit_kills_it_at_apply() {
     aborted, 2,
     "the abort's own signal plus the killed commit's"
   );
-  // Exactly one thaw relay — the applied abort's.
-  assert!(ep.pop_pending_abort().is_some());
-  assert!(ep.pop_pending_abort().is_none());
+  // Exactly one abandoned obligation — the applied abort's.
+  assert!(ep.has_abandoned());
 }
 
 /// A TARGET-role abort with a STALE mint is a silent deterministic no-op: no lineage move, no
-/// thaw relay, no event — the winner of its base already surfaced the definitive signal.
+/// abandoned obligation, no event — the winner of its base already surfaced the definitive signal.
 #[test]
 fn stale_abort_is_a_silent_no_op() {
   let (mut ep, mut log, mut stable) = make_three_voter_leader();
@@ -1985,7 +2032,7 @@ fn stale_abort_is_a_silent_no_op() {
   ack_through(&mut ep, &mut log, &mut stable, a);
   assert_eq!(ep.applied_index(), a, "applied as a no-op");
   assert_eq!(ep.shape_gen(), 0, "no lineage move");
-  assert!(ep.pop_pending_abort().is_none(), "no thaw relay");
+  assert!(!ep.has_abandoned(), "no abandoned obligation");
   assert!(
     !core::iter::from_fn(|| ep.poll_event()).any(|ev| matches!(ev, Event::MergeAborted(_))),
     "no signal — the base's winner already spoke"

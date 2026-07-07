@@ -157,37 +157,29 @@ pub(crate) struct MergeState {
   /// Never cleared: the check compares against the live `first_index`, so it self-releases
   /// permanently once the capture's compaction lands.
   pub(crate) absorb_index: Option<Index>,
-  /// Source-unfreeze relays staged by TARGET-side abort applies, drained by the container
-  /// (mirroring the fork relay): each records the abort entry's named source AND its own log
-  /// index, and the driver proposes the SOURCE-side `RollbackMerge` on that group's own log.
-  /// Replay re-stages them (the relay's restart derivation); a duplicate proposal dies at the
-  /// source's own incarnation gate (`StaleThaw` once the source has thawed past the recorded
-  /// generation), and a relay lost to lifecycle churn is recovered by re-proposing the
-  /// target-side abort (a fresh entry, a fresh relay) — documented on `rollback_merge`. Because
-  /// this restart derivation is the ONLY recovery source, EVERY target capture FENCES against
-  /// compacting past an outstanding relay's `abort_index` through the shared `abort_relay_fences`
-  /// (both `maybe_snapshot` and the forced absorb capture), mirroring the fork durability barrier
-  /// — a capture past the abort entry would erase the relay from a restart with the source still
-  /// frozen, a permanent frozen-source wedge.
-  pub(crate) pending_aborts: VecDeque<AbortRelay>,
-}
-
-/// One staged source-unfreeze relay: a TARGET-side abort applied here, and the source it names
-/// must now be thawed on its own log. G-free like the entry (the container decodes the typed id
-/// when it relays).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct AbortRelay {
-  /// The frozen source group id's canonical `Data` encoding.
-  pub(crate) source_bytes: Bytes,
-  /// The freeze generation the abort abandoned (observability; the source-side mint re-reads
-  /// the live frozen state at propose).
-  pub(crate) source_gen_after: u64,
-  /// The abort entry's OWN log index — the target-capture fence boundary (`abort_relay_fences`,
-  /// shared by `maybe_snapshot` and the forced absorb capture): this relay is re-derivable only by
-  /// replaying that entry, so a capture at-or-past it would compact the entry and lose the relay
-  /// across restart. Carried through the container relay ([`crate::MergeAbortRelay`]) so a requeue
-  /// restores it, keeping the fence alive across the drain until the relay retires.
-  pub(crate) abort_index: Index,
+  /// The abandoned merges this TARGET must thaw its sources out of, keyed by source id — one entry
+  /// per aborted source, inserted when a target-role abort (`RollbackMerge` at its live mint)
+  /// APPLIES here, removed once that source is observed thawed past the abandoned generation (or
+  /// floored). A COLLECTION rather than one slot because a target legitimately absorbs many sources
+  /// (fan-in): a second source can already be frozen toward it from the window before the first
+  /// abort applied, so when its own abort lands a single-slot record would silently drop one
+  /// obligation and strand that source frozen forever. DURABLE-DERIVED exactly like `frozen_for`:
+  /// every obligation re-set on restart by REPLAYING the target's own committed abort entries, so
+  /// each survives a crash in `[abort-committed, unfreeze-committed]` with no new persistence and no
+  /// wire change. The per-crank container service ([`crate::MultiRaft::service_merge_applies`])
+  /// drives each source-side `RollbackMerge` FROM this map — the source rollback is NEVER an
+  /// independent source decision, only the downstream consequence of a committed target abort. The
+  /// value is `(the abandoned freeze generation — the thaw's `expected_gen` — and the abort entry's
+  /// own index)`; the abort index is the compaction fence boundary ([`Endpoint::abort_relay_fences`]),
+  /// because the entry must stay replayable while its obligation is set or a restart past it would
+  /// lose the obligation with the source still frozen — a permanent frozen-source wedge. Insert is
+  /// LAST-WINS per source: a source re-frozen for a fresh merge (its earlier obligation already
+  /// discharged) records the new generation over the spent one — idempotent for a replayed
+  /// duplicate, correct for a re-freeze. Written ONLY by the abort apply, the install-clear
+  /// ([`Endpoint::note_abort_rebaselined`]), the container's purge when the named source leaves the
+  /// host ([`crate::MultiRaft::remove_group`] — so a removed incarnation's obligation can never back
+  /// a recreate's thaw), and the service's per-source discharge.
+  pub(crate) abandoned: BTreeMap<Bytes, (u64, Index)>,
 }
 
 /// A parked commit's ABORT-WINDOW verdict — the target-log half of the park's resolution rule.
@@ -297,28 +289,64 @@ where
     self.merge.frozen_for.as_ref()
   }
 
-  /// Pop the next staged source-unfreeze relay (a TARGET-side abort applied on this endpoint),
-  /// for the container's relay drain.
-  pub(crate) fn pop_pending_abort(&mut self) -> Option<AbortRelay> {
-    self.merge.pending_aborts.pop_front()
+  /// Whether this target owes ANY source a thaw — the container service's per-crank filter for
+  /// the merge-abort thaw pass, and the `commit_merge` propose gate's read.
+  pub(crate) fn has_abandoned(&self) -> bool {
+    !self.merge.abandoned.is_empty()
   }
 
-  /// Re-stage a source-unfreeze relay onto this target's queue — the container's REQUEUE of a
-  /// relay whose thaw could not land yet (a leaderless source, or one unreachable this crank). FIFO
-  /// with any others still queued; the container re-marks this target for the next abort drain, so
-  /// a committed abort keeps thawing its source across source-leader churn instead of being lost
-  /// to the one consume the old drain allowed.
-  pub(crate) fn stage_abort_relay(
-    &mut self,
-    source_bytes: Bytes,
-    source_gen_after: u64,
-    abort_index: Index,
-  ) {
-    self.merge.pending_aborts.push_back(AbortRelay {
-      source_bytes,
-      source_gen_after,
-      abort_index,
-    });
+  /// Every outstanding thaw obligation this target owes: `(source id bytes, the abandoned freeze
+  /// generation, the abort entry's index)` — the durable-derived triggers the container service
+  /// reads each crank to drive (and discharge) each source-side thaw independently. Re-derived by
+  /// replay like `frozen_for`, so each survives a restart from its committed abort entry.
+  pub(crate) fn abandoned_obligations(&self) -> Vec<(Bytes, u64, Index)> {
+    self
+      .merge
+      .abandoned
+      .iter()
+      .map(|(source, (generation, at))| (source.clone(), *generation, *at))
+      .collect()
+  }
+
+  /// Whether this target hosts a committed abort obligation for exactly this `(source, generation)`
+  /// incarnation — the structural derived-from-abort gate's read: a source thaw appends only when
+  /// its claimed target owes precisely this freeze generation's thaw.
+  pub(crate) fn abandoned_matches(&self, source: &Bytes, generation: u64) -> bool {
+    self
+      .merge
+      .abandoned
+      .get(source)
+      .is_some_and(|(g, _)| *g == generation)
+  }
+
+  /// The freeze generation this target still owes `source` a thaw for, if any — the removal-floor
+  /// query's per-target read ([`crate::MultiRaft::abort_thaw_floor`]). The max of this across every
+  /// host becomes the durable admission floor a removal of `source` persists, so the incarnation an
+  /// outstanding abort abandoned can never be re-derived past the fence nor repeated by a recreate.
+  pub(crate) fn abandoned_gen(&self, source: &Bytes) -> Option<u64> {
+    self.merge.abandoned.get(source).map(|(g, _)| *g)
+  }
+
+  /// Record the merge this target-role abort abandoned — inserted at the abort's apply (and re-set
+  /// by its replay), so the source-side thaw is DERIVED from the committed target abort, never an
+  /// independent source decision. Keyed by source, so a concurrent fan-in of aborts each keeps its
+  /// own obligation. LAST-WINS on a repeat of the same source: a re-frozen source (its earlier
+  /// obligation already discharged) records the new generation over the spent one — idempotent for
+  /// a replayed duplicate (same value), correct for a re-freeze (the live generation wins). A
+  /// still-live earlier obligation is never overwritten here: the source must thaw past it (which
+  /// discharges it) before it can re-freeze to a higher generation at all.
+  pub(crate) fn note_abandoned(&mut self, source_bytes: Bytes, source_gen_after: u64, at: Index) {
+    self
+      .merge
+      .abandoned
+      .insert(source_bytes, (source_gen_after, at));
+  }
+
+  /// Discharge one abandoned merge — the container service removes the named source's obligation
+  /// once that source is observed thawed past its abandoned generation (the thaw committed+applied
+  /// on the source log) or floored, releasing the target's compaction fence over that abort entry.
+  pub(crate) fn clear_abandoned(&mut self, source: &Bytes) {
+    self.merge.abandoned.remove(source);
   }
 
   /// Whether a merge freeze is ACTIVE right now: a pending (append-observed) freeze or the
@@ -365,23 +393,24 @@ where
   }
 
   /// A snapshot install re-baselined the log to `boundary`, discarding every abort entry at-or-below
-  /// it: retire each source-unfreeze relay the boundary COVERS. The installed snapshot sits past a
-  /// committed-and-applied abort (a non-redundant install re-baselines strictly above `commit`, and
-  /// an abort relay is staged at apply, so `abort_index <= applied <= commit < boundary`), so the
-  /// leader that captured it proved the source thawed past the abandoned freeze — the leader's own
-  /// relay drives that thaw. The relay here is MOOT, and its ONLY restart re-derivation (replaying
-  /// the abort entry) was just discarded: keeping it would strand `abort_relay_fences` on a boundary
-  /// the install already crossed — a permanent target-capture wedge with the relay's log source gone
-  /// (`resolve_merge_abort` can never retire it when the source is unhosted here, `None` → requeue).
-  /// A relay ABOVE the boundary is RETAINED: the install does not prove the source past THAT freeze
-  /// (symmetric with the fence's own `abort_index <= boundary` test). Mirrors the restart path, whose
-  /// volatile `pending_aborts` re-derives only from surviving entries — a below-boundary abort is
-  /// equally absent there, so runtime install and restart agree.
-  pub(crate) fn note_aborts_rebaselined(&mut self, boundary: Index) {
+  /// it: drop each obligation whose abort entry the boundary COVERS. The installed snapshot sits past
+  /// a committed-and-applied abort (a non-redundant install re-baselines strictly above `commit`, and
+  /// an obligation is set at apply, so `abort_index <= applied <= commit < boundary`), so the leader
+  /// that captured it proved that source thawed past its abandoned freeze — its own service drove the
+  /// thaw before compacting. A covered obligation is MOOT, and its ONLY restart re-derivation
+  /// (replaying the abort entry) was just discarded: keeping it would strand `abort_relay_fences` on
+  /// a boundary the install already crossed — a permanent target-capture wedge with the source thawed
+  /// and gone (the service could never observe it advance to discharge it). An obligation whose abort
+  /// entry is ABOVE the boundary is RETAINED: the install does not prove that source past THAT freeze,
+  /// and the re-delivered entry re-applies to re-derive it (symmetric with the fence's own
+  /// `abort_index <= boundary` test). Mirrors the restart path, whose replay re-derives obligations
+  /// only from surviving entries — a below-boundary abort is equally absent there, so runtime install
+  /// and restart agree.
+  pub(crate) fn note_abort_rebaselined(&mut self, boundary: Index) {
     self
       .merge
-      .pending_aborts
-      .retain(|relay| relay.abort_index > boundary);
+      .abandoned
+      .retain(|_, (_, abort_index)| *abort_index > boundary);
   }
 
   /// One bounded, kind-only pass over the UNAPPLIED suffix `(applied, last]` for the lowest
@@ -431,28 +460,29 @@ where
     self.fsm
   }
 
-  /// Whether an outstanding source-unfreeze relay FENCES a TARGET capture/compaction at `boundary`
-  /// — true when any relay's abort entry sits at-or-below it. That entry's replay is the relay's
-  /// ONLY restart re-derivation (`AbortRelay::abort_index`), so a capture at-or-past it would
-  /// compact the entry and lose the relay across a restart with the source still frozen — a
-  /// permanent frozen-source wedge. The SINGLE predicate every target-capture site shares so none
-  /// can drift: `maybe_snapshot` checks it at `applied`, the forced `capture_absorb_snapshot` at
-  /// the absorb boundary `pending.at()` (via `absorb_capture_blocked`). A snapshot INSTALL is the
-  /// one floor-advance that can cross an abort entry NO local fenced capture produced — it
-  /// re-baselines to a LEADER's boundary — so it does not lean on the fence: it RETIRES every
-  /// covered relay (`note_aborts_rebaselined`), sound because that boundary proves the source thawed
-  /// past the abandoned freeze. Every other floor-advance is covered transitively — the deferred
+  /// Whether ANY outstanding obligation FENCES a TARGET capture/compaction at `boundary` — true
+  /// when some abort entry sits at-or-below it. That entry's replay is its obligation's ONLY restart
+  /// re-derivation (the abort index in the map value), so a capture at-or-past it would compact the
+  /// entry and lose the obligation across a restart with the source still frozen — a permanent
+  /// frozen-source wedge. The SINGLE predicate every target-capture site shares so none can drift:
+  /// `maybe_snapshot` checks it at `applied`, the forced `capture_absorb_snapshot` at the absorb
+  /// boundary `pending.at()` (via `absorb_capture_blocked`). A snapshot INSTALL is the one
+  /// floor-advance that can cross an abort entry NO local fenced capture produced — it re-baselines to
+  /// a LEADER's boundary — so it does not lean on the fence: it CLEARS every covered obligation
+  /// (`note_abort_rebaselined`), sound because that boundary proves each covered source thawed past
+  /// its abandoned freeze. Every other floor-advance is covered transitively — the deferred
   /// `log.compact` and the restart reconciliation only reach a boundary a fenced capture (or a
-  /// retiring install) already produced — so an abort entry leaves the durable log only with its
-  /// relay either fenced or retired. The fence lifts when the relay RETIRES — a terminal
-  /// `resolve_merge_abort`, or a covered install — by then the source is thawed or provably gone,
-  /// so the erased entry's replay is moot.
+  /// clearing install) already produced — so an abort entry leaves the durable log only with its
+  /// obligation either fenced or discharged. The fence lifts per source when the service DISCHARGES
+  /// its obligation — that source observed thawed past its abandoned generation (its committed thaw
+  /// applied) or floored — so the erased entry's replay is by then moot. This is the discharge-gated
+  /// durability release: the target keeps each abort entry until its source's unfreeze commits.
   pub(crate) fn abort_relay_fences(&self, boundary: Index) -> bool {
     self
       .merge
-      .pending_aborts
-      .iter()
-      .any(|relay| relay.abort_index <= boundary)
+      .abandoned
+      .values()
+      .any(|(_, abort_index)| *abort_index <= boundary)
   }
 
   /// Whether the absorb's forced snapshot capture would be REFUSED right now — the capture

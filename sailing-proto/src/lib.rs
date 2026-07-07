@@ -99,8 +99,8 @@ pub use endpoint::{Endpoint, PeerProgress, PendingMergeApply, PoisonReason, Role
 mod multi;
 pub use multi::{
   EngineLog, EngineStable, EngineStorageError, FORK_BASE_INDEX, FORK_BASE_TERM, FloorStore,
-  GroupEngine, GroupFork, GroupId, GroupStores, MERGED_FLOOR, MergeAbortRelay, MergeResolution,
-  MultiRaft, NoFloors, floor_admits,
+  GroupEngine, GroupFork, GroupId, GroupStores, MERGED_FLOOR, MergeResolution, MultiRaft, NoFloors,
+  floor_admits,
 };
 
 mod tracker;

@@ -359,6 +359,16 @@ pub enum MergeError<I> {
     /// The source's current lineage, already past it.
     seen: u64,
   },
+  /// The CLAIMED target holds NO committed abort obligation for this `(source, expected)`
+  /// incarnation — the structural derived-from-abort gate. A source thaw is legal ONLY as the
+  /// downstream consequence of a committed target-side abort: the target's durable `abandoned`
+  /// record for exactly this source and freeze generation is what authorizes moving the source's
+  /// counter. Absent it, appending the thaw would unfreeze a source no target ever abandoned —
+  /// the cross-log rollback race the whole abort-derives-thaw path exists to prevent. Unreachable
+  /// from the container's own per-crank service, which derives the drive FROM the obligation; the
+  /// belt-and-suspenders refusal that makes the invariant intrinsic to the thaw path itself.
+  #[error("the claimed target holds no committed abort obligation for this source incarnation")]
+  UnbackedThaw,
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large). The merge-specific gates all passed; the failure is the ordinary
   /// admin-append class, surfaced verbatim.

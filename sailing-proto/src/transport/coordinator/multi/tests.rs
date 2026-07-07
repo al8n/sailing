@@ -2456,25 +2456,18 @@ fn merge_verbs_ride_the_coordinator() {
   assert!(coord.group(&1).is_none());
   assert!(coord.is_retired(&1), "resolved merge tombstones the source");
 
-  // The abort and thaw delegators are reachable too, each with a typed refusal: the merged-away
-  // source is gone (`SourceMissing`), and a gen-0 thaw of the surviving target — whose lineage the
-  // absorb advanced to 1 — is past that incarnation (`StaleThaw`).
+  // The abort delegator is reachable too, with a typed refusal: the merged-away source is gone
+  // (`SourceMissing`). The source-side thaw has NO delegator — it is fully service-driven, so no
+  // external path can move a frozen source's counter without a committed target abort.
   {
     let (l, s) = stores.stores(&2).unwrap();
     assert!(matches!(
       coord.rollback_merge(&2, now, l, s, &1).unwrap(),
       Err(crate::MergeError::SourceMissing)
     ));
-    assert!(matches!(
-      coord.propose_merge_unfreeze(&2, now, l, s, &2, 0).unwrap(),
-      Err(crate::MergeError::StaleThaw {
-        expected: 0,
-        seen: 1
-      })
-    ));
   }
   assert!(
-    coord.poll_pending_merge_abort().is_none(),
-    "no abort applied, nothing relays"
+    coord.group(&2).is_some_and(|ep| !ep.has_abandoned()),
+    "no abort applied — the target records no thaw obligation"
   );
 }

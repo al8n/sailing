@@ -268,16 +268,16 @@ where
     if self.merge_freeze_active() {
       return;
     }
-    // THE ABORT-RELAY REPLAY FENCE: a TARGET-side abort applied here stages its source-unfreeze
-    // relay ONLY in volatile `pending_aborts`, re-derivable solely by replaying that abort entry.
-    // A capture at-or-past the entry's index would compact it, and a restart from the snapshot
-    // would then find `pending_aborts` empty with the source possibly still frozen — no relay left
-    // to thaw it, a permanent frozen-source wedge across compaction. Refuse the capture while any
-    // abort relay's entry sits at-or-below `applied` (the capture boundary here). The forced
-    // absorb capture shares this exact predicate (`absorb_capture_blocked`), so no target-capture
-    // site can drift; see `abort_relay_fences` for how the deferred compact and restart
-    // floor-advances are covered transitively, how a snapshot install instead RETIRES the relays its
-    // boundary covers (`note_aborts_rebaselined`), and when the fence lifts.
+    // THE ABORT REPLAY FENCE: a TARGET-side abort applied here records its `abandoned` obligation
+    // durable-derived from that entry, re-derivable solely by replaying it. A capture at-or-past
+    // the entry's index would compact it, and a restart from the snapshot would then re-derive no
+    // obligation with the source possibly still frozen — no trigger left to thaw it, a permanent
+    // frozen-source wedge across compaction. Refuse the capture while the abort entry sits
+    // at-or-below `applied` (the capture boundary here). The forced absorb capture shares this
+    // exact predicate (`absorb_capture_blocked`), so no target-capture site can drift; see
+    // `abort_relay_fences` for how the deferred compact and restart floor-advances are covered
+    // transitively, how a snapshot install instead CLEARS a covered obligation
+    // (`note_abort_rebaselined`), and when the fence lifts (the service discharges `abandoned`).
     if self.abort_relay_fences(self.applied) {
       return;
     }
@@ -868,12 +868,13 @@ where
     // A stale park kept here would wedge the drain forever below a boundary it cannot re-reach.
     self.merge.pending_apply = None;
     // The re-baseline discarded every abort entry at-or-below the boundary — the ONLY restart
-    // re-derivation of a source-unfreeze relay. The install sits past the committed+applied abort,
-    // proving the source thawed past the abandoned freeze (the capturing leader's own relay drives
-    // it), so a covered relay is MOOT; retire it here or `abort_relay_fences` would stay stuck on a
-    // boundary the install already crossed (the source is unhosted, so `resolve_merge_abort` requeues
-    // it forever) — a permanent capture wedge. A relay above the boundary is retained (see the helper).
-    self.note_aborts_rebaselined(meta.last_index());
+    // re-derivation of the `abandoned` obligation. The install sits past the committed+applied abort,
+    // proving the source thawed past the abandoned freeze (the capturing leader's own service drove
+    // it), so a covered obligation is MOOT; clear it here or `abort_relay_fences` would stay stuck on
+    // a boundary the install already crossed (the source thawed and gone, so the service could never
+    // observe it advance to discharge it) — a permanent capture wedge. An obligation above the
+    // boundary is retained (see the helper).
+    self.note_abort_rebaselined(meta.last_index());
     // `restore` DISCARDS the prior tail, so the durable boundary IS exactly the snapshot's last index — a
     // hard RESET. `durable_index` and the re-baseline advance together, after the blob is durable, so the
     // boundary is recoverable (no stale-HIGH watermark, no orphan).
