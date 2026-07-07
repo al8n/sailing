@@ -342,6 +342,72 @@ where
     let rec = self.lineage_staged.entry(gid.clone()).or_default();
     rec.generation = rec.generation.max(generation);
   }
+
+  /// The admission floor a REMOVAL of `gid` must persist — one past the id's removal CEILING,
+  /// the highest generation this incarnation could have minted on this host: the engine's
+  /// mirrored lineage record ⊔ the stores' snapshot-meta lineage ⊔ a shape-kind scan of the
+  /// resident log (every `Split`/`PrepareMerge`/`CommitMerge`/`RollbackMerge` entry names the
+  /// generation it sets for its OWN group, and every lineage move rides the group's own log or
+  /// its snapshot meta — nothing else can mint). `0` (no fence) for an id that never reshaped,
+  /// preserving the gen-0 volatile-tombstone rejoin.
+  ///
+  /// With the drivers' eager mirrors (admission, fork relay, and the merge lineage events) the
+  /// record leg already carries the ceiling, so the stores legs are almost always a no-op; they
+  /// exist for the crash window where an applied move's mirror never became durable and the
+  /// group was never re-hosted (a stores-only removal). Flooring one past the ceiling makes
+  /// every outstanding gen-keyed authorization (a merge-abort thaw obligation's `expected`
+  /// above all) discharge off the floor and forces a recreate to admit strictly above it — with
+  /// NO knowledge of any other group. Over-approximation is safe: a truncated-away suffix entry
+  /// only raises the fence, never lowers what durability would demand.
+  #[must_use]
+  pub fn removal_floor(&self, gid: &G) -> u64 {
+    let mut ceiling = self.group_gen(gid);
+    if let Some(storage) = self.groups.get(gid) {
+      let meta_gen = storage
+        .stable
+        .snapshot
+        .as_ref()
+        .map_or(0, |(m, _)| m.shape_gen())
+        .max(
+          storage
+            .stable
+            .durable_snapshot
+            .as_ref()
+            .map_or(0, SnapshotMeta::shape_gen),
+        );
+      ceiling = ceiling.max(meta_gen);
+      for entry in &storage.log.entries {
+        let minted = match entry.kind() {
+          crate::EntryKind::Split => crate::wire::decode_split_payload(entry.data_bytes())
+            .map_or(0, |p| p.parent_gen_after()),
+          crate::EntryKind::PrepareMerge => {
+            crate::wire::decode_prepare_merge_payload(entry.data_bytes())
+              .map_or(0, |p| p.source_gen_after())
+          }
+          crate::EntryKind::CommitMerge => {
+            crate::wire::decode_commit_merge_payload(entry.data_bytes())
+              .map_or(0, |p| p.target_gen_after())
+          }
+          crate::EntryKind::RollbackMerge => {
+            crate::wire::decode_rollback_merge_payload(entry.data_bytes()).map_or(0, |p| {
+              if p.is_unfreeze() {
+                p.source_gen_after()
+              } else {
+                p.target_gen_after()
+              }
+            })
+          }
+          _ => 0,
+        };
+        ceiling = ceiling.max(minted);
+      }
+    }
+    if ceiling == 0 {
+      0
+    } else {
+      ceiling.saturating_add(1)
+    }
+  }
 }
 
 impl<G, I> Default for GroupEngine<G, I> {

@@ -32,7 +32,7 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  Config, ConnId, Event, FloorStore, GroupControl, GroupEngine, GroupId, Index, Instant,
+  Config, ConnId, Endpoint, Event, FloorStore, GroupControl, GroupEngine, GroupId, Index, Instant,
   MultiStreamCoordinator, Now, ReadOnlyOption, RecordIo, StateMachine, StorageProgress,
   floor_admits,
 };
@@ -974,7 +974,12 @@ where
     };
     match result {
       Ok(()) => {
-        self.engine.set_group_gen(&gid, generation);
+        // Re-sync to the LIVE restored counter, not just the catalog's generation: restart
+        // replay re-applies lineage moves (a merge freeze above all) whose event-time mirror
+        // may have died with the crash — replay surfaces no events, so this is the fold that
+        // heals the engine record (INV-LINEAGE across the crash window).
+        let live = self.coord.group(&gid).map_or(0, Endpoint::shape_gen);
+        self.engine.set_group_gen(&gid, generation.max(live));
         // The restore may leave one staged stable write (a recovered lease floor): barrier it.
         self.flush_pending = true;
         self.election.insert(gid.cheap_clone(), election);
@@ -1060,22 +1065,14 @@ where
   /// group was hosted.
   fn remove_group(&mut self, gid: &G) -> bool {
     // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin; a
-    // reshaped id is fenced below its next incarnation forever. A source a target still owes a
-    // merge-abort thaw is floored above that obligation's freeze generation too — the DURABLE
-    // backstop to the container's in-memory purge, so a crash-replay re-derivation discharges off
-    // the floor and a recreate can never repeat the frozen incarnation. The reshape floor alone
-    // misses it: a freeze bumps the endpoint shape gen, never this engine lineage, so a
-    // frozen-then-aborted source is removed at lineage 0 with no reshape floor. Queried BEFORE the
-    // removal below purges the obligation.
-    let generation = self.engine.group_gen(gid);
-    let mut floor = if generation > 0 {
-      generation.saturating_add(1)
-    } else {
-      0
-    };
-    if let Some(owed) = self.coord.abort_thaw_floor(gid) {
-      floor = floor.max(owed);
-    }
+    // reshaped id is fenced below its next incarnation forever. The floor is one past the id's
+    // removal CEILING — every generation this incarnation could have minted (splits and merge
+    // freezes/thaws/absorbs alike, all riding the unified counter the lineage mirrors track) —
+    // so any outstanding gen-keyed authorization (a merge-abort thaw obligation above all)
+    // discharges off it and a recreate admits strictly above it, with no knowledge of any other
+    // group. The stores legs of the ceiling cover the mirror-lost crash window; with the eager
+    // mirrors they are almost always a no-op.
+    let floor = self.engine.removal_floor(gid);
     if floor > 0 {
       self.engine.set_group_floor(gid, floor);
       self.flush_pending = true;
@@ -1603,6 +1600,22 @@ where
         let _ = self.lifecycle_tx.try_send(LifecycleEvent::RemovedSelf {
           group: g.cheap_clone(),
         });
+      }
+      // THE LINEAGE MIRROR (the fork-relay idiom for every other lineage move): fold each
+      // applied merge move — and an install's monotone catch-up — into the engine's per-id
+      // record, so the ordinary removal floor covers every generation the group ever minted
+      // (INV-LINEAGE: engine record == live counter once the crank's folds land).
+      let lineage_move = match &ev {
+        Event::MergeFrozen(f) => f.gen_after(),
+        Event::MergeRolledBack(r) => r.gen_after(),
+        Event::MergeAborted(a) => a.gen_after(),
+        Event::Merged(m) => m.gen_after(),
+        Event::SnapshotInstalled(meta) => meta.shape_gen(),
+        _ => 0,
+      };
+      if lineage_move > 0 {
+        self.engine.set_group_gen(&g, lineage_move);
+        self.flush_pending = true;
       }
       let _ = self.events_tx.try_send((g, ev));
     }

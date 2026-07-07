@@ -319,14 +319,6 @@ where
       .is_some_and(|(g, _)| *g == generation)
   }
 
-  /// The freeze generation this target still owes `source` a thaw for, if any — the removal-floor
-  /// query's per-target read ([`crate::MultiRaft::abort_thaw_floor`]). The max of this across every
-  /// host becomes the durable admission floor a removal of `source` persists, so the incarnation an
-  /// outstanding abort abandoned can never be re-derived past the fence nor repeated by a recreate.
-  pub(crate) fn abandoned_gen(&self, source: &Bytes) -> Option<u64> {
-    self.merge.abandoned.get(source).map(|(g, _)| *g)
-  }
-
   /// Record the merge this target-role abort abandoned — inserted at the abort's apply (and re-set
   /// by its replay), so the source-side thaw is DERIVED from the committed target abort, never an
   /// independent source decision. Keyed by source, so a concurrent fan-in of aborts each keeps its
@@ -527,12 +519,14 @@ where
     self.applied = pending.at();
     self.split.shape_gen = self.split.shape_gen.max(pending.target_gen_after());
     self.merge.absorb_index = Some(pending.at());
+    // The post-absorb counter rides the event — the driver's engine mirror (INV-LINEAGE).
     self
       .outputs
       .events
       .push_back(crate::Event::Merged(crate::Merged::new(
         pending.at(),
         pending.source_bytes(),
+        self.split.shape_gen,
       )));
   }
 
@@ -553,6 +547,7 @@ where
       .push_back(crate::Event::MergeAborted(crate::MergeAborted::new(
         pending.at(),
         pending.source_bytes(),
+        self.split.shape_gen,
       )));
   }
 

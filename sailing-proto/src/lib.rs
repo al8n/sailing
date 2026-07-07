@@ -89,8 +89,8 @@ pub use read_only::{FailoverReadWindow, ReadState};
 
 mod event;
 pub use event::{
-  Applied, ConfChanged, Event, LeaderChanged, MergeAborted, Merged, ReadModeChanged, SplitApplied,
-  SplitStale,
+  Applied, ConfChanged, Event, LeaderChanged, MergeAborted, MergeFrozen, MergeRolledBack, Merged,
+  ReadModeChanged, SplitApplied, SplitStale,
 };
 
 mod endpoint;

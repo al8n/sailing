@@ -29,7 +29,7 @@ use std::{
 use bytes::Bytes;
 use compio::net::{TcpListener, TcpStream};
 use sailing_proto::{
-  Config, ConnId, Event, FloorStore, GroupControl, GroupEngine, GroupId, Index, Instant,
+  Config, ConnId, Endpoint, Event, FloorStore, GroupControl, GroupEngine, GroupId, Index, Instant,
   MultiStreamCoordinator, Now, ReadOnlyOption, RecordIo, StateMachine, StorageProgress,
   floor_admits,
 };
@@ -991,7 +991,10 @@ where
     };
     match result {
       Ok(()) => {
-        self.engine.set_group_gen(&gid, generation);
+        // Re-sync to the LIVE restored counter (see the reactor hosts): replay re-applies
+        // lineage moves whose event-time mirror may have died with the crash.
+        let live = self.coord.group(&gid).map_or(0, Endpoint::shape_gen);
+        self.engine.set_group_gen(&gid, generation.max(live));
         // The restore may leave one staged stable write (a recovered lease floor): barrier it.
         self.flush_pending = true;
         self.election.insert(gid.cheap_clone(), election);
@@ -1073,23 +1076,12 @@ where
   /// the group's parked work fails with the group-scoped teardown verdict. Returns whether the
   /// group was hosted.
   fn remove_group(&mut self, gid: &G) -> bool {
-    // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin; a
-    // reshaped id is fenced below its next incarnation forever. A source a target still owes a
-    // merge-abort thaw is floored above that obligation's freeze generation too — the DURABLE
-    // backstop to the container's in-memory purge, so a crash-replay re-derivation discharges off
-    // the floor and a recreate can never repeat the frozen incarnation. The reshape floor alone
-    // misses it: a freeze bumps the endpoint shape gen, never this engine lineage, so a
-    // frozen-then-aborted source is removed at lineage 0 with no reshape floor. Queried BEFORE the
-    // removal below purges the obligation.
-    let generation = self.engine.group_gen(gid);
-    let mut floor = if generation > 0 {
-      generation.saturating_add(1)
-    } else {
-      0
-    };
-    if let Some(owed) = self.coord.abort_thaw_floor(gid) {
-      floor = floor.max(owed);
-    }
+    // Floors are the OPT-IN reshaping fence: a gen-0 id keeps the P5 volatile-tombstone rejoin;
+    // a reshaped id is fenced one past its removal CEILING — every generation this incarnation
+    // could have minted rides the unified counter the lineage mirrors track, so the floor
+    // covers every outstanding gen-keyed authorization with no knowledge of any other group
+    // (see the reactor hosts).
+    let floor = self.engine.removal_floor(gid);
     if floor > 0 {
       self.engine.set_group_floor(gid, floor);
       self.flush_pending = true;
@@ -1619,6 +1611,20 @@ where
         let _ = self.lifecycle_tx.try_send(LifecycleEvent::RemovedSelf {
           group: g.cheap_clone(),
         });
+      }
+      // THE LINEAGE MIRROR (see the reactor hosts): fold each applied merge move — and an
+      // install's monotone catch-up — into the engine's per-id record (INV-LINEAGE).
+      let lineage_move = match &ev {
+        Event::MergeFrozen(f) => f.gen_after(),
+        Event::MergeRolledBack(r) => r.gen_after(),
+        Event::MergeAborted(a) => a.gen_after(),
+        Event::Merged(m) => m.gen_after(),
+        Event::SnapshotInstalled(meta) => meta.shape_gen(),
+        _ => 0,
+      };
+      if lineage_move > 0 {
+        self.engine.set_group_gen(&g, lineage_move);
+        self.flush_pending = true;
       }
       let _ = self.events_tx.try_send((g, ev));
     }

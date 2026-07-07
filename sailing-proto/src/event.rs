@@ -213,23 +213,90 @@ impl SplitStale {
   }
 }
 
+/// A `PrepareMerge` entry was committed and applied: this group is now FROZEN as a merge source.
+/// Carries the post-freeze lineage so a driver can MIRROR the move into its engine record the
+/// moment it applies (INV-LINEAGE: the engine-durable counter tracks every applied lineage move,
+/// so the ordinary removal floor covers every generation a freeze ever minted).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeFrozen {
+  /// The log index of the applied `PrepareMerge` entry.
+  index: Index,
+  /// The group's lineage counter after the freeze (`source_gen_after`).
+  gen_after: u64,
+}
+
+impl MergeFrozen {
+  /// Construct.
+  pub const fn new(index: Index, gen_after: u64) -> Self {
+    Self { index, gen_after }
+  }
+
+  /// The log index of the applied `PrepareMerge` entry.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The group's lineage counter after the freeze.
+  #[inline(always)]
+  pub const fn gen_after(&self) -> u64 {
+    self.gen_after
+  }
+}
+
+/// A SOURCE-role `RollbackMerge` entry was committed and applied: the freeze is undone. Carries
+/// the post-thaw lineage for the same driver mirror as [`MergeFrozen`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MergeRolledBack {
+  /// The log index of the applied `RollbackMerge` (unfreeze) entry.
+  index: Index,
+  /// The group's lineage counter after the thaw (`source_gen_after`).
+  gen_after: u64,
+}
+
+impl MergeRolledBack {
+  /// Construct.
+  pub const fn new(index: Index, gen_after: u64) -> Self {
+    Self { index, gen_after }
+  }
+
+  /// The log index of the applied `RollbackMerge` (unfreeze) entry.
+  #[inline(always)]
+  pub const fn index(&self) -> Index {
+    self.index
+  }
+
+  /// The group's lineage counter after the thaw.
+  #[inline(always)]
+  pub const fn gen_after(&self) -> u64 {
+    self.gen_after
+  }
+}
+
 /// A `CommitMerge` entry RESOLVED: the frozen source group's state machine was absorbed into
 /// this group at the parked entry, and this group now serves the union. G-FREE like
 /// [`SplitApplied`] — `source` is the absorbed group id's canonical `Data` encoding; the typed id
 /// surfaces on the drivers' lifecycle tail. The source group's endpoint is gone the moment this
-/// fires (its id is floored terminally at the storage layer).
+/// fires (its id is floored terminally at the storage layer). `gen_after` is the TARGET's
+/// lineage after the absorb — the driver's engine mirror, as on [`MergeFrozen`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Merged {
   /// The log index of the resolved `CommitMerge` entry.
   index: Index,
   /// The absorbed (source) group id's canonical `Data` encoding.
   source: Bytes,
+  /// The absorbing target's lineage counter after the absorb (`target_gen_after`).
+  gen_after: u64,
 }
 
 impl Merged {
   /// Construct.
-  pub const fn new(index: Index, source: Bytes) -> Self {
-    Self { index, source }
+  pub const fn new(index: Index, source: Bytes, gen_after: u64) -> Self {
+    Self {
+      index,
+      source,
+      gen_after,
+    }
   }
 
   /// The log index of the resolved `CommitMerge` entry.
@@ -243,27 +310,42 @@ impl Merged {
   pub fn source(&self) -> Bytes {
     self.source.clone()
   }
+
+  /// The absorbing target's lineage counter after the absorb.
+  #[inline(always)]
+  pub const fn gen_after(&self) -> u64 {
+    self.gen_after
+  }
 }
 
-/// A `CommitMerge` entry resolved as a deterministic NO-OP: the source's log settled the race
-/// against it (a rollback moved the lineage past the committed expectation), or the entry is a
-/// replayed/duplicate commit for an already-absorbed source. Nothing was absorbed; the group's
-/// state machine and lineage are untouched.
+/// A merge attempt against this group DIED deterministically: a `CommitMerge` no-op'd (the
+/// source's log settled the race, or the entry is a replayed duplicate), a parked commit
+/// resolved aborted, or a TARGET-role `RollbackMerge` abandoned the merge at its live mint.
+/// Nothing was absorbed. `gen_after` is this group's lineage at the event — bumped only by the
+/// target-role abort arm (its mint kills the raced commit at the lineage guard), unchanged at
+/// the no-op arms; the driver mirrors it unconditionally (monotone-max makes the no-bump arms
+/// free).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MergeAborted {
-  /// The log index of the no-op'd `CommitMerge` entry.
+  /// The log index of the deciding entry.
   index: Index,
   /// The named (source) group id's canonical `Data` encoding.
   source: Bytes,
+  /// This group's lineage counter after the event.
+  gen_after: u64,
 }
 
 impl MergeAborted {
   /// Construct.
-  pub const fn new(index: Index, source: Bytes) -> Self {
-    Self { index, source }
+  pub const fn new(index: Index, source: Bytes, gen_after: u64) -> Self {
+    Self {
+      index,
+      source,
+      gen_after,
+    }
   }
 
-  /// The log index of the no-op'd `CommitMerge` entry.
+  /// The log index of the deciding entry.
   #[inline(always)]
   pub const fn index(&self) -> Index {
     self.index
@@ -273,6 +355,12 @@ impl MergeAborted {
   #[inline(always)]
   pub fn source(&self) -> Bytes {
     self.source.clone()
+  }
+
+  /// This group's lineage counter after the event.
+  #[inline(always)]
+  pub const fn gen_after(&self) -> u64 {
+    self.gen_after
   }
 }
 
@@ -305,12 +393,13 @@ pub enum Event<I, R> {
   /// proposals, conf changes, transfers, and reads (typed) until the merge resolves (the group
   /// is absorbed and removed) or an explicit rollback lands. Replication, elections, and
   /// snapshot sends run unchanged, so the freeze itself propagates and survives leader crashes.
-  Frozen,
+  /// Carries the post-freeze lineage for the drivers' engine mirror.
+  MergeFrozen(MergeFrozen),
   /// A `RollbackMerge` entry was committed and applied: the freeze is undone, proposals and
   /// reads resume, and any parked `CommitMerge` naming the old freeze aborts deterministically
   /// (the rollback moved the lineage counter past it). Leases are NOT resurrected — they re-form
-  /// from live traffic.
-  MergeRolledBack,
+  /// from live traffic. Carries the post-thaw lineage for the drivers' engine mirror.
+  MergeRolledBack(MergeRolledBack),
   /// A parked `CommitMerge` RESOLVED: the source group was absorbed and this group serves the
   /// union from the resolved index on.
   Merged(Merged),

@@ -423,16 +423,6 @@ where
     self.multi.split_reserved(gid)
   }
 
-  /// The durable admission floor a removal of `source` must persist to fence its outstanding
-  /// merge-abort thaw obligation — see [`MultiRaft::abort_thaw_floor`]. A driver reads it BEFORE
-  /// [`remove_group`](Self::remove_group) (which purges the obligation) and writes it through its
-  /// `FloorStore`, so a crash-replay re-derivation discharges off the floor and a recreate can never
-  /// repeat the frozen incarnation.
-  #[must_use]
-  pub fn abort_thaw_floor(&self, source: &G) -> Option<u64> {
-    self.multi.abort_thaw_floor(source)
-  }
-
   /// Whether `gid` is TOMBSTONED: removed and not explicitly cleared since — its inbound entries
   /// dropping silently and its re-creation refusing (see [`remove_group`](Self::remove_group)).
   /// Volatile — a restart starts clean.

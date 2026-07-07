@@ -493,39 +493,6 @@ where
     removed
   }
 
-  /// The durable admission floor a REMOVAL of `source` must persist so an outstanding merge-abort
-  /// thaw obligation cannot outlive the incarnation: `Some(expected + 1)`, strictly above the
-  /// highest freeze generation any hosted target still owes `source` a thaw for, or `None` when no
-  /// target owes one. The caller (a driver's [`remove_group`](Self::remove_group) wiring) writes it
-  /// through its [`FloorStore`] BEFORE the removal purges the obligation.
-  ///
-  /// This is the DURABLE backstop to the in-memory purge on removal. The purge binds the obligation
-  /// to the incarnation synchronously, but the obligation is RE-DERIVED from the target's still-durable
-  /// committed abort entry on a restart that has not yet compacted past it — so a crash between the
-  /// removal and that compaction resurrects it. The reshape floor (`generation + 1`) does NOT cover
-  /// this: a merge freeze bumps the source endpoint's shape generation, never the driver's engine
-  /// lineage, so a source frozen-then-aborted at engine-lineage 0 is removed with no reshape floor at
-  /// all. Persisting `expected + 1` makes the re-derived obligation discharge off the floor
-  /// (`!floor_admits(floor, expected)`) AND forces a recreate to admit strictly above `expected`
-  /// (`validate_floor`), closing crash-replay resurrection and recreate reuse by construction.
-  ///
-  /// An embedder driving [`MultiRaft`] directly owes the same discipline against its own real
-  /// `FloorStore`; a [`NoFloors`] world keeps only the volatile purge (no durable fence), so a
-  /// crash-replay-then-recreate there can still reuse the incarnation — the documented cost of
-  /// opting out of floors.
-  #[must_use]
-  pub fn abort_thaw_floor(&self, source: &G) -> Option<u64> {
-    let mut source_key = Vec::new();
-    source.encode(&mut source_key);
-    let source_key = Bytes::from(source_key);
-    self
-      .groups
-      .values()
-      .filter_map(|ep| ep.abandoned_gen(&source_key))
-      .max()
-      .map(|expected| expected.saturating_add(1))
-  }
-
   /// End `gid`'s park episode: leave the parked set and purge any still-queued conflict
   /// signal. Every arm that resolves a park routes through here, so an UNDELIVERED signal (one
   /// a full driver tail deferred) dies with its episode — delivered afterwards it would be

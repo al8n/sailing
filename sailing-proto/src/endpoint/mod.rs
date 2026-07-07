@@ -1572,8 +1572,13 @@ where
           "stale-minted split no-op'd"
         );
       }
-      Event::Frozen => {
-        tracing::info!(target: "sailing::consensus", "group frozen by a merge");
+      Event::MergeFrozen(e) => {
+        tracing::info!(
+          target: "sailing::consensus",
+          index = e.index().get(),
+          gen_after = e.gen_after(),
+          "group frozen by a merge"
+        );
       }
       Event::Merged(e) => {
         tracing::info!(target: "sailing::consensus", index = e.index().get(), "merge absorbed");
@@ -1581,8 +1586,13 @@ where
       Event::MergeAborted(e) => {
         tracing::info!(target: "sailing::consensus", index = e.index().get(), "merge aborted");
       }
-      Event::MergeRolledBack => {
-        tracing::info!(target: "sailing::consensus", "merge rolled back; group thawed");
+      Event::MergeRolledBack(e) => {
+        tracing::info!(
+          target: "sailing::consensus",
+          index = e.index().get(),
+          gen_after = e.gen_after(),
+          "merge rolled back; group thawed"
+        );
       }
     }
   }
@@ -2644,7 +2654,15 @@ where
             self.merge.freeze_pending = None;
             self.merge.frozen_for = Some(payload.target_bytes());
             self.split.shape_gen = self.split.shape_gen.max(payload.source_gen_after());
-            self.outputs.events.push_back(Event::Frozen);
+            // The event carries the post-freeze counter so the driver can mirror this lineage
+            // move into its engine record the crank it applies (INV-LINEAGE).
+            self
+              .outputs
+              .events
+              .push_back(Event::MergeFrozen(crate::MergeFrozen::new(
+                idx,
+                self.split.shape_gen,
+              )));
           }
           EntryKind::CommitMerge => {
             // A committed CommitMerge whose payload won't decode is corrupt — mirror Split.
@@ -2670,6 +2688,7 @@ where
                 .push_back(Event::MergeAborted(crate::MergeAborted::new(
                   idx,
                   payload.source_bytes(),
+                  self.split.shape_gen,
                 )));
             } else {
               // PARK: the endpoint cannot apply this entry alone — the absorbed half lives in
@@ -2718,7 +2737,14 @@ where
                   break;
                 }
               }
-              self.outputs.events.push_back(Event::MergeRolledBack);
+              // Post-thaw counter rides the event — the driver's engine mirror (INV-LINEAGE).
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeRolledBack(crate::MergeRolledBack::new(
+                  idx,
+                  self.split.shape_gen,
+                )));
             } else if Some(payload.target_gen_after()) == self.split.shape_gen.checked_add(1) {
               // The TARGET-role abort at its live mint: the merge attempt named in the payload
               // is dead on THIS log, totally ordered against its CommitMerge — a later commit
@@ -2740,6 +2766,7 @@ where
                 .push_back(Event::MergeAborted(crate::MergeAborted::new(
                   idx,
                   payload.source_bytes(),
+                  self.split.shape_gen,
                 )));
             }
             // A TARGET-role abort with a stale mint lost its race (the merge resolved, or a

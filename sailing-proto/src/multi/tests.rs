@@ -3632,18 +3632,17 @@ fn a_floored_sources_rederived_obligation_discharges() {
 /// DURABLE INCARNATION FENCE (the crash-replay layer of the #22 remove/recreate race): the in-memory
 /// purge on removal binds an abort obligation to its incarnation SYNCHRONOUSLY, but the obligation is
 /// RE-DERIVED from the target's still-durable committed abort entry on a restart that has not yet
-/// compacted past it — so a crash between the removal and that compaction resurrects it, and a source
-/// recreated at reset gen 0 that re-freezes the SAME pair at the SAME repeated gen would find the
-/// re-derived record still backing a thaw the target never aborted for THIS incarnation.
+/// compacted past it — so a crash between the removal and that compaction resurrects it, and a
+/// squatter recreated at reset gen 0 that re-freezes the SAME pair at the SAME repeated gen would
+/// find the re-derived record still backing a thaw the target never aborted for THIS incarnation.
 ///
-/// The cure is a DURABLE floor the removal persists, derived from container state ALONE: whenever a
-/// source a target still owes an abort thaw is removed, [`MultiRaft::abort_thaw_floor`] yields
-/// `expected + 1`, which the driver's removal wiring writes through its `FloorStore`. The reshape
-/// floor (`generation + 1`) does NOT cover this — a merge freeze bumps the source endpoint's shape
-/// gen, never the engine lineage, so this source is removed at engine-lineage 0 with no reshape
-/// floor. On replay the re-derived obligation discharges off the persisted floor (`!floor_admits`),
-/// and a recreate must admit strictly above `expected`. This test plays the driver's removal-floor
-/// discipline against a REAL settable `FloorStore` and proves BOTH legs close the race.
+/// The cure is the ORDINARY removal floor off the UNIFIED lineage counter: the freeze bumped the
+/// source's own lineage, so `group_gen + 1` (what a driver's `removal_floor` ceiling persists —
+/// mirrored eagerly by the merge lineage events, re-derivable from the stores) already fences one
+/// past every generation an obligation could name, with NO target scan. On replay the re-derived
+/// obligation discharges off the persisted floor (`!floor_admits`), and a recreate must admit
+/// strictly above `expected`. This test plays the driver's removal-floor discipline against a REAL
+/// settable `FloorStore` and proves BOTH legs close the race.
 ///
 /// RED without the fence (no floor persisted on removal): the re-derived obligation is NOT discharged,
 /// and the recreated source's re-freeze at the repeated gen is thawed — `abandoned_matches` still
@@ -3670,19 +3669,15 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
   }
   let abort_index = m.group(&2).unwrap().abandoned_obligations()[0].2;
 
-  // THE REMOVAL-FLOOR DISCIPLINE, played as a driver's `remove_group` wiring does. The source was
-  // frozen at engine-lineage 0 (the freeze bumped only the endpoint shape gen), so the reshape floor
-  // is absent — the fence must come from the outstanding obligation. Derive it from container state,
-  // persist it durably, THEN purge and drop the store.
-  let fence = m.abort_thaw_floor(&1);
+  // THE REMOVAL-FLOOR DISCIPLINE, played as a driver's `remove_group` wiring does: one past the
+  // source's OWN lineage — the freeze rode the unified counter, so no target scan is needed.
+  // Persist it durably, THEN purge and drop the store.
+  let fence = m.group_gen(&1).saturating_add(1);
   assert_eq!(
-    fence,
-    Some(2),
-    "the removal fences the source one past the freeze gen (1) it still owes 2 a thaw for"
+    fence, 2,
+    "the frozen source's own lineage fences one past the freeze gen (1) it owes 2 a thaw for"
   );
-  if let Some(floor) = fence {
-    stores.floors.insert(1, floor);
-  }
+  stores.floors.insert(1, fence);
   assert!(m.remove_group(&1).is_some());
   stores.inner.0.remove(&1);
 
@@ -3706,8 +3701,9 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
     "the removal-persisted floor discharged the re-derived obligation across the restart"
   );
 
-  // RECREATE source 1 at genesis (its LOCAL shape gen resets to 0), elect, and drain. Its store is
-  // fresh; the durable floor is the persistent fence a real coordinator's admission checks against.
+  // RECREATE source 1 as a BELOW-FLOOR SQUATTER at genesis gen 0 — the floor-free container
+  // admits what a coordinator's `validate_floor` would refuse. Deliberate adversarial belt: even
+  // an improperly-admitted repeat incarnation must find no authorization left to ride.
   stores
     .inner
     .0
@@ -3889,6 +3885,410 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
   assert!(
     m.group(&1).unwrap().is_frozen(),
     "the new incarnation's freeze stands"
+  );
+}
+
+/// THE SOURCE-LINEAGE FLOOR NEEDS NO TARGET (the unhosted-target escape): an obligation lives in
+/// its TARGET's endpoint, so any removal floor derived by scanning hosted targets misses every
+/// obligation whose target is UNHOSTED at the source's removal — restored later, the target
+/// replays its abort entry, re-derives the obligation, and a recreated source that re-freezes the
+/// pair at the repeated gen finds it still backing a thaw (the codex-R4 critical). Under the
+/// unified counter the removal floor comes from the SOURCE'S OWN lineage (`group_gen + 1` — the
+/// freeze rode the same counter), so it covers every minted `expected` with no knowledge of any
+/// target, and the re-derived obligation discharges off the persisted floor.
+///
+/// RED under the old target-scan discipline (no hosted target owes anything at the removal → no
+/// floor): the re-derived obligation survives, the gen-0 recreate re-mints the repeated gen, and
+/// the service's own drive thaws the new incarnation's freeze off the dead incarnation's abort.
+#[test]
+fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor() {
+  let (mut m, base) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  let mut stores = LineageStores {
+    inner: base,
+    floors: std::collections::BTreeMap::new(),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  // Freeze 1 -> 2 (gen 1) and abort on the target: obligation `abandoned[1] = (1, _)`.
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().has_abandoned());
+
+  // The TARGET goes UNHOSTED first (lifecycle churn; its durable stores survive). No hosted
+  // endpoint carries the obligation now — a target-scan removal floor would find NOTHING.
+  assert!(m.remove_group(&2).is_some());
+
+  // Remove the SOURCE with the unified-counter discipline: its OWN lineage covers the freeze.
+  let fence = m.group_gen(&1).saturating_add(1);
+  assert_eq!(fence, 2, "the source's own counter carries the freeze");
+  stores.floors.insert(1, fence);
+  assert!(m.remove_group(&1).is_some());
+  stores.inner.0.remove(&1);
+
+  // RESTORE the target later: replaying its committed abort entry RE-DERIVES the obligation.
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    m.restore_group(
+      2,
+      single_node_cfg(1),
+      now,
+      7,
+      CountSm::default(),
+      1,
+      log,
+      stable,
+    )
+    .unwrap();
+  }
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "the restored target re-derived the obligation from its durable abort entry"
+  );
+
+  // THE DISCHARGE, off the source's own floor — no target scan produced it, and no live source
+  // exists to observe: `!floor_admits(2, 1)` proves the frozen-at-1 incarnation is gone forever.
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the re-derived obligation discharged off the source's removal floor"
+  );
+
+  // RECREATE the source at its admitted generation and re-freeze the SAME pair: the fresh
+  // freeze mints above every generation the dead incarnation ever named.
+  stores
+    .inner
+    .0
+    .insert(1, (VecLog::default(), AsyncStable::default()));
+  assert!(crate::floor_admits(*stores.floors.get(&1).unwrap(), 2));
+  m.create_group(1, 2, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 3,
+    "the recreate's freeze minted above the dead incarnation"
+  );
+
+  // NO thaw is backed: the discharged obligation authorizes nothing (UnbackedThaw at the new
+  // gen; StaleThaw at the old), and the service leaves the new freeze standing.
+  let last_before = stores.inner.0.get(&1).unwrap().0.last_index();
+  let unbacked = {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 3)
+  };
+  assert!(
+    matches!(unbacked, Some(Err(MergeError::UnbackedThaw))),
+    "no committed abort backs the new incarnation's thaw: {unbacked:?}"
+  );
+  let stale = {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(
+      stale,
+      Some(Err(MergeError::StaleThaw {
+        expected: 1,
+        seen: 3
+      }))
+    ),
+    "the dead incarnation's expected gen is spent: {stale:?}"
+  );
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert_eq!(
+    stores.inner.0.get(&1).unwrap().0.last_index(),
+    last_before,
+    "nothing appended a thaw"
+  );
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "the new incarnation's freeze survives the dead incarnation's abort"
+  );
+}
+
+/// One driver-shaped storage crank for an engine-hosted group: barrier, then drain completions
+/// (the reactor/compio crank loop's shape).
+fn engine_crank(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  engine: &mut GroupEngine<u64, u64>,
+  gid: u64,
+  now: Instant,
+) {
+  for _ in 0..4 {
+    engine.flush();
+    let Some((log, stable)) = engine.stores(&gid) else {
+      break;
+    };
+    let _ = m.handle_storage(&gid, now, log, stable);
+  }
+}
+
+/// The drivers' event-pump lineage fold — the mirror discipline under test: every merge lineage
+/// event (and an install's monotone catch-up) lands in the engine's per-id record.
+fn fold_lineage_events(m: &mut MultiRaft<u64, u64, CountSm>, engine: &mut GroupEngine<u64, u64>) {
+  while let Some((g, ev)) = m.poll_event() {
+    let lineage_move = match &ev {
+      Event::MergeFrozen(f) => f.gen_after(),
+      Event::MergeRolledBack(r) => r.gen_after(),
+      Event::MergeAborted(a) => a.gen_after(),
+      Event::Merged(mg) => mg.gen_after(),
+      Event::SnapshotInstalled(meta) => meta.shape_gen(),
+      _ => 0,
+    };
+    if lineage_move > 0 {
+      engine.set_group_gen(&g, lineage_move);
+    }
+  }
+}
+
+/// INV-LINEAGE: every hosted group's live counter equals the engine's lineage record once the
+/// crank's folds land — the doctrine pin, so the two counters can never silently diverge again.
+fn assert_inv_lineage(m: &MultiRaft<u64, u64, CountSm>, engine: &GroupEngine<u64, u64>) {
+  for gid in m.group_ids() {
+    assert_eq!(
+      m.group(gid).unwrap().shape_gen(),
+      engine.group_gen(gid),
+      "INV-LINEAGE drift on group {gid}: hosted counter != engine record"
+    );
+  }
+}
+
+/// Admit + elect one engine-hosted single-voter group, recording the admitted generation in the
+/// engine as the drivers do after a create `Ok`.
+fn engine_group(
+  m: &mut MultiRaft<u64, u64, CountSm>,
+  engine: &mut GroupEngine<u64, u64>,
+  gid: u64,
+  generation: u64,
+  now: Instant,
+) {
+  assert!(engine.add_group(gid));
+  m.create_group(
+    gid,
+    generation,
+    single_node_cfg(1),
+    now,
+    7,
+    CountSm::default(),
+  )
+  .unwrap();
+  engine.set_group_gen(&gid, generation);
+  let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+  {
+    let (log, stable) = engine.stores(&gid).unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+  }
+  engine_crank(m, engine, gid, now);
+  assert!(m.group(&gid).unwrap().role().is_leader());
+}
+
+/// THE INV-LINEAGE PIN: across the whole merge choreography — freeze, target abort, service-driven
+/// thaw, re-freeze, parked absorb — every applied lineage move folds into the engine record within
+/// its crank, so a hosted group's live counter and the engine's durable lineage NEVER disagree at
+/// a crank boundary. This is the doctrine ("one lineage counter, gen ≡ shape gen") pinned as a
+/// test: any future lineage move that forgets its mirror trips it immediately.
+#[test]
+fn hosted_lineage_equals_the_engine_record_after_every_fold() {
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_group(&mut m, &mut engine, 2, 0, now);
+  fold_lineage_events(&mut m, &mut engine);
+  assert_inv_lineage(&m, &engine);
+
+  // FREEZE 1 -> 2: the source's counter moves; the MergeFrozen fold mirrors it.
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+  }
+  engine_crank(&mut m, &mut engine, 1, now);
+  fold_lineage_events(&mut m, &mut engine);
+  assert!(m.group(&1).unwrap().is_frozen());
+  assert_eq!(engine.group_gen(&1), 1, "the freeze mirrored eagerly");
+  assert_inv_lineage(&m, &engine);
+
+  // TARGET-role ABORT on 2: the target's counter moves; the MergeAborted fold mirrors it.
+  {
+    let (log, stable) = engine.stores(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+  }
+  engine_crank(&mut m, &mut engine, 2, now);
+  fold_lineage_events(&mut m, &mut engine);
+  assert_eq!(engine.group_gen(&2), 1, "the abort mint mirrored eagerly");
+  assert_inv_lineage(&m, &engine);
+
+  // The service drives the SOURCE thaw; the MergeRolledBack fold mirrors it, and the follow-up
+  // crank discharges the obligation off the observed advance.
+  m.service_merge_applies(now, &mut engine);
+  engine_crank(&mut m, &mut engine, 1, now);
+  fold_lineage_events(&mut m, &mut engine);
+  assert!(!m.group(&1).unwrap().is_frozen(), "thawed");
+  assert_eq!(engine.group_gen(&1), 2, "the thaw mirrored eagerly");
+  assert_inv_lineage(&m, &engine);
+  m.service_merge_applies(now, &mut engine);
+  assert!(!m.group(&2).unwrap().has_abandoned());
+
+  // RE-FREEZE and ABSORB: park, seal, resolve — the Merged fold mirrors the target's bump.
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+  }
+  engine_crank(&mut m, &mut engine, 1, now);
+  fold_lineage_events(&mut m, &mut engine);
+  assert_inv_lineage(&m, &engine);
+  {
+    let (log, stable) = engine.stores(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap();
+  }
+  engine_crank(&mut m, &mut engine, 2, now);
+  assert!(m.group(&2).unwrap().pending_merge().is_some(), "parked");
+  // First service pass seals the abort window; the crank commits the seal; the second resolves.
+  let mut resolutions = m.service_merge_applies(now, &mut engine);
+  engine_crank(&mut m, &mut engine, 2, now);
+  resolutions.extend(m.service_merge_applies(now, &mut engine));
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }]
+  );
+  // The driver's storage half of a Merged resolution, then the fold: floor + teardown.
+  engine.set_group_floor(&1, MERGED_FLOOR);
+  engine.remove_group(&1);
+  engine_crank(&mut m, &mut engine, 2, now);
+  fold_lineage_events(&mut m, &mut engine);
+  assert!(!m.contains_group(&1), "the source was absorbed");
+  assert_eq!(engine.group_gen(&2), 2, "the absorb mirrored eagerly");
+  assert_inv_lineage(&m, &engine);
+}
+
+/// THE CRASH-WINDOW HEAL (restore re-sync): a freeze applies and the crash eats its engine
+/// mirror — the staged lineage record never reached a barrier, and restart replay surfaces NO
+/// events to re-fold. The drivers' restore re-sync (`set_group_gen(gid, live counter)` after the
+/// restore) heals the record from the replayed endpoint state, so the ordinary removal floor
+/// still lands above every generation the lost mirror covered.
+#[test]
+fn a_lost_freeze_mirror_heals_on_the_restore_resync() {
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_group(&mut m, &mut engine, 2, 0, now);
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+  }
+  engine_crank(&mut m, &mut engine, 1, now);
+  assert!(m.group(&1).unwrap().is_frozen());
+  // THE CRASH: the freeze is durable in the source's log, but its event-time mirror is LOST —
+  // the events die undrained with the process, the engine record still reads 0.
+  drop(m);
+  assert_eq!(engine.group_gen(&1), 0, "the mirror never landed");
+
+  // RESTORE from the surviving engine stores; replay re-freezes the endpoint (no events), and
+  // the driver's re-sync folds the LIVE counter back into the engine record.
+  let mut m2: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let epoch = engine.next_boot_epoch(&1).unwrap();
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    m2.restore_group(
+      1,
+      single_node_cfg(1),
+      now,
+      7,
+      CountSm::default(),
+      epoch,
+      log,
+      stable,
+    )
+    .unwrap();
+  }
+  let live = m2.group(&1).unwrap().shape_gen();
+  assert_eq!(live, 1, "replay re-derived the freeze bump");
+  engine.set_group_gen(&1, live);
+  assert_eq!(
+    m2.group(&1).unwrap().shape_gen(),
+    engine.group_gen(&1),
+    "the re-sync healed INV-LINEAGE across the crash"
+  );
+
+  // The removal now floors ABOVE the obligation's expected gen (1) — the crash window is shut.
+  assert_eq!(engine.removal_floor(&1), 2);
+}
+
+/// THE STORES-ONLY CRASH WINDOW (the ceiling helper's log and meta legs): the group is never
+/// re-hosted after the crash, so no restore re-sync runs — the removal must derive its floor
+/// from the stores alone. Every lineage move rides the group's own log (the shape-kind entries
+/// carry the generation they set) or its snapshot meta, so the ceiling covers the un-mirrored
+/// freeze with no target knowledge. RED under the record-only discipline (`group_gen + 1` with
+/// a lost mirror reads 0 → no floor at all).
+#[test]
+fn removal_floor_reads_the_stores_when_the_mirror_never_landed() {
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let now = Instant::ORIGIN;
+  engine_group(&mut m, &mut engine, 1, 0, now);
+  engine_group(&mut m, &mut engine, 2, 0, now);
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+  }
+  engine_crank(&mut m, &mut engine, 1, now);
+  assert!(m.group(&1).unwrap().is_frozen());
+  drop(m);
+  assert_eq!(engine.group_gen(&1), 0, "the mirror never landed");
+
+  // THE LOG LEG: the durable PrepareMerge entry names source_gen_after = 1 → ceiling 1 → floor 2.
+  assert_eq!(
+    engine.removal_floor(&1),
+    2,
+    "the log scan floors one past the un-mirrored freeze"
+  );
+
+  // THE META LEG: once compaction folds the entries away, the snapshot meta carries the lineage
+  // (every capture stamps the live counter) — model a post-freeze snapshot boundary and re-check.
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    let last = log.last_index();
+    let meta = crate::SnapshotMeta::new(
+      last,
+      Term::new(1),
+      crate::ConfState::from_voters(std::vec![1u64]),
+    )
+    .with_shape_gen(1);
+    crate::StableStore::submit_snapshot(stable, OpId::first_of_epoch(9), meta, fork_blob(0));
+    log.restore(last, Term::new(1));
+  }
+  assert_eq!(
+    engine.removal_floor(&1),
+    2,
+    "the meta leg floors one past the un-mirrored freeze once the log is compacted away"
   );
 }
 

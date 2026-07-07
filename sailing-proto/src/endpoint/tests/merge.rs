@@ -650,7 +650,7 @@ fn ack_through(
 }
 
 /// The freeze fold: a committed `PrepareMerge` applies as full `Frozen` — the boundary recorded,
-/// the lineage bumped to the minted gen, the pending kill subsumed, `Event::Frozen` emitted.
+/// the lineage bumped to the minted gen, the pending kill subsumed, `Event::MergeFrozen` emitted with the post-freeze lineage.
 #[test]
 fn prepare_merge_apply_freezes_and_bumps_gen() {
   let (mut ep, mut log, mut stable) = make_three_voter_leader();
@@ -670,11 +670,17 @@ fn prepare_merge_apply_freezes_and_bumps_gen() {
     ep.merge.freeze_pending, None,
     "pending subsumed into frozen"
   );
-  let mut saw_frozen = false;
+  let mut frozen_gen = None;
   while let Some(ev) = ep.poll_event() {
-    saw_frozen |= matches!(ev, crate::Event::Frozen);
+    if let crate::Event::MergeFrozen(e) = ev {
+      frozen_gen = Some(e.gen_after());
+    }
   }
-  assert!(saw_frozen, "Event::Frozen surfaced");
+  assert_eq!(
+    frozen_gen,
+    Some(1),
+    "Event::MergeFrozen surfaced carrying the post-freeze lineage"
+  );
 }
 
 /// The spec's §4 gate table: every typed surface refuses on a FROZEN group — proposals, conf
@@ -948,11 +954,17 @@ fn rollback_merge_apply_unfreezes() {
   assert_eq!(ep.freeze_index(), None);
   assert_eq!(ep.shape_gen(), 2, "gen moved PAST the freeze generation");
   assert!(!ep.merge_freeze_active(), "lease formation may resume");
-  let mut saw = false;
+  let mut thaw_gen = None;
   while let Some(ev) = ep.poll_event() {
-    saw |= matches!(ev, crate::Event::MergeRolledBack);
+    if let crate::Event::MergeRolledBack(e) = ev {
+      thaw_gen = Some(e.gen_after());
+    }
   }
-  assert!(saw, "Event::MergeRolledBack surfaced");
+  assert_eq!(
+    thaw_gen,
+    Some(2),
+    "Event::MergeRolledBack surfaced carrying the post-thaw lineage"
+  );
   // Proposals resume.
   let cmd = bytes::Bytes::from_static(b"w");
   assert!(ep.propose(Instant::ORIGIN, &mut log, &stable, &cmd).is_ok());
