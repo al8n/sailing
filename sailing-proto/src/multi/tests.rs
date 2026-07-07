@@ -5482,6 +5482,115 @@ fn a_log_behind_source_park_never_self_resolves() {
   );
 }
 
+/// A group admitted at the highest working generation — one below the reserved `MERGED_FLOOR`
+/// terminal — can never reshape: the next lineage mint would BE the sentinel, which every
+/// downstream reader treats as merged-away. Every shape verb refuses `LineageExhausted` at propose
+/// (nothing appended, the group stays serviceable) rather than minting the sentinel as a live
+/// generation or, on a second move, wrapping the counter past the terminal to `0`. Off the
+/// boundary the guard is invisible — small generations chain unchanged.
+#[test]
+fn lineage_mint_stops_short_of_the_reserved_terminal() {
+  // The pure mint helper: it chains strictly below the terminal, and refuses AT it (the negative
+  // pin — a normal small generation is untouched, the ceiling is `None`).
+  assert_eq!(next_lineage(5), Some(6));
+  assert_eq!(next_lineage(MERGED_FLOOR - 2), Some(MERGED_FLOOR - 1));
+  assert_eq!(
+    next_lineage(MERGED_FLOOR - 1),
+    None,
+    "the next mint would be the reserved terminal itself"
+  );
+  assert_eq!(next_lineage(MERGED_FLOOR), None);
+
+  // ---- prepare_merge at the ceiling ----
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log1, mut stable1) = (VecLog::default(), AsyncStable::default());
+  let (mut log2, mut stable2) = (VecLog::default(), AsyncStable::default());
+  // Source (1) admitted one below the terminal; target (2) at genesis. Identical single voter, so
+  // every merge precondition passes and the freeze reaches its `source_gen_after` mint.
+  m.create_group(
+    1,
+    MERGED_FLOOR - 1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    SplitSm::default(),
+  )
+  .unwrap();
+  m.create_group(
+    2,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d1 = lead_single_split(&mut m, 1, &mut log1, &mut stable1);
+  lead_single_split(&mut m, 2, &mut log2, &mut stable2);
+  let before = log1.last_index();
+  assert_eq!(
+    m.prepare_merge(&1, d1, &mut log1, &stable1, &2),
+    Some(Err(MergeError::LineageExhausted)),
+    "a freeze mint at the ceiling would be the reserved terminal"
+  );
+  assert_eq!(
+    log1.last_index(),
+    before,
+    "the refused freeze appended nothing"
+  );
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "the refusal left the source live, not frozen"
+  );
+  // Serviceable: a normal write still commits on the refused source.
+  let applied_before = m.group(&1).unwrap().applied_index();
+  commit_one_split(&mut m, 1, d1, &mut log1, &mut stable1);
+  assert!(
+    m.group(&1).unwrap().applied_index() > applied_before,
+    "a normal write still commits after the freeze refusal"
+  );
+
+  // ---- propose_split at the ceiling ----
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  m.create_group(
+    7,
+    MERGED_FLOOR - 1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
+  let before = log.last_index();
+  assert_eq!(
+    m.propose_split(
+      &7,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x01")
+    ),
+    Some(Err(SplitError::LineageExhausted)),
+    "a split mint at the ceiling would be the reserved terminal"
+  );
+  assert_eq!(
+    log.last_index(),
+    before,
+    "the refused split appended nothing"
+  );
+  // Serviceable: a normal write still commits on the refused parent.
+  let applied_before = m.group(&7).unwrap().applied_index();
+  commit_one_split(&mut m, 7, d, &mut log, &mut stable);
+  assert!(
+    m.group(&7).unwrap().applied_index() > applied_before,
+    "a normal write still commits after the split refusal"
+  );
+}
+
 /// Every propose-time precondition maps to its typed refusal, with nothing appended.
 #[test]
 fn merge_verb_preconditions_refuse_typed() {

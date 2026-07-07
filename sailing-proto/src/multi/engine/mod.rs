@@ -358,7 +358,11 @@ where
   /// every outstanding gen-keyed authorization (a merge-abort thaw obligation's `expected`
   /// above all) discharge off the floor and forces a recreate to admit strictly above it — with
   /// NO knowledge of any other group. Over-approximation is safe: a truncated-away suffix entry
-  /// only raises the fence, never lowers what durability would demand.
+  /// only raises the fence, never lowers what durability would demand. The `+ 1` SATURATES: a
+  /// ceiling at the highest working generation (one below the reserved terminal) floors at
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) — the id is then permanently retired, exactly the
+  /// terminal verdict a group that can never reshape again should carry — rather than wrapping
+  /// past the terminal to `0`.
   #[must_use]
   pub fn removal_floor(&self, gid: &G) -> u64 {
     let mut ceiling = self.group_gen(gid);

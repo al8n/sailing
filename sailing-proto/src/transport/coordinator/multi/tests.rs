@@ -1310,6 +1310,36 @@ fn merged_floor_sentinel_generation_is_reserved() {
   );
 }
 
+/// A group admitted at the highest working generation — one below the reserved `MERGED_FLOOR`
+/// terminal — floors PERMANENTLY on removal: its removal ceiling saturates AT the terminal rather
+/// than overflowing past it, and the persisted terminal fence then refuses every recreate.
+#[test]
+fn a_terminal_edge_group_floors_permanently_on_removal() {
+  // One below the terminal is still an admissible working generation.
+  assert!(crate::floor_admits(0, MERGED_FLOOR - 1));
+  let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
+  engine.set_group_gen(&7, MERGED_FLOOR - 1);
+  // The removal ceiling is `group_gen + 1`, saturated: at the edge it lands ON the terminal
+  // instead of wrapping to `0` (which would break the monotone removal/recreate fence).
+  let floor = engine.removal_floor(&7);
+  assert_eq!(
+    floor, MERGED_FLOOR,
+    "the removal ceiling saturates at the reserved terminal"
+  );
+  engine.set_group_floor(&7, floor);
+  // The persisted terminal fence admits nothing: under a `MERGED_FLOOR` floor the truthful verdict
+  // stays the fence itself at EVERY generation — the sentinel included — so recreation is refused.
+  for generation in [0, MERGED_FLOOR - 1, MERGED_FLOOR] {
+    assert_eq!(
+      crate::multi::validate_floor(engine.group_floor(&7), generation),
+      Err(CreateGroupError::BelowFloor {
+        floor: MERGED_FLOOR
+      }),
+      "the terminal fence refuses recreation at generation {generation}"
+    );
+  }
+}
+
 /// A vote request for a group this host neither hosts nor has tombstoned surfaces ONCE via
 /// `poll_unknown_group` — keyed to the authenticated sender, deduped until polled, re-armed by
 /// polling, and purged by an admission — while hosted and tombstoned groups stay silent.

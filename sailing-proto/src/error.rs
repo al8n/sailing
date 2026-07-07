@@ -218,6 +218,17 @@ pub enum SplitError<I> {
   /// freeze machinery is its surface; nothing produces this today).
   #[error("the parent group is frozen by an in-flight merge")]
   Frozen,
+  /// The parent's lineage counter is one below the reserved
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) terminal, so the split's `parent_gen_after` mint would
+  /// reach the sentinel — a generation every downstream reader treats as merged-away, never a
+  /// working incarnation. Refused at propose so the unmintable value never enters the log (the
+  /// lineage analogue of [`ProposeError::LogIndexExhausted`]); this parent can never split again.
+  /// Unreachable short of log-index exhaustion — every mint consumes a log index — so only a
+  /// crafted or corrupt lineage counter reaches it. Nothing was appended.
+  #[error(
+    "the parent group's lineage counter is exhausted (a split cannot mint past the reserved u64::MAX terminal)"
+  )]
+  LineageExhausted,
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large for one frame). The split-specific gates all passed; the failure is the
   /// ordinary admin-append class, surfaced verbatim.
@@ -369,6 +380,18 @@ pub enum MergeError<I> {
   /// belt-and-suspenders refusal that makes the invariant intrinsic to the thaw path itself.
   #[error("the claimed target holds no committed abort obligation for this source incarnation")]
   UnbackedThaw,
+  /// The mutated group's lineage counter is one below the reserved
+  /// [`MERGED_FLOOR`](crate::MERGED_FLOOR) terminal, so this verb's generation mint (a freeze's
+  /// `source_gen_after`, an absorb's or abort's `target_gen_after`, or a thaw's `source_gen_after`)
+  /// would reach the sentinel — a generation every downstream reader treats as merged-away, never a
+  /// working incarnation. Refused at propose so the unmintable value never enters the log (the
+  /// lineage analogue of [`ProposeError::LogIndexExhausted`]); this group can never reshape again.
+  /// Unreachable short of log-index exhaustion — every mint consumes a log index. Nothing was
+  /// appended.
+  #[error(
+    "the group's lineage counter is exhausted (a merge verb cannot mint past the reserved u64::MAX terminal)"
+  )]
+  LineageExhausted,
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large). The merge-specific gates all passed; the failure is the ordinary
   /// admin-append class, surfaced verbatim.

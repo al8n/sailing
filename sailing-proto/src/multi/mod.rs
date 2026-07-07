@@ -117,6 +117,16 @@ pub(crate) const fn validate_floor(floor: u64, generation: u64) -> Result<(), Cr
   }
 }
 
+/// The next lineage generation after `gen`, or `None` when the mint would reach the reserved
+/// [`MERGED_FLOOR`] terminal (or overflow `u64`). Every shape-move mint — a split's
+/// `parent_gen_after`, a merge freeze/absorb/abort/thaw's generation — passes through here so a
+/// working generation stays STRICTLY below the sentinel: the value that enters the log can never be
+/// read downstream as merged-away, and the counter can never wrap past the terminal to `0`. The
+/// mint analogue of [`floor_admits`]'s admission leg.
+pub(crate) fn next_lineage(generation: u64) -> Option<u64> {
+  generation.checked_add(1).filter(|n| *n < MERGED_FLOOR)
+}
+
 /// The engine IS the drivers' floor store: lookups delegate to the freshest-read lineage
 /// accessors, so a floor staged this crank already fences before the barrier lands (monotone-max
 /// staging makes that early visibility safe).
@@ -1544,9 +1554,12 @@ where
     let ep = self.groups.get_mut(gid)?;
     // The bump is computed from the LIVE counter, whose sole bump site is the earlier split's
     // APPLY — the in-flight gate above holds new proposals until then, so consecutive mints
-    // chain instead of duplicating. Lineage exhaustion is unreachable before log-index
-    // exhaustion — every bump consumes a log index — so no ceiling check rides here.
-    let parent_gen_after = ep.shape_gen() + 1;
+    // chain instead of duplicating. The mint stops strictly below the reserved `MERGED_FLOOR`
+    // terminal: at the ceiling the split is refused here, before any append (unreachable short of
+    // log-index exhaustion, every bump consuming a log index).
+    let Some(parent_gen_after) = next_lineage(ep.shape_gen()) else {
+      return Some(Err(SplitError::LineageExhausted));
+    };
     let child_bytes = Bytes::from(child_bytes);
     let payload = SplitPayload::new(
       child_bytes.clone(),
@@ -1646,8 +1659,12 @@ where
       return Some(Err(MergeError::ReadModesDiffer));
     }
     // The mint reads the live counter; it bumps only when THIS freeze applies, and a second
-    // freeze cannot be proposed while this one is pending or applied (AlreadyFrozen above).
-    let source_gen_after = sep.shape_gen() + 1;
+    // freeze cannot be proposed while this one is pending or applied (AlreadyFrozen above). It
+    // stops strictly below the reserved `MERGED_FLOOR` terminal — at the ceiling the freeze is
+    // refused here, before any append (unreachable short of log-index exhaustion).
+    let Some(source_gen_after) = next_lineage(sep.shape_gen()) else {
+      return Some(Err(MergeError::LineageExhausted));
+    };
     let mut target_bytes = Vec::new();
     target.encode(&mut target_bytes);
     let payload = PrepareMergePayload::new(Bytes::from(target_bytes), source_gen_after);
@@ -1775,7 +1792,11 @@ where
     if !source_barrier_met {
       return Some(Err(MergeError::SourceBarrierPending));
     }
-    let target_gen_after = tep.shape_gen() + 1;
+    // The absorb mint stops strictly below the reserved `MERGED_FLOOR` terminal — at the ceiling
+    // the absorb is refused here, before any append.
+    let Some(target_gen_after) = next_lineage(tep.shape_gen()) else {
+      return Some(Err(MergeError::LineageExhausted));
+    };
     let mut source_bytes = Vec::new();
     source.encode(&mut source_bytes);
     let payload = CommitMergePayload::new(
@@ -1869,8 +1890,11 @@ where
     source.encode(&mut source_bytes);
     // The mint reads the target's live counter — deliberately NOT gated on an in-flight or
     // parked commit: racing one is this verb's whole purpose, and the shared base is exactly
-    // what makes the race resolve to one log-ordered winner.
-    let target_gen_after = tep.shape_gen() + 1;
+    // what makes the race resolve to one log-ordered winner. It stops strictly below the reserved
+    // `MERGED_FLOOR` terminal — at the ceiling the abort is refused here, before any append.
+    let Some(target_gen_after) = next_lineage(tep.shape_gen()) else {
+      return Some(Err(MergeError::LineageExhausted));
+    };
     let payload = RollbackMergePayload::abort(
       Bytes::from(source_bytes),
       source_gen_after,
@@ -2050,9 +2074,14 @@ where
     if let Some(idx) = ep.thaw_in_flight() {
       return Some(Ok(idx));
     }
-    // The thaw is minted at `expected_gen + 1` — written against the BOUND incarnation, not the live
-    // counter — so it advances exactly the abandoned freeze's generation.
-    let source_gen_after = expected_gen + 1;
+    // The thaw is minted at `expected_gen + 1` — written against the BOUND incarnation, not the
+    // live counter — so it advances exactly the abandoned freeze's generation. It stops strictly
+    // below the reserved `MERGED_FLOOR` terminal: a freeze at the ceiling leaves the source frozen
+    // (fail-closed) rather than wrapping the counter past the terminal — an unreachable boundary
+    // (the freeze that set `expected_gen` already consumed the log index that would exhaust first).
+    let Some(source_gen_after) = next_lineage(expected_gen) else {
+      return Some(Err(MergeError::LineageExhausted));
+    };
     let payload = RollbackMergePayload::unfreeze(source_gen_after);
     let mut buf = Vec::new();
     crate::wire::encode_rollback_merge_payload(&payload, &mut buf);
