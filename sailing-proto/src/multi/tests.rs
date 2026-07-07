@@ -3413,6 +3413,249 @@ fn both_fanned_in_aborts_thaw_neither_dropped() {
   );
 }
 
+/// A host with three colocated single-voter [`CountSm`] groups (1, 2, 3), each with the given
+/// applied-command count, elected and fully drained — the substrate for the obligation-holder
+/// lifecycle, where group 2 plays a merge TARGET (of 1) that later tries to become a merge SOURCE
+/// (into 3).
+fn merge_host_triple(c1: usize, c2: usize, c3: usize) -> (MultiRaft<u64, u64, CountSm>, MapStores) {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  for (gid, n) in [(1u64, c1), (2u64, c2), (3u64, c3)] {
+    stores
+      .0
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    m.create_group(
+      gid,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      7,
+      CountSm::default(),
+    )
+    .unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+    drain_storage(&mut m, gid, d, log, stable);
+    assert!(m.group(&gid).unwrap().role().is_leader());
+    for i in 0..n {
+      let cmd = Bytes::copy_from_slice(&[i as u8]);
+      m.propose(&gid, d, log, stable, &cmd).unwrap().unwrap();
+      drain_storage(&mut m, gid, d, log, stable);
+    }
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  (m, stores)
+}
+
+/// LEG alpha (liveness, the obligation-holder lifecycle): a group that owes an aborted upstream
+/// source its thaw must NOT dissolve as a fresh merge's SOURCE. Group 2 is the TARGET of a 1 -> 2
+/// merge that 2 aborts (recording `abandoned[1]`); that thaw is still undischarged. RED current:
+/// `prepare_merge(2 -> 3)` ADMITS, 2 later dissolves into 3, and its `abandoned[1]` vanishes with
+/// the endpoint — 1 is stranded frozen forever. GREEN: the freeze is refused `SourceOwesThaw`, and
+/// once the thaw pass discharges 1 the SAME freeze admits (the self-clearing pin).
+#[test]
+fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  // 1 freezes into 2, then 2 aborts the merge and APPLIES it: 2 now owes 1 a thaw.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "source 1 froze into 2");
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "2 recorded its target-role abort obligation for 1"
+  );
+
+  // The gate: 2 cannot freeze as a source while it still owes 1 a thaw.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(
+        m.prepare_merge(&2, now, log, stable, &3),
+        Some(Err(MergeError::SourceOwesThaw))
+      ),
+      "a source owing a thaw is refused SourceOwesThaw — never admitted to dissolve"
+    );
+  }
+  assert!(
+    !m.group(&2).unwrap().merge_freeze_active(),
+    "the refusal appended nothing"
+  );
+
+  // Drive the thaw pass: it unfreezes 1 from 2's obligation; draining 1 commits the thaw and 1
+  // advances past its freeze generation; the next pass discharges the obligation.
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().is_frozen(), "the thaw unfroze 1");
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the observed advance discharged 2's obligation"
+  );
+
+  // SELF-CLEARING PIN: with the obligation discharged, the SAME freeze now admits.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      m.prepare_merge(&2, now, log, stable, &3).unwrap().is_ok(),
+      "once the thaw discharges, 2 freezes into 3 exactly as a clean source would"
+    );
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().is_frozen(), "2 froze into 3");
+}
+
+/// LEG beta (liveness, the residual window `prepare_merge`'s gate cannot see): an abort committed on
+/// 2 BELOW its own freeze materializes `abandoned[1]` only AFTER `prepare_merge(2 -> 3)` already
+/// admitted — the gate saw no applied obligation, and the freeze fold is an unguarded max, so 2
+/// freezes for 3 while carrying the fresh obligation. RED current: the Resolve arm dissolves 2 with
+/// the live obligation, stranding 1 frozen forever. GREEN: the absorb is HELD; the thaw pass (which
+/// does NOT skip the frozen holder 2) discharges 1 first, and only then is 2 absorbed into 3.
+#[test]
+fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  // 1 freezes into 2 (1 frozen, claim = 2).
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen());
+  // 2 aborts the 1 -> 2 merge but the abort is NOT drained — appended+committed below where 2's own
+  // freeze will land. `has_abandoned` reads APPLIED state, so it is still false here: the prepare
+  // gate below cannot see the obligation.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+  }
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the abort has not applied — no obligation yet"
+  );
+  // 2 freezes into 3: the alpha gate passes (no obligation applied yet), appending 2's PrepareMerge
+  // ABOVE the still-unapplied abort. Draining then applies the abort (recording `abandoned[1]`) THEN
+  // the freeze (2 frozen for 3, the unguarded max-fold keeps both at the same generation).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "the abort applied — 2 now owes 1 a thaw"
+  );
+  assert!(m.group(&2).unwrap().is_frozen(), "and 2 is frozen for 3");
+  // 3 commits the absorb of 2 and parks; seal 3's abort window.
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    m.commit_merge(&3, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(m.group(&3).unwrap().pending_merge().is_some(), "3 parked");
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+
+  // The absorb is HELD while 2 still owes 1 a thaw — 2 is NOT dissolved, no Merged surfaces.
+  let held = m.service_merge_applies(now, &mut stores);
+  assert!(
+    held.is_empty(),
+    "the absorb is held while the obligation stands: {held:?}"
+  );
+  assert!(m.contains_group(&2), "2 is NOT dissolved this crank");
+  // The thaw pass ran on that SAME crank and drove 1's unfreeze despite 2 being FROZEN — the frozen
+  // holder is not skipped. Draining 1 commits the thaw; 1 advances past its freeze generation.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "1 thawed while 2's absorb waited"
+  );
+
+  // Next crank discharges 2's obligation (park still held); the crank after completes the absorb.
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "2's obligation discharged on the observed advance"
+  );
+  let done = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    done,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 3
+    }],
+    "with the obligation cleared, 2 is finally absorbed into 3"
+  );
+  assert!(!m.contains_group(&2), "2 dissolved");
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "and 1 stayed thawed — never stranded"
+  );
+  assert_eq!(
+    m.group(&3).unwrap().state_machine().count(),
+    4 + 3,
+    "3 serves the 2 + 3 union"
+  );
+}
+
+/// The negative pin: a source that owes NO thaw dissolves in the ordinary cadence — the residual
+/// belt never over-fires. 2 freezes into 3 with no outstanding obligation and is absorbed in the
+/// same single resolve pass a clean source always was.
+#[test]
+fn a_source_without_an_obligation_absorbs_at_once() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  assert!(!m.group(&2).unwrap().has_abandoned(), "2 owes nothing");
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    m.commit_merge(&3, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  let done = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    done,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 3
+    }],
+    "a clean source is absorbed with no extra crank"
+  );
+  assert!(!m.contains_group(&2));
+  assert_eq!(m.group(&3).unwrap().state_machine().count(), 4 + 3);
+}
+
 /// FINDING-1 RED (safety, structural): a source thaw is REFUSED with NO append unless the claimed
 /// target hosts a matching committed abort obligation. A frozen source claimed by target 2 — but with
 /// NO abort ever applied on 2 — must not thaw: appending it would move the source's counter out from

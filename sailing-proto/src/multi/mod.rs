@@ -489,9 +489,13 @@ where
     // name, so a stale record can never match a fresh incarnation's freeze anyway. It remains the
     // whole story for a NoFloors embedder (whose recreates may re-mint a removed incarnation's
     // generations — the documented cost of opting out of floors, #22 reopened across
-    // incarnations). The merge Resolve arm removes a source too, but a dissolving source holds no
-    // live FOREIGN obligation (it thawed past any earlier abort before becoming free to merge),
-    // so the purge is a no-op there.
+    // incarnations). The merge Resolve arm removes a source too, and by the time it does the source
+    // holds no obligation in EITHER direction: none owed TO it (it thawed past any earlier abort
+    // before becoming free to merge, discharging every target's `abandoned[self]`), and none it
+    // OWES as a former target — the `prepare_merge` `SourceOwesThaw` gate refuses a source that
+    // still owes a thaw, and the Resolve arm HOLDS the absorb while an obligation that materialized
+    // after that gate still stands. So the purge is a no-op there and the source's own `abandoned`
+    // map is empty.
     if removed.is_some() && self.groups.values().any(Endpoint::has_abandoned) {
       let mut source_key = Vec::new();
       gid.encode(&mut source_key);
@@ -1639,6 +1643,17 @@ where
     if sep.commit_merge_in_flight() || sep.pending_merge().is_some() {
       return Some(Err(MergeError::AlreadyPending));
     }
+    // A source still owing a target-role thaw must discharge it before dissolving. It applied an
+    // abort as a TARGET, whose durable `abandoned` obligation the per-crank thaw pass discharges
+    // from THIS endpoint; the Resolve arm removes the source endpoint, so freezing it here races
+    // that removal against the obligation's discharge — a source torn down mid-thaw takes the
+    // obligation with it and strands the upstream source frozen forever. Sits with `AlreadyPending`
+    // among the target-role-residue gates (both refuse a source still entangled in a prior merge as
+    // a target). TRANSIENT like `SourceBarrierPending`: the thaw pass clears it within a few cranks,
+    // then the same freeze admits.
+    if sep.has_abandoned() {
+      return Some(Err(MergeError::SourceOwesThaw));
+    }
     let source_conf = sep.conf_state();
     if source_conf.is_joint() || target_conf.is_joint() {
       return Some(Err(MergeError::JointConfig));
@@ -2304,6 +2319,23 @@ where
             .groups
             .get(&tgid)
             .is_some_and(Endpoint::absorb_capture_blocked)
+          {
+            continue;
+          }
+          // THE RESIDUAL BELT for the obligation-holder lifecycle: a source that still owes a
+          // target-role thaw must NOT dissolve this crank. `prepare_merge`'s `SourceOwesThaw` gate
+          // refuses the common case at propose, but an abort this source applied AS A TARGET may
+          // have committed BELOW its own freeze and materialized its `abandoned` obligation only
+          // after that gate passed (the freeze fold is an unguarded max, so a source frozen for
+          // this target can still carry a fresh obligation). Removing it here drops the obligation
+          // and strands the upstream source frozen forever. HOLD the park — leave it parked exactly
+          // as a busy target does — so the thaw pass below discharges the obligation FIRST; a later
+          // crank observes the clean source and completes the absorb. A parked target is never
+          // quiesce-eligible, so this service keeps being reached until it resolves.
+          if self
+            .groups
+            .get(&source)
+            .is_some_and(Endpoint::has_abandoned)
           {
             continue;
           }

@@ -289,9 +289,14 @@ where
     self.merge.frozen_for.as_ref()
   }
 
-  /// Whether this target owes ANY source a thaw — the container service's per-crank filter for
-  /// the merge-abort thaw pass, and the `commit_merge` propose gate's read.
-  pub(crate) fn has_abandoned(&self) -> bool {
+  /// Whether this group still owes ANY aborted source a thaw — it applied a merge abort as a TARGET
+  /// whose durable `abandoned` obligation the container's per-crank thaw pass has not yet discharged.
+  /// The service reads it as the thaw pass's per-crank filter and the removal purge's guard, and the
+  /// `prepare_merge` source-side gate and the Resolve arm both refuse to DISSOLVE such a group (its
+  /// obligations would vanish with its endpoint, stranding the upstream source frozen). A group with
+  /// obligations outstanding is therefore a merge participant the embedder MUST NOT remove; recovery
+  /// is the embedder's catalog, exactly like any dead group.
+  pub fn has_abandoned(&self) -> bool {
     !self.merge.abandoned.is_empty()
   }
 

@@ -231,10 +231,14 @@ configuration, so they are exempt. Both `prepare_merge` and `commit_merge` refus
 
 Residual, by contract: **do not remove a merge participant mid-choreography.** Removing the
 TARGET while its source is frozen strands the source's unfreeze (the abort and its relay ride
-the target's log); recovery is the embedder's catalog, exactly like any dead group. The freeze
-gates cover the whole admin propose family (a frozen group refuses splits and refuses to be a
-merge target; a mid-absorb source refuses a fresh freeze), and `pre_vote`/`check_quorum`
-recommendations are unaffected by the freeze — a frozen group elects normally.
+the target's log); recovery is the embedder's catalog, exactly like any dead group. A group still
+**owing an aborted source its thaw** (its target-role `abandoned` obligation undischarged) is
+likewise a participant — do not remove it: the container refuses to dissolve it as a fresh merge's
+source (`SourceOwesThaw`) and HOLDS any absorb of it until the thaw pass discharges the obligation,
+and catalog recovery applies if it is torn down. The freeze gates cover the whole admin propose
+family (a frozen group refuses splits and refuses to be a merge target; a mid-absorb source refuses
+a fresh freeze), and `pre_vote`/`check_quorum` recommendations are unaffected by the freeze — a
+frozen group elects normally.
 
 ## The `multi` container (as built)
 

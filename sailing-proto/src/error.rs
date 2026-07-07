@@ -321,6 +321,15 @@ pub enum MergeError<I> {
   /// retry once it catches up, or roll the merge back if a voter is permanently gone).
   #[error("not every source voter has reached the freeze boundary yet")]
   SourceBarrierPending,
+  /// The source still owes an aborted upstream merge its thaw: a merge this endpoint applied as a
+  /// TARGET was aborted, recording a durable `abandoned` obligation that its per-crank thaw pass has
+  /// not yet discharged. It cannot dissolve as a fresh merge's source — the Resolve arm removes the
+  /// source endpoint, and every undischarged obligation would vanish with it, stranding the upstream
+  /// source frozen forever. TRANSIENT, exactly like [`SourceBarrierPending`](Self::SourceBarrierPending):
+  /// the thaw pass drives each abandoned source past its freeze within a few cranks, discharging the
+  /// obligation, after which the same freeze admits.
+  #[error("the source still owes an aborted merge its thaw")]
+  SourceOwesThaw,
   /// A participant's CURRENT incarnation is below its persisted admission floor (a
   /// coordinator-layer refusal through its floor seam): this replica belongs to a fenced
   /// incarnation — a stale survivor that must not anchor a merge.
