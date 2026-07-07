@@ -559,6 +559,13 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     if w.group_leader_count(gid) != 1 || !w.agreement_holds(gid) {
       return false;
     }
+    // A merge-parked target is NOT converged: its apply is pinned at the park boundary while its
+    // commit races ahead, so the caught-up check below would read its members as equally applied
+    // though the group is wedged. A resolving park clears inside the quiesce ticking; a permanent
+    // one is a livelock this refuses to certify.
+    if w.group_merge_parked(gid) {
+      return false;
+    }
     let members: BTreeSet<u64> = w
       .group_voters(gid)
       .into_iter()

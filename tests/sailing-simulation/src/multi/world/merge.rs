@@ -56,6 +56,8 @@ pub(super) struct NodeStores<'a> {
   pub(super) stables: &'a mut BTreeMap<(u64, u64), MemStable<u64>>,
   /// The host's terminal merge floors (recorded when a source's deferred teardown lands).
   pub(super) floored: &'a BTreeSet<(u64, u64)>,
+  /// The cluster-wide non-terminal removal floors (one past a reshaped id's removal ceiling).
+  pub(super) removal_floors: &'a BTreeMap<u64, u64>,
 }
 
 impl sailing_proto::GroupStores<u64, MemLog, MemStable<u64>> for NodeStores<'_> {
@@ -68,11 +70,14 @@ impl sailing_proto::GroupStores<u64, MemLog, MemStable<u64>> for NodeStores<'_> 
 
 impl sailing_proto::FloorStore<u64> for NodeStores<'_> {
   fn floor(&self, gid: &u64) -> u64 {
-    if self.floored.contains(&(self.node, *gid)) {
+    // The catalog's floor is the MAX of the terminal merge leg (a source absorbed on this host)
+    // and the cluster-wide non-terminal removal leg (a reshaped id the world stopped hosting).
+    let terminal = if self.floored.contains(&(self.node, *gid)) {
       sailing_proto::MERGED_FLOOR
     } else {
       0
-    }
+    };
+    terminal.max(self.removal_floors.get(gid).copied().unwrap_or(0))
   }
 
   fn lineage(&self, _gid: &u64) -> u64 {
@@ -139,6 +144,7 @@ impl MultiWorld {
           logs: &mut self.logs,
           stables: &mut self.stables,
           floored: &self.merge_floors,
+          removal_floors: &self.removal_floors,
         };
         host.service_merge_applies(now, &mut stores)
       };
@@ -355,6 +361,20 @@ impl MultiWorld {
       .filter_map(|&n| self.hosts[&n].group(&gid))
       .any(sailing_proto::Endpoint::is_frozen)
   }
+
+  /// Whether any hosting replica of `gid` is a merge TARGET still PARKED on an unresolved absorb
+  /// (`pending_merge`) — the quiesce convergence tooth: a park holds the target's apply at the
+  /// boundary while its commit races ahead, so its members look "equally applied" and would pass a
+  /// naive caught-up check though the group is wedged. A genuinely resolving park clears inside
+  /// the healed quiesce ticking; only a PERMANENT one keeps this true to the tick budget and
+  /// surfaces the livelock instead of masking it as converged.
+  pub fn group_merge_parked(&self, gid: u64) -> bool {
+    self
+      .node_ids
+      .iter()
+      .filter_map(|&n| self.hosts[&n].group(&gid))
+      .any(|ep| ep.pending_merge().is_some())
+  }
 }
 
 /// Prints replay context if a union assert unwinds (the ledger's panics carry ids and histories
@@ -391,15 +411,17 @@ impl MultiWorld {
   /// above the pure container, played truthfully by the world.
   ///
   /// The legs, cheapest truthful reads of the world's own surfaces: a hosting replica frozen
-  /// (a source from freeze-apply until absorbed or thawed) or parked (a target mid-resolution);
-  /// a merge admin entry still in a hosting replica's UNAPPLIED durable-log suffix (the
-  /// accepted-but-not-yet-folded window — read off the store's raw durable view, so the
-  /// predicate never touches the faultable read path and is schedule-inert for every profile
-  /// that never merges); or any live park anywhere NAMING `gid` as its source.
+  /// (a source from freeze-apply until absorbed or thawed) or parked (a target mid-resolution)
+  /// or still OWING an aborted source its thaw (a former target whose `abandoned` obligation the
+  /// container's thaw pass has not discharged — tearing it down drops the obligation and strands
+  /// the upstream source frozen); a merge admin entry still in a hosting replica's UNAPPLIED
+  /// durable-log suffix (the accepted-but-not-yet-folded window — read off the store's raw durable
+  /// view, so the predicate never touches the faultable read path and is schedule-inert for every
+  /// profile that never merges); or any live park anywhere NAMING `gid` as its source.
   pub fn merge_choreography_active(&self, gid: u64) -> bool {
     for node in &self.node_ids {
       if let Some(ep) = self.hosts[node].group(&gid) {
-        if ep.is_frozen() || ep.pending_merge().is_some() {
+        if ep.is_frozen() || ep.pending_merge().is_some() || ep.has_abandoned() {
           return true;
         }
         if let Some(log) = self.logs.get(&(*node, gid))

@@ -2510,7 +2510,10 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
 /// unfloored id stays at the working floor. The arm's verdict on the sentinel (a replayed
 /// duplicate no-ops past the park) is pinned in the product's own service tests; this seam is
 /// what the dead hosting-check sweep left permanently empty, making that arm unreachable from
-/// the world.
+/// the world. The non-terminal removal leg is folded in beside it: a per-gid `removal_floors`
+/// entry (a reshaped id the world stopped hosting) surfaces at every node, and the two legs take
+/// their MAX — so a target re-deriving a torn-down source's abort obligation discharges it off
+/// the removal floor even where the terminal per-host sentinel was never recorded.
 #[test]
 fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
   use sailing_proto::FloorStore as _;
@@ -2518,11 +2521,16 @@ fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
   let mut stables: BTreeMap<(u64, u64), MemStable<u64>> = BTreeMap::new();
   let mut floored: BTreeSet<(u64, u64)> = BTreeSet::new();
   floored.insert((1, 10));
+  // A reshaped id the world tore down without merging: floored ABOVE its removal ceiling (gen 3),
+  // cluster-wide (every node reads it), never the terminal sentinel.
+  let mut removal_floors: BTreeMap<u64, u64> = BTreeMap::new();
+  removal_floors.insert(12, 3);
   let stores = super::merge::NodeStores {
     node: 1,
     logs: &mut logs,
     stables: &mut stables,
     floored: &floored,
+    removal_floors: &removal_floors,
   };
   assert_eq!(stores.floor(&10), sailing_proto::MERGED_FLOOR);
   assert_eq!(
@@ -2530,15 +2538,30 @@ fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
     0,
     "an unfloored id keeps the working floor"
   );
+  assert_eq!(
+    stores.floor(&12),
+    3,
+    "a non-terminal removal floor surfaces at its recorded gen (not the sentinel)"
+  );
+  assert!(
+    !sailing_proto::floor_admits(stores.floor(&12), 2),
+    "the removal floor fences a below-ceiling gen — the re-derived abort obligation discharges"
+  );
   let other = super::merge::NodeStores {
     node: 2,
     logs: &mut logs,
     stables: &mut stables,
     floored: &floored,
+    removal_floors: &removal_floors,
   };
   assert_eq!(
     other.floor(&10),
     0,
-    "floors are per-host: another node's teardown does not floor this one"
+    "the TERMINAL floor is per-host: another node's teardown does not floor this one"
+  );
+  assert_eq!(
+    other.floor(&12),
+    3,
+    "the REMOVAL floor is cluster-wide: the catalog is one fact, read at every node"
   );
 }

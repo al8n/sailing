@@ -178,6 +178,13 @@ pub struct MultiWorld {
   /// Per-host TERMINAL merge floors `(node, source)` — recorded when a source's deferred
   /// teardown lands (the world's engine-floor model; the service's absent-arm discriminator).
   merge_floors: BTreeSet<(u64, u64)>,
+  /// Per-gid NON-TERMINAL admission floor persisted when the world permanently stops hosting a
+  /// RESHAPED id — the embedder catalog's `removal_floor` discipline (one past the id's removal
+  /// ceiling). Cluster-wide by construction (the catalog is one fact, not per host): a target
+  /// that later re-derives a torn-down source's abort-thaw obligation discharges it off this floor
+  /// (`!floor_admits(floor, expected)`) while the source is unhosted, before any recreate. `0`/absent
+  /// for an id that never reshaped, so the default (no-merge, no-split) profile is byte-identical.
+  removal_floors: BTreeMap<u64, u64>,
   /// Deferred merge-source teardowns `(node, source, target, capture boundary)` awaiting the
   /// target capture's durability on that host (the one-barrier batch model; see
   /// `sweep_merge_teardowns`).
@@ -235,6 +242,7 @@ impl MultiWorld {
       split_refused: 0,
       merges: Vec::new(),
       merge_floors: BTreeSet::new(),
+      removal_floors: BTreeMap::new(),
       pending_merge_teardowns: Vec::new(),
       merges_resolved: 0,
       merges_aborted: 0,

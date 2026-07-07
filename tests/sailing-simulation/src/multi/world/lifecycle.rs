@@ -75,6 +75,25 @@ impl MultiWorld {
   /// stands in for the wire, so purging its `gid` entries (plus the unhosted-drop on anything
   /// later addressed to the gid) is the same observable semantics.
   pub fn remove_group(&mut self, gid: u64) {
+    // The embedder catalog floors what it permanently stops hosting: one past the id's removal
+    // CEILING (the max shape generation any hosting replica reached). A reshaped id that later
+    // backs a RE-DERIVED merge-abort thaw obligation — a target replays its still-durable abort
+    // entry after a crash, but the source's stores are gone — then discharges it off this floor
+    // (`!floor_admits(floor, expected)`) while unhosted, instead of wedging the target's compaction
+    // fence forever. The obligation is thus discharged before any recreate, so a gen-0 recreate
+    // squats harmlessly (no authorization left to ride). A never-reshaped id (ceiling 0) takes NO
+    // floor, preserving the gen-0 volatile-tombstone rejoin — the default profile stays byte-identical.
+    let ceiling = self
+      .node_ids
+      .iter()
+      .filter_map(|&n| self.hosts[&n].group(&gid))
+      .map(sailing_proto::Endpoint::shape_gen)
+      .max()
+      .unwrap_or(0);
+    if ceiling > 0 {
+      let floor = self.removal_floors.entry(gid).or_insert(0);
+      *floor = (*floor).max(ceiling.saturating_add(1));
+    }
     let meta = self
       .groups
       .get_mut(&gid)
