@@ -472,15 +472,16 @@ where
     self.unpark(gid);
     let removed = self.groups.remove(gid);
     // PURGE-ON-REMOVAL: a source leaving the container takes every target's outstanding thaw
-    // obligation for it along with it. An obligation's `expected` gen is the source's LOCAL
-    // `shape_gen`, which a P5 remove/recreate RESETS — so an obligation left behind could be
-    // reused by a fresh incarnation that re-froze the same pair at the same repeated gen, backing
-    // a thaw the target never aborted for THIS incarnation (the #22 cross-log race, reopened across
-    // incarnations). Clearing it here binds the obligation to the incarnation by construction: no
-    // removed source's authorization outlives it, race-free (synchronous with the removal) and
-    // independent of whatever floor the embedder does or does not set. The merge Resolve arm removes
-    // a source too, but a dissolving source holds no live FOREIGN obligation (it thawed past any
-    // earlier abort before becoming free to merge), so the purge is a no-op there.
+    // obligation for it along with it, binding the obligation to the incarnation SYNCHRONOUSLY —
+    // race-free with the removal and independent of whatever floor the embedder does or does not
+    // persist. Under the unified lineage counter this is the FAST PATH, not the safety line: a
+    // floored recreate admits (and seeds) strictly above every generation an obligation could
+    // name, so a stale record can never match a fresh incarnation's freeze anyway. It remains the
+    // whole story for a NoFloors embedder (whose recreates may re-mint a removed incarnation's
+    // generations — the documented cost of opting out of floors, #22 reopened across
+    // incarnations). The merge Resolve arm removes a source too, but a dissolving source holds no
+    // live FOREIGN obligation (it thawed past any earlier abort before becoming free to merge),
+    // so the purge is a no-op there.
     if removed.is_some() && self.groups.values().any(Endpoint::has_abandoned) {
       let mut source_key = Vec::new();
       gid.encode(&mut source_key);
@@ -921,6 +922,13 @@ where
   /// `seed` folded with `gid`, so co-located groups draw decorrelated election-timeout jitter
   /// (identical jitter would correlate their elections into a host-wide storm).
   ///
+  /// `generation` is the id's ADMITTED incarnation under the unified lineage counter (0 at
+  /// genesis; a floor-validated recreate passes the same value its coordinator admission checked
+  /// and its driver records in the engine). It SEEDS the endpoint's lineage counter, so every
+  /// generation this incarnation ever mints (splits, merge freezes/thaws/absorbs) lies strictly
+  /// above its floor — a recreate can never repeat a predecessor's generations, which is what
+  /// binds gen-keyed state (a stale merge-abort obligation above all) to exactly one incarnation.
+  ///
   /// # Errors
   /// [`CreateGroupError::Exists`] if a group with `gid` is already hosted,
   /// [`CreateGroupError::NodeIdMismatch`] if `config`'s id differs from the hosted groups' shared
@@ -930,6 +938,7 @@ where
   pub fn create_group(
     &mut self,
     gid: G,
+    generation: u64,
     config: Config<I>,
     now: impl Into<Now>,
     seed: u64,
@@ -937,10 +946,12 @@ where
   ) -> Result<(), CreateGroupError> {
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
-    let ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
-    // Genesis: reset the relay-time lineage view (a stale entry from an earlier same-uptime
-    // incarnation must not shadow this admission — every admission reseeds it).
-    self.lineage.insert(gid.cheap_clone(), 0);
+    let mut ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
+    ep.seed_lineage(generation);
+    // Every admission reseeds the relay-time lineage view (a stale entry from an earlier
+    // same-uptime incarnation must not shadow this admission) — at the ADMITTED generation,
+    // exactly where the endpoint's own counter starts.
+    self.lineage.insert(gid.cheap_clone(), generation);
     self.groups.insert(gid, ep);
     Ok(())
   }
@@ -1150,13 +1161,16 @@ where
   F: StateMachine,
   R: rand::Rng,
 {
-  /// Create a fresh group driven by a caller-supplied RNG (see [`Endpoint::new_with_rng`]).
+  /// Create a fresh group driven by a caller-supplied RNG (see [`Endpoint::new_with_rng`]);
+  /// `generation` seeds the lineage counter exactly as on
+  /// [`create_group`](MultiRaft::create_group).
   ///
   /// # Errors
   /// The admission checks of [`CreateGroupError`], as on the seed-taking constructors.
   pub fn create_group_with_rng(
     &mut self,
     gid: G,
+    generation: u64,
     config: Config<I>,
     now: impl Into<Now>,
     rng: R,
@@ -1164,8 +1178,9 @@ where
   ) -> Result<(), CreateGroupError> {
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     self.host_id.get_or_insert(config.id());
-    let ep = Endpoint::new_with_rng(config, now, rng, fsm);
-    self.lineage.insert(gid.cheap_clone(), 0);
+    let mut ep = Endpoint::new_with_rng(config, now, rng, fsm);
+    ep.seed_lineage(generation);
+    self.lineage.insert(gid.cheap_clone(), generation);
     self.groups.insert(gid, ep);
     Ok(())
   }

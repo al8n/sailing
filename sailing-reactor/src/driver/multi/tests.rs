@@ -83,6 +83,7 @@ fn a_parked_merge_blocks_quiescence() {
     multi
       .create_group(
         gid,
+        0,
         Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap(),
         now,
         7,

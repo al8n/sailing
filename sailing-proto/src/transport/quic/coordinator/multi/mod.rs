@@ -203,9 +203,10 @@ where
   /// then the tombstone, then the container: `generation` — the id's incarnation under the
   /// single-incarnation contract, 0 unless the embedder reshapes ids — is compared against the
   /// persisted admission floor read through `floors`, and an under-floor incarnation is refused
-  /// before anything volatile is consulted (the durable fence outranks in-session state; the
-  /// coordinator itself does not otherwise consume `generation` yet — the driver records it
-  /// after the `Ok`, and the split milestone consumes it at this layer). The driver hands its
+  /// before anything volatile is consulted (the durable fence outranks in-session state). The
+  /// ADMITTED generation then SEEDS the container's lineage counter — the created incarnation
+  /// mints strictly above its floor, so it can never repeat a fenced predecessor's generations —
+  /// and the driver records the same value in its engine after the `Ok`. The driver hands its
   /// engine as `floors`; the deterministic sim and proto-level embedders hand their own store —
   /// durability is the store-owner's job. A tombstoned id still REFUSES creation at ANY
   /// generation until an explicit [`clear_tombstone`](Self::clear_tombstone) consents to
@@ -244,7 +245,9 @@ where
       return Err(CreateGroupError::SplitReserved);
     }
     let key = gid.cheap_clone();
-    self.multi.create_group(gid, config, now, seed, fsm)?;
+    self
+      .multi
+      .create_group(gid, generation, config, now, seed, fsm)?;
     self.purge_unknown_signal(&key);
     // A fresh group can widen the tracked-peer union; raise the connection cap now rather than at
     // the next pump, so accepts arriving in the gap are not statelessly refused.

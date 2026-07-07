@@ -322,7 +322,7 @@ impl MultiWorld {
     // identical election timeouts and split votes forever (the single-group harness seeds each
     // Endpoint by node id for the same reason).
     host
-      .create_group(gid, config, self.now, self.seed ^ node, LogSm::new())
+      .create_group(gid, 0, config, self.now, self.seed ^ node, LogSm::new())
       .unwrap_or_else(|e| panic!("wire_replica: admission of group {gid} on node {node}: {e:?}"));
   }
 

@@ -181,7 +181,7 @@ fn committed_split_with_malformed_instruction_poisons() {
     core::time::Duration::from_millis(100),
   )
   .expect("valid config");
-  m.create_group(100u64, config, Instant::ORIGIN, 7, LogSm::new())
+  m.create_group(100u64, 0, config, Instant::ORIGIN, 7, LogSm::new())
     .expect("admission");
 
   // A single voter elects itself on its first due timer.

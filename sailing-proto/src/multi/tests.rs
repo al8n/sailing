@@ -135,6 +135,7 @@ fn fork_admission_matches_create_group() {
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   m.create_group(
     1,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -520,6 +521,7 @@ fn fork_with_a_corrupt_blob_poisons_only_that_group() {
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
   m.create_group(
     1,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -726,6 +728,7 @@ fn host_identity_is_latched_across_group_removal() {
   assert!(mr.host_id().is_none(), "no identity before any admission");
   mr.create_group(
     1,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -742,6 +745,7 @@ fn host_identity_is_latched_across_group_removal() {
   assert_eq!(
     mr.create_group(
       2,
+      0,
       single_node_cfg(2),
       Instant::ORIGIN,
       42,
@@ -752,6 +756,7 @@ fn host_identity_is_latched_across_group_removal() {
   // The latched id re-admits.
   mr.create_group(
     2,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -766,6 +771,7 @@ fn two_groups_are_isolated() {
   let mut mr = MultiRaft::<u64, u64, CountSm>::new();
   mr.create_group(
     1,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -774,6 +780,7 @@ fn two_groups_are_isolated() {
   .unwrap();
   mr.create_group(
     2,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -835,6 +842,7 @@ fn create_dup_errors_and_remove_returns_the_group() {
   let mut mr = MultiRaft::<u64, u64, CountSm>::new();
   mr.create_group(
     1,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -844,6 +852,7 @@ fn create_dup_errors_and_remove_returns_the_group() {
   assert_eq!(
     mr.create_group(
       1,
+      0,
       single_node_cfg(1),
       Instant::ORIGIN,
       42,
@@ -862,6 +871,7 @@ fn mismatched_node_id_is_rejected() {
   let mut mr = MultiRaft::<u64, u64, CountSm>::new();
   mr.create_group(
     1,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -873,6 +883,7 @@ fn mismatched_node_id_is_rejected() {
   assert_eq!(
     mr.create_group(
       2,
+      0,
       single_node_cfg(2),
       Instant::ORIGIN,
       42,
@@ -884,6 +895,7 @@ fn mismatched_node_id_is_rejected() {
   // The same id on a new group id is admitted.
   mr.create_group(
     2,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -922,6 +934,7 @@ fn out_of_bound_group_id_encodings_are_rejected() {
     assert_eq!(
       mr.create_group(
         bad,
+        0,
         single_node_cfg(1),
         Instant::ORIGIN,
         42,
@@ -934,6 +947,7 @@ fn out_of_bound_group_id_encodings_are_rejected() {
   // The bound is inclusive: exactly 1024 bytes is admitted.
   mr.create_group(
     SizedId(1024),
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -995,8 +1009,15 @@ fn restore_from_empty_stores_surfaces_no_events() {
 #[test]
 fn remove_group_with_queued_output_is_safe() {
   let mut mr = MultiRaft::<u64, u64, CountSm>::new();
-  mr.create_group(1, two_voter_cfg(), Instant::ORIGIN, 42, CountSm::default())
-    .unwrap();
+  mr.create_group(
+    1,
+    0,
+    two_voter_cfg(),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+  )
+  .unwrap();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
 
   // A 2-voter campaign queues vote traffic to peer 2 — output pending, deliberately undrained.
@@ -1016,8 +1037,15 @@ fn remove_group_with_queued_output_is_safe() {
   assert!(mr.remove_group(&1).is_none());
 
   // The same gid is admissible again.
-  mr.create_group(1, two_voter_cfg(), Instant::ORIGIN, 42, CountSm::default())
-    .unwrap();
+  mr.create_group(
+    1,
+    0,
+    two_voter_cfg(),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+  )
+  .unwrap();
   assert!(mr.contains_group(&1));
 }
 
@@ -1039,6 +1067,7 @@ fn interleaved_groups_drain_in_group_batches() {
   let mut mr = MultiRaft::<u64, u64, CountSm>::new();
   mr.create_group(
     100,
+    0,
     three_voter_cfg(),
     Instant::ORIGIN,
     42,
@@ -1047,6 +1076,7 @@ fn interleaved_groups_drain_in_group_batches() {
   .unwrap();
   mr.create_group(
     200,
+    0,
     three_voter_cfg(),
     Instant::ORIGIN,
     42,
@@ -1156,6 +1186,7 @@ fn drive_forked_leader_and_fresh_joiner() -> ForkJoin {
   let (mut lb, mut sb) = (VecLog::default(), AsyncStable::default());
   b.create_group(
     7,
+    0,
     Config::try_new(
       2u64,
       std::vec![1, 2],
@@ -1376,7 +1407,7 @@ fn propose_split_delegator_gates() {
     Duration::from_millis(100),
   )
   .unwrap();
-  m.create_group(7, two_voters, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, two_voters, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   assert_eq!(
     m.propose_split(
@@ -1395,6 +1426,7 @@ fn propose_split_delegator_gates() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   m.create_group(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -1403,6 +1435,7 @@ fn propose_split_delegator_gates() {
   .unwrap();
   m.create_group(
     8,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     43,
@@ -1427,6 +1460,7 @@ fn propose_split_refuses_a_joint_parent() {
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   m.create_group(
     7,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -1502,6 +1536,7 @@ fn propose_split_refuses_an_over_bound_child_id() {
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   m.create_group(
     WideId(1),
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     42,
@@ -1542,7 +1577,7 @@ fn committed_split_relays_a_group_fork() {
   let cfg = single_node_cfg(1)
     .with_snapshot_threshold(1)
     .with_pre_vote(true);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
   commit_one_split(&mut m, 7, d, &mut log, &mut stable);
@@ -1655,7 +1690,7 @@ fn same_mint_split_noops_at_apply_and_conserves_state() {
   )
   .unwrap()
   .with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
 
   // Three units of load, then the two same-mint splits, each giving 2 units away.
@@ -1801,7 +1836,7 @@ fn back_to_back_split_proposals_are_gated_until_apply() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let cfg = single_node_cfg(1).with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
   for _ in 0..5 {
@@ -2011,11 +2046,12 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
   )
   .unwrap()
   .with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   // The squatter: hosted under the child id, zero progress (its timers never fire here).
   m.create_group(
     200,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     43,
@@ -2127,10 +2163,11 @@ fn parked_fork_resolves_redundant_when_the_twin_catches_up() {
   )
   .unwrap()
   .with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   m.create_group(
     200,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     43,
@@ -2179,10 +2216,11 @@ fn park_with_queued_conflict(
     Duration::from_millis(100),
   )
   .unwrap();
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   m.create_group(
     200,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     43,
@@ -2322,7 +2360,7 @@ fn pre_hosted_twin_resolves_redundant_without_parking() {
   )
   .unwrap()
   .with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   // The twin: fork-born at the manufactured baseline (applied == FORK_BASE_INDEX, lineage 0)
   // holding exactly the half the split gives away.
@@ -2380,7 +2418,7 @@ fn split_admission_race_parks_instead_of_dropping() {
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let cfg = single_node_cfg(1).with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
   for _ in 0..3 {
@@ -2401,7 +2439,7 @@ fn split_admission_race_parks_instead_of_dropping() {
     )
     .unwrap()
     .unwrap();
-  m.create_group(200, single_node_cfg(1), d, 43, SplitSm::default())
+  m.create_group(200, 0, single_node_cfg(1), d, 43, SplitSm::default())
     .unwrap();
 
   // Apply the split: the parent shrinks deterministically (apply is replica-identical and
@@ -2583,7 +2621,7 @@ fn reshaped_twin_breaks_the_fork_merge_capture_cycle() {
     };
 
   // The child (gid 1), hosted BEFORE the parent's replay re-stages the fork naming it.
-  m.create_group(1, single_node_cfg(1), now, 43, SplitSm::default())
+  m.create_group(1, 0, single_node_cfg(1), now, 43, SplitSm::default())
     .unwrap();
 
   // The parent (gid 2) restores from a durable log whose committed tail holds the split naming
@@ -2713,7 +2751,7 @@ fn recreated_squatter_at_higher_lineage_resolves_redundant() {
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
   let cfg = single_node_cfg(1).with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
   for _ in 0..3 {
@@ -2735,7 +2773,7 @@ fn recreated_squatter_at_higher_lineage_resolves_redundant() {
     )
     .unwrap()
     .unwrap();
-  m.create_group(200, single_node_cfg(1), d, 43, SplitSm::default())
+  m.create_group(200, 0, single_node_cfg(1), d, 43, SplitSm::default())
     .unwrap();
   let d200 = lead_single_split(&mut m, 200, &mut log200, &mut stable200);
   commit_one_split(&mut m, 200, d200, &mut log200, &mut stable200);
@@ -2798,7 +2836,7 @@ fn below_lineage_squatter_stays_parked() {
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
   let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
   let cfg = single_node_cfg(1).with_snapshot_threshold(1);
-  m.create_group(7, cfg, Instant::ORIGIN, 42, SplitSm::default())
+  m.create_group(7, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
     .unwrap();
   let d = lead_single_split(&mut m, 7, &mut log, &mut stable);
   for _ in 0..3 {
@@ -2819,7 +2857,7 @@ fn below_lineage_squatter_stays_parked() {
     )
     .unwrap()
     .unwrap();
-  m.create_group(200, single_node_cfg(1), d, 43, SplitSm::default())
+  m.create_group(200, 0, single_node_cfg(1), d, 43, SplitSm::default())
     .unwrap();
   let d200 = lead_single_split(&mut m, 200, &mut log200, &mut stable200);
   commit_one_split(&mut m, 200, d200, &mut log200, &mut stable200);
@@ -2938,7 +2976,7 @@ where
     stores
       .0
       .insert(gid, (VecLog::default(), AsyncStable::default()));
-    m.create_group(gid, single_node_cfg(1), Instant::ORIGIN, 7, fsm)
+    m.create_group(gid, 0, single_node_cfg(1), Instant::ORIGIN, 7, fsm)
       .unwrap();
     let (log, stable) = stores.0.get_mut(&gid).unwrap();
     let d = m.group(&gid).unwrap().poll_timeout().unwrap();
@@ -3318,7 +3356,7 @@ fn both_fanned_in_aborts_thaw_neither_dropped() {
   stores
     .0
     .insert(3, (VecLog::default(), AsyncStable::default()));
-  m.create_group(3, single_node_cfg(1), now, 7, CountSm::default())
+  m.create_group(3, 0, single_node_cfg(1), now, 7, CountSm::default())
     .unwrap();
   {
     let (log, stable) = stores.0.get_mut(&3).unwrap();
@@ -3482,7 +3520,7 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
   stores
     .0
     .insert(1, (VecLog::default(), AsyncStable::default()));
-  m.create_group(1, single_node_cfg(1), now, 7, CountSm::default())
+  m.create_group(1, 0, single_node_cfg(1), now, 7, CountSm::default())
     .unwrap();
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
@@ -3674,7 +3712,7 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
     .inner
     .0
     .insert(1, (VecLog::default(), AsyncStable::default()));
-  m.create_group(1, single_node_cfg(1), now, 7, CountSm::default())
+  m.create_group(1, 0, single_node_cfg(1), now, 7, CountSm::default())
     .unwrap();
   {
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
@@ -3724,6 +3762,133 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
   assert!(
     m.group(&1).unwrap().is_frozen(),
     "the recreated source stays frozen — the removed incarnation's abort can never thaw it"
+  );
+}
+
+/// THE SEEDED-COUNTER INCARNATION KILL (a recreated HOSTED source): a floor-validated recreate
+/// used to reset its endpoint counter to 0, so (a) a stale obligation re-derived from the old
+/// incarnation's abort entry could never discharge off the HOSTED arm (`shape_gen > expected`
+/// read `0 > 1`), and (b) the recreate's first freeze re-minted EXACTLY the abandoned generation
+/// — the stale record then backed a thaw the target never aborted for THIS incarnation.
+/// `create_group` seeding the counter from the ADMITTED generation kills both by construction:
+/// the recreate lives strictly above its floor, the re-derived obligation discharges off the
+/// live counter with no floor consult (the source is hosted), and every fresh freeze mints
+/// strictly above the old `expected`.
+///
+/// RED without the seed (a recreate at reset gen 0): the re-derived obligation survives the
+/// service crank on the hosted arm, the re-freeze mints the repeated gen 1, and the stale drive
+/// naming the old incarnation APPENDS the thaw.
+#[test]
+fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_counter() {
+  let (mut m, base) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  let mut stores = LineageStores {
+    inner: base,
+    floors: std::collections::BTreeMap::new(),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  // Freeze 1 -> 2 (gen 1) and abort on the target: obligation `abandoned[1] = (1, abort_index)`.
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  let abort_index = m.group(&2).unwrap().abandoned_obligations()[0].2;
+
+  // The removal-floor discipline off the UNIFIED counter: the frozen source's OWN lineage (1)
+  // already covers the obligation's generation — the floor needs no target scan. Persist it,
+  // then remove and drop the store.
+  let floor = m.group_gen(&1).saturating_add(1);
+  assert_eq!(
+    floor, 2,
+    "the frozen source's own lineage covers the obligation"
+  );
+  stores.floors.insert(1, floor);
+  assert!(m.remove_group(&1).is_some());
+  stores.inner.0.remove(&1);
+
+  // Crash-replay: the target's surviving abort entry re-derives the purged obligation.
+  let mut key = Vec::new();
+  Data::encode(&1u64, &mut key);
+  m.group_mut(&2)
+    .unwrap()
+    .note_abandoned(Bytes::from(key), 1, abort_index);
+
+  // RECREATE the source HOSTED, at the generation its floor admits, and elect it.
+  assert!(
+    crate::floor_admits(*stores.floors.get(&1).unwrap(), 2),
+    "the recreate admits at its floor"
+  );
+  stores
+    .inner
+    .0
+    .insert(1, (VecLog::default(), AsyncStable::default()));
+  m.create_group(1, 2, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    let d = m.group(&1).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&1, d, log, stable).unwrap();
+    drain_storage(&mut m, 1, d, log, stable);
+    assert!(m.group(&1).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  assert_eq!(
+    m.group(&1).unwrap().shape_gen(),
+    2,
+    "the created counter starts at the admitted generation, not 0"
+  );
+
+  // THE HOSTED DISCHARGE: the live counter (2) is past the abandoned freeze (1), so the service
+  // clears the re-derived obligation off the source's own lineage. RED without the seed: the
+  // hosted arm reads 0 > 1 and the stale record survives.
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the seeded counter discharged the re-derived obligation on the hosted arm"
+  );
+
+  // The fresh freeze mints ABOVE the old expected — the recreate can never repeat gen 1.
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 3,
+    "the re-freeze minted strictly above the removed incarnation's generations"
+  );
+
+  // And a stale drive naming the OLD incarnation is terminally refused with NO append.
+  let last_before = stores.inner.0.get(&1).unwrap().0.last_index();
+  let result = {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.propose_merge_unfreeze(&1, now, log, stable, &2, 1)
+  };
+  assert!(
+    matches!(
+      result,
+      Some(Err(MergeError::StaleThaw {
+        expected: 1,
+        seen: 3
+      }))
+    ),
+    "the old incarnation's authorization is spent: {result:?}"
+  );
+  assert_eq!(
+    stores.inner.0.get(&1).unwrap().0.last_index(),
+    last_before,
+    "the refused thaw appended nothing"
+  );
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "the new incarnation's freeze stands"
   );
 }
 
@@ -4109,7 +4274,7 @@ fn frozen_source_relay_classification_is_exhaustive() {
   // --- a never-frozen source is NotFrozen at and below the named gen, BEFORE the leadership gate —
   //     a leader (group 2) and an un-elected follower (group 3) both answer NotFrozen, since the
   //     terminal-dedupe does not depend on role. ---
-  m.create_group(3, single_node_cfg(1), now, 7, CountSm::default())
+  m.create_group(3, 0, single_node_cfg(1), now, 7, CountSm::default())
     .unwrap();
   for (gid, expected, why) in [
     (2u64, 0u64, "leader, seen == expected, not frozen"),
@@ -4536,6 +4701,7 @@ fn park_waits_for_the_source_then_resolves() {
     .insert(1, (VecLog::default(), AsyncStable::default()));
   m.create_group(
     1,
+    0,
     single_node_cfg(1),
     Instant::ORIGIN,
     7,
@@ -4926,7 +5092,7 @@ fn merge_verb_preconditions_refuse_typed() {
   stores
     .0
     .insert(3, (VecLog::default(), AsyncStable::default()));
-  m.create_group(3, two_voter_cfg(), now, 7, CountSm::default())
+  m.create_group(3, 0, two_voter_cfg(), now, 7, CountSm::default())
     .unwrap();
   stores
     .0
@@ -4940,7 +5106,7 @@ fn merge_verb_preconditions_refuse_typed() {
   .unwrap()
   .with_read_only(crate::ReadOnlyOption::LeaseBased)
   .with_check_quorum(true);
-  m.create_group(4, lease_cfg, now, 7, CountSm::default())
+  m.create_group(4, 0, lease_cfg, now, 7, CountSm::default())
     .unwrap();
   {
     let (log, stable) = stores.0.get_mut(&4).unwrap();
@@ -5176,9 +5342,9 @@ fn seed0_target_learner_pair_refused_at_propose() {
   let (mut slog, mut sstable) = (VecLog::default(), AsyncStable::default());
   let (mut tlog, mut tstable) = (VecLog::default(), AsyncStable::default());
   // Source (10) and target (11), both single-voter {2}, colocated on host 2.
-  m.create_group(10, single_node_cfg(2), now, 7, CountSm::default())
+  m.create_group(10, 0, single_node_cfg(2), now, 7, CountSm::default())
     .unwrap();
-  m.create_group(11, single_node_cfg(2), now, 7, CountSm::default())
+  m.create_group(11, 0, single_node_cfg(2), now, 7, CountSm::default())
     .unwrap();
   let ds = m.group(&10).unwrap().poll_timeout().unwrap();
   m.handle_timeout(&10, ds, &mut slog, &mut sstable).unwrap();
@@ -5307,6 +5473,7 @@ fn merge_commit_refuses_learner_carrying_participants() {
     let (mut tlog, mut tstable) = (VecLog::default(), AsyncStable::default());
     m.create_group(
       2,
+      0,
       single_node_cfg(1),
       Instant::ORIGIN,
       7,
@@ -5438,8 +5605,15 @@ fn commit_merge_refuses_until_every_source_voter_reaches_the_freeze() {
     stores
       .0
       .insert(gid, (VecLog::default(), AsyncStable::default()));
-    m.create_group(gid, three_voters(), Instant::ORIGIN, 7, CountSm::default())
-      .unwrap();
+    m.create_group(
+      gid,
+      0,
+      three_voters(),
+      Instant::ORIGIN,
+      7,
+      CountSm::default(),
+    )
+    .unwrap();
     let d = m.group(&gid).unwrap().poll_timeout().unwrap();
     let (log, stable) = stores.0.get_mut(&gid).unwrap();
     m.handle_timeout(&gid, d, log, stable).unwrap();
@@ -5559,8 +5733,15 @@ fn dissolution_rides_the_committed_commit_merge_after_source_leader_loss() {
     stores
       .0
       .insert(gid, (VecLog::default(), AsyncStable::default()));
-    m.create_group(gid, three_voters(), Instant::ORIGIN, 7, CountSm::default())
-      .unwrap();
+    m.create_group(
+      gid,
+      0,
+      three_voters(),
+      Instant::ORIGIN,
+      7,
+      CountSm::default(),
+    )
+    .unwrap();
     let d = m.group(&gid).unwrap().poll_timeout().unwrap();
     let (log, stable) = stores.0.get_mut(&gid).unwrap();
     m.handle_timeout(&gid, d, log, stable).unwrap();
@@ -5697,7 +5878,7 @@ fn freeze_gates_cover_split_and_target_verbs() {
   stores
     .0
     .insert(3, (VecLog::default(), AsyncStable::default()));
-  m.create_group(3, single_node_cfg(1), now, 7, CountSm::default())
+  m.create_group(3, 0, single_node_cfg(1), now, 7, CountSm::default())
     .unwrap();
   {
     let (log, stable) = stores.0.get_mut(&3).unwrap();
@@ -5762,6 +5943,7 @@ fn poisoned_absorb_surfaces_no_resolution() {
       .insert(gid, (VecLog::default(), AsyncStable::default()));
     m.create_group(
       gid,
+      0,
       single_node_cfg(1),
       Instant::ORIGIN,
       7,

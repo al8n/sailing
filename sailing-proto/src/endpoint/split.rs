@@ -150,6 +150,19 @@ where
     self.split.restored_lineage
   }
 
+  /// Seed the lineage counter at group ADMISSION — the container's create path calls this with
+  /// the ADMITTED generation (the same value the coordinator's floor check validated and the
+  /// driver records in its engine), so a created incarnation's counter starts where its
+  /// admission says it lives rather than resetting to 0. Without the seed a floor-validated
+  /// recreate re-mints its predecessor's generations, and every gen-keyed observer (a stale
+  /// merge-abort obligation above all) collapses the two incarnations into one. Both the live
+  /// counter and the restored view seed together: a fresh group has no durable forks, so the
+  /// relay guard has nothing older to trust.
+  pub(crate) fn seed_lineage(&mut self, generation: u64) {
+    self.split.shape_gen = generation;
+    self.split.restored_lineage = generation;
+  }
+
   /// Whether a proposed `Split` entry is still UNAPPLIED — the container's one-in-flight propose
   /// gate (see [`SplitState::pending_split_index`] for the self-healing derivation).
   pub(crate) fn split_in_flight(&self) -> bool {

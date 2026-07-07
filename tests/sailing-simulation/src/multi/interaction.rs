@@ -168,7 +168,7 @@ impl MultiInteractionEnv {
       let host = self.hosts.entry(id).or_default();
       let cfg = Config::try_new(id, voters.clone(), ELECTION_TIMEOUT, HEARTBEAT_INTERVAL)
         .expect("valid harness config");
-      match host.create_group(gid, cfg, self.now, id, LogSm::new()) {
+      match host.create_group(gid, 0, cfg, self.now, id, LogSm::new()) {
         Ok(()) => {
           self
             .stores
@@ -332,7 +332,7 @@ impl MultiInteractionEnv {
           .expect("valid observer config");
       let host = self.hosts.entry(node).or_default();
       host
-        .create_group(gid, cfg, self.now, node, LogSm::new())
+        .create_group(gid, 0, cfg, self.now, node, LogSm::new())
         .expect("observer admission");
       self
         .stores
