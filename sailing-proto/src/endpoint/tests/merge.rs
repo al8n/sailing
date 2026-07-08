@@ -1946,6 +1946,85 @@ fn snapshot_install_supersedes_a_parked_commit_merge() {
   assert_eq!(ep.applied_index(), Index::new(11), "the drain resumed");
 }
 
+/// A snapshot install that re-baselines PAST an applied freeze clears the whole applied-freeze
+/// quartet, not just the append-observed pending flag — a replica that applied the freeze,
+/// partitioned, and installs a boundary past the thaw must derive NOT-frozen, exactly as a plain
+/// restart from the same durable state would (install and restart must agree).
+///
+/// RED before the fix: the install leaves `frozen`/`frozen_for`/`freeze_index` set, so the replica
+/// stays frozen forever — captures freeze-fenced, proposes/reads/transfers refused if elected, its
+/// stale claim blocking the claimed target's removal.
+#[test]
+fn snapshot_install_clears_an_applied_freeze() {
+  use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  // The follower APPLIES a freeze: Normal@1 + PrepareMerge@2 committed (leader_commit = 2).
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(1),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(1),
+          Index::new(1),
+          EntryKind::Normal,
+          encode_cmd(b"a")
+        ),
+        Entry::new(
+          Term::new(1),
+          Index::new(2),
+          EntryKind::PrepareMerge,
+          prepare_payload(b"\x2b", 1),
+        ),
+      ],
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(ep.is_frozen(), "the freeze applied");
+  assert_eq!(ep.freeze_index(), Some(Index::new(2)));
+  assert_eq!(
+    ep.frozen_for().map(|t| t.as_ref().to_vec()),
+    Some(b"\x2b".to_vec())
+  );
+  assert!(ep.merge_freeze_active(), "the capture fence is armed");
+
+  // A boundary PAST the freeze (and past any thaw) installs — the partitioned replica catches up
+  // wholesale on a leader that already resolved the freeze it once applied.
+  let meta = SnapshotMeta::new(
+    Index::new(10),
+    Term::new(4),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(4),
+      1u64,
+      meta,
+      encode_snapshot(42),
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert_eq!(ep.applied_index(), Index::new(10), "the install landed");
+  assert!(!ep.is_frozen(), "the install cleared the applied freeze");
+  assert_eq!(ep.freeze_index(), None, "no lingering boundary");
+  assert_eq!(ep.frozen_for(), None, "no lingering claim");
+  assert!(
+    !ep.merge_freeze_active(),
+    "the capture is no longer freeze-fenced"
+  );
+}
+
 /// The freeze retains its CLAIM (the named target) for the whole frozen generation, and only
 /// the thaw clears it — the claim is what lets exactly one target absorb or abort this freeze,
 /// read host-order-independently off the frozen source.

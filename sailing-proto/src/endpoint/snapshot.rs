@@ -861,6 +861,20 @@ where
     // them no longer exists in this log, so the append-observed kill releases (re-armed at
     // accept if the freeze is still live and re-delivered).
     self.note_freeze_rebaselined();
+    // The re-baseline also crossed the APPLIED freeze, so clear the whole applied-freeze quartet,
+    // not just the append-observed pending flag above. No conforming snapshot boundary can sit
+    // INSIDE a live freeze: every source-side capture is fenced by `merge_freeze_active` for the
+    // freeze's whole life, the forced absorb capture is target-side, and a fork is refused on a
+    // freezing parent — so any install boundary proves every freeze it covers already RESOLVED (the
+    // same totality argument `note_freeze_rebaselined` makes for the pending flag). Leaving the
+    // quartet set would strand this replica frozen FOREVER — captures fenced, proposes/reads/conf/
+    // transfers refused if elected, its stale `frozen_for` blocking the claimed target's removal —
+    // while a plain restart from the same durable state derives NOT-frozen (install and restart must
+    // agree). The sole other clear site is the thaw apply arm.
+    self.merge.frozen = false;
+    self.merge.freeze_index = None;
+    self.merge.freeze_term = None;
+    self.merge.frozen_for = None;
     // A parked CommitMerge is SUPERSEDED by the install: at-or-below the boundary, the blob IS
     // the union (the target leader's forced absorb capture sits past every resolution, so a
     // log-behind straggler is caught up wholesale without ever touching its local source);
