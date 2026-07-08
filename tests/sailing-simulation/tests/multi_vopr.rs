@@ -427,6 +427,62 @@ fn merge_profile_same_seed_same_report() {
   );
 }
 
+/// The merge×compaction band smoke: the merge menu under [`MultiProfile::merge_reshape_compacting`]'s
+/// snapshot-heavy threshold at the fast budget — the first randomized coverage where installs and
+/// the merge choreography share a world (plain `merge_reshape` never compacts). Beyond the standing
+/// non-vacuity floor, the merge witness must hold over the band (the verbs stay drawable under
+/// compaction pressure) and the applied-threshold witness must prove the override reached a
+/// constructed replica (the snapshot band's detector, kept here because this profile re-derives
+/// the draw). Deliberately NO membership-counter bounds, the snapshot band's parity: at fast
+/// budgets compaction-driven install comparisons are structurally near-zero — install×freeze
+/// coverage physically needs the soak twin's tick budget.
+#[test]
+fn merge_compacting_band_smoke() {
+  let mut total_registered = 0u64;
+  let mut total_rollbacks = 0u64;
+  let mut total_aborted = 0u64;
+  for seed in 0..8u64 {
+    let r = run_multi_vopr(seed, 4_000, MultiProfile::merge_reshape_compacting(seed));
+    std::eprintln!(
+      "merge-compacting seed {seed}: prepared={} committed={} rolled_back={} registered={} \
+       resolved={} aborted={} splits={} committed_load={} threshold={:?}",
+      r.merges_prepared,
+      r.merges_committed,
+      r.merges_rolled_back,
+      r.merges_registered,
+      r.merges_resolved,
+      r.merges_aborted,
+      r.splits_applied,
+      r.committed,
+      r.applied_snapshot_threshold,
+    );
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    let applied = r
+      .applied_snapshot_threshold
+      .expect("a completed run constructed at least one replica");
+    assert!(
+      (256..=511).contains(&applied),
+      "seed {seed}: the runner did not apply the compacting threshold to a replica \
+       (witness {applied}, outside the 256..=511 band): {r:?}"
+    );
+    total_registered += r.merges_registered;
+    total_rollbacks += r.merges_rolled_back;
+    total_aborted += r.merges_aborted;
+  }
+  assert!(
+    total_registered > 0,
+    "the merge-compacting band never resolved an absorb — the merge verbs are inert under \
+     compaction pressure"
+  );
+  assert!(
+    total_rollbacks + total_aborted > 0,
+    "the merge-compacting band never exercised the abort side"
+  );
+}
+
 /// The merge soak: the [`soak_default_profile`] shape under [`MultiProfile::merge_reshape`],
 /// so freezes, parked commits, rollback races, and resolutions land amid soak-scale
 /// fault/lifecycle churn, with every run's union verdict judging the accumulated absorbs. Each
@@ -464,5 +520,46 @@ fn soak_merge_profile() {
   assert!(
     registered > 0,
     "the merge soak slice {start}..{end} never resolved an absorb"
+  );
+}
+
+/// The merge×compaction soak: the [`soak_merge_profile`] shape under
+/// [`MultiProfile::merge_reshape_compacting`], so snapshot installs land on frozen sources,
+/// parked targets, and obligation holders amid soak-scale churn — the install×freeze/park seams
+/// only this profile reaches. Each slice requires the merge witness (`merges_registered`
+/// nonzero). `#[ignore]` so the everyday gate stays fast; ALWAYS run it `--release`:
+///
+/// ```text
+/// cargo test --release -p sailing-simulation --test multi_vopr -- --ignored soak_merge_compacting_profile
+/// ```
+///
+/// Shardable via its own env vars (`MULTI_VOPR_MERGE_COMPACTING_SEED_{START,END}` +
+/// `MULTI_VOPR_MERGE_COMPACTING_TICKS`). Deterministic per (seed, ticks): failures replay
+/// anywhere.
+#[test]
+#[ignore = "the merge-compacting soak — run explicitly, --release. Shard via MULTI_VOPR_MERGE_COMPACTING_SEED_{START,END} + MULTI_VOPR_MERGE_COMPACTING_TICKS."]
+fn soak_merge_compacting_profile() {
+  fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+      .ok()
+      .and_then(|v| v.parse().ok())
+      .unwrap_or(default)
+  }
+  let start = env_u64("MULTI_VOPR_MERGE_COMPACTING_SEED_START", 0);
+  let end = env_u64("MULTI_VOPR_MERGE_COMPACTING_SEED_END", 64);
+  let ticks = env_u64("MULTI_VOPR_MERGE_COMPACTING_TICKS", 40_000) as usize;
+  assert!(end > start, "empty band: {start} >= {end}");
+  let mut registered = 0u64;
+  for seed in start..end {
+    let r = run_multi_vopr(seed, ticks, MultiProfile::merge_reshape_compacting(seed));
+    assert!(
+      r.groups_created >= 2 && r.committed > 0,
+      "seed {seed} vacuous: {r:?}"
+    );
+    registered += r.merges_registered;
+  }
+  assert!(
+    registered > 0,
+    "the merge-compacting soak slice {start}..{end} never resolved an absorb"
   );
 }

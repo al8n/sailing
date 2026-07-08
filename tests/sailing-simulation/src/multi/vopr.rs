@@ -161,6 +161,20 @@ impl MultiProfile {
     }
   }
 
+  /// The merge×compaction profile: [`merge_reshape`](Self::merge_reshape)'s verbs under
+  /// [`snapshot_heavy`](Self::snapshot_heavy)'s compaction pressure. `merge_reshape` leaves
+  /// `snapshot_threshold` at the never-compacting default, so snapshot installs never land on a
+  /// frozen source, a parked target, or an obligation holder — the install×freeze/park seams
+  /// have zero randomized coverage without this profile. The threshold IS snapshot_heavy's own
+  /// draw (256..=511 from its dedicated sub-stream), so the master action/topology stream draws
+  /// nothing of it and the merge menu's schedules shift only through world evolution.
+  pub fn merge_reshape_compacting(seed: u64) -> Self {
+    Self {
+      snapshot_threshold: Self::snapshot_heavy(seed).snapshot_threshold,
+      ..Self::merge_reshape()
+    }
+  }
+
   /// The reshape profile: the default menu PLUS a steady [`MultiAction::Split`] weight, so
   /// splits land amid the full fault/lifecycle churn. The split rides the default menu as an
   /// ADDED row rather than a re-weighting — the default mix's schedules stay the reference
