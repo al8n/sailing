@@ -4971,6 +4971,128 @@ fn a_source_without_an_obligation_absorbs_at_once() {
   assert_eq!(m.group(&3).unwrap().state_machine().count(), 4 + 3);
 }
 
+/// FIX 4: an obligation whose owed id will NOT decode is committed-corrupt — the same `MergeDecode`
+/// class the thaw pass and park decode raise. The drivability belt must HOLD the park and poison the
+/// SOURCE (the deterministic fail-stop every host reaches), never treat the undecodable id as "not
+/// drivable" and AUTHORIZE the dissolve — which would diverge hosts between fail-stop and progress by
+/// crank order. RED before the fix: the absorb proceeds (Merged) and the corrupt obligation drops.
+#[test]
+fn a_corrupt_owed_id_holds_the_park_and_poisons_the_source() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  // A corrupt obligation on 2, then 2 freezes into 3 ABOVE it (the unguarded-max ordering the
+  // `SourceOwesThaw` gate cannot see): draining applies the abort (abandoned[corrupt]) then the
+  // freeze. 3 bytes never decode as the `u64` group id.
+  let corrupt = Bytes::from_static(&[0xFF, 0xFF, 0xFF]);
+  {
+    let (log, _stable) = stores.0.get_mut(&2).unwrap();
+    let abort = crate::RollbackMergePayload::abort(corrupt.clone(), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().is_frozen(), "2 is frozen for 3");
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "2 carries the corrupt obligation"
+  );
+  // 3 commits the absorb of 2 and parks; seal 3's window.
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    m.commit_merge(&3, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(m.group(&3).unwrap().pending_merge().is_some(), "3 parked");
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  // The belt HOLDS the park and poisons the source — never a silent dissolve.
+  let held = m.service_merge_applies(now, &mut stores);
+  assert!(
+    held.is_empty(),
+    "the corrupt obligation holds the absorb: {held:?}"
+  );
+  assert!(m.contains_group(&2), "2 is NOT dissolved");
+  assert!(
+    m.group(&3).unwrap().pending_merge().is_some(),
+    "3 is still parked"
+  );
+  assert!(
+    m.group(&2).unwrap().is_poisoned(),
+    "the source is poisoned MergeDecode"
+  );
+}
+
+/// FIX 4 contrast (kept green): an obligation whose owed id DECODES but is not hosted here is a local
+/// dead-end — a co-hosting replica drives that thaw, so the absorb PROCEEDS and dropping the dead-end
+/// obligation strands nothing. Distinguishes the corrupt-id poison above from the belt's ordinary
+/// dead-end drop; both share the resolve arm's decode.
+#[test]
+fn a_decodable_unhosted_owed_id_lets_the_absorb_proceed() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  // 999 is a decodable `u64` that is NOT a hosted group — a local dead-end obligation.
+  let mut unhosted = Vec::new();
+  Data::encode(&999u64, &mut unhosted);
+  let unhosted = Bytes::from(unhosted);
+  {
+    let (log, _stable) = stores.0.get_mut(&2).unwrap();
+    let abort = crate::RollbackMergePayload::abort(unhosted.clone(), 1, 1);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut buf);
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::RollbackMerge, Bytes::from(buf))
+      .unwrap();
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "2 owes a dead-end thaw"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    m.commit_merge(&3, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(m.service_merge_applies(now, &mut stores).is_empty());
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  let done = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    done,
+    std::vec![MergeResolution::Merged {
+      source: 2,
+      target: 3
+    }],
+    "a decodable dead-end obligation does not hold the absorb"
+  );
+  assert!(
+    !m.contains_group(&2),
+    "2 dissolved — the dead-end obligation dropped by design"
+  );
+  assert!(
+    !m.group(&3).unwrap().is_poisoned(),
+    "no poison for a decodable id"
+  );
+}
+
 /// FINDING-1 RED (safety, structural): a source thaw is REFUSED with NO append unless the claimed
 /// target hosts a matching committed abort obligation. A frozen source claimed by target 2 — but with
 /// NO abort ever applied on 2 — must not thaw: appending it would move the source's counter out from

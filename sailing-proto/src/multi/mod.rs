@@ -606,13 +606,14 @@ where
     // name, so a stale record can never match a fresh incarnation's freeze anyway. It remains the
     // whole story for a NoFloors embedder (whose recreates may re-mint a removed incarnation's
     // generations — the documented cost of opting out of floors, #22 reopened across
-    // incarnations). The merge Resolve arm removes a source too, and by the time it does the source
-    // holds no obligation in EITHER direction: none owed TO it (it thawed past any earlier abort
-    // before becoming free to merge, discharging every target's `abandoned[self]`), and none it
-    // OWES as a former target — the `prepare_merge` `SourceOwesThaw` gate refuses a source that
-    // still owes a thaw, and the Resolve arm HOLDS the absorb while an obligation that materialized
-    // after that gate still stands. So the purge is a no-op there and the source's own `abandoned`
-    // map is empty.
+    // incarnations). The merge Resolve arm removes a source too. By then the source owes nothing TO
+    // it (it thawed past any earlier abort before becoming free to merge, discharging every target's
+    // `abandoned[self]`). As a former TARGET it may still OWE a thaw, but only a LOCALLY-UNDRIVABLE
+    // one: `prepare_merge`'s `SourceOwesThaw` gate refuses a source that owes at propose, and the
+    // Resolve arm HOLDS the absorb while a DRIVABLE obligation (its owed target hosted here) stands —
+    // so what survives to the dissolve is a dead-end obligation this replica can neither drive nor
+    // observe, which the belt DROPS by design (a co-hosting replica drives that thaw; dropping it
+    // here strands nothing). The purge then clears whatever such residue the source still carries.
     if removed.is_some() && self.groups.values().any(Endpoint::has_abandoned) {
       let mut source_key = Vec::new();
       gid.encode(&mut source_key);
@@ -2731,17 +2732,32 @@ where
           // co-hosting replica drives THAT thaw to discharge; absorbing here — the dissolve drops
           // an obligation this replica never advanced and never could — cannot strand it. A parked
           // target is never quiesce-eligible, so a genuinely-held park keeps being reached until it
-          // resolves.
-          let owes_a_drivable_thaw = self
+          // resolves. An owed id whose committed bytes will NOT decode is committed-corrupt — the
+          // same `MergeDecode` class the thaw pass and the park decode raise. Treating it as
+          // not-drivable (the old `is_ok_and` did) would AUTHORIZE the dissolve, so hosts diverge
+          // between fail-stop and progress by crank order: HOLD the park and poison the SOURCE, the
+          // deterministic fail-stop every host reaches.
+          let obligations = self
             .groups
             .get(&source)
             .map(Endpoint::abandoned_obligations)
-            .unwrap_or_default()
-            .into_iter()
-            .any(|(owed, _, _)| {
-              G::decode_exact(owed).is_ok_and(|owed| self.groups.contains_key(&owed))
-            });
-          if owes_a_drivable_thaw {
+            .unwrap_or_default();
+          let mut hold_for_thaw = false;
+          for (owed, _, _) in obligations {
+            match G::decode_exact(owed) {
+              Ok(owed) if self.groups.contains_key(&owed) => hold_for_thaw = true,
+              // Decodable but not hosted here: a local dead-end — a co-hosting replica drives it,
+              // so this absorb strands nothing.
+              Ok(_) => {}
+              Err(_) => {
+                if let Some(sep) = self.groups.get_mut(&source) {
+                  sep.poison(PoisonReason::MergeDecode);
+                }
+                hold_for_thaw = true;
+              }
+            }
+          }
+          if hold_for_thaw {
             continue;
           }
           // The β hold above proved the source owes no thaw; this absorb IS the merge resolving, so

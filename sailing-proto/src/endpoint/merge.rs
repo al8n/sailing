@@ -332,11 +332,15 @@ where
 
   /// Whether this group still owes ANY aborted source a thaw — it applied a merge abort as a TARGET
   /// whose durable `abandoned` obligation the container's per-crank thaw pass has not yet discharged.
-  /// The service reads it as the thaw pass's per-crank filter and the removal purge's guard, and the
-  /// `prepare_merge` source-side gate and the Resolve arm both refuse to DISSOLVE such a group (its
-  /// obligations would vanish with its endpoint, stranding the upstream source frozen). A group with
-  /// obligations outstanding is therefore a merge participant the embedder MUST NOT remove; recovery
-  /// is the embedder's catalog, exactly like any dead group.
+  /// The service reads it as the thaw pass's per-crank filter and the removal purge's guard, the
+  /// conf-change fence reads it (a joiner would inherit an undischargeable ghost), and the
+  /// `prepare_merge` source-side gate refuses to DISSOLVE such a group as a fresh merge's source (its
+  /// obligations would vanish with its endpoint, stranding the upstream source frozen). The Resolve
+  /// arm is DRIVABILITY-gated by contrast: it holds the absorb only while the obligation's owed
+  /// target is hosted HERE (so this replica can still drive that thaw); a locally-undrivable dead-end
+  /// obligation is dropped by the dissolve by design, since a co-hosting replica drives it and
+  /// absorbing here strands nothing. A group with a DRIVABLE obligation outstanding is a merge
+  /// participant the embedder MUST NOT remove; recovery is the embedder's catalog, like any dead group.
   pub fn has_abandoned(&self) -> bool {
     !self.merge.abandoned.is_empty()
   }
