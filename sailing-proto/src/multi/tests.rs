@@ -4646,6 +4646,84 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
   );
 }
 
+/// FIX 3 leg (b): the container refuses a conf change on a target another hosted source's APPLIED
+/// freeze CLAIMS — moving the target's voters off the frozen source's hosts would strand the source
+/// (`commit_merge` then refuses `VoterSetsDiffer`, `rollback_merge` `SourceMissing`, no release
+/// valve). The endpoint's own fence cannot see the cross-group claim; the container surfaces the
+/// same `MergeInFlight` class. Once the claim is released (the merge aborted and the thaw
+/// discharged) the same conf change admits. RED before the leg: the claimed target ADMITS the voter
+/// change.
+#[test]
+fn conf_change_on_a_claimed_merge_target_is_refused() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // 1 freezes into 2 (1 frozen, claim = 2). 2 itself is clean — only the cross-group claim fences it.
+  {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen());
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(
+        m.propose_conf_change_v2(
+          &2,
+          now,
+          log,
+          stable,
+          crate::ConfChange::new(crate::ConfChangeType::AddNode, 9u64, Bytes::new()).into_v2(),
+        ),
+        Some(Err(crate::ProposeError::MergeInFlight))
+      ),
+      "a claimed merge target refuses a voter change"
+    );
+  }
+  // Release the claim: abort the merge, then drive and discharge the source's thaw.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "1 thawed — it no longer claims 2"
+  );
+  m.service_merge_applies(now, &mut stores);
+  // The observing leader deferred its clear to the witness — apply it on the holder.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "2's obligation discharged"
+  );
+  // With the claim gone and no obligation, the same conf change now ADMITS.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(
+        m.propose_conf_change_v2(
+          &2,
+          now,
+          log,
+          stable,
+          crate::ConfChange::new(crate::ConfChangeType::AddNode, 9u64, Bytes::new()).into_v2(),
+        ),
+        Some(Ok(_))
+      ),
+      "the released target admits the voter change"
+    );
+  }
+}
+
 /// Leg 4 in isolation: a source is refused `SpokenFor` PURELY because another hosted endpoint's park
 /// names it — even when its own replica contributes no freeze signal (the window where a target has
 /// committed its `CommitMerge` but this node has not observed the source's freeze). Group 2 parks
