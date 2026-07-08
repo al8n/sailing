@@ -41,6 +41,16 @@ pub enum EntryKind {
   /// totally ordered against [`CommitMerge`](Self::CommitMerge) on that one log; on the
   /// SOURCE's log — source empty — it is the container-relayed unfreeze that follows.
   RollbackMerge,
+  /// A committed WITNESS on a merge TARGET's log that some leader OBSERVED one of its outstanding
+  /// merge-abort thaw obligations DISCHARGED (the named source thawed past its abandoned freeze, or
+  /// was terminally merged away). Every replica's apply clears the obligation for exactly the named
+  /// `(source, generation)` — so a replica that can NEVER locally observe the source (unhosted, its
+  /// floor 0 or non-terminal, its lineage unknown here) still clears, instead of fencing compaction
+  /// and blocking teardown forever. FSM-non-mutating: the apply is a pure gen-exact map clear — no
+  /// lineage move, no park/fence interaction. The payload is a [`ThawDischargedPayload`], G-free like
+  /// the other merge kinds. Minted ONLY from a GLOBALLY-valid discharge proof (never a host-local
+  /// non-terminal floor), so it can never clear a still-live obligation on a co-hosting holder.
+  ThawDischarged,
 }
 
 impl EntryKind {
@@ -55,6 +65,7 @@ impl EntryKind {
       Self::PrepareMerge => "prepare_merge",
       Self::CommitMerge => "commit_merge",
       Self::RollbackMerge => "rollback_merge",
+      Self::ThawDischarged => "thaw_discharged",
     }
   }
 }
@@ -304,6 +315,45 @@ impl RollbackMergePayload {
   }
 }
 
+/// The payload of an [`EntryKind::ThawDischarged`] entry (rides `Entry.data`), proposed on a merge
+/// TARGET's log: a committed witness that some leader OBSERVED this target's outstanding thaw
+/// obligation for `source` at freeze generation `generation` discharged. G-free like the other merge
+/// payloads — `source_bytes` is the canonical `Data` encoding of the embedder's group id (1..=1024
+/// bytes, the group-tag bound). The apply clears the obligation iff it is still held at EXACTLY
+/// `generation`, so a stale witness (the source re-froze at a higher generation for a fresh merge) or
+/// a replayed duplicate no-ops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThawDischargedPayload {
+  /// The discharged source group id's canonical `Data` encoding (1..=1024 bytes, the group-tag
+  /// bound). Always present — a witness names exactly one source.
+  source_bytes: Bytes,
+  /// The abandoned freeze generation whose obligation this witness discharges — the value the
+  /// target's `abandoned[source]` record must equal for the apply's gen-exact clear to fire.
+  generation: u64,
+}
+
+impl ThawDischargedPayload {
+  /// Construct.
+  pub const fn new(source_bytes: Bytes, generation: u64) -> Self {
+    Self {
+      source_bytes,
+      generation,
+    }
+  }
+
+  /// The discharged source group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn source_bytes(&self) -> Bytes {
+    self.source_bytes.clone()
+  }
+
+  /// The abandoned freeze generation this witness discharges (the gen-exact clear comparator).
+  #[inline(always)]
+  pub const fn generation(&self) -> u64 {
+    self.generation
+  }
+}
+
 /// A single replicated-log entry. Payload is opaque bytes (O(1) clone via `Bytes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Entry {
@@ -457,6 +507,7 @@ mod tests {
       (EntryKind::PrepareMerge, "prepare_merge"),
       (EntryKind::CommitMerge, "commit_merge"),
       (EntryKind::RollbackMerge, "rollback_merge"),
+      (EntryKind::ThawDischarged, "thaw_discharged"),
     ] {
       assert_eq!(kind.as_str(), name);
       assert_eq!(std::format!("{kind}"), name);

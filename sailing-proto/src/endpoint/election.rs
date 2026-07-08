@@ -640,6 +640,10 @@ where
     // the thaw, so it starts with none in flight — the guard suppresses only this leader's own
     // duplicate, never an inherited one.
     self.merge.thaw_pending_index = Index::ZERO;
+    // The witness idempotence guard re-seats the SAME way as the thaw guard, and for the same
+    // reason: a `ThawDischarged` appended then truncated before it committed must be re-appendable
+    // by this fresh leader if it still holds the obligation, so it starts with none in flight.
+    self.merge.witness_pending_index = Index::ZERO;
     self.tracker.reset_progress(
       last.next(),
       self.config.max_inflight_msgs(),

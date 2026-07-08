@@ -1264,6 +1264,7 @@ fn split_entry_kind_round_trips_and_merge_kinds_map() {
     EntryKind::PrepareMerge,
     EntryKind::CommitMerge,
     EntryKind::RollbackMerge,
+    EntryKind::ThawDischarged,
   ] {
     let entry = Entry::new(
       Term::new(2),
@@ -1414,6 +1415,50 @@ fn rollback_merge_payload_round_trips_and_pins_bytes() {
   );
 }
 
+/// The pinned wire bytes of one `ThawDischargedPayload` — proto3 fields in ascending order:
+/// `source` (1, bytes), `generation` (2, varint). A new merge kind under LABEL_VERSION 3, so its
+/// vector is pinned like the others; the unrelated merge vectors above are untouched.
+const GOLDEN_THAW_DISCHARGED_PAYLOAD: &[u8] = &[
+  0x0A, 0x01, 0x2A, // source = [0x2a]
+  0x10, 0x03, // generation = 3
+];
+
+#[test]
+fn thaw_discharged_payload_round_trips_and_pins_bytes() {
+  let p = ThawDischargedPayload::new(Bytes::from_static(b"\x2a"), 3);
+  let mut buf = Vec::new();
+  encode_thaw_discharged_payload(&p, &mut buf);
+  assert_eq!(buf, GOLDEN_THAW_DISCHARGED_PAYLOAD, "wire bytes are pinned");
+  let d = decode_thaw_discharged_payload(Bytes::from(buf)).unwrap();
+  assert_eq!(d, p);
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from_static(b"\xff\xff")).is_err(),
+    "garbage rejects"
+  );
+  // Truncating inside the source field's bytes rejects rather than yielding a partial id.
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from_static(&GOLDEN_THAW_DISCHARGED_PAYLOAD[..2]))
+      .is_err(),
+    "a truncated payload rejects"
+  );
+  // The source is ALWAYS present (a witness names one source): an empty source rejects like a
+  // commit-merge's, and an over-bound one rejects like every group tag.
+  let empty = ThawDischargedPayload::new(Bytes::new(), 1);
+  let mut buf = Vec::new();
+  encode_thaw_discharged_payload(&empty, &mut buf);
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from(buf)).is_err(),
+    "an empty source rejects"
+  );
+  let oversized = ThawDischargedPayload::new(Bytes::from(std::vec![7u8; MAX_GROUP_ID_LEN + 1]), 1);
+  let mut buf = Vec::new();
+  encode_thaw_discharged_payload(&oversized, &mut buf);
+  assert!(
+    decode_thaw_discharged_payload(Bytes::from(buf)).is_err(),
+    "an over-bound source encoding rejects"
+  );
+}
+
 #[test]
 fn merge_payloads_reject_out_of_bound_group_ids() {
   // An absent/empty group id is never a merge participant; over the group-tag wire bound rejects
@@ -1515,9 +1560,9 @@ fn merge_entries_fit_the_append_frame_budget() {
 fn unknown_entry_kind_rejects() {
   use buffa::Message as _;
 
-  // An UNKNOWN pb kind value (beyond the mapped 0..=7) still rejects at conversion — the
+  // An UNKNOWN pb kind value (beyond the mapped 0..=8) still rejects at conversion — the
   // reservation arm is gone, the unknown-value fence is not.
-  for kind in [buffa::EnumValue::Unknown(8), buffa::EnumValue::Unknown(255)] {
+  for kind in [buffa::EnumValue::Unknown(9), buffa::EnumValue::Unknown(255)] {
     let ae = pb::AppendEntries {
       term: 2,
       leader_id: {

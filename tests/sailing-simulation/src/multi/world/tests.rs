@@ -2303,14 +2303,16 @@ fn a_virgin_non_member_on_a_frozen_participant_world_parks() {
   );
 }
 
-/// A DEAD-END merge-abort obligation must not wedge a co-hosted absorb. Source S owes a target-role
-/// thaw to an upstream group U (S was the aborted TARGET of U→S, so it carries `abandoned[U]`) and
-/// then freezes into T. On a host that holds S and T but NEVER U, the old residual belt held T's
-/// park for as long as `S.has_abandoned()` — but that host can neither drive U's thaw (no local U
-/// stores) nor observe U's lineage advance (U unhosted, floor 0), so the obligation never discharges
-/// there and the park wedged forever while the U-hosting replicas resolved and raced ahead. The belt
-/// now holds only for an obligation whose owed group THIS host holds; a co-hosting replica drives the
-/// real thaw, so dissolving S on the dead-end host strands nothing.
+/// A DEAD-END merge-abort obligation clears CLUSTER-WIDE off a committed `ThawDischarged` witness.
+/// Source S owes a target-role thaw to an upstream group U (S was the aborted TARGET of U→S, so it
+/// carries `abandoned[U]`). On a host that holds S but NEVER U, that host can neither drive U's thaw
+/// (no local U stores) nor observe U's lineage advance (U unhosted, floor 0, lineage 0) — the ghost
+/// obligation. Once U thaws, S's LEADER (an observer: it hosts U and sees `shape_gen(U) > expected`,
+/// a GLOBAL proof) appends a `ThawDischarged` witness on S's own log; every S replica's apply clears
+/// `abandoned[U]` — so node 2 reaches `!has_abandoned()` WITHOUT ever hosting U, the observer-led
+/// self-heal. (The drivability belt — dissolving S drops a dead-end obligation the absorb never
+/// needed — remains the fallback when no observer leads S; either mechanism keeps the co-hosted
+/// S→T absorb from wedging.)
 ///
 /// The construction is the only one that reaches the bug — every single-container path purges or
 /// discharges the obligation first. U and S on {0,1} freeze+abort so S carries `abandoned[U]` on
@@ -2376,34 +2378,29 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
   );
   w.reconcile_membership(S);
 
-  // Unmute: U thaws on {0,1} and the obligation discharges THERE — but node 2 never hosts U, so its
-  // copy of abandoned[U] can never discharge (unhosted source, floor 0, lineage 0).
+  // Unmute: U thaws on {0,1}, and S's observer leader appends a `ThawDischarged` witness that clears
+  // `abandoned[U]` on EVERY S replica — node 2 included, which can neither drive nor observe U. The
+  // ghost self-heals cluster-wide.
   w.unmute_all();
   assert!(
     w.run_until(8_000, |w| {
-      [0u64, 1].iter().all(|&n| {
-        w.hosts[&n].group(&U).is_some_and(|ep| !ep.is_frozen())
-          && w.hosts[&n].group(&S).is_some_and(|ep| !ep.has_abandoned())
-      })
+      [0u64, 1]
+        .iter()
+        .all(|&n| w.hosts[&n].group(&U).is_some_and(|ep| !ep.is_frozen()))
+        && (0..3).all(|n| w.hosts[&n].group(&S).is_some_and(|ep| !ep.has_abandoned()))
     }),
-    "U must thaw and the obligation discharge on its own host replicas"
+    "U must thaw and the witness must discharge the obligation on EVERY S replica"
   );
 
-  // THE DEAD-END POSTCONDITION the bug turns on.
+  // THE CLUSTER-WIDE CLEAR the witness delivers — node 2 discharges WITHOUT ever hosting U.
   assert!(w.hosts_group(2, S), "node 2 hosts S");
   assert!(
     !w.hosts_group(2, U),
-    "node 2 never hosts U — the obligation is a local dead end there"
+    "node 2 never hosts U — the obligation was a local dead end there"
   );
   assert!(
-    w.hosts[&2].group(&S).expect("S on 2").has_abandoned(),
-    "node 2's S still owes U a thaw it can neither drive nor observe"
-  );
-  assert!(
-    [0u64, 1]
-      .iter()
-      .all(|&n| !w.hosts[&n].group(&S).expect("S hosted").has_abandoned()),
-    "the U-hosting replicas discharged the same obligation"
+    !w.hosts[&2].group(&S).expect("S on 2").has_abandoned(),
+    "node 2's ghost obligation cleared off the committed witness, not any local observation"
   );
   assert!(
     [0u64, 1]
@@ -2430,8 +2427,10 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
     w.propose_commit_merge(T, S)
   });
 
-  // THE PIN: every host resolves the absorb within a bounded budget — node 2 included. The old belt
-  // held node 2's park forever on the dead-end obligation while {0,1} resolved and raced ahead.
+  // THE PIN: with node 2's ghost already cleared by the witness, S owes no thaw anywhere and the
+  // co-hosted absorb resolves on EVERY host — node 2 included. (Pre-witness, node 2's park wedged
+  // forever on the dead-end obligation while {0,1} resolved and raced ahead; the belt was the only
+  // exit.)
   assert!(
     w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, S))),
     "the S→T absorb must resolve on EVERY host — a dead-end obligation must not wedge node 2's park"

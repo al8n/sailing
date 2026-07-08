@@ -162,6 +162,15 @@ pub(crate) struct MergeState {
   /// thaw the previous leader appended but never committed (a truncated thaw would otherwise
   /// wedge the source frozen forever); the guard only suppresses THIS leader's own duplicate.
   pub(crate) thaw_pending_index: Index,
+  /// Log index of the `ThawDischarged` WITNESS this leader last appended (on its own TARGET log) and
+  /// not yet applied (`> applied` ⇒ a witness is in flight) — the witness mint's IDEMPOTENT-APPEND
+  /// guard, the exact twin of `thaw_pending_index` for the discharge-observing side. Without it the
+  /// thaw pass would append a fresh witness every crank while a global proof stands until the first
+  /// commits. Derived, self-releasing via `> applied`, and re-seated to ZERO (not `last`) at
+  /// `become_leader` like `thaw_pending_index`: a witness appended then truncated before it committed
+  /// must be re-appendable by the next observing leader, so a fresh leader starts with none in flight
+  /// and the guard suppresses only THIS leader's own duplicate.
+  pub(crate) witness_pending_index: Index,
   /// The resolved absorb's `CommitMerge` index, set by `resolve_pending_merge` — the membership
   /// fence's compaction leg: the target refuses conf changes until `first_index` passes it (the
   /// forced absorb capture compacts through it within a crank), so a replica added post-merge
@@ -693,6 +702,21 @@ where
     self.merge.thaw_pending_index = index;
   }
 
+  /// The index of a `ThawDischarged` WITNESS this leader has appended (on its own target log) but not
+  /// yet applied, if any — the witness mint's idempotent-append guard. `Some` means the thaw pass must
+  /// RETAIN rather than append another witness this crank; it retires once the witness commits, applies
+  /// (clearing the obligation), and the lifted obligation stops the pass from re-observing it.
+  pub(crate) fn witness_in_flight(&self) -> Option<Index> {
+    (self.merge.witness_pending_index > self.applied).then_some(self.merge.witness_pending_index)
+  }
+
+  /// Record a `ThawDischarged` witness this leader just appended at `index` — arms
+  /// [`witness_in_flight`](Self::witness_in_flight) so the thaw pass does not pile on a duplicate
+  /// witness while this one is in flight.
+  pub(crate) fn note_witness_appended(&mut self, index: Index) {
+    self.merge.witness_pending_index = index;
+  }
+
   /// The target-side membership fence: whether a conf change must refuse because a merge is in
   /// flight (proposed, parked, or absorbed-but-not-yet-compacted). Adding a replica in any of
   /// those windows lets it be LOG-WALKED across the absorb point — it parks there with no local
@@ -926,7 +950,10 @@ where
     use crate::ProposeError;
     debug_assert!(matches!(
       kind,
-      EntryKind::PrepareMerge | EntryKind::CommitMerge | EntryKind::RollbackMerge
+      EntryKind::PrepareMerge
+        | EntryKind::CommitMerge
+        | EntryKind::RollbackMerge
+        | EntryKind::ThawDischarged
     ));
     let now: Now = now.into();
     if self.poison.poisoned {

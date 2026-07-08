@@ -2793,6 +2793,29 @@ where
             // already surfaced the definitive event, and no thaw is relayed (an absorbed
             // source no longer exists to thaw; a live one is covered by re-proposing).
           }
+          EntryKind::ThawDischarged => {
+            // A committed witness that some leader OBSERVED this target's obligation for the named
+            // source discharged. A PURE gen-exact map clear — no `shape_gen` move, no park/fence
+            // interaction (it is FSM-non-mutating, so an entry above a surviving freeze is legal and
+            // a frozen target-holder still discharges through it). Clears the obligation iff still
+            // held at EXACTLY the witnessed generation: a STALE witness (the source re-froze at a
+            // higher generation for a fresh merge, or this is a replayed duplicate) no-ops on the
+            // gen-exact match, so the fresh obligation is untouched. Uniform on every replica — the
+            // leader that minted it clears HERE too, and a replica that can never LOCALLY observe the
+            // source (unhosted, floor 0/non-terminal, lineage unknown) clears here and NOWHERE else.
+            let payload = match crate::wire::decode_thaw_discharged_payload(entry.data_bytes()) {
+              Ok(p) => p,
+              // A committed witness whose payload won't decode is corrupt — mirror the other merge
+              // kinds' committed-corrupt fail-stop.
+              Err(_) => {
+                self.poison(PoisonReason::MergeDecode);
+                break;
+              }
+            };
+            if self.abandoned_matches(&payload.source_bytes(), payload.generation()) {
+              self.clear_abandoned(&payload.source_bytes());
+            }
+          }
           EntryKind::SetReadMode => {
             // Decode the target mode from the EXACTLY-1-byte payload; unrecoverable on failure → poison
             // (mirror ConfChange's exact decode). An empty, trailing-junk, or out-of-range payload is a

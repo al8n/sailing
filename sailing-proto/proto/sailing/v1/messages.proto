@@ -51,7 +51,8 @@ message Entry {
 
 // Entry discriminant. Zero = Normal so the dominant case is the proto3 default.
 // The three merge kinds (5..=7) were RESERVED by the split milestone's LABEL_VERSION 3 bump and
-// are mapped by the merge milestone — no wire change, as the reservation promised.
+// are mapped by the merge milestone — no wire change, as the reservation promised. ThawDischarged
+// (8) is added under the still-UNRELEASED LABEL_VERSION 3 — a new kind, not a version bump.
 enum EntryKind {
   ENTRY_KIND_NORMAL = 0;
   ENTRY_KIND_CONF_CHANGE = 1;
@@ -61,6 +62,7 @@ enum EntryKind {
   ENTRY_KIND_PREPARE_MERGE = 5;
   ENTRY_KIND_COMMIT_MERGE = 6;
   ENTRY_KIND_ROLLBACK_MERGE = 7;
+  ENTRY_KIND_THAW_DISCHARGED = 8;
 }
 
 // The payload of an ENTRY_KIND_SPLIT entry (rides Entry.data). G-free: `child` is the embedder's
@@ -124,6 +126,20 @@ message RollbackMergePayload {
   uint64 source_gen_after = 1;
   bytes source = 2;
   uint64 target_gen_after = 3;
+}
+
+// The payload of an ENTRY_KIND_THAW_DISCHARGED entry (rides Entry.data), proposed on a merge
+// TARGET's log: a committed witness that some leader OBSERVED this target's outstanding thaw
+// obligation for `source` at freeze generation `generation` discharged (the source thawed past the
+// abandoned freeze, or was terminally merged). Every replica's apply clears the obligation for
+// exactly (source, generation) — so a replica that can never LOCALLY observe the source still
+// clears, instead of fencing compaction and blocking teardown forever. G-free like the other merge
+// payloads: `source` is the embedder's group id encoded by its Data impl (1..=1024 bytes,
+// decode_exact — always present). Minted only from a globally-valid discharge proof, so it never
+// clears a still-live obligation on a co-hosting holder. Rides LABEL_VERSION 3.
+message ThawDischargedPayload {
+  bytes source = 1;
+  uint64 generation = 2;
 }
 
 // Cluster membership. Each repeated field is a SET: elements are the embedder's

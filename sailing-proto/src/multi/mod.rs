@@ -31,7 +31,8 @@ use crate::{
   Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore, MergeError, Message, NodeId,
   Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng, ProposeError, ReadIndexError,
   ReadOnlyOption, RemoveError, RollbackMergePayload, SnapshotMeta, SplitError, SplitPayload,
-  StableStore, StateMachine, StorageProgress, Term, TransferError, endpoint::MergeWindow,
+  StableStore, StateMachine, StorageProgress, Term, ThawDischargedPayload, TransferError,
+  endpoint::MergeWindow,
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
@@ -2473,6 +2474,49 @@ where
     Some(result)
   }
 
+  /// Append a `ThawDischarged` WITNESS on `target`'s own log — the discharge-observing leg of the
+  /// thaw pass, driven ONLY by [`service_merge_applies`](Self::service_merge_applies) when the
+  /// obligation holder LEADS and holds a GLOBALLY-valid proof the named source is discharged (its
+  /// mint predicate lives at the call site, where the source's counter/floor is read). Not public and
+  /// has no coordinator delegator: like the source-side thaw, the witness is fully service-driven, so
+  /// no external path can forge one. The append rides `propose_merge_entry` with NO freeze gate — a
+  /// holder may itself be a frozen source and must still discharge its obligations mid-freeze, and the
+  /// witness is FSM-non-mutating so it is legal above a surviving freeze. IDEMPOTENT per obligation
+  /// holder: a witness already appended-and-unapplied on this leader RETAINS its index rather than
+  /// piling on a duplicate every crank (the exact twin of the thaw relay's `thaw_in_flight` guard).
+  /// `None` if no group `target` is hosted; a non-leader falls out of `propose_merge_entry` as
+  /// `NotLeader` (the outcome is discarded — the discharge is decided by the committed apply, not this
+  /// append).
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  fn propose_thaw_witness<L>(
+    &mut self,
+    target: &G,
+    source_bytes: &Bytes,
+    generation: u64,
+    now: impl Into<Now>,
+    log: &mut L,
+  ) -> Option<Result<Index, MergeError<I>>>
+  where
+    L: LogStore,
+  {
+    let ep = self.groups.get(target)?;
+    if let Some(idx) = ep.witness_in_flight() {
+      return Some(Ok(idx));
+    }
+    let payload = ThawDischargedPayload::new(source_bytes.clone(), generation);
+    let mut buf = Vec::new();
+    crate::wire::encode_thaw_discharged_payload(&payload, &mut buf);
+    let ep = self.groups.get_mut(target).expect("checked hosted above");
+    let result = ep
+      .propose_merge_entry(now, log, EntryKind::ThawDischarged, Bytes::from(buf))
+      .map_err(MergeError::Propose);
+    if let Ok(index) = &result {
+      ep.note_witness_appended(*index);
+    }
+    self.mark_dirty(target);
+    Some(result)
+  }
+
   /// Resolve every parked `CommitMerge` that the TARGET's log and local facts now decide —
   /// called ONCE PER CRANK by every driver, after the per-group apply drains.
   ///
@@ -2812,29 +2856,64 @@ where
           }
           break;
         };
-        // DISCHARGE by OBSERVING the source's lineage, never by classifying the thaw's append
-        // outcome: the abandoned freeze is gen `expected` and the thaw mints `expected + 1`, so a
-        // source whose lineage advanced PAST `expected` has committed+applied its unfreeze (or
-        // re-froze past it) — the obligation is delivered. HOSTED reads the live counter. UNHOSTED
-        // consults the PERSISTED lineage/floor `stores` exposes, the durable record that OUTLIVES the
-        // source's teardown: a lineage past `expected`, OR a floor that no longer admits `expected`
-        // (a non-terminal teardown of a reshaped source floors it ABOVE its own gen, and the terminal
-        // `MERGED_FLOOR` fences every gen) each prove the frozen-at-`expected` incarnation is gone —
-        // a recreate lands at a strictly higher incarnation this obligation never named. Binding the
-        // unhosted discharge to the persisted record — not only the volatile local counter — is what
-        // keeps a re-derived obligation (replayed from the abort entry after a restart) from fencing
-        // that abort entry FOREVER once its source was torn down and floored rather than terminally
-        // merged. Clearing lifts the target's compaction fence over THIS abort entry, so the fence
-        // releases only once the source is proven past `expected` — the discharge-gated durability
-        // of the abort, crash-durable via the abort entry's replay.
-        let discharged = match self.groups.get(&source) {
-          Some(sep) => sep.shape_gen() > expected,
+        // DISCHARGE by OBSERVING the source, never by classifying the thaw's append outcome: the
+        // abandoned freeze is gen `expected`, so a source advanced PAST it committed its unfreeze (or
+        // re-froze past it) — the obligation is delivered. HOSTED reads the live counter; UNHOSTED
+        // consults the PERSISTED lineage/floor that OUTLIVES the source's teardown (a lineage past
+        // `expected`, or a floor that no longer admits it). Clearing lifts the target's compaction
+        // fence over the abort entry, so it releases only once the source is proven past `expected` —
+        // crash-durable via the abort entry's replay.
+        //
+        // TWO predicates from one lookup. LOCAL discharge is what THIS replica can observe directly.
+        // The WITNESS mint predicate is STRICTLY STRONGER: a witness is a COMMITTED claim every replica
+        // applies, so it may rest ONLY on a GLOBALLY-valid proof — a hosted replica's applied lineage
+        // past `expected` (committed ⇒ global), the persisted engine lineage past it (the driver's
+        // global mirror of the source's committed counter), or the TERMINAL `MERGED_FLOOR` (the source
+        // was absorbed away — global). NEVER a non-terminal floor: that is a HOST-LOCAL fact ("THIS host
+        // stopped hosting at/below `expected`", set by the local removal ceiling), so witnessing it
+        // would clear a LIVE obligation on a co-hosting holder whose source is still frozen — killing
+        // the thaw drive and stranding the source frozen forever.
+        let (local_discharged, global_proof) = match self.groups.get(&source) {
+          Some(sep) => {
+            let seen_past = sep.shape_gen() > expected;
+            (seen_past, seen_past)
+          }
           None => {
-            stores.lineage(&source) > expected
-              || !crate::floor_admits(stores.floor(&source), expected)
+            let lineage_past = stores.lineage(&source) > expected;
+            let floor = stores.floor(&source);
+            (
+              lineage_past || !crate::floor_admits(floor, expected),
+              lineage_past || floor == crate::MERGED_FLOOR,
+            )
           }
         };
-        if discharged {
+        // THE OBSERVER LEADER DEFERS ITS CLEAR TO THE WITNESS APPLY. An UNPARKED holder that LEADS with
+        // a global proof appends the witness once (idempotent) and lets the committed apply clear the
+        // map — uniformly on every replica, this leader included — so a replica that can never LOCALLY
+        // observe the source (the dead-end class) clears off the same committed entry. Keeping the map
+        // entry alive is the re-append trigger under leader churn (a truncated witness is re-observed
+        // and re-appended by the next leader still holding it). A holder whose ONLY proof is a
+        // non-terminal floor mints nothing and takes the local clear below; a non-leader likewise.
+        //
+        // A PARKED holder is EXCLUDED from the defer: its apply drain is stopped at the absorb boundary,
+        // so a witness above the park could NEVER apply there, and a standing obligation whose abort
+        // entry sits at/below that boundary FENCES the holder's OWN in-flight absorb
+        // (`abort_relay_fences`) — deferring would deadlock the absorb on a witness the park blocks. It
+        // takes the local clear instead (the pre-witness behavior), which lifts that fence; a co-parked
+        // non-observing follower resolves on the absorb's forced-snapshot path (`note_abort_rebaselined`
+        // supersedes its park), not the witness. RESIDUAL: while a NON-observer leads an unparked holder,
+        // un-observing followers keep the ghost; it self-heals on the first observer-led term.
+        let holder_defers = self
+          .groups
+          .get(&tgid)
+          .is_some_and(|t| t.role().is_leader() && t.pending_merge().is_none());
+        if holder_defers && global_proof {
+          if let Some((tlog, _)) = stores.stores(&tgid) {
+            let _ = self.propose_thaw_witness(&tgid, &source_key, expected, now, tlog);
+          }
+          continue;
+        }
+        if local_discharged {
           if let Some(tep) = self.groups.get_mut(&tgid) {
             tep.clear_abandoned(&source_key);
           }

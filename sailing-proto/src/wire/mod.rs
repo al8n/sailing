@@ -36,7 +36,7 @@
 use crate::{
   CommitMergePayload, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2,
   ConfState, Entry, EntryKind, Index, InstallSnapshot, Message, NodeId, PrepareMergePayload,
-  RollbackMergePayload, SnapshotMeta, SplitPayload, Term,
+  RollbackMergePayload, SnapshotMeta, SplitPayload, Term, ThawDischargedPayload,
   data::{Data, DecodeError},
 };
 use buffa::{EnumValue, Message as _};
@@ -575,6 +575,32 @@ pub(crate) fn decode_rollback_merge_payload(
   })
 }
 
+/// Encode a thaw-discharged witness payload as an entry payload.
+pub(crate) fn encode_thaw_discharged_payload(p: &ThawDischargedPayload, buf: &mut Vec<u8>) {
+  pb::ThawDischargedPayload {
+    source: p.source_bytes(),
+    generation: p.generation(),
+    ..Default::default()
+  }
+  .encode(buf);
+}
+
+/// Decode a thaw-discharged witness payload from an entry payload. The source id is ALWAYS present
+/// (a witness names exactly one source) and obeys the group-tag bound (1..=[`MAX_GROUP_ID_LEN`]) —
+/// the same rule the commit-merge source obeys; an empty or over-bound source is corrupt.
+pub(crate) fn decode_thaw_discharged_payload(
+  mut data: Bytes,
+) -> Result<ThawDischargedPayload, DecodeError> {
+  let w = buffa::DecodeOptions::new()
+    .with_unknown_field_limit(MAX_UNKNOWN_FIELDS)
+    .decode::<pb::ThawDischargedPayload>(&mut data)
+    .map_err(map_err)?;
+  if w.source.is_empty() || w.source.len() > MAX_GROUP_ID_LEN {
+    return Err(DecodeError::Invalid("ThawDischargedPayload.source length"));
+  }
+  Ok(ThawDischargedPayload::new(w.source, w.generation))
+}
+
 /// Map buffa's structural decode errors onto the crate's error surface. The envelope
 /// rejects-and-closes at the transport either way; the distinction that matters to
 /// callers is truncation vs malformation.
@@ -663,6 +689,7 @@ fn pb_entry(e: &Entry) -> pb::Entry {
       EntryKind::PrepareMerge => pb::EntryKind::PrepareMerge,
       EntryKind::CommitMerge => pb::EntryKind::CommitMerge,
       EntryKind::RollbackMerge => pb::EntryKind::RollbackMerge,
+      EntryKind::ThawDischarged => pb::EntryKind::ThawDischarged,
     }),
     data: e.data_bytes(),
     timestamp: e.timestamp(),
@@ -682,6 +709,7 @@ fn entry_from(w: pb::Entry) -> Result<Entry, DecodeError> {
     EnumValue::Known(pb::EntryKind::PrepareMerge) => EntryKind::PrepareMerge,
     EnumValue::Known(pb::EntryKind::CommitMerge) => EntryKind::CommitMerge,
     EnumValue::Known(pb::EntryKind::RollbackMerge) => EntryKind::RollbackMerge,
+    EnumValue::Known(pb::EntryKind::ThawDischarged) => EntryKind::ThawDischarged,
     EnumValue::Unknown(_) => return Err(DecodeError::Invalid("EntryKind")),
   };
   Ok(
