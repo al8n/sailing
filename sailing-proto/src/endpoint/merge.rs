@@ -332,8 +332,7 @@ where
 
   /// Whether this group still owes ANY aborted source a thaw — it applied a merge abort as a TARGET
   /// whose durable `abandoned` obligation the container's per-crank thaw pass has not yet discharged.
-  /// The service reads it as the thaw pass's per-crank filter and the removal purge's guard, the
-  /// conf-change fence reads it (a joiner would inherit an undischargeable ghost), and the
+  /// The service reads it as the thaw pass's per-crank filter and the removal purge's guard, and the
   /// `prepare_merge` source-side gate refuses to DISSOLVE such a group as a fresh merge's source (its
   /// obligations would vanish with its endpoint, stranding the upstream source frozen). The Resolve
   /// arm is DRIVABILITY-gated by contrast: it holds the absorb only while the obligation's owed
@@ -695,18 +694,19 @@ where
   }
 
   /// The target-side membership fence: whether a conf change must refuse because a merge is in
-  /// flight (proposed, parked, or absorbed-but-not-yet-compacted) OR an aborted-merge thaw
-  /// obligation is still outstanding. Adding a replica in the first three windows lets it be
-  /// LOG-WALKED across the absorb point — it parks there with no local source and no floor, no-ops
-  /// past the union, and silently diverges (the fork milestone's log-walk lesson). The fourth leg
-  /// is the abort obligation: the abort entry is pinned BELOW every capture by the compaction fence
-  /// (`abort_relay_fences`) for as long as the obligation stands, so a voter joining inside the
-  /// abort→discharge window log-walks it and re-derives an obligation it can NEVER discharge if it
-  /// never comes to host the owed group — a permanent ghost that also wedges any future merge into
-  /// this target. So the obligation must discharge before the voter set may move. All four legs
-  /// release on their own: apply absorbs the in-flight index, resolution consumes the park, the
-  /// absorb capture's compaction moves `first_index` past the absorb point within a crank, and the
-  /// thaw pass discharges the obligation once its source is observed thawed.
+  /// flight (proposed, parked, or absorbed-but-not-yet-compacted). Adding a replica in any of
+  /// those windows lets it be LOG-WALKED across the absorb point — it parks there with no local
+  /// source and no floor, no-ops past the union, and silently diverges (the fork milestone's
+  /// log-walk lesson). The three legs release on their own: apply absorbs the in-flight index,
+  /// resolution consumes the park, and the absorb capture's compaction moves `first_index`
+  /// past the absorb point within a crank.
+  ///
+  /// An outstanding abort obligation (`has_abandoned`) deliberately does NOT fence here: a voter
+  /// joining a group that owes a thaw re-derives that obligation, and if it never hosts the owed
+  /// group the obligation is a local dead end — but the drivability belt in the resolve arm drops
+  /// exactly such a dead end at the absorb, so the joiner never wedges (the world test
+  /// `a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb` pins this). Fencing joins here would
+  /// forbid the legitimate growth of a target that is aborting an inbound merge.
   pub(crate) fn merge_conf_fence<L: LogStore>(&self, log: &L) -> bool {
     self.merge.pending_commit_index > self.applied
       || self.merge.pending_apply.is_some()
@@ -714,7 +714,6 @@ where
         .merge
         .absorb_index
         .is_some_and(|k| log.first_index() <= k)
-      || self.has_abandoned()
   }
 }
 

@@ -1767,15 +1767,14 @@ fn merge_conf_fence_releases_with_the_capture() {
   );
 }
 
-/// FIX 3 leg (a): an outstanding aborted-merge thaw obligation fences conf changes. A voter joining
-/// inside the abort→discharge window log-walks the abort entry (pinned below every capture by the
-/// compaction fence) and re-derives an obligation it can never discharge if it never hosts the owed
-/// group — a permanent ghost. `merge_conf_fence` refuses `MergeInFlight` while the obligation stands;
-/// discharging it releases the fence. RED before the leg: the conf change ADMITS with the obligation
-/// still outstanding.
+/// A group that owes an aborted-merge thaw deliberately does NOT fence conf changes: a voter may
+/// join it (re-deriving the obligation), and if that obligation becomes a local dead end the resolve
+/// arm's drivability belt drops it at the absorb — so the join never wedges (the container world test
+/// `a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb` pins that end to end). Fencing joins on
+/// an obligation holder would forbid growing a target that is legitimately aborting an inbound merge.
 #[test]
-fn an_outstanding_thaw_obligation_fences_conf_changes() {
-  use crate::{ConfChange, ConfChangeType, ProposeError};
+fn an_outstanding_thaw_obligation_does_not_fence_conf_changes() {
+  use crate::{ConfChange, ConfChangeType};
   let (mut ep, mut log, mut stable) = make_three_voter_leader();
   // A TARGET-side abort at the live mint applies and records one durable `abandoned` obligation.
   let a = ep
@@ -1791,21 +1790,6 @@ fn an_outstanding_thaw_obligation_fences_conf_changes() {
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
   assert!(
-    matches!(
-      ep.propose_conf_change(
-        Instant::ORIGIN,
-        &mut log,
-        &stable,
-        ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
-      ),
-      Err(ProposeError::MergeInFlight)
-    ),
-    "the fence refuses a voter change while the obligation stands"
-  );
-  // Discharging the obligation (the source observed thawed, modeled by clearing it) lifts the fence.
-  ep.clear_abandoned(&bytes::Bytes::from_static(b"\x2a"));
-  assert!(!ep.has_abandoned());
-  assert!(
     ep.propose_conf_change(
       Instant::ORIGIN,
       &mut log,
@@ -1813,7 +1797,7 @@ fn an_outstanding_thaw_obligation_fences_conf_changes() {
       ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
     )
     .is_ok(),
-    "the fence releases once the obligation discharges"
+    "an outstanding abort obligation does not fence a conf change — the belt drops a dead end at absorb"
   );
 }
 
