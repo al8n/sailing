@@ -182,6 +182,17 @@ impl MultiWorld {
           sailing_proto::MergeResolution::Aborted { .. } => {
             self.merges_aborted += 1;
           }
+          sailing_proto::MergeResolution::Retired { source } => {
+            // A hosted frozen husk of a terminally-absorbed lineage dissolved locally — no absorbing
+            // target and no capture. Fold the SAME source half as `Merged` MINUS the capture: record
+            // the terminal floor DURABLY and drop the source stores, CO-BARRIERED. Unlike `Merged` this
+            // needs no deferral (there is no capture to wait on), but the floor re-write is MANDATORY
+            // even when the husk was already at `MERGED_FLOOR` — a crash after the store drop but before
+            // a durable floor would re-admit the id below its gen (the resurrection the restore pin
+            // checks). The world's `merge_floors` IS the durable terminal floor.
+            self.merge_floors.insert((node, source));
+            self.drop_group_replica(source, node);
+          }
         }
       }
     }

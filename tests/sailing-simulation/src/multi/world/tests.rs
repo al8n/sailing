@@ -2439,6 +2439,53 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
   assert!(w.is_merged(S), "S is terminally merged away");
 }
 
+/// A dissolved husk does not RESURRECT across a crash — the `Retired` fold's co-barriered terminal
+/// floor is durable, so a restore-from-durable-state never re-admits the id. A frozen source is
+/// floored terminally on its host (modeling a merge that resolved elsewhere while no park formed
+/// here); the husk-dissolve arm reclaims it; a crash then rebuilds every hosted replica from durable
+/// state and the source is not among them, its floor intact.
+#[test]
+fn a_dissolved_husk_does_not_resurrect_across_a_crash() {
+  const S: u64 = 40;
+  const T: u64 = 41;
+  let mut w = MultiWorld::new(11);
+  w.add_node(0);
+  let solo: BTreeSet<u64> = [0].into_iter().collect();
+  w.create_group(S, &solo);
+  w.create_group(T, &solo);
+  assert!(w.run_until(2_000, |w| w.leader_of(S).is_some()
+    && w.leader_of(T).is_some()));
+  // Freeze S into T — S is now a frozen source.
+  merge_verb_until_accepted(&mut w, 2_000, "the S→T freeze", |w| {
+    w.propose_prepare_merge(S, T)
+  });
+  assert!(w.run_until(4_000, |w| {
+    w.hosts[&0].group(&S).is_some_and(|ep| ep.is_frozen())
+  }));
+  // MODEL THE HUSK: the catalog floors S terminally on node 0 (its merge resolved elsewhere) while S
+  // is still frozen+hosted and no park formed here — the exact husk the dissolve reclaims.
+  w.merge_floors.insert((0, S));
+  // THE DISSOLVE (driven off the oracle path, as the container reclaims a source the world registry
+  // still tracks as live): the husk-dissolve arm retires S locally.
+  assert!(w.pump_merges(), "the husk dissolved");
+  assert!(!w.hosts_group(0, S), "S's husk replica is gone");
+  assert!(
+    w.merge_floors.contains(&(0, S)),
+    "its terminal floor was re-written durably, co-barriered with the teardown"
+  );
+  // CRASH + RESTORE: the node rebuilds every hosted replica from durable state. S is NOT among them,
+  // and the durable terminal floor persists — so it never re-admits.
+  w.crash(0);
+  assert!(
+    !w.hosts_group(0, S),
+    "S does not resurrect across the crash — the durable floor held"
+  );
+  assert!(
+    w.merge_floors.contains(&(0, S)),
+    "the terminal floor survives the crash"
+  );
+}
+
 /// Drive `source → target` on a fresh 3-node world through freeze, commit, and every host's
 /// resolution (the merge-test preamble shared by the teardown pins).
 fn drive_merge_to_full_resolution(seed: u64, source: u64, target: u64) -> MultiWorld {

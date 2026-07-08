@@ -843,10 +843,10 @@ where
 
   /// Resolve every parked merge that local facts now decide (see
   /// [`MultiRaft::service_merge_applies`]) — called once per crank by the driver after the
-  /// per-group storage drains. On a resolved ABSORB the coordinator TOMBSTONES the source id:
-  /// its straggler frames drop silently from here on (the P5 wire story, unchanged), while the
-  /// terminal floor the DRIVER persists from the returned resolutions is what makes the refusal
-  /// survive restarts. Aborted resolutions touch nothing here — the source group is still live.
+  /// per-group storage drains. On a resolved ABSORB or a husk RETIREMENT the coordinator TOMBSTONES
+  /// the source id: its straggler frames drop silently from here on (the P5 wire story, unchanged),
+  /// while the terminal floor the DRIVER persists from the returned resolutions is what makes the
+  /// refusal survive restarts. Aborted resolutions touch nothing here — the source group is still live.
   pub fn service_merge_applies<L, S, St>(
     &mut self,
     now: impl Into<Now>,
@@ -859,12 +859,17 @@ where
   {
     let resolutions = self.multi.service_merge_applies(now, stores);
     for r in &resolutions {
-      if let crate::MergeResolution::Merged { source, .. } = r {
-        self.quiesce_intents.remove(source);
-        self.controls.retain(|(g, _)| g != source);
-        self.retired.insert(source.cheap_clone());
-        self.purge_unknown_signal(source);
-      }
+      // A `Merged` source (absorbed) and a `Retired` source (husk dissolved) both LEAVE the container
+      // terminally floored — tombstone each id. `Aborted` leaves both groups live.
+      let source = match r {
+        crate::MergeResolution::Merged { source, .. }
+        | crate::MergeResolution::Retired { source } => source,
+        crate::MergeResolution::Aborted { .. } => continue,
+      };
+      self.quiesce_intents.remove(source);
+      self.controls.retain(|(g, _)| g != source);
+      self.retired.insert(source.cheap_clone());
+      self.purge_unknown_signal(source);
     }
     resolutions
   }

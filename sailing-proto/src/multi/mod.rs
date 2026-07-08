@@ -90,6 +90,16 @@ pub trait GroupStores<G, L, S> {
 /// and [`floor_admits`] refuses it at ANY floor. That reservation is what makes this fence
 /// terminal BY CONSTRUCTION: the floor leg alone (`generation >= floor`) would wave the
 /// sentinel generation through its own fence, since `u64::MAX < u64::MAX` is false.
+///
+/// EMBEDDER CONTRACT: write `MERGED_FLOOR` for an id ONLY once its lineage is TERMINALLY resolved
+/// (absorbed away — the driver folds it from a [`MergeResolution::Merged`] or
+/// [`MergeResolution::Retired`]). A floor claiming an UNRESOLVED lineage was always a safety
+/// violation (it buries a live incarnation below an admission it can never clear); it is now also
+/// actively DESTRUCTIVE — the per-crank service treats a hosted FROZEN source at this floor as a
+/// dead husk and DISSOLVES it (`Retired`), so a premature `MERGED_FLOOR` tears down a live merge
+/// source. The terminal floor must be re-persisted CO-BARRIERED with the source teardown a merge
+/// resolution folds: dropping the stores while the floor is only STAGED (not durable) and crashing
+/// would re-admit the id below its generation.
 pub const MERGED_FLOOR: u64 = u64::MAX;
 
 /// The floor-admission predicate every admission gate applies — the multi coordinators'
@@ -281,8 +291,9 @@ pub struct GroupFork<G, I, F> {
 /// DRIVER folds into its storage engine and lifecycle teardown. The container already did the
 /// consensus-side work (the absorb or the deterministic abort, the events, the source
 /// endpoint's removal on a merge); the driver owns the storage half: persist
-/// `floor(source) = `[`MERGED_FLOOR`] and drop the source's stores for a `Merged`, nothing for
-/// an `Aborted` (the source group is still live — its log settled the race).
+/// `floor(source) = `[`MERGED_FLOOR`] and drop the source's stores for a `Merged` (and, minus the
+/// capture, for a `Retired`), nothing for an `Aborted` (the source group is still live — its log
+/// settled the race).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum MergeResolution<G> {
   /// The target ABSORBED the source: the source endpoint is gone from this container, the
@@ -301,6 +312,17 @@ pub enum MergeResolution<G> {
     source: G,
     /// The target group whose parked apply no-op'd.
     target: G,
+  },
+  /// A hosted FROZEN source at the TERMINAL [`MERGED_FLOOR`] — the husk of a lineage that was
+  /// absorbed away ELSEWHERE (its target caught up via a snapshot install and never parked here) —
+  /// was DISSOLVED locally. There is no absorb and so no capture: the driver folds the SAME source
+  /// half as `Merged` MINUS the capture — re-persist `floor(source) = `[`MERGED_FLOOR`] (a monotone
+  /// no-op when already durable, but MANDATORY co-barriered with the teardown: a `FloorStore` may
+  /// serve a STAGED floor, and dropping the stores off it then crashing before the flush would
+  /// re-admit the id below its gen) and drop the source's stores.
+  Retired {
+    /// The dissolved husk's source group.
+    source: G,
   },
 }
 
@@ -658,6 +680,41 @@ where
       .groups
       .iter()
       .any(|(g, ep)| g != gid && ep.pending_merge().is_some_and(|p| p.source_bytes() == key))
+  }
+
+  /// Whether `source` owes a LOCALLY-DRIVABLE target-role thaw — the shared residual belt of the
+  /// absorb Resolve arm and the husk dissolve. A source-side teardown drops the source's endpoint
+  /// (and its outstanding obligations), so it must HOLD while THIS replica can still drive one, or the
+  /// dropped obligation would strand the upstream source frozen forever. DRIVABLE = the owed target is
+  /// HOSTED here (this replica can append that thaw and observe its lineage advance). An owed target
+  /// NOT hosted here is a local DEAD END — a co-hosting replica drives it — so it does not hold, and
+  /// dropping it here strands nothing (`prepare_merge`'s `SourceOwesThaw` gate refuses the common case
+  /// at propose; this belt covers the abort a source applied AS A TARGET that materialized an
+  /// obligation below its own freeze). An owed id whose committed bytes will NOT decode is
+  /// committed-corrupt: POISON the source (the `MergeDecode` fail-stop every host reaches
+  /// deterministically) and HOLD, never authorizing a teardown some other host would fail-stop on. The
+  /// poison makes this a side-effecting read (`&mut self`).
+  fn owes_a_drivable_thaw(&mut self, source: &G) -> bool {
+    let obligations = self
+      .groups
+      .get(source)
+      .map(Endpoint::abandoned_obligations)
+      .unwrap_or_default();
+    let mut drivable = false;
+    for (owed, _, _) in obligations {
+      match G::decode_exact(owed) {
+        Ok(owed) if self.groups.contains_key(&owed) => drivable = true,
+        // Decodable but not hosted here: a local dead-end — a co-hosting replica drives it.
+        Ok(_) => {}
+        Err(_) => {
+          if let Some(sep) = self.groups.get_mut(source) {
+            sep.poison(PoisonReason::MergeDecode);
+          }
+          drivable = true;
+        }
+      }
+    }
+    drivable
   }
 
   /// Whether any OTHER hosted endpoint is a merge SOURCE that names `gid` as its TARGET — the
@@ -2728,47 +2785,13 @@ where
           {
             continue;
           }
-          // THE RESIDUAL BELT, gated to LOCAL DRIVABILITY. A source that still owes a target-role
-          // thaw must not dissolve while THIS replica can still drive that thaw — dissolving would
-          // drop the obligation and strand the upstream source frozen forever. `prepare_merge`'s
-          // `SourceOwesThaw` gate refuses the common case at propose, but an abort this source
-          // applied AS A TARGET can commit BELOW its own freeze and materialize the obligation
-          // after that gate passed (the freeze fold is an unguarded max). HOLD the park so the thaw
-          // pass below discharges the obligation FIRST — but ONLY for an obligation whose target
-          // this replica HOSTS. An obligation to a group this host does not hold is a local
-          // dead-end: this replica can neither append that source's thaw (it has no local source
-          // stores — see the drive below, which fires only on `stores(&source)`) nor observe its
-          // lineage advance, so `discharged` above stays false forever and holding wedges the
-          // absorb permanently (the never-hosted, alive-elsewhere obligation-source class). A
-          // co-hosting replica drives THAT thaw to discharge; absorbing here — the dissolve drops
-          // an obligation this replica never advanced and never could — cannot strand it. A parked
-          // target is never quiesce-eligible, so a genuinely-held park keeps being reached until it
-          // resolves. An owed id whose committed bytes will NOT decode is committed-corrupt — the
-          // same `MergeDecode` class the thaw pass and the park decode raise. Treating it as
-          // not-drivable (the old `is_ok_and` did) would AUTHORIZE the dissolve, so hosts diverge
-          // between fail-stop and progress by crank order: HOLD the park and poison the SOURCE, the
-          // deterministic fail-stop every host reaches.
-          let obligations = self
-            .groups
-            .get(&source)
-            .map(Endpoint::abandoned_obligations)
-            .unwrap_or_default();
-          let mut hold_for_thaw = false;
-          for (owed, _, _) in obligations {
-            match G::decode_exact(owed) {
-              Ok(owed) if self.groups.contains_key(&owed) => hold_for_thaw = true,
-              // Decodable but not hosted here: a local dead-end — a co-hosting replica drives it,
-              // so this absorb strands nothing.
-              Ok(_) => {}
-              Err(_) => {
-                if let Some(sep) = self.groups.get_mut(&source) {
-                  sep.poison(PoisonReason::MergeDecode);
-                }
-                hold_for_thaw = true;
-              }
-            }
-          }
-          if hold_for_thaw {
+          // THE RESIDUAL BELT, gated to LOCAL DRIVABILITY (see `owes_a_drivable_thaw`). HOLD the park
+          // while the source still owes a thaw THIS replica can drive, so the thaw pass discharges it
+          // FIRST — dissolving would drop the obligation and strand the upstream source frozen. A
+          // dead-end obligation (owed target not hosted here) does NOT hold: a co-hosting replica
+          // drives it, so absorbing here strands nothing. A parked target is never quiesce-eligible,
+          // so a genuinely-held park keeps being reached until it resolves.
+          if self.owes_a_drivable_thaw(&source) {
             continue;
           }
           // The β hold above proved the source owes no thaw; this absorb IS the merge resolving, so
@@ -2928,6 +2951,45 @@ where
         if let Some((slog, sstable)) = stores.stores(&source) {
           let _ = self.propose_merge_unfreeze(&source, now, slog, sstable, &tgid, expected);
         }
+      }
+    }
+    // THE FLOOR-AUTHORITATIVE HUSK DISSOLVE, ordered AFTER the resolver loop AND the thaw pass so a
+    // witness has already cleared any of a husk's UNDRIVABLE obligations before the belt reads them.
+    // A hosted FROZEN source at the TERMINAL `MERGED_FLOOR` is the husk of a lineage absorbed away
+    // ELSEWHERE (its target caught up via a snapshot install and never parked here): tombstones refuse
+    // recreation, so no later same-id incarnation can ever exist and the floor is AUTHORITATIVE that
+    // this frozen replica is dead. Otherwise it is unremovable (`Frozen`), blocks its claimed target's
+    // removal (`Claimed`), and is capture-fenced forever. Dissolve it LOCALLY; a poisoned husk is left
+    // for its own fail-stop.
+    let husks: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(gid, ep)| {
+        ep.is_frozen() && !ep.is_poisoned() && stores.floor(gid) == crate::MERGED_FLOOR
+      })
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for gid in husks {
+      // THE PARK GATE: a co-hosted target's park may still NAME this husk as its source (that target
+      // has not parked-resolved the absorb here). Dissolving first would hand that park's resolver a
+      // MANUFACTURED absence + `MERGED_FLOOR` — its absent-source arm resolves Abort and SKIPS the
+      // union = committed divergence from every host that absorbed. HOLD; the resolver absorbs the
+      // husk normally (source hosted → Resolve) on this same host.
+      if self.park_names_source(&gid) {
+        continue;
+      }
+      // THE BELT (shared with the absorb Resolve arm): a husk that still owes a LOCALLY-DRIVABLE thaw
+      // must not dissolve — dropping the obligation strands the upstream source. A decode-corrupt owed
+      // id poisons the husk and holds.
+      if self.owes_a_drivable_thaw(&gid) {
+        continue;
+      }
+      // Dissolve through the UNGATED inner teardown (the public gate's `Frozen`/`Claimed` refusals all
+      // describe this very dead lineage). The driver folds the SAME source half as `Merged` MINUS the
+      // capture — the co-barriered terminal-floor re-write keeps a crash from re-admitting the id.
+      if self.remove_group_inner(&gid).is_some() {
+        self.mark_dirty(&gid);
+        resolutions.push(MergeResolution::Retired { source: gid });
       }
     }
     resolutions

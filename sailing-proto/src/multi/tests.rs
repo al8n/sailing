@@ -4909,6 +4909,150 @@ fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
   );
 }
 
+/// PIN B(a): a hosted FROZEN source at the TERMINAL floor is the husk of a lineage absorbed away
+/// ELSEWHERE (this host's target caught up via a snapshot install and never parked here). It is
+/// otherwise unremovable (`Frozen`) and capture-fenced forever; the husk-dissolve arm reclaims it.
+#[test]
+fn a_hosted_husk_at_the_terminal_floor_dissolves() {
+  let (mut m, mut stores) = merge_host(0, 0);
+  let now = Instant::ORIGIN;
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "1 is a frozen source");
+  // The catalog floors 1 terminally — its merge resolved elsewhere while no park formed here. 1 is now
+  // a husk; no live park names it. Pre-mechanism it stays forever.
+  stores.1.insert(1);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Retired { source: 1 }],
+    "the frozen husk at the terminal floor dissolved locally"
+  );
+  assert!(!m.contains_group(&1), "the husk is gone");
+  assert_eq!(
+    stores.floor(&1),
+    MERGED_FLOOR,
+    "its terminal floor still fences the id"
+  );
+}
+
+/// PIN B(b): the dissolve keys on the EXACT terminal `MERGED_FLOOR`. A frozen source one below it —
+/// the closest non-terminal floor — is a live participant, not a husk, and must NOT dissolve.
+#[test]
+fn a_frozen_source_one_below_the_terminal_does_not_dissolve() {
+  let (mut m, map_stores) = merge_host(0, 0);
+  let now = Instant::ORIGIN;
+  let mut stores = LineageStores {
+    inner: map_stores,
+    floors: std::collections::BTreeMap::from([(1u64, u64::MAX - 1)]),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "1 is a frozen source");
+  assert_eq!(stores.floor(&1), u64::MAX - 1);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert!(
+    resolutions.is_empty(),
+    "only the EXACT terminal floor dissolves a husk — a floor one below does not"
+  );
+  assert!(
+    m.contains_group(&1),
+    "the frozen source is untouched below the terminal"
+  );
+}
+
+/// PIN B(c), the B1 red-proof: a hosted park still NAMING the husk as its source HOLDS the dissolve —
+/// reclaiming it first would hand the resolver a MANUFACTURED absence and skip the union (committed
+/// divergence). The park absorbs it instead (Merged, never Retired), union intact.
+#[test]
+fn a_park_naming_the_husk_holds_the_dissolve_then_absorbs() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  let k = freeze_and_park(&mut m, &mut stores);
+  // The catalog floors 1 terminally, RACING the local absorb: 1 is frozen + MERGED_FLOOR AND 2's park
+  // names it as source. The husk arm must HOLD (the park gate).
+  stores.1.insert(1);
+  let sealed = m.service_merge_applies(now, &mut stores);
+  assert!(sealed.is_empty(), "the seal pass resolves nothing");
+  assert!(
+    m.contains_group(&1),
+    "the park gate held the dissolve — 1 is not reclaimed as a husk"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  let resolved = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolved,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }],
+    "the park absorbs the husk (Merged), never the dissolve (Retired)"
+  );
+  assert!(!m.contains_group(&1), "1 absorbed into 2");
+  let tep = m.group(&2).unwrap();
+  assert_eq!(tep.applied_index(), k, "the parked entry applied");
+  assert_eq!(
+    tep.state_machine().count(),
+    2 + 3,
+    "the union is intact — 1's content folded in"
+  );
+}
+
+/// PIN B(d), the belt: a husk that still owes a LOCALLY-DRIVABLE thaw must NOT dissolve — dropping the
+/// obligation would strand the upstream source frozen forever. Construction mirrors the late-obligation
+/// belt: 2 aborts 1→2 below its own freeze into 3, so 2 owes 1 a thaw (1 hosted) AND is frozen.
+#[test]
+fn the_belt_holds_a_husk_owing_a_locally_drivable_thaw() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().has_abandoned() && m.group(&2).unwrap().is_frozen(),
+    "2 owes 1 a drivable thaw AND is frozen for 3"
+  );
+  // The catalog (adversarially) floors 2 terminally; the belt must hold the dissolve while 2 owes a
+  // thaw THIS host can drive (1 is hosted).
+  stores.1.insert(2);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert!(
+    !resolutions
+      .iter()
+      .any(|r| matches!(r, MergeResolution::Retired { .. })),
+    "the belt held — a husk owing a locally-drivable thaw is NOT dissolved"
+  );
+  assert!(
+    m.contains_group(&2),
+    "2 is untouched while its drivable obligation stands"
+  );
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "the obligation is intact — the dissolve did not drop it"
+  );
+}
+
 /// The negative pin: a source that owes NO thaw dissolves in the ordinary cadence — the residual
 /// belt never over-fires. 2 freezes into 3 with no outstanding obligation and is absorbed in the
 /// same single resolve pass a clean source always was.

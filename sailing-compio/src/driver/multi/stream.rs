@@ -690,19 +690,27 @@ where
       self.flush_pending = true;
     }
     for r in resolutions {
-      if let sailing_proto::MergeResolution::Merged { source, .. } = r {
-        self
-          .engine
-          .set_group_floor(&source, sailing_proto::MERGED_FLOOR);
-        self.engine.remove_group(&source);
-        self.was_leader.remove(&source);
-        self.quiesced.remove(&source);
-        self.quiesce_pending.remove(&source);
-        self.activity.remove(&source);
-        self.election.remove(&source);
-        if let Some(mut routing) = self.routing.remove(&source) {
-          routing.fail_all(&DriverError::ShuttingDown);
-        }
+      // `Merged` (absorbed) and `Retired` (a hosted frozen husk dissolved off its terminal floor)
+      // fold the SAME source half — floor terminally, drop the stores and engine record, and tear
+      // down the routing. A `Retired` has no capture, but the floor re-write is STILL mandatory: a
+      // `FloorStore` may serve a STAGED floor, and dropping the stores off it before the flush would
+      // re-admit the id below its gen. `Aborted` needs nothing — the source is still live.
+      let source = match r {
+        sailing_proto::MergeResolution::Merged { source, .. }
+        | sailing_proto::MergeResolution::Retired { source } => source,
+        sailing_proto::MergeResolution::Aborted { .. } => continue,
+      };
+      self
+        .engine
+        .set_group_floor(&source, sailing_proto::MERGED_FLOOR);
+      self.engine.remove_group(&source);
+      self.was_leader.remove(&source);
+      self.quiesced.remove(&source);
+      self.quiesce_pending.remove(&source);
+      self.activity.remove(&source);
+      self.election.remove(&source);
+      if let Some(mut routing) = self.routing.remove(&source) {
+        routing.fail_all(&DriverError::ShuttingDown);
       }
     }
     self.flush_pending = self.engine.has_staged() || more;
