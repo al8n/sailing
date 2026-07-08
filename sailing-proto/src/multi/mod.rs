@@ -1838,6 +1838,24 @@ where
     if sep.merge_freeze_active() {
       return Some(Err(MergeError::AlreadyFrozen));
     }
+    // A source mid-SPLIT must not freeze: the freeze mints `source_gen_after` from the source's
+    // live `shape_gen`, but the appended-unapplied `Split` below it applies first and bumps that
+    // counter — so the freeze's generation COLLIDES with the split's on the one lineage counter,
+    // and every gen-keyed reader (the absorb's source-gen check, the abort-relay's incarnation
+    // gate) can no longer tell the two moves apart. The exact dual of `propose_split` refusing a
+    // freezing parent ([`SplitError::Frozen`]): split and freeze are mutually exclusive on a group.
+    // TRANSIENT — the split applies, then the same freeze mints from the post-split counter.
+    if sep.split_in_flight() {
+      return Some(Err(MergeError::SplitInFlight));
+    }
+    // NB: a source with a target-role abort still in flight is deliberately NOT fenced here. Unlike
+    // the split (which materializes a child and must stay mutually exclusive with a freeze), the
+    // freeze fold is a monotone MAX — never a stale-aborting lineage guard — so a freeze whose
+    // generation collides with the in-flight abort's still applies, and the abort's `abandoned`
+    // obligation is honored DOWNSTREAM: the absorbing target's Resolve arm HOLDS the absorb until
+    // the thaw pass discharges it (see `a_late_obligation_holds_the_absorb_until_the_thaw_discharges`).
+    // Only the TARGET side (`commit_merge`), whose absorb rides a STRICT lineage guard that
+    // stale-aborts and strands, needs the abort fence.
     // A source that is itself mid-ABSORB (a CommitMerge in flight or parked as a target)
     // must finish that first: freezing it would mint a source generation the pending absorb
     // is about to move, and the two verbs' entries would race on one counter.
@@ -1967,6 +1985,30 @@ where
     if tep.merge_freeze_active() {
       return Some(Err(MergeError::AlreadyFrozen));
     }
+    // THE LINEAGE-SERIALIZATION FENCE. `target_gen_after` is minted below from the target's LIVE
+    // `shape_gen`, and the apply-time guard admits the CommitMerge ONLY at exactly that mint. A
+    // stale mint — a lineage move that applied on the target's own log between this propose and the
+    // CommitMerge's apply — makes the parked apply no-op and emit `MergeAborted` WITHOUT recording
+    // the source's thaw obligation: a permanently stranded frozen source. The target's `shape_gen`
+    // has a CLOSED set of apply-time writers; every one that could be in flight below the CommitMerge
+    // is gated so none can stale the mint:
+    //   PrepareMerge-freeze        → `merge_freeze_active`                 (AlreadyFrozen, above)
+    //   CommitMerge-absorb         → `commit_merge_in_flight`/`pending_merge` (AlreadyPending, above)
+    //   RollbackMerge target-abort → `rollback_in_flight`                  (RollbackInFlight, below)
+    //   RollbackMerge source-thaw  → only ever on a FROZEN group           (AlreadyFrozen, above)
+    //   Split                      → `split_in_flight`                     (here)
+    //   ConfChange                 → not a `shape_gen` write, but its apply races the voter
+    //                                comparison            → `conf_change_in_flight` (ConfChangeInFlight, below)
+    //   snapshot-install           → monotone-max on the same lineage that already accounts for a
+    //                                committed CommitMerge, so it cannot regress the mint (no gate)
+    // The SPLIT: an appended-unapplied `Split` applies first, bumps `shape_gen`, strands the absorb.
+    // Both here are TRANSIENT — self-clearing once the reshaping move applies.
+    if tep.split_in_flight() {
+      return Some(Err(MergeError::SplitInFlight));
+    }
+    if tep.rollback_in_flight() {
+      return Some(Err(MergeError::RollbackInFlight));
+    }
     // The local readiness gate: the source must be frozen-applied at its boundary. `>=` rather
     // than `==` deliberately — a post-freeze election lands an FSM-no-op above the boundary on
     // every replica, and only FSM-no-ops can follow a surviving freeze, so applied-past-F is
@@ -2050,7 +2092,11 @@ where
   /// The gates are best-effort truthfulness (the apply-time lineage guard is the decider): the
   /// TARGET leader proposes; the LOCAL source must exist and be frozen or freezing (the mint
   /// names its freeze generation); a frozen target refuses (its own dissolution outranks —
-  /// aborting through it would bump its lineage above its own boundary).
+  /// aborting through it would bump its lineage above its own boundary). A target mid-split or with
+  /// a DIFFERENT source's abort already in flight defers (`SplitInFlight`/`RollbackInFlight`) so an
+  /// unapplied lineage move cannot stale this abort's generation mint into an obligation-less no-op
+  /// that strands the aborted source — while an in-flight or parked commit of the SAME merge is
+  /// deliberately RACED, not fenced (see the fence comment below and #22).
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn rollback_merge<L, S>(
     &mut self,
@@ -2104,10 +2150,89 @@ where
     let source_gen_after = sep.shape_gen();
     let mut source_bytes = Vec::new();
     source.encode(&mut source_bytes);
-    // The mint reads the target's live counter — deliberately NOT gated on an in-flight or
-    // parked commit: racing one is this verb's whole purpose, and the shared base is exactly
-    // what makes the race resolve to one log-ordered winner. It stops strictly below the reserved
-    // `MERGED_FLOOR` terminal — at the ceiling the abort is refused here, before any append.
+    // THE LINEAGE-SERIALIZATION FENCE — the abort's proposer leg, completing the trio with
+    // `commit_merge` and `prepare_merge`. `target_gen_after` is minted below from the target's LIVE
+    // `shape_gen`, and the abort's apply-time guard records the source's `abandoned` thaw obligation
+    // ONLY at exactly that mint (the strict `== shape_gen + 1` arm). A stale mint — a lineage move
+    // that applied on the target's own log between this propose and the abort's apply — makes the
+    // abort SILENTLY no-op WITHOUT recording `abandoned`, stranding the aborted source frozen forever.
+    //
+    // The full PROPOSERS × MOVES matrix. The moves are the CLOSED set of apply-time `shape_gen`
+    // writers (every `self.split.shape_gen =` site — Split ×2, PrepareMerge-freeze, CommitMerge-absorb,
+    // RollbackMerge-abort, RollbackMerge-thaw, snapshot-install; ConfChange writes no `shape_gen`).
+    // The strict lineage-MINTING proposers each mint from a live counter and admit only at the mint:
+    //   commit_merge  (target absorb) — gated: Split, RollbackMerge-abort, CommitMerge/pending, freeze,
+    //                                   ConfChange (its absorb compares voter/read state)
+    //   rollback_merge (target abort) — gated HERE (this fence)
+    //   prepare_merge (source freeze) — the freeze fold is MONOTONE-MAX, not a stale-aborting guard,
+    //                                   so it fences only Split (counter collision), never an abort
+    //   propose_split                 — self-gates (it IS the split)
+    // Against THIS proposer (the target abort), each move is fenced / raced / exempt:
+    //   PrepareMerge-freeze         → a freezing target is refused `AlreadyFrozen` above — a frozen
+    //                                 target cannot abort at all (its own dissolution outranks)
+    //   RollbackMerge source-thaw   → only ever on a FROZEN group → `AlreadyFrozen` above (as above;
+    //                                 `rollback_in_flight` is set for thaws too but never reaches here)
+    //   RollbackMerge target-abort  → `rollback_in_flight` → FENCE `RollbackInFlight` (below). THE
+    //                                 FAN-IN STRAND: two sources frozen into one target, abort A
+    //                                 un-drained then abort B mint the SAME gen; A applies + records
+    //                                 `abandoned[A]`, B stale-no-ops without `abandoned[B]` → B stranded.
+    //   Split                       → `split_in_flight` → FENCE `SplitInFlight` (below): an appended-
+    //                                 unapplied `Split` applies first, bumps `shape_gen`, stales the abort.
+    //   CommitMerge-absorb          → `commit_merge_in_flight`/`pending_merge` → SAME-MERGE-EXACT race
+    //                                 (the match below): racing an in-flight or PARKED commit of the
+    //                                 SAME merge is this verb's whole PURPOSE (#22), so it is allowed;
+    //                                 a CROSS-source commit is FENCED `AlreadyPending` (else B's abort
+    //                                 lands at A's `k+1`, A absorbs, B strands frozen). The PARKED
+    //                                 source is compared in memory (`pending_merge`); the IN-FLIGHT
+    //                                 one is DECODED from the `CommitMerge` at `pending_commit_index`
+    //                                 (`pending_commit_source`, fail-closed to a defer on a cold or
+    //                                 undecodable read). Both mint from the shared base and the
+    //                                 target's own log totally-orders them to ONE winner — landing below
+    //                                 the commit kills it at the commit's OWN guard (parks never form),
+    //                                 landing after a parked commit un-parks every replica ABORTED off
+    //                                 that one coordinate. Fencing the SAME merge would deadlock the
+    //                                 release valve (a parked commit that could never complete could
+    //                                 then never be aborted).
+    //   ConfChange                  → writes no `shape_gen`, AND the abort compares no voter/read state
+    //                                 (unlike the absorb) → irrelevant here, no gate.
+    //   snapshot-install            → monotone-max on the same lineage that already accounts for any
+    //                                 committed abort → cannot regress the mint → no gate.
+    // Both fences are TRANSIENT and self-clearing (`> applied`): re-propose once the reshaping applies.
+    if tep.split_in_flight() {
+      return Some(Err(MergeError::SplitInFlight));
+    }
+    if tep.rollback_in_flight() {
+      return Some(Err(MergeError::RollbackInFlight));
+    }
+    // THE COMMIT RACE IS SAME-MERGE-EXACT. Racing an in-flight/parked `CommitMerge` at k+1 is this
+    // verb's purpose (#22) — but ONLY for THIS merge. A CROSS-source commit (fan-in: T committing
+    // source A while B is aborted) would land B's abort at A's k+1: `merge_abort_window` reads a
+    // different-source rollback there as `Closed`, A absorbs and bumps the lineage, and B's abort
+    // then stale-no-ops WITHOUT recording `abandoned[B]` — B stranded, and A's release valve
+    // consumed. So allow the race ONLY when the racing commit names this exact
+    // `(source, source_gen_after)`: a PARKED commit exposes it in memory (`pending_merge`); an
+    // IN-FLIGHT one not yet parked is DECODED off the `CommitMerge` at `pending_commit_index`
+    // (`pending_commit_source`, whose cold/undecodable read fails closed to a defer). A commit of
+    // any OTHER source — or one this abort cannot read — is refused `AlreadyPending`.
+    match tep.pending_merge() {
+      Some(park)
+        if park.source_bytes().as_ref() == source_bytes.as_slice()
+          && park.source_gen_after() == source_gen_after => {}
+      Some(_) => return Some(Err(MergeError::AlreadyPending)),
+      // In flight but not yet parked: no in-memory park to compare, so DECODE the appended
+      // `CommitMerge`'s source off the log at `pending_commit_index`. Same source → race it (the
+      // #22 in-flight race); any other source, or a read/decode the abort cannot resolve, → defer.
+      None if tep.commit_merge_in_flight() => match tep.pending_commit_source(log) {
+        Some((in_flight_source, in_flight_gen))
+          if in_flight_source.as_ref() == source_bytes.as_slice()
+            && in_flight_gen == source_gen_after => {}
+        _ => return Some(Err(MergeError::AlreadyPending)),
+      },
+      None => {}
+    }
+    // The mint reads the target's live counter, now serialized behind the fences above (the commit
+    // race SAME-MERGE-EXACT per the match above). It stops strictly below the reserved `MERGED_FLOOR`
+    // terminal — at the ceiling the abort is refused here, before any append.
     let Some(target_gen_after) = next_lineage(tep.shape_gen()) else {
       return Some(Err(MergeError::LineageExhausted));
     };

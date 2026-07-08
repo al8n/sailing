@@ -3158,6 +3158,452 @@ fn service_resolves_a_ready_merge() {
   );
 }
 
+/// The lineage-serialization fence on `commit_merge`'s target side. A `Split` appended-and-unapplied
+/// on the target bumps its `shape_gen` when it drains, so a `CommitMerge` proposed over it mints a
+/// generation the split immediately stales — the parked apply no-ops at its lineage guard and emits
+/// `MergeAborted` WITHOUT recording the source's thaw obligation, leaving the source `frozen_for` a
+/// target that owes it nothing (a permanent strand). RED before the gate: `commit_merge` ADMITTED.
+/// GREEN: refused `SplitInFlight` while the split is in flight; once the split applies the same
+/// `commit_merge` mints from the post-split counter and absorbs — the source is never stranded.
+#[test]
+fn commit_merge_defers_a_target_reshaping_by_a_split() {
+  let (mut m, mut stores) = merge_host_with(SplitSm::default(), 1, SplitSm::default(), 3);
+  let now = Instant::ORIGIN;
+
+  // Freeze source 1 into target 2: 1 is frozen_for 2, its barrier trivially met (single voter).
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "source frozen for the target"
+  );
+
+  // Append a Split on the TARGET without draining it: split_in_flight is armed, unapplied.
+  let split_idx = {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.propose_split(&2, now, log, stable, &3, 0, Bytes::from_static(b"\x01"))
+      .unwrap()
+      .unwrap()
+  };
+  assert!(
+    m.group(&2).unwrap().split_in_flight(),
+    "the target has a split appended-unapplied"
+  );
+
+  // THE FENCE: the absorb defers while the target is reshaping (RED: it ADMITTED, then the
+  // drained split staled the CommitMerge into an obligation-less MergeAborted).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert_eq!(
+      m.commit_merge(&2, now, log, stable, &1),
+      Some(Err(MergeError::SplitInFlight)),
+      "a target mid-split defers the absorb"
+    );
+  }
+  // The source is untouched — still frozen_for the target, never stranded by a stale abort.
+  assert!(m.group(&1).unwrap().is_frozen());
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "no obligation-less abort was recorded on the target"
+  );
+
+  // Let the split resolve: it applies, `shape_gen` bumps, the fork relays out, the barrier lifts.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.flush_appends(&2, now, log, stable).unwrap();
+    while matches!(
+      m.handle_storage(&2, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(!m.group(&2).unwrap().split_in_flight(), "the split applied");
+  let fork = m.poll_pending_fork().expect("the fork relays out");
+  assert_eq!(fork.child, 3);
+  m.lift_fork_barrier(&2, split_idx);
+  while m.poll_event().is_some() {}
+
+  // Re-propose against the post-split lineage: now it admits and PARKS (not stranded).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_some(),
+    "the absorb parks against the post-split target"
+  );
+
+  // Drive it to resolution: the source is absorbed and removed — the opposite of a strand.
+  seal_window(&mut m, &mut stores);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }]
+  );
+  assert!(
+    !m.contains_group(&1),
+    "the source is absorbed, not left frozen forever"
+  );
+}
+
+/// The `prepare_merge` dual of the same fence, on the SOURCE side. A source mid-split must not
+/// freeze: the freeze mints `source_gen_after` from the source's live `shape_gen`, but the pending
+/// split applies first and bumps it, so the freeze's generation COLLIDES with the split's on the
+/// one lineage counter. Symmetric to `propose_split` refusing a freezing parent. RED before the
+/// gate: the freeze ADMITTED mid-split. GREEN: refused `SplitInFlight`; the same freeze admits once
+/// the split applies.
+#[test]
+fn prepare_merge_defers_a_source_reshaping_by_a_split() {
+  let (mut m, mut stores) = merge_host_with(SplitSm::default(), 3, SplitSm::default(), 1);
+  let now = Instant::ORIGIN;
+
+  // Append a Split on the SOURCE (group 1) without draining it.
+  let split_idx = {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.propose_split(&1, now, log, stable, &3, 0, Bytes::from_static(b"\x01"))
+      .unwrap()
+      .unwrap()
+  };
+  assert!(m.group(&1).unwrap().split_in_flight());
+
+  // THE FENCE: the freeze defers while the source is reshaping (RED: it froze, colliding the
+  // freeze generation with the split's on one counter).
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    assert_eq!(
+      m.prepare_merge(&1, now, log, stable, &2),
+      Some(Err(MergeError::SplitInFlight)),
+      "a source mid-split defers the freeze"
+    );
+  }
+  assert!(
+    !m.group(&1).unwrap().merge_freeze_active(),
+    "the source never froze mid-split — nothing was appended"
+  );
+
+  // Resolve the split; then the same freeze admits against the post-split counter.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.flush_appends(&1, now, log, stable).unwrap();
+    while matches!(
+      m.handle_storage(&1, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(!m.group(&1).unwrap().split_in_flight());
+  let fork = m.poll_pending_fork().expect("the fork relays out");
+  assert_eq!(fork.child, 3);
+  m.lift_fork_barrier(&1, split_idx);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "the freeze admits once the split has applied"
+  );
+}
+
+/// The SAME fence closing the CROSS-SOURCE fan-in case the split gate does not reach: a target-role
+/// abort (`RollbackMerge`) in flight bumps the target's `shape_gen` when it applies, exactly like a
+/// split. Two sources (1, 3) freeze into one target (2); 2 aborts 1's freeze as a release valve
+/// (appended, unapplied) then tries to commit 3 while that abort is in flight. RED before the fence:
+/// `commit_merge(3 -> 2)` ADMITTED, then draining 2 applied the abort (bumping the counter and
+/// recording `abandoned[1]`) and stale-aborted 3's commit WITHOUT recording `abandoned[3]` — 3 left
+/// frozen_for 2 forever while 1 correctly thawed (verified: `has_abandoned` cleared 1 but never
+/// held 3). GREEN: refused `RollbackInFlight`; once 1's abort applies the same commit admits and 3
+/// absorbs. (The abort of the SAME merge being committed is caught earlier by `AlreadyPending`.)
+#[test]
+fn commit_merge_defers_a_target_with_a_fanin_abort_in_flight() {
+  let (mut m, mut stores) = merge_host_triple(1, 2, 1);
+  let now = Instant::ORIGIN;
+  for src in [1u64, 3] {
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
+    m.prepare_merge(&src, now, log, stable, &2)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, src, now, log, stable);
+    assert!(m.group(&src).unwrap().is_frozen(), "fan-in source frozen");
+  }
+  // Abort 1's freeze (release valve) — append but DO NOT drain: the abort is in flight on 2's log.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+  }
+  assert!(
+    m.group(&2).unwrap().rollback_in_flight(),
+    "1's abort is in flight"
+  );
+
+  // THE FENCE: committing a DIFFERENT frozen source into the same target defers while that abort is
+  // in flight (RED: it admitted, then the drained abort staled 3's commit into an obligation-less
+  // MergeAborted, stranding 3).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert_eq!(
+      m.commit_merge(&2, now, log, stable, &3),
+      Some(Err(MergeError::RollbackInFlight)),
+      "a target with a fan-in abort in flight defers the absorb"
+    );
+  }
+
+  // Let 1's abort apply: it records abandoned[1] and clears the fence. 3 is untouched (still frozen).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    !m.group(&2).unwrap().rollback_in_flight(),
+    "the abort applied"
+  );
+  assert!(m.group(&3).unwrap().is_frozen(), "3 was never disturbed");
+
+  // The same commit now admits against the post-abort lineage and parks — 3 is not stranded.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &3).unwrap().unwrap();
+  }
+  // Drive the service + thaw pass to quiescence: 1 thaws out of its aborted freeze, 3 absorbs into 2.
+  for _ in 0..16 {
+    m.service_merge_applies(now, &mut stores);
+    for g in [1u64, 2, 3] {
+      if let Some((log, stable)) = stores.0.get_mut(&g) {
+        drain_storage(&mut m, g, now, log, stable);
+      }
+    }
+  }
+  assert!(
+    !m.group(&1).unwrap().is_frozen(),
+    "1's aborted freeze thawed — its obligation was honored"
+  );
+  assert!(
+    !m.contains_group(&3),
+    "3 absorbed into 2 — not left frozen forever by a stale abort"
+  );
+}
+
+/// The lineage-serialization fence on `rollback_merge`'s OWN proposer side — the fan-in strand the
+/// abort verb closes on itself. Two sources (1, 3) freeze into one target (2); 2 aborts 1 (release
+/// valve, appended, UNAPPLIED) then tries to abort 3 while that first abort is in flight. Both mint
+/// `target_gen_after` from the SAME live `shape_gen`; RED before the fence: the second abort ADMITTED,
+/// then draining 2 applied 1's abort (bumping the counter, recording `abandoned[1]`) and stale-no-oped
+/// 3's abort at the strict apply-time guard WITHOUT recording `abandoned[3]` — 3 left frozen_for 2
+/// forever, owed a thaw no obligation names. GREEN: the second abort defers `RollbackInFlight` until
+/// 1's applies; re-proposed against the post-abort lineage it records its OWN `abandoned[3]` and 3
+/// thaws. (The abort of the SAME merge as an in-flight commit is deliberately RACED, not fenced — see
+/// `rollback_merge_races_an_in_flight_commit_of_the_same_merge`.)
+#[test]
+fn rollback_merge_defers_a_target_with_a_fanin_abort_in_flight() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // A second single-voter source (3), colocated, elected and drained.
+  stores
+    .0
+    .insert(3, (VecLog::default(), AsyncStable::default()));
+  m.create_group(3, 0, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    let d = m.group(&3).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&3, d, log, stable).unwrap();
+    drain_storage(&mut m, 3, d, log, stable);
+    assert!(m.group(&3).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+
+  // Both sources freeze toward target 2 — the concurrent fan-in.
+  for src in [1u64, 3u64] {
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
+    m.prepare_merge(&src, now, log, stable, &2)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, src, now, log, stable);
+    assert!(m.group(&src).unwrap().is_frozen(), "source {src} froze");
+  }
+
+  // Abort 1's freeze — append but DO NOT drain: the abort is in flight on 2's log, its mint live.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+  }
+  assert!(
+    m.group(&2).unwrap().rollback_in_flight(),
+    "1's abort is in flight, unapplied"
+  );
+
+  // THE FENCE: aborting a DIFFERENT frozen source while the first abort is in flight defers (RED: it
+  // admitted, minted the SAME gen as 1's abort, and stale-no-oped on apply WITHOUT recording
+  // abandoned[3] — 3 stranded frozen forever).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert_eq!(
+      m.rollback_merge(&2, now, log, stable, &3),
+      Some(Err(MergeError::RollbackInFlight)),
+      "a second fan-in abort defers while the first is in flight"
+    );
+  }
+  assert!(m.group(&3).unwrap().is_frozen(), "3 is untouched");
+  assert!(
+    m.group(&2).unwrap().abandoned_obligations().is_empty(),
+    "neither abort has applied yet — no obligation recorded (3 not stale-no-oped into a strand)"
+  );
+
+  // Let 1's abort apply: it records abandoned[1] and clears the fence.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    !m.group(&2).unwrap().rollback_in_flight(),
+    "1's abort applied"
+  );
+  assert_eq!(
+    m.group(&2).unwrap().abandoned_obligations().len(),
+    1,
+    "only 1's obligation recorded so far"
+  );
+
+  // The same abort now admits against the post-abort lineage and records 3's OWN obligation.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert_eq!(
+    m.group(&2).unwrap().abandoned_obligations().len(),
+    2,
+    "3's abort recorded its own obligation once serialized after 1's — RED stranded 3 with none"
+  );
+
+  // The service drives BOTH source thaws; draining each commits+applies its unfreeze.
+  m.service_merge_applies(now, &mut stores);
+  for src in [1u64, 3u64] {
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
+    drain_storage(&mut m, src, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().is_frozen(), "source 1 thawed");
+  assert!(
+    !m.group(&3).unwrap().is_frozen(),
+    "source 3 thawed — not stranded by a stale abort"
+  );
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "both obligations discharged on the observed advances"
+  );
+}
+
+/// The `rollback_merge` analogue of `commit_merge_defers_a_target_reshaping_by_a_split`. A `Split`
+/// appended-and-unapplied on the target bumps its `shape_gen` when it drains, so an abort proposed
+/// over it mints a generation the split immediately stales — the abort no-ops at its strict apply-time
+/// guard and records NO `abandoned` obligation, leaving the frozen source owed a thaw nothing names.
+/// RED before the gate: `rollback_merge` ADMITTED mid-split. GREEN: refused `SplitInFlight`; once the
+/// split applies the same abort mints from the post-split counter and records the obligation.
+#[test]
+fn rollback_merge_defers_a_target_reshaping_by_a_split() {
+  let (mut m, mut stores) = merge_host_with(SplitSm::default(), 1, SplitSm::default(), 3);
+  let now = Instant::ORIGIN;
+
+  // Freeze source 1 into target 2.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "source frozen for the target"
+  );
+
+  // Append a Split on the TARGET without draining it: split_in_flight is armed, unapplied.
+  let split_idx = {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.propose_split(&2, now, log, stable, &3, 0, Bytes::from_static(b"\x01"))
+      .unwrap()
+      .unwrap()
+  };
+  assert!(
+    m.group(&2).unwrap().split_in_flight(),
+    "the target has a split appended-unapplied"
+  );
+
+  // THE FENCE: the abort defers while the target is reshaping (RED: it ADMITTED, then the drained
+  // split staled its mint into an obligation-less no-op that strands the frozen source).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert_eq!(
+      m.rollback_merge(&2, now, log, stable, &1),
+      Some(Err(MergeError::SplitInFlight)),
+      "a target mid-split defers the abort"
+    );
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "the source is untouched");
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "no obligation-less abort was recorded on the target"
+  );
+
+  // Let the split resolve: it applies, `shape_gen` bumps, the fork relays out, the barrier lifts.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.flush_appends(&2, now, log, stable).unwrap();
+    while matches!(
+      m.handle_storage(&2, now, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+  }
+  assert!(!m.group(&2).unwrap().split_in_flight(), "the split applied");
+  let fork = m.poll_pending_fork().expect("the fork relays out");
+  assert_eq!(fork.child, 3);
+  m.lift_fork_barrier(&2, split_idx);
+  while m.poll_event().is_some() {}
+
+  // Re-propose against the post-split lineage: now it admits and records the obligation.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().has_abandoned(),
+    "the abort recorded its obligation post-split — the source is never stranded"
+  );
+}
+
+/// THE INTENTIONAL RACE that MUST SURVIVE the fences above (#22). A `CommitMerge` of the SAME merge
+/// parked (in flight) on the target must NOT block its abort: the abort is the release valve for a
+/// park that can never complete, so fencing `commit_merge_in_flight` here would deadlock it. The abort
+/// mints from the SAME base as the parked commit and the target's own log totally-orders the two — the
+/// abort lands at the coordinate right after the park and un-parks every replica ABORTED. The pin: the
+/// abort is ADMITTED (`Ok`), never refused `RollbackInFlight`/`AlreadyPending`. (End-to-end resolution
+/// is `rollback_races_commit`.)
+#[test]
+fn rollback_merge_races_an_in_flight_commit_of_the_same_merge() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  let k = freeze_and_park(&mut m, &mut stores);
+  assert!(
+    m.group(&2).unwrap().commit_merge_in_flight(),
+    "the SAME merge's commit is parked, in flight"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert_eq!(
+      m.rollback_merge(&2, now, log, stable, &1),
+      Some(Ok(k.next())),
+      "the abort races the parked commit at the next coordinate — not fenced by the in-flight commit"
+    );
+  }
+}
+
 /// A concrete, `core::error::Error` snapshot failure for [`SnapFailSm`].
 #[derive(Debug)]
 struct SnapErr;
@@ -3423,6 +3869,201 @@ fn both_fanned_in_aborts_thaw_neither_dropped() {
   assert!(
     !m.group(&2).unwrap().has_abandoned(),
     "both obligations discharged on the observed advances"
+  );
+}
+
+/// A target legitimately fans in TWO sources (1, 3), then COMMITS source 1 — parking it. A
+/// concurrent abort of the OTHER source (3) MUST defer `AlreadyPending`: admitting it would land
+/// source 3's abort at source 1's `k+1`, where `merge_abort_window` reads a different-source
+/// rollback as `Closed`. Source 1 would then absorb and bump the lineage, and source 3's abort would
+/// stale-no-op WITHOUT recording `abandoned[3]` — source 3 stranded frozen forever, and source 1's
+/// release valve consumed. The fence is SAME-MERGE-EXACT (racing THIS merge's own park is #22's
+/// purpose) and self-clearing: once source 1's park resolves (`Merged`, lineage bumped, park gone),
+/// the SAME source-3 abort admits, records `abandoned[3]`, and the service thaws source 3. RED with
+/// the cross-source arms neutered: the abort ADMITS `Some(Ok(_))` and source 3 strands.
+#[test]
+fn rollback_merge_defers_a_target_committing_a_different_source() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // A second single-voter source (3), colocated with 1 and 2, elected and drained.
+  stores
+    .0
+    .insert(3, (VecLog::default(), AsyncStable::default()));
+  m.create_group(3, 0, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    let d = m.group(&3).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&3, d, log, stable).unwrap();
+    drain_storage(&mut m, 3, d, log, stable);
+    assert!(m.group(&3).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+
+  // BOTH sources freeze toward target 2 — the fan-in.
+  for src in [1u64, 3u64] {
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
+    m.prepare_merge(&src, now, log, stable, &2)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, src, now, log, stable);
+    assert!(m.group(&src).unwrap().is_frozen(), "source {src} froze");
+  }
+
+  // COMMIT source 1 into 2 and PARK it — do NOT resolve.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_some(),
+    "source 1's commit is parked"
+  );
+  assert!(
+    m.group(&2).unwrap().commit_merge_in_flight(),
+    "the parked commit is still in flight (applied held at k-1)"
+  );
+
+  // RED-PROOF: the CROSS-source abort (source 3) defers to source 1's parked commit.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert_eq!(
+      m.rollback_merge(&2, now, log, stable, &3),
+      Some(Err(MergeError::AlreadyPending)),
+      "a cross-source abort must NOT race a parked commit of a DIFFERENT source"
+    );
+  }
+  // The fence appended nothing: source 1's park stands and source 3 stays frozen.
+  assert!(m.group(&2).unwrap().pending_merge().is_some());
+  assert!(m.group(&3).unwrap().is_frozen(), "source 3 stayed frozen");
+
+  // SELF-CLEARING: resolve source 1's parked commit (seal the window, then absorb).
+  seal_window(&mut m, &mut stores);
+  let resolutions = m.service_merge_applies(now, &mut stores);
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::Merged {
+      source: 1,
+      target: 2
+    }],
+    "source 1 absorbed"
+  );
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_none(),
+    "the park cleared"
+  );
+  assert!(!m.group(&2).unwrap().commit_merge_in_flight());
+
+  // The SAME source-3 abort now ADMITS off the bumped live lineage.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let admitted = m.rollback_merge(&2, now, log, stable, &3);
+    assert!(
+      matches!(admitted, Some(Ok(_))),
+      "with source 1's park resolved the source-3 abort admits: {admitted:?}"
+    );
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert_eq!(
+    m.group(&2).unwrap().abandoned_obligations().len(),
+    1,
+    "the admitted abort recorded source 3's thaw obligation"
+  );
+
+  // The service drives source 3's thaw; draining commits+applies its unfreeze.
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    drain_storage(&mut m, 3, now, log, stable);
+  }
+  assert!(
+    !m.group(&3).unwrap().is_frozen(),
+    "the service-driven thaw unfroze source 3 — never stranded"
+  );
+}
+
+/// The IN-FLIGHT-UNPARKED twin of [`rollback_merge_defers_a_target_committing_a_different_source`]:
+/// the cross-source fence must discriminate BEFORE the commit parks, when there is no in-memory
+/// `pending_merge` to compare. A target appends a `CommitMerge` of source 1 but does NOT drain it —
+/// `commit_merge_in_flight()` is true, `pending_merge()` is still `None` — so the fence DECODES the
+/// in-flight commit's source off the log at `pending_commit_index`. Both directions of that decode
+/// are pinned here:
+///
+/// - A concurrent abort of the OTHER source (3) sees `1 != 3` and DEFERS `AlreadyPending`; nothing
+///   is appended and source 3 stays frozen. Admitting it would land source 3's abort at source 1's
+///   `k + 1` and strand source 3, exactly as the parked case does.
+/// - An abort of the SAME source (1) sees `1 == 1` and RACES (`Ok`) — the #22 release valve holds
+///   in the pre-park window too. THIS is the assertion the coarse `commit_merge_in_flight` defer
+///   this fix replaced got wrong (it deferred every unparked abort, same-source included); the sim
+///   band pins the same race end-to-end. RED if the in-flight arm blanket-admits (source 3 strands)
+///   or blanket-defers (source 1 cannot release its own stuck commit).
+#[test]
+fn rollback_merge_source_discriminates_an_in_flight_unparked_commit() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // A second single-voter source (3), colocated with 1 and 2, elected and drained.
+  stores
+    .0
+    .insert(3, (VecLog::default(), AsyncStable::default()));
+  m.create_group(3, 0, single_node_cfg(1), now, 7, CountSm::default())
+    .unwrap();
+  {
+    let (log, stable) = stores.0.get_mut(&3).unwrap();
+    let d = m.group(&3).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&3, d, log, stable).unwrap();
+    drain_storage(&mut m, 3, d, log, stable);
+    assert!(m.group(&3).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+
+  // BOTH sources freeze toward target 2 — the fan-in.
+  for src in [1u64, 3u64] {
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
+    m.prepare_merge(&src, now, log, stable, &2)
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, src, now, log, stable);
+    assert!(m.group(&src).unwrap().is_frozen(), "source {src} froze");
+  }
+
+  // COMMIT source 1 into 2 — APPEND ONLY, no drain: the commit stays in flight and UNPARKED.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.commit_merge(&2, now, log, stable, &1).unwrap().unwrap();
+  }
+  assert!(
+    m.group(&2).unwrap().commit_merge_in_flight(),
+    "source 1's commit is in flight"
+  );
+  assert!(
+    m.group(&2).unwrap().pending_merge().is_none(),
+    "and NOT yet parked — only the log decode, not `pending_merge`, can name its source"
+  );
+
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    // CROSS-source abort (3): decoded `1 != 3` → defer, append nothing.
+    assert_eq!(
+      m.rollback_merge(&2, now, log, stable, &3),
+      Some(Err(MergeError::AlreadyPending)),
+      "a cross-source abort must not race an IN-FLIGHT commit of a DIFFERENT source"
+    );
+    // SAME-source abort (1): decoded `1 == 1` → race the in-flight commit's release valve.
+    assert!(
+      matches!(m.rollback_merge(&2, now, log, stable, &1), Some(Ok(_))),
+      "the SAME-source abort races the in-flight commit — the #22 valve, pre-park"
+    );
+  }
+  assert!(
+    m.group(&3).unwrap().is_frozen(),
+    "the deferred cross-source abort left source 3 frozen"
   );
 }
 

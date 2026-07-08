@@ -357,6 +357,34 @@ pub enum MergeError<I> {
   /// strands the changed membership outside the merge. Re-propose after it applies.
   #[error("a merge participant has a membership change in flight")]
   ConfChangeInFlight,
+  /// A group SPLIT is still in flight (a `Split` appended, not yet applied) on a participant. A
+  /// merge verb mints its lineage generation from the participant's LIVE `shape_gen`, but a split
+  /// appended BELOW the merge entry applies FIRST and bumps that counter — so the merge's mint is
+  /// already stale by the time it applies. On a `commit_merge` target that is fatal: the stale
+  /// `CommitMerge` no-ops at its apply-time lineage guard and emits `MergeAborted` WITHOUT parking
+  /// or recording the source's thaw obligation, stranding the frozen source (only a manual
+  /// rollback recovers it). On a `prepare_merge` source the freeze's generation would COLLIDE with
+  /// the split's on one counter. The same serialize-one-lineage-move rule as
+  /// [`ConfChangeInFlight`](Self::ConfChangeInFlight) and the dual of
+  /// [`SplitError::Frozen`](crate::SplitError::Frozen) (which refuses a split on a freezing group).
+  /// TRANSIENT and self-clearing: re-propose once the split applies — the merge then mints from the
+  /// post-split counter and completes (or aborts through the normal claim path, which DOES record
+  /// the thaw obligation).
+  #[error("a merge participant has a split in flight")]
+  SplitInFlight,
+  /// A merge ROLLBACK is still in flight (a target-role `RollbackMerge` appended, not yet applied)
+  /// on the `commit_merge` TARGET. The same lineage-staling hazard as
+  /// [`SplitInFlight`](Self::SplitInFlight): an abort applies at its live mint and bumps `shape_gen`,
+  /// so an unapplied one below a fresh `CommitMerge` stales its generation mint — the fan-in strand,
+  /// where a target absorbing one source while a release-valve abort of a DIFFERENT frozen source
+  /// sits unapplied on its log makes the absorb no-op at its STRICT lineage guard and strand the
+  /// committed source with no thaw obligation. (The abort of the SAME merge being committed is caught
+  /// earlier by [`AlreadyPending`](Self::AlreadyPending); this closes the cross-source case. The
+  /// SOURCE side of a merge is unaffected — the freeze fold is a monotone max, not a stale-aborting
+  /// guard, and its collision is honored downstream by the absorb's Resolve-arm hold.) TRANSIENT:
+  /// re-propose once the abort applies — its own thaw is relayed and the merge mints afresh.
+  #[error("a merge participant has a merge rollback in flight")]
+  RollbackInFlight,
   /// The source is already frozen (or its freeze is pending in the log). One merge at a time
   /// per source; the standing freeze must resolve or roll back first.
   #[error("the source group is already frozen or freezing")]

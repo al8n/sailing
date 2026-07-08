@@ -627,6 +627,12 @@ where
     // Mirror for commit-merges: an inherited unapplied CommitMerge in the tail will PARK this
     // leader's apply when it commits; hold the membership fence until the tail applies.
     self.merge.pending_commit_index = last;
+    // Mirror for rollbacks: an inherited unapplied RollbackMerge (a target-role abort) bumps this
+    // group's `shape_gen` when it applies, so hold the merge verbs' lineage fence until the tail
+    // applies — a truncated abort re-elected here must not leave `pending_rollback_index` stale-high
+    // and wedge every future merge. The fresh-leader window it opens is already covered by the
+    // commit fence above (a fresh leader refuses merges until its tail drains regardless).
+    self.merge.pending_rollback_index = last;
     // The abort-relay thaw guard re-seats the OPPOSITE way — to ZERO, not to `last`. The fences
     // above hold an inherited tail (assume-in-flight is the SAFE bias); a thaw guard biased that
     // way would refuse to re-append and leave a source wedged if the previous leader's thaw was

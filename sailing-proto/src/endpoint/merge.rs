@@ -140,6 +140,19 @@ pub(crate) struct MergeState {
   /// flight), mirroring `pending_split_index` exactly: derived state, re-seated conservatively
   /// at `become_leader`, never a sticky flag.
   pub(crate) pending_commit_index: Index,
+  /// Log index of the most recently appended (not-yet-applied) `RollbackMerge` on THIS leader
+  /// (`> applied` ⇒ a rollback is in flight) — `commit_merge`'s LINEAGE fence, the exact analogue
+  /// of `pending_commit_index`. A target-role abort applies at its live mint and bumps `shape_gen`,
+  /// so an unapplied one BELOW a freshly proposed `CommitMerge` staled its generation mint: the
+  /// fan-in strand — a target absorbing one source while a release-valve abort of a DIFFERENT frozen
+  /// source sits unapplied on its log makes the absorb no-op at its STRICT lineage guard and strand
+  /// the committed source. (`prepare_merge`'s freeze is a monotone max, not a stale-aborting guard,
+  /// so it does NOT read this fence — its collision is honored downstream by the Resolve-arm hold.)
+  /// Set for EVERY `RollbackMerge` append (the source-role thaw included — harmlessly, since a
+  /// thawing source is `frozen` and `commit_merge` refuses it `AlreadyFrozen` first). Derived,
+  /// self-releasing via `> applied`, re-seated conservatively to `last` at `become_leader` like the
+  /// other fences (a truncated-then-re-elected abort must not wedge the merge verbs).
+  pub(crate) pending_rollback_index: Index,
   /// Log index of the SOURCE-role `RollbackMerge` (thaw) this leader last appended and not yet
   /// applied (`> applied` ⇒ a thaw is in flight) — the abort-relay's IDEMPOTENT-APPEND guard:
   /// the relay is retained across cranks until the source lineage is observed past the freeze,
@@ -248,6 +261,34 @@ where
       // (same committed bytes everywhere).
       _ => MergeWindow::Closed,
     }
+  }
+
+  /// The `(source id, freeze generation)` named by the in-flight `CommitMerge` this leader appended
+  /// at [`pending_commit_index`](MergeState::pending_commit_index) but has not yet applied —
+  /// decoded from that one log entry, the cold-read twin of
+  /// [`merge_abort_window`](Self::merge_abort_window) for the pre-park window a `pending_merge` read
+  /// cannot see. `rollback_merge`'s cross-source fence reads it: an abort may RACE an in-flight
+  /// commit only of the SAME merge (#22), so it compares its own `(source, source_gen_after)`
+  /// against this before minting. `None` on a cold/absent read, a non-`CommitMerge` at that index
+  /// (a conservative `become_leader` reseat to `last`, or a truncation), or a decode fault — the
+  /// caller FAILS CLOSED on every one (defer the abort `AlreadyPending`), never mistaking a source
+  /// it cannot read for a match. Meaningful only with a commit in flight
+  /// ([`commit_merge_in_flight`](Self::commit_merge_in_flight)); reads only THIS group's own log.
+  pub(crate) fn pending_commit_source<L: LogStore>(&self, log: &L) -> Option<(Bytes, u64)> {
+    let coord = self.merge.pending_commit_index;
+    let read = match log.entries(coord..coord.next(), 1 << 20) {
+      Ok(EntriesRead::Ready(e)) if !e.is_empty() => e,
+      // Cold, briefly invisible, or empty: the abort cannot rule out a same-source race, so the
+      // caller defers — the safe, self-clearing choice (retried once the entry is resident or once
+      // the commit parks and the in-memory `pending_merge` arm decides it).
+      _ => return None,
+    };
+    let entry = &read[0];
+    if entry.kind() != EntryKind::CommitMerge {
+      return None;
+    }
+    let payload = crate::wire::decode_commit_merge_payload(entry.data_bytes()).ok()?;
+    Some((payload.source_bytes(), payload.source_gen_after()))
   }
 }
 
@@ -626,6 +667,14 @@ where
     self.merge.pending_commit_index > self.applied
   }
 
+  /// Whether a `RollbackMerge` is appended-and-unapplied on this leader's log — the merge verbs'
+  /// lineage fence (see [`MergeState::pending_rollback_index`]). A target-role abort here bumps
+  /// `shape_gen` when it applies, so `commit_merge`/`prepare_merge` refuse to mint a generation it
+  /// would stale until it clears (`> applied`).
+  pub(crate) fn rollback_in_flight(&self) -> bool {
+    self.merge.pending_rollback_index > self.applied
+  }
+
   /// The index of a SOURCE-role `RollbackMerge` (thaw) this leader has appended but not yet
   /// applied, if any — the abort-relay's idempotent-append guard. `Some` means the accept arm
   /// must RETAIN and wait rather than append a duplicate; the retained relay retires only once
@@ -904,6 +953,9 @@ where
     }
     if kind == EntryKind::CommitMerge {
       self.merge.pending_commit_index = index;
+    }
+    if kind == EntryKind::RollbackMerge {
+      self.merge.pending_rollback_index = index;
     }
     Ok(index)
   }
