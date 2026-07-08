@@ -1362,20 +1362,17 @@ where
         reservation,
       } => {
         // The merge floor leg reads a pre-call snapshot of BOTH participants' lineage (the
-        // engine is lent to the propose as `(log, stable)`).
+        // engine is lent WHOLE as the propose's store seam: the container's claimed-target
+        // gate reads co-hosted claimants' logs, not just the source's own).
         let floors = PairFloors::snapshot(&self.engine, &source, &target);
-        let verdict = match self.engine.stores(&source) {
-          None => Err(no_such_group()),
-          Some((log, stable)) => {
-            match self
-              .coord
-              .prepare_merge(&source, now, log, stable, &target, &floors)
-            {
-              Some(r) => r.map_err(map_merge_err),
-              None => Err(no_such_group()),
-            }
-          }
-        };
+        let verdict =
+          match self
+            .coord
+            .prepare_merge(&source, now, &mut self.engine, &target, &floors)
+          {
+            Some(r) => r.map_err(map_merge_err),
+            None => Err(no_such_group()),
+          };
         if verdict.is_ok() {
           self.flush_pending = true;
         }

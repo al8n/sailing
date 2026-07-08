@@ -418,6 +418,20 @@ pub enum MergeError<I> {
   /// obligation, after which the same freeze admits.
   #[error("the source still owes an aborted merge its thaw")]
   SourceOwesThaw,
+  /// The `prepare_merge` source is itself the CLAIMED TARGET of another in-flight merge: a
+  /// co-hosted source's freeze — applied (`frozen_for`) or still append-pending in its log —
+  /// names this group. Freezing it as a fresh merge's source would
+  /// let a later absorb dissolve it, and the claimant's release verbs BOTH ride the dissolved
+  /// group's log (`commit_merge` and `rollback_merge` are target-proposed), stranding the
+  /// claimant frozen with no release valve. The propose-time twin of the teardown gate's
+  /// [`Claimed`](crate::RemoveError::Claimed) leg, sharing its claim read — equal-voter-set
+  /// pairing means every host of this group co-hosts the claimant, so the claim is locally
+  /// visible wherever this propose can run — and FAIL-CLOSED like it (an unreadable claim
+  /// refuses). TRANSIENT: the claiming choreography's resolution releases it — an absorb
+  /// dissolves the claim holder, an abort's relayed thaw clears its claim — after which the
+  /// same freeze admits.
+  #[error("the source is another in-flight merge's claimed target")]
+  SourceClaimedAsTarget,
   /// The `commit_merge` TARGET already owes THIS source incarnation an aborted-merge thaw: a prior
   /// abort of this very merge committed+applied on the target — recording a durable `abandoned`
   /// obligation for `(source, freeze generation)` — while the source is still frozen at that

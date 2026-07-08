@@ -106,13 +106,10 @@ fn a_parked_merge_blocks_quiescence() {
     "the target is idle before the merge"
   );
 
-  {
-    let (log, stable) = engine.stores(&1).unwrap();
-    multi
-      .prepare_merge(&1, now, log, stable, &2)
-      .unwrap()
-      .unwrap();
-  }
+  multi
+    .prepare_merge(&1, now, &mut engine, &2)
+    .unwrap()
+    .unwrap();
   for _ in 0..4 {
     engine.flush();
     let (log, stable) = engine.stores(&1).unwrap();

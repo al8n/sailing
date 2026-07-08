@@ -735,22 +735,23 @@ where
   }
 
   /// Propose a merge FREEZE of `source` into `target` (see [`MultiRaft::prepare_merge`] for the
-  /// container gates), replicating immediately. The coordinator adds the merge's floor leg
-  /// through the caller's `floors` seam: a participant whose CURRENT incarnation sits below its
-  /// persisted admission floor is a stale survivor of a fenced incarnation — refused BEFORE
-  /// anything is appended, exactly as the split delegator fences its child. `None` if no group
-  /// `source` is hosted.
+  /// container gates), replicating immediately. The source's log resolves through the caller's
+  /// `stores` seam — the container's claimed-target gate reads co-hosted claimants' logs, not
+  /// just the source's own. The coordinator adds the merge's floor leg through the caller's
+  /// `floors` seam: a participant whose CURRENT incarnation sits below its persisted admission
+  /// floor is a stale survivor of a fenced incarnation — refused BEFORE anything is appended,
+  /// exactly as the split delegator fences its child. `None` if no group `source` is hosted.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
-  pub fn prepare_merge<L, S>(
+  pub fn prepare_merge<L, S, St>(
     &mut self,
     source: &G,
     now: impl Into<Now>,
-    log: &mut L,
-    stable: &S,
+    stores: &mut St,
     target: &G,
     floors: &impl FloorStore<G>,
   ) -> Option<Result<Index, crate::MergeError<I>>>
   where
+    St: GroupStores<G, L, S>,
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
@@ -761,8 +762,10 @@ where
       return Some(Err(e));
     }
     let now: Now = now.into();
-    let r = self.multi.prepare_merge(source, now, log, stable, target)?;
-    let _ = self.multi.flush_appends(source, now, log, stable);
+    let r = self.multi.prepare_merge(source, now, stores, target)?;
+    if let Some((log, stable)) = stores.stores(source) {
+      let _ = self.multi.flush_appends(source, now, log, stable);
+    }
     self.flush();
     Some(r)
   }

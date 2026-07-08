@@ -2677,10 +2677,14 @@ fn reshaped_twin_breaks_the_fork_merge_capture_cycle() {
   // freezes for the merge into the parent — the freeze apply bumps its lineage to 1 > child_gen.
   let d = lead_single_split(&mut m, 1, &mut clog, &mut cstable);
   commit_one_split(&mut m, 1, d, &mut clog, &mut cstable);
-  m.prepare_merge(&1, d, &mut clog, &cstable, &2)
-    .unwrap()
-    .unwrap();
-  drain(&mut m, 1, &mut clog, &mut cstable);
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  stores.0.insert(1, (clog, cstable));
+  stores.0.insert(2, (plog, pstable));
+  m.prepare_merge(&1, d, &mut stores, &2).unwrap().unwrap();
+  {
+    let (clog, cstable) = stores.0.get_mut(&1).unwrap();
+    drain(&mut m, 1, clog, cstable);
+  }
   assert!(m.group(&1).unwrap().is_frozen());
   assert_eq!(m.group(&1).unwrap().shape_gen(), 1);
   assert!(m.group(&1).unwrap().applied_index() >= FORK_BASE_INDEX);
@@ -2700,10 +2704,10 @@ fn reshaped_twin_breaks_the_fork_merge_capture_cycle() {
 
   // The dependent merge now completes: park, seal, resolve — the absorb capture the fence was
   // blocking lands, the child departs, and the parent serves the union.
-  let dp = lead_single_split(&mut m, 2, &mut plog, &mut pstable);
-  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
-  stores.0.insert(1, (clog, cstable));
-  stores.0.insert(2, (plog, pstable));
+  let dp = {
+    let (plog, pstable) = stores.0.get_mut(&2).unwrap();
+    lead_single_split(&mut m, 2, plog, pstable)
+  };
   {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     m.commit_merge(&2, dp, log, stable, &1).unwrap().unwrap();
@@ -3022,8 +3026,8 @@ where
 {
   let now = Instant::ORIGIN;
   {
+    m.prepare_merge(&1, now, stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen());
@@ -3172,8 +3176,8 @@ fn commit_merge_defers_a_target_reshaping_by_a_split() {
 
   // Freeze source 1 into target 2: 1 is frozen_for 2, its barrier trivially met (single voter).
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -3275,9 +3279,8 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
   // THE FENCE: the freeze defers while the source is reshaping (RED: it froze, colliding the
   // freeze generation with the split's on one counter).
   {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert_eq!(
-      m.prepare_merge(&1, now, log, stable, &2),
+      m.prepare_merge(&1, now, &mut stores, &2),
       Some(Err(MergeError::SplitInFlight)),
       "a source mid-split defers the freeze"
     );
@@ -3301,8 +3304,8 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
   assert_eq!(fork.child, 3);
   m.lift_fork_barrier(&1, split_idx);
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -3325,10 +3328,10 @@ fn commit_merge_defers_a_target_with_a_fanin_abort_in_flight() {
   let (mut m, mut stores) = merge_host_triple(1, 2, 1);
   let now = Instant::ORIGIN;
   for src in [1u64, 3] {
-    let (log, stable) = stores.0.get_mut(&src).unwrap();
-    m.prepare_merge(&src, now, log, stable, &2)
+    m.prepare_merge(&src, now, &mut stores, &2)
       .unwrap()
       .unwrap();
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
     drain_storage(&mut m, src, now, log, stable);
     assert!(m.group(&src).unwrap().is_frozen(), "fan-in source frozen");
   }
@@ -3421,10 +3424,10 @@ fn rollback_merge_defers_a_target_with_a_fanin_abort_in_flight() {
 
   // Both sources freeze toward target 2 — the concurrent fan-in.
   for src in [1u64, 3u64] {
-    let (log, stable) = stores.0.get_mut(&src).unwrap();
-    m.prepare_merge(&src, now, log, stable, &2)
+    m.prepare_merge(&src, now, &mut stores, &2)
       .unwrap()
       .unwrap();
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
     drain_storage(&mut m, src, now, log, stable);
     assert!(m.group(&src).unwrap().is_frozen(), "source {src} froze");
   }
@@ -3520,8 +3523,8 @@ fn rollback_merge_defers_a_target_reshaping_by_a_split() {
 
   // Freeze source 1 into target 2.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -3823,8 +3826,8 @@ fn commit_merge_refuses_a_target_owing_this_source_a_thaw() {
   let now = Instant::ORIGIN;
   // 1 freezes into 2 (1 frozen at gen 1, claim = 2).
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen());
@@ -3870,8 +3873,8 @@ fn commit_merge_refuses_a_target_owing_this_source_a_thaw() {
   // GEN-EXACTNESS: 1 re-freezes FRESH (a strictly higher generation) and the same target now ADMITS
   // — the spent obligation named a dead incarnation, so its discharge cleared the refusal.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
@@ -3895,8 +3898,8 @@ fn a_committed_abort_below_a_fresh_commit_kills_it_at_apply() {
   let now = Instant::ORIGIN;
   // 1 freezes into 2 (1 frozen at gen 1, claim = 2) — the real source the dead commit names.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   let mut source_bytes = Vec::new();
@@ -3989,10 +3992,10 @@ fn both_fanned_in_aborts_thaw_neither_dropped() {
   // BOTH sources freeze toward target 2 — the concurrent fan-in (neither abort has applied yet, so
   // the retired freeze guard could not have caught the second one regardless).
   for src in [1u64, 3u64] {
-    let (log, stable) = stores.0.get_mut(&src).unwrap();
-    m.prepare_merge(&src, now, log, stable, &2)
+    m.prepare_merge(&src, now, &mut stores, &2)
       .unwrap()
       .unwrap();
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
     drain_storage(&mut m, src, now, log, stable);
     assert!(m.group(&src).unwrap().is_frozen(), "source {src} froze");
   }
@@ -4067,10 +4070,10 @@ fn rollback_merge_defers_a_target_committing_a_different_source() {
 
   // BOTH sources freeze toward target 2 — the fan-in.
   for src in [1u64, 3u64] {
-    let (log, stable) = stores.0.get_mut(&src).unwrap();
-    m.prepare_merge(&src, now, log, stable, &2)
+    m.prepare_merge(&src, now, &mut stores, &2)
       .unwrap()
       .unwrap();
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
     drain_storage(&mut m, src, now, log, stable);
     assert!(m.group(&src).unwrap().is_frozen(), "source {src} froze");
   }
@@ -4189,10 +4192,10 @@ fn rollback_merge_source_discriminates_an_in_flight_unparked_commit() {
 
   // BOTH sources freeze toward target 2 — the fan-in.
   for src in [1u64, 3u64] {
-    let (log, stable) = stores.0.get_mut(&src).unwrap();
-    m.prepare_merge(&src, now, log, stable, &2)
+    m.prepare_merge(&src, now, &mut stores, &2)
       .unwrap()
       .unwrap();
+    let (log, stable) = stores.0.get_mut(&src).unwrap();
     drain_storage(&mut m, src, now, log, stable);
     assert!(m.group(&src).unwrap().is_frozen(), "source {src} froze");
   }
@@ -4282,8 +4285,8 @@ fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
   let now = Instant::ORIGIN;
   // 1 freezes into 2, then 2 aborts the merge and APPLIES it: 2 now owes 1 a thaw.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen(), "source 1 froze into 2");
@@ -4299,10 +4302,9 @@ fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
 
   // The gate: 2 cannot freeze as a source while it still owes 1 a thaw.
   {
-    let (log, stable) = stores.0.get_mut(&2).unwrap();
     assert!(
       matches!(
-        m.prepare_merge(&2, now, log, stable, &3),
+        m.prepare_merge(&2, now, &mut stores, &3),
         Some(Err(MergeError::SourceOwesThaw))
       ),
       "a source owing a thaw is refused SourceOwesThaw — never admitted to dissolve"
@@ -4334,11 +4336,11 @@ fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
 
   // SELF-CLEARING PIN: with the obligation discharged, the SAME freeze now admits.
   {
-    let (log, stable) = stores.0.get_mut(&2).unwrap();
     assert!(
-      m.prepare_merge(&2, now, log, stable, &3).unwrap().is_ok(),
+      m.prepare_merge(&2, now, &mut stores, &3).unwrap().is_ok(),
       "once the thaw discharges, 2 freezes into 3 exactly as a clean source would"
     );
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(m.group(&2).unwrap().is_frozen(), "2 froze into 3");
@@ -4357,8 +4359,8 @@ fn teardown_refuses_a_group_that_still_owes_a_thaw() {
   let now = Instant::ORIGIN;
   // 1 freezes into 2, then 2 aborts the merge and APPLIES it: 2 now owes 1 a thaw.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen(), "source 1 froze into 2");
@@ -4572,8 +4574,8 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
   let now = Instant::ORIGIN;
   // 1 freezes into 2 at gen 1, then 2 aborts and APPLIES: 2 owes 1 a gen-1 thaw, 1 is still frozen.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert_eq!(
@@ -4612,8 +4614,8 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
   // Re-freeze 1 for a FRESH merge into 3 at gen 3. Its new target 3 has not parked yet, so leg 2
   // (Frozen) is the only strand-preventing refusal available in this window.
   {
+    m.prepare_merge(&1, now, &mut stores, &3).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &3).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -4690,8 +4692,8 @@ fn teardown_refuses_a_claimed_target_before_the_park() {
   let now = Instant::ORIGIN;
   // 1 freezes into 2 and APPLIES — 1 is frozen_for 2 — but 2 never commits, so it never parks.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -4767,8 +4769,7 @@ fn teardown_refuses_a_claimed_target_from_the_append_pending_freeze() {
   let now = Instant::ORIGIN;
   // 1's PrepareMerge is APPENDED but deliberately NOT drained — freeze-pending, claim undecoded.
   {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
   }
   assert!(
     m.group(&1).unwrap().merge_freeze_active() && !m.group(&1).unwrap().is_frozen(),
@@ -4804,20 +4805,194 @@ fn teardown_refuses_a_claimed_target_from_the_append_pending_freeze() {
   );
 }
 
-/// LEG beta (liveness, the residual window `prepare_merge`'s gate cannot see): an abort committed on
-/// 2 BELOW its own freeze materializes `abandoned[1]` only AFTER `prepare_merge(2 -> 3)` already
-/// admitted — the gate saw no applied obligation, and the freeze fold is an unguarded max, so 2
-/// freezes for 3 while carrying the fresh obligation. RED current: the Resolve arm dissolves 2 with
-/// the live obligation, stranding 1 frozen forever. GREEN: the absorb is HELD; the thaw pass (which
-/// does NOT skip the frozen holder 2) discharges 1 first, and only then is 2 absorbed into 3.
+/// The PROPOSE-TIME twin of teardown leg 5, at the freeze door: a group another hosted source's
+/// APPLIED freeze claims as its TARGET must not freeze as a fresh merge's SOURCE. 1 freezes into 2
+/// (1 is `frozen_for` 2); 2 then tries to freeze into 3. RED current: `prepare_merge(2 -> 3)`
+/// ADMITS — a later absorb dissolves 2, and 1's release verbs (`commit_merge`, `rollback_merge`)
+/// both ride 2's dead log: `None` forever, 1 stranded frozen with no release valve. GREEN: refused
+/// `SourceClaimedAsTarget`, appending nothing. THE RELEASE (abort path): rolling 1's merge back on
+/// 2 thaws 1 — clearing its claim — and discharges 2's obligation, after which the SAME freeze
+/// admits.
+#[test]
+fn a_claimed_merge_target_cannot_freeze_as_a_source() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  // 1 freezes into 2 and APPLIES — 1 is frozen_for 2.
+  {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "1 claims 2");
+
+  // THE GATE: 2 is a claimed target — it must not dissolve as a source while 1's claim stands.
+  assert!(
+    matches!(
+      m.prepare_merge(&2, now, &mut stores, &3),
+      Some(Err(MergeError::SourceClaimedAsTarget))
+    ),
+    "a claimed target is refused source-role, typed"
+  );
+  assert!(
+    !m.group(&2).unwrap().merge_freeze_active(),
+    "the refusal appended nothing"
+  );
+
+  // THE RELEASE, abort path: 2 aborts 1's merge; the relayed thaw unfreezes 1 (clearing its
+  // claim) and the observed advance discharges 2's obligation.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().is_frozen(), "the rollback thawed 1");
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the observed thaw discharged 2's obligation"
+  );
+
+  // SELF-CLEARING PIN: with the claim discharged, the SAME freeze now admits.
+  {
+    assert!(
+      m.prepare_merge(&2, now, &mut stores, &3).unwrap().is_ok(),
+      "the released target freezes into 3 exactly as a clean source would"
+    );
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().is_frozen(), "2 froze into 3");
+}
+
+/// The freeze door's APPEND-PENDING window, mirroring teardown leg 5's: the claim refuses
+/// source-role even before the claiming freeze applies. 1's `PrepareMerge` is appended, not
+/// folded — its claim is undecoded in-memory (`frozen_for` is `None`), so only the log scan can
+/// see it. RED current: `prepare_merge(2 -> 3)` ADMITS in the window and the strand forms
+/// identically once the freeze folds. GREEN: the claim is decoded from 1's unapplied suffix and
+/// refused; once the freeze APPLIES the refusal continues through the applied leg — no gap
+/// between the windows. The decode is EXACT: candidate 3, which 1's claim does not name, freezes
+/// toward 2 unrefused (fan-in onto one target is the designed `abandoned` fan-in).
+#[test]
+fn an_append_pending_claim_refuses_source_role_too() {
+  let (mut m, mut stores) = merge_host_triple(2, 3, 4);
+  let now = Instant::ORIGIN;
+  // 1's PrepareMerge is APPENDED but deliberately NOT drained — freeze-pending, claim undecoded.
+  m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
+  assert!(
+    m.group(&1).unwrap().merge_freeze_active() && !m.group(&1).unwrap().is_frozen(),
+    "1 observes its freeze at append but has not applied"
+  );
+
+  // THE GATE, pending sub-case: 2 is refused source-role off the decoded suffix claim.
+  assert!(
+    matches!(
+      m.prepare_merge(&2, now, &mut stores, &3),
+      Some(Err(MergeError::SourceClaimedAsTarget))
+    ),
+    "an append-pending claim refuses the target source-role before the freeze folds"
+  );
+
+  // CONTINUITY: once the freeze APPLIES, the applied leg (frozen_for) keeps refusing.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen(), "the freeze folded");
+  assert!(
+    matches!(
+      m.prepare_merge(&2, now, &mut stores, &3),
+      Some(Err(MergeError::SourceClaimedAsTarget))
+    ),
+    "the applied claim keeps refusing source-role — no gap between the two windows"
+  );
+
+  // EXACTNESS: the claim names 2, not 3 — 3 freezes toward 2 unrefused.
+  assert!(
+    m.prepare_merge(&3, now, &mut stores, &2).unwrap().is_ok(),
+    "a candidate the claim does not name is never over-refused"
+  );
+}
+
+/// The gate FAILS CLOSED, the teardown leg's read discipline verbatim: an append-pending claim
+/// the scan cannot READ (the claimant's suffix is cold) is treated as a claim it cannot rule
+/// out, and the freeze refuses — never risking a dissolve that would strand an uninspectable
+/// claimant. Candidate 3 is NOT the pending claim's target (1 claims 2), so a READABLE scan
+/// admits the same propose — the warm re-run proves the refusal was the fail-closed arm, not a
+/// claim match.
+#[test]
+fn an_unreadable_claim_scan_fails_closed_at_the_freeze_door() {
+  use crate::testkit::FailTermLog;
+  struct ColdStores(std::collections::BTreeMap<u64, (FailTermLog, AsyncStable)>);
+  impl crate::GroupStores<u64, FailTermLog, AsyncStable> for ColdStores {
+    fn stores(&mut self, group: &u64) -> Option<(&mut FailTermLog, &mut AsyncStable)> {
+      self.0.get_mut(group).map(|(l, s)| (l, s))
+    }
+  }
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut stores = ColdStores(std::collections::BTreeMap::new());
+  let now = Instant::ORIGIN;
+  for gid in [1u64, 2, 3] {
+    stores
+      .0
+      .insert(gid, (FailTermLog::default(), AsyncStable::default()));
+    m.create_group(gid, 0, single_node_cfg(1), now, 7, CountSm::default())
+      .unwrap();
+    let (log, stable) = stores.0.get_mut(&gid).unwrap();
+    let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+    while matches!(
+      m.handle_storage(&gid, d, log, stable),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(m.group(&gid).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+
+  // 1's freeze toward 2 is APPENDED, not applied: the claim lives only in 1's log suffix.
+  m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
+  // The claimant's suffix goes COLD: the scan for candidate 3 cannot rule the claim out.
+  stores.0.get_mut(&1).unwrap().0.return_cold_on_read();
+  assert!(
+    matches!(
+      m.prepare_merge(&3, now, &mut stores, &2),
+      Some(Err(MergeError::SourceClaimedAsTarget))
+    ),
+    "an unreadable pending claim refuses fail-closed — even a candidate it may not name"
+  );
+  // Warm again, the decode is exact: 1's claim names 2, so candidate 3 admits.
+  stores.0.get_mut(&1).unwrap().0.clear_cold_on_read();
+  assert!(
+    m.prepare_merge(&3, now, &mut stores, &2).unwrap().is_ok(),
+    "the same propose admits once the claim is readable — the refusal was the fail-closed arm"
+  );
+}
+
+/// LEG beta (liveness, the residual window the propose doors cannot fully close): an abort
+/// committed on 2 BELOW its own freeze materializes `abandoned[1]` only after the freeze already
+/// landed — the freeze fold is an unguarded max, so 2 freezes for 3 while carrying the fresh
+/// obligation. The colocated form is now DOOR-REFUSED (`SourceClaimedAsTarget`, asserted below);
+/// the window survives cross-host, where the proposing 2-leader's local replica of 1 has not
+/// observed 1's freeze — reproduced here past the door. RED current: the Resolve arm dissolves 2
+/// with the live obligation, stranding 1 frozen forever. GREEN: the absorb is HELD; the thaw pass
+/// (which does NOT skip the frozen holder 2) discharges 1 first, and only then is 2 absorbed into 3.
 #[test]
 fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
   let (mut m, mut stores) = merge_host_triple(2, 3, 4);
   let now = Instant::ORIGIN;
   // 1 freezes into 2 (1 frozen, claim = 2).
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen());
@@ -4832,12 +5007,32 @@ fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
     !m.group(&2).unwrap().has_abandoned(),
     "the abort has not applied — no obligation yet"
   );
-  // 2 freezes into 3: the alpha gate passes (no obligation applied yet), appending 2's PrepareMerge
-  // ABOVE the still-unapplied abort. Draining then applies the abort (recording `abandoned[1]`) THEN
-  // the freeze (2 frozen for 3, the unguarded max-fold keeps both at the same generation).
+  // The freeze DOOR now refuses this colocated shape outright: 1's applied claim on 2 is locally
+  // visible, so `prepare_merge(2 -> 3)` is `SourceClaimedAsTarget` — the window no longer opens
+  // through the propose here.
+  assert!(
+    matches!(
+      m.prepare_merge(&2, now, &mut stores, &3),
+      Some(Err(MergeError::SourceClaimedAsTarget))
+    ),
+    "the colocated form of the window is door-refused"
+  );
+  // The window REMAINS reachable cross-host (a distributed 2-leader whose local replica of 1 has
+  // not observed 1's freeze yet sees no claim), so the belt below must still hold. Reproduce it
+  // past the door with a direct endpoint append: 2's PrepareMerge for 3 ABOVE the still-unapplied
+  // abort. Draining then applies the abort (recording `abandoned[1]`) THEN the freeze (2 frozen
+  // for 3, the unguarded max-fold keeps both at the same generation the real mint would use).
   {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
-    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    let mut tbytes = Vec::new();
+    Data::encode(&3u64, &mut tbytes);
+    let freeze = crate::PrepareMergePayload::new(Bytes::from(tbytes), 1);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(&freeze, &mut fbuf);
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
@@ -4917,8 +5112,8 @@ fn a_hosted_husk_at_the_terminal_floor_dissolves() {
   let (mut m, mut stores) = merge_host(0, 0);
   let now = Instant::ORIGIN;
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen(), "1 is a frozen source");
@@ -4951,8 +5146,8 @@ fn a_frozen_source_one_below_the_terminal_does_not_dissolve() {
     lineages: std::collections::BTreeMap::new(),
   };
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen(), "1 is a frozen source");
@@ -5016,17 +5211,28 @@ fn the_belt_holds_a_husk_owing_a_locally_drivable_thaw() {
   let (mut m, mut stores) = merge_host_triple(2, 3, 4);
   let now = Instant::ORIGIN;
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
   }
+  // The freeze door refuses the colocated form (`SourceClaimedAsTarget` — 1's applied claim on 2
+  // is locally visible); the window is cross-host residue now, so build it past the door with a
+  // direct endpoint append, exactly as the late-obligation belt does.
   {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
-    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
+    let mut tbytes = Vec::new();
+    Data::encode(&3u64, &mut tbytes);
+    let freeze = crate::PrepareMergePayload::new(Bytes::from(tbytes), 1);
+    let mut fbuf = Vec::new();
+    crate::wire::encode_prepare_merge_payload(&freeze, &mut fbuf);
+    m.group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::PrepareMerge, Bytes::from(fbuf))
+      .unwrap();
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
@@ -5062,8 +5268,8 @@ fn a_source_without_an_obligation_absorbs_at_once() {
   let now = Instant::ORIGIN;
   assert!(!m.group(&2).unwrap().has_abandoned(), "2 owes nothing");
   {
+    m.prepare_merge(&2, now, &mut stores, &3).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&2).unwrap();
-    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
     drain_storage(&mut m, 2, now, log, stable);
   }
   {
@@ -5113,8 +5319,8 @@ fn a_corrupt_owed_id_holds_the_park_and_poisons_the_source() {
       .unwrap();
   }
   {
+    m.prepare_merge(&2, now, &mut stores, &3).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&2).unwrap();
-    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(m.group(&2).unwrap().is_frozen(), "2 is frozen for 3");
@@ -5174,8 +5380,8 @@ fn a_decodable_unhosted_owed_id_lets_the_absorb_proceed() {
       .unwrap();
   }
   {
+    m.prepare_merge(&2, now, &mut stores, &3).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&2).unwrap();
-    m.prepare_merge(&2, now, log, stable, &3).unwrap().unwrap();
     drain_storage(&mut m, 2, now, log, stable);
   }
   assert!(
@@ -5225,8 +5431,8 @@ fn thaw_without_a_committed_target_abort_is_refused() {
   // Source 1 frozen-applied at gen 1, claimed by target 2, leader — but 2 NEVER aborted, so it holds
   // no `abandoned` obligation for source 1.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 1);
@@ -5286,8 +5492,8 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
   let now = Instant::ORIGIN;
   // Freeze source 1 -> target 2 (gen 1) and abort on the target: the obligation records gen 1.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
@@ -5333,8 +5539,8 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
   // RE-FREEZE the SAME pair: the reset counter mints gen 1 again — the exact value the OLD obligation
   // named, but a NEW incarnation the target never aborted.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -5386,8 +5592,8 @@ fn a_floored_sources_rederived_obligation_discharges() {
   let now = Instant::ORIGIN;
   // Freeze 1 -> 2 (gen 1) and abort: target 2 records the obligation; capture the abort index.
   {
+    m.prepare_merge(&1, now, &mut base, &2).unwrap().unwrap();
     let (log, stable) = base.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
@@ -5456,8 +5662,8 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
   };
   // Freeze 1 -> 2 (gen 1) and abort on the target: obligation `abandoned[1] = (1, abort_index)`.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
@@ -5521,8 +5727,8 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
   // RE-FREEZE the SAME pair: the reset counter mints gen 1 again — the exact value the removed
   // incarnation's abort named, but a new incarnation 2 never abandoned.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -5583,8 +5789,8 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
   };
   // Freeze 1 -> 2 (gen 1) and abort on the target: obligation `abandoned[1] = (1, abort_index)`.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
@@ -5655,8 +5861,8 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
 
   // The fresh freeze mints ABOVE the old expected — the recreate can never repeat gen 1.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -5715,8 +5921,8 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
   };
   // Freeze 1 -> 2 (gen 1) and abort on the target: obligation `abandoned[1] = (1, _)`.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
@@ -5790,8 +5996,8 @@ fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor
   while m.poll_message().is_some() {}
   while m.poll_event().is_some() {}
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -5932,10 +6138,7 @@ fn hosted_lineage_equals_the_engine_record_after_every_fold() {
   assert_inv_lineage(&m, &engine);
 
   // FREEZE 1 -> 2: the source's counter moves; the MergeFrozen fold mirrors it.
-  {
-    let (log, stable) = engine.stores(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
-  }
+  m.prepare_merge(&1, now, &mut engine, &2).unwrap().unwrap();
   engine_crank(&mut m, &mut engine, 1, now);
   fold_lineage_events(&mut m, &mut engine);
   assert!(m.group(&1).unwrap().is_frozen());
@@ -5966,10 +6169,7 @@ fn hosted_lineage_equals_the_engine_record_after_every_fold() {
   assert!(!m.group(&2).unwrap().has_abandoned());
 
   // RE-FREEZE and ABSORB: park, seal, resolve — the Merged fold mirrors the target's bump.
-  {
-    let (log, stable) = engine.stores(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
-  }
+  m.prepare_merge(&1, now, &mut engine, &2).unwrap().unwrap();
   engine_crank(&mut m, &mut engine, 1, now);
   fold_lineage_events(&mut m, &mut engine);
   assert_inv_lineage(&m, &engine);
@@ -6012,10 +6212,7 @@ fn a_lost_freeze_mirror_heals_on_the_restore_resync() {
   let now = Instant::ORIGIN;
   engine_group(&mut m, &mut engine, 1, 0, now);
   engine_group(&mut m, &mut engine, 2, 0, now);
-  {
-    let (log, stable) = engine.stores(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
-  }
+  m.prepare_merge(&1, now, &mut engine, &2).unwrap().unwrap();
   engine_crank(&mut m, &mut engine, 1, now);
   assert!(m.group(&1).unwrap().is_frozen());
   // THE CRASH: the freeze is durable in the source's log, but its event-time mirror is LOST —
@@ -6067,10 +6264,7 @@ fn removal_floor_reads_the_stores_when_the_mirror_never_landed() {
   let now = Instant::ORIGIN;
   engine_group(&mut m, &mut engine, 1, 0, now);
   engine_group(&mut m, &mut engine, 2, 0, now);
-  {
-    let (log, stable) = engine.stores(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
-  }
+  m.prepare_merge(&1, now, &mut engine, &2).unwrap().unwrap();
   engine_crank(&mut m, &mut engine, 1, now);
   assert!(m.group(&1).unwrap().is_frozen());
   drop(m);
@@ -6299,8 +6493,8 @@ fn stale_abort_relay_does_not_thaw_a_refrozen_source() {
   // The SAME pair freezes AGAIN — a brand-new merge with its own parked commit at a new gen, admitted
   // only because the prior obligation discharged above (the abort-pending gate).
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(
@@ -6399,8 +6593,7 @@ fn committed_but_unapplied_freeze_thaw_is_retained_not_dropped() {
   // exactly these predicates; it never consults commit or persistence, so this is the endpoint a
   // freshly elected source leader presents while its apply trails the abort's recorded freeze.
   {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
   }
   {
     let src = m.group(&1).unwrap();
@@ -6521,8 +6714,7 @@ fn frozen_source_relay_classification_is_exhaustive() {
   // --- the committed-but-unapplied freeze (freeze-pending, seen < expected): SourceBehindFreeze,
   //     the catch-up the service keeps `abandoned` set through. ---
   {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
   }
   let pending_behind = {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
@@ -6666,8 +6858,8 @@ fn a_follower_retires_the_relay_on_the_observed_advance() {
   // PAST the freeze (seen == 2) — the delivery this host will merely OBSERVE. A committed target
   // abort backs the thaw (target 2 abandons source 1 at gen 1).
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   {
@@ -6721,8 +6913,8 @@ fn a_truncated_thaw_is_retained_and_re_driven() {
   let now = Instant::ORIGIN;
   // Freeze group 1 for target 2 (seen == 1), leader.
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen() && m.group(&1).unwrap().shape_gen() == 1);
@@ -7290,10 +7482,10 @@ fn park_waits_for_the_source_then_resolves() {
 
   // The source's freeze lands (gen reaches 1, frozen at its boundary): the next crank resolves.
   {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, Instant::ORIGIN, log, stable, &2)
+    m.prepare_merge(&1, Instant::ORIGIN, &mut stores, &2)
       .unwrap()
       .unwrap();
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
     drain_storage(&mut m, 1, Instant::ORIGIN, log, stable);
   }
   // Group 2's own stores must be reachable through the seam for the absorb capture.
@@ -7663,7 +7855,7 @@ fn lineage_mint_stops_short_of_the_reserved_terminal() {
   lead_single_split(&mut m, 2, &mut log2, &mut stable2);
   let before = log1.last_index();
   assert_eq!(
-    m.prepare_merge(&1, d1, &mut log1, &stable1, &2),
+    m.prepare_merge(&1, d1, &mut empty_stores(), &2),
     Some(Err(MergeError::LineageExhausted)),
     "a freeze mint at the ceiling would be the reserved terminal"
   );
@@ -7765,34 +7957,33 @@ fn merge_verb_preconditions_refuse_typed() {
   }
 
   {
-    let (log, stable) = src!();
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &1).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &1).unwrap(),
       Err(MergeError::SelfMerge)
     ));
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &9).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &9).unwrap(),
       Err(MergeError::TargetMissing)
     ));
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &3).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &3).unwrap(),
       Err(MergeError::VoterSetsDiffer)
     ));
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &4).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &4).unwrap(),
       Err(MergeError::ReadModesDiffer)
     ));
-    assert!(m.prepare_merge(&9, now, log, stable, &2).is_none());
+    assert!(m.prepare_merge(&9, now, &mut stores, &2).is_none());
   }
   {
     // NotLeader: group 3 never elected — as the freeze's proposer and as the abort's target
     // leader. The relayed thaw refuses EARLIER: its terminal-dedupe precedes the leadership gate,
     // so a never-frozen source (seen == expected, not frozen) is NotFrozen regardless of role.
-    let (log, stable) = stores.0.get_mut(&3).map(|(l, s)| (l, s)).unwrap();
     assert!(matches!(
-      m.prepare_merge(&3, now, log, stable, &1).unwrap(),
+      m.prepare_merge(&3, now, &mut stores, &1).unwrap(),
       Err(MergeError::NotLeader { .. })
     ));
+    let (log, stable) = stores.0.get_mut(&3).map(|(l, s)| (l, s)).unwrap();
     assert!(matches!(
       m.rollback_merge(&3, now, log, stable, &1).unwrap(),
       Err(MergeError::NotLeader { .. })
@@ -7834,9 +8025,10 @@ fn merge_verb_preconditions_refuse_typed() {
     .unwrap()
     .unwrap();
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &2).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &2).unwrap(),
       Err(MergeError::ConfChangeInFlight)
     ));
+    let (log, stable) = src!();
     drain_storage(&mut m, 1, now, log, stable);
     m.propose_conf_change(
       &1,
@@ -7852,11 +8044,13 @@ fn merge_verb_preconditions_refuse_typed() {
   }
   {
     // Freeze, then: a second freeze refuses; a parked commit refuses a second commit.
-    let (log, stable) = src!();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
-    drain_storage(&mut m, 1, now, log, stable);
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
+    {
+      let (log, stable) = src!();
+      drain_storage(&mut m, 1, now, log, stable);
+    }
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &2).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &2).unwrap(),
       Err(MergeError::AlreadyFrozen)
     ));
   }
@@ -7940,9 +8134,8 @@ fn merge_propose_refuses_learner_carrying_participants() {
       m.group(&2).unwrap().conf_state().learners().contains(&3),
       "the learner applied on the target"
     );
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &2).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &2).unwrap(),
       Err(MergeError::LearnersPresent)
     ));
   }
@@ -7967,9 +8160,8 @@ fn merge_propose_refuses_learner_carrying_participants() {
       m.group(&1).unwrap().role().is_leader(),
       "the sole voter still leads"
     );
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert!(matches!(
-      m.prepare_merge(&1, now, log, stable, &2).unwrap(),
+      m.prepare_merge(&1, now, &mut stores, &2).unwrap(),
       Err(MergeError::LearnersPresent)
     ));
   }
@@ -8015,7 +8207,7 @@ fn seed0_target_learner_pair_refused_at_propose() {
     "the committed conf lists learners {{1, 3}}"
   );
   assert!(matches!(
-    m.prepare_merge(&10, ds, &mut slog, &sstable, &11).unwrap(),
+    m.prepare_merge(&10, ds, &mut empty_stores(), &11).unwrap(),
     Err(MergeError::LearnersPresent)
   ));
 }
@@ -8032,8 +8224,8 @@ fn merge_commit_refuses_learner_carrying_participants() {
   {
     let (mut m, mut stores) = merge_host(1, 1);
     {
+      m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
       let (log, stable) = stores.0.get_mut(&1).unwrap();
-      m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
       drain_storage(&mut m, 1, now, log, stable);
     }
     assert!(m.group(&1).unwrap().is_frozen(), "the source froze");
@@ -8146,8 +8338,7 @@ fn rollback_refuses_a_pending_freeze_then_lands() {
   let (mut m, mut stores) = merge_host(1, 1);
   let now = Instant::ORIGIN;
   {
-    let (log, stable) = stores.0.get_mut(&1).map(|(l, s)| (l, s)).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
   }
   // No drain: the freeze is pending, not applied — the abort refuses.
   {
@@ -8278,10 +8469,7 @@ fn commit_merge_refuses_until_every_source_voter_reaches_the_freeze() {
 
   // Freeze the source: peer 2's ack commits and applies the PrepareMerge; peer 3's match stays
   // at 0 — log-behind, below the freeze boundary F.
-  let f = {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap()
-  };
+  let f = { m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap() };
   ack(&mut m, &mut stores, 1, 2, f);
   assert!(m.group(&1).unwrap().is_frozen());
   assert!(
@@ -8405,10 +8593,7 @@ fn dissolution_rides_the_committed_commit_merge_after_source_leader_loss() {
   let now = Instant::ORIGIN;
 
   // Freeze the source, then bring EVERY source voter to the boundary — the admission barrier.
-  let f = {
-    let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap()
-  };
+  let f = { m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap() };
   ack(&mut m, &mut stores, 1, 2, f);
   ack(&mut m, &mut stores, 1, 3, f);
   assert!(m.group(&1).unwrap().is_frozen());
@@ -8480,8 +8665,8 @@ fn freeze_gates_cover_split_and_target_verbs() {
   let now = Instant::ORIGIN;
   // Freeze group 1 (into 2, the ordinary pairing).
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain_storage(&mut m, 1, now, log, stable);
   }
   assert!(m.group(&1).unwrap().is_frozen());
@@ -8496,9 +8681,8 @@ fn freeze_gates_cover_split_and_target_verbs() {
   }
   // A frozen group can be neither a prepare target nor a commit target.
   {
-    let (log, stable) = stores.0.get_mut(&2).unwrap();
     assert!(matches!(
-      m.prepare_merge(&2, now, log, stable, &1).unwrap(),
+      m.prepare_merge(&2, now, &mut stores, &1).unwrap(),
       Err(MergeError::AlreadyFrozen)
     ));
   }
@@ -8530,9 +8714,8 @@ fn freeze_gates_cover_split_and_target_verbs() {
     drain_storage(&mut m, 3, d, log, stable);
   }
   {
-    let (log, stable) = stores.0.get_mut(&2).unwrap();
     assert!(matches!(
-      m.prepare_merge(&2, now, log, stable, &3).unwrap(),
+      m.prepare_merge(&2, now, &mut stores, &3).unwrap(),
       Err(MergeError::AlreadyPending)
     ));
   }
@@ -8601,8 +8784,8 @@ fn poisoned_absorb_surfaces_no_resolution() {
   }
   let now = Instant::ORIGIN;
   {
+    m.prepare_merge(&1, now, &mut stores, &2).unwrap().unwrap();
     let (log, stable) = stores.0.get_mut(&1).unwrap();
-    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
     drain(&mut m, 1, now, log, stable);
   }
   {

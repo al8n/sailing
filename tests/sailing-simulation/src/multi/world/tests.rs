@@ -1983,6 +1983,99 @@ fn colocate_source_onto_target(w: &mut MultiWorld, source: u64, target: u64) {
   panic!("g{source} leadership never colocated onto g{target}'s leader");
 }
 
+/// A claimed merge target cannot itself freeze as a SOURCE — the world form of the stranding
+/// class the freeze-teeth's first run caught (seed 0): S (10) froze claiming T (11); nothing
+/// refused T source-role, so T froze into T2 (12), was absorbed away, and S's release verbs —
+/// `commit_merge` and `rollback_merge` both ride T's retired log — returned `None` forever: S
+/// stranded frozen with no release valve. GREEN: the gate refuses T's freeze TYPED while S's
+/// claim stands (deterministic on the colocated leader, applied or append-pending); S's own
+/// choreography then resolves normally, T merges onward freely, and no replica is frozen at the
+/// end. RED without the gate (stash the `SourceClaimedAsTarget` hunk): the refusal assert sees
+/// `Ok` — T's freeze admits and the run strands S exactly as seed 0 did.
+#[test]
+fn a_claimed_merge_target_cannot_freeze_as_a_source() {
+  let mut w = MultiWorld::new(13);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // S — the claiming source
+  w.create_group(11, &all); // T — S's claimed target
+  w.create_group(12, &all); // T2 — the target T tries to dissolve into
+  assert!(w.run_until(3_000, |w| {
+    w.leader_of(10).is_some() && w.leader_of(11).is_some() && w.leader_of(12).is_some()
+  }));
+  for key in 0u16..2 {
+    propose_until_accepted(
+      &mut w,
+      10,
+      &crate::multi::encode_gkv(10, key, u64::from(key)),
+    );
+    propose_until_accepted(
+      &mut w,
+      11,
+      &crate::multi::encode_gkv(11, key, 100 + u64::from(key)),
+    );
+  }
+
+  // S freezes claiming T (leadership colocated so the commit barrier reads off one host).
+  colocate_source_onto_target(&mut w, 10, 11);
+  merge_verb_until_accepted(&mut w, 3_000, "the claiming freeze", |w| {
+    w.propose_prepare_merge(10, 11)
+  });
+
+  // THE GATE: T is a claimed target — its own freeze refuses while the claim stands. Equal
+  // voter sets colocate S wherever T's propose can run, so the claim is locally visible
+  // (applied or still append-pending) and the refusal needs no settling.
+  assert!(
+    matches!(
+      w.propose_prepare_merge(11, 12),
+      Some(Err(sailing_proto::MergeError::SourceClaimedAsTarget))
+    ),
+    "a claimed target must refuse source-role while the claim stands"
+  );
+
+  // S's choreography resolves normally: T absorbs S.
+  merge_verb_until_accepted(&mut w, 4_000, "the claiming commit", |w| {
+    w.propose_commit_merge(11, 10)
+  });
+  assert!(
+    w.run_until(8_000, |w| !w.live_groups().contains(&10)),
+    "S absorbs into T"
+  );
+
+  // The claim dissolved with S: T now freezes into T2 freely and merges onward.
+  colocate_source_onto_target(&mut w, 11, 12);
+  merge_verb_until_accepted(&mut w, 3_000, "the freed freeze", |w| {
+    w.propose_prepare_merge(11, 12)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the freed commit", |w| {
+    w.propose_commit_merge(12, 11)
+  });
+  assert!(
+    w.run_until(8_000, |w| !w.live_groups().contains(&11)),
+    "T absorbs into T2 once the claim resolved"
+  );
+
+  // NOTHING STRANDED: the absorbed lineages dismantle everywhere and the union is not frozen.
+  assert!(
+    w.run_until(8_000, |w| {
+      (0..3u64).all(|n| w.hosts[&n].group(&10).is_none() && w.hosts[&n].group(&11).is_none())
+    }),
+    "the absorbed lineages dismantle on every host — nothing lingers frozen"
+  );
+  for n in 0..3u64 {
+    assert!(
+      w.hosts[&n]
+        .group(&12)
+        .is_none_or(|ep| !sailing_proto::Endpoint::is_frozen(ep)),
+      "the surviving union is not frozen on n{n}"
+    );
+  }
+  assert_eq!(w.merges_registered(), 2, "both merges resolved as absorbs");
+  w.finalize_merge_conservation_or_panic(13);
+}
+
 /// THE COMMIT BARRIER ELIMINATES THE CROSS-HOST ROLLBACK RACE. The source cannot dissolve until
 /// every source voter has matched the freeze, so a commit is never admitted while a voter lags —
 /// the exact window a live generation read once used to SPLIT the hosts (caught-up hosts absorbed

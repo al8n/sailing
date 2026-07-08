@@ -1857,26 +1857,31 @@ where
 
   /// Propose a merge FREEZE on `source` (the group that will be absorbed): a committed
   /// `PrepareMerge` freezes it on every replica so `target` can absorb it at the boundary.
-  /// Leader-proposed on the SOURCE's own log. The preconditions are checked against the LOCAL
-  /// replicas (colocation makes them representative; every parked apply re-checks the facts
-  /// that matter from its own log): identical voter sets, neither carrying learners, both
-  /// non-joint, same active read mode, no membership change in flight on either side, and the
-  /// source not already frozen or freezing. `None` if no group `source` is hosted.
+  /// Leader-proposed on the SOURCE's own log, resolved through the callers' `stores` seam —
+  /// the same seam the teardown gate reads, because one refusal here
+  /// ([`SourceClaimedAsTarget`](MergeError::SourceClaimedAsTarget)) must decode a co-hosted
+  /// claimant's append-pending claim from ITS log. The preconditions are checked against the
+  /// LOCAL replicas (colocation makes them representative; every parked apply re-checks the
+  /// facts that matter from its own log): identical voter sets, neither carrying learners,
+  /// both non-joint, same active read mode, no membership change in flight on either side, the
+  /// source not already frozen or freezing, and the source not itself the claimed target of
+  /// another in-flight merge. `None` if no group `source` is hosted (or the seam cannot
+  /// resolve its stores — the starvation case of the [`GroupStores`] contract; nothing was
+  /// proposed either way).
   ///
   /// Floor refusals (`MergeError::BelowFloor`) are the COORDINATOR delegators' leg through
   /// their per-call floor seam, and `CrossPlane` the sharded handle's — the container stays
   /// floor- and plane-free, exactly as it is for splits.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
-  pub fn prepare_merge<L, S>(
+  pub fn prepare_merge<L, S, St>(
     &mut self,
     source: &G,
     now: impl Into<Now>,
-    log: &mut L,
-    // Vestigial, as on the whole propose family: kept so the delegators thread `&stable`.
-    _stable: &S,
+    stores: &mut St,
     target: &G,
   ) -> Option<Result<Index, MergeError<I>>>
   where
+    St: GroupStores<G, L, S>,
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
@@ -1976,11 +1981,30 @@ where
     let Some(source_gen_after) = next_lineage(sep.shape_gen()) else {
       return Some(Err(MergeError::LineageExhausted));
     };
+    // THE CLAIMED-TARGET SOURCE-ROLE GATE — the propose-time twin of the teardown lattice's
+    // `Claimed` leg (`remove_group`), refusing the same participant state at the other door it
+    // could slip through. A co-hosted source's freeze — applied `frozen_for`, or an
+    // append-pending `PrepareMerge` decoded from its log, FAIL-CLOSED on unreadable ranges —
+    // names THIS source as its target. Freezing it anyway lets a later absorb dissolve it, and
+    // the claimant's release verbs BOTH ride the dissolved group's log (`commit_merge` and
+    // `rollback_merge` are target-proposed), so the claimant strands frozen with no release
+    // valve. Equal-voter-set pairing makes the claim locally visible wherever this propose can
+    // run: the claimant's own freeze passed `VoterSetsDiffer` against this group, so every host
+    // of this group co-hosts it. LAST among the refusals, exactly as the teardown leg sits: the
+    // scan is fail-closed and TRANSIENT, so it must mask no structural (or terminal) verdict —
+    // a caller told to wait for the claiming choreography must be able to trust that retrying
+    // after its resolution can admit.
+    if self.some_source_claims_target(source, stores) {
+      return Some(Err(MergeError::SourceClaimedAsTarget));
+    }
     let mut target_bytes = Vec::new();
     target.encode(&mut target_bytes);
     let payload = PrepareMergePayload::new(Bytes::from(target_bytes), source_gen_after);
     let mut buf = Vec::new();
     crate::wire::encode_prepare_merge_payload(&payload, &mut buf);
+    // A hosted source whose stores the seam cannot resolve is the contract's starvation case:
+    // nothing can be appended, which is exactly the `None` the absent-group arm reports.
+    let (log, _) = stores.stores(source)?;
     let ep = self.groups.get_mut(source).expect("checked hosted above");
     let result = ep
       .propose_merge_entry(now, log, EntryKind::PrepareMerge, Bytes::from(buf))

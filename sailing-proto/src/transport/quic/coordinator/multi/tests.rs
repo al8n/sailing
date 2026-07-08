@@ -1660,31 +1660,29 @@ fn merge_verbs_ride_the_coordinator() {
   let now = Instant::ORIGIN;
 
   // The coordinator's floor leg refuses a fenced participant BEFORE anything is appended.
-  {
-    let (l, s) = stores.stores(&1).unwrap();
-    assert!(matches!(
-      coord.prepare_merge(&1, now, l, s, &2, &MaxFloors).unwrap(),
-      Err(crate::MergeError::BelowFloor {
-        floor: MERGED_FLOOR
-      })
-    ));
-  }
+  assert!(matches!(
+    coord
+      .prepare_merge(&1, now, &mut stores, &2, &MaxFloors)
+      .unwrap(),
+    Err(crate::MergeError::BelowFloor {
+      floor: MERGED_FLOOR
+    })
+  ));
   // The container preconditions surface through the delegator verbatim.
-  {
-    let (l, s) = stores.stores(&1).unwrap();
-    assert!(matches!(
-      coord.prepare_merge(&1, now, l, s, &1, &NoFloors).unwrap(),
-      Err(crate::MergeError::SelfMerge)
-    ));
-  }
+  assert!(matches!(
+    coord
+      .prepare_merge(&1, now, &mut stores, &1, &NoFloors)
+      .unwrap(),
+    Err(crate::MergeError::SelfMerge)
+  ));
 
   // Freeze, park, and resolve THROUGH the coordinator.
+  coord
+    .prepare_merge(&1, now, &mut stores, &2, &NoFloors)
+    .unwrap()
+    .unwrap();
   {
     let (l, s) = stores.stores(&1).unwrap();
-    coord
-      .prepare_merge(&1, now, l, s, &2, &NoFloors)
-      .unwrap()
-      .unwrap();
     coord.handle_storage(&1, now, l, s).unwrap();
   }
   assert!(coord.group(&1).unwrap().is_frozen());

@@ -88,7 +88,8 @@ impl sailing_proto::FloorStore<u64> for NodeStores<'_> {
 impl MultiWorld {
   /// Propose the merge FREEZE of `source` into `target` on the source's current leader;
   /// returns the container verdict verbatim (`None` while leaderless). Every refusal arm is a
-  /// legitimate no-op tick for the fuzzer.
+  /// legitimate no-op tick for the fuzzer. The whole host store map rides along as the
+  /// container's `GroupStores` seam — the claimed-target gate reads co-hosted claimants' logs.
   pub fn propose_prepare_merge(
     &mut self,
     source: u64,
@@ -96,9 +97,14 @@ impl MultiWorld {
   ) -> Option<Result<sailing_proto::Index, sailing_proto::MergeError<u64>>> {
     let leader = self.leader_of(source)?;
     let host = self.hosts.get_mut(&leader).expect("leader host exists");
-    let log = self.logs.get_mut(&(leader, source)).expect("leader log");
-    let stable = self.stables.get(&(leader, source)).expect("leader stable");
-    let verdict = host.prepare_merge(&source, self.now, log, stable, &target);
+    let mut stores = NodeStores {
+      node: leader,
+      logs: &mut self.logs,
+      stables: &mut self.stables,
+      floored: &self.merge_floors,
+      removal_floors: &self.removal_floors,
+    };
+    let verdict = host.prepare_merge(&source, self.now, &mut stores, &target);
     // Record the embedder's freeze intent on acceptance: this source now claims this target, so the
     // choreography predicate keeps the target off the removal draws (the container's `Claimed` gate).
     if matches!(verdict, Some(Ok(_))) {
