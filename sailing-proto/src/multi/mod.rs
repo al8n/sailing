@@ -27,12 +27,11 @@ mod group_id;
 pub use group_id::GroupId;
 
 use crate::{
-  CommitMergePayload, ConfChange, ConfChangeType, ConfChangeV2, ConfState, Config,
-  CreateGroupError, Data, Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore,
-  MergeError, Message, NodeId, Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng,
-  ProposeError, ReadIndexError, ReadOnlyOption, RemoveError, RollbackMergePayload, SnapshotMeta,
-  SplitError, SplitPayload, StableStore, StateMachine, StorageProgress, Term, TransferError,
-  endpoint::MergeWindow,
+  CommitMergePayload, ConfChange, ConfChangeV2, ConfState, Config, CreateGroupError, Data,
+  Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore, MergeError, Message, NodeId,
+  Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng, ProposeError, ReadIndexError,
+  ReadOnlyOption, RemoveError, RollbackMergePayload, SnapshotMeta, SplitError, SplitPayload,
+  StableStore, StateMachine, StorageProgress, Term, TransferError, endpoint::MergeWindow,
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
@@ -723,35 +722,6 @@ where
       .groups
       .iter()
       .any(|(g, ep)| g != gid && ep.frozen_for().is_some_and(|t| *t == target_key))
-  }
-
-  /// Whether any OTHER hosted source's APPLIED freeze names `gid` as its merge target for a merge
-  /// `gid` has NOT yet aborted — the conf-change fence's read. The hazard is a voter change moving
-  /// `gid`'s voters WHOLLY OFF the frozen source's hosts, after which the merge can neither commit
-  /// (`VoterSetsDiffer`) nor abort (`SourceMissing`): the source strands frozen with no release
-  /// valve. Growing the set (an add) never moves voters off — the abort stays reachable — but is
-  /// still fenced here while the claim is UNRESOLVED, both because a diverged voter set already
-  /// blocks the commit and to keep the reshape from racing the merge. Once `gid` ABORTS the merge
-  /// (it holds `abandoned[source]`), the source thaws off that durable obligation regardless of
-  /// `gid`'s voter set, so voter changes become safe and this returns false — the exemption the
-  /// dead-end-obligation world test turns on. Stores-free (in-memory `frozen_for`/`abandoned`), so
-  /// the conf-change delegates, holding only `gid`'s own log, consult it directly.
-  fn some_source_claims_target_unresolved(&self, gid: &G) -> bool {
-    let mut target_key = Vec::new();
-    gid.encode(&mut target_key);
-    let target_key = Bytes::from(target_key);
-    let target = self.groups.get(gid);
-    self.groups.iter().any(|(g, ep)| {
-      if g == gid || !ep.frozen_for().is_some_and(|t| *t == target_key) {
-        return false;
-      }
-      let mut source_key = Vec::new();
-      g.encode(&mut source_key);
-      let source_key = Bytes::from(source_key);
-      // Exempt a claim `gid` has already aborted: the source thaws off `abandoned[source]`, not off
-      // `gid`'s voters, so moving them cannot strand it.
-      target.is_none_or(|t| t.owes_thaw_for(&source_key).is_none())
-    })
   }
 
   /// End `gid`'s park episode: leave the parked set and purge any still-queued conflict
@@ -1675,19 +1645,6 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    if !self.groups.contains_key(gid) {
-      return None;
-    }
-    // The container-level claimed-target fence: another hosted source's APPLIED freeze names `gid`
-    // as its merge target for an UNRESOLVED merge, and this change would MOVE `gid`'s voters. Off the
-    // source's hosts the source strands frozen (`commit_merge` then refuses `VoterSetsDiffer`,
-    // `rollback_merge` `SourceMissing`, with no release valve). A learner-only change keeps the voter
-    // sets aligned and is left to the merge's own `LearnersPresent` re-check; a claim `gid` already
-    // aborted is exempt (the source thaws off its obligation). The endpoint's own `merge_conf_fence`
-    // cannot see this cross-group claim, so surface the same class.
-    if conf_change_moves_voters(cc.ty()) && self.some_source_claims_target_unresolved(gid) {
-      return Some(Err(ProposeError::MergeInFlight));
-    }
     let result = self
       .groups
       .get_mut(gid)?
@@ -1712,20 +1669,6 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
-    if !self.groups.contains_key(gid) {
-      return None;
-    }
-    // The container-level claimed-target fence (see [`propose_conf_change`]): another hosted
-    // source's applied freeze names `gid` as its target for an UNRESOLVED merge, and this change
-    // moves `gid`'s voters — a learner-only change, or a claim `gid` already aborted, is exempt.
-    if cc
-      .changes()
-      .iter()
-      .any(|c| conf_change_moves_voters(c.ty()))
-      && self.some_source_claims_target_unresolved(gid)
-    {
-      return Some(Err(ProposeError::MergeInFlight));
-    }
     let result = self
       .groups
       .get_mut(gid)?
@@ -2965,14 +2908,6 @@ where
   fn default() -> Self {
     Self::new()
   }
-}
-
-/// Whether a single conf-change operation MOVES the voter set — `AddNode` (adds or promotes a
-/// voter) or `RemoveNode` (may drop a voter). `AddLearnerNode` never touches the voter set. The
-/// claimed-target conf fence keys on this: only a voter move can strand a frozen source by carrying
-/// the target's voters off its hosts; a learner change leaves the sets aligned for the absorb.
-const fn conf_change_moves_voters(ty: ConfChangeType) -> bool {
-  matches!(ty, ConfChangeType::AddNode | ConfChangeType::RemoveNode)
 }
 
 /// Fold the group id into the base election seed so co-located groups draw distinct
