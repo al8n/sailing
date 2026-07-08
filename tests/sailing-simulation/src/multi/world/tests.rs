@@ -2303,6 +2303,143 @@ fn a_virgin_non_member_on_a_frozen_participant_world_parks() {
   );
 }
 
+/// A DEAD-END merge-abort obligation must not wedge a co-hosted absorb. Source S owes a target-role
+/// thaw to an upstream group U (S was the aborted TARGET of U→S, so it carries `abandoned[U]`) and
+/// then freezes into T. On a host that holds S and T but NEVER U, the old residual belt held T's
+/// park for as long as `S.has_abandoned()` — but that host can neither drive U's thaw (no local U
+/// stores) nor observe U's lineage advance (U unhosted, floor 0), so the obligation never discharges
+/// there and the park wedged forever while the U-hosting replicas resolved and raced ahead. The belt
+/// now holds only for an obligation whose owed group THIS host holds; a co-hosting replica drives the
+/// real thaw, so dissolving S on the dead-end host strands nothing.
+///
+/// The construction is the only one that reaches the bug — every single-container path purges or
+/// discharges the obligation first. U and S on {0,1} freeze+abort so S carries `abandoned[U]` on
+/// both; U is muted so its thaw cannot run and the abort entry stays uncompacted on S's leader; node
+/// 2 then JOINS S as a voter, catching that abort entry up by append and re-deriving `abandoned[U]`
+/// though it never hosts U; U is unmuted and thaws, discharging the obligation on {0,1} but never on
+/// node 2 (unhosted source, floor 0, lineage 0 — the dead end). S then freezes into T on a discharged
+/// leader (clearing the `SourceOwesThaw` gate) and every host must resolve the absorb, node 2 too.
+#[test]
+fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
+  const U: u64 = 30;
+  const S: u64 = 31;
+  const T: u64 = 32;
+  let mut w = MultiWorld::new(9);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let uf: BTreeSet<u64> = [0, 1].into_iter().collect();
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(U, &uf); // the upstream source, on {0,1} only — never hosted on node 2
+  w.create_group(S, &uf); // its target; grows to {0,1,2}, carrying the obligation
+  w.create_group(T, &all); // the eventual absorb target, on every node
+  assert!(w.run_until(3_000, |w| {
+    w.leader_of(U).is_some() && w.leader_of(S).is_some() && w.leader_of(T).is_some()
+  }));
+
+  // U freezes into S (equal voter sets {0,1}); capture U's frozen generation for the thaw check.
+  merge_verb_until_accepted(&mut w, 2_000, "the U→S freeze", |w| {
+    w.propose_prepare_merge(U, S)
+  });
+  assert!(w.run_until(4_000, |w| {
+    [0u64, 1]
+      .iter()
+      .all(|&n| w.hosts[&n].group(&U).is_some_and(|ep| ep.is_frozen()))
+  }));
+  let frozen_gen = w.hosts[&0].group(&U).expect("U hosted on 0").shape_gen();
+
+  // Mute U so its thaw cannot commit: the obligation stays live and the abort entry stays uncompacted
+  // on S's leader (its compaction fence held by the live obligation), so the joiner below catches the
+  // entry up by APPEND and re-derives abandoned[U] rather than installing a snapshot past it.
+  w.mute_group(0, 1, U);
+  w.mute_group(1, 0, U);
+
+  // S aborts the U→S merge as the TARGET: every S replica records abandoned[U].
+  merge_verb_until_accepted(&mut w, 2_000, "the U→S abort", |w| {
+    w.propose_rollback_merge(S, U)
+  });
+  assert!(w.run_until(4_000, |w| {
+    [0u64, 1]
+      .iter()
+      .all(|&n| w.hosts[&n].group(&S).is_some_and(|ep| ep.has_abandoned()))
+  }));
+
+  // Node 2 JOINS S as a voter, catching up the abort entry and re-deriving abandoned[U] though it
+  // never hosts U — the dead-end host the bug needs (holds S and T, but not U).
+  w.wire_group_observer(S, 2);
+  propose_conf_change_until_accepted(&mut w, S, sailing_proto::ConfChangeType::AddNode, 2);
+  assert!(
+    w.run_until(6_000, |w| {
+      w.hosts_group(2, S) && w.hosts[&2].group(&S).is_some_and(|ep| ep.has_abandoned())
+    }),
+    "node 2 must join S and re-derive the abandoned[U] obligation"
+  );
+  w.reconcile_membership(S);
+
+  // Unmute: U thaws on {0,1} and the obligation discharges THERE — but node 2 never hosts U, so its
+  // copy of abandoned[U] can never discharge (unhosted source, floor 0, lineage 0).
+  w.unmute_all();
+  assert!(
+    w.run_until(8_000, |w| {
+      [0u64, 1].iter().all(|&n| {
+        w.hosts[&n].group(&U).is_some_and(|ep| !ep.is_frozen())
+          && w.hosts[&n].group(&S).is_some_and(|ep| !ep.has_abandoned())
+      })
+    }),
+    "U must thaw and the obligation discharge on its own host replicas"
+  );
+
+  // THE DEAD-END POSTCONDITION the bug turns on.
+  assert!(w.hosts_group(2, S), "node 2 hosts S");
+  assert!(
+    !w.hosts_group(2, U),
+    "node 2 never hosts U — the obligation is a local dead end there"
+  );
+  assert!(
+    w.hosts[&2].group(&S).expect("S on 2").has_abandoned(),
+    "node 2's S still owes U a thaw it can neither drive nor observe"
+  );
+  assert!(
+    [0u64, 1]
+      .iter()
+      .all(|&n| !w.hosts[&n].group(&S).expect("S hosted").has_abandoned()),
+    "the U-hosting replicas discharged the same obligation"
+  );
+  assert!(
+    [0u64, 1]
+      .iter()
+      .all(|&n| w.hosts[&n].group(&U).expect("U hosted").shape_gen() > frozen_gen),
+    "U advanced past its frozen generation on its own hosts"
+  );
+
+  // S freezes into T and every host commits the absorb. Pin S's leader onto a discharged host (via
+  // T's leader) so the freeze clears the SourceOwesThaw gate and the commit barrier reads the source
+  // leader off the target's leader.
+  for _ in 0..2_000 {
+    if w.leader_of(T) == Some(0) {
+      break;
+    }
+    w.transfer_group_leader(T, 0);
+    w.tick();
+  }
+  colocate_source_onto_target(&mut w, S, T);
+  merge_verb_until_accepted(&mut w, 3_000, "the S→T freeze", |w| {
+    w.propose_prepare_merge(S, T)
+  });
+  merge_verb_until_accepted(&mut w, 4_000, "the S→T commit", |w| {
+    w.propose_commit_merge(T, S)
+  });
+
+  // THE PIN: every host resolves the absorb within a bounded budget — node 2 included. The old belt
+  // held node 2's park forever on the dead-end obligation while {0,1} resolved and raced ahead.
+  assert!(
+    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, S))),
+    "the S→T absorb must resolve on EVERY host — a dead-end obligation must not wedge node 2's park"
+  );
+  assert_eq!(w.merges_registered(), 1, "one absorb, registered once");
+  assert!(w.is_merged(S), "S is terminally merged away");
+}
+
 /// Drive `source → target` on a fresh 3-node world through freeze, commit, and every host's
 /// resolution (the merge-test preamble shared by the teardown pins).
 fn drive_merge_to_full_resolution(seed: u64, source: u64, target: u64) -> MultiWorld {

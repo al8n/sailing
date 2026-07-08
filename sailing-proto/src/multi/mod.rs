@@ -2648,21 +2648,32 @@ where
           {
             continue;
           }
-          // THE RESIDUAL BELT for the obligation-holder lifecycle: a source that still owes a
-          // target-role thaw must NOT dissolve this crank. `prepare_merge`'s `SourceOwesThaw` gate
-          // refuses the common case at propose, but an abort this source applied AS A TARGET may
-          // have committed BELOW its own freeze and materialized its `abandoned` obligation only
-          // after that gate passed (the freeze fold is an unguarded max, so a source frozen for
-          // this target can still carry a fresh obligation). Removing it here drops the obligation
-          // and strands the upstream source frozen forever. HOLD the park — leave it parked exactly
-          // as a busy target does — so the thaw pass below discharges the obligation FIRST; a later
-          // crank observes the clean source and completes the absorb. A parked target is never
-          // quiesce-eligible, so this service keeps being reached until it resolves.
-          if self
+          // THE RESIDUAL BELT, gated to LOCAL DRIVABILITY. A source that still owes a target-role
+          // thaw must not dissolve while THIS replica can still drive that thaw — dissolving would
+          // drop the obligation and strand the upstream source frozen forever. `prepare_merge`'s
+          // `SourceOwesThaw` gate refuses the common case at propose, but an abort this source
+          // applied AS A TARGET can commit BELOW its own freeze and materialize the obligation
+          // after that gate passed (the freeze fold is an unguarded max). HOLD the park so the thaw
+          // pass below discharges the obligation FIRST — but ONLY for an obligation whose target
+          // this replica HOSTS. An obligation to a group this host does not hold is a local
+          // dead-end: this replica can neither append that source's thaw (it has no local source
+          // stores — see the drive below, which fires only on `stores(&source)`) nor observe its
+          // lineage advance, so `discharged` above stays false forever and holding wedges the
+          // absorb permanently (the never-hosted, alive-elsewhere obligation-source class). A
+          // co-hosting replica drives THAT thaw to discharge; absorbing here — the dissolve drops
+          // an obligation this replica never advanced and never could — cannot strand it. A parked
+          // target is never quiesce-eligible, so a genuinely-held park keeps being reached until it
+          // resolves.
+          let owes_a_drivable_thaw = self
             .groups
             .get(&source)
-            .is_some_and(Endpoint::has_abandoned)
-          {
+            .map(Endpoint::abandoned_obligations)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|(owed, _, _)| {
+              G::decode_exact(owed).is_ok_and(|owed| self.groups.contains_key(&owed))
+            });
+          if owes_a_drivable_thaw {
             continue;
           }
           // The β hold above proved the source owes no thaw; this absorb IS the merge resolving, so
