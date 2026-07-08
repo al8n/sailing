@@ -314,6 +314,37 @@ impl MultiWorld {
   /// Sound at any quiescent point; the multi VOPR runs it at run end beside the split verdict.
   pub fn finalize_merge_conservation_or_panic(&self, seed: u64) {
     for rec in &self.merges {
+      // A key this source SPLIT AWAY before the merge left its pre-split cells with the split child,
+      // record-wide (the one non-append-only FSM mutation), so a later merge target is not demanded
+      // to hold them. Collect them per absorbed key — every value in a registered split child's record
+      // for a key this source parented — and exempt them from the union demand: values are globally
+      // unique, so membership in the child's record is an EXACT departure witness.
+      //
+      // Deliberately NOT netted against "returns" (a departed cell whose child lineage later merged
+      // BACK into this source): the only ledger signal is the value's presence in an absorbed union
+      // source's record, and the append-only, dedup-by-value ledger cannot separate a genuine return
+      // to the FSM from a value merely INHERITED into that union source's record and never in the
+      // source's FSM at the merge — subtracting it over-demands, re-tripping legitimately departed
+      // cells. A genuinely returned cell that survives to the merge is in the target anyway, so a
+      // faithful absorb needs no exemption for it; the split partition verdict still guards the
+      // handover.
+      let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+      for sp in self.splits.values() {
+        if sp.parent_led != rec.source_led {
+          continue;
+        }
+        for &k in &rec.absorbed_keys {
+          if sp.child_keys.contains(&k) {
+            departed.entry(k).or_default().extend(
+              self
+                .conservation
+                .history(sp.child_led, k)
+                .iter()
+                .map(|&(_, v)| v),
+            );
+          }
+        }
+      }
       let ctx = MergeReplayContext {
         seed,
         source_led: rec.source_led,
@@ -324,9 +355,12 @@ impl MultiWorld {
       // (its own partition verdict judges the handover) and never rode this union, so the
       // target rightly lacks it — `keys_of` (ledger-retained written keys) would demand it and
       // false-trip. Owned-but-unwritten keys judge vacuously (empty source history).
-      self
-        .conservation
-        .assert_union(rec.target_led, rec.source_led, &rec.absorbed_keys);
+      self.conservation.assert_union(
+        rec.target_led,
+        rec.source_led,
+        &rec.absorbed_keys,
+        &departed,
+      );
       drop(ctx); // no panic: disarm silently
     }
   }

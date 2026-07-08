@@ -1,8 +1,13 @@
 use super::*;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn keyset(keys: &[u16]) -> BTreeSet<u16> {
   keys.iter().copied().collect()
+}
+
+/// No departed cells — the common case, and the shape every pre-exemption call site asserts.
+fn no_departed() -> BTreeMap<u16, BTreeSet<u64>> {
+  BTreeMap::new()
 }
 
 /// The green partition shape: the child starts from the parent's exact baseline for its assigned
@@ -72,7 +77,7 @@ fn union_holds_when_the_target_absorbs_the_source() {
   l.record(400, 4, 5, 9);
   l.record(400, 4, 11, 14);
   l.record(400, 6, 1, 3); // a target-only key asserts nothing
-  l.assert_union(400, 300, &keyset(&[4]));
+  l.assert_union(400, 300, &keyset(&[4]), &no_departed());
 }
 
 /// Union LOSS: the target's copy of a source key diverges from (or stops short of) the source's
@@ -85,7 +90,7 @@ fn union_panics_when_source_history_is_dropped() {
   l.record(300, 4, 2, 8);
   l.record(300, 4, 5, 9);
   l.record(400, 4, 2, 8);
-  l.assert_union(400, 300, &keyset(&[4]));
+  l.assert_union(400, 300, &keyset(&[4]), &no_departed());
 }
 
 /// The union judges the transferred POPULATION, not every key the source ever wrote. Key 4 was
@@ -99,7 +104,7 @@ fn union_ignores_a_key_the_source_split_away_before_merging() {
   l.record(300, 4, 1, 5); // written, then split away before the merge
   l.record(300, 5, 2, 8); // still owned at the merge
   l.record(400, 5, 2, 8); // the target absorbed only the owned key
-  l.assert_union(400, 300, &keyset(&[5]));
+  l.assert_union(400, 300, &keyset(&[5]), &no_departed());
 }
 
 /// The seed-7 cross-incarnation shape: a recreated source (its own ledger id) hands the target
@@ -116,7 +121,7 @@ fn union_finds_an_absorbed_cell_below_the_targets_own_max() {
     l.record(103, 5, index, value);
   }
   l.record(103, 5, 2, 85); // ... then the absorbed cell, trailing below that max
-  l.assert_union(103, 1_000_101, &keyset(&[5]));
+  l.assert_union(103, 1_000_101, &keyset(&[5]), &no_departed());
 }
 
 /// The cross-incarnation union still catches a genuine drop: the source handed key 5 =
@@ -133,7 +138,7 @@ fn union_trips_on_a_dropped_cell_in_a_cross_incarnation_merge() {
     l.record(103, 5, index, value);
   }
   l.record(103, 5, 2, 85); // ... but the target absorbed only (2, 85), never (6, 120)
-  l.assert_union(103, 1_000_101, &keyset(&[5]));
+  l.assert_union(103, 1_000_101, &keyset(&[5]), &no_departed());
 }
 
 /// The seed-4 shape: a child that later becomes a merge TARGET carries in the source's keys. The
@@ -199,4 +204,59 @@ fn partition_exempts_a_divergent_key_a_union_re_acquired_into_the_parent() {
   l.record(175, 3, 2, 1563);
   l.record(175, 3, 55, 1579);
   l.assert_partition(175, 178, &keyset(&[3]), &BTreeSet::new(), &keyset(&[3]));
+}
+
+/// The split-eviction exemption (the seed-8 g333→g388 shape): key 7 was written on the source, then
+/// SPLIT AWAY to a child (its cells evicted record-wide), then RE-ACQUIRED from another owner and
+/// continued. The source now holds the early cells plus the re-acquired run, but the union target
+/// absorbed only the re-acquired run — the departed early cells left with the split child. Passing
+/// them as `departed` exempts them and the union holds; the split-blind demand would false-trip.
+#[test]
+fn union_exempts_cells_a_registered_split_carried_away() {
+  let mut l = ConservationLedger::new();
+  l.record(500, 7, 1, 100); // early — split away to the child
+  l.record(500, 7, 3, 101);
+  l.record(500, 7, 8, 200); // re-acquired run
+  l.record(500, 7, 9, 201);
+  // The target absorbed only the re-acquired run (plus a target-only cell of its own).
+  l.record(600, 7, 8, 200);
+  l.record(600, 7, 9, 201);
+  l.record(600, 7, 12, 202);
+  let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  departed.insert(7, [100, 101].into_iter().collect());
+  l.assert_union(600, 500, &keyset(&[7]), &departed);
+}
+
+/// The oracle keeps its teeth. Same shape as the exemption pin, but the target genuinely dropped a
+/// LATE re-acquired cell (9, 201) that is NOT departed — a real absorb failure. The exemption softens
+/// only the split-evicted cells, so the missing non-departed cell still breaks the subsequence match.
+#[test]
+#[should_panic(expected = "not absorbed")]
+fn union_still_trips_when_a_non_departed_cell_is_dropped() {
+  let mut l = ConservationLedger::new();
+  l.record(500, 7, 1, 100); // early — split away
+  l.record(500, 7, 3, 101);
+  l.record(500, 7, 8, 200); // re-acquired run
+  l.record(500, 7, 9, 201);
+  l.record(600, 7, 8, 200); // the target dropped (9, 201) — a genuine loss, not a departure
+  let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  departed.insert(7, [100, 101].into_iter().collect());
+  l.assert_union(600, 500, &keyset(&[7]), &departed);
+}
+
+/// The seam exempts ONLY what it is handed, and keeps its teeth for everything else — the guarantee a
+/// return-aware caller relies on. A cell a caller believes RETURNED to the source (so it withholds it
+/// from `departed`) is still demanded, and its absence from the target trips. Here value 100 is left
+/// out of the exemption though the source recorded it; the target dropped it, and the union trips.
+#[test]
+#[should_panic(expected = "not absorbed")]
+fn union_still_trips_for_a_cell_the_caller_did_not_exempt() {
+  let mut l = ConservationLedger::new();
+  l.record(500, 7, 1, 100); // recorded on the source but NOT exempted below
+  l.record(500, 7, 3, 101); // exempted — a departed cell
+  l.record(500, 7, 8, 200); // an ordinary owned cell the target kept
+  l.record(600, 7, 8, 200); // the target dropped the un-exempted cell (1, 100)
+  let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  departed.insert(7, [101].into_iter().collect());
+  l.assert_union(600, 500, &keyset(&[7]), &departed);
 }

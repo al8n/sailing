@@ -124,14 +124,32 @@ impl ConservationLedger {
   /// handed over. A key the source WROTE but then SPLIT AWAY before merging is NOT here (it rode
   /// that split, whose partition verdict judges the handover), so it is not demanded of the
   /// target — a written-history (`keys_of`) sweep would false-trip it. An owned key the source
-  /// never wrote judges vacuously (its source history is empty). Panics with the group ids, the
-  /// key, and both histories otherwise.
-  pub(crate) fn assert_union(&self, target: u64, source: u64, absorbed_keys: &BTreeSet<u16>) {
+  /// never wrote judges vacuously (its source history is empty).
+  ///
+  /// `departed` exempts individual CELLS, not whole keys. The ledger is append-only save for the ONE
+  /// legitimate FSM mutation — `LogSm::split` evicts a moved key's cells record-wide — so cells a
+  /// split carried away are demanded of no later target. The caller supplies them per key: values are
+  /// globally unique (the fuzzer's command counter), so a value present in a registered split child's
+  /// record for `k` is an EXACT departure witness. Exempt values are dropped from the demand before
+  /// the subsequence check; the remainder's order is preserved, so a dropped NON-exempt cell still
+  /// trips — the seam keeps its teeth for every cell the caller does not hand it. Panics with the
+  /// group ids, the key, and both histories otherwise.
+  pub(crate) fn assert_union(
+    &self,
+    target: u64,
+    source: u64,
+    absorbed_keys: &BTreeSet<u16>,
+    departed: &BTreeMap<u16, BTreeSet<u64>>,
+  ) {
     for &k in absorbed_keys {
       let s = self.history(source, k);
       let t = self.history(target, k);
+      let gone = departed.get(&k);
       let mut ti = t.iter();
-      let absorbed = s.iter().all(|cell| ti.by_ref().any(|tc| tc == cell));
+      let absorbed = s
+        .iter()
+        .filter(|&&(_, value)| !gone.is_some_and(|d| d.contains(&value)))
+        .all(|cell| ti.by_ref().any(|tc| tc == cell));
       assert!(
         absorbed,
         "[conservation] merge g{source}->g{target}: key {k} source history not absorbed\n  \
