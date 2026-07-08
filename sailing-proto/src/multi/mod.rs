@@ -27,11 +27,12 @@ mod group_id;
 pub use group_id::GroupId;
 
 use crate::{
-  CommitMergePayload, ConfChange, ConfChangeV2, ConfState, Config, CreateGroupError, Data,
-  Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore, MergeError, Message, NodeId,
-  Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng, ProposeError, ReadIndexError,
-  ReadOnlyOption, RemoveError, RollbackMergePayload, SnapshotMeta, SplitError, SplitPayload,
-  StableStore, StateMachine, StorageProgress, Term, TransferError, endpoint::MergeWindow,
+  CommitMergePayload, ConfChange, ConfChangeType, ConfChangeV2, ConfState, Config,
+  CreateGroupError, Data, Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore,
+  MergeError, Message, NodeId, Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng,
+  ProposeError, ReadIndexError, ReadOnlyOption, RemoveError, RollbackMergePayload, SnapshotMeta,
+  SplitError, SplitPayload, StableStore, StateMachine, StorageProgress, Term, TransferError,
+  endpoint::MergeWindow,
 };
 use bytes::Bytes;
 use cheap_clone::CheapClone;
@@ -677,6 +678,13 @@ where
     St: GroupStores<G, L, S>,
     L: LogStore,
   {
+    // APPLIED leg (in-memory, stores-free — shared with the conf-change fence): a folded freeze's
+    // target claim is decoded in `frozen_for`.
+    if self.some_source_applied_claims_target(gid) {
+      return true;
+    }
+    // APPEND-PENDING leg: the freeze is observed only at append (its payload undecoded until
+    // apply), so read the claim off the source's log. A faulted scan/decode fails closed.
     let mut target_key = Vec::new();
     gid.encode(&mut target_key);
     let target_key = Bytes::from(target_key);
@@ -684,12 +692,6 @@ where
       if g == gid {
         continue;
       }
-      // Applied leg: the freeze folded, so its target claim is decoded in-memory.
-      if ep.frozen_for().is_some_and(|t| *t == target_key) {
-        return true;
-      }
-      // Append-pending leg: the freeze is observed only at append (its payload undecoded until
-      // apply), so read the claim off the source's log. A faulted scan/decode fails closed.
       if ep.merge_freeze_active() && !ep.is_frozen() {
         let Some((log, _)) = stores.stores(g) else {
           continue;
@@ -706,6 +708,26 @@ where
       }
     }
     false
+  }
+
+  /// Whether any OTHER hosted source's APPLIED freeze names `gid` as its merge target — the
+  /// in-memory (stores-free) APPLIED sub-leg of [`some_source_claims_target`]. The conf-change
+  /// delegates read it directly (combined with a voter-moving change): they hold only `gid`'s own
+  /// log, not the multi-store seam the append-pending sub-leg needs, and the frozen source it
+  /// catches is exactly the claimed-target voter-move hazard (`commit_merge` would then refuse
+  /// `VoterSetsDiffer`, `rollback_merge` `SourceMissing`, stranding the source frozen with no
+  /// release valve). The append-pending claim window (freeze observed but not yet applied) is not
+  /// covered here — it needs the source's log — and stays covered by the teardown gate's own
+  /// append-pending sub-leg; a conf change slipping through that narrow window is caught at the
+  /// absorb by `commit_merge`'s re-checked `VoterSetsDiffer`.
+  fn some_source_applied_claims_target(&self, gid: &G) -> bool {
+    let mut target_key = Vec::new();
+    gid.encode(&mut target_key);
+    let target_key = Bytes::from(target_key);
+    self
+      .groups
+      .iter()
+      .any(|(g, ep)| g != gid && ep.frozen_for().is_some_and(|t| *t == target_key))
   }
 
   /// End `gid`'s park episode: leave the parked set and purge any still-queued conflict
@@ -1629,6 +1651,18 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.groups.contains_key(gid) {
+      return None;
+    }
+    // The container-level claimed-target fence: another hosted source's APPLIED freeze names `gid`
+    // as its merge target, and this change would MOVE `gid`'s voters (add/remove a voter). Off the
+    // source's hosts the source strands frozen (`commit_merge` then refuses `VoterSetsDiffer`,
+    // `rollback_merge` `SourceMissing`, with no release valve). A learner-only change keeps the
+    // voter sets aligned and is left to the merge's own defensive `LearnersPresent` re-check; the
+    // endpoint's own `merge_conf_fence` cannot see this cross-group claim, so surface the same class.
+    if conf_change_moves_voters(cc.ty()) && self.some_source_applied_claims_target(gid) {
+      return Some(Err(ProposeError::MergeInFlight));
+    }
     let result = self
       .groups
       .get_mut(gid)?
@@ -1653,6 +1687,20 @@ where
     L: LogStore,
     S: StableStore<NodeId = I>,
   {
+    if !self.groups.contains_key(gid) {
+      return None;
+    }
+    // The container-level claimed-target fence (see [`propose_conf_change`]): another hosted
+    // source's applied freeze names `gid` as its target, and this change moves `gid`'s voters —
+    // a learner-only change is left to the merge's own `LearnersPresent` re-check.
+    if cc
+      .changes()
+      .iter()
+      .any(|c| conf_change_moves_voters(c.ty()))
+      && self.some_source_applied_claims_target(gid)
+    {
+      return Some(Err(ProposeError::MergeInFlight));
+    }
     let result = self
       .groups
       .get_mut(gid)?
@@ -2877,6 +2925,14 @@ where
   fn default() -> Self {
     Self::new()
   }
+}
+
+/// Whether a single conf-change operation MOVES the voter set — `AddNode` (adds or promotes a
+/// voter) or `RemoveNode` (may drop a voter). `AddLearnerNode` never touches the voter set. The
+/// claimed-target conf fence keys on this: only a voter move can strand a frozen source by carrying
+/// the target's voters off its hosts; a learner change leaves the sets aligned for the absorb.
+const fn conf_change_moves_voters(ty: ConfChangeType) -> bool {
+  matches!(ty, ConfChangeType::AddNode | ConfChangeType::RemoveNode)
 }
 
 /// Fold the group id into the base election seed so co-located groups draw distinct

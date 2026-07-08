@@ -691,12 +691,18 @@ where
   }
 
   /// The target-side membership fence: whether a conf change must refuse because a merge is in
-  /// flight (proposed, parked, or absorbed-but-not-yet-compacted). Adding a replica in any of
-  /// those windows lets it be LOG-WALKED across the absorb point — it parks there with no local
-  /// source and no floor, no-ops past the union, and silently diverges (the fork milestone's
-  /// log-walk lesson). The three legs release on their own: apply absorbs the in-flight index,
-  /// resolution consumes the park, and the absorb capture's compaction moves `first_index`
-  /// past the absorb point within a crank.
+  /// flight (proposed, parked, or absorbed-but-not-yet-compacted) OR an aborted-merge thaw
+  /// obligation is still outstanding. Adding a replica in the first three windows lets it be
+  /// LOG-WALKED across the absorb point — it parks there with no local source and no floor, no-ops
+  /// past the union, and silently diverges (the fork milestone's log-walk lesson). The fourth leg
+  /// is the abort obligation: the abort entry is pinned BELOW every capture by the compaction fence
+  /// (`abort_relay_fences`) for as long as the obligation stands, so a voter joining inside the
+  /// abort→discharge window log-walks it and re-derives an obligation it can NEVER discharge if it
+  /// never comes to host the owed group — a permanent ghost that also wedges any future merge into
+  /// this target. So the obligation must discharge before the voter set may move. All four legs
+  /// release on their own: apply absorbs the in-flight index, resolution consumes the park, the
+  /// absorb capture's compaction moves `first_index` past the absorb point within a crank, and the
+  /// thaw pass discharges the obligation once its source is observed thawed.
   pub(crate) fn merge_conf_fence<L: LogStore>(&self, log: &L) -> bool {
     self.merge.pending_commit_index > self.applied
       || self.merge.pending_apply.is_some()
@@ -704,6 +710,7 @@ where
         .merge
         .absorb_index
         .is_some_and(|k| log.first_index() <= k)
+      || self.has_abandoned()
   }
 }
 

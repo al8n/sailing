@@ -1767,6 +1767,56 @@ fn merge_conf_fence_releases_with_the_capture() {
   );
 }
 
+/// FIX 3 leg (a): an outstanding aborted-merge thaw obligation fences conf changes. A voter joining
+/// inside the abort→discharge window log-walks the abort entry (pinned below every capture by the
+/// compaction fence) and re-derives an obligation it can never discharge if it never hosts the owed
+/// group — a permanent ghost. `merge_conf_fence` refuses `MergeInFlight` while the obligation stands;
+/// discharging it releases the fence. RED before the leg: the conf change ADMITS with the obligation
+/// still outstanding.
+#[test]
+fn an_outstanding_thaw_obligation_fences_conf_changes() {
+  use crate::{ConfChange, ConfChangeType, ProposeError};
+  let (mut ep, mut log, mut stable) = make_three_voter_leader();
+  // A TARGET-side abort at the live mint applies and records one durable `abandoned` obligation.
+  let a = ep
+    .propose_merge_entry(
+      Instant::ORIGIN,
+      &mut log,
+      EntryKind::RollbackMerge,
+      abort_payload(b"\x2a", 1, 1),
+    )
+    .unwrap();
+  ack_through(&mut ep, &mut log, &mut stable, a);
+  assert!(ep.has_abandoned(), "the abort recorded an obligation");
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  assert!(
+    matches!(
+      ep.propose_conf_change(
+        Instant::ORIGIN,
+        &mut log,
+        &stable,
+        ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
+      ),
+      Err(ProposeError::MergeInFlight)
+    ),
+    "the fence refuses a voter change while the obligation stands"
+  );
+  // Discharging the obligation (the source observed thawed, modeled by clearing it) lifts the fence.
+  ep.clear_abandoned(&bytes::Bytes::from_static(b"\x2a"));
+  assert!(!ep.has_abandoned());
+  assert!(
+    ep.propose_conf_change(
+      Instant::ORIGIN,
+      &mut log,
+      &stable,
+      ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()),
+    )
+    .is_ok(),
+    "the fence releases once the obligation discharges"
+  );
+}
+
 /// A parked 3-voter target leader that ALSO carries an OUTSTANDING `abandoned` obligation from a
 /// DIFFERENT merge's abort committed BELOW the park: no-op@1, a TARGET-side abort@2 (applied below
 /// the park, `abandoned` recorded), a CommitMerge@3 for another source (parked at k−1). Returns
