@@ -57,9 +57,18 @@ impl MultiReadLedger {
   }
 
   /// Issue one read on `(target, gid)` for `key`, recording the invocation snapshot iff the
-  /// replica accepts. The value floor reads BOTH pure views per hosting node — the applied state
-  /// (retains any compacted prefix) ⊔ the committed log tail (holds committed-not-yet-applied
-  /// writes) — so neither apply lag nor compaction under-counts a completed write.
+  /// replica accepts. The per-key value floor scans only the group's AUTHORITATIVE replicas —
+  /// non-parked and caught up to the applied frontier ([`authoritative_nodes`]) — and reads their
+  /// split-aware `applied()` record alone. The raw committed log is NOT a floor source: it is
+  /// reshape-BLIND (`LogSm::split`/`absorb` rewrite `applied()` only), so an uncompacted pre-split
+  /// entry there resurrects a value a later split moved away or a merge-back reset, lifting the
+  /// floor above the live committed value the serve side (also `applied()`) can ever return — the
+  /// exact inflation that let a parked, far-behind replica's stale log fail a correct read. A
+  /// caught-up replica has already applied the group's committed prefix, so `applied()` alone is
+  /// its complete committed value; the read's own index floor plus the serve-point apply wait
+  /// carry any committed-not-yet-applied write the raw-log leg once covered.
+  ///
+  /// [`authoritative_nodes`]: MultiWorld::authoritative_nodes
   pub(super) fn issue(
     &mut self,
     w: &mut MultiWorld,
@@ -72,14 +81,9 @@ impl MultiReadLedger {
     self.next_ctx += 1;
     let floor = w.max_commit_of(gid);
     let v_inv = w
-      .hosting_nodes(gid)
+      .authoritative_nodes(gid)
       .into_iter()
-      .filter_map(|n| {
-        value_of(&w.applied_of(n, gid), gid, key)
-          .into_iter()
-          .chain(value_of(&w.committed_entries_of(n, gid), gid, key))
-          .max()
-      })
+      .filter_map(|n| value_of(&w.applied_of(n, gid), gid, key))
       .max()
       .unwrap_or(0);
     if w.read_index_on(target, gid, &ctx.to_be_bytes()) {
@@ -228,3 +232,6 @@ fn value_of_asof(entries: &[(u64, Vec<u8>)], gid: u64, key: u16, upto: u64) -> O
 fn value_of(entries: &[(u64, Vec<u8>)], gid: u64, key: u16) -> Option<u64> {
   value_of_asof(entries, gid, key, u64::MAX)
 }
+
+#[cfg(test)]
+mod tests;
