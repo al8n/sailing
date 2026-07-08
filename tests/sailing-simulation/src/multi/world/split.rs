@@ -440,12 +440,37 @@ impl MultiWorld {
         .filter(|m| m.target_led == rec.parent_led)
         .flat_map(|m| m.absorbed_keys.iter().copied())
         .collect();
+      // `inherited` — the parent-side CELL-level exemption, deliberately population-blind. An
+      // absorb copies the source's whole FSM RECORD into the target — including cells for keys
+      // OUTSIDE the source's owned population (carried/foreign-tagged cells) — and the sweep
+      // records them under the target, so an assigned key's cells can reach this parent through a
+      // union whose `absorbed_keys` never named the key (`reacquired` above is blind to them).
+      // Collect, per assigned key, every value in ANY inbound union source's record: values are
+      // globally unique, so such a value reached the parent's record only via that absorb, and a
+      // fresh parent own-write can never match one.
+      let mut inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+      for m in self
+        .merges
+        .iter()
+        .filter(|m| m.target_led == rec.parent_led)
+      {
+        for &k in &rec.child_keys {
+          let hist = self.conservation.history(m.source_led, k);
+          if !hist.is_empty() {
+            inherited
+              .entry(k)
+              .or_default()
+              .extend(hist.iter().map(|&(_, v)| v));
+          }
+        }
+      }
       self.conservation.assert_partition(
         rec.parent_led,
         rec.child_led,
         &rec.child_keys,
         &absorbed,
         &reacquired,
+        &inherited,
       );
       drop(ctx); // no panic: disarm silently
     }

@@ -10,6 +10,12 @@ fn no_departed() -> BTreeMap<u16, BTreeSet<u64>> {
   BTreeMap::new()
 }
 
+/// No union-carried parent cells — the common case, and the shape every pre-exemption partition
+/// call site asserts.
+fn no_inherited() -> BTreeMap<u16, BTreeSet<u64>> {
+  BTreeMap::new()
+}
+
 /// The green partition shape: the child starts from the parent's exact baseline for its assigned
 /// keys and continues alone; unassigned keys stay parent-only; untouched keys assert nothing.
 #[test]
@@ -28,6 +34,7 @@ fn partition_holds_for_a_clean_handover() {
     &keyset(&[2, 7]),
     &BTreeSet::new(),
     &BTreeSet::new(),
+    &no_inherited(),
   );
 }
 
@@ -40,7 +47,14 @@ fn partition_panics_on_lost_history() {
   l.record(100, 2, 2, 11);
   l.record(100, 2, 4, 15);
   l.record(200, 2, 2, 11);
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &BTreeSet::new());
+  l.assert_partition(
+    100,
+    200,
+    &keyset(&[2]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &no_inherited(),
+  );
 }
 
 /// DUP: after the handover both sides extend the common baseline — the key's history continued
@@ -53,7 +67,14 @@ fn partition_panics_on_a_double_continuation() {
   l.record(100, 2, 6, 17);
   l.record(200, 2, 2, 11);
   l.record(200, 2, 5, 16);
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &BTreeSet::new());
+  l.assert_partition(
+    100,
+    200,
+    &keyset(&[2]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &no_inherited(),
+  );
 }
 
 /// CROSS-TALK: a key the instruction never assigned surfaces in the child.
@@ -63,7 +84,14 @@ fn partition_panics_on_an_unassigned_key_in_the_child() {
   let mut l = ConservationLedger::new();
   l.record(100, 1, 1, 10);
   l.record(200, 1, 3, 9);
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &BTreeSet::new());
+  l.assert_partition(
+    100,
+    200,
+    &keyset(&[2]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &no_inherited(),
+  );
 }
 
 /// The green union shape (M5's merge): the target absorbed every source key's full history as a
@@ -154,7 +182,14 @@ fn partition_exempts_a_key_a_registered_union_carried_in() {
   // Post-birth the child absorbs a source, so its key 5 now surfaces in the child's history.
   l.record(200, 5, 7, 30);
   // Key 5 registered as absorbed ⇒ the partition holds; without the exemption it would trip.
-  l.assert_partition(100, 200, &keyset(&[2]), &keyset(&[5]), &BTreeSet::new());
+  l.assert_partition(
+    100,
+    200,
+    &keyset(&[2]),
+    &keyset(&[5]),
+    &BTreeSet::new(),
+    &no_inherited(),
+  );
 }
 
 /// The negative pin: the exemption is EXACT. A key that surfaces in the child but was neither
@@ -168,7 +203,14 @@ fn partition_still_trips_on_a_key_no_union_carried() {
   l.record(200, 2, 2, 11);
   l.record(200, 5, 7, 30); // absorbed via a union — exempt
   l.record(200, 8, 9, 40); // NOT assigned and NOT absorbed — a real cross-talk leak
-  l.assert_partition(100, 200, &keyset(&[2]), &keyset(&[5]), &BTreeSet::new());
+  l.assert_partition(
+    100,
+    200,
+    &keyset(&[2]),
+    &keyset(&[5]),
+    &BTreeSet::new(),
+    &no_inherited(),
+  );
 }
 
 /// The seed-0 LOSS shape closed: the split hands key 2 to the child, then the child MERGES BACK
@@ -185,7 +227,14 @@ fn partition_exempts_a_key_a_union_re_acquired_into_the_parent() {
   // child's inherited copy.
   l.record(100, 2, 9, 20);
   l.record(100, 2, 12, 25);
-  l.assert_partition(100, 200, &keyset(&[2]), &BTreeSet::new(), &keyset(&[2]));
+  l.assert_partition(
+    100,
+    200,
+    &keyset(&[2]),
+    &BTreeSet::new(),
+    &keyset(&[2]),
+    &no_inherited(),
+  );
 }
 
 /// The seed-3 DUP shape closed: the split hands key 3 to the child, then the PARENT re-acquires
@@ -203,7 +252,14 @@ fn partition_exempts_a_divergent_key_a_union_re_acquired_into_the_parent() {
   // The parent re-acquires key 3 by absorbing a different source — a disjoint lineage.
   l.record(175, 3, 2, 1563);
   l.record(175, 3, 55, 1579);
-  l.assert_partition(175, 178, &keyset(&[3]), &BTreeSet::new(), &keyset(&[3]));
+  l.assert_partition(
+    175,
+    178,
+    &keyset(&[3]),
+    &BTreeSet::new(),
+    &keyset(&[3]),
+    &no_inherited(),
+  );
 }
 
 /// The split-eviction exemption (the seed-8 g333→g388 shape): key 7 was written on the source, then
@@ -259,4 +315,127 @@ fn union_still_trips_for_a_cell_the_caller_did_not_exempt() {
   let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
   departed.insert(7, [101].into_iter().collect());
   l.assert_union(600, 500, &keyset(&[7]), &departed);
+}
+
+/// The carried-record exemption (the seed-8 g127/g185/g215 shape): the parent absorbed a union
+/// source whose RECORD carried key-3 cells while key 3 was outside that union's absorbed
+/// population, so the sweep recorded them under the parent; a later split assigned key 3 (with
+/// those cells) to the child, and the parent's append-only ledger history retains them. The
+/// parent's post-prefix cells are all in the union source's history — no own-write witness — so
+/// the double-claim leg holds with the exemption; the key-level `reacquired` set (built from
+/// absorbed POPULATIONS) is blind to this shape.
+#[test]
+fn partition_exempts_a_parent_tail_a_unions_record_carried_in() {
+  let mut l = ConservationLedger::new();
+  // The union source's record carried key-3 cells (key 3 NOT in its absorbed_keys).
+  l.record(185, 3, 7, 300);
+  l.record(185, 3, 9, 301);
+  // The parent: its own prefix, then the carried cells the sweep recorded under it.
+  l.record(1_000_127, 3, 2, 11);
+  l.record(1_000_127, 3, 7, 300);
+  l.record(1_000_127, 3, 9, 301);
+  // The child inherited the prefix at fork and continues with its own write.
+  l.record(215, 3, 2, 11);
+  l.record(215, 3, 12, 400);
+  let mut inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  inherited.insert(3, [300, 301].into_iter().collect());
+  l.assert_partition(
+    1_000_127,
+    215,
+    &keyset(&[3]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &inherited,
+  );
+}
+
+/// The red assertion kept: the same carried-record shape WITHOUT the exemption is exactly the
+/// latent false-trip the exemption closes — the double-claim leg reads the union's cargo as a
+/// parent continuation.
+#[test]
+#[should_panic(expected = "BOTH sides")]
+fn partition_trips_on_the_carried_record_shape_without_the_exemption() {
+  let mut l = ConservationLedger::new();
+  l.record(185, 3, 7, 300);
+  l.record(185, 3, 9, 301);
+  l.record(1_000_127, 3, 2, 11);
+  l.record(1_000_127, 3, 7, 300);
+  l.record(1_000_127, 3, 9, 301);
+  l.record(215, 3, 2, 11);
+  l.record(215, 3, 12, 400);
+  l.assert_partition(
+    1_000_127,
+    215,
+    &keyset(&[3]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &no_inherited(),
+  );
+}
+
+/// The exemption keeps its teeth: values are globally unique, so a FRESH parent own-write past
+/// the common prefix can never appear in any union source's history — with both sides continuing,
+/// the double-claim leg still trips even though the inherited cells around it are exempt.
+#[test]
+#[should_panic(expected = "BOTH sides")]
+fn partition_still_trips_on_a_fresh_own_write_on_both_sides() {
+  let mut l = ConservationLedger::new();
+  l.record(1_000_127, 3, 2, 11);
+  l.record(1_000_127, 3, 7, 300); // carried in by the union — exempt
+  l.record(1_000_127, 3, 10, 500); // a fresh parent own-write — the double-claim witness
+  l.record(215, 3, 2, 11);
+  l.record(215, 3, 12, 400);
+  let mut inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  inherited.insert(3, [300].into_iter().collect());
+  l.assert_partition(
+    1_000_127,
+    215,
+    &keyset(&[3]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &inherited,
+  );
+}
+
+/// The LOSS leg's reduction: the child stopped at the common prefix and the parent's tail is
+/// entirely inherited — the union's cargo, not a continuation the child was ever handed — so the
+/// common prefix is the parent's effective end and the leg holds.
+#[test]
+fn partition_loss_leg_excuses_an_entirely_inherited_parent_tail() {
+  let mut l = ConservationLedger::new();
+  l.record(1_000_127, 3, 2, 11);
+  l.record(1_000_127, 3, 7, 300); // the union's cargo — the child rightly never saw it
+  l.record(215, 3, 2, 11); // the child stops at the common prefix
+  let mut inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  inherited.insert(3, [300].into_iter().collect());
+  l.assert_partition(
+    1_000_127,
+    215,
+    &keyset(&[3]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &inherited,
+  );
+}
+
+/// The LOSS leg keeps its teeth: one fresh own-write in the parent's tail is a real continuation
+/// the child's copy stops short of — the leg still trips through the surrounding inherited cells.
+#[test]
+#[should_panic(expected = "history LOST")]
+fn partition_loss_leg_still_trips_on_an_own_write_in_the_tail() {
+  let mut l = ConservationLedger::new();
+  l.record(1_000_127, 3, 2, 11);
+  l.record(1_000_127, 3, 7, 300); // inherited — exempt
+  l.record(1_000_127, 3, 10, 500); // a fresh own-write the child never received
+  l.record(215, 3, 2, 11);
+  let mut inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  inherited.insert(3, [300].into_iter().collect());
+  l.assert_partition(
+    1_000_127,
+    215,
+    &keyset(&[3]),
+    &BTreeSet::new(),
+    &BTreeSet::new(),
+    &inherited,
+  );
 }

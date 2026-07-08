@@ -74,6 +74,25 @@ impl ConservationLedger {
   ///     re-introduced history. A key no union re-acquired still trips both legs, so a genuine
   ///     double-claim — two sides past a common prefix with no re-acquiring union — is caught.
   ///
+  /// `inherited` exempts individual PARENT-side cells, not whole keys. An absorb copies the
+  /// source's whole FSM RECORD into the target — including cells for keys OUTSIDE the source's
+  /// owned population (carried/foreign-tagged cells) — so cells of an ASSIGNED key can reach the
+  /// parent's append-only ledger history through a union whose `absorbed_keys` never named the
+  /// key, invisible to the key-level `reacquired` set. The caller supplies, per assigned key, the
+  /// values found in any inbound union source's record; on BOTH legs the parent counts as
+  /// continuing past the common prefix only on an OWN-WRITE witness — a post-prefix cell whose
+  /// value is NOT exempt. Values are globally unique, so a fresh own-write can never appear in
+  /// any union source's history (the exemption cannot mask a REAL double-claim: an own-write on
+  /// both sides still trips both legs); conversely a value in a union source's history reached
+  /// the parent's record only via that absorb. The shared prefix itself is never filtered — an
+  /// inherited cell inside it is legitimate common history the child copied at fork, and dropping
+  /// it would break the prefix match. The child side is untouched (a union into the CHILD is the
+  /// key-level `absorbed` exemption). The LOSS leg applies the same reduction: a parent tail that
+  /// is entirely inherited counts as not-continuing (the common prefix is the effective end), so
+  /// a child stopping short of only-inherited tail cells does not trip. Accepted residual: an
+  /// inherited-then-lost parent tail is excused here — the inbound union's own
+  /// [`assert_union`](Self::assert_union) judges that absorb.
+  ///
   /// Panics with the group ids, the key, and both histories on any violation.
   pub(crate) fn assert_partition(
     &self,
@@ -82,6 +101,7 @@ impl ConservationLedger {
     child_keys: &BTreeSet<u16>,
     absorbed: &BTreeSet<u16>,
     reacquired: &BTreeSet<u16>,
+    inherited: &BTreeMap<u16, BTreeSet<u64>>,
   ) {
     let mut keys = self.keys_of(parent);
     keys.extend(self.keys_of(child));
@@ -100,13 +120,20 @@ impl ConservationLedger {
         continue;
       }
       let common = p.iter().zip(c.iter()).take_while(|(a, b)| a == b).count();
+      let inh = inherited.get(&k);
+      // Own-write witness: the parent continues past the common prefix only via a cell no
+      // inbound union's record carries — an inherited-only tail is that union's cargo, not a
+      // continuation of the split's assignment.
+      let parent_continues = p[common..]
+        .iter()
+        .any(|&(_, value)| !inh.is_some_and(|s| s.contains(&value)));
       assert!(
-        !(common < p.len() && common < c.len()) || reacquired.contains(&k),
+        !(parent_continues && common < c.len()) || reacquired.contains(&k),
         "[conservation] split g{parent}->g{child}: key {k} continued on BOTH sides past their \
          common prefix ({common} cells)\n  parent={p:?}\n  child={c:?}",
       );
       assert!(
-        common == p.len() || reacquired.contains(&k),
+        !parent_continues || reacquired.contains(&k),
         "[conservation] split g{parent}->g{child}: key {k} history LOST — the child's copy \
          stops short of the parent's recorded history\n  parent={p:?}\n  child={c:?}",
       );
