@@ -200,6 +200,12 @@ pub struct MultiWorld {
   merges_resolved: u64,
   /// Aborted resolutions observed across all hosts.
   merges_aborted: u64,
+  /// Per-`(target, source)` MONOTONE count of `Event::MergeAborted` observations drained across
+  /// the run — the abort clock the fuzzer's pending-merge book retires against: a pair booked at
+  /// clock `c` is resolved-by-abort once the clock reads past `c` (the absorb side retires via
+  /// merge registration instead). A count, not a set, because the same pair can legitimately
+  /// freeze, abort, and re-freeze across a run.
+  merge_aborts_observed: BTreeMap<(u64, u64), u64>,
 }
 
 impl MultiWorld {
@@ -254,6 +260,7 @@ impl MultiWorld {
       active_freezes: BTreeMap::new(),
       merges_resolved: 0,
       merges_aborted: 0,
+      merge_aborts_observed: BTreeMap::new(),
     }
   }
 
@@ -972,6 +979,14 @@ impl MultiWorld {
         Event::SplitApplied(_) => {}
         Event::SplitStale(_) => {
           self.split_stale += 1;
+        }
+        Event::MergeAborted(ma) => {
+          // The abort clock (see `merge_aborts_observed`): the fuzzer book retires a booked
+          // pair on OBSERVED resolution, and the abort side's observation is exactly this
+          // apply-point event on a target replica.
+          if let Ok(source) = <u64 as sailing_proto::Data>::decode_exact(ma.source()) {
+            *self.merge_aborts_observed.entry((gid, source)).or_insert(0) += 1;
+          }
         }
         _ => {}
       }

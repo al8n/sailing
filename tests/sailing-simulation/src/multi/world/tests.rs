@@ -2814,12 +2814,14 @@ fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
   // cluster-wide (every node reads it), never the terminal sentinel.
   let mut removal_floors: BTreeMap<u64, u64> = BTreeMap::new();
   removal_floors.insert(12, 3);
+  let no_husks = BTreeSet::new();
   let stores = super::merge::NodeStores {
     node: 1,
     logs: &mut logs,
     stables: &mut stables,
     floored: &floored,
     removal_floors: &removal_floors,
+    husk_floors: &no_husks,
   };
   assert_eq!(stores.floor(&10), sailing_proto::MERGED_FLOOR);
   assert_eq!(
@@ -2842,6 +2844,7 @@ fn recorded_floors_reach_the_service_as_the_terminal_sentinel() {
     stables: &mut stables,
     floored: &floored,
     removal_floors: &removal_floors,
+    husk_floors: &no_husks,
   };
   assert_eq!(
     other.floor(&10),

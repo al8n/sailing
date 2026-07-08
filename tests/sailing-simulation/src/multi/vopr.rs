@@ -300,15 +300,32 @@ pub struct MultiVoprReport {
   pub kind_unobservable_installs: u64,
 }
 
+/// One accepted-freeze entry in the fuzzer's pending-merge book.
+struct PendingMerge {
+  /// The target the accepted freeze claims.
+  target: u64,
+  /// Whether ANY replica of the source has been OBSERVED carrying the freeze (applied or
+  /// append-pending) since booking. A booked propose whose entry died un-landed (leader churn
+  /// truncated it) never trips this, and the quiesce teeth prune it as undrivable noise; a pair
+  /// that DID freeze must resolve by run end or the wedge scan panics.
+  saw_frozen: bool,
+  /// The world's `(target, source)` abort clock at booking: the pair is resolved-by-abort once
+  /// the clock moves past this (the absorb side retires via the source leaving the live set).
+  abort_mark: u64,
+}
+
 /// The fuzzer's deterministic bookkeeping threaded through the run.
 struct MState {
   /// The monotone group-id allocator (starts at 100; NEVER reused for a different logical
   /// group — `RecreateGroup` reuses a retired gid as the SAME logical group at gen+1).
   next_gid: u64,
-  /// Accepted merge freezes not yet observed resolved: source → target — the commit/rollback
-  /// actions' pick book (entries prune once the source stops being live: merged away, or its
-  /// freeze rolled back and later retired). Stale entries only produce typed refusals.
-  pending_merges: BTreeMap<u64, u64>,
+  /// Accepted merge freezes not yet OBSERVED resolved: source → [`PendingMerge`] — the
+  /// commit/rollback actions' pick book AND the quiesce drive's pair lookup. Entries retire on
+  /// observed resolution only (the source merged away, or the world drained a `MergeAborted`
+  /// for the pair past its booking mark) — NEVER on a rollback's propose-accept: an accepted
+  /// abort that never commits leaves the source frozen, and a book that forgot the pair could
+  /// neither drive nor attribute the wedge.
+  pending_merges: BTreeMap<u64, PendingMerge>,
   /// Per-group journal of every accepted client command (the quiesce expected set).
   expected: BTreeMap<u64, Vec<Vec<u8>>>,
   /// The global monotone client-command counter (distinct commands; per-key values increase).
@@ -400,6 +417,13 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
     for _ in 0..steps {
       w.tick();
       report.ticks_run += 1;
+    }
+    // Track which booked freezes actually LANDED somewhere: the quiesce teeth drive every such
+    // pair to resolution, and prune the ones whose accepted propose died un-landed.
+    for (s, pm) in st.pending_merges.iter_mut() {
+      if !pm.saw_frozen && w.group_freeze_seen(*s) {
+        pm.saw_frozen = true;
+      }
     }
     reads.scan(&w, &mut report, seed);
     report.max_term_seen = report.max_term_seen.max(w.max_term_all());
@@ -569,6 +593,58 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     w.crash(node);
   }
 
+  // FREEZE TEETH, phase 1 — the drive: every group still carrying freeze state is driven to
+  // RESOLUTION under the healed world, bounded. A freeze is a claim on a specific target; its
+  // ONLY exits are the absorb and the abort, both proposed on that target's log — so propose
+  // the booked commit (folding the source's expected history into the target's, as the action
+  // does) and, when it refuses typed, the rollback release valve; the ticking pumps parks and
+  // relays thaws. Anything still frozen when the budget runs out falls through to the wedge
+  // scan below. Booked pairs that never landed a freeze anywhere are pruned first — an
+  // accepted propose whose entry died with a deposed leader has nothing to resolve.
+  st.pending_merges
+    .retain(|s, pm| w.live_groups().contains(s) && (pm.saw_frozen || w.group_freeze_seen(*s)));
+  let mut budget = 12_000u32;
+  while budget > 0 {
+    prune_merge_book(w, st);
+    let active: Vec<u64> = w
+      .live_groups()
+      .into_iter()
+      .filter(|&g| w.group_freeze_seen(g))
+      .collect();
+    if active.is_empty() {
+      break;
+    }
+    if budget.is_multiple_of(16) {
+      for gid in active {
+        let target = st
+          .pending_merges
+          .get(&gid)
+          .map(|pm| pm.target)
+          .or_else(|| w.claimed_target_of(gid));
+        let Some(target) = target else { continue };
+        // A parked target is already deciding this merge — the ticking resolves it.
+        if !w.live_groups().contains(&target) || w.group_merge_parked(target) {
+          continue;
+        }
+        if matches!(w.propose_commit_merge(target, gid), Some(Ok(_))) {
+          let moved: Vec<Vec<u8>> = st.expected.get(&gid).cloned().unwrap_or_default();
+          if !moved.is_empty() {
+            st.expected.entry(target).or_default().extend(moved);
+          }
+          report.merges_committed += 1;
+        } else if matches!(w.propose_rollback_merge(target, gid), Some(Ok(_))) {
+          report.merges_rolled_back += 1;
+        }
+      }
+    }
+    for gid in w.live_groups() {
+      w.reconcile_membership(gid);
+    }
+    w.tick();
+    report.ticks_run += 1;
+    budget -= 1;
+  }
+
   let converged_group = |w: &MultiWorld, gid: u64| -> bool {
     if w.group_leader_count(gid) != 1 || !w.agreement_holds(gid) {
       return false;
@@ -625,6 +701,25 @@ fn quiesce(w: &mut MultiWorld, st: &mut MState, report: &mut MultiVoprReport, se
     panic!(
       "MULTI VOPR QUIESCE FAILURE: a fully-healed world failed to converge every live group \
        within 20000 ticks\n  seed={seed} (replay: run_multi_vopr({seed}, ticks, profile))\n  {}",
+      dumps.join("\n  "),
+    );
+  }
+
+  // FREEZE TEETH, phase 2 — the wedge scan: a replica still FROZEN after the drive and full
+  // convergence is a stranded merge participant (a frozen group converges — freeze refuses only
+  // writes — so the convergence pass above cannot see this class). Every accepted freeze must
+  // resolve by run end; anything else is a product wedge, seed-attributed.
+  let frozen = w.frozen_replicas();
+  if !frozen.is_empty() {
+    let groups: BTreeSet<u64> = frozen.iter().map(|&(_, gid)| gid).collect();
+    let dumps: Vec<String> = groups
+      .iter()
+      .map(|&gid| std::format!("g{gid}: {}", w.dbg_group(gid)))
+      .collect();
+    panic!(
+      "MULTI VOPR FREEZE WEDGE: replicas still frozen at run end after the quiesce drive\n  \
+       seed={seed} (replay: run_multi_vopr({seed}, ticks, profile))\n  frozen (node, gid): \
+       {frozen:?}\n  {}",
       dumps.join("\n  "),
     );
   }

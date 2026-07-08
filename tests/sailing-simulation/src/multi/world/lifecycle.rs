@@ -418,12 +418,15 @@ impl MultiWorld {
     // source's log through, threaded exactly as the merge pump threads it.
     {
       let host = self.hosts.get_mut(&node).expect("host exists");
+      // The teardown gate reads logs (the Claimed leg), never floors — an empty husk feed.
+      let no_husks = BTreeSet::new();
       let mut stores = super::merge::NodeStores {
         node,
         logs: &mut self.logs,
         stables: &mut self.stables,
         floored: &self.merge_floors,
         removal_floors: &self.removal_floors,
+        husk_floors: &no_husks,
       };
       host
         .remove_group(&gid, &mut stores)

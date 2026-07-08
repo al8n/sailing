@@ -46,6 +46,10 @@ pub(super) struct MergeRecord {
   /// The target's FULL applied record at the FIRST resolution — the absorb-determinism
   /// reference every later host's resolution is compared against.
   pub(super) resolved_record: AppliedLog,
+  /// The committed absorb coordinate (the parked index, identical on every replica of the
+  /// target's log) — the diligent-embedder floor feed's eligibility line: a host whose target
+  /// replica sits BELOW it has not folded the union yet and must never see the terminal floor.
+  pub(super) boundary: sailing_proto::Index,
 }
 
 /// Per-node `(log, stable)` resolution over the world's split store maps — the driver's
@@ -58,6 +62,11 @@ pub(super) struct NodeStores<'a> {
   pub(super) floored: &'a BTreeSet<(u64, u64)>,
   /// The cluster-wide non-terminal removal floors (one past a reshaped id's removal ceiling).
   pub(super) removal_floors: &'a BTreeMap<u64, u64>,
+  /// The diligent-embedder floor feed for THIS node (see
+  /// [`MultiWorld::embedder_husk_floors`]): registered-absorbed sources whose local replica is
+  /// a husk nothing here still needs, surfaced at the terminal floor so the service's dissolve
+  /// arm can reclaim them — the catalog action pin B(a) models with its direct floor write.
+  pub(super) husk_floors: &'a BTreeSet<u64>,
 }
 
 impl sailing_proto::GroupStores<u64, MemLog, MemStable<u64>> for NodeStores<'_> {
@@ -70,9 +79,11 @@ impl sailing_proto::GroupStores<u64, MemLog, MemStable<u64>> for NodeStores<'_> 
 
 impl sailing_proto::FloorStore<u64> for NodeStores<'_> {
   fn floor(&self, gid: &u64) -> u64 {
-    // The catalog's floor is the MAX of the terminal merge leg (a source absorbed on this host)
-    // and the cluster-wide non-terminal removal leg (a reshaped id the world stopped hosting).
-    let terminal = if self.floored.contains(&(self.node, *gid)) {
+    // The catalog's floor is the MAX of three legs: the terminal merge leg THIS host folded (a
+    // source it locally resolved), the diligent-embedder husk feed (boundary-aware — see
+    // `embedder_husk_floors` for why it must never reach a host still short of the union), and
+    // the non-terminal removal leg (a reshaped id the world stopped hosting).
+    let terminal = if self.floored.contains(&(self.node, *gid)) || self.husk_floors.contains(gid) {
       sailing_proto::MERGED_FLOOR
     } else {
       0
@@ -96,6 +107,9 @@ impl MultiWorld {
     target: u64,
   ) -> Option<Result<sailing_proto::Index, sailing_proto::MergeError<u64>>> {
     let leader = self.leader_of(source)?;
+    // The propose path never consults floors (the container is floor-free by design); the
+    // seam's husk feed is empty here.
+    let no_husks = BTreeSet::new();
     let host = self.hosts.get_mut(&leader).expect("leader host exists");
     let mut stores = NodeStores {
       node: leader,
@@ -103,6 +117,7 @@ impl MultiWorld {
       stables: &mut self.stables,
       floored: &self.merge_floors,
       removal_floors: &self.removal_floors,
+      husk_floors: &no_husks,
     };
     let verdict = host.prepare_merge(&source, self.now, &mut stores, &target);
     // Record the embedder's freeze intent on acceptance: this source now claims this target, so the
@@ -149,6 +164,7 @@ impl MultiWorld {
     let mut progressed = false;
     for node in self.node_ids.clone() {
       let now = self.now;
+      let husk_floors = self.embedder_husk_floors(node);
       let resolutions = {
         let host = self.hosts.get_mut(&node).expect("host exists");
         let mut stores = NodeStores {
@@ -157,6 +173,7 @@ impl MultiWorld {
           stables: &mut self.stables,
           floored: &self.merge_floors,
           removal_floors: &self.removal_floors,
+          husk_floors: &husk_floors,
         };
         host.service_merge_applies(now, &mut stores)
       };
@@ -165,7 +182,12 @@ impl MultiWorld {
         match r {
           sailing_proto::MergeResolution::Merged { source, target } => {
             self.merges_resolved += 1;
-            self.register_or_check_merge(node, source, target);
+            let boundary = self
+              .hosts
+              .get(&node)
+              .and_then(|h| h.group(&target))
+              .map_or(sailing_proto::Index::ZERO, |ep| ep.applied_index());
+            self.register_or_check_merge(node, source, target, boundary);
             // The driver's teardown half — DEFERRED behind the capture's durability, modeling
             // the engine's one-barrier batch: floor, teardown, and the absorb capture land
             // together or not at all. Dropping the source stores at resolution time would make
@@ -176,11 +198,6 @@ impl MultiWorld {
             // absorb; a crash before that re-parks the restored target, which waits on its
             // extracted source until the resolved quorum's post-merge install supersedes the
             // park — the same install's durability then completes this entry.
-            let boundary = self
-              .hosts
-              .get(&node)
-              .and_then(|h| h.group(&target))
-              .map_or(sailing_proto::Index::ZERO, |ep| ep.applied_index());
             self
               .pending_merge_teardowns
               .push((node, source, target, boundary));
@@ -251,7 +268,13 @@ impl MultiWorld {
   /// reference record); every LATER host's resolution is judged against that reference —
   /// byte-for-byte equality of the target's applied record at the resolution point, the direct
   /// form of the absorbed-state determinism argument.
-  fn register_or_check_merge(&mut self, node: u64, source: u64, target: u64) {
+  fn register_or_check_merge(
+    &mut self,
+    node: u64,
+    source: u64,
+    target: u64,
+    boundary: sailing_proto::Index,
+  ) {
     let record = self.applied_of(node, target);
     // Multiset form, like the equal-applied agreement: a crash-restored replica resolving the
     // re-encountered commit presents earlier absorbs at capture-embedded positions, so equal
@@ -323,6 +346,7 @@ impl MultiWorld {
       target,
       absorbed_keys,
       resolved_record: record,
+      boundary,
     });
   }
 
@@ -408,15 +432,133 @@ impl MultiWorld {
     self.groups.get(&gid).is_some_and(|m| m.merged)
   }
 
-  /// Whether any hosting replica of `gid` reports the applied merge FREEZE — the calm window's
-  /// skip predicate: a frozen group refuses writes by design, so demanding fresh client load
-  /// from it would misread the covered refusal as a livelock.
+  /// Whether `gid` currently REFUSES writes for a merge freeze, read where write authority
+  /// lives: the LEADER's replica, falling back to a VOTER-QUORUM read while leaderless (a
+  /// frozen majority refuses any would-be leader's fresh load just the same). The calm window's
+  /// skip predicate. Deliberately NOT ∃-any-replica: one stale frozen FOLLOWER — a thaw it has
+  /// not applied yet — does not stop the leader from accepting load, and skipping the calm
+  /// progress demand on its account would blind the window to real livelocks.
   pub fn group_frozen(&self, gid: u64) -> bool {
+    if let Some(leader) = self.leader_of(gid) {
+      return self.hosts[&leader]
+        .group(&gid)
+        .is_some_and(sailing_proto::Endpoint::is_frozen);
+    }
+    let voters = self.group_voters(gid);
+    if voters.is_empty() {
+      return false;
+    }
+    let frozen = voters
+      .iter()
+      .filter(|&&n| {
+        self
+          .hosts
+          .get(&n)
+          .and_then(|h| h.group(&gid))
+          .is_some_and(sailing_proto::Endpoint::is_frozen)
+      })
+      .count();
+    frozen * 2 > voters.len()
+  }
+
+  /// Every hosted replica FROZEN by an applied merge freeze, as `(node, gid)` — the quiesce
+  /// teeth's wedge scan. ∃-any deliberately, unlike [`group_frozen`](Self::group_frozen): ANY
+  /// replica left frozen at run end is a stranded merge participant, whatever its leader thinks.
+  /// World-PARKED replicas are exempt: a removed ex-member's retained witness is no longer a
+  /// protocol participant (the `leader_of` rule), so nothing will ever replicate a thaw to it —
+  /// its stale frozen view is designed residue, not a wedge.
+  pub fn frozen_replicas(&self) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    for &node in &self.node_ids {
+      for gid in self.groups.keys() {
+        if !self.parked.contains(&(node, *gid))
+          && let Some(ep) = self.hosts[&node].group(gid)
+          && ep.is_frozen()
+        {
+          out.push((node, *gid));
+        }
+      }
+    }
+    out
+  }
+
+  /// Whether ANY hosting replica of `gid` carries ACTIVE freeze state — applied or still
+  /// append-pending. The quiesce drive's work predicate: the wedge scan reads `is_frozen`, but
+  /// the drive must also outlive a freeze still settling toward it, or a commit landing in the
+  /// drive's last ticks would freeze past the loop and trip the scan unfairly. World-parked
+  /// replicas are exempt, as on the scan.
+  pub fn group_freeze_seen(&self, gid: u64) -> bool {
     self
       .node_ids
       .iter()
+      .filter(|&&n| !self.parked.contains(&(n, gid)))
       .filter_map(|&n| self.hosts[&n].group(&gid))
-      .any(sailing_proto::Endpoint::is_frozen)
+      .any(sailing_proto::Endpoint::merge_freeze_active)
+  }
+
+  /// The target a live freeze of `source` claims, read off the embedder's own freeze record
+  /// (`active_freezes`, last-wins) — the quiesce drive's pair lookup when the fuzzer book has
+  /// already retired the pair (an abort observation from a previous incarnation of the same
+  /// pair can race a re-freeze's booking).
+  pub fn claimed_target_of(&self, source: u64) -> Option<u64> {
+    self.active_freezes.get(&source).copied()
+  }
+
+  /// `Event::MergeAborted` observations drained for `(target, source)` across the run — the
+  /// monotone abort clock (see the field): the fuzzer book stamps it at booking and retires the
+  /// pair once it moves, the abort-side twin of merge registration.
+  pub fn merge_abort_observations(&self, target: u64, source: u64) -> u64 {
+    self
+      .merge_aborts_observed
+      .get(&(target, source))
+      .copied()
+      .unwrap_or(0)
+  }
+
+  /// The diligent-embedder floor feed for `node`: every REGISTERED-absorbed source whose local
+  /// replica is a frozen HUSK nothing on this node still needs. The world plays the embedder
+  /// pin B(a) models with its direct floor write — a host that never locally resolved the park
+  /// (crashed through the capture window, or was superseded by an install) never folds its own
+  /// per-node floor, and its husk is otherwise unremovable (`Frozen`), claim-blocking, and
+  /// capture-fenced forever; only the service's floor-keyed dissolve arm reclaims it.
+  ///
+  /// BOUNDARY-AWARE, the load-bearing scope: the registered merge's absorb coordinate rides
+  /// [`MergeRecord::boundary`], and a target replica still BELOW it has not folded the union —
+  /// it will park and absorb the husk (or install past it). Feeding the terminal floor there
+  /// manufactures the absent/duplicate abort arm and skips the union: committed divergence
+  /// against every host that absorbed. Eligible only when this node's target replica is gone,
+  /// or is past the boundary with no park naming the source.
+  fn embedder_husk_floors(&self, node: u64) -> BTreeSet<u64> {
+    let mut out = BTreeSet::new();
+    let host = &self.hosts[&node];
+    for (gid, meta) in &self.groups {
+      if !meta.merged {
+        continue;
+      }
+      if !host
+        .group(gid)
+        .is_some_and(sailing_proto::Endpoint::is_frozen)
+      {
+        continue;
+      }
+      let led = Self::ledger_id(self.generation_of(*gid), *gid);
+      let Some(rec) = self.merges.iter().find(|m| m.source_led == led) else {
+        continue;
+      };
+      let eligible = match host.group(&rec.target) {
+        None => true,
+        Some(tep) => {
+          let parked_on_it = tep.pending_merge().is_some_and(|p| {
+            <u64 as sailing_proto::Data>::decode_exact(p.source_bytes()) == Ok(*gid)
+          });
+          !parked_on_it && tep.applied_index() >= rec.boundary
+        }
+      };
+      if eligible {
+        out.insert(*gid);
+      }
+    }
+    out
   }
 
   /// Whether any hosting replica of `gid` is a merge TARGET still PARKED on an unresolved absorb

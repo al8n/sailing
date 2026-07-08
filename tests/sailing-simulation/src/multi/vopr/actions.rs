@@ -440,6 +440,18 @@ pub(super) fn split_group(w: &mut MultiWorld, st: &mut MState, prng: &mut FaultP
   }
 }
 
+/// Prune the pending-merge book down to entries still awaiting an OBSERVED resolution: the
+/// source must still be live (an absorbed source left via merge registration; a rolled-back
+/// source that later retired left via lifecycle), and the world must not have drained a
+/// `MergeAborted` for the pair past its booking mark. Retiring on the OBSERVATION — never on a
+/// rollback's propose-accept — keeps an accepted-but-uncommitted abort's pair drivable at
+/// quiesce instead of silently forgotten while its source is still frozen.
+pub(super) fn prune_merge_book(w: &MultiWorld, st: &mut MState) {
+  st.pending_merges.retain(|s, pm| {
+    w.live_groups().contains(s) && w.merge_abort_observations(pm.target, *s) <= pm.abort_mark
+  });
+}
+
 /// Propose a merge FREEZE of a seed-picked live source into an equal-voter-set live sibling —
 /// the harness pairing filter (split children are colocated by construction, so the reshape
 /// churn keeps minting mergeable pairs). Every landed refusal arm is a legitimate no-op tick;
@@ -450,7 +462,7 @@ pub(super) fn prepare_merge_action(
   prng: &mut FaultPrng,
   report: &mut MultiVoprReport,
 ) {
-  st.pending_merges.retain(|s, _| w.live_groups().contains(s));
+  prune_merge_book(w, st);
   let live: Vec<u64> = w.live_groups();
   let candidates: Vec<(u64, u64)> = live
     .iter()
@@ -466,7 +478,14 @@ pub(super) fn prepare_merge_action(
   }
   let (source, target) = candidates[(prng.next_u64() % candidates.len() as u64) as usize];
   if let Some(Ok(_)) = w.propose_prepare_merge(source, target) {
-    st.pending_merges.insert(source, target);
+    st.pending_merges.insert(
+      source,
+      PendingMerge {
+        target,
+        saw_frozen: false,
+        abort_mark: w.merge_abort_observations(target, source),
+      },
+    );
     report.merges_prepared += 1;
   }
 }
@@ -482,15 +501,16 @@ pub(super) fn commit_merge_action(
   prng: &mut FaultPrng,
   report: &mut MultiVoprReport,
 ) {
-  st.pending_merges.retain(|s, _| w.live_groups().contains(s));
+  prune_merge_book(w, st);
   let sources: Vec<u64> = st.pending_merges.keys().copied().collect();
   if sources.is_empty() {
     return;
   }
   let source = sources[(prng.next_u64() % sources.len() as u64) as usize];
-  let target = st.pending_merges[&source];
+  let target = st.pending_merges[&source].target;
   if !w.live_groups().contains(&target) {
-    st.pending_merges.remove(&source);
+    // A dead target with a live booked source is the STRANDED class — keep the pair booked so
+    // the quiesce teeth can attribute it; dropping it here erased the evidence.
     return;
   }
   if let Some(Ok(_)) = w.propose_commit_merge(target, source) {
@@ -505,25 +525,27 @@ pub(super) fn commit_merge_action(
 /// Propose the merge ABORT for a seed-picked pending freeze — deliberately able to RACE an
 /// already-accepted commit: the source's log settles the race, and the parked applies must all
 /// take the same side (the union verdict and the absorb-determinism check judge the outcome).
+/// The book entry is NOT retired on the accept: an abort that never commits leaves the source
+/// frozen, so the pair stays booked until the world OBSERVES a resolution (a `MergeAborted`
+/// drained past the booking mark, or the source absorbed away) — see [`prune_merge_book`].
 pub(super) fn rollback_merge_action(
   w: &mut MultiWorld,
   st: &mut MState,
   prng: &mut FaultPrng,
   report: &mut MultiVoprReport,
 ) {
-  st.pending_merges.retain(|s, _| w.live_groups().contains(s));
+  prune_merge_book(w, st);
   let sources: Vec<u64> = st.pending_merges.keys().copied().collect();
   if sources.is_empty() {
     return;
   }
   let source = sources[(prng.next_u64() % sources.len() as u64) as usize];
-  let target = st.pending_merges[&source];
+  let target = st.pending_merges[&source].target;
   if !w.live_groups().contains(&target) {
-    st.pending_merges.remove(&source);
+    // Keep the stranded pair booked for the quiesce teeth (see `commit_merge_action`).
     return;
   }
   if let Some(Ok(_)) = w.propose_rollback_merge(target, source) {
-    st.pending_merges.remove(&source);
     report.merges_rolled_back += 1;
   }
 }
