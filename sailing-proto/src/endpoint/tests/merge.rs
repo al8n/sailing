@@ -2232,3 +2232,227 @@ fn merge_seal_appends_once_on_the_leader() {
   );
   assert_eq!(log.last_index(), k.next());
 }
+
+/// A 3-voter FOLLOWER (node 1) rebuilt at restart PARKED at the `CommitMerge`@2, with one entry
+/// committed-but-unapplied ABOVE the park (the gap the campaign guard scans): no-op@1 +
+/// CommitMerge@2 + `gap_kind`@3, hard state at commit=3. The reconcile applies the no-op, parks
+/// at 1, and leaves index 3 committed above the held apply — the exact shape
+/// `merge_park_membership_superseded` judges.
+fn restart_parked_follower_with_gap(
+  pre_vote: bool,
+  gap_kind: EntryKind,
+  gap_payload: bytes::Bytes,
+) -> (Endpoint<u64, CountSm>, VecLog, AsyncStable) {
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_pre_vote(pre_vote);
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(7), 1, 1),
+    ),
+    Entry::new(Term::new(1), Index::new(3), gap_kind, gap_payload),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(ep.role().is_follower(), "a restarted replica is a follower");
+  assert!(ep.pending_merge().is_some(), "parked at the CommitMerge");
+  assert_eq!(
+    ep.applied_index(),
+    Index::new(1),
+    "the park holds apply at k-1"
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(3),
+    "commit runs past the park"
+  );
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  (ep, log, stable)
+}
+
+/// A committed conf-change payload (AddNode 4) for the gap entry — the membership supersession.
+fn add4_payload() -> bytes::Bytes {
+  use crate::{ConfChange, ConfChangeType};
+  let v2 = ConfChange::new(ConfChangeType::AddNode, 4u64, bytes::Bytes::new()).into_v2();
+  let mut buf = Vec::new();
+  crate::wire::encode_conf_change_v2(&v2, &mut buf);
+  bytes::Bytes::from(buf)
+}
+
+/// The campaign guard, `become_candidate` path: a parked replica whose committed-but-unapplied
+/// gap holds a `ConfChange` is running on a SUPERSEDED voter set (membership is apply-time), so
+/// an election timeout must not make it a candidate — a win on the stale configuration could
+/// truncate entries the real configuration committed.
+#[test]
+fn a_parked_replica_with_a_superseded_voter_set_does_not_campaign() {
+  let (mut ep, mut log, mut stable) =
+    restart_parked_follower_with_gap(false, EntryKind::ConfChange, add4_payload());
+  let deadline = ep.poll_timeout().expect("election timer armed");
+  ep.handle_timeout(deadline, &mut log, &mut stable);
+  assert!(
+    ep.role().is_follower(),
+    "the superseded parked replica must not become a candidate"
+  );
+  assert_eq!(
+    ep.term(),
+    Term::new(1),
+    "no term bump — no campaign started"
+  );
+  while let Some(out) = ep.poll_message() {
+    assert!(
+      !matches!(out.message(), Message::RequestVote(_)),
+      "no vote request may leave a superseded parked replica"
+    );
+  }
+}
+
+/// The campaign guard, `become_pre_candidate` path: the same superseded park must not even
+/// PROBE — a pre-vote quorum on the stale set would walk straight into the real campaign.
+#[test]
+fn a_parked_replica_with_a_superseded_voter_set_does_not_pre_campaign() {
+  let (mut ep, mut log, mut stable) =
+    restart_parked_follower_with_gap(true, EntryKind::ConfChange, add4_payload());
+  let deadline = ep.poll_timeout().expect("election timer armed");
+  ep.handle_timeout(deadline, &mut log, &mut stable);
+  assert!(
+    ep.role().is_follower(),
+    "the superseded parked replica must not become a pre-candidate"
+  );
+  assert_eq!(
+    ep.term(),
+    Term::new(1),
+    "pre-vote never bumps the term, and none was probed"
+  );
+  while let Some(out) = ep.poll_message() {
+    assert!(
+      !matches!(out.message(), Message::RequestVote(_)),
+      "no pre-vote probe may leave a superseded parked replica"
+    );
+  }
+}
+
+/// The guard fails CLOSED: a park gap the log cannot serve (a cold read) cannot be proven free of
+/// membership changes, so the campaign refuses this pass — and a warm retry over the same PLAIN
+/// gap re-evaluates and campaigns, proving the refusal was the unreadable range, not the content.
+#[test]
+fn an_unreadable_park_gap_refuses_the_campaign_until_a_warm_retry() {
+  use crate::testkit::FailTermLog;
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = FailTermLog::default();
+  let mut stable = AsyncStable::default();
+  log.force_append(&[
+    Entry::new(
+      Term::new(1),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(2),
+      EntryKind::CommitMerge,
+      commit_payload(b"\x2a", Index::new(7), 1, 1),
+    ),
+    Entry::new(
+      Term::new(1),
+      Index::new(3),
+      EntryKind::Normal,
+      bytes::Bytes::from_static(b"w"),
+    ),
+  ]);
+  stable.force_state(Term::new(1), Some(1u64), Index::new(3));
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  assert!(ep.pending_merge().is_some(), "parked at the CommitMerge");
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  log.return_cold_on_read();
+  let deadline = ep.poll_timeout().expect("election timer armed");
+  ep.handle_timeout(deadline, &mut log, &mut stable);
+  assert!(
+    ep.role().is_follower(),
+    "an unprovable gap fails closed — no campaign this pass"
+  );
+  assert_eq!(ep.term(), Term::new(1));
+
+  // The range becomes resident: the next timeout re-evaluates the plain gap and campaigns.
+  log.clear_cold_on_read();
+  let deadline = ep.poll_timeout().expect("election timer re-armed");
+  ep.handle_timeout(deadline, &mut log, &mut stable);
+  assert!(
+    ep.role().is_candidate(),
+    "a warm retry over a plain gap campaigns normally"
+  );
+  assert_eq!(ep.term(), Term::new(2), "the real campaign bumped the term");
+}
+
+/// The guard must not over-fire: a park over PLAIN entries (no membership change in the
+/// committed-but-unapplied gap) leaves the voter set current, so the parked replica still
+/// campaigns — a group whose only up-to-date replicas are parked mid-merge can still elect.
+#[test]
+fn a_park_over_plain_entries_still_campaigns() {
+  let (mut ep, mut log, mut stable) =
+    restart_parked_follower_with_gap(false, EntryKind::Normal, bytes::Bytes::from_static(b"w"));
+  let deadline = ep.poll_timeout().expect("election timer armed");
+  ep.handle_timeout(deadline, &mut log, &mut stable);
+  assert!(
+    ep.role().is_candidate(),
+    "a plain-gap park campaigns — the guard keys on membership supersession only"
+  );
+  assert_eq!(ep.term(), Term::new(2), "the campaign bumped the term");
+  let mut targets: Vec<u64> = Vec::new();
+  while let Some(out) = ep.poll_message() {
+    if matches!(out.message(), Message::RequestVote(_)) {
+      targets.push(out.to());
+    }
+  }
+  targets.sort();
+  assert_eq!(
+    targets,
+    std::vec![2u64, 3],
+    "votes requested from both peers"
+  );
+}
