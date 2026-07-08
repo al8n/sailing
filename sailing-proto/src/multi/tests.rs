@@ -3800,6 +3800,149 @@ fn rollback_races_commit() {
   );
 }
 
+/// FIX 2 leg (a): `commit_merge` refuses `TargetOwesThaw` when the target already owes THIS source
+/// incarnation an aborted-merge thaw — the same merge's abort applied, the source still frozen at
+/// the aborted generation, its thaw not yet discharged. Re-parking there would wedge on the freeze
+/// generation the thaw pass drives past. GENERATION-EXACT: once the thaw discharges and the source
+/// re-freezes fresh, the same target admits the new commit. RED before the gate: the re-propose
+/// ADMITS and the resulting park wedges.
+#[test]
+fn commit_merge_refuses_a_target_owing_this_source_a_thaw() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // 1 freezes into 2 (1 frozen at gen 1, claim = 2).
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&1).unwrap().is_frozen());
+  // 2 aborts the 1 -> 2 merge and APPLIES it: 2 now owes 1 a thaw at freeze generation 1, and 1 is
+  // still frozen at gen 1 (its relayed thaw has not been driven).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    m.rollback_merge(&2, now, log, stable, &1).unwrap().unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().has_abandoned(), "2 owes 1 a thaw");
+  assert!(
+    m.group(&1).unwrap().is_frozen(),
+    "1 is still frozen at gen 1"
+  );
+  // The re-propose is refused GEN-EXACT — parking here would wedge on the freeze generation the
+  // thaw pass drives past.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert_eq!(
+      m.commit_merge(&2, now, log, stable, &1),
+      Some(Err(MergeError::TargetOwesThaw)),
+      "a target owing this source incarnation a thaw refuses the re-commit"
+    );
+  }
+  // Drive the thaw: 1 unfreezes, then the observed advance discharges 2's obligation.
+  m.service_merge_applies(now, &mut stores);
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(!m.group(&1).unwrap().is_frozen(), "the thaw unfroze 1");
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the obligation discharged"
+  );
+  // GEN-EXACTNESS: 1 re-freezes FRESH (a strictly higher generation) and the same target now ADMITS
+  // — the spent obligation named a dead incarnation, so its discharge cleared the refusal.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    assert!(
+      matches!(m.commit_merge(&2, now, log, stable, &1), Some(Ok(_))),
+      "the fresh freeze admits — generation-exact"
+    );
+  }
+}
+
+/// FIX 2 leg (b): the apply-time belt for the in-flight order the gate cannot see — a `CommitMerge`
+/// with a FRESH mint appended ABOVE the same merge's already-committed abort. The lineage guard
+/// admits the fresh mint, so without the belt it would PARK at the aborted freeze generation and
+/// wedge once the thaw pass drives the source past it. The belt reads `abandoned` at apply and
+/// aborts the dead commit instead: no park, no lineage bump, `MergeAborted` surfaced, drain resumes.
+/// RED before the belt: the fresh-mint commit parks and the drain wedges below it.
+#[test]
+fn a_committed_abort_below_a_fresh_commit_kills_it_at_apply() {
+  let (mut m, mut stores) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  // 1 freezes into 2 (1 frozen at gen 1, claim = 2) — the real source the dead commit names.
+  {
+    let (log, stable) = stores.0.get_mut(&1).unwrap();
+    m.prepare_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  let mut source_bytes = Vec::new();
+  Data::encode(&1u64, &mut source_bytes);
+  let source_bytes = Bytes::from(source_bytes);
+  // Append directly on target 2, bypassing the propose gate to reproduce the in-flight order the
+  // gate cannot see: the same merge's abort BELOW, then a FRESH-mint commit ABOVE, then drain both.
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    // Target-role abort at the live mint (target_gen_after = 1 against base 0): its apply records
+    // abandoned[1] = freeze generation 1.
+    let abort = crate::RollbackMergePayload::abort(source_bytes.clone(), 1, 1);
+    let mut abuf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&abort, &mut abuf);
+    let a = m
+      .group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::RollbackMerge, Bytes::from(abuf))
+      .unwrap();
+    // A FRESH-mint commit for the SAME (source, freeze generation): target_gen_after = 2, one past
+    // the abort's own bump, so the lineage guard ADMITS it — only the belt can kill it.
+    let commit =
+      crate::CommitMergePayload::new(source_bytes.clone(), Index::new(2), Term::new(1), 1, 2);
+    let mut cbuf = Vec::new();
+    crate::wire::encode_commit_merge_payload(&commit, &mut cbuf);
+    let k = m
+      .group_mut(&2)
+      .unwrap()
+      .propose_merge_entry(now, log, crate::EntryKind::CommitMerge, Bytes::from(cbuf))
+      .unwrap();
+    assert_eq!(k, a.next(), "the commit sits directly above the abort");
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  let tep = m.group(&2).unwrap();
+  assert!(tep.pending_merge().is_none(), "the dead commit never parks");
+  assert_eq!(
+    tep.shape_gen(),
+    1,
+    "only the abort's bump — the dead commit does not move the lineage"
+  );
+  assert!(m.contains_group(&1), "the source is not absorbed");
+  let mut aborted = false;
+  while let Some((gid, ev)) = m.poll_event() {
+    aborted |= gid == 2 && matches!(ev, Event::MergeAborted(_));
+  }
+  assert!(aborted, "the dead commit surfaced MergeAborted");
+  // NOT WEDGED: the drain ran straight through the belt-aborted commit, so a fresh proposal on 2
+  // applies (a park would have stopped the drain below it forever).
+  {
+    let (log, stable) = stores.0.get_mut(&2).unwrap();
+    let before = m.group(&2).unwrap().applied_index();
+    m.propose(&2, now, log, stable, &Bytes::from_static(b"z"))
+      .unwrap()
+      .unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+    assert!(
+      m.group(&2).unwrap().applied_index() > before,
+      "the drain is not wedged at a park"
+    );
+  }
+}
+
 /// A target legitimately absorbs a FAN-IN of sources, so its abort obligations are a per-source
 /// COLLECTION. Two sources frozen toward one target (the second from the window BEFORE the first
 /// abort applied) each record their OWN obligation when aborted, and BOTH thaw. RED with the old

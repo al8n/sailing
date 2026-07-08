@@ -1823,6 +1823,9 @@ where
     // is a per-source collection, so a fresh freeze toward this target adds an independent obligation
     // (fan-in) that its own later abort records under its own key — nothing is dropped. The absorb
     // itself is still serialized by `AlreadyPending` (one `CommitMerge` in flight/parked at a time).
+    // The SAME-source hazard — re-committing a merge whose own abort this target already applied,
+    // which would park at the dead freeze generation the thaw pass then drives past — is fenced at
+    // the absorb by `commit_merge`'s `TargetOwesThaw` gate (and its apply-time belt), not here.
     let target_conf = tep.conf_state();
     let target_mode = tep.active_read_mode();
     let target_conf_in_flight = tep.conf_change_in_flight();
@@ -2022,6 +2025,23 @@ where
       // other target could only park and abort at the service's claim leg — refuse it here
       // with the truthful verdict instead.
       return Some(Err(MergeError::SourceClaimed));
+    }
+    // The target must not already owe THIS exact source incarnation an aborted-merge thaw. A prior
+    // abort of this very merge committed+applied on the target — recording `abandoned[source] ==
+    // source_gen_after` — while the source is still frozen at that generation (its relayed thaw not
+    // yet applied). Parking a re-proposed commit at the aborted gen would wedge every replica
+    // forever: the per-crank thaw pass drives the source PAST it, so the park could never observe
+    // frozen-at-expected again (the apply-time belt catches the same hazard for an order the gate
+    // cannot see). GENERATION-EXACT — a spent obligation the source already thawed past and re-froze
+    // above names a dead incarnation and must not refuse a fresh legitimate merge; the discharge
+    // clears the record, so the re-freeze admits.
+    let source_owed_key = {
+      let mut b = Vec::new();
+      source.encode(&mut b);
+      Bytes::from(b)
+    };
+    if tep.owes_thaw_for(&source_owed_key) == Some(source_gen_after) {
+      return Some(Err(MergeError::TargetOwesThaw));
     }
     let target_conf = tep.conf_state();
     if source_conf.is_joint() || target_conf.is_joint() {

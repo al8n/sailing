@@ -2690,6 +2690,25 @@ where
                   payload.source_bytes(),
                   self.split.shape_gen,
                 )));
+            } else if self.abandoned_matches(&payload.source_bytes(), payload.source_gen_after()) {
+              // THE SAME-MERGE ABORT BELT: this target already owes THIS `(source, freeze
+              // generation)` an aborted-merge thaw, so the same merge's abort is committed BELOW
+              // this entry (the obligation is set at that abort's apply, and apply is in log order).
+              // The commit is DEAD even though its mint is fresh: parking it would stop the drain at
+              // the aborted freeze generation, which the thaw pass then drives the source PAST — a
+              // permanent wedge. Do NOT park and do NOT bump the lineage; emit `MergeAborted` like
+              // the aborted-park resolution. Uniform across replicas: the abort precedes this entry
+              // in the SAME log, so every replica's `abandoned` at this apply is identical (a pure
+              // function of the log prefix). The `commit_merge` gate refuses the common re-propose
+              // at propose; this belt covers the in-flight order the gate cannot see.
+              self
+                .outputs
+                .events
+                .push_back(Event::MergeAborted(crate::MergeAborted::new(
+                  idx,
+                  payload.source_bytes(),
+                  self.split.shape_gen,
+                )));
             } else {
               // PARK: the endpoint cannot apply this entry alone — the absorbed half lives in
               // another group's endpoint, which only the container holds. Record the pending

@@ -418,6 +418,19 @@ pub enum MergeError<I> {
   /// obligation, after which the same freeze admits.
   #[error("the source still owes an aborted merge its thaw")]
   SourceOwesThaw,
+  /// The `commit_merge` TARGET already owes THIS source incarnation an aborted-merge thaw: a prior
+  /// abort of this very merge committed+applied on the target — recording a durable `abandoned`
+  /// obligation for `(source, freeze generation)` — while the source is still frozen at that
+  /// generation, its relayed thaw not yet applied. Re-proposing the commit would park every replica
+  /// at the aborted freeze generation, and the per-crank thaw pass then drives the source PAST it —
+  /// so the park could never observe the source frozen-at-expected again and would wedge the
+  /// target's apply forever. The apply-time dual of [`SourceOwesThaw`](Self::SourceOwesThaw), on the
+  /// target side. GENERATION-EXACT: a spent obligation the source already thawed past (and re-froze
+  /// above for a fresh merge) names a DEAD incarnation and does not refuse the legitimate new merge.
+  /// TRANSIENT: the thaw pass discharges the obligation within a few cranks, after which the source
+  /// re-freezes and the same target admits the commit.
+  #[error("the merge target still owes this source incarnation an aborted-merge thaw")]
+  TargetOwesThaw,
   /// A participant's CURRENT incarnation is below its persisted admission floor (a
   /// coordinator-layer refusal through its floor seam): this replica belongs to a fenced
   /// incarnation — a stale survivor that must not anchor a merge.
