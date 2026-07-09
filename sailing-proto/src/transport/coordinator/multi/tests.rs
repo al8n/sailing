@@ -2445,7 +2445,7 @@ fn merge_verbs_ride_the_coordinator() {
   // The coordinator's floor leg refuses a fenced participant BEFORE anything is appended.
   assert!(matches!(
     coord
-      .prepare_merge(&1, now, &mut stores, &2, &MaxFloors)
+      .prepare_merge(&2, now, &mut stores, &1, &MaxFloors)
       .unwrap(),
     Err(crate::MergeError::BelowFloor {
       floor: MERGED_FLOOR
@@ -2454,30 +2454,30 @@ fn merge_verbs_ride_the_coordinator() {
   // The container preconditions surface through the delegator verbatim.
   assert!(matches!(
     coord
-      .prepare_merge(&1, now, &mut stores, &1, &NoFloors)
+      .prepare_merge(&2, now, &mut stores, &2, &NoFloors)
       .unwrap(),
     Err(crate::MergeError::SelfMerge)
   ));
 
   // Freeze, park, and resolve THROUGH the coordinator.
   coord
-    .prepare_merge(&1, now, &mut stores, &2, &NoFloors)
+    .prepare_merge(&2, now, &mut stores, &1, &NoFloors)
     .unwrap()
     .unwrap();
   {
-    let (l, s) = stores.stores(&1).unwrap();
-    coord.handle_storage(&1, now, l, s).unwrap();
-  }
-  assert!(coord.group(&1).unwrap().is_frozen());
-  {
     let (l, s) = stores.stores(&2).unwrap();
-    coord
-      .commit_merge(&2, now, l, s, &1, &NoFloors)
-      .unwrap()
-      .unwrap();
     coord.handle_storage(&2, now, l, s).unwrap();
   }
-  assert!(coord.group(&2).unwrap().pending_merge().is_some());
+  assert!(coord.group(&2).unwrap().is_frozen());
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .commit_merge(&1, now, l, s, &2, &NoFloors)
+      .unwrap()
+      .unwrap();
+    coord.handle_storage(&1, now, l, s).unwrap();
+  }
+  assert!(coord.group(&1).unwrap().pending_merge().is_some());
   // The first pass seals the park's abort window; the drain commits the seal; the next pass
   // absorbs.
   assert!(
@@ -2485,35 +2485,35 @@ fn merge_verbs_ride_the_coordinator() {
     "the first pass only seals"
   );
   {
-    let (l, s) = stores.stores(&2).unwrap();
-    coord.handle_storage(&2, now, l, s).unwrap();
+    let (l, s) = stores.stores(&1).unwrap();
+    coord.handle_storage(&1, now, l, s).unwrap();
   }
   let resolutions = coord.service_merge_applies(now, &mut stores);
   assert_eq!(
     resolutions,
     std::vec![crate::MergeResolution::Merged {
-      source: 1,
-      target: 2
+      source: 2,
+      target: 1
     }]
   );
   // The source id is TOMBSTONED at the coordinator: stragglers drop silently (the P5 wire
   // story), and re-admission refuses until the explicit clear — while the terminal floor the
   // DRIVER persists from the resolution outlives even that.
-  assert!(coord.group(&1).is_none());
-  assert!(coord.is_retired(&1), "resolved merge tombstones the source");
+  assert!(coord.group(&2).is_none());
+  assert!(coord.is_retired(&2), "resolved merge tombstones the source");
 
   // The abort delegator is reachable too, with a typed refusal: the merged-away source is gone
   // (`SourceMissing`). The source-side thaw has NO delegator — it is fully service-driven, so no
   // external path can move a frozen source's counter without a committed target abort.
   {
-    let (l, s) = stores.stores(&2).unwrap();
+    let (l, s) = stores.stores(&1).unwrap();
     assert!(matches!(
-      coord.rollback_merge(&2, now, l, s, &1).unwrap(),
+      coord.rollback_merge(&1, now, l, s, &2).unwrap(),
       Err(crate::MergeError::SourceMissing)
     ));
   }
   assert!(
-    coord.group(&2).is_some_and(|ep| !ep.has_abandoned()),
+    coord.group(&1).is_some_and(|ep| !ep.has_abandoned()),
     "no abort applied — the target records no thaw obligation"
   );
 }
@@ -2558,40 +2558,40 @@ fn coordinator_teardown_inherits_the_participant_gate_without_tombstoning() {
   let now = Instant::ORIGIN;
   // Freeze 1 into 2 and park 2 THROUGH the coordinator.
   coord
-    .prepare_merge(&1, now, &mut stores, &2, &NoFloors)
+    .prepare_merge(&2, now, &mut stores, &1, &NoFloors)
     .unwrap()
     .unwrap();
   {
-    let (l, s) = stores.stores(&1).unwrap();
-    coord.handle_storage(&1, now, l, s).unwrap();
-  }
-  assert!(coord.group(&1).unwrap().is_frozen());
-  {
     let (l, s) = stores.stores(&2).unwrap();
-    coord
-      .commit_merge(&2, now, l, s, &1, &NoFloors)
-      .unwrap()
-      .unwrap();
     coord.handle_storage(&2, now, l, s).unwrap();
   }
-  assert!(coord.group(&2).unwrap().pending_merge().is_some());
+  assert!(coord.group(&2).unwrap().is_frozen());
+  {
+    let (l, s) = stores.stores(&1).unwrap();
+    coord
+      .commit_merge(&1, now, l, s, &2, &NoFloors)
+      .unwrap()
+      .unwrap();
+    coord.handle_storage(&1, now, l, s).unwrap();
+  }
+  assert!(coord.group(&1).unwrap().pending_merge().is_some());
 
   // THE DOOR inherits the container gate verbatim — the new variants surface through the delegator.
   assert!(matches!(
-    coord.remove_group(&1, &mut stores),
+    coord.remove_group(&2, &mut stores),
     Err(crate::RemoveError::Frozen)
   ));
   assert!(matches!(
-    coord.remove_group(&2, &mut stores),
+    coord.remove_group(&1, &mut stores),
     Err(crate::RemoveError::MergeParked)
   ));
   // NO SIDE STATE: neither id was tombstoned, and both stay hosted for the retry.
   assert!(
-    coord.group(&1).is_some() && !coord.is_retired(&1),
+    coord.group(&2).is_some() && !coord.is_retired(&2),
     "the frozen source is left intact and un-tombstoned"
   );
   assert!(
-    coord.group(&2).is_some() && !coord.is_retired(&2),
+    coord.group(&1).is_some() && !coord.is_retired(&1),
     "the parked target is left intact and un-tombstoned"
   );
 }

@@ -1928,6 +1928,14 @@ where
   /// Floor refusals (`MergeError::BelowFloor`) are the COORDINATOR delegators' leg through
   /// their per-call floor seam, and `CrossPlane` the sharded handle's — the container stays
   /// floor- and plane-free, exactly as it is for splits.
+  ///
+  /// DIRECTION: a claim must point strictly DOWN the fixed total order over ids — the source must
+  /// encode STRICTLY ABOVE the target ([`DirectionInverted`](MergeError::DirectionInverted)), so
+  /// the encoding-minimal id of any pair is the target/survivor. Orient each pair (source = the
+  /// encoding-larger side) before proposing; this makes a claim cycle unconstructible. Admission is
+  /// otherwise optimistically concurrent — these propose gates are truthful LOCAL refusals, not a
+  /// serializer; overlapping admissions at different leaders are safe but may resolve deterministically
+  /// against you, and a refusal error must never be used as a mutual-exclusion primitive.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn prepare_merge<L, S, St>(
     &mut self,
@@ -1946,6 +1954,21 @@ where
     }
     if source == target {
       return Some(Err(MergeError::SelfMerge));
+    }
+    // THE DIRECTION RULE — a constant-vs-constant STRUCTURAL refusal, so it sits with the earliest
+    // gates. A merge claim must point strictly DOWN the fixed total order over ids: the source must
+    // encode STRICTLY ABOVE the target (their canonical `Data` encodings compared as byte strings).
+    // Every edge then strictly decreases one total order, so a claim cycle (A→B→…→A) is
+    // UNCONSTRUCTIBLE — the property that keeps concurrently-admitted freezes at different leaders
+    // from deadlocking every release valve `AlreadyFrozen`. The ids never move, so this verdict is
+    // truthful ahead of every state-dependent gate; the embedder orients each pair before proposing.
+    // Both encodings are reused below (the target for the claim payload; the pair to compare here).
+    let mut source_bytes = Vec::new();
+    source.encode(&mut source_bytes);
+    let mut target_bytes = Vec::new();
+    target.encode(&mut target_bytes);
+    if source_bytes <= target_bytes {
+      return Some(Err(MergeError::DirectionInverted));
     }
     let Some(tep) = self.groups.get(target) else {
       return Some(Err(MergeError::TargetMissing));
@@ -2053,8 +2076,7 @@ where
     if self.some_source_claims_target(source, stores) {
       return Some(Err(MergeError::SourceClaimedAsTarget));
     }
-    let mut target_bytes = Vec::new();
-    target.encode(&mut target_bytes);
+    // `target_bytes` is the encoding computed for the direction rule above — the claim payload.
     let payload = PrepareMergePayload::new(Bytes::from(target_bytes), source_gen_after);
     let mut buf = Vec::new();
     crate::wire::encode_prepare_merge_payload(&payload, &mut buf);

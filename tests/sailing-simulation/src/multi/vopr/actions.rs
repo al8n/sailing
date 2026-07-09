@@ -464,13 +464,20 @@ pub(super) fn prepare_merge_action(
 ) {
   prune_merge_book(w, st);
   let live: Vec<u64> = w.live_groups();
+  // ORIENT every pair down the id order: the direction rule refuses a claim unless the source's
+  // canonical `Data` encoding sorts strictly ABOVE the target's, so pairing arbitrarily would let
+  // half of every draw refuse `DirectionInverted` and halve merge coverage. `u64`'s `Data` encoding
+  // is `to_le_bytes`, so this compares the exact byte strings the container does. Keeping only the
+  // oriented direction of each unordered pair (source encodes above target) covers the same
+  // mergeable pairs, one canonical orientation each.
   let candidates: Vec<(u64, u64)> = live
     .iter()
-    .flat_map(|&s| live.iter().map(move |&t| (s, t)))
-    .filter(|&(s, t)| s != t && !st.pending_merges.contains_key(&s))
-    .filter(|&(s, t)| {
-      let sv = w.group_voters(s);
-      !sv.is_empty() && sv == w.group_voters(t)
+    .flat_map(|&a| live.iter().map(move |&b| (a, b)))
+    .filter(|&(source, target)| source.to_le_bytes() > target.to_le_bytes())
+    .filter(|&(source, _)| !st.pending_merges.contains_key(&source))
+    .filter(|&(source, target)| {
+      let sv = w.group_voters(source);
+      !sv.is_empty() && sv == w.group_voters(target)
     })
     .collect();
   if candidates.is_empty() {

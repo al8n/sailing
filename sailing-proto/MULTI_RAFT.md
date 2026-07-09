@@ -188,6 +188,17 @@ remove the learners on both sides first. Boot-config observers never enter a com
 configuration, so they are exempt. Both `prepare_merge` and `commit_merge` refuse with
 `MergeError::LearnersPresent`.
 
+**Direction rule (claims point strictly down the id order).** A claim must point strictly DOWN a
+fixed total order over ids: `prepare_merge` refuses (`MergeError::DirectionInverted`) unless the
+source's canonical `Data` encoding sorts STRICTLY ABOVE the target's. The encoding-minimal id of any
+pair is therefore always the target/survivor, and because every claim edge strictly decreases one
+total order, a claim CYCLE (A→B→…→A) is UNCONSTRUCTIBLE — the property that keeps concurrently-admitted
+freezes at different leaders from deadlocking every release valve with mutual `AlreadyFrozen`. This is
+a constant property of the id pair (race-immune, never self-clearing); the embedder orients each pair
+(source = the encoding-larger side) before proposing. Admission is otherwise optimistically concurrent
+— the propose gates are truthful LOCAL refusals, not a serializer — and refusal errors must never be
+used as a mutual-exclusion primitive.
+
 - **`PrepareMerge` (the source's log)** freezes the source. The lease SAFETY gate moves even
   earlier than apply — to APPEND observation of the entry (`freeze_pending`, a kind check on
   the hot path): every lease-serve and lease-formation gate fails closed the moment the freeze

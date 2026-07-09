@@ -321,6 +321,17 @@ pub enum MergeError<I> {
   /// The source and target are the same group. A group cannot absorb itself.
   #[error("a group cannot merge into itself")]
   SelfMerge,
+  /// The claim points the WRONG way along the fixed total order over ids: a merge claim must
+  /// point strictly DOWN it, so the source's canonical [`Data`](crate::Data) encoding must sort
+  /// STRICTLY ABOVE the target's (their encoded byte strings compared with `Ord`). Because every
+  /// edge strictly decreases one total order, a claim cycle (A→B→…→A) is UNCONSTRUCTIBLE — no
+  /// cycle can strictly decrease all the way around — which is what keeps concurrently-admitted
+  /// freezes at different leaders from deadlocking every release valve. The encoding-minimal id of
+  /// any pair is therefore always the target/survivor; the embedder orients each pair (source =
+  /// the encoding-larger side) before proposing. This is a property of the id PAIR, not of any
+  /// mutable state, so it never self-clears — re-pair with the roles swapped.
+  #[error("the merge claim is inverted: the source must encode strictly above the target")]
+  DirectionInverted,
   /// `prepare_merge`'s target group is not hosted by this container. The preconditions compare
   /// the two groups' LOCAL replicas (voter sets, read modes), so the target must live here —
   /// which colocation guarantees for every legitimate pairing.

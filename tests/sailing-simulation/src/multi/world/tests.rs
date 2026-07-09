@@ -1891,51 +1891,51 @@ fn partition_exempts_an_owned_unwritten_key_a_union_carried_into_the_child() {
     w.add_node(n);
   }
   let all: BTreeSet<u64> = (0..3).collect();
-  w.create_group(100, &all);
-  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
-  w.reconcile_membership(100);
+  w.create_group(200, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(200).is_some()));
+  w.reconcile_membership(200);
   // Write ONLY keys 4..=7 — the parent keeps 0..=3 in its population but never writes key 0.
   for key in 4u16..8 {
     propose_until_accepted(
       &mut w,
-      100,
-      &crate::multi::encode_gkv(100, key, u64::from(key)),
+      200,
+      &crate::multi::encode_gkv(200, key, u64::from(key)),
     );
   }
   assert!(w.run_until(2_000, |w| {
-    w.leader_of(100)
-      .is_some_and(|l| w.applied_of(l, 100).len() >= 4)
+    w.leader_of(200)
+      .is_some_and(|l| w.applied_of(l, 200).len() >= 4)
   }));
 
   // Split keys 4..=7 to the child; 0..=3 stay on the parent, key 0 still unwritten.
-  propose_split_until_accepted(&mut w, 100, 200, 4);
-  assert_eq!(w.group_keys_of(100), std::vec![0, 1, 2, 3]);
-  assert!(w.run_until(3_000, |w| w.leader_of(200).is_some()));
-  assert_eq!(w.group_keys_of(200), std::vec![4, 5, 6, 7]);
+  propose_split_until_accepted(&mut w, 200, 100, 4);
+  assert_eq!(w.group_keys_of(200), std::vec![0, 1, 2, 3]);
+  assert!(w.run_until(3_000, |w| w.leader_of(100).is_some()));
+  assert_eq!(w.group_keys_of(100), std::vec![4, 5, 6, 7]);
 
   // The parent MERGES BACK into its own child (voter sets align by construction): the child
   // absorbs the whole parent population, key 0 included. Colocate the parent's leadership onto
   // the child's leader first, so the commit barrier reads the source off the target's leader.
-  colocate_source_onto_target(&mut w, 100, 200);
+  colocate_source_onto_target(&mut w, 200, 100);
   merge_verb_until_accepted(&mut w, 3_000, "the freeze", |w| {
-    w.propose_prepare_merge(100, 200)
+    w.propose_prepare_merge(200, 100)
   });
   merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
-    w.propose_commit_merge(200, 100)
+    w.propose_commit_merge(100, 200)
   });
   assert!(
-    w.run_until(8_000, |w| !w.live_groups().contains(&100)),
+    w.run_until(8_000, |w| !w.live_groups().contains(&200)),
     "the parent absorbs into its child"
   );
   assert_eq!(w.merges_registered(), 1);
 
   // The child now OWNS key 0 and writes it for the first time anywhere.
-  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 0, 900));
+  propose_until_accepted(&mut w, 100, &crate::multi::encode_gkv(100, 0, 900));
   assert!(w.run_until(2_000, |w| {
-    w.leader_of(200).is_some_and(|l| {
-      w.applied_of(l, 200)
+    w.leader_of(100).is_some_and(|l| {
+      w.applied_of(l, 100)
         .iter()
-        .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 0, 900)))
+        .any(|(_, c)| crate::multi::decode_gkv(c) == Some((100, 0, 900)))
     })
   }));
 
@@ -1999,17 +1999,17 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
     w.add_node(n);
   }
   let all: BTreeSet<u64> = (0..3).collect();
-  w.create_group(10, &all); // S — the claiming source
+  w.create_group(12, &all); // S — the claiming source
   w.create_group(11, &all); // T — S's claimed target
-  w.create_group(12, &all); // T2 — the target T tries to dissolve into
+  w.create_group(10, &all); // T2 — the target T tries to dissolve into
   assert!(w.run_until(3_000, |w| {
-    w.leader_of(10).is_some() && w.leader_of(11).is_some() && w.leader_of(12).is_some()
+    w.leader_of(12).is_some() && w.leader_of(11).is_some() && w.leader_of(10).is_some()
   }));
   for key in 0u16..2 {
     propose_until_accepted(
       &mut w,
-      10,
-      &crate::multi::encode_gkv(10, key, u64::from(key)),
+      12,
+      &crate::multi::encode_gkv(12, key, u64::from(key)),
     );
     propose_until_accepted(
       &mut w,
@@ -2019,9 +2019,9 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
   }
 
   // S freezes claiming T (leadership colocated so the commit barrier reads off one host).
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 12, 11);
   merge_verb_until_accepted(&mut w, 3_000, "the claiming freeze", |w| {
-    w.propose_prepare_merge(10, 11)
+    w.propose_prepare_merge(12, 11)
   });
 
   // THE GATE: T is a claimed target — its own freeze refuses while the claim stands. Equal
@@ -2029,7 +2029,7 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
   // (applied or still append-pending) and the refusal needs no settling.
   assert!(
     matches!(
-      w.propose_prepare_merge(11, 12),
+      w.propose_prepare_merge(11, 10),
       Some(Err(sailing_proto::MergeError::SourceClaimedAsTarget))
     ),
     "a claimed target must refuse source-role while the claim stands"
@@ -2037,20 +2037,20 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
 
   // S's choreography resolves normally: T absorbs S.
   merge_verb_until_accepted(&mut w, 4_000, "the claiming commit", |w| {
-    w.propose_commit_merge(11, 10)
+    w.propose_commit_merge(11, 12)
   });
   assert!(
-    w.run_until(8_000, |w| !w.live_groups().contains(&10)),
+    w.run_until(8_000, |w| !w.live_groups().contains(&12)),
     "S absorbs into T"
   );
 
   // The claim dissolved with S: T now freezes into T2 freely and merges onward.
-  colocate_source_onto_target(&mut w, 11, 12);
+  colocate_source_onto_target(&mut w, 11, 10);
   merge_verb_until_accepted(&mut w, 3_000, "the freed freeze", |w| {
-    w.propose_prepare_merge(11, 12)
+    w.propose_prepare_merge(11, 10)
   });
   merge_verb_until_accepted(&mut w, 4_000, "the freed commit", |w| {
-    w.propose_commit_merge(12, 11)
+    w.propose_commit_merge(10, 11)
   });
   assert!(
     w.run_until(8_000, |w| !w.live_groups().contains(&11)),
@@ -2060,20 +2060,104 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
   // NOTHING STRANDED: the absorbed lineages dismantle everywhere and the union is not frozen.
   assert!(
     w.run_until(8_000, |w| {
-      (0..3u64).all(|n| w.hosts[&n].group(&10).is_none() && w.hosts[&n].group(&11).is_none())
+      (0..3u64).all(|n| w.hosts[&n].group(&12).is_none() && w.hosts[&n].group(&11).is_none())
     }),
     "the absorbed lineages dismantle on every host — nothing lingers frozen"
   );
   for n in 0..3u64 {
     assert!(
       w.hosts[&n]
-        .group(&12)
+        .group(&10)
         .is_none_or(|ep| !sailing_proto::Endpoint::is_frozen(ep)),
       "the surviving union is not frozen on n{n}"
     );
   }
   assert_eq!(w.merges_registered(), 2, "both merges resolved as absorbs");
   w.finalize_merge_conservation_or_panic(13);
+}
+
+/// A 2-CYCLE IS UNCONSTRUCTIBLE. The direction rule refuses the wrong-direction claim at propose
+/// (`DirectionInverted`), so two equal-voter groups can never both freeze claiming EACH OTHER — the
+/// mutual-`AlreadyFrozen` deadlock (every release valve wedged) this batch closed. The verdict is a
+/// constant of the id pair, decided locally with no network round, so it holds under any concurrent
+/// admission pressure. RED (stash the direction hunk): both freezes admit and each group is frozen
+/// claiming the other, with no valve to release either.
+#[test]
+fn no_two_cycle_can_form_under_concurrent_admission() {
+  let mut w = MultiWorld::new(51);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(20, &all);
+  w.create_group(21, &all);
+  assert!(w.run_until(3_000, |w| w.leader_of(20).is_some()
+    && w.leader_of(21).is_some()));
+  // The UP-order claim (encoding-smaller source) refuses TYPED, independent of the network — a
+  // constant of the pair. This is the leg that makes the 2-cycle unconstructible.
+  assert!(
+    matches!(
+      w.propose_prepare_merge(20, 21),
+      Some(Err(sailing_proto::MergeError::DirectionInverted))
+    ),
+    "the up-order claim refuses DirectionInverted"
+  );
+  // The oriented (down-order) claim is the only admissible one; only one side can ever freeze.
+  colocate_source_onto_target(&mut w, 21, 20);
+  merge_verb_until_accepted(&mut w, 3_000, "the oriented freeze", |w| {
+    w.propose_prepare_merge(21, 20)
+  });
+  assert!(
+    !w.group_frozen(20),
+    "the target never froze claiming the source — no mutual freeze, no 2-cycle"
+  );
+  // The reverse claim STILL refuses by direction (checked ahead of every state gate).
+  assert!(
+    matches!(
+      w.propose_prepare_merge(20, 21),
+      Some(Err(sailing_proto::MergeError::DirectionInverted))
+    ),
+    "the reverse claim stays refused — the cycle can never close"
+  );
+}
+
+/// A 3-CYCLE IS UNCONSTRUCTIBLE. A cycle needs every edge to strictly DECREASE one total order, which
+/// none can close: over three equal-voter groups the two up-order edges of the cyclic claim set
+/// 10→11→12→10 refuse `DirectionInverted` at propose, and only the single down-order edge (12→10) is
+/// admissible. Whatever the schedule (even a host that admitted an earlier edge without observing the
+/// others), the closing up-order edge is refused — so the deadlock-every-valve cycle cannot form.
+#[test]
+fn no_three_cycle_can_form() {
+  let mut w = MultiWorld::new(53);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  for g in [10u64, 11, 12] {
+    w.create_group(g, &all);
+  }
+  assert!(w.run_until(3_000, |w| {
+    [10u64, 11, 12].iter().all(|&g| w.leader_of(g).is_some())
+  }));
+  // Two of the three cyclic edges point UP the order — both refuse DirectionInverted (a local
+  // constant), so the cycle can never close no matter which host proposes which edge when.
+  assert!(matches!(
+    w.propose_prepare_merge(10, 11),
+    Some(Err(sailing_proto::MergeError::DirectionInverted))
+  ));
+  assert!(matches!(
+    w.propose_prepare_merge(11, 12),
+    Some(Err(sailing_proto::MergeError::DirectionInverted))
+  ));
+  // Only the single DOWN-order edge is admissible; the cycle has no closing edge.
+  colocate_source_onto_target(&mut w, 12, 10);
+  merge_verb_until_accepted(&mut w, 3_000, "the one down-order edge", |w| {
+    w.propose_prepare_merge(12, 10)
+  });
+  assert!(
+    w.run_until(3_000, |w| w.group_frozen(12)),
+    "only the down-order claim froze — no cyclic claim set could form"
+  );
 }
 
 /// THE COMMIT BARRIER ELIMINATES THE CROSS-HOST ROLLBACK RACE. The source cannot dissolve until
@@ -2091,42 +2175,42 @@ fn merge_rollback_race_decides_identically_across_hosts() {
     w.add_node(n);
   }
   let all: BTreeSet<u64> = (0..3).collect();
-  w.create_group(10, &all); // source
-  w.create_group(11, &all); // target
+  w.create_group(11, &all); // source
+  w.create_group(10, &all); // target
   assert!(w.run_until(2_000, |w| {
-    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+    w.leader_of(11).is_some() && w.leader_of(10).is_some()
   }));
   for i in 0..2u8 {
-    assert!(w.run_until(500, |w| w.leader_of(10).is_some()));
+    assert!(w.run_until(500, |w| w.leader_of(11).is_some()));
     let gid_cmd = [b's', i];
-    w.propose(10, &gid_cmd);
-    let gid_cmd = [b't', i];
     w.propose(11, &gid_cmd);
+    let gid_cmd = [b't', i];
+    w.propose(10, &gid_cmd);
     w.run_until(200, |_| false);
   }
   // The barrier is read off the source LEADER, which must sit on the target's leader.
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 11, 10);
 
   // Lag one host's SOURCE replica only (a host leading neither group, so the freeze still commits
   // and the colocated leader still reaches the boundary): the freeze will not reach it until the
-  // heal. Only group 10 is muted, so the target's leadership — the colocation anchor — never moves.
+  // heal. Only group 11 is muted, so the target's leadership — the colocation anchor — never moves.
   let lagged = (0..3u64)
-    .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
+    .find(|n| Some(*n) != w.leader_of(11) && Some(*n) != w.leader_of(10))
     .expect("three nodes, at most two leaders");
   for n in 0..3 {
     if n != lagged {
-      w.mute_group(n, lagged, 10);
-      w.mute_group(lagged, n, 10);
+      w.mute_group(n, lagged, 11);
+      w.mute_group(lagged, n, 11);
     }
   }
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
-    w.propose_prepare_merge(10, 11)
+    w.propose_prepare_merge(11, 10)
   });
   assert!(
     w.run_until(4_000, |w| {
       (0..3).filter(|&n| n != lagged).all(|n| {
         w.hosts[&n]
-          .group(&10)
+          .group(&11)
           .is_some_and(sailing_proto::Endpoint::is_frozen)
       })
     }),
@@ -2134,7 +2218,7 @@ fn merge_rollback_race_decides_identically_across_hosts() {
   );
   assert!(
     !w.hosts[&lagged]
-      .group(&10)
+      .group(&11)
       .is_some_and(sailing_proto::Endpoint::is_frozen),
     "the lagged source replica must not have seen the freeze"
   );
@@ -2144,22 +2228,22 @@ fn merge_rollback_race_decides_identically_across_hosts() {
   // with a voter still behind, and there is no committed coordinate for the hosts to split over.
   assert!(
     matches!(
-      w.propose_commit_merge(11, 10),
+      w.propose_commit_merge(10, 11),
       Some(Err(sailing_proto::MergeError::SourceBarrierPending))
     ),
     "the commit is refused while a source voter lags the freeze"
   );
 
-  // Heal: the lagged voter catches up, the (idempotent) colocation re-settles group 10 onto the
+  // Heal: the lagged voter catches up, the (idempotent) colocation re-settles group 11 onto the
   // still-stable target leader, and the commit admits — then the abort races onto the very next
   // slot BEFORE any tick can seal (the leader accepted the commit, so its gates pass here too).
   w.unmute_all();
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 11, 10);
   merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
-    w.propose_commit_merge(11, 10)
+    w.propose_commit_merge(10, 11)
   });
   assert!(
-    matches!(w.propose_rollback_merge(11, 10), Some(Ok(_))),
+    matches!(w.propose_rollback_merge(10, 11), Some(Ok(_))),
     "the abort races onto the coordinate right after the commit"
   );
 
@@ -2169,32 +2253,32 @@ fn merge_rollback_race_decides_identically_across_hosts() {
     w.run_until(6_000, |w| {
       (0..3).all(|n| {
         w.hosts[&n]
-          .group(&10)
+          .group(&11)
           .is_some_and(|ep| !ep.is_frozen() && ep.shape_gen() == 2)
           && w.hosts[&n]
-            .group(&11)
+            .group(&10)
             .is_some_and(|ep| ep.pending_merge().is_none() && ep.shape_gen() == 1)
       })
     }),
     "every host un-parks aborted and the relayed thaw lands everywhere"
   );
   assert_eq!(w.merges_registered(), 0, "nothing absorbed anywhere");
-  assert!(w.agreement_holds(10) && w.agreement_holds(11));
+  assert!(w.agreement_holds(11) && w.agreement_holds(10));
 
   // The state is clean enough to merge for real: the same pair completes end to end.
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 11, 10);
   merge_verb_until_accepted(&mut w, 2_000, "the fresh freeze", |w| {
-    w.propose_prepare_merge(10, 11)
+    w.propose_prepare_merge(11, 10)
   });
   merge_verb_until_accepted(&mut w, 4_000, "the fresh commit", |w| {
-    w.propose_commit_merge(11, 10)
+    w.propose_commit_merge(10, 11)
   });
   assert!(
-    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 10))),
+    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 11))),
     "the second attempt absorbs on every host"
   );
   assert_eq!(w.merges_registered(), 1);
-  assert!(w.is_merged(10), "the source id is terminally merged away");
+  assert!(w.is_merged(11), "the source id is terminally merged away");
 }
 
 /// THE LATE ABORT NO-OPS AFTER THE SEAL, and the barrier keeps the seal honest. A source voter
@@ -2209,32 +2293,32 @@ fn merge_late_abort_no_ops_and_every_host_absorbs() {
     w.add_node(n);
   }
   let all: BTreeSet<u64> = (0..3).collect();
-  w.create_group(10, &all);
   w.create_group(11, &all);
+  w.create_group(10, &all);
   assert!(w.run_until(2_000, |w| {
-    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+    w.leader_of(11).is_some() && w.leader_of(10).is_some()
   }));
-  w.propose(10, b"s0");
-  w.propose(11, b"t0");
+  w.propose(11, b"s0");
+  w.propose(10, b"t0");
   w.run_until(200, |_| false);
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 11, 10);
 
   let lagged = (0..3u64)
-    .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
+    .find(|n| Some(*n) != w.leader_of(11) && Some(*n) != w.leader_of(10))
     .expect("three nodes, at most two leaders");
   for n in 0..3 {
     if n != lagged {
-      w.mute_group(n, lagged, 10);
-      w.mute_group(lagged, n, 10);
+      w.mute_group(n, lagged, 11);
+      w.mute_group(lagged, n, 11);
     }
   }
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
-    w.propose_prepare_merge(10, 11)
+    w.propose_prepare_merge(11, 10)
   });
   assert!(w.run_until(4_000, |w| {
     (0..3).filter(|&n| n != lagged).all(|n| {
       w.hosts[&n]
-        .group(&10)
+        .group(&11)
         .is_some_and(sailing_proto::Endpoint::is_frozen)
     })
   }));
@@ -2242,7 +2326,7 @@ fn merge_late_abort_no_ops_and_every_host_absorbs() {
   // straggler, so no half-sealed window exists for a late abort to race into divergence.
   assert!(
     matches!(
-      w.propose_commit_merge(11, 10),
+      w.propose_commit_merge(10, 11),
       Some(Err(sailing_proto::MergeError::SourceBarrierPending))
     ),
     "the commit is refused while a source voter lags the freeze"
@@ -2251,9 +2335,9 @@ fn merge_late_abort_no_ops_and_every_host_absorbs() {
   // Heal, re-colocate, and let the commit admit; run until the absorb has begun somewhere (a
   // first resolution) — the window is sealed and the merge is past its last abortable coordinate.
   w.unmute_all();
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 11, 10);
   merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
-    w.propose_commit_merge(11, 10)
+    w.propose_commit_merge(10, 11)
   });
   assert!(
     w.run_until(6_000, |w| w.merges_registered() >= 1),
@@ -2261,15 +2345,15 @@ fn merge_late_abort_no_ops_and_every_host_absorbs() {
   );
   // The late abort: wherever it is still proposable it lands ABOVE the seal and must no-op;
   // where the local view already resolved, it refuses typed. Either way it changes nothing.
-  let late = w.propose_rollback_merge(11, 10);
+  let late = w.propose_rollback_merge(10, 11);
   assert!(late.is_some(), "the target group is still hosted somewhere");
   assert!(
-    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 10))),
+    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 11))),
     "every host absorbs — the sealed merge was irrevocable"
   );
   assert_eq!(w.merges_registered(), 1, "one absorb, registered once");
-  assert!(w.is_merged(10));
-  assert!(w.agreement_holds(11));
+  assert!(w.is_merged(11));
+  assert!(w.agreement_holds(10));
 }
 
 /// The lifecycle churn's "spoken for" predicate tracks a choreography end to end: the source
@@ -2284,61 +2368,61 @@ fn choreography_participants_read_active_until_resolution() {
     w.add_node(n);
   }
   let all: BTreeSet<u64> = (0..3).collect();
-  w.create_group(10, &all); // source
-  w.create_group(11, &all); // target
+  w.create_group(11, &all); // source
+  w.create_group(10, &all); // target
   w.create_group(12, &all); // bystander
   assert!(w.run_until(3_000, |w| {
-    w.leader_of(10).is_some() && w.leader_of(11).is_some() && w.leader_of(12).is_some()
+    w.leader_of(11).is_some() && w.leader_of(10).is_some() && w.leader_of(12).is_some()
   }));
   assert!(
-    !w.merge_choreography_active(10) && !w.merge_choreography_active(11),
+    !w.merge_choreography_active(11) && !w.merge_choreography_active(10),
     "no choreography yet — everything is drawable"
   );
   // Colocate before the freeze so the commit barrier reads the source off the target's leader; a
   // bare leadership transfer speaks for nobody, so the choreography predicate stays quiet.
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 11, 10);
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
-    w.propose_prepare_merge(10, 11)
+    w.propose_prepare_merge(11, 10)
   });
   assert!(
-    w.merge_choreography_active(10),
+    w.merge_choreography_active(11),
     "an accepted (still unapplied) freeze already speaks for the source"
   );
   assert!(
-    w.merge_choreography_active(11),
-    "the freeze already CLAIMS target 11 (pre-park, append-pending) — the mirror leg keeps it \
+    w.merge_choreography_active(10),
+    "the freeze already CLAIMS target 10 (pre-park, append-pending) — the mirror leg keeps it \
      undrawable, so a removal never trips the container's Claimed gate"
   );
   assert!(
     !w.merge_choreography_active(12),
     "the bystander 12 is claimed by no freeze"
   );
-  assert!(w.run_until(4_000, |w| w.group_frozen(10)));
+  assert!(w.run_until(4_000, |w| w.group_frozen(11)));
   assert!(
-    w.merge_choreography_active(10),
+    w.merge_choreography_active(11),
     "a frozen source stays spoken for"
   );
   assert!(
-    w.merge_choreography_active(11),
-    "the APPLIED freeze still claims 11 through to the commit — no gap in the mirror leg"
+    w.merge_choreography_active(10),
+    "the APPLIED freeze still claims 10 through to the commit — no gap in the mirror leg"
   );
   merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
-    w.propose_commit_merge(11, 10)
+    w.propose_commit_merge(10, 11)
   });
   assert!(
-    w.merge_choreography_active(11),
+    w.merge_choreography_active(10),
     "an accepted commit speaks for the target through park and resolution"
   );
   assert!(
-    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 10))),
+    w.run_until(8_000, |w| (0..3).all(|n| !w.hosts_group(n, 11))),
     "the merge resolves on every host"
   );
   assert!(
-    !w.merge_choreography_active(11),
+    !w.merge_choreography_active(10),
     "a fully resolved target is drawable again"
   );
   assert!(
-    !w.merge_choreography_active(10),
+    !w.merge_choreography_active(11),
     "an absorbed source is past its choreography (and terminally merged besides)"
   );
   assert!(
@@ -2361,37 +2445,37 @@ fn a_virgin_non_member_on_a_frozen_participant_world_parks() {
     w.add_node(n);
   }
   let voters: BTreeSet<u64> = (0..3).collect();
-  w.create_group(10, &voters); // the merge source
-  w.create_group(11, &voters); // its target
-  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
-    && w.leader_of(11).is_some()));
+  w.create_group(11, &voters); // the merge source
+  w.create_group(10, &voters); // its target
+  assert!(w.run_until(3_000, |w| w.leader_of(11).is_some()
+    && w.leader_of(10).is_some()));
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
-    w.propose_prepare_merge(10, 11)
+    w.propose_prepare_merge(11, 10)
   });
-  assert!(w.run_until(4_000, |w| w.group_frozen(10)));
+  assert!(w.run_until(4_000, |w| w.group_frozen(11)));
   assert!(
-    w.merge_choreography_active(10),
+    w.merge_choreography_active(11),
     "the grow draw's gate reads the source active across this whole window"
   );
   // Wire the virgin non-member the ungated grow draw would have added.
-  w.wire_group_observer(10, 3);
+  w.wire_group_observer(11, 3);
   assert!(
-    !w.parked.contains(&(3, 10)),
+    !w.parked.contains(&(3, 11)),
     "freshly wired, not yet judged"
   );
   // The departed sweep parks a hosting non-member once its absent-streak passes the grace.
   for _ in 0..8 {
-    w.reconcile_membership(10);
-    if w.parked.contains(&(3, 10)) {
+    w.reconcile_membership(11);
+    if w.parked.contains(&(3, 11)) {
       break;
     }
   }
   assert!(
-    w.parked.contains(&(3, 10)),
+    w.parked.contains(&(3, 11)),
     "with no applied membership, the departed sweep world-parks the virgin non-member"
   );
   assert!(
-    w.merge_choreography_active(10),
+    w.merge_choreography_active(11),
     "the window is still open — the gate would have skipped the wire for all of it"
   );
 }
@@ -2416,9 +2500,10 @@ fn a_virgin_non_member_on_a_frozen_participant_world_parks() {
 /// leader (clearing the `SourceOwesThaw` gate) and every host must resolve the absorb, node 2 too.
 #[test]
 fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
-  const U: u64 = 30;
+  // Ids chosen so each claim points down the id order: U (source) > S > T (final target).
+  const U: u64 = 32;
   const S: u64 = 31;
-  const T: u64 = 32;
+  const T: u64 = 30;
   let mut w = MultiWorld::new(9);
   for n in 0..3 {
     w.add_node(n);
@@ -2539,8 +2624,9 @@ fn a_dead_end_obligation_does_not_wedge_a_co_hosted_absorb() {
 /// state and the source is not among them, its floor intact.
 #[test]
 fn a_dissolved_husk_does_not_resurrect_across_a_crash() {
-  const S: u64 = 40;
-  const T: u64 = 41;
+  // The source encodes above the target so the freeze claim points down the id order.
+  const S: u64 = 41;
+  const T: u64 = 40;
   let mut w = MultiWorld::new(11);
   w.add_node(0);
   let solo: BTreeSet<u64> = [0].into_iter().collect();
@@ -2619,25 +2705,25 @@ fn drive_merge_to_full_resolution(seed: u64, source: u64, target: u64) -> MultiW
 /// restorable on every host forever.
 #[test]
 fn merge_teardown_records_floors_and_drops_source_stores() {
-  let mut w = drive_merge_to_full_resolution(17, 10, 11);
+  let mut w = drive_merge_to_full_resolution(17, 11, 10);
   assert!(
     w.run_until(2_000, |w| w.pending_merge_teardowns.is_empty()),
     "every staged teardown completes"
   );
   for n in 0..3u64 {
     assert!(
-      w.merge_floors.contains(&(n, 10)),
+      w.merge_floors.contains(&(n, 11)),
       "node {n}: the terminal merge floor is recorded"
     );
     assert!(
-      !w.logs.contains_key(&(n, 10)) && !w.stables.contains_key(&(n, 10)),
+      !w.logs.contains_key(&(n, 11)) && !w.stables.contains_key(&(n, 11)),
       "node {n}: the absorbed source's stores are dropped"
     );
-    assert!(!w.hosts_group(n, 10));
+    assert!(!w.hosts_group(n, 11));
   }
   assert_eq!(w.merges_resolved(), 3);
   assert_eq!(w.merges_registered(), 1);
-  assert!(w.is_merged(10));
+  assert!(w.is_merged(11));
   w.check_now();
   w.finalize_merge_conservation_or_panic(17);
 }
@@ -2649,7 +2735,7 @@ fn merge_teardown_records_floors_and_drops_source_stores() {
 /// registry walk away from a zombie frozen replica.
 #[test]
 fn crash_after_full_absorb_does_not_restore_the_source() {
-  let mut w = drive_merge_to_full_resolution(17, 10, 11);
+  let mut w = drive_merge_to_full_resolution(17, 11, 10);
   assert!(
     w.run_until(2_000, |w| w.pending_merge_teardowns.is_empty()),
     "every staged teardown completes"
@@ -2657,21 +2743,21 @@ fn crash_after_full_absorb_does_not_restore_the_source() {
   for n in 0..3u64 {
     w.crash(n);
     assert!(
-      !w.hosts_group(n, 10),
+      !w.hosts_group(n, 11),
       "node {n}: the crash must not rebuild the absorbed source"
     );
     assert!(
-      !w.logs.contains_key(&(n, 10)) && !w.stables.contains_key(&(n, 10)),
+      !w.logs.contains_key(&(n, 11)) && !w.stables.contains_key(&(n, 11)),
       "node {n}: no source stores survive to restore from"
     );
-    assert!(w.hosts_group(n, 11), "node {n}: the target restores");
+    assert!(w.hosts_group(n, 10), "node {n}: the target restores");
   }
-  assert!(!w.group_frozen(10), "no zombie frozen source replica");
+  assert!(!w.group_frozen(11), "no zombie frozen source replica");
   // The restored union keeps serving: fresh load commits and applies on every host.
-  assert!(w.run_until(4_000, |w| w.leader_of(11).is_some()));
+  assert!(w.run_until(4_000, |w| w.leader_of(10).is_some()));
   let mut idx = None;
   for _ in 0..2_000 {
-    if let Some(i) = w.propose(11, b"t9") {
+    if let Some(i) = w.propose(10, b"t9") {
       idx = Some(i);
       break;
     }
@@ -2682,7 +2768,7 @@ fn crash_after_full_absorb_does_not_restore_the_source() {
     w.run_until(4_000, |w| {
       (0..3).all(|n| {
         w.hosts[&n]
-          .group(&11)
+          .group(&10)
           .is_some_and(|ep| ep.applied_index() >= idx)
       })
     }),
@@ -2708,31 +2794,31 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
     w.add_node(n);
   }
   let all: BTreeSet<u64> = (0..3).collect();
-  w.create_group(10, &all);
   w.create_group(11, &all);
+  w.create_group(10, &all);
   assert!(w.run_until(2_000, |w| {
-    w.leader_of(10).is_some() && w.leader_of(11).is_some()
+    w.leader_of(11).is_some() && w.leader_of(10).is_some()
   }));
-  w.propose(10, b"s0");
-  w.propose(11, b"t0");
+  w.propose(11, b"s0");
+  w.propose(10, b"t0");
   w.run_until(200, |_| false);
   // Colocate before the freeze so the commit barrier reads the source off the target's leader;
   // the follower picked below is then a non-leader of both, its target capture free to lag.
-  colocate_source_onto_target(&mut w, 10, 11);
+  colocate_source_onto_target(&mut w, 11, 10);
   let follower = (0..3u64)
-    .find(|n| Some(*n) != w.leader_of(10) && Some(*n) != w.leader_of(11))
+    .find(|n| Some(*n) != w.leader_of(11) && Some(*n) != w.leader_of(10))
     .expect("three nodes, at most two leaders");
   // A real fsync window on the follower's TARGET stable only: the absorb capture will sit in
   // flight there while the (sync) log keeps the parked commit itself durable.
   w.stables
-    .get_mut(&(follower, 11))
+    .get_mut(&(follower, 10))
     .expect("target stable")
     .set_mode(crate::StoreMode::Async);
   merge_verb_until_accepted(&mut w, 2_000, "the freeze", |w| {
-    w.propose_prepare_merge(10, 11)
+    w.propose_prepare_merge(11, 10)
   });
   merge_verb_until_accepted(&mut w, 4_000, "the commit", |w| {
-    w.propose_commit_merge(11, 10)
+    w.propose_commit_merge(10, 11)
   });
   assert!(
     w.run_until(8_000, |w| w.merges_resolved() >= 3),
@@ -2741,16 +2827,16 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
   // The sync hosts' barriers landed at resolution; the follower's capture honestly pends.
   for n in (0..3u64).filter(|n| *n != follower) {
     assert!(
-      w.merge_floors.contains(&(n, 10)),
+      w.merge_floors.contains(&(n, 11)),
       "node {n}: the durable hosts' floors are recorded"
     );
   }
   assert!(
-    w.stables[&(follower, 11)].has_inflight(),
+    w.stables[&(follower, 10)].has_inflight(),
     "the follower's capture sits in the fsync window"
   );
   assert!(
-    !w.merge_floors.contains(&(follower, 10)),
+    !w.merge_floors.contains(&(follower, 11)),
     "no floor may be recorded ahead of the capture's durability"
   );
 
@@ -2760,7 +2846,7 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
   assert!(
     w.run_until(4_000, |w| {
       w.hosts[&follower]
-        .group(&11)
+        .group(&10)
         .is_some_and(|ep| ep.pending_merge().is_some())
     }),
     "the restored target replays the commit and re-parks"
@@ -2770,7 +2856,7 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
   }
   assert!(
     w.hosts[&follower]
-      .group(&11)
+      .group(&10)
       .is_some_and(|ep| ep.pending_merge().is_some()),
     "without the floor the replayed park holds for the snapshot route"
   );
@@ -2778,17 +2864,17 @@ fn replayed_park_holds_while_the_capture_barrier_is_open() {
   // The open barrier keeps the whole batch honest: no floor, the extracted source's stores
   // retained for the pending teardown, and the entry itself still staged.
   assert!(
-    !w.merge_floors.contains(&(follower, 10)),
+    !w.merge_floors.contains(&(follower, 11)),
     "the floor may not land while the capture is unrecoverable"
   );
   assert!(
-    w.logs.contains_key(&(follower, 10)),
+    w.logs.contains_key(&(follower, 11)),
     "the pending teardown retains the source stores until the barrier lands"
   );
   assert!(
     w.pending_merge_teardowns
       .iter()
-      .any(|(n, s, _, _)| *n == follower && *s == 10),
+      .any(|(n, s, _, _)| *n == follower && *s == 11),
     "the follower's teardown entry stays staged"
   );
 }
