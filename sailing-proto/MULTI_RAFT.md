@@ -238,7 +238,21 @@ used as a mutual-exclusion primitive.
   proposes the source-side `RollbackMerge` (empty source field) on the source's own log —
   log-borne there so a restart re-derives the thaw; the claim gates the relay, so a foreign
   target's abort can never thaw a source claimed elsewhere. A relay lost to churn is recovered
-  by re-proposing the abort.
+  by re-proposing the abort. This abort-derived thaw is the FIRST of two legitimate thaw
+  derivations.
+- **The dead-target self-thaw (the SECOND thaw derivation).** A source can be stranded when its
+  claimed target legally DISSOLVES — a chain `S→T→U` where `T` freezes into `U` and is absorbed —
+  because both of `S`'s release verbs ride the now-dead `T`'s log. `service_merge_applies` self-heals
+  it: a hosted FROZEN source whose claimed target is (i) NOT hosted here AND (ii) reads the terminal
+  `MERGED_FLOOR` derives its OWN thaw on its own log (leader-only, bound to the freeze generation,
+  `thaw_in_flight`-idempotent — the same mint discipline as the abort relay), refusing while any local
+  park still names it (fail-safe). The safety argument is the husk-minority lemma: a committed
+  `CommitMerge(S→T)` lives on a target QUORUM whose replicas all PARK and resolve locally, so any
+  target replica that skipped the commit via install-supersede is sub-quorum and its (leader-only)
+  source could never even append this thaw — so in the merge-SUCCEEDED world the derivation is
+  unconstructible, in the ABORTED world the drivable-thaw belt heals `S` first, and in the
+  never-committed world (the genuine strand) it is exactly correct. This is why a FALSE terminal floor
+  is now a consensus-grade safety violation: it can mint a committed thaw against a live lineage.
 
 **Do not remove a merge participant mid-choreography** — and this is now a TYPED GUARANTEE, not
 advice: `remove_group` (and every coordinator/driver door that threads it) REFUSES each unresolved

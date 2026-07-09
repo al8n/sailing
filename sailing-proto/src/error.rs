@@ -505,6 +505,15 @@ pub enum MergeError<I> {
     /// The source's current lineage, already past it.
     seen: u64,
   },
+  /// A hosted target's parked `CommitMerge` still names this source — the fail-safe belt on the
+  /// DEAD-TARGET thaw derivation. A source frozen for a terminally-floored, no-longer-hosted target
+  /// derives its OWN thaw (the second legitimate thaw derivation); this belt refuses that mint while
+  /// any local park names the source, because a live park means an absorb of this source may still
+  /// be resolving on this very host, and minting a thaw underneath would move the counter the park
+  /// gates on. TRANSIENT: the park resolves (absorb or abort) within a few cranks, after which — if
+  /// the target is genuinely dead — the derivation admits.
+  #[error("a hosted target's parked commit still names this source")]
+  SourceAbsorbParked,
   /// The CLAIMED target holds NO committed abort obligation for this `(source, expected)`
   /// incarnation — the structural derived-from-abort gate. A source thaw is legal ONLY as the
   /// downstream consequence of a committed target-side abort: the target's durable `abandoned`

@@ -100,6 +100,14 @@ pub trait GroupStores<G, L, S> {
 /// source. The terminal floor must be re-persisted CO-BARRIERED with the source teardown a merge
 /// resolution folds: dropping the stores while the floor is only STAGED (not durable) and crashing
 /// would re-admit the id below its generation.
+///
+/// CONSENSUS-GRADE WARNING: a false terminal floor no longer costs merely ONE local replica. The
+/// per-crank service reads this floor on a source's DEAD (unhosted) TARGET to authorize the source
+/// minting its OWN thaw — a COMMITTED entry every replica applies (see the dead-target derivation in
+/// [`service_merge_applies`](crate::MultiRaft::service_merge_applies)). Writing `MERGED_FLOOR` for a
+/// lineage that is NOT terminally resolved can therefore unfreeze a source out from under a target
+/// that never released it and DIVERGE that target's replicas — a safety violation, full stop. The
+/// floor is a GLOBAL fact about a resolved lineage; it is never a knob to break a wedge by hand.
 pub const MERGED_FLOOR: u64 = u64::MAX;
 
 /// The floor-admission predicate every admission gate applies — the multi coordinators'
@@ -1932,10 +1940,17 @@ where
   /// DIRECTION: a claim must point strictly DOWN the fixed total order over ids — the source must
   /// encode STRICTLY ABOVE the target ([`DirectionInverted`](MergeError::DirectionInverted)), so
   /// the encoding-minimal id of any pair is the target/survivor. Orient each pair (source = the
-  /// encoding-larger side) before proposing; this makes a claim cycle unconstructible. Admission is
-  /// otherwise optimistically concurrent — these propose gates are truthful LOCAL refusals, not a
-  /// serializer; overlapping admissions at different leaders are safe but may resolve deterministically
-  /// against you, and a refusal error must never be used as a mutual-exclusion primitive.
+  /// encoding-larger side) before proposing; this makes a claim cycle unconstructible.
+  ///
+  /// ADMISSION IS OPTIMISTICALLY CONCURRENT. These propose gates are TRUTHFUL LOCAL REFUSALS about
+  /// the state THIS replica observes, not a distributed serializer. Admission reads the target's
+  /// state from LOCAL replicas, so overlapping admissions at different leaders are SAFE but may
+  /// resolve deterministically AGAINST you (the losing claim aborts through the normal path). Serialize
+  /// your OWN admissions if you like, as an optimization — but never treat a refusal error as a
+  /// mutual-exclusion primitive, and NEVER write `MERGED_FLOOR` to break a wedge by hand (see the
+  /// consensus-grade warning on [`MERGED_FLOOR`](crate::MERGED_FLOOR)). The direction rule and the
+  /// dead-target self-thaw make the two liveness wedges (claim cycles, dead-target strands) impossible
+  /// and self-healing respectively, with no embedder serialization required.
   #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
   pub fn prepare_merge<L, S, St>(
     &mut self,
@@ -2633,6 +2648,95 @@ where
     Some(result)
   }
 
+  /// Mint a source's OWN thaw for a TERMINALLY-FLOORED, no-longer-hosted target — the SECOND
+  /// legitimate thaw derivation. The first ([`propose_merge_unfreeze`](Self::propose_merge_unfreeze))
+  /// rides a committed TARGET-side abort; this one rides the target's DEATH. Both mint the same
+  /// unfreeze entry on the source's own log with the same incarnation discipline — leader-only,
+  /// bound to the FREEZE generation (never the blind live counter), `thaw_in_flight`-idempotent —
+  /// and differ ONLY in the authorization gate: `propose_merge_unfreeze`'s derived-from-abort gate
+  /// ([`UnbackedThaw`](MergeError::UnbackedThaw)) is DELIBERATELY LEFT UNWEAKENED; the dead-target
+  /// authorization is a wholly SEPARATE private path with its own gate, driven only from the
+  /// service arm where the target's unhosted-and-terminally-floored fact is read.
+  ///
+  /// The caller supplies the decoded dead `target` and has already established it is unhosted here
+  /// and reads [`MERGED_FLOOR`](crate::MERGED_FLOOR). This re-checks everything readable without the
+  /// floor seam: the source is frozen-applied (so its `shape_gen` IS the freeze generation to bind
+  /// to), its claim names `target`, this host leads, and — the FAIL-SAFE BELT — no hosted target's
+  /// parked commit still names the source ([`SourceAbsorbParked`](MergeError::SourceAbsorbParked)): a
+  /// live park means an absorb of this source may still be resolving locally, so moving the counter
+  /// underneath it is refused. Private and service-driven only (no coordinator delegator): no
+  /// external path can forge a dead-target thaw. `None` if no group `source` is hosted.
+  #[must_use = "`None` means no group with this id is hosted — nothing was proposed"]
+  fn propose_dead_target_thaw<L, S>(
+    &mut self,
+    source: &G,
+    now: impl Into<Now>,
+    log: &mut L,
+    // Vestigial, as on the whole propose family: kept so the service threads `&stable`.
+    _stable: &S,
+    target: &G,
+  ) -> Option<Result<Index, MergeError<I>>>
+  where
+    L: LogStore,
+    S: StableStore<NodeId = I>,
+  {
+    let ep = self.groups.get(source)?;
+    if ep.is_poisoned() {
+      return Some(Err(MergeError::Propose(ProposeError::Poisoned)));
+    }
+    // Frozen-APPLIED is the incarnation anchor: `shape_gen` reaches the freeze generation ONLY by
+    // applying that freeze, so a frozen-applied source sits AT it — bind the mint to it, never the
+    // live counter. A source not frozen-applied has nothing to thaw.
+    if !ep.is_frozen() {
+      return Some(Err(MergeError::NotFrozen));
+    }
+    let freeze_gen = ep.shape_gen();
+    // Only a leader appends the thaw (mirrors the relay). A follower waits and later retires by
+    // OBSERVING the committed thaw its leader minted.
+    if !ep.role().is_leader() {
+      return Some(Err(MergeError::NotLeader {
+        leader: ep.leader(),
+      }));
+    }
+    // The freeze CLAIM must name exactly this dead target — the claim is authoritative for the
+    // incarnation, and a thaw riding a foreign claim must never move this source (mirrors
+    // `propose_merge_unfreeze`'s `SourceClaimed` leg).
+    let mut target_bytes = Vec::new();
+    target.encode(&mut target_bytes);
+    if ep.frozen_for().is_none_or(|t| *t != target_bytes) {
+      return Some(Err(MergeError::SourceClaimed));
+    }
+    // THE FAIL-SAFE BELT (the same `park_names_source` read the husk dissolve and teardown gate
+    // use): refuse while any hosted target's parked commit still names this source. A live park may
+    // be resolving an absorb of this source on this host RIGHT NOW, and the park gates on the
+    // source counter staying put — minting a thaw underneath it would race that resolution.
+    if self.park_names_source(source) {
+      return Some(Err(MergeError::SourceAbsorbParked));
+    }
+    // IDEMPOTENT: a thaw already appended-and-unapplied retains its index rather than piling on a
+    // duplicate every crank (the twin of the relay's `thaw_in_flight` guard).
+    if let Some(idx) = ep.thaw_in_flight() {
+      return Some(Ok(idx));
+    }
+    // Minted at `freeze_gen + 1` against the BOUND freeze incarnation, stopping strictly below the
+    // reserved `MERGED_FLOOR` terminal (fail-closed at the ceiling) — exactly as the relay does.
+    let Some(source_gen_after) = next_lineage(freeze_gen) else {
+      return Some(Err(MergeError::LineageExhausted));
+    };
+    let payload = RollbackMergePayload::unfreeze(source_gen_after);
+    let mut buf = Vec::new();
+    crate::wire::encode_rollback_merge_payload(&payload, &mut buf);
+    let ep = self.groups.get_mut(source).expect("checked hosted above");
+    let result = ep
+      .propose_merge_entry(now, log, EntryKind::RollbackMerge, Bytes::from(buf))
+      .map_err(MergeError::Propose);
+    if let Ok(index) = &result {
+      ep.note_thaw_appended(*index);
+    }
+    self.mark_dirty(source);
+    Some(result)
+  }
+
   /// Append a `ThawDischarged` WITNESS on `target`'s own log — the discharge-observing leg of the
   /// thaw pass, driven ONLY by [`service_merge_applies`](Self::service_merge_applies) when the
   /// obligation holder LEADS and holds a GLOBALLY-valid proof the named source is discharged (its
@@ -3092,6 +3196,71 @@ where
       if self.remove_group_inner(&gid).is_some() {
         self.mark_dirty(&gid);
         resolutions.push(MergeResolution::Retired { source: gid });
+      }
+    }
+    // THE DEAD-TARGET THAW DERIVATION, ordered LAST (after the resolver loop, the thaw pass, and the
+    // husk dissolve so those own every case they can). A hosted FROZEN source whose claimed target is
+    // (i) NOT hosted here AND (ii) reads the TERMINAL `MERGED_FLOOR` is STRANDED: the target dissolved
+    // (a legal chain S→T→U absorbed T into U), and BOTH of the source's release verbs — `commit_merge`
+    // and `rollback_merge` — ride the dead target's log, so no external verb can ever thaw it. The
+    // source self-heals by minting its OWN thaw.
+    //
+    // THE HUSK-MINORITY LEMMA (why this can never race a live commit into divergence). A committed
+    // `CommitMerge(S→T)` at coordinate k lives durably on a target QUORUM; every k-holding T replica
+    // PARKS at k−1 and resolves the absorb locally (a restart re-parks; a leader never installs over a
+    // peer whose match ≥ k). So the only T replicas that ever SKIP k are those an install SUPERSEDED —
+    // the "success-husk" shape where floor(T) is already terminal yet S's merge genuinely SUCCEEDED —
+    // and being install-superseded they are always SUB-QUORUM. S's voter set is FROZEN-TIME-FIXED (a
+    // frozen source refuses conf changes) and dissolved T replicas are tombstoned NON-voters; this
+    // mint is LEADER-only. Therefore in the success world an S leader can never even APPEND this thaw
+    // (a sub-quorum husk cannot lead), let alone commit it — the divergence is unconstructible. In the
+    // commit-ABORTED world the source's drivable-thaw belt (the absorb Resolve arm / husk belt) thaws
+    // S off the target's `abandoned` obligation before T could ever dissolve. In the
+    // commit-NEVER-EXISTED world (the genuine chain strand) this thaw is exactly correct: no commit is
+    // owed, and the terminal floor on the vanished target is authoritative that its lineage is dead.
+    // The consensus-grade cost of a FALSE terminal floor (writing `MERGED_FLOOR` for an unresolved
+    // lineage) is spelled out on [`MERGED_FLOOR`] — it can now mint a COMMITTED thaw and diverge a
+    // target's replicas, so it is a safety violation, full stop.
+    let frozen_sources: Vec<G> = self
+      .groups
+      .iter()
+      .filter(|(_, ep)| ep.is_frozen() && !ep.is_poisoned())
+      .map(|(gid, _)| gid.cheap_clone())
+      .collect();
+    for sgid in frozen_sources {
+      // Re-read under the mutating loop; decode the applied claim to its target (a committed-corrupt
+      // claim is the park/husk decode class — poison and skip).
+      let Some(sep) = self.groups.get(&sgid) else {
+        continue;
+      };
+      let Some(claim) = sep.frozen_for().cloned() else {
+        continue;
+      };
+      let target = match G::decode_exact(claim) {
+        Ok(t) => t,
+        Err(_) => {
+          if let Some(sep) = self.groups.get_mut(&sgid) {
+            sep.poison(PoisonReason::MergeDecode);
+          }
+          continue;
+        }
+      };
+      // (i) A hosted target is NOT dead — the resolver (park) or the husk dissolve owns it.
+      if self.groups.contains_key(&target) {
+        continue;
+      }
+      // (ii) THE TERMINAL-FLOOR-ONLY TRIGGER. A non-terminal floor is a HOST-LOCAL fact (this host
+      // merely stopped hosting the target at/below some generation) and must NEVER mint — the same
+      // two-predicate discipline as the `ThawDischarged` witness mint, which likewise rests a
+      // COMMITTED entry only on the globally-valid `MERGED_FLOOR`, never a local removal ceiling.
+      if stores.floor(&target) != crate::MERGED_FLOOR {
+        continue;
+      }
+      // Derive the source's own thaw. The mint re-checks leadership, the incarnation, the claim, and
+      // the park belt; its outcome is DISCARDED — a later crank observes the committed thaw advance
+      // the source's lineage past the freeze, exactly as the abort-relay drive is observation-retired.
+      if let Some((slog, sstable)) = stores.stores(&sgid) {
+        let _ = self.propose_dead_target_thaw(&sgid, now, slog, sstable, &target);
       }
     }
     resolutions

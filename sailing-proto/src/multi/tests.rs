@@ -5265,6 +5265,110 @@ fn a_frozen_source_one_below_the_terminal_does_not_dissolve() {
   );
 }
 
+/// THE DEAD-TARGET THAW FAIL-SAFE BELT: the mint refuses while any hosted target's parked commit
+/// still names the source. A live park means an absorb of this source may still be resolving locally,
+/// so moving the counter underneath it is refused (`SourceAbsorbParked`). `freeze_and_park` leaves
+/// source 2 frozen-for-1 AND target 1 parked naming 2, so the belt fires when the mint is driven.
+#[test]
+fn dead_target_thaw_belt_refuses_while_a_park_names_the_source() {
+  let (mut m, mut stores) = merge_host(1, 1);
+  freeze_and_park(&mut m, &mut stores);
+  let now = Instant::ORIGIN;
+  let (log, stable) = stores.0.get_mut(&2).unwrap();
+  assert!(
+    matches!(
+      m.propose_dead_target_thaw(&2, now, log, stable, &1),
+      Some(Err(MergeError::SourceAbsorbParked))
+    ),
+    "the belt refuses the dead-target mint while a hosted park still names the source"
+  );
+}
+
+/// THE TERMINAL-FLOOR-ONLY TRIGGER: a source frozen for an UNHOSTED target self-thaws ONLY when the
+/// target reads the terminal `MERGED_FLOOR` — a NON-terminal floor is a host-local fact and must mint
+/// NOTHING (the witness-mint discipline, second edition). A crafted frozen source (2) claims target 1,
+/// which is never hosted; under a non-terminal floor the source stays frozen forever, and only the
+/// terminal floor derives its thaw.
+#[test]
+fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  // Craft group 2 FROZEN for the (never-hosted) target 1 via a restored durable log.
+  let mut prep = Vec::new();
+  {
+    let mut tb = Vec::new();
+    Data::encode(&1u64, &mut tb);
+    crate::wire::encode_prepare_merge_payload(
+      &crate::PrepareMergePayload::new(Bytes::from(tb), 1),
+      &mut prep,
+    );
+  }
+  let mut slog = VecLog::default();
+  slog.force_append(&[crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::PrepareMerge,
+    Bytes::from(prep),
+  )]);
+  let mut sstable = AsyncStable::default();
+  sstable.force_state(Term::new(1), Some(1u64), Index::new(1));
+  m.restore_group(
+    2,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut slog,
+    &mut sstable,
+  )
+  .unwrap();
+  assert!(
+    m.group(&2).unwrap().is_frozen(),
+    "the crafted freeze applied"
+  );
+  // Elect group 2 (leader-only mint); a frozen group still campaigns.
+  let now = Instant::ORIGIN;
+  let d = m.group(&2).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&2, d, &mut slog, &mut sstable).unwrap();
+  drain_storage(&mut m, 2, d, &mut slog, &mut sstable);
+  assert!(m.group(&2).unwrap().role().is_leader());
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+
+  let mut inner = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  inner.0.insert(2, (slog, sstable));
+  // Target 1 is UNHOSTED with a NON-terminal floor (5): the trigger must NOT mint.
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::from([(1u64, 5u64)]),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  for _ in 0..4 {
+    m.service_merge_applies(now, &mut stores);
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().is_frozen(),
+    "a non-terminal floor is host-local — it mints NO dead-target thaw"
+  );
+
+  // Flip the target's floor to the TERMINAL sentinel: now the source derives its own thaw.
+  stores.floors.insert(1, crate::MERGED_FLOOR);
+  for _ in 0..4 {
+    m.service_merge_applies(now, &mut stores);
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  assert!(
+    !m.group(&2).unwrap().is_frozen(),
+    "the terminal floor on the dead target derived the source's own thaw"
+  );
+}
+
 /// PIN B(c), the B1 red-proof: a hosted park still NAMING the husk as its source HOLDS the dissolve —
 /// reclaiming it first would hand the resolver a MANUFACTURED absence and skip the union (committed
 /// divergence). The park absorbs it instead (Merged, never Retired), union intact.
