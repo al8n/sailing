@@ -220,10 +220,12 @@ impl MultiWorld {
   /// Reconcile `gid`'s registry entry from the group's REAL committed state (the leader's
   /// runtime `conf_state()`), never propose-time bookkeeping — the single-group `VoprState`
   /// reconciliation, scoped per group:
-  ///   - keep the last-known sets while leaderless (don't thrash on a transient election) —
-  ///     but first COMPLETE an under-hosted group (see [`complete_under_hosted`]
-  ///     (Self::complete_under_hosted)): the resurrect arm below is leader-gated, and a group
-  ///     whose hosting replicas sit below its voter quorum can never produce the leader;
+  ///   - keep the last-known sets while leaderless (don't thrash on a transient election) — but
+  ///     first COMPLETE an under-hosted group (see [`complete_under_hosted`]
+  ///     (Self::complete_under_hosted)) AND still UNPARK its committed members: a quorum mis-parked
+  ///     by the sweep is leaderless precisely because its own voters were parked, and nothing else
+  ///     re-derives it back to a quorum (`complete_under_hosted` reads a parked replica as
+  ///     still-hosting), so the unpark pass must run here too, not only behind a leader;
   ///   - promote a wired joiner once it appears in the committed membership;
   ///   - sweep departed replicas: a hosting node absent from the committed membership for
   ///     [`DEPARTED_GRACE_PASSES`] settled passes is PARKED — delivery-isolated with state
@@ -241,7 +243,13 @@ impl MultiWorld {
       return;
     }
     if self.leader_of(gid).is_none() {
+      // Read the committed set for the unpark decision only; leave `meta` at its last-known values
+      // (don't thrash on a transient election). Completing the under-hosted set repairs torn-down
+      // voters; the unpark pass then re-derives a mis-parked quorum back to hosting.
+      let voters = self.committed_voters_of(gid);
+      let learners = self.committed_learners_of(gid);
       self.complete_under_hosted(gid);
+      self.unpark_committed_members(gid, &voters, &learners);
       return;
     }
     let voters = self.committed_voters_of(gid);
@@ -263,6 +271,7 @@ impl MultiWorld {
       .into_iter()
       .filter(|n| self.hosts[n].contains_group(&gid))
       .collect();
+    let choreography_active = self.merge_choreography_active(gid);
     {
       let parked = self.parked.clone();
       let meta = self.groups.get_mut(&gid).expect("registered group");
@@ -271,9 +280,12 @@ impl MultiWorld {
           meta.departed_streak.remove(&node);
           continue;
         }
-        if conf_in_flight {
-          // A change is still in flight (this joiner's add, or a removal about to land):
-          // don't count the pass — settle first.
+        if conf_in_flight || choreography_active {
+          // A conf-change is still in flight (this joiner's add, or a removal about to land), or a
+          // merge choreography still holds this group's participants put: don't count the pass. The
+          // contract keeps a frozen/claimed participant in place until it resolves, and the
+          // committed-view derivation can transiently misjudge a current member of one — parking a
+          // mis-derived voter of a frozen source is the freeze-wedge shape this guards against.
           meta.departed_streak.insert(node, 0);
           continue;
         }
@@ -285,10 +297,21 @@ impl MultiWorld {
       }
     }
 
-    // Unpark / resurrect committed members. A parked member rejoins with its retained state; a
-    // genuinely torn-down member (post self-removal, later re-added) re-wires as a fresh
-    // observer whose bootstrap excludes itself, so it cannot campaign until it learns its own
-    // membership from the log.
+    self.unpark_committed_members(gid, &voters, &learners);
+  }
+
+  /// Unpark / resurrect the committed members of `gid` (the single-group `reinstate` arm). A
+  /// parked member rejoins with its retained state; a genuinely torn-down member (post
+  /// self-removal, later re-added) re-wires as a fresh observer whose bootstrap excludes itself,
+  /// so it cannot campaign until it learns its own membership from the log. Runs on the LED and
+  /// the LEADERLESS paths alike: a quorum mis-parked by the sweep stays leaderless until this
+  /// un-parks it back to hosting.
+  fn unpark_committed_members(
+    &mut self,
+    gid: u64,
+    voters: &BTreeSet<u64>,
+    learners: &BTreeSet<u64>,
+  ) {
     let members: Vec<u64> = voters.iter().chain(learners.iter()).copied().collect();
     for member in members {
       if self.parked.remove(&(member, gid)) {

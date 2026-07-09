@@ -112,3 +112,65 @@ fn conf_change_scopes_to_one_group() {
   assert!(w.run_until(600, |w| !w.applied_of(3, 100).is_empty()));
   assert!(w.applied_of(3, 200).is_empty());
 }
+
+/// A quorum mis-parked by the sweep must be able to UN-PARK once membership is re-derived.
+/// `complete_under_hosted` reads a parked replica as still-hosting (missing = ∅), so a leaderless
+/// group whose own voters were parked can never repair itself — the unpark arm must run on the
+/// leaderless path too, not only behind a leader. GREEN: reconcile un-parks the mis-parked
+/// majority and the group recovers a leader. RED (restore the leaderless early-return above the
+/// unpark arm): the parked voters stay parked and the group is leaderless forever.
+#[test]
+fn a_mis_parked_quorum_un_parks_and_recovers() {
+  let mut w = settled_world(43, 5, &[100]);
+  let all: BTreeSet<u64> = (0..5).collect();
+  assert_eq!(w.group_voters(100), all, "five committed voters");
+  let leader = w.leader_of(100).expect("elected");
+
+  // Mis-park a MAJORITY including the leader — the aftermath of the sweep over-parking a quorum.
+  // Seed `parked` directly (the sweep's own effect); no ticks, so the minority never re-elects.
+  let mut mis_parked: BTreeSet<u64> = BTreeSet::new();
+  mis_parked.insert(leader);
+  for n in 0..5u64 {
+    if mis_parked.len() >= 3 {
+      break;
+    }
+    mis_parked.insert(n);
+  }
+  for &n in &mis_parked {
+    w.parked.insert((n, 100));
+  }
+  assert!(
+    w.leader_of(100).is_none(),
+    "a mis-parked quorum (leader among the parked) is leaderless"
+  );
+
+  // ONE reconcile re-derives the committed set off the two still-unparked voters (both list all
+  // five) and un-parks the mis-parked majority.
+  w.reconcile_membership(100);
+  for &n in &mis_parked {
+    assert!(
+      !w.parked.contains(&(n, 100)),
+      "reconcile must un-park mis-parked committed voter {n}"
+    );
+  }
+
+  // Liveness restored: the group re-elects and commits fresh load (the wedge denied this forever).
+  let mut elected = false;
+  for _ in 0..5_000 {
+    w.reconcile_membership(100);
+    if w.leader_of(100).is_some() {
+      elected = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(
+    elected,
+    "the group recovers a leader once the mis-parked quorum un-parks"
+  );
+  assert!(w.propose(100, &encode_gkv(100, 1, 5)).is_some());
+  assert!(
+    w.run_until(2_000, |w| w.agreement_holds(100)),
+    "the recovered group commits fresh load"
+  );
+}

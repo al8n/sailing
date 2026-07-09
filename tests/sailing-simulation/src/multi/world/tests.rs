@@ -2431,15 +2431,17 @@ fn choreography_participants_read_active_until_resolution() {
   );
 }
 
-/// The world-park the grow draw's choreography gate exists to prevent. A virgin non-member wired
-/// onto a merge participant has no applied membership — the product refuses its conf change for
-/// the whole window (a frozen source, a parked target) — so the departed sweep PARKS it after the
-/// grace passes. The `conf_change` grow draw now reads `merge_choreography_active` (true across
-/// this window) and skips the observer-wire entirely: the harness models the embedder contract
-/// that keeps a choreography's participants in place, rather than wiring a replica the product
-/// only refuses and the sweep only parks — the remove/recreate discipline, extended to the grow.
+/// The departed sweep respects an active merge choreography. A virgin non-member wired onto a
+/// merge participant has no applied membership — the product refuses its conf change for the whole
+/// window (a frozen source, a parked target) — so the ungated sweep would PARK it after the grace,
+/// sub-quorum-ing the participant into a freeze wedge. The sweep now reads `merge_choreography_active`
+/// (true across this whole window) and ZEROES the absent-streak instead: the harness keeps a
+/// choreography's participants in place until it resolves — the same embedder contract the already-gated
+/// grow draw honors when it skips the observer-wire, extended to the sweep for a replica wired before
+/// the freeze. RED (drop the `|| choreography_active` guard in the sweep): the virgin crosses the grace
+/// and parks.
 #[test]
-fn a_virgin_non_member_on_a_frozen_participant_world_parks() {
+fn a_virgin_non_member_on_a_frozen_participant_is_spared_by_the_sweep() {
   let mut w = MultiWorld::new(7);
   for n in 0..4 {
     w.add_node(n);
@@ -2455,28 +2457,28 @@ fn a_virgin_non_member_on_a_frozen_participant_world_parks() {
   assert!(w.run_until(4_000, |w| w.group_frozen(11)));
   assert!(
     w.merge_choreography_active(11),
-    "the grow draw's gate reads the source active across this whole window"
+    "the sweep's gate reads the source active across this whole window"
   );
-  // Wire the virgin non-member the ungated grow draw would have added.
+  // Wire a virgin non-member (an orphan the grow draw would refuse) onto the frozen source, then
+  // reconcile well past the grace: the sweep must never park it while the choreography is active —
+  // and the source's own voters are spared just the same.
   w.wire_group_observer(11, 3);
-  assert!(
-    !w.parked.contains(&(3, 11)),
-    "freshly wired, not yet judged"
-  );
-  // The departed sweep parks a hosting non-member once its absent-streak passes the grace.
   for _ in 0..8 {
     w.reconcile_membership(11);
-    if w.parked.contains(&(3, 11)) {
-      break;
+    assert!(
+      !w.parked.contains(&(3, 11)),
+      "the sweep must not park a frozen participant's replica mid-choreography"
+    );
+    for n in 0..3u64 {
+      assert!(
+        !w.parked.contains(&(n, 11)),
+        "the frozen source's voter {n} must not park mid-choreography"
+      );
     }
   }
   assert!(
-    w.parked.contains(&(3, 11)),
-    "with no applied membership, the departed sweep world-parks the virgin non-member"
-  );
-  assert!(
     w.merge_choreography_active(11),
-    "the window is still open — the gate would have skipped the wire for all of it"
+    "the window stayed open throughout — the sweep spared the participant for all of it"
   );
 }
 
