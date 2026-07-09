@@ -339,6 +339,25 @@ impl MemLog {
     self.faults.cold_fetch_per_mille = rate;
   }
 
+  /// Suspend BOTH read-fault rates (`transient_read` and `cold_fetch`) — zero them, returning the
+  /// prior `(transient, cold)` pair — WITHOUT reseeding the read PRNG, so a bracketed fault-free read
+  /// leaves the fault schedule exactly where it was (unlike `set_faults`, which reseeds). Both
+  /// surface as a FAIL-CLOSED read to a `LogStore::entries` scan (`transient_read` an `Err`,
+  /// `cold_fetch` a `Pending`), so a caller that must read its own bookkeeping WITHOUT rolling the
+  /// dice against it brackets the read with this. Pair with [`restore_read_faults`](Self::restore_read_faults).
+  pub fn suspend_read_faults(&mut self) -> (u16, u16) {
+    (
+      core::mem::replace(&mut self.faults.transient_read_per_mille, 0),
+      core::mem::replace(&mut self.faults.cold_fetch_per_mille, 0),
+    )
+  }
+
+  /// Restore the `(transient, cold)` rates previously taken by [`suspend_read_faults`](Self::suspend_read_faults).
+  pub fn restore_read_faults(&mut self, rates: (u16, u16)) {
+    self.faults.transient_read_per_mille = rates.0;
+    self.faults.cold_fetch_per_mille = rates.1;
+  }
+
   /// Total COLD (`EntriesRead::Pending`) reads returned so far — the cold-fetch coverage non-vacuity signal.
   pub fn cold_reads(&self) -> u64 {
     self.cold_reads.get()

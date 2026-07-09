@@ -75,14 +75,18 @@ impl MultiWorld {
   /// stands in for the wire, so purging its `gid` entries (plus the unhosted-drop on anything
   /// later addressed to the gid) is the same observable semantics.
   pub fn remove_group(&mut self, gid: u64) {
-    // The embedder catalog floors what it permanently stops hosting: one past the id's removal
-    // CEILING (the max shape generation any hosting replica reached). A reshaped id that later
-    // backs a RE-DERIVED merge-abort thaw obligation — a target replays its still-durable abort
-    // entry after a crash, but the source's stores are gone — then discharges it off this floor
-    // (`!floor_admits(floor, expected)`) while unhosted, instead of wedging the target's compaction
-    // fence forever. The obligation is thus discharged before any recreate, so a gen-0 recreate
-    // squats harmlessly (no authorization left to ride). A never-reshaped id (ceiling 0) takes NO
-    // floor, preserving the gen-0 volatile-tombstone rejoin — the default profile stays byte-identical.
+    let generation = {
+      let meta = self
+        .groups
+        .get(&gid)
+        .unwrap_or_else(|| panic!("remove_group: unknown group {gid}"));
+      assert!(!meta.retired, "remove_group: group {gid} already retired");
+      meta.generation
+    };
+
+    // The removal CEILING — the max shape generation any hosting replica reached — captured while
+    // the replicas are still present (they vanish on teardown below); the catalog floor derived
+    // from it is applied only once the teardown lands.
     let ceiling = self
       .node_ids
       .iter()
@@ -90,46 +94,104 @@ impl MultiWorld {
       .map(sailing_proto::Endpoint::shape_gen)
       .max()
       .unwrap_or(0);
-    if ceiling > 0 {
-      let floor = self.removal_floors.entry(gid).or_insert(0);
-      *floor = (*floor).max(ceiling.saturating_add(1));
-    }
-    let meta = self
-      .groups
-      .get_mut(&gid)
-      .unwrap_or_else(|| panic!("remove_group: unknown group {gid}"));
-    assert!(!meta.retired, "remove_group: group {gid} already retired");
-    meta.retired = true;
-    meta.conf_in_flight = false;
-    meta.wired.clear();
-    meta.departed_streak.clear();
-    let generation = meta.generation;
 
-    // One final check against the still-hosted state, then freeze the checker into the archive
-    // (its cross-tick history remains inspectable; the live suite stops judging the gid).
+    // One final check against the still-hosted state, then one last exact-term walk of the retiring
+    // replicas' durable logs (it extends the committed-config history through any install boundary
+    // the frozen archive could otherwise never witness — the absorb→observers-only→retire shape,
+    // where snapshot-installed replicas emit no ConfChanged). Both read the retiring durable logs,
+    // so they run BEFORE teardown and on the FULL view; the checker stays LIVE (not yet archived)
+    // until the teardown lands, so a fault-burned attempt re-runs them harmlessly (`check_or_panic`
+    // is the per-tick check and `certify_retiring_history` is a monotone, idempotent observer).
     let view = self.group_view(gid);
-    let mut checker = self
-      .checkers
-      .remove(&gid)
-      .expect("a live group has a checker");
-    checker.check_or_panic(&view);
-    // One last exact-term walk of the retiring replicas' durable logs extends the committed-config
-    // history through any install boundary the frozen archive could otherwise never witness (the
-    // absorb→observers-only→retire shape, where snapshot-installed replicas emit no ConfChanged).
-    crate::checker::certify_retiring_history(&mut checker, &view);
-    self.retired.insert((gid, generation), checker);
-    self.pending_transitions.remove(&gid);
-    self.pending_new_installs.remove(&gid);
+    {
+      let checker = self
+        .checkers
+        .get_mut(&gid)
+        .expect("a live group has a checker");
+      checker.check_or_panic(&view);
+      crate::checker::certify_retiring_history(checker, &view);
+    }
 
+    // Tear down every hosting replica ATOMICALLY. The container's teardown gate reads a co-hosted
+    // freeze-pending source's log through `LogStore::entries` to rule out a `Claimed` tie (its
+    // append-pending leg), and that read FAILS CLOSED on a transient read fault — correct product
+    // conservatism, since a real embedder must never admit a teardown it cannot prove safe. But the
+    // world plays an embedder with GLOBAL, non-faulting knowledge of every freeze: its removal draws
+    // already EXCLUDE every real participant (`merge_choreography_active`, a superset of this gate,
+    // read off `active_freezes` and `durable_entries` — never the fault dice), so for a DRAWN removal
+    // the fault-free gate always admits. Read the teardown scan FAULT-FREE, exactly as that draw
+    // filter already reads logs, so a transient fault cannot fail-close a claim-free teardown into a
+    // PARTIAL one: dropping some committed voters' durable logs while the group stays live would
+    // strand the survivors below quorum and trip `commit_is_quorum_durable`. The container's own
+    // fail-closed handling stays exercised by the merge pump and the Tier-B coordinator paths — here
+    // the world need not roll the dice against its own bookkeeping teardown. A refusal that SURVIVES
+    // fault suppression is a REAL tie (a genuine choreography, or one the world's superset missed):
+    // trip with both verdicts so the tooth stays sharp.
+    let suspended: Vec<((u64, u64), (u16, u16))> = self
+      .logs
+      .iter_mut()
+      .map(|(k, log)| (*k, log.suspend_read_faults()))
+      .collect();
+    let mut refused = None;
     for node in self.node_ids.clone() {
-      if self
+      if !self
         .hosts
         .get(&node)
         .is_some_and(|h| h.contains_group(&gid))
       {
-        self.drop_group_replica(gid, node);
+        continue;
+      }
+      if let Err(refusal) = self.try_drop_group_replica(gid, node) {
+        refused = Some((node, refusal));
+        break;
       }
     }
+    for (k, rates) in suspended {
+      if let Some(log) = self.logs.get_mut(&k) {
+        log.restore_read_faults(rates);
+      }
+    }
+    if let Some((node, refusal)) = refused {
+      let active = self.merge_choreography_active(gid);
+      panic!(
+        "remove_group: tearing down g{gid} on node {node} was refused {refusal:?} even with the \
+         transient read fault suppressed — a REAL teardown-gate tie \
+         (merge_choreography_active={active}), not a fault-born fail-closed read (seed={} tick={})",
+        self.seed, self.tick_count,
+      );
+    }
+
+    // The teardown landed on every host: COMMIT the retirement. The embedder catalog floors what it
+    // permanently stops hosting — one past the removal ceiling. A reshaped id that later backs a
+    // RE-DERIVED merge-abort thaw obligation (a target replays its still-durable abort entry after a
+    // crash, but the source's stores are gone) discharges it off this floor
+    // (`!floor_admits(floor, expected)`) while unhosted, instead of wedging the target's compaction
+    // fence forever; the obligation is thus discharged before any recreate, so a gen-0 recreate
+    // squats harmlessly. A never-reshaped id (ceiling 0) takes NO floor, so the default (no-merge,
+    // no-split) profile stays byte-identical.
+    if ceiling > 0 {
+      let floor = self.removal_floors.entry(gid).or_insert(0);
+      *floor = (*floor).max(ceiling.saturating_add(1));
+    }
+    {
+      let meta = self
+        .groups
+        .get_mut(&gid)
+        .expect("remove_group: the group was live above");
+      meta.retired = true;
+      meta.conf_in_flight = false;
+      meta.wired.clear();
+      meta.departed_streak.clear();
+    }
+    // Freeze the checker into the archive (its cross-tick history remains inspectable; the live
+    // suite stops judging the gid).
+    let checker = self
+      .checkers
+      .remove(&gid)
+      .expect("a live group has a checker");
+    self.retired.insert((gid, generation), checker);
+    self.pending_transitions.remove(&gid);
+    self.pending_new_installs.remove(&gid);
     self.bus.retain(|m| m.gid != gid);
   }
 
@@ -431,17 +493,31 @@ impl MultiWorld {
   }
 
   /// Tear down node `node`'s replica of `gid`: container removal + store/bookkeeping teardown.
-  /// The embedder acting on RemovedSelf / the catalog — the group itself lives on elsewhere.
+  /// The embedder acting on RemovedSelf / the catalog — the group itself lives on elsewhere. The
+  /// internal merge-teardown callers (the husk-dissolve and deferred-capture sweeps) tear down a
+  /// source the resolver already settled, where no participant refusal can stand — assert it away.
   pub(crate) fn drop_group_replica(&mut self, gid: u64, node: u64) {
-    // The world plays the embedder, whose contract keeps a merge choreography's participants put
-    // until it resolves — the removal draws exclude EVERY unresolved participant
-    // (`merge_choreography_active`, a superset of the container's whole teardown gate). So no
-    // participant refusal is ever tripped here; asserting success makes that exclusion STRUCTURAL
-    // rather than a silent precondition. `stores` is the seam the `Claimed` leg reads a freeze-pending
-    // source's log through, threaded exactly as the merge pump threads it.
+    self
+      .try_drop_group_replica(gid, node)
+      .expect("the world never tears down an unresolved merge participant");
+  }
+
+  /// Tear down node `node`'s replica of `gid`, RETURNING the container's participant refusal rather
+  /// than asserting it away. The removal verb tears every host down under fault suppression and uses
+  /// this to catch a refusal that SURVIVES it — a real tie, never a fault-born fail-closed read (see
+  /// [`remove_group`](Self::remove_group)); the strict [`drop_group_replica`](Self::drop_group_replica)
+  /// wrapper keeps the assert for the internal merge-teardown callers, whose sources are past any
+  /// choreography.
+  pub(crate) fn try_drop_group_replica(
+    &mut self,
+    gid: u64,
+    node: u64,
+  ) -> Result<(), sailing_proto::RemoveError> {
     {
       let host = self.hosts.get_mut(&node).expect("host exists");
-      // The teardown gate reads logs (the Claimed leg), never floors — an empty husk feed.
+      // The teardown gate reads logs (the Claimed leg), never floors — an empty husk feed. `stores`
+      // is the seam the `Claimed` leg reads a freeze-pending source's log through, threaded exactly
+      // as the merge pump threads it.
       let no_husks = BTreeSet::new();
       let mut stores = super::merge::NodeStores {
         node,
@@ -451,9 +527,9 @@ impl MultiWorld {
         removal_floors: &self.removal_floors,
         husk_floors: &no_husks,
       };
-      host
-        .remove_group(&gid, &mut stores)
-        .expect("the world never tears down an unresolved merge participant");
+      // A refusal leaves the endpoint FULLY intact (the gate refuses before any teardown), so an
+      // early return here skips the store cleanup below and the replica stands untouched for a retry.
+      host.remove_group(&gid, &mut stores)?;
     }
     self.logs.remove(&(node, gid));
     self.stables.remove(&(node, gid));
@@ -465,6 +541,7 @@ impl MultiWorld {
     self.parked.remove(&(node, gid));
     // `restarts` and `read_states` deliberately survive: a later re-wire of the same (node, gid)
     // must bump past the old incarnation, and ledger scan offsets index the monotone vec.
+    Ok(())
   }
 
   /// The committed LEARNER set of `gid`, read like [`committed_voters_of`](Self::committed_voters_of)

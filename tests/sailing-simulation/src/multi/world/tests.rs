@@ -2482,6 +2482,136 @@ fn a_virgin_non_member_on_a_frozen_participant_is_spared_by_the_sweep() {
   );
 }
 
+/// Fixture for the fault-born-refusal teeth: a merge SOURCE (11) frozen-PENDING toward target (10),
+/// both led on node 0, beside a single-voter claim-free BYSTANDER (100) hosted only on node 0. The
+/// freeze is left APPEND-pending (unapplied) so the container's `Claimed` gate reaches it through
+/// the append-pending log SCAN — the one leg that reads a faultable store path — when the bystander
+/// is torn down on node 0. `merge_choreography_active(100)` reads false: no freeze names 100.
+fn freeze_pending_beside_bystander(seed: u64) -> MultiWorld {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // target
+  w.create_group(11, &all); // source
+  let just_zero: BTreeSet<u64> = std::iter::once(0).collect();
+  w.create_group(100, &just_zero); // single-voter bystander, hosted only on node 0
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
+    && w.leader_of(11).is_some()
+    && w.leader_of(100).is_some()));
+  // Land both participants' leadership on node 0, so the append-pending freeze appends on the
+  // bystander's only host. 100 is single-voter on 0, so these transfers never unseat it.
+  for gid in [10u64, 11] {
+    let mut landed = false;
+    for _ in 0..3_000 {
+      if w.leader_of(gid) == Some(0) {
+        landed = true;
+        break;
+      }
+      w.transfer_group_leader(gid, 0);
+      w.tick();
+    }
+    assert!(landed, "g{gid} leadership never landed on node 0");
+  }
+  // Freeze 11 -> 10, accepted (append-pending). NO ticks afterward: it stays unapplied, so the
+  // container reads its claim through the append-pending `Claimed` leg's faultable log scan.
+  merge_verb_until_accepted(&mut w, 3_000, "the freeze", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  assert_eq!(
+    w.leader_of(11),
+    Some(0),
+    "the freeze must remain led by (and appended on) node 0"
+  );
+  assert!(
+    w.merge_choreography_active(11) && !w.group_frozen(11),
+    "source 11 must be freeze-PENDING (append-observed, not yet applied)"
+  );
+  assert!(
+    !w.merge_choreography_active(100),
+    "the bystander 100 is claimed by no freeze"
+  );
+  w
+}
+
+/// The seed-0 compacting-band survivor: a transient read fault fires on a co-hosted freeze-pending
+/// source's log while a claim-free bystander is torn down, so the container's `Claimed` scan fails
+/// CLOSED (correct product conservatism). PRE-FIX the world's `.expect` reads that as a teardown
+/// failure and panics; POST-FIX the world reads its own teardown scan FAULT-FREE, so the removal
+/// lands ATOMICALLY despite the armed fault — never a partial teardown that would drop committed
+/// voters' durable logs and strand the survivors below quorum. The fault-free scan proves no claim
+/// on the bystander (source 11 names target 10, not 100).
+#[test]
+fn a_claim_free_teardown_reads_fault_free_and_lands() {
+  let mut w = freeze_pending_beside_bystander(13);
+  let armed = crate::StorageFaults {
+    transient_read_per_mille: 1000, // every read of source 11's log fails closed
+    ..crate::StorageFaults::none()
+  };
+  w.logs
+    .get_mut(&(0, 11))
+    .expect("source 11 log on node 0")
+    .set_faults(armed, 0xF);
+  // PRE-FIX: this panics inside the container-removal `.expect` when the armed scan fails closed.
+  w.remove_group(100);
+  assert!(
+    !w.hosts_group(0, 100),
+    "the removal lands atomically — the fault-free scan admits the claim-free teardown"
+  );
+  assert_eq!(w.retired_checkers(), 1, "the bystander retired");
+}
+
+/// Teeth (real claim): a genuinely claimed target — an APPLIED freeze names it — is NEVER swallowed.
+/// `merge_choreography_active(10)` reads TRUE and the container's in-memory `frozen_for` leg refuses,
+/// so the removal trips with both verdicts. (The removal DRAW excludes such a target; this calls it
+/// directly to prove the guard is not silent.)
+#[test]
+#[should_panic(expected = "a REAL teardown-gate tie")]
+fn a_genuinely_claimed_target_is_never_swallowed() {
+  let mut w = MultiWorld::new(13);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(11, &all); // source
+  w.create_group(10, &all); // target
+  assert!(w.run_until(3_000, |w| w.leader_of(11).is_some()
+    && w.leader_of(10).is_some()));
+  colocate_source_onto_target(&mut w, 11, 10);
+  merge_verb_until_accepted(&mut w, 3_000, "the freeze", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  assert!(
+    w.run_until(4_000, |w| w.group_frozen(11)),
+    "the freeze applies (the in-memory `frozen_for` claim leg, no faultable scan)"
+  );
+  assert!(
+    w.merge_choreography_active(10),
+    "target 10 is genuinely claimed by the frozen source"
+  );
+  w.remove_group(10);
+}
+
+/// Teeth (a forgotten claim): fault suppression must never BLIND the container gate — it removes the
+/// FAULT, not the real claim in the log. Here the world's `active_freezes` record is dropped so its
+/// `merge_choreography_active(10)` superset reads FALSE (a simulated predicate hole), yet the
+/// fault-free append-pending scan still decodes source 11's genuine claim on target 10. The refusal
+/// SURVIVES suppression, so the world trips with both verdicts rather than tearing down a genuinely
+/// claimed target.
+#[test]
+#[should_panic(expected = "a REAL teardown-gate tie")]
+fn a_forgotten_claim_survives_fault_suppression_and_trips() {
+  let mut w = freeze_pending_beside_bystander(13);
+  w.active_freezes.remove(&11);
+  assert!(
+    !w.merge_choreography_active(10),
+    "the world has FORGOTTEN the freeze — its superset now misses the claim"
+  );
+  // The container's fault-free scan still decodes source 11's append-pending claim on 10.
+  w.remove_group(10);
+}
+
 /// A DEAD-END merge-abort obligation clears CLUSTER-WIDE off a committed `ThawDischarged` witness.
 /// Source S owes a target-role thaw to an upstream group U (S was the aborted TARGET of U→S, so it
 /// carries `abandoned[U]`). On a host that holds S but NEVER U, that host can neither drive U's thaw
