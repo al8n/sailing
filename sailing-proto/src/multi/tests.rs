@@ -7400,6 +7400,158 @@ fn a1_a_non_terminal_floor_clears_locally_and_mints_no_witness() {
   );
 }
 
+/// A hosted incarnation at a LOWER gen than the abandoned freeze — a legal squatter recreated above a
+/// non-terminal floor at a fresh gen — must not SHADOW the durable host-local proof that the NAMED
+/// (dead) incarnation is discharged. The hosted arm now ORs the persisted floor/lineage legs into the
+/// LOCAL clear, so the squatter's gen-0 counter no longer pins the obligation. RED before the fix: the
+/// hosted arm reads only `shape_gen(0) > 1 = false`, consults no persisted leg, and the re-derived
+/// obligation holds forever (the seed-0 g102 calm-window livelock).
+#[test]
+fn a_lower_gen_squatter_does_not_shadow_the_floor_discharge() {
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let mut inner = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  // The target holder (group 2) and the gen-0 SQUATTER source (group 1, recreated hosted BELOW the
+  // abandoned freeze's gen 1). Both single-voter, elected.
+  for gid in [2u64, 1] {
+    inner
+      .0
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    m.create_group(
+      gid,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      7,
+      CountSm::default(),
+    )
+    .unwrap();
+    let (log, stable) = inner.0.get_mut(&gid).unwrap();
+    let d = m.group(&gid).unwrap().poll_timeout().unwrap();
+    m.handle_timeout(&gid, d, log, stable).unwrap();
+    drain_storage(&mut m, gid, d, log, stable);
+    assert!(m.group(&gid).unwrap().role().is_leader());
+  }
+  while m.poll_message().is_some() {}
+  while m.poll_event().is_some() {}
+  let now = Instant::ORIGIN;
+  assert_eq!(
+    m.group(&1).unwrap().shape_gen(),
+    0,
+    "the squatter sits BELOW the abandoned freeze's generation"
+  );
+  // Crash-replay re-derives the target's obligation on source 1 at expected gen 1.
+  m.group_mut(&2)
+    .unwrap()
+    .note_abandoned(gid_key(1), 1, Index::new(1));
+  // The removal floor of the DEAD gen-1 incarnation: floored to 2 (past expected), NON-terminal.
+  let mut stores = LineageStores {
+    inner,
+    floors: std::collections::BTreeMap::from([(1u64, 2u64)]),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    !m.group(&2).unwrap().has_abandoned(),
+    "the persisted floor discharged the obligation off the durable proof, not the squatter's counter"
+  );
+  // A lower-gen hosted counter is HOST-LOCAL, never a global proof: no witness is minted (the A1
+  // discipline — only the local clear fires).
+  assert_eq!(
+    witness_count(&stores.inner.0.get(&2).unwrap().0),
+    0,
+    "a lower-gen hosted incarnation mints NO witness — only the local clear fires"
+  );
+}
+
+/// A LIVE source hosted AND FROZEN at the abandoned generation is NOT prematurely discharged by the
+/// new hosted floor/lineage legs: its own admission guaranteed `floor_admits(floor, expected)`, so the
+/// floor leg is false, and a frozen source's lineage has not passed `expected` either. The obligation
+/// stands until the source actually thaws past it — the no-over-reach guard on the hosted-arm change
+/// (GREEN both before and after the fix).
+#[test]
+fn a_live_frozen_source_at_expected_is_not_prematurely_discharged() {
+  let (mut m, base) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  let mut stores = LineageStores {
+    inner: base,
+    floors: std::collections::BTreeMap::new(),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  // Freeze source 2 into target 1 (source 2 frozen at gen 1) and abort on the target: it records
+  // abandoned[2] = (1, idx). Source 2 stays HOSTED and frozen at gen 1 — the LIVE obligation.
+  {
+    m.prepare_merge(&2, now, &mut stores, &1).unwrap().unwrap();
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(
+    m.group(&2).unwrap().is_frozen() && m.group(&2).unwrap().shape_gen() == 1,
+    "source 2 is the live obligation, frozen at the abandoned generation"
+  );
+  assert!(
+    m.group(&1).unwrap().has_abandoned(),
+    "the target owes 2 a thaw"
+  );
+  // The floor at the source's OWN admission value (a gen-1 incarnation admits iff `floor <= 1`):
+  // `floor_admits(1, 1)` holds, so the floor leg is false and cannot clear the LIVE obligation.
+  stores.floors.insert(2, 1);
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&1).unwrap().has_abandoned(),
+    "a live frozen source AT the abandoned gen is not prematurely discharged by the hosted floor leg"
+  );
+}
+
+/// A hosted FROZEN source whose STALE removal floor sits ABOVE the abandoned generation is a LIVE
+/// obligation, not a dead squatter: the id was removed (floored) and its fresh incarnation legally
+/// re-froze BELOW that floor at a colliding generation. The floor leg is FENCED off a frozen source,
+/// so only the source-side thaw drive may clear it. RED without the `is_frozen` fence: `!floor_admits`
+/// discharges the live freeze and strands the source frozen forever — the merge-freeze wedge.
+#[test]
+fn a_frozen_source_below_a_stale_floor_is_not_floor_discharged() {
+  let (mut m, base) = merge_host(2, 3);
+  let now = Instant::ORIGIN;
+  let mut stores = LineageStores {
+    inner: base,
+    floors: std::collections::BTreeMap::new(),
+    lineages: std::collections::BTreeMap::new(),
+  };
+  // Source 2 freezes into target 1 at gen 1; target 1 aborts and records abandoned[2] = (1, idx).
+  // Source 2 stays HOSTED and frozen at gen 1 — a LIVE re-freeze below the stale floor below.
+  {
+    m.prepare_merge(&2, now, &mut stores, &1).unwrap().unwrap();
+    let (log, stable) = stores.inner.0.get_mut(&2).unwrap();
+    drain_storage(&mut m, 2, now, log, stable);
+  }
+  {
+    let (log, stable) = stores.inner.0.get_mut(&1).unwrap();
+    m.rollback_merge(&1, now, log, stable, &2).unwrap().unwrap();
+    drain_storage(&mut m, 1, now, log, stable);
+  }
+  assert!(m.group(&2).unwrap().is_frozen() && m.group(&2).unwrap().shape_gen() == 1);
+  assert!(m.group(&1).unwrap().has_abandoned());
+  // A STALE removal floor ABOVE the freeze gen (the id's PRIOR incarnation was floored to 3): it does
+  // NOT admit gen 1, so the bare floor leg WOULD fire — but the source is FROZEN, so the fence holds.
+  stores.floors.insert(2, 3);
+  assert!(
+    !crate::floor_admits(3, 1),
+    "the stale floor fences gen 1 — the bare floor leg would discharge the live freeze"
+  );
+  m.service_merge_applies(now, &mut stores);
+  assert!(
+    m.group(&1).unwrap().has_abandoned(),
+    "a FROZEN source below a stale floor is a live obligation — the floor leg must not discharge it"
+  );
+}
+
 /// PIN (c): the apply is GEN-EXACT. A witness at generation `g` no-ops against a fresh obligation at
 /// `g' != g` (the source re-froze for a new merge) — the stale witness cannot clear the live record.
 #[test]

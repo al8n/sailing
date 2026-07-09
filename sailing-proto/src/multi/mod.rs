@@ -3087,25 +3087,41 @@ where
         };
         // DISCHARGE by OBSERVING the source, never by classifying the thaw's append outcome: the
         // abandoned freeze is gen `expected`, so a source advanced PAST it committed its unfreeze (or
-        // re-froze past it) — the obligation is delivered. HOSTED reads the live counter; UNHOSTED
-        // consults the PERSISTED lineage/floor that OUTLIVES the source's teardown (a lineage past
-        // `expected`, or a floor that no longer admits it). Clearing lifts the target's compaction
-        // fence over the abort entry, so it releases only once the source is proven past `expected` —
-        // crash-durable via the abort entry's replay.
+        // re-froze past it) — the obligation is delivered. The LOCAL clear takes the hosted live
+        // counter past `expected`, the PERSISTED engine lineage past it, or — for an UNHOSTED or a
+        // hosted-but-UNFROZEN source — a removal floor that no longer admits `expected` (both persisted
+        // legs OUTLIVE the source's teardown). Clearing lifts the target's compaction fence over the
+        // abort entry, so it releases only once the source is proven past `expected` — crash-durable
+        // via the abort entry's replay.
+        //
+        // WHY the floor leg is FENCED OFF a FROZEN hosted source. A hosted incarnation at a LOWER gen
+        // than `expected` that is NOT frozen is a legal SQUATTER — the id was removed (floored past
+        // `expected`) and recreated below that non-terminal floor at a fresh gen — and its live counter
+        // must NOT SHADOW the durable proof that the NAMED (dead) incarnation is discharged; the floor
+        // advanced past `expected` at the removal and floors are MONOTONE, so `!floor_admits` fires. But
+        // a hosted source that is FROZEN is LIVE-and-owing whatever its generation: a recreated id can
+        // refreeze at a gen the OLD removal floor still sits above, and that fresh freeze is a REAL
+        // obligation only the source-side thaw DRIVE (below) may clear — the floor must never
+        // short-circuit it, or the source strands frozen forever (the merge-freeze wedge). A frozen
+        // source already PAST `expected` still discharges via `seen_past`.
         //
         // TWO predicates from one lookup. LOCAL discharge is what THIS replica can observe directly.
         // The WITNESS mint predicate is STRICTLY STRONGER: a witness is a COMMITTED claim every replica
         // applies, so it may rest ONLY on a GLOBALLY-valid proof — a hosted replica's applied lineage
         // past `expected` (committed ⇒ global), the persisted engine lineage past it (the driver's
         // global mirror of the source's committed counter), or the TERMINAL `MERGED_FLOOR` (the source
-        // was absorbed away — global). NEVER a non-terminal floor: that is a HOST-LOCAL fact ("THIS host
-        // stopped hosting at/below `expected`", set by the local removal ceiling), so witnessing it
-        // would clear a LIVE obligation on a co-hosting holder whose source is still frozen — killing
-        // the thaw drive and stranding the source frozen forever.
+        // was absorbed away — global). NEVER a non-terminal floor, and NEVER a lower-gen squatter's
+        // counter: both are HOST-LOCAL facts ("THIS host stopped hosting at/below `expected`", set by
+        // the local removal ceiling), so witnessing either would clear a LIVE obligation on a
+        // co-hosting holder whose source is still frozen — killing the thaw drive and stranding the
+        // source frozen forever.
         let (local_discharged, global_proof) = match self.groups.get(&source) {
           Some(sep) => {
             let seen_past = sep.shape_gen() > expected;
-            (seen_past, seen_past)
+            let local = seen_past
+              || stores.lineage(&source) > expected
+              || (!sep.is_frozen() && !crate::floor_admits(stores.floor(&source), expected));
+            (local, seen_past)
           }
           None => {
             let lineage_past = stores.lineage(&source) > expected;
