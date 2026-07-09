@@ -271,12 +271,22 @@ pub(super) fn conf_change(w: &mut MultiWorld, prng: &mut FaultPrng, report: &mut
     }
     _ => match pick_from(&removable, prng) {
       Some(victim) => {
-        let cc = sailing_proto::ConfChange::new(
-          sailing_proto::ConfChangeType::RemoveNode,
-          victim,
-          bytes::Bytes::new(),
-        );
-        w.propose_conf_change(gid, cc).is_some()
+        if w.merge_choreography_active(gid) {
+          // A merge participant must not SHRINK mid-choreography (the lifecycle-churn discipline,
+          // extended from the grow draw to the remove draw): a RemoveNode on a frozen source or a
+          // claimed/parked target drops a voter the choreography still counts on — the victim
+          // self-removes-and-parks, and a frozen source pushed below quorum goes leaderless
+          // forever (the freeze wedge). The victim was still drawn off the prng, so non-merge
+          // profiles — which never see the predicate true — keep byte-identical schedules.
+          false
+        } else {
+          let cc = sailing_proto::ConfChange::new(
+            sailing_proto::ConfChangeType::RemoveNode,
+            victim,
+            bytes::Bytes::new(),
+          );
+          w.propose_conf_change(gid, cc).is_some()
+        }
       }
       None => false,
     },
