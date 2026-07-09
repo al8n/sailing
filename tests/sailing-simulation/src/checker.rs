@@ -1206,6 +1206,13 @@ pub fn record_membership_observation(checker: &mut Checker, view: &ClusterView) 
       }
     }
   }
+
+  // DERIVE any committed conf-change the event-sourced history never recorded, decoding it from a
+  // hosting replica's durable log WHILE IT IS STILL PRESENT — the frozen/parked replica that carries
+  // the entry (a committed change it never applied, e.g. its own removal) may DEPART before the group
+  // retires, so a retirement-only walk would find its log already gone. Capturing per tick records the
+  // config permanently; the run-end walk then crosses it. Conservative (see `derive_unrecorded_conf_changes`).
+  derive_unrecorded_conf_changes(checker, view);
 }
 
 /// A retiring group's committed-config history FREEZES at archival, so an install whose boundary sits beyond
@@ -1259,9 +1266,147 @@ pub fn certify_retiring_history(checker: &mut Checker, view: &ClusterView) {
     }
   }
 
+  // 1b. DERIVE any committed conf-change the event-sourced history still never recorded, decoding it
+  //     from the retiring group's own durable log and folding it forward, so the frontier walk can
+  //     cross it. This is what witnesses the fork-born install lineage: an install-suppressed replica
+  //     emits no `ConfChanged`, and the one lineage-free replica may have FROZEN below a committed
+  //     conf-change it never applied (its own removal), so neither move above records that config —
+  //     yet later installs legitimately reflect it, and without deriving it they never face a verdict.
+  derive_unrecorded_conf_changes(checker, view);
+
   // 2. Raise the completeness frontier across the gap-free committed prefix, now that the retiring
-  //    replicas' freshly-recorded configs help certify it.
+  //    replicas' freshly-recorded (and freshly-derived) configs help certify it.
   certify_committed_prefix(checker);
+}
+
+/// The config in effect just BELOW `boundary`: the config of the greatest recorded, exact-term-PROVEN,
+/// unambiguous conf-change strictly below it — [`finalize_membership`]'s resolution rules (a
+/// higher-term non-ConfChange TOMBSTONES; anything weaker DECLINES) — else the genesis config. `None`
+/// when the nearest recorded conf-change is ambiguous or unprovable, so the derivation refuses to
+/// fold onto a guessed base.
+fn config_in_effect_below(checker: &Checker, boundary: u64) -> Option<ConfSnapshot> {
+  for (idx, (term_cc, conf, amb)) in checker.committed_config_history.range(..boundary).rev() {
+    match checker.committed_log_kind.get(idx) {
+      Some((term_log, CommittedKind::ConfChange)) if *term_log == *term_cc => {}
+      Some((term_log, CommittedKind::NonConfChange)) if *term_log >= *term_cc => continue,
+      _ => return None,
+    }
+    if *amb {
+      return None;
+    }
+    return Some(conf.clone());
+  }
+  checker.genesis_conf.clone()
+}
+
+/// Fill any committed ConfChange the event-sourced history NEVER recorded, by decoding it from the
+/// retiring group's own durable log and folding it forward from the config just below the frontier —
+/// so the frontier walk crosses it and the installs beyond it face a verdict rather than freezing
+/// unwitnessed forever. Sound because at retirement the committed log IS the authority the product
+/// applied from: the anti-circularity suppression that keeps a snapshot-installed replica out of LIVE
+/// install certification does NOT apply here — the config is DECODED FROM THE LOG, never adopted from
+/// a snapshot-installed `ConfState`. Conservative everywhere else: an undecodable, joint, or multi-op
+/// change, an unprovable/ambiguous base, or a committed-log conflict STOPS the walk (the existing
+/// fail-safe freeze), so only a cleanly-decoded SIMPLE change onto a non-joint base ever extends.
+///
+/// Runs PER TICK (from [`record_membership_observation`]) so the entry is decoded WHILE its holder
+/// still hosts — the frozen/parked replica carrying a committed conf-change it never applied (the
+/// fork-born install lineage's downstream removal) can DEPART before the group retires, leaving a
+/// retirement-only walk with the log already gone; the per-tick capture records the config
+/// permanently. Also runs at retirement (from [`certify_retiring_history`]) as a backstop.
+pub(crate) fn derive_unrecorded_conf_changes(checker: &mut Checker, view: &ClusterView) {
+  let mut idx = checker.complete_up_to + 1;
+  let Some(mut current) = config_in_effect_below(checker, idx) else {
+    return;
+  };
+  while let Some((term, kind)) = checker.committed_log_kind.get(&idx).copied() {
+    match kind {
+      CommittedKind::ConfChange => match checker.committed_config_history.get(&idx) {
+        // Already recorded and exact-term-proven: adopt it as the running config and walk on.
+        Some((rec_term, rec_conf, false)) if *rec_term == term => current = rec_conf.clone(),
+        // Recorded but ambiguous or off-term — cannot trust as a fold base; stop (fail-safe).
+        Some(_) => break,
+        // Never recorded: DERIVE it from the durable log and extend the history.
+        None => {
+          let Some(conf) = derive_simple_fold(view, idx, term, &current) else {
+            break;
+          };
+          checker
+            .committed_config_history
+            .insert(idx, (term, conf.clone(), false));
+          current = conf;
+        }
+      },
+      // An impossible-in-correct-Raft same-term conflict: trust nothing past it.
+      CommittedKind::Conflicted => break,
+      // A non-conf-change committed entry leaves the config unchanged.
+      CommittedKind::NonConfChange => {}
+    }
+    idx += 1;
+  }
+}
+
+/// Decode the committed ConfChange entry at `(idx, term)` from any retiring replica's durable log and
+/// fold it (as a SIMPLE, non-joint change — the shape every multi-world membership change takes) onto
+/// `current`. A committed `(index, term)` is a unique immutable entry, so any replica that still holds
+/// it carries the same bytes. `None` for anything the simple path cannot fold: no matching durable
+/// entry, a decode error, a joint / multi-op change, a joint `current`, or a fold that would empty the
+/// voter set — the caller then leaves the rest of the history unwitnessed.
+fn derive_simple_fold(
+  view: &ClusterView,
+  idx: u64,
+  term: u64,
+  current: &ConfSnapshot,
+) -> Option<ConfSnapshot> {
+  let entry = view
+    .nodes
+    .iter()
+    .flat_map(|n| n.durable_entries.iter())
+    .find(|e| e.index == idx && e.term == term && e.is_conf_change)?;
+  let cc =
+    sailing_proto::decode_conf_change_v2::<u64>(bytes::Bytes::from(entry.data.clone())).ok()?;
+  // A single Auto-transition change is the SIMPLE (non-joint) shape; a joint enter/leave needs the
+  // tracker's Progress machinery, out of a pure config walk's reach.
+  if cc.transition() != sailing_proto::ConfChangeTransition::Auto || cc.changes().len() != 1 {
+    return None;
+  }
+  // A simple change folds cleanly only onto a NON-JOINT base (`Changer::simple` rejects a joint prior).
+  if !current.voters_outgoing.is_empty() || !current.learners_next.is_empty() || current.auto_leave
+  {
+    return None;
+  }
+  let change = &cc.changes()[0];
+  let node = change.node();
+  let mut voters = current.voters.clone();
+  let mut learners = current.learners.clone();
+  // The config-only projection of `Changer::apply` on a non-joint tracker (make_voter / make_learner /
+  // remove): voter and learner are mutually exclusive, and a simple change touches exactly one node.
+  match change.ty() {
+    sailing_proto::ConfChangeType::AddNode => {
+      learners.remove(&node);
+      voters.insert(node);
+    }
+    sailing_proto::ConfChangeType::AddLearnerNode => {
+      voters.remove(&node);
+      learners.insert(node);
+    }
+    sailing_proto::ConfChangeType::RemoveNode => {
+      voters.remove(&node);
+      learners.remove(&node);
+    }
+  }
+  // A committed simple change never empties the voter set (`apply`'s `EmptyVoterSet` guard); refuse to
+  // mint an invalid config if a decode somehow implies one.
+  if voters.is_empty() {
+    return None;
+  }
+  Some(ConfSnapshot {
+    voters,
+    voters_outgoing: BTreeSet::new(),
+    learners,
+    learners_next: BTreeSet::new(),
+    auto_leave: false,
+  })
 }
 
 /// Raise [`complete_up_to`](Checker::complete_up_to) across the GAP-FREE prefix the DURABLE-COMMITTED log
@@ -1375,8 +1520,22 @@ pub fn finalize_membership(checker: &mut Checker) -> Result<(), Violation> {
   let mut kind_unobservable = 0u64;
   for ((node_id, boundary), install_conf) in observed.iter() {
     // The history is certified complete only up to `complete_up_to` (the highest index a LOG-BUILT node has
-    // APPLIED, hence emitted every conf-change for). Beyond it the reference is not final — count it unwitnessed.
+    // APPLIED, hence emitted every conf-change for). Beyond it the reference is not final.
     if *boundary > checker.complete_up_to {
+      // An observed install boundary is a durable snapshot boundary, hence committed. If committed_log_kind
+      // holds committed entries ABOVE the frontier, the frontier stopped at a HOLE — indices compacted before
+      // any tick observed them, this boundary bridged by that snapshot — so the config there is committed but
+      // its reference is UNPROVABLE: a sound KIND-UNOBSERVABLE decline (the bounded compaction limit), not an
+      // un-converged completeness gap. A frontier that stopped at the END (no committed entry above it) is a
+      // genuine completeness gap the zero-tolerance still catches (SKIPPED — a converged run drives it to 0).
+      if checker
+        .committed_log_kind
+        .range((checker.complete_up_to + 1)..)
+        .next()
+        .is_some()
+      {
+        kind_unobservable += 1;
+      }
       continue;
     }
     // The FINAL committed config in effect at the BOUNDARY = the conf of the greatest SURVIVING conf-change

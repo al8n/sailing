@@ -1607,6 +1607,186 @@ fn certify_retiring_history_leaves_a_genuine_gap_unwitnessed() {
   );
 }
 
+/// Encode a single-change conf-change entry payload for the derivation tests.
+fn encode_cc(
+  transition: sailing_proto::ConfChangeTransition,
+  ty: sailing_proto::ConfChangeType,
+  node: u64,
+) -> Vec<u8> {
+  let cc = sailing_proto::ConfChangeV2::new(
+    transition,
+    std::vec![sailing_proto::ConfChangeSingle::new(ty, node)],
+    bytes::Bytes::new(),
+  );
+  let mut buf = Vec::new();
+  sailing_proto::encode_conf_change_v2(&cc, &mut buf);
+  buf
+}
+
+/// Set up the fork-born retire shape whose committed conf-change at index 6 the event-sourced history
+/// NEVER recorded: genesis {0,1,2}; the install lineage commits `RemoveNode 2 -> {0,1}` at index 6 but
+/// emits no `ConfChanged` (snapshot-derived), so `committed_log_kind[6]` is a ConfChange yet its config
+/// is unrecorded and the frontier stays at 5; an install lands at boundary 6 with `install_conf`. The
+/// retire view is the one lineage-free replica, FROZEN at commit 5 (one short of index 6, so its
+/// `conf_snapshot` records nothing there) but still carrying the uncommitted conf-change entry — the
+/// sole witness of that config's CONTENT. Returns the checker and the retire view (not yet certified).
+fn fork_born_retire_shape(cc6: Vec<u8>, install_conf: ConfSnapshot) -> (Checker, ClusterView) {
+  let mut ck = Checker::new();
+  let pre: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 5, 5);
+      n.conf_voters = [0, 1, 2].into_iter().collect();
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(0, 1, pre));
+
+  let committed6: Vec<NodeView> = (0..3)
+    .map(|id| {
+      let mut n = healthy_node(id, 6, 6);
+      n.durable_entries[5] = DurableEntry {
+        index: 6,
+        term: 1,
+        data: cc6.clone(),
+        is_conf_change: true,
+      };
+      n.conf_voters = [0, 1].into_iter().collect();
+      n.installed_snapshot = true; // snapshot-derived: emits no ConfChanged, never raises the frontier
+      n
+    })
+    .collect();
+  record_membership_observation(&mut ck, &cv(0, 2, committed6));
+
+  let install_view = with_install(cv(0, 3, std::vec![]), 0, 6, install_conf);
+  record_membership_observation(&mut ck, &install_view);
+
+  let mut frozen = healthy_node(0, 5, 6); // commit 5, durable log reaches the uncommitted index 6
+  frozen.durable_entries[5] = DurableEntry {
+    index: 6,
+    term: 1,
+    data: cc6,
+    is_conf_change: true,
+  };
+  frozen.conf_voters = [0, 1, 2].into_iter().collect();
+  let retire_view = cv(0, 4, std::vec![frozen]);
+  record_membership_observation(&mut ck, &retire_view);
+  (ck, retire_view)
+}
+
+/// The seed-10 g259 survivor, unit-isolated: the walk must DERIVE the config of a committed
+/// conf-change no live replica ever recorded a ConfState for — decoding it from a hosting replica's
+/// durable log and folding it. Seeded directly (bypassing `record_membership_observation`, whose own
+/// per-tick call would derive it immediately): before the walk index 6's config is absent; after, it
+/// is the fold `{0,1,2}` −RemoveNode(2)→ `{0,1}`.
+#[test]
+fn the_walk_derives_an_unrecorded_committed_conf_change() {
+  let mut ck = Checker::new();
+  ck.genesis_conf = Some(conf(&[0, 1, 2], &[]));
+  ck.complete_up_to = 5;
+  ck.committed_log_kind
+    .insert(6, (1, CommittedKind::ConfChange));
+  let mut frozen = healthy_node(0, 5, 6); // commit 5, durable log carries the uncommitted index 6
+  frozen.durable_entries[5] = DurableEntry {
+    index: 6,
+    term: 1,
+    data: encode_cc(
+      sailing_proto::ConfChangeTransition::Auto,
+      sailing_proto::ConfChangeType::RemoveNode,
+      2,
+    ),
+    is_conf_change: true,
+  };
+  let view = cv(0, 1, std::vec![frozen]);
+
+  assert!(
+    !ck.committed_config_history.contains_key(&6),
+    "index 6's config is unrecorded before the walk"
+  );
+  derive_unrecorded_conf_changes(&mut ck, &view);
+  assert_eq!(
+    ck.committed_config_history.get(&6).map(|(_, c, _)| c
+      .voters
+      .iter()
+      .copied()
+      .collect::<Vec<u64>>()),
+    Some(std::vec![0, 1]),
+    "the walk decoded RemoveNode 2 and folded genesis {{0,1,2}} -> {{0,1}}"
+  );
+}
+
+/// End to end: with the config derived PER TICK, an install past the (once-unrecorded) conf-change is
+/// WITNESSED against the derived reference at the run-end pass — not skipped, not merely declined.
+#[test]
+fn a_derived_config_witnesses_the_install() {
+  let cc6 = encode_cc(
+    sailing_proto::ConfChangeTransition::Auto,
+    sailing_proto::ConfChangeType::RemoveNode,
+    2,
+  );
+  let (mut ck, _view) = fork_born_retire_shape(cc6, conf(&[0, 1], &[]));
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "the per-tick-derived config witnessed the install"
+  );
+  assert!(
+    ck.membership_comparisons() >= 1,
+    "the install was JUDGED against the derived config {{0,1}}, not merely declined"
+  );
+}
+
+/// Teeth: the derived config is a real REFERENCE, not a blanket bless — an install whose membership
+/// does NOT match it still trips the divergence arm. Here the install adopted {0,2} where the derived
+/// committed config at the boundary is {0,1}: node 2 is a phantom voter, node 1 a missing joiner.
+#[test]
+fn a_derived_config_still_trips_a_divergent_install() {
+  let cc6 = encode_cc(
+    sailing_proto::ConfChangeTransition::Auto,
+    sailing_proto::ConfChangeType::RemoveNode,
+    2,
+  );
+  let (mut ck, retire_view) = fork_born_retire_shape(cc6, conf(&[0, 2], &[]));
+  certify_retiring_history(&mut ck, &retire_view);
+  let v = finalize_membership(&mut ck).unwrap_err();
+  assert_eq!(v.oracle, "snapshot_membership_coherent");
+  assert!(
+    v.detail.contains("phantom voters {2}") && v.detail.contains("missing joiners {1}"),
+    "{}",
+    v.detail
+  );
+}
+
+/// Conservatism: a gap conf-change the pure simple fold CANNOT derive (here a JOINT / non-`Auto`
+/// change) is NEVER guessed — the walk leaves its config unrecorded. The install past it is then a
+/// sound KIND-UNOBSERVABLE decline: its snapshot boundary proves committed, but the config reference
+/// is unprovable, so the accounting TOLERATES it (never a false witness, never a hard skip).
+#[test]
+fn an_undecodable_gap_change_declines_the_install() {
+  let cc6 = encode_cc(
+    sailing_proto::ConfChangeTransition::Implicit, // joint entry — not a simple fold
+    sailing_proto::ConfChangeType::RemoveNode,
+    2,
+  );
+  let (mut ck, _view) = fork_born_retire_shape(cc6, conf(&[0, 1], &[]));
+  finalize_membership(&mut ck).unwrap();
+  assert_eq!(
+    ck.membership_comparisons(),
+    0,
+    "the joint config was never guessed — the install is not witnessed"
+  );
+  assert_eq!(
+    ck.kind_unobservable_installs(),
+    1,
+    "the boundary is bridged but its config reference is unprovable — a sound decline"
+  );
+  assert_eq!(
+    ck.skipped_unwitnessed_installs(),
+    0,
+    "a bridged, unprovable boundary is a tolerated decline, not a hard completeness gap"
+  );
+}
+
 /// A LIVE all-snapshot-derived group (the merge-target shape, group 110): its log-built witnesses
 /// all departed before applying far, freezing `complete_up_to` below the durable-committed extent,
 /// so an install whose boundary is committed-final but past the applied frontier was silently

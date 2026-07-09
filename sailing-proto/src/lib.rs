@@ -48,6 +48,22 @@ pub use conf::{
   ConfChange, ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, ConfState,
 };
 
+/// Decode a `ConfChange` entry's payload bytes into a [`ConfChangeV2`] — the read half of the
+/// committed membership-change codec. Exposed for audit / replay walks over a committed log where no
+/// live tracker survives to fold the change (e.g. a simulation checker reconstructing the config a
+/// committed conf-change installed after the applying replicas have all departed).
+pub fn decode_conf_change_v2<I: NodeId>(
+  data: bytes::Bytes,
+) -> Result<ConfChangeV2<I>, DecodeError> {
+  crate::wire::decode_conf_change_v2::<I>(data)
+}
+
+/// Encode a [`ConfChangeV2`] to its `ConfChange` entry-payload bytes — the write half of the codec,
+/// the exact inverse of [`decode_conf_change_v2`].
+pub fn encode_conf_change_v2<I: NodeId>(cc: &ConfChangeV2<I>, buf: &mut std::vec::Vec<u8>) {
+  crate::wire::encode_conf_change_v2::<I>(cc, buf)
+}
+
 mod quorum;
 pub(crate) use quorum::{JointConfig, MajorityConfig, VoteResult};
 
