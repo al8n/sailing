@@ -384,11 +384,17 @@ fn merge_band_smoke() {
   let mut total_registered = 0u64;
   let mut total_rollbacks = 0u64;
   let mut total_aborted = 0u64;
+  // The async crash-suite non-vacuity witnesses, summed over the band (the merge family runs its
+  // stores async — see [`MultiProfile::merge_reshape`]).
+  let mut total_torn = 0u64;
+  let mut total_crashes_inflight = 0u64;
+  let mut total_flushes = 0u64;
   for seed in 0..8u64 {
     let r = run_multi_vopr(seed, 4_000, MultiProfile::merge_reshape());
     std::eprintln!(
       "merge seed {seed}: prepared={} committed={} rolled_back={} registered={} resolved={} \
-       aborted={} splits={} committed_load={}",
+       aborted={} splits={} committed_load={} log_flushes={} stable_flushes={} torn={} \
+       crash_log_inflight={} crash_stable_inflight={}",
       r.merges_prepared,
       r.merges_committed,
       r.merges_rolled_back,
@@ -396,7 +402,12 @@ fn merge_band_smoke() {
       r.merges_resolved,
       r.merges_aborted,
       r.splits_applied,
-      r.committed
+      r.committed,
+      r.log_flushes,
+      r.stable_flushes,
+      r.torn_writes_fired,
+      r.crashes_with_log_inflight,
+      r.crashes_with_stable_inflight,
     );
     assert!(
       r.groups_created >= 2 && r.committed > 0,
@@ -405,6 +416,9 @@ fn merge_band_smoke() {
     total_registered += r.merges_registered;
     total_rollbacks += r.merges_rolled_back;
     total_aborted += r.merges_aborted;
+    total_flushes += r.log_flushes + r.stable_flushes;
+    total_torn += r.torn_writes_fired;
+    total_crashes_inflight += r.crashes_with_log_inflight + r.crashes_with_stable_inflight;
   }
   assert!(
     total_registered > 0,
@@ -413,6 +427,20 @@ fn merge_band_smoke() {
   assert!(
     total_rollbacks + total_aborted > 0,
     "the merge band never exercised the abort side (no rollback accepted, no parked abort)"
+  );
+  // The async crash suite is non-vacuous over the band: the multi tick fsync-flushes, torn writes
+  // strand real batches, and crashes land mid-window — the coverage the sync default cannot reach.
+  assert!(
+    total_flushes > 0,
+    "the merge band never flushed an async store — the multi tick is not fsync-flushing"
+  );
+  assert!(
+    total_torn > 0,
+    "the merge band never fired a torn write that stranded a real batch — the lost-fsync window is inert"
+  );
+  assert!(
+    total_crashes_inflight > 0,
+    "the merge band never crashed mid-fsync-window — the crash×durability interleaving is vacuous"
   );
 }
 
@@ -509,6 +537,13 @@ fn soak_merge_profile() {
   let ticks = env_u64("MULTI_VOPR_MERGE_TICKS", 40_000) as usize;
   assert!(end > start, "empty band: {start} >= {end}");
   let mut registered = 0u64;
+  // The async crash-suite non-vacuity witnesses: the merge family runs its stores through the real
+  // fsync-loss window, so the crash campaign must actually flush, tear, and crash mid-window.
+  let mut log_flushes = 0u64;
+  let mut stable_flushes = 0u64;
+  let mut torn = 0u64;
+  let mut crashes_log_inflight = 0u64;
+  let mut crashes_stable_inflight = 0u64;
   for seed in start..end {
     let r = run_multi_vopr(seed, ticks, MultiProfile::merge_reshape());
     assert!(
@@ -516,10 +551,40 @@ fn soak_merge_profile() {
       "seed {seed} vacuous: {r:?}"
     );
     registered += r.merges_registered;
+    log_flushes += r.log_flushes;
+    stable_flushes += r.stable_flushes;
+    torn += r.torn_writes_fired;
+    crashes_log_inflight += r.crashes_with_log_inflight;
+    crashes_stable_inflight += r.crashes_with_stable_inflight;
   }
+  std::eprintln!(
+    "merge soak {start}..{end} @{ticks}: merges_registered={registered} log_flushes={log_flushes} \
+     stable_flushes={stable_flushes} torn_writes_fired={torn} \
+     crashes_with_log_inflight={crashes_log_inflight} \
+     crashes_with_stable_inflight={crashes_stable_inflight}"
+  );
   assert!(
     registered > 0,
     "the merge soak slice {start}..{end} never resolved an absorb"
+  );
+  // Non-vacuity of the async crash suite: a configured-but-never-fired durability fault must fail
+  // the check, exactly like the network/cross-talk non-vacuity gates. If any of these is zero the
+  // suite CLAIMED to test lost-fsync durability but exercised none of it.
+  assert!(
+    log_flushes > 0 && stable_flushes > 0,
+    "the merge soak slice {start}..{end} never flushed an async store — the multi tick is not \
+     fsync-flushing (log_flushes={log_flushes} stable_flushes={stable_flushes})"
+  );
+  assert!(
+    torn > 0,
+    "the merge soak slice {start}..{end} never fired a torn write that stranded a real batch — the \
+     lost-fsync window is not being exercised"
+  );
+  assert!(
+    crashes_log_inflight + crashes_stable_inflight > 0,
+    "the merge soak slice {start}..{end} never crashed mid-fsync-window — the crash×durability \
+     interleaving is vacuous (crashes_with_log_inflight={crashes_log_inflight} \
+     crashes_with_stable_inflight={crashes_stable_inflight})"
   );
 }
 
@@ -550,6 +615,11 @@ fn soak_merge_compacting_profile() {
   let ticks = env_u64("MULTI_VOPR_MERGE_COMPACTING_TICKS", 40_000) as usize;
   assert!(end > start, "empty band: {start} >= {end}");
   let mut registered = 0u64;
+  let mut log_flushes = 0u64;
+  let mut stable_flushes = 0u64;
+  let mut torn = 0u64;
+  let mut crashes_log_inflight = 0u64;
+  let mut crashes_stable_inflight = 0u64;
   for seed in start..end {
     let r = run_multi_vopr(seed, ticks, MultiProfile::merge_reshape_compacting(seed));
     assert!(
@@ -557,9 +627,31 @@ fn soak_merge_compacting_profile() {
       "seed {seed} vacuous: {r:?}"
     );
     registered += r.merges_registered;
+    log_flushes += r.log_flushes;
+    stable_flushes += r.stable_flushes;
+    torn += r.torn_writes_fired;
+    crashes_log_inflight += r.crashes_with_log_inflight;
+    crashes_stable_inflight += r.crashes_with_stable_inflight;
   }
+  std::eprintln!(
+    "merge-compacting soak {start}..{end} @{ticks}: merges_registered={registered} \
+     log_flushes={log_flushes} stable_flushes={stable_flushes} torn_writes_fired={torn} \
+     crashes_with_log_inflight={crashes_log_inflight} \
+     crashes_with_stable_inflight={crashes_stable_inflight}"
+  );
   assert!(
     registered > 0,
     "the merge-compacting soak slice {start}..{end} never resolved an absorb"
+  );
+  // The async crash suite is non-vacuous under compaction pressure too.
+  assert!(
+    log_flushes > 0 && stable_flushes > 0 && torn > 0,
+    "the merge-compacting soak slice {start}..{end} did not exercise the fsync-loss window \
+     (log_flushes={log_flushes} stable_flushes={stable_flushes} torn={torn})"
+  );
+  assert!(
+    crashes_log_inflight + crashes_stable_inflight > 0,
+    "the merge-compacting soak slice {start}..{end} never crashed mid-fsync-window \
+     (crashes_with_log_inflight={crashes_log_inflight} crashes_with_stable_inflight={crashes_stable_inflight})"
   );
 }
