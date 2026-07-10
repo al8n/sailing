@@ -206,6 +206,13 @@ pub struct MultiWorld {
   /// merge registration instead). A count, not a set, because the same pair can legitimately
   /// freeze, abort, and re-freeze across a run.
   merge_aborts_observed: BTreeMap<(u64, u64), u64>,
+  /// Per-gid count of CONSECUTIVE teardown-gate refusals a `remove_group` draw has abandoned while
+  /// `merge_choreography_active` read false — the append-pending-residual escalation counter (see
+  /// [`remove_group`](Self::remove_group)). Reset on any successful teardown or a live-choreography
+  /// read; a transient replication lag clears within a handful of cranks (the streak never grows),
+  /// so passing [`TEARDOWN_TIE_BUDGET`](lifecycle::TEARDOWN_TIE_BUDGET) means a genuine
+  /// non-superset hole that refuses forever — and still trips.
+  teardown_tie_streak: BTreeMap<u64, usize>,
 }
 
 impl MultiWorld {
@@ -261,6 +268,7 @@ impl MultiWorld {
       merges_resolved: 0,
       merges_aborted: 0,
       merge_aborts_observed: BTreeMap::new(),
+      teardown_tie_streak: BTreeMap::new(),
     }
   }
 

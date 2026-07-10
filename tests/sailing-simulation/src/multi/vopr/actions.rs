@@ -404,8 +404,12 @@ pub(super) fn remove_group_action(
   let Some(gid) = pick_from(&live, prng) else {
     return;
   };
-  w.remove_group(gid);
-  report.groups_removed += 1;
+  // A refusal that survives the world's superset filter (an append-pending residual after a merge
+  // globally resolved) abandons the draw as a retryable no-op; the pick already burned the prng, so
+  // the schedule stays deterministic and only a committed teardown counts.
+  if w.remove_group(gid) {
+    report.groups_removed += 1;
+  }
 }
 
 /// Propose a SPLIT of a seed-picked live group: mint a fresh child id, pick a split point

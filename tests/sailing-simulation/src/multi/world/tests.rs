@@ -2535,6 +2535,50 @@ fn freeze_pending_beside_bystander(seed: u64) -> MultiWorld {
   w
 }
 
+/// Land source 11's append-pending freeze claiming target 10 on node 2 ONLY, with 10 a 3-voter group
+/// on {0,1,2}. Leadership of 11 is transferred to node 2 and the freeze accepted with NO ticks after,
+/// so the `PrepareMerge` stays unapplied AND unreplicated — only node 2's source replica carries the
+/// claim. A teardown of 10 then ADMITS on nodes 0 and 1 (their 11 replica has no freeze) and REFUSES
+/// on node 2: the partial-admit topology the soak's seed-18 residual hits, exercising the atomic
+/// rollback.
+fn freeze_pending_led_on_node2(seed: u64) -> MultiWorld {
+  let mut w = MultiWorld::new(seed);
+  for n in 0..3 {
+    w.add_node(n);
+  }
+  let all: BTreeSet<u64> = (0..3).collect();
+  w.create_group(10, &all); // target
+  w.create_group(11, &all); // source
+  assert!(w.run_until(3_000, |w| w.leader_of(10).is_some()
+    && w.leader_of(11).is_some()));
+  // Land 11's leadership on node 2 so its append-pending freeze appends there and nowhere else.
+  let mut landed = false;
+  for _ in 0..3_000 {
+    if w.leader_of(11) == Some(2) {
+      landed = true;
+      break;
+    }
+    w.transfer_group_leader(11, 2);
+    w.tick();
+  }
+  assert!(landed, "g11 leadership never landed on node 2");
+  // Freeze 11 -> 10, accepted (append-pending on node 2). NO ticks afterward: unapplied AND
+  // unreplicated, so only node 2's source replica carries the claim.
+  merge_verb_until_accepted(&mut w, 3_000, "the freeze", |w| {
+    w.propose_prepare_merge(11, 10)
+  });
+  assert_eq!(
+    w.leader_of(11),
+    Some(2),
+    "the freeze must remain led by (and appended on) node 2"
+  );
+  assert!(
+    w.merge_choreography_active(11) && !w.group_frozen(11),
+    "source 11 must be freeze-PENDING (append-observed, not yet applied)"
+  );
+  w
+}
+
 /// The seed-0 compacting-band survivor: a transient read fault fires on a co-hosted freeze-pending
 /// source's log while a claim-free bystander is torn down, so the container's `Claimed` scan fails
 /// CLOSED (correct product conservatism). PRE-FIX the world's `.expect` reads that as a teardown
@@ -2554,20 +2598,20 @@ fn a_claim_free_teardown_reads_fault_free_and_lands() {
     .expect("source 11 log on node 0")
     .set_faults(armed, 0xF);
   // PRE-FIX: this panics inside the container-removal `.expect` when the armed scan fails closed.
-  w.remove_group(100);
   assert!(
-    !w.hosts_group(0, 100),
+    w.remove_group(100),
     "the removal lands atomically — the fault-free scan admits the claim-free teardown"
   );
+  assert!(!w.hosts_group(0, 100), "the bystander replica is gone");
   assert_eq!(w.retired_checkers(), 1, "the bystander retired");
 }
 
 /// Teeth (real claim): a genuinely claimed target — an APPLIED freeze names it — is NEVER swallowed.
-/// `merge_choreography_active(10)` reads TRUE and the container's in-memory `frozen_for` leg refuses,
-/// so the removal trips with both verdicts. (The removal DRAW excludes such a target; this calls it
-/// directly to prove the guard is not silent.)
+/// `merge_choreography_active(10)` reads TRUE, so the removal is the legitimate choreography-active
+/// case the draw filters upstream: the container refuses and the world ABANDONS as a retryable no-op
+/// (resetting the tie streak), never tearing down the claimed target. (The removal DRAW excludes such
+/// a target; this calls it directly to prove the guard is not silent about the refusal.)
 #[test]
-#[should_panic(expected = "a REAL teardown-gate tie")]
 fn a_genuinely_claimed_target_is_never_swallowed() {
   let mut w = MultiWorld::new(13);
   for n in 0..3 {
@@ -2590,18 +2634,25 @@ fn a_genuinely_claimed_target_is_never_swallowed() {
     w.merge_choreography_active(10),
     "target 10 is genuinely claimed by the frozen source"
   );
-  w.remove_group(10);
+  assert!(
+    !w.remove_group(10),
+    "the claimed target's removal is abandoned, not committed"
+  );
+  for n in 0..3 {
+    assert!(
+      w.hosts_group(n, 10),
+      "node {n}'s claimed target replica survives untouched"
+    );
+  }
 }
 
-/// Teeth (a forgotten claim): fault suppression must never BLIND the container gate — it removes the
-/// FAULT, not the real claim in the log. Here the world's `active_freezes` record is dropped so its
-/// `merge_choreography_active(10)` superset reads FALSE (a simulated predicate hole), yet the
-/// fault-free append-pending scan still decodes source 11's genuine claim on target 10. The refusal
-/// SURVIVES suppression, so the world trips with both verdicts rather than tearing down a genuinely
-/// claimed target.
+/// A forgotten claim is a RETRYABLE NO-OP, not a panic: the world's
+/// `active_freezes` record is dropped so `merge_choreography_active(10)` reads FALSE (the
+/// replication-lag residual — a co-hosted source's stale log still claims 10 after the book moved
+/// on), yet the fault-free append-pending scan still decodes source 11's genuine claim on target 10.
+/// One draw abandons and leaves 10 fully hosted; a real embedder retries once the lag clears.
 #[test]
-#[should_panic(expected = "a REAL teardown-gate tie")]
-fn a_forgotten_claim_survives_fault_suppression_and_trips() {
+fn a_forgotten_claim_is_a_retryable_no_op() {
   let mut w = freeze_pending_beside_bystander(13);
   w.active_freezes.remove(&11);
   assert!(
@@ -2609,7 +2660,64 @@ fn a_forgotten_claim_survives_fault_suppression_and_trips() {
     "the world has FORGOTTEN the freeze — its superset now misses the claim"
   );
   // The container's fault-free scan still decodes source 11's append-pending claim on 10.
-  w.remove_group(10);
+  assert!(
+    !w.remove_group(10),
+    "the residual refusal abandons the draw"
+  );
+  for n in 0..3 {
+    assert!(
+      w.hosts_group(n, 10),
+      "node {n}'s target replica is untouched by the no-op"
+    );
+  }
+  // The rolled-back world stays quorum-durable (nothing was dropped).
+  w.check_now();
+}
+
+/// Teeth (a persistent forgotten claim): the escalation bound keeps the tooth. In this frozen fixture
+/// no tick ever clears the claim, so it is NOT transient — each draw abandons and bumps the per-gid
+/// streak until it passes `TEARDOWN_TIE_BUDGET` and trips with both verdicts, exactly as a genuine
+/// world-predicate hole would.
+#[test]
+#[should_panic(expected = "a REAL teardown-gate tie")]
+fn a_persistent_forgotten_claim_escalates_and_trips() {
+  let mut w = freeze_pending_beside_bystander(13);
+  w.active_freezes.remove(&11);
+  for _ in 0..=super::lifecycle::TEARDOWN_TIE_BUDGET {
+    assert!(
+      !w.remove_group(10),
+      "each residual draw abandons until the budget is passed"
+    );
+  }
+  unreachable!("the budget-passing draw panics");
+}
+
+/// The atomic-rollback teeth (the soak's seed-18 residual topology): source 11's append-pending
+/// freeze claiming target 10 lands on node 2 ONLY, so tearing 10 down ADMITS on nodes 0 and 1 (their
+/// 11 replica carries no freeze) and REFUSES on node 2. The world restores the two admitted teardowns
+/// from their retained durable stores and abandons — never a PARTIAL teardown that would strand 10's
+/// survivors below quorum. `merge_choreography_active(10)` is FORGOTTEN so the residual escalation
+/// path (not the choreography-active branch) drives the rollback.
+#[test]
+fn a_partial_admit_teardown_rolls_back_atomically() {
+  let mut w = freeze_pending_led_on_node2(13);
+  w.active_freezes.remove(&11);
+  assert!(
+    !w.merge_choreography_active(10),
+    "the world's superset misses the node-2 append-pending claim"
+  );
+  assert!(
+    !w.remove_group(10),
+    "the partial-admit teardown rolls back and abandons"
+  );
+  for n in 0..3 {
+    assert!(
+      w.hosts_group(n, 10),
+      "node {n}'s target replica survives the atomic rollback"
+    );
+  }
+  // Every replica kept its durable log, so the quorum-durability oracle stays green.
+  w.check_now();
 }
 
 /// A DEAD-END merge-abort obligation clears CLUSTER-WIDE off a committed `ThawDischarged` witness.
