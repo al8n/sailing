@@ -140,27 +140,33 @@ impl ConservationLedger {
     }
   }
 
-  /// Assert the merge of `source` into `target` absorbed every OWNED source key's FULL history:
-  /// the target's recorded history for the key must CONTAIN the source's, in order (an ordered
-  /// subsequence). Not a leading prefix: a cross-incarnation merge folds the source's cells under
-  /// the target's ledger id where a PRIOR incarnation's cells for that key already sit, so the
-  /// absorbed run trails the target's own. The state machine's `absorb` appends the source record
-  /// intact, so a faithful absorb leaves those cells as a contiguous in-order run the subsequence
-  /// check finds; a dropped, altered, or reordered source cell breaks the match and still trips.
+  /// Assert the merge of `source` into `target` CONSERVED every OWNED source key's history: every
+  /// non-departed source VALUE must appear SOMEWHERE in the target's recorded values for that key.
+  /// Conservation is a CONTAINMENT property, not an order property — a faithful `absorb` appends the
+  /// source record intact, but a cross-incarnation merge folds it under the target's ledger id where
+  /// a PRIOR incarnation's cells (and the source's OWN earlier-absorbed run) already sit, so the
+  /// absorbed values legitimately INTERLEAVE with the target's own in a different order. ORDER is the
+  /// absorb-DETERMINISM oracle's business — the byte-for-byte cross-host record comparison at the
+  /// resolution coordinate (the world's `register_or_check_merge`) — not conservation's; an
+  /// ordered-subsequence demand here false-trips a source that folded an earlier-absorbed run under a
+  /// different interleaving. Values are globally unique (the fuzzer's
+  /// command counter), so a present value is an EXACT absorb witness and a genuinely DROPPED source
+  /// value is absent from the target's value set and still trips.
+  ///
   /// `absorbed_keys` is the source's key POPULATION at the merge — the keys this union actually
   /// handed over. A key the source WROTE but then SPLIT AWAY before merging is NOT here (it rode
   /// that split, whose partition verdict judges the handover), so it is not demanded of the
   /// target — a written-history (`keys_of`) sweep would false-trip it. An owned key the source
   /// never wrote judges vacuously (its source history is empty).
   ///
-  /// `departed` exempts individual CELLS, not whole keys. The ledger is append-only save for the ONE
-  /// legitimate FSM mutation — `LogSm::split` evicts a moved key's cells record-wide — so cells a
-  /// split carried away are demanded of no later target. The caller supplies them per key: values are
-  /// globally unique (the fuzzer's command counter), so a value present in a registered split child's
-  /// record for `k` is an EXACT departure witness. Exempt values are dropped from the demand before
-  /// the subsequence check; the remainder's order is preserved, so a dropped NON-exempt cell still
-  /// trips — the seam keeps its teeth for every cell the caller does not hand it. Panics with the
-  /// group ids, the key, and both histories otherwise.
+  /// `departed` exempts individual source VALUES, not whole keys. The ledger is append-only save for
+  /// the ONE legitimate FSM mutation — `LogSm::split` evicts a moved key's cells record-wide — so
+  /// values a split carried away are demanded of no later target. The caller supplies them per key:
+  /// values are globally unique, so a value present in a registered split child's record for `k` is
+  /// an EXACT departure witness. Exempt values are subtracted from the demand; every remaining source
+  /// value must still be a member of the target's set, so a dropped NON-exempt value still trips — the
+  /// seam keeps its teeth for every value the caller does not hand it. Panics with the group ids, the
+  /// key, and both histories otherwise.
   pub(crate) fn assert_union(
     &self,
     target: u64,
@@ -172,11 +178,11 @@ impl ConservationLedger {
       let s = self.history(source, k);
       let t = self.history(target, k);
       let gone = departed.get(&k);
-      let mut ti = t.iter();
+      let target_values: BTreeSet<u64> = t.iter().map(|&(_, value)| value).collect();
       let absorbed = s
         .iter()
         .filter(|&&(_, value)| !gone.is_some_and(|d| d.contains(&value)))
-        .all(|cell| ti.by_ref().any(|tc| tc == cell));
+        .all(|&(_, value)| target_values.contains(&value));
       assert!(
         absorbed,
         "[conservation] merge g{source}->g{target}: key {k} source history not absorbed\n  \

@@ -439,3 +439,55 @@ fn partition_loss_leg_still_trips_on_an_own_write_in_the_tail() {
     &inherited,
   );
 }
+
+/// Conservation is CONTAINMENT, not order (the seed-18 compacting survivor): the source recorded its
+/// own writes first then an earlier-absorbed run, while the target copied the absorbed run to its
+/// front (an absorbed cell that is the target's OWN pre-existing cell) and the source's own writes
+/// after — a legitimate reordering with every source value present. Value-set membership holds; the
+/// old ordered-subsequence demand false-tripped on it (the absorbed run trails the own-writes in the
+/// source but leads them in the target). ORDER is the absorb-determinism oracle's business.
+#[test]
+fn union_holds_when_absorbed_values_are_reordered_in_the_target() {
+  let mut l = ConservationLedger::new();
+  // The source: its own writes, THEN a run it absorbed from an earlier merge.
+  l.record(115, 5, 2, 50); // own writes
+  l.record(115, 5, 5, 51);
+  l.record(115, 5, 8, 60); // earlier-absorbed run
+  l.record(115, 5, 9, 61);
+  // The target folded the source under its ledger id where the absorbed run already sat at its
+  // front, then the source's own writes, then a later target write — the same values, reordered.
+  l.record(1_000_106, 5, 8, 60);
+  l.record(1_000_106, 5, 9, 61);
+  l.record(1_000_106, 5, 2, 50);
+  l.record(1_000_106, 5, 5, 51);
+  l.record(1_000_106, 5, 15, 70);
+  l.assert_union(1_000_106, 115, &keyset(&[5]), &no_departed());
+}
+
+/// The containment seam keeps its teeth: a genuinely dropped NON-departed source value is absent from
+/// the target's value set and still trips, regardless of order.
+#[test]
+#[should_panic(expected = "not absorbed")]
+fn union_still_trips_on_a_dropped_value_out_of_order() {
+  let mut l = ConservationLedger::new();
+  l.record(115, 5, 2, 50);
+  l.record(115, 5, 5, 51);
+  l.record(115, 5, 8, 60); // the target never absorbs this value
+  // The target has 50 and 51 (reordered) but never 60.
+  l.record(1_000_106, 5, 5, 51);
+  l.record(1_000_106, 5, 2, 50);
+  l.assert_union(1_000_106, 115, &keyset(&[5]), &no_departed());
+}
+
+/// A departed value stays exempt under value-set membership: a value a registered split carried away
+/// is absent from the target and demanded of no later target.
+#[test]
+fn union_exempts_a_departed_value_absent_from_the_target() {
+  let mut l = ConservationLedger::new();
+  l.record(115, 5, 1, 40); // split away before the merge
+  l.record(115, 5, 8, 60); // still owned at the merge
+  l.record(1_000_106, 5, 8, 60); // the target absorbed only the owned value
+  let mut departed: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  departed.insert(5, [40].into_iter().collect());
+  l.assert_union(1_000_106, 115, &keyset(&[5]), &departed);
+}
