@@ -509,6 +509,80 @@ fn leaseguard_failover_leader_stamps_wall_timestamp() {
   );
 }
 
+/// A failover-tier leader handed a wall-LESS `Now::monotonic` (the driver clock's transient
+/// `Wall::ABSENT` over-bound fold) must NOT panic — a missing wall is a legitimate runtime
+/// degradation, not a misconfiguration. It fails closed: the entry stamps `wall_timestamp == 0`
+/// (degrading reads to Safe) and `wall_stamp_degradations` counts the fallback.
+#[test]
+fn failover_leader_absent_wall_stamps_zero_and_counts() {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50))
+  .with_bounded_clock_uncertainty(Duration::from_millis(20));
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  // Elect under a SYNCHRONIZED wall so the leader's own no-op stamps normally (no degradation).
+  let mono = ep.poll_timeout().unwrap();
+  let synced = Now::synchronized(mono, crate::Wall::from_nanos(1_700_000_000_000_000_000));
+  ep.handle_timeout(synced, &mut log, &mut stable);
+  ep.handle_storage(synced, &mut log, &mut stable);
+  ep.handle_message(
+    synced,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(synced, &mut log, &mut stable);
+  assert_eq!(
+    ep.wall_stamp_degradations(),
+    0,
+    "the synchronized-wall election never degrades"
+  );
+
+  // Propose with NO synchronized wall: the tier is active, so lease_wall_stamp must fail closed to
+  // 0 and count the degradation — reaching here at all proves it did not panic the debug build.
+  let idx = ep
+    .propose(
+      Now::monotonic(mono),
+      &mut log,
+      &stable,
+      &bytes::Bytes::from_static(b"cmd"),
+    )
+    .expect("leader accepts the proposal");
+  ep.flush_appends(Now::monotonic(mono), &log, &stable);
+
+  let mut stamped = None;
+  while let Some(out) = ep.poll_message() {
+    if let Message::AppendEntries(ae) = out.message()
+      && let Some(e) = ae.entries().iter().find(|e| e.index() == idx)
+    {
+      stamped = Some(e.wall_timestamp());
+      break;
+    }
+  }
+  assert_eq!(
+    stamped,
+    Some(0),
+    "an absent wall stamps 0 on the failover tier (fail-closed to Safe)"
+  );
+  assert_eq!(
+    ep.wall_stamp_degradations(),
+    1,
+    "the absent-wall fallback is counted exactly once"
+  );
+}
+
 /// A FRESH LeaseGuard cluster's first leader has no inherited entries (`max_lease_window = 0`), so it
 /// has no deposed lease to wait out — its no-op commits immediately on a quorum ack, exactly like
 /// Safe. (The commit-wait engages only on a real failover; see

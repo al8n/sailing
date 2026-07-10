@@ -1130,6 +1130,14 @@ where
   /// only via [`lease_refreshes`](Self::lease_refreshes). A positive value proves the proactive path actually
   /// re-anchored, so a configured refresh mode cannot pass a test vacuously.
   lease_refreshes: u64,
+  /// Failover wall-stamp degradation counter (sibling of [`cold_read_defers`](Self::cold_read_defers)).
+  /// Bumped each time [`lease_wall_stamp`](Self::lease_wall_stamp) runs under an ACTIVE failover tier but
+  /// the supplied [`Now`] carries no synchronized wall (`Wall::ABSENT` — the driver clock's documented
+  /// over-bound / transient-NTP-loss fold): the stamp degrades to `0` (fail-closed to Safe) instead of
+  /// emitting a falsely-fresh wall. `0` on a healthy synchronized-clock feed; a steadily climbing value
+  /// flags a degraded time source. Pure in-memory metric — never persisted, never on the wire, reset to
+  /// `0` on construction and restart, read only via [`wall_stamp_degradations`](Self::wall_stamp_degradations).
+  wall_stamp_degradations: u64,
   /// The pending output queues (outbound messages + application events).
   outputs: Outputs<I, F>,
   /// Runtime membership: joint voter config, learner sets, and per-peer `Progress`.
@@ -1290,6 +1298,7 @@ where
       },
       cold_read_defers: 0,
       lease_refreshes: 0,
+      wall_stamp_degradations: 0,
       outputs: Outputs {
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
@@ -1476,6 +1485,15 @@ where
   #[inline(always)]
   pub const fn lease_refreshes(&self) -> u64 {
     self.lease_refreshes
+  }
+
+  /// Failover wall-stamp degradation counter: how many times an active-failover-tier stamp fell back
+  /// to `0` because the supplied [`Now`] carried no synchronized wall (`Wall::ABSENT`). `0` on a
+  /// healthy clock feed; a climbing value flags a degraded time source. Diagnostic only — a wall loss
+  /// degrades the read path to Safe, it never poisons.
+  #[inline(always)]
+  pub const fn wall_stamp_degradations(&self) -> u64 {
+    self.wall_stamp_degradations
   }
 
   /// The current applied index — the highest log index this node has applied to its
@@ -1769,14 +1787,19 @@ where
   /// `ε_unc ≥ Δ`) would still emit nonzero `wall_timestamp`s, which a VALID successor would fold into
   /// `max_wall_plus_window` and trust as an inherited-read / release horizon — a rejected config seeding
   /// the failover tier. FAIL-CLOSED: if the tier is active but the caller supplied no wall
-  /// (`Now::monotonic`), this returns `0` and the read path degrades to Safe — never a falsely-fresh
-  /// stamp. The `debug_assert` makes that misconfiguration LOUD in test/debug builds.
-  pub(crate) fn lease_wall_stamp(&self, now: Now) -> u64 {
+  /// (`Now::monotonic`, or the driver clock's `Wall::ABSENT` over-bound / transient-NTP-loss fold),
+  /// this stamps `0` and the read path degrades to Safe — never a falsely-fresh stamp. A missing wall
+  /// is a LEGITIMATE transient runtime condition, NOT a misconfiguration, so it must not panic a debug
+  /// build (the driver deliberately produces `Wall::ABSENT`); it is counted via
+  /// [`wall_stamp_degradations`](Self::wall_stamp_degradations) so a degraded clock feed stays observable.
+  pub(crate) fn lease_wall_stamp(&mut self, now: Now) -> u64 {
     if self.config.failover_tier_valid(self.reads.active_read_mode) {
-      debug_assert!(
-        !now.wall().is_absent(),
-        "LeaseGuard failover tier is active but the caller supplied no synchronized wall (Now::monotonic)"
-      );
+      // `Wall::ABSENT.as_nanos()` is already `0`, so this is release-behavior-neutral; the count is
+      // the only added effect (and the reason for taking `&mut self`).
+      if now.wall().is_absent() {
+        self.wall_stamp_degradations = self.wall_stamp_degradations.saturating_add(1);
+        return 0;
+      }
       now.wall().as_nanos()
     } else {
       0

@@ -476,6 +476,7 @@ where
       },
       cold_read_defers: 0,
       lease_refreshes: 0,
+      wall_stamp_degradations: 0,
       // seed the op-id counter at seq 0 of THIS boot epoch (strictly greater than every prior
       // incarnation's ids), so a prior-incarnation storage completion that survives the crash can never
       // match a post-restart op (epoch-major OpId ordering + map-key equality make it miss every lookup

@@ -509,8 +509,8 @@ fn committed_membership_growth_raises_the_connection_cap() {
 ///
 /// MUTATION (revert FIX 2 — `drain_bridge(now.mono(), ..)`): the decoded `VoteResponse` reaches
 /// `handle_message` with the wall STRIPPED (`Now::monotonic`), so the failover tier's
-/// `lease_wall_stamp` debug-asserts the absent wall and PANICS the election (and, with the assert
-/// compiled out, the no-op would stamp `0`, also failing the `== W` assertion).
+/// `lease_wall_stamp` fails closed — it stamps `0` (counting a `wall_stamp_degradations`) rather than
+/// the synchronized wall, failing the `== W` assertion below.
 #[test]
 fn quic_election_preserves_synchronized_wall_on_leader_noop() {
   use crate::{EntryKind, Index, LogStore, Now, Wall};
