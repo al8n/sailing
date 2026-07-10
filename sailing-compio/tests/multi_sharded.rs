@@ -766,6 +766,18 @@ fn same_plane_merges_resolve_and_cross_plane_refuses() {
   assert_eq!(submit_anywhere(std::slice::from_ref(&h1), b"s2"), 2);
   assert_eq!(submit_anywhere(std::slice::from_ref(&h2), b"t1"), 1);
 
+  // Orient the pair by the direction rule: the source must encode strictly ABOVE the target, which
+  // for u64 is LE-byte-string order, NOT numeric order — g2 is the first same-plane multiple of
+  // 100, which may be a two-byte id (e.g. 300) whose LE encoding sorts BELOW the single-byte g1.
+  // The larger-encoding id is the source that dissolves; the union (2 + 1 = 3) is served by the
+  // target either way.
+  let (msrc, mtgt, h_tgt, h_src) = if g1.to_le_bytes() > g2.to_le_bytes() {
+    (g1, g2, &h2, &h1)
+  } else {
+    (g2, g1, &h1, &h2)
+  };
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
+
   // Cross-plane pairings refuse at the handle edge, typed, before ANY propose.
   for verdict in [
     bo(node.prepare_merge(g2, g3)),
@@ -783,14 +795,18 @@ fn same_plane_merges_resolve_and_cross_plane_refuses() {
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   loop {
     assert!(std::time::Instant::now() < deadline, "no freeze accepted");
-    if bo(node.prepare_merge(g1, g2)).is_ok() {
-      break;
+    match bo(node.prepare_merge(msrc, mtgt)) {
+      Ok(_) => break,
+      Err(DriverError::Rejected { reason }) if reason == inverted => {
+        panic!("the freeze is permanently inverted — source must encode above target")
+      }
+      Err(_) => {}
     }
     std::thread::sleep(Duration::from_millis(30));
   }
   loop {
     assert!(std::time::Instant::now() < deadline, "no commit accepted");
-    if bo(node.commit_merge(g2, g1)).is_ok() {
+    if bo(node.commit_merge(mtgt, msrc)).is_ok() {
       break;
     }
     std::thread::sleep(Duration::from_millis(30));
@@ -800,7 +816,7 @@ fn same_plane_merges_resolve_and_cross_plane_refuses() {
       std::time::Instant::now() < deadline,
       "the union never served"
     );
-    if bo(h2.query(|sm: &CountSm| sm.count())) == Ok(3) {
+    if bo(h_tgt.query(|sm: &CountSm| sm.count())) == Ok(3) {
       break;
     }
     std::thread::sleep(Duration::from_millis(30));
@@ -814,12 +830,12 @@ fn same_plane_merges_resolve_and_cross_plane_refuses() {
       std::time::Instant::now() < deadline,
       "the source never died"
     );
-    if matches!(bo(h1.status()), Err(DriverError::Rejected { .. })) {
+    if matches!(bo(h_src.status()), Err(DriverError::Rejected { .. })) {
       break;
     }
     std::thread::sleep(Duration::from_millis(30));
   }
-  match bo(node.create_group(g1, config(1, vec![1]), 9, CountSm::default(), 42)) {
+  match bo(node.create_group(msrc, config(1, vec![1]), 9, CountSm::default(), 42)) {
     Err(DriverError::Rejected { reason }) => {
       assert!(reason.contains("floor"), "got: {reason}");
     }

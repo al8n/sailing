@@ -323,13 +323,21 @@ async fn merge_absorbs_and_source_never_returns() {
   assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
   assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
 
-  // Freeze 100 into 200 (retry across nodes for the source leader).
+  // Freeze 200 into 100 (retry across nodes for the source leader). The direction rule makes the
+  // encoding-minimal id the survivor: group 100 is the target, group 200 the source that dissolves
+  // (200's LE encoding sorts strictly above 100's). DirectionInverted is a property of the id pair,
+  // never transient, so fail fast on it — `map_merge_err` carries the variant's Debug form.
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   'freeze: loop {
     assert!(std::time::Instant::now() < deadline, "no freeze accepted");
     for h in &handles {
-      if h.prepare_merge(100, 200).await.is_ok() {
-        break 'freeze;
+      match h.prepare_merge(200, 100).await {
+        Ok(_) => break 'freeze,
+        Err(DriverError::Rejected { reason }) if reason == inverted => {
+          panic!("the freeze is permanently inverted — source must encode above target")
+        }
+        Err(_) => {}
       }
     }
     compio::time::sleep(Duration::from_millis(40)).await;
@@ -339,7 +347,7 @@ async fn merge_absorbs_and_source_never_returns() {
   'commit: loop {
     assert!(std::time::Instant::now() < deadline, "no commit accepted");
     for h in &handles {
-      if h.commit_merge(200, 100).await.is_ok() {
+      if h.commit_merge(100, 200).await.is_ok() {
         break 'commit;
       }
     }
@@ -353,7 +361,7 @@ async fn merge_absorbs_and_source_never_returns() {
       "the union never served"
     );
     let mut counts = Vec::new();
-    for g in &g200 {
+    for g in &g100 {
       if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
         counts.push(c);
       }
@@ -372,7 +380,7 @@ async fn merge_absorbs_and_source_never_returns() {
       "the source never tore down everywhere"
     );
     let mut gone = 0;
-    for g in &g100 {
+    for g in &g200 {
       if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
         gone += 1;
       }
@@ -385,7 +393,7 @@ async fn merge_absorbs_and_source_never_returns() {
   for (i, h) in handles.iter().enumerate() {
     let id = i as u64 + 1;
     match h
-      .create_group(100, config(id, vec![1, 2]), 9, CountSm::default(), 9)
+      .create_group(200, config(id, vec![1, 2]), 9, CountSm::default(), 9)
       .await
     {
       Err(DriverError::Rejected { reason }) => {
