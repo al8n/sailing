@@ -84,6 +84,16 @@ const IO_BUDGET: usize = 256;
 /// (`bounded_clock_uncertainty`) is rejected loudly at admission, exactly as a single-group
 /// `bind` under the default [`Monotonic`] clock rejects it — never a silently-inert tier. The
 /// wall-clock generalization is a later seam.
+///
+/// # Storage is in-memory — NOT crash-durable
+///
+/// This host OWNS its [`GroupEngine`] (`GroupEngine::new`): the shared IN-MEMORY reference engine,
+/// with no store-injection seam in v1, so a PROCESS CRASH loses ALL consensus state — for tests,
+/// single-process deployments, and as the reference a persistent engine is validated against, NOT for
+/// crash recovery. Because a plane of the sharded host IS one of these drivers, that limit is
+/// per-plane too. `restore_group` reconnects a group within the SAME live process, not a
+/// recover-from-disk path. The lifecycle and event tails are best-effort TELEMETRY for observability,
+/// never a correctness feed.
 pub struct CompioMultiStreamDriver<G, I, F, R>
 where
   I: sailing_proto::NodeId,
@@ -962,6 +972,10 @@ where
   /// Recover a group from the engine's storage, the driver deriving the boot epoch from the
   /// engine's per-group counter. The floor check reads a pre-call [`FloorSnapshot`] of the
   /// engine's lineage (the engine itself is lent to the restore as `(log, stable)`).
+  ///
+  /// This reconnects a group against the SAME live in-memory engine (after a driver-level teardown),
+  /// NOT a recovery from durable storage: the in-memory engine keeps no state across a process crash.
+  /// Real crash recovery is the planned persistent-engine seam's job.
   fn restore_group(
     &mut self,
     now: Now,

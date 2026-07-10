@@ -656,6 +656,10 @@ where
   /// Recover a group from ITS MAPPED PLANE's engine and await the admission verdict.
   /// `generation` forwards to the plane command unchanged, as on
   /// [`create_group`](Self::create_group).
+  ///
+  /// Each plane is a `CompioMultiStreamDriver` over an IN-MEMORY engine, so this reconnects a group
+  /// within the SAME live process — NOT a recovery from durable storage across a process crash (the
+  /// sharded host is no more crash-durable than one plane).
   pub async fn restore_group(
     &self,
     gid: G,
