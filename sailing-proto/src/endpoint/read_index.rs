@@ -508,8 +508,15 @@ where
   ///   [`crate::ReadIndexError::ForwardingDisabled`] if `disable_proposal_forwarding` is set.
   /// - **Candidate / PreCandidate:** returns [`crate::ReadIndexError::NoLeader`] (no leader to confirm).
   ///
-  /// A poisoned node returns `Ok(())` without effect (it is inert; the driver should already be
-  /// stopping on `poison_reason()`).
+  /// Two rejections cut across every role:
+  /// - **Group being absorbed (frozen):** returns [`crate::ReadIndexError::Frozen`]; the read would
+  ///   otherwise leak forever, so the embedder re-routes to the merge target once the absorb resolves.
+  /// - **In-flight backlog at capacity:** returns [`crate::ReadIndexError::TooManyInFlight`] as
+  ///   back-pressure — the leader's combined deferred+confirming backlog, or the follower's forwarded
+  ///   set, is full; retry once it drains.
+  ///
+  /// A poisoned node returns [`crate::ReadIndexError::Poisoned`] without effect (it is inert; the
+  /// driver should already be stopping on `poison_reason()`).
   pub fn read_index<L, S>(
     &mut self,
     now: impl Into<Now>,

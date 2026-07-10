@@ -509,16 +509,19 @@ pub(crate) enum Pending<I> {
 /// Cap on the number of distinct read contexts a follower may hold in-flight to its leader at once
 /// (the [`ForwardedReads`] set). A follower inserts a context before forwarding and removes it only
 /// on the matching `ReadIndexResponse`; if the request or its response is dropped while the leader stays
-/// stable, distinct retry contexts would otherwise accumulate without bound. At the cap the oldest
-/// in-flight context is evicted FIFO. Kept independent of `max_inflight_msgs` (the leader's per-peer
-/// replication window) because the two limits are unrelated; 256 is the same generous default.
+/// stable, distinct retry contexts would otherwise accumulate without bound. At the cap the follower
+/// rejects the NEW read with `TooManyInFlight` (back-pressure, never eviction — evicting an accepted
+/// read would strand it, and a reused context could then complete the wrong one). Kept independent of
+/// `max_inflight_msgs` (the leader's per-peer replication window) because the two limits are
+/// unrelated; 256 is the same generous default.
 const MAX_FORWARDED_READS: usize = 256;
 
 /// Upper bound on a LEADER's combined in-flight read backlog — deferred reads awaiting the
 /// current-term no-op (`pending_reads`) plus reads awaiting heartbeat-quorum confirmation
 /// (`read_only`). A partitioned leader never drains this backlog, so without the cap a spammy or
 /// looping client could drive unbounded `Bytes` retention. Beyond the cap a local read is rejected
-/// with `TooManyInFlight` and a forwarded read is dropped (the follower can re-issue).
+/// with `TooManyInFlight` and a forwarded read is DECLINED with a rejecting `ReadIndexResponse` (the
+/// follower clears its slot and can re-issue once the backlog drains).
 const MAX_LEADER_READS: usize = 256;
 
 /// The reads this node (as a FOLLOWER) has forwarded to its current leader and is still awaiting a
@@ -1072,8 +1075,9 @@ struct Reads<I> {
   /// `read_context_in_flight` guard: a duplicate forward for an in-flight context is rejected with
   /// `DuplicateContext` instead of being silently coalesced (or unboundedly re-forwarded), so the
   /// originator is never left waiting on a confirmation the first forward already owns. Removed on
-  /// the matching `ReadIndexResponse`, FIFO-evicted at [`MAX_FORWARDED_READS`] (so dropped reads cannot
-  /// grow it without bound), and cleared wholesale on any term change or leader change (a read
+  /// the matching `ReadIndexResponse`, bounded at [`MAX_FORWARDED_READS`] by BACK-PRESSURE (a full set
+  /// rejects the new read with `TooManyInFlight` rather than evicting an accepted one, so dropped reads
+  /// cannot grow it without bound), and cleared wholesale on any term change or leader change (a read
   /// forwarded to a now-stale leader must not block re-issuing it to the new one).
   forwarded_reads: ForwardedReads,
   /// The index of the last appended `SetReadMode` entry — the one-in-flight guard for read-mode
