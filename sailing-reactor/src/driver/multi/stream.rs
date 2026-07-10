@@ -95,6 +95,17 @@ struct Redial {
 /// (`bounded_clock_uncertainty`) is rejected loudly at admission, exactly as a single-group
 /// `bind` under the default [`Monotonic`] clock rejects it — never a silently-inert tier. The
 /// wall-clock generalization is a later seam.
+///
+/// # Storage is in-memory — NOT crash-durable
+///
+/// This host OWNS its [`GroupEngine`], built with `GroupEngine::new`: the shared IN-MEMORY reference
+/// engine (its own doc: floors survive exactly what the engine survives, and a disk-engine mirror is
+/// the planned persistent form). There is no store-injection seam in v1, so a PROCESS CRASH loses ALL
+/// consensus state — this host is for tests, single-process deployments, and as the reference a
+/// persistent engine is validated against, NOT for crash recovery. `restore_group` reconnects a group
+/// within the SAME live process (after a driver-level teardown); it is not a recover-from-disk path.
+/// The lifecycle and event tails are best-effort TELEMETRY for observability, never a correctness
+/// feed: a dropped tail entry loses a notification, never consensus state.
 pub struct MultiReactorStreamDriver<R, G, I, F, Rec>
 where
   R: Runtime,
@@ -945,6 +956,10 @@ where
   /// Recover a group from the engine's storage, the driver deriving the boot epoch from the
   /// engine's per-group counter. The floor check reads a pre-call [`FloorSnapshot`] of the
   /// engine's lineage (the engine itself is lent to the restore as `(log, stable)`).
+  ///
+  /// This reconnects a group against the SAME live in-memory engine (after a driver-level teardown),
+  /// NOT a recovery from durable storage: the in-memory engine keeps no state across a process crash.
+  /// Real crash recovery is the planned persistent-engine seam's job.
   fn restore_group(
     &mut self,
     now: Now,

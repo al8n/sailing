@@ -66,6 +66,15 @@ struct Redial {
 /// per-group routing and fault scope, same storage crank over the shared engine; only the I/O
 /// model differs. Monotonic-only in v1, exactly as the stream sibling (a walled failover-tier
 /// group config is rejected loudly at admission).
+///
+/// # Storage is in-memory — NOT crash-durable
+///
+/// Like its stream sibling, this host OWNS its [`GroupEngine`] (`GroupEngine::new`): the shared
+/// IN-MEMORY reference engine, with no store-injection seam in v1, so a PROCESS CRASH loses ALL
+/// consensus state — for tests, single-process deployments, and as the reference a persistent engine
+/// is validated against, NOT for crash recovery. `restore_group` reconnects a group within the SAME
+/// live process, not a recover-from-disk path. The lifecycle and event tails are best-effort
+/// TELEMETRY for observability, never a correctness feed.
 pub struct MultiReactorQuicDriver<R, G, I, F>
 where
   R: Runtime,
@@ -688,6 +697,10 @@ where
   /// Recover a group from the engine's storage, the driver deriving the boot epoch. The floor
   /// check reads a pre-call [`FloorSnapshot`] of the engine's lineage (the engine itself is lent
   /// to the restore as `(log, stable)`).
+  ///
+  /// This reconnects a group against the SAME live in-memory engine (after a driver-level teardown),
+  /// NOT a recovery from durable storage: the in-memory engine keeps no state across a process crash.
+  /// Real crash recovery is the planned persistent-engine seam's job.
   fn restore_group(
     &mut self,
     now: Now,
