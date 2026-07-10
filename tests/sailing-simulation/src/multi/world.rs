@@ -135,6 +135,14 @@ pub struct MultiWorld {
   /// the construction default — leaves the library's demand-driven threshold untouched, so a
   /// world without the override is byte-identical to one predating the seam.
   snapshot_threshold: Option<usize>,
+  /// Whether every replica the world wires constructs its `Config` with pre-vote on — the
+  /// removed-replica disruption cure's prevention layer, set per-group by the reshaping profiles.
+  /// `false` — the construction default — applies `with_pre_vote(false)`, which equals the library
+  /// default, so a world that never sets it is byte-identical to one predating the seam.
+  pre_vote: bool,
+  /// Whether every replica the world wires constructs its `Config` with check-quorum on — the
+  /// prevention layer's leader-side half, defaulted and applied exactly like [`pre_vote`](Self::pre_vote).
+  check_quorum: bool,
   /// The instruction-conservation ledger: per-`(ledger id, key)` write histories recorded from
   /// the replicas' RAW applied records (see `conserve_sweep`), judged per recorded split by
   /// [`finalize_conservation_or_panic`](Self::finalize_conservation_or_panic).
@@ -260,6 +268,8 @@ impl MultiWorld {
       parked: BTreeSet::new(),
       cross_talk_checked: 0,
       snapshot_threshold: None,
+      pre_vote: false,
+      check_quorum: false,
       conservation: ConservationLedger::new(),
       cons_recorded: BTreeMap::new(),
       splits: BTreeMap::new(),
@@ -285,6 +295,19 @@ impl MultiWorld {
   /// replicas keep the config they were built under.
   pub fn set_snapshot_threshold(&mut self, threshold: Option<usize>) {
     self.snapshot_threshold = threshold;
+  }
+
+  /// Set whether replicas construct with pre-vote on (`false` restores the library default).
+  /// Applies at replica CONSTRUCTION — call before creating groups; already-wired replicas keep
+  /// the config they were built under.
+  pub fn set_pre_vote(&mut self, on: bool) {
+    self.pre_vote = on;
+  }
+
+  /// Set whether replicas construct with check-quorum on (`false` restores the library default).
+  /// Applies at replica CONSTRUCTION, exactly like [`set_pre_vote`](Self::set_pre_vote).
+  pub fn set_check_quorum(&mut self, on: bool) {
+    self.check_quorum = on;
   }
 
   /// Add node `id` as an empty container host (no groups). Panics if the id already exists.
@@ -343,6 +366,13 @@ impl MultiWorld {
       Some(t) => config.with_snapshot_threshold(t),
       None => config,
     };
+    // The prevention-layer knobs land at the SAME chokepoint, so every construction path
+    // (create/recreate/observer/resurrect, and crash restores via the retained `configs` entry)
+    // carries them. Both `false` — the default profiles — applies the library default, keeping the
+    // built config byte-identical to a world predating the seam.
+    let config = config
+      .with_pre_vote(self.pre_vote)
+      .with_check_quorum(self.check_quorum);
     let host = self
       .hosts
       .get_mut(&node)

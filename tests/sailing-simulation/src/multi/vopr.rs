@@ -87,6 +87,19 @@ pub struct MultiProfile {
   /// untouched: construction is byte-identical to a world without the seam, so the default
   /// profile's schedules (and its pinned regression seeds) cannot move.
   snapshot_threshold: Option<usize>,
+  /// Whether reshaping-participant groups construct their `Config` with pre-vote on — the
+  /// removed-replica disruption cure's prevention layer. Scoped PER-GROUP (never the global
+  /// `DEFAULT_PRE_VOTE` const: flipping that reseeds the whole VOPR corpus and breaks etcd-library
+  /// parity). `false` for the default/snapshot profiles, so their construction stays
+  /// byte-identical; `true` only where the profile weaves in the merge reshape verbs, whose
+  /// wholesale source-group removal is exactly the steady-state churn a pre-election probe (which
+  /// never inflates the real term) keeps from deposing the live leader.
+  pre_vote: bool,
+  /// Whether reshaping-participant groups construct their `Config` with check-quorum on — the
+  /// prevention layer's leader-side half (a leader that has lost quorum contact steps down rather
+  /// than shadowing a fresh election). Scoped and defaulted identically to
+  /// [`pre_vote`](Self::pre_vote).
+  check_quorum: bool,
 }
 
 impl MultiProfile {
@@ -111,6 +124,8 @@ impl MultiProfile {
         (MultiAction::RecreateGroup, 2),
       ],
       snapshot_threshold: None,
+      pre_vote: false,
+      check_quorum: false,
     }
   }
 
@@ -158,6 +173,12 @@ impl MultiProfile {
         (MultiAction::RollbackMerge, 2),
       ],
       snapshot_threshold: None,
+      // Prevention layer ON for the merge profiles: a merge dissolves a whole source group, so
+      // ignorant removed ex-voters are steady-state churn here — pre-vote keeps their election
+      // timer from inflating the real term and deposing the live target/sibling leader, and
+      // check-quorum makes a partitioned stale leader step down instead of flapping.
+      pre_vote: true,
+      check_quorum: true,
     }
   }
 
@@ -201,6 +222,8 @@ impl MultiProfile {
         (MultiAction::Split, 8),
       ],
       snapshot_threshold: None,
+      pre_vote: false,
+      check_quorum: false,
     }
   }
 }
@@ -339,6 +362,11 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   let nodes = 5 + (prng.next_u64() % 3); // 5..=7 hosts
   let mut w = MultiWorld::new(seed);
   w.set_snapshot_threshold(profile.snapshot_threshold);
+  // The prevention layer, per-group (never a global const flip): reshaping-participant profiles
+  // construct every replica with pre-vote + check-quorum, funneled through `wire_replica` so all
+  // construction paths inherit it. Both `false` on the default profiles ⇒ byte-identical Configs.
+  w.set_pre_vote(profile.pre_vote);
+  w.set_check_quorum(profile.check_quorum);
   for n in 0..nodes {
     w.add_node(n);
   }
