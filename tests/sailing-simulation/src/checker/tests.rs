@@ -206,9 +206,12 @@ fn commit_is_quorum_durable_detects_solo_commit() {
 #[test]
 fn commit_is_quorum_durable_detects_nonquorum_volatile_commit() {
   // A volatile commit that is NOT quorum-durable must trip even though the lagging durable commit alone
-  // looks fine. Node 0 has volatile commit=5 (durable commit only 4) and is the ONLY voter holding index
-  // 5 → 1 of 3 durable copies, below quorum. The volatile commit is what the node applies and serves, so
-  // checking only the durable commit (4) would miss it.
+  // looks fine. Node 0 has volatile commit=5 while its durable commit watermark is only 4, so it RETAINS
+  // index 5 in its durable log WITHOUT having durably committed it. The oracle therefore does not witness
+  // node 0's own term for index 5 (it did not choose it) and falls to the holder-quorum fallback, which
+  // finds no term durably held by a voter quorum for index 5 (node 0 is the sole holder) → trip. The
+  // volatile commit is what the node applies and serves, so checking only the durable commit (4) would
+  // miss it.
   let mut n0 = healthy_node(0, 5, 5); // volatile commit=5, durably holds 5
   n0.hardstate_commit = 4; // ...but the durable commit watermark lags (unflushed)
   n0.applied = 4;
@@ -218,7 +221,7 @@ fn commit_is_quorum_durable_detects_nonquorum_volatile_commit() {
   let v = commit_is_quorum_durable(&view, 0).unwrap_err();
   assert_eq!(v.oracle, "commit_is_quorum_durable");
   assert!(
-    v.detail.contains("only 1 of 3 voter durable logs"),
+    v.detail.contains("no term holds a durable quorum"),
     "{}",
     v.detail
   );

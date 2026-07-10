@@ -832,18 +832,22 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
     if c <= commit_floor {
       continue;
     }
-    // Pick the witness term, then check quorum-durability of `c`. When the committing node RETAINS `c`,
-    // use ITS term, so a (c, term A) commit while the quorum durably holds (c, term B) — a stale-tail /
-    // wrong-branch commit — still trips. When it does NOT retain `c` (volatile commit ahead of its own
-    // durable log, or it compacted `c` whose boundary term is not the entry term), it did not choose the
-    // term, so accept if `c` is quorum-durable at ANY term a holder retains (compacted = wildcard); a
-    // compacted-cover-only quorum is accepted (term-unobservable). `quorum_holds_committed`'s denominator
-    // excludes lower-term-branch and below-floor voters, so solo / under-replicated / losing-branch
-    // commits all still trip.
-    let committer_term = if c >= n.durable_first {
-      n.durable_term(c)
+    // Pick the witness term, then check quorum-durability of `c`. Witness the committing node's OWN term
+    // ONLY when it durably COMMITTED `c` (`c` within its durable HardState commit watermark): that is the
+    // term it chose, so a (c, term A) commit while the quorum durably holds (c, term B) — a stale-tail /
+    // wrong-branch commit — still trips. A node can RETAIN `c` in its durable log WITHOUT having committed
+    // it (an unflushed tail later superseded, e.g. a follower with an in-memory commit ahead of a stale
+    // durable branch); it did not choose that term, so witnessing it would demand a quorum at the wrong
+    // term and false-trip when `c` is legitimately quorum-durable at another. When the node did NOT durably
+    // commit `c` (volatile commit ahead of its durable commit, an uncommitted retained tail, or `c`
+    // compacted below the log), fall through to `None`: accept if `c` is quorum-durable at ANY term a
+    // holder retains (compacted = wildcard); a compacted-cover-only quorum is accepted (term-unobservable).
+    // `quorum_holds_committed`'s denominator excludes lower-term-branch and below-floor voters, so solo /
+    // under-replicated / losing-branch commits all still trip.
+    let committer_term = if c >= n.durable_first && c <= n.hardstate_commit {
+      n.durable_term(c) // n durably COMMITTED `c` → its term is the committed witness
     } else {
-      None // `c` is compacted on this node (boundary term ≠ entry term) → holder fallback
+      None // uncommitted stale tail, volatile-ahead, or compacted → holder-quorum fallback
     };
     let per_voter = || -> std::vec::Vec<_> {
       view
