@@ -288,8 +288,11 @@ impl MultiWorld {
       let e = self.relayed_lineage.entry((node, fork.parent)).or_insert(0);
       *e = (*e).max(fork.parent_gen_after);
     }
-    self.logs.insert((node, child), MemLog::new());
-    self.stables.insert((node, child), MemStable::new());
+    // Fresh stores in the world's configured mode (async under the merge profiles), so a fork-born
+    // child's stores match every other replica's rather than silently reverting to synchronous.
+    let (fresh_log, fresh_stable) = self.fresh_stores(node, child);
+    self.logs.insert((node, child), fresh_log);
+    self.stables.insert((node, child), fresh_stable);
     self.configs.insert((node, child), fork.config.clone());
     self.member_view.insert((node, child), true);
     *self.restarts.entry((node, child)).or_insert(0) += 1;

@@ -100,6 +100,11 @@ impl MultiWorld {
       let relayed = self.relayed_lineage.get(&(id, gid)).copied().unwrap_or(0);
       let log = self.logs.get_mut(&(id, gid)).expect("replica log");
       let stable = self.stables.get_mut(&(id, gid)).expect("replica stable");
+      // Witness whether this crash lands MID-WINDOW (a non-empty un-flushed tail is about to be
+      // lost) — read before the rollback clears it. Always false in sync mode (nothing is ever in
+      // flight), so the counters stay 0 on the default profiles.
+      let log_inflight = log.has_inflight();
+      let stable_inflight = stable.has_inflight();
       log.discard_inflight();
       stable.discard_inflight();
       let config = self.configs[&(id, gid)].clone();
@@ -118,6 +123,8 @@ impl MultiWorld {
       // Fold every already-materialized fork the replay re-stages back to a duplicate no-op.
       fresh.raise_relay_guard(&gid, relayed);
       *self.restarts.entry((id, gid)).or_insert(0) += 1;
+      self.crashes_with_log_inflight += u64::from(log_inflight);
+      self.crashes_with_stable_inflight += u64::from(stable_inflight);
     }
     self.hosts.insert(id, fresh);
     self.bus.retain(|m| m.from != id && m.to != id);

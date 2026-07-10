@@ -13,7 +13,7 @@ use super::{
 };
 use crate::{
   AppliedLog, Checker, DurableEntry, LogSm, MemLog, MemStable, NetworkFaults, StorageFaults,
-  checker, network::NetPrng,
+  StoreMode, checker, network::NetPrng,
 };
 use core::time::Duration;
 use sailing_proto::{
@@ -228,6 +228,38 @@ pub struct MultiWorld {
   /// so passing [`TEARDOWN_TIE_BUDGET`](lifecycle::TEARDOWN_TIE_BUDGET) means a genuine
   /// non-superset hole that refuses forever — and still trips.
   teardown_tie_streak: BTreeMap<u64, usize>,
+  /// The write mode every replica store the world wires is constructed under. `Sync` — the
+  /// construction default, byte-identical to a world predating the seam — is commit-on-submit;
+  /// `Async` runs the stores through the staged-write fsync-loss window (submit → `flush` →
+  /// durable; a `crash`/rollback `discard_inflight` drops the un-flushed tail), which is what makes
+  /// the randomized crash campaign actually EXERCISE lost-fsync durability (persist-vote-before-grant,
+  /// append-before-ack, commit persistence, the reshaping lineage across a crash). Set once from the
+  /// profile before any group is wired ([`set_store_mode`](Self::set_store_mode)) and PRESERVED
+  /// across every store-creating (re)wire path (create/observer/recreate/resurrect/fork-child) via
+  /// the [`fresh_stores`](Self::fresh_stores) chokepoint; the crash/rollback restores inherit it for
+  /// free by reusing the retained store objects.
+  store_mode: StoreMode,
+  /// Async flush-phase witness: log stores made durable across the run (`0` under the sync default —
+  /// the flush phase never runs). Nonzero proves the multi tick now fsync-flushes (the second cause
+  /// the crash suite was vacuous for).
+  log_flushes: u64,
+  /// Async flush-phase witness: stable stores made durable across the run.
+  stable_flushes: u64,
+  /// Seeded torn writes (fsync failures) that stranded a REAL in-flight batch across the run — the
+  /// lost-fsync coverage's non-vacuity witness. `0` under the sync default.
+  torn_writes_fired: u64,
+  /// Crashes that rolled back a NON-EMPTY log-store fsync window (`discard_inflight` dropped a
+  /// staged tail) — proof the crash campaign lands mid-window rather than only post-flush. `0`
+  /// under the sync default (nothing is ever in flight).
+  crashes_with_log_inflight: u64,
+  /// Crashes that rolled back a NON-EMPTY stable-store fsync window. `0` under the sync default.
+  crashes_with_stable_inflight: u64,
+  /// A node armed to crash MID-SETTLE on the next tick (see [`arm_mid_fsync_crash`](Self::arm_mid_fsync_crash)):
+  /// the tick's settle loop crashes it AFTER a delivery sub-step submitted fresh appends but BEFORE
+  /// the store flush, so `discard_inflight` rolls back a genuine replication window — a crash at an
+  /// arbitrary instant, not only at the fully-durable tick boundary an ordinary [`crash`](Self::crash)
+  /// models. Consumed (taken) by the next tick. `None` for a between-ticks (durable-window) crash.
+  pending_mid_crash: Option<u64>,
 }
 
 impl MultiWorld {
@@ -287,6 +319,13 @@ impl MultiWorld {
       merges_aborted: 0,
       merge_aborts_observed: BTreeMap::new(),
       teardown_tie_streak: BTreeMap::new(),
+      store_mode: StoreMode::Sync,
+      log_flushes: 0,
+      stable_flushes: 0,
+      torn_writes_fired: 0,
+      crashes_with_log_inflight: 0,
+      crashes_with_stable_inflight: 0,
+      pending_mid_crash: None,
     }
   }
 
@@ -308,6 +347,31 @@ impl MultiWorld {
   /// Applies at replica CONSTRUCTION, exactly like [`set_pre_vote`](Self::set_pre_vote).
   pub fn set_check_quorum(&mut self, on: bool) {
     self.check_quorum = on;
+  }
+
+  /// Set the [`StoreMode`](crate::StoreMode) every replica the world wires is constructed under
+  /// (`Sync` restores the default). Applies at replica CONSTRUCTION — call before creating groups;
+  /// already-wired replicas keep the store they were built with, and crash/rollback restores reuse
+  /// the retained store, so the mode is preserved for a replica's whole life once set.
+  pub fn set_store_mode(&mut self, mode: StoreMode) {
+    self.store_mode = mode;
+  }
+
+  /// A fresh `(log, stable)` store pair for `(node, gid)` in the world's configured
+  /// [`StoreMode`](crate::StoreMode) — the ONE chokepoint every store-creating wire path calls, so
+  /// the mode is preserved on create/observer/recreate/resurrect/fork-child alike. Async seeds each
+  /// store from the world seed folded with the node and gid so co-located replicas' fault schedules
+  /// decorrelate; the seed only governs the pre-`reroll_storage` window, since installing a fault
+  /// rate reseeds the store's fault PRNG.
+  fn fresh_stores(&self, node: u64, gid: u64) -> (MemLog, MemStable<u64>) {
+    if self.store_mode.is_async() {
+      (
+        MemLog::new_async(self.seed ^ node ^ gid.rotate_left(32)),
+        MemStable::new_async(self.seed.rotate_left(32) ^ node ^ gid.rotate_left(32)),
+      )
+    } else {
+      (MemLog::new(), MemStable::new())
+    }
   }
 
   /// Add node `id` as an empty container host (no groups). Panics if the id already exists.
@@ -373,12 +437,15 @@ impl MultiWorld {
     let config = config
       .with_pre_vote(self.pre_vote)
       .with_check_quorum(self.check_quorum);
+    // Fresh stores in the world's configured mode (async for the merge profiles' fsync-loss
+    // window). Built before the host borrow so it never straddles the `&self` `fresh_stores` read.
+    let (log, stable) = self.fresh_stores(node, gid);
     let host = self
       .hosts
       .get_mut(&node)
       .unwrap_or_else(|| panic!("wire_replica: node {node} was never added"));
-    self.logs.insert((node, gid), MemLog::new());
-    self.stables.insert((node, gid), MemStable::new());
+    self.logs.insert((node, gid), log);
+    self.stables.insert((node, gid), stable);
     self.configs.insert((node, gid), config.clone());
     self.member_view.insert((node, gid), is_member);
     // Bump the replica incarnation on EVERY (re)wire: a member re-added after a teardown starts
@@ -592,6 +659,29 @@ impl MultiWorld {
 
       let any_new = self.drain_outgoing_all();
       let delivered = self.deliver_due();
+      // A crash armed to land MID-SETTLE fires HERE — after this sub-step's deliveries submitted
+      // fresh appends into the async stores but BEFORE the flush below makes them durable — so
+      // `discard_inflight` rolls back a genuine, non-empty replication window (a crash at an
+      // arbitrary instant, the "in-flight (pre-flush)" window; an ordinary `crash` between ticks
+      // sees only the durable post-flush window). Taken so it fires exactly once, on the first
+      // settle sub-step, where the just-delivered appends are still un-flushed.
+      if let Some(victim) = self.pending_mid_crash.take() {
+        self.crash(victim);
+      }
+      // Async stores only: make the in-flight (visible-but-unflushed) window durable BEFORE draining
+      // completions — the fsync completing between driver sub-steps, the exact analogue of
+      // `Cluster::tick`'s in-loop `flush_all` and the model the store docs specify ("flush() each
+      // step, before draining completions"). In-loop (fine-grained), NOT once-per-tick: a
+      // once-per-tick flush fires every deferred ack in one batch at the tick boundary and only then
+      // processes this tick's higher-term truncations, so a follower's already-fired lower-term ack
+      // escapes `scrub_acks_above` and a deposed leader sees a phantom durable quorum — a stale-ack
+      // artifact of the coarse schedule, not a product fault. Fine-grained flushing keeps each ack's
+      // window one sub-step wide, matching the proven single-group model. Gated on the WORLD mode so
+      // a default (sync) world skips the phase entirely (byte-identical); a store manually set async
+      // in a sync world (a targeted test) is deliberately left un-driven.
+      if self.store_mode.is_async() {
+        self.flush_async_stores();
+      }
       let storage_produced = self.drain_storage_all();
       let forked = self.pump_forks();
       let merged = self.pump_merges();
@@ -1203,6 +1293,52 @@ impl MultiWorld {
     // Collect outgoing produced by completion handlers — same path as the tick outgoing-drain.
     any_new |= self.drain_outgoing_all();
     any_new
+  }
+
+  /// Flush every hosted store's staged in-flight window to durable state, tallying the flush-phase
+  /// non-vacuity witnesses (flush counts, and torn writes that stranded a REAL batch, summed into
+  /// world-running totals so a store purged mid-run does not lose its tally). Only ever called when
+  /// the world's [`StoreMode`](crate::StoreMode) is async, so every hosted store is async.
+  ///
+  /// A store is flushed only when it holds an in-flight window: an empty flush would clone the whole
+  /// log for nothing (a big constant on a long log) and roll the torn PRNG on a batch it cannot tear.
+  fn flush_async_stores(&mut self) {
+    for node in self.node_ids.clone() {
+      let gids: Vec<u64> = self.hosts[&node].group_ids().copied().collect();
+      for gid in gids {
+        if let Some(log) = self.logs.get_mut(&(node, gid))
+          && log.has_inflight()
+        {
+          let torn_before = log.torn_writes();
+          log.flush();
+          self.log_flushes += 1;
+          self.torn_writes_fired += log.torn_writes() - torn_before;
+        }
+        if let Some(stable) = self.stables.get_mut(&(node, gid))
+          && stable.has_inflight()
+        {
+          let torn_before = stable.torn_writes();
+          stable.flush();
+          self.stable_flushes += 1;
+          self.torn_writes_fired += stable.torn_writes() - torn_before;
+        }
+      }
+    }
+  }
+
+  /// Arm node `node` to crash MID-SETTLE on the next [`tick`](Self::tick) instead of now: the tick's
+  /// settle loop crashes it after a delivery sub-step submitted fresh appends but before the store
+  /// flush, so the crash rolls back a genuine, non-empty replication fsync window (the "in-flight
+  /// (pre-flush)" crash the brief asks for, complementing the durable-window [`crash`](Self::crash)).
+  /// Only meaningful under an async store mode — a sync store never holds an in-flight window.
+  pub(crate) fn arm_mid_fsync_crash(&mut self, node: u64) {
+    self.pending_mid_crash = Some(node);
+  }
+
+  /// Whether the world wires async stores (the merge profiles) — the fuzzer gates the mid-fsync
+  /// crash draw on this so the sync profiles neither draw the extra PRNG nor change behavior.
+  pub(crate) fn is_async_stores(&self) -> bool {
+    self.store_mode.is_async()
   }
 }
 

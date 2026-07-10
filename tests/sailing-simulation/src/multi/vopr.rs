@@ -100,6 +100,17 @@ pub struct MultiProfile {
   /// than shadowing a fresh election). Scoped and defaulted identically to
   /// [`pre_vote`](Self::pre_vote).
   check_quorum: bool,
+  /// The [`StoreMode`](crate::StoreMode) every replica the profile's world wires is constructed
+  /// under. `Sync` (the default) keeps the stores commit-on-submit — byte-identical to a world
+  /// predating the seam, so the non-merge profiles' schedules and pinned seeds cannot move. `Async`
+  /// runs them through the staged-write fsync-loss window (submit → `flush` → durable; crash →
+  /// `discard_inflight`) so the randomized crash campaign actually EXERCISES lost-fsync durability
+  /// (persist-vote-before-grant, append-before-ack, commit persistence, the reshaping lineage across
+  /// a crash) rather than claiming to. Async ONLY on the merge family (`merge_reshape` and
+  /// `merge_reshape_compacting`), whose whole-source-group teardowns are the churn that makes the
+  /// crash×durability seams reachable; the merge runs reseed against their own prior sync runs,
+  /// which the standing merge-band decision permits.
+  store_mode: crate::StoreMode,
 }
 
 impl MultiProfile {
@@ -126,6 +137,7 @@ impl MultiProfile {
       snapshot_threshold: None,
       pre_vote: false,
       check_quorum: false,
+      store_mode: crate::StoreMode::Sync,
     }
   }
 
@@ -179,6 +191,10 @@ impl MultiProfile {
       // check-quorum makes a partitioned stale leader step down instead of flapping.
       pre_vote: true,
       check_quorum: true,
+      // Async stores ON for the merge family: the whole-source-group teardowns are exactly the
+      // churn that makes the crash×durability seams reachable, so this is where the crash campaign
+      // must run through the real fsync-loss window to stop being vacuous.
+      store_mode: crate::StoreMode::Async,
     }
   }
 
@@ -224,6 +240,7 @@ impl MultiProfile {
       snapshot_threshold: None,
       pre_vote: false,
       check_quorum: false,
+      store_mode: crate::StoreMode::Sync,
     }
   }
 }
@@ -321,6 +338,21 @@ pub struct MultiVoprReport {
   /// limitation of compaction, not a soundness hole — the net never trusts a possibly-stale
   /// ConfChange.
   pub kind_unobservable_installs: u64,
+  /// Async flush-phase witness: log stores the world made durable across the run. `0` under the
+  /// sync store mode (the default/snapshot/reshape profiles), where the flush phase never runs;
+  /// nonzero under the merge family — the proof the multi tick now fsync-flushes at all.
+  pub log_flushes: u64,
+  /// Async flush-phase witness: stable stores made durable across the run.
+  pub stable_flushes: u64,
+  /// Seeded torn writes (fsync failures) that stranded a REAL in-flight batch across the run — the
+  /// lost-fsync coverage's non-vacuity witness. `0` under the sync store mode.
+  pub torn_writes_fired: u64,
+  /// Crashes that rolled back a NON-EMPTY log-store fsync window — proof the crash campaign lands
+  /// mid-window (the interleaving lost-fsync durability actually depends on), not only post-flush.
+  /// `0` under the sync store mode (nothing is ever in flight).
+  pub crashes_with_log_inflight: u64,
+  /// Crashes that rolled back a NON-EMPTY stable-store fsync window. `0` under the sync store mode.
+  pub crashes_with_stable_inflight: u64,
 }
 
 /// One accepted-freeze entry in the fuzzer's pending-merge book.
@@ -367,6 +399,10 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   // construction paths inherit it. Both `false` on the default profiles ⇒ byte-identical Configs.
   w.set_pre_vote(profile.pre_vote);
   w.set_check_quorum(profile.check_quorum);
+  // The store write mode, funneled through the `fresh_stores` chokepoint so every construction path
+  // inherits it. `Sync` on the non-merge profiles ⇒ the flush phase never runs and construction is
+  // byte-identical; `Async` on the merge family opens the fsync-loss window the crash campaign needs.
+  w.set_store_mode(profile.store_mode);
   for n in 0..nodes {
     w.add_node(n);
   }
@@ -493,6 +529,13 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   report.cross_talk_checks = w.cross_talk_checked();
   report.max_term_seen = report.max_term_seen.max(w.max_term_all());
   report.faults_fired = w.net_dropped() + w.net_duplicated();
+  // The async crash-suite non-vacuity witnesses (all 0 under the sync store mode): the flush phase
+  // ran, torn writes stranded real batches, and crashes landed mid-window.
+  report.log_flushes = w.log_flushes();
+  report.stable_flushes = w.stable_flushes();
+  report.torn_writes_fired = w.torn_writes_fired();
+  report.crashes_with_log_inflight = w.crashes_with_log_inflight();
+  report.crashes_with_stable_inflight = w.crashes_with_stable_inflight();
   report
 }
 

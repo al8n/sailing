@@ -221,6 +221,31 @@ impl MultiWorld {
     self.cross_talk_checked
   }
 
+  /// Async flush-phase witness: log stores made durable across the run (`0` under the sync default).
+  pub(crate) fn log_flushes(&self) -> u64 {
+    self.log_flushes
+  }
+
+  /// Async flush-phase witness: stable stores made durable across the run.
+  pub(crate) fn stable_flushes(&self) -> u64 {
+    self.stable_flushes
+  }
+
+  /// Seeded torn writes that stranded a REAL in-flight batch — the lost-fsync non-vacuity witness.
+  pub(crate) fn torn_writes_fired(&self) -> u64 {
+    self.torn_writes_fired
+  }
+
+  /// Crashes that rolled back a NON-EMPTY log-store fsync window (the crash landed mid-window).
+  pub(crate) fn crashes_with_log_inflight(&self) -> u64 {
+    self.crashes_with_log_inflight
+  }
+
+  /// Crashes that rolled back a NON-EMPTY stable-store fsync window.
+  pub(crate) fn crashes_with_stable_inflight(&self) -> u64 {
+    self.crashes_with_stable_inflight
+  }
+
   /// Group `gid`'s LIVE key population, ascending (the keyed workload's pick set; empty for an
   /// unknown gid).
   pub(crate) fn group_keys_of(&self, gid: u64) -> Vec<u16> {

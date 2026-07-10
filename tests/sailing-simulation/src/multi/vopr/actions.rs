@@ -165,10 +165,20 @@ pub(super) fn heal_one(w: &mut MultiWorld, prng: &mut FaultPrng, report: &mut Mu
 
 /// Crash a seed-picked node (a point event: it restores from durable state immediately, so it
 /// never counts against the sustained budget).
+///
+/// Under an async store mode HALF the crashes (seeded) are armed to land MID-SETTLE on the next
+/// tick — after a delivery submitted fresh appends but before the store flush — so they roll back a
+/// genuine in-flight fsync window, while the other half stay between-tick (durable-window) crashes:
+/// the "both in-flight and durable windows" the brief's crash suite needs. The mid-fsync draw is
+/// gated on the async mode so the sync profiles neither draw the extra PRNG nor change behavior.
 pub(super) fn crash_one(w: &mut MultiWorld, prng: &mut FaultPrng, report: &mut MultiVoprReport) {
   let nodes: BTreeSet<u64> = w.node_list().into_iter().collect();
   if let Some(victim) = pick_from(&nodes, prng) {
-    w.crash(victim);
+    if w.is_async_stores() && prng.next_u64().is_multiple_of(2) {
+      w.arm_mid_fsync_crash(victim);
+    } else {
+      w.crash(victim);
+    }
     report.crashes += 1;
   }
 }
