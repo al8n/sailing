@@ -159,11 +159,21 @@ impl Data for bool {
 }
 
 impl Data for () {
-  #[inline(always)]
-  fn encode(&self, _buf: &mut Vec<u8>) {}
-  #[inline(always)]
-  fn decode(_cur: &mut ByteCursor) -> Result<Self, DecodeError> {
-    Ok(())
+  #[inline]
+  fn encode(&self, buf: &mut Vec<u8>) {
+    // A single canonical byte, so `()` is a FIXED-WIDTH element. A zero-width encoding made every
+    // nonempty `Vec<()>`/`BTreeSet<()>` encode but never decode — the collection decoders reject a
+    // zero-width element as attacker-controlled work — which is a round-trip contract violation on
+    // a committed-payload path. `0x00` is the sole valid byte (decode rejects any other), so the
+    // encoding stays canonical: distinct byte strings never decode to the same value.
+    buf.push(0);
+  }
+  #[inline]
+  fn decode(cur: &mut ByteCursor) -> Result<Self, DecodeError> {
+    match cur.take_u8()? {
+      0 => Ok(()),
+      _ => Err(DecodeError::Invalid("unit")),
+    }
   }
 }
 
@@ -255,6 +265,20 @@ mod tests {
     roundtrip(());
   }
 
+  /// `()` encodes to exactly one canonical byte (`0x00`) so it is a fixed-width element; any other
+  /// byte is non-canonical and must DECODE TO AN ERROR, never silently coerce — the same
+  /// canonicality property `bool` carries.
+  #[test]
+  fn unit_encodes_one_canonical_byte() {
+    let mut buf = Vec::new();
+    ().encode(&mut buf);
+    assert_eq!(buf, std::vec![0u8]);
+    assert_eq!(
+      <()>::decode_exact(Bytes::from_static(&[1u8])),
+      Err(DecodeError::Invalid("unit"))
+    );
+  }
+
   #[test]
   fn primitive_roundtrips() {
     roundtrip(0u64);
@@ -300,15 +324,16 @@ mod tests {
     );
   }
 
-  /// A `BTreeSet` of a zero-width element type must not spin `len` times from only the count prefix.
+  /// A `BTreeSet<()>` round-trips now that `()` is a fixed-width element: its sole inhabitant is
+  /// `{()}`, encoded as count 1 plus the one canonical byte. A count that claims an element the
+  /// buffer cannot supply still errors — the decode never spins past the missing byte.
   #[test]
-  fn btreeset_decode_rejects_zero_width_element() {
-    let mut buf = Vec::new();
-    1u64.encode(&mut buf); // claim one `()` element, which consumes no input bytes
-    assert_eq!(
-      <BTreeSet<()>>::decode_exact(Bytes::from(buf)),
-      Err(DecodeError::Invalid("zero-width set element"))
-    );
+  fn btreeset_of_unit_roundtrips() {
+    roundtrip(BTreeSet::<()>::from([()]));
+    // count 1, but no element byte follows: the per-element decode runs out of input at once.
+    let mut truncated = Vec::new();
+    1u64.encode(&mut truncated);
+    assert!(<BTreeSet<()>>::decode_exact(Bytes::from(truncated)).is_err());
   }
 
   #[test]
@@ -379,15 +404,17 @@ mod tests {
     assert_eq!(cur.remaining(), payload.len());
   }
 
-  /// A `Vec<T>` of a zero-width element type must not spin `len` times from only the count prefix —
-  /// each element is required to consume input.
+  /// A nonempty `Vec<()>` round-trips now that each `()` consumes its one byte, and a count that
+  /// claims a million elements with no element bytes still errors on the FIRST missing byte — the
+  /// work bound holds: a bulk decode from only the count prefix is never possible.
   #[test]
-  fn vec_decode_rejects_zero_width_element_spin() {
-    let mut buf = Vec::new();
-    1_000_000u64.encode(&mut buf); // claim a million () elements, with no following bytes
+  fn vec_of_unit_roundtrips_and_bounds_bulk_claims() {
+    roundtrip(std::vec![(), (), ()]);
+    let mut bulk = Vec::new();
+    1_000_000u64.encode(&mut bulk); // a million claimed elements, no element bytes follow
     assert!(
-      <Vec<()>>::decode_exact(Bytes::from(buf)).is_err(),
-      "a zero-width element type must not be decodable in bulk from just the count"
+      <Vec<()>>::decode_exact(Bytes::from(bulk)).is_err(),
+      "a count with no element bytes must error, never spin the claimed length"
     );
     // An empty Vec<()> (count 0) is still fine.
     let mut empty = Vec::new();
@@ -396,6 +423,15 @@ mod tests {
       <Vec<()>>::decode_exact(Bytes::from(empty)).unwrap(),
       std::vec![]
     );
+  }
+
+  /// Nested unit collections round-trip: the fixed-width `()` composes under `Vec` and `BTreeSet`
+  /// at every layer without tripping the zero-width guard (an inner EMPTY collection still consumes
+  /// its own count prefix, so it is never mistaken for a zero-width element of the outer).
+  #[test]
+  fn nested_unit_collections_roundtrip() {
+    roundtrip(std::vec![std::vec![(), ()], std::vec![], std::vec![()]]);
+    roundtrip(std::vec![BTreeSet::<()>::from([()]), BTreeSet::<()>::new()]);
   }
 
   /// A `BTreeSet` decode is canonical: it rejects duplicate and non-ascending elements, so distinct
