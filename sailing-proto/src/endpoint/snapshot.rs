@@ -324,6 +324,12 @@ where
     if self.reads.read_mode_migrated {
       meta = meta.with_read_only(self.reads.active_read_mode);
     }
+    // Preserve fork PROVENANCE: a forked child's own snapshots must keep carrying its ForkId, so a
+    // child that compacted past its manufactured baseline — or a restart from this snapshot — still
+    // reports its origin. Absent for a non-fork group.
+    if let Some(fork_id) = &self.split.fork_id {
+      meta = meta.with_fork_id(fork_id.clone());
+    }
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     // Defer compaction until SnapshotWritten fires.
@@ -849,6 +855,14 @@ where
     // carrying it — a straggler that installed a post-split parent snapshot, then leads and
     // compacts, must not drop the fold.
     self.split.shape_gen = self.split.shape_gen.max(meta.shape_gen());
+    // Adopt the installed meta's fork PROVENANCE: a sibling replica's manufactured fork baseline (or
+    // a forked child's own snapshot) carries the child's ForkId, so a child materialized ONLY via
+    // snapshot transfer — never through the local fork constructor — still reports its origin, and
+    // the parent's parked fork then resolves REDUNDANT against exactly this token. Keep-if-set: a
+    // later non-fork snapshot must not erase an established provenance.
+    if let Some(fork_id) = meta.fork_id() {
+      self.split.fork_id = Some(fork_id.clone());
+    }
 
     // Step 4: re-baseline the log on the now-durable snapshot. Discards the follower's stale/short log;
     // after this call first_index == last_index + 1 and term(last_index) == last_term, so the next

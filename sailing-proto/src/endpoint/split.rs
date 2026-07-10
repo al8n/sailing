@@ -29,6 +29,10 @@ pub(crate) struct PendingFork<I> {
   pub read_only: Option<ReadOnlyOption>,
   /// The split entry's log index — the fork durability barrier's anchor.
   pub index: Index,
+  /// The split entry's term. Together with [`index`](Self::index) it locates the committed split
+  /// entry in the parent's log — the replica-identical coordinates the container mints the child's
+  /// [`ForkId`](crate::ForkId) provenance token from.
+  pub split_term: Term,
 }
 
 /// The endpoint-resident split state. One instance per endpoint, defaulted empty; restart seeds
@@ -76,10 +80,18 @@ pub(crate) struct SplitState<I, F> {
   /// index it rides beside: once `applied` absorbs `pending_split_index`, the window is over
   /// and these bytes are inert.
   pub(crate) pending_split_child: Bytes,
+  /// This group's own fork PROVENANCE — the [`ForkId`](crate::ForkId) of the manufactured baseline
+  /// this endpoint was born from (a forked child), `None` for any group created/restored through a
+  /// non-fork path. Seeded at restart from the durable snapshot meta, adopted when a peer's fork
+  /// baseline is installed here, and stamped into every snapshot this endpoint captures — so a
+  /// forked child reports its origin however it materialized (local fork constructor or snapshot
+  /// transfer) and across restarts, which is what lets a parent's parked fork resolve REDUNDANT only
+  /// against an exact match.
+  pub(crate) fork_id: Option<crate::ForkId>,
 }
 
 impl<I, F> SplitState<I, F> {
-  pub(crate) fn new(lineage: u64) -> Self {
+  pub(crate) fn new(lineage: u64, fork_id: Option<crate::ForkId>) -> Self {
     Self {
       pending_forks: VecDeque::new(),
       forked_fsms: VecDeque::new(),
@@ -88,6 +100,7 @@ impl<I, F> SplitState<I, F> {
       restored_lineage: lineage,
       pending_split_index: Index::ZERO,
       pending_split_child: Bytes::new(),
+      fork_id,
     }
   }
 }
@@ -148,6 +161,15 @@ where
   /// live counter — the container's replay-guard seed.
   pub(crate) fn restored_lineage(&self) -> u64 {
     self.split.restored_lineage
+  }
+
+  /// This group's fork PROVENANCE token, or `None` for a group not born from a fork baseline. A
+  /// forked child reports it however it materialized (local fork install or peer snapshot transfer)
+  /// and across restarts — the container's parked-fork relay compares it against the fork's own
+  /// [`ForkId`](crate::ForkId) so a REDUNDANT resolution certifies exactly this split's child, never
+  /// an unrelated group squatting the child id.
+  pub fn fork_id(&self) -> Option<crate::ForkId> {
+    self.split.fork_id.clone()
   }
 
   /// Seed the lineage counter at group ADMISSION — the container's create path calls this with

@@ -1,6 +1,6 @@
 use super::*;
 use crate::{
-  AppendEntries, AppendResponse, Heartbeat, HeartbeatResponse, InstallSnapshot, ReadIndex,
+  AppendEntries, AppendResponse, ForkId, Heartbeat, HeartbeatResponse, InstallSnapshot, ReadIndex,
   ReadIndexResponse, ReadOnlyOption, RequestVote, SnapshotResponse, TimeoutNow, VoteResponse,
   conf::ConfState,
 };
@@ -916,6 +916,38 @@ fn install_snapshot_encoded_len_agrees_with_encoder() {
       .with_read_only(ReadOnlyOption::LeaseGuard)
       .with_shape_gen(u64::MAX),
     ),
+    (
+      // A fork baseline: the nested ForkId with every inner field PRESENT.
+      "fork_id, all inner fields present",
+      SnapshotMeta::new(
+        Index::new(1),
+        Term::new(1),
+        ConfState::from_voters([1u64, 2, 3]),
+      )
+      .with_shape_gen(5)
+      .with_fork_id(ForkId::new(
+        Bytes::from_static(&[7u8, 8]),
+        9,
+        Index::new(11),
+        Term::new(4),
+        Bytes::from_static(&[200u8]),
+        3,
+      )),
+    ),
+    (
+      // A first-incarnation fork: child_gen 0 is a proto3-default → ABSENT inside the nested ForkId.
+      "fork_id, child_gen absent",
+      SnapshotMeta::new(Index::new(1), Term::new(1), ConfState::from_voters([1u64])).with_fork_id(
+        ForkId::new(
+          Bytes::from_static(&[42u8]),
+          1,
+          Index::new(1),
+          Term::new(1),
+          Bytes::from_static(&[43u8]),
+          0,
+        ),
+      ),
+    ),
   ];
 
   for (term_raw, leader, offset, total) in [
@@ -1638,5 +1670,61 @@ fn snapshot_meta_shape_gen_round_trips() {
   assert_eq!(
     a, b,
     "shape_gen 0 encodes absent (byte-identical to before)"
+  );
+}
+
+#[test]
+fn snapshot_meta_fork_id_round_trips() {
+  let conf = ConfState::from_voters(std::vec![1u64, 2, 3]);
+  let fork_id = ForkId::new(
+    Bytes::from_static(&[10u8, 20, 30]),
+    7,
+    Index::new(42),
+    Term::new(4),
+    Bytes::from_static(&[99u8]),
+    2,
+  );
+  let meta =
+    SnapshotMeta::new(Index::new(1), Term::new(1), conf.clone()).with_fork_id(fork_id.clone());
+  let m = Message::InstallSnapshot(InstallSnapshot::new(
+    Term::new(1),
+    1,
+    meta,
+    Bytes::from_static(b"blob"),
+  ));
+  let mut buf = Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::InstallSnapshot(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back.snapshot().fork_id(),
+    Some(&fork_id),
+    "the whole ForkId (parent/child bytes, incarnation, split index+term, child gen) round-trips"
+  );
+
+  // A non-fork snapshot carries no token: absent on the wire, byte-identical to a pre-provenance
+  // peer's meta.
+  let plain = SnapshotMeta::new(Index::new(1), Term::new(1), conf);
+  assert_eq!(plain.fork_id(), None);
+  let mut a = Vec::new();
+  encode_message(
+    &Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(1),
+      1,
+      plain,
+      Bytes::from_static(b"blob"),
+    )),
+    &mut a,
+  );
+  let Message::InstallSnapshot(back_plain) = decode_message::<u64>(Bytes::from(a)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert_eq!(
+    back_plain.snapshot().fork_id(),
+    None,
+    "an absent ForkId decodes as None"
   );
 }

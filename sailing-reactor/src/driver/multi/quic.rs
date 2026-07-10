@@ -25,9 +25,9 @@ use agnostic::{
 };
 use bytes::Bytes;
 use sailing_proto::{
-  ClusterId, Config, Endpoint, Event, FloorStore, GroupControl, GroupEngine, GroupId, Index,
-  Instant, MultiQuicCoordinator, Now, ReadOnlyOption, StateMachine, StorageProgress, floor_admits,
-  quic::QuicOptions,
+  ClusterId, Config, Endpoint, Event, FloorStore, ForkId, GroupControl, GroupEngine, GroupId,
+  Index, Instant, MultiQuicCoordinator, Now, ReadOnlyOption, StateMachine, StorageProgress,
+  floor_admits, quic::QuicOptions,
 };
 
 use sailing_driver::{
@@ -497,6 +497,9 @@ where
         fork.fsm,
         fork.blob,
         fork.read_only,
+        // The child's provenance token rides its manufactured baseline so every replica reports
+        // the same origin and the parent's parked fork resolves redundant only against a match.
+        Some(fork.fork_id),
         fork.child_gen,
       ) {
         Ok(()) => {
@@ -769,6 +772,7 @@ where
     fsm: F,
     snapshot: Bytes,
     read_only: Option<ReadOnlyOption>,
+    fork_id: Option<ForkId>,
     generation: u64,
   ) -> Result<(), DriverError<I>> {
     validate_and_capture_eps::<I, Monotonic>(&config).map_err(rejected)?;
@@ -792,6 +796,7 @@ where
         fsm,
         snapshot,
         read_only,
+        fork_id,
         epoch,
         generation,
         &lineage,
@@ -1222,6 +1227,8 @@ where
           now, gid, config, seed, fsm, snapshot,
           // An embedder-driven fork inherits no parent mode: the child's config supplies
           // it, which is exactly the absent-provenance meaning of `None`.
+          None,
+          // ...and it carries no split provenance token — only a committed split's fork does.
           None, generation,
         ));
         drop(reservation);

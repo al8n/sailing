@@ -218,6 +218,13 @@ where
       .as_ref()
       .map(|(meta, _)| meta.shape_gen())
       .unwrap_or(0);
+    // The fork provenance this snapshot carries (a manufactured fork baseline, or a forked child's
+    // own later snapshot that preserved it) — recovered so a forked child still reports its origin
+    // across restart, exactly as it does across snapshot transfer. `None` for every non-fork
+    // snapshot.
+    let snap_fork_id: Option<crate::ForkId> = snapshot
+      .as_ref()
+      .and_then(|(meta, _)| meta.fork_id().cloned());
     // The failover release floor this snapshot carries over its compacted entries — combined below
     // with a scan of the live log to recompute `max_wall_plus_window` from durable state alone.
     let snap_max_wall_plus: u64 = snapshot
@@ -525,7 +532,7 @@ where
         outgoing: VecDeque::new(),
         events: VecDeque::new(),
       },
-      split: super::split::SplitState::new(snap_shape_gen),
+      split: super::split::SplitState::new(snap_shape_gen, snap_fork_id),
       merge: super::merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),

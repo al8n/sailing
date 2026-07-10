@@ -704,6 +704,7 @@ impl MultiInteractionEnv {
             fork.fsm,
             fork.blob,
             fork.read_only,
+            Some(fork.fork_id),
             1,
             log,
             stable,

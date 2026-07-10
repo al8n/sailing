@@ -70,8 +70,8 @@ pub(crate) use quorum::{JointConfig, MajorityConfig, VoteResult};
 mod message;
 pub mod wire;
 pub use message::{
-  AppendEntries, AppendResponse, Heartbeat, HeartbeatResponse, InstallSnapshot, Message, Outgoing,
-  ReadIndex, ReadIndexResponse, RequestVote, SnapshotMeta, SnapshotResponse, TimeoutNow,
+  AppendEntries, AppendResponse, ForkId, Heartbeat, HeartbeatResponse, InstallSnapshot, Message,
+  Outgoing, ReadIndex, ReadIndexResponse, RequestVote, SnapshotMeta, SnapshotResponse, TimeoutNow,
   VoteResponse,
 };
 

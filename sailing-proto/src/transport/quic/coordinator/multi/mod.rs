@@ -346,6 +346,7 @@ where
     fsm: F,
     snapshot: bytes::Bytes,
     read_only: Option<crate::ReadOnlyOption>,
+    fork_id: Option<crate::ForkId>,
     boot_epoch: u64,
     generation: u64,
     floors: &impl FloorStore<G>,
@@ -370,7 +371,8 @@ where
     }
     let key = gid.cheap_clone();
     self.multi.create_group_from_fork(
-      gid, generation, config, now, seed, fsm, snapshot, read_only, boot_epoch, log, stable,
+      gid, generation, config, now, seed, fsm, snapshot, read_only, fork_id, boot_epoch, log,
+      stable,
     )?;
     self.purge_unknown_signal(&key);
     // Same cap-raise as `create_group`: the forked group widens the tracked-peer union.

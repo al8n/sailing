@@ -1332,7 +1332,7 @@ where
         lease_vote_fence_until: None,
       },
       pending_conf_index: Index::ZERO,
-      split: split::SplitState::new(0),
+      split: split::SplitState::new(0, None),
       merge: merge::MergeState::default(),
       reads: Reads {
         read_only: ReadOnly::new(read_only_opt),
@@ -2652,6 +2652,9 @@ where
                 voters,
                 read_only,
                 index: idx,
+                // The split entry's term: with `idx` it locates this committed split in the log —
+                // the replica-identical coordinates the container mints the child's ForkId from.
+                split_term: entry.term(),
               });
             }
           }

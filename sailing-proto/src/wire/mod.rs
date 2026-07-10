@@ -165,6 +165,19 @@ pub(crate) fn install_snapshot_encoded_len<I: NodeId>(
   meta_size += present_uint64(meta.max_unwalled_lease_window());
   meta_size += present_uint64(meta.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1));
   meta_size += present_uint64(meta.shape_gen());
+  // The nested ForkId (a present sub-message, field 9 → 1-byte tag): each inner field is present
+  // per proto3 (a default-0 uint64 / empty bytes is absent), then tag + length-prefix + body. Absent
+  // (a non-fork snapshot) costs nothing, exactly as the proto3-default sub-message it is.
+  if let Some(f) = meta.fork_id() {
+    let mut fork_size = 0usize;
+    fork_size += present_bytes(f.parent());
+    fork_size += present_uint64(f.parent_incarnation());
+    fork_size += present_uint64(f.split_index().get());
+    fork_size += present_uint64(f.split_term().get());
+    fork_size += present_bytes(f.child());
+    fork_size += present_uint64(f.child_gen());
+    meta_size += 1 + buffa::encoding::varint_len(fork_size as u64) + fork_size;
+  }
 
   // InstallSnapshot: term/offset/total_len ride only when non-zero; the leader id is always present
   // (1..=1024 bytes); the snapshot sub-message is always set; the data field rides only when non-empty.
@@ -189,6 +202,17 @@ fn present_uint64(value: u64) -> usize {
     0
   } else {
     1 + buffa::types::uint64_encoded_len(value)
+  }
+}
+
+/// The encoded cost of a present `bytes` field with a 1-byte tag (every such field here is
+/// field-number 1..=15), or `0` when empty and so absent on the wire (proto3 default).
+#[inline]
+fn present_bytes(value: &[u8]) -> usize {
+  if value.is_empty() {
+    0
+  } else {
+    1 + buffa::types::bytes_encoded_len(value)
   }
 }
 
@@ -741,6 +765,29 @@ fn conf_state_from<I: NodeId>(w: &pb::ConfState) -> Result<ConfState<I>, DecodeE
   ))
 }
 
+fn pb_fork_id(f: &crate::ForkId) -> pb::ForkId {
+  pb::ForkId {
+    parent: f.parent().clone(),
+    parent_incarnation: f.parent_incarnation(),
+    split_index: f.split_index().get(),
+    split_term: f.split_term().get(),
+    child: f.child().clone(),
+    child_gen: f.child_gen(),
+    ..Default::default()
+  }
+}
+
+fn fork_id_from(w: &pb::ForkId) -> crate::ForkId {
+  crate::ForkId::new(
+    w.parent.clone(),
+    w.parent_incarnation,
+    Index::new(w.split_index),
+    Term::new(w.split_term),
+    w.child.clone(),
+    w.child_gen,
+  )
+}
+
 fn pb_snapshot_meta<I: Data>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
   pb::SnapshotMeta {
     last_index: m.last_index().get(),
@@ -751,6 +798,10 @@ fn pb_snapshot_meta<I: Data>(m: &SnapshotMeta<I>) -> pb::SnapshotMeta {
     max_unwalled_lease_window: m.max_unwalled_lease_window(),
     read_only: m.read_only().map_or(0, |o| u64::from(o.as_u8()) + 1),
     shape_gen: m.shape_gen(),
+    fork_id: match m.fork_id() {
+      Some(f) => buffa::MessageField::some(pb_fork_id(f)),
+      None => buffa::MessageField::default(),
+    },
     ..Default::default()
   }
 }
@@ -772,7 +823,7 @@ fn snapshot_meta_from<I: NodeId>(w: &pb::SnapshotMeta) -> Result<SnapshotMeta<I>
         .ok_or(DecodeError::Invalid("SnapshotMeta.read_only"))?,
     ),
   };
-  let meta = SnapshotMeta::new(
+  let mut meta = SnapshotMeta::new(
     Index::new(w.last_index),
     Term::new(w.last_term),
     conf_state_from(conf)?,
@@ -781,10 +832,15 @@ fn snapshot_meta_from<I: NodeId>(w: &pb::SnapshotMeta) -> Result<SnapshotMeta<I>
   .with_max_wall_plus_window(w.max_wall_plus_window)
   .with_max_unwalled_lease_window(w.max_unwalled_lease_window)
   .with_shape_gen(w.shape_gen);
-  Ok(match read_only {
-    Some(mode) => meta.with_read_only(mode),
-    None => meta,
-  })
+  if let Some(mode) = read_only {
+    meta = meta.with_read_only(mode);
+  }
+  // A present nested ForkId decodes to the child's provenance token; absent stays None (a non-fork
+  // snapshot, byte-identical to a pre-provenance peer's meta).
+  if let Some(f) = w.fork_id.as_option() {
+    meta = meta.with_fork_id(fork_id_from(f));
+  }
+  Ok(meta)
 }
 
 fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {

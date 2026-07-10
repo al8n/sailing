@@ -308,6 +308,9 @@ impl MultiWorld {
         fork.fsm,
         fork.blob,
         fork.read_only,
+        // The child's provenance token rides its manufactured baseline, so every replica — this
+        // one and any snapshot-wired latecomer — reports the same origin.
+        Some(fork.fork_id),
         epoch,
         log,
         stable,

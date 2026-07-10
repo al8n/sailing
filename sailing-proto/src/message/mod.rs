@@ -442,6 +442,90 @@ impl<I: CheapClone> HeartbeatResponse<I> {
   }
 }
 
+/// The durable, unforgeable identity of a split's forked child — the provenance token that
+/// distinguishes the REAL fork of a parent from any independently-created, squatter, or recreated
+/// group that merely happens to occupy the child id and cross the fork's applied/lineage
+/// thresholds by its OWN commits. Minted from the committed split entry's coordinates (all
+/// replica-identical, since the split rides the parent's totally-ordered log), persisted in the
+/// child's manufactured baseline [`SnapshotMeta`], and carried through snapshot transfer and
+/// restart. A group that never installed a fork baseline carries NO `ForkId` — so a parked fork
+/// resolves redundant only against an EXACT match, and everything else parks conservatively (the
+/// staged blob is the child partition's only local copy).
+///
+/// The group ids are stored as their canonical `Data` encodings (never re-decoded/re-encoded here),
+/// keeping the token generic-free while matching byte-for-byte across replicas. A blob digest would
+/// harden this further against a re-fork at identical coordinates, but any distinct split already
+/// differs in `(split_index, split_term)`, so it is deferred.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ForkId {
+  parent: Bytes,
+  parent_incarnation: u64,
+  split_index: Index,
+  split_term: Term,
+  child: Bytes,
+  child_gen: u64,
+}
+
+impl ForkId {
+  /// Construct a fork identity from its committed split coordinates. `parent`/`child` are the
+  /// group ids' canonical `Data` encodings; `parent_incarnation` is the parent's lineage AFTER the
+  /// split (its `parent_gen_after`), and `(split_index, split_term)` locate the split entry in the
+  /// parent's log — together an unforgeable fingerprint of exactly one committed split.
+  pub fn new(
+    parent: Bytes,
+    parent_incarnation: u64,
+    split_index: Index,
+    split_term: Term,
+    child: Bytes,
+    child_gen: u64,
+  ) -> Self {
+    Self {
+      parent,
+      parent_incarnation,
+      split_index,
+      split_term,
+      child,
+      child_gen,
+    }
+  }
+
+  /// The parent group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn parent(&self) -> &Bytes {
+    &self.parent
+  }
+
+  /// The parent's lineage after the split (its `parent_gen_after`).
+  #[inline(always)]
+  pub const fn parent_incarnation(&self) -> u64 {
+    self.parent_incarnation
+  }
+
+  /// The split entry's index in the parent's log.
+  #[inline(always)]
+  pub const fn split_index(&self) -> Index {
+    self.split_index
+  }
+
+  /// The split entry's term.
+  #[inline(always)]
+  pub const fn split_term(&self) -> Term {
+    self.split_term
+  }
+
+  /// The child group id's canonical `Data` encoding.
+  #[inline(always)]
+  pub fn child(&self) -> &Bytes {
+    &self.child
+  }
+
+  /// The child's incarnation under the unified lineage counter (0 at a first-incarnation fork).
+  #[inline(always)]
+  pub const fn child_gen(&self) -> u64 {
+    self.child_gen
+  }
+}
+
 /// Metadata describing a snapshot (the logical "header" without the raw blob).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SnapshotMeta<I> {
@@ -479,6 +563,14 @@ pub struct SnapshotMeta<I> {
   /// bounds, EXCLUDED from [`identity_eq`](Self::identity_eq): boundary metadata, not transfer
   /// identity.
   shape_gen: u64,
+  /// The forked child's provenance token when this snapshot IS (or descends from) a fork baseline —
+  /// the durable [`ForkId`] a manufactured fork install writes, preserved by the child's own later
+  /// snapshots and adopted by a peer that installs one. `None` for every non-fork snapshot, so it is
+  /// absent on the wire (byte-identical to a pre-provenance peer's meta). Like the lease/read-mode
+  /// bounds and `shape_gen`, EXCLUDED from [`identity_eq`](Self::identity_eq): provenance metadata,
+  /// not transfer identity. BOXED because it is present only on the rare fork baseline, so it must
+  /// not inflate every `SnapshotMeta` (and thus every `Message::InstallSnapshot`) by its full size.
+  fork_id: Option<Box<ForkId>>,
 }
 
 impl<I> SnapshotMeta<I> {
@@ -494,6 +586,7 @@ impl<I> SnapshotMeta<I> {
       max_unwalled_lease_window: 0,
       read_only: None,
       shape_gen: 0,
+      fork_id: None,
     }
   }
 
@@ -542,6 +635,15 @@ impl<I> SnapshotMeta<I> {
   #[must_use]
   pub const fn with_shape_gen(mut self, shape_gen: u64) -> Self {
     self.shape_gen = shape_gen;
+    self
+  }
+
+  /// Set the forked child's provenance token. A builder, so the common 3-arg [`new`](Self::new)
+  /// stays `None` (absent on the wire) for every non-fork snapshot.
+  #[inline(always)]
+  #[must_use]
+  pub fn with_fork_id(mut self, fork_id: ForkId) -> Self {
+    self.fork_id = Some(Box::new(fork_id));
     self
   }
 
@@ -609,6 +711,12 @@ impl<I> SnapshotMeta<I> {
   #[inline(always)]
   pub const fn shape_gen(&self) -> u64 {
     self.shape_gen
+  }
+
+  /// The forked child's provenance token, or `None` for a non-fork snapshot (the common case).
+  #[inline(always)]
+  pub fn fork_id(&self) -> Option<&ForkId> {
+    self.fork_id.as_deref()
   }
 }
 

@@ -28,7 +28,7 @@ pub use group_id::GroupId;
 
 use crate::{
   CommitMergePayload, ConfChange, ConfChangeType, ConfChangeV2, ConfState, Config,
-  CreateGroupError, Data, Endpoint, EntryKind, Event, HardState, Index, Instant, LogStore,
+  CreateGroupError, Data, Endpoint, EntryKind, Event, ForkId, HardState, Index, Instant, LogStore,
   MergeError, Message, NodeId, Now, OpId, Outgoing, PoisonReason, PrepareMergePayload, Prng,
   ProposeError, ReadIndexError, ReadOnlyOption, RemoveError, RollbackMergePayload, SnapshotMeta,
   SplitError, SplitPayload, StableStore, StateMachine, StorageProgress, Term,
@@ -190,11 +190,13 @@ pub const FORK_BASE_TERM: Term = Term::new(1);
 /// what `boot_epoch == 0` would produce — the saturating subtraction has no prior epoch to land
 /// in — so the fork constructors refuse it ([`validate_fork_boot_epoch`]) before reaching here;
 /// the subtraction never actually saturates.
+#[allow(clippy::too_many_arguments)]
 fn write_fork_baseline<I, L, S>(
   config: &Config<I>,
   snapshot: Bytes,
   generation: u64,
   read_only: Option<ReadOnlyOption>,
+  fork_id: Option<ForkId>,
   boot_epoch: u64,
   log: &mut L,
   stable: &mut S,
@@ -212,15 +214,46 @@ fn write_fork_baseline<I, L, S>(
   );
   let conf = ConfState::from_voters(config.voters().iter().map(CheapClone::cheap_clone));
   // The baseline meta carries the child's own lineage (its incarnation under the unified
-  // counter, absent at 0) and — when the parent had a committed migration — the inherited read
-  // mode, exactly as a real install's meta would: the restart boot below then recovers both.
+  // counter, absent at 0), the inherited read mode when the parent had a committed migration, and
+  // the child's fork PROVENANCE token — exactly as a real install's meta would: the restart boot
+  // below then recovers all three, and the token survives every later snapshot/restart/transfer so
+  // the parent's parked fork can resolve REDUNDANT only against an exact match.
   let mut meta =
     SnapshotMeta::new(FORK_BASE_INDEX, FORK_BASE_TERM, conf).with_shape_gen(generation);
   if let Some(mode) = read_only {
     meta = meta.with_read_only(mode);
   }
+  if let Some(fork_id) = fork_id {
+    meta = meta.with_fork_id(fork_id);
+  }
   stable.submit_snapshot(opid.next(), meta, snapshot);
   log.restore(FORK_BASE_INDEX, FORK_BASE_TERM);
+}
+
+/// Mint a child's [`ForkId`] from one committed split's coordinates — the single source of the
+/// provenance token, minted identically at the relay YIELD (into the [`GroupFork`] the driver
+/// installs) and at the parked-fork REDUNDANT check. Every input is a property of the committed
+/// split entry, so the token is replica-identical: the parent id (its canonical `Data` encoding),
+/// the parent's lineage after the split (`parent_gen_after`), the split entry's `(index, term)`,
+/// and the child's already-canonical id bytes and incarnation.
+fn mint_fork_id<G: GroupId>(
+  parent: &G,
+  parent_gen_after: u64,
+  split_index: Index,
+  split_term: Term,
+  child_bytes: Bytes,
+  child_gen: u64,
+) -> ForkId {
+  let mut parent_bytes = Vec::new();
+  parent.encode(&mut parent_bytes);
+  ForkId::new(
+    Bytes::from(parent_bytes),
+    parent_gen_after,
+    split_index,
+    split_term,
+    child_bytes,
+    child_gen,
+  )
 }
 
 /// The fork constructors' boot-epoch admission check, run BEFORE any store write: a fork must
@@ -293,6 +326,11 @@ pub struct GroupFork<G, I, F> {
   /// The split entry's index in the PARENT's log — the fork durability barrier's anchor, handed
   /// back through [`MultiRaft::lift_fork_barrier`] once the child's baseline is flush-durable.
   pub split_index: Index,
+  /// The child's durable PROVENANCE token, minted from this committed split's coordinates. The
+  /// driver passes it to [`create_group_from_fork`](MultiRaft::create_group_from_fork) so the
+  /// manufactured baseline persists it; a group that never went through a fork baseline carries no
+  /// such token, which is what lets a parked fork resolve REDUNDANT only against an exact match.
+  pub fork_id: ForkId,
 }
 
 /// One resolved parked merge from a [`MultiRaft::service_merge_applies`] crank — what the
@@ -1127,6 +1165,16 @@ where
         self
           .lineage
           .insert(gid.cheap_clone(), fork.parent_gen_after);
+        // Mint the child's provenance token from this committed split's coordinates; the driver
+        // hands it to `create_group_from_fork` so the manufactured baseline persists it.
+        let fork_id = mint_fork_id(
+          gid,
+          fork.parent_gen_after,
+          fork.index,
+          fork.split_term,
+          fork.child_bytes.clone(),
+          fork.child_gen,
+        );
         HeadFork::Yield(GroupFork {
           parent: gid.cheap_clone(),
           child,
@@ -1137,6 +1185,7 @@ where
           blob: fork.blob,
           read_only: fork.read_only,
           split_index: fork.index,
+          fork_id,
         })
       }
     }
@@ -1402,6 +1451,7 @@ where
     fsm: F,
     snapshot: Bytes,
     read_only: Option<ReadOnlyOption>,
+    fork_id: Option<ForkId>,
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
@@ -1418,12 +1468,13 @@ where
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     validate_virgin_stores(log, stable)?;
     self.host_id.get_or_insert(config.id());
-    // `generation` (the child's incarnation under the unified lineage counter) and the
-    // inherited `read_only` provenance ride the baseline meta, so the restart boot below — and
-    // every later restart from the child's own stores — recovers both exactly as it would from
-    // a real install (absent at 0 / `None`: byte-identical to the pre-reshaping baseline).
+    // `generation` (the child's incarnation under the unified lineage counter), the inherited
+    // `read_only` provenance, and the child's `fork_id` PROVENANCE token ride the baseline meta,
+    // so the restart boot below — and every later restart from the child's own stores — recovers
+    // all three exactly as it would from a real install (absent at 0 / `None`: byte-identical to
+    // the pre-reshaping baseline).
     write_fork_baseline(
-      &config, snapshot, generation, read_only, boot_epoch, log, stable,
+      &config, snapshot, generation, read_only, fork_id, boot_epoch, log, stable,
     );
     let ep = Endpoint::restart(
       config,
@@ -1580,6 +1631,7 @@ where
     fsm: F,
     snapshot: Bytes,
     read_only: Option<ReadOnlyOption>,
+    fork_id: Option<ForkId>,
     boot_epoch: u64,
     log: &mut L,
     stable: &mut S,
@@ -1597,7 +1649,7 @@ where
     validate_virgin_stores(log, stable)?;
     self.host_id.get_or_insert(config.id());
     write_fork_baseline(
-      &config, snapshot, generation, read_only, boot_epoch, log, stable,
+      &config, snapshot, generation, read_only, fork_id, boot_epoch, log, stable,
     );
     let ep = Endpoint::restart_with_rng(config, now, rng, fsm, boot_epoch, log, stable);
     self
