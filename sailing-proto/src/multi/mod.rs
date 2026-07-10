@@ -992,25 +992,20 @@ where
   /// not lift, and one `(parent, child)` conflict signal surfaces via
   /// [`poll_split_conflict`](Self::poll_split_conflict). Every drain re-examines parked forks
   /// first and resolves by exactly one of: (a) the hosted child is REMOVED — the fork
-  /// materializes normally; (b) the hosted child reaches `applied >=` [`FORK_BASE_INDEX`] with
-  /// lineage AT OR PAST the fork's `child_gen` — under single-incarnation ids and the monotone
-  /// lineage counter that is this fork materialized: at equality the same-logical-fork twin
-  /// (from a sibling replica whose own blob was flush-durable before it could transmit), above
-  /// it that twin's lineage evolved (the child reshaped after birth) or a recreation that
-  /// superseded the fork outright (the two-act rejoin retires the id first, certifying the
-  /// fork's incarnation registered somewhere before the id could return) — so the fork data
-  /// provably exists in the id's history and this fork resolves as redundant (fence lifts,
-  /// guard advances, blob discarded — now safe); (c) the hosted child sits below the baseline
-  /// or below the fork's lineage — it stays parked (a below-lineage squatter predates the
-  /// fork's mint and cannot contain the handover). Parking is a conservative HOLD whose exits
-  /// are (a) and (b), and the at-or-past form in (b) is what keeps both reachable: the
-  /// conflict signal is the embedder's cue, and the standing fence means the parent cannot
-  /// compact past the split entry while parked — the fork's replay source survives
-  /// indefinitely, however late the embedder acts. Under the earlier lineage-EQUALITY form
-  /// that promise was FALSE: a child that reshaped after birth parked its fork forever, and
-  /// the standing fence then blocked the parent's own absorb capture — a true deadlock once a
-  /// merge into the parent waited on that capture while the child's departure waited on the
-  /// merge (fence → child-gone → merge → capture → fence).
+  /// materializes normally; (b) the hosted child carries THIS split's exact [`ForkId`] — the
+  /// provenance token a sibling replica's manufactured baseline (or the child's own later
+  /// snapshot) installed here, so the child IS this fork already materialized: it resolves as
+  /// redundant (fence lifts, guard advances, blob discarded — now safe); (c) the hosted child
+  /// carries a DIFFERENT token or none — an independently-created group, a squatter, or a
+  /// recreation that merely occupies the id — so it stays PARKED, however far its own commits
+  /// pushed applied-index or lineage. The ForkId match is what makes the discard safe: progress
+  /// alone cannot distinguish the real fork from an unrelated child, and treating a threshold
+  /// crossing as proof of materialization discarded the fork blob for an unrelated child and lost
+  /// the child partition. Parking is a conservative HOLD whose exits are (a) and (b): the conflict
+  /// signal is the embedder's cue, and the standing fence means the parent cannot compact past the
+  /// split entry while parked — the fork's replay source survives indefinitely, however late the
+  /// embedder acts, and a genuinely-reshaped twin still resolves the moment its token arrives here
+  /// (the token is fixed at the split, so later reshaping never changes it).
   pub fn poll_pending_fork(&mut self) -> Option<GroupFork<G, I, F>> {
     // Parked parents first: their resolution triggers are child-side, so the dirty queue —
     // marked only by parent dispatches — cannot be relied on to revisit them.
@@ -1083,18 +1078,26 @@ where
         if !in_voters || fork.parent_gen_after <= self.lineage.get(gid).copied().unwrap_or(0) {
           Verdict::Resolve
         } else if let Some(hosted) = self.groups.get(&child) {
-          // Arm (b): a twin at-or-past the manufactured baseline under AT-OR-PAST the fork's
-          // lineage IS this fork materialized (single-incarnation ids + the monotone lineage
-          // counter): at equality, the sibling-flushed twin; above it, that twin's lineage
-          // evolved (the child reshaped after birth) or a recreation that superseded the fork
-          // — and the two-act rejoin retires the id first, certifying the fork's incarnation
-          // registered somewhere before the id could return, so the staged blob is redundant
-          // history either way. Requiring EQUALITY here deadlocked the reshape cycle (fence →
-          // child-gone → merge → capture → fence): a reshaped child parked this fork forever
-          // while the standing fence blocked the very absorb capture its departure waited on.
-          // BELOW the fork's lineage parks (arm (c)): that state predates the fork's mint and
-          // cannot contain the handover.
-          if hosted.applied_index() >= FORK_BASE_INDEX && hosted.shape_gen() >= fork.child_gen {
+          // Arm (b) is a PROVENANCE decision, not a progress one: the hosted child IS this fork
+          // materialized iff it carries THIS split's exact ForkId — the token a sibling replica's
+          // manufactured baseline (or the child's own later snapshot) transferred here. Only a
+          // child that installed this fork's baseline has it; an independently-created group, a
+          // squatter, or a recreation at the id carries a DIFFERENT token or none, however far its
+          // own commits pushed applied-index or lineage. A match resolves redundant (the fork
+          // already exists in the id's history — fence lifts, blob safely discarded); anything else
+          // PARKS (arm (c)): the staged blob is the child partition's only local copy, so the
+          // standing fence holds it until the conflict resolves. Progress alone can never authorize
+          // the discard — that mistaking an unrelated child for the fork is the data-loss defect
+          // this closes.
+          let this_fork_id = mint_fork_id(
+            gid,
+            fork.parent_gen_after,
+            fork.index,
+            fork.split_term,
+            fork.child_bytes.clone(),
+            fork.child_gen,
+          );
+          if hosted.fork_id() == Some(this_fork_id) {
             Verdict::Redundant
           } else {
             Verdict::Park(child)

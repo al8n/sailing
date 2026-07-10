@@ -185,6 +185,15 @@ where
     self.split.restored_lineage = generation;
   }
 
+  /// Test seam: seed this endpoint's fork provenance exactly as a peer's installed fork baseline
+  /// would ([`on_install_snapshot`](Endpoint::on_install_snapshot) adopts `meta.fork_id`), so a
+  /// unit test can model a hosted child GAINING its `ForkId` via snapshot transfer — the parked
+  /// fork's redundant-resolution trigger — without standing up a second replica to send the install.
+  #[cfg(test)]
+  pub(crate) fn seed_fork_id_for_test(&mut self, fork_id: crate::ForkId) {
+    self.split.fork_id = Some(fork_id);
+  }
+
   /// Whether a proposed `Split` entry is still UNAPPLIED — the container's one-in-flight propose
   /// gate (see [`SplitState::pending_split_index`] for the self-healing derivation).
   pub(crate) fn split_in_flight(&self) -> bool {
