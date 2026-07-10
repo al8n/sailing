@@ -6,6 +6,12 @@ use sailing_proto::{Config, Instant, NodeId, Now, Wall};
 
 use crate::{BindError, Monotonic, WallClock};
 
+/// Clamp horizon (~100 years) for mapping a crate [`Instant`] back onto the std epoch. std
+/// `Instant + Duration` PANICS on overflow (the crate [`Instant`] saturates; std does not), so the
+/// elapsed is clamped to this before the add: a pathological deadline (e.g. `Duration::MAX`) maps to
+/// a too-early — never panicking — `sleep_until`, a harmless re-poll.
+const CLOCK_HORIZON: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// Anchors the proto's monotonic [`Instant`] to an epoch captured at startup, owns the [`WallClock`]
 /// source `W` (default [`Monotonic`]), and holds the cluster `ε_unc` captured from the proto `Config`
 /// at bind: `Some(nanos)` INSIDE the LeaseGuard failover tier (including an exact `Some(0)`), `None`
@@ -65,7 +71,9 @@ impl<W: WallClock> Clock<W> {
   /// `compio::time::sleep_until`.
   #[must_use]
   pub fn to_std(&self, at: Instant) -> StdInstant {
-    self.base + at.since_origin()
+    // std `Instant + Duration` panics on overflow (the crate `Instant` saturates; std does not) —
+    // clamp the elapsed to the horizon so a pathological `at` maps to a re-poll, never a panic.
+    self.base + at.since_origin().min(CLOCK_HORIZON)
   }
 }
 
@@ -115,6 +123,20 @@ mod tests {
     // affine over one shared base.
     let recovered = Instant::from_origin(std_later.duration_since(clock.base));
     assert_eq!(recovered, later);
+  }
+
+  #[test]
+  fn to_std_clamps_a_pathological_deadline_without_panicking() {
+    let clock = Clock::new(None, Monotonic);
+    // A crate `Instant` at `Duration::MAX` must map WITHOUT panicking (std `Instant + Duration`
+    // would overflow): the horizon clamp maps it to `base + ~100 years`, never earlier than a normal
+    // deadline, so a too-far timer is a harmless re-poll rather than a crash.
+    let normal = clock.to_std(Instant::from_origin(Duration::from_secs(1)));
+    let pathological = clock.to_std(Instant::from_origin(Duration::MAX));
+    assert!(
+      pathological >= normal,
+      "the clamped deadline is not earlier than a normal one"
+    );
   }
 
   #[test]
