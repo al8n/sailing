@@ -1038,3 +1038,21 @@ fn poll_timeout_uses_the_quic_deadline_for_a_non_voter() {
     "it is the future quic deadline, not the immediate (pending-work) value"
   );
 }
+
+/// `quinn_now` maps a crate `Instant` onto quinn's std clock through a lazily-captured anchor. A
+/// pathological `now` (`Instant::from_origin(Duration::MAX)`, reachable from public deadline input)
+/// must NOT panic the std `Instant + Duration` — the horizon clamp maps it to a too-far, never
+/// earlier, deadline.
+#[test]
+fn quinn_now_clamps_a_pathological_now_without_panicking() {
+  let ca = TestClusterCa::generate();
+  let c = cluster(7);
+  let mut coord = coord(&ca, 1, c);
+  // Anchor on a normal first `now` (returns the std base), then map `Duration::MAX`.
+  let base = coord.quinn_now(Instant::ORIGIN);
+  let pathological = coord.quinn_now(Instant::from_origin(Duration::MAX));
+  assert!(
+    pathological >= base,
+    "the clamped quinn deadline is not earlier than the anchor"
+  );
+}

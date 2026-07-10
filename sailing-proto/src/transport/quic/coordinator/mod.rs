@@ -70,6 +70,13 @@ fn tracked_peer_count<I: Ord>(conf: &crate::ConfState<I>, me: &I) -> usize {
   peers.len()
 }
 
+/// Clamp horizon (~100 years) for mapping a crate [`Instant`] onto quinn's std clock. std
+/// `Instant + Duration` PANICS on overflow (the crate [`Instant`] saturates; std does not), so the
+/// elapsed is clamped to this before the add: a pathological `now` (e.g. a `Duration::MAX` deadline
+/// from public input) maps to a too-early — never panicking — quinn deadline, a harmless re-poll.
+const CLOCK_HORIZON: core::time::Duration =
+  core::time::Duration::from_secs(100 * 365 * 24 * 60 * 60);
+
 /// A consensus node speaking QUIC: the [`Endpoint`] composed with the quinn-proto bridge and an
 /// [`IdentitySource`] (`ID`, the provided [`Hello`] by default).
 ///
@@ -259,7 +266,9 @@ where
     let (base, std_base) = *self
       .clock_anchor
       .get_or_insert_with(|| (now, std::time::Instant::now()));
-    std_base + now.duration_since(base)
+    // `duration_since` already saturates, but std `Instant + Duration` panics on overflow — clamp
+    // the elapsed to the horizon so a pathological `now` maps to a re-poll, never a panic.
+    std_base + now.duration_since(base).min(CLOCK_HORIZON)
   }
 
   /// Reverse-map a quinn deadline back into crate time through the same anchor. `None` before
