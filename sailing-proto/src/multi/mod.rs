@@ -119,6 +119,19 @@ pub const fn floor_admits(floor: u64, generation: u64) -> bool {
   generation < MERGED_FLOOR && generation >= floor
 }
 
+/// The floor-INDEPENDENT admission leg of [`floor_admits`], enforced by the CORE group
+/// constructors so the reserved terminal [`MERGED_FLOOR`] sentinel is refused at creation — not
+/// only at the coordinators' floor validator. A group born AT the sentinel would read as
+/// merged-away to every downstream consumer (a `MERGED_FLOOR` floor admits nothing, `next_lineage`
+/// never mints it), so no working incarnation may occupy it, whatever floor a caller supplies.
+const fn validate_working_generation(generation: u64) -> Result<(), CreateGroupError> {
+  if generation < MERGED_FLOOR {
+    Ok(())
+  } else {
+    Err(CreateGroupError::ReservedGeneration)
+  }
+}
+
 /// The refusing form of [`floor_admits`] the coordinators' admission methods report through:
 /// the reserved sentinel under a lower floor maps to [`CreateGroupError::ReservedGeneration`]
 /// (the caller supplied a generation that can never work), everything else to
@@ -1290,6 +1303,7 @@ where
     fsm: F,
   ) -> Result<(), CreateGroupError> {
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    validate_working_generation(generation)?;
     self.host_id.get_or_insert(config.id());
     let mut ep = Endpoint::new(config, now, group_seed(seed, &gid), fsm);
     ep.seed_lineage(generation);
@@ -1468,6 +1482,7 @@ where
     I: Data,
   {
     validate_fork_boot_epoch(boot_epoch)?;
+    validate_working_generation(generation)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     validate_virgin_stores(log, stable)?;
     self.host_id.get_or_insert(config.id());
@@ -1524,6 +1539,7 @@ where
     fsm: F,
   ) -> Result<(), CreateGroupError> {
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
+    validate_working_generation(generation)?;
     self.host_id.get_or_insert(config.id());
     let mut ep = Endpoint::new_with_rng(config, now, rng, fsm);
     ep.seed_lineage(generation);
@@ -1648,6 +1664,7 @@ where
     I: Data,
   {
     validate_fork_boot_epoch(boot_epoch)?;
+    validate_working_generation(generation)?;
     validate_new_group(&self.groups, &self.host_id, &gid, &config)?;
     validate_virgin_stores(log, stable)?;
     self.host_id.get_or_insert(config.id());

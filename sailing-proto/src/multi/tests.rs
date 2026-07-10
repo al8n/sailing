@@ -296,6 +296,61 @@ fn fork_refuses_boot_epoch_zero() {
 }
 
 #[test]
+fn create_rejects_the_reserved_terminal_generation() {
+  // #101-F8: the CORE constructors refuse the reserved MERGED_FLOOR sentinel — a group born at it
+  // reads as merged-away to every downstream consumer (a MERGED_FLOOR floor admits nothing;
+  // `next_lineage` never mints it) — even without a coordinator floor validator in the path.
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  assert_eq!(
+    m.create_group(
+      1,
+      MERGED_FLOOR,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      CountSm::default()
+    ),
+    Err(CreateGroupError::ReservedGeneration)
+  );
+  assert!(m.is_empty(), "nothing admitted at the sentinel");
+  assert!(m.host_id().is_none(), "the refusal precedes the id latch");
+  assert_eq!(
+    m.create_group_from_fork(
+      2,
+      MERGED_FLOOR,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      42,
+      preloaded_sm(3),
+      fork_blob(3),
+      None,
+      None,
+      1,
+      &mut log,
+      &mut stable
+    ),
+    Err(CreateGroupError::ReservedGeneration)
+  );
+  assert!(
+    stable.snapshot().is_none(),
+    "the fork's baseline write never happened — refused before any store write"
+  );
+
+  // A working generation just below the sentinel admits normally.
+  m.create_group(
+    3,
+    MERGED_FLOOR - 1,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    42,
+    CountSm::default(),
+  )
+  .unwrap();
+  assert_eq!(m.group_gen(&3), MERGED_FLOOR - 1);
+}
+
+#[test]
 fn fork_refuses_used_stores_before_any_write() {
   // The manufactured baseline OVERWRITES whatever the stores hold, so a fork is only ever
   // written over VIRGIN stores. Each leg of the used-storage probe refuses on its own — a
