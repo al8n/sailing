@@ -22,6 +22,11 @@ use super::{map_propose_err, map_read_err, map_transfer_err};
 
 /// IP-layer maximum UDP payload — the persistent receive buffer's size.
 const RECV_BUF_LEN: usize = 65_507;
+/// Upper bound on storage-ready signals coalesced per loop turn. `handle_storage` below drains ALL
+/// queued completions regardless, so this only bounds the wake-coalescing — and stops a
+/// continuously replenishing producer from starving the task in an unbounded drain. Matches the
+/// multi driver's `IO_BUDGET`.
+const IO_BUDGET: usize = 256;
 /// Backoff before retrying a failed `recv_from`, bounding the retry rate under a persistent
 /// synchronously-resolving error so the thread always makes progress.
 const RECV_ERROR_BACKOFF: Duration = Duration::from_millis(20);
@@ -564,8 +569,13 @@ where
         }
         (inbound, fire_timeout, command, ended)
       };
-      // Coalesce any burst of storage signals: handle_storage below drains ALL completions.
-      while self.storage_ready.try_recv().is_ok() {}
+      // Coalesce any burst of storage signals to a bounded count: handle_storage below drains ALL
+      // completions, so a replenishing producer never starves this task in an unbounded drain.
+      for _ in 0..IO_BUDGET {
+        if self.storage_ready.try_recv().is_err() {
+          break;
+        }
+      }
       if ended {
         break;
       }

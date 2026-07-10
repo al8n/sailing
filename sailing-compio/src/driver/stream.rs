@@ -23,6 +23,12 @@ use crate::{
 
 use super::{map_propose_err, map_read_err, map_transfer_err};
 
+/// Upper bound on storage-ready signals coalesced per loop turn. `handle_storage` below drains ALL
+/// queued completions regardless, so this only bounds the wake-coalescing — and stops a
+/// continuously replenishing producer from starving the task in an unbounded drain. Matches the
+/// multi driver's `IO_BUDGET`.
+const IO_BUDGET: usize = 256;
+
 /// Builds the record layer for an OUTBOUND connection to the given peer (the peer parameter
 /// carries the dial target so a TLS dialer can derive its SNI). Infallibility is not assumed:
 /// a failed construction (a bad local id, a TLS config error) surfaces as an `io::Error` and the
@@ -616,7 +622,13 @@ where
           }
         }
       };
-      while self.storage_ready.try_recv().is_ok() {}
+      // Coalesce a burst of storage-ready signals to a bounded count (handle_storage below drains
+      // ALL queued completions), so a replenishing producer never starves this task in the drain.
+      for _ in 0..IO_BUDGET {
+        if self.storage_ready.try_recv().is_err() {
+          break;
+        }
+      }
 
       let now = self.clock.now();
       match wake {
