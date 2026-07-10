@@ -106,6 +106,13 @@ pub struct MultiWorld {
   /// Per-node crash counter — the durable boot epoch handed to `restore_group` so a restarted
   /// node's forwarded-read tokens are unique across incarnations.
   boot_epochs: BTreeMap<u64, u64>,
+  /// Per-`(node, parent)` DURABLE relay lineage — the max `parent_gen_after` of the parent's forks
+  /// this node has MATERIALIZED. The container's live relay guard is reset to the (possibly
+  /// lagging) durable snapshot meta on restart, so — exactly as a real driver restores it from
+  /// `engine.group_gen` (bumped in its fork drain) via `raise_relay_guard` — the restore path feeds
+  /// this back so a replayed split folds to a duplicate no-op instead of re-materializing (or, now,
+  /// PARKING against) an already-relayed child.
+  relayed_lineage: BTreeMap<(u64, u64), u64>,
   /// Per-`(node, gid)` confirmed `ReadState`s in confirmation order. Monotone and NEVER removed
   /// on replica teardown, so the read ledger's scan offsets stay valid across re-wiring.
   read_states: BTreeMap<(u64, u64), Vec<ReadState>>,
@@ -246,6 +253,7 @@ impl MultiWorld {
       net_duplicated: 0,
       configs: BTreeMap::new(),
       restarts: BTreeMap::new(),
+      relayed_lineage: BTreeMap::new(),
       boot_epochs: BTreeMap::new(),
       read_states: BTreeMap::new(),
       member_view: BTreeMap::new(),

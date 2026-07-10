@@ -95,6 +95,9 @@ impl MultiWorld {
     let mut fresh: MultiRaft<u64, u64, LogSm> = MultiRaft::new();
     for gid in &gids {
       let gid = *gid;
+      // The durable relay lineage restored below (a real driver's `raise_relay_guard` after
+      // restore) — read before the store borrows.
+      let relayed = self.relayed_lineage.get(&(id, gid)).copied().unwrap_or(0);
       let log = self.logs.get_mut(&(id, gid)).expect("replica log");
       let stable = self.stables.get_mut(&(id, gid)).expect("replica stable");
       log.discard_inflight();
@@ -112,6 +115,8 @@ impl MultiWorld {
           stable,
         )
         .unwrap_or_else(|e| panic!("crash: restore of group {gid} on node {id}: {e:?}"));
+      // Fold every already-materialized fork the replay re-stages back to a duplicate no-op.
+      fresh.raise_relay_guard(&gid, relayed);
       *self.restarts.entry((id, gid)).or_insert(0) += 1;
     }
     self.hosts.insert(id, fresh);

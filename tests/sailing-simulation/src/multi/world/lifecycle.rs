@@ -597,6 +597,10 @@ impl MultiWorld {
     self.snapshot_lineage.remove(&(node, gid));
     self.member_view.remove(&(node, gid));
     self.parked.remove(&(node, gid));
+    // The durable relay lineage is per-incarnation (a real driver's engine drops the group's
+    // `group_gen` on teardown): a fresh incarnation of this id must not inherit the retired one's
+    // relayed forks, or a later restart's guard would fold its legitimate new forks.
+    self.relayed_lineage.remove(&(node, gid));
     // `restarts` and `read_states` deliberately survive: a later re-wire of the same (node, gid)
     // must bump past the old incarnation, and ledger scan offsets index the monotone vec.
   }
@@ -623,12 +627,18 @@ impl MultiWorld {
       .expect("retained replica stable");
     log.discard_inflight();
     stable.discard_inflight();
+    let relayed = self.relayed_lineage.get(&(node, gid)).copied().unwrap_or(0);
     let host = self.hosts.get_mut(&node).expect("host exists");
     host
       .restore_group(gid, config, now, seed, LogSm::new(), epoch, log, stable)
       .unwrap_or_else(|e| {
         panic!("remove_group rollback: restore of group {gid} on node {node}: {e:?}")
       });
+    // Restore the container's relay guard from the durable relay lineage (a real driver's
+    // `raise_relay_guard(engine.group_gen)` after restore): the restart replay re-stages every
+    // already-materialized fork, and the guard must fold them to duplicates rather than re-relay —
+    // or, now, PARK them against a co-hosted child that lost its provenance to churn.
+    host.raise_relay_guard(&gid, relayed);
     *self.restarts.entry((node, gid)).or_insert(0) += 1;
   }
 

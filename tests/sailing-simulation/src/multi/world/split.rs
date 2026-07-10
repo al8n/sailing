@@ -281,6 +281,13 @@ impl MultiWorld {
   /// passing through this path.
   fn wire_fork_replica(&mut self, node: u64, fork: sailing_proto::GroupFork<u64, u64, LogSm>) {
     let child = fork.child;
+    // Record the parent's DURABLE relay lineage on this node — mirroring a real driver's
+    // `engine.set_group_gen(&parent, fork.parent_gen_after)` in its fork drain — so a later restart
+    // restores the container's relay guard past this now-materialized fork (see `relayed_lineage`).
+    {
+      let e = self.relayed_lineage.entry((node, fork.parent)).or_insert(0);
+      *e = (*e).max(fork.parent_gen_after);
+    }
     self.logs.insert((node, child), MemLog::new());
     self.stables.insert((node, child), MemStable::new());
     self.configs.insert((node, child), fork.config.clone());
