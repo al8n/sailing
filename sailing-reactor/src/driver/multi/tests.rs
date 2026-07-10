@@ -101,34 +101,36 @@ fn a_parked_merge_blocks_quiescence() {
     }
     assert!(multi.group(&gid).unwrap().role().is_leader());
   }
+  // The direction rule makes the encoding-minimal id the survivor: group 1 is the target, group 2
+  // the source that dissolves (2's LE encoding sorts strictly above 1's).
   assert!(
-    super::group_idle(multi.group(&2).unwrap()),
+    super::group_idle(multi.group(&1).unwrap()),
     "the target is idle before the merge"
   );
 
   multi
-    .prepare_merge(&1, now, &mut engine, &2)
+    .prepare_merge(&2, now, &mut engine, &1)
     .unwrap()
     .unwrap();
-  for _ in 0..4 {
-    engine.flush();
-    let (log, stable) = engine.stores(&1).unwrap();
-    let _ = multi.handle_storage(&1, now, log, stable).unwrap();
-  }
-  assert!(multi.group(&1).unwrap().is_frozen());
-  {
-    let (log, stable) = engine.stores(&2).unwrap();
-    multi
-      .commit_merge(&2, now, log, stable, &1)
-      .unwrap()
-      .unwrap();
-  }
   for _ in 0..4 {
     engine.flush();
     let (log, stable) = engine.stores(&2).unwrap();
     let _ = multi.handle_storage(&2, now, log, stable).unwrap();
   }
-  let target = multi.group(&2).unwrap();
+  assert!(multi.group(&2).unwrap().is_frozen());
+  {
+    let (log, stable) = engine.stores(&1).unwrap();
+    multi
+      .commit_merge(&1, now, log, stable, &2)
+      .unwrap()
+      .unwrap();
+  }
+  for _ in 0..4 {
+    engine.flush();
+    let (log, stable) = engine.stores(&1).unwrap();
+    let _ = multi.handle_storage(&1, now, log, stable).unwrap();
+  }
+  let target = multi.group(&1).unwrap();
   assert!(target.pending_merge().is_some(), "parked");
   assert!(
     !super::group_idle(target),
@@ -141,18 +143,18 @@ fn a_parked_merge_blocks_quiescence() {
   let mut resolved = multi.service_merge_applies(now, &mut engine);
   for _ in 0..4 {
     engine.flush();
-    let (log, stable) = engine.stores(&2).unwrap();
-    let _ = multi.handle_storage(&2, now, log, stable).unwrap();
+    let (log, stable) = engine.stores(&1).unwrap();
+    let _ = multi.handle_storage(&1, now, log, stable).unwrap();
   }
   resolved.extend(multi.service_merge_applies(now, &mut engine));
   assert_eq!(resolved.len(), 1);
   for _ in 0..4 {
     engine.flush();
-    let (log, stable) = engine.stores(&2).unwrap();
-    let _ = multi.handle_storage(&2, now, log, stable).unwrap();
+    let (log, stable) = engine.stores(&1).unwrap();
+    let _ = multi.handle_storage(&1, now, log, stable).unwrap();
   }
   assert!(
-    super::group_idle(multi.group(&2).unwrap()),
+    super::group_idle(multi.group(&1).unwrap()),
     "the merged target settles idle after the resolution"
   );
 }

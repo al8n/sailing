@@ -3916,6 +3916,10 @@ async fn merge_verb_anywhere<Fut>(what: &str, mut verb: impl FnMut(usize) -> Fut
 where
   Fut: core::future::Future<Output = Result<sailing_proto::Index, DriverError<u64>>>,
 {
+  // A DirectionInverted refusal is a property of the id PAIR, not of transient state, so it can
+  // never clear by retrying across nodes or time. Fail on it immediately instead of spinning out
+  // the deadline, so a re-introduced direction bug surfaces as a pointed panic, not a 15s timeout.
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
   let deadline = std::time::Instant::now() + Duration::from_secs(15);
   loop {
     assert!(
@@ -3923,8 +3927,14 @@ where
       "{what} never accepted"
     );
     for at in 0..n {
-      if verb(at).await.is_ok() {
-        return at;
+      match verb(at).await {
+        Ok(_) => return at,
+        Err(DriverError::Rejected { reason }) if reason == inverted => {
+          panic!(
+            "{what}: the merge claim is permanently inverted — source must encode above target"
+          )
+        }
+        Err(_) => {}
       }
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
@@ -3979,17 +3989,19 @@ async fn merge_absorbs_and_source_never_returns() {
   assert_eq!(submit_anywhere(&g200, b"b2").await, 2);
   assert_eq!(submit_anywhere(&g200, b"b3").await, 3);
 
-  // Pin the target's leadership through the whole choreography.
-  let t_leader = find_leader(&g200, "target pre-merge").await;
-  let t_term = g200[t_leader].status().await.expect("status").term;
+  // The direction rule makes the encoding-minimal id the survivor: group 100 is the target, group
+  // 200 the source that dissolves (200's LE encoding sorts strictly above 100's). Pin the target's
+  // leadership through the whole choreography.
+  let t_leader = find_leader(&g100, "target pre-merge").await;
+  let t_term = g100[t_leader].status().await.expect("status").term;
   // Colocate the source onto the target leader so the absorb can certify the freeze barrier.
-  colocate_onto(&g100, t_leader as u64 + 1, "source onto target leader").await;
+  colocate_onto(&g200, t_leader as u64 + 1, "source onto target leader").await;
 
   merge_verb_anywhere(
     "the freeze",
     |at| {
       let h = handles[at].clone();
-      async move { h.prepare_merge(100, 200).await }
+      async move { h.prepare_merge(200, 100).await }
     },
     handles.len(),
   )
@@ -3998,7 +4010,7 @@ async fn merge_absorbs_and_source_never_returns() {
     "the commit",
     |at| {
       let h = handles[at].clone();
-      async move { h.commit_merge(200, 100).await }
+      async move { h.commit_merge(100, 200).await }
     },
     handles.len(),
   )
@@ -4012,7 +4024,7 @@ async fn merge_absorbs_and_source_never_returns() {
       "the union never served everywhere"
     );
     let mut counts = Vec::new();
-    for g in &g200 {
+    for g in &g100 {
       if let Ok(c) = g.query(|sm: &CountSm| sm.count()).await {
         counts.push(c);
       }
@@ -4024,7 +4036,7 @@ async fn merge_absorbs_and_source_never_returns() {
   }
 
   // No leadership churn on the target: same leader, same term.
-  let status = g200[t_leader].status().await.expect("status");
+  let status = g100[t_leader].status().await.expect("status");
   assert_eq!(status.role, Role::Leader, "the target leader never moved");
   assert_eq!(status.term, t_term, "the target's term never moved");
 
@@ -4037,7 +4049,7 @@ async fn merge_absorbs_and_source_never_returns() {
       "the source never tore down everywhere"
     );
     let mut gone = 0;
-    for g in &g100 {
+    for g in &g200 {
       if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
         gone += 1;
       }
@@ -4050,7 +4062,7 @@ async fn merge_absorbs_and_source_never_returns() {
   for (i, h) in handles.iter().enumerate() {
     let id = i as u64 + 1;
     match h
-      .create_group(100, config(id, vec![1, 2, 3]), 9, CountSm::default(), 9)
+      .create_group(200, config(id, vec![1, 2, 3]), 9, CountSm::default(), 9)
       .await
     {
       Err(DriverError::Rejected { reason }) => {
@@ -4090,11 +4102,13 @@ async fn merge_rollback_unfreezes() {
   assert_eq!(submit_anywhere(&g100, b"a1").await, 1);
   assert_eq!(submit_anywhere(&g200, b"b1").await, 1);
 
+  // The direction rule makes the encoding-minimal id the survivor: group 100 is the target, group
+  // 200 the source that dissolves and thaws (200's LE encoding sorts strictly above 100's).
   merge_verb_anywhere(
     "the freeze",
     |at| {
       let h = handles[at].clone();
-      async move { h.prepare_merge(100, 200).await }
+      async move { h.prepare_merge(200, 100).await }
     },
     handles.len(),
   )
@@ -4107,7 +4121,7 @@ async fn merge_rollback_unfreezes() {
       "the freeze never took effect"
     );
     let mut frozen = false;
-    for g in &g100 {
+    for g in &g200 {
       if matches!(g.submit(Bytes::from_static(b"x")).await, Err(DriverError::Rejected { reason }) if reason.contains("Frozen"))
       {
         frozen = true;
@@ -4126,22 +4140,22 @@ async fn merge_rollback_unfreezes() {
     "the abort",
     |at| {
       let h = handles[at].clone();
-      async move { h.rollback_merge(200, 100).await }
+      async move { h.rollback_merge(100, 200).await }
     },
     handles.len(),
   )
   .await;
 
   // The relayed thaw lands on the source's own log: it accepts fresh writes again everywhere.
-  assert_eq!(submit_anywhere(&g100, b"a2").await, 2);
+  assert_eq!(submit_anywhere(&g200, b"a2").await, 2);
   // Both groups intact: nothing was absorbed.
-  assert_eq!(query_anywhere(&g200).await, 1, "no union — the merge died");
+  assert_eq!(query_anywhere(&g100).await, 1, "no union — the merge died");
 
   // A LATER merge of the same pair completes end to end: the abort left a clean lineage. Colocate
   // the (now thawed) source onto the target leader again so the fresh absorb can certify the barrier.
-  let t2_leader = find_leader(&g200, "target pre-second-merge").await;
+  let t2_leader = find_leader(&g100, "target pre-second-merge").await;
   colocate_onto(
-    &g100,
+    &g200,
     t2_leader as u64 + 1,
     "source onto target leader (second)",
   )
@@ -4150,7 +4164,7 @@ async fn merge_rollback_unfreezes() {
     "the fresh freeze",
     |at| {
       let h = handles[at].clone();
-      async move { h.prepare_merge(100, 200).await }
+      async move { h.prepare_merge(200, 100).await }
     },
     handles.len(),
   )
@@ -4159,7 +4173,7 @@ async fn merge_rollback_unfreezes() {
     "the fresh commit",
     |at| {
       let h = handles[at].clone();
-      async move { h.commit_merge(200, 100).await }
+      async move { h.commit_merge(100, 200).await }
     },
     handles.len(),
   )
@@ -4171,14 +4185,46 @@ async fn merge_rollback_unfreezes() {
       "the second merge never completed"
     );
     let mut gone = 0;
-    for g in &g100 {
+    for g in &g200 {
       if matches!(g.status().await, Err(DriverError::Rejected { .. })) {
         gone += 1;
       }
     }
-    if gone == 3 && query_anywhere(&g200).await == 3 {
+    if gone == 3 && query_anywhere(&g100).await == 3 {
       break;
     }
     tokio::time::sleep(Duration::from_millis(40)).await;
+  }
+}
+
+/// The direction rule is a permanent, state-independent refusal: an inverted claim (source
+/// encoding strictly BELOW the target) is rejected typed on the FIRST call, before any leadership
+/// consideration and with nothing appended — the id pair, not any mutable state, decides it, so it
+/// can never self-clear and must never be retried.
+#[tokio::test(flavor = "multi_thread")]
+async fn prepare_merge_refuses_an_inverted_claim() {
+  let addrs = addrs(44_900, 3);
+  let mut handles = Vec::new();
+  for id in 1u64..=3 {
+    let peers: Vec<_> = (1u64..=3)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    tokio::spawn(driver.run());
+    handles.push(handle);
+  }
+  create_group_everywhere::<CountSm>(&handles, 100, &[1, 2, 3]).await;
+  create_group_everywhere::<CountSm>(&handles, 200, &[1, 2, 3]).await;
+
+  // source 100 encodes strictly BELOW target 200: the direction gate is the earliest,
+  // constant-vs-constant check, so the host of the source refuses on the first call regardless of
+  // who leads. `map_merge_err` carries the variant's Debug form as the rejection reason.
+  let inverted = format!("{:?}", sailing_proto::MergeError::<u64>::DirectionInverted);
+  match handles[0].prepare_merge(100, 200).await {
+    Err(DriverError::Rejected { reason }) => {
+      assert_eq!(reason, inverted, "the refusal must be DirectionInverted");
+    }
+    other => panic!("an inverted claim must refuse typed on the first call, got {other:?}"),
   }
 }
