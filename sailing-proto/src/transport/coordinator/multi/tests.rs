@@ -1909,6 +1909,81 @@ fn propose_split_gates_the_child_floor() {
   assert_eq!(log.last_index(), last, "nothing was proposed");
 }
 
+#[test]
+fn propose_split_refuses_a_tombstoned_child() {
+  // The #97-1 ChildRetired gate: a split whose child id THIS host has tombstoned is refused at
+  // propose (beside the floor leg) — the fork could never materialize onto a retired id (admission
+  // refuses `Retired`), so the entry is never appended. Clear-then-recreate is the rejoin path.
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+  let (mut log, stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  c.create_group(
+    200,
+    single_voter(1),
+    now,
+    2,
+    CountSm::default(),
+    0,
+    &NoFloors,
+  )
+  .unwrap();
+  assert!(c.remove_group(&200, &mut empty_stores()).unwrap().is_some());
+  assert!(c.is_retired(&200), "removal tombstones the child id");
+  let last = log.last_index();
+
+  let e = c
+    .propose_split(
+      &100,
+      now,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"i"),
+      &NoFloors,
+    )
+    .expect("the parent is hosted")
+    .unwrap_err();
+  assert_eq!(e, SplitError::ChildRetired);
+  assert_eq!(
+    log.last_index(),
+    last,
+    "nothing was proposed for a tombstoned child"
+  );
+
+  // Clearing the tombstone lifts THIS gate (the split then fails for an unrelated reason, never
+  // ChildRetired).
+  assert!(c.clear_tombstone(&200), "a tombstone existed");
+  let e = c
+    .propose_split(
+      &100,
+      now,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"i"),
+      &NoFloors,
+    )
+    .expect("the parent is hosted")
+    .unwrap_err();
+  assert_ne!(
+    e,
+    SplitError::ChildRetired,
+    "a cleared tombstone no longer gates the split"
+  );
+}
+
 /// A state machine whose `split` gives away `instruction[0]` units — the minimal partitionable
 /// FSM the crash-restore pins below need (self-contained, mirroring the container tests').
 #[derive(Default, Debug, PartialEq)]

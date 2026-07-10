@@ -721,6 +721,12 @@ where
     if !self.multi.contains_group(group) {
       return None;
     }
+    // A locally-tombstoned child could never materialize its fork here (admission refuses
+    // `Retired`), so refuse the split at propose — the entry is never appended. The floor leg
+    // fences a below-floor incarnation; this leg fences a removed one, beside it.
+    if self.retired.contains(child) {
+      return Some(Err(crate::SplitError::ChildRetired));
+    }
     if let Err(e) = validate_floor(floors.floor(child), child_gen) {
       return Some(Err(match e {
         CreateGroupError::BelowFloor { floor } => crate::SplitError::BelowFloor { floor },

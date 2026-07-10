@@ -251,6 +251,13 @@ pub enum SplitError<I> {
   /// until the conflict resolves — refuse at propose instead of manufacturing that conflict.
   #[error("a group with the child id is already hosted")]
   ChildExists,
+  /// The child id is TOMBSTONED by a removal on this host (a coordinator-layer refusal through its
+  /// `retired` set): a committed split against a locally-retired id could never materialize here
+  /// (admission refuses [`CreateGroupError::Retired`]) — refuse at propose so the entry is never
+  /// appended. Re-admission is the explicit clear-then-recreate rejoin path, exactly as for
+  /// [`CreateGroupError::Retired`]; retry the split once the id is live again.
+  #[error("the child group id is tombstoned by a removal on this host")]
+  ChildRetired,
   /// The child id's `Data` encoding is outside the group-tag wire bound (1..=1024 bytes).
   /// Refused at propose because a COMMITTED split whose child cannot decode poisons every
   /// replica of the parent (`SplitDecode`) — a self-inflicted cluster-wide fail-stop.

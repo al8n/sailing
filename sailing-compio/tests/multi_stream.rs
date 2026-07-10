@@ -202,14 +202,12 @@ async fn two_node_multi_host_commits_and_removes() {
   }
 }
 
-/// An abandoned fork is VISIBLE on the compio plane too: a committed split whose child id is
-/// tombstoned on this host cannot materialize — the drain refuses it, resolves the parent's
-/// fence, and surfaces `LifecycleEvent::SplitRefused` on the lifecycle tail. The parent keeps
-/// serving on its shrunk half; the child stays unhosted until the embedder acts.
+/// A split into a child id this host has TOMBSTONED is refused at PROPOSE on the compio plane too
+/// (the coordinator's #97-1 ChildRetired gate): the fork could never materialize onto a retired id,
+/// so the entry is never appended and the parent never shrinks — no data loss. The child stays
+/// unhosted; clear-then-recreate is the rejoin path.
 #[compio::test]
-async fn refused_fork_surfaces_on_the_lifecycle_tail() {
-  use sailing_compio::LifecycleEvent;
-
+async fn split_into_a_tombstoned_child_refuses_at_propose() {
   let addr: SocketAddr = "127.0.0.1:45310".parse().unwrap();
   let (dialer, acceptor) = plain_factories(1);
   let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
@@ -236,37 +234,25 @@ async fn refused_fork_surfaces_on_the_lifecycle_tail() {
   }
 
   // Tombstone the child id (an unhosted removal still tombstones), then split into it: the
-  // propose gate cannot see this host's removal history, so the entry commits and the refusal
-  // happens at the materialization edge.
+  // coordinator's ChildRetired gate refuses at PROPOSE, before anything is appended.
   assert!(!handle.remove_group(300).await.expect("remove resolves"));
-  g100
+  let err = g100
     .propose_split(300, 0, Bytes::from_static(b"\x02"))
     .await
-    .expect("the single-voter leader appends the split");
+    .expect_err("a split into a locally-tombstoned child is refused at propose");
+  assert!(
+    matches!(&err, DriverError::Rejected { reason } if reason.contains("ChildRetired")),
+    "the typed ChildRetired refusal, got {err:?}"
+  );
 
-  // The driver shares this thread's runtime: await the tail, never block it.
-  let deadline = std::time::Instant::now() + Duration::from_secs(15);
-  loop {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    assert!(remaining > Duration::ZERO, "no SplitRefused in time");
-    match compio::time::timeout(remaining, handle.lifecycle().recv_async()).await {
-      Ok(Ok(LifecycleEvent::SplitRefused { parent, child })) => {
-        assert_eq!((parent, child), (100, 300), "the typed refusal");
-        break;
-      }
-      Ok(Ok(_)) => {}
-      Ok(Err(e)) => panic!("the lifecycle tail closed: {e:?}"),
-      Err(_) => panic!("no SplitRefused in time"),
-    }
-  }
-
-  // The parent's half shrank exactly once and its fence resolved: it keeps committing.
-  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 1);
+  // The parent never shrank — the split was never appended, so no unit was given away or lost —
+  // and it keeps committing.
+  assert_eq!(query_anywhere(std::slice::from_ref(&g100)).await, 3);
   assert_eq!(
     submit_anywhere(std::slice::from_ref(&g100), b"after").await,
-    2
+    4
   );
-  // The refused child never materialized here.
+  // The tombstoned child id stays unhosted.
   assert!(handle.group(300).status().await.is_err());
 
   handle.shutdown().await.expect("the multi host tears down");
