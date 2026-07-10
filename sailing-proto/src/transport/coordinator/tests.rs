@@ -400,6 +400,41 @@ fn unvalidated_conn_reaped_surfaces_via_poll_conn_closed() {
   );
 }
 
+/// `poll_timeout` SCHEDULES the router's handshake deadline, not just the endpoint's own timers —
+/// so a driver whose endpoint has no near wake still wakes to reap a silent half-open socket. A
+/// large election timeout pushes the endpoint's own next wake far past the 10s handshake deadline,
+/// standing in for a genuinely timerless observer: the handshake deadline is then the only near
+/// wake, and must be the value `poll_timeout` returns or nothing ever reaps and the socket pins
+/// `max_conns`.
+#[test]
+fn poll_timeout_schedules_the_router_handshake_deadline() {
+  let cfg =
+    crate::Config::try_new(1u64, std::vec![1, 2], Duration::from_secs(100), HEARTBEAT).unwrap();
+  let mut c: Coord = StreamCoordinator::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  // Register an inbound connection that never completes its handshake (no settle).
+  let _id = c.on_conn_open(label(1, true), Instant::ORIGIN);
+
+  let handshake = Instant::ORIGIN + Duration::from_secs(10);
+  assert_eq!(
+    c.poll_timeout(),
+    Some(handshake),
+    "poll_timeout must fold in the router handshake deadline when the endpoint's timer is later"
+  );
+
+  // Firing housekeeping AT that scheduled deadline reaps the silent conn and surfaces the close.
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+  c.handle_timeout(handshake, &mut log, &mut stable);
+  assert_eq!(
+    c.poll_conn_closed(),
+    Some((
+      ConnId(1),
+      Some(crate::transport::TransportError::NotValidated)
+    )),
+    "the conn scheduled by poll_timeout is reaped exactly at its deadline"
+  );
+}
+
 /// The read / transfer / membership / read-mode proxies each delegate to the wrapped endpoint and
 /// run the coordinator's flush. On a fresh follower the endpoint refuses each (not the leader), but
 /// the delegation + flush path executes — and `poll_event` / `endpoint()` expose the endpoint.

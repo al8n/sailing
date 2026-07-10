@@ -379,9 +379,20 @@ where
     self.router.poll_transmit()
   }
 
-  /// The endpoint's next timer deadline.
+  /// The next timer deadline: the min of the endpoint's own timers and the router's next handshake
+  /// deadline. Folding the handshake deadline is what lets a TIMERLESS endpoint (an observer with no
+  /// election or heartbeat timer) still wake to reap a silent half-open connection in
+  /// [`handle_timeout`](Self::handle_timeout); without it that endpoint never schedules a wake, so a
+  /// silent socket pins `max_conns` until some distant driver fallback fires.
   pub fn poll_timeout(&self) -> Option<Instant> {
-    self.endpoint.poll_timeout()
+    match (
+      self.endpoint.poll_timeout(),
+      self.router.next_handshake_deadline(),
+    ) {
+      (Some(a), Some(b)) => Some(a.min(b)),
+      (a, None) => a,
+      (None, b) => b,
+    }
   }
 
   /// Drain the next application event (committed entry, read-state, …).

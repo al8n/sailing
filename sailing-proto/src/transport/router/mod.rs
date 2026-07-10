@@ -94,9 +94,9 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   }
 
   /// The earliest pending handshake deadline, if any registered connection is still un-validated.
-  /// The multi-group coordinator folds this into its `poll_timeout` so the driver wakes to reap
-  /// even when no group surfaces a consensus deadline (zero hosted groups, every group poisoned,
-  /// or a host of non-voter learners).
+  /// Both the single- and multi-group coordinators fold this into their `poll_timeout` so the driver
+  /// wakes to reap even when the endpoint surfaces no consensus deadline (a timerless observer, or —
+  /// for multi — zero hosted groups, every group poisoned, or a host of non-voter learners).
   pub fn next_handshake_deadline(&self) -> Option<Instant> {
     self.handshake_deadline.values().min().copied()
   }
