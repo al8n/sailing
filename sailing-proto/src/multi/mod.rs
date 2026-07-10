@@ -3183,6 +3183,17 @@ where
     // this frozen replica is dead. Otherwise it is unremovable (`Frozen`), blocks its claimed target's
     // removal (`Claimed`), and is capture-fenced forever. Dissolve it LOCALLY; a poisoned husk is left
     // for its own fail-stop.
+    // The source ids NAMED by any co-hosted target's still-standing park, collected in ONE pass
+    // here (exact because the resolver + thaw passes above already ran) rather than re-scanning
+    // every group per husk — the husk×park product was O(N²) under merge-heavy reshaping. A frozen
+    // husk holds no park itself, so it never self-contributes; membership is the exact predicate
+    // `park_names_source` computes for a husk. A removals-only staleness is conservative: dissolving
+    // husks (frozen sources) never mutates a target's park, so the set stays valid across the loop.
+    let park_named_sources: BTreeSet<Bytes> = self
+      .groups
+      .values()
+      .filter_map(|ep| ep.pending_merge().map(|p| p.source_bytes()))
+      .collect();
     let husks: Vec<G> = self
       .groups
       .iter()
@@ -3197,7 +3208,9 @@ where
       // MANUFACTURED absence + `MERGED_FLOOR` — its absent-source arm resolves Abort and SKIPS the
       // union = committed divergence from every host that absorbed. HOLD; the resolver absorbs the
       // husk normally (source hosted → Resolve) on this same host.
-      if self.park_names_source(&gid) {
+      let mut husk_key = Vec::new();
+      gid.encode(&mut husk_key);
+      if park_named_sources.contains(&Bytes::from(husk_key)) {
         continue;
       }
       // THE BELT (shared with the absorb Resolve arm): a husk that still owes a LOCALLY-DRIVABLE thaw
