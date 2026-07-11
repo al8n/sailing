@@ -130,6 +130,12 @@ where
   /// The configured peer book: every OTHER node's address, dialed and redialed as needed.
   peers: Vec<Node<I, SocketAddr>>,
   redial: BTreeMap<I, Redial>,
+  /// The earliest pending-redial instant, recomputed each reconcile pass and folded into the loop
+  /// deadline so a due retry wakes on its own backoff schedule instead of on the ~1s housekeeping
+  /// backstop. Snapshotting the minimum (rather than folding the raw `redial` map into the
+  /// deadline) avoids a HOT-SPIN: an unbound peer whose backoff just elapsed carries a past `at`
+  /// that would fire the timer every iteration until the next pass re-arms it.
+  redial_wake: Option<std::time::Instant>,
   cmd_budget: usize,
   recv_cap: usize,
   redial_base: Duration,
@@ -431,6 +437,7 @@ where
         _storage_ready_keepalive: keepalive,
         peers,
         redial: BTreeMap::new(),
+        redial_wake: None,
         // Clamped to at least one: the iter-top drain is the only flood-independent command path,
         // and shutdown's stoppable-under-load guarantee rides on it.
         cmd_budget: driver_cfg.cmd_budget.max(1),
@@ -568,6 +575,7 @@ where
         .poll_timeout()
         .map(|d| self.clock.to_std(d))
         .into_iter()
+        .chain(self.redial_wake)
         .chain(housekeeping)
         .chain(storage_redrive)
         .min()
@@ -862,14 +870,17 @@ where
   /// that re-binds resets its backoff.
   fn reconcile_peer_links(&mut self, now: Instant) {
     let std_now = std::time::Instant::now();
+    let mut wake: Option<std::time::Instant> = None;
     for node in self.peers.clone() {
       let (peer, addr) = node.into_parts();
       if self.coord.has_bound_conn(&peer) {
         self.redial.remove(&peer);
         continue;
       }
-      let due = self.redial.get(&peer).is_none_or(|r| std_now >= r.at);
-      if !due {
+      if let Some(r) = self.redial.get(&peer)
+        && std_now < r.at
+      {
+        wake = Some(wake.map_or(r.at, |w| w.min(r.at))); // backing off: wake to retry
         continue;
       }
       // A refused dial (cap, config) is just retried on the schedule; the typed error matters to
@@ -880,14 +891,13 @@ where
         .get(&peer)
         .map(|r| (r.backoff * 2).min(self.redial_cap))
         .unwrap_or(self.redial_base);
-      self.redial.insert(
-        peer,
-        Redial {
-          at: std_now + jittered(backoff),
-          backoff,
-        },
-      );
+      let at = std_now + jittered(backoff);
+      self.redial.insert(peer, Redial { at, backoff });
+      // Arm the wake for this attempt even if it produced no future event, so the next retry fires
+      // on its own schedule rather than waiting for the housekeeping backstop.
+      wake = Some(wake.map_or(at, |w| w.min(at)));
     }
+    self.redial_wake = wake;
   }
 
   /// Serve (or fall back) the parked failover inherited-read queries, re-deriving the serve window from
