@@ -529,6 +529,27 @@ fn boot_epochs_are_per_group_monotonic() {
   assert_eq!(eng.next_boot_epoch(&9), None, "no such group");
 }
 
+/// The boot-epoch counter is CHECKED: at `u64::MAX` it REFUSES (`None`) rather than wrapping to a
+/// colliding epoch. A wrapped epoch restarts at 0 and folds two incarnations onto one
+/// `(group, epoch)` identity for every gen-keyed observer — the identity fail-stop class the
+/// `OpId`/read-round ceilings also hold.
+#[test]
+fn next_boot_epoch_refuses_exhaustion() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(1));
+  eng.set_boot_epochs_for_test(&1, u64::MAX);
+  assert_eq!(
+    eng.next_boot_epoch(&1),
+    None,
+    "a saturated counter refuses rather than wrapping onto a colliding identity"
+  );
+  assert_eq!(
+    eng.next_boot_epoch(&1),
+    None,
+    "the refusal is stable — the counter holds at its ceiling, never wrapping to 0"
+  );
+}
+
 /// `remove_group` is the teardown seam: the storage (including staged work) is dropped, the id is
 /// re-admissible with FRESH empty storage, and an unknown group resolves to `None` — the
 /// coordinator's deliberate unhosted-drop path.

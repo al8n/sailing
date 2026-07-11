@@ -283,12 +283,30 @@ where
   /// The next boot epoch for `gid` — a per-group monotonic counter (first call returns 1). Pass
   /// it to [`MultiRaft::restore_group`](crate::MultiRaft::restore_group) so each incarnation's
   /// [`OpId`]s strictly exceed every prior incarnation's for that group (the epoch-major ordering
-  /// the completion plumbing relies on). `None` if no such group.
-  #[must_use = "`None` means no such group; the returned epoch is the restore_group argument"]
+  /// the completion plumbing relies on).
+  ///
+  /// `None` if no such group is hosted, OR if the counter is EXHAUSTED. The increment is CHECKED,
+  /// never wrapping: a wrapped epoch restarts at 0 and collides with a live incarnation, folding
+  /// two incarnations onto ONE `(group, epoch)` identity for every gen-keyed observer — the same
+  /// identity fail-stop class as the [`OpId`]/read-round ceilings. Exhaustion is unreachable in
+  /// practice (2^64 restarts of one group), so a caller surfaces the refusal rather than wrapping.
+  #[must_use = "`None` means no such group or an exhausted counter; the returned epoch is the restore_group argument"]
   pub fn next_boot_epoch(&mut self, gid: &G) -> Option<u64> {
     let storage = self.groups.get_mut(gid)?;
-    storage.boot_epochs += 1;
-    Some(storage.boot_epochs)
+    let next = storage.boot_epochs.checked_add(1)?;
+    storage.boot_epochs = next;
+    Some(next)
+  }
+
+  /// Seed `gid`'s boot-epoch counter so the exhaustion fail-stop can be exercised without 2^64
+  /// calls. Panics if no such group is hosted — a test must admit the group first.
+  #[cfg(test)]
+  fn set_boot_epochs_for_test(&mut self, gid: &G, boot_epochs: u64) {
+    self
+      .groups
+      .get_mut(gid)
+      .expect("group must be hosted to seed its boot epoch")
+      .boot_epochs = boot_epochs;
   }
 
   /// `gid`'s admission floor (0 = never floored) — the FRESHEST value, `max(durable, staged)`.

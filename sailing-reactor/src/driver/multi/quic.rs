@@ -756,10 +756,14 @@ where
       self.engine.remove_group(&gid);
       return Err(DriverError::NoStoredState);
     }
-    let epoch = self
-      .engine
-      .next_boot_epoch(&gid)
-      .expect("storage admitted above");
+    let epoch = match self.engine.next_boot_epoch(&gid) {
+      Some(epoch) => epoch,
+      // Storage was admitted just above (a fresh store already failed closed with `NoStoredState`),
+      // so `None` here means the per-group boot-epoch counter is EXHAUSTED — refuse rather than
+      // wrap onto a colliding incarnation identity. A pre-existing store is never rolled back on
+      // refusal (it held real state before this call).
+      None => return Err(rejected("boot epoch counter exhausted for this group")),
+    };
     let result = {
       let (log, stable) = self.engine.stores(&gid).expect("storage admitted above");
       self.coord.restore_group(
@@ -815,10 +819,18 @@ where
       lineage: self.engine.group_gen(&gid),
     };
     let added = self.engine.add_group(gid.cheap_clone());
-    let epoch = self
-      .engine
-      .next_boot_epoch(&gid)
-      .expect("storage admitted above");
+    let epoch = match self.engine.next_boot_epoch(&gid) {
+      Some(epoch) => epoch,
+      // Storage was admitted just above, so `None` here means the per-group boot-epoch counter is
+      // EXHAUSTED — refuse rather than wrap onto a colliding incarnation identity, rolling a
+      // freshly-added store back out (create's rollback discipline).
+      None => {
+        if added {
+          self.engine.remove_group(&gid);
+        }
+        return Err(rejected("boot epoch counter exhausted for this group"));
+      }
+    };
     let result = {
       let (log, stable) = self.engine.stores(&gid).expect("storage admitted above");
       self.coord.create_group_from_fork(
