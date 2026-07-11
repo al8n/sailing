@@ -294,6 +294,30 @@ splits and refuses to be a merge target; a mid-absorb source refuses a fresh fre
 `pre_vote`/`check_quorum` recommendations are unaffected by the freeze — a frozen group elects
 normally.
 
+## Ownership boundary
+
+Split and merge are an OPAQUE fork/fold: the LIBRARY owns fork/fold correctness and incarnation
+safety — lineage counters, admission floors, tombstones, and fork provenance — while the EMBEDDER
+owns range ownership, descriptors, adjacency, and routing. The library decides how a group forks
+its state, fences the child's durability, and floors a dissolved id; it never decides WHICH group
+serves which keyspan, nor WHEN to split or merge. Those are placement decisions, and the placement
+brain is the embedder's (the blessed embedded policy loop above). The library never interprets
+range boundaries — a `Split` instruction is an opaque blob to the group-unaware core, and the
+merge direction rule sorts ids, not ranges. The range map, the adjacency that makes two groups
+mergeable, and the routing of a key to its serving group all stay entirely embedder-side.
+
+## Id-reuse constraint
+
+A tombstone-cleared group id may be re-used only for the SAME logical range/group it previously
+named — never repurposed for a DIFFERENT logical group. There is no wire-level incarnation epoch
+yet: the frame envelope tags the group id but carries no incarnation, so a delayed frame from the
+old incarnation could reach a repurposed id and demux into the wrong group's `Endpoint`. Re-using
+an id for its own successor incarnation is safe — the intra-group generation floor (the persisted
+tombstone's next-incarnation floor, CockroachDB's `NextReplicaID` model) fences a stale same-range
+frame — but that floor cannot tell a DIFFERENT logical group wearing a recycled id from the group
+that id used to name. A wire-level incarnation epoch is the roadmap cure; until it lands, keeping a
+recycled id bound to its original logical group is the embedder's constraint to honor.
+
 ## The `multi` container (as built)
 
 New module `sailing-proto/src/multi/` — Sans-I/O, `no_std` + `alloc`,
