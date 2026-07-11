@@ -1211,6 +1211,73 @@ fn cold_apply_stop_does_not_report_more_pending() {
   );
 }
 
+/// A budget-cut backlog is quiesce-INELIGIBLE — a quiesced group stops being cranked, which would
+/// strand the un-applied remainder forever (nothing re-drives the budget's re-crank). The driver-tier
+/// quiesce-eligibility predicate (`group_idle` in the multi drivers) refuses a group unless, among
+/// other conjuncts, its peers are all caught up, no merge is parked, AND `commit == applied`. This PIN
+/// proves that conjunct is load-bearing here: after a budget cut a single-voter leader has NO lagging
+/// peer and NO parked merge (the peer/park conjuncts are satisfied), yet `applied < commit` — so
+/// `commit == applied` is the sole gate that keeps it non-quiescent. It already holds; this pins it.
+#[test]
+fn a_budget_cut_backlog_is_quiesce_ineligible() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, StorageProgress, Term};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold((10 * MAX_READ_BATCH_ENTRIES) as usize);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  while ep.handle_storage(d, &mut log, &mut stable) == StorageProgress::MorePending {}
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // A committed backlog larger than one budget, so a single crank leaves a partly-unapplied remainder.
+  let n = 2 * MAX_READ_BATCH_ENTRIES;
+  let first = ep.applied_index().next().get();
+  let entries: Vec<Entry> = (0..n)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(first + i),
+        EntryKind::Normal,
+        encode_cmd(b"x"),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+  ep.commit = Index::new(first + n - 1);
+
+  // One crank: the budget cuts the drain, leaving applied < commit.
+  assert_eq!(
+    ep.handle_storage(d, &mut log, &mut stable),
+    StorageProgress::MorePending
+  );
+  assert!(
+    ep.applied_index() < ep.commit_index(),
+    "a budget cut leaves committed entries unapplied"
+  );
+  // The peer and park conjuncts of quiesce-eligibility are BOTH satisfied — so the applied == commit
+  // conjunct is the sole reason the group cannot quiesce (and thus cannot strand the remainder).
+  assert!(
+    !ep.has_lagging_peer(),
+    "the sole voter is caught up — no peer blocks quiescence"
+  );
+  assert!(
+    ep.pending_merge().is_none(),
+    "no parked merge — the park conjunct does not block quiescence"
+  );
+}
+
 /// A follower must not send AppendResponse until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]
