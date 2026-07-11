@@ -510,6 +510,10 @@ where
     let now = self.clock.now();
     self.reconcile_peer_links(now.mono());
     let mut poisoned = self.pump(now).await;
+    // The previous `handle_storage` verdict, carried into the next deadline fold: a budget-cut
+    // apply drain over already-durable committed entries leaves BOTH store queues empty, so the
+    // stores' live `has_pending` state alone cannot re-drive it.
+    let mut storage_more_pending = false;
 
     while !poisoned {
       let now = self.clock.now();
@@ -554,11 +558,14 @@ where
 
       // An already-due instant when EITHER store still has a completion queued — derived from the
       // stores' LIVE state here, so it catches storage queued by a command (the loop-top fairness
-      // drain OR the selected command) as well as a budget cutoff, not just the prior
-      // `handle_storage`. So the timer fires immediately and the loop re-drives `handle_storage`
-      // next pass WITHOUT sleeping.
+      // drain OR the selected command) as well as a store-queue budget cutoff, not just the prior
+      // `handle_storage` — OR when that prior call reported `MorePending`: a budget-cut apply
+      // drain over already-durable committed entries leaves both queues empty, so only the carried
+      // verdict can re-drive it. Either way the timer fires immediately and the loop re-drives
+      // `handle_storage` next pass WITHOUT sleeping.
       let storage_redrive =
-        (self.log.has_pending() || self.stable.has_pending()).then(std::time::Instant::now);
+        (self.log.has_pending() || self.stable.has_pending() || storage_more_pending)
+          .then(std::time::Instant::now);
       let deadline = self
         .coord
         .poll_timeout()
@@ -649,9 +656,10 @@ where
         Wake::Storage => {}
         Wake::StorageClosed => self.storage_closed = true,
       }
-      self
+      storage_more_pending = self
         .coord
-        .handle_storage(now, &mut self.log, &mut self.stable);
+        .handle_storage(now, &mut self.log, &mut self.stable)
+        .is_more_pending();
       poisoned = self.pump(now).await;
     }
 
