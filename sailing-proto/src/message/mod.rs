@@ -3,7 +3,7 @@
 use crate::{CheapClone, Entry, Index, ReadOnlyOption, Term, conf::ConfState};
 use bytes::Bytes;
 use core::time::Duration;
-use std::{sync::Arc, vec::Vec};
+use std::{boxed::Box, sync::Arc, vec::Vec};
 
 /// AppendEntries / heartbeat-with-entries (log replication).
 #[derive(Debug, Clone, PartialEq, Eq)]
