@@ -1335,7 +1335,16 @@ where
     // (the boundary), telling the caller "no conflict at or below the boundary". With no snapshot
     // (`first_index == 1`) this is exactly the historical `while index > 0`.
     let floor = log.first_index();
+    let mut budget = CONFLICT_WALK_BUDGET;
     while index >= floor {
+      // Bound the peer-steered walk to CONFLICT_WALK_BUDGET synchronous `log_term` reads per dispatch:
+      // on exhaustion return the best-so-far (higher-than-true) index. It is advisory — the leader's
+      // MaybeDecrTo floor still lowers `next_index` by at least one per reject, so the next, lower
+      // reject refines the search to convergence rather than looping.
+      if budget == 0 {
+        break;
+      }
+      budget -= 1;
       // A fatal term-read poisoned the node (inside `log_term`): propagate `None` so the caller
       // short-circuits rather than acting on a fabricated index the incomplete search would return.
       let t = self.log_term(log, index)?;

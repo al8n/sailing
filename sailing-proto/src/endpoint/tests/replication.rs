@@ -3646,3 +3646,58 @@ fn append_below_snapshot_boundary_does_not_poison() {
     "the follower does not reject a below-boundary re-send"
   );
 }
+
+/// The conflict-term walk is BOUNDED per dispatch: a peer-supplied `hint_term` of 0 against a long
+/// higher-term tail would otherwise force an O(tail) synchronous `log_term` scan inside one message
+/// dispatch. The walk stops after `CONFLICT_WALK_BUDGET` steps and returns the best-so-far index; a
+/// second call from that lower hint continues down to the boundary, so the search converges.
+///
+/// MUTATION: drop the `budget` guard in `find_conflict_by_term` → the first call walks the whole
+/// 2000-entry tail to the floor in ONE dispatch (result `Index::ZERO`, not the budget-capped index).
+#[test]
+fn conflict_by_term_walk_is_bounded_per_dispatch() {
+  use crate::{Config, Entry, EntryKind, Index, Instant, Term, endpoint::CONFLICT_WALK_BUDGET};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  // A 2000-entry tail all in term 5 (> the hint term 0), so the walk never breaks early on term.
+  let entries: std::vec::Vec<Entry> = (1..=2000u64)
+    .map(|i| {
+      Entry::new(
+        Term::new(5),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+
+  // A `hint_term` of 0 forces the walk downward for every entry. One dispatch stops at the budget.
+  let first = ep
+    .find_conflict_by_term(&log, Index::new(2000), Term::ZERO)
+    .expect("walk does not poison");
+  assert_eq!(
+    first,
+    Index::new(2000 - u64::from(CONFLICT_WALK_BUDGET)),
+    "the walk stops after the budget, returning the best-so-far index (not the floor)"
+  );
+
+  // The next reject probes from that lower hint; within one more budget it reaches the boundary
+  // (`Index::ZERO` = first_index - 1), so the search converges over an extra round-trip.
+  let second = ep
+    .find_conflict_by_term(&log, first, Term::ZERO)
+    .expect("walk does not poison");
+  assert_eq!(
+    second,
+    Index::ZERO,
+    "a second dispatch from the lower hint completes the walk to the boundary"
+  );
+}

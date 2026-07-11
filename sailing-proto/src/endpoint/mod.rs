@@ -35,6 +35,14 @@ pub use merge::PendingMergeApply;
 /// the count regardless of payload. The caller's loop re-reads the remainder.
 pub(crate) const MAX_READ_BATCH_ENTRIES: u64 = 8192;
 
+/// Per-dispatch cap on the conflict-term walk in [`Endpoint::find_conflict_by_term`]. That walk is
+/// steered by a PEER-supplied reject hint (`hint_term`); a crafted low term (e.g. `0`) would otherwise
+/// force a full `first_index..=hint_index` scan of synchronous, possibly-cold `log_term` reads in ONE
+/// message dispatch. The hint is advisory, so a walk cut short returns the best-so-far index and the
+/// search still converges: each reject strictly lowers the probed prev index, so it terminates in
+/// `ceil(D / CONFLICT_WALK_BUDGET)` extra round-trips instead of blocking the dispatch on an O(D) scan.
+pub(crate) const CONFLICT_WALK_BUDGET: u32 = 1024;
+
 /// The role of a node in its current term.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, derive_more::Display, derive_more::IsVariant)]
 #[display("{}", self.as_str())]
