@@ -763,24 +763,35 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
     "held by the commit-wait sized at the MAX inherited lease window"
   );
 
-  // 1ns before now+350ms: still held — proves the wait is the 350ms MAX, not the 200ms or 0.
+  // The wait is the MAX inherited window (350ms) INFLATED by this successor's own (1+ρ_S):
+  // ceil(350ms · (300+50)/300) = 408_333_334ns. At the RAW 350ms boundary it is STILL held — a legally
+  // faster successor must not clear at the bare window (the heterogeneous-drift undercut).
+  ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released at the RAW inherited window — the successor-side (1+ρ_S) inflation still holds it"
+  );
+
+  // 1ns before the inflated deadline: still held — proves the wait is the 350ms MAX (not 200ms or 0),
+  // grown by (1+ρ_S).
   ep.handle_timeout(
-    d + Duration::from_nanos(350_000_000 - 1),
+    d + Duration::from_nanos(408_333_334 - 1),
     &mut log,
     &mut stable,
   );
   assert_eq!(
     ep.commit_index(),
     Index::ZERO,
-    "not released before now + max(inherited window)"
+    "not released before now + ceil(max_inherited_window · (1+ρ_S))"
   );
 
-  // At now+350ms: the commit-wait fires; the no-op and the inherited entries commit.
-  ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
+  // At the inflated deadline: the commit-wait fires; the no-op and the inherited entries commit.
+  ep.handle_timeout(d + Duration::from_nanos(408_333_334), &mut log, &mut stable);
   assert_eq!(
     ep.commit_index(),
     Index::new(3),
-    "released at now + max(inherited window) = 350ms"
+    "released at now + ceil(350ms · (300+50)/300) = 408_333_334ns"
   );
 }
 
@@ -1053,29 +1064,35 @@ fn leaseguard_failover_precise_anchor_waits_for_unwalled_failclosed_entry() {
     !ep.precise_release_ready(at(0)),
     "the fail-closed (wall-absent) inherited lease gates the precise release"
   );
-  // Even with the wall raced 1400ms past election (S + 2400ms, far past the walled deadline), the
-  // mono fallback still holds (d + 1400ms < d + 1500ms): the fail-closed lease is never skipped.
+  // Even with the wall raced 1400ms past election (S + 2400ms, far past the walled deadline), the mono
+  // fallback still holds (d + 1400ms < the inflated d + 1750ms): the fail-closed lease is never skipped.
   assert!(
     !ep.precise_release_ready(at(1_400_000_000)),
     "the mono-frame fallback still holds the fail-closed lease before its conservative deadline"
   );
-  // Once the mono fallback elapses (d + 1500ms) the precise anchor is satisfied (the unwalled fallback
-  // `unwalled_commit_wait_until` is NOT inflated — only walled entries gate the inherited serve).
+  // The unwalled fallback `unwalled_commit_wait_until` is INFLATED by this successor's own (1+ρ_S) — the
+  // same LENGTH pad as the walled arm: ceil(1500ms · (300+50)/300) = d + 1750ms. At the RAW 1500ms window
+  // the fail-closed lease is NOT yet releasable, so a faster successor cannot precise-release past it.
   assert!(
-    ep.precise_release_ready(at(1_500_000_000)),
-    "both the wall floor and the unwalled mono fallback are satisfied at d + 1500ms"
+    !ep.precise_release_ready(at(1_500_000_000)),
+    "the RAW unwalled window does not release the fail-closed lease — the (1+ρ_S) inflation still holds it"
   );
-  // The conservative CommitWait backstop fires once the mono fallback has elapsed; probed at d + 1750ms,
-  // UNDER A SYNCHRONIZED WALL (this is an ε_unc failover-tier node — the Option B wall-gate fail-closes a
-  // non-armed node's conservative clear on an ABSENT wall, so the contract is to supply the wall). The
-  // wall (W_E + 1750ms) is far past every WALLED inherited deadline, so the walled class is released; the
-  // unwalled mono fallback (d + 1500ms) has also elapsed, so the backstop commits the inherited entries +
-  // the no-op.
+  // At the inflated d + 1750ms both the wall floor and the unwalled mono fallback are satisfied.
+  assert!(
+    ep.precise_release_ready(at(1_750_000_000)),
+    "the wall floor and the INFLATED unwalled mono fallback are both satisfied at d + 1750ms"
+  );
+  // The conservative CommitWait backstop fires once the (inflated) mono fallback has elapsed; probed at
+  // d + 1750ms UNDER A SYNCHRONIZED WALL (this is an ε_unc failover-tier node — the Option B wall-gate
+  // fail-closes a non-armed node's conservative clear on an ABSENT wall, so the contract is to supply the
+  // wall). The wall (W_E + 1750ms) is far past every WALLED inherited deadline, so the walled class is
+  // released; the inflated unwalled mono fallback (d + 1750ms) has also elapsed, so the backstop commits
+  // the inherited entries + the no-op.
   ep.handle_timeout(at(1_750_000_000), &mut log, &mut stable);
   assert_eq!(
     ep.commit_index(),
     Index::new(3),
-    "released at the E′-inflated conservative mono deadline (no early skip of the fail-closed lease)"
+    "released at the (1+ρ_S)-inflated conservative mono deadline (no early skip of the fail-closed lease)"
   );
 }
 
@@ -3659,8 +3676,8 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   while ep.poll_message().is_some() {}
 
-  // Elect near Instant::MAX (monotonic — basic LeaseGuard stamps no wall). The bare commit-wait
-  // `near_max + 100ms` saturates.
+  // Elect near Instant::MAX (monotonic — basic LeaseGuard stamps no wall). The successor-inflated
+  // commit-wait `near_max + ceil(100ms · (300+50)/300)` saturates (any nonzero window would).
   let near_max = Instant::from_origin(Duration::MAX - Duration::from_millis(50));
   let now = Now::monotonic(near_max);
   ep.handle_timeout(now, &mut log, &mut stable);
@@ -3672,10 +3689,10 @@ fn basic_leaseguard_unrepresentable_commit_deadline_fails_stop() {
     3u64,
     Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
   );
-  // The saturated bare commit-wait fail-stops: the node poisons.
+  // The saturated commit-wait fail-stops: the node poisons.
   assert!(
     ep.is_poisoned(),
-    "a saturated BARE (basic LeaseGuard) commit-wait must fail-stop, not clear early"
+    "a saturated basic-LeaseGuard commit-wait must fail-stop, not clear early"
   );
   assert_eq!(
     ep.poison_reason(),
@@ -4150,9 +4167,9 @@ fn inconsistent_lease_floor_no_classified_floor_fails_stop() {
 /// The runtime inflation keys on `max_lease_window` — the MAX window INHERITED, possibly stamped by
 /// ANOTHER node's larger config — which config-time validation cannot bound (there is no cluster-wide
 /// config check, design §1). So the over-large case is gated at RUNTIME (`inherited_serve_armed` in
-/// `become_leader`: the serve is disarmed and the bare wait is used), NOT rejected here. This supersedes
-/// the earlier config-rejection test, which incorrectly checked the LOCAL window as if it bounded the
-/// inherited max.
+/// `become_leader`: the serve is disarmed while the commit-wait keeps its successor-side inflated LENGTH),
+/// NOT rejected here. This supersedes the earlier config-rejection test, which incorrectly checked the
+/// LOCAL window as if it bounded the inherited max.
 #[test]
 fn failover_config_with_inflated_wait_over_election_is_still_valid() {
   use crate::{Config, ReadOnlyOption};
@@ -4179,11 +4196,13 @@ fn failover_config_with_inflated_wait_over_election_is_still_valid() {
 }
 
 /// FAILOVER finding (heterogeneous-window runtime guard): when this node INHERITS a lease window so
-/// large that the E′-inflated conservative wait would NOT fit below the election timeout, the inherited
-/// serve is DISARMED (`failover_read_window` returns `None` even though the committed anchor's lease is
-/// live), and the commit-wait falls back to the BARE `max_lease_window` (the shipped conservative anchor)
-/// so the node still makes progress. The inflation keys on the inherited max — another node's larger
-/// config — which config validation cannot bound, so the guard lives at `become_leader`, not config time.
+/// large that the E′-inflated wait would NOT fit below the election timeout, the inherited SERVE is
+/// DISARMED (`failover_read_window` returns `None` even though the committed anchor's lease is live) and
+/// the E′ veto-SKIP permission is withheld. The commit-wait LENGTH, however, is STILL the successor-side
+/// (1+ρ_S) inflation of `max_lease_window` (pure safety) — it does NOT drop to the RAW window a faster
+/// successor would under-wait; the node simply stays wall-GOVERNED and releases at the inflated
+/// conservative deadline. The inflation keys on the inherited max — another node's larger config — which
+/// config validation cannot bound, so the guard lives at `become_leader`, not config time.
 #[test]
 fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
   use crate::{
@@ -4263,7 +4282,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
   assert_eq!(
     ep.commit_index(),
     Index::new(1),
-    "commit held at the inherited index during the (bare) wait"
+    "commit held at the inherited index during the wait"
   );
 
   // The inherited serve is DISARMED: even though the committed anchor's lease is live (now_wall + 2·ε_unc
@@ -4275,7 +4294,7 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
     "an oversized inherited window must DISARM the serve even while the anchor lease is live"
   );
 
-  // peer 3 acks the no-op at index 2 → quorum, so commit CAN advance once the (bare) wait lifts.
+  // peer 3 acks the no-op at index 2 → quorum, so commit CAN advance once the wait lifts.
   ep.handle_message(
     at(0),
     &mut log,
@@ -4291,28 +4310,36 @@ fn failover_serve_disarmed_when_inherited_window_inflation_exceeds_election() {
     )),
   );
 
-  // The commit-wait uses the BARE max_lease_window (NOT the E′ inflation — that is the disarm), but it is
-  // WALL-GOVERNED (Option B): at the bare deadline d + W (wall S + 900ms, still below the floor
-  // S + W + 2·ε_unc = S + 940ms) the conservative clear is VETOED — commit holds — and the timer re-arms.
-  // (Driven under the synchronized wall: this is an ε_unc failover-tier node, and an absent wall fails
-  // closed for a non-armed node, so the contract is to supply the wall.)
+  // The serve disarm does NOT drop the commit-wait to the RAW window: the LENGTH is STILL the
+  // successor-side (1+ρ_S) inflation ceil(900ms · (300+50)/300) = d + 1050ms (only the E′ veto-SKIP
+  // permission is withheld — this node stays wall-GOVERNED). At the RAW 900ms window it is held (the
+  // inflated mono deadline is not due), so a faster successor cannot under-wait the inherited lease.
   ep.handle_timeout(at(W), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
     ep.commit_index(),
     Index::new(1),
-    "the bare mono deadline does NOT clear a still-live walled lease (held below the wall floor)"
+    "the RAW mono window does not clear the inherited lease — the (1+ρ_S) inflation holds it"
   );
-  // Once the wall passes the floor (S + 940ms), the re-armed conservative deadline (d + W + heartbeat =
-  // d + 1000ms) clears and commits — the release is governed by the WALL, not the bare d + 900ms mono
-  // deadline (which would have under-waited the 940ms wall floor). This proves the wait is NOT the
-  // inflated 1050ms (an inflated deadline would still be held at d + 1000ms) AND is wall-gated.
-  ep.handle_timeout(at(W + 100_000_000), &mut log, &mut stable);
+  // Even at d + 1000ms — where the BARE wait would have released (wall past the S + 940ms floor) — the
+  // commit is STILL held: the successor-inflated 1050ms deadline has not elapsed. This pins the LENGTH as
+  // the inflation, not the bare 900ms.
+  ep.handle_timeout(at(1_000_000_000), &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(1),
+    "still held at the old d + 1000ms wall-release — the successor-inflated 1050ms deadline governs"
+  );
+  // At the inflated deadline d + 1050ms the wall (S + 1050ms) is past the floor S + 940ms and the
+  // conservative mono deadline has elapsed, so commit releases — the LENGTH inflation governs even when
+  // the serve is disarmed.
+  ep.handle_timeout(at(1_050_000_000), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   assert_eq!(
     ep.commit_index(),
     Index::new(2),
-    "once the wall passes the floor the re-armed conservative deadline commits (wall-governed release)"
+    "released at the successor-inflated conservative deadline d + ceil(900ms · (300+50)/300) = 1050ms"
   );
 }
 
@@ -4442,7 +4469,9 @@ fn failover_tier_active_requires_leaseguard_timing_and_bounded_uncertainty() {
 /// the arming check compare a too-small value against the election timeout: with an election timeout above
 /// `u64::MAX` nanos and an inherited window forcing the exact inflation above `u64::MAX`, the clamp armed
 /// the serve while scheduling a wait SHORTER than the E′ bound, re-opening the mono-undercut. The fix
-/// returns `None` on overflow → the serve is disarmed and the bare wait is used.
+/// returns `None` on overflow. Because the successor-side commit-wait LENGTH inflation shares that
+/// overflow (`inflate_inherited_wait(u64::MAX)` is `None`), the node cannot schedule ANY sound wait — so
+/// it FAILS STOP (`CommitWaitUnrepresentable`) rather than arm a clamped-short wait, and serves nothing.
 ///
 /// The magnitudes are deliberately at the `u64` boundary (this is a totality guard, not a realistic
 /// deployment): Δ = 2ns, ε_drift = 1ns (inflation factor 3/2), inherited `max_lease_window = u64::MAX`
@@ -4521,19 +4550,29 @@ fn failover_serve_disarmed_when_inflation_overflows_u64() {
   ep.handle_storage(at(0), &mut log, &mut stable);
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
+  // FAIL-STOP: the successor-side inflation of the u64::MAX inherited window overflows u64, so no
+  // schedulable wait exists — the node poisons rather than arm a clamped-short wait. Its handlers return
+  // early, so commit never advances past the inherited index.
+  assert!(
+    ep.is_poisoned(),
+    "an overflowing inflation must fail-stop, not clamp"
+  );
+  assert_eq!(
+    ep.poison_reason(),
+    Some(PoisonReason::CommitWaitUnrepresentable)
+  );
   assert_eq!(
     ep.commit_index(),
     Index::new(1),
-    "commit held at the inherited index during the (bare) wait — the wait is armed (role Leader)"
+    "a poisoned node holds commit at the inherited index (the clamped wait would have under-waited)"
   );
 
-  // The serve is DISARMED: the exact inflation overflows u64, so `failover_inflated_commit_wait` returns
-  // None and the serve does not arm — even though the lease is live and the election timeout (1268y) is
-  // far above the clamped u64::MAX the prior code would have (buggily) compared against. With the clamp
-  // bug this would return Some (an inherited serve backed by a wait ~292 years too short).
+  // A poisoned node serves nothing — the inherited serve is refused too (the E′ overflow also disarms it,
+  // even though the lease is live and the election timeout (1268y) is far above the clamped u64::MAX the
+  // prior code would have (buggily) compared against).
   assert!(
     ep.failover_read_window(at(0)).is_none(),
-    "an inflation overflowing u64 must DISARM the serve (fail closed), not arm with a clamped wait"
+    "an inflation overflowing u64 must fail closed — no serve backed by a clamped-short wait"
   );
 }
 
