@@ -138,6 +138,30 @@ pub type FailoverOutcome<'a, I, F> =
 /// the caller keeps full error fidelity across the erasure.
 pub type FailoverComplete<I, F> = Box<dyn FnOnce(FailoverOutcome<'_, I, F>) + Send>;
 
+/// Apply a CHECKED failover inherited read to a [`FailoverOutcome`]: serve the closure's result ONLY
+/// when the limbo region is EMPTY (the coarse-but-safe mode), else decline with `Ok(None)`. The closure
+/// never has to reason about limbo — a non-empty limbo declines BEFORE it runs, so it cannot serve a
+/// stale read by ignoring the region. Shared verbatim by the single- and multi-group `failover_query` so
+/// the two cannot drift.
+pub(crate) fn apply_checked_failover<I, F, Out>(
+  outcome: FailoverOutcome<'_, I, F>,
+  f: impl FnOnce(&F, FailoverReadWindow) -> Option<Out>,
+) -> Result<Option<Out>, DriverError<I>> {
+  outcome
+    .map(|opt| opt.and_then(|(fsm, limbo, win)| if limbo.is_empty() { f(fsm, win) } else { None }))
+}
+
+/// Apply an UNCHECKED failover inherited read: hand the closure the FSM, the limbo region, and the
+/// window; the closure owns the per-key absence proof. The primitive behind `failover_query_unchecked` —
+/// a closure that IGNORES the limbo slice can serve stale, which is the documented obligation the API
+/// cannot enforce.
+pub(crate) fn apply_unchecked_failover<I, F, Out>(
+  outcome: FailoverOutcome<'_, I, F>,
+  f: impl FnOnce(&F, &[Entry], FailoverReadWindow) -> Option<Out>,
+) -> Result<Option<Out>, DriverError<I>> {
+  outcome.map(|opt| opt.and_then(|(fsm, limbo, win)| f(fsm, limbo, win)))
+}
+
 /// A parked failover inherited-read query: held until the committed prefix applies AND the serve
 /// window is (re-)confirmed live, then run against the state machine with the limbo region. The
 /// completion is type-erased and carries its own reply channel.
@@ -1043,6 +1067,45 @@ mod tests {
       read_limbo(&log, &at_ceiling, u64::MAX),
       Ok(None),
       "the index-ceiling fallback short-circuits before the log read"
+    );
+  }
+
+  /// The checked/unchecked failover split: with a NON-empty limbo the UNCHECKED wrapper still runs a
+  /// limbo-ignoring closure (serving stale — the documented obligation the API cannot enforce), while the
+  /// CHECKED wrapper declines regardless of the closure. With an EMPTY limbo the checked wrapper serves.
+  #[test]
+  fn failover_split_checked_gates_on_empty_limbo() {
+    use sailing_proto::Term;
+
+    let fsm = 42u64;
+    let win = FailoverReadWindow::new(Index::new(5), Index::new(6));
+    let nonempty = [Entry::new(
+      Term::ZERO,
+      Index::new(6),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    )];
+    let empty: [Entry; 0] = [];
+
+    // UNCHECKED, non-empty limbo: a limbo-ignoring closure serves — the stale-read hazard the split names.
+    let out: FailoverOutcome<'_, u64, u64> = Ok(Some((&fsm, &nonempty, win)));
+    assert_eq!(
+      apply_unchecked_failover(out, |f: &u64, _limbo, _win| Some(*f)),
+      Ok(Some(42))
+    );
+
+    // CHECKED, same non-empty limbo: declined regardless of the closure (the coarse-but-safe gate).
+    let out: FailoverOutcome<'_, u64, u64> = Ok(Some((&fsm, &nonempty, win)));
+    assert_eq!(
+      apply_checked_failover(out, |f: &u64, _win| Some(*f)),
+      Ok(None)
+    );
+
+    // CHECKED, empty limbo: the gate is satisfied, the closure serves.
+    let out: FailoverOutcome<'_, u64, u64> = Ok(Some((&fsm, &empty, win)));
+    assert_eq!(
+      apply_checked_failover(out, |f: &u64, _win| Some(*f)),
+      Ok(Some(42))
     );
   }
 }

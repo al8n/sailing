@@ -584,7 +584,7 @@ async fn a_poisoned_group_leaves_co_hosted_groups_committing() {
   assert!(!g200.status().await.expect("status").is_poisoned);
 
   let out: Option<u64> = g200
-    .failover_query(|_fsm: &TrapSm, _limbo: &[sailing_proto::Entry], _win| Some(9))
+    .failover_query(|_fsm: &TrapSm, _win| Some(9))
     .await
     .expect("the failover query resolves");
   assert_eq!(out, None, "no serve window → normal-read fallback");

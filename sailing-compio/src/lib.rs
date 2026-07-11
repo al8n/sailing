@@ -74,12 +74,14 @@
 //! ## Serving inherited reads
 //!
 //! While the commit-wait holds, [`Handle::failover_query`] serves a linearizable read on the inherited
-//! committed prefix: the closure runs ON the driver thread against the FSM and the limbo region
-//! `(index, limbo_upper]`, returning `Some(out)` to serve — having confirmed the read's key was not
-//! written in that region (the proto is key-agnostic; the closure owns the command format) — or `None`
-//! to decline. The call resolves to `Ok(None)` when no serve window is available (commit-wait already
-//! lifted — read normally — inherited lease expired, or off the failover tier); the caller then falls
-//! back to [`Handle::query`].
+//! committed prefix. The CHECKED default serves ONLY when the limbo region `(index, limbo_upper]` is
+//! EMPTY, so the closure — which runs ON the driver thread against the FSM and the window — never has to
+//! inspect limbo and cannot serve stale by omission; it returns `Some(out)` to serve or `None` to
+//! decline. For per-key limbo inspection, [`Handle::failover_query_unchecked`] hands the closure the
+//! limbo entries and shifts the key-absence proof onto it (a limbo-ignoring closure can serve stale — the
+//! proto is key-agnostic; the closure owns the command format). Either call resolves to `Ok(None)` when
+//! no serve window is available (commit-wait already lifted — read normally — inherited lease expired, or
+//! off the failover tier); the caller then falls back to [`Handle::query`].
 //!
 //! ## The operator contract (READ THIS)
 //!

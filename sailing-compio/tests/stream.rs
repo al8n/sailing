@@ -1179,7 +1179,7 @@ async fn failover_query_without_a_window_falls_back() {
   );
 
   let out: Option<u64> = handle
-    .failover_query(|_fsm: &CountSm, _limbo: &[sailing_proto::Entry], _win| Some(123u64))
+    .failover_query(|_fsm: &CountSm, _win| Some(123u64))
     .await
     .expect("the failover query resolves");
   assert_eq!(

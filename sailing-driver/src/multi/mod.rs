@@ -91,8 +91,9 @@ where
     reservation: ReservationGuard,
   },
   /// A failover inherited-read query against one group (see
-  /// [`Handle::failover_query`](crate::Handle::failover_query) for the single-group contract; the
-  /// serve window is per group).
+  /// [`Handle::failover_query`](crate::Handle::failover_query) /
+  /// [`failover_query_unchecked`](crate::Handle::failover_query_unchecked) for the single-group
+  /// contract; the serve window is per group).
   FailoverWindow {
     /// The addressed group.
     group: G,
@@ -811,11 +812,37 @@ where
     rx.await.map_err(|_| DriverError::ShuttingDown)?
   }
 
-  /// Run an inherited-read query during this group's post-election failover commit-wait — the
-  /// group-keyed [`Handle::failover_query`](crate::Handle::failover_query). Resolves `Ok(None)`
-  /// whenever the group has no serve window (including on a monotonic-only multi host, whose
-  /// failover tier is inert); the caller falls back to [`query`](Self::query).
+  /// Run a CHECKED inherited-read query during this group's post-election failover commit-wait — the
+  /// group-keyed [`Handle::failover_query`](crate::Handle::failover_query). Serves ONLY when the limbo
+  /// region is EMPTY (the coarse-but-safe mode); resolves `Ok(None)` whenever the group has no serve
+  /// window (including on a monotonic-only multi host, whose failover tier is inert), when the limbo
+  /// region is non-empty, or when the closure declined; the caller falls back to [`query`](Self::query).
+  /// For per-key limbo inspection use
+  /// [`failover_query_unchecked`](Self::failover_query_unchecked).
   pub async fn failover_query<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
+  where
+    Out: Send + 'static,
+    Q: FnOnce(&F, FailoverReadWindow) -> Option<Out> + Send + 'static,
+  {
+    let reservation = self.budget.try_reserve(0)?;
+    let (tx, rx) = oneshot::channel();
+    let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
+      let _ = tx.send(crate::shared::apply_checked_failover(res, f));
+    });
+    self.send(MultiCommand::FailoverWindow {
+      group: self.group.cheap_clone(),
+      complete,
+      reservation,
+    })?;
+    rx.await.map_err(|_| DriverError::ShuttingDown)?
+  }
+
+  /// Run an UNCHECKED inherited-read query during this group's post-election failover commit-wait — the
+  /// group-keyed [`Handle::failover_query_unchecked`](crate::Handle::failover_query_unchecked). Hands the
+  /// closure the limbo region `(index, limbo_upper]`; the closure MUST return `None` when its key was
+  /// written there, an obligation the API cannot verify (a limbo-ignoring closure can serve stale).
+  /// Resolves `Ok(None)` when the group has no serve window or the closure declined.
+  pub async fn failover_query_unchecked<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,
     Q: FnOnce(&F, &[Entry], FailoverReadWindow) -> Option<Out> + Send + 'static,
@@ -823,7 +850,7 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
-      let _ = tx.send(res.map(|opt| opt.and_then(|(fsm, limbo, win)| f(fsm, limbo, win))));
+      let _ = tx.send(crate::shared::apply_unchecked_failover(res, f));
     });
     self.send(MultiCommand::FailoverWindow {
       group: self.group.cheap_clone(),
