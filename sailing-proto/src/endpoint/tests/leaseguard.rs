@@ -930,6 +930,190 @@ fn safe_successor_inflates_inherited_wait_by_assumed_rate_bound() {
   );
 }
 
+/// HETEROGENEOUS-DRIFT falsifying witness: the per-entry commit-wait window is stamped from the
+/// appending leader's config yet consumed RAW on the successor's monotonic clock, so a legally faster
+/// successor can commit past an inherited anchor before a slower deposed leader's lease expires — a
+/// stale read whenever ρ_S > ρ_D. TWO nodes on a SHARED real timeline, each with its OWN
+/// validator-passing config and OWN drift: the deposed leader D (Δ=10s, ε=1s; a slow 0.9× clock, a long
+/// ~11.1s real lease) and the successor S (Δ=300ms, ε=150ms; a fast 1.5× clock). Real t = 0 is both D's
+/// anchor stamp and S's election. At t* = 10s real D's lease is STILL live (D-mono 9s < Δ_D 10s), so S
+/// must NOT yet have committed past the anchor: the RAW wait clears S at ~8.1s real (the stale read);
+/// the successor-side (1+ρ_S) inflation pushes the clear to ~12.2s real, strictly past D's lease.
+#[test]
+fn leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease() {
+  use crate::{
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
+  };
+  use core::time::Duration;
+
+  // The deposed leader D: a slow 0.9× clock and a LONG lease. `w_d` is the exact window D stamps on every
+  // entry and the length S must cover on its own clock.
+  let cfg_d = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(20),
+    Duration::from_secs(2),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_secs(10))
+  .with_clock_drift_bound(Duration::from_secs(1));
+  let w_d = cfg_d
+    .leaseguard_commit_wait_ns(ReadOnlyOption::LeaseGuard)
+    .expect("D's LeaseGuard window is valid");
+
+  // D elects (term 1) and commits its no-op — a current-term, LeaseGuard-stamped anchor (window `w_d`,
+  // timestamp = the election mono d0). D holds no inherited window, so nothing defers this commit.
+  let mut d = Endpoint::new(cfg_d, Instant::ORIGIN, 1, CountSm::default());
+  let mut d_log = VecLog::default();
+  let mut d_stable = NoopStable::default();
+  let d0 = d.poll_timeout().unwrap();
+  d.handle_timeout(d0, &mut d_log, &mut d_stable);
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(d.role().is_leader());
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  while d.poll_message().is_some() {}
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert_eq!(
+    d.commit_index(),
+    Index::new(1),
+    "D commits its LeaseGuard no-op (a fresh leader holds no inherited window to defer it)"
+  );
+
+  // The successor S: a fast 1.5× clock and a SHORT lease (ρ_S = 0.5 ⇒ 1+ρ_S = 3/2). It inherits an entry
+  // stamped with D's window `w_d` from a deposed leader (term 5), then campaigns term 6.
+  let cfg_s = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(1),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(150));
+  let mut s = Endpoint::new(cfg_s, Instant::ORIGIN, 1, CountSm::default());
+  let mut s_log = VecLog::default();
+  let mut s_stable = NoopStable::default();
+  s.handle_message(
+    Instant::ORIGIN,
+    &mut s_log,
+    &mut s_stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(w_d),
+      ],
+      Index::ZERO,
+    )),
+  );
+  s.handle_storage(Instant::ORIGIN, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  let s0 = s.poll_timeout().unwrap();
+  s.handle_timeout(s0, &mut s_log, &mut s_stable);
+  s.handle_storage(s0, &mut s_log, &mut s_stable);
+  s.handle_message(
+    s0,
+    &mut s_log,
+    &mut s_stable,
+    3u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(s.role().is_leader());
+  s.handle_storage(s0, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  while s.poll_event().is_some() {}
+  s.handle_message(
+    s0,
+    &mut s_log,
+    &mut s_stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert_eq!(
+    s.commit_index(),
+    Index::ZERO,
+    "S's inherited commit-wait holds its quorum-ready no-op"
+  );
+
+  // The SHARED real timeline: t = 0 is D's anchor stamp AND S's election. At real t, D-mono = d0 + 0.9·t
+  // (slow) and S-mono = s0 + 1.5·t (fast). Probe the single instant t* = 10s real.
+  const T_STAR_REAL_NS: u64 = 10_000_000_000;
+  let d_mono_at = d0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 9); // 0.9 · 10s = 9s
+  let s_mono_at = s0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 15); // 1.5 · 10s = 15s
+
+  // Witness guards (config-drift proofs, independent of the fix): t*'s S-mono (15s) is PAST S's RAW wait
+  // `w_d` (~12.2s) but BELOW the (1+ρ_S)-inflated wait `w_d + w_d/2` (~18.3s) — so a RAW wait would have
+  // cleared S here (the stale read), while the inflation must still hold it.
+  let s_mono_elapsed = T_STAR_REAL_NS / 10 * 15;
+  assert!(
+    s_mono_elapsed >= w_d,
+    "t* must be past S's RAW inherited wait (the RED band)"
+  );
+  assert!(
+    s_mono_elapsed < w_d + w_d / 2,
+    "t* must be below S's (1+ρ_S)-inflated wait (the GREEN target)"
+  );
+
+  // Drive S past t*, then probe BOTH nodes at the same real instant.
+  s.handle_timeout(s_mono_at, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  let d_lease_live = d.lease_guard_read_live(Now::monotonic(d_mono_at), &d_log);
+  let s_committed_past_anchor = s.commit_index() > Index::ZERO;
+
+  // Non-vacuous: D's lease IS live at t* (else the safety property would hold trivially).
+  assert!(
+    d_lease_live,
+    "the deposed leader's lease is still live at t* = 10s real (D-mono 9s < Δ_D 10s)"
+  );
+  // The safety property the P0 falsifies: a live inherited lease forbids the successor committing past
+  // the anchor. RED before the successor-side inflation (S cleared the RAW wait at ~8.1s real); GREEN
+  // once the wait grows by (1+ρ_S) to ~12.2s real, strictly past D's ~11.1s real lease.
+  assert!(
+    !s_committed_past_anchor,
+    "heterogeneous-drift stale read: the fast successor committed past the inherited anchor while the \
+     deposed leader's lease is still live"
+  );
+}
+
 /// FAILOVER-tier PRECISE commit-anchor: a successor that inherited a deposed FAILOVER leader's
 /// WALL-STAMPED entries lifts its post-election commit-wait as soon as the synchronized wall passes
 /// each inherited entry's own `wall_timestamp + lease_window` by `2·ε_unc` — committing FAR sooner
