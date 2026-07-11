@@ -294,7 +294,7 @@ fn shard_addr(base: SocketAddr, shard: usize) -> Option<SocketAddr> {
 /// The builder for the sharded host: K planes, each a complete [`CompioMultiStreamDriver`] on
 /// its own `std::thread` + compio runtime, behind one [`ShardedMultiHandle`].
 ///
-/// # The plane model (read the [module docs](self) first)
+/// # The plane model (read the module docs first)
 ///
 /// - K independent meshes: plane `i` listens on `listen base port + i` and dials every peer's
 ///   `base port + i` — the ADDRESSING contract mirrors the [`ShardMap`]'s: every node of the

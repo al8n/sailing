@@ -1048,7 +1048,7 @@ where
 
   /// Drain queued outbound wire bytes as `(conn, bytes)` pairs for the driver to write. This is
   /// the drain-end chokepoint where the crank's batched heartbeats ship (one coalesced frame per
-  /// peer — see [`flush`](Self::flush)), so every `handle_*` call's beats leave with that call's
+  /// peer — see `flush`), so every `handle_*` call's beats leave with that call's
   /// transmit drain.
   pub fn poll_transmit(&mut self) -> Vec<(ConnId, Vec<u8>)> {
     self.ship_heartbeats();

@@ -565,7 +565,7 @@ where
 {
   /// Consume this endpoint into its state machine — the absorb extraction: the container
   /// removes the frozen source from its map and hands the FSM to the target's
-  /// [`resolve_pending_merge`](Self::resolve_pending_merge). Everything else about the endpoint
+  /// `resolve_pending_merge`. Everything else about the endpoint
   /// (its stores outlive it until the driver's teardown) is dropped; the log-derived state is
   /// re-derivable should a crash rewind the resolution.
   pub fn into_state_machine(self) -> F {

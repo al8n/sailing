@@ -260,7 +260,7 @@ const SNAPSHOT_META_CACHE_MAX_BYTES: usize = 64 * 1024;
 /// leaves the cache untouched and routes through the stateless [`encode_message`]. Hold one per outbound
 /// connection so every chunk of a transfer hits.
 ///
-/// The cache is MEMORY-BOUNDED: it holds at most [`SNAPSHOT_META_CACHE_MAX_BYTES`] (a large meta is not
+/// The cache is MEMORY-BOUNDED: it holds at most `SNAPSHOT_META_CACHE_MAX_BYTES` (a large meta is not
 /// cached at all), it is released the moment a transfer COMPLETES (the final chunk, or a legacy
 /// single-shot), and it can be dropped on connection teardown via [`clear`](Self::clear) — so nothing is
 /// retained after a transfer. Clearing never affects output (a cleared cache simply re-encodes).

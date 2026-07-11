@@ -395,7 +395,7 @@ where
   /// burst of proposals replicates as a single broadcast. Correctness-preserving: `maybe_send_append`
   /// derives each peer's `next..last_index` from live state, so coalescing changes only message COUNT.
   ///
-  /// Idempotent per staged append: the [`replication_pending`](Self::replication_pending) dirty flag
+  /// Idempotent per staged append: the `replication_pending` dirty flag
   /// gates the fan-out, so the unconditional per-pump call sends only when a new append was staged.
   pub fn flush_appends<L, S>(&mut self, now: impl Into<Now>, log: &L, stable: &S)
   where

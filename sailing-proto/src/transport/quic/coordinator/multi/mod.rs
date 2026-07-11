@@ -1021,7 +1021,7 @@ where
 
   /// Pop one outbound datagram (destination + owned bytes), or `None` when the queue is empty. The
   /// driver drains this to exhaustion after every `handle_*` call — the drain-end chokepoint where
-  /// the crank's batched heartbeats ship (one coalesced frame per peer, see [`Self::pump`]), so
+  /// the crank's batched heartbeats ship (one coalesced frame per peer, see `pump`), so
   /// every call's beats leave with that call's transmit drain.
   pub fn poll_transmit(&mut self) -> Option<(SocketAddr, Vec<u8>)> {
     self.ship_heartbeats();

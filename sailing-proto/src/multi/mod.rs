@@ -71,7 +71,7 @@ impl<G> FloorStore<G> for NoFloors {
   }
 }
 
-/// Per-group storage a [`MultiStreamCoordinator`] uses to drive each group's endpoint when inbound
+/// Per-group storage a `MultiStreamCoordinator` uses to drive each group's endpoint when inbound
 /// bytes span multiple groups. The caller implements it over its own per-group store table.
 ///
 /// CONTRACT: resolution must be STABLE (the same group always resolves to the same stores) and
@@ -617,10 +617,8 @@ where
   /// host identity is NOT cleared — even removing the last group leaves it latched, so a re-created
   /// group must carry the same node id (live transport connections stay authenticated under it).
   /// This is also the SINGLE choke point where a merge SOURCE leaves the container, so it PURGES the
-  /// removed id's outstanding thaw obligation from every target — see [`remove_group_inner`]. `Ok(None)`
+  /// removed id's outstanding thaw obligation from every target — see `remove_group_inner`. `Ok(None)`
   /// when no such group is hosted (removing an absent id is a no-op).
-  ///
-  /// [`remove_group_inner`]: Self::remove_group_inner
   pub fn remove_group<L, S, St>(
     &mut self,
     gid: &G,
