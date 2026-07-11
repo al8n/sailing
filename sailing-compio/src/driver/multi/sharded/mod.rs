@@ -1,4 +1,4 @@
-//! The sharded thread-per-core multi-raft host: K PARALLEL PLANES, each a complete
+//! The sharded thread-per-shard multi-raft host: K PARALLEL PLANES, each a complete
 //! [`CompioMultiStreamDriver`] on its own core, behind one group-routing
 //! [`ShardedMultiHandle`].
 //!
@@ -254,6 +254,15 @@ pub enum SpawnError {
     /// The failed plane.
     shard: usize,
   },
+  /// The OS refused to create one plane's thread (the process hit its thread or address-space
+  /// limit). Surfaced instead of the panic a bare `thread::spawn` would raise at bind time.
+  #[error("shard {shard}: the plane thread could not be spawned")]
+  Thread {
+    /// The shard whose thread creation failed.
+    shard: usize,
+    /// The OS thread-spawn error.
+    source: std::io::Error,
+  },
 }
 
 /// One plane's bind verdict, shipped from its thread during [`ShardedCompioHost::spawn`]: the
@@ -463,49 +472,63 @@ where
         });
       let staging_cap = self.snapshot_staging_cap;
       let (verdict_tx, verdict_rx) = std::sync::mpsc::channel::<Verdict<G, I, F>>();
-      let thread = std::thread::spawn(move || {
-        let runtime = match compio::runtime::Runtime::new() {
-          Ok(runtime) => runtime,
-          Err(source) => {
-            let _ = verdict_tx.send(Err(SpawnError::Runtime { shard, source }));
-            return;
-          }
-        };
-        runtime.block_on(async move {
-          // The record layers are built HERE, on the plane's thread: the returned factories
-          // are `Rc` and must never cross threads.
-          let (dialer, acceptor) = match (record_layers)(shard) {
-            Ok(pair) => pair,
+      let thread = match std::thread::Builder::new()
+        .name(format!("sailing-shard-{shard}"))
+        .spawn(move || {
+          let runtime = match compio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
             Err(source) => {
-              let _ = verdict_tx.send(Err(SpawnError::RecordLayers { shard, source }));
+              let _ = verdict_tx.send(Err(SpawnError::Runtime { shard, source }));
               return;
             }
           };
-          let bound = CompioMultiStreamDriver::bind_with_tails(
-            addr, peers, dialer, acceptor, driver_cfg, tails,
-          )
-          .await;
-          let (mut driver, handle) = match bound {
-            Ok(pair) => pair,
-            Err(source) => {
-              let _ = verdict_tx.send(Err(SpawnError::Bind { shard, source }));
+          runtime.block_on(async move {
+            // The record layers are built HERE, on the plane's thread: the returned factories
+            // are `Rc` and must never cross threads.
+            let (dialer, acceptor) = match (record_layers)(shard) {
+              Ok(pair) => pair,
+              Err(source) => {
+                let _ = verdict_tx.send(Err(SpawnError::RecordLayers { shard, source }));
+                return;
+              }
+            };
+            let bound = CompioMultiStreamDriver::bind_with_tails(
+              addr, peers, dialer, acceptor, driver_cfg, tails,
+            )
+            .await;
+            let (mut driver, handle) = match bound {
+              Ok(pair) => pair,
+              Err(source) => {
+                let _ = verdict_tx.send(Err(SpawnError::Bind { shard, source }));
+                return;
+              }
+            };
+            if let Some(cap) = staging_cap {
+              driver = driver.with_snapshot_staging_cap(cap);
+            }
+            if let Some(factory) = factory {
+              driver = driver.with_boxed_group_factory(factory);
+            }
+            let metrics = driver.engine_metrics();
+            if verdict_tx.send(Ok((handle, metrics))).is_err() {
+              // The spawner unwound (another plane failed): stop before running.
               return;
             }
-          };
-          if let Some(cap) = staging_cap {
-            driver = driver.with_snapshot_staging_cap(cap);
+            driver.run().await;
+          });
+        }) {
+        Ok(thread) => thread,
+        Err(source) => {
+          // The OS refused a new thread (thread/address-space limit). Unwind the planes already
+          // spawned — dropping each verdict receiver disconnects its plane, which then exits and
+          // joins — and surface the typed refusal instead of the panic `thread::spawn` would raise.
+          for (verdict_rx, thread) in planes {
+            drop(verdict_rx);
+            let _ = thread.join();
           }
-          if let Some(factory) = factory {
-            driver = driver.with_boxed_group_factory(factory);
-          }
-          let metrics = driver.engine_metrics();
-          if verdict_tx.send(Ok((handle, metrics))).is_err() {
-            // The spawner unwound (another plane failed): stop before running.
-            return;
-          }
-          driver.run().await;
-        });
-      });
+          return Err(SpawnError::Thread { shard, source });
+        }
+      };
       planes.push((verdict_rx, thread));
     }
 
