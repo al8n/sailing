@@ -180,7 +180,16 @@ where
   G: GroupId,
 {
   fn materialize(&mut self, group: &G, from: &I) -> Option<GroupBlueprint<I>> {
-    if self.map.shard(group) != self.plane {
+    let shard = self.map.shard(group);
+    // The whole fail-closed guarantee rests on a custom `ShardMap` closure being DETERMINISTIC:
+    // `shard(group)` must be stable. Probe it here (debug/test only) so a nondeterministic map
+    // trips at the decline site instead of silently hosting a group on the wrong plane.
+    debug_assert_eq!(
+      shard,
+      self.map.shard(group),
+      "the shard map returned different shards for the same group (it must be deterministic)"
+    );
+    if shard != self.plane {
       // Fail closed BEFORE the embedder's catalog is even asked: a group that does not belong
       // to this plane must never materialize here, whatever the inner factory would say.
       return None;
@@ -803,10 +812,13 @@ where
 
   /// One plane's [`MultiHandle`] — the ESCAPE HATCH for plane-scoped work (status polls against
   /// a known plane, plane-local shutdown in tests). Group-keyed operations issued here bypass
-  /// the shard map: a create on the wrong plane would host a replica no other node ever dials,
-  /// so lifecycle mutations should ride the sharded surface unless the caller re-derives the
-  /// map itself. Manual creates also bypass the shard guard — it covers only factory
-  /// materialization, and this handle is the deliberate opt-out.
+  /// BOTH the shard map AND the shard guard, so the dragons are specific: a manual `create_group`
+  /// on the WRONG plane hosts a replica no correctly-mapped peer ever dials, and — because it skips
+  /// the guard that exists to catch exactly this — a later correctly-routed create can leave TWO
+  /// local replicas of one group under this node's ONE identity: the double-vote shape a plane's
+  /// factory guard fails closed to prevent. Keep to the map: issue lifecycle mutations on the
+  /// sharded surface unless the caller re-derives `shard(group)` itself. The hatch stays open by
+  /// design; the hazard is the caller's to hold.
   #[must_use]
   pub fn shard_handle(&self, shard: usize) -> Option<&MultiHandle<G, I, F>> {
     self.shards.get(shard)
