@@ -324,6 +324,10 @@ where
       self.poison(PoisonReason::LogTerm);
       return;
     };
+    // A campaign proceeding under a walled inherited floor this node cannot prove as leader would, on a
+    // win, HOLD commit (the conservative veto) until a wall capability is configured or leadership is
+    // transferred away — warn and count that pre-election so the wedge is not silent until after the win.
+    self.note_campaign_floor_provability();
     self.term = next_term;
     // All pending work from the previous term is now stale (spec §7). Clear before recording
     // the self-vote below so old completions that arrive later are harmlessly ignored.
@@ -412,6 +416,9 @@ where
       self.poison(PoisonReason::LogTerm);
       return false;
     };
+    // Same pre-election signal as the real candidacy: a pre-vote probe under an unprovable walled floor
+    // still warrants the operator warning and counter (a won probe becomes a real campaign that wedges).
+    self.note_campaign_floor_provability();
     let me = self.config.id();
     let voter_peers: Vec<_> = self.peers().filter(|p| self.tracker.is_voter(p)).collect();
     for peer in voter_peers {

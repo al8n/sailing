@@ -870,6 +870,16 @@ struct LeaseGuardState {
   /// review surfaced). A wall-PRESENT, not-yet-released
   /// hold is NORMAL (it lifts when the wall passes the floor) and is NOT counted here.
   unprovable_floor_holds: u64,
+  /// FAILOVER-tier observability: how many times this node STARTED a campaign (a pre-vote probe or a real
+  /// candidacy) while holding a walled inherited-lease floor it could not prove as leader — a walled
+  /// obligation (`max_wall_plus_window != 0`) with no `bounded_clock_uncertainty` to wall-gate it. The
+  /// PRE-election dual of [`unprovable_floor_holds`](Endpoint::unprovable_floor_holds): were this node to
+  /// win, the conservative veto would HOLD commit until a wall capability is configured or leadership is
+  /// transferred away, so this counter fires BEFORE the wedge rather than only after it. Pure in-memory
+  /// metric — never persisted, never on the wire, reset to `0` on construction and restart, read only via
+  /// [`unprovable_floor_campaigns`](Endpoint::unprovable_floor_campaigns). `0` for a node with ε_unc
+  /// configured, with no inherited walled floor, or off the failover tier.
+  unprovable_floor_campaigns: u64,
   /// FAILOVER-tier inherited-read serve anchor — the election TAIL, captured ONCE at
   /// [`become_leader`](Endpoint::become_leader) as `log.last_index()` BEFORE the leader's own no-op (which
   /// would otherwise inflate it). Immutable for the term (`log.last_index()` drifts as the leader
@@ -1338,6 +1348,7 @@ where
         unwalled_commit_wait_until: None,
         precise_releases: 0,
         unprovable_floor_holds: 0,
+        unprovable_floor_campaigns: 0,
         // Inherited-read serve anchors — armed only at become_leader.
         limbo_upper: Index::ZERO,
         committed_anchor_wall: 0,
@@ -1519,6 +1530,20 @@ where
   #[inline(always)]
   pub const fn unprovable_floor_holds(&self) -> u64 {
     self.lease_guard.unprovable_floor_holds
+  }
+
+  /// How many times this node STARTED a campaign while holding a walled inherited-lease floor it could
+  /// not prove as leader — a walled obligation (`max_wall_plus_window != 0`) with no bounded
+  /// clock-uncertainty to wall-gate it. Read-only observability (see [`commit_index`](Self::commit_index));
+  /// never persisted, reset to `0` on restart, `0` with ε_unc configured, with no inherited walled floor,
+  /// or off the failover tier. Unlike its POST-election sibling
+  /// [`unprovable_floor_holds`](Self::unprovable_floor_holds) — which climbs only after a win wedges commit
+  /// — this fires at campaign time, BEFORE the node can wedge, so an operator can act by configuring a wall
+  /// capability or transferring leadership away. The randomized tester reads it to assert a Safe/no-ε_unc
+  /// successor that inherited walled entries is flagged before it leads.
+  #[inline(always)]
+  pub const fn unprovable_floor_campaigns(&self) -> u64 {
+    self.lease_guard.unprovable_floor_campaigns
   }
 
   /// Cold-read wedge counter: how many times `apply_committed` deferred on a cold

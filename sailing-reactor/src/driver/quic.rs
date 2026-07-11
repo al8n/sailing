@@ -846,6 +846,7 @@ where
           is_poisoned: ep.is_poisoned(),
           precise_releases: ep.precise_releases(),
           unprovable_floor_holds: ep.unprovable_floor_holds(),
+          unprovable_floor_campaigns: ep.unprovable_floor_campaigns(),
           frozen: ep.is_frozen(),
           shape_gen: ep.shape_gen(),
         };

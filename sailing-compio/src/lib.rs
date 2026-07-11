@@ -98,6 +98,19 @@
 //! tier is live end-to-end. `unprovable_floor_holds` counts waits held conservatively for want of a
 //! provable wall — nonzero in a configured-failover deployment flags a node OUTSIDE the clock contract
 //! (an unsynchronized clock, a missing source), the intended backstop rather than a wiring fault.
+//! `unprovable_floor_campaigns` is the PRE-election counterpart: it counts campaigns a node started while
+//! holding a walled inherited floor it could not prove as leader, so the wedge is visible BEFORE the node
+//! wins and holds commit (a `tracing` warn fires at the same campaign point).
+//!
+//! ## The precondition (and repairing a wedge)
+//!
+//! Enabling the failover tier on ANY node is a CLUSTER precondition: every electable voter must be able to
+//! prove an inherited wall floor — ε_unc with a supplied wall, or valid LeaseGuard timing for the E′
+//! inflation. A voter that can prove neither stays SAFE (it fail-closes) but HOLDS its own commit if it
+//! wins. Two repairs need no new committed entry: TRANSFER leadership to a capable peer (only
+//! commit-advance is gated — elections, votes, and transfers are not), or RESTART the node with a clock
+//! capability (the veto reads LIVE config, so it heals in place). Capability negotiation is a planned
+//! follow-up.
 
 mod bridge;
 mod driver;

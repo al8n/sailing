@@ -471,6 +471,7 @@ where
         // Observability counters reset on restart (in-memory only, never persisted).
         precise_releases: 0,
         unprovable_floor_holds: 0,
+        unprovable_floor_campaigns: 0,
         // Inherited-read serve anchors arm only when a restarted follower (re-)wins an election.
         limbo_upper: Index::ZERO,
         committed_anchor_wall: 0,

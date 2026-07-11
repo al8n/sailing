@@ -530,6 +530,48 @@ where
     walled_expired && unwalled_expired
   }
 
+  /// The node LACKS the wall capability to prove an inherited walled-lease floor: no
+  /// `bounded_clock_uncertainty`, so it can neither wall-gate the floor nor E′-inflate a bare mono wait
+  /// past it. The SINGLE capability check shared by the pre-election campaign warning
+  /// ([`campaign_holds_unprovable_floor`](Self::campaign_holds_unprovable_floor)) and the post-election
+  /// veto's fail-closed branch ([`walled_lease_vetoes_conservative`](Self::walled_lease_vetoes_conservative)),
+  /// so warn-time and veto-time can never drift apart.
+  #[inline]
+  fn wall_capability_absent(&self) -> bool {
+    self.config.bounded_clock_uncertainty().is_none()
+  }
+
+  /// Whether WINNING the campaign now starting would leave this node holding a walled inherited-lease
+  /// floor it cannot prove: it carries a walled obligation (`max_wall_plus_window != 0`, folded per-entry
+  /// so present regardless of local tier) but [lacks the wall capability](Self::wall_capability_absent) to
+  /// wall-gate it. Keys on `max_wall_plus_window` because `inherited_release_deadline` — the pinned floor
+  /// the veto reads — is not captured until `become_leader`; the two share the capability check so a
+  /// campaign-time warning and the post-win commit-hold can never disagree.
+  #[inline]
+  fn campaign_holds_unprovable_floor(&self) -> bool {
+    self.lease_guard.max_wall_plus_window != 0 && self.wall_capability_absent()
+  }
+
+  /// Warn and count when a starting campaign holds an unprovable walled floor
+  /// ([`campaign_holds_unprovable_floor`](Self::campaign_holds_unprovable_floor)). A win would HOLD commit
+  /// (the conservative veto) until a wall capability is configured or leadership is transferred away — the
+  /// pre-election signal for a wedge that is otherwise silent until after the node leads. Called from both
+  /// campaign entries (the pre-vote probe and real candidacy).
+  pub(crate) fn note_campaign_floor_provability(&mut self) {
+    if !self.campaign_holds_unprovable_floor() {
+      return;
+    }
+    self.lease_guard.unprovable_floor_campaigns = self
+      .lease_guard
+      .unprovable_floor_campaigns
+      .saturating_add(1);
+    #[cfg(feature = "tracing")]
+    tracing::warn!(
+      target: "sailing::consensus",
+      "campaigning under an unprovable walled inherited-lease floor; winning holds commit until a wall capability (bounded_clock_uncertainty or LeaseGuard timing for E′) is configured or leadership is transferred away"
+    );
+  }
+
   /// Whether a still-live WALLED inherited lease must VETO the conservative mono commit-wait clear this
   /// tick. The invariant: a node may clear its commit-wait for inherited WALLED entries ONLY when it has
   /// proven the wall floor `s_c + W_c` expired — via the WALL, or because its wait is E′-INFLATED (covers
@@ -559,6 +601,23 @@ where
   /// Keys on `inherited_release_deadline` (folded ENTRY-property-gated, so present on EVERY holder
   /// regardless of read mode) — NOT `failover_tier_active`. The fail-closed branches hold a misconfigured
   /// node rather than serve a stale read (safety over the liveness of a node outside the clock contract).
+  ///
+  /// # Operability (an operator-repairable wedge, no new commit required)
+  ///
+  /// A fail-closed hold is SAFE but does not self-resolve, so treat it as a cluster PRECONDITION: enabling
+  /// the failover tier on ANY node means every electable voter must be able to prove an inherited wall
+  /// floor — a `bounded_clock_uncertainty` (ε_unc) with a supplied wall, or valid LeaseGuard timing for the
+  /// E′ inflation. A voter that can prove neither wedges its own commit if it wins. Two repairs exist
+  /// TODAY, neither needing a committed entry:
+  /// - TRANSFER leadership away: only COMMIT-advance is gated here — elections, votes, and leader transfers
+  ///   are not — so a `TimeoutNow` to a capable peer moves leadership off the wedged node at once.
+  /// - RESTART the wedged node with a clock capability: this veto reads the LIVE `config`, so a node
+  ///   brought back up with ε_unc (or valid LeaseGuard timing) heals in place — the next tick proves the
+  ///   floor, no new commit required.
+  ///
+  /// Capability negotiation (refusing the vote / gating membership so an incapable voter never leads) is a
+  /// planned follow-up; today the pre-election signal is the
+  /// [`unprovable_floor_campaigns`](Endpoint::unprovable_floor_campaigns) counter plus its `tracing` warn.
   fn walled_lease_vetoes_conservative(&self, now: Now) -> bool {
     if self.lease_guard.inherited_release_deadline == 0 {
       return false; // no walled inherited lease to honor
@@ -568,12 +627,17 @@ where
     }
     // BARE wait with inherited walled entries: the conservative mono clear is allowed ONLY when the wall
     // proves the floor expired.
-    let Some(eps) = self.config.bounded_clock_uncertainty() else {
-      // No ε_unc AND no E′ (bare wait): the node can neither wall-gate nor inflate, so it cannot bound the
-      // inherited walled lease at all — FAIL CLOSED. (A Safe/LeaseBased successor that inherited failover
-      // entries; outside the synchronized-clock contract the serve assumes.)
+    // No ε_unc AND no E′ (bare wait): the node can neither wall-gate nor inflate, so it cannot bound the
+    // inherited walled lease at all — FAIL CLOSED. (A Safe/LeaseBased successor that inherited failover
+    // entries; outside the synchronized-clock contract the serve assumes.) The capability check is
+    // `wall_capability_absent`, shared with the pre-election campaign warning so the two can never drift.
+    if self.wall_capability_absent() {
       return true;
-    };
+    }
+    let eps = self
+      .config
+      .bounded_clock_uncertainty()
+      .expect("wall_capability_absent ruled out None");
     let eps_ns = u64::try_from(eps.as_nanos()).unwrap_or(u64::MAX);
     // NON-PASSABLE horizon (`deadline + 2·ε ≥ u64::MAX`) is NOT skipped here: a bare ε_unc successor with a
     // non-passable inherited horizon already FAIL-STOPPED at `become_leader`

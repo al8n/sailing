@@ -2945,6 +2945,89 @@ fn failover_unprovable_floor_hold_is_counted() {
   }
 }
 
+/// The PRE-election dual of `failover_unprovable_floor_hold_is_counted`: a node that STARTS a campaign
+/// while holding a walled inherited floor it could not prove as leader — a walled obligation
+/// (`max_wall_plus_window != 0`, folded per-entry) with NO `bounded_clock_uncertainty` — is flagged at
+/// campaign time via `unprovable_floor_campaigns`, so the wedge is observable BEFORE the node wins and
+/// holds commit, not only after. A node WITH ε_unc, or with NO walled floor, counts nothing.
+#[test]
+fn campaign_under_unprovable_walled_floor_is_counted() {
+  use crate::{AppendEntries, Entry, EntryKind, Index, Message, Term};
+
+  const S: u64 = 1_700_000_000_000_000_000;
+  const W: u64 = 100_000_000;
+
+  // Build a 3-voter node — optionally with ε_unc, optionally fed a WALLED inherited entry (which folds
+  // `max_wall_plus_window` per-entry regardless of local tier) — then fire its election timeout so it
+  // campaigns. Pre-vote is off by default, so the timeout drives `become_candidate` directly. Returns the
+  // campaign counter after the campaign has started.
+  fn campaigns(with_eps: bool, walled_floor: bool) -> u64 {
+    let mut cfg = Config::try_new(
+      1u64,
+      std::vec![1u64, 2, 3],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap();
+    if with_eps {
+      cfg = cfg.with_bounded_clock_uncertainty(Duration::from_millis(5));
+    }
+    let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+    let mut log = VecLog::default();
+    let mut stable = NoopStable::default();
+
+    let mut entry = Entry::new(
+      Term::new(5),
+      Index::new(1),
+      EntryKind::Empty,
+      bytes::Bytes::new(),
+    );
+    if walled_floor {
+      entry = entry.with_lease_window(W).with_wall_timestamp(S);
+    }
+    ep.handle_message(
+      Instant::ORIGIN,
+      &mut log,
+      &mut stable,
+      2u64,
+      Message::AppendEntries(AppendEntries::new(
+        Term::new(5),
+        2u64,
+        Index::ZERO,
+        Term::ZERO,
+        std::vec![entry],
+        Index::new(1),
+      )),
+    );
+    ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+
+    let d = ep.poll_timeout().unwrap();
+    ep.handle_timeout(Now::monotonic(d), &mut log, &mut stable);
+    assert!(
+      ep.role().is_candidate(),
+      "the election timeout must have started a real campaign"
+    );
+    ep.unprovable_floor_campaigns()
+  }
+
+  assert_eq!(
+    campaigns(false, true),
+    1,
+    "a no-ε_unc node campaigning under a walled inherited floor is flagged pre-election"
+  );
+  assert_eq!(
+    campaigns(true, true),
+    0,
+    "ε_unc makes the floor provable — nothing is flagged"
+  );
+  assert_eq!(
+    campaigns(false, false),
+    0,
+    "no walled floor to prove — nothing is flagged"
+  );
+}
+
 /// FAILOVER regression (the absent-wall fail-OPEN): a NON-armed Safe+ε_unc successor driven with a
 /// MONOTONIC-only `Now` (no synchronized wall) at its bare deadline must FAIL CLOSED — hold the
 /// commit-wait — NOT clear via the bare mono path. Without the wall-absent veto, `walled_lease_vetoes_

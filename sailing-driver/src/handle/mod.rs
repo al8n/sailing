@@ -132,6 +132,10 @@ pub struct Status<I> {
   pub precise_releases: u64,
   /// Failover-tier commit-waits HELD because the inherited walled-lease floor was unprovable.
   pub unprovable_floor_holds: u64,
+  /// Campaigns this node STARTED while holding a walled inherited-lease floor it could not prove as
+  /// leader — the PRE-election signal that a win would wedge commit (`0` with a wall capability or no
+  /// walled floor).
+  pub unprovable_floor_campaigns: u64,
   /// Whether the group is FROZEN by an in-flight merge (refusing proposals, conf changes,
   /// transfers, and reads until the merge resolves or rolls back).
   pub frozen: bool,
