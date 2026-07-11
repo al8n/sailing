@@ -313,6 +313,14 @@ where
     self.metrics.clone()
   }
 
+  /// Cap the engine's chunked-snapshot staging buffers (the [`GroupEngine`] knob, applied to
+  /// this host's engine). Set between `bind` and `run()`.
+  #[must_use]
+  pub fn with_snapshot_staging_cap(mut self, cap: usize) -> Self {
+    self.engine.set_snapshot_staging_cap(cap);
+    self
+  }
+
   /// Register a [`GroupFactory`] — the auto-materialization hook consulted on every polled
   /// unknown-group signal (see the trait for the full admission-edge contract; assemble one
   /// from its two phases as closures with [`factory_fn`](sailing_driver::factory_fn)). The
