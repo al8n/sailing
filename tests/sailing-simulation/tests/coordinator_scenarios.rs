@@ -312,8 +312,10 @@ fn tombstone_refusal_chain() {
 }
 
 /// A quiescing leader's final round: `mark_quiescing` stamps the next beat, the receiver folds
-/// to net-quiesced (Wake then Quiesce, in order), and the returning `HeartbeatResponse` is
-/// ABSORBED at the leader — no `Wake`, or the quiesce could never settle. The absorb set is
+/// to net-quiesced (only the LATEST control per group survives to the driver, so the flagged
+/// beat's `Wake` is overwritten by its `Quiesce` before the drain — the net state is identical),
+/// and the returning `HeartbeatResponse` is ABSORBED at the leader — no `Wake`, or the quiesce
+/// could never settle. The absorb set is
 /// EXACTLY that response: fresh replication traffic is wake-class on both sides (the
 /// `AppendEntries` wakes the follower, its `AppendResponse` wakes the leader). The empty-append
 /// arm of the wake class is pinned at the proto tier with crafted frames; this fixture pins the
@@ -337,8 +339,8 @@ fn quiesce_final_round_absorbs_only_the_response() {
   );
   assert_eq!(
     w.drain_controls_b(),
-    std::vec![(100, GroupControl::Wake), (100, GroupControl::Quiesce)],
-    "the beat wakes, then the flag quiesces — folding in order nets quiesced"
+    std::vec![(100, GroupControl::Quiesce)],
+    "the flagged beat collapses to its latest control — net quiesced"
   );
   assert_eq!(
     w.a.poll_group_control(),
