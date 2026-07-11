@@ -729,7 +729,7 @@ fn stale_intent_never_rides_a_response() {
 /// `mark_quiescing` stamps the group's next heartbeat with the QUIESCE flag (a flagged single
 /// rides a one-entry coalesced frame — only a coalesced entry has a flags byte), the intent is
 /// consumed by that broadcast, and the receiver surfaces exactly one `GroupControl::Quiesce` for
-/// the group — ordered AFTER the beat's own `Wake`, so folding controls in order nets quiesced.
+/// the group — the flagged beat's `Wake` and `Quiesce` collapse to the latter, netting quiesced.
 /// The responding `HeartbeatResponse` back at the leader surfaces NO `Wake` (a quiescing leader's
 /// final beat draws responses; waking on them would never let the quiesce settle).
 #[test]
@@ -775,8 +775,8 @@ fn quiesce_flag_round_trips_as_group_control() {
   }
   assert_eq!(
     controls,
-    std::vec![(100, GroupControl::Wake), (100, GroupControl::Quiesce)],
-    "the beat wakes, then the flag quiesces — net quiesced"
+    std::vec![(100, GroupControl::Quiesce)],
+    "the flagged beat collapses to its latest control — net quiesced"
   );
 
   // The response flows back to the leader WITHOUT waking group 100 there.
@@ -800,6 +800,71 @@ fn quiesce_flag_round_trips_as_group_control() {
     w.b.poll_group_control(),
     None,
     "the follower stays settled after the round's tail"
+  );
+}
+
+/// Interleaved controls across groups (a burst the driver has not drained) leave one queued
+/// entry per DISTINCT group, not one per push: the queue is membership-deduped by `control_state`.
+#[test]
+fn interleaved_controls_dedup_by_membership() {
+  let mut coord = MultiCoord::new();
+  for _ in 0..64 {
+    coord.push_control(&1, GroupControl::Wake);
+    coord.push_control(&2, GroupControl::Wake);
+  }
+  assert!(
+    coord.controls.len() <= 2,
+    "control queue grew to {}",
+    coord.controls.len()
+  );
+}
+
+/// A group's queued signal collapses to its LATEST control: `Wake`, `Quiesce`, then `Wake` for one
+/// group delivers a single `Wake`.
+#[test]
+fn controls_collapse_to_the_latest_per_group() {
+  let mut coord = MultiCoord::new();
+  coord.push_control(&7, GroupControl::Wake);
+  coord.push_control(&7, GroupControl::Quiesce);
+  coord.push_control(&7, GroupControl::Wake);
+  let mut drained = Vec::new();
+  while let Some(c) = coord.poll_group_control() {
+    drained.push(c);
+  }
+  assert_eq!(drained, std::vec![(7, GroupControl::Wake)]);
+}
+
+/// The flagged beat — a `Wake` immediately followed by a `Quiesce` for one group — delivers a
+/// single `Quiesce`, net-identical to folding the pair.
+#[test]
+fn flagged_beat_collapses_to_a_single_quiesce() {
+  let mut coord = MultiCoord::new();
+  coord.push_control(&7, GroupControl::Wake);
+  coord.push_control(&7, GroupControl::Quiesce);
+  let mut drained = Vec::new();
+  while let Some(c) = coord.poll_group_control() {
+    drained.push(c);
+  }
+  assert_eq!(drained, std::vec![(7, GroupControl::Quiesce)]);
+}
+
+/// A purged group's queued gid goes inert: `poll_group_control` skips it and keeps draining the
+/// live groups.
+#[test]
+fn purged_group_control_is_skipped_at_poll() {
+  let mut coord = MultiCoord::new();
+  coord.push_control(&100, GroupControl::Wake);
+  coord.push_control(&200, GroupControl::Wake);
+  coord.remove_group(&100, &mut empty_stores()).unwrap();
+  assert_eq!(
+    coord.poll_group_control(),
+    Some((200, GroupControl::Wake)),
+    "the live group still drains"
+  );
+  assert_eq!(
+    coord.poll_group_control(),
+    None,
+    "the purged group yields nothing"
   );
 }
 

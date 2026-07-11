@@ -23,9 +23,9 @@ use std::{
 };
 
 /// A group-scoped scheduling signal a multi-group coordinator surfaces to its driver (drained via
-/// `poll_group_control`, like `poll_event`). The queue preserves DISPATCH ORDER, so a driver that
-/// folds the signals left to right always lands on the group's latest state — e.g. a quiesce-flagged
-/// beat followed by an append in the same read yields `Quiesce` then `Wake`, ending awake.
+/// `poll_group_control`, like `poll_event`). Only the LATEST signal per group survives to the
+/// driver — a group's net state is its last control in stream order — so a quiesce-flagged beat
+/// followed by an append in the same read collapses to a single `Wake`, landing the group awake.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum GroupControl {
@@ -97,8 +97,15 @@ where
   /// Groups whose NEXT heartbeat broadcast carries the QUIESCE flag (set by
   /// [`mark_quiescing`](Self::mark_quiescing), consumed by the flush that stamps the beats).
   quiesce_intents: BTreeSet<G>,
-  /// Group-scoped scheduling signals for the driver, in dispatch order (see [`GroupControl`]).
-  controls: VecDeque<(G, GroupControl)>,
+  /// The LATEST group-scoped scheduling signal per group. A group's net driver state is its last
+  /// control in stream order (`Wake` re-arms its timers, `Quiesce` parks them), and cross-group
+  /// order carries no invariant, so keeping only the latest per group delivers the same net state
+  /// as the full stream would — a burst collapses to the one control that matters.
+  control_state: BTreeMap<G, GroupControl>,
+  /// Groups with a pending scheduling signal, in first-signal order, membership-deduped by
+  /// `control_state` (see [`poll_group_control`](Self::poll_group_control)). A gid whose map entry
+  /// was purged (removal/merge) stays queued but inert and is skipped at poll.
+  controls: VecDeque<G>,
   /// Tombstoned group ids: REMOVED groups whose inbound frames drop silently and whose
   /// create/restore refuses until an explicit [`clear_tombstone`](Self::clear_tombstone) (see
   /// [`remove_group`](Self::remove_group)). In-memory and volatile — a restart starts clean; the
@@ -132,6 +139,7 @@ where
       next_conn_id: 1,
       hb_batches: BTreeMap::new(),
       quiesce_intents: BTreeSet::new(),
+      control_state: BTreeMap::new(),
       controls: VecDeque::new(),
       retired: BTreeSet::new(),
       unknown_pending: VecDeque::new(),
@@ -353,7 +361,8 @@ where
   {
     let removed = self.multi.remove_group(gid, stores)?;
     self.quiesce_intents.remove(gid);
-    self.controls.retain(|(g, _)| g != gid);
+    // Drop the group's latest control; a still-queued gid goes inert and is skipped at poll.
+    self.control_state.remove(gid);
     self.retired.insert(gid.cheap_clone());
     self.purge_unknown_signal(gid);
     Ok(removed)
@@ -906,7 +915,8 @@ where
         crate::MergeResolution::Aborted { .. } => continue,
       };
       self.quiesce_intents.remove(source);
-      self.controls.retain(|(g, _)| g != source);
+      // Drop the source's latest control; a still-queued gid goes inert and is skipped at poll.
+      self.control_state.remove(source);
       self.retired.insert(source.cheap_clone());
       self.purge_unknown_signal(source);
     }
@@ -1065,9 +1075,15 @@ where
     self.quiesce_intents.remove(group);
   }
 
-  /// Drain the next group-scoped scheduling signal, in dispatch order (see [`GroupControl`]).
+  /// Drain the next group-scoped scheduling signal — each group's LATEST control, in first-signal
+  /// order (see [`GroupControl`]). Skips a queued gid whose control was purged (removal/merge).
   pub fn poll_group_control(&mut self) -> Option<(G, GroupControl)> {
-    self.controls.pop_front()
+    while let Some(gid) = self.controls.pop_front() {
+      if let Some(ctrl) = self.control_state.remove(&gid) {
+        return Some((gid, ctrl));
+      }
+    }
+    None
   }
 
   /// The transport's OWN earliest deadline — handshake reaping AND validated-connection liveness
@@ -1227,7 +1243,7 @@ where
   /// Queue the dispatch-driven [`GroupControl`]s for one delivered message: a `Wake` for every
   /// wake-class kind (see [`GroupControl::Wake`] — the heartbeat response is absorbed), then a
   /// `Quiesce` if the entry carried the flag — flag AFTER wake, so a flagged
-  /// beat nets quiesced. Consecutive duplicates collapse (a burst of appends is one `Wake`).
+  /// beat nets quiesced. Same-group controls collapse to the latest (a burst of appends is one `Wake`).
   fn push_dispatch_controls(&mut self, group: &G, wake: bool, flags: u8) {
     if wake {
       self.push_control(group, GroupControl::Wake);
@@ -1248,14 +1264,17 @@ where
   }
 
   fn push_control(&mut self, group: &G, ctrl: GroupControl) {
+    // Latest-wins: overwrite the group's control, enqueuing the gid only when it was absent so the
+    // queue holds each dirty group once. A later push in the same drain cycle just replaces the
+    // value (Quiesce after Wake nets Quiesce; a Wake after Quiesce re-arms), which the single
+    // queued visit then delivers.
     if self
-      .controls
-      .back()
-      .is_some_and(|(g, c)| g == group && *c == ctrl)
+      .control_state
+      .insert(group.cheap_clone(), ctrl)
+      .is_none()
     {
-      return;
+      self.controls.push_back(group.cheap_clone());
     }
-    self.controls.push_back((group.cheap_clone(), ctrl));
   }
 }
 
