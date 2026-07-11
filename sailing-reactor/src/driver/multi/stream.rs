@@ -338,9 +338,13 @@ where
     self
   }
 
-  /// Drive every hosted group until shutdown (or until every `MultiHandle` clone has dropped and
-  /// the buffered commands drained). Per-iteration crank order is the single-group loop's, with
-  /// the storage crank replacing the single `handle_storage` call.
+  /// Drive every hosted group until an exit, then tear down. `run` returns `()` with NO reason on a
+  /// `shutdown()` command or every `MultiHandle` clone dropping (the command channel disconnects and
+  /// the buffered commands drain). Fault scope is PER GROUP: a poisoned group does NOT exit `run` —
+  /// it fails only its own parked work `Poisoned` while the other groups keep running (teardown
+  /// classifies each group's verdict). A typed `run() -> Result` exit is future work. Per-iteration
+  /// crank order is the single-group loop's, with the storage crank replacing the single
+  /// `handle_storage` call.
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 

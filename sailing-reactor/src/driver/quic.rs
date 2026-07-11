@@ -471,8 +471,12 @@ where
     self.coord.endpoint().unprovable_floor_holds()
   }
 
-  /// Drive consensus until shutdown (or until every `Handle` clone has dropped AND the buffered
-  /// commands are drained — a driver nobody can talk to has no reason to run).
+  /// Drive consensus until an exit, then tear down (join the recv task before the socket drop — the
+  /// fd-release barrier). `run` returns `()` with NO reason on any of three conditions: a
+  /// `shutdown()` command, every `Handle` clone dropping (the command channel disconnects and the
+  /// buffered commands drain), or the endpoint POISONING. The untyped exit cannot distinguish a
+  /// clean shutdown from a poison fail-stop; teardown fails parked work with the right verdict
+  /// (`Poisoned` or `ShuttingDown`) either way. A typed `run() -> Result` exit is future work.
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 

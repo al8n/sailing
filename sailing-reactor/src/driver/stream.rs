@@ -483,8 +483,12 @@ where
     self.coord.endpoint().unprovable_floor_holds()
   }
 
-  /// Drive consensus until shutdown (or until every `Handle` clone has dropped and the buffered
-  /// commands drained).
+  /// Drive consensus until an exit, then tear down. `run` returns `()` with NO reason on any of
+  /// three conditions: a `shutdown()` command, every `Handle` clone dropping (the command channel
+  /// disconnects and the buffered commands drain), or the endpoint POISONING (an unrecoverable
+  /// storage/apply fault). The untyped exit cannot distinguish a clean shutdown from a poison
+  /// fail-stop; teardown fails parked work with the right verdict (`Poisoned` or `ShuttingDown`)
+  /// either way. A typed `run() -> Result` exit is future work.
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
@@ -709,8 +713,14 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
     }
     self.routing.fail_all(&DriverError::ShuttingDown);
-    // Dropping every Conn aborts its tasks; queued frames are discarded (consensus
-    // retransmission re-drives them — see close_conn for why bounded teardown wins).
+    // Dropping every Conn aborts its tasks WITHOUT joining them — deliberately, and unlike the QUIC
+    // driver's teardown, which JOINS its recv task. The asymmetry is by design: each stream Conn
+    // owns its OWN per-peer TCP fd, so dropping the Conn closes that fd on the spot, and the
+    // immediate-rebind contract needs only the LISTENER's fd freed (dropped below) — no Conn shares
+    // it, so there is nothing to join for. QUIC must join because its single recv task SHARES the
+    // one socket fd with the driver, so that fd frees only after the join. Queued frames are
+    // discarded (consensus retransmission re-drives them — see close_conn for why bounded teardown
+    // wins).
     self.conns.clear();
     // Drain everything already buffered, then DROP the receiver: a racing `try_send` then sees a
     // disconnected channel and the handle's own rollback runs — no command survives teardown.

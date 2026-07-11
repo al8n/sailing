@@ -279,10 +279,13 @@ where
     self
   }
 
-  /// Drive every hosted group until shutdown (or until every `MultiHandle` clone has dropped and
-  /// the buffered commands drained). The single-group QUIC loop's iteration order with the
-  /// multi-group storage crank; teardown joins the recv task before dropping the socket (the
-  /// fd-release barrier), exactly as on the single driver.
+  /// Drive every hosted group until an exit, then tear down (join the recv task before the socket
+  /// drop — the fd-release barrier, exactly as on the single driver). `run` returns `()` with NO
+  /// reason on a `shutdown()` command or every `MultiHandle` clone dropping (the command channel
+  /// disconnects and the buffered commands drain). Fault scope is PER GROUP: a poisoned group does
+  /// NOT exit `run` — it fails only its own parked work `Poisoned` while the other groups keep
+  /// running. A typed `run() -> Result` exit is future work. The single-group QUIC loop's iteration
+  /// order with the multi-group storage crank.
   pub async fn run(mut self) {
     use futures_util::{FutureExt, select_biased};
 
