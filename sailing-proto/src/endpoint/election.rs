@@ -567,14 +567,21 @@ where
   /// monotonic clock; a legally `(1+ρ_S)`-fast successor would clear a RAW wait in less REAL time than a
   /// deposed leader's lease on that window lasts (the bare bound is safe only when `ρ_S ≤ ρ_D`). Padding
   /// the LENGTH by this node's own `(1+ρ_S)` makes the monotonic clear land no earlier, in real time,
-  /// than the window elapses at the fastest admissible rate — for EVERY drift pair. A pure LENGTH bound
-  /// applied UNCONDITIONALLY, distinct from the E′ veto-SKIP permission (which stays wall-proof-gated).
-  /// `None` iff the exact ceil overflows a schedulable `u64` — the caller FAILS CLOSED (poison), never the
-  /// raw (under-waiting) window.
+  /// than the window elapses at the fastest admissible rate — for EVERY drift pair. A KNOB-LESS successor
+  /// (Safe / LeaseBased, or an invalid LeaseGuard pair) has no own `(Δ_S, ε_S)`, so it inflates by the
+  /// UNIVERSAL assumed clock-rate bound (`assumed_clock_rate_bound_ppm`) — NEVER the raw window it would
+  /// under-wait, and NEVER the off-mode lease knobs (mirroring E′'s fail-closed refusal to read them).
+  /// A pure LENGTH bound applied UNCONDITIONALLY, distinct from the E′ veto-SKIP permission (which stays
+  /// wall-proof-gated). `None` iff the exact ceil overflows a schedulable `u64` — the caller FAILS CLOSED
+  /// (poison), never the raw (under-waiting) window.
   fn inflate_inherited_wait(&self, window: u64) -> Option<u64> {
     let Some((delta, drift)) = self.leaseguard_timing() else {
-      // A successor with no VALIDATED LeaseGuard timing pair uses the raw inherited window.
-      return Some(window);
+      // A knob-less successor has no validated `(Δ_S, ε_S)`, but must still inflate: the raw window a
+      // legally faster successor would under-wait is unsafe, and refusing leadership would wedge the
+      // supported mixed Safe + LeaseGuard topology. Inflate by the UNIVERSAL assumed rate `ppm/1e6` as
+      // the exact rational `(1_000_000 + ppm)/1_000_000` (never the possibly-stale off-mode lease knobs).
+      let ppm = u128::from(self.config.assumed_clock_rate_bound_ppm());
+      return Self::inflate_by_rational(window, 1_000_000 + ppm, 1_000_000);
     };
     Self::inflate_by_rational(
       window,

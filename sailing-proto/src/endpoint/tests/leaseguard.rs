@@ -795,6 +795,141 @@ fn leaseguard_commit_wait_covers_inherited_max_window() {
   );
 }
 
+/// A KNOB-LESS successor (Safe mode, carrying INERT stale lease knobs) inherits a LeaseGuard leader's
+/// per-entry window and MUST still inflate its post-election commit-wait — by the UNIVERSAL assumed
+/// clock-rate bound, NOT the raw window a legally faster successor would under-wait, and NOT the
+/// off-mode lease knobs (`leaseguard_timing` fails closed on them). Refusing leadership is not an
+/// option: it would wedge the supported mixed Safe + LeaseGuard topology. Pins the STRICT inflation
+/// (held at the RAW window, released at the assumed-rate deadline) AND that the inert
+/// `lease_duration`/`clock_drift_bound` are never read (their `7/6` factor is never applied).
+#[test]
+fn safe_successor_inflates_inherited_wait_by_assumed_rate_bound() {
+  use crate::{
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse,
+  };
+  use core::time::Duration;
+
+  // A Safe successor. The lease knobs (Δ=300ms, ε=50ms ⇒ a 7/6 factor) are set but INERT under Safe —
+  // present ONLY to prove the inflation ignores them and uses the universal assumed rate instead.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(50));
+  assert_eq!(
+    cfg.read_only(),
+    ReadOnlyOption::Safe,
+    "the successor is knob-less (Safe) — the lease knobs are inert"
+  );
+  assert_eq!(
+    cfg.assumed_clock_rate_bound_ppm(),
+    1_000,
+    "the default assumed clock-rate bound is 1e-3 (1000 ppm)"
+  );
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  // A deposed LeaseGuard leader (node 2, term 5) replicated an entry stamped with its own 350ms window.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(350_000_000)
+      ],
+      Index::ZERO,
+    )),
+  );
+  ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // The deposed leader goes silent; node 1 times out, campaigns (term 6), wins, appends its no-op.
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(ep.role().is_leader());
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // peer 3 acks the no-op at index 2 → quorum, but the inherited commit-wait holds it.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    3u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(6),
+      3u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(2),
+    )),
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "held by the inherited commit-wait even though this successor serves Safe reads"
+  );
+
+  // The wait is the RAW 350ms window inflated by the UNIVERSAL assumed rate (1 + 1000/1e6):
+  // ceil(350_000_000 · 1_001_000 / 1_000_000) = 350_350_000ns. AT the raw window the commit is STILL
+  // held — a knob-less-but-legally-faster successor must not clear at the bare window.
+  ep.handle_timeout(d + Duration::from_nanos(350_000_000), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released at the RAW inherited window — the universal assumed-rate inflation still holds it"
+  );
+
+  // 1ns before the assumed-rate deadline: still held. Had the code read the inert 7/6 lease knobs the
+  // deadline would be 408_333_334ns; this pins it at the assumed-rate 350_350_000, not the stale knobs.
+  ep.handle_timeout(
+    d + Duration::from_nanos(350_350_000 - 1),
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.commit_index(),
+    Index::ZERO,
+    "not released before now + ceil(raw · (1 + ppm/1e6))"
+  );
+
+  // At the assumed-rate deadline the commit-wait fires; the inherited entry and the no-op commit.
+  ep.handle_timeout(d + Duration::from_nanos(350_350_000), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(2),
+    "released at now + ceil(350ms · 1_001_000/1_000_000) = 350_350_000ns (assumed rate, not the 7/6 knobs)"
+  );
+}
+
 /// FAILOVER-tier PRECISE commit-anchor: a successor that inherited a deposed FAILOVER leader's
 /// WALL-STAMPED entries lifts its post-election commit-wait as soon as the synchronized wall passes
 /// each inherited entry's own `wall_timestamp + lease_window` by `2·ε_unc` — committing FAR sooner
@@ -1374,13 +1509,21 @@ fn leaseguard_inherited_window_defers_commit_even_for_a_safe_successor() {
     "a Safe successor must still defer commit while a deposed LeaseGuard lease may be live"
   );
 
-  // Released at now + the inherited window (350ms) — proving the wait keyed on the inherited window,
-  // not on the successor's own read mode.
+  // The wait keys on the inherited window (350ms) INFLATED by the universal assumed clock-rate bound —
+  // regardless of the successor's read mode, and NOT the raw window a legally faster successor would
+  // under-wait. Held at the raw 350ms:
   ep.handle_timeout(d + Duration::from_millis(350), &mut log, &mut stable);
   assert_eq!(
     ep.commit_index(),
+    Index::ZERO,
+    "not released at the RAW inherited window — the assumed-rate inflation holds it, whatever the read mode"
+  );
+  // Released at now + ceil(350ms · (1 + 1000/1e6)) = 350_350_000ns.
+  ep.handle_timeout(d + Duration::from_nanos(350_350_000), &mut log, &mut stable);
+  assert_eq!(
+    ep.commit_index(),
     Index::new(2),
-    "released at now + inherited max_lease_window, independent of the successor's read mode"
+    "released at now + the assumed-rate-inflated inherited window, independent of the successor's read mode"
   );
 }
 
@@ -2944,10 +3087,13 @@ fn failover_unprovable_floor_hold_is_counted() {
   );
 
   // The driver now drops the wall on the release path: drive WALL-ABSENT due ticks. Each holds fail-closed
-  // and is COUNTED; commit stays pinned (the walled lease is never undercut).
+  // and is COUNTED; commit stays pinned (the walled lease is never undercut). The first due tick is the
+  // knob-less (Safe + ε_unc) inherited-window inflation ceil(W · (1 + 1000/1e6)) = 100_100_000ns, not the
+  // bare W — a legally faster successor must not clear at the raw window.
+  const W_INFLATED: u64 = 100_100_000;
   let mono = |off: u64| Now::monotonic(d + Duration::from_nanos(off));
   for k in 1..=3u64 {
-    ep.handle_timeout(mono(W + (k - 1) * HB), &mut log, &mut stable);
+    ep.handle_timeout(mono(W_INFLATED + (k - 1) * HB), &mut log, &mut stable);
     while ep.poll_message().is_some() {}
     assert_eq!(
       ep.commit_index(),

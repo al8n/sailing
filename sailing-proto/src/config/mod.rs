@@ -158,6 +158,11 @@ pub const DEFAULT_LEASE_DURATION: Option<Duration> = None;
 pub const DEFAULT_CLOCK_DRIFT_BOUND: Option<Duration> = None;
 /// Default [`Config::bounded_clock_uncertainty`]: no bounded cross-node clock-uncertainty configured.
 pub const DEFAULT_BOUNDED_CLOCK_UNCERTAINTY: Option<Duration> = None;
+/// Default [`Config::assumed_clock_rate_bound_ppm`]: `1000` parts-per-million (`1e-3`) — the one-sided
+/// monotonic clock-rate bound a successor WITHOUT a validated LeaseGuard timing pair assumes when
+/// inflating an inherited commit-wait. An order of magnitude beyond real crystal / NTP-disciplined
+/// monotonic drift, so it over-waits rather than under-covers a deposed leader's lease.
+pub const DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM: u32 = 1_000;
 /// Default [`Config::election_timeout`]: 1s (10× the heartbeat — etcd's standard ratio). Exceeds
 /// [`DEFAULT_HEARTBEAT_INTERVAL`], so the parsed-path `election_timeout > heartbeat_interval`
 /// invariant holds for a config that defaults both.
@@ -240,6 +245,10 @@ const fn default_election_timeout() -> Duration {
 #[cfg(feature = "serde")]
 const fn default_heartbeat_interval() -> Duration {
   DEFAULT_HEARTBEAT_INTERVAL
+}
+#[cfg(feature = "serde")]
+const fn default_assumed_clock_rate_bound_ppm() -> u32 {
+  DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM
 }
 
 /// Static configuration for an [`crate::Endpoint`]. Holds the initial voter set (dynamic
@@ -336,6 +345,13 @@ pub struct Config<I> {
   /// Default: `None`.
   #[cfg_attr(feature = "serde", serde(with = "humantime_serde"))]
   bounded_clock_uncertainty: Option<Duration>,
+  /// The one-sided monotonic clock-RATE bound (parts-per-million) a successor assumes when it must
+  /// inflate an inherited LeaseGuard commit-wait but has NO validated timing pair of its own (a Safe /
+  /// LeaseBased node, or an invalid LeaseGuard config). UNIVERSAL and mode-independent — read regardless
+  /// of `read_only`, so a knob-less successor never consults the (possibly stale) off-mode lease knobs.
+  /// A validated LeaseGuard successor instead uses its own `clock_drift_bound / lease_duration` rate.
+  /// Default: [`DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM`] (`1e-3`).
+  assumed_clock_rate_bound_ppm: u32,
 }
 
 impl<I: PartialEq> Config<I> {
@@ -387,6 +403,7 @@ impl<I: PartialEq> Config<I> {
       lease_duration: DEFAULT_LEASE_DURATION,
       clock_drift_bound: DEFAULT_CLOCK_DRIFT_BOUND,
       bounded_clock_uncertainty: DEFAULT_BOUNDED_CLOCK_UNCERTAINTY,
+      assumed_clock_rate_bound_ppm: DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM,
     })
   }
 
@@ -442,6 +459,7 @@ impl<I: PartialEq> Config<I> {
       lease_duration: DEFAULT_LEASE_DURATION,
       clock_drift_bound: DEFAULT_CLOCK_DRIFT_BOUND,
       bounded_clock_uncertainty: DEFAULT_BOUNDED_CLOCK_UNCERTAINTY,
+      assumed_clock_rate_bound_ppm: DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM,
     })
   }
 
@@ -849,6 +867,28 @@ impl<I> Config<I> {
     self
   }
 
+  /// The universal assumed monotonic clock-RATE bound (parts-per-million) for a successor with no
+  /// validated LeaseGuard timing pair. See [`assumed_clock_rate_bound_ppm`](Self::assumed_clock_rate_bound_ppm).
+  #[inline(always)]
+  pub const fn assumed_clock_rate_bound_ppm(&self) -> u32 {
+    self.assumed_clock_rate_bound_ppm
+  }
+
+  /// Override the universal assumed clock-rate bound (parts-per-million; consuming).
+  #[inline(always)]
+  #[must_use]
+  pub const fn with_assumed_clock_rate_bound_ppm(mut self, ppm: u32) -> Self {
+    self.set_assumed_clock_rate_bound_ppm(ppm);
+    self
+  }
+
+  /// Override the universal assumed clock-rate bound (parts-per-million) in place.
+  #[inline(always)]
+  pub const fn set_assumed_clock_rate_bound_ppm(&mut self, ppm: u32) -> &mut Self {
+    self.assumed_clock_rate_bound_ppm = ppm;
+    self
+  }
+
   /// The SINGLE validating builder both parse mirrors funnel through: direct-construct the private
   /// fields from the already-parsed parts, then run [`Self::validate`]. Keeping the construction +
   /// validation in one place is what stops the two mirrors (serde's `ConfigSerde`, clap's `ConfigCli`)
@@ -875,6 +915,7 @@ impl<I> Config<I> {
     lease_duration: Option<Duration>,
     clock_drift_bound: Option<Duration>,
     bounded_clock_uncertainty: Option<Duration>,
+    assumed_clock_rate_bound_ppm: u32,
   ) -> Result<Self, ConfigError> {
     let cfg = Self {
       id,
@@ -895,6 +936,7 @@ impl<I> Config<I> {
       lease_duration,
       clock_drift_bound,
       bounded_clock_uncertainty,
+      assumed_clock_rate_bound_ppm,
     };
     cfg.validate()?;
     Ok(cfg)
@@ -1149,6 +1191,8 @@ where
   clock_drift_bound: Option<Duration>,
   #[serde(default, with = "humantime_serde")]
   bounded_clock_uncertainty: Option<Duration>,
+  #[serde(default = "default_assumed_clock_rate_bound_ppm")]
+  assumed_clock_rate_bound_ppm: u32,
 }
 
 #[cfg(feature = "serde")]
@@ -1178,6 +1222,7 @@ where
       c.lease_duration,
       c.clock_drift_bound,
       c.bounded_clock_uncertainty,
+      c.assumed_clock_rate_bound_ppm,
     )
   }
 }
@@ -1332,6 +1377,13 @@ where
     value_parser = humantime::parse_duration
   )]
   bounded_clock_uncertainty: Option<Duration>,
+  #[arg(
+    id = "config-assumed-clock-rate-bound-ppm",
+    long = "assumed-clock-rate-bound-ppm",
+    env = "SAILING_ASSUMED_CLOCK_RATE_BOUND_PPM",
+    default_value_t = DEFAULT_ASSUMED_CLOCK_RATE_BOUND_PPM
+  )]
+  assumed_clock_rate_bound_ppm: u32,
 }
 
 #[cfg(feature = "clap")]
@@ -1362,6 +1414,7 @@ where
       c.lease_duration,
       c.clock_drift_bound,
       c.bounded_clock_uncertainty,
+      c.assumed_clock_rate_bound_ppm,
     )
   }
 }
