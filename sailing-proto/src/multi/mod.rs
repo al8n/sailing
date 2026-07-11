@@ -444,11 +444,18 @@ where
   /// Groups that may have a pending outbound message to drain (see [`poll_message`](Self::poll_message)).
   /// Enqueued after every dispatch and removed lazily once the group's message queue is exhausted.
   dirty_msgs: VecDeque<G>,
+  /// Membership mirror of `dirty_msgs`: holds exactly the queued gids, so `mark_dirty` enqueues a
+  /// group at most once while it stays queued (the bound the queue relies on under interleaving).
+  dirty_msgs_set: BTreeSet<G>,
   /// Groups that may have a pending event to drain (see [`poll_event`](Self::poll_event)).
   dirty_events: VecDeque<G>,
+  /// Membership mirror of `dirty_events`, kept exact with it at every push and pop.
+  dirty_events_set: BTreeSet<G>,
   /// Groups that may have a staged pending fork to relay (see
   /// [`poll_pending_fork`](Self::poll_pending_fork)).
   dirty_forks: VecDeque<G>,
+  /// Membership mirror of `dirty_forks`, kept exact with it at every push and pop.
+  dirty_forks_set: BTreeSet<G>,
   /// Parents whose HEAD fork is PARKED on a hosted-child conflict (see
   /// [`poll_pending_fork`](Self::poll_pending_fork)): the fork stays staged (blob retained, the
   /// snapshot fence armed, the relay guard unmoved) and is re-examined at the top of every relay
@@ -493,8 +500,11 @@ where
     Self {
       groups: BTreeMap::new(),
       dirty_msgs: VecDeque::new(),
+      dirty_msgs_set: BTreeSet::new(),
       dirty_events: VecDeque::new(),
+      dirty_events_set: BTreeSet::new(),
       dirty_forks: VecDeque::new(),
+      dirty_forks_set: BTreeSet::new(),
       parked: BTreeSet::new(),
       conflicts: VecDeque::new(),
       lineage: BTreeMap::new(),
@@ -891,6 +901,7 @@ where
         Some(msg) => return Some((gid, msg)),
         None => {
           self.dirty_msgs.pop_front();
+          self.dirty_msgs_set.remove(&gid);
         }
       }
     }
@@ -904,22 +915,26 @@ where
         Some(ev) => return Some((gid, ev)),
         None => {
           self.dirty_events.pop_front();
+          self.dirty_events_set.remove(&gid);
         }
       }
     }
     None
   }
 
-  /// Enqueue a group for output draining after a dispatch. Consecutive-deduped so a burst of
-  /// dispatches to one group between drains does not grow the queues unboundedly.
+  /// Enqueue a group for output draining after a dispatch. Membership-deduped against each queue's
+  /// companion set, so at most one entry per group per queue is live between drains — interleaved
+  /// dispatches across many groups (A,B,A,B,…) never grow a queue past the count of distinct dirty
+  /// groups, and a group re-marked while still queued is not re-enqueued (its pending visit drains
+  /// everything staged since).
   fn mark_dirty(&mut self, gid: &G) {
-    if self.dirty_msgs.back() != Some(gid) {
+    if self.dirty_msgs_set.insert(gid.cheap_clone()) {
       self.dirty_msgs.push_back(gid.cheap_clone());
     }
-    if self.dirty_events.back() != Some(gid) {
+    if self.dirty_events_set.insert(gid.cheap_clone()) {
       self.dirty_events.push_back(gid.cheap_clone());
     }
-    if self.dirty_forks.back() != Some(gid) {
+    if self.dirty_forks_set.insert(gid.cheap_clone()) {
       self.dirty_forks.push_back(gid.cheap_clone());
     }
   }
@@ -1032,13 +1047,17 @@ where
           // Arm (b): the head fork resolved as redundant — later forks of this parent flow
           // through the ordinary drain below.
           self.unpark(&gid);
-          self.dirty_forks.push_back(gid);
+          if self.dirty_forks_set.insert(gid.cheap_clone()) {
+            self.dirty_forks.push_back(gid);
+          }
         }
         HeadFork::Parked => {}
         HeadFork::Yield(fork) => {
           // Arm (a): the squatter is gone and the fork materializes normally.
           self.unpark(&gid);
-          self.dirty_forks.push_back(gid);
+          if self.dirty_forks_set.insert(gid.cheap_clone()) {
+            self.dirty_forks.push_back(gid);
+          }
           return Some(fork);
         }
       }
@@ -1047,11 +1066,13 @@ where
       // A parked parent's queue is owned by the sweep above (head-of-line by design).
       if self.parked.contains(&gid) {
         self.dirty_forks.pop_front();
+        self.dirty_forks_set.remove(&gid);
         continue;
       }
       match self.examine_head_fork(&gid) {
         HeadFork::Empty | HeadFork::Parked => {
           self.dirty_forks.pop_front();
+          self.dirty_forks_set.remove(&gid);
         }
         // Re-examine the same parent: its next staged fork (if any) is now at the head.
         HeadFork::Resolved => {}

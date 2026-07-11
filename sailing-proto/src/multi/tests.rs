@@ -81,6 +81,39 @@ fn route_until_quiescent(
 }
 
 #[test]
+fn dirty_queues_dedup_interleaved_marks_by_membership() {
+  // Interleaved dispatches across groups (A,B,A,B,…) must not grow the dirty queues without
+  // bound: the membership mirror caps each queue at one entry per distinct dirty group. 2*n
+  // alternating marks leave at most the two ids queued (consecutive-dedup alone kept all 2*n,
+  // because each mark's predecessor is the OTHER group).
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (a, b) = (1u64, 2u64);
+  for _ in 0..64 {
+    m.mark_dirty(&a);
+    m.mark_dirty(&b);
+  }
+  assert!(
+    m.dirty_msgs.len() <= 2,
+    "dirty_msgs grew to {}",
+    m.dirty_msgs.len()
+  );
+  assert!(
+    m.dirty_events.len() <= 2,
+    "dirty_events grew to {}",
+    m.dirty_events.len()
+  );
+  assert!(
+    m.dirty_forks.len() <= 2,
+    "dirty_forks grew to {}",
+    m.dirty_forks.len()
+  );
+  // Each mirror stays exact with its queue.
+  assert_eq!(m.dirty_msgs_set.len(), m.dirty_msgs.len());
+  assert_eq!(m.dirty_events_set.len(), m.dirty_events.len());
+  assert_eq!(m.dirty_forks_set.len(), m.dirty_forks.len());
+}
+
+#[test]
 fn fork_boots_at_the_synthetic_baseline() {
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
