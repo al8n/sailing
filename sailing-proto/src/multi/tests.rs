@@ -9784,3 +9784,142 @@ fn poisoned_absorb_surfaces_no_resolution() {
     "the extracted source endpoint is consumed either way (its stores are not)"
   );
 }
+
+/// A backlogged group cannot starve its co-hosted neighbours. Each group's apply is INDEPENDENTLY
+/// budget-bounded per crank: a group whose commit leapt far ahead of applied (a catch-up follower —
+/// the classic budget-cut source, since a steady leader's commit paces at the storage-drain budget so
+/// apply keeps up) applies at most one budget per `handle_storage` crank and reports `MorePending` to
+/// be re-driven, while a co-hosted group with a small backlog applies to completion in its OWN crank —
+/// the fairness witness. The backlogged group then fully drains over repeated cranks — the liveness
+/// witness. Driven through the container's public message + storage path: the >budget backlog arrives
+/// as ONE large committed AppendEntries (the driver's per-crank storage pass visits every group, so a
+/// budget-cut group yields after its own budget rather than monopolizing the crank).
+#[test]
+fn a_backlogged_group_cannot_starve_its_co_hosted_neighbors() {
+  use crate::endpoint::{APPLY_BUDGET_ENTRIES, MAX_READ_BATCH_ENTRIES};
+
+  // A committed Normal entry the CountSm decodes and applies.
+  let mut buf = Vec::new();
+  Data::encode(&Bytes::from_static(b"x"), &mut buf);
+  let payload = Bytes::from(buf);
+  let entry = |i: u64| {
+    crate::Entry::new(
+      Term::new(1),
+      Index::new(i),
+      crate::EntryKind::Normal,
+      payload.clone(),
+    )
+  };
+  // Snapshot threshold ABOVE the whole backlog so no capture/compaction perturbs the drain counters.
+  let cfg = || {
+    Config::try_new(
+      1u64,
+      std::vec![1u64, 2],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+    .with_snapshot_threshold((10 * APPLY_BUDGET_ENTRIES) as usize)
+  };
+
+  let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
+  let (mut la, mut sa) = (VecLog::default(), AsyncStable::default());
+  let (mut lb, mut sb) = (VecLog::default(), AsyncStable::default());
+  m.create_group(100, 0, cfg(), Instant::ORIGIN, 42, CountSm::default())
+    .unwrap();
+  m.create_group(200, 0, cfg(), Instant::ORIGIN, 43, CountSm::default())
+    .unwrap();
+  let now = Instant::ORIGIN;
+
+  // Group A (100): a committed backlog of THREE budgets, delivered as ONE AppendEntries from leader 2.
+  // `on_append_entries` itself applies one budget then the budget cuts, so even at delivery A is far
+  // from drained — a re-crank per remaining budget is required.
+  let big = 3 * APPLY_BUDGET_ENTRIES;
+  let a_entries: Vec<crate::Entry> = (1..=big).map(entry).collect();
+  m.handle_message(
+    &100,
+    now,
+    &mut la,
+    &mut sa,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      a_entries,
+      Index::new(big),
+    )),
+  )
+  .unwrap();
+  // Group B (200): one command, delivered the same way.
+  m.handle_message(
+    &200,
+    now,
+    &mut lb,
+    &mut sb,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![entry(1)],
+      Index::new(1),
+    )),
+  )
+  .unwrap();
+
+  // The delivery applied one budget and the budget cut — A holds a multi-budget backlog still.
+  assert!(
+    m.group(&100).unwrap().applied_index() < m.group(&100).unwrap().commit_index(),
+    "A's delivery cannot drain a 3-budget backlog — the budget cut it"
+  );
+
+  // B applies to completion in a bounded number of cranks WHILE A's backlog is untouched — B's
+  // progress does not wait on A's backlog (the fairness witness).
+  let mut b_cranks = 0u32;
+  while matches!(
+    m.handle_storage(&200, now, &mut lb, &mut sb),
+    Some(StorageProgress::MorePending)
+  ) {
+    b_cranks += 1;
+    assert!(b_cranks < 100, "B applies its command in bounded passes");
+  }
+  assert_eq!(
+    m.group(&200).unwrap().applied_index(),
+    m.group(&200).unwrap().commit_index(),
+    "B fully applied — its completion does not wait on A's backlog"
+  );
+  assert!(
+    m.group(&100).unwrap().applied_index() < m.group(&100).unwrap().commit_index(),
+    "A is STILL draining while B is already done (the fairness witness)"
+  );
+
+  // A fully drains over repeated cranks (the liveness witness); each crank advances applied by at
+  // most one budget + one batch — a backlogged group can never monopolize a crank.
+  let mut cranks = 0u32;
+  loop {
+    let before = m.group(&100).unwrap().applied_index().get();
+    let progress = m.handle_storage(&100, now, &mut la, &mut sa);
+    let after = m.group(&100).unwrap().applied_index().get();
+    assert!(
+      after - before <= APPLY_BUDGET_ENTRIES + MAX_READ_BATCH_ENTRIES,
+      "a crank applied {} entries — must be at most one budget + one batch",
+      after - before
+    );
+    cranks += 1;
+    assert!(
+      cranks < 1000,
+      "the budgeted drain completes in bounded cranks"
+    );
+    if !matches!(progress, Some(StorageProgress::MorePending)) {
+      break;
+    }
+  }
+  assert_eq!(
+    m.group(&100).unwrap().applied_index(),
+    m.group(&100).unwrap().commit_index(),
+    "A fully drains to applied == commit"
+  );
+}
