@@ -268,8 +268,8 @@ async fn engine_barrier_amortizes_ops_across_groups() {
   assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"w").await, 1);
   assert_eq!(submit_anywhere(std::slice::from_ref(&g200), b"w").await, 1);
 
-  let flushes0 = metrics.flushes();
-  let ops0 = metrics.ops_flushed();
+  let barriers0 = metrics.barriers();
+  let ops0 = metrics.ops_batched();
 
   let mut futs = Vec::new();
   for _ in 0..8 {
@@ -282,14 +282,14 @@ async fn engine_barrier_amortizes_ops_across_groups() {
     r.expect("every burst submit commits");
   }
 
-  let flushes1 = metrics.flushes();
-  let ops1 = metrics.ops_flushed();
-  assert!(flushes1 > 0, "the barrier ran");
+  let barriers1 = metrics.barriers();
+  let ops1 = metrics.ops_batched();
+  assert!(barriers1 > 0, "the barrier ran");
   assert!(
-    ops1 - ops0 > flushes1 - flushes0,
+    ops1 - ops0 > barriers1 - barriers0,
     "the burst amortized: {} ops rode {} barriers",
     ops1 - ops0,
-    flushes1 - flushes0
+    barriers1 - barriers0
   );
 }
 

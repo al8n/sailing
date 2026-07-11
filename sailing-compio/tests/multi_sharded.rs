@@ -249,11 +249,11 @@ fn sharded_host_commits_and_isolates_planes() {
   // independently-nonzero counters on one node witness the independent WALs).
   for h in &handles {
     assert!(
-      h.engine_metrics(shard_a).unwrap().flushes() > 0,
+      h.engine_metrics(shard_a).unwrap().barriers() > 0,
       "plane {shard_a}'s barrier ran"
     );
     assert!(
-      h.engine_metrics(shard_b).unwrap().flushes() > 0,
+      h.engine_metrics(shard_b).unwrap().barriers() > 0,
       "plane {shard_b}'s barrier ran"
     );
   }

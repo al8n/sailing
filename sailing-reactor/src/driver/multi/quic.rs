@@ -604,7 +604,7 @@ where
     self.flush_pending = self.engine.has_staged() || more;
     self
       .metrics
-      .record(self.engine.flushes(), self.engine.ops_flushed());
+      .record(self.engine.barriers(), self.engine.ops_batched());
   }
 
   /// Dial every configured peer with no bound connection whose backoff has elapsed (the

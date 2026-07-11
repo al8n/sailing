@@ -562,9 +562,9 @@ where
   }
 
   /// The per-crank storage step, replacing the single loop's one `handle_storage` call:
-  /// (a) ONE engine flush — the batched durability barrier every hosted group's staged writes
-  /// share, the fsync-amortization point — gated on the pending-flush flag so an idle pass never
-  /// burns a barrier on a knowably-empty batch; then (b) every hosted group's completion drain,
+  /// (a) ONE engine flush — the batched in-memory visibility barrier every hosted group's staged
+  /// writes share, the cross-group batching point — gated on the pending-flush flag so an idle pass
+  /// never burns a barrier on a knowably-empty batch; then (b) every hosted group's completion drain,
   /// re-driving a budget-cut group at most [`STORAGE_REDRIVES`] times (the remainder rides the
   /// next crank). v1 deliberately iterates ALL hosted groups — an idle group's drain is a cheap
   /// no-op poll — with dirty-set tracking as the scale refinement.
@@ -708,7 +708,7 @@ where
     self.flush_pending = self.engine.has_staged() || more;
     self
       .metrics
-      .record(self.engine.flushes(), self.engine.ops_flushed());
+      .record(self.engine.barriers(), self.engine.ops_batched());
   }
 
   /// One inbound bridge frame: feed bytes/EOF to the coordinator, which demuxes each frame's

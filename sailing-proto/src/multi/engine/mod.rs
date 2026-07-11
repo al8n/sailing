@@ -1,16 +1,16 @@
-//! A shared in-memory group-storage engine with ONE batched durability barrier.
+//! A shared in-memory group-storage engine with ONE batched visibility barrier.
 //!
 //! [`GroupEngine`] hosts every co-located Raft group's log and stable state and lends each group a
 //! `(log, stable)` handle pair ([`EngineLog`], [`EngineStable`]) implementing the ordinary
 //! single-group [`LogStore`]/[`StableStore`] contracts, with one engine-wide difference: a
 //! `submit_*`/`compact` STAGES its completion instead of enqueueing it, and only
-//! [`GroupEngine::flush`] — the durability barrier — releases every group's staged completions
-//! into that group's poll FIFO. One flush is one fsync-equivalent covering ALL groups' staged
-//! writes: the cross-group fsync amortization the multi-Raft design exists for. This is the
-//! Sans-I/O reference implementation of the Phase-2 storage contract in `MULTI_RAFT.md`; a disk
-//! engine mirrors these semantics over group-prefixed keys and a real write batch — INCLUDING
-//! the per-group lineage records (incarnation gen + admission floor), which outlive
-//! `remove_group` and fold at the same barrier.
+//! [`GroupEngine::flush`] — the batch barrier — releases every group's staged completions
+//! into that group's poll FIFO. One flush is one batched in-memory visibility barrier covering ALL
+//! groups' staged writes — NOT crash durability: the cross-group batching the multi-Raft design
+//! exists for. This is the Sans-I/O reference implementation of the Phase-2 storage contract in
+//! `MULTI_RAFT.md`; a disk engine mirrors these semantics over group-prefixed keys and a real
+//! write batch — the durable form — INCLUDING the per-group lineage records (incarnation gen +
+//! admission floor), which outlive `remove_group` and fold at the same barrier.
 //!
 //! The per-group storage invariants hold BY CONSTRUCTION under a barrier: log durability is
 //! prefix-ordered because everything staged becomes durable together, and stable completions
@@ -98,7 +98,7 @@ impl LineageRecord {
 }
 
 /// A shared in-memory storage engine: ONE engine hosts EVERY co-located group's replicated log
-/// and stable state, keyed by group id, with a single batched durability barrier
+/// and stable state, keyed by group id, with a single batched visibility barrier
 /// ([`flush`](Self::flush)) spanning all of them.
 ///
 /// Per-group handles come from [`stores`](Self::stores) — and, under the `tcp` feature, from the
@@ -118,8 +118,8 @@ pub struct GroupEngine<G, I> {
   /// Lineage writes staged since the last barrier, monotone-max folded into `lineage` by
   /// [`flush`](Self::flush).
   lineage_staged: BTreeMap<G, LineageRecord>,
-  flushes: u64,
-  ops_flushed: u64,
+  barriers: u64,
+  ops_batched: u64,
   /// The per-group snapshot-staging byte cap (see
   /// [`set_snapshot_staging_cap`](Self::set_snapshot_staging_cap)); allocator-bound by default.
   staging_cap: usize,
@@ -136,8 +136,8 @@ impl<G, I> GroupEngine<G, I> {
       groups: BTreeMap::new(),
       lineage: BTreeMap::new(),
       lineage_staged: BTreeMap::new(),
-      flushes: 0,
-      ops_flushed: 0,
+      barriers: 0,
+      ops_batched: 0,
       staging_cap: usize::MAX,
     }
   }
@@ -171,17 +171,17 @@ impl<G, I> GroupEngine<G, I> {
   }
 
   /// How many times [`flush`](Self::flush) has run — every call counts, including a barrier that
-  /// released nothing. Together with [`ops_flushed`](Self::ops_flushed) this is the amortization
-  /// metric: operations per flush is the cross-group batch factor.
+  /// released nothing. Together with [`ops_batched`](Self::ops_batched) this is the batch metric:
+  /// operations per barrier is the cross-group batch factor.
   #[must_use]
-  pub const fn flushes(&self) -> u64 {
-    self.flushes
+  pub const fn barriers(&self) -> u64 {
+    self.barriers
   }
 
   /// Total operations completed across every [`flush`](Self::flush) so far.
   #[must_use]
-  pub const fn ops_flushed(&self) -> u64 {
-    self.ops_flushed
+  pub const fn ops_batched(&self) -> u64 {
+    self.ops_batched
   }
 
   /// Whether ANY hosted group holds staged-but-unreleased work — the driver's exact re-arm signal
@@ -202,13 +202,15 @@ impl<G, I> GroupEngine<G, I> {
       || !self.lineage_staged.is_empty()
   }
 
-  /// THE durability barrier: make every group's staged log appends/compactions and stable
-  /// writes/snapshots durable at once, releasing their completions into each owning group's poll
+  /// THE batch barrier: make every group's staged log appends/compactions and stable
+  /// writes/snapshots VISIBLE at once, releasing their completions into each owning group's poll
   /// FIFO. Returns the number of operations completed across all groups.
   ///
-  /// One flush is one fsync-equivalent covering EVERY hosted group's staged writes — the
-  /// cross-group batching a multi-Raft host exists for (a disk engine renders it as one write
-  /// batch + one fsync over group-prefixed keys). The per-group contracts hold trivially under a
+  /// One flush is one batched in-memory visibility barrier covering EVERY hosted group's staged
+  /// writes — NOT crash durability (this engine is in-memory; the host drivers' "Storage is
+  /// in-memory" notes say the same): the cross-group batching a multi-Raft host exists for (a disk
+  /// engine renders the same barrier as one write batch + one fsync over group-prefixed keys, and
+  /// only that adds durability). The per-group contracts hold trivially under a
   /// barrier: log durability is prefix-ordered (everything staged becomes durable together), and
   /// stable completions release in submit order (each group's staging is a FIFO). Log completions
   /// release in submit order too — the trait permits any order; submit order is the simplest
@@ -228,8 +230,8 @@ impl<G, I> GroupEngine<G, I> {
       self.lineage.entry(gid).or_default().fold(staged);
       released += 1;
     }
-    self.flushes += 1;
-    self.ops_flushed += released as u64;
+    self.barriers += 1;
+    self.ops_batched += released as u64;
     released
   }
 }

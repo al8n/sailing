@@ -5,7 +5,7 @@
 //! # The plane model
 //!
 //! Every core runs a FULL compio multi-group driver — its own fused coordinator, its own
-//! [`GroupEngine`](sailing_proto::GroupEngine) (a per-core WAL barrier: zero cross-core fsync
+//! [`GroupEngine`](sailing_proto::GroupEngine) (a per-core batch barrier: zero cross-core barrier
 //! contention), and its own TCP listener on a per-shard port — hosting the disjoint subset of
 //! groups a cluster-wide-consistent [`ShardMap`] assigns it. Because every node runs the SAME
 //! map (same K, same mapping), group `g`'s replicas always talk `shard(g)` ↔ `shard(g)`: the
@@ -161,7 +161,7 @@ where
 /// solicitation for a group lands on the WRONG plane here, and a catalog-backed factory (the
 /// natural embedder shape — catalogs are not plane-aware) would materialize it there; a later
 /// correctly-routed create then leaves TWO local replicas of the group under this node's ONE
-/// identity, on independent WAL barriers — one voter that can ack and vote twice. With the
+/// identity, on independent batch barriers — one voter that can ack and vote twice. With the
 /// guard the decline falls into the driver's ordinary path: no build, no create, and the
 /// solicitation surfaces as [`LifecycleEvent::UnknownGroup`] on the shared tail, so the
 /// embedder OBSERVES the skew instead of the cluster silently splitting a group. The contract
@@ -283,7 +283,7 @@ fn shard_addr(base: SocketAddr, shard: usize) -> Option<SocketAddr> {
 ///   cluster runs the same K, the same map, and the same port convention (or the same explicit
 ///   per-shard lists), so `shard(g)` on one node always reaches `shard(g)` on another.
 /// - Per-plane engines: each plane owns its own [`GroupEngine`](sailing_proto::GroupEngine) —
-///   K independent durability barriers, no cross-core fsync contention, observable per plane
+///   K independent batch barriers, no cross-core barrier contention, observable per plane
 ///   through [`ShardedMultiHandle::engine_metrics`].
 /// - Per-plane multi semantics unchanged: coalescing, quiescence, tombstones, lifecycle
 ///   surfacing, and factories all run inside each plane exactly as on a single multi driver;
@@ -789,7 +789,7 @@ where
     self.shards.get(shard)
   }
 
-  /// One plane's engine counters (its own durability barrier + quiesced-group gauge) — the
+  /// One plane's engine counters (its own batch barrier + quiesced-group gauge) — the
   /// per-plane observability that makes the independent barriers visible.
   #[must_use]
   pub fn engine_metrics(&self, shard: usize) -> Option<&EngineMetrics> {

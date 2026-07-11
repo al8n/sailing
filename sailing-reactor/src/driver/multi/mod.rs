@@ -247,9 +247,9 @@ where
 }
 
 /// Cross-thread observability for a multi driver: the driver republishes the shared engine's
-/// [`flushes`](sailing_proto::GroupEngine::flushes) /
-/// [`ops_flushed`](sailing_proto::GroupEngine::ops_flushed) counters after every storage crank —
-/// so a test or operator thread can watch the fsync-amortization ratio (operations per barrier)
+/// [`barriers`](sailing_proto::GroupEngine::barriers) /
+/// [`ops_batched`](sailing_proto::GroupEngine::ops_batched) counters after every storage crank —
+/// so a test or operator thread can watch the batch ratio (operations per barrier)
 /// while the driver task exclusively owns the engine — plus the QUIESCED-group gauge the driver's
 /// scheduler maintains (idle groups whose timers it neither arms nor sweeps), published after
 /// every quiesce sweep. Obtain it from the driver BEFORE spawning `run()` (e.g.
@@ -261,24 +261,24 @@ pub struct EngineMetrics {
 
 #[derive(Default)]
 struct EngineMetricsInner {
-  flushes: AtomicU64,
-  ops_flushed: AtomicU64,
+  barriers: AtomicU64,
+  ops_batched: AtomicU64,
   quiesced_groups: AtomicU64,
 }
 
 impl EngineMetrics {
-  /// Durability barriers run so far (every [`GroupEngine::flush`](sailing_proto::GroupEngine::flush)
+  /// Batch barriers run so far (every [`GroupEngine::flush`](sailing_proto::GroupEngine::flush)
   /// call counts, including one that released nothing).
   #[must_use]
-  pub fn flushes(&self) -> u64 {
-    self.inner.flushes.load(Ordering::Acquire)
+  pub fn barriers(&self) -> u64 {
+    self.inner.barriers.load(Ordering::Acquire)
   }
 
-  /// Total storage operations completed across every barrier so far. `ops_flushed / flushes` is
+  /// Total storage operations completed across every barrier so far. `ops_batched / barriers` is
   /// the cross-group batch factor the shared engine exists for.
   #[must_use]
-  pub fn ops_flushed(&self) -> u64 {
-    self.inner.ops_flushed.load(Ordering::Acquire)
+  pub fn ops_batched(&self) -> u64 {
+    self.inner.ops_batched.load(Ordering::Acquire)
   }
 
   /// The number of hosted groups currently QUIESCED (idle: the driver neither arms nor sweeps
@@ -289,9 +289,9 @@ impl EngineMetrics {
   }
 
   /// Publish the engine's current counters (driver-side, once per crank).
-  pub(crate) fn record(&self, flushes: u64, ops_flushed: u64) {
-    self.inner.flushes.store(flushes, Ordering::Release);
-    self.inner.ops_flushed.store(ops_flushed, Ordering::Release);
+  pub(crate) fn record(&self, barriers: u64, ops_batched: u64) {
+    self.inner.barriers.store(barriers, Ordering::Release);
+    self.inner.ops_batched.store(ops_batched, Ordering::Release);
   }
 
   /// Publish the quiesced-group gauge (driver-side, once per quiesce sweep).

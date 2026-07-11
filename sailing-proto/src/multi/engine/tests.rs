@@ -232,14 +232,14 @@ fn one_flush_covers_every_group() {
       HardState::initial().with_term(Term::new(1)),
     );
   }
-  assert_eq!((eng.flushes(), eng.ops_flushed()), (0, 0));
+  assert_eq!((eng.barriers(), eng.ops_batched()), (0, 0));
 
   assert_eq!(
     eng.flush(),
     6,
     "one barrier covers all three groups' appends and writes"
   );
-  assert_eq!((eng.flushes(), eng.ops_flushed()), (1, 6));
+  assert_eq!((eng.barriers(), eng.ops_batched()), (1, 6));
 
   for gid in [1u64, 2, 3] {
     let (log, stable) = eng.stores(&gid).unwrap();
@@ -256,7 +256,7 @@ fn one_flush_covers_every_group() {
   }
 
   assert_eq!(eng.flush(), 0, "nothing staged: the barrier is a no-op");
-  assert_eq!((eng.flushes(), eng.ops_flushed()), (2, 6));
+  assert_eq!((eng.barriers(), eng.ops_batched()), (2, 6));
 }
 
 /// Stable completions are ORDERED (submit order) per group: two hard-state writes and a snapshot
@@ -658,7 +658,7 @@ mod engine_backed_cluster {
     now: Instant,
     /// `ea.flush()` calls that released at least one op (the effective barriers).
     a_effective_flushes: u64,
-    /// Total ops those barriers released (must mirror `ea.ops_flushed()`).
+    /// Total ops those barriers released (must mirror `ea.ops_batched()`).
     a_ops: u64,
   }
 
@@ -827,7 +827,7 @@ mod engine_backed_cluster {
     // barrier above released more, so completed ops strictly outnumber the barriers that
     // completed them.
     assert_eq!(
-      w.ea.ops_flushed(),
+      w.ea.ops_batched(),
       w.a_ops,
       "the engine's cumulative metric matches the harness's accounting"
     );
