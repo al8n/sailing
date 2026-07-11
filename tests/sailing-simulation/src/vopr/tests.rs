@@ -146,9 +146,9 @@ fn vopr_exercises_leaseguard_under_drift() {
   // the superseded path too, but this assertion is specifically the rate-drift cross-leader case). Re-
   // derive from the `drift_sweep` example's `SUPERSEDED-SERVE ... drifted=true` lines if they fall to
   // zero — the seeds are schedule-sensitive, so any change to the per-round message flow (heartbeat
-  // rounds, replication fan-out) can move which seeds reach the path; the current pair came from a
-  // 0..1024 sweep at this tick count.
-  let superseded: u64 = [540u64, 560]
+  // rounds, replication fan-out, leader-transfer handoffs) can move which seeds reach the path; the
+  // current pair came from a 0..700 sweep at this tick count.
+  let superseded: u64 = [573u64, 586]
     .iter()
     .map(|&seed| {
       let r = run_vopr(seed, 2_000);
