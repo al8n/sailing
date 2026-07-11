@@ -326,7 +326,7 @@ impl MultiWorld {
       .map(|n| {
         let ep = self.hosts[&n].group(&gid).expect("hosting");
         std::format!(
-          "n{n}[{:?}{} term={} commit={} applied={} poison={} voters={:?}]",
+          "n{n}[{:?}{} term={} commit={} applied={} poison={} frozen={} merge_wait={} voters={:?}]",
           ep.role(),
           if self.parked.contains(&(n, gid)) {
             " PARKED"
@@ -337,6 +337,11 @@ impl MultiWorld {
           ep.commit_index().get(),
           ep.applied_index().get(),
           ep.is_poisoned(),
+          ep.is_frozen(),
+          // A parked CommitMerge apply: the drain holds at the merge entry until the container's
+          // per-crank merge service resolves it — invisible in commit/applied alone, and exactly
+          // the state a merge-liveness livelock needs named.
+          ep.pending_merge().is_some(),
           ep.conf_state().voters(),
         )
       })
