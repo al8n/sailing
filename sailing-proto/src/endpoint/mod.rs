@@ -808,8 +808,9 @@ struct LeaseGuardState {
   commit_wait_until: Option<Instant>,
   /// The MAX LeaseGuard commit-wait window (`Entry::lease_window`, nanos) over every entry this node
   /// has ever held — the SELF-DESCRIBING cross-leader safety bound. `become_leader` sizes its
-  /// commit-wait at `now + max_lease_window`, which covers ANY deposed leader's lease on an inherited
-  /// entry (each carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`), no assumption about other configs.
+  /// commit-wait at `now + max_lease_window` INFLATED by this node's OWN rate bound, which covers ANY
+  /// deposed leader's lease on an inherited entry (each carries its own leader's exact `Δ·(Δ+ε)/(Δ−ε)`),
+  /// assuming only that each node honors its OWN configured rate bound.
   /// Monotonically non-decreasing in memory (a stale-HIGH value is safe — it only over-waits): raised
   /// on `submit_append` over appended entries and on snapshot install over `SnapshotMeta`; carried
   /// through compaction (into the created `SnapshotMeta`) and recomputed at restart from the durable
@@ -1910,8 +1911,9 @@ where
   ///
   /// The `window < election_timeout` bound is a LIVENESS guard (a fresh leader commits before a
   /// follower could depose it). Cross-leader SAFETY (covering a deposed leader's lease) rests on the
-  /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX), needing no assumption
-  /// about any other node's config. Gated HERE, not only in the optional `Config::validate`, so an
+  /// per-entry SELF-DESCRIBING window (a successor waits the inherited MAX, inflated by its OWN rate
+  /// bound), needing no assumption beyond each node honoring its OWN configured rate bound. Gated HERE,
+  /// not only in the optional `Config::validate`, so an
   /// unvalidated config degrades to Safe. Returns `(Δ, ε)` for the read gate's same-leader check.
   pub(crate) fn leaseguard_timing(&self) -> Option<(Duration, Duration)> {
     self

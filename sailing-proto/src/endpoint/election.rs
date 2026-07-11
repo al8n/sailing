@@ -713,7 +713,8 @@ where
     // LeaseGuard reads: a node rolled to Safe/LeaseBased (or holding an invalid LeaseGuard config)
     // that committed new entries while a deposed LeaseGuard leader's lease was still live would
     // recreate the stale read. TWO conservative bounds, with no cross-node clock comparison and no
-    // assumption about any other node's config:
+    // assumption beyond each node honoring its OWN configured rate bound (ε is rate-proportional
+    // provisioning — mono clocks are rate-bounded hardware — NOT an absolute step bound):
     //   • TIME anchor = THIS election's `now` — a lower bound on every inherited entry's creation
     //     time (this node replicated them all before winning the election).
     //   • WINDOW bound = `max_lease_window` — the MAX of every inherited entry's SELF-DESCRIBING
@@ -739,7 +740,8 @@ where
     // E′ alone.
     //
     // BUT the inflated wait keys on `max_lease_window` — the MAX window INHERITED, possibly stamped by
-    // ANOTHER node's larger config — which config validation cannot bound (no cluster-wide config check).
+    // ANOTHER node's larger config — which config validation cannot bound (there is no cluster-wide config
+    // check); cross-leader safety instead rests on each node honoring its own configured rate bound.
     // So ARM the serve (and the inflation) ONLY when a valid active failover tier is configured AND the
     // EXACT inflated wait both fits a schedulable `u64` nanos (`failover_inflated_commit_wait` is `Some`)
     // AND stays strictly below the election timeout (else the first failover commit could not land before

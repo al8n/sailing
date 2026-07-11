@@ -1099,9 +1099,10 @@ impl<I> Config<I> {
     // must also fit below the election timeout, but it is gated at RUNTIME (`inherited_serve_armed` in
     // `become_leader`), NOT here: the wait keys on `max_lease_window` — the MAX window INHERITED from
     // entries possibly stamped by another node's larger config — which config-time validation cannot
-    // bound (there is no cluster-wide config check, §1). A node whose inflated wait would exceed its
-    // election timeout simply does not arm the inherited serve that term (falling back to the shipped
-    // bare wait); it is not an invalid config.
+    // bound (there is no cluster-wide config check, §1 — cross-leader safety instead rests on each node
+    // honoring its own rate bound). A node whose inflated wait would exceed its election timeout simply
+    // does not arm the inherited SERVE that term (the conservative commit-wait keeps its successor-side
+    // rate inflation — only the serve / veto-skip is withheld); it is not an invalid config.
     Ok(w as u64)
   }
 

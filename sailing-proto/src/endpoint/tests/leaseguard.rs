@@ -667,9 +667,10 @@ fn leaseguard_fresh_cluster_has_no_commit_wait() {
 
 /// The LeaseGuard commit-wait covers the MAX inherited lease window (the self-describing cross-leader
 /// safety). A node that inherits entries a deposed leader stamped — each carrying that leader's own
-/// window — holds its first post-election commit until `now + max(inherited window)`, so any deposed
-/// leader's read-lease has provably expired, even under heterogeneous per-node windows (the LARGER
-/// of two inherited windows binds, regardless of entry order — no assumption about other configs).
+/// window — holds its first post-election commit until `now + max(inherited window)` inflated by its OWN
+/// rate bound, so any deposed leader's read-lease has provably expired, even under heterogeneous per-node
+/// windows (the LARGER of two inherited windows binds, regardless of entry order — assuming only that
+/// each node honors its OWN configured rate bound).
 #[test]
 fn leaseguard_commit_wait_covers_inherited_max_window() {
   use crate::{
@@ -1111,6 +1112,168 @@ fn leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease() {
     !s_committed_past_anchor,
     "heterogeneous-drift stale read: the fast successor committed past the inherited anchor while the \
      deposed leader's lease is still live"
+  );
+}
+
+/// The FAILOVER WALL-ABSENT twin of the heterogeneous-drift witness. A fail-closed (wall-absent)
+/// inherited lease is covered ONLY by the mono-frame fallback `unwalled_commit_wait_until`, so a fast
+/// failover successor's PRECISE early-release would fire on its own clock before a slower deposed
+/// leader's lease expires. Same two nodes and shared timeline as the walled witness, but S is a FAILOVER
+/// node (ε_unc) inheriting a WALL-ABSENT entry, probed through `precise_release_ready` (which for a
+/// wall-absent-only inheritance reduces to the unwalled fallback — the walled floor is vacuously 0). At
+/// t* = 10s real D's lease is live; the RAW unwalled fallback would already permit the precise release
+/// (the stale read), while the successor-side (1+ρ_S) inflation of the unwalled arm still holds it.
+#[test]
+fn leaseguard_heterogeneous_drift_unwalled_precise_release_must_not_undercut_deposed_lease() {
+  use crate::{
+    AppendEntries, AppendResponse, Config, Entry, EntryKind, Index, Instant, Message, Term,
+    VoteResponse, Wall,
+  };
+  use core::time::Duration;
+
+  // A realistic synchronized cluster-epoch wall for S's failover tier. The inherited entry is WALL-ABSENT
+  // (no walled floor), so the wall value only needs to be non-absent for the precise-release probe.
+  const W_EPOCH: u64 = 1_700_000_000_000_000_000;
+
+  // The deposed leader D (as in the walled witness): a slow 0.9× clock and a long ~11.1s real lease.
+  let cfg_d = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(20),
+    Duration::from_secs(2),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_secs(10))
+  .with_clock_drift_bound(Duration::from_secs(1));
+  let w_d = cfg_d
+    .leaseguard_commit_wait_ns(ReadOnlyOption::LeaseGuard)
+    .expect("D's LeaseGuard window is valid");
+  let mut d = Endpoint::new(cfg_d, Instant::ORIGIN, 1, CountSm::default());
+  let mut d_log = VecLog::default();
+  let mut d_stable = NoopStable::default();
+  let d0 = d.poll_timeout().unwrap();
+  d.handle_timeout(d0, &mut d_log, &mut d_stable);
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(1), 2u64, false, false)),
+  );
+  assert!(d.role().is_leader());
+  d.handle_storage(d0, &mut d_log, &mut d_stable);
+  while d.poll_message().is_some() {}
+  d.handle_message(
+    d0,
+    &mut d_log,
+    &mut d_stable,
+    2u64,
+    Message::AppendResponse(AppendResponse::new(
+      Term::new(1),
+      2u64,
+      false,
+      Index::ZERO,
+      Term::ZERO,
+      Index::new(1),
+    )),
+  );
+  assert_eq!(d.commit_index(), Index::new(1));
+
+  // The successor S: a fast 1.5× clock, a short lease (ρ_S = 0.5), AND a FAILOVER tier (ε_unc). It
+  // inherits a single WALL-ABSENT fail-closed entry stamped with D's window `w_d`, so ONLY the unwalled
+  // mono fallback covers that lease.
+  let cfg_s = Config::try_new(
+    1u64,
+    std::vec![1u64, 2, 3],
+    Duration::from_secs(1),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_read_only(ReadOnlyOption::LeaseGuard)
+  .with_lease_duration(Duration::from_millis(300))
+  .with_clock_drift_bound(Duration::from_millis(150))
+  .with_bounded_clock_uncertainty(Duration::from_millis(20));
+  let mut s = Endpoint::new(cfg_s, Instant::ORIGIN, 1, CountSm::default());
+  let mut s_log = VecLog::default();
+  let mut s_stable = NoopStable::default();
+  s.handle_message(
+    Instant::ORIGIN,
+    &mut s_log,
+    &mut s_stable,
+    2u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(5),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        Entry::new(
+          Term::new(5),
+          Index::new(1),
+          EntryKind::Normal,
+          bytes::Bytes::from_static(b"a"),
+        )
+        .with_lease_window(w_d),
+      ],
+      Index::ZERO,
+    )),
+  );
+  s.handle_storage(Instant::ORIGIN, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  // Elect S under a synchronized wall (a failover node's arming path expects one).
+  let s0 = s.poll_timeout().unwrap();
+  let s_elect = Now::synchronized(s0, Wall::from_nanos(W_EPOCH));
+  s.handle_timeout(s_elect, &mut s_log, &mut s_stable);
+  s.handle_storage(s_elect, &mut s_log, &mut s_stable);
+  s.handle_message(
+    s_elect,
+    &mut s_log,
+    &mut s_stable,
+    3u64,
+    Message::VoteResponse(VoteResponse::new(Term::new(6), 3u64, false, false)),
+  );
+  assert!(s.role().is_leader());
+  s.handle_storage(s_elect, &mut s_log, &mut s_stable);
+  while s.poll_message().is_some() {}
+  while s.poll_event().is_some() {}
+
+  // Shared real timeline, t* = 10s. D-mono = d0 + 9s (0.9×); S-mono = s0 + 15s (1.5×). S's WALL is the
+  // real-rate synchronized clock, against which its fast mono drifts (the whole point).
+  const T_STAR_REAL_NS: u64 = 10_000_000_000;
+  let d_mono_at = d0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 9);
+  let s_probe = Now::synchronized(
+    s0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 15),
+    Wall::from_nanos(W_EPOCH + T_STAR_REAL_NS),
+  );
+
+  // Witness guards: t*'s S-mono (15s) is past S's RAW unwalled wait `w_d` (~12.2s) but below the
+  // (1+ρ_S)-inflated unwalled wait `w_d + w_d/2` (~18.3s).
+  let s_mono_elapsed = T_STAR_REAL_NS / 10 * 15;
+  assert!(
+    s_mono_elapsed >= w_d,
+    "t* must be past S's RAW unwalled wait (the RED band)"
+  );
+  assert!(
+    s_mono_elapsed < w_d + w_d / 2,
+    "t* must be below S's (1+ρ_S)-inflated unwalled wait (the GREEN target)"
+  );
+
+  let d_lease_live = d.lease_guard_read_live(Now::monotonic(d_mono_at), &d_log);
+  let s_would_precise_release = s.precise_release_ready(s_probe);
+
+  assert!(
+    d_lease_live,
+    "the deposed leader's lease is still live at t* = 10s real"
+  );
+  // The unwalled fallback is the SOLE cover for the fail-closed inherited lease. Its RAW length would let
+  // S's precise release fire here (the stale read); the (1+ρ_S) inflation of the unwalled arm must still
+  // hold it. RED before the unwalled inflation, GREEN after.
+  assert!(
+    !s_would_precise_release,
+    "heterogeneous-drift stale read (wall-absent tier): the fast failover successor's precise release \
+     would clear the fail-closed inherited lease while the deposed leader's lease is still live"
   );
 }
 

@@ -1,5 +1,44 @@
 use super::*;
 
+/// The HETEROGENEOUS-drift sub-mode, end-to-end: each node draws its OWN validator-passing `(Δ_i, ε_i)`
+/// so `ρ_i` VARIES across nodes, and its own rate within its OWN band — the regime the uniform harness
+/// cannot produce. A single fixed `ρ` makes `ρ_S ≡ ρ_D`, which structurally hid the heterogeneous-drift
+/// stale read: a `(1+ρ_S)`-fast successor under-waits a slower deposed leader's lease only when
+/// `ρ_S > ρ_D`, impossible when every node shares one `ρ`. Each seed runs the full adversarial schedule
+/// (crash + partition + lossy network + membership churn) under per-node-heterogeneous drift and must
+/// complete WITHOUT a read-linearizability panic — the run completing IS the safety assertion; the
+/// EXISTING oracle judges every confirmed read unaided (no new oracle), and a stale cross-leader serve
+/// would trip it with seed+tick — AND confirm reads, proving the oracle actually judged reads under this
+/// regime rather than merely that the machinery is present.
+///
+/// The cross-leader SUPERSEDED-serve path (where the stale read surfaces) is schedule-rare — the uniform
+/// drift coverage pins hand-picked seeds (573, 586) found via a 0..700 sweep — so this band asserts the
+/// regime is read-linearizable and non-vacuous at the read level; the deterministic proto witnesses
+/// `leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease` (and its wall-absent twin)
+/// prove the exact `ρ_S > ρ_D` stale read the oracle here would catch, red before the inflation and green
+/// after. A deep hetero sweep (e.g. via the `drift_sweep` example) reaches the superseded path for the
+/// cross-leader coverage.
+#[test]
+fn vopr_hetero_drift_read_linearizable() {
+  for seed in [0u64, 1, 2] {
+    let r = run_vopr_hetero_drift(seed, 1_500);
+    assert!(
+      r.hetero && r.drifted && !r.failover,
+      "seed {seed}: expected the HETEROGENEOUS-drift sub-mode (report={r:?})"
+    );
+    assert!(
+      r.reads_confirmed > 0,
+      "hetero-drift seed {seed} confirmed no reads — the read-linearizability oracle never judged a \
+       drifted read under per-node-heterogeneous ρ (report={r:?})"
+    );
+    assert!(
+      r.committed > 0 && r.partitions > 0,
+      "hetero-drift seed {seed} was vacuous — it must commit load AND partition a node so the \
+       heterogeneous drifted clocks meet leadership churn (report={r:?})"
+    );
+  }
+}
+
 /// A FNV-1a checksum of a slice of bytes — used to fingerprint a whole run's applied state so the
 /// determinism test can assert two runs are bit-identical (not just that the reports match).
 fn fnv1a(bytes: &[u8], mut h: u64) -> u64 {
