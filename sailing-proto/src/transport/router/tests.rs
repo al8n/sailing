@@ -223,6 +223,61 @@ fn unvalidated_conns_are_reaped_after_the_handshake_deadline() {
 }
 
 #[test]
+fn a_validated_conn_probes_when_idle_and_is_reaped_when_silent() {
+  use crate::transport::TransportError;
+  use core::time::Duration;
+  let mut router = R::new();
+  let id = ConnId(1);
+  router.register(id, acceptor(10), Instant::ORIGIN);
+  let mut peer = Conn::new(dialer(7));
+  pump(&mut router, id, &mut peer); // validates peer 7 at ORIGIN
+  assert_eq!(router.conn_of(&7), Some(id));
+  assert!(
+    router.next_liveness_deadline().is_some(),
+    "validation arms the liveness clock"
+  );
+
+  // At the probe deadline (before the idle timeout) the connection emits a probe and is NOT reaped.
+  let probe_at = Instant::ORIGIN + Duration::from_millis(1000);
+  router.service_liveness(probe_at);
+  assert_eq!(router.poll_conn_closed(), None, "a probe is not a reap");
+  assert_eq!(
+    router.conn_of(&7),
+    Some(id),
+    "the probed connection survives"
+  );
+  // The probe reaches the wire as an empty coalesced frame the peer decodes to zero messages.
+  let probe_bytes: Vec<u8> = router
+    .poll_transmit()
+    .into_iter()
+    .find(|(cid, _)| *cid == id)
+    .map(|(_, bytes)| bytes)
+    .unwrap_or_default();
+  assert!(!probe_bytes.is_empty(), "the probe was queued for the peer");
+  let mut got = Vec::new();
+  peer.handle_data(&probe_bytes, false, probe_at).unwrap();
+  peer.poll_decoded(&mut got).unwrap();
+  assert!(got.is_empty(), "the probe decodes to zero messages");
+
+  // Now the peer goes SILENT: no bytes reach the router past the idle timeout, so the connection is
+  // reaped as a blackhole. (Received bytes would have restarted the silence deadline.)
+  let idle_at = probe_at + Duration::from_millis(3001);
+  assert!(
+    router
+      .next_liveness_deadline()
+      .is_some_and(|d| d <= idle_at),
+    "the silence deadline is due at the idle horizon"
+  );
+  router.service_liveness(idle_at);
+  assert_eq!(
+    router.poll_conn_closed(),
+    Some((id, Some(TransportError::IdleTimeout))),
+    "a validated connection silent past the idle timeout is reaped"
+  );
+  assert_eq!(router.conn_of(&7), None, "the route is dropped");
+}
+
+#[test]
 fn duplicate_conn_id_registration_is_rejected_not_replaced() {
   use crate::transport::TransportError;
   let mut router = R::new();

@@ -316,6 +316,35 @@ fn demuxes_two_groups_over_one_connection() {
   );
 }
 
+/// A quiesced connection whose peer goes SILENT (a blackhole — socket alive, bytes dropped) is
+/// reaped through the transport-timeout seam: past the idle timeout `transport_timeout` surfaces the
+/// silence deadline and `handle_transport_timeout` closes the connection — the loss the driver turns
+/// into a wake-all → election. Pre-fix a validated connection surfaced no transport deadline and was
+/// never reaped, so a quiesced plane that sends nothing would never produce that wake.
+#[test]
+fn a_silent_quiesced_connection_is_reaped_through_the_transport_timeout() {
+  let mut w = World::new(&[100], &[100]);
+  w.settle();
+  w.elect_a(100);
+  assert_eq!(w.a.conn_of(&2), Some(ConnId(1)), "a bound its link to b");
+  w.a.mark_quiescing(&100);
+  w.settle();
+
+  // Blackhole: no further bytes reach `a`. Past the idle timeout the transport timeout is due.
+  let idle = w.now + Duration::from_millis(3001);
+  assert!(
+    w.a.transport_timeout().is_some_and(|d| d <= idle),
+    "the silence deadline is armed and due at the idle horizon"
+  );
+  w.a.handle_transport_timeout(idle);
+  assert_eq!(
+    w.a.poll_conn_closed(),
+    Some((ConnId(1), Some(TransportError::IdleTimeout))),
+    "the silent link is reaped, surfacing the loss the driver wakes on"
+  );
+  assert_eq!(w.a.conn_of(&2), None, "the route is dropped");
+}
+
 /// A well-formed tag for a group the receiver does not host: the frame is dropped but the shared
 /// connection SURVIVES — one unhosted group must not sever the link for the hosted ones.
 #[test]

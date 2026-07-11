@@ -316,7 +316,7 @@ fn coalesced_many_entries_round_trip() {
 }
 
 #[test]
-fn coalesced_rejects_missing_marker_and_empty_list() {
+fn coalesced_rejects_a_missing_marker() {
   // A single-message payload (group header first) is not a coalesced frame.
   let mut normal = Vec::new();
   write_group_header(b"grp", &mut normal);
@@ -326,29 +326,42 @@ fn coalesced_rejects_missing_marker_and_empty_list() {
     split_coalesced(Bytes::from(normal)),
     Err(TransportError::Decode)
   ));
-  // A bare marker with no entries is an empty list, not a valid frame.
-  assert!(matches!(
-    split_coalesced(Bytes::from_static(&[0xFF, 0xFF])),
-    Err(TransportError::Decode)
-  ));
-  // As is anything shorter than the marker itself.
+  // Anything shorter than the marker itself is not a coalesced frame either.
   assert!(matches!(
     split_coalesced(Bytes::from_static(&[0xFF])),
     Err(TransportError::Decode)
   ));
 }
 
+/// An empty coalesced frame — the bare marker, zero entries — is the idle keep-alive PROBE shape.
+/// It decodes to zero messages, so a receiver dispatches nothing and only its transport-liveness
+/// clock advances. Accepting it needs no wire-version change: a pre-probe peer's parser rejects the
+/// empty list, but the `LABEL_VERSION` hello fence keeps such a peer off the wire entirely.
+#[test]
+fn coalesced_accepts_the_empty_probe_frame() {
+  let frame = Bytes::from_static(&[0xFF, 0xFF]);
+  assert!(is_coalesced_frame(&frame));
+  assert_eq!(
+    split_coalesced(frame)
+      .expect("the empty probe frame decodes")
+      .len(),
+    0,
+    "the bare marker decodes to zero entries"
+  );
+}
+
 #[test]
 fn coalesced_rejects_truncated_entries() {
   let whole = coalesced_payload(&[(0x00, b"gg", b"mm"), (0x01, b"hh", b"nn")]);
-  // Every strict prefix that still carries the marker must reject: a cut anywhere inside an entry
-  // is a truncated entry, and a cut at an entry boundary is caught by the second entry vanishing
-  // only when the cut also removed it entirely (those prefixes are themselves valid ONE-entry
-  // frames — the boundary cut after entry 1 is the single valid shorter form).
+  // A cut anywhere INSIDE an entry is a truncated entry and rejects; a cut at an entry boundary is
+  // a valid shorter frame. The two valid shorter forms are the bare marker (cut 2 — the empty
+  // probe, zero entries) and the boundary after entry 1 (one entry).
   let entry1_end = 2 + (1 + 2 + 2 + 4 + 2);
   for cut in 2..whole.len() {
     let prefix = Bytes::copy_from_slice(&whole[..cut]);
-    if cut == entry1_end {
+    if cut == 2 {
+      assert_eq!(split_coalesced(prefix).expect("empty probe").len(), 0);
+    } else if cut == entry1_end {
       assert_eq!(split_coalesced(prefix).expect("entry boundary").len(), 1);
     } else {
       assert!(

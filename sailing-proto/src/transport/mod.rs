@@ -108,6 +108,10 @@ pub enum TransportError {
   /// violation — ids are unique and monotonic). The rejected registration's socket must be closed.
   #[error("connection id is already registered")]
   DuplicateConnId,
+  /// A validated connection received no bytes for the idle timeout: the peer went silent without
+  /// closing the socket (a blackhole). Reaping it surfaces the close a quiesced plane needs to wake.
+  #[error("connection idle past the liveness timeout")]
+  IdleTimeout,
   /// The locally configured node-id encoding is outside the hello's bounds (`1..=1024` bytes) —
   /// a configuration error, rejected at construction before any hello byte reaches the wire
   /// (an out-of-range length would otherwise wrap through the hello's `u16` length field and

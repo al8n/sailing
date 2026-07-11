@@ -14,6 +14,21 @@ use std::{
 /// socket whose peer never answers) would hold its `Conn` — and the driver's socket — forever.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// How long a VALIDATED connection may go without receiving ANY bytes before it is reaped as a
+/// blackholed peer (socket alive, its bytes silently dropped). This is the peer-silence detector a
+/// quiesced plane needs: a plane that sends nothing produces no close on its own, so without a
+/// transport-level idle reap a silent blackhole would never wake the quiesced group. Refreshed by
+/// any received bytes; a connection's own sends never refresh it. QUIC-parity with the quinn
+/// max-idle default — tuning it rides the transport-hardening milestone.
+const IDLE_TIMEOUT_MILLIS: u64 = 3000;
+const IDLE_TIMEOUT: Duration = Duration::from_millis(IDLE_TIMEOUT_MILLIS);
+
+/// How long a validated connection may go without SENDING before it emits an empty no-op probe, so
+/// an idle-but-healthy peer keeps receiving bytes and never trips its own [`IDLE_TIMEOUT`]. QUIC-parity
+/// with the quinn keep-alive default (idle/3): three probe windows fit inside one idle window, so a
+/// single lost probe cannot by itself cause a spurious reap.
+const PROBE_INTERVAL: Duration = Duration::from_millis(IDLE_TIMEOUT_MILLIS / 3);
+
 /// Routes consensus messages over a table of per-peer connections.
 ///
 /// A connection is registered by [`ConnId`] while still handshaking; once it validates, the router
@@ -30,6 +45,14 @@ pub struct PeerRouter<I, R> {
   peer_of: BTreeMap<I, ConnId>,
   /// Handshake deadline per not-yet-validated connection (registration time + the timeout).
   handshake_deadline: BTreeMap<ConnId, Instant>,
+  /// Per-VALIDATED-connection idle-reap deadline: last-received-bytes instant + [`IDLE_TIMEOUT`].
+  /// Refreshed by any received bytes; a connection's own sends never touch it. A connection past
+  /// this is a silent (blackholed) peer and is reaped by [`service_liveness`](Self::service_liveness).
+  idle_deadline: BTreeMap<ConnId, Instant>,
+  /// Per-VALIDATED-connection keep-alive-probe deadline: last-probe/validation instant +
+  /// [`PROBE_INTERVAL`]. At this deadline an otherwise-idle connection emits an empty probe so the
+  /// peer keeps receiving bytes and never reaps it.
+  probe_deadline: BTreeMap<ConnId, Instant>,
   /// Connections the router closed on its own initiative, with the fault that closed them
   /// (`None` = a clean close: peer EOF/close_notify, duplicate eviction, outbound-cap stall).
   closed: VecDeque<(ConnId, Option<TransportError>)>,
@@ -42,6 +65,8 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
       conns: BTreeMap::new(),
       peer_of: BTreeMap::new(),
       handshake_deadline: BTreeMap::new(),
+      idle_deadline: BTreeMap::new(),
+      probe_deadline: BTreeMap::new(),
       closed: VecDeque::new(),
     }
   }
@@ -67,6 +92,8 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   pub fn remove(&mut self, id: ConnId) {
     self.conns.remove(&id);
     self.handshake_deadline.remove(&id);
+    self.idle_deadline.remove(&id);
+    self.probe_deadline.remove(&id);
     self.peer_of.retain(|_, &mut c| c != id);
   }
 
@@ -115,6 +142,56 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     }
   }
 
+  /// The earliest liveness deadline across VALIDATED connections — the minimum of every pending
+  /// idle-reap and keep-alive-probe deadline. The multi-group coordinator folds this into its
+  /// `transport_timeout` so a quiesced driver wakes to probe idle peers and reap silent (blackholed)
+  /// ones. The single-group coordinator does NOT fold it (its groups never quiesce; election timers
+  /// detect silence), so its validated connections' deadlines sit unserviced until removal.
+  pub fn next_liveness_deadline(&self) -> Option<Instant> {
+    self
+      .idle_deadline
+      .values()
+      .chain(self.probe_deadline.values())
+      .min()
+      .copied()
+  }
+
+  /// Service validated-connection liveness at `now`. Reap any connection whose peer has been silent
+  /// past `IDLE_TIMEOUT` — closed as [`TransportError::IdleTimeout`] so the driver releases the
+  /// socket and, via its conn-loss wake, elections proceed. Then emit an empty keep-alive probe on
+  /// any connection idle past `PROBE_INTERVAL` so a healthy idle peer keeps receiving bytes.
+  /// Silence outranks a probe: a connection past BOTH deadlines is reaped, never probed.
+  pub fn service_liveness(&mut self, now: Instant) {
+    let reap: Vec<ConnId> = self
+      .idle_deadline
+      .iter()
+      .filter(|&(_, &deadline)| deadline <= now)
+      .map(|(&id, _)| id)
+      .collect();
+    for id in &reap {
+      self.remove_internal(*id, Some(TransportError::IdleTimeout));
+    }
+    let due: Vec<ConnId> = self
+      .probe_deadline
+      .iter()
+      .filter(|&(id, &deadline)| deadline <= now && !reap.contains(id))
+      .map(|(&id, _)| id)
+      .collect();
+    for id in due {
+      let Some(conn) = self.conns.get_mut(&id) else {
+        continue;
+      };
+      conn.send_probe();
+      if conn.is_closed() {
+        // The probe tripped the outbound cap (the peer stopped draining): drop the route like any
+        // send-close, so no later message is queued into a dead connection.
+        self.remove_internal(id, None);
+      } else {
+        self.probe_deadline.insert(id, now + PROBE_INTERVAL);
+      }
+    }
+  }
+
   /// Feed inbound bytes to connection `id`, decode any complete messages, and bind the peer on
   /// validation. Returns the decoded `(group, entry_flags, peer, message)` tuples (flags are `0`
   /// for a single-message frame; a coalesced frame expands to one tuple per entry). A connection
@@ -137,6 +214,11 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
       Ok(()) => {
         if self.conns.get(&id).is_some_and(|c| c.is_closed()) {
           self.remove_internal(id, None);
+        } else if !bytes.is_empty() && self.conns.get(&id).is_some_and(|c| c.peer().is_some()) {
+          // A validated, live connection received bytes: any inbound (a probe or real traffic)
+          // proves the peer is alive, so its silence deadline restarts. A connection's own sends
+          // never refresh it — only proof the PEER is still there does.
+          self.idle_deadline.insert(id, now + IDLE_TIMEOUT);
         }
       }
     }
@@ -166,7 +248,10 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     if !conn.is_closed()
       && let Some(peer) = conn.peer()
     {
-      self.handshake_deadline.remove(&id);
+      // The handshake→validated transition (the FIRST read that binds a peer) arms the keep-alive
+      // probe; the idle-silence deadline is armed and refreshed by `handle_conn_data` on every
+      // received read, this one included.
+      let first_validation = self.handshake_deadline.remove(&id).is_some();
       if let Some(&prev) = self.peer_of.get(&peer) {
         if prev > id {
           // A stale older duplicate validated late: drop it, keep the newer binding.
@@ -178,6 +263,9 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
         }
       }
       self.peer_of.insert(peer, id);
+      if first_validation {
+        self.probe_deadline.insert(id, now + PROBE_INTERVAL);
+      }
     }
     let conn = self.conns.get_mut(&id).expect("conn present");
     let mut msgs = Vec::new();

@@ -50,7 +50,9 @@ pub enum GroupControl {
   /// non-empty `AppendEntries` is live replication, votes/transfers/reads/snapshots are live
   /// consensus, and an empty `AppendEntries` or `AppendResponse` no longer belongs to an idle
   /// round at all, so a spurious one costs one wake instead of riding the absorb trust surface.
-  /// A connection loss, the liveness oracle, is the driver's own wake signal.
+  /// A connection loss, the liveness oracle, is the driver's own wake signal — and a silent
+  /// blackhole (a peer that stops sending without closing the socket) becomes exactly such a loss:
+  /// the transport idle-probe/reap closes the quiet connection, so even a fully-quiesced plane wakes.
   Wake,
 }
 
@@ -1042,26 +1044,17 @@ where
     self.controls.pop_front()
   }
 
-  /// The transport's OWN earliest deadline (handshake reaping), without any group's consensus
-  /// deadline — the [`poll_timeout`](Self::poll_timeout) decomposition a quiescing driver needs:
-  /// it folds this with the non-quiesced subset of [`deadlines`](Self::deadlines) instead of the
-  /// all-groups aggregate.
+  /// The transport's OWN earliest deadline — handshake reaping AND validated-connection liveness
+  /// (idle-peer keep-alive probes and silent-peer reaping) — without any group's consensus deadline.
+  /// This is the [`poll_timeout`](Self::poll_timeout) decomposition a quiescing driver needs: it
+  /// folds this with the non-quiesced subset of [`deadlines`](Self::deadlines) instead of the
+  /// all-groups aggregate, so a fully-quiesced host still wakes to keep its links alive and detect a
+  /// blackhole.
   #[must_use]
   pub fn transport_timeout(&self) -> Option<Instant> {
-    self.router.next_handshake_deadline()
-  }
-
-  /// The earliest deadline the driver must wake for: the minimum over every group's consensus
-  /// deadline AND the transport's earliest handshake deadline. The transport half matters when no
-  /// group surfaces a deadline at all (zero hosted groups, every group poisoned, or a host of
-  /// non-voter learners) — without it, un-validated connections would never be reaped. On expiry
-  /// call [`handle_transport_timeout`](Self::handle_transport_timeout) unconditionally and
-  /// [`handle_timeout`](Self::handle_timeout) for whichever groups are due.
-  #[must_use]
-  pub fn poll_timeout(&self) -> Option<Instant> {
     match (
-      self.multi.poll_timeout(),
       self.router.next_handshake_deadline(),
+      self.router.next_liveness_deadline(),
     ) {
       (Some(a), Some(b)) => Some(a.min(b)),
       (a, None) => a,
@@ -1069,12 +1062,31 @@ where
     }
   }
 
-  /// Fire the transport's own housekeeping (handshake-deadline reaping) without touching any
-  /// group. Call at every [`poll_timeout`](Self::poll_timeout) expiry: the surfaced deadline may
-  /// be a transport deadline with no group due.
+  /// The earliest deadline the driver must wake for: the minimum over every group's consensus
+  /// deadline AND the transport's earliest deadline ([`transport_timeout`](Self::transport_timeout):
+  /// handshake reaping plus validated-connection liveness). The transport half matters when no group
+  /// surfaces a deadline at all (zero hosted groups, every group poisoned, or a host of non-voter
+  /// learners) — and when every group is quiesced — so un-validated connections are reaped and idle
+  /// links are probed / blackhole-reaped even then. On expiry call
+  /// [`handle_transport_timeout`](Self::handle_transport_timeout) unconditionally and
+  /// [`handle_timeout`](Self::handle_timeout) for whichever groups are due.
+  #[must_use]
+  pub fn poll_timeout(&self) -> Option<Instant> {
+    match (self.multi.poll_timeout(), self.transport_timeout()) {
+      (Some(a), Some(b)) => Some(a.min(b)),
+      (a, None) => a,
+      (None, b) => b,
+    }
+  }
+
+  /// Fire the transport's own housekeeping — handshake-deadline reaping AND validated-connection
+  /// liveness (probing idle peers, reaping silent/blackholed ones) — without touching any group.
+  /// Call at every [`poll_timeout`](Self::poll_timeout) expiry: the surfaced deadline may be a
+  /// transport deadline with no group due.
   pub fn handle_transport_timeout(&mut self, now: impl Into<Now>) {
     let now: Now = now.into();
     self.router.reap_handshakes(now.mono());
+    self.router.service_liveness(now.mono());
   }
 
   /// Each group's next deadline — a driver's input for an aggregate timing wheel.

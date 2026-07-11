@@ -92,10 +92,11 @@ pub(crate) fn write_coalesced_entry(flags: u8, group: &[u8], msg_bytes: &[u8], o
 }
 
 /// Split a coalesced frame into its `(flags, group_id_bytes, message_bytes)` entries, each a
-/// zero-copy slice of the frame (like [`split_group_header`]). `Err(Decode)` on a missing marker, a
-/// truncated entry, a group length of zero or past [`crate::wire::MAX_GROUP_ID_LEN`], a message
-/// length overrunning the frame, or an empty entry list — the payload must be exactly one or more
-/// complete entries, so any trailing remainder after the last complete one rejects too.
+/// zero-copy slice of the frame (like [`split_group_header`]). A frame carrying ONLY the marker
+/// (zero entries) is the empty keep-alive PROBE and decodes to an empty list. `Err(Decode)` on a
+/// missing marker, a truncated entry, a group length of zero or past
+/// [`crate::wire::MAX_GROUP_ID_LEN`], or a message length overrunning the frame — any trailing
+/// remainder after the last complete entry is itself a truncated entry and rejects too.
 pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, TransportError> {
   if !is_coalesced_frame(&frame) {
     return Err(TransportError::Decode);
@@ -135,9 +136,8 @@ pub(crate) fn split_coalesced(frame: Bytes) -> Result<Vec<(u8, Bytes, Bytes)>, T
     at += msg_len;
     entries.push((flags, group, msg));
   }
-  if entries.is_empty() {
-    return Err(TransportError::Decode);
-  }
+  // An empty list (the bare marker) is the keep-alive PROBE: it decodes to zero entries and
+  // dispatches nothing — only the receiver's transport-liveness clock advances.
   Ok(entries)
 }
 

@@ -384,6 +384,12 @@ where
   /// election or heartbeat timer) still wake to reap a silent half-open connection in
   /// [`handle_timeout`](Self::handle_timeout); without it that endpoint never schedules a wake, so a
   /// silent socket pins `max_conns` until some distant driver fallback fires.
+  ///
+  /// This deliberately folds ONLY the handshake deadline, NOT the router's validated-connection
+  /// liveness (idle probe/reap) that `MultiStreamCoordinator::transport_timeout` folds: a
+  /// single-group host never quiesces, so its always-armed election timer already detects a leader's
+  /// silence and campaigns — a transport idle reap would be redundant here, so the single coordinator
+  /// stays inert to the router's liveness deadlines (they arm but are never serviced).
   pub fn poll_timeout(&self) -> Option<Instant> {
     match (
       self.endpoint.poll_timeout(),

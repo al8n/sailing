@@ -310,6 +310,19 @@ impl<I: NodeId, R: RecordIo> Conn<I, R> {
     }
   }
 
+  /// Queue an empty coalesced control frame — a no-op keep-alive PROBE. Its only effect is to put a
+  /// few bytes on the wire so a send-idle connection keeps a silence-reaping peer's clock refreshed;
+  /// it decodes to ZERO messages, so it never wakes a quiesced group. A closed connection drops it,
+  /// exactly as [`send_message`](Self::send_message) drops one message.
+  pub fn send_probe(&mut self) {
+    if matches!(self.state, ConnState::Closed { .. }) {
+      return;
+    }
+    let mut payload = Vec::new();
+    write_coalesced_marker(&mut payload);
+    self.emit_frame(&payload);
+  }
+
   /// Frame `payload` and queue it, enforcing the per-frame bounds BEFORE anything is queued.
   /// Returns whether the frame was accepted (`false` = the connection closed):
   /// - a payload over [`MAX_FRAME_LEN`] closes the connection (the receiver's frame bound would
