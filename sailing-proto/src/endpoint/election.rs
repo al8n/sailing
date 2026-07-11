@@ -597,6 +597,7 @@ where
     // a fresh leader term has authorized no forced handoff yet, so the LeaseBased read shortcut is
     // available again once a fresh quorum lease forms. (A `TimeoutNow` sent later this term re-arms it.)
     self.transfer.forced_handoff_this_term = false;
+    self.transfer.forced_handoff_target = None;
     // Clear the candidate/follower election_deadline unconditionally; it will be re-armed
     // below only if check_quorum is enabled. Without this clear, a CQ-disabled leader would
     // inherit the stale candidate election_deadline (arm_heartbeat_timer no longer clears it).

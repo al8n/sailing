@@ -572,6 +572,13 @@ pub enum TransferError<I> {
   /// group). Roll the merge back first if the transfer genuinely matters.
   #[error("the group is frozen by an in-flight merge")]
   Frozen,
+  /// A forced handoff is already in flight THIS term: a `TimeoutNow` was sent to an earlier target,
+  /// authorizing a forced campaign. Retargeting to a DIFFERENT node would authorize a SECOND forced
+  /// campaign in the same term — two peers bypassing PreVote/lease at once. Retrying the SAME target
+  /// is idempotent (`Ok`); a different target is admitted only once a fresh leadership term begins
+  /// (`become_leader` resets the flag), since a mere step-down leaves the node unable to transfer at all.
+  #[error("a forced leadership handoff is already in flight this term")]
+  HandoffPending,
   /// The node has entered the permanent poisoned state and accepts no new work. The transfer was
   /// NOT initiated; inspect `poison_reason()`.
   #[error("the node is poisoned and cannot initiate a transfer")]

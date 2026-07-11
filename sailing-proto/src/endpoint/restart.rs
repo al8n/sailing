@@ -558,6 +558,7 @@ where
       transfer: Transfer {
         // A restarted node is not leader (recovers as Follower) and has authorized no handoff.
         forced_handoff_this_term: false,
+        forced_handoff_target: None,
         lead_transferee: None,
         transfer_deadline: None,
       },

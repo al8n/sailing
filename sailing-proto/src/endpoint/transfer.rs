@@ -19,6 +19,8 @@ where
   /// Returns `Err(TransferError::NotLeader)` if this node is not the current leader.
   /// Returns `Err(TransferError::NotAVoter)` if `to` is not a voter.
   /// Returns `Err(TransferError::AlreadyLeader)` if `to == self.id()`.
+  /// Returns `Err(TransferError::HandoffPending)` if a forced handoff to a DIFFERENT target is
+  /// already in flight this term (retrying the same target is idempotent `Ok`).
   pub fn transfer_leader<L, S>(
     &mut self,
     now: impl Into<Now>,
@@ -54,6 +56,18 @@ where
     if self.transfer.lead_transferee.as_ref() == Some(&to) {
       return Ok(());
     }
+    // A forced handoff (TimeoutNow) was already authorized this term: refuse a retarget to a DIFFERENT
+    // node. The forced campaign it authorized can still fire under unbounded message delay, so a second
+    // forced TimeoutNow to another node would let TWO peers force-campaign in one term (bypassing
+    // PreVote and the lease) — the split the handoff is meant to avoid. Re-transferring to the SAME
+    // node is harmless (one campaigner) and stays admissible even after the first transfer aborted on
+    // its deadline (when `lead_transferee` has cleared but this authorization lingers). become_leader
+    // resets the target, so a fresh leadership term admits any transfer.
+    if self.transfer.forced_handoff_this_term
+      && self.transfer.forced_handoff_target.as_ref() != Some(&to)
+    {
+      return Err(TransferError::HandoffPending);
+    }
     // Arm the transfer: stop accepting proposals, start the deadline window.
     self.transfer.lead_transferee = Some(to.cheap_clone());
     self.transfer.transfer_deadline = Some(now.mono() + self.config.election_timeout());
@@ -74,6 +88,9 @@ where
       .unwrap_or(crate::Index::ZERO);
     if target_match == log.last_index() {
       let (term, me) = (self.term, self.config.id());
+      // Remember the forced target before `to` is moved into the send: a later retarget to a DIFFERENT
+      // node is refused, but re-transferring to this same node stays admissible.
+      self.transfer.forced_handoff_target = Some(to.cheap_clone());
       self.send(to, Message::TimeoutNow(TimeoutNow::new(term, me)));
       // a forced campaign is now authorized for this term — disable LeaseBased reads for the rest
       // of it (the forced campaign can elect a new leader at any later point, even after this transfer

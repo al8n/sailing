@@ -949,6 +949,13 @@ struct Transfer<I> {
   /// leader. (The `lead_transferee` gate covers the lagging-transfer window BEFORE `TimeoutNow` is
   /// sent; this flag covers everything AFTER it, including post-abort.)
   forced_handoff_this_term: bool,
+  /// The node a forced handoff (`TimeoutNow`) was aimed at THIS term, or `None` if none was sent.
+  /// Retained even after `lead_transferee` clears on abort, because the forced campaign it authorized
+  /// can still fire: re-transferring to the SAME node is harmless (one campaigner), but retargeting to
+  /// a DIFFERENT node while this is set would authorize a SECOND forced campaign — refused with
+  /// [`TransferError::HandoffPending`](crate::TransferError::HandoffPending). Reset alongside
+  /// `forced_handoff_this_term` in `become_leader`.
+  forced_handoff_target: Option<I>,
   /// Target of an in-progress leader transfer, or `None` if no transfer is active.
   ///
   /// Set by `transfer_leader`; cleared on any leadership change (term bump step-down,
@@ -1385,6 +1392,7 @@ where
       transfer: Transfer {
         // No forced handoff authorized yet.
         forced_handoff_this_term: false,
+        forced_handoff_target: None,
         lead_transferee: None,
         transfer_deadline: None,
       },

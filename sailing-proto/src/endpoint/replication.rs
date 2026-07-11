@@ -1517,6 +1517,7 @@ where
         .unwrap_or(crate::Index::ZERO);
       if peer_match == log.last_index() {
         let (term, me) = (self.term, self.config.id());
+        self.transfer.forced_handoff_target = Some(from.cheap_clone());
         self.send(
           from.cheap_clone(),
           Message::TimeoutNow(crate::TimeoutNow::new(term, me)),
