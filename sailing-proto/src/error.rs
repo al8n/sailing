@@ -70,6 +70,21 @@ pub enum ProposeError<I> {
     /// The per-frame entry budget, in bytes.
     max: usize,
   },
+  /// The membership this conf change would install carries a `ConfState` so large that its
+  /// `InstallSnapshot` metadata leaves no room for a data chunk under the frame limit. A committed
+  /// such config would make `send_snapshot_chunk` defer FOREVER after the next compaction — a silent,
+  /// permanent replication wedge. Refused at propose so the entry never enters the log. `size` is the
+  /// metadata's worst-case encoded frame cost and `max` the permitted share of the frame, in bytes.
+  /// Nothing was appended.
+  #[error(
+    "the resulting membership is too large to snapshot ({size} > {max} bytes of frame metadata)"
+  )]
+  MembershipTooLargeToSnapshot {
+    /// The resulting `ConfState`'s worst-case `InstallSnapshot` metadata frame cost, in bytes.
+    size: usize,
+    /// The permitted share of a transport frame for snapshot metadata, in bytes.
+    max: usize,
+  },
 }
 
 /// Why [`MultiRaft::create_group`](crate::MultiRaft::create_group) /

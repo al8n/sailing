@@ -1,6 +1,15 @@
 use super::*;
 use crate::{ConfChangeV2, ProposeError};
 
+/// The largest share of [`MAX_FRAME_BYTES`](crate::wire::MAX_FRAME_BYTES) a membership's
+/// `InstallSnapshot` metadata may occupy before a conf change is refused at propose. A committed
+/// `ConfState` whose encoded snapshot metadata leaves no room for a data chunk under the frame limit
+/// makes `send_snapshot_chunk` defer FOREVER — a silent, permanent replication wedge that surfaces
+/// only after the next compaction. Half the frame guarantees ample room for a full data chunk: real
+/// memberships are kilobytes, so this ~32 MiB metadata bound is unreachable outside a crafted or
+/// corrupt `ConfState`.
+const MAX_SNAPSHOT_META_FRAME_BYTES: usize = crate::wire::MAX_FRAME_BYTES / 2;
+
 impl<I, F, R> Endpoint<I, F, R>
 where
   I: NodeId,
@@ -185,8 +194,31 @@ where
       } else {
         changer.simple(&self.tracker, cc.changes())
       };
-      if result.is_err() {
-        return Err(ProposeError::InvalidConfChange);
+      let resulting = match result {
+        Ok(tracker) => tracker,
+        Err(_) => return Err(ProposeError::InvalidConfChange),
+      };
+      // Refuse a membership too large to snapshot BEFORE it enters the log. If the RESULTING
+      // ConfState's InstallSnapshot metadata would leave no room for a data chunk under the frame
+      // limit, `send_snapshot_chunk` defers forever once the log compacts past the boundary — a silent,
+      // permanent wedge. Size the metadata frame in closed form (no meta clone; `total_len = u64::MAX`
+      // for the worst-case varint) and refuse above the documented share. The precedent is the
+      // `EntryTooLarge` refusal below, which fences the append path against an oversized single entry.
+      let conf = resulting.conf_state();
+      let meta = crate::SnapshotMeta::new(self.applied, crate::Term::ZERO, conf);
+      let meta_frame = crate::wire::install_snapshot_encoded_len(
+        self.term,
+        &self.config.id(),
+        &meta,
+        0,
+        u64::MAX,
+        0,
+      );
+      if meta_frame > MAX_SNAPSHOT_META_FRAME_BYTES {
+        return Err(ProposeError::MembershipTooLargeToSnapshot {
+          size: meta_frame,
+          max: MAX_SNAPSHOT_META_FRAME_BYTES,
+        });
       }
     }
     // Reject a conf change whose entry would exceed one transport frame BEFORE it enters the log: the

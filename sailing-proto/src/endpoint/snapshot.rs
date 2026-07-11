@@ -1,18 +1,25 @@
 use super::*;
 use crate::{InstallSnapshot, ProgressState, SnapshotChunkRead, SnapshotMeta};
 
-/// The outcome of a snapshot-chunk send attempt. A FATAL store error and a benign cold deferral are
-/// DISTINCT outcomes — both emit no `InstallSnapshot`, but conflating them let a poisoned node keep
-/// mutating state (advance commit, compact) in the same dispatch. Callers match exhaustively, so the
-/// poison case can never be silently treated as a retryable defer.
+/// The outcome of a snapshot-chunk send attempt. A FATAL store error, a benign TRANSIENT deferral, and
+/// a PERMANENT unsendable frame are DISTINCT outcomes — all three emit no `InstallSnapshot`, but
+/// conflating the poison with a defer let a poisoned node keep mutating state (advance commit, compact)
+/// in the same dispatch, and conflating the permanent wedge with a transient defer hides a config that
+/// can never replicate. Callers match exhaustively.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[must_use = "a ChunkSend::Poisoned must fail-stop the caller; Sent/Deferred drive resend-pacing"]
+#[must_use = "a ChunkSend::Poisoned must fail-stop the caller; Sent/Deferred/Unsendable drive resend-pacing"]
 pub(crate) enum ChunkSend {
   /// An `InstallSnapshot` was emitted — arm the resend-pacing deadline.
   Sent,
-  /// No chunk went out for a BENIGN reason (cold `Pending`, nothing persisted, or an unsendable frame) —
-  /// clear the deadline so the next heartbeat retries immediately.
+  /// No chunk went out for a TRANSIENT reason (cold `Pending`, nothing persisted yet) — clear the
+  /// deadline so the next heartbeat retries immediately; a retry is expected to make progress.
   Deferred,
+  /// No chunk went out because the snapshot METADATA alone leaves no room for a data byte under the
+  /// frame limit — the config is too large to snapshot on this transport. Retrying cannot help (the
+  /// meta never shrinks), so the peer stays wedged in `Snapshot`; a diagnostic counter is bumped so
+  /// the wedge is visible. Native `propose_conf_change` refuses such a membership up front
+  /// (`MembershipTooLargeToSnapshot`), so this only guards a config that predates the gate.
+  Unsendable,
   /// A FATAL store error poisoned the node — the caller MUST bail (no further work this dispatch).
   Poisoned,
 }
@@ -144,15 +151,18 @@ where
     // invariants, NOT encoded size) leaves no room for even one data byte under the frame limit, the
     // snapshot is UNSENDABLE on this transport. Do NOT enqueue an oversized frame (the stream transport
     // would close the connection / QUIC would drop it): return without sending. The peer stays in Snapshot
-    // — this is a misconfiguration (a membership too large to snapshot), not a transient condition a
-    // re-send resolves.
+    // — this is a misconfiguration (a membership too large to snapshot), NOT a transient condition a
+    // re-send resolves, so it is a distinct `Unsendable` outcome (the propose-time
+    // `MembershipTooLargeToSnapshot` gate normally prevents ever reaching it).
     // Also reserve the transport's group-demux header (prepended to every frame payload) so a
     // maximum-size chunk plus a group tag still fits under the frame limit.
     let frame_budget = crate::wire::MAX_FRAME_BYTES
       .saturating_sub(overhead + data_field_max_self_cost + crate::wire::GROUP_HEADER_RESERVE)
       as u64;
     if frame_budget == 0 {
-      return ChunkSend::Deferred;
+      // Bump the diagnostic so a permanently-wedged peer is visible; retrying cannot shrink the meta.
+      self.snapshot.unsendable_meta_frames = self.snapshot.unsendable_meta_frames.saturating_add(1);
+      return ChunkSend::Unsendable;
     }
     let chunk_len = config_chunk.min(frame_budget);
     // Reuse the chunk already read at `from_offset` when the reconciled offset is unchanged (the common
@@ -1030,7 +1040,7 @@ where
               now.mono() + self.config.election_timeout(),
             );
           }
-          ChunkSend::Deferred => {
+          ChunkSend::Deferred | ChunkSend::Unsendable => {
             self.snapshot.snapshot_resend_after.remove(&from);
           }
           ChunkSend::Poisoned => return,

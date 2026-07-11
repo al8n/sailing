@@ -2792,7 +2792,8 @@ fn chunked_install_frame_stays_under_limit_with_large_metadata() {
 }
 
 /// When the snapshot METADATA alone exceeds the frame limit (no room for even a 1-byte chunk), the snapshot
-/// is UNSENDABLE — `send_snapshot_chunk` must emit NOTHING, never an oversized frame the transport refuses.
+/// is UNSENDABLE — `send_snapshot_chunk` must emit NOTHING and report the distinct `ChunkSend::Unsendable`
+/// outcome (not a transient `Deferred`), bumping the diagnostic counter so the permanent wedge is visible.
 ///
 /// MUTATION: revert the unsendable guard to `frame_budget.max(1)` → a 1-byte chunk is enqueued in an
 /// oversized frame (poll_message returns Some, assert fails). `#[ignore]` — allocates a >64 MiB ConfState.
@@ -2820,10 +2821,73 @@ fn unsendable_oversized_metadata_emits_no_chunk() {
   if let Some(p) = ep.tracker.progress_mut(&1u64) {
     p.become_snapshot(Index::new(10), 1024);
   }
-  let _ = ep.send_snapshot_chunk(1u64, &stable, 0);
+  let outcome = ep.send_snapshot_chunk(1u64, &stable, 0);
+  assert_eq!(
+    outcome,
+    ChunkSend::Unsendable,
+    "an oversized-meta snapshot is a distinct permanent Unsendable, not a transient Deferred"
+  );
+  assert_eq!(
+    ep.unsendable_snapshot_meta_count(),
+    1,
+    "the Unsendable outcome bumps the diagnostic counter"
+  );
   assert!(
     ep.poll_message().is_none(),
     "an InstallSnapshot whose metadata alone exceeds MAX_FRAME_BYTES must NOT be enqueued (no oversized frame)"
+  );
+}
+
+/// A membership whose RESULTING `ConfState` is too large to snapshot is refused at PROPOSE with
+/// `MembershipTooLargeToSnapshot` — nothing is appended — rather than committing and wedging
+/// `send_snapshot_chunk` forever after the next compaction.
+///
+/// MUTATION: drop the propose-time size gate → the oversized conf change appends (the log grows) and
+/// the wedge is deferred to the post-compaction snapshot path. `#[ignore]` — builds a ~3.5M-voter result.
+#[test]
+#[ignore = "builds a ~3.5M-voter resulting ConfState (~35 MiB); run with cargo test -- --ignored"]
+fn oversized_membership_refused_at_propose() {
+  use crate::{
+    ConfChangeSingle, ConfChangeTransition, ConfChangeType, ConfChangeV2, Config, Instant,
+    ProposeError,
+  };
+  use core::time::Duration;
+  // A single-voter leader is a self-quorum, so it is cheap to elect.
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 7, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  ep.handle_storage(d, &mut log, &mut stable); // self-vote durable → become_leader
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  let last_before = log.last_index();
+
+  // A joint change adding enough new voters that the resulting ConfState's InstallSnapshot metadata
+  // exceeds MAX_SNAPSHOT_META_FRAME_BYTES (half of MAX_FRAME_BYTES ≈ 32 MiB): ~10 bytes per u64 voter,
+  // so ~3.5M voters clears it with margin.
+  let changes: std::vec::Vec<ConfChangeSingle<u64>> = (2..=3_500_001u64)
+    .map(|id| ConfChangeSingle::new(ConfChangeType::AddNode, id))
+    .collect();
+  let ccv2 = ConfChangeV2::new(ConfChangeTransition::Explicit, changes, bytes::Bytes::new());
+  let err = ep
+    .propose_conf_change_v2(d, &mut log, &stable, ccv2)
+    .unwrap_err();
+  assert!(
+    matches!(err, ProposeError::MembershipTooLargeToSnapshot { .. }),
+    "an oversized membership must be refused at propose; got {err:?}"
+  );
+  assert_eq!(
+    log.last_index(),
+    last_before,
+    "a refused conf change appends nothing"
   );
 }
 

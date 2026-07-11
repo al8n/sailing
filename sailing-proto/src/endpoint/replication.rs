@@ -249,9 +249,11 @@ where
             .snapshot_resend_after
             .insert(peer, now.mono() + self.config.election_timeout());
         }
-        // Nothing went out (no snapshot persisted yet, or a cold/unsendable read) → CLEAR any stale deadline
-        // so the next heartbeat retries immediately rather than honoring a lingering future deadline.
-        ChunkSend::Deferred => {
+        // Nothing went out (no snapshot persisted yet, or a cold read) → CLEAR any stale deadline so the
+        // next heartbeat retries immediately rather than honoring a lingering future deadline. Unsendable
+        // (oversized meta) clears it too: retrying is futile, but a lingering future deadline would
+        // suppress even the diagnostic re-attempt, and clearing keeps the two benign-defer arms uniform.
+        ChunkSend::Deferred | ChunkSend::Unsendable => {
           self.snapshot.snapshot_resend_after.remove(&peer);
         }
         // Fatal store read → the node is poisoned; fall through to the bail below.
@@ -1259,7 +1261,7 @@ where
               now.mono() + self.config.election_timeout(),
             );
           }
-          ChunkSend::Deferred => {}
+          ChunkSend::Deferred | ChunkSend::Unsendable => {}
           ChunkSend::Poisoned => return,
         }
       }

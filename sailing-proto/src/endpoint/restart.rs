@@ -451,6 +451,7 @@ where
         pending_install: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
+        unsendable_meta_frames: 0,
       },
       rng,
       votes: BTreeMap::new(),

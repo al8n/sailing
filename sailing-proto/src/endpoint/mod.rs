@@ -1035,6 +1035,12 @@ where
   /// dropped blob is still retried within one election timeout of the next response (liveness).
   /// Entries clear when the peer leaves `Snapshot` state and on leadership change.
   snapshot_resend_after: BTreeMap<I, Instant>,
+  /// Diagnostic: how many times `send_snapshot_chunk` refused to emit a chunk because the snapshot
+  /// METADATA alone (a `ConfState` too large) left no room for a data byte under the frame limit (a
+  /// `ChunkSend::Unsendable` outcome). With the propose-time `MembershipTooLargeToSnapshot` gate this
+  /// should never advance in native operation; a CLIMBING value flags a peer permanently wedged in
+  /// `Snapshot` on an oversized meta (e.g. a config that predates the gate). Saturating.
+  unsendable_meta_frames: u64,
 }
 
 // Hand-written so the impl does not require `F::Snapshot: Debug` (its only bound is `Data`, which is
@@ -1058,6 +1064,7 @@ where
       .field("snapshot_recv", &self.snapshot_recv)
       .field("pending_compact", &self.pending_compact)
       .field("snapshot_resend_after", &self.snapshot_resend_after)
+      .field("unsendable_meta_frames", &self.unsendable_meta_frames)
       .finish()
   }
 }
@@ -1313,6 +1320,7 @@ where
         pending_install: None,
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
+        unsendable_meta_frames: 0,
       },
       rng,
       votes: BTreeMap::new(),
@@ -1556,6 +1564,15 @@ where
   #[inline]
   pub const fn state_machine(&self) -> &F {
     &self.fsm
+  }
+
+  /// Diagnostic count of snapshot chunks refused because the metadata (an oversized `ConfState`) left
+  /// no room for a data byte under the transport frame limit. Native `propose_conf_change` refuses such
+  /// a membership up front, so a CLIMBING value flags a peer permanently wedged in `Snapshot` on a
+  /// config that predates that gate — otherwise indistinguishable from a slow install.
+  #[inline]
+  pub const fn unsendable_snapshot_meta_count(&self) -> u64 {
+    self.snapshot.unsendable_meta_frames
   }
 
   /// Next outbound message, if any.
