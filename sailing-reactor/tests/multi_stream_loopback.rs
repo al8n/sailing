@@ -2740,20 +2740,19 @@ async fn fork_rollback_leaves_no_engine_residue() {
     handle.clear_tombstone(300).await.expect("clear resolves"),
     "a tombstone existed"
   );
-  handle
+  // The refused fork's rollback removed the freshly-added storage, so there is NO stored state to
+  // restore and the host fails closed. A leaked baseline (stores left behind) would instead let
+  // the restore succeed against them — so NoStoredState IS the no-leak assertion here.
+  match handle
     .restore_group(300, config(1, vec![1]), 9, CountSm::default(), 0)
     .await
-    .expect("a cleared id restores");
-  let status = handle
-    .group(300)
-    .status()
-    .await
-    .expect("the restored group answers");
-  assert_eq!(
-    status.applied_index,
-    Index::ZERO,
-    "virgin stores: the refused fork's baseline did NOT leak through the rollback"
-  );
+  {
+    Err(DriverError::NoStoredState) => {}
+    other => panic!(
+      "the rollback must leave no stored state to restore (a leaked baseline would let restore \
+       succeed), got {other:?}"
+    ),
+  }
 
   // The driver keeps serving after both refusals.
   assert_eq!(

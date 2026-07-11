@@ -986,7 +986,15 @@ where
       floor: self.engine.group_floor(&gid),
       lineage: self.engine.group_gen(&gid),
     };
-    let added = self.engine.add_group(gid.cheap_clone());
+    if self.engine.add_group(gid.cheap_clone()) {
+      // `add_group` CREATED the store: the host has no stored state for this group (it was never
+      // staged, or was torn down and its volatile state died with the in-memory engine). Restoring
+      // now would fabricate a blank index-0 incarnation masquerading as recovered state — fail
+      // closed after rolling the fresh store back out, rather than silently returning Ok. A durable
+      // engine is the roadmap cure.
+      self.engine.remove_group(&gid);
+      return Err(DriverError::NoStoredState);
+    }
     let epoch = self
       .engine
       .next_boot_epoch(&gid)
@@ -1020,12 +1028,9 @@ where
         self.admit_group(gid);
         Ok(())
       }
-      Err(e) => {
-        if added {
-          self.engine.remove_group(&gid);
-        }
-        Err(rejected(e))
-      }
+      // A pre-existing store is never removed on refusal (it held real state before this call); the
+      // fresh-store case already failed closed above, so nothing here rolls a store back out.
+      Err(e) => Err(rejected(e)),
     }
   }
 

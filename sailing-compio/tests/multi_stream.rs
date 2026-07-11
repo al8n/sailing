@@ -396,3 +396,63 @@ async fn merge_absorbs_and_source_never_returns() {
     h.shutdown().await.expect("the multi host tears down");
   }
 }
+
+/// A restore for a group the host holds NO stored state for fails closed instead of fabricating a
+/// blank incarnation: removing a group drops its in-memory stores, so a later restore of that id
+/// finds nothing to recover and returns `NoStoredState` rather than a silent empty `Ok`. The id is
+/// not resurrected, and the co-hosted live group keeps committing.
+#[compio::test]
+async fn restore_without_stored_state_fails_closed() {
+  let addr: SocketAddr = "127.0.0.1:45330".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+  )
+  .await
+  .expect("the empty multi host binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("the live co-hosted group admits");
+  handle
+    .create_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
+    .await
+    .expect("the second group admits");
+  let g200 = handle.group(200);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g200), b"x").await, 1);
+  assert!(
+    handle.remove_group(200).await.expect("remove resolves"),
+    "the hosted removal dropped storage"
+  );
+  assert!(
+    handle.clear_tombstone(200).await.expect("clear resolves"),
+    "the removal left a tombstone to clear"
+  );
+
+  // The tombstone is cleared, so nothing but the ABSENT stores stands between this call and a
+  // restore. The removal dropped those in-memory stores, so the restore has nothing to recover:
+  // it fails closed rather than silently standing up a blank index-0 incarnation.
+  match handle
+    .restore_group(200, config(1, vec![1]), 2, CountSm::default(), 0)
+    .await
+  {
+    Err(DriverError::NoStoredState) => {}
+    other => panic!("expected NoStoredState for a group with no stored state, got {other:?}"),
+  }
+  assert!(
+    handle.group(200).status().await.is_err(),
+    "the group was not resurrected"
+  );
+
+  // The co-hosted live group is undisturbed by the refused restore.
+  let g100 = handle.group(100);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 1);
+
+  handle.shutdown().await.expect("the multi host tears down");
+}

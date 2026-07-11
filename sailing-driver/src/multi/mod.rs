@@ -542,6 +542,11 @@ where
   /// cross-restart incarnation authority (pass 0 unless the embedder reshapes ids): a restore
   /// that lies about it collapses two incarnations into one identity for every gen-keyed
   /// observer, voiding exactly what the admission floor exists to distinguish.
+  ///
+  /// Fails closed with [`DriverError::NoStoredState`] when the host holds no stored state for
+  /// `gid` (never staged, or torn down and its volatile state gone with the in-memory engine): a
+  /// restore that found nothing to recover returns the error rather than silently standing up a
+  /// blank index-0 incarnation. A durable engine is the roadmap cure.
   pub async fn restore_group(
     &self,
     gid: G,
