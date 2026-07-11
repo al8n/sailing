@@ -1539,8 +1539,7 @@ where
   /// or off the failover tier. Unlike its POST-election sibling
   /// [`unprovable_floor_holds`](Self::unprovable_floor_holds) — which climbs only after a win wedges commit
   /// — this fires at campaign time, BEFORE the node can wedge, so an operator can act by configuring a wall
-  /// capability or transferring leadership away. The randomized tester reads it to assert a Safe/no-ε_unc
-  /// successor that inherited walled entries is flagged before it leads.
+  /// capability or transferring leadership away.
   #[inline(always)]
   pub const fn unprovable_floor_campaigns(&self) -> u64 {
     self.lease_guard.unprovable_floor_campaigns

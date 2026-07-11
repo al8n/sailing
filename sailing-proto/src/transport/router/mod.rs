@@ -19,7 +19,7 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 /// quiesced plane needs: a plane that sends nothing produces no close on its own, so without a
 /// transport-level idle reap a silent blackhole would never wake the quiesced group. Refreshed by
 /// any received bytes; a connection's own sends never refresh it. QUIC-parity with the quinn
-/// max-idle default — tuning it rides the transport-hardening milestone.
+/// max-idle default; a provisional fixed value, not yet configurable.
 const IDLE_TIMEOUT_MILLIS: u64 = 3000;
 const IDLE_TIMEOUT: Duration = Duration::from_millis(IDLE_TIMEOUT_MILLIS);
 

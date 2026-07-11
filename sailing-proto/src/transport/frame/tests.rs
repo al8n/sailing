@@ -335,8 +335,10 @@ fn coalesced_rejects_a_missing_marker() {
 
 /// An empty coalesced frame — the bare marker, zero entries — is the idle keep-alive PROBE shape.
 /// It decodes to zero messages, so a receiver dispatches nothing and only its transport-liveness
-/// clock advances. Accepting it needs no wire-version change: a pre-probe peer's parser rejects the
-/// empty list, but the `LABEL_VERSION` hello fence keeps such a peer off the wire entirely.
+/// clock advances. Accepting it needs no wire-version change while the crates are unreleased: no
+/// deployed peer predates the probe, so none can receive an empty frame it would reject. A released
+/// build carries the probe within its `LABEL_VERSION`, and the hello handshake fences any peer on an
+/// older label.
 #[test]
 fn coalesced_accepts_the_empty_probe_frame() {
   let frame = Bytes::from_static(&[0xFF, 0xFF]);
