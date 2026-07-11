@@ -465,9 +465,13 @@ where
   /// A snapshot install re-baselined the log to `boundary`, discarding every abort entry at-or-below
   /// it: drop each obligation whose abort entry the boundary COVERS. The installed snapshot sits past
   /// a committed-and-applied abort (a non-redundant install re-baselines strictly above `commit`, and
-  /// an obligation is set at apply, so `abort_index <= applied <= commit < boundary`), so the leader
-  /// that captured it proved that source thawed past its abandoned freeze — its own service drove the
-  /// thaw before compacting. A covered obligation is MOOT, and its ONLY restart re-derivation
+  /// an obligation is set at apply, so `abort_index <= applied <= commit < boundary`), so the covered
+  /// obligation is already RESOLVED by the envelope §4.5 invariant — covered ⟹ the source was THAWED
+  /// (this leader's own service drove the thaw past its abandoned freeze before compacting) OR
+  /// ESCAPE-FLOORED (the source was removed and purged, its incarnation fenced by escape⟹terminal-floor
+  /// and its frozen remnant torn down by the husk-dissolve pass). It does NOT prove a thaw in
+  /// particular: the removal-purge leg never thaws, which is why the earlier "the leader proved the
+  /// source thawed" reading was wrong. A covered obligation is MOOT, and its ONLY restart re-derivation
   /// (replaying the abort entry) was just discarded: keeping it would strand `abort_relay_fences` on
   /// a boundary the install already crossed — a permanent target-capture wedge with the source thawed
   /// and gone (the service could never observe it advance to discharge it). An obligation whose abort

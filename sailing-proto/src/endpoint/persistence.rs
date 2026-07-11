@@ -392,6 +392,13 @@ where
   ///
   /// Idempotent via the durable `HardState` read: a same-term message, a pre-vote (which never adopts a
   /// term), or a handler that already persisted the step-down (a vote grant) does NOT double-write.
+  ///
+  /// The persist-before-RESPOND gate this feeds relies on the store's STRICT-completion contract (see
+  /// [`StableStore::poll`](crate::StableStore::poll)): the withheld grant/ack is released only when the
+  /// matching `Wrote` completion drains. A LOST completion is a store-contract violation that STALLS the
+  /// response — the SAFE direction, since a peer never observed the ungranted vote / unacked append — and
+  /// a restart re-submits from the durable state and heals it. Missing a completion costs liveness, never
+  /// §5.1 safety.
   pub(crate) fn ensure_term_durable<S: StableStore<NodeId = I>>(&mut self, stable: &mut S) {
     if self.poison.poisoned {
       return;

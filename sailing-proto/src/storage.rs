@@ -285,6 +285,16 @@ pub trait LogStore {
   fn restore(&mut self, last_index: Index, last_term: Term);
 
   /// Drain the next completion, if any.
+  ///
+  /// **Completion contract (NORMATIVE):** every accepted [`submit_append`](Self::submit_append) MUST
+  /// eventually surface EXACTLY ONE matching completion here, in FIFO order. A LOST completion — an
+  /// accepted write whose `LogDone` never arrives — is a STORE-CONTRACT VIOLATION, not a tolerated
+  /// outcome. The core gates real actions on durability (persist-before-ack, persist-before-vote, the
+  /// term-durable gate), so a missing completion STALLS the gated path
+  /// rather than advancing it — the SAFE direction: the node makes no unsafe progress (never a stale
+  /// ack, never a lost-vote grant), it merely fails to make forward progress. A restart re-submits from
+  /// the durable state and heals the stall. The contract is thus "eventually, exactly once"; violating
+  /// it costs liveness (a wedge), never safety.
   fn poll(&mut self) -> Option<Result<LogDone, Self::Error>>;
 
   /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion
@@ -488,6 +498,12 @@ pub trait StableStore {
   fn discard_snapshot_staging(&mut self);
 
   /// Drain the next completion, if any.
+  ///
+  /// **Completion contract (NORMATIVE):** as for [`LogStore::poll`](crate::LogStore::poll), every
+  /// accepted `submit_write`/`submit_snapshot` MUST eventually surface EXACTLY ONE matching
+  /// `StableDone` here, in FIFO order. A LOST completion is a store-contract violation: it STALLS the
+  /// durability-gated path (a term/vote persist that never lands blocks the become-leader / cast-vote
+  /// it fences) rather than advancing it — the safe direction — and a restart re-submits and heals.
   fn poll(&mut self) -> Option<Result<StableDone, Self::Error>>;
 
   /// Whether a subsequent [`poll`](Self::poll) would return `Some` — i.e. at least one completion
