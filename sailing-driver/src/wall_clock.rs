@@ -81,36 +81,65 @@ impl WallClock for Monotonic {
 }
 
 /// `SystemTime::now()` as nanos since the Unix epoch, saturating into `u64` (a ~year-2554 ceiling).
-#[cfg_attr(
-  all(not(target_os = "linux"), not(feature = "unverified-wall-clock")),
-  allow(dead_code)
-)]
+/// Serves ONLY the raw `unverified-wall-clock` source now; `disciplined_reading` reads the wall from the
+/// adjtimex result instead, so this is dead when that feature is off.
+#[cfg_attr(not(feature = "unverified-wall-clock"), allow(dead_code))]
 fn system_wall_nanos() -> u64 {
   std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
-/// adjtimex `maxerror` (signed MICROSECONDS) to nanoseconds. Clamp BEFORE the `*1000` so a
-/// negative/huge value can never wrap. Isolated + unit-tested because a raw µs-vs-ns compare
-/// downstream would be a 1000× fail-OPEN bug; here it is a pure unit normalization, no threshold in
-/// scope (the driver `Clock` applies ε_unc).
+/// adjtimex `maxerror` (signed MICROSECONDS) to nanoseconds, or `None` when it is not a real bound. A
+/// NEGATIVE `maxerror` is FAIL-CLOSED: the prior clamp-to-0 turned it into a claimed-PERFECT clock
+/// (fail-OPEN — a zero error passes every ε_unc gate), letting a successor pass the precise release
+/// early. A valid non-negative value scales by `1000`; `saturating_mul` guards the (unreachable for a
+/// real kernel) overflow so nothing ever wraps. Isolated + unit-tested because a raw µs-vs-ns compare
+/// downstream would be a 1000× bug; no threshold is in scope here (the driver `Clock` applies ε_unc).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn maxerror_us_to_ns(maxerror_us: i64) -> u64 {
-  (maxerror_us.max(0) as u64).saturating_mul(1_000)
+fn maxerror_us_to_ns(maxerror_us: i64) -> Option<u64> {
+  u64::try_from(maxerror_us)
+    .ok()
+    .map(|us| us.saturating_mul(1_000))
 }
 
-/// The disciplined reading from a kernel `timex`, factored out so it is unit-testable WITHOUT a
-/// syscall: `None` when unsynchronized, else a reading with the µs→ns-normalized error.
+/// The disciplined reading from a kernel `timex`, factored out so it is unit-testable WITHOUT a syscall.
+/// Takes the timex-relevant fields — `status`, `maxerror` (µs), the `time` seconds and fractional part,
+/// and the `STA_UNSYNC`/`STA_NANO` bit masks — so the WALL and its ERROR BOUND come from the SAME
+/// adjtimex result. A separate later `SystemTime::now()` (the prior implementation) could step or be
+/// descheduled between the syscall and the wall sample, pairing a fresh wall with a stale-small error:
+/// a falsely-low wall that the precise release passes early, overlapping the old leader's live lease.
+///
+/// `None` when unsynchronized OR any field is invalid — fail CLOSED rather than fabricate a trusted
+/// reading: a negative `maxerror` (not a real bound), or a negative/pre-epoch `time`. Never wraps
+/// (saturating throughout).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn disciplined_reading(status: i32, maxerror_us: i64, unsync_bit: i32) -> Option<WallReading> {
+fn disciplined_reading(
+  status: i32,
+  maxerror_us: i64,
+  time_sec: i64,
+  time_frac: i64,
+  unsync_bit: i32,
+  nano_bit: i32,
+) -> Option<WallReading> {
+  // Unsynchronized: the kernel cannot vouch for the clock at all.
   if (status & unsync_bit) != 0 {
     return None;
   }
-  Some(WallReading::new(
-    system_wall_nanos(),
-    maxerror_us_to_ns(maxerror_us),
-  ))
+  // Fail-closed field validation (any `?` below ⇒ `None`, never a fabricated reading).
+  let max_error_nanos = maxerror_us_to_ns(maxerror_us)?;
+  let sec = u64::try_from(time_sec).ok()?;
+  let frac = u64::try_from(time_frac).ok()?;
+  // adjtimex reports `time.tv_usec` in NANOSECONDS when STA_NANO is set, else MICROSECONDS (`maxerror`
+  // is ALWAYS microseconds, regardless of STA_NANO). Reading a nanosecond fraction as microseconds
+  // would inflate the wall by 1000×; the sub-second field is bounded (<1 s), but the scale must match.
+  let frac_nanos = if (status & nano_bit) != 0 {
+    frac
+  } else {
+    frac.saturating_mul(1_000)
+  };
+  let wall_nanos = sec.saturating_mul(1_000_000_000).saturating_add(frac_nanos);
+  Some(WallReading::new(wall_nanos, max_error_nanos))
 }
 
 /// The PRODUCTION wall source: reads the OS clock-discipline state (Linux `adjtimex`) and reports a
@@ -134,7 +163,16 @@ impl NtpDisciplinedClock {
     if ret < 0 || ret == libc::TIME_ERROR {
       return None;
     }
-    disciplined_reading(t.status, t.maxerror as i64, libc::STA_UNSYNC)
+    // Marshal the timex-relevant fields into the pure reader; the wall (`t.time`) and its error
+    // (`t.maxerror`) both come from THIS one result. `STA_NANO` selects the `t.time.tv_usec` unit.
+    disciplined_reading(
+      t.status,
+      t.maxerror as i64,
+      t.time.tv_sec as i64,
+      t.time.tv_usec as i64,
+      libc::STA_UNSYNC,
+      libc::STA_NANO,
+    )
   }
 
   #[cfg(not(target_os = "linux"))]
@@ -187,20 +225,60 @@ mod tests {
   }
 
   #[test]
-  fn maxerror_us_to_ns_scales_and_clamps() {
-    assert_eq!(maxerror_us_to_ns(50), 50_000); // 50 µs -> 50_000 ns (the 1000x scale)
-    assert_eq!(maxerror_us_to_ns(0), 0);
-    assert_eq!(maxerror_us_to_ns(-1), 0); // negative clamps to 0, never wraps
-    assert_eq!(maxerror_us_to_ns(i64::MAX), u64::MAX); // saturates, never wraps
+  fn maxerror_us_to_ns_scales_or_fails_closed() {
+    assert_eq!(maxerror_us_to_ns(50), Some(50_000)); // 50 µs -> 50_000 ns (the 1000x scale)
+    assert_eq!(maxerror_us_to_ns(0), Some(0));
+    assert_eq!(maxerror_us_to_ns(-1), None); // negative is not a real bound -> fail closed
+    assert_eq!(maxerror_us_to_ns(i64::MAX), Some(u64::MAX)); // saturates, never wraps
   }
+
+  // adjtimex status bits used by the pure tests below (the real values live in `libc`).
+  const UNSYNC: i32 = 0x0001;
+  const NANO: i32 = 0x2000;
 
   #[test]
   fn disciplined_reading_unsync_is_none_else_reports_error() {
-    const UNSYNC: i32 = 0x0001;
-    assert!(disciplined_reading(UNSYNC, 10, UNSYNC).is_none()); // unsynchronized -> None
-    let r = disciplined_reading(0, 50, UNSYNC).expect("synced");
+    // STA_UNSYNC set -> None regardless of the other fields.
+    assert!(disciplined_reading(UNSYNC, 10, 1, 0, UNSYNC, NANO).is_none());
+    // Synced: the µs->ns error, and a wall taken from the injected `time` (100 s, zero fraction).
+    let r = disciplined_reading(0, 50, 100, 0, UNSYNC, NANO).expect("synced");
     assert_eq!(r.max_error_nanos(), 50_000); // 50 µs reported as 50_000 ns
-    assert!(r.wall_nanos() > 0);
+    assert_eq!(r.wall_nanos(), 100 * 1_000_000_000);
+  }
+
+  /// Fail CLOSED on invalid fields: a NEGATIVE maxerror (the prior clamp-to-0 made it a claimed-PERFECT
+  /// clock — fail-OPEN), and a negative/pre-epoch `time` seconds, both yield `None`.
+  #[test]
+  fn disciplined_reading_fails_closed_on_invalid_fields() {
+    assert!(disciplined_reading(0, -1, 100, 0, UNSYNC, NANO).is_none()); // negative maxerror
+    assert!(disciplined_reading(0, 50, -1, 0, UNSYNC, NANO).is_none()); // pre-epoch seconds
+  }
+
+  /// STA_NANO selects the `time.tv_usec` unit — NANOSECONDS when set, MICROSECONDS when clear — so the
+  /// same raw fraction differs by exactly 1000× in the reading's sub-second wall (`maxerror` is
+  /// unaffected: always microseconds).
+  #[test]
+  fn disciplined_reading_honors_sta_nano() {
+    let as_micros = disciplined_reading(0, 0, 5, 250, UNSYNC, NANO).expect("synced");
+    let as_nanos = disciplined_reading(NANO, 0, 5, 250, UNSYNC, NANO).expect("synced");
+    assert_eq!(as_micros.wall_nanos(), 5 * 1_000_000_000 + 250_000); // 250 µs
+    assert_eq!(as_nanos.wall_nanos(), 5 * 1_000_000_000 + 250); // 250 ns
+    assert_eq!(
+      as_micros.wall_nanos() - as_nanos.wall_nanos(),
+      250 * 1_000 - 250
+    );
+  }
+
+  /// The wall equals the INJECTED timex `time` exactly — proving no `SystemTime::now()` sits in the
+  /// path (the wall and its error come from the one adjtimex result).
+  #[test]
+  fn disciplined_reading_wall_is_the_injected_time() {
+    let r = disciplined_reading(0, 20, 1_700_000_000, 123_456, UNSYNC, NANO).expect("synced");
+    assert_eq!(
+      r.wall_nanos(),
+      1_700_000_000 * 1_000_000_000 + 123_456 * 1_000
+    );
+    assert_eq!(r.max_error_nanos(), 20_000);
   }
 
   #[test]
