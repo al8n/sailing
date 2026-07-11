@@ -692,8 +692,8 @@ mod engine_backed_cluster {
         .unwrap();
         assert!(eb.add_group(g));
       }
-      let ca = a.on_conn_open(label(1, true), Instant::ORIGIN);
-      let cb = b.on_conn_open(label(2, false), Instant::ORIGIN);
+      let ca = a.on_dial_open(2, label(1, true), Instant::ORIGIN);
+      let cb = b.on_accept_open(label(2, false), Instant::ORIGIN);
       assert_eq!(ca, cb, "first allocation on both sides");
       World {
         a,

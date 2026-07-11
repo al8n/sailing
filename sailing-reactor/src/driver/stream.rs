@@ -764,7 +764,7 @@ where
     // Best-effort latency tuning: consensus pipelines small writes, so disable Nagle. A socket that
     // rejects it still carries traffic.
     let _ = socket.set_nodelay(true);
-    let id = self.coord.on_conn_open(record, now);
+    let id = self.coord.on_accept_open(record, now);
     let (out_tx, out_rx) = flume::unbounded();
     let queued = Arc::new(AtomicUsize::new(0));
     let (read_half, write_half) = socket.into_split();
@@ -884,7 +884,7 @@ where
       Ok(r) => r,
       Err(_) => return,
     };
-    let id = self.coord.on_conn_open(record, now);
+    let id = self.coord.on_dial_open(peer.cheap_clone(), record, now);
     let (out_tx, out_rx) = flume::unbounded();
     let queued = Arc::new(AtomicUsize::new(0));
     let dial_ready = self.dial_ready_tx.clone();

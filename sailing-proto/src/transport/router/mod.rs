@@ -29,12 +29,22 @@ const IDLE_TIMEOUT: Duration = Duration::from_millis(IDLE_TIMEOUT_MILLIS);
 /// single lost probe cannot by itself cause a spurious reap.
 const PROBE_INTERVAL: Duration = Duration::from_millis(IDLE_TIMEOUT_MILLIS / 3);
 
+/// How a connection was opened — the provenance the duplicate-peer tie-break and the dial-expectation
+/// gate read. `Dialed` carries the id the local node MEANT to reach; `Accepted` has no expectation.
+enum Provenance<I> {
+  /// The local node accepted an inbound connection — the peer dialed us.
+  Accepted,
+  /// The local node dialed out, expecting to reach this peer id.
+  Dialed(I),
+}
+
 /// Routes consensus messages over a table of per-peer connections.
 ///
 /// A connection is registered by [`ConnId`] while still handshaking; once it validates, the router
-/// binds `peer → conn`. If a second connection validates for an already-bound peer, the HIGHER id
-/// (the newer dial — ids are driver-monotonic) wins and the other is dropped — a deterministic
-/// tie-break, since both connections carry the same authenticated peer.
+/// binds `peer → conn`. If a second connection validates for an already-bound peer the tie-break
+/// depends on provenance: MIXED (one dialed, one accepted — the mutual-dial sibling case) keeps the
+/// connection dialed by the LOWER node id, which both ends compute identically; SAME provenance (a
+/// redial race) keeps the HIGHER id (the newer dial — ids are driver-monotonic).
 ///
 /// Every connection the router drops on its OWN initiative (transport fault, clean close,
 /// duplicate tie-break, outbound-cap stall, handshake timeout) is queued and surfaced via
@@ -53,6 +63,13 @@ pub struct PeerRouter<I, R> {
   /// [`PROBE_INTERVAL`]. At this deadline an otherwise-idle connection emits an empty probe so the
   /// peer keeps receiving bytes and never reaps it.
   probe_deadline: BTreeMap<ConnId, Instant>,
+  /// How each connection was opened (dial-expected peer, or accept) — the provenance the
+  /// self-ID/dial-expectation gates and the duplicate tie-break read.
+  provenance: BTreeMap<ConnId, Provenance<I>>,
+  /// This node's OWN id, once the owning coordinator knows it: a hello claiming it is rejected
+  /// (self-ID), and it decides the lower-id-dials-win tie-break. `None` before the coordinator has an
+  /// identity (a multi host with no group yet); the self-ID gate is then a no-op, exactly as QUIC's.
+  local_id: Option<I>,
   /// Connections the router closed on its own initiative, with the fault that closed them
   /// (`None` = a clean close: peer EOF/close_notify, duplicate eviction, outbound-cap stall).
   closed: VecDeque<(ConnId, Option<TransportError>)>,
@@ -67,8 +84,28 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
       handshake_deadline: BTreeMap::new(),
       idle_deadline: BTreeMap::new(),
       probe_deadline: BTreeMap::new(),
+      provenance: BTreeMap::new(),
+      local_id: None,
       closed: VecDeque::new(),
     }
+  }
+
+  /// Record this node's own id, so the self-ID gate and the lower-id-dials-win tie-break can consult
+  /// it. Idempotent — the owning coordinator sets it as soon as an identity exists (unconditionally
+  /// for a single-group host, once a group is admitted for a multi host).
+  pub fn set_local_id(&mut self, id: I) {
+    self.local_id = Some(id);
+  }
+
+  /// Register a freshly DIALED connection under `id`, expecting to reach `expected`. A hello that
+  /// authenticates as any other id closes the connection (see [`handle_conn_data`](Self::handle_conn_data)).
+  pub fn register_dial(&mut self, id: ConnId, expected: I, record: R, now: Instant) {
+    self.register(id, Provenance::Dialed(expected), record, now);
+  }
+
+  /// Register a freshly ACCEPTED connection under `id` (the peer dialed us; no dial expectation).
+  pub fn register_accept(&mut self, id: ConnId, record: R, now: Instant) {
+    self.register(id, Provenance::Accepted, record, now);
   }
 
   /// Register a freshly opened connection (still handshaking) under `id`, starting its handshake
@@ -77,7 +114,7 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   /// rejected attempt is reported via [`poll_conn_closed`](Self::poll_conn_closed) so the driver
   /// tears down whatever socket it tried to register. (Accepting the replacement would be
   /// ambiguous: a later close notification for the id could not say WHICH socket to release.)
-  pub fn register(&mut self, id: ConnId, record: R, now: Instant) {
+  fn register(&mut self, id: ConnId, provenance: Provenance<I>, record: R, now: Instant) {
     if self.conns.contains_key(&id) {
       self
         .closed
@@ -86,6 +123,7 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     }
     self.conns.insert(id, Conn::new(record));
     self.handshake_deadline.insert(id, now + HANDSHAKE_TIMEOUT);
+    self.provenance.insert(id, provenance);
   }
 
   /// Driver-initiated removal (the driver already knows the socket is gone — not echoed back).
@@ -94,6 +132,7 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     self.handshake_deadline.remove(&id);
     self.idle_deadline.remove(&id);
     self.probe_deadline.remove(&id);
+    self.provenance.remove(&id);
     self.peer_of.retain(|_, &mut c| c != id);
   }
 
@@ -101,6 +140,37 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
   fn remove_internal(&mut self, id: ConnId, reason: Option<TransportError>) {
     self.remove(id);
     self.closed.push_back((id, reason));
+  }
+
+  /// Which of two connections to KEEP when both authenticate as `peer`. MIXED provenance (the
+  /// mutual-dial sibling case) keeps the connection DIALED BY the lower node id: if WE are the lower
+  /// id our DIALED connection survives, else the ACCEPTED one does. Both ends compute the same
+  /// survivor from the two ids and the direction, so exactly one physical pair lives. SAME provenance
+  /// (a redial race) — or an unknown local id — keeps the higher (newer) id, the driver-monotonic
+  /// tie-break.
+  fn duplicate_winner(&self, id: ConnId, prev: ConnId, peer: &I) -> ConnId {
+    let we_are_lower = self.local_id.as_ref().map(|me| me < peer);
+    match (
+      self.provenance.get(&id),
+      self.provenance.get(&prev),
+      we_are_lower,
+    ) {
+      (Some(Provenance::Dialed(_)), Some(Provenance::Accepted), Some(lower)) => {
+        if lower {
+          id
+        } else {
+          prev
+        }
+      }
+      (Some(Provenance::Accepted), Some(Provenance::Dialed(_)), Some(lower)) => {
+        if lower {
+          prev
+        } else {
+          id
+        }
+      }
+      _ => id.max(prev),
+    }
   }
 
   /// Close `id` on the OWNER's initiative — for an integrity fault detected above the router (a
@@ -248,19 +318,33 @@ impl<I: NodeId, R: RecordIo> PeerRouter<I, R> {
     if !conn.is_closed()
       && let Some(peer) = conn.peer()
     {
+      // Self-ID reject: a hello claiming OUR own id (a crossed/looped-back dial, or a duplicate-id
+      // member) must never bind — it would speak AS us. A no-op before we have an identity.
+      if self.local_id.as_ref().is_some_and(|me| *me == peer) {
+        self.remove_internal(id, Some(TransportError::SelfIdentity));
+        return Ok(());
+      }
+      // Dial-expectation: a DIALED connection must authenticate as exactly the peer we meant to
+      // reach; a mismatch is a wrong-DNS/crossed connection and closes rather than binding a lie.
+      if let Some(Provenance::Dialed(expected)) = self.provenance.get(&id)
+        && *expected != peer
+      {
+        self.remove_internal(id, Some(TransportError::UnexpectedPeer));
+        return Ok(());
+      }
       // The handshake→validated transition (the FIRST read that binds a peer) arms the keep-alive
       // probe; the idle-silence deadline is armed and refreshed by `handle_conn_data` on every
       // received read, this one included.
       let first_validation = self.handshake_deadline.remove(&id).is_some();
-      if let Some(&prev) = self.peer_of.get(&peer) {
-        if prev > id {
-          // A stale older duplicate validated late: drop it, keep the newer binding.
+      if let Some(&prev) = self.peer_of.get(&peer)
+        && prev != id
+      {
+        if self.duplicate_winner(id, prev, &peer) == prev {
+          // The existing binding wins the tie-break: drop the newcomer, keep `prev`.
           self.remove_internal(id, None);
           return Ok(());
         }
-        if prev != id {
-          self.remove_internal(prev, None); // newer connection wins
-        }
+        self.remove_internal(prev, None); // the newcomer wins: evict the old binding
       }
       self.peer_of.insert(peer, id);
       if first_validation {

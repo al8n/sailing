@@ -53,8 +53,8 @@ impl World {
     let mut b = coord(2);
     // Node 1 dials node 2; node 2 accepts. Each coordinator assigns its own ConnId; with a single
     // connection both counters yield the same first id.
-    let ca = a.on_conn_open(label(1, true), Instant::ORIGIN);
-    let cb = b.on_conn_open(label(2, false), Instant::ORIGIN);
+    let ca = a.on_dial_open(2, label(1, true), Instant::ORIGIN);
+    let cb = b.on_accept_open(label(2, false), Instant::ORIGIN);
     assert_eq!(ca, cb, "first allocation on both sides");
     World {
       a,
@@ -252,7 +252,7 @@ fn conn_id_exhaustion_panics_instead_of_wrapping() {
   let mut c = coord(1);
   c.next_conn_id = u64::MAX;
   // This open hands out ConnId(u64::MAX) and must refuse to wrap the successor.
-  let _ = c.on_conn_open(label(1, true), Instant::ORIGIN);
+  let _ = c.on_dial_open(2, label(1, true), Instant::ORIGIN);
 }
 
 /// The coordinator/driver counterpart of `flush_appends_is_idempotent_for_a_probe_peer`: the driver
@@ -372,7 +372,7 @@ fn restart_and_restart_migrating_rebuild_a_follower() {
 #[test]
 fn driver_initiated_close_is_not_echoed() {
   let mut c = coord(1);
-  let id = c.on_conn_open(label(1, true), Instant::ORIGIN);
+  let id = c.on_dial_open(2, label(1, true), Instant::ORIGIN);
   c.on_conn_close(id);
   assert_eq!(
     c.poll_conn_closed(),
@@ -412,7 +412,7 @@ fn poll_timeout_schedules_the_router_handshake_deadline() {
     crate::Config::try_new(1u64, std::vec![1, 2], Duration::from_secs(100), HEARTBEAT).unwrap();
   let mut c: Coord = StreamCoordinator::new(cfg, Instant::ORIGIN, 1, CountSm::default());
   // Register an inbound connection that never completes its handshake (no settle).
-  let _id = c.on_conn_open(label(1, true), Instant::ORIGIN);
+  let _id = c.on_dial_open(2, label(1, true), Instant::ORIGIN);
 
   let handshake = Instant::ORIGIN + Duration::from_secs(10);
   assert_eq!(

@@ -112,24 +112,41 @@ where
     }
   }
 
-  /// Register a freshly opened connection (the driver dialed or accepted a socket), returning the
-  /// coordinator-assigned [`ConnId`] the driver must key its socket by. Ids are allocated by an
-  /// internal counter, making the uniqueness/monotonicity the duplicate-peer tie-break relies on
-  /// hold by construction. `now` starts the handshake deadline — a connection that never validates
-  /// is reaped and reported closed.
+  /// Register a freshly DIALED connection (the driver dialed `expected`), returning the
+  /// coordinator-assigned [`ConnId`] the driver keys its socket by. The expectation is enforced: a
+  /// hello authenticating as any other id closes the connection ([`super::TransportError::UnexpectedPeer`]).
+  pub fn on_dial_open(&mut self, expected: I, record: R, now: Instant) -> ConnId {
+    let me = self.endpoint.id();
+    self.router.set_local_id(me);
+    let id = self.alloc_conn_id();
+    self.router.register_dial(id, expected, record, now);
+    id
+  }
+
+  /// Register a freshly ACCEPTED connection (the driver accepted an inbound socket — no dial
+  /// expectation), returning the coordinator-assigned [`ConnId`] the driver keys its socket by.
+  pub fn on_accept_open(&mut self, record: R, now: Instant) -> ConnId {
+    let me = self.endpoint.id();
+    self.router.set_local_id(me);
+    let id = self.alloc_conn_id();
+    self.router.register_accept(id, record, now);
+    id
+  }
+
+  /// Allocate the next [`ConnId`] from the internal monotonic counter, making the
+  /// uniqueness/monotonicity the duplicate-peer tie-break relies on hold by construction.
   ///
   /// # Panics
   ///
   /// Panics if the `u64` id space is exhausted (~10^19 opens — unreachable in practice, but a
   /// silent release-mode wrap would reuse a live id and break the uniqueness guarantee the
   /// tie-break relies on, so it is checked).
-  pub fn on_conn_open(&mut self, record: R, now: Instant) -> ConnId {
+  fn alloc_conn_id(&mut self) -> ConnId {
     let id = ConnId(self.next_conn_id);
     self.next_conn_id = self
       .next_conn_id
       .checked_add(1)
       .expect("connection id space exhausted");
-    self.router.register(id, record, now);
     id
   }
 

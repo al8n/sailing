@@ -112,6 +112,14 @@ pub enum TransportError {
   /// closing the socket (a blackhole). Reaping it surfaces the close a quiesced plane needs to wake.
   #[error("connection idle past the liveness timeout")]
   IdleTimeout,
+  /// A hello claimed THIS node's own id (a crossed/looped-back dial, or a duplicate-id member). Binding
+  /// it would let the connection speak AS us, so it is closed instead of bound.
+  #[error("peer claimed this node's own identity")]
+  SelfIdentity,
+  /// A DIALED connection authenticated as a peer other than the one it was dialed to reach (wrong DNS
+  /// or a crossed connection). It is closed rather than bound to the wrong route.
+  #[error("dialed connection authenticated as an unexpected peer")]
+  UnexpectedPeer,
   /// The locally configured node-id encoding is outside the hello's bounds (`1..=1024` bytes) —
   /// a configuration error, rejected at construction before any hello byte reaches the wire
   /// (an out-of-range length would otherwise wrap through the hello's `u16` length field and

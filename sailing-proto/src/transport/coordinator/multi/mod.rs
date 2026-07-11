@@ -432,19 +432,45 @@ where
     }
   }
 
-  /// Register a freshly opened connection, returning the coordinator-assigned [`ConnId`] the driver
-  /// keys its socket by.
+  /// Register a freshly DIALED connection (the driver dialed `expected`), returning the
+  /// coordinator-assigned [`ConnId`] the driver keys its socket by. A hello authenticating as any
+  /// other id closes the connection ([`TransportError::UnexpectedPeer`]).
+  pub fn on_dial_open(&mut self, expected: I, record: R, now: Instant) -> ConnId {
+    self.refresh_local_id();
+    let id = self.alloc_conn_id();
+    self.router.register_dial(id, expected, record, now);
+    id
+  }
+
+  /// Register a freshly ACCEPTED connection (an inbound socket — no dial expectation), returning the
+  /// coordinator-assigned [`ConnId`] the driver keys its socket by.
+  pub fn on_accept_open(&mut self, record: R, now: Instant) -> ConnId {
+    self.refresh_local_id();
+    let id = self.alloc_conn_id();
+    self.router.register_accept(id, record, now);
+    id
+  }
+
+  /// Allocate the next [`ConnId`] from the monotonic counter.
   ///
   /// # Panics
   /// Panics if the `u64` connection-id space is exhausted (unreachable in practice).
-  pub fn on_conn_open(&mut self, record: R, now: Instant) -> ConnId {
+  fn alloc_conn_id(&mut self) -> ConnId {
     let id = ConnId(self.next_conn_id);
     self.next_conn_id = self
       .next_conn_id
       .checked_add(1)
       .expect("connection id space exhausted");
-    self.router.register(id, record, now);
     id
+  }
+
+  /// Hand the router this host's own id once a group exists — before then a multi host has no
+  /// identity, so the self-ID gate stays a no-op (matching the QUIC coordinator).
+  fn refresh_local_id(&mut self) {
+    if let Some(me) = self.multi.host_id() {
+      let me = me.cheap_clone();
+      self.router.set_local_id(me);
+    }
   }
 
   /// Tear down a driver-closed connection.

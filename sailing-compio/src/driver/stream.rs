@@ -715,7 +715,7 @@ where
       Ok(r) => r,
       Err(_) => return, // a mis-built record layer cannot serve this socket
     };
-    let id = self.coord.on_conn_open(record, now);
+    let id = self.coord.on_accept_open(record, now);
     let (out_tx, out_rx) = lochan::mpsc::unbounded();
     let queued = Rc::new(Cell::new(0usize));
     let (read_half, write_half) = socket.into_split();
@@ -832,7 +832,7 @@ where
       Ok(r) => r,
       Err(_) => return,
     };
-    let id = self.coord.on_conn_open(record, now);
+    let id = self.coord.on_dial_open(peer.cheap_clone(), record, now);
     let (out_tx, out_rx) = lochan::mpsc::unbounded();
     let queued = Rc::new(Cell::new(0usize));
     let dial_ready = self.dial_ready_tx.clone();
