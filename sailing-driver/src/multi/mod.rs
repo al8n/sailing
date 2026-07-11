@@ -807,7 +807,13 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     let complete = Box::new(move |res: Result<&F, DriverError<I>>| {
-      let _ = tx.send(res.map(f));
+      // The user closure runs on the driver thread; a panic here would unwind the driver and take
+      // EVERY co-located group on the plane down. Catch it so one bad query fails only ITS caller
+      // with `QueryPanicked`. AssertUnwindSafe is sound: the closure borrows the FSM as `&F` and
+      // the driver observes only the returned value, so a caught panic tears no sailing state.
+      let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.map(f)))
+        .unwrap_or_else(|_| Err(DriverError::QueryPanicked));
+      let _ = tx.send(out);
     });
     self.send(MultiCommand::Query {
       group: self.group.cheap_clone(),
@@ -832,7 +838,12 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
-      let _ = tx.send(crate::shared::apply_checked_failover(res, f));
+      // Catch a user-closure panic (see `query`): the driver survives, the caller gets QueryPanicked.
+      let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::shared::apply_checked_failover(res, f)
+      }))
+      .unwrap_or_else(|_| Err(DriverError::QueryPanicked));
+      let _ = tx.send(out);
     });
     self.send(MultiCommand::FailoverWindow {
       group: self.group.cheap_clone(),
@@ -855,7 +866,12 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = oneshot::channel();
     let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
-      let _ = tx.send(crate::shared::apply_unchecked_failover(res, f));
+      // Catch a user-closure panic (see `query`): the driver survives, the caller gets QueryPanicked.
+      let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::shared::apply_unchecked_failover(res, f)
+      }))
+      .unwrap_or_else(|_| Err(DriverError::QueryPanicked));
+      let _ = tx.send(out);
     });
     self.send(MultiCommand::FailoverWindow {
       group: self.group.cheap_clone(),

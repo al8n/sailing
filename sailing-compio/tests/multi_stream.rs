@@ -456,3 +456,51 @@ async fn restore_without_stored_state_fails_closed() {
 
   handle.shutdown().await.expect("the multi host tears down");
 }
+
+/// A query closure that PANICS fails only its own caller with `QueryPanicked`, caught at the handle
+/// seam — it does NOT unwind the driver and take every co-located group down. The driver stays
+/// live: a second query on the same group answers and the group keeps committing.
+#[compio::test]
+async fn a_panicking_query_fails_typed_and_the_driver_survives() {
+  let addr: SocketAddr = "127.0.0.1:45340".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, CountSm, _>::bind(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+  )
+  .await
+  .expect("the empty multi host binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("group 100 admits");
+  let g100 = handle.group(100);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"x").await, 1);
+
+  // The panic is caught at the handle seam: the caller gets QueryPanicked, the driver task does
+  // NOT unwind.
+  match g100
+    .query(|_: &CountSm| -> u64 { panic!("boom in query") })
+    .await
+  {
+    Err(DriverError::QueryPanicked) => {}
+    other => panic!("expected QueryPanicked, got {other:?}"),
+  }
+
+  // The driver survived: a normal query answers and the group still commits.
+  assert_eq!(
+    g100
+      .query(|sm: &CountSm| sm.count())
+      .await
+      .expect("the driver is still live"),
+    1
+  );
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 2);
+
+  handle.shutdown().await.expect("the multi host tears down");
+}

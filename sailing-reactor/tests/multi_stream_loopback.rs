@@ -4222,3 +4222,104 @@ async fn prepare_merge_refuses_an_inverted_claim() {
     other => panic!("an inverted claim must refuse typed on the first call, got {other:?}"),
   }
 }
+
+/// A query closure that PANICS fails only its own caller with `QueryPanicked`, caught at the handle
+/// seam — it does NOT unwind the driver task and take every co-located group down. The driver stays
+/// live: a second query answers and the group keeps committing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_query_fails_typed_and_the_driver_survives() {
+  let addr: SocketAddr = "127.0.0.1:44800".parse().unwrap();
+  let (driver, handle) = bind_node::<CountSm>(1, addr, Vec::new()).await;
+  tokio::spawn(driver.run());
+
+  handle
+    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
+    .await
+    .expect("group 100 admits");
+  let g100 = handle.group(100);
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"x").await, 1);
+
+  // The panic is caught at the handle seam: the caller gets QueryPanicked, the driver task does
+  // NOT unwind.
+  match g100
+    .query(|_: &CountSm| -> u64 { panic!("boom in query") })
+    .await
+  {
+    Err(DriverError::QueryPanicked) => {}
+    other => panic!("expected QueryPanicked, got {other:?}"),
+  }
+
+  // The driver survived: a normal query answers and the group still commits.
+  assert_eq!(
+    g100
+      .query(|sm: &CountSm| sm.count())
+      .await
+      .expect("the driver is still live"),
+    1
+  );
+  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 2);
+}
+
+/// A factory whose `materialize` PANICS declines like any other refusal instead of unwinding the
+/// plane: node 1's group-100 solicitation falls through to node 2's lifecycle tail as
+/// `UnknownGroup`, nothing materializes, and node 2's driver survives — the co-hosted sibling group
+/// keeps committing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_panicking_factory_declines_and_the_plane_survives() {
+  let addrs = addrs(44_820, 2);
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, _from: &u64| -> Option<GroupBlueprint<u64>> {
+          if *group == 100 {
+            panic!("boom in materialize");
+          }
+          None
+        },
+        |_group: &u64| Some(CountSm::default()),
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh and proves node 2 is alive throughout.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its solicitation makes node 2's factory materialize PANIC,
+  // caught as a decline, so the signal falls through to the lifecycle tail and nothing materializes.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(
+    handles[1].lifecycle(),
+    "the panicked-factory solicitation",
+    |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::UnknownGroup {
+          group: 100,
+          from: 1
+        }
+      )
+    },
+  )
+  .await;
+  match handles[1].group(100).status().await {
+    Err(DriverError::Rejected { .. }) => {}
+    other => panic!("a panicked factory must materialize nothing, got {other:?}"),
+  }
+
+  // Node 2's driver survived the panic: the co-hosted sibling keeps committing.
+  assert_eq!(submit_anywhere(&g900, b"after").await, 2);
+}

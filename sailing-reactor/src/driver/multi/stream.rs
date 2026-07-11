@@ -1700,7 +1700,15 @@ where
     // could not place; without a factory every signal falls through, exactly as before.
     while let Some((group, from)) = self.coord.poll_unknown_group() {
       if let Some(factory) = self.factory.as_mut()
-        && let Some(blueprint) = factory.materialize(&group, &from)
+        // A panicking factory DECLINES (maps to `None`) instead of unwinding the plane and taking
+        // every co-located group down; the signal then falls through to the lifecycle tail like
+        // any other refusal. AssertUnwindSafe: the driver acts only on the returned Option, and a
+        // factory decline is always safe.
+        && let Some(blueprint) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          factory.materialize(&group, &from)
+        }))
+        .ok()
+        .flatten()
         && blueprint_names(&blueprint, &from)
         // The floors gate, on the same seam the create below consults authoritatively: the
         // cheap PRE-BUILD refusal keeps the resource-phase ordering — a fenced id (or the
@@ -1711,7 +1719,11 @@ where
         // reserves declines BEFORE build, so the local fork stays the id's one materializer
         // (the solicitation falls to the lifecycle tail and the sender retries).
         && !self.coord.is_split_reserved(&group)
-        && let Some(fsm) = factory.build(&group)
+        && let Some(fsm) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+          factory.build(&group)
+        }))
+        .ok()
+        .flatten()
       {
         let generation = blueprint.generation();
         let (config, seed) = blueprint.into_parts();

@@ -47,6 +47,13 @@ pub enum DriverError<I> {
   /// incarnation that would masquerade as recovered state. A durable engine is the roadmap cure.
   #[error("no stored state to restore for this group")]
   NoStoredState,
+  /// A user query (or failover-query) closure PANICKED while running on the driver thread. The
+  /// panic is caught at the handle seam so the driver survives — on a multi host every other
+  /// co-located group keeps running — and the caller receives this instead of a silently dropped
+  /// channel (which would misreport as [`Self::ShuttingDown`]). Fix the closure: a query must not
+  /// panic.
+  #[error("the query closure panicked")]
+  QueryPanicked,
 }
 
 /// Why a driver `bind` did not start. Distinct from [`DriverError`] (a per-operation outcome): these
