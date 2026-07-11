@@ -1065,6 +1065,152 @@ fn owned_zero_payload_backlog_reads_are_count_bounded() {
   );
 }
 
+/// The per-crank apply budget: a single `handle_storage` crank applies at MOST one budget of committed
+/// entries (a batch-boundary bound, so at most budget + one batch), stops strictly below `commit`, and
+/// reports `MorePending` so the driver re-drives without sleeping — instead of draining the whole backlog
+/// in one crank and starving co-located groups / timers / IO. Repeated cranks then reach `applied ==
+/// commit`, and the final crank reports `Drained` (liveness). Single-voter leader, snapshot disabled so
+/// no capture/compaction perturbs the drain; the backlog is force-appended and `commit` advanced directly.
+#[test]
+fn apply_drain_is_budgeted_and_re_driven_to_completion() {
+  use crate::{
+    Config, Entry, EntryKind, Index, Instant, StorageProgress, Term, endpoint::APPLY_BUDGET_ENTRIES,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  // Above the whole backlog: no snapshot capture/compaction fires mid-drain to perturb the counters.
+  .with_snapshot_threshold((10 * MAX_READ_BATCH_ENTRIES) as usize);
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = VecLog::default();
+  let mut stable = NoopStable::default();
+
+  // Elect the single voter and settle the no-op (applied == commit == 1, stores drained).
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  while ep.handle_storage(d, &mut log, &mut stable) == StorageProgress::MorePending {}
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+  let applied_before = ep.applied_index();
+
+  // A committed backlog of 3 budgets of small Normal entries, appended durably and committed directly.
+  let n = 3 * MAX_READ_BATCH_ENTRIES;
+  let first = applied_before.next().get();
+  let entries: Vec<Entry> = (0..n)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(first + i),
+        EntryKind::Normal,
+        encode_cmd(b"x"),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+  ep.commit = Index::new(first + n - 1);
+
+  // ONE crank must NOT drain the whole backlog: at most one budget + one batch, strictly below commit,
+  // and it reports MorePending. (RED at the pre-budget tip: one crank drains everything to commit and
+  // reports Drained.)
+  let p1 = ep.handle_storage(d, &mut log, &mut stable);
+  let applied1 = ep.applied_index();
+  assert!(
+    applied1.get() <= applied_before.get() + APPLY_BUDGET_ENTRIES + MAX_READ_BATCH_ENTRIES,
+    "one crank applied {} entries — must be at most one budget + one batch",
+    applied1.get() - applied_before.get()
+  );
+  assert!(
+    applied1 < ep.commit_index(),
+    "one crank must leave the backlog partly unapplied (applied {} < commit {})",
+    applied1.get(),
+    ep.commit_index().get()
+  );
+  assert_eq!(
+    p1,
+    StorageProgress::MorePending,
+    "a budget cut must re-drive via the storage-progress signal"
+  );
+
+  // Repeated cranks reach applied == commit in a bounded number of passes; the last reports Drained.
+  let mut last = p1;
+  let mut cranks = 0u32;
+  while last == StorageProgress::MorePending {
+    last = ep.handle_storage(d, &mut log, &mut stable);
+    cranks += 1;
+    assert!(
+      cranks < 1000,
+      "the budgeted drain must reach applied == commit in bounded cranks"
+    );
+  }
+  assert_eq!(
+    ep.applied_index(),
+    ep.commit_index(),
+    "the budgeted drain completes to applied == commit"
+  );
+  assert_eq!(
+    last,
+    StorageProgress::Drained,
+    "the final crank (nothing left) reports Drained, not MorePending"
+  );
+}
+
+/// No-spin pin: a cold (`EntriesRead::Pending`) apply stop is `Waiting`, never `BudgetCut`, so it must
+/// NOT report `MorePending` — the store's storage-ready wake re-drives it, and folding it into
+/// MorePending would busy-spin the driver against that external wait. With the range held cold the
+/// storage cranks SETTLE to `Drained` in a bounded number of passes even though `applied < commit`.
+#[test]
+fn cold_apply_stop_does_not_report_more_pending() {
+  use crate::{Config, Instant, StorageProgress};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 42, CountSm::default());
+  let mut log = FailTermLog::default();
+  let mut stable = NoopStable::default();
+
+  let d = ep.poll_timeout().unwrap();
+  ep.handle_timeout(d, &mut log, &mut stable);
+  while ep.handle_storage(d, &mut log, &mut stable) == StorageProgress::MorePending {}
+  assert!(ep.role().is_leader());
+  while ep.poll_message().is_some() {}
+  while ep.poll_event().is_some() {}
+
+  // Arm cold, propose + flush: commit advances but every apply read is cold, so applied stays behind.
+  log.return_cold_on_read();
+  ep.propose(d, &mut log, &stable, &bytes::Bytes::from_static(b"cmd"))
+    .unwrap();
+  ep.flush_appends(d, &log, &stable);
+
+  // The cranks must SETTLE to Drained despite applied < commit — a cold (Waiting) stop that spun
+  // MorePending would loop here until the guard trips.
+  let mut progress = StorageProgress::MorePending;
+  let mut cranks = 0u32;
+  while progress == StorageProgress::MorePending {
+    progress = ep.handle_storage(d, &mut log, &mut stable);
+    cranks += 1;
+    assert!(
+      cranks < 100,
+      "a cold apply stop must not spin MorePending — it is Waiting, never BudgetCut"
+    );
+  }
+  assert!(ep.poison_reason().is_none(), "a cold read is not a fault");
+  assert!(
+    ep.applied_index() < ep.commit_index(),
+    "the proposed entry stays cold-unapplied while the read is held"
+  );
+}
+
 /// A follower must not send AppendResponse until the new log entries are durable.
 /// Uses `VecLog` which enqueues `LogDone::Appended` on `submit_append`, released on `poll`.
 #[test]

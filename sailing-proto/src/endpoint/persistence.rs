@@ -608,10 +608,16 @@ where
     // apply, a SILENT stall (`applied < commit`, no poison). Idempotent: a no-op when caught up, and a
     // still-cold or not-yet-viewable read simply defers again. (Replication has the periodic heartbeat
     // re-pump; apply did not, which is the gap this closes.)
-    if !self.poison.poisoned && self.applied < self.commit {
-      self.apply_committed(log);
+    // Capture the drain verdict: a per-crank budget cut (committed entries still unapplied) must be
+    // re-driven, and it rides the storage-progress signal below — nothing lands in a store queue for
+    // an in-memory apply stop, so `has_pending()` alone would let a budget-cut backlog stall.
+    let apply_drain = if !self.poison.poisoned && self.applied < self.commit {
+      let verdict = self.apply_committed(log);
       self.maybe_flush_deferred_reads(now, log, stable);
-    }
+      verdict
+    } else {
+      ApplyDrain::Drained
+    };
     // apply_committed / the deferred-read flush can poison on a fatal log or state read → fail-stop before
     // the snapshot, auto-leave, and commit-persist tail runs on a dead node.
     if self.poison.poisoned {
@@ -680,12 +686,16 @@ where
     self.reconcile_election_timer(now);
 
     // Storage-derived progress: MorePending iff a completion is queued for the next poll() at EITHER
-    // store, checked AFTER every drain and the whole fixed tail (which can submit / compact into a
-    // queue whose drain already exited). Exact by construction — catches every post-drain enqueue
-    // uniformly (a budget cut leaves the remainder queued; a post-drain submit's completion; a
-    // compact's `LogDone::Compacted`) with no per-site detector. poll() is a FIFO; the remainder
-    // re-drives next call.
-    if log.has_pending() || stable.has_pending() {
+    // store, OR the apply drain was cut by its per-crank budget. The store-queue check, taken AFTER
+    // every drain and the whole fixed tail (which can submit / compact into a queue whose drain already
+    // exited), catches every post-drain STORE enqueue uniformly (a post-drain submit's completion, a
+    // compact's `LogDone::Compacted`) with no per-site detector. A budget cut is NOT a store enqueue —
+    // its remainder is committed-but-unapplied, an in-memory backlog — so it is folded in explicitly:
+    // an immediate re-crank applies the next budget. A cold or parked apply stop (`Waiting`) is
+    // deliberately excluded — those advance only when an EXTERNAL wait completes (the store's
+    // storage-ready signal / the container's merge service), so re-driving them would busy-spin the
+    // driver against that wait. poll() is a FIFO; the remainder re-drives next call.
+    if log.has_pending() || stable.has_pending() || apply_drain == ApplyDrain::BudgetCut {
       StorageProgress::MorePending
     } else {
       StorageProgress::Drained

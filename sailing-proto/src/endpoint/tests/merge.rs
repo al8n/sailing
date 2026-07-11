@@ -1526,6 +1526,39 @@ fn commit_merge_apply_parks_at_k_minus_1() {
   ));
 }
 
+/// No-spin pin: a parked `CommitMerge` apply stop is `Waiting`, never `BudgetCut`, so `handle_storage`
+/// must NOT report `MorePending` while parked — the container's per-crank merge service resolves the
+/// park, and folding it into MorePending would busy-spin the driver against that external wait. A parked
+/// crank SETTLES to `Drained` even though `applied < commit`.
+#[test]
+fn parked_merge_stop_does_not_report_more_pending() {
+  use crate::StorageProgress;
+  let (mut ep, mut log, mut stable, k) = make_parked_target(2);
+  assert_eq!(ep.applied_index(), Index::new(k.get() - 1), "parked at k-1");
+  assert!(
+    ep.applied_index() < ep.commit_index(),
+    "the parked entry keeps applied below commit"
+  );
+  // The cranks must settle to Drained despite applied < commit — a parked (Waiting) stop that spun
+  // MorePending would loop here until the guard trips.
+  let mut progress = StorageProgress::MorePending;
+  let mut cranks = 0u32;
+  while progress == StorageProgress::MorePending {
+    progress = ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
+    cranks += 1;
+    assert!(
+      cranks < 100,
+      "a parked merge stop must not spin MorePending — it is Waiting, never BudgetCut"
+    );
+  }
+  assert!(ep.pending_merge().is_some(), "still parked");
+  assert_eq!(
+    progress,
+    StorageProgress::Drained,
+    "the parked crank reports Drained, not MorePending"
+  );
+}
+
 /// The membership fence's IN-FLIGHT leg: a proposed-but-uncommitted CommitMerge already fences
 /// conf changes on its proposer (nothing else marks the window before the park exists).
 #[test]

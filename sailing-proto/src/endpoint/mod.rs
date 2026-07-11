@@ -35,6 +35,31 @@ pub use merge::PendingMergeApply;
 /// the count regardless of payload. The caller's loop re-reads the remainder.
 pub(crate) const MAX_READ_BATCH_ENTRIES: u64 = 8192;
 
+/// The per-crank apply budget: at most one read-batch's worth of committed entries is applied per
+/// `apply_committed` call. WHY: the drain is otherwise unbounded in PASSES — the per-pass FETCH is
+/// byte/count-capped, but a node with a huge committed backlog (catch-up, a post-snapshot tail, a
+/// commit burst) re-fetches until `applied == commit`, monopolizing its crank. On a multi host every
+/// co-located group's dispatch waits (the container cranks groups serially); on any host the crank's
+/// timers/IO wait. Applying at most one budget per crank bounds that head-of-line cost; the remainder
+/// is re-driven to completion via the storage-progress signal (`ApplyDrain::BudgetCut` → MorePending).
+/// Sized to one read batch — the 1 MiB byte cap already bounds the per-crank PAYLOAD.
+pub(crate) const APPLY_BUDGET_ENTRIES: u64 = MAX_READ_BATCH_ENTRIES;
+
+/// How an [`Endpoint::apply_committed`] drain ended (consumed by the storage-progress derivation).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ApplyDrain {
+  /// `applied == commit` (or the node poisoned): nothing further to do.
+  Drained,
+  /// The per-crank budget elapsed with committed entries still unapplied — an IMMEDIATE
+  /// re-crank makes progress. The ONLY variant that must surface as storage MorePending.
+  BudgetCut,
+  /// Blocked on something a re-crank cannot advance: a parked merge apply (the container's
+  /// merge service resolves it), a cold log read (the store's storage-ready completion
+  /// re-drives), or a committed entry not yet readable. NEVER reported as MorePending —
+  /// reporting it would busy-spin the driver loop against an external wait.
+  Waiting,
+}
+
 /// Per-dispatch cap on the conflict-term walk in [`Endpoint::find_conflict_by_term`]. That walk is
 /// steered by a PEER-supplied reject hint (`hint_term`); a crafted low term (e.g. `0`) would otherwise
 /// force a full `first_index..=hint_index` scan of synchronous, possibly-cold `log_term` reads in ONE
@@ -2570,19 +2595,20 @@ where
   /// This matches the policy of `on_install_snapshot` and the ConfChange Changer-reject arm.
   /// A bare `break` is used ONLY for the benign "committed entry not yet readable" case (the
   /// log slice is empty), which is transient and retried on the next `handle_*`.
-  fn apply_committed<L: LogStore>(&mut self, log: &L)
+  fn apply_committed<L: LogStore>(&mut self, log: &L) -> ApplyDrain
   where
     F::Snapshot: Data,
   {
     if self.poison.poisoned {
-      return;
+      return ApplyDrain::Drained;
     }
     // A PARKED CommitMerge holds the whole drain at its entry: the absorb needs another group's
     // state machine, which only the container holds — the per-crank merge service resolves it
     // and the drain resumes on the next call. Nothing else about the node stops (elections,
-    // replication, read confirmation all continue); only apply waits.
+    // replication, read confirmation all continue); only apply waits. A re-crank cannot advance
+    // it (only the container's service can), so it is `Waiting`, never re-driven as MorePending.
     if self.merge.pending_apply.is_some() {
-      return;
+      return ApplyDrain::Waiting;
     }
     // Bound BOTH the per-pass payload bytes AND the entry COUNT so a COLD/disk store returning
     // `Ready(Owned(..))` materializes a bounded amount per call instead of the whole unapplied backlog (a
@@ -2592,12 +2618,15 @@ where
     // `applied.next()`, so a short prefix just costs another pass; the in-memory borrowed path is unaffected
     // (a small range comes back in one pass).
     const APPLY_READ_MAX_BYTES: u64 = 1 << 20;
+    // Entries applied by THIS call, accumulated across the (byte-capped) batches, so the per-crank
+    // budget is a bound on the whole call — not per batch (a short byte-capped batch would slip it).
+    let mut applied_this_call: u64 = 0;
     while self.applied < self.commit {
       // Halt the drain the moment the node poisons (including a poison set EARLIER in the same
       // dispatch, e.g. by a storage completion processed just before this call): once fail-stopped,
       // the user FSM must not be re-invoked with further applies.
       if self.poison.poisoned {
-        return;
+        return ApplyDrain::Drained;
       }
       // ONE byte-capped range fetch per pass (was one call per index), iterated BY REFERENCE (no
       // per-entry clone). A conforming store returns a CONTIGUOUS prefix starting at `applied.next()`
@@ -2612,17 +2641,20 @@ where
           .saturating_add(MAX_READ_BATCH_ENTRIES + 1),
       ));
       let batch = match log.entries(self.applied.next()..read_end, APPLY_READ_MAX_BYTES) {
-        Ok(EntriesRead::Ready(e)) if e.is_empty() => break,
+        // The committed entry is not yet in the read view: a benign transient. A re-crank cannot
+        // advance it (the store must land it first), so `Waiting`, never re-driven as MorePending.
+        Ok(EntriesRead::Ready(e)) if e.is_empty() => return ApplyDrain::Waiting,
         Ok(EntriesRead::Ready(e)) => e,
         // Present but cold: stop applying this pass and retry on the next pump (the store signals
-        // storage-ready when the range lands). A cold defer is not a fault — never poison.
+        // storage-ready when the range lands). A cold defer is not a fault — never poison, and a
+        // re-crank cannot advance it until the store resolves, so `Waiting`, never MorePending.
         Ok(EntriesRead::Pending) => {
           self.cold_read_defers = self.cold_read_defers.saturating_add(1);
-          break;
+          return ApplyDrain::Waiting;
         }
         Err(_) => {
           self.poison(PoisonReason::LogRead);
-          break;
+          return ApplyDrain::Drained;
         }
       };
       for entry in &*batch {
@@ -2853,7 +2885,9 @@ where
                 payload.target_gen_after(),
                 idx,
               ));
-              return;
+              // Only the container's merge service can advance a park — a re-crank cannot — so
+              // `Waiting`, never re-driven as MorePending.
+              return ApplyDrain::Waiting;
             }
           }
           EntryKind::RollbackMerge => {
@@ -3172,8 +3206,22 @@ where
           }
         }
         self.applied = idx;
+        applied_this_call += 1;
+      }
+      // Batch boundary: the per-crank budget elapsed with committed entries still unapplied. Cut the
+      // drain HERE (a boundary-only check — never mid-batch: the fetch is already paid and the boundary
+      // keeps the loop shape intact) and let the storage-progress signal re-crank. A poison mid-batch is
+      // NOT a budget cut — it makes no progress on a re-crank, which the `BudgetCut` contract requires —
+      // so it falls through to the top-of-loop `poisoned → Drained` instead.
+      if !self.poison.poisoned
+        && applied_this_call >= APPLY_BUDGET_ENTRIES
+        && self.applied < self.commit
+      {
+        return ApplyDrain::BudgetCut;
       }
     }
+    // The `while` exited because `applied == commit` (or never entered): the backlog is fully applied.
+    ApplyDrain::Drained
   }
 }
 

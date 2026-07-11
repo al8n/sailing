@@ -571,7 +571,10 @@ where
     // Replay the durable committed tail (applied..commit] into the restored SM. Skip if the
     // snapshot restore failed (the SM is in an unknown state and the node is poisoned).
     if !ep.poison.poisoned {
-      ep.apply_committed(log);
+      // Boot replay must COMPLETE before serving: `scan_freeze_pending` below derives the
+      // append-observed lease kill from the FINAL `applied`, so the per-crank budget (a
+      // steady-state fairness bound, not a boot bound) must not leave a partial replay here.
+      while matches!(ep.apply_committed(log), ApplyDrain::BudgetCut) {}
     }
     // Re-derive the append-observed lease kill from the UNAPPLIED suffix: a committed-but-
     // unapplied PrepareMerge must re-arm `freeze_pending` BEFORE this replica can win an
