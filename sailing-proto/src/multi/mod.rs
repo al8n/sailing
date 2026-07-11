@@ -471,6 +471,16 @@ where
   /// still-queued signal ([`unpark`](Self::unpark)) — delivered after resolution it would be
   /// stale — so queued signals always name currently-parked parents.
   conflicts: VecDeque<(G, G)>,
+  /// Groups seen poisoned since their CURRENT hosting began — the dedupe that makes
+  /// [`poll_poisoned`](Self::poll_poisoned) fire once per poisoning per hosted incarnation. An id's
+  /// entry is cleared at removal, so a re-admitted id that poisons again re-signals as a fresh
+  /// incarnation.
+  poisoned_seen: BTreeSet<G>,
+  /// Groups whose fail-stop has not yet surfaced on the aggregate lifecycle tail: pushed once when a
+  /// crank leaves an endpoint poisoned (a storage/apply fault) and drained by
+  /// [`poll_poisoned`](Self::poll_poisoned). An OBSERVATION riding a best-effort tail — a removal
+  /// purges any still-queued signal, so a delivered id names a currently poisoned, hosted group.
+  poisoned_pending: VecDeque<G>,
   /// The RELAY-TIME lineage view, one entry per admitted id: seeded at every admission (0 at
   /// genesis create, the DURABLE restored lineage at restore/fork) and bumped to
   /// `parent_gen_after` when a fork is relayed. This is the replay guard: a fork whose bump is
@@ -507,6 +517,8 @@ where
       dirty_forks_set: BTreeSet::new(),
       parked: BTreeSet::new(),
       conflicts: VecDeque::new(),
+      poisoned_seen: BTreeSet::new(),
+      poisoned_pending: VecDeque::new(),
       lineage: BTreeMap::new(),
       host_id: None,
     }
@@ -688,6 +700,11 @@ where
     // included — dies too. Removing a parked fork's CHILD needs nothing here: the next relay
     // drain re-examines the park and materializes.
     self.unpark(gid);
+    // A poison signal names a hosted incarnation: an un-consumed one dies with the endpoint (stale
+    // after teardown), and clearing `poisoned_seen` lets a re-admitted id that poisons again signal
+    // afresh as the new incarnation it is.
+    self.poisoned_seen.remove(gid);
+    self.poisoned_pending.retain(|g| g != gid);
     let removed = self.groups.remove(gid);
     // PURGE-ON-REMOVAL: a source leaving the container takes every target's outstanding thaw
     // obligation for it along with it, binding the obligation to the incarnation SYNCHRONOUSLY —
@@ -779,6 +796,7 @@ where
           if let Some(sep) = self.groups.get_mut(source) {
             sep.poison(PoisonReason::MergeDecode);
           }
+          self.note_if_poisoned(source);
           drivable = true;
         }
       }
@@ -926,7 +944,8 @@ where
   /// companion set, so at most one entry per group per queue is live between drains — interleaved
   /// dispatches across many groups (A,B,A,B,…) never grow a queue past the count of distinct dirty
   /// groups, and a group re-marked while still queued is not re-enqueued (its pending visit drains
-  /// everything staged since).
+  /// everything staged since). The post-dispatch choke point also latches a poison signal: a crank
+  /// that fail-stopped its endpoint surfaces once on [`poll_poisoned`](Self::poll_poisoned).
   fn mark_dirty(&mut self, gid: &G) {
     if self.dirty_msgs_set.insert(gid.cheap_clone()) {
       self.dirty_msgs.push_back(gid.cheap_clone());
@@ -936,6 +955,20 @@ where
     }
     if self.dirty_forks_set.insert(gid.cheap_clone()) {
       self.dirty_forks.push_back(gid.cheap_clone());
+    }
+    self.note_if_poisoned(gid);
+  }
+
+  /// Latch a one-shot poison signal for `gid` when its endpoint is fail-stopped: the aggregate
+  /// mirror of [`Endpoint::is_poisoned`], surfaced once per poisoning per hosted incarnation via
+  /// [`poll_poisoned`](Self::poll_poisoned). Called at the post-dispatch choke point (catching a
+  /// crank that self-poisons) and beside every container-driven `poison` on a path that does not
+  /// route through it; `poisoned_seen` makes the overlap idempotent.
+  fn note_if_poisoned(&mut self, gid: &G) {
+    if self.groups.get(gid).is_some_and(Endpoint::is_poisoned)
+      && self.poisoned_seen.insert(gid.cheap_clone())
+    {
+      self.poisoned_pending.push_back(gid.cheap_clone());
     }
   }
 
@@ -1152,6 +1185,7 @@ where
           ep.poison(PoisonReason::SplitDecode);
           while ep.pop_pending_fork().is_some() {}
         }
+        self.note_if_poisoned(gid);
         HeadFork::Empty
       }
       Verdict::Resolve => {
@@ -1258,6 +1292,16 @@ where
   /// holds its replay source.
   pub fn poll_split_conflict(&mut self) -> Option<(G, G)> {
     self.conflicts.pop_front()
+  }
+
+  /// The next group whose endpoint FAIL-STOPPED — a storage/apply fault poisoned it — reported once
+  /// per poisoning per hosted incarnation. An OBSERVATION riding a best-effort tail, not a command:
+  /// the poisoned endpoint stays hosted with its consensus frozen and its parked work failing typed
+  /// verdicts, and NOTHING is torn down — the embedder decides whether to inspect, remove, or
+  /// replace the group. A removal purges any still-queued signal, so a delivered id always names a
+  /// currently poisoned, hosted group; a re-admitted id that poisons again signals afresh.
+  pub fn poll_poisoned(&mut self) -> Option<G> {
+    self.poisoned_pending.pop_front()
   }
 
   /// Resolve the fork staged at exactly `split_index` on `parent`: the driver reports the
@@ -2964,6 +3008,7 @@ where
         if let Some(tep) = self.groups.get_mut(&tgid) {
           tep.poison(PoisonReason::MergeDecode);
         }
+        self.note_if_poisoned(&tgid);
         continue;
       };
       enum Verdict {
@@ -3197,6 +3242,7 @@ where
           if let Some(tep) = self.groups.get_mut(&tgid) {
             tep.poison(PoisonReason::MergeDecode);
           }
+          self.note_if_poisoned(&tgid);
           break;
         };
         // DISCHARGE by OBSERVING the source, never by classifying the thaw's append outcome: the
@@ -3385,6 +3431,7 @@ where
           if let Some(sep) = self.groups.get_mut(&sgid) {
             sep.poison(PoisonReason::MergeDecode);
           }
+          self.note_if_poisoned(&sgid);
           continue;
         }
       };

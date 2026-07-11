@@ -551,6 +551,13 @@ where
       }
       let _ = self.coord.poll_split_conflict();
     }
+    // A fail-stopped group surfaces once on the same best-effort tail; a full tail drops the
+    // observation and the embedder still finds the poison by direct inspection.
+    while let Some(group) = self.coord.poll_poisoned() {
+      let _ = self
+        .lifecycle_tx
+        .try_send(LifecycleEvent::Poisoned { group });
+    }
   }
 
   fn storage_crank(&mut self, now: Now) {

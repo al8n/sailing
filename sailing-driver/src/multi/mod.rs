@@ -376,6 +376,14 @@ pub enum LifecycleEvent<G, I> {
     /// The child group id both the fork and a hosted group claim.
     child: G,
   },
+  /// The group's endpoint FAIL-STOPPED on this host: a storage or apply fault poisoned it, freezing
+  /// its consensus. Its parked work fails with typed verdicts and NO auto-teardown follows — the
+  /// embedder decides whether to inspect the fault, tear the group down, or replace it. Fired ONCE
+  /// per poisoning (a re-admitted id that faults again signals afresh).
+  Poisoned {
+    /// The fail-stopped group.
+    group: G,
+  },
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to a MULTI-GROUP driver: group lifecycle, the

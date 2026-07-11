@@ -667,6 +667,112 @@ fn fork_with_a_corrupt_blob_poisons_only_that_group() {
   assert_eq!(m.group(&1).unwrap().state_machine().count(), 1);
 }
 
+/// A committed `Split` entry whose CHILD id bytes will NOT decode as `G` — the committed-corrupt
+/// shape `poll_pending_fork` fail-stops as `SplitDecode` (`[0xFF; 3]` is not a valid `u64`).
+fn corrupt_child_split_entry() -> Bytes {
+  let payload = crate::SplitPayload::new(
+    Bytes::from_static(&[0xFF, 0xFF, 0xFF]),
+    0,
+    1,
+    Bytes::copy_from_slice(&[1]),
+  );
+  let mut buf = Vec::new();
+  crate::wire::encode_split_payload(&payload, &mut buf);
+  Bytes::from(buf)
+}
+
+/// Drive follower group `gid` (leader `2`) to apply one committed corrupt-child split, then relay
+/// it: the relay decode fail-stops the parent via `poll_pending_fork` (which does NOT route through
+/// `mark_dirty`, so the poison signal is latched at that site). Leaves the group hosted-and-poisoned
+/// with its signal pending.
+fn poison_via_corrupt_fork(
+  m: &mut MultiRaft<u64, u64, SplitSm>,
+  gid: u64,
+  log: &mut VecLog,
+  stable: &mut AsyncStable,
+) {
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64, 2],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  m.create_group(gid, 0, cfg, Instant::ORIGIN, 42, SplitSm::default())
+    .unwrap();
+  let entries = std::vec![crate::Entry::new(
+    Term::new(1),
+    Index::new(1),
+    crate::EntryKind::Split,
+    corrupt_child_split_entry(),
+  )];
+  m.handle_message(
+    &gid,
+    Instant::ORIGIN,
+    log,
+    stable,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(1),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(1),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&gid, Instant::ORIGIN, log, stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "the corrupt child yields no fork"
+  );
+  assert!(
+    m.group(&gid).unwrap().is_poisoned(),
+    "the relay decode fail-stops the parent"
+  );
+}
+
+/// A fail-stopped group surfaces on the aggregate lifecycle tail exactly ONCE — however many cranks
+/// re-observe the poison, the seen-set caps it at one signal per hosted incarnation.
+#[test]
+fn poll_poisoned_reports_a_fail_stopped_group_once() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  poison_via_corrupt_fork(&mut m, 7, &mut log, &mut stable);
+
+  // The post-dispatch choke point re-checks on every mark; the signal still fires once.
+  m.mark_dirty(&7);
+  m.mark_dirty(&7);
+
+  assert_eq!(
+    m.poll_poisoned(),
+    Some(7),
+    "the fail-stop surfaces on the aggregate tail"
+  );
+  assert_eq!(m.poll_poisoned(), None, "exactly once");
+}
+
+/// A removed group's un-consumed poison signal dies with the incarnation — never delivered stale
+/// after teardown.
+#[test]
+fn removing_a_group_purges_its_pending_poison_signal() {
+  let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  poison_via_corrupt_fork(&mut m, 7, &mut log, &mut stable);
+
+  let mut stores = MapStores(std::collections::BTreeMap::new(), Default::default());
+  m.remove_group(&7, &mut stores).unwrap();
+  assert_eq!(
+    m.poll_poisoned(),
+    None,
+    "a removed group's stale signal is never delivered"
+  );
+}
+
 #[test]
 fn forked_group_elects_off_the_baseline() {
   fn voter_pair_cfg(id: u64) -> Config<u64> {

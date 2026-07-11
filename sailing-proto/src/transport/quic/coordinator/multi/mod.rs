@@ -933,6 +933,12 @@ where
     self.multi.poll_split_conflict()
   }
 
+  /// Drain the next FAIL-STOPPED group id (see [`MultiRaft::poll_poisoned`]); the driver surfaces
+  /// it on its lifecycle tail for the placement brain. Best-effort, like the other observations.
+  pub fn poll_poisoned(&mut self) -> Option<G> {
+    self.multi.poll_poisoned()
+  }
+
   /// Initiate a linearizable read on `group`; the resulting `ReadState` surfaces via
   /// [`poll_event`](Self::poll_event) stamped with the group. `None` if no such group.
   #[must_use = "`None` means no group with this id is hosted — the call did nothing"]

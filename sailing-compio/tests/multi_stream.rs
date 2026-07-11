@@ -9,9 +9,10 @@ mod common;
 use std::{net::SocketAddr, rc::Rc, time::Duration};
 
 use bytes::Bytes;
-use common::CountSm;
+use common::{CountSm, TrapSm};
 use sailing_compio::{
-  CompioMultiStreamDriver, DriverConfig, DriverError, GroupHandle, MultiHandle, Node,
+  CompioMultiStreamDriver, DriverConfig, DriverError, GroupHandle, LifecycleEvent, MultiHandle,
+  Node,
 };
 use sailing_proto::{ClusterId, Config, Data, LabelOptions, Labeled, Passthrough};
 
@@ -501,6 +502,62 @@ async fn a_panicking_query_fails_typed_and_the_driver_survives() {
     1
   );
   assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 2);
+
+  handle.shutdown().await.expect("the multi host tears down");
+}
+
+/// A storage/apply fault fail-stops a group and the container surfaces it on the aggregate
+/// lifecycle tail as `LifecycleEvent::Poisoned` — best-effort, with NO auto-teardown: a sibling
+/// group on the same host keeps committing throughout.
+#[compio::test]
+async fn a_poisoned_group_surfaces_on_the_lifecycle_tail() {
+  let addr: SocketAddr = "127.0.0.1:45320".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioMultiStreamDriver::<u64, u64, TrapSm, _>::bind(
+    addr,
+    Vec::new(),
+    dialer,
+    acceptor,
+    DriverConfig::default(),
+  )
+  .await
+  .expect("the empty multi host binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  for gid in [100u64, 200] {
+    handle
+      .create_group(gid, config(1, vec![1]), 1, TrapSm::default(), 0)
+      .await
+      .expect("group admission");
+  }
+  let g100 = handle.group(100);
+  let g200 = handle.group(200);
+
+  // Fail-stop group 100 with a trapped apply: retry until it leads and the BOOM commits+applies.
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the trapped apply never poisoned"
+    );
+    match g100.submit(Bytes::from_static(b"BOOM")).await {
+      Err(DriverError::Poisoned) => break,
+      _ => compio::time::sleep(Duration::from_millis(50)).await,
+    }
+  }
+
+  // The fail-stop rides the best-effort lifecycle tail. Sibling group 200 keeps committing (no
+  // auto-teardown) and each submit cranks the driver, draining the pending observation.
+  let mut seen = false;
+  while !seen && std::time::Instant::now() < deadline {
+    let _ = g200.submit(Bytes::from_static(b"tick")).await;
+    while let Ok(ev) = handle.lifecycle().try_recv() {
+      if matches!(ev, LifecycleEvent::Poisoned { group: 100 }) {
+        seen = true;
+      }
+    }
+  }
+  assert!(seen, "the poisoned group surfaced on the lifecycle tail");
 
   handle.shutdown().await.expect("the multi host tears down");
 }
