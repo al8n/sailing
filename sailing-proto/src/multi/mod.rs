@@ -1036,29 +1036,32 @@ where
   /// (the token is fixed at the split, so later reshaping never changes it).
   pub fn poll_pending_fork(&mut self) -> Option<GroupFork<G, I, F>> {
     // Parked parents first: their resolution triggers are child-side, so the dirty queue —
-    // marked only by parent dispatches — cannot be relied on to revisit them.
-    let parked: Vec<G> = self.parked.iter().map(CheapClone::cheap_clone).collect();
-    for gid in parked {
-      match self.examine_head_fork(&gid) {
-        HeadFork::Empty => {
-          self.unpark(&gid);
-        }
-        HeadFork::Resolved => {
-          // Arm (b): the head fork resolved as redundant — later forks of this parent flow
-          // through the ordinary drain below.
-          self.unpark(&gid);
-          if self.dirty_forks_set.insert(gid.cheap_clone()) {
-            self.dirty_forks.push_back(gid);
+    // marked only by parent dispatches — cannot be relied on to revisit them. Skip the scan and
+    // its allocation entirely when nothing is parked (the overwhelmingly common case).
+    if !self.parked.is_empty() {
+      let parked: Vec<G> = self.parked.iter().map(CheapClone::cheap_clone).collect();
+      for gid in parked {
+        match self.examine_head_fork(&gid) {
+          HeadFork::Empty => {
+            self.unpark(&gid);
           }
-        }
-        HeadFork::Parked => {}
-        HeadFork::Yield(fork) => {
-          // Arm (a): the squatter is gone and the fork materializes normally.
-          self.unpark(&gid);
-          if self.dirty_forks_set.insert(gid.cheap_clone()) {
-            self.dirty_forks.push_back(gid);
+          HeadFork::Resolved => {
+            // Arm (b): the head fork resolved as redundant — later forks of this parent flow
+            // through the ordinary drain below.
+            self.unpark(&gid);
+            if self.dirty_forks_set.insert(gid.cheap_clone()) {
+              self.dirty_forks.push_back(gid);
+            }
           }
-          return Some(fork);
+          HeadFork::Parked => {}
+          HeadFork::Yield(fork) => {
+            // Arm (a): the squatter is gone and the fork materializes normally.
+            self.unpark(&gid);
+            if self.dirty_forks_set.insert(gid.cheap_clone()) {
+              self.dirty_forks.push_back(gid);
+            }
+            return Some(fork);
+          }
         }
       }
     }
