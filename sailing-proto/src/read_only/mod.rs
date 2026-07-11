@@ -268,13 +268,23 @@ impl<I: Ord> ReadOnly<I> {
   /// after an earlier read with the same context completed.  The caller's own in-flight dedup
   /// ([`Self::context_in_flight`]) surfaces a concurrent same-`context` reuse as
   /// [`crate::ReadIndexError::DuplicateContext`] before this is called.
-  pub fn add_request(&mut self, index: Index, context: Bytes, from: Option<I>, leader: I) -> Bytes {
+  ///
+  /// Returns `None` iff the round counter is exhausted (the next token would REUSE a value and
+  /// reopen the stale-confirmation hazard); the caller fail-stops rather than mint a duplicate.
+  /// Unreachable by legitimate use (2^64 reads per incarnation).
+  pub fn add_request(
+    &mut self,
+    index: Index,
+    context: Bytes,
+    from: Option<I>,
+    leader: I,
+  ) -> Option<Bytes> {
     let token = Bytes::copy_from_slice(&self.next_round.to_be_bytes());
-    self.next_round += 1;
+    self.next_round = self.next_round.checked_add(1)?;
     let status = ReadIndexStatus::new(context, from, index, leader);
     self.pending.insert(token.clone(), status);
     self.queue.push(token.clone());
-    token
+    Some(token)
   }
 
   /// Record that `from` has acknowledged the heartbeat round identified by round `token`.

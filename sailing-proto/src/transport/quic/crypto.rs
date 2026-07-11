@@ -558,7 +558,10 @@ const MIN_CONNECTION_FLOOR: usize = 4;
 /// this when the configured cap is lower, so the cap can never refuse a legitimate steady-state
 /// mesh connection; it still bounds an untrusted-network flood.
 pub(crate) const fn mesh_connection_floor(peers: usize) -> usize {
-  let mesh_with_reconnect = peers * 3;
+  // Saturate rather than wrap: an overflowed product would collapse the floor to a tiny value and
+  // wrongly refuse a legitimate mesh connection. At the ceiling the floor admits everything — the safe
+  // direction (it only weakens the flood bound, in an unreachable regime of ~usize::MAX peers).
+  let mesh_with_reconnect = peers.saturating_mul(3);
   if mesh_with_reconnect > MIN_CONNECTION_FLOOR {
     mesh_with_reconnect
   } else {

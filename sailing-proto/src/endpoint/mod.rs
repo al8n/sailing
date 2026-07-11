@@ -250,6 +250,25 @@ pub enum PoisonReason {
   /// the pre-upgrade election_timeout, or Some(ZERO) if it never enforced)`. Native nodes never hit this
   /// (genesis is `Recorded`), so it only guards a pre-format upgrade done via plain `restart`.
   LegacyLeaseUnrecoverable,
+  /// The storage op-id counter is exhausted: `mint_op_id` reached the saturating ceiling of
+  /// [`OpId::next`](crate::OpId), so the next mint would hand out a DUPLICATE id. A duplicate aliases
+  /// the pending-write map and lets an older completion satisfy a newer op's durability watermark
+  /// (`opid >= term_persist_opid`) — marking a term durable off a stale write. Fail-stop rather than
+  /// reuse. Unreachable by legitimate use (2^64 submissions per incarnation); reachable only from a
+  /// crafted/corrupt seed.
+  OpIdExhausted,
+  /// A read-correlation token counter is exhausted — the leader's Safe-read round counter
+  /// (`ReadOnly::next_round`) or a follower's forwarded-read token counter
+  /// (`ForwardedReads::next_token`). Both keep every in-flight read on a UNIQUE token so a
+  /// stale/duplicated `HeartbeatResponse`/`ReadIndexResponse` echoing an earlier token cannot confirm
+  /// a later read (a linearizability break). Reusing a token would reopen exactly that hazard, so
+  /// fail-stop. Unreachable by legitimate use (2^64 reads per incarnation).
+  ReadRoundExhausted,
+  /// The CheckQuorum lease-round counter (`check_quorum_lease.lease_round`) is exhausted. Each
+  /// heartbeat bumps it so the read lease is renewed only by a `HeartbeatResponse` echoing the CURRENT
+  /// round; reusing a round would let a stale earlier-round response keep an isolated leader's lease
+  /// alive (a stale-read break). Fail-stop rather than reuse. Unreachable (2^64 heartbeats).
+  LeaseRoundExhausted,
 }
 
 impl PoisonReason {
@@ -283,6 +302,9 @@ impl PoisonReason {
       Self::CommitWaitUnrepresentable => "commit_wait_unrepresentable",
       Self::LogExhausted => "log_exhausted",
       Self::LegacyLeaseUnrecoverable => "legacy_lease_unrecoverable",
+      Self::OpIdExhausted => "op_id_exhausted",
+      Self::ReadRoundExhausted => "read_round_exhausted",
+      Self::LeaseRoundExhausted => "lease_round_exhausted",
     }
   }
 }
@@ -575,14 +597,18 @@ impl ForwardedReads {
   /// Record a NEW forwarded read for user `context` and return its fresh internal token (sent to the
   /// leader as the `ReadIndex` context and echoed back in the `ReadIndexResponse`). The caller has already
   /// verified `!contains_context(context)` (dedup) AND `!is_full()` (back-pressure).
-  fn push(&mut self, context: Bytes) -> Bytes {
+  ///
+  /// Returns `None` iff the per-incarnation token counter is exhausted: reusing a `next_token` value
+  /// would let a stale `ReadIndexResponse` echoing an earlier forward complete a later read at a wrong
+  /// index. The caller fail-stops rather than reuse. Unreachable by legitimate use (2^64 forwards).
+  fn push(&mut self, context: Bytes) -> Option<Bytes> {
     let mut buf = [0u8; 16];
     buf[..8].copy_from_slice(&self.boot_epoch.to_be_bytes());
     buf[8..].copy_from_slice(&self.next_token.to_be_bytes());
-    self.next_token += 1;
+    self.next_token = self.next_token.checked_add(1)?;
     let token = Bytes::copy_from_slice(&buf);
     self.order.push_back((token.clone(), context));
-    token
+    Some(token)
   }
 
   /// Remove the forwarded read identified by `token` (the echoed correlator), returning its user
@@ -1657,7 +1683,15 @@ where
   /// Mint a unique, monotonically-increasing operation id for a storage submission.
   fn mint_op_id(&mut self) -> OpId {
     let id = self.next_op_id;
-    self.next_op_id = self.next_op_id.next();
+    let next = id.next();
+    // `OpId::next` saturates its `seq`, so once the counter reaches the ceiling advancing is a
+    // no-op (`next == id`) and every later mint returns the SAME id. A duplicate op-id aliases the
+    // pending-write map and lets an older completion satisfy a newer op's durability watermark. Poison
+    // the moment the pre-increment id is already saturated — one id early, before any duplicate escapes.
+    if next == id {
+      self.poison(PoisonReason::OpIdExhausted);
+    }
+    self.next_op_id = next;
     id
   }
 
@@ -2014,6 +2048,12 @@ where
   #[cfg(test)]
   pub(crate) fn mint_op_id_for_test(&mut self) -> OpId {
     self.mint_op_id()
+  }
+
+  /// Seed the op-id counter so the exhaustion fail-stop can be exercised without 2^64 mints.
+  #[cfg(test)]
+  pub(crate) fn set_next_op_id_for_test(&mut self, id: OpId) {
+    self.next_op_id = id;
   }
 
   /// Feed an inbound message. Runs the universal term pre-pass then dispatches.

@@ -437,10 +437,16 @@ where
     // `context`): the token is unique per round, so a stale/duplicated HeartbeatResponse echoing an
     // earlier round's token can never confirm this read — the linearizability hazard when a user
     // reuses a `context` after an earlier read with it completed.
-    let round = self
+    let Some(round) = self
       .reads
       .read_only
-      .add_request(commit, context, from, me.cheap_clone());
+      .add_request(commit, context, from, me.cheap_clone())
+    else {
+      // The round counter is exhausted: minting a duplicate token would let a stale HeartbeatResponse
+      // confirm this fresh read. Fail-stop; the caller's poison-check turns this into a typed rejection.
+      self.poison(PoisonReason::ReadRoundExhausted);
+      return;
+    };
     // Single-node cluster fast-path: self-ack is already a quorum. `vote_result_by` evaluates the SAME
     // joint-voter quorum the materialized `BTreeMap<I, bool>` did (it queries only voter ids, each with a
     // definite grant/reject), with no per-read allocation of the map, the `ids()` set, or an ack-set
@@ -599,7 +605,12 @@ where
         // means a stale/duplicated response from an earlier forward (even of the same user context)
         // cannot complete a later read. `read_index` already returned early if poisoned, so this never
         // desyncs from the suppressed `send` below.
-        let token = self.reads.forwarded_reads.push(context);
+        let Some(token) = self.reads.forwarded_reads.push(context) else {
+          // The forward-token counter is exhausted: reusing a token would let a stale
+          // `ReadIndexResponse` complete a later read at a wrong index. Fail-stop and report it.
+          self.poison(PoisonReason::ReadRoundExhausted);
+          return Err(ReadIndexError::Poisoned);
+        };
         let (term, me) = (self.term, self.config.id());
         self.send(leader, Message::ReadIndex(ReadIndex::new(term, me, token)));
         Ok(())

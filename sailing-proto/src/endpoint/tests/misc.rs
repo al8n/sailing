@@ -1032,6 +1032,9 @@ fn poison_reason_as_str_covers_all_variants() {
     (CommitWaitUnrepresentable, "commit_wait_unrepresentable"),
     (LogExhausted, "log_exhausted"),
     (LegacyLeaseUnrecoverable, "legacy_lease_unrecoverable"),
+    (OpIdExhausted, "op_id_exhausted"),
+    (ReadRoundExhausted, "read_round_exhausted"),
+    (LeaseRoundExhausted, "lease_round_exhausted"),
   ] {
     assert_eq!(reason.as_str(), name);
     assert_eq!(std::format!("{reason}"), name, "Display mirrors as_str");
@@ -1598,4 +1601,39 @@ fn tracing_subscriber_panic_does_not_drop_a_queued_event() {
     ep.poll_event().is_some(),
     "a queued consensus event must survive a tracing subscriber panic"
   );
+}
+
+/// The op-id counter fail-stops on exhaustion rather than mint a DUPLICATE id: `OpId::next` saturates
+/// its `seq`, so a re-minted id would alias the pending-write map and let an older completion satisfy a
+/// newer op's durability watermark (`opid >= term_persist_opid`) — marking a term durable off a stale
+/// write. Seeded near the ceiling so the boundary is exercised without 2^64 mints.
+///
+/// MUTATION: drop the `if next == id` guard in `mint_op_id` → the saturated counter re-mints the same
+/// id forever with no poison.
+#[test]
+fn mint_op_id_fail_stops_on_exhaustion() {
+  use crate::{Config, Instant, OpId, PoisonReason};
+  let cfg = Config::try_new(
+    1u64,
+    std::vec![1u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut ep = Endpoint::new(cfg, Instant::ORIGIN, 1, CountSm::default());
+  // One below the saturating ceiling: the penultimate id is still handed out cleanly.
+  ep.set_next_op_id_for_test(OpId::new(u64::MAX - 1));
+  let a = ep.mint_op_id_for_test();
+  assert!(
+    ep.poison_reason().is_none(),
+    "the penultimate id must mint without poisoning"
+  );
+  // The next mint is at the ceiling: it hands out the last unique id AND poisons, so the following
+  // mint (which would duplicate) can never run on a live node.
+  let b = ep.mint_op_id_for_test();
+  assert_ne!(
+    a, b,
+    "the last unique id still differs from the penultimate"
+  );
+  assert_eq!(ep.poison_reason(), Some(PoisonReason::OpIdExhausted));
 }

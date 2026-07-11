@@ -36,7 +36,13 @@ where
     // echoing THIS round and is bounded by this round's send time. A stale/duplicated
     // earlier-round response then cannot keep an isolated leader's lease alive, and a delayed
     // current-round response cannot extend it past the quorum's election window.
-    self.check_quorum_lease.lease_round += 1;
+    let Some(next_round) = self.check_quorum_lease.lease_round.checked_add(1) else {
+      // The lease-round counter is exhausted: reusing a round would let a stale earlier-round
+      // HeartbeatResponse renew an isolated leader's read lease. Fail-stop before broadcasting.
+      self.poison(PoisonReason::LeaseRoundExhausted);
+      return;
+    };
+    self.check_quorum_lease.lease_round = next_round;
     self.check_quorum_lease.lease_round_start = now.mono();
     self.check_quorum_lease.lease_acks.clear();
     // the contributing quorum's min support resets to the leader's OWN election_timeout (its self
