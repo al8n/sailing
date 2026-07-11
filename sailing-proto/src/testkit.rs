@@ -456,6 +456,18 @@ impl crate::StateMachine for CountSm {
     self.count += source.count;
     true
   }
+
+  // The workhorse test FSM ADVERTISES both reshape capabilities so the propose-time gates admit its
+  // splits/merges (the many container tests exercise split/merge MECHANICS on it). `absorb` is real;
+  // `split` stays defaulted to `None`, so a committed `Split` still fail-stops at apply
+  // (`SplitUnsupported`) — the apply-time backstop a dedicated non-splitting FSM exercises directly.
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
 }
 
 /// A synchronous in-memory stable store: `submit_write` persists `HardState<u64>` immediately AND

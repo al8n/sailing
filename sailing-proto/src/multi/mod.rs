@@ -1934,6 +1934,12 @@ where
           leader: ep.leader(),
         }));
       }
+      // The parent's FSM cannot split: a committed `Split` against it would poison every replica at
+      // apply (`SplitUnsupported`). Refuse at propose so nothing is appended. `supports_split` is
+      // type-constant, so the leader's answer holds for the whole group.
+      if !ep.state_machine().supports_split() {
+        return Some(Err(SplitError::Unsupported));
+      }
       // A frozen (or freezing) parent must not fork: the split would mutate the FSM above the
       // freeze boundary, breaking the absorb's nothing-above-the-freeze determinism — the same
       // gate class as propose/conf-change/read, applied to the one admin verb that had slipped
@@ -2063,6 +2069,12 @@ where
     // A frozen (or freezing) target is being dissolved itself — it can absorb nothing.
     if tep.merge_freeze_active() {
       return Some(Err(MergeError::AlreadyFrozen));
+    }
+    // The target's FSM cannot absorb: a committed `CommitMerge` against it would poison every replica
+    // at apply (`MergeUnsupported`), so freezing the source now would only strand it. Refuse at
+    // propose. `supports_absorb` is type-constant and colocation makes the local target authoritative.
+    if !tep.state_machine().supports_absorb() {
+      return Some(Err(MergeError::Unsupported));
     }
     // A target owing outstanding thaws to already-aborted sources is NOT refused here: `abandoned`
     // is a per-source collection, so a fresh freeze toward this target adds an independent obligation
@@ -2250,6 +2262,12 @@ where
     // target depends on.
     if tep.merge_freeze_active() {
       return Some(Err(MergeError::AlreadyFrozen));
+    }
+    // The target's FSM cannot absorb: a committed `CommitMerge` against it would poison every replica
+    // at apply (`MergeUnsupported`). Refuse at propose so the entry is never appended. `supports_absorb`
+    // is type-constant, so the target leader's answer holds for the whole group.
+    if !tep.state_machine().supports_absorb() {
+      return Some(Err(MergeError::Unsupported));
     }
     // THE LINEAGE-SERIALIZATION FENCE. `target_gen_after` is minted below from the target's LIVE
     // `shape_gen`, and the apply-time guard admits the CommitMerge ONLY at exactly that mint. A

@@ -1400,6 +1400,10 @@ fn quic_restore_seeds_the_replay_guard_from_the_floor_seam() {
       self.units -= give;
       Some(Self { units: give })
     }
+
+    fn supports_split(&self) -> bool {
+      true
+    }
   }
 
   // A crash image whose split is durable in the LOG but not yet in any snapshot meta: two

@@ -296,6 +296,13 @@ pub enum SplitError<I> {
     "the parent group's lineage counter is exhausted (a split cannot mint past the reserved u64::MAX terminal)"
   )]
   LineageExhausted,
+  /// The parent group's state machine does not support splitting
+  /// ([`StateMachine::supports_split`](crate::StateMachine::supports_split) is `false`). A committed
+  /// `Split` against a non-splitting FSM would poison every replica at apply
+  /// (`PoisonReason::SplitUnsupported`); refused at propose so the entry is never appended. A fixed
+  /// property of the FSM type — re-propose only against a group whose FSM implements `split`.
+  #[error("the parent group's state machine does not support splitting")]
+  Unsupported,
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large for one frame). The split-specific gates all passed; the failure is the
   /// ordinary admin-append class, surfaced verbatim.
@@ -310,9 +317,10 @@ pub enum SplitError<I> {
 /// precedent verbatim: the container produces the consensus-shaped refusals, a coordinator's
 /// delegator produces the floor refusals through its per-call seam, and a sharded host's handle
 /// produces `CrossPlane` before any command crosses a plane. Nothing is appended in every case.
-/// There is deliberately NO `Unsupported` variant: absorb support is knowable only at apply
-/// (the FSM seam is a defaulted method), where an unsupporting state machine fail-stops
-/// deterministically rather than diverging.
+/// A propose-time [`Unsupported`](Self::Unsupported) gate consults the leader's
+/// [`StateMachine::supports_absorb`](crate::StateMachine::supports_absorb) — a type-constant property —
+/// so a merge into a non-absorbing FSM is refused before it is appended; the apply-time
+/// `PoisonReason::MergeUnsupported` fail-stop remains the determinism backstop for a mixed-version cluster.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 #[non_exhaustive]
 pub enum MergeError<I> {
@@ -543,6 +551,14 @@ pub enum MergeError<I> {
     "the group's lineage counter is exhausted (a merge verb cannot mint past the reserved u64::MAX terminal)"
   )]
   LineageExhausted,
+  /// A merge participant's state machine does not support absorbing
+  /// ([`StateMachine::supports_absorb`](crate::StateMachine::supports_absorb) is `false`). A committed
+  /// `CommitMerge` against a non-absorbing
+  /// FSM would poison every replica at apply (`PoisonReason::MergeUnsupported`); refused at propose so
+  /// the entry is never appended. A fixed property of the FSM type — re-propose only against groups
+  /// whose FSM implements `absorb`.
+  #[error("a merge participant's state machine does not support absorbing")]
+  Unsupported,
   /// The underlying append refused (poisoned / transfer in progress / index space exhausted /
   /// entry too large). The merge-specific gates all passed; the failure is the ordinary
   /// admin-append class, surfaced verbatim.

@@ -80,6 +80,17 @@ impl StateMachine for LogSm {
     true
   }
 
+  // Type-constant capability gates consulted at propose. This FSM CAN split and absorb; the
+  // per-instruction `None`/`false` verdicts above stay the apply-time determinism backstop (a
+  // malformed `Split` instruction still fail-stops via `PoisonReason::SplitUnsupported`).
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
+
   fn snapshot(&self) -> Result<Bytes, Self::Error> {
     let mut buf: Vec<u8> = Vec::new();
     // entry count

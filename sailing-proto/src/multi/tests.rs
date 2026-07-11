@@ -1403,6 +1403,14 @@ impl crate::StateMachine for SplitSm {
     self.units += source.units;
     true
   }
+
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
 }
 
 /// Drive `gid` (single voter) to leadership on `m` under one fixed instant.
@@ -1454,6 +1462,131 @@ fn split_entry_bytes(child: u64, child_gen: u64, parent_gen_after: u64, give: u8
   let mut buf = Vec::new();
   crate::wire::encode_split_payload(&payload, &mut buf);
   Bytes::from(buf)
+}
+
+/// A split or merge against a state machine that does not support the verb is refused at PROPOSE
+/// (nothing appended), rather than committing and then poisoning every replica at apply. A supporting
+/// FSM still admits the split.
+///
+/// MUTATION: drop the `supports_split`/`supports_absorb` gate in `propose_split`/`prepare_merge` →
+/// the default-FSM verbs are appended and the log grows, deferring the fail-stop to apply.
+#[test]
+fn split_and_merge_refuse_an_unsupported_fsm_at_propose() {
+  // A plain FSM: overrides neither `split` nor `absorb`, so both `supports_*` default to false.
+  #[derive(Default)]
+  struct PlainSm(u64);
+  impl crate::StateMachine for PlainSm {
+    type Command = Bytes;
+    type Response = u64;
+    type Snapshot = u64;
+    type Error = core::convert::Infallible;
+    fn apply(&mut self, _: Index, _: Bytes) -> Result<u64, Self::Error> {
+      self.0 += 1;
+      Ok(self.0)
+    }
+    fn snapshot(&self) -> Result<u64, Self::Error> {
+      Ok(self.0)
+    }
+    fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
+      self.0 = s;
+      Ok(())
+    }
+  }
+
+  // SPLIT: drive a single-voter PlainSm group to leadership, then a split is refused at propose and
+  // the log is untouched.
+  let mut m: MultiRaft<u64, u64, PlainSm> = MultiRaft::new();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  m.create_group(
+    1,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    PlainSm::default(),
+  )
+  .unwrap();
+  let d = m.group(&1).unwrap().poll_timeout().unwrap();
+  m.handle_timeout(&1, d, &mut log, &mut stable).unwrap();
+  while matches!(
+    m.handle_storage(&1, d, &mut log, &mut stable),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert!(m.group(&1).unwrap().role().is_leader());
+  let last_before = log.last_index();
+  let err = m
+    .propose_split(
+      &1,
+      d,
+      &mut log,
+      &stable,
+      &200,
+      0,
+      Bytes::from_static(b"\x01"),
+    )
+    .unwrap()
+    .unwrap_err();
+  assert!(matches!(err, SplitError::Unsupported), "got {err:?}");
+  assert_eq!(
+    log.last_index(),
+    last_before,
+    "a refused split appends nothing"
+  );
+
+  // MERGE: two colocated PlainSm groups; the non-absorbing target refuses at prepare_merge (the
+  // gate sits before the source-leader check, so no leadership setup is needed).
+  let mut mm: MultiRaft<u64, u64, PlainSm> = MultiRaft::new();
+  let mut stores = MapStores(
+    std::collections::BTreeMap::new(),
+    std::collections::BTreeSet::new(),
+  );
+  for gid in [1u64, 2] {
+    stores
+      .0
+      .insert(gid, (VecLog::default(), AsyncStable::default()));
+    mm.create_group(
+      gid,
+      0,
+      single_node_cfg(1),
+      Instant::ORIGIN,
+      7,
+      PlainSm::default(),
+    )
+    .unwrap();
+  }
+  // source = 2 (encodes strictly above target = 1), the required merge direction.
+  let merr = mm
+    .prepare_merge(&2, Instant::ORIGIN, &mut stores, &1)
+    .unwrap()
+    .unwrap_err();
+  assert!(matches!(merr, MergeError::Unsupported), "got {merr:?}");
+
+  // A SUPPORTING FSM (`SplitSm` overrides split + supports_split) still admits the split.
+  let mut ms: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  let (mut slog, mut sstable) = (VecLog::default(), AsyncStable::default());
+  ms.create_group(
+    1,
+    0,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    7,
+    SplitSm::default(),
+  )
+  .unwrap();
+  let sd = lead_single_split(&mut ms, 1, &mut slog, &mut sstable);
+  commit_one_split(&mut ms, 1, sd, &mut slog, &mut sstable);
+  ms.propose_split(
+    &1,
+    sd,
+    &mut slog,
+    &sstable,
+    &200,
+    0,
+    Bytes::from_static(b"\x01"),
+  )
+  .unwrap()
+  .expect("a supporting FSM admits the split");
 }
 
 #[test]
@@ -3933,6 +4066,10 @@ impl crate::StateMachine for SnapFailSm {
 
   fn absorb(&mut self, source: Self) -> bool {
     self.count += source.count;
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
     true
   }
 }
@@ -9411,6 +9548,9 @@ fn freeze_gates_cover_split_and_target_verbs() {
 /// service must surface NO `Merged` resolution for it: the driver would otherwise floor the
 /// source terminally and tear its stores down behind the fail-stop, destroying the union's
 /// only copy. The fail-stop stands alone; the source's storage half stays untouched.
+///
+/// The FSM ADVERTISES `supports_absorb` (so the propose gate admits the merge) but its `absorb`
+/// returns `false` — the mixed-version / lying-implementation shape the apply-time poison backstops.
 #[test]
 fn poisoned_absorb_surfaces_no_resolution() {
   #[derive(Default)]
@@ -9430,6 +9570,11 @@ fn poisoned_absorb_surfaces_no_resolution() {
     fn restore(&mut self, s: u64) -> Result<(), Self::Error> {
       self.0 = s as usize;
       Ok(())
+    }
+    // Advertise support so the propose-time gate admits the merge; `absorb` still returns the
+    // default `false`, so the apply-time poison (the backstop this test exercises) fires.
+    fn supports_absorb(&self) -> bool {
+      true
     }
   }
   fn drain(

@@ -73,6 +73,9 @@ fn a_parked_merge_blocks_quiescence() {
       self.0 += source.0;
       true
     }
+    fn supports_absorb(&self) -> bool {
+      true
+    }
   }
 
   let mut engine: GroupEngine<u64, u64> = GroupEngine::new();

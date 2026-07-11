@@ -2016,6 +2016,10 @@ impl crate::StateMachine for SplitSm {
     self.units -= give;
     Some(Self { units: give })
   }
+
+  fn supports_split(&self) -> bool {
+    true
+  }
 }
 
 type SplitCoord = MultiStreamCoordinator<u64, u64, SplitSm, TestRecord>;

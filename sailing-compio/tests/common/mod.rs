@@ -60,6 +60,14 @@ impl StateMachine for CountSm {
     self.count += source.count;
     true
   }
+
+  fn supports_split(&self) -> bool {
+    true
+  }
+
+  fn supports_absorb(&self) -> bool {
+    true
+  }
 }
 
 /// A counting state machine whose apply FAILS on the magic `b"BOOM"` payload. An FSM apply error
