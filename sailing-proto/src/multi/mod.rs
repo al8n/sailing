@@ -3169,7 +3169,7 @@ where
           let Some(tep) = self.groups.get_mut(&tgid) else {
             continue;
           };
-          tep.resolve_pending_merge(fsm);
+          let merged = tep.resolve_pending_merge(fsm);
           // An FSM that refuses the absorb POISONED the target (deterministic on every
           // replica — MergeUnsupported is the SplitUnsupported class). Nothing was absorbed:
           // surfacing `Merged` here would have the driver floor the source terminally and
@@ -3202,6 +3202,13 @@ where
           };
           self.mark_dirty(&tgid);
           if staged {
+            // The capture staged: the union is durable, so `Merged` may now surface. The event
+            // rides ONLY this arm — a withheld resolution (a poisoned target above) drains none.
+            if let Some(m) = merged
+              && let Some(tep) = self.groups.get_mut(&tgid)
+            {
+              tep.emit_merged(m);
+            }
             resolutions.push(MergeResolution::Merged {
               source,
               target: tgid,

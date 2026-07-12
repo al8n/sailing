@@ -4251,6 +4251,21 @@ fn capture_failure_withholds_merged_and_keeps_the_source_recoverable() {
   // restart re-parks against the restored source and the merge re-resolves.
   assert!(stores.0.contains_key(&2), "the source's stores are intact");
   assert_eq!(stores.floor(&2), 0, "the source id was never floored");
+  // The gated event: a withheld resolution must surface NO `Event::Merged`. The driver folds a
+  // Merged's gen into its lineage mirror and lets the application retire external state on it, so
+  // an event queued ahead of the capture would leak a false durable-union claim even though the
+  // target poisoned. `poll_event` does not filter poisoned groups, so drain the whole queue and
+  // prove nothing merged slipped out.
+  let mut merged_events = 0;
+  while let Some((_, ev)) = m.poll_event() {
+    if matches!(ev, Event::Merged(_)) {
+      merged_events += 1;
+    }
+  }
+  assert_eq!(
+    merged_events, 0,
+    "a failed absorb capture must surface no Event::Merged"
+  );
 }
 
 /// The negative pin: with the forced capture SUCCEEDING, the resolve arm still emits exactly one

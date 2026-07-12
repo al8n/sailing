@@ -618,8 +618,16 @@ where
   }
 
   /// Resolve the parked `CommitMerge` by ABSORBING the extracted source state machine: fold it
-  /// in, mark the parked entry applied, bump the lineage, and surface `Event::Merged`. The
-  /// ONLY writer of a successful resolution; the caller (the container's per-crank service)
+  /// in, mark the parked entry applied, and bump the lineage. Returns the `Merged` payload for
+  /// the caller to surface via [`emit_merged`](Self::emit_merged) ONLY once the absorb's forced
+  /// durable capture has staged. The event is the driver's permission to floor the source
+  /// terminally and drop its stores, so it must never surface on a capture fault that poisons the
+  /// target and withholds the resolution. The in-memory mutations here are volatile — they die
+  /// with a poison — so it is the EVENT alone that carries an external side effect and must be
+  /// gated on a staged capture (mirrors the container's staged-capture arm). Returns `None` when
+  /// the absorb is refused: nothing was folded in.
+  ///
+  /// The ONLY writer of a successful resolution; the caller (the container's per-crank service)
   /// verified the source was frozen-applied at the boundary with the expected gen, so the
   /// absorbed state is identical on every replica — log-matching plus deterministic apply up
   /// to the boundary, with nothing FSM-mutating above a surviving freeze.
@@ -627,27 +635,32 @@ where
   /// An FSM whose `absorb` returns `false` (the defaulted unsupported verdict) poisons —
   /// deterministic on every replica, mirroring `SplitUnsupported`: never a silent skip that
   /// diverges absorbed replicas from refusing ones.
-  pub(crate) fn resolve_pending_merge(&mut self, source_fsm: F) {
+  pub(crate) fn resolve_pending_merge(&mut self, source_fsm: F) -> Option<crate::Merged> {
     let Some(pending) = self.merge.pending_apply.take() else {
       debug_assert!(false, "resolve without a parked CommitMerge");
-      return;
+      return None;
     };
     if !self.fsm.absorb(source_fsm) {
       self.poison(PoisonReason::MergeUnsupported);
-      return;
+      return None;
     }
     self.applied = pending.at();
     self.split.shape_gen = self.split.shape_gen.max(pending.target_gen_after());
     self.merge.absorb_index = Some(pending.at());
     // The post-absorb counter rides the event — the driver's engine mirror (INV-LINEAGE).
-    self
-      .outputs
-      .events
-      .push_back(crate::Event::Merged(crate::Merged::new(
-        pending.at(),
-        pending.source_bytes(),
-        self.split.shape_gen,
-      )));
+    Some(crate::Merged::new(
+      pending.at(),
+      pending.source_bytes(),
+      self.split.shape_gen,
+    ))
+  }
+
+  /// Surface the union [`Event::Merged`](crate::Event::Merged) — the driver's permission to floor
+  /// the source terminally and drop its stores. The container calls this ONLY once the absorb's
+  /// forced capture has staged its snapshot/compaction, so the event never claims a durable union
+  /// a capture fault withheld: a poisoned target surfaces nothing.
+  pub(crate) fn emit_merged(&mut self, m: crate::Merged) {
+    self.outputs.events.push_back(crate::Event::Merged(m));
   }
 
   /// Resolve the parked `CommitMerge` as a deterministic NO-OP: the source's log settled the

@@ -1587,7 +1587,10 @@ fn in_flight_commit_merge_fences_membership() {
 }
 
 /// The resolve: absorbing the extracted source FSM applies the parked entry — state folded,
-/// lineage bumped, `Event::Merged` surfaced — and the drain resumes on the next crank.
+/// lineage bumped — and RETURNS the `Merged` payload WITHOUT queuing any event. Emission is the
+/// container's job via `emit_merged`, gated on the forced absorb capture staging; the resolve
+/// itself surfaces nothing, so no durable-union claim can leak ahead of the capture. The drain
+/// resumes on the next crank.
 #[test]
 fn resolve_pending_merge_absorbs_and_resumes() {
   let (mut ep, mut log, mut stable, k) = make_parked_target(2);
@@ -1596,7 +1599,7 @@ fn resolve_pending_merge_absorbs_and_resumes() {
   for i in 0..3 {
     let _ = crate::StateMachine::apply(&mut source, Index::new(i + 1), bytes::Bytes::new());
   }
-  ep.resolve_pending_merge(source);
+  let merged = ep.resolve_pending_merge(source);
   assert!(!ep.is_poisoned());
   assert_eq!(ep.applied_index(), k, "the parked entry applied");
   assert!(ep.pending_merge().is_none());
@@ -1606,15 +1609,31 @@ fn resolve_pending_merge_absorbs_and_resumes() {
     "the union folded in"
   );
   assert_eq!(ep.shape_gen(), 1, "lineage bumped to target_gen_after");
-  let mut merged = false;
+  // The payload is RETURNED, not queued: the resolve emits nothing (poll drains empty) so the
+  // container can withhold the event on a failed capture. The endpoint here is not poisoned, so
+  // a leaked event WOULD surface — the pre-gate code failed exactly this assertion.
+  let m = merged.expect("a successful absorb returns the Merged payload");
+  assert_eq!(m.index(), k);
+  assert_eq!(m.source().as_ref(), b"\x2a");
+  assert!(
+    ep.poll_event().is_none(),
+    "resolve queues no event ahead of emit_merged"
+  );
+  // `emit_merged` is the surfacing seam the container calls once the capture stages: exactly one
+  // `Event::Merged` then drains.
+  ep.emit_merged(m);
+  let mut merged_events = 0;
   while let Some(ev) = ep.poll_event() {
-    if let crate::Event::Merged(m) = ev {
-      merged = true;
-      assert_eq!(m.index(), k);
-      assert_eq!(m.source().as_ref(), b"\x2a");
+    if let crate::Event::Merged(me) = ev {
+      merged_events += 1;
+      assert_eq!(me.index(), k);
+      assert_eq!(me.source().as_ref(), b"\x2a");
     }
   }
-  assert!(merged, "Event::Merged surfaced");
+  assert_eq!(
+    merged_events, 1,
+    "emit_merged surfaces the event exactly once"
+  );
   // The drain RESUMES: a later committed entry applies on the next crank.
   let cmd = bytes::Bytes::from_static(b"after");
   let idx = ep
