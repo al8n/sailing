@@ -817,6 +817,15 @@ where
     if self.reads.read_mode_migrated {
       meta = meta.with_read_only(self.reads.active_read_mode);
     }
+    // Preserve fork PROVENANCE exactly as the ordinary capture does: absorbing a source does not
+    // change this group's own origin, and this forced capture OVERWRITES the durable meta that a
+    // restart re-derives `fork_id` from and that every later snapshot send advertises. Omitting
+    // the stamp sheds the token — a fork sibling that missed the absorb then refuses this
+    // lineage's every snapshot as foreign (the receipt fork-provenance gate) and never
+    // reconverges. Absent for a non-fork target.
+    if let Some(fork_id) = &self.split.fork_id {
+      meta = meta.with_fork_id(fork_id.clone());
+    }
     let opid = self.mint_op_id();
     self.submit_snapshot(stable, opid, meta, bytes::Bytes::from(data));
     self.snapshot.pending_compact = Some((opid, self.applied));

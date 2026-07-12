@@ -2841,6 +2841,189 @@ fn a_destructive_install_refuses_foreign_fork_provenance() {
 }
 
 #[test]
+fn a_same_identity_remint_is_refused_not_superseded() {
+  // Cross-mint installs NEVER supersede an established provenance — not even a plausible
+  // "successor" of the same fork identity. A genuine retry re-mints under a strictly higher
+  // parent incarnation (every committed split bumps the parent's lineage counter), and the
+  // coordinator's admission floor tears the stale incarnation down before the re-mint exists;
+  // a stale-token replica meeting a re-minted lineage is a lifecycle breach the embedder
+  // resolves by placement. Admitting any not-exact token would let an authenticated but
+  // mis-lineaged leader wholesale-replace a token-bearing replica — the child-partition loss
+  // the receipt gate exists to prevent.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let mut m = park_with_queued_conflict(&mut log, &mut stable);
+  let stale = staged_fork_id(&m, 7);
+  m.group_mut(&200)
+    .unwrap()
+    .seed_fork_id_for_test(stale.clone());
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+  let applied_before = m.group(&200).unwrap().applied_index();
+
+  let install = |m: &mut MultiRaft<u64, u64, SplitSm>,
+                 log200: &mut VecLog,
+                 stable200: &mut AsyncStable,
+                 fork_id: ForkId| {
+    let meta = crate::SnapshotMeta::new(
+      Index::new(5),
+      Term::new(3),
+      crate::ConfState::from_voters(std::vec![1u64]),
+    )
+    .with_fork_id(fork_id);
+    m.handle_message(
+      &200,
+      Instant::ORIGIN,
+      log200,
+      stable200,
+      2u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(3),
+        2u64,
+        meta,
+        fork_blob(9),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&200, Instant::ORIGIN, log200, stable200),
+      Some(StorageProgress::MorePending)
+    ) {}
+  };
+
+  // A delayed stale frame; a rival same-generation mint; a forged same-incarnation successor
+  // (structurally impossible for a real retry — the parent's counter moves); and the shape a
+  // real retry WOULD carry (incarnation and generation both advanced). One rule covers all
+  // four: not this token, not this lineage.
+  let older = ForkId::new(
+    stale.parent().clone(),
+    stale.parent_incarnation(),
+    Index::new(1),
+    Term::new(1),
+    stale.child().clone(),
+    stale.child_gen().saturating_sub(1),
+  );
+  let rival = ForkId::new(
+    stale.parent().clone(),
+    stale.parent_incarnation(),
+    Index::new(9),
+    Term::new(2),
+    stale.child().clone(),
+    stale.child_gen(),
+  );
+  let forged = ForkId::new(
+    stale.parent().clone(),
+    stale.parent_incarnation(),
+    Index::new(9),
+    Term::new(2),
+    stale.child().clone(),
+    stale.child_gen() + 1,
+  );
+  let remint = ForkId::new(
+    stale.parent().clone(),
+    stale.parent_incarnation() + 1,
+    Index::new(9),
+    Term::new(2),
+    stale.child().clone(),
+    stale.child_gen() + 1,
+  );
+  for (mint, shape) in [
+    (older, "a lower-generation mint"),
+    (rival, "an equal-generation rival mint"),
+    (forged, "a same-incarnation higher-generation mint"),
+    (remint, "a genuine re-mint's higher-incarnation shape"),
+  ] {
+    install(&mut m, &mut log200, &mut stable200, mint);
+    let child = m.group(&200).unwrap();
+    assert_eq!(
+      child.applied_index(),
+      applied_before,
+      "{shape} must not land"
+    );
+    assert!(!child.is_poisoned(), "refusal, not fail-stop");
+    assert_eq!(child.fork_id(), Some(stale.clone()), "provenance intact");
+  }
+}
+
+#[test]
+fn an_absorb_capture_preserves_fork_provenance() {
+  // THE SHED (multi-VOPR merge band, seed 1): a fork-child TARGET absorbing a merge source
+  // anchors the union with the FORCED capture — and that capture's durable meta is what a
+  // restart re-derives `fork_id` from and what every later snapshot send advertises. It must
+  // re-stamp the child's token exactly as the ordinary capture does; a token-less union anchor
+  // sheds provenance, and a stale fork sibling then refuses the lineage's every snapshot as
+  // foreign — pinned behind its healed quorum forever.
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let mut m = park_with_queued_conflict(&mut log, &mut stable);
+  let f = staged_fork_id(&m, 7);
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(f.clone());
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+
+  // Real applied state below the capture boundary: the twin's retransfer at index 6.
+  let twin = crate::SnapshotMeta::new(
+    Index::new(6),
+    Term::new(3),
+    crate::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_fork_id(f.clone());
+  m.handle_message(
+    &200,
+    Instant::ORIGIN,
+    &mut log200,
+    &mut stable200,
+    2u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(3),
+      2u64,
+      twin,
+      fork_blob(2),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&200, Instant::ORIGIN, &mut log200, &mut stable200),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert_eq!(m.group(&200).unwrap().applied_index(), Index::new(6));
+
+  // The container's resolve arm runs the forced capture with the target's stores in hand.
+  assert!(
+    m.group_mut(&200)
+      .unwrap()
+      .capture_absorb_snapshot(&log200, &mut stable200),
+    "the union anchor stages"
+  );
+  while matches!(
+    m.handle_storage(&200, Instant::ORIGIN, &mut log200, &mut stable200),
+    Some(StorageProgress::MorePending)
+  ) {}
+  let (meta, _) = stable200.snapshot().expect("the union anchor is durable");
+  assert_eq!(
+    meta.fork_id(),
+    Some(&f),
+    "the absorb capture re-stamps fork provenance"
+  );
+
+  // The contract the stamp protects: a rebuilt container re-derives the token from exactly
+  // this durable meta.
+  let mut m2: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
+  m2.restore_group(
+    200,
+    single_node_cfg(1),
+    Instant::ORIGIN,
+    43,
+    SplitSm::default(),
+    1,
+    &mut log200,
+    &mut stable200,
+  )
+  .unwrap();
+  assert_eq!(
+    m2.group(&200).unwrap().fork_id(),
+    Some(f),
+    "restart re-derives provenance from the absorb anchor"
+  );
+}
+
+#[test]
 fn removing_the_parked_parent_purges_its_undelivered_conflict() {
   // The parent's removal is the embedder's explicit destruction of this replica: the staged
   // forks die with the endpoint, so the park bookkeeping — a still-queued conflict signal a
