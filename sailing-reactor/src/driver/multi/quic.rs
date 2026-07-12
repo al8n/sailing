@@ -106,6 +106,13 @@ where
   /// `LifecycleEvent::SplitApplied` — registration, blob, and lineage become durable atomically
   /// before any lift.
   forks_pending_flush: Vec<(G, Index, G)>,
+  /// Applied merges' `Event::Merged`, withheld from the application until the engine barrier
+  /// (the fork queue's idiom): when the endpoint surfaces the event, the absorb's forced
+  /// capture, the source's terminal floor, and its removal are only STAGED — forwarding it
+  /// earlier would let a consumer retire the source's external state on the strength of a
+  /// union a crash still loses (recovery re-parks the merge). Queuing arms `flush_pending`,
+  /// so the next crank's `engine.flush()` covers those writes before any queued event drains.
+  merges_pending_flush: Vec<(G, Event<I, F::Response>)>,
   storage_ready: flume::Receiver<()>,
   _storage_ready_keepalive: Option<flume::Sender<()>>,
   peers: Vec<Node<I, SocketAddr>>,
@@ -223,6 +230,7 @@ where
         lifecycle_tx,
         factory: None,
         forks_pending_flush: Vec::new(),
+        merges_pending_flush: Vec::new(),
         storage_ready,
         _storage_ready_keepalive: keepalive,
         peers,
@@ -562,7 +570,8 @@ where
 
   fn storage_crank(&mut self, now: Now) {
     self.fork_drain(now);
-    if self.flush_pending {
+    let flushed = self.flush_pending;
+    if flushed {
       self.engine.flush();
     }
     // Registration + blob + lineage became durable in the flush above (ONE barrier): only now
@@ -572,6 +581,19 @@ where
       let _ = self
         .lifecycle_tx
         .try_send(LifecycleEvent::SplitApplied { parent, child });
+    }
+    // The fork lift's merge twin: a queued `Merged` drains only behind a barrier that ran, and
+    // queuing armed `flush_pending`, so a non-empty queue always finds one — the absorb's
+    // capture, the terminal floor, and the source's removal are covered before the application
+    // can act on the union. `route_event` moves no waiter or watermark for `Merged`; both the
+    // per-group copy and the stamped tail copy are the deferred app-visible surfaces.
+    if flushed {
+      for (g, ev) in self.merges_pending_flush.drain(..) {
+        if let Some(routing) = self.routing.get_mut(&g) {
+          let _ = routing.route_event(ev.clone());
+        }
+        let _ = self.events_tx.try_send((g, ev));
+      }
     }
     let mut more = false;
     let hosted: Vec<G> = self.engine.group_ids().map(|g| g.cheap_clone()).collect();
@@ -1392,6 +1414,19 @@ where
     }
     let mut run_queries: BTreeSet<G> = BTreeSet::new();
     while let Some((g, ev)) = self.coord.poll_event() {
+      // A `Merged` is withheld until the barrier covering the absorb's staged capture, floor,
+      // and source removal (see `merges_pending_flush`): fold the lineage mirror NOW — the same
+      // barrier must cover it — arm the flush, and defer both app-visible copies to the
+      // post-barrier drain in the storage crank.
+      if let Event::Merged(m) = &ev {
+        let gen_after = m.gen_after();
+        if gen_after > 0 {
+          self.engine.set_group_gen(&g, gen_after);
+        }
+        self.flush_pending = true;
+        self.merges_pending_flush.push((g, ev));
+        continue;
+      }
       if let Some(routing) = self.routing.get_mut(&g)
         && routing.route_event(ev.clone())
       {
@@ -1417,7 +1452,6 @@ where
         Event::MergeFrozen(f) => f.gen_after(),
         Event::MergeRolledBack(r) => r.gen_after(),
         Event::MergeAborted(a) => a.gen_after(),
-        Event::Merged(m) => m.gen_after(),
         Event::SnapshotInstalled(meta) => meta.shape_gen(),
         _ => 0,
       };
