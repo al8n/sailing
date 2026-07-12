@@ -2696,6 +2696,151 @@ fn twin_catch_up_purges_an_undelivered_conflict() {
 }
 
 #[test]
+fn a_destructive_install_refuses_foreign_fork_provenance() {
+  // The park shape, then the squatter becomes the fork's genuine twin (a sibling's baseline —
+  // the seam `twin_catch_up_purges_an_undelivered_conflict` models): the child now BEARS the
+  // fork's token, and every snapshot of its lineage carries that token (own captures stamp it).
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let mut m = park_with_queued_conflict(&mut log, &mut stable);
+  let f = staged_fork_id(&m, 7);
+  m.group_mut(&200).unwrap().seed_fork_id_for_test(f.clone());
+
+  let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+  let applied_before = m.group(&200).unwrap().applied_index();
+
+  // An authenticated foreign leader ships a TOKEN-LESS destructive install. Landing it would
+  // replace the twin's state wholesale while the keep-if-set adoption retains the token — the
+  // replica would impersonate the fork on foreign state, and the parked parent could resolve
+  // its fork redundant against it. It must be REFUSED (never fail-stop), leaving state, token,
+  // and the durable store untouched.
+  let foreign = crate::SnapshotMeta::new(
+    Index::new(5),
+    Term::new(3),
+    crate::ConfState::from_voters(std::vec![1u64, 9]),
+  );
+  m.handle_message(
+    &200,
+    Instant::ORIGIN,
+    &mut log200,
+    &mut stable200,
+    9u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(3),
+      9u64,
+      foreign,
+      fork_blob(99),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&200, Instant::ORIGIN, &mut log200, &mut stable200),
+    Some(StorageProgress::MorePending)
+  ) {}
+  {
+    let child = m.group(&200).unwrap();
+    assert_eq!(
+      child.applied_index(),
+      applied_before,
+      "a token-less install over an established provenance must not land"
+    );
+    assert!(!child.is_poisoned(), "refusal, not fail-stop");
+    assert_eq!(child.fork_id(), Some(f.clone()), "provenance intact");
+  }
+
+  // A DIFFERENT fork's token refuses identically: adoption must never overwrite provenance.
+  let alien = ForkId::new(
+    Bytes::from_static(&[9u8]),
+    1,
+    Index::new(4),
+    Term::new(1),
+    Bytes::from_static(&[200u8]),
+    7,
+  );
+  let foreign2 = crate::SnapshotMeta::new(
+    Index::new(5),
+    Term::new(3),
+    crate::ConfState::from_voters(std::vec![1u64, 9]),
+  )
+  .with_fork_id(alien);
+  m.handle_message(
+    &200,
+    Instant::ORIGIN,
+    &mut log200,
+    &mut stable200,
+    9u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(3),
+      9u64,
+      foreign2,
+      fork_blob(98),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&200, Instant::ORIGIN, &mut log200, &mut stable200),
+    Some(StorageProgress::MorePending)
+  ) {}
+  {
+    let child = m.group(&200).unwrap();
+    assert_eq!(child.applied_index(), applied_before, "still refused");
+    assert!(!child.is_poisoned(), "refusal, not fail-stop");
+    assert_eq!(
+      child.fork_id(),
+      Some(f.clone()),
+      "provenance not overwritten"
+    );
+  }
+
+  // The SAME token still installs — the twin's genuine retransfer at a higher boundary (the
+  // e2e fork-transfer pins: `a_zero_progress_joiner_is_forced_onto_the_snapshot_path` and
+  // `the_joiner_lands_on_the_preloaded_state_plus_tail` cover the None→Some adoption leg).
+  let twin = crate::SnapshotMeta::new(
+    Index::new(6),
+    Term::new(3),
+    crate::ConfState::from_voters(std::vec![1u64]),
+  )
+  .with_fork_id(f.clone());
+  m.handle_message(
+    &200,
+    Instant::ORIGIN,
+    &mut log200,
+    &mut stable200,
+    2u64,
+    Message::InstallSnapshot(crate::InstallSnapshot::new(
+      Term::new(3),
+      2u64,
+      twin,
+      fork_blob(2),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&200, Instant::ORIGIN, &mut log200, &mut stable200),
+    Some(StorageProgress::MorePending)
+  ) {}
+  {
+    let child = m.group(&200).unwrap();
+    assert_eq!(
+      child.applied_index(),
+      Index::new(6),
+      "the matching-token retransfer lands"
+    );
+    assert_eq!(child.state_machine().units, 2, "the twin's state arrived");
+    assert_eq!(child.fork_id(), Some(f), "provenance carried through");
+  }
+
+  // The park resolves redundant against the COHERENT twin — never against foreign state.
+  assert!(
+    m.poll_pending_fork().is_none(),
+    "the twin resolves the park without yielding"
+  );
+  assert!(
+    m.group(&7).unwrap().peek_pending_fork().is_none(),
+    "the redundant fork is consumed"
+  );
+}
+
+#[test]
 fn removing_the_parked_parent_purges_its_undelivered_conflict() {
   // The parent's removal is the embedder's explicit destruction of this replica: the staged
   // forks die with the endpoint, so the park bookkeeping — a still-queued conflict signal a

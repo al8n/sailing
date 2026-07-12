@@ -518,6 +518,26 @@ where
 
     // meta.last_index() > self.commit: a genuinely-newer snapshot.
 
+    // FORK-PROVENANCE gate: this replica's lineage token rides every snapshot of its own lineage
+    // — the manufactured fork baseline carries it, own captures re-stamp it, and a sibling twin's
+    // transfer repeats it — and the handshake fences pre-token peers, so absence is meaningful:
+    // an authenticated leader shipping a token-less (or other-token) DESTRUCTIVE install is
+    // foreign lineage for this id, not an older version. Landing it would replace this child's
+    // state wholesale while the keep-if-set adoption below retains the token — the replica would
+    // impersonate the fork on foreign state (a parked parent could resolve its fork redundant
+    // against it), and a restart would re-derive provenance from the foreign durable meta and
+    // silently shed the token. REFUSE at receipt, BEFORE any staging, so the foreign blob never
+    // becomes durable and restart re-derivation stays coherent with the live token. Refusal, not
+    // fail-stop: the sender is authenticated, merely mis-lineaged — dropping the message leaves
+    // it pinned in Snapshot state, the same standing-conflict posture as a parked fork, resolved
+    // by placement (removal / the genuine twin's transfer). A token-less self adopts freely (the
+    // fresh-joiner leg); a matching token re-installs freely (the twin retransfer leg).
+    if let Some(existing) = &self.split.fork_id
+      && meta.fork_id() != Some(existing)
+    {
+      return;
+    }
+
     // Duplicate-install guard: a deferred install for the SAME snapshot identity (or one at a
     // strictly-NEWER boundary) is completing — do NOT re-stage or re-decode (that would orphan the
     // in-flight blob, or stage a now-stale older snapshot). A DIFFERENT snapshot at the same-or-lower
