@@ -477,6 +477,25 @@ impl MultiWorld {
           }
         }
       }
+      // `child_inherited` — the CHILD-side CELL-level exemption, the mirror of `inherited`. The
+      // same whole-record absorb carries cells of keys OUTSIDE the transferred population into a
+      // child that became a merge target (a parked key's cells ride the source's record), and the
+      // sweep records them under the child though `absorbed` never named the key. Collect, per key
+      // the source recorded, every value in its record: values are globally unique, so such a value
+      // reached the child only via that absorb, and a child own-write of an unassigned key can
+      // never match one.
+      let mut child_inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+      for m in self.merges.iter().filter(|m| m.target_led == rec.child_led) {
+        for k in self.conservation.keys_of(m.source_led) {
+          let hist = self.conservation.history(m.source_led, k);
+          if !hist.is_empty() {
+            child_inherited
+              .entry(k)
+              .or_default()
+              .extend(hist.iter().map(|&(_, v)| v));
+          }
+        }
+      }
       self.conservation.assert_partition(
         rec.parent_led,
         rec.child_led,
@@ -484,6 +503,7 @@ impl MultiWorld {
         &absorbed,
         &reacquired,
         &inherited,
+        &child_inherited,
       );
       drop(ctx); // no panic: disarm silently
     }

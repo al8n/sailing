@@ -86,14 +86,27 @@ impl ConservationLedger {
   /// both sides still trips both legs); conversely a value in a union source's history reached
   /// the parent's record only via that absorb. The shared prefix itself is never filtered — an
   /// inherited cell inside it is legitimate common history the child copied at fork, and dropping
-  /// it would break the prefix match. The child side is untouched (a union into the CHILD is the
-  /// key-level `absorbed` exemption). The LOSS leg applies the same reduction: a parent tail that
+  /// it would break the prefix match. Symmetrically, `child_inherited` exempts individual
+  /// CHILD-side cells: the same whole-record absorb can carry cells of an UNASSIGNED key INTO a
+  /// child that became a merge target (a parked key's cells ride the source's record), recorded
+  /// under the child though the union's `absorbed_keys` never named it — invisible to the
+  /// key-level `absorbed` set above. On the cross-talk leg the child counts as leaking only on
+  /// a STRAY cell — one whose value no inbound union source carries; values being globally
+  /// unique, a child own-write of an unassigned key can never match a union source's history and
+  /// still trips (a key with no registered union still trips). The LOSS leg applies the same
+  /// reduction: a parent tail that
   /// is entirely inherited counts as not-continuing (the common prefix is the effective end), so
-  /// a child stopping short of only-inherited tail cells does not trip. Accepted residual: an
-  /// inherited-then-lost parent tail is excused here — the inbound union's own
+  /// a child stopping short of only-inherited tail cells does not trip. Accepted residual,
+  /// symmetric on both sides: an inherited-then-lost parent tail — and a union-carried-then-stray
+  /// child cell — is excused here, each exemption reading the source's recorded HISTORY (a
+  /// superset of the exact absorb capture); the inbound union's own
   /// [`assert_union`](Self::assert_union) judges that absorb.
   ///
   /// Panics with the group ids, the key, and both histories on any violation.
+  // Seven inputs — two ledger ids, the assigned set, and the four union-reroute exemptions
+  // (key-level `absorbed`/`reacquired`, cell-level `inherited`/`child_inherited`); a params struct
+  // would only indirect the mirror-symmetric call sites.
+  #[allow(clippy::too_many_arguments)]
   pub(crate) fn assert_partition(
     &self,
     parent: u64,
@@ -102,6 +115,7 @@ impl ConservationLedger {
     absorbed: &BTreeSet<u16>,
     reacquired: &BTreeSet<u16>,
     inherited: &BTreeMap<u16, BTreeSet<u64>>,
+    child_inherited: &BTreeMap<u16, BTreeSet<u64>>,
   ) {
     let mut keys = self.keys_of(parent);
     keys.extend(self.keys_of(child));
@@ -112,10 +126,24 @@ impl ConservationLedger {
         if absorbed.contains(&k) {
           continue; // carried in by a registered union — the merge's assert_union judges it
         }
+        // Cross-talk with the CHILD-side cell-level exemption, the mirror of `inherited`: a
+        // registered union's whole-record absorb can carry cells of a key OUTSIDE its transferred
+        // population into the child (a parked key rides the source's record), recorded under the
+        // child though `absorbed` never named it. Such a cell's value is in the inbound source's
+        // history and is exempt; a stray cell — a child own-write of an unassigned key, whose
+        // globally-unique value no union source carries — still trips.
+        let inh = child_inherited.get(&k);
+        let child_strays = c
+          .iter()
+          .any(|&(_, value)| !inh.is_some_and(|s| s.contains(&value)));
         assert!(
-          c.is_empty(),
+          !child_strays,
           "[conservation] split g{parent}->g{child}: key {k} was never assigned to the child \
-           but surfaced there\n  child={c:?}",
+           but surfaced there\n  child={c:?}{}",
+          inh.map_or_else(String::new, |s| {
+            let stray: Vec<_> = c.iter().filter(|&&(_, v)| !s.contains(&v)).collect();
+            format!("\n  stray (non-union-carried) cells={stray:?}")
+          }),
         );
         continue;
       }

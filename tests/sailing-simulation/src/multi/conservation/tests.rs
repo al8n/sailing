@@ -35,6 +35,7 @@ fn partition_holds_for_a_clean_handover() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -54,6 +55,7 @@ fn partition_panics_on_lost_history() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -74,6 +76,7 @@ fn partition_panics_on_a_double_continuation() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -91,6 +94,7 @@ fn partition_panics_on_an_unassigned_key_in_the_child() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -189,6 +193,7 @@ fn partition_exempts_a_key_a_registered_union_carried_in() {
     &keyset(&[5]),
     &BTreeSet::new(),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -210,6 +215,7 @@ fn partition_still_trips_on_a_key_no_union_carried() {
     &keyset(&[5]),
     &BTreeSet::new(),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -234,6 +240,7 @@ fn partition_exempts_a_key_a_union_re_acquired_into_the_parent() {
     &BTreeSet::new(),
     &keyset(&[2]),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -259,6 +266,7 @@ fn partition_exempts_a_divergent_key_a_union_re_acquired_into_the_parent() {
     &BTreeSet::new(),
     &keyset(&[3]),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -346,6 +354,7 @@ fn partition_exempts_a_parent_tail_a_unions_record_carried_in() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &inherited,
+    &BTreeMap::new(),
   );
 }
 
@@ -370,6 +379,7 @@ fn partition_trips_on_the_carried_record_shape_without_the_exemption() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &no_inherited(),
+    &BTreeMap::new(),
   );
 }
 
@@ -394,6 +404,7 @@ fn partition_still_trips_on_a_fresh_own_write_on_both_sides() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &inherited,
+    &BTreeMap::new(),
   );
 }
 
@@ -415,6 +426,7 @@ fn partition_loss_leg_excuses_an_entirely_inherited_parent_tail() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &inherited,
+    &BTreeMap::new(),
   );
 }
 
@@ -437,6 +449,68 @@ fn partition_loss_leg_still_trips_on_an_own_write_in_the_tail() {
     &BTreeSet::new(),
     &BTreeSet::new(),
     &inherited,
+    &BTreeMap::new(),
+  );
+}
+
+/// The child-side carried-record exemption (the seed-23 g444->g438 shape): a REGISTERED union into
+/// the child transferred population {4,5}, but its whole-record absorb also carried cells of key 6 —
+/// a key parked on the source's lineage by an earlier accepted-but-lost split, OUTSIDE that
+/// population — so the sweep recorded them under the child though the split never assigned key 6 and
+/// `absorbed` does not name it. Their values are in the inbound source's history, so `child_inherited`
+/// exempts them cell-by-cell and the cross-talk leg holds; the key-level `absorbed` set is blind to
+/// this shape (the mirror of [`partition_exempts_a_parent_tail_a_unions_record_carried_in`]).
+#[test]
+fn partition_exempts_a_child_cell_a_unions_record_carried_in() {
+  let mut l = ConservationLedger::new();
+  // The split hands key 2 to the child, which inherits the parent's baseline.
+  l.record(100, 2, 2, 11);
+  l.record(438, 2, 2, 11);
+  // The inbound union source's record carried key-6 cells (key 6 parked, outside the {4,5}
+  // transferred population).
+  l.record(444, 6, 3, 700);
+  l.record(444, 6, 5, 701);
+  // The child absorbed that source: key 6's carried cells surface under the child.
+  l.record(438, 6, 3, 700);
+  l.record(438, 6, 5, 701);
+  let mut child_inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  child_inherited.insert(6, [700, 701].into_iter().collect());
+  l.assert_partition(
+    100,
+    438,
+    &keyset(&[2]),
+    &keyset(&[4, 5]),
+    &BTreeSet::new(),
+    &no_inherited(),
+    &child_inherited,
+  );
+}
+
+/// The child-side exemption keeps its teeth: values are globally unique, so a stray child own-write
+/// of an unassigned key — a value no inbound union source carries — never matches `child_inherited`
+/// and still trips the never-assigned cross-talk leg, even beside a legitimately union-carried cell
+/// of the same key.
+#[test]
+#[should_panic(expected = "never assigned")]
+fn partition_still_trips_on_a_stray_child_write_of_an_unassigned_key() {
+  let mut l = ConservationLedger::new();
+  l.record(100, 2, 2, 11);
+  l.record(438, 2, 2, 11);
+  // Key 6 rode in on the union — exempt ...
+  l.record(444, 6, 3, 700);
+  l.record(438, 6, 3, 700);
+  // ... but the child then WROTE key 6 itself, a value no union source carries: a real leak.
+  l.record(438, 6, 8, 900);
+  let mut child_inherited: BTreeMap<u16, BTreeSet<u64>> = BTreeMap::new();
+  child_inherited.insert(6, [700].into_iter().collect());
+  l.assert_partition(
+    100,
+    438,
+    &keyset(&[2]),
+    &keyset(&[4, 5]),
+    &BTreeSet::new(),
+    &no_inherited(),
+    &child_inherited,
   );
 }
 
