@@ -1068,7 +1068,11 @@ where
               },
             );
           }
-          Err(e) => complete(Err(map_read_err(e))),
+          // An immediate read-index refusal: the completion runs with `Err`, which never invokes
+          // the user closure, so it cannot panic — discard the (always `Delivered`) outcome.
+          Err(e) => {
+            complete(Err(map_read_err(e)));
+          }
         }
       }
       Command::FailoverWindow {
@@ -1136,8 +1140,9 @@ where
   /// `now` each pass: `None` (commit-wait lifted, off-tier, inherited lease expired, poisoned) falls
   /// every query back to a normal read (`Ok(None)`); a live window whose committed prefix has applied
   /// serves the whole batch against the FSM with the limbo region; otherwise the queries stay parked for
-  /// next pass. Returns `true` on a FATAL limbo storage fault (the caller fails the parked work
-  /// `Poisoned` and stops the driver — a corrupt committed-range log is unrecoverable).
+  /// next pass. Returns `true` when the pass POISONED the endpoint — a FATAL limbo storage fault (a
+  /// corrupt committed-range log is unrecoverable) OR a caught user-closure panic in the served batch —
+  /// and the caller fails the parked work `Poisoned` and stops the driver.
   fn run_failover_serve(&mut self) -> bool {
     if self.routing.failovers.is_empty() {
       return false;
@@ -1162,13 +1167,20 @@ where
             let fsm = self.coord.state_machine();
             // Re-check the lease with a FRESH wall before EACH completion — the scan and each closure
             // burn wall time, so the window can expire mid-batch.
-            sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
-              self
-                .coord
-                .endpoint()
-                .failover_read_window(self.clock.now())
-                .is_some()
-            });
+            let panicked =
+              sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+                self
+                  .coord
+                  .endpoint()
+                  .failover_read_window(self.clock.now())
+                  .is_some()
+              });
+            if panicked {
+              // A served inherited-read's user closure panicked: fail-stop the endpoint (interior
+              // mutability could have torn its FSM) and stop the driver, exactly like a fatal fault.
+              self.coord.fail_stop_query_panicked();
+              return true;
+            }
           }
           // A SAFE fallback (truncated / over-budget / incomplete / index-ceiling limbo): fall the
           // batch back to a normal read.
@@ -1248,7 +1260,15 @@ where
     }
     if run_queries {
       for q in self.routing.take_runnable_queries() {
-        (q.complete)(Ok(self.coord.state_machine()));
+        // A caught user-closure panic fail-stops the endpoint: interior mutability could have torn
+        // the replicated FSM mid-read, so stop before serving any more reads off it. The poison
+        // check below fails the remaining parked work typed and stops the driver.
+        if (q.complete)(Ok(self.coord.state_machine()))
+          == sailing_driver::shared::CompletionOutcome::Panicked
+        {
+          self.coord.fail_stop_query_panicked();
+          break;
+        }
       }
     }
     // The fail-stop check: a poisoned endpoint suppresses poll_event and poll_timeout by design, so

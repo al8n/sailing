@@ -446,6 +446,13 @@ where
     self.endpoint.state_machine()
   }
 
+  /// Fail-stop the wrapped endpoint because a user QUERY closure panicked mid-read against its state
+  /// machine (see [`Endpoint::fail_stop_query_panicked`]). The driver caught the unwind to keep its
+  /// task alive and routes here so the endpoint stops serving possibly-torn replicated state.
+  pub fn fail_stop_query_panicked(&mut self) {
+    self.endpoint.fail_stop_query_panicked();
+  }
+
   /// Read-only access to the wrapped consensus endpoint, for introspection a driver needs that the
   /// coordinator does not re-export: poison detection (`is_poisoned`/`poison_reason` — the
   /// fail-stop discipline requires the driver to detect poison and halt), the leader hint for

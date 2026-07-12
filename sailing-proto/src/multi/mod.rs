@@ -970,6 +970,20 @@ where
     }
   }
 
+  /// Fail-stop the addressed group because a user QUERY closure panicked mid-read against its state
+  /// machine, then LATCH the signal for [`poll_poisoned`](Self::poll_poisoned). A driver caught the
+  /// unwind (keeping its plane and every co-located group alive) and routes here so this group joins
+  /// the poison surface: the closure borrows only `&F`, but interior mutability could have torn
+  /// replicated state, so fail-stop beats risking silent divergence from replicas that never ran it.
+  /// A no-op if the group is not hosted. The explicit `note_if_poisoned` latches this driver-invoked
+  /// poison exactly as the post-dispatch choke point latches a crank that self-poisons.
+  pub fn fail_stop_query_panicked(&mut self, gid: &G) {
+    if let Some(ep) = self.groups.get_mut(gid) {
+      ep.fail_stop_query_panicked();
+    }
+    self.note_if_poisoned(gid);
+  }
+
   /// The group's lineage counter under the unified per-id scheme (incarnation ⊔ shape), as this
   /// container knows it: the LIVE endpoint counter when hosted (it includes every applied
   /// split), else the relay-time view (a removed id's last relayed bump). `0` for an id never

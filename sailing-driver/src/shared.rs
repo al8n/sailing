@@ -122,10 +122,39 @@ pub enum Pending<I, R> {
   },
 }
 
+/// Whether a query/failover completion DELIVERED its result or caught a user-closure panic. The
+/// completion runs the user closure under `catch_unwind`; a caught panic replies `QueryPanicked`
+/// to the caller AND reports `Panicked` here, so the invoking driver learns the read ran against —
+/// and interior mutability could have TORN — the replicated state machine, and fail-stops the
+/// addressed group rather than serve possibly-divergent state. `Delivered` on the normal path and
+/// on every non-serving completion (an `Err` or `Ok(None)` never runs the user closure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompletionOutcome {
+  /// The completion ran to normal delivery — no user-closure panic was caught.
+  Delivered,
+  /// A user-closure panic was caught; the caller received `QueryPanicked`. The driver must
+  /// fail-stop the group the closure read against.
+  Panicked,
+}
+
+impl CompletionOutcome {
+  /// Map a completion's caught-panic flag to the outcome: `Panicked` when the `catch_unwind` fired,
+  /// else `Delivered`.
+  pub(crate) const fn caught(panicked: bool) -> Self {
+    if panicked {
+      Self::Panicked
+    } else {
+      Self::Delivered
+    }
+  }
+}
+
 /// The type-erased completion of a linearizable query: called with `Ok(&F)` ON the driver
 /// thread to run the query (the result ships through the captured channel), or with the error
 /// that voided it — one closure, so the caller keeps full error fidelity across the erasure.
-pub type QueryComplete<I, F> = Box<dyn FnOnce(Result<&F, DriverError<I>>) + Send>;
+/// Reports whether a user-closure panic was caught (see [`CompletionOutcome`]).
+pub type QueryComplete<I, F> =
+  Box<dyn FnOnce(Result<&F, DriverError<I>>) -> CompletionOutcome + Send>;
 
 /// The argument a [`FailoverComplete`] receives: the served `(FSM, limbo entries, window)` triple to
 /// run the read against, `None` when no serve window is available (the caller falls back to a normal
@@ -135,8 +164,10 @@ pub type FailoverOutcome<'a, I, F> =
 
 /// The type-erased completion of a failover inherited-read query. Called ON the driver thread with the
 /// [`FailoverOutcome`] — the served triple, `Ok(None)`, or the error that voided it — one closure, so
-/// the caller keeps full error fidelity across the erasure.
-pub type FailoverComplete<I, F> = Box<dyn FnOnce(FailoverOutcome<'_, I, F>) + Send>;
+/// the caller keeps full error fidelity across the erasure. Reports whether a user-closure panic was
+/// caught (see [`CompletionOutcome`]).
+pub type FailoverComplete<I, F> =
+  Box<dyn FnOnce(FailoverOutcome<'_, I, F>) -> CompletionOutcome + Send>;
 
 /// Apply a CHECKED failover inherited read to a [`FailoverOutcome`]: serve the closure's result ONLY
 /// when the limbo region is EMPTY (the coarse-but-safe mode), else decline with `Ok(None)`. The closure
@@ -276,20 +307,28 @@ fn contiguous_normal_entries(
 /// window live when the batch started can expire mid-batch — a completion past expiry must fall back
 /// (`Ok(None)`) rather than serve a stale inherited read. Shared by both drivers so the freshness rule
 /// cannot drift.
+/// Returns whether ANY served completion caught a user-closure panic — the caller fail-stops the
+/// group the batch read against (interior mutability could have torn its replicated state). A
+/// declined completion (`Ok(None)`, past the live window) never runs the user closure, so only the
+/// served arm can report `Panicked`.
+#[must_use]
 pub fn serve_failover_batch<I, F>(
   parked: Vec<ParkedFailover<I, F>>,
   fsm: &F,
   limbo: &[Entry],
   window: FailoverReadWindow,
   mut still_live: impl FnMut() -> bool,
-) {
+) -> bool {
+  let mut panicked = false;
   for p in parked {
-    if still_live() {
-      (p.complete)(Ok(Some((fsm, limbo, window))));
+    let outcome = if still_live() {
+      (p.complete)(Ok(Some((fsm, limbo, window))))
     } else {
-      (p.complete)(Ok(None));
-    }
+      (p.complete)(Ok(None))
+    };
+    panicked |= outcome == CompletionOutcome::Panicked;
   }
+  panicked
 }
 
 /// A linearizable query's lifecycle: confirmed by `ReadState` (which fixes `ready_at`), then run
@@ -649,6 +688,7 @@ mod tests {
         // A parked inherited-read MUST be voided on a leadership change — its serve window belonged to
         // the old leadership's reasoning, exactly like a parked query.
         let _ = tx.send(matches!(res, Err(DriverError::Superseded)));
+        CompletionOutcome::Delivered
       }),
       _reservation: b.try_reserve::<u64>(0).unwrap(),
     });
@@ -765,14 +805,17 @@ mod tests {
       let served = served.clone();
       let fell_back = fell_back.clone();
       batch.push(ParkedFailover {
-        complete: Box::new(move |res: FailoverOutcome<'_, u64, ()>| match res {
-          Ok(Some(_)) => {
-            served.fetch_add(1, Ordering::Relaxed);
+        complete: Box::new(move |res: FailoverOutcome<'_, u64, ()>| {
+          match res {
+            Ok(Some(_)) => {
+              served.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(None) => {
+              fell_back.fetch_add(1, Ordering::Relaxed);
+            }
+            Err(_) => {}
           }
-          Ok(None) => {
-            fell_back.fetch_add(1, Ordering::Relaxed);
-          }
-          Err(_) => {}
+          CompletionOutcome::Delivered
         }),
         _reservation: b.try_reserve::<u64>(0).unwrap(),
       });
@@ -786,7 +829,10 @@ mod tests {
       n < 2
     };
     let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
-    serve_failover_batch(batch, &(), &[], window, still_live);
+    assert!(
+      !serve_failover_batch(batch, &(), &[], window, still_live),
+      "no user closure panicked"
+    );
     assert_eq!(served.load(Ordering::Relaxed), 2, "two served while live");
     assert_eq!(
       fell_back.load(Ordering::Relaxed),
@@ -804,7 +850,7 @@ mod tests {
       ctx,
       ParkedQuery {
         ready_at: None,
-        complete: Box::new(|_| {}),
+        complete: Box::new(|_| CompletionOutcome::Delivered),
         _reservation: b.try_reserve::<u64>(0).unwrap(),
       },
     );
@@ -850,7 +896,7 @@ mod tests {
       ctx,
       ParkedQuery {
         ready_at: Some(Index::new(5)),
-        complete: Box::new(|_| {}),
+        complete: Box::new(|_| CompletionOutcome::Delivered),
         _reservation: b.try_reserve::<u64>(0).unwrap(),
       },
     );
@@ -875,7 +921,7 @@ mod tests {
       ctx,
       ParkedQuery {
         ready_at: Some(Index::new(5)),
-        complete: Box::new(|_| {}),
+        complete: Box::new(|_| CompletionOutcome::Delivered),
         _reservation: b.try_reserve::<u64>(0).unwrap(),
       },
     );
@@ -909,7 +955,7 @@ mod tests {
       ctx,
       ParkedQuery {
         ready_at: Some(Index::new(4)),
-        complete: Box::new(|_| {}),
+        complete: Box::new(|_| CompletionOutcome::Delivered),
         _reservation: b.try_reserve::<u64>(0).unwrap(),
       },
     );
@@ -987,6 +1033,7 @@ mod tests {
         ready_at: Some(Index::new(4)),
         complete: Box::new(move |res: Result<&(), DriverError<u64>>| {
           let _ = q_tx.send(matches!(res, Err(DriverError::Superseded)));
+          CompletionOutcome::Delivered
         }),
         _reservation: b.try_reserve::<u64>(0).unwrap(),
       },

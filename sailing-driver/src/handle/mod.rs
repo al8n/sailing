@@ -276,13 +276,15 @@ where
     let (tx, rx) = futures_channel::oneshot::channel();
     let complete = Box::new(move |res: Result<&F, DriverError<I>>| {
       // The user closure runs on the driver thread; a panic here would unwind the driver and take
-      // it (and, on a multi host, every co-located group) down. Catch it so one bad query fails
-      // only ITS caller with `QueryPanicked`. AssertUnwindSafe is sound: the closure borrows the
-      // FSM as `&F` and the driver observes only the returned value, so a caught panic tears no
-      // sailing state.
-      let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.map(f)))
-        .unwrap_or_else(|_| Err(DriverError::QueryPanicked));
-      let _ = tx.send(out);
+      // it (and, on a multi host, every co-located group) down. Catch it so the plane survives and
+      // this caller fails with `QueryPanicked`. AssertUnwindSafe is sound for the CATCH — the driver
+      // observes only the returned value — but interior mutability (a `Cell`, atomics, a lock in the
+      // FSM) means the closure could have TORN replicated state mid-read, so the outcome reports the
+      // catch to the driver, which fail-stops the group rather than serve possibly-divergent state.
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.map(f)));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
     });
     self.send(Command::Query {
       complete,
@@ -315,12 +317,14 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = futures_channel::oneshot::channel();
     let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
-      // Catch a user-closure panic (see `query`): the driver survives, the caller gets QueryPanicked.
-      let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      // Catch a user-closure panic (see `query`): the plane survives, the caller gets QueryPanicked,
+      // and the reported outcome fail-stops the group (a torn read could have diverged its FSM).
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::shared::apply_checked_failover(res, f)
-      }))
-      .unwrap_or_else(|_| Err(DriverError::QueryPanicked));
-      let _ = tx.send(out);
+      }));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
     });
     self.send(Command::FailoverWindow {
       complete,
@@ -352,12 +356,14 @@ where
     let reservation = self.budget.try_reserve(0)?;
     let (tx, rx) = futures_channel::oneshot::channel();
     let complete = Box::new(move |res: crate::shared::FailoverOutcome<'_, I, F>| {
-      // Catch a user-closure panic (see `query`): the driver survives, the caller gets QueryPanicked.
-      let out = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      // Catch a user-closure panic (see `query`): the plane survives, the caller gets QueryPanicked,
+      // and the reported outcome fail-stops the group (a torn read could have diverged its FSM).
+      let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         crate::shared::apply_unchecked_failover(res, f)
-      }))
-      .unwrap_or_else(|_| Err(DriverError::QueryPanicked));
-      let _ = tx.send(out);
+      }));
+      let panicked = caught.is_err();
+      let _ = tx.send(caught.unwrap_or_else(|_| Err(DriverError::QueryPanicked)));
+      crate::shared::CompletionOutcome::caught(panicked)
     });
     self.send(Command::FailoverWindow {
       complete,

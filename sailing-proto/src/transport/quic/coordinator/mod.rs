@@ -255,6 +255,13 @@ where
     self.endpoint.state_machine()
   }
 
+  /// Fail-stop the wrapped endpoint because a user QUERY closure panicked mid-read against its state
+  /// machine (see [`Endpoint::fail_stop_query_panicked`]). The driver caught the unwind to keep its
+  /// task alive and routes here so the endpoint stops serving possibly-torn replicated state.
+  pub fn fail_stop_query_panicked(&mut self) {
+    self.endpoint.fail_stop_query_panicked();
+  }
+
   /// `now` mapped onto quinn's `std::time::Instant` clock: the std anchor plus the crate-time
   /// elapsed since the crate anchor. The anchor is captured LAZILY on the first call, so
   /// `quinn_now(first_now) == std_base` regardless of the driver's epoch — a fixed anchor at

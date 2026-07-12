@@ -799,6 +799,63 @@ async fn status_reports_leader_role_term_and_commit() {
   );
 }
 
+/// A query closure that PANICS on a SINGLE-group driver is caught at the handle seam — the caller
+/// gets `QueryPanicked` rather than the driver task unwinding — but the read ran against the
+/// replicated FSM, so the endpoint FAIL-STOPS (interior mutability could have torn it) and the
+/// single driver stops. A subsequent op then surfaces the fail-stop as `Poisoned`/`ShuttingDown`.
+#[compio::test]
+async fn a_panicking_query_fail_stops_the_single_driver() {
+  let addr: SocketAddr = "127.0.0.1:43390".parse().unwrap();
+  let (dialer, acceptor) = plain_factories(1);
+  let (driver, handle) = CompioStreamDriver::bind(
+    addr,
+    Config::try_new(1u64, vec![1u64], ELECTION, HEARTBEAT).unwrap(),
+    1,
+    CountSm::default(),
+    Vec::new(),
+    dialer,
+    acceptor,
+    MemLog::new(),
+    MemStable::new(),
+    DriverConfig::default(),
+  )
+  .await
+  .expect("binds");
+  compio::runtime::spawn(driver.run()).detach();
+
+  assert_eq!(
+    submit_anywhere(std::slice::from_ref(&handle), b"x").await,
+    1
+  );
+
+  // Caught at the handle seam: the caller gets QueryPanicked, the driver task does NOT unwind.
+  match handle
+    .query(|_: &CountSm| -> u64 { panic!("boom in query") })
+    .await
+  {
+    Err(DriverError::QueryPanicked) => {}
+    other => panic!("expected QueryPanicked, got {other:?}"),
+  }
+
+  // The read ran against the endpoint's FSM, so the caught panic FAIL-STOPS it and the single driver
+  // stops. A subsequent op surfaces Poisoned (parked work) or ShuttingDown (the run loop exited). RED
+  // before the fail-stop wiring — the driver kept serving and a normal query answered.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  loop {
+    match handle.submit(Bytes::from_static(b"y")).await {
+      Err(DriverError::Poisoned | DriverError::ShuttingDown) => break,
+      Ok(_) => {
+        assert!(
+          std::time::Instant::now() < deadline,
+          "the single driver never fail-stopped after the query panic"
+        );
+        compio::time::sleep(Duration::from_millis(30)).await;
+      }
+      other => panic!("expected Poisoned/ShuttingDown after the fail-stop, got {other:?}"),
+    }
+  }
+}
+
 /// REGRESSION: a `query` issued AFTER a committed read-mode migration — with NO further entry appended
 /// — must COMPLETE. A committed `SetReadMode` reports `Event::ReadModeChanged`, not `Applied`, so
 /// unless `route_event` advances the apply watermark on that event, the query confirms at the

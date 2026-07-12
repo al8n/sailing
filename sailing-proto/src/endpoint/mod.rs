@@ -302,6 +302,16 @@ pub enum PoisonReason {
   /// round; reusing a round would let a stale earlier-round response keep an isolated leader's lease
   /// alive (a stale-read break). Fail-stop rather than reuse. Unreachable (2^64 heartbeats).
   LeaseRoundExhausted,
+  /// A user QUERY closure panicked while running ON the driver thread against this group's state
+  /// machine, and the driver caught the unwind. The closure borrows only `&F`, but interior
+  /// mutability (a `Cell`, atomics, a lock inside the FSM) means the panic could have TORN the
+  /// replicated state mid-read; continuing to serve risks silent divergence from replicas that
+  /// never ran the closure. A driver caught the panic to keep its plane alive, then invokes
+  /// [`fail_stop_query_panicked`](Endpoint::fail_stop_query_panicked) so this group fail-stops
+  /// rather than serve possibly-torn state — the fail-stop doctrine arm of the apply/decode
+  /// poisons (a pre-catch process crash + replay would have healed the FSM; the catch must not
+  /// trade that for possible divergence).
+  QueryPanicked,
 }
 
 impl PoisonReason {
@@ -338,6 +348,7 @@ impl PoisonReason {
       Self::OpIdExhausted => "op_id_exhausted",
       Self::ReadRoundExhausted => "read_round_exhausted",
       Self::LeaseRoundExhausted => "lease_round_exhausted",
+      Self::QueryPanicked => "query_panicked",
     }
   }
 }
@@ -1803,6 +1814,16 @@ where
   #[inline(always)]
   pub const fn poison_reason(&self) -> Option<PoisonReason> {
     self.poison.poison_reason
+  }
+
+  /// Fail-stop this group because a user QUERY closure panicked mid-read against its state machine.
+  /// Invoked by a driver that CAUGHT the unwind (keeping its plane and any co-located groups alive):
+  /// the closure borrows only `&F`, but interior mutability could have torn replicated state, so
+  /// fail-stop beats risking silent divergence from replicas that never ran the closure. This is the
+  /// [`QueryPanicked`](PoisonReason::QueryPanicked) fail-stop doctrine arm of the apply/decode
+  /// poisons; a caught panic must not trade the heal a pre-catch crash + replay would have given.
+  pub fn fail_stop_query_panicked(&mut self) {
+    self.poison(PoisonReason::QueryPanicked);
   }
 
   /// The armed deadline for the given timer kind, regardless of whether it is serviceable now.

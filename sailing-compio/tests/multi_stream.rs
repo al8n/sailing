@@ -458,9 +458,11 @@ async fn restore_without_stored_state_fails_closed() {
   handle.shutdown().await.expect("the multi host tears down");
 }
 
-/// A query closure that PANICS fails only its own caller with `QueryPanicked`, caught at the handle
-/// seam — it does NOT unwind the driver and take every co-located group down. The driver stays
-/// live: a second query on the same group answers and the group keeps committing.
+/// A query closure that PANICS is caught at the handle seam — the caller gets `QueryPanicked` and the
+/// driver task does NOT unwind and take every co-located group down. But the group it read against
+/// FAIL-STOPS: interior mutability could have torn the replicated FSM mid-read, so fail-stop beats
+/// risking silent divergence. The poison surfaces on the best-effort lifecycle tail; a SIBLING group
+/// on the same plane keeps committing throughout (plane survival, no auto-teardown).
 #[compio::test]
 async fn a_panicking_query_fails_typed_and_the_driver_survives() {
   let addr: SocketAddr = "127.0.0.1:45340".parse().unwrap();
@@ -476,11 +478,14 @@ async fn a_panicking_query_fails_typed_and_the_driver_survives() {
   .expect("the empty multi host binds");
   compio::runtime::spawn(driver.run()).detach();
 
-  handle
-    .create_group(100, config(1, vec![1]), 1, CountSm::default(), 0)
-    .await
-    .expect("group 100 admits");
+  for gid in [100u64, 200] {
+    handle
+      .create_group(gid, config(1, vec![1]), 1, CountSm::default(), 0)
+      .await
+      .expect("group admission");
+  }
   let g100 = handle.group(100);
+  let g200 = handle.group(200);
   assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"x").await, 1);
 
   // The panic is caught at the handle seam: the caller gets QueryPanicked, the driver task does
@@ -493,15 +498,30 @@ async fn a_panicking_query_fails_typed_and_the_driver_survives() {
     other => panic!("expected QueryPanicked, got {other:?}"),
   }
 
-  // The driver survived: a normal query answers and the group still commits.
-  assert_eq!(
-    g100
-      .query(|sm: &CountSm| sm.count())
-      .await
-      .expect("the driver is still live"),
-    1
+  // The read ran against group 100's FSM, so the caught panic FAIL-STOPS group 100 — it surfaces on
+  // the best-effort lifecycle tail as `Poisoned`. Cranking the driver via sibling submits drains the
+  // observation. RED before the fail-stop wiring (a caught panic kept the group serving, no poison).
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  let mut seen = false;
+  while !seen && std::time::Instant::now() < deadline {
+    let _ = g200.submit(Bytes::from_static(b"tick")).await;
+    while let Ok(ev) = handle.lifecycle().try_recv() {
+      if matches!(ev, LifecycleEvent::Poisoned { group: 100 }) {
+        seen = true;
+      }
+    }
+  }
+  assert!(
+    seen,
+    "the query-panicked group fail-stopped and surfaced on the lifecycle tail"
   );
-  assert_eq!(submit_anywhere(std::slice::from_ref(&g100), b"y").await, 2);
+
+  // Plane survival: the panic took ONLY group 100. Sibling group 200 keeps committing (the ticks
+  // above already cranked it), and a fresh submit still lands.
+  assert!(
+    submit_anywhere(std::slice::from_ref(&g200), b"z").await >= 1,
+    "the sibling group keeps committing after the co-located fail-stop"
+  );
 
   handle.shutdown().await.expect("the multi host tears down");
 }

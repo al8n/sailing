@@ -1314,8 +1314,14 @@ where
               },
             );
           }
-          Some(Err(e)) => complete(Err(map_read_err(e))),
-          None => complete(Err(no_such_group())),
+          // An immediate refusal completes with `Err`, which never invokes the user closure, so it
+          // cannot panic — discard the (always `Delivered`) outcome.
+          Some(Err(e)) => {
+            complete(Err(map_read_err(e)));
+          }
+          None => {
+            complete(Err(no_such_group()));
+          }
         }
       }
       MultiCommand::FailoverWindow {
@@ -1575,8 +1581,9 @@ where
   /// Serve (or fall back) ONE group's parked failover inherited-read queries — the single-group
   /// `run_failover_serve` scoped to `gid`. Structurally inert on this monotonic-only v1 host
   /// (no group can arm a serve window without the failover tier), but kept whole so the wall-clock
-  /// generalization does not reshape the loop. Returns `true` on a FATAL limbo storage fault; the
-  /// caller then fails THAT group's parked work `Poisoned` (group-scoped, never the driver).
+  /// generalization does not reshape the loop. Returns `true` when the pass POISONED the group — a
+  /// FATAL limbo storage fault OR a caught user-closure panic in the served batch — and the caller
+  /// then fails THAT group's parked work `Poisoned` (group-scoped, never the whole driver).
   fn run_failover_serve(&mut self, gid: &G) -> bool {
     let Some(routing) = self.routing.get_mut(gid) else {
       return false;
@@ -1603,12 +1610,20 @@ where
           Ok(Some(limbo)) => {
             let parked = std::mem::take(&mut routing.failovers);
             let fsm = ep.state_machine();
-            sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
-              self
-                .coord
-                .group(gid)
-                .is_some_and(|e| e.failover_read_window(self.clock.now()).is_some())
-            });
+            let panicked =
+              sailing_driver::shared::serve_failover_batch(parked, fsm, &limbo, window, || {
+                self
+                  .coord
+                  .group(gid)
+                  .is_some_and(|e| e.failover_read_window(self.clock.now()).is_some())
+              });
+            if panicked {
+              // A served inherited-read's user closure panicked: fail-stop THIS group (interior
+              // mutability could have torn its FSM) and latch it; the caller fails its parked work
+              // `Poisoned` group-scoped. Siblings keep serving.
+              self.coord.fail_stop_query_panicked(gid);
+              return true;
+            }
           }
           Ok(None) => {
             for p in std::mem::take(&mut routing.failovers) {
@@ -1726,7 +1741,10 @@ where
         // A panicking factory DECLINES (maps to `None`) instead of unwinding the plane and taking
         // every co-located group down; the signal then falls through to the lifecycle tail like
         // any other refusal. AssertUnwindSafe: the driver acts only on the returned Option, and a
-        // factory decline is always safe.
+        // factory decline is always safe. Decline (not fail-stop) is sufficient here because a
+        // factory is NOT replicated state — unlike a query against a group's FSM, which fail-stops:
+        // the trust gates below (solicitor-naming, floors, split-reservation, the create admission)
+        // make a torn factory availability-only, never a divergence of committed state.
         && let Some(blueprint) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
           factory.materialize(&group, &from)
         }))
@@ -1930,15 +1948,31 @@ where
       }
       return;
     }
+    let mut query_panicked = false;
     if run_queries
       && let Some(ep) = self.coord.group(gid)
       && let Some(routing) = self.routing.get_mut(gid)
     {
       for q in routing.take_runnable_queries() {
-        (q.complete)(Ok(ep.state_machine()));
+        // A caught user-closure panic fail-stops THIS group: interior mutability could have torn its
+        // replicated FSM mid-read. Stop serving more reads off it; the fail-stop runs once the `ep`
+        // borrow releases below. Siblings keep serving.
+        if (q.complete)(Ok(ep.state_machine()))
+          == sailing_driver::shared::CompletionOutcome::Panicked
+        {
+          query_panicked = true;
+          break;
+        }
       }
     }
-    if poisoned && let Some(routing) = self.routing.get_mut(gid) {
+    if query_panicked {
+      // Poison + latch the group (surfaces once on the lifecycle tail via `poll_poisoned`), then
+      // fail its parked work `Poisoned` group-scoped — `poisoned` above predates this fail-stop.
+      self.coord.fail_stop_query_panicked(gid);
+    }
+    if (poisoned || query_panicked)
+      && let Some(routing) = self.routing.get_mut(gid)
+    {
       routing.fail_all(&DriverError::Poisoned);
     }
   }

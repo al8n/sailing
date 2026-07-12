@@ -451,6 +451,15 @@ where
     self.retired.contains(gid)
   }
 
+  /// Fail-stop the addressed group because a user QUERY closure panicked mid-read against its state
+  /// machine, LATCHING the poison for the lifecycle tail (see
+  /// [`MultiRaft::fail_stop_query_panicked`]). A driver caught the unwind to keep its plane and every
+  /// co-located group alive, then routes here so this group joins the poison surface
+  /// ([`poll_poisoned`](Self::poll_poisoned)) and stops serving possibly-torn replicated state.
+  pub fn fail_stop_query_panicked(&mut self, gid: &G) {
+    self.multi.fail_stop_query_panicked(gid);
+  }
+
   /// Drain the next UNKNOWN-GROUP placement signal: `(group, authenticated sender)` for
   /// well-formed INITIAL-SHAPED traffic — a vote request, or a first-contact heartbeat carrying
   /// commit 0 — whose group this host neither hosts, nor resolves stores for, nor has
