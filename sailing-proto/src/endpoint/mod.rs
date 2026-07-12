@@ -45,6 +45,22 @@ pub(crate) const MAX_READ_BATCH_ENTRIES: u64 = 8192;
 /// Sized to one read batch — the 1 MiB byte cap already bounds the per-crank PAYLOAD.
 pub(crate) const APPLY_BUDGET_ENTRIES: u64 = MAX_READ_BATCH_ENTRIES;
 
+/// The exclusive upper bound of the next apply fetch: the drain requests `applied.next()..span`, so
+/// the span caps the fetch at `MAX_READ_BATCH_ENTRIES` indices AND at the per-crank apply allowance
+/// still unspent (`APPLY_BUDGET_ENTRIES - applied_this_call`), clamped to `commit.next()`. Capping the
+/// FETCH by the remaining allowance — not only the boundary check that follows it — makes the budget a
+/// HARD per-crank bound: a byte-cap-shortened first batch can no longer let the next fetch pull a full
+/// batch PAST the budget (the un-capped fetch let one crank apply up to `APPLY_BUDGET_ENTRIES +
+/// MAX_READ_BATCH_ENTRIES - 1`). When the allowance is spent the span is empty (`applied.next()`); the
+/// caller's boundary check has by then already cut the drain at exactly the budget.
+pub(crate) fn apply_read_span(applied: Index, commit: Index, applied_this_call: u64) -> Index {
+  let allowance = APPLY_BUDGET_ENTRIES.saturating_sub(applied_this_call);
+  let width = MAX_READ_BATCH_ENTRIES.min(allowance);
+  commit.next().min(Index::new(
+    applied.get().saturating_add(width).saturating_add(1),
+  ))
+}
+
 /// How an [`Endpoint::apply_committed`] drain ended (consumed by the storage-progress derivation).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ApplyDrain {
@@ -2654,13 +2670,11 @@ where
       // (the LogStore::entries contract), capped at `APPLY_READ_MAX_BYTES`; a short prefix is re-fetched
       // by the outer while. An empty slice is the benign "committed entry not yet in the read view" case
       // → break and retry next tick; an Err is a fatal committed-range read fault → poison.
-      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices (the entry-count bound).
-      let read_end = self.commit.next().min(Index::new(
-        self
-          .applied
-          .get()
-          .saturating_add(MAX_READ_BATCH_ENTRIES + 1),
-      ));
+      // Cap the requested range at MAX_READ_BATCH_ENTRIES indices AND at the per-crank apply
+      // allowance still unspent, so the budget is a HARD bound: a byte-cap-shortened batch can never
+      // let this fetch pull a full batch past it. The boundary check below then cuts at exactly the
+      // budget (never mid-batch — the span guarantees the batch cannot exceed the allowance).
+      let read_end = apply_read_span(self.applied, self.commit, applied_this_call);
       let batch = match log.entries(self.applied.next()..read_end, APPLY_READ_MAX_BYTES) {
         // The committed entry is not yet in the read view: a benign transient. A re-crank cannot
         // advance it (the store must land it first), so `Waiting`, never re-driven as MorePending.

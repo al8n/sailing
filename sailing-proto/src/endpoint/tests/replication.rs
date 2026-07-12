@@ -1066,8 +1066,9 @@ fn owned_zero_payload_backlog_reads_are_count_bounded() {
 }
 
 /// The per-crank apply budget: a single `handle_storage` crank applies at MOST one budget of committed
-/// entries (a batch-boundary bound, so at most budget + one batch), stops strictly below `commit`, and
-/// reports `MorePending` so the driver re-drives without sleeping — instead of draining the whole backlog
+/// entries (a HARD bound — the fetch is capped by the remaining allowance, so never budget + a batch),
+/// stops strictly below `commit`, and reports `MorePending` so the driver re-drives without sleeping —
+/// instead of draining the whole backlog
 /// in one crank and starving co-located groups / timers / IO. Repeated cranks then reach `applied ==
 /// commit`, and the final crank reports `Drained` (liveness). Single-voter leader, snapshot disabled so
 /// no capture/compaction perturbs the drain; the backlog is force-appended and `commit` advanced directly.
@@ -1115,14 +1116,14 @@ fn apply_drain_is_budgeted_and_re_driven_to_completion() {
   log.force_append(&entries);
   ep.commit = Index::new(first + n - 1);
 
-  // ONE crank must NOT drain the whole backlog: at most one budget + one batch, strictly below commit,
-  // and it reports MorePending. (RED at the pre-budget tip: one crank drains everything to commit and
-  // reports Drained.)
+  // ONE crank must NOT drain the whole backlog: at most one budget (a HARD bound now the fetch is
+  // capped by the remaining allowance — never budget + a batch), strictly below commit, and it reports
+  // MorePending. (RED at the pre-budget tip: one crank drains everything to commit and reports Drained.)
   let p1 = ep.handle_storage(d, &mut log, &mut stable);
   let applied1 = ep.applied_index();
   assert!(
-    applied1.get() <= applied_before.get() + APPLY_BUDGET_ENTRIES + MAX_READ_BATCH_ENTRIES,
-    "one crank applied {} entries — must be at most one budget + one batch",
+    applied1.get() <= applied_before.get() + APPLY_BUDGET_ENTRIES,
+    "one crank applied {} entries — must be at most one budget",
     applied1.get() - applied_before.get()
   );
   assert!(
@@ -1157,6 +1158,63 @@ fn apply_drain_is_budgeted_and_re_driven_to_completion() {
     last,
     StorageProgress::Drained,
     "the final crank (nothing left) reports Drained, not MorePending"
+  );
+}
+
+/// `apply_read_span` is the HARD-bound seam of the per-crank apply budget: the next fetch's exclusive
+/// upper bound is capped by BOTH the read-batch width AND the allowance still unspent, so a
+/// byte-cap-shortened first batch can never let the next fetch pull a full batch PAST the budget. Pinned
+/// directly here: the tiny-entry e2e batch above hits the entry-count cap exactly, so it cannot exercise
+/// the allowance clamp — this is the red-proof vehicle for the hard bound. RED against the un-capped
+/// fetch (which ignored `applied_this_call` and always requested a full `MAX_READ_BATCH_ENTRIES`).
+#[test]
+fn apply_read_span_caps_each_fetch_by_the_remaining_allowance() {
+  use crate::{
+    Index,
+    endpoint::{APPLY_BUDGET_ENTRIES, MAX_READ_BATCH_ENTRIES, apply_read_span},
+  };
+  let applied = Index::new(1000);
+  // A commit far beyond one budget, so `commit.next()` never governs the span here.
+  let commit = Index::new(1000 + 10 * MAX_READ_BATCH_ENTRIES);
+
+  // FULL allowance (nothing applied this call): the span is a full read batch.
+  let full = apply_read_span(applied, commit, 0);
+  assert_eq!(
+    full.get() - applied.next().get(),
+    MAX_READ_BATCH_ENTRIES,
+    "a fresh crank fetches a full read batch"
+  );
+
+  // PARTIAL allowance: 8000 already applied leaves 192 of the 8192 budget, so the span clamps to 192 —
+  // NOT the full 8192 the un-capped fetch requested (the defect that let one crank overrun the budget).
+  let partial = apply_read_span(applied, commit, APPLY_BUDGET_ENTRIES - 192);
+  assert_eq!(
+    partial.get() - applied.next().get(),
+    192,
+    "a fetch is clamped to the allowance still unspent"
+  );
+
+  // ZERO allowance (a full budget already applied): the span is EMPTY, so no fetch runs — the caller's
+  // boundary check will have already cut the drain at exactly the budget.
+  let none = apply_read_span(applied, commit, APPLY_BUDGET_ENTRIES);
+  assert_eq!(
+    none,
+    applied.next(),
+    "a spent allowance yields an empty span (no fetch)"
+  );
+}
+
+/// With commit CLOSE, `commit.next()` governs the span before either cap fires — the drain never reads
+/// past the committed frontier regardless of the allowance.
+#[test]
+fn apply_read_span_never_reads_past_commit() {
+  use crate::{Index, endpoint::apply_read_span};
+  let applied = Index::new(1000);
+  let commit = Index::new(1050); // only 50 committed entries left, well under a batch
+  assert_eq!(
+    apply_read_span(applied, commit, 0),
+    commit.next(),
+    "the span clamps to commit.next() when the backlog is smaller than a batch"
   );
 }
 
