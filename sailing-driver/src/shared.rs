@@ -308,9 +308,12 @@ fn contiguous_normal_entries(
 /// (`Ok(None)`) rather than serve a stale inherited read. Shared by both drivers so the freshness rule
 /// cannot drift.
 /// Returns whether ANY served completion caught a user-closure panic — the caller fail-stops the
-/// group the batch read against (interior mutability could have torn its replicated state). A
-/// declined completion (`Ok(None)`, past the live window) never runs the user closure, so only the
-/// served arm can report `Panicked`.
+/// group the batch read against (interior mutability could have torn its replicated state). The
+/// batch stops SERVING at the first caught panic, exactly like the normal query drain: the
+/// remaining items complete `Poisoned` — the verdict the caller's fail-stop sweep gives the
+/// group's parked siblings — without their user closures ever running against the possibly-torn
+/// FSM. A declined completion (`Ok(None)`, past the live window) never runs the user closure, so
+/// only the served arm can report `Panicked`.
 #[must_use]
 pub fn serve_failover_batch<I, F>(
   parked: Vec<ParkedFailover<I, F>>,
@@ -321,12 +324,17 @@ pub fn serve_failover_batch<I, F>(
 ) -> bool {
   let mut panicked = false;
   for p in parked {
+    if panicked {
+      // An `Err` completion never runs the user closure (see `CompletionOutcome`).
+      let _ = (p.complete)(Err(DriverError::Poisoned));
+      continue;
+    }
     let outcome = if still_live() {
       (p.complete)(Ok(Some((fsm, limbo, window))))
     } else {
       (p.complete)(Ok(None))
     };
-    panicked |= outcome == CompletionOutcome::Panicked;
+    panicked = outcome == CompletionOutcome::Panicked;
   }
   panicked
 }
@@ -839,6 +847,55 @@ mod tests {
       2,
       "the rest fell back on expiry"
     );
+  }
+
+  #[test]
+  fn failover_batch_stops_serving_at_the_first_caught_panic() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let b = InflightBudget::new(8, 8);
+    let second_served = Arc::new(AtomicBool::new(false));
+    let second_poisoned = Arc::new(AtomicBool::new(false));
+    let mut batch: Vec<ParkedFailover<u64, ()>> = Vec::new();
+    // Item 1's user closure panics (caught inside the completion): only the SERVED arm runs the
+    // closure, so only it can report the caught panic.
+    batch.push(ParkedFailover {
+      complete: Box::new(|res: FailoverOutcome<'_, u64, ()>| {
+        CompletionOutcome::caught(matches!(res, Ok(Some(_))))
+      }),
+      _reservation: b.try_reserve::<u64>(0).unwrap(),
+    });
+    // Item 2 must never be SERVED after the batch caught a panic — a served completion is the
+    // only arm that runs the user closure, and the FSM may be torn. It must instead complete
+    // with the poisoned-group verdict its parked siblings receive from the caller's fail-stop.
+    {
+      let served = second_served.clone();
+      let poisoned = second_poisoned.clone();
+      batch.push(ParkedFailover {
+        complete: Box::new(move |res: FailoverOutcome<'_, u64, ()>| {
+          match res {
+            Ok(Some(_)) => served.store(true, Ordering::Relaxed),
+            Err(DriverError::Poisoned) => poisoned.store(true, Ordering::Relaxed),
+            _ => {}
+          }
+          CompletionOutcome::Delivered
+        }),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      });
+    }
+    let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
+    assert!(
+      serve_failover_batch(batch, &(), &[], window, || true),
+      "the panic indication reaches the caller, which fail-stops the group"
+    );
+    assert!(
+      !second_served.load(Ordering::Relaxed),
+      "no later user closure may run against the possibly-torn FSM"
+    );
+    assert!(
+      second_poisoned.load(Ordering::Relaxed),
+      "the remaining item completes Poisoned without its closure running"
+    );
+    assert_eq!(b.in_flight(), (0, 0), "every reservation released");
   }
 
   #[test]
