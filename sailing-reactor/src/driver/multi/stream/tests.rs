@@ -1090,3 +1090,355 @@ async fn a_capture_failed_merge_fails_the_source_routing_instead_of_hanging() {
     "the poisoned target surfaces on the lifecycle tail: {lifecycle:?}"
   );
 }
+
+/// The ID-ORDER red-proof for the plane-wide pre-serve phase.
+///
+/// `a_pre_serve_completion_panic_skips_the_serve_and_fail_stops_the_plane` parks the panicking decline on
+/// the LOWER id, so a per-group tail (sweep, decline, THEN serve — group by group, ascending) reaches the
+/// torn group FIRST and its plane fail-stop lands before the sibling is ever asked to serve. That is an
+/// accident of the ids. REVERSE them and the same per-group tail serves the LOWER group's confirmed query
+/// — its own latch clear, its endpoint unpoisoned, nothing on the plane torn YET — and only afterwards
+/// reaches the decline whose dropped guard tears a state machine and fail-stops the plane. Safety would
+/// depend on how the application numbered its groups, and a driver cannot offer that.
+///
+/// The phased crank removes the dependence: EVERY group's tear-capable step (here group 2's failover
+/// decline) runs, and its verdict is routed, before ANY group's serve step. So the reversed shape must
+/// behave exactly like the forward one — group 1's runnable query is NOT served, it completes `Poisoned`,
+/// and both groups fail-stop.
+#[tokio::test]
+async fn a_higher_id_completion_panic_skips_the_lower_id_siblings_serve() {
+  use std::sync::atomic::{AtomicBool, Ordering};
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+    // Commit one entry so each endpoint's applied index is past zero: resetting a group's routing
+    // watermark to zero below then makes `sync_applied` advance it this crank, which is exactly what
+    // sets `run_queries` — the query serve runs only when the watermark moved.
+    drive(
+      &mut driver,
+      handle.group(gid).submit(Bytes::from_static(b"warm")),
+    )
+    .await
+    .expect("warm-up commit");
+  }
+
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  // THE REVERSAL: the panicking decline is parked on the HIGHER id, which a per-group tail reaches only
+  // AFTER the lower-id sibling has already served.
+  let served_2 = Arc::new(AtomicBool::new(false));
+  let poisoned_2 = Arc::new(AtomicBool::new(false));
+  {
+    let routing = driver.routing.get_mut(&2).expect("group 2 routes");
+    routing
+      .failovers
+      .push(sailing_driver::shared::ParkedFailover {
+        complete: Box::new(
+          |res: sailing_driver::shared::FailoverOutcome<'_, u64, MergeSm>| {
+            if matches!(res, Ok(None)) {
+              sailing_driver::shared::CompletionOutcome::Panicked
+            } else {
+              sailing_driver::shared::CompletionOutcome::Delivered
+            }
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      });
+    let served = served_2.clone();
+    let poisoned = poisoned_2.clone();
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: Some(Index::ZERO),
+        complete: Box::new(
+          move |res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+            match res {
+              Ok(_) => served.store(true, Ordering::Relaxed),
+              Err(sailing_driver::DriverError::Poisoned) => poisoned.store(true, Ordering::Relaxed),
+              Err(_) => {}
+            }
+            sailing_driver::shared::CompletionOutcome::Delivered
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.applied = Index::ZERO;
+  }
+  // The LOWER-id sibling: a runnable confirmed query and nothing else. Its tail runs FIRST, and at that
+  // moment nothing on the plane has torn — which is why only a plane-wide PRE-SERVE phase (not a
+  // plane-wide reaction bolted onto a per-group tail) can stop it serving.
+  let served_1 = Arc::new(AtomicBool::new(false));
+  let poisoned_1 = Arc::new(AtomicBool::new(false));
+  {
+    let served = served_1.clone();
+    let poisoned = poisoned_1.clone();
+    let routing = driver.routing.get_mut(&1).expect("group 1 routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: Some(Index::ZERO),
+        complete: Box::new(
+          move |res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+            match res {
+              Ok(_) => served.store(true, Ordering::Relaxed),
+              Err(sailing_driver::DriverError::Poisoned) => poisoned.store(true, Ordering::Relaxed),
+              Err(_) => {}
+            }
+            sailing_driver::shared::CompletionOutcome::Delivered
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.applied = Index::ZERO;
+  }
+
+  crank(&mut driver).await;
+
+  assert!(
+    !served_1.load(Ordering::Relaxed),
+    "the LOWER-id sibling served a read in a crank whose HIGHER-id group tore the state machine: every \
+     group's decline must run, and its verdict land, before ANY group serves"
+  );
+  assert!(
+    poisoned_1.load(Ordering::Relaxed),
+    "the skipped sibling's query completes Poisoned from the plane fail-stop instead"
+  );
+  assert!(
+    !served_2.load(Ordering::Relaxed),
+    "the torn group does not serve its own runnable query either"
+  );
+  assert!(
+    poisoned_2.load(Ordering::Relaxed),
+    "the torn group's query completes Poisoned"
+  );
+  for gid in [1u64, 2] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| ep.is_poisoned()),
+      "the unattributable tear fail-stops group {gid} whatever the id order"
+    );
+  }
+}
+
+/// The HARVEST's red-proof: a latch already SET when the tails begin.
+///
+/// `route_event`'s `LeaderChanged` arm sweeps the changed group's parked work with `fail_all(Superseded)`
+/// — in the pump, ahead of every tail — so a swept closure's dropped guard can tear a state machine while
+/// every group's confirmed reads are still parked. A tail that reads only its OWN latch cannot see that:
+/// a sibling sorting EARLIER than the torn group finds a clear latch and an unpoisoned endpoint, serves
+/// its query against the ALREADY-torn FSM, and the torn group's fail-stop arrives a step too late. The
+/// plane-wide harvest closes it — every routing's latch is taken before any group's step, so the plane is
+/// poisoned before the first serve gate is reached.
+///
+/// The sweep is invoked exactly as `route_event`'s arm invokes it (as
+/// `a_swept_completion_panic_fail_stops_the_whole_plane` does), which is what leaves the latch standing
+/// BEFORE the crank's tails — the state a routed `LeaderChanged` leaves behind.
+#[tokio::test]
+async fn a_latch_set_before_the_tails_stops_every_group_from_serving() {
+  use std::sync::atomic::{AtomicBool, Ordering};
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+    drive(
+      &mut driver,
+      handle.group(gid).submit(Bytes::from_static(b"warm")),
+    )
+    .await
+    .expect("warm-up commit");
+  }
+
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  // Group 2 (the HIGHER id) carries the tear, and it is already DONE when the crank starts: the swept
+  // completion caught its closure's guard-`Drop` panic and the latch stands, unread.
+  {
+    let routing = driver.routing.get_mut(&2).expect("group 2 routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: Box::new(|res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+          if matches!(res, Err(sailing_driver::DriverError::Superseded)) {
+            sailing_driver::shared::CompletionOutcome::Panicked
+          } else {
+            sailing_driver::shared::CompletionOutcome::Delivered
+          }
+        }),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.fail_all(&sailing_driver::DriverError::Superseded);
+  }
+  // Group 1 (the LOWER id) has a confirmed, runnable query — and its tail runs FIRST.
+  let served_1 = Arc::new(AtomicBool::new(false));
+  let poisoned_1 = Arc::new(AtomicBool::new(false));
+  {
+    let served = served_1.clone();
+    let poisoned = poisoned_1.clone();
+    let routing = driver.routing.get_mut(&1).expect("group 1 routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: Some(Index::ZERO),
+        complete: Box::new(
+          move |res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+            match res {
+              Ok(_) => served.store(true, Ordering::Relaxed),
+              Err(sailing_driver::DriverError::Poisoned) => poisoned.store(true, Ordering::Relaxed),
+              Err(_) => {}
+            }
+            sailing_driver::shared::CompletionOutcome::Delivered
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.applied = Index::ZERO;
+  }
+
+  crank(&mut driver).await;
+
+  assert!(
+    !served_1.load(Ordering::Relaxed),
+    "a read was served against a state machine a sibling's swept completion had ALREADY torn: the latch \
+     must be harvested plane-wide before any group's serve"
+  );
+  assert!(
+    poisoned_1.load(Ordering::Relaxed),
+    "the skipped query completes Poisoned from the plane fail-stop instead"
+  );
+  for gid in [1u64, 2] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| ep.is_poisoned()),
+      "the harvested latch fail-stops group {gid}"
+    );
+  }
+}
+
+/// `remove_group` runs on a LIVE plane: the loop continues, every sibling stays hosted and keeps serving.
+/// Its teardown sweep completes the removed group's parked work, dropping each completion's unused
+/// closure — so a captured guard's `Drop` runs inside the completion's `catch_unwind` and a panicking one
+/// is caught and latched. That latch used to be DISCARDED, on the reasoning that a removal has "no heir"
+/// and so the tear could only be in the group being destroyed. But the closure captured arbitrary state:
+/// its guard can alias state a SIBLING's replicated FSM shares, and that sibling goes on serving reads
+/// from it. The tear is UNATTRIBUTABLE — the same verdict the merge fold's source teardown raises — so a
+/// removal's fired latch is PLANE-FATAL: every hosted sibling fail-stops. (The removed group is already
+/// out of the coordinator, so it is not among them: nothing of it is left to poison, or to serve.)
+#[tokio::test]
+async fn a_remove_group_teardown_drop_panic_fail_stops_every_hosted_sibling() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+  // A query parked on the group about to be REMOVED that can never become runnable (`ready_at` stays
+  // `None`), so only the teardown's `fail_all` sweep can complete it — dropping its closure unused, and
+  // with it the guard whose `Drop` panics inside the completion's unwind boundary.
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  {
+    let routing = driver.routing.get_mut(&2).expect("the doomed group routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: drop_panic_completion(),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+  }
+
+  let removed = drive(&mut driver, handle.remove_group(2))
+    .await
+    .expect("the removal is accepted");
+  assert!(removed, "group 2 was hosted");
+  assert!(!hosts(&driver, 2), "the removed group is torn down");
+
+  // THE SURVIVING SIBLING fail-stops: the swept closure's guard could have torn ITS state machine.
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "a removal's caught drop-panic is unattributable: every hosted sibling must fail-stop"
+  );
+  // And it must not SERVE — the whole point of the fail-stop.
+  let served: Result<u64, _> = drive(&mut driver, handle.group(1).query(|sm: &MergeSm| sm.0)).await;
+  assert!(
+    matches!(served, Err(sailing_driver::DriverError::Poisoned)),
+    "the fail-stopped sibling must not serve a read against state the removal's guard could have torn"
+  );
+  // It surfaces on the lifecycle tail — the plane fails LOUDLY. The REMOVED group does not: it left the
+  // coordinator before the fail-stop, and a torn-down group has nothing left to serve.
+  let poisoned: Vec<u64> = handle
+    .lifecycle()
+    .try_iter()
+    .filter_map(|ev| match ev {
+      LifecycleEvent::Poisoned { group } => Some(group),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(
+    poisoned,
+    vec![1],
+    "the surviving sibling surfaces its poison, and only it"
+  );
+}
+
+/// The no-over-fail-stop guard for `remove_group`: a WELL-BEHAVED removal (its swept completion
+/// `Delivered`) must NOT fail-stop the siblings. Removal is a COMMON path — a plane-fatal reaction to
+/// every one of them would be a catastrophic over-reaction. The LATCH fires the plane stop, never the
+/// removal itself.
+#[tokio::test]
+async fn a_normal_remove_group_does_not_fail_stop_the_siblings() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  {
+    let routing = driver.routing.get_mut(&2).expect("the doomed group routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: Box::new(|_res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+          sailing_driver::shared::CompletionOutcome::Delivered
+        }),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+  }
+
+  let removed = drive(&mut driver, handle.remove_group(2))
+    .await
+    .expect("the removal is accepted");
+  assert!(removed, "group 2 was hosted");
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| !ep.is_poisoned()),
+    "a well-behaved removal must not fail-stop the surviving sibling"
+  );
+  // The sibling keeps serving and committing — the plane is untouched.
+  let total: u64 = drive(&mut driver, handle.group(1).query(|sm: &MergeSm| sm.0))
+    .await
+    .expect("the sibling still serves reads");
+  assert_eq!(total, 0, "no commit has landed on the sibling yet");
+  drive(
+    &mut driver,
+    handle.group(1).submit(Bytes::from_static(b"y")),
+  )
+  .await
+  .expect("a plane with no fail-stop keeps committing");
+}

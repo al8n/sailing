@@ -547,11 +547,13 @@ where
     }
     for routing in self.routing.values_mut() {
       routing.fail_all(&DriverError::ShuttingDown);
-      // No heir, and no survivor: the driver is stopping, this sweep has just failed the group's parked
-      // work with its typed verdict, and no group outlives the loop to serve a state machine a swept
-      // completion's dropped guard could have torn — so there is nothing to fail-stop. Drain the latch
-      // the sweep may have just set; a dropped `Routing` still carrying one is the un-routed-verdict bug
-      // its `Drop` asserts against.
+      // THE ONE SOUND DISCARD, and it turns on the PLANE's lifecycle, not on any group's: the run loop
+      // has EXITED. This sweep has failed the group's parked work with its typed verdict, no crank
+      // follows, and no group outlives the loop — so a swept completion's dropped guard has no serve
+      // left to corrupt anywhere on this plane and there is nothing to fail-stop. (On a LIVE plane the
+      // same latch is plane-fatal: siblings keep serving, and the tear could be in any of them.) Drain
+      // the latch the sweep may have just set; a dropped `Routing` still carrying one is the
+      // un-routed-verdict bug its `Drop` asserts against.
       let _ = routing.take_completion_panicked();
     }
     self.conns.clear();
@@ -1237,15 +1239,19 @@ where
     self.quiesce_pending.remove(gid);
     self.activity.remove(gid);
     self.election.remove(gid);
-    // NO HEIR: the coordinator has already dropped this endpoint and no other group inherited its
-    // state machine, so a sweep's drop-panic tore only the group being destroyed and there is nothing
-    // left to fail-stop. DRAIN the latch rather than let it die with the routing — a dropped `Routing`
-    // whose latch is still set is the un-routed-verdict bug its `Drop` asserts against, and only the
-    // detaching site can tell "no heir" from "forgot to route it". (The merge fold's source teardown is
-    // the case that DOES have an heir — see `storage_crank`.)
+    // The DETACHED routing dies at the end of this block, and its completion-panic latch with it: the
+    // pump's tails read latches through `self.routing`, which no longer holds this group. Drain it HERE
+    // or lose it — and a fired latch is PLANE-FATAL. The sweep drops each parked completion's unused
+    // closure, and a captured guard's `Drop` can tear ANY hosted group's FSM, not merely the one being
+    // destroyed. Removal is not a teardown of the plane: the loop runs on and every sibling keeps
+    // serving, so an unattributable tear must stop them all — the same verdict the merge fold's source
+    // teardown raises. (The removed group is already out of the coordinator, so it is not among the
+    // groups poisoned: nothing of it is left to serve.)
     if let Some(mut routing) = self.routing.remove(gid) {
       routing.fail_all(&DriverError::ShuttingDown);
-      let _ = routing.take_completion_panicked();
+      if routing.take_completion_panicked() {
+        self.coord.fail_stop_plane_unattributable_panic();
+      }
     }
     Ok(existed || had_storage)
   }
@@ -1698,9 +1704,13 @@ where
   /// Serve (or fall back) ONE group's parked failover inherited-read queries — the single-group
   /// `run_failover_serve` scoped to `gid`. Structurally inert on this monotonic-only v1 host
   /// (no group can arm a serve window without the failover tier), but kept whole so the wall-clock
-  /// generalization does not reshape the loop. Returns `true` when the pass POISONED the group — a
-  /// FATAL limbo storage fault OR a caught user-closure panic in the served batch — and the caller
-  /// then fails THAT group's parked work `Poisoned` (group-scoped, never the whole driver).
+  /// generalization does not reshape the loop.
+  ///
+  /// Returns `true` when the pass POISONED the group: a FATAL limbo storage fault (GROUP-scoped — the
+  /// co-located groups and the driver keep running), or a caught user-closure panic in the served batch
+  /// (UNATTRIBUTABLE, so it has already fail-stopped the whole plane). Either way the caller fails THAT
+  /// group's parked work with the typed verdict. A DECLINE returns `false` and can still latch a caught
+  /// drop-panic in the routing — the caller's pre-serve verdict read is what routes it.
   fn run_failover_serve(&mut self, gid: &G) -> bool {
     let Some(routing) = self.routing.get_mut(gid) else {
       return false;
@@ -1933,11 +1943,53 @@ where
         .lifecycle_tx
         .try_send(LifecycleEvent::UnknownGroup { group, from });
     }
-    // The single pump's completion tail, PER GROUP — one group's supersede or fail-stop never
-    // touches a co-located group's parked work.
+    // The single pump's completion tail, split PLANE-WIDE into a TEAR phase and a SERVE phase.
+    //
+    // Detection is per group — each group's caught completion(-drop) panic latches in ITS routing — but
+    // the REACTION is plane-fatal, because the tear is unattributable. Running one group's whole tail
+    // (sweep, decline, THEN serve) before the next group's would let a sibling that sorts EARLIER serve
+    // a read this crank against a state machine a LATER group's dropped guard has already torn: the
+    // sibling's own latch is clear and its endpoint is not yet poisoned, so nothing stops it. Whether a
+    // torn read is served would then depend on the numeric order of the group ids — accidental safety.
+    //
+    // So the crank is phased instead:
+    //   (1) HARVEST every routing's latch, plane-wide, before any group's completion step runs — the
+    //       sweeps `route_event` ran above (a `LeaderChanged` fails the parked work of the group that
+    //       changed) latch here, and a fired latch fail-stops the plane BEFORE anything serves;
+    //   (2) the PRE-SERVE step of every group — watermark sync, the leadership-loss backstop, the
+    //       failover serve/decline — each routing its OWN latch at the end of its step, so a tear in
+    //       one group's step poisons the plane before the NEXT group's step can serve an inherited read;
+    //   (3) the SERVE step of every group, each gated on a FRESH `is_poisoned()` read.
+    // Every tear is therefore converted into a plane-wide poison before any subsequent serve, in
+    // program order: no group serves a read after a caught panic, whatever the id order.
+    self.harvest_completion_panics();
     let with_routing: Vec<G> = self.routing.keys().map(|g| g.cheap_clone()).collect();
     for g in &with_routing {
+      self.pump_group_pre_serve(g, &mut run_queries);
+    }
+    for g in &with_routing {
       self.pump_group_tail(g, run_queries.contains(g));
+    }
+  }
+
+  /// Take EVERY hosted routing's completion-panic latch and fail-stop the plane ONCE if any fired —
+  /// the crank's authoritative pre-serve harvest.
+  ///
+  /// A latch is set by a completion that caught a user-closure(-drop) panic while DROPPING an unused
+  /// closure (a `fail_all` sweep, a failover decline). The tear is unattributable — the closure's guard
+  /// can alias any hosted group's FSM — so reading only the latched group's latch before only that
+  /// group's serve is not enough: every OTHER group must be stopped too, and stopped BEFORE it serves.
+  /// This runs ahead of every per-group step in the pump, so a latch set anywhere earlier in the crank
+  /// (above all a `route_event` sweep) poisons the plane while every group's parked reads are still
+  /// parked. Draining every routing — not stopping at the first — keeps the `Drop` invariant: no
+  /// `Routing` outlives its verdict.
+  fn harvest_completion_panics(&mut self) {
+    let mut torn = false;
+    for routing in self.routing.values_mut() {
+      torn |= routing.take_completion_panicked();
+    }
+    if torn {
+      self.coord.fail_stop_plane_unattributable_panic();
     }
   }
 
@@ -2063,11 +2115,18 @@ where
     self.metrics.record_quiesced(self.quiesced.len() as u64);
   }
 
-  /// One group's per-pass completion tail: watermark sync, the leadership-loss backstop, the
-  /// failover serve, runnable queries, and the group-scoped poison sweep — the single-group
-  /// pump's tail with every step keyed to `gid`. A poisoned group fails ITS parked work with the
-  /// typed verdict; the driver keeps running for the co-located groups.
-  fn pump_group_tail(&mut self, gid: &G, mut run_queries: bool) {
+  /// One group's PRE-SERVE step: watermark sync, the leadership-loss backstop, and the failover
+  /// serve/decline — every completion this group runs in a crank that is NOT the parked-query serve.
+  /// The pump runs it for EVERY group before ANY group serves, and it routes this group's
+  /// completion-panic latch at its END: the sweeps and declines here drop unused user closures, a
+  /// captured guard's `Drop` can tear any hosted group's FSM, so the verdict must become a plane-wide
+  /// poison before the NEXT group's step (whose failover serve would otherwise read a torn state
+  /// machine) and before every group's query serve.
+  ///
+  /// Records the group in `run_queries` when its apply watermark advanced — the reads it confirmed are
+  /// now runnable — and REMOVES it when the failover pass poisoned the group: the typed sweep drained
+  /// its parked queries, so nothing of it is left for the serve step (the early return this replaces).
+  fn pump_group_pre_serve(&mut self, gid: &G, run_queries: &mut BTreeSet<G>) {
     let Some(ep) = self.coord.group(gid) else {
       return;
     };
@@ -2078,7 +2137,7 @@ where
       && let Some(routing) = self.routing.get_mut(gid)
       && routing.sync_applied(applied)
     {
-      run_queries = true;
+      run_queries.insert(gid.cheap_clone());
     }
     let was = self
       .was_leader
@@ -2095,31 +2154,57 @@ where
       }
     }
     if !poisoned && self.run_failover_serve(gid) {
-      // A FATAL limbo storage fault is GROUP-scoped on a multi host: fail that group's parked
-      // work with the typed verdict; co-located groups (and the driver) keep running.
+      // A FATAL limbo storage fault (group-scoped), or a caught panic in the served inherited-read
+      // batch (which has already fail-stopped the plane). Either way this group's parked work fails
+      // with the typed verdict, and that sweep leaves nothing for the serve step to run.
       if let Some(routing) = self.routing.get_mut(gid) {
         routing.fail_all(&DriverError::Poisoned);
       }
-      return;
+      run_queries.remove(gid);
     }
-    // Read this group's completion-panic latch ONCE, BEFORE the serve. A `fail_all` sweep (the routed
-    // `LeaderChanged` or the leadership backstop) or a failover decline earlier THIS crank drops an
-    // unused user closure whose captured guard's `Drop` can tear this group's FSM and latch here;
-    // serving the parked queries against that torn FSM is the ordering window this read closes. When it
-    // is already set, SKIP the serve so no query runs against the torn state — the fail-stop and the
-    // `fail_all(Poisoned)` below fail the parked queries `Poisoned` instead. A query that panics DURING
-    // the serve still reports through `query_panicked`; one read-and-clear both gates and decides.
+    // THE STEP'S OWN VERDICT. The backstop's sweep, the failover decline, and the typed sweep above all
+    // drop unused user closures inside `catch_unwind`; a caught guard-`Drop` panic latches in this
+    // group's routing. Route it NOW — the tear is unattributable, so it fail-stops the plane, and every
+    // group whose step or serve is still to come reads that poison before it runs. (The fault arm
+    // returned early without this read: a latch it set was deferred a whole crank — every sibling
+    // serving meanwhile — and lost outright if the group was removed before the next one.)
+    if self
+      .routing
+      .get_mut(gid)
+      .is_some_and(|routing| routing.take_completion_panicked())
+    {
+      self.coord.fail_stop_plane_unattributable_panic();
+    }
+  }
+
+  /// One group's SERVE step: the poison gate, the runnable parked queries, and the poison sweep.
+  ///
+  /// Reached only after the plane-wide harvest and EVERY group's [`Self::pump_group_pre_serve`], so a
+  /// completion(-drop) panic caught anywhere earlier in this crank has already poisoned this group and
+  /// the gate below skips the serve. A poisoned group fails ITS parked work with the typed verdict.
+  fn pump_group_tail(&mut self, gid: &G, run_queries: bool) {
+    let Some(ep) = self.coord.group(gid) else {
+      return;
+    };
+    // FRESH: a group whose serve step ran earlier in this loop may have fail-stopped the plane after the
+    // harvest — this read is what makes that stop bind here, before this group serves.
+    let poisoned = ep.is_poisoned();
+    // The last thing between a caught panic and a serve. The harvest and the pre-serve steps drained
+    // every latch that could have fired before this loop, so this can only catch one set after them —
+    // and when it is set, the serve is SKIPPED: the fail-stop and the `fail_all(Poisoned)` below fail
+    // the parked queries `Poisoned` instead. A query that panics DURING the serve still reports through
+    // `query_panicked`; one read-and-clear both gates and decides.
     let completion_panicked = self
       .routing
       .get_mut(gid)
       .is_some_and(|routing| routing.take_completion_panicked());
     let mut query_panicked = false;
     // A POISONED group never serves a parked read, and this gate is what makes a fail-stop raised
-    // EARLIER in the crank actually stop the serve: an immediate refusal's dropped closure panicked
-    // in `handle_command`, or a merge teardown fail-stopped this group as the absorbing target in
-    // `storage_crank` — both precede the pump with this group's confirmed queries still parked, and
-    // neither routes through this group's completion latch. `is_poisoned` is the one surface every
-    // fail-stop funnels through, so gating on it covers every present and future poison source.
+    // EARLIER in the crank actually stop the serve: an immediate refusal's dropped closure panicked in
+    // `handle_command`, a merge teardown or a `remove_group` fail-stopped the plane in `storage_crank`,
+    // or another group's pre-serve step tore and fail-stopped it moments ago — none of them routes
+    // through THIS group's completion latch. `is_poisoned` is the one surface every fail-stop funnels
+    // through, so gating on it covers every present and future poison source.
     if !poisoned
       && !completion_panicked
       && run_queries
@@ -2129,7 +2214,7 @@ where
       // A caught user-closure panic fail-stops the WHOLE plane (the closure captured arbitrary state
       // aliasing any group's FSM, so the tear is unattributable): the batch completes its remainder
       // `Poisoned` (already drained from routing, so the `fail_all` below cannot reach them); the
-      // fail-stop runs once the `ep` borrow releases.
+      // fail-stop runs once the `ep` borrow releases — before any later group's serve step.
       query_panicked = sailing_driver::shared::serve_query_batch(
         routing.take_runnable_queries(),
         ep.state_machine(),
@@ -2142,10 +2227,18 @@ where
       // tail via `poll_poisoned`, then fails its parked work `Poisoned`.
       self.coord.fail_stop_plane_unattributable_panic();
     }
+    let mut swept_panicked = false;
     if (poisoned || query_panicked || completion_panicked)
       && let Some(routing) = self.routing.get_mut(gid)
     {
       routing.fail_all(&DriverError::Poisoned);
+      swept_panicked = routing.take_completion_panicked();
+    }
+    if swept_panicked {
+      // The typed sweep's OWN dropped closures tear too, and a GROUP-scoped poison (an apply or storage
+      // fault) reaches it with the plane otherwise healthy — so this latch must fail-stop the plane
+      // here, or the groups whose serve step has not run yet would serve after the tear.
+      self.coord.fail_stop_plane_unattributable_panic();
     }
   }
 }
