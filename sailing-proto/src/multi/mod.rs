@@ -984,6 +984,34 @@ where
     self.note_if_poisoned(gid);
   }
 
+  /// Fail-stop EVERY hosted group because a completion caught a user-closure(-drop) panic this
+  /// container cannot ATTRIBUTE to one — the verdict a refusal addressed to a group this host does
+  /// NOT carry reports (the drivers' not-hosted `query`/`failover_query` arms).
+  ///
+  /// Being handed no state machine does not bound what the closure TOUCHED. A query closure is
+  /// `Send + 'static` and captures whatever it likes; [`StateMachine`] imposes no ownership or
+  /// isolation constraint, so a guard captured for the MISSING group can alias state a HOSTED group's
+  /// replicated FSM shares — tear it in `Drop`, and panic there, inside the completion's `catch_unwind`.
+  /// A container cannot see what a closure captured, so the tear could be in ANY hosted group: there is
+  /// no group to name, and naming none leaves a torn group serving.
+  ///
+  /// So consensus safety outranks availability and the whole PLANE fail-stops. Each group poisons on
+  /// its own account and surfaces through [`poll_poisoned`](Self::poll_poisoned), so the embedder learns
+  /// what happened to every one of them; each fails its parked work with the typed verdict, and recovery
+  /// runs from durable state after a restart. A plane whose groups all fail-stop is recoverable; a group
+  /// serving divergent committed state is not. The trigger is a panicking `Drop` — already an
+  /// abort-level Rust anti-pattern — so a closure that honors the `query` contract never pays this.
+  pub fn fail_stop_plane_unattributable_panic(&mut self) {
+    for (gid, ep) in &mut self.groups {
+      ep.fail_stop_query_panicked();
+      // `note_if_poisoned`, inlined: the endpoint is already in hand, and the `groups` borrow this
+      // walk holds is exactly what would forbid the helper's second lookup.
+      if ep.is_poisoned() && self.poisoned_seen.insert(gid.cheap_clone()) {
+        self.poisoned_pending.push_back(gid.cheap_clone());
+      }
+    }
+  }
+
   /// The group's lineage counter under the unified per-id scheme (incarnation ⊔ shape), as this
   /// container knows it: the LIVE endpoint counter when hosted (it includes every applied
   /// split), else the relay-time view (a removed id's last relayed bump). `0` for an id never

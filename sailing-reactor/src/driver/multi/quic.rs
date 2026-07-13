@@ -1082,16 +1082,30 @@ where
         complete,
         reservation,
       } => {
-        // The two NOT-HOSTED refusals below (no routing, no stores) handed the closure nothing: the
-        // library never exposed a state machine to it, so a caught drop-panic here has no group to
-        // address a fail-stop to. Catch it — the driver must survive — and let the refusal stand.
+        // THE NOT-HOSTED REFUSALS — the two below (no routing, no stores) and the coordinator's own
+        // further down. The library handed this closure no state machine, and that bounds NOTHING:
+        // `Q` is `Send + 'static` and captures whatever it likes, `StateMachine` imposes no ownership
+        // or isolation constraint, so a guard captured for a group this host does not carry can alias
+        // state a HOSTED group's replicated FSM shares — tear it in `Drop`, and panic there, inside
+        // the completion's `catch_unwind`. The driver cannot see what a closure captured, so the tear
+        // is UNATTRIBUTABLE: it could be in ANY hosted group, and fail-stopping none leaves a torn
+        // group serving committed state that has silently diverged from the replicas that never ran
+        // the closure. A caught panic here is therefore PLANE-FATAL — every hosted group fail-stops,
+        // each surfacing its own poison and failing its parked work with the typed verdict (see
+        // `fail_stop_plane_unattributable_panic`). Availability loses to safety by design: a plane of
+        // fail-stopped groups restarts from durable state, a divergent group is unrecoverable. Only a
+        // panicking `Drop` — an abort-level anti-pattern the `query` contract forbids — reaches this.
         let Some(routing) = self.routing.get_mut(&group) else {
-          let _ = complete(Err(no_such_group()));
+          if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
+            self.coord.fail_stop_plane_unattributable_panic();
+          }
           return false;
         };
         let ctx = routing.mint_query_ctx();
         let Some((log, stable)) = self.engine.stores(&group) else {
-          let _ = complete(Err(no_such_group()));
+          if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
+            self.coord.fail_stop_plane_unattributable_panic();
+          }
           return false;
         };
         match self.coord.read_index(
@@ -1122,11 +1136,12 @@ where
               self.coord.fail_stop_query_panicked(&group);
             }
           }
-          // The coordinator does not hold the group: there is no endpoint, hence no state machine
-          // the library ever exposed to this closure and no group to address a fail-stop to. Catch
-          // the outcome (the driver must survive the caught panic) and let the refusal stand.
+          // The coordinator does not hold the group: the third not-hosted refusal, plane-fatal on a
+          // caught panic for the reason above.
           None => {
-            let _ = complete(Err(no_such_group()));
+            if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
+              self.coord.fail_stop_plane_unattributable_panic();
+            }
           }
         }
       }
@@ -1140,10 +1155,11 @@ where
             complete,
             _reservation: reservation,
           });
-        } else {
-          // Not hosted: no state machine was ever handed to this closure (see the `Query` arm) — a
-          // `Drop` that tears an FSM the library never exposed to it is outside the contract.
-          let _ = complete(Err(no_such_group()));
+        } else if complete(Err(no_such_group())) == CompletionOutcome::Panicked {
+          // Not hosted: the same UNATTRIBUTABLE tear the `Query` arm's refusals describe — the
+          // dropped closure's captured guard could have torn ANY hosted group's state machine, and
+          // this one names none — so the refusal is plane-fatal here too.
+          self.coord.fail_stop_plane_unattributable_panic();
         }
       }
       MultiCommand::Transfer {

@@ -135,9 +135,18 @@ pub enum Pending<I, R> {
 /// `#[must_use]` is the ENFORCEMENT. A discarded outcome is a silently dropped fail-stop, so the
 /// COMPILER — not a convention, and not a grep that only ever matched one of the two call syntaxes —
 /// enumerates every invocation that fails to consume its verdict. Ignoring one is correct in exactly
-/// two shapes, and each must say so at the site: the addressed group is not hosted here (the library
-/// handed that closure no state machine, so there is nothing to fail-stop), or the fail-stop is
-/// already decided and a second report cannot change it.
+/// ONE shape, and it must say so at the site: the fail-stop is already decided and a second report
+/// cannot change it.
+///
+/// A completion addressed to a group this host does NOT carry is the shape that LOOKS discardable and
+/// is not. Being handed no state machine bounds nothing about what the closure TOUCHED: `Q` is
+/// `Send + 'static` and captures whatever it likes, and [`StateMachine`](sailing_proto::StateMachine)
+/// imposes no ownership or isolation constraint, so a guard captured for the missing group can alias
+/// state a HOSTED group's replicated FSM shares and tear it in `Drop`. A driver cannot see what a
+/// closure captured, so such a panic is UNATTRIBUTABLE — it names no group — and the multi drivers
+/// treat it as PLANE-FATAL: every hosted group fail-stops, each surfacing its own poison. Consensus
+/// safety outranks availability there; a plane of fail-stopped groups restarts from durable state,
+/// while a group serving torn committed state cannot be recovered at all.
 #[must_use = "a completion reports the fail-stop verdict: `Panicked` means the user closure — or the \
               guard it captured, dropped unused inside the same `catch_unwind` — could have torn the \
               group's replicated state machine, and discarding it leaves the group serving \

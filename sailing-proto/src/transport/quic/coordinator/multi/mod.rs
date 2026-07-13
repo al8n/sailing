@@ -460,6 +460,15 @@ where
     self.multi.fail_stop_query_panicked(gid);
   }
 
+  /// Fail-stop EVERY hosted group because a completion caught a user-closure(-drop) panic that names
+  /// no group — the verdict a refusal addressed to a group this host does not carry reports (see
+  /// [`MultiRaft::fail_stop_plane_unattributable_panic`] for why an unattributable tear is PLANE-fatal
+  /// and why that is the safe trade). Every group poisons and surfaces on the lifecycle tail
+  /// ([`poll_poisoned`](Self::poll_poisoned)), so the plane fails LOUDLY, never silently.
+  pub fn fail_stop_plane_unattributable_panic(&mut self) {
+    self.multi.fail_stop_plane_unattributable_panic();
+  }
+
   /// Drain the next UNKNOWN-GROUP placement signal: `(group, authenticated sender)` for
   /// well-formed INITIAL-SHAPED traffic — a vote request, or a first-contact heartbeat carrying
   /// commit 0 — whose group this host neither hosts, nor resolves stores for, nor has

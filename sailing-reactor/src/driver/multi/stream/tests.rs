@@ -850,3 +850,106 @@ async fn a_normal_merge_teardown_does_not_poison_the_target() {
     .expect("the merged target still serves the union it absorbed");
   assert_eq!(total, 2, "the union is both groups' commits");
 }
+
+/// The UNATTRIBUTABLE-panic arm. A query addressed to a group this host does NOT carry is refused with
+/// `no_such_group` — the completion never CALLS the closure, but it DROPS it unused inside its
+/// `catch_unwind`, so a captured guard's `Drop` runs there and can panic. The library handed this
+/// closure no state machine, but that bounds nothing: a `Send + 'static` closure can capture a guard
+/// aliasing state a HOSTED group's replicated FSM shares (`StateMachine` imposes no isolation), tear it
+/// in `Drop`, and panic. The driver cannot see what was captured, so the tear could be in ANY hosted
+/// group — the panic names none. Rather than leave some torn group serving silently-divergent committed
+/// state, the refusal is PLANE-FATAL: every hosted group fail-stops, surfaces its own poison, and stops
+/// serving. The caught panic reports directly, as the sibling completion tests do, avoiding a real unwind.
+#[tokio::test]
+async fn an_unattributable_refusal_drop_panic_fail_stops_the_whole_plane() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+
+  // A query on group 999 — never created, so NOT hosted: the refusal drops the closure unused, and its
+  // captured guard's `Drop` panics inside the completion's unwind boundary.
+  let guard = PanicOnDrop;
+  let refused: Result<u64, _> = drive(
+    &mut driver,
+    handle.group(999).query(move |sm: &MergeSm| {
+      let _guard = guard;
+      sm.0
+    }),
+  )
+  .await;
+  assert!(
+    matches!(refused, Err(sailing_driver::DriverError::QueryPanicked)),
+    "the caller learns its closure panicked, not the group's absence"
+  );
+
+  // EVERY hosted group fail-stops — the panic could have torn any of them.
+  for gid in [1u64, 2] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| ep.is_poisoned()),
+      "group {gid} must fail-stop on the unattributable plane-fatal panic"
+    );
+  }
+  // Neither can serve: a fail-stopped group refuses the read rather than answer possibly-torn state.
+  for gid in [1u64, 2] {
+    let served: Result<u64, _> =
+      drive(&mut driver, handle.group(gid).query(|sm: &MergeSm| sm.0)).await;
+    assert!(
+      matches!(served, Err(sailing_driver::DriverError::Poisoned)),
+      "the fail-stopped group {gid} must not serve"
+    );
+  }
+  // Each surfaces its poison ONCE on the lifecycle tail — the plane fails LOUDLY, never silently.
+  let mut poisoned: Vec<u64> = handle
+    .lifecycle()
+    .try_iter()
+    .filter_map(|ev| match ev {
+      LifecycleEvent::Poisoned { group } => Some(group),
+      _ => None,
+    })
+    .collect();
+  poisoned.sort_unstable();
+  assert_eq!(
+    poisoned,
+    vec![1, 2],
+    "every hosted group surfaces its poison on the lifecycle tail"
+  );
+}
+
+/// The no-over-fail-stop guard for the unattributable arm: a WELL-BEHAVED query on a not-hosted group
+/// (its refused completion `Delivered`) must NOT fail-stop anything. The caller gets the group-absent
+/// rejection and every hosted group keeps serving — a missing group is not a torn plane.
+#[tokio::test]
+async fn a_normal_unhosted_refusal_does_not_fail_stop_the_plane() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+  let refused: Result<u64, _> =
+    drive(&mut driver, handle.group(999).query(|sm: &MergeSm| sm.0)).await;
+  assert!(
+    matches!(refused, Err(sailing_driver::DriverError::Rejected { .. })),
+    "a well-behaved unhosted query reports the group's absence"
+  );
+  for gid in [1u64, 2] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| !ep.is_poisoned()),
+      "a well-behaved unhosted refusal must not fail-stop group {gid}"
+    );
+  }
+  // Both groups still commit — the plane is untouched.
+  for gid in [1u64, 2] {
+    drive(
+      &mut driver,
+      handle.group(gid).submit(Bytes::from_static(b"x")),
+    )
+    .await
+    .expect("a plane with no fail-stop keeps committing");
+  }
+}

@@ -807,6 +807,21 @@ where
   /// Run a linearizable query against this group's state machine and await its result — the
   /// group-keyed [`Handle::query`](crate::Handle::query): the closure runs ON the driver thread
   /// once the group's read index is confirmed AND applied.
+  ///
+  /// # Closure contract
+  ///
+  /// The closure MUST NOT capture state aliased with a replicated state machine such that its
+  /// destructor can tear that state, and MUST NOT panic in `Drop`. The driver runs — and drops — the
+  /// closure under `catch_unwind`. When this group is HOSTED, a caught `Drop`-panic fail-stops THIS
+  /// group. But a query addressed to a group this host does NOT carry still drops the closure: the
+  /// library handed it no state machine, yet a `Send + 'static` closure can capture a guard aliasing
+  /// state ANOTHER, hosted group's replicated FSM shares — `StateMachine` imposes no isolation — and
+  /// tear it in `Drop`. That panic names no group, so the driver cannot attribute it; rather than
+  /// leave some torn group serving silently-divergent committed state, it fail-stops the WHOLE PLANE
+  /// (every hosted group poisons and surfaces on the lifecycle tail, its parked work failing with a
+  /// typed error). Consensus safety outranks availability: a fail-stopped plane restarts from durable
+  /// state, a divergent group does not recover. A panicking `Drop` is an abort-level Rust anti-pattern
+  /// regardless; well-behaved closures never trip this.
   pub async fn query<Out, Q>(&self, f: Q) -> Result<Out, DriverError<I>>
   where
     Out: Send + 'static,
@@ -841,6 +856,10 @@ where
   /// region is non-empty, or when the closure declined; the caller falls back to [`query`](Self::query).
   /// For per-key limbo inspection use
   /// [`failover_query_unchecked`](Self::failover_query_unchecked).
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query), including
+  /// the PLANE fail-stop when a not-hosted group's declined completion drops a closure whose captured
+  /// guard tears an unattributable state machine.
   pub async fn failover_query<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,
@@ -871,6 +890,9 @@ where
   /// closure the limbo region `(index, limbo_upper]`; the closure MUST return `None` when its key was
   /// written there, an obligation the API cannot verify (a limbo-ignoring closure can serve stale).
   /// Resolves `Ok(None)` when the group has no serve window or the closure declined.
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query), including
+  /// the PLANE fail-stop on a not-hosted group.
   pub async fn failover_query_unchecked<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,

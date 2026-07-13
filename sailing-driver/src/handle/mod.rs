@@ -267,6 +267,18 @@ where
   /// The closure runs ON the driver thread, against the FSM, only after a `ReadIndex`
   /// confirmation AND the apply watermark covering the confirmed index — the linearizability
   /// point. The FSM never leaves the driver thread; the closure (and its result) cross instead.
+  ///
+  /// # Closure contract
+  ///
+  /// The closure MUST NOT capture state aliased with a replicated state machine such that its
+  /// destructor can tear that state, and MUST NOT panic in `Drop`. The driver runs the closure — and
+  /// drops it, used or not — under `catch_unwind`, so a `Drop` that mutates FSM-aliased state and
+  /// panics is CAUGHT: on a single-group host it fail-stops this endpoint. The panic is
+  /// [`QueryPanicked`](DriverError::QueryPanicked) to this caller. (On a multi host the same panic on
+  /// a NOT-HOSTED group cannot be attributed to any group, so it fail-stops the WHOLE plane — see the
+  /// multi `query` — which is why the contract is stated for the whole read family, not just this
+  /// endpoint.) A panicking `Drop` is an abort-level Rust anti-pattern regardless; well-behaved
+  /// closures never trip this.
   pub async fn query<Out, Q>(&self, f: Q) -> Result<Out, DriverError<I>>
   where
     Out: Send + 'static,
@@ -309,6 +321,10 @@ where
   /// per-key limbo inspection use [`failover_query_unchecked`](Self::failover_query_unchecked) and
   /// discharge its proof obligation yourself. The FSM never leaves the driver thread; the closure (and
   /// its result) cross instead.
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query) — a
+  /// declined failover read still DROPS the closure under `catch_unwind`, so a `Drop` that tears
+  /// FSM-aliased state and panics fail-stops just as a served one does.
   pub async fn failover_query<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,
@@ -348,6 +364,8 @@ where
   /// linearizability proof. Prefer the checked [`failover_query`](Self::failover_query) unless the
   /// closure genuinely inspects limbo per key. The FSM and the limbo entries never leave the driver
   /// thread; the closure (and its result) cross instead.
+  ///
+  /// The closure obeys the same destructor/`Drop`-panic contract as [`query`](Self::query).
   pub async fn failover_query_unchecked<Out, Q>(&self, f: Q) -> Result<Option<Out>, DriverError<I>>
   where
     Out: Send + 'static,
