@@ -395,6 +395,15 @@ pub struct Routing<I, R, F> {
   pub applied: Index,
   /// The best-effort events tail (dropped-on-full; never blocks the driver).
   pub events: flume::Sender<Event<I, R>>,
+  /// Latched when a Routing completion — a [`Self::fail_all`] sweep or a [`Self::decline_failovers`]
+  /// decline — catches a user-closure(-drop) panic. Such a completion never RUNS the user closure
+  /// (an `Err`/`Ok(None)` short-circuits it), but it DROPS the closure unused, running any guard the
+  /// closure captured; that guard's `Drop` can mutate shared FSM state and panic, caught by the
+  /// completion's `catch_unwind`. A caught panic means the state machine could be TORN, so the
+  /// addressed group must fail-stop rather than keep serving divergent state. Read AND cleared by
+  /// [`Self::take_completion_panicked`], which the driver folds into its per-group fail-stop tail
+  /// alongside the serve batches' returned panic — ONE fail-stop decision fed by every source.
+  completion_panicked: bool,
 }
 
 impl<I, R, F> Routing<I, R, F> {
@@ -407,6 +416,7 @@ impl<I, R, F> Routing<I, R, F> {
       failovers: Vec::new(),
       applied: Index::ZERO,
       events,
+      completion_panicked: false,
     }
   }
 
@@ -474,11 +484,50 @@ impl<I, R, F> Routing<I, R, F> {
         }
       }
     }
+    // Route the query/failover completions through the centralized invokers so a caught
+    // user-closure(-drop) panic is LATCHED, never discarded: a swept completion drops its unused
+    // closure, whose captured guard's `Drop` can panic against shared FSM state.
     for (_, q) in std::mem::take(&mut self.queries) {
-      (q.complete)(Err(err.clone()));
+      self.complete_query(q, Err(err.clone()));
     }
     for p in std::mem::take(&mut self.failovers) {
-      (p.complete)(Err(err.clone()));
+      self.complete_failover(p, Err(err.clone()));
+    }
+  }
+
+  /// Complete every parked failover inherited-read with `Ok(None)` — decline to serve, so the caller
+  /// falls back to a normal read — routing each through [`Self::complete_failover`] so a caught
+  /// drop-panic latches the completion-panic signal. The drivers' failover serve calls this on its
+  /// decline arms instead of invoking the completion raw, so no decline can silently swallow a panic.
+  pub fn decline_failovers(&mut self) {
+    for p in std::mem::take(&mut self.failovers) {
+      self.complete_failover(p, Ok(None));
+    }
+  }
+
+  /// Take AND clear whether any Routing completion caught a user-closure(-drop) panic since the last
+  /// read. The driver folds this into its per-group fail-stop decision (see
+  /// [`Self::completion_panicked`]).
+  #[must_use]
+  pub fn take_completion_panicked(&mut self) -> bool {
+    std::mem::replace(&mut self.completion_panicked, false)
+  }
+
+  /// Invoke ONE parked query's completion, latching a caught user-closure(-drop) panic. The SOLE
+  /// invoker of a query completion outside [`serve_query_batch`]: no Routing method invokes a query
+  /// completion raw, so every non-serving completion panic reaches
+  /// [`Self::take_completion_panicked`] and thus the group's fail-stop.
+  fn complete_query(&mut self, q: ParkedQuery<I, F>, res: Result<&F, DriverError<I>>) {
+    if (q.complete)(res) == CompletionOutcome::Panicked {
+      self.completion_panicked = true;
+    }
+  }
+
+  /// Invoke ONE parked failover completion, latching a caught user-closure(-drop) panic. The SOLE
+  /// invoker of a failover completion outside [`serve_failover_batch`] (see [`Self::complete_query`]).
+  fn complete_failover(&mut self, p: ParkedFailover<I, F>, res: FailoverOutcome<'_, I, F>) {
+    if (p.complete)(res) == CompletionOutcome::Panicked {
+      self.completion_panicked = true;
     }
   }
 }
@@ -1185,6 +1234,83 @@ mod tests {
       b.in_flight(),
       (0, 0),
       "the sweep released both reservations"
+    );
+  }
+
+  #[test]
+  fn fail_all_latches_a_caught_completion_panic() {
+    // The defect this closes: `fail_all` invoked the query/failover completions but DISCARDED their
+    // `CompletionOutcome`. A swept completion never runs the user closure (the `Err` short-circuits
+    // it) yet DROPS it unused, running any guard it captured — whose `Drop` can panic against shared
+    // FSM state, caught by the completion's `catch_unwind` and reported `Panicked` (simulated here
+    // exactly as `query_batch_stops_serving_at_the_first_caught_panic` does, without a real unwind).
+    // The discarded panic left the group LIVE against possibly-torn state; now `fail_all` latches it
+    // for the driver's per-group fail-stop tail.
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    let ctx = r.mint_query_ctx();
+    r.queries.insert(
+      ctx,
+      ParkedQuery {
+        ready_at: None,
+        complete: Box::new(|res: Result<&(), DriverError<u64>>| {
+          CompletionOutcome::caught(matches!(res, Err(DriverError::Superseded)))
+        }),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    r.fail_all(&DriverError::Superseded);
+    assert!(
+      r.take_completion_panicked(),
+      "fail_all must latch a completion's caught panic, not discard it"
+    );
+    assert!(!r.take_completion_panicked(), "the take cleared the latch");
+  }
+
+  #[test]
+  fn decline_failovers_latches_a_caught_completion_panic() {
+    // The drivers' failover decline arms (`Ok(None)`, no serve window / safe fallback) route through
+    // `decline_failovers`; a declined completion still drops its unused closure, so a guard-drop
+    // panic there must reach the fail-stop too — not just the `fail_all` supersede path.
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    r.failovers.push(ParkedFailover {
+      complete: Box::new(|res: FailoverOutcome<'_, u64, ()>| {
+        CompletionOutcome::caught(matches!(res, Ok(None)))
+      }),
+      _reservation: b.try_reserve::<u64>(0).unwrap(),
+    });
+    r.decline_failovers();
+    assert!(r.failovers.is_empty(), "the decline drained the failovers");
+    assert!(
+      r.take_completion_panicked(),
+      "a declined completion's caught panic latches for the group fail-stop"
+    );
+  }
+
+  #[test]
+  fn a_normal_fail_all_does_not_latch_a_panic() {
+    // The regression guard: a WELL-BEHAVED sweep (every completion `Delivered`) must NOT latch — a
+    // superseded group is not a poisoned one, and the fix must not over-fail-stop.
+    let (mut r, _rx) = routing();
+    let b = InflightBudget::new(8, 8);
+    let ctx = r.mint_query_ctx();
+    r.queries.insert(
+      ctx,
+      ParkedQuery {
+        ready_at: None,
+        complete: Box::new(|_res: Result<&(), DriverError<u64>>| CompletionOutcome::Delivered),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    r.failovers.push(ParkedFailover {
+      complete: Box::new(|_res: FailoverOutcome<'_, u64, ()>| CompletionOutcome::Delivered),
+      _reservation: b.try_reserve::<u64>(0).unwrap(),
+    });
+    r.fail_all(&DriverError::Superseded);
+    assert!(
+      !r.take_completion_panicked(),
+      "a well-behaved supersede sweep must not latch a panic (no over-fail-stop)"
     );
   }
 

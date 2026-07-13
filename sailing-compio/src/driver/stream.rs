@@ -1086,11 +1086,7 @@ where
     // and the proto lease gate is strict at the boundary.
     let now = self.clock.now();
     match self.coord.endpoint().failover_read_window(now) {
-      None => {
-        for p in std::mem::take(&mut self.routing.failovers) {
-          (p.complete)(Ok(None));
-        }
-      }
+      None => self.routing.decline_failovers(),
       Some(window) if self.routing.applied >= window.index() => {
         match sailing_driver::shared::read_limbo(
           &self.log,
@@ -1119,11 +1115,7 @@ where
           }
           // A SAFE fallback (truncated / over-budget / incomplete / index-ceiling limbo): fall the
           // batch back to a normal read.
-          Ok(None) => {
-            for p in std::mem::take(&mut self.routing.failovers) {
-              (p.complete)(Ok(None));
-            }
-          }
+          Ok(None) => self.routing.decline_failovers(),
           // A FATAL limbo storage fault (corrupt/unreadable committed-range log): leave the reads
           // parked for the pump to fail `Poisoned` and stop the driver.
           Err(_) => return true,
@@ -1194,15 +1186,18 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    if run_queries
+    let query_panicked = run_queries
       && sailing_driver::shared::serve_query_batch(
         self.routing.take_runnable_queries(),
         self.coord.state_machine(),
-      )
-    {
-      // A caught user-closure panic fail-stops the endpoint: interior mutability could have torn
-      // the replicated FSM mid-read. The batch completed its remainder `Poisoned` rather than
-      // stranding it; the poison check below fails any still-parked work typed and stops the driver.
+      );
+    // ONE fail-stop decision fed by EVERY completion source this crank: the served query batch above,
+    // plus any caught user-closure(-drop) panic latched in routing by a `fail_all` sweep (the routed
+    // `LeaderChanged` or the leadership backstop) or a failover decline. A caught panic means interior
+    // mutability could have torn the replicated FSM mid-read, so fail-stop rather than keep serving;
+    // the poison check below fails any still-parked work typed and stops the driver.
+    let completion_panicked = self.routing.take_completion_panicked();
+    if query_panicked || completion_panicked {
       self.coord.fail_stop_query_panicked();
     }
     // The fail-stop check: a poisoned endpoint suppresses poll_event and poll_timeout by

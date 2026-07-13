@@ -1356,11 +1356,7 @@ where
       return false;
     };
     match ep.failover_read_window(now) {
-      None => {
-        for p in std::mem::take(&mut routing.failovers) {
-          (p.complete)(Ok(None));
-        }
-      }
+      None => routing.decline_failovers(),
       Some(window) if routing.applied >= window.index() => {
         let Some((log, _stable)) = self.engine.stores(gid) else {
           return false;
@@ -1385,11 +1381,7 @@ where
               return true;
             }
           }
-          Ok(None) => {
-            for p in std::mem::take(&mut routing.failovers) {
-              (p.complete)(Ok(None));
-            }
-          }
+          Ok(None) => routing.decline_failovers(),
           Err(_) => return true,
         }
       }
@@ -1720,12 +1712,20 @@ where
         ep.state_machine(),
       );
     }
-    if query_panicked {
+    // Fold EVERY completion-panic source for this group into ONE fail-stop decision: the served query
+    // batch above, plus any caught user-closure(-drop) panic latched in this group's routing by a
+    // `fail_all` sweep (the routed `LeaderChanged` or the leadership backstop) or a failover decline.
+    // A caught panic means interior mutability could have torn the FSM.
+    let completion_panicked = self
+      .routing
+      .get_mut(gid)
+      .is_some_and(|routing| routing.take_completion_panicked());
+    if query_panicked || completion_panicked {
       // Poison + latch the group (surfaces once on the lifecycle tail via `poll_poisoned`), then
       // fail its parked work `Poisoned` group-scoped — `poisoned` above predates this fail-stop.
       self.coord.fail_stop_query_panicked(gid);
     }
-    if (poisoned || query_panicked)
+    if (poisoned || query_panicked || completion_panicked)
       && let Some(routing) = self.routing.get_mut(gid)
     {
       routing.fail_all(&DriverError::Poisoned);

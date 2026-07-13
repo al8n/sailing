@@ -203,3 +203,103 @@ async fn a_merged_event_surfaces_only_after_its_barrier() {
     "exactly one Merged surfaces once the barrier has covered the staged writes"
   );
 }
+
+/// A completion swept by `fail_all` (a `LeaderChanged`) can catch a user-closure(-drop) panic: the
+/// swept closure is dropped unused, its captured guard's `Drop` mutates shared FSM state and panics,
+/// caught by the handle's `catch_unwind`. Before the fix `fail_all` DISCARDED that `Panicked`
+/// outcome and the group stayed LIVE against possibly-torn state; now the panic routes through the
+/// group's routing to the per-group fail-stop tail. The panicked group poisons; a co-located sibling
+/// keeps committing. The parked query reports the caught-panic outcome directly (as
+/// `shared::query_batch_stops_serving_at_the_first_caught_panic` does), avoiding a real unwind.
+#[tokio::test]
+async fn a_swept_completion_panic_fail_stops_only_its_group() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+  // Park a query on group 1 that never becomes runnable (`ready_at` stays `None`), so ONLY a
+  // `fail_all` sweep can complete it. Its completion reports the caught-panic outcome on the `Err`
+  // supersede — the outcome the handle's `catch_unwind` returns when a swept closure's captured
+  // guard `Drop` panics.
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  {
+    let routing = driver.routing.get_mut(&1).expect("group 1 routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: Box::new(|res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+          // The outcome the handle's `catch_unwind` returns when a swept closure's captured guard
+          // `Drop` panics on the `Err` supersede — `Panicked`; anything else `Delivered`.
+          if matches!(res, Err(sailing_driver::DriverError::Superseded)) {
+            sailing_driver::shared::CompletionOutcome::Panicked
+          } else {
+            sailing_driver::shared::CompletionOutcome::Delivered
+          }
+        }),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    // The `LeaderChanged` sweep, invoked exactly as `route_event`'s `LeaderChanged` arm does.
+    // (Synthesizing a real single-voter deposition is not cheap; the swept completion path is
+    // identical, and the discarded-`Panicked` defect lived entirely in `fail_all`.)
+    routing.fail_all(&sailing_driver::DriverError::Superseded);
+  }
+  // The next crank's per-group tail folds the latched completion panic into the group fail-stop.
+  crank(&mut driver).await;
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "the swept completion's caught panic fail-stopped group 1"
+  );
+  assert!(
+    driver.coord.group(&2).is_some_and(|ep| !ep.is_poisoned()),
+    "the co-located sibling was not poisoned"
+  );
+  // The sibling still accepts and commits a proposal.
+  let g2 = handle.group(2);
+  drive(&mut driver, g2.submit(Bytes::from_static(b"x")))
+    .await
+    .expect("the co-located sibling keeps committing");
+}
+
+/// The regression guard: a WELL-BEHAVED `fail_all(Superseded)` sweep (its completion `Delivered`)
+/// must NOT poison the group — a superseded group is not a poisoned one. Pins that the fix does not
+/// over-fail-stop on the common leadership-change sweep.
+#[tokio::test]
+async fn a_normal_supersede_sweep_does_not_poison_the_group() {
+  let (mut driver, handle) = bind_host().await;
+  let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+  let fut = handle.create_group(1u64, cfg, 7, MergeSm::default(), 0);
+  drive(&mut driver, fut).await.expect("group admission");
+  elect(&mut driver, 1).await;
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  {
+    let routing = driver.routing.get_mut(&1).expect("group 1 routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: Box::new(|_res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+          sailing_driver::shared::CompletionOutcome::Delivered
+        }),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.fail_all(&sailing_driver::DriverError::Superseded);
+  }
+  crank(&mut driver).await;
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| !ep.is_poisoned()),
+    "a well-behaved supersede sweep must not poison the group"
+  );
+  // The group still commits (it was superseded, not poisoned).
+  let g1 = handle.group(1);
+  drive(&mut driver, g1.submit(Bytes::from_static(b"y")))
+    .await
+    .expect("a superseded (not poisoned) group keeps committing");
+}
