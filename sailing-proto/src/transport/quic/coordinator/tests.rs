@@ -443,7 +443,7 @@ fn tracked_peer_count_spans_joint_config_and_learners() {
   assert_eq!(super::tracked_peer_count(&joint, &5u64), 5);
 }
 
-/// FAILS-ON-OLD: with the connection-cap floor computed once at construction, a committed
+/// With the connection-cap floor computed once at construction, a committed
 /// membership change that grows the tracked peer set outruns the cap — the floor must grow WITH
 /// the membership, or the new member's legitimate mesh connections are refused.
 #[test]
@@ -500,14 +500,14 @@ fn committed_membership_growth_raises_the_connection_cap() {
   assert_eq!(w.b.effective_max_connections(), 6);
 }
 
-/// FAILS-ON-OLD (FIX 2: `drain_bridge` must forward the full `Now` to `handle_message`): a
+/// `drain_bridge` must forward the FULL `Now` to `handle_message`: a
 /// network-driven election over QUIC, with EVERY coordinator hop driven by a SYNCHRONIZED `Now`,
 /// must preserve the synchronized wall onto the elected leader's term-current no-op (Empty) entry.
 /// The winning `VoteResponse` rides a QUIC stream into `drain_bridge`, which decodes it and calls
 /// `endpoint.handle_message` → `become_leader` → `append_leader_noop`, stamping
 /// `lease_wall_stamp(now)`. Under the FAILOVER tier that stamp is `now.wall().as_nanos()`.
 ///
-/// MUTATION (revert FIX 2 — `drain_bridge(now.mono(), ..)`): the decoded `VoteResponse` reaches
+/// MUTATION (`drain_bridge(now.mono(), ..)`): the decoded `VoteResponse` reaches
 /// `handle_message` with the wall STRIPPED (`Now::monotonic`), so the failover tier's
 /// `lease_wall_stamp` fails closed — it stamps `0` (counting a `wall_stamp_degradations`) rather than
 /// the synchronized wall, failing the `== W` assertion below.

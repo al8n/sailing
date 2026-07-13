@@ -15,8 +15,8 @@ use super::*;
 /// drift coverage pins hand-picked seeds (573, 586) found via a 0..700 sweep — so this band asserts the
 /// regime is read-linearizable and non-vacuous at the read level; the deterministic proto witnesses
 /// `leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease` (and its wall-absent twin)
-/// prove the exact `ρ_S > ρ_D` stale read the oracle here would catch, red before the inflation and green
-/// after. A deep hetero sweep (e.g. via the `drift_sweep` example) reaches the superseded path for the
+/// prove the exact `ρ_S > ρ_D` stale read the oracle here would catch — the read the successor-side
+/// inflation closes. A deep hetero sweep (e.g. via the `drift_sweep` example) reaches the superseded path for the
 /// cross-leader coverage.
 #[test]
 fn vopr_hetero_drift_read_linearizable() {
@@ -840,12 +840,12 @@ fn value_oracle_floor_folds_applied_after_compaction() {
      the state machine) — exactly the value the committed-only floor missed"
   );
 
-  // The committed-ONLY fold over ALL NODES (the pre-fix floor): because EVERY node compacted the entry
-  // out of its live log, no node contributes V_COMPACTED to a committed-only fold, so the CLUSTER-WIDE
-  // committed-only v_inv is strictly below V_COMPACTED. This is the all-nodes under-count that caused the
-  // bug — a committed-only oracle would have recorded this stale floor and passed a stale read. (If even
-  // one node still retained the value in its live slice, this fold would recover it; that is why the
-  // fixture drives EVERY node to compact.)
+  // The committed-ONLY fold over ALL NODES: because EVERY node compacted the entry out of its live
+  // log, no node contributes V_COMPACTED to a committed-only fold, so the CLUSTER-WIDE committed-only
+  // v_inv is strictly below V_COMPACTED. This all-nodes under-count is why the oracle's floor must
+  // read the APPLIED state and not the committed log — a committed-only oracle records this stale
+  // floor and passes a stale read. (If even one node still retained the value in its live slice, this
+  // fold would recover it; that is why the fixture drives EVERY node to compact.)
   let committed_only_fold: u64 = c
     .node_ids()
     .into_iter()
@@ -1463,8 +1463,9 @@ fn conf_change_applied_in_fsync_pump_is_recorded() {
     c.total_conf_changed() > 0,
     "the conf-change must commit + apply through the pump (the shared drain counts it)"
   );
-  // The shared drain recorded the applied conf-change as a committed-config transition — pre-fix the pump
-  // dropped `ConfChanged`, leaving this empty while the oracle's watermark still advanced (a stale reference).
+  // The shared drain recorded the applied conf-change as a committed-config transition. A pump that
+  // drops `ConfChanged` leaves this empty while the oracle's watermark still advances — the oracle
+  // would then resolve against a stale reference config.
   assert!(
     !c.view().committed_transitions.is_empty(),
     "the pump must record the applied conf-change in the committed-config transitions (no drain cherry-picks)"

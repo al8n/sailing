@@ -1300,7 +1300,7 @@ fn snapshot_membership_coherent_compacted_kind_at_committed_final_index_is_a_sou
 
 #[test]
 fn snapshot_membership_coherent_un_witnessed_snapshot_boundary_does_not_corroborate() {
-  // STRICT trust (R10 FINDING 1): an UN-independently-witnessed snapshot boundary is NO proof. A ConfChange
+  // STRICT trust: an UN-independently-witnessed snapshot boundary is NO proof. A ConfChange
   // compacted INTO a snapshot at its own index leaves no standalone log entry (committed_log_kind missing), and
   // the snapshot's boundary term is itself unwitnessed — NO committed retained log entry attests it, so
   // snapshot_boundary_coherent would skip it. The resolver must NOT let such a boundary self-corroborate the
@@ -1337,7 +1337,7 @@ fn snapshot_membership_coherent_un_witnessed_snapshot_boundary_does_not_corrobor
 
 #[test]
 fn snapshot_membership_coherent_stale_lower_term_record_is_not_trusted() {
-  // STRICT trust (R10 FINDING 2): a committed-log record at the resolving index with a LOWER term than the
+  // STRICT trust: a committed-log record at the resolving index with a LOWER term than the
   // recorded ConfChange is stale (the higher-term ConfChange superseded it) and is NOT exact-term proof — the
   // transition must NOT be trusted via it. The install is a sound kind-unobservable decline.
   let mut ck = Checker::new();
@@ -1364,7 +1364,7 @@ fn snapshot_membership_coherent_stale_lower_term_record_is_not_trusted() {
 
 #[test]
 fn snapshot_membership_coherent_same_term_non_confchange_tombstones_not_trusts() {
-  // STRICT trust (R10 FINDING 2): a committed-log record at the resolving index that is a non-ConfChange at the
+  // STRICT trust: a committed-log record at the resolving index that is a non-ConfChange at the
   // SAME term as the recorded ConfChange is the committed entry there (committed entries are immutable, so the
   // recorded ConfChange transition is stale) — the config does NOT change at that index ⇒ TOMBSTONE (walk past),
   // NEVER trust the stale ConfChange. The install is then compared against the PRIOR (genesis) config.

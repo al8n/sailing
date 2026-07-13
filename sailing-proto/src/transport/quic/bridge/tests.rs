@@ -208,9 +208,9 @@ fn lost_connection_frees_the_quinn_slab_after_drain() {
   assert_eq!(a.table_len(), 0, "the local entry is reaped with it");
 }
 
-/// FAILS-ON-OLD: under a budget-based pre-auth read (rather than one steered by the first
+/// Under a budget-based pre-auth read (rather than one steered by the first
 /// frame's own length prefix), a peer that pipelines a consensus frame behind a SHORT hello in
-/// one flight would have up to a full hello-budget of tail bytes pulled into the decoder before
+/// one flight gets up to a full hello-budget of tail bytes pulled into the decoder before
 /// validation. Exactly the hello must be readable pre-validation — the tail stays backpressured
 /// in quinn until the connection validates, then arrives on the rescheduled read.
 #[test]
@@ -321,7 +321,7 @@ fn max_declared_preface_closes_at_the_header() {
   assert_eq!(b.take_lost(), Some(hb));
 }
 
-/// FAILS-ON-OLD: without applying the deferred feedback BEFORE the cap check, a reconnect
+/// Without applying the deferred feedback BEFORE the cap check, a reconnect
 /// racing the previous connection's teardown is refused for capacity a QUEUED `Drained` event
 /// has already released. The freed slot must be visible to the very dial that needs it.
 #[test]
@@ -381,7 +381,7 @@ fn reconnect_is_not_refused_while_a_drained_event_holds_the_slot() {
   );
 }
 
-/// FAILS-ON-OLD: quinn reuses slab handles after Drained, so a `lost` entry surviving the
+/// quinn reuses slab handles after Drained, so a `lost` entry surviving the
 /// Drained purge would — once the handle is reused by a NEW connection — make the coordinator's
 /// end-of-drain `reap` unbind the new connection's freshly validated route. The Drained arm must
 /// purge EVERY per-handle queue.
@@ -1023,10 +1023,10 @@ fn next_frame_and_flush_on_absent_handles_are_noops() {
   a.flush_stream(now, bogus);
 }
 
-/// FAILS-ON-OLD: staged bytes with no send stream open must NOT open the stream until the identity
-/// preface has been staged. The preface is frame zero on the send stream, so a consensus frame
-/// queued behind an un-sent preface has to be held back — on the old code the flush opened the
-/// stream and wrote that frame as the stream's first bytes. Once the preface step latches
+/// Staged bytes with no send stream open must NOT open the stream until the identity preface has
+/// been staged. The preface is frame zero on the send stream, so a consensus frame queued behind an
+/// un-sent preface has to be held back — a flush that opens the stream regardless writes that frame
+/// as the stream's FIRST bytes, displacing the preface. Once the preface step latches
 /// `preface_done`, the flush opens the stream and drains the staged bytes.
 #[test]
 fn flush_outbound_gates_the_stream_open_on_the_preface() {
@@ -1197,7 +1197,7 @@ fn take_ready_unique_dedups_first_occurrence_deferred_first() {
   );
 }
 
-/// FAILS-ON-OLD: a pump turn that flushes several progressed streams collects quinn's output with a
+/// A pump turn that flushes several progressed streams collects quinn's output with a
 /// SINGLE whole-table service, deferred to the pump's end — not one whole-table poll per flushed
 /// stream. The service count is independent of whether the progressed flushes land on one ready
 /// stream or many, so one validated connection flushed repeatedly stands in for the ready loop.

@@ -487,8 +487,8 @@ fn duplicate_append_does_not_ack_in_flight_tail() {
 /// unconditional advance, even though no `pending` action survives. A later duplicate's
 /// immediate ack must report 1, proving the watermark advanced.
 ///
-/// MUTATION: revert FIX 2 so the advance lives only inside the `FollowerAck`/`LeaderAppend`
-/// arms. Then the cleared-pending completion hits the `_` arm, `durable_index` stays at 0, and
+/// MUTATION: move the advance back inside the `FollowerAck`/`LeaderAppend`
+/// arms only. Then the cleared-pending completion hits the `_` arm, `durable_index` stays at 0, and
 /// the duplicate clamps to `min(1, 0) = 0` — the assertion (duplicate acks 1) FAILS.
 #[test]
 fn durable_index_advances_after_term_cleared_follower_ack() {
@@ -720,7 +720,8 @@ fn stale_append_entries_does_not_erase_committed_entries() {
   assert_eq!(log.last_index(), Index::new(3), "log must hold 3 entries");
 
   // Now feed a stale/duplicate AppendEntries carrying only entry 1 (a short prefix already
-  // present). Under the old code this would have truncated entries 2 and 3.
+  // present). A blind truncate-to-the-append's-end would delete entries 2 and 3: a matching prefix
+  // is not a conflict, so only a genuinely DIVERGENT entry may truncate.
   let e1_dup = Entry::new(
     Term::new(1),
     Index::new(1),
@@ -1116,9 +1117,9 @@ fn apply_drain_is_budgeted_and_re_driven_to_completion() {
   log.force_append(&entries);
   ep.commit = Index::new(first + n - 1);
 
-  // ONE crank must NOT drain the whole backlog: at most one budget (a HARD bound now the fetch is
-  // capped by the remaining allowance — never budget + a batch), strictly below commit, and it reports
-  // MorePending. (RED at the pre-budget tip: one crank drains everything to commit and reports Drained.)
+  // ONE crank must NOT drain the whole backlog: at most one budget (a HARD bound, since the fetch is
+  // capped by the remaining allowance — never budget + a batch), strictly below commit, and it
+  // reports MorePending. Unbudgeted, one crank drains everything to commit and reports Drained.
   let p1 = ep.handle_storage(d, &mut log, &mut stable);
   let applied1 = ep.applied_index();
   assert!(
@@ -1165,8 +1166,8 @@ fn apply_drain_is_budgeted_and_re_driven_to_completion() {
 /// upper bound is capped by BOTH the read-batch width AND the allowance still unspent, so a
 /// byte-cap-shortened first batch can never let the next fetch pull a full batch PAST the budget. Pinned
 /// directly here: the tiny-entry e2e batch above hits the entry-count cap exactly, so it cannot exercise
-/// the allowance clamp — this is the red-proof vehicle for the hard bound. RED against the un-capped
-/// fetch (which ignored `applied_this_call` and always requested a full `MAX_READ_BATCH_ENTRIES`).
+/// the allowance clamp — only this seam does. An un-capped fetch (one that ignores `applied_this_call`
+/// and always requests a full `MAX_READ_BATCH_ENTRIES`) overshoots the budget by up to a batch.
 #[test]
 fn apply_read_span_caps_each_fetch_by_the_remaining_allowance() {
   use crate::{
@@ -1606,10 +1607,10 @@ fn leader_paces_by_inflight_window() {
 }
 
 /// A SINGLE-entry ack from a peer already in Replicate must NOT
-/// rewind `next_index` or reset the in-flight window. The old code called
-/// `become_replicate()` unconditionally on every successful ack, which rewound
-/// `next_index` to `match.next()` and reset the whole `Inflights` window — so the next
-/// `maybe_send_append` re-sent the already-in-flight tail and the window cap never tripped.
+/// rewind `next_index` or reset the in-flight window. Calling `become_replicate()`
+/// unconditionally on every successful ack rewinds `next_index` to `match.next()` and resets the
+/// whole `Inflights` window — so the next `maybe_send_append` re-sends the already-in-flight tail
+/// and the window cap never trips.
 ///
 /// Setup (window = 2, one entry per message so each send is observable):
 ///   peer 2 in Replicate at match=1, next=2; propose 4 entries (indexes 2..=5).
@@ -1661,7 +1662,8 @@ fn single_ack_does_not_rewind_replicate_window() {
   while ep.poll_event().is_some() {}
 
   // Move peer 2 into Replicate by acking the no-op (index 1). This is the legitimate
-  // Probe -> Replicate transition (must still happen — preserved by the fix).
+  // Probe -> Replicate transition, which must still happen: the guard narrows WHEN the window is
+  // reset, it never suppresses this transition.
   ep.handle_message(
     d,
     &mut log,
@@ -1766,8 +1768,8 @@ fn single_ack_does_not_rewind_replicate_window() {
 
   // (4) The window cap is respected: freeing one slot lets the leader send at most ONE
   //     new entry. It must be a *fresh* entry (index 4), NOT a re-send of the entry that
-  //     is still in flight (index 3). The old code re-sent index 3 because the window was
-  //     reset and next rewound to 3.
+  //     is still in flight (index 3) — which is what a reset window with next rewound to 3
+  //     would produce.
   assert!(
     appends_after <= 1,
     "expected at most one new AppendEntries after freeing one slot, got {appends_after}"
@@ -2027,7 +2029,8 @@ fn divergent_follower_resyncs_fast_via_term_skip() {
 /// is thousands of reject cycles compressed into a single tick, making a run pathologically slow.
 /// (The symptom was a >350s run that the jump cuts to ~20s.)
 ///
-/// Before fix: a `(0,0)` hint took the `conflict == 0` branch and stepped `next_index` back by one.
+/// A `(0,0)` hint takes the `conflict == 0` branch and steps `next_index` back by ONE per round —
+/// the decrement walk this jump exists to replace.
 #[test]
 fn deeply_divergent_follower_jumps_to_one_not_decrement() {
   use crate::{AppendResponse, Entry, EntryKind, Index, Message, Term};
@@ -2284,19 +2287,19 @@ fn append_cap_bounds_zero_byte_entry_suffix() {
   );
 }
 
-// ---- Fix 1 regression: empty appends must NOT consume the inflight window ----
+// ---- Empty appends must NOT consume the inflight window ----
 
 /// A Replicate peer whose `match` is STALE (caught up by `next_index`, but the acks were lost in
 /// transit) triggers an empty AppendEntries on every HeartbeatResponse — the probe whose success
-/// ack refreshes `match`. Before the fix, each call to `sent_entries` added a zero-byte inflight
-/// slot that was never freed (no ack for empty sends), so after `max_inflight_msgs`
-/// heartbeat-responses the window filled and newly proposed entries were silently not delivered.
+/// ack refreshes `match`. An empty send must therefore take NO inflight slot: a zero-byte slot is
+/// never freed (an empty send draws no ack), so after `max_inflight_msgs` heartbeat-responses the
+/// window fills and newly proposed entries are silently not delivered.
 ///
 /// (This regression originally drove the empty probe through a fully CAUGHT-UP peer — `match ==
 /// last_index` — but such a responder no longer draws any append at all: the heartbeat-response
 /// pump is gated on the responder being behind or probing. The stale-`match` shape here is the one
-/// that still legitimately elicits per-response empty appends, so it is the one that keeps this
-/// pin FAILS-ON-OLD for the recording guard.)
+/// that still legitimately elicits per-response empty appends, so it is the only shape that can
+/// still exercise the recording guard.)
 ///
 /// This test uses a small window (4 slots), delivers many HeartbeatResponses (more than 4),
 /// then proposes a new entry and asserts that an AppendEntries carrying it IS emitted.
@@ -2756,7 +2759,8 @@ fn lagging_follower_hint_is_two_sided() {
   };
   assert!(ar.reject(), "follower must reject (prev=20 > last=2)");
   // Two-sided hint: hint_index_raw=min(20,2)=2; find_conflict_by_term(log, 2, ceiling=1):
-  // term(2)=1 ≤ 1 → stop → hint_index=2, hint_term=1 (NOT Term::ZERO as in the old code).
+  // term(2)=1 ≤ 1 → stop → hint_index=2, hint_term=1. The hint term must be the REAL term at the
+  // hint index, never Term::ZERO — a zero term forfeits the two-sided walk (see below).
   assert_eq!(
     ar.reject_hint_index(),
     Index::new(2),
@@ -2854,8 +2858,8 @@ fn lagging_follower_hint_is_two_sided() {
   );
 
   // The leader must send AppendEntries with prev_log_index ≤ 2 (next_index ≤ 3).
-  // If the old code were used with hint=(2, 0), it would fall back to cur_next-1 = 20
-  // (because find_conflict_by_term walks to 0 with ceiling=0 → safe_next = cur_next-1).
+  // A hint of (2, 0) instead falls back to cur_next-1 = 20 (find_conflict_by_term walks to 0 with
+  // ceiling=0 → safe_next = cur_next-1) — one index per round-trip instead of one jump.
   let mut found_low_prev = false;
   while let Some(out) = leader.poll_message() {
     if out.to() == 2u64
@@ -3247,8 +3251,8 @@ fn commit_persist_is_fenced_by_durable_index() {
 /// r.Term` MsgAppResp branch; only fires when CheckQuorum or PreVote is enabled (plain Raft relies
 /// on the disruptive higher-term campaign instead).
 ///
-/// Before fix: the stale-term branch silently `return`ed for every non-pre-vote message, so NO
-/// response was sent and the lower-term leader never learned it was stale — a permanent livelock.
+/// A stale-term branch that silently `return`s for every non-pre-vote message sends NO
+/// response, so the lower-term leader never learns it is stale — a permanent livelock.
 #[test]
 fn stale_term_heartbeat_forces_leader_step_down() {
   use crate::{Config, Index, Instant, Message, Term};

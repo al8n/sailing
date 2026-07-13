@@ -870,7 +870,7 @@ fn transfer_aborted_when_transferee_removed_by_conf_change() {
 /// NOT start the disruptive, lease-bypassing forced campaign — while one from the real leader still
 /// triggers it.
 ///
-/// FAILS-ON-OLD: without the `self.leader != Some(tn.leader())` guard, the non-leader `TimeoutNow`
+/// Without the `self.leader != Some(tn.leader())` guard, the non-leader `TimeoutNow`
 /// makes the node a real Candidate at a bumped term (a wrong peer disrupting the cluster).
 #[test]
 fn timeout_now_is_authenticated_against_current_leader() {
@@ -1049,7 +1049,7 @@ fn transfer_refuses_retarget_while_handoff_pending() {
   ep.transfer_leader(Instant::ORIGIN, &log, &stable, 2u64)
     .expect("re-targeting the same node is idempotent Ok");
 
-  // A DIFFERENT target while the handoff is pending is refused (this is the fix).
+  // A DIFFERENT target while the handoff is pending is refused.
   let err = ep
     .transfer_leader(Instant::ORIGIN, &log, &stable, 3u64)
     .unwrap_err();

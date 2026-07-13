@@ -319,8 +319,8 @@ fn demuxes_two_groups_over_one_connection() {
 /// A quiesced connection whose peer goes SILENT (a blackhole — socket alive, bytes dropped) is
 /// reaped through the transport-timeout seam: past the idle timeout `transport_timeout` surfaces the
 /// silence deadline and `handle_transport_timeout` closes the connection — the loss the driver turns
-/// into a wake-all → election. Pre-fix a validated connection surfaced no transport deadline and was
-/// never reaped, so a quiesced plane that sends nothing would never produce that wake.
+/// into a wake-all → election. A validated connection that surfaces no transport deadline is never
+/// reaped, so a quiesced plane that sends nothing would never produce that wake.
 #[test]
 fn a_silent_quiesced_connection_is_reaped_through_the_transport_timeout() {
   let mut w = World::new(&[100], &[100]);
@@ -2142,9 +2142,9 @@ fn settle_engine(c: &mut SplitCoord, e: &mut GroupEngine<u64, u64>, gids: &[u64]
 /// The restore-overwrite regression, end to end over ONE engine (the disk): a fork
 /// materializes and goes flush-durable, the child accrues post-fork progress, the host
 /// crashes, and the PARENT ALONE is restored — its un-compacted split entry replays and
-/// re-stages the fork. Pre-fix, the parent's own snapshot meta was the guard's ONLY seed
-/// (zero here: the parent never snapshotted), so the drain re-materialized the fork and the
-/// manufactured baseline overwrote the child's real durable progress (stores collapsed to the
+/// re-stages the fork. Seeding the guard from the parent's own snapshot meta ALONE
+/// (zero here: the parent never snapshotted) lets the drain re-materialize the fork, and the
+/// manufactured baseline overwrites the child's real durable progress (stores collapse to the
 /// baseline: last_index 4 -> 1, units 4 -> 2). Both independent stops are pinned: the restore
 /// arm seeds the relay guard from the DURABLE engine lineage (the replayed fork folds to a
 /// resolved no-op), and — with that seed bypassed through a lineage-blind floor store — the
@@ -2322,7 +2322,7 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
   }
   drop(c2);
 
-  // Leg 1, the fix proper: the restore arm consumes the DURABLE engine lineage (the driver's
+  // Leg 1: the restore arm consumes the DURABLE engine lineage (the driver's
   // pre-call floor snapshot), so the guard already covers the replayed fork and it folds to a
   // resolved no-op — nothing is relayed at all.
   struct Snapshot {
@@ -2408,8 +2408,8 @@ fn restored_parent_replay_never_overwrites_the_childs_durable_progress() {
 /// create, restore, fork — refuses the child id with the typed verdict, and the factory-gate
 /// predicate reads true; the reservation releases exactly when the relay yields the fork to
 /// the driver, which is why the fork's OWN materialization passes the very gate that refused
-/// everyone else; thereafter the id refuses as plain `Exists`. Pre-fix, every one of these
-/// admissions succeeded — planting the squatter whose conflict the relay must then park around.
+/// everyone else; thereafter the id refuses as plain `Exists`. Without the reservation every one of
+/// these admissions succeeds — planting the squatter whose conflict the relay must then park around.
 #[test]
 fn admission_refuses_an_in_flight_splits_child_id() {
   let now = Instant::ORIGIN;

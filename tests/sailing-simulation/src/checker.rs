@@ -921,12 +921,12 @@ pub fn commit_is_quorum_durable(view: &ClusterView, commit_floor: u64) -> Result
 /// invariant: a node's in-memory `commit` must be `>=` the committed prefix it durably persisted —
 /// concretely, `commit >= min(durable HardState.commit, durable last_index)`.
 ///
-/// # Why this catches the commit-persistence bug
+/// # Why this catches a commit-persistence regression
 ///
 /// The durable `HardState.commit` is precisely the committed-prefix length the node had
-/// **acknowledged and persisted** before any crash. The bug was that `restart` rebuilt an
+/// **acknowledged and persisted** before any crash. A `restart` that rebuilds an
 /// empty / snapshot-only state machine — recovering `commit = 0` — *despite* a durable
-/// `HardState.commit > 0` and a durable log covering it. That trips this oracle the instant the
+/// `HardState.commit > 0` and a durable log covering it trips this oracle the instant the
 /// restarted node is observed: `commit (=0) < min(hs.commit, durable_last) (= hs.commit > 0)`.
 ///
 /// # Why it never false-positives

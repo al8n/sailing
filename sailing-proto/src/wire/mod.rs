@@ -23,7 +23,7 @@
 //! fields are skipped (forward compatibility), and buffa enforces the structural
 //! bounds (length-before-allocation, overlong-varint rejection, recursion depth,
 //! bounded skips). Sailing's stricter, semantic validation lives in the conversions
-//! here, where the old codec's guarantees are preserved:
+//! here, which preserve these guarantees:
 //!
 //! - an id field must be 1..=1024 bytes (the hello's bound) and must decode consuming
 //!   EXACTLY its length ([`Data::decode_exact`]);

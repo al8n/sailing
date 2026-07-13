@@ -1113,7 +1113,7 @@ fn frozen_source_captures_no_snapshot() {
 /// `maybe_snapshot` refuses while the obligation is outstanding; the fence lifts once the service
 /// discharges it (the source observed thawed, modeled here by `clear_abandoned`).
 ///
-/// RED without the fence: the capture below lands, compaction erases the abort entry, and a later
+/// Without the fence the capture below lands, compaction erases the abort entry, and a later
 /// restart re-derives no `abandoned` — the frozen-source wedge.
 #[test]
 fn outstanding_abort_relay_captures_no_snapshot() {
@@ -1231,7 +1231,7 @@ fn restart_re_derives_the_abort_relay() {
 /// on a boundary the install already crossed — a permanent target-capture wedge with the abort entry
 /// gone.
 ///
-/// RED without the clear: after the install `abandoned` stays set with its entry compacted, so a
+/// Without the clear, after the install `abandoned` stays set with its entry compacted, so a
 /// LATER `maybe_snapshot` is fenced forever and never captures.
 #[test]
 fn snapshot_install_retires_the_covered_abort_relay() {
@@ -1307,16 +1307,17 @@ fn snapshot_install_retires_the_covered_abort_relay() {
   );
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
   assert_eq!(ep.applied_index(), Index::new(5), "the install landed");
-  // GREEN: the boundary (5 >= abort_index 2) cleared the obligation — the fence lifts for every later
-  // boundary. RED (no clear): the obligation is stranded with its entry compacted, so this stays true.
+  // The boundary (5 >= abort_index 2) cleared the obligation — the fence lifts for every later
+  // boundary. Without the clear the obligation is stranded with its entry compacted, and the fence
+  // stays raised forever.
   assert!(
     !ep.abort_relay_fences(Index::new(1_000)),
     "the covering install cleared the obligation — the fence lifts"
   );
 
   // END TO END: the fence really is gone — a LATER maybe_snapshot captures. Append and apply two
-  // entries ABOVE the boundary (threshold 1), then a storage crank captures. RED: still fenced, so
-  // maybe_snapshot refuses and no snapshot is ever written.
+  // entries ABOVE the boundary (threshold 1), then a storage crank captures. Were it still fenced,
+  // maybe_snapshot would refuse and no snapshot would ever be written.
   ep.handle_message(
     Instant::ORIGIN,
     &mut log,
@@ -1891,7 +1892,7 @@ fn make_parked_target_with_pending_abort()
 /// wedging the source frozen forever. The absorb capture shares `maybe_snapshot`'s abort fence via
 /// `abort_relay_fences`, so `absorb_capture_blocked` holds the park until the obligation discharges.
 ///
-/// RED without the leg: `absorb_capture_blocked` returns false, the container's resolve arm captures,
+/// Without the leg `absorb_capture_blocked` returns false, the container's resolve arm captures,
 /// and the deferred compaction moves `first_index` PAST the abort entry with the obligation live —
 /// the entry (its only restart re-derivation) is gone and the park is consumed.
 #[test]
@@ -1907,10 +1908,10 @@ fn outstanding_abort_relay_blocks_the_forced_absorb_capture() {
     assert!(ep.capture_absorb_snapshot(&log, &mut stable));
   }
   ep.handle_storage(Instant::ORIGIN, &mut log, &mut stable);
-  // GREEN: the fence held the park, nothing compacted — the abort entry is RETAINED, so a
-  // crash-restart re-derives `abandoned` (see `restart_re_derives_the_abort_relay`) and the source
-  // stays thawable. RED (no leg): the arm resolved+captured and the deferred compaction crossed
-  // `abort_at`, erasing the obligation's only restart source and consuming the park.
+  // The fence held the park, nothing compacted — the abort entry is RETAINED, so a crash-restart
+  // re-derives `abandoned` (see `restart_re_derives_the_abort_relay`) and the source stays thawable.
+  // Without the leg the arm resolves+captures and the deferred compaction crosses `abort_at`,
+  // erasing the obligation's only restart source and consuming the park.
   assert!(
     log.first_index() <= abort_at,
     "the abort entry must survive: an absorb capture past it erases the obligation's restart source"
@@ -2037,9 +2038,9 @@ fn snapshot_install_supersedes_a_parked_commit_merge() {
 /// partitioned, and installs a boundary past the thaw must derive NOT-frozen, exactly as a plain
 /// restart from the same durable state would (install and restart must agree).
 ///
-/// RED before the fix: the install leaves `frozen`/`frozen_for`/`freeze_index` set, so the replica
-/// stays frozen forever — captures freeze-fenced, proposes/reads/transfers refused if elected, its
-/// stale claim blocking the claimed target's removal.
+/// Clearing only the append-observed pending flag leaves `frozen`/`frozen_for`/`freeze_index` set,
+/// so the replica stays frozen forever — captures freeze-fenced, proposes/reads/transfers refused if
+/// elected, its stale claim blocking the claimed target's removal.
 #[test]
 fn snapshot_install_clears_an_applied_freeze() {
   use crate::{InstallSnapshot, SnapshotMeta, conf::ConfState};

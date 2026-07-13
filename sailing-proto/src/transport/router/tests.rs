@@ -471,8 +471,8 @@ fn a_dialed_conn_reaching_the_wrong_peer_is_rejected() {
 
 /// The duplicate-peer tie-break keeps the connection DIALED BY the LOWER id. Here the local node
 /// (id 1) is the lower, so its DIAL to peer 2 survives even when a later ACCEPT from peer 2 binds.
-/// Pre-fix the bare newer-id rule kept the later ACCEPT — a choice the two ends do not compute
-/// alike, so a simultaneous mutual dial could keep the sockets the other side closed and lose both.
+/// A bare newer-id rule keeps the later ACCEPT instead — a choice the two ends do not compute
+/// alike, so a simultaneous mutual dial can keep the sockets the other side closed and lose both.
 /// This is the local half of that symmetric decision; the two-node mutual dial is exercised e2e by
 /// the driver loopback suites.
 #[test]

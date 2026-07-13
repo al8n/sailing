@@ -655,8 +655,8 @@ fn poll_timeout_only_surfaces_serviceable_deadlines() {
 /// revived only by an external `restart`, never by a timer (a poisoned, already-removed voter that
 /// froze the simulated clock would starve every election).
 ///
-/// Before fix: `serviceable_now` ignored `poisoned`, so a poisoned voter's election timer was
-/// surfaced and `poll_timeout` returned `Some`.
+/// A `serviceable_now` that ignores `poisoned` surfaces a poisoned voter's election timer, so
+/// `poll_timeout` returns `Some`.
 #[test]
 fn poisoned_node_surfaces_no_timer() {
   use core::time::Duration;
@@ -829,9 +829,9 @@ fn handle_timeout_makes_progress_no_wedge() {
 /// `Err` must POISON the node with `PoisonReason::Apply` — not silently stall apply — and the
 /// poisoned node must be inert (all `handle_*` are no-ops).
 ///
-/// FAILS-ON-OLD: with the bare `break` (no `self.poison()`), `is_poisoned()` stays `false`,
-/// `applied` stays stuck behind `commit`, and the node keeps serving — so all three asserts
-/// (poisoned, reason, inertness) fail.
+/// With a bare `break` (no `self.poison()`), `is_poisoned()` stays `false`,
+/// `applied` stays stuck behind `commit`, and the node keeps serving — poisoned, reason and
+/// inertness all violated at once.
 #[test]
 fn failing_fsm_apply_poisons_node() {
   use crate::{AppendEntries, Index, Message, Term};
@@ -923,7 +923,7 @@ fn failing_fsm_apply_poisons_node() {
 /// Regression: a committed Normal entry whose `data` does NOT decode as the
 /// SM's `Command` must POISON the node with `PoisonReason::NormalEntryDecode`.
 ///
-/// FAILS-ON-OLD: with the bare `break` the decode error silently stalls apply —
+/// With a bare `break` the decode error silently stalls apply —
 /// `is_poisoned()` stays `false` and `applied` is stuck behind `commit`.
 #[test]
 fn corrupt_normal_entry_poisons_node() {
@@ -1083,7 +1083,7 @@ fn timer_kind_as_str_covers_all_variants() {
 /// over a durable-but-undecodable `Normal` entry; `apply_committed` poisons (`NormalEntryDecode`)
 /// and the handler would otherwise still queue a `HeartbeatResponse` to the leader.
 ///
-/// FAILS-ON-OLD: without the `send` guard the poisoned follower still replies a `HeartbeatResponse`,
+/// Without the `send` guard the poisoned follower still replies a `HeartbeatResponse`,
 /// acking a heartbeat it can no longer honor.
 #[test]
 fn poison_after_apply_emits_nothing() {
@@ -1147,11 +1147,11 @@ fn poison_after_apply_emits_nothing() {
 /// Follower side: a fatal term-read inside `find_conflict_by_term` during an AppendEntries
 /// reject walk must short-circuit — the node poisons and sends NO reject `AppendResponse`.
 ///
-/// On the follower path the no-send guarantee is enforced jointly by FIX 1 (propagate `None`) and
-/// the pre-existing `hint_term` guard (the index `find_conflict_by_term` fails on is the same index
-/// the follower would re-read for `hint_term`, which fails again). This test locks in the
-/// end-to-end behavior; the leader-side sibling test is the one that isolates FIX 1's
-/// progress-mutation short-circuit.
+/// On the follower path the no-send guarantee is enforced jointly by the `None` propagation out of
+/// `find_conflict_by_term` and the `hint_term` guard (the index `find_conflict_by_term` fails on is
+/// the same index the follower would re-read for `hint_term`, which fails again). This test locks in
+/// the end-to-end behavior; the leader-side sibling test isolates the progress-mutation
+/// short-circuit on its own.
 #[test]
 fn find_conflict_by_term_poison_propagation_follower() {
   use crate::{AppendEntries, Config, Entry, EntryKind, Index, Instant, Message, Term};
@@ -1227,7 +1227,7 @@ fn find_conflict_by_term_poison_propagation_follower() {
 /// triggers a fatal term-read mid-`on_append_entries` and poisons — those already-queued votes must
 /// be SUPPRESSED at the egress, not leak from a dead node.
 ///
-/// FAILS-ON-OLD: with the `if self.poisoned { return None; }` guard removed from `poll_message`, a
+/// With the `if self.poisoned { return None; }` guard removed from `poll_message`, a
 /// queued `RequestVote` leaks and the `is_none()` assertion below fires.
 #[test]
 fn queued_message_is_suppressed_after_later_dispatch_poisons() {
@@ -1333,7 +1333,7 @@ fn queued_message_is_suppressed_after_later_dispatch_poisons() {
 /// (not silently `Ok` or `NotLeader`), and — because every durability submit routes through the
 /// `submit_*` no-op-when-poisoned wrappers — none of them may advance the durable log.
 ///
-/// FAILS-ON-OLD: with the `if self.poisoned { return Err(ProposeError::Poisoned); }` guard
+/// With the `if self.poisoned { return Err(ProposeError::Poisoned); }` guard
 /// removed from `propose`, a poisoned leader's `propose` returns `Ok`/`NotLeader` instead.
 #[test]
 fn poisoned_node_rejects_work_and_persists_nothing() {

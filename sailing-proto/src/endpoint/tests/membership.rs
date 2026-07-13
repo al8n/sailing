@@ -253,10 +253,10 @@ fn non_leader_conf_change_is_refused() {
 /// becomes leader. Its log contains an uncommitted ConfChange at index 2 (the inherited tail).
 /// The one-in-flight guard must fire and refuse a second ConfChange proposal.
 ///
-/// On the OLD code (before the fix): `pending_conf_index` was ZERO on a fresh leader, so
-/// `ZERO > applied` is false and the second ConfChange was wrongly accepted → Ok(_).
-/// On the FIXED code: `become_leader` sets `pending_conf_index = last_index` (= 2), so
-/// `2 > applied(0)` is true → Err(ConfChangeInFlight).
+/// The guard rides `pending_conf_index`, which a fresh leader must SEED from its inherited tail:
+/// `become_leader` sets `pending_conf_index = last_index` (= 2), so `2 > applied(0)` is true →
+/// Err(ConfChangeInFlight). Left at ZERO, `ZERO > applied` is false and the second ConfChange is
+/// wrongly accepted → Ok(_), putting two conf changes in flight at once.
 #[test]
 fn inherited_uncommitted_conf_change_blocks_new_proposal() {
   use crate::{
@@ -573,8 +573,8 @@ fn leader_steps_down_on_demotion_to_learner() {
 /// `election_deadline = None` and never start an election — a cluster whose voters were ALL
 /// promoted learners would wedge leaderless.
 ///
-/// Before fix: `apply_committed` updated the tracker on promotion but never armed the timer, so
-/// `election_deadline` stayed `None` and `is_some()` below was false.
+/// An `apply_committed` that updates the tracker on promotion but never arms the timer leaves
+/// `election_deadline` at `None`, and `is_some()` below is false.
 #[test]
 fn promoted_learner_arms_election_timer() {
   use crate::{ConfChange, ConfChangeType, Entry, EntryKind, Instant, Term};
@@ -1430,7 +1430,7 @@ fn remove3_payload() -> bytes::Bytes {
 
 /// The ack-in-flight removed voter learns via the farewell APPEND: node 3 HOLDS the conf entry
 /// (its ack simply never reached the leader before node 2's completed the quorum), so at the fold
-/// `match[3] = 1 < idx` and the old clamped farewell Heartbeat (`min(commit, match) = 1`) left it
+/// `match[3] = 1 < idx` and a clamped farewell Heartbeat (`min(commit, match) = 1`) leaves it
 /// IGNORANT — with pre-vote/check-quorum off (the defaults) its election timer then fires a REAL
 /// higher-term campaign whose up-to-date log wins, briefly deposing the live leader before it
 /// commits its own removal. The farewell AppendEntries closes that window: `prev = match` is the

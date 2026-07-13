@@ -186,7 +186,7 @@ fn follower_grants_then_rejects_second_candidate() {
 /// the append completes it hits the `_` arm (role no longer leader), but it still became
 /// durable, so `durable_index` must advance via the unconditional advance.
 ///
-/// MUTATION: revert FIX 2 so the advance is only in the arms. Then the post-step-down
+/// MUTATION: move the advance back into the arms only. Then the post-step-down
 /// completion hits `_`, `durable_index` stays at the pre-append value, and the assertion FAILS.
 #[test]
 fn durable_index_advances_after_same_term_leader_step_down() {
@@ -443,9 +443,9 @@ fn quorum_from_peer_vote_waits_for_durable_self_vote() {
 }
 
 /// Regression: A vote grant for term N must NOT be emitted when storage drains
-/// if the node has since advanced to a higher term. Without the fix two grants would be
-/// emitted — one to candidate 1 (term 5, stale) and one to candidate 3 (term 6) — both
-/// stamped term 6, giving two leaders.
+/// if the node has since advanced to a higher term. Ungated, TWO grants are emitted — one to
+/// candidate 1 (term 5, stale) and one to candidate 3 (term 6) — both stamped term 6, giving two
+/// leaders in one term.
 #[test]
 fn deferred_vote_does_not_leak_across_term_bump() {
   use crate::{Config, Index, Instant, Message, RequestVote, Term};
@@ -599,8 +599,8 @@ fn non_voter_does_not_campaign_on_timeout() {
 /// higher-term RESPONSE (VoteResponse / AppendResponse — whose handler returns early without arming) would
 /// otherwise leave it a voter Follower that can NEVER campaign, wedging the cluster leaderless.
 ///
-/// Before fix: the term pre-pass step-down never armed the timer, so a leader stepping down on a
-/// higher-term VoteResponse kept `election_deadline = None`.
+/// A term pre-pass step-down that never arms the timer leaves a leader stepping down on a
+/// higher-term VoteResponse with `election_deadline = None` — it can never campaign again.
 #[test]
 fn step_down_on_higher_term_arms_voter_election_timer() {
   use crate::{Message, Term, VoteResponse};
@@ -764,8 +764,9 @@ fn pre_vote_reject_at_higher_term_is_adopted() {
   );
 
   // It must adopt the higher real term and step down — so its NEXT election pre-votes for term 6,
-  // high enough to clear the peer's term-5 ballot and finally win. Before the fix it stayed at term
-  // 0, re-proposing term 1 the peer rejects forever.
+  // high enough to clear the peer's term-5 ballot and finally win. A node that ignores the term
+  // carried on a pre-vote REJECT stays at term 0, re-proposing term 1 the peer rejects forever —
+  // the 2-voter livelock.
   assert_eq!(
     ep.term(),
     higher,
@@ -1170,9 +1171,10 @@ fn term_pre_pass_exemption_for_pre_vote_request() {
 ///
 /// No durable state is touched (pre-vote path).
 ///
-/// Before fix: the `voted_for.is_none()` disjunct in the old `term_ok` incorrectly
-/// GRANTED this stale pre-vote (reject: false). The fix adds `rv.term() >= self.term` as
-/// a required conjunct so a stale advertised term is rejected regardless of voted_for.
+/// `rv.term() >= self.term` is a REQUIRED conjunct of `term_ok`, never an alternative to it: a
+/// `voted_for.is_none()` disjunct on its own GRANTS this stale pre-vote (reject: false), since an
+/// unvoted node would then accept any advertised term. A stale term is rejected regardless of
+/// `voted_for`.
 #[test]
 fn stale_term_pre_vote_is_rejected() {
   use crate::{Config, Index, Instant, Message, RequestVote, Term};
@@ -1704,12 +1706,12 @@ fn election_time_last_log_failure_poisons_without_self_vote() {
 /// reject must short-circuit — the leader must NOT mutate the peer's progress (no `next_index`
 /// rewind, no Replicate→Probe flip) and must NOT send a follow-on AppendEntries.
 ///
-/// FAILS-ON-OLD: the old `-> Index` return handed back a fabricated conflict index, so the leader
-/// computed `safe_next` (= `min(rejected_prev, conflict+1)`), called `become_probe()` +
-/// `set_next_index()`, and `maybe_send_append` on a poisoned node. The peer here is driven to
-/// Replicate at next_index=4 first, with the failure armed at the walk's FIRST probe (index 4): the
-/// old path would rewind next to 3 and flip the state to Probe — both OBSERVABLE — whereas the fix
-/// leaves the full `PeerProgress` untouched.
+/// The read failure must SIGNAL, never fold into a value: an `-> Index` return hands back a
+/// fabricated conflict index, so the leader computes `safe_next` (= `min(rejected_prev,
+/// conflict+1)`), calls `become_probe()` + `set_next_index()`, and `maybe_send_append` on a poisoned
+/// node. The peer here is driven to Replicate at next_index=4 first, with the failure armed at the
+/// walk's FIRST probe (index 4), so such a path rewinds next to 3 and flips the state to Probe —
+/// both OBSERVABLE. The full `PeerProgress` must be left untouched.
 #[test]
 fn find_conflict_by_term_poison_propagation_leader() {
   use crate::{
@@ -1847,7 +1849,7 @@ fn find_conflict_by_term_poison_propagation_leader() {
 /// dropped — so a single hostile peer cannot forge a second node's grant to push a candidate
 /// over quorum. The legitimate grant (payload from = 2, transport from = 2) then elects it.
 ///
-/// FAILS-ON-OLD: with the `if msg.from() != from { return; }` choke-point removed, the spoofed
+/// With the `if msg.from() != from { return; }` choke-point removed, the spoofed
 /// grant from peer 3 is tallied as node 2's vote, reaching quorum and electing the candidate
 /// before the legitimate grant ever arrives.
 #[test]

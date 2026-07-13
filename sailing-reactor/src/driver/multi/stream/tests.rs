@@ -639,7 +639,7 @@ async fn a_merge_teardown_drop_panic_fail_stops_the_absorbing_target() {
 /// `run_queries` before reaching the poison gate. That suppression is a PROTO property; this gate is
 /// the driver's own, and this test pins it independently of the proto's.)
 ///
-/// RED without the poison gate: the confirmed query is served `Ok(&fsm)` against the absorbed union
+/// Without the poison gate the confirmed query is served `Ok(&fsm)` against the absorbed union
 /// (`observed` = the merged total) instead of completing `Poisoned`.
 #[tokio::test]
 async fn a_fail_stopped_merge_target_never_serves_its_confirmed_parked_query() {

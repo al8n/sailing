@@ -1402,8 +1402,8 @@ mod tests {
 
   #[test]
   fn a_normal_fail_all_does_not_latch_a_panic() {
-    // The regression guard: a WELL-BEHAVED sweep (every completion `Delivered`) must NOT latch — a
-    // superseded group is not a poisoned one, and the fix must not over-fail-stop.
+    // The no-over-reach bound: a WELL-BEHAVED sweep (every completion `Delivered`) must NOT latch —
+    // a superseded group is not a poisoned one, so the latch must never fail-stop it.
     let (mut r, _rx) = routing();
     let b = InflightBudget::new(8, 8);
     let ctx = r.mint_query_ctx();

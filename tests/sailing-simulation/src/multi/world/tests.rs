@@ -1984,14 +1984,13 @@ fn colocate_source_onto_target(w: &mut MultiWorld, source: u64, target: u64) {
 }
 
 /// A claimed merge target cannot itself freeze as a SOURCE — the world form of the stranding
-/// class the freeze-teeth's first run caught (seed 0): S (10) froze claiming T (11); nothing
-/// refused T source-role, so T froze into T2 (12), was absorbed away, and S's release verbs —
-/// `commit_merge` and `rollback_merge` both ride T's retired log — returned `None` forever: S
-/// stranded frozen with no release valve. GREEN: the gate refuses T's freeze TYPED while S's
-/// claim stands (deterministic on the colocated leader, applied or append-pending); S's own
-/// choreography then resolves normally, T merges onward freely, and no replica is frozen at the
-/// end. RED without the gate (stash the `SourceClaimedAsTarget` hunk): the refusal assert sees
-/// `Ok` — T's freeze admits and the run strands S exactly as seed 0 did.
+/// class: S (10) freezes claiming T (11); with nothing refusing T source-role, T freezes into T2
+/// (12), is absorbed away, and S's release verbs — `commit_merge` and `rollback_merge` both ride
+/// T's retired log — return `None` forever: S stranded frozen with no release valve. The gate
+/// refuses T's freeze TYPED while S's claim stands (deterministic on the colocated leader, applied
+/// or append-pending); S's own choreography then resolves normally, T merges onward freely, and no
+/// replica is frozen at the end. Without the `SourceClaimedAsTarget` refusal T's freeze admits and
+/// the run strands S.
 #[test]
 fn a_claimed_merge_target_cannot_freeze_as_a_source() {
   let mut w = MultiWorld::new(13);
@@ -2078,9 +2077,9 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
 
 /// A 2-CYCLE IS UNCONSTRUCTIBLE. The direction rule refuses the wrong-direction claim at propose
 /// (`DirectionInverted`), so two equal-voter groups can never both freeze claiming EACH OTHER — the
-/// mutual-`AlreadyFrozen` deadlock (every release valve wedged) this batch closed. The verdict is a
+/// mutual-`AlreadyFrozen` deadlock in which every release valve is wedged. The verdict is a
 /// constant of the id pair, decided locally with no network round, so it holds under any concurrent
-/// admission pressure. RED (stash the direction hunk): both freezes admit and each group is frozen
+/// admission pressure. Without the direction rule both freezes admit and each group is frozen
 /// claiming the other, with no valve to release either.
 #[test]
 fn no_two_cycle_can_form_under_concurrent_admission() {
@@ -2434,11 +2433,11 @@ fn choreography_participants_read_active_until_resolution() {
 /// The departed sweep respects an active merge choreography. A virgin non-member wired onto a
 /// merge participant has no applied membership — the product refuses its conf change for the whole
 /// window (a frozen source, a parked target) — so the ungated sweep would PARK it after the grace,
-/// sub-quorum-ing the participant into a freeze wedge. The sweep now reads `merge_choreography_active`
+/// sub-quorum-ing the participant into a freeze wedge. The sweep reads `merge_choreography_active`
 /// (true across this whole window) and ZEROES the absent-streak instead: the harness keeps a
-/// choreography's participants in place until it resolves — the same embedder contract the already-gated
+/// choreography's participants in place until it resolves — the same embedder contract the gated
 /// grow draw honors when it skips the observer-wire, extended to the sweep for a replica wired before
-/// the freeze. RED (drop the `|| choreography_active` guard in the sweep): the virgin crosses the grace
+/// the freeze. Without the `|| choreography_active` guard in the sweep the virgin crosses the grace
 /// and parks.
 #[test]
 fn a_virgin_non_member_on_a_frozen_participant_is_spared_by_the_sweep() {
@@ -2579,13 +2578,13 @@ fn freeze_pending_led_on_node2(seed: u64) -> MultiWorld {
   w
 }
 
-/// The seed-0 compacting-band survivor: a transient read fault fires on a co-hosted freeze-pending
-/// source's log while a claim-free bystander is torn down, so the container's `Claimed` scan fails
-/// CLOSED (correct product conservatism). PRE-FIX the world's `.expect` reads that as a teardown
-/// failure and panics; POST-FIX the world reads its own teardown scan FAULT-FREE, so the removal
-/// lands ATOMICALLY despite the armed fault — never a partial teardown that would drop committed
-/// voters' durable logs and strand the survivors below quorum. The fault-free scan proves no claim
-/// on the bystander (source 11 names target 10, not 100).
+/// A transient read fault fires on a co-hosted freeze-pending source's log while a claim-free
+/// bystander is torn down, so the container's `Claimed` scan fails CLOSED (correct product
+/// conservatism). The WORLD must read its OWN teardown scan FAULT-FREE: a harness that lets the
+/// armed fault reach that scan takes the closed verdict for a teardown failure and panics in its
+/// `.expect`. Reading it fault-free, the removal lands ATOMICALLY despite the armed fault — never a
+/// partial teardown that would drop committed voters' durable logs and strand the survivors below
+/// quorum. The scan proves no claim on the bystander (source 11 names target 10, not 100).
 #[test]
 fn a_claim_free_teardown_reads_fault_free_and_lands() {
   let mut w = freeze_pending_beside_bystander(13);
@@ -2597,7 +2596,8 @@ fn a_claim_free_teardown_reads_fault_free_and_lands() {
     .get_mut(&(0, 11))
     .expect("source 11 log on node 0")
     .set_faults(armed, 0xF);
-  // PRE-FIX: this panics inside the container-removal `.expect` when the armed scan fails closed.
+  // A harness whose teardown scan is itself subject to the armed fault panics inside the
+  // container-removal `.expect` when that scan fails closed.
   assert!(
     w.remove_group(100),
     "the removal lands atomically — the fault-free scan admits the claim-free teardown"

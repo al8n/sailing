@@ -162,8 +162,8 @@ fn restart_recovers_commit_persisted_via_real_path() {
   while ep.poll_message().is_some() {}
   while ep.poll_event().is_some() {}
 
-  // Propose N Normal entries through the real path; drain storage after each so it commits
-  // and applies (and, with the fix, persists the advanced commit watermark). The command
+  // Propose N Normal entries through the real path; drain storage after each so it commits,
+  // applies, and persists the advanced commit watermark. The command
   // bytes are irrelevant to CountSm (it just counts applies); use fixed distinct payloads.
   let cmds: [&[u8]; 4] = [b"c0", b"c1", b"c2", b"c3"];
   const N: usize = 4;
@@ -182,7 +182,7 @@ fn restart_recovers_commit_persisted_via_real_path() {
     N,
     "live leader must have applied all N proposed entries"
   );
-  // The durable HardState.commit must now reflect the advanced watermark (the fix). The log
+  // The durable HardState.commit must reflect the advanced watermark. The log
   // holds the no-op at index 1 plus N Normal entries, so commit == N + 1.
   let expected_commit = Index::new(N as u64 + 1);
   assert_eq!(
@@ -538,7 +538,7 @@ fn restart_restores_snapshot_no_tail() {
 /// Drives the REAL commit-persist path (a live single-node leader) instead of
 /// `force_state`-injecting the durable commit. This makes the no-snapshot restart
 /// suite genuinely exercise the handle_storage commit-watermark write: the live leader's
-/// `commit` reaches HardState only because of the fix, and the restart reads it back.
+/// `commit` reaches HardState only through that write, and the restart reads it back.
 #[test]
 fn restart_no_snapshot_replays_from_one() {
   use crate::{Config, Index, Instant};
@@ -1086,7 +1086,7 @@ fn restart_local_snapshot_compaction_window_preserves_tail() {
 /// Regression (a fatal boundary term-read at restart must poison, NOT truncate): the
 /// compaction/install discriminator reads the boundary term `term(N)`. A `term()` `Err` is a FATAL
 /// storage read failure (as everywhere else in the core), NOT evidence the boundary is absent.
-/// Collapsing `Err` into "absent" (the old `.unwrap_or(false)`) would take the `restore` branch and
+/// Collapsing `Err` into "absent" (an `.unwrap_or(false)`) would take the `restore` branch and
 /// DELETE a committed tail that is actually present. Here the local-compaction-window log holds the
 /// committed tail 1..=7 but `term(5)` fails; restart must poison `LogTerm` and leave the log intact.
 ///
@@ -1188,8 +1188,8 @@ fn restart_boundary_term_read_failure_poisons_not_truncates() {
 /// Completeness proof for the restart log/snapshot reconciliation: `reconcile_restart_log` is a
 /// pure, total function over the durable shape, so we exhaustively map every distinct
 /// `(snapshot, committed_in_log, first_index, last_index, boundary_term)` class to its action. This
-/// covers EVERY branch of the function — the guarantee the per-shape ad-hoc cases never gave (they
-/// missed a case for five review rounds, including a committed-tail truncation).
+/// covers EVERY branch of the function — the guarantee per-shape ad-hoc cases cannot give, since a
+/// class they omit (a committed-tail truncation among them) is invisible to them by construction.
 #[test]
 fn reconcile_restart_log_is_exhaustive() {
   use super::{RestartLogAction as A, reconcile_restart_log};

@@ -482,14 +482,14 @@ fn fork_refuses_used_stores_before_any_write() {
   assert_eq!(m.group(&7).unwrap().applied_index(), FORK_BASE_INDEX);
 }
 
-/// WHY the guard exists, demonstrated at the endpoint level. The pre-guard fork shape at
-/// `boot_epoch = 0` — reproduced by calling `write_fork_baseline` directly, exactly what
-/// `create_group_from_fork` did before refusing 0 — collapses the baseline's prior-epoch write
-/// ids into epoch 0, the same epoch the child's op counter is seeded with. Observed pre-fix
-/// failure mode (the red proof this test pins): the campaign's self-vote write is minted at
+/// WHY the guard exists, demonstrated at the endpoint level. The forbidden fork shape at
+/// `boot_epoch = 0` — reachable here only by calling `write_fork_baseline` directly, since
+/// `create_group_from_fork` refuses epoch 0 — collapses the baseline's prior-epoch write
+/// ids into epoch 0, the same epoch the child's op counter is seeded with. The two id spaces
+/// then ALIAS: the campaign's self-vote write is minted at
 /// `(0, 0)` — the id of the QUEUED baseline HardState write — so draining the BASELINE's
-/// `Wrote(0, 0)` matched the pending `Campaign` action and fired `become_leader` while the
-/// self-vote's own fsync was still in flight: leadership on a phantom durable self-vote (a
+/// `Wrote(0, 0)` matches the pending `Campaign` action and fires `become_leader` while the
+/// self-vote's own fsync is still in flight: leadership on a phantom durable self-vote (a
 /// crash in that window forgets the vote, and a revote could grant the same term elsewhere).
 /// At the enforced floor (`boot_epoch >= 1`) the identical drive stays a candidate until the
 /// REAL completion lands — the baseline's completions release nothing.
@@ -2515,10 +2515,10 @@ fn hosted_child_fork_parks_and_materializes_after_removal() {
 
 #[test]
 fn parked_fork_stays_parked_when_an_independent_twin_catches_up() {
-  // THE P0, pinned: an INDEPENDENTLY-created child at the fork's id crosses the fork baseline and
+  // An INDEPENDENTLY-created child at the fork's id crosses the fork baseline and
   // the fork's lineage by its OWN commits — but it never installed this fork's baseline, so it
   // carries no matching ForkId. Progress is NOT provenance: the parked fork must NOT resolve
-  // redundant against it (that discard lost the child partition), it stays PARKED, and the staged
+  // redundant against it (that discard loses the child partition), it stays PARKED, and the staged
   // blob — the partition's only local copy — survives untouched.
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
@@ -3823,17 +3823,17 @@ fn only_matching_provenance_resolves_a_parked_fork() {
 
 #[test]
 fn parked_fork_conserves_units_across_a_crash() {
-  // Crash-conservation regression (the P0's teeth): a parent splits 2 of its 3 units into a child
-  // id an INDEPENDENT group already occupies AND has advanced past the fork's baseline and lineage.
+  // Conservation across a crash: a parent splits 2 of its 3 units into a child id an INDEPENDENT
+  // group already occupies AND has advanced past the fork's baseline and lineage.
   // A crash/restart replays the durable split and re-stages the fork; because the advanced occupant
   // carries no matching ForkId, the fork PARKS instead of resolving redundant, so no unit is
   // discarded across the crash — the parent keeps 1, the staged blob holds 2, all three conserved.
-  // Pre-fix, the occupant's progress resolved the fork redundant here and lost its 2 units.
+  // Resolving on the occupant's PROGRESS rather than its provenance discards the staged 2 units.
   let mut m: MultiRaft<u64, u64, SplitSm> = MultiRaft::new();
   let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
   // The independent occupant, advanced past the fork baseline (applied >= FORK_BASE_INDEX) at the
-  // fork's own lineage — the exact `applied >= baseline && shape_gen >= child_gen` shape the old
-  // progress-based resolver mistook for the fork and discarded.
+  // fork's own lineage — the exact `applied >= baseline && shape_gen >= child_gen` shape a
+  // progress-based resolver mistakes for this fork's own child, discarding the blob against it.
   m.create_group(
     200,
     0,
@@ -4180,9 +4180,9 @@ fn service_resolves_a_ready_merge() {
 /// on the target bumps its `shape_gen` when it drains, so a `CommitMerge` proposed over it mints a
 /// generation the split immediately stales — the parked apply no-ops at its lineage guard and emits
 /// `MergeAborted` WITHOUT recording the source's thaw obligation, leaving the source `frozen_for` a
-/// target that owes it nothing (a permanent strand). RED before the gate: `commit_merge` ADMITTED.
-/// GREEN: refused `SplitInFlight` while the split is in flight; once the split applies the same
-/// `commit_merge` mints from the post-split counter and absorbs — the source is never stranded.
+/// target that owes it nothing (a permanent strand). So `commit_merge` is refused `SplitInFlight`
+/// while the split is in flight; once the split applies the same `commit_merge` mints from the
+/// post-split counter and absorbs — the source is never stranded.
 #[test]
 fn commit_merge_defers_a_target_reshaping_by_a_split() {
   let (mut m, mut stores) = merge_host_with(SplitSm::default(), 1, SplitSm::default(), 3);
@@ -4211,8 +4211,8 @@ fn commit_merge_defers_a_target_reshaping_by_a_split() {
     "the target has a split appended-unapplied"
   );
 
-  // THE FENCE: the absorb defers while the target is reshaping (RED: it ADMITTED, then the
-  // drained split staled the CommitMerge into an obligation-less MergeAborted).
+  // THE FENCE: the absorb defers while the target is reshaping. Admitting it here lets the drained
+  // split stale the CommitMerge into an obligation-less MergeAborted.
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert_eq!(
@@ -4273,9 +4273,9 @@ fn commit_merge_defers_a_target_reshaping_by_a_split() {
 /// The `prepare_merge` dual of the same fence, on the SOURCE side. A source mid-split must not
 /// freeze: the freeze mints `source_gen_after` from the source's live `shape_gen`, but the pending
 /// split applies first and bumps it, so the freeze's generation COLLIDES with the split's on the
-/// one lineage counter. Symmetric to `propose_split` refusing a freezing parent. RED before the
-/// gate: the freeze ADMITTED mid-split. GREEN: refused `SplitInFlight`; the same freeze admits once
-/// the split applies.
+/// one lineage counter. Symmetric to `propose_split` refusing a freezing parent. The freeze is
+/// refused `SplitInFlight` and admits once the split applies; admitting it mid-split is what
+/// collides the two generations.
 #[test]
 fn prepare_merge_defers_a_source_reshaping_by_a_split() {
   let (mut m, mut stores) = merge_host_with(SplitSm::default(), 3, SplitSm::default(), 1);
@@ -4290,8 +4290,8 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
   };
   assert!(m.group(&2).unwrap().split_in_flight());
 
-  // THE FENCE: the freeze defers while the source is reshaping (RED: it froze, colliding the
-  // freeze generation with the split's on one counter).
+  // THE FENCE: the freeze defers while the source is reshaping. Admitting it collides the freeze's
+  // generation with the split's on the one lineage counter.
   {
     assert_eq!(
       m.prepare_merge(&2, now, &mut stores, &1),
@@ -4331,12 +4331,12 @@ fn prepare_merge_defers_a_source_reshaping_by_a_split() {
 /// The SAME fence closing the CROSS-SOURCE fan-in case the split gate does not reach: a target-role
 /// abort (`RollbackMerge`) in flight bumps the target's `shape_gen` when it applies, exactly like a
 /// split. Two sources (1, 3) freeze into one target (2); 2 aborts 1's freeze as a release valve
-/// (appended, unapplied) then tries to commit 3 while that abort is in flight. RED before the fence:
-/// `commit_merge(3 -> 2)` ADMITTED, then draining 2 applied the abort (bumping the counter and
-/// recording `abandoned[1]`) and stale-aborted 3's commit WITHOUT recording `abandoned[3]` — 3 left
-/// frozen_for 2 forever while 1 correctly thawed (verified: `has_abandoned` cleared 1 but never
-/// held 3). GREEN: refused `RollbackInFlight`; once 1's abort applies the same commit admits and 3
-/// absorbs. (The abort of the SAME merge being committed is caught earlier by `AlreadyPending`.)
+/// (appended, unapplied) then tries to commit 3 while that abort is in flight. The commit is refused
+/// `RollbackInFlight`; once 1's abort applies the same commit admits and 3 absorbs. Admitting it
+/// under the in-flight abort strands 3: draining 2 applies the abort (bumping the counter and
+/// recording `abandoned[1]`) and stale-aborts 3's commit WITHOUT recording `abandoned[3]`, leaving 3
+/// frozen_for 2 forever while 1 thaws (`has_abandoned` clears 1 but never held 3).
+/// (The abort of the SAME merge being committed is caught earlier by `AlreadyPending`.)
 #[test]
 fn commit_merge_defers_a_target_with_a_fanin_abort_in_flight() {
   let (mut m, mut stores) = merge_host_triple(2, 1, 1);
@@ -4360,8 +4360,8 @@ fn commit_merge_defers_a_target_with_a_fanin_abort_in_flight() {
   );
 
   // THE FENCE: committing a DIFFERENT frozen source into the same target defers while that abort is
-  // in flight (RED: it admitted, then the drained abort staled 3's commit into an obligation-less
-  // MergeAborted, stranding 3).
+  // in flight. Admitting it lets the drained abort stale 3's commit into an obligation-less
+  // MergeAborted, stranding 3.
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert_eq!(
@@ -4409,12 +4409,12 @@ fn commit_merge_defers_a_target_with_a_fanin_abort_in_flight() {
 /// The lineage-serialization fence on `rollback_merge`'s OWN proposer side — the fan-in strand the
 /// abort verb closes on itself. Two sources (1, 3) freeze into one target (2); 2 aborts 1 (release
 /// valve, appended, UNAPPLIED) then tries to abort 3 while that first abort is in flight. Both mint
-/// `target_gen_after` from the SAME live `shape_gen`; RED before the fence: the second abort ADMITTED,
-/// then draining 2 applied 1's abort (bumping the counter, recording `abandoned[1]`) and stale-no-oped
-/// 3's abort at the strict apply-time guard WITHOUT recording `abandoned[3]` — 3 left frozen_for 2
-/// forever, owed a thaw no obligation names. GREEN: the second abort defers `RollbackInFlight` until
-/// 1's applies; re-proposed against the post-abort lineage it records its OWN `abandoned[3]` and 3
-/// thaws. (The abort of the SAME merge as an in-flight commit is deliberately RACED, not fenced — see
+/// `target_gen_after` from the SAME live `shape_gen`, so the second abort defers `RollbackInFlight`
+/// until 1's applies; re-proposed against the post-abort lineage it records its OWN `abandoned[3]`
+/// and 3 thaws. Minting both off one counter strands 3: draining 2 applies 1's abort (bumping the
+/// counter, recording `abandoned[1]`) and stale-no-ops 3's abort at the strict apply-time guard
+/// WITHOUT recording `abandoned[3]` — 3 left frozen_for 2 forever, owed a thaw no obligation names.
+/// (The abort of the SAME merge as an in-flight commit is deliberately RACED, not fenced — see
 /// `rollback_merge_races_an_in_flight_commit_of_the_same_merge`.)
 #[test]
 fn rollback_merge_defers_a_target_with_a_fanin_abort_in_flight() {
@@ -4456,9 +4456,9 @@ fn rollback_merge_defers_a_target_with_a_fanin_abort_in_flight() {
     "1's abort is in flight, unapplied"
   );
 
-  // THE FENCE: aborting a DIFFERENT frozen source while the first abort is in flight defers (RED: it
-  // admitted, minted the SAME gen as 1's abort, and stale-no-oped on apply WITHOUT recording
-  // abandoned[3] — 3 stranded frozen forever).
+  // THE FENCE: aborting a DIFFERENT frozen source while the first abort is in flight defers.
+  // Admitting it mints the SAME gen as 1's abort, which stale-no-ops on apply WITHOUT recording
+  // abandoned[3] — 3 stranded frozen forever.
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert_eq!(
@@ -4528,8 +4528,8 @@ fn rollback_merge_defers_a_target_with_a_fanin_abort_in_flight() {
 /// appended-and-unapplied on the target bumps its `shape_gen` when it drains, so an abort proposed
 /// over it mints a generation the split immediately stales — the abort no-ops at its strict apply-time
 /// guard and records NO `abandoned` obligation, leaving the frozen source owed a thaw nothing names.
-/// RED before the gate: `rollback_merge` ADMITTED mid-split. GREEN: refused `SplitInFlight`; once the
-/// split applies the same abort mints from the post-split counter and records the obligation.
+/// The abort is refused `SplitInFlight`; once the split applies it mints from the post-split counter
+/// and records the obligation. Admitting it mid-split is what drops the obligation.
 #[test]
 fn rollback_merge_defers_a_target_reshaping_by_a_split() {
   let (mut m, mut stores) = merge_host_with(SplitSm::default(), 1, SplitSm::default(), 3);
@@ -4558,8 +4558,8 @@ fn rollback_merge_defers_a_target_reshaping_by_a_split() {
     "the target has a split appended-unapplied"
   );
 
-  // THE FENCE: the abort defers while the target is reshaping (RED: it ADMITTED, then the drained
-  // split staled its mint into an obligation-less no-op that strands the frozen source).
+  // THE FENCE: the abort defers while the target is reshaping. Admitting it lets the drained split
+  // stale its mint into an obligation-less no-op that strands the frozen source.
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert_eq!(
@@ -4847,12 +4847,11 @@ fn rollback_races_commit() {
   );
 }
 
-/// FIX 2 leg (a): `commit_merge` refuses `TargetOwesThaw` when the target already owes THIS source
-/// incarnation an aborted-merge thaw — the same merge's abort applied, the source still frozen at
-/// the aborted generation, its thaw not yet discharged. Re-parking there would wedge on the freeze
+/// The propose-time gate: `commit_merge` refuses `TargetOwesThaw` when the target already owes THIS
+/// source incarnation an aborted-merge thaw — the same merge's abort applied, the source still frozen
+/// at the aborted generation, its thaw not yet discharged. Re-parking there wedges on the freeze
 /// generation the thaw pass drives past. GENERATION-EXACT: once the thaw discharges and the source
-/// re-freezes fresh, the same target admits the new commit. RED before the gate: the re-propose
-/// ADMITS and the resulting park wedges.
+/// re-freezes fresh, the same target admits the new commit.
 #[test]
 fn commit_merge_refuses_a_target_owing_this_source_a_thaw() {
   let (mut m, mut stores) = merge_host(2, 3);
@@ -4919,12 +4918,12 @@ fn commit_merge_refuses_a_target_owing_this_source_a_thaw() {
   }
 }
 
-/// FIX 2 leg (b): the apply-time belt for the in-flight order the gate cannot see — a `CommitMerge`
+/// The apply-time belt for the in-flight order the propose-time gate cannot see — a `CommitMerge`
 /// with a FRESH mint appended ABOVE the same merge's already-committed abort. The lineage guard
-/// admits the fresh mint, so without the belt it would PARK at the aborted freeze generation and
-/// wedge once the thaw pass drives the source past it. The belt reads `abandoned` at apply and
-/// aborts the dead commit instead: no park, no lineage bump, `MergeAborted` surfaced, drain resumes.
-/// RED before the belt: the fresh-mint commit parks and the drain wedges below it.
+/// admits the fresh mint, so without the belt it PARKS at the aborted freeze generation and the
+/// drain wedges below it once the thaw pass drives the source past that generation. The belt reads
+/// `abandoned` at apply and aborts the dead commit instead: no park, no lineage bump, `MergeAborted`
+/// surfaced, drain resumes.
 #[test]
 fn a_committed_abort_below_a_fresh_commit_kills_it_at_apply() {
   let (mut m, mut stores) = merge_host(2, 3);
@@ -4997,11 +4996,11 @@ fn a_committed_abort_below_a_fresh_commit_kills_it_at_apply() {
 
 /// A target legitimately absorbs a FAN-IN of sources, so its abort obligations are a per-source
 /// COLLECTION. Two sources frozen toward one target (the second from the window BEFORE the first
-/// abort applied) each record their OWN obligation when aborted, and BOTH thaw. RED with the old
-/// single-slot keep-first record: the second abort silently DROPPED the first source's obligation,
-/// stranding it frozen forever. This also retires the old `prepare_merge` one-abort-at-a-time freeze
-/// guard, which forbade this supported shape — and was insufficient anyway, since a source frozen
-/// before the first abort applied slipped past it entirely.
+/// abort applied) each record their OWN obligation when aborted, and BOTH thaw. A single-slot
+/// keep-first record cannot express this: the second abort silently DROPS the first source's
+/// obligation, stranding it frozen forever. A `prepare_merge` one-abort-at-a-time freeze guard is no
+/// substitute — it forbids this supported shape, and is insufficient anyway, since a source frozen
+/// before the first abort applied slips past it entirely.
 #[test]
 fn both_fanned_in_aborts_thaw_neither_dropped() {
   // Fan-in of sources 2 and 3 into target 1 (each source encodes above the target).
@@ -5080,8 +5079,8 @@ fn both_fanned_in_aborts_thaw_neither_dropped() {
 /// stale-no-op WITHOUT recording `abandoned[3]` — source 3 stranded frozen forever, and source 1's
 /// release valve consumed. The fence is SAME-MERGE-EXACT (racing THIS merge's own park is #22's
 /// purpose) and self-clearing: once source 1's park resolves (`Merged`, lineage bumped, park gone),
-/// the SAME source-3 abort admits, records `abandoned[3]`, and the service thaws source 3. RED with
-/// the cross-source arms neutered: the abort ADMITS `Some(Ok(_))` and source 3 strands.
+/// the SAME source-3 abort admits, records `abandoned[3]`, and the service thaws source 3. Without
+/// the cross-source arms the abort ADMITS `Some(Ok(_))` and source 3 strands.
 #[test]
 fn rollback_merge_defers_a_target_committing_a_different_source() {
   let (mut m, mut stores) = merge_host(2, 3);
@@ -5127,7 +5126,7 @@ fn rollback_merge_defers_a_target_committing_a_different_source() {
     "the parked commit is still in flight (applied held at k-1)"
   );
 
-  // RED-PROOF: the CROSS-source abort (source 3) defers to source 1's parked commit.
+  // THE FENCE: the CROSS-source abort (source 3) defers to source 1's parked commit.
   {
     let (log, stable) = stores.0.get_mut(&1).unwrap();
     assert_eq!(
@@ -5200,10 +5199,10 @@ fn rollback_merge_defers_a_target_committing_a_different_source() {
 ///   is appended and source 3 stays frozen. Admitting it would land source 3's abort at source 1's
 ///   `k + 1` and strand source 3, exactly as the parked case does.
 /// - An abort of the SAME source (1) sees `1 == 1` and RACES (`Ok`) — the #22 release valve holds
-///   in the pre-park window too. THIS is the assertion the coarse `commit_merge_in_flight` defer
-///   this fix replaced got wrong (it deferred every unparked abort, same-source included); the sim
-///   band pins the same race end-to-end. RED if the in-flight arm blanket-admits (source 3 strands)
-///   or blanket-defers (source 1 cannot release its own stuck commit).
+///   in the pre-park window too; the sim band pins the same race end-to-end. The in-flight arm must
+///   discriminate BY SOURCE: a blanket admit strands source 3, and a blanket defer — what a coarse
+///   `commit_merge_in_flight` check does, deferring every unparked abort, same-source included —
+///   leaves source 1 unable to release its own stuck commit.
 #[test]
 fn rollback_merge_source_discriminates_an_in_flight_unparked_commit() {
   let (mut m, mut stores) = merge_host(2, 3);
@@ -5309,10 +5308,10 @@ fn merge_host_triple(c1: usize, c2: usize, c3: usize) -> (MultiRaft<u64, u64, Co
 
 /// LEG alpha (liveness, the obligation-holder lifecycle): a group that owes an aborted upstream
 /// source its thaw must NOT dissolve as a fresh merge's SOURCE. Group 2 is the TARGET of a 1 -> 2
-/// merge that 2 aborts (recording `abandoned[1]`); that thaw is still undischarged. RED current:
-/// `prepare_merge(2 -> 3)` ADMITS, 2 later dissolves into 3, and its `abandoned[1]` vanishes with
-/// the endpoint — 1 is stranded frozen forever. GREEN: the freeze is refused `SourceOwesThaw`, and
-/// once the thaw pass discharges 1 the SAME freeze admits (the self-clearing pin).
+/// merge that 2 aborts (recording `abandoned[1]`); that thaw is still undischarged. The freeze is
+/// refused `SourceOwesThaw`, and once the thaw pass discharges 1 the SAME freeze admits (the
+/// self-clearing pin). Admitting `prepare_merge(2 -> 3)` dissolves 2 into 3 and its `abandoned[1]`
+/// vanishes with the endpoint — 1 stranded frozen forever.
 #[test]
 fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
   let (mut m, mut stores) = merge_host_triple(4, 3, 2);
@@ -5383,10 +5382,10 @@ fn a_source_owing_a_thaw_cannot_freeze_as_a_source() {
 /// The EXPLICIT-TEARDOWN door twin of `a_source_owing_a_thaw_cannot_freeze_as_a_source`: the public
 /// `remove_group` refuses a hosted group that still owes an aborted upstream source its thaw. Group
 /// 2 is the TARGET of a 1 -> 2 merge that 2 aborts (recording `abandoned[1]`), still undischarged.
-/// RED current: `remove_group(&2)` SUCCEEDS, 2's endpoint + stores drop, and 1 is stranded frozen
-/// forever with no holder left to run the thaw pass. GREEN: the removal is REFUSED `OwesThaw`,
-/// tearing nothing down; once the thaw pass discharges 1 the SAME `remove_group(&2)` admits (the
-/// self-clearing pin). Removing a group that owes nothing (3) is unchanged — `Ok(Some(endpoint))`.
+/// The removal is REFUSED `OwesThaw`, tearing nothing down; once the thaw pass discharges 1 the SAME
+/// `remove_group(&2)` admits (the self-clearing pin). Letting it through drops 2's endpoint and
+/// stores, stranding 1 frozen forever with no holder left to run the thaw pass. Removing a group
+/// that owes nothing (3) is unaffected — `Ok(Some(endpoint))`.
 #[test]
 fn teardown_refuses_a_group_that_still_owes_a_thaw() {
   let (mut m, mut stores) = merge_host_triple(3, 2, 4);
@@ -5419,8 +5418,8 @@ fn teardown_refuses_a_group_that_still_owes_a_thaw() {
     matches!(m.remove_group(&1, &mut stores), Err(RemoveError::OwesThaw)),
     "a holder of an undischarged thaw is refused OwesThaw — never torn down"
   );
-  // The refusal tore NOTHING down — the strand the RED path would have created is absent: 2 is still
-  // hosted with its obligation, and 1 is still frozen but still HAS a holder (2) to run the thaw.
+  // The refusal tore NOTHING down, so nothing is stranded: 2 is still hosted with its obligation,
+  // and 1 is still frozen but still HAS a holder (2) to run the thaw.
   assert!(m.contains_group(&1), "the refused removal left 2 hosted");
   assert!(
     m.group(&1).unwrap().has_abandoned(),
@@ -5458,11 +5457,11 @@ fn teardown_refuses_a_group_that_still_owes_a_thaw() {
 }
 
 /// The PUBLIC teardown gate refuses EVERY unresolved merge participant, not just a thaw-ower. Group
-/// 1 freezes into 2 and 2 parks its `CommitMerge`: 1 is a frozen SOURCE, 2 a parked TARGET. RED
-/// current: `remove_group(&1)` and `remove_group(&2)` BOTH succeed, each stranding the other half —
-/// 1 torn out leaves 2's park with no source to absorb or abort against; 2 torn out leaves 1 frozen
-/// with no decider. GREEN: 1 refuses `Frozen`, 2 refuses `MergeParked`, and neither refusal touches
-/// a thing (the group stays hosted with its exact merge state). Once the merge resolves — here by
+/// 1 freezes into 2 and 2 parks its `CommitMerge`: 1 is a frozen SOURCE, 2 a parked TARGET. 1 refuses
+/// `Frozen`, 2 refuses `MergeParked`, and neither refusal touches a thing (the group stays hosted
+/// with its exact merge state). Letting either removal through strands the other half — 1 torn out
+/// leaves 2's park with no source to absorb or abort against; 2 torn out leaves 1 frozen with no
+/// decider. Once the merge resolves — here by
 /// abort + thaw — the SAME removals admit (the self-clearing pin). A non-participant (3) is
 /// byte-for-byte unchanged.
 #[test]
@@ -5490,8 +5489,7 @@ fn teardown_refuses_a_frozen_source_and_a_parked_target() {
     ),
     "a target parked on a commit is refused MergeParked"
   );
-  // NO SIDE EFFECTS: both refusals left the choreography fully intact — the strand the RED path
-  // would have created is absent.
+  // NO SIDE EFFECTS: both refusals left the choreography fully intact — neither half is stranded.
   assert!(
     m.contains_group(&2) && m.group(&2).unwrap().is_frozen(),
     "1 is still a frozen source"
@@ -5598,10 +5596,10 @@ fn teardown_admits_an_owed_frozen_source_and_purges_the_obligation() {
 /// Source 1 freezes into 2 at gen 1 and 2 ABORTS (recording `abandoned[1]` for gen 1); the thaw pass
 /// then DELIVERS — 1 unfreezes and advances to gen 2 — but the discharge pass is deliberately NOT
 /// run, so 2's obligation lingers naming the now-SPENT gen 1. 1 is then re-frozen for a FRESH merge
-/// into 3 (gen 3), whose target has not yet parked. RED current (id-only escape): `remove_group(&1)`
-/// admits — the lingering `abandoned[1]` suppresses `Frozen` — tearing down the newly-frozen source
-/// and stranding 3's forming park. GREEN: the escape is generation-exact (obligation gen 1 ≠ live gen
-/// 3), so the stale record suppresses NOTHING and leg 2 refuses `Frozen`, leaving the merge intact.
+/// into 3 (gen 3), whose target has not yet parked. The escape is generation-exact (obligation gen 1
+/// ≠ live gen 3), so the stale record suppresses NOTHING and leg 2 refuses `Frozen`, leaving the
+/// merge intact. An id-only escape admits `remove_group(&1)` — the lingering `abandoned[1]`
+/// suppressing `Frozen` — tearing down the newly-frozen source and stranding 3's forming park.
 #[test]
 fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
   let (mut m, mut stores) = merge_host_triple(4, 3, 2);
@@ -5663,7 +5661,7 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
   );
 
   // THE GATE, generation-exact: 2's obligation names gen 1, 1 is live at gen 3 — the stale record
-  // suppresses NOTHING, so leg 2 refuses the newly-frozen source (RED under the id-only escape).
+  // suppresses NOTHING, so leg 2 refuses the newly-frozen source (an id-only escape would admit it).
   assert!(
     matches!(m.remove_group(&3, &mut stores), Err(RemoveError::Frozen)),
     "a freshly-frozen source is refused Frozen — a stale obligation cannot bypass the gate"
@@ -5680,13 +5678,12 @@ fn a_stale_obligation_does_not_bypass_the_frozen_gate() {
   );
 }
 
-/// FIX 3 leg (b): the container refuses a conf change on a target another hosted source's APPLIED
-/// freeze CLAIMS — moving the target's voters off the frozen source's hosts would strand the source
-/// (`commit_merge` then refuses `VoterSetsDiffer`, `rollback_merge` `SourceMissing`, no release
-/// valve). The endpoint's own fence cannot see the cross-group claim; the container surfaces the
-/// same `MergeInFlight` class. Once the claim is released (the merge aborted and the thaw
-/// discharged) the same conf change admits. RED before the leg: the claimed target ADMITS the voter
-/// change.
+/// The container refuses a conf change on a target another hosted source's APPLIED freeze CLAIMS —
+/// moving the target's voters off the frozen source's hosts would strand the source (`commit_merge`
+/// then refuses `VoterSetsDiffer`, `rollback_merge` `SourceMissing`, no release valve). The
+/// endpoint's own fence cannot see the cross-group claim; the container surfaces the same
+/// `MergeInFlight` class. Once the claim is released (the merge aborted and the thaw discharged) the
+/// same conf change admits.
 #[test]
 fn conf_change_on_a_claimed_merge_target_is_refused() {
   let (mut m, mut stores) = merge_host(2, 3);
@@ -5793,11 +5790,12 @@ fn teardown_refuses_a_spoken_for_source_with_no_local_freeze() {
 /// Leg 5, the CLAIMED-TARGET pre-park window (the last leg of the participant lattice). Source 1
 /// freezes into 2 and APPLIES it (1 is `frozen_for` 2), but 2 never proposes its `CommitMerge` — so
 /// 2 has no `pending_merge` (`MergeParked` misses) and no park names 2 (`SpokenFor` reads the mirror
-/// direction and misses). RED current: `remove_group(&2)` ADMITS, stranding 1 frozen for a target
-/// that no longer exists — 1's absorb AND its abort both ride 2's log, so neither can be proposed,
-/// and 1's own removal then refuses `Frozen` (it owes no thaw). GREEN: leg 5 refuses `Claimed`,
-/// touching nothing. THE ESCAPE: roll the merge back on 2 (still hosted pre-park), which thaws 1 and
-/// discharges 2's obligation, after which the SAME removal admits. A non-participant (3) is unchanged.
+/// direction and misses). Only leg 5's mirror scan catches the claim: `remove_group(&2)` refuses
+/// `Claimed`, touching nothing. Admitting it strands 1 frozen for a target that no longer exists —
+/// 1's absorb AND its abort both ride 2's log, so neither can be proposed, and 1's own removal then
+/// refuses `Frozen` (it owes no thaw). THE ESCAPE: roll the merge back on 2 (still hosted pre-park),
+/// which thaws 1 and discharges 2's obligation, after which the SAME removal admits. A
+/// non-participant (3) is unchanged.
 #[test]
 fn teardown_refuses_a_claimed_target_before_the_park() {
   let (mut m, mut stores) = merge_host_triple(3, 2, 4);
@@ -5829,7 +5827,7 @@ fn teardown_refuses_a_claimed_target_before_the_park() {
     matches!(m.remove_group(&1, &mut stores), Err(RemoveError::Claimed)),
     "a target a frozen source claims is refused Claimed before it parks"
   );
-  // NO SIDE EFFECTS: the choreography is intact — the strand the RED path would create is absent.
+  // NO SIDE EFFECTS: the choreography is intact — the source is not stranded.
   assert!(
     m.contains_group(&1) && m.group(&2).unwrap().is_frozen(),
     "the refused removal left 2 hosted and 1 frozen for it"
@@ -5872,9 +5870,10 @@ fn teardown_refuses_a_claimed_target_before_the_park() {
 /// Leg 5's APPEND-PENDING window: the claim is refused even before the freeze applies. Source 1's
 /// `PrepareMerge` is APPENDED (its append-observed lease kill is live) but NOT yet folded, so its
 /// target claim is still undecoded in-memory (`frozen_for` is `None`) — the applied leg cannot see
-/// it. RED current: `remove_group(&2)` ADMITS, stranding 1 identically once the freeze applies.
-/// GREEN: the gate DECODES the claim from 1's own unapplied log suffix and refuses `Claimed`. A
-/// DIFFERENT target (3) still tears down — the decode reads the exact claim (2), never over-refusing.
+/// it. The gate DECODES the claim from 1's own unapplied log suffix and refuses `Claimed`; an
+/// applied-only gate admits `remove_group(&2)` here, stranding 1 identically once the freeze applies.
+/// A DIFFERENT target (3) still tears down — the decode reads the exact claim (2), never
+/// over-refusing.
 #[test]
 fn teardown_refuses_a_claimed_target_from_the_append_pending_freeze() {
   let (mut m, mut stores) = merge_host_triple(3, 2, 4);
@@ -5919,10 +5918,10 @@ fn teardown_refuses_a_claimed_target_from_the_append_pending_freeze() {
 
 /// The PROPOSE-TIME twin of teardown leg 5, at the freeze door: a group another hosted source's
 /// APPLIED freeze claims as its TARGET must not freeze as a fresh merge's SOURCE. 1 freezes into 2
-/// (1 is `frozen_for` 2); 2 then tries to freeze into 3. RED current: `prepare_merge(2 -> 3)`
-/// ADMITS — a later absorb dissolves 2, and 1's release verbs (`commit_merge`, `rollback_merge`)
-/// both ride 2's dead log: `None` forever, 1 stranded frozen with no release valve. GREEN: refused
-/// `SourceClaimedAsTarget`, appending nothing. THE RELEASE (abort path): rolling 1's merge back on
+/// (1 is `frozen_for` 2); 2 then tries to freeze into 3. `prepare_merge(2 -> 3)` is refused
+/// `SourceClaimedAsTarget`, appending nothing. Admitting it lets a later absorb dissolve 2, after
+/// which 1's release verbs (`commit_merge`, `rollback_merge`) both ride 2's dead log: `None`
+/// forever, 1 stranded frozen with no release valve. THE RELEASE (abort path): rolling 1's merge back on
 /// 2 thaws 1 — clearing its claim — and discharges 2's obligation, after which the SAME freeze
 /// admits.
 #[test]
@@ -5988,10 +5987,10 @@ fn a_claimed_merge_target_cannot_freeze_as_a_source() {
 /// The freeze door's APPEND-PENDING window, mirroring teardown leg 5's: the claim refuses
 /// source-role even before the claiming freeze applies. 1's `PrepareMerge` is appended, not
 /// folded — its claim is undecoded in-memory (`frozen_for` is `None`), so only the log scan can
-/// see it. RED current: `prepare_merge(2 -> 3)` ADMITS in the window and the strand forms
-/// identically once the freeze folds. GREEN: the claim is decoded from 1's unapplied suffix and
-/// refused; once the freeze APPLIES the refusal continues through the applied leg — no gap
-/// between the windows. The decode is EXACT: candidate 3, which 1's claim does not name, freezes
+/// see it. The claim is decoded from 1's unapplied suffix and `prepare_merge(2 -> 3)` refused;
+/// once the freeze APPLIES the refusal continues through the applied leg — no gap between the
+/// windows, which an applied-only gate leaves open (the strand forms identically once the freeze
+/// folds). The decode is EXACT: candidate 3, which 1's claim does not name, freezes
 /// toward 2 unrefused (fan-in onto one target is the designed `abandoned` fan-in).
 #[test]
 fn an_append_pending_claim_refuses_source_role_too() {
@@ -6115,9 +6114,9 @@ fn an_unreadable_claim_scan_fails_closed_at_the_freeze_door() {
 /// landed — the freeze fold is an unguarded max, so 2 freezes for 3 while carrying the fresh
 /// obligation. The colocated form is now DOOR-REFUSED (`SourceClaimedAsTarget`, asserted below);
 /// the window survives cross-host, where the proposing 2-leader's local replica of 1 has not
-/// observed 1's freeze — reproduced here past the door. RED current: the Resolve arm dissolves 2
-/// with the live obligation, stranding 1 frozen forever. GREEN: the absorb is HELD; the thaw pass
-/// (which does NOT skip the frozen holder 2) discharges 1 first, and only then is 2 absorbed into 3.
+/// observed 1's freeze — reproduced here past the door. The absorb is HELD; the thaw pass (which
+/// does NOT skip the frozen holder 2) discharges 1 first, and only then is 2 absorbed into 3. A
+/// Resolve arm that dissolved 2 with the live obligation would strand 1 frozen forever.
 #[test]
 fn a_late_obligation_holds_the_absorb_until_the_thaw_discharges() {
   let (mut m, mut stores) = merge_host_triple(4, 3, 2);
@@ -6400,9 +6399,9 @@ fn dead_target_thaw_needs_the_terminal_floor_not_a_non_terminal_one() {
   );
 }
 
-/// PIN B(c), the B1 red-proof: a hosted park still NAMING the husk as its source HOLDS the dissolve —
-/// reclaiming it first would hand the resolver a MANUFACTURED absence and skip the union (committed
-/// divergence). The park absorbs it instead (Merged, never Retired), union intact.
+/// PIN B(c): a hosted park still NAMING the husk as its source HOLDS the dissolve — reclaiming it
+/// first would hand the resolver a MANUFACTURED absence and skip the union (committed divergence).
+/// The park absorbs it instead (Merged, never Retired), union intact.
 #[test]
 fn a_park_naming_the_husk_holds_the_dissolve_then_absorbs() {
   let (mut m, mut stores) = merge_host(2, 3);
@@ -6532,11 +6531,11 @@ fn a_source_without_an_obligation_absorbs_at_once() {
   assert_eq!(m.group(&2).unwrap().state_machine().count(), 4 + 3);
 }
 
-/// FIX 4: an obligation whose owed id will NOT decode is committed-corrupt — the same `MergeDecode`
-/// class the thaw pass and park decode raise. The drivability belt must HOLD the park and poison the
+/// An obligation whose owed id will NOT decode is committed-corrupt — the same `MergeDecode` class
+/// the thaw pass and park decode raise. The drivability belt must HOLD the park and poison the
 /// SOURCE (the deterministic fail-stop every host reaches), never treat the undecodable id as "not
-/// drivable" and AUTHORIZE the dissolve — which would diverge hosts between fail-stop and progress by
-/// crank order. RED before the fix: the absorb proceeds (Merged) and the corrupt obligation drops.
+/// drivable" and AUTHORIZE the dissolve: that lets the absorb proceed (Merged) and drops the corrupt
+/// obligation, diverging hosts between fail-stop and progress by crank order.
 #[test]
 fn a_corrupt_owed_id_holds_the_park_and_poisons_the_source() {
   let (mut m, mut stores) = merge_host_triple(2, 4, 3);
@@ -6594,10 +6593,10 @@ fn a_corrupt_owed_id_holds_the_park_and_poisons_the_source() {
   );
 }
 
-/// FIX 4 contrast (kept green): an obligation whose owed id DECODES but is not hosted here is a local
-/// dead-end — a co-hosting replica drives that thaw, so the absorb PROCEEDS and dropping the dead-end
-/// obligation strands nothing. Distinguishes the corrupt-id poison above from the belt's ordinary
-/// dead-end drop; both share the resolve arm's decode.
+/// The CONTRAST to the corrupt-id poison above: an obligation whose owed id DECODES but is not hosted
+/// here is a local dead-end — a co-hosting replica drives that thaw, so the absorb PROCEEDS and
+/// dropping the dead-end obligation strands nothing. This is what separates the corrupt-id poison
+/// from the belt's ordinary dead-end drop; both share the resolve arm's decode.
 #[test]
 fn a_decodable_unhosted_owed_id_lets_the_absorb_proceed() {
   let (mut m, mut stores) = merge_host_triple(2, 4, 3);
@@ -6654,7 +6653,7 @@ fn a_decodable_unhosted_owed_id_lets_the_absorb_proceed() {
   );
 }
 
-/// FINDING-1 RED (safety, structural): a source thaw is REFUSED with NO append unless the claimed
+/// SAFETY, structural: a source thaw is REFUSED with NO append unless the claimed
 /// target hosts a matching committed abort obligation. A frozen source claimed by target 2 — but with
 /// NO abort ever applied on 2 — must not thaw: appending it would move the source's counter out from
 /// under a target that never abandoned it (the #22 cross-log race). The gate is intrinsic to the thaw
@@ -6680,9 +6679,9 @@ fn thaw_without_a_committed_target_abort_is_refused() {
   let last_before = stores.0.get(&2).unwrap().0.last_index();
 
   // The constructed thaw naming the exact frozen incarnation is REFUSED with NO append — the invariant
-  // `unfreeze(source) ⟹ ∃ committed target-abort(source, gen)` is structural, not advisory. RED
-  // without the gate: the source-local checks all pass and the thaw APPENDS, unfreezing a source no
-  // target abandoned.
+  // `unfreeze(source) ⟹ ∃ committed target-abort(source, gen)` is structural, not advisory. Without
+  // the gate the source-local checks all pass and the thaw APPENDS, unfreezing a source no target
+  // abandoned.
   let result = {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     m.propose_merge_unfreeze(&2, now, log, stable, &1, 1)
@@ -6717,8 +6716,8 @@ fn thaw_without_a_committed_target_abort_is_refused() {
   );
 }
 
-/// INCARNATION RED (safety, the #22 race across a source remove/recreate): a target's `abandoned`
-/// obligation is keyed by the source's LOCAL freeze gen, which a P5 remove/recreate RESETS. Were the
+/// INCARNATION SAFETY (the #22 race across a source remove/recreate): a target's `abandoned`
+/// obligation is keyed by the source's LOCAL freeze gen, which a remove/recreate RESETS. Were the
 /// removed source's obligation left behind, a fresh incarnation that re-froze the SAME pair at the
 /// SAME repeated gen would find the stale record still backing a thaw the target never aborted for
 /// THIS incarnation — a frozen source thawed with no committed target-abort, reopening the cross-log
@@ -6749,7 +6748,7 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
   );
 
   // REMOVE source 1, non-terminally (no `MERGED_FLOOR`), and drop its store. The choke point purges
-  // the obligation — RED here without the purge: the removed source's record strands on the target.
+  // the obligation; without the purge the removed source's record strands on the target.
   assert!(m.remove_group(&2, &mut stores).unwrap().is_some());
   stores.0.remove(&2);
   assert!(
@@ -6786,7 +6785,7 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
   );
 
   // The stale obligation must NOT authorize this incarnation's thaw: the derived-from-abort gate
-  // finds no matching obligation and refuses with NO append. RED without the purge: the stale record
+  // finds no matching obligation and refuses with NO append. Without the purge the stale record
   // still matches `(1, 1)` and the thaw APPENDS, unfreezing a source no target abandoned.
   let last_before = stores.0.get(&2).unwrap().0.last_index();
   let result = {
@@ -6820,9 +6819,9 @@ fn removed_source_obligation_cannot_back_a_recreates_thaw() {
 /// still-durable abort entry) for a source that was torn down and FLOORED — not terminally merged —
 /// must still discharge, or that abort entry stays capture-fenced forever. The unhosted discharge binds
 /// to the PERSISTED lineage/floor: a floor that no longer admits `expected` proves the frozen-at-
-/// `expected` incarnation is gone for good. RED under the old `floor == MERGED_FLOOR` discharge — a
-/// non-terminal floor never equals the sentinel, so the re-derived obligation wedges the target's
-/// compaction fence.
+/// `expected` incarnation is gone for good. A discharge keyed on `floor == MERGED_FLOOR` cannot see
+/// this — a non-terminal floor never equals the sentinel — and the re-derived obligation wedges the
+/// target's compaction fence.
 #[test]
 fn a_floored_sources_rederived_obligation_discharges() {
   let (mut m, mut base) = merge_host(2, 3);
@@ -6885,7 +6884,7 @@ fn a_floored_sources_rederived_obligation_discharges() {
 /// strictly above `expected`. This test plays the driver's removal-floor discipline against a REAL
 /// settable `FloorStore` and proves BOTH legs close the race.
 ///
-/// RED without the fence (no floor persisted on removal): the re-derived obligation is NOT discharged,
+/// Without the fence (no floor persisted on removal) the re-derived obligation is NOT discharged,
 /// and the recreated source's re-freeze at the repeated gen is thawed — `abandoned_matches` still
 /// backs `propose_merge_unfreeze`, reopening the cross-log race across a crash.
 #[test]
@@ -6935,7 +6934,8 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
   );
 
   // THE FIRST LEG: the durable floor discharges the re-derived obligation (the source is absent and
-  // floored past `expected`), lifting the target's compaction fence. RED without the persisted floor.
+  // floored past `expected`), lifting the target's compaction fence. Without a floor persisted at
+  // removal the fence never lifts.
   m.service_merge_applies(now, &mut stores);
   assert!(
     !m.group(&1).unwrap().has_abandoned(),
@@ -6975,7 +6975,7 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
 
   // THE SECOND LEG: no thaw appends. The re-derived obligation was discharged off the floor, so the
   // derived-from-abort gate finds no match and refuses with NO append; the service leaves the
-  // recreate frozen. RED without the fence: the stale obligation still matches `(1, 1)` and the thaw
+  // recreate frozen. Without the fence the stale obligation still matches `(1, 1)` and the thaw
   // appends, unfreezing a source no target abandoned this incarnation.
   let last_before = stores.inner.0.get(&2).unwrap().0.last_index();
   let result = {
@@ -7012,7 +7012,7 @@ fn a_removed_sources_durable_floor_fences_the_rederived_abort_across_a_recreate(
 /// live counter with no floor consult (the source is hosted), and every fresh freeze mints
 /// strictly above the old `expected`.
 ///
-/// RED without the seed (a recreate at reset gen 0): the re-derived obligation survives the
+/// Without the seed (a recreate at reset gen 0) the re-derived obligation survives the
 /// service crank on the hosted arm, the re-freeze mints the repeated gen 1, and the stale drive
 /// naming the old incarnation APPENDS the thaw.
 #[test]
@@ -7083,8 +7083,8 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
   );
 
   // THE HOSTED DISCHARGE: the live counter (2) is past the abandoned freeze (1), so the service
-  // clears the re-derived obligation off the source's own lineage. RED without the seed: the
-  // hosted arm reads 0 > 1 and the stale record survives.
+  // clears the re-derived obligation off the source's own lineage. Without the seed the hosted arm
+  // reads 0 > 1 and the stale record survives.
   m.service_merge_applies(now, &mut stores);
   // The observing leader deferred its clear to the witness — apply it on the holder.
   {
@@ -7143,10 +7143,10 @@ fn a_recreated_hosted_source_discharges_the_stale_obligation_off_its_seeded_coun
 /// (The teardown gate also forbids tearing the target down WHILE it owes, so this scenario reaches
 /// an unhosted-then-restored target only after the obligation is off the holder — see below.)
 ///
-/// RED under the old target-scan discipline (no hosted target owes the freeze's gen once the source
-/// is gone → no floor): the re-derived obligation survives, the gen-0 recreate re-mints the
-/// repeated gen, and the service's own drive thaws the new incarnation's freeze off the dead
-/// incarnation's abort (the codex-R4 critical).
+/// Under a target-scan discipline (no hosted target owes the freeze's gen once the source is gone →
+/// no floor) the re-derived obligation survives, the gen-0 recreate re-mints the repeated gen, and
+/// the service's own drive thaws the new incarnation's freeze off the DEAD incarnation's abort — a
+/// source unfrozen by an abort no live target ever issued for it.
 #[test]
 fn an_unhosted_targets_rederived_obligation_discharges_off_the_sources_own_floor() {
   let (mut m, base) = merge_host(2, 3);
@@ -7492,8 +7492,8 @@ fn a_lost_freeze_mirror_heals_on_the_restore_resync() {
 /// re-hosted after the crash, so no restore re-sync runs — the removal must derive its floor
 /// from the stores alone. Every lineage move rides the group's own log (the shape-kind entries
 /// carry the generation they set) or its snapshot meta, so the ceiling covers the un-mirrored
-/// freeze with no target knowledge. RED under the record-only discipline (`group_gen + 1` with
-/// a lost mirror reads 0 → no floor at all).
+/// freeze with no target knowledge. A record-only discipline (`group_gen + 1`) reads 0 when the
+/// mirror is lost — no floor at all.
 #[test]
 fn removal_floor_reads_the_stores_when_the_mirror_never_landed() {
   let mut engine: GroupEngine<u64, u64> = GroupEngine::new();
@@ -7846,8 +7846,9 @@ fn committed_but_unapplied_freeze_thaw_is_retained_not_dropped() {
     );
   }
 
-  // RED (pre-fix): the gate answered terminal `NotFrozen`; it must instead answer transient
-  // `SourceBehindFreeze` so the committed abort's obligation can still thaw the source later.
+  // A source whose LOG has not reached its own freeze must answer transient `SourceBehindFreeze`,
+  // never terminal `NotFrozen`: a terminal verdict discharges the committed abort's obligation, and
+  // the source could then never be thawed.
   let result = {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     m.propose_merge_unfreeze(&2, now, log, stable, &1, 1)
@@ -7869,7 +7870,7 @@ fn committed_but_unapplied_freeze_thaw_is_retained_not_dropped() {
     assert_eq!(src.shape_gen(), 0);
   }
 
-  // GREEN: the leader applies the freeze, and the retained obligation's thaw now lands.
+  // Once the leader applies the freeze, the retained obligation's thaw lands.
   {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     drain_storage(&mut m, 2, now, log, stable);
@@ -8080,13 +8081,13 @@ fn frozen_source_relay_classification_is_exhaustive() {
   );
 }
 
-/// RED-first for the [MEDIUM] finding: a FOLLOWER host that OBSERVES the source past the freeze must
-/// discharge its own obligation — the gate answers terminal `StaleThaw` — WITHOUT ever leading. The
-/// source is thawed here (modelling another host's leader delivering the thaw, `seen == 2`), then
-/// this host's source replica is stepped down to a follower. Pre-reorder the `NotLeader` check
-/// shadowed the lineage dedupe, so a follower answered `NotLeader` (transient) forever and could
-/// never discharge; the reorder puts the observed-advance verdict BEFORE the leadership gate — the
-/// same advance the service's leadership-independent discharge check reads.
+/// A FOLLOWER host that OBSERVES the source past the freeze must discharge its own obligation — the
+/// gate answers terminal `StaleThaw` — WITHOUT ever leading. The source is thawed here (modelling
+/// another host's leader delivering the thaw, `seen == 2`), then this host's source replica is
+/// stepped down to a follower. The observed-advance verdict is therefore ordered BEFORE the
+/// leadership gate: a `NotLeader` check ahead of the lineage dedupe shadows it, so a follower answers
+/// transient `NotLeader` forever and can never discharge. This is the same advance the service's
+/// leadership-independent discharge check reads.
 #[test]
 fn a_follower_retires_the_relay_on_the_observed_advance() {
   let (mut m, mut stores) = merge_host(2, 3);
@@ -8137,7 +8138,7 @@ fn a_follower_retires_the_relay_on_the_observed_advance() {
   );
 }
 
-/// RED-first for the [HIGH] finding: an appended thaw is only APPENDED, not delivered — a source
+/// SAFETY of the discharge signal: an appended thaw is only APPENDED, not delivered — a source
 /// leader that appends the thaw then loses leadership before it commits has that entry TRUNCATED by
 /// the next leader. A design that treated the append as delivered would drop the obligation and the
 /// committed abort would have no path left to thaw — the source wedged frozen. The durable obligation
@@ -8375,7 +8376,7 @@ fn a_witness_apply_clears_an_unobservable_dead_end_obligation() {
   );
 }
 
-/// PIN (b), the A1 red-proof: a leader whose ONLY proof is a NON-terminal floor clears LOCALLY and
+/// PIN (b): a leader whose ONLY proof is a NON-terminal floor clears LOCALLY and
 /// mints NO witness. A non-terminal floor is a HOST-LOCAL fact (this host stopped hosting at/below the
 /// abandoned gen); witnessing it would clear a LIVE obligation on a co-hosting holder whose source is
 /// still frozen, so the mint predicate excludes it — direction matters.
@@ -8433,10 +8434,10 @@ fn a1_a_non_terminal_floor_clears_locally_and_mints_no_witness() {
 
 /// A hosted incarnation at a LOWER gen than the abandoned freeze — a legal squatter recreated above a
 /// non-terminal floor at a fresh gen — must not SHADOW the durable host-local proof that the NAMED
-/// (dead) incarnation is discharged. The hosted arm now ORs the persisted floor/lineage legs into the
-/// LOCAL clear, so the squatter's gen-0 counter no longer pins the obligation. RED before the fix: the
-/// hosted arm reads only `shape_gen(0) > 1 = false`, consults no persisted leg, and the re-derived
-/// obligation holds forever (the seed-0 g102 calm-window livelock).
+/// (dead) incarnation is discharged. The hosted arm ORs the persisted floor/lineage legs into the
+/// LOCAL clear, so the squatter's gen-0 counter does not pin the obligation. A hosted arm reading
+/// only the live counter (`shape_gen(0) > 1 = false`) and consulting no persisted leg holds the
+/// re-derived obligation forever — the calm-window livelock.
 #[test]
 fn a_lower_gen_squatter_does_not_shadow_the_floor_discharge() {
   let mut m: MultiRaft<u64, u64, CountSm> = MultiRaft::new();
@@ -8498,10 +8499,9 @@ fn a_lower_gen_squatter_does_not_shadow_the_floor_discharge() {
 }
 
 /// A LIVE source hosted AND FROZEN at the abandoned generation is NOT prematurely discharged by the
-/// new hosted floor/lineage legs: its own admission guaranteed `floor_admits(floor, expected)`, so the
+/// hosted floor/lineage legs: its own admission guaranteed `floor_admits(floor, expected)`, so the
 /// floor leg is false, and a frozen source's lineage has not passed `expected` either. The obligation
-/// stands until the source actually thaws past it — the no-over-reach guard on the hosted-arm change
-/// (GREEN both before and after the fix).
+/// stands until the source actually thaws past it — the no-over-reach bound on the hosted arm.
 #[test]
 fn a_live_frozen_source_at_expected_is_not_prematurely_discharged() {
   let (mut m, base) = merge_host(2, 3);
@@ -8544,7 +8544,7 @@ fn a_live_frozen_source_at_expected_is_not_prematurely_discharged() {
 /// A hosted FROZEN source whose STALE removal floor sits ABOVE the abandoned generation is a LIVE
 /// obligation, not a dead squatter: the id was removed (floored) and its fresh incarnation legally
 /// re-froze BELOW that floor at a colliding generation. The floor leg is FENCED off a frozen source,
-/// so only the source-side thaw drive may clear it. RED without the `is_frozen` fence: `!floor_admits`
+/// so only the source-side thaw drive may clear it. Without the `is_frozen` fence `!floor_admits`
 /// discharges the live freeze and strands the source frozen forever — the merge-freeze wedge.
 #[test]
 fn a_frozen_source_below_a_stale_floor_is_not_floor_discharged() {
@@ -9097,7 +9097,7 @@ fn a_divergent_source_boundary_never_advances_on_index_alone() {
 }
 
 /// THE WEDGE THE ADMISSION BARRIER PREVENTS (the log-behind dual of the freeze-identity
-/// red-proof): a source replica whose LOG never reached the freeze boundary, cut off from any
+/// wedge): a source replica whose LOG never reached the freeze boundary, cut off from any
 /// source leader, can neither advance on identity (its log lacks the boundary entry) nor be
 /// snapshotted past it here — so its co-located, log-complete parked target wedges FOREVER. This
 /// state is exactly what `commit_merge`'s all-source-voters barrier makes unconstructible: the
@@ -9607,9 +9607,9 @@ fn merge_propose_refuses_learner_carrying_participants() {
   }
 }
 
-/// The VOPR seed-0 shape, distilled: a target whose committed configuration lists learners
-/// {1, 3}. The freeze is refused at propose — the randomized reshape band would otherwise place
-/// a live absorb on a learner host that parks forever.
+/// A target whose committed configuration lists learners {1, 3}. The freeze is refused at propose —
+/// admitting it places a live absorb on a learner host, which parks forever (a learner never leads,
+/// so the park has no decider). The randomized reshape band reaches this shape end-to-end.
 #[test]
 fn seed0_target_learner_pair_refused_at_propose() {
   let now = Instant::ORIGIN;
@@ -9822,7 +9822,7 @@ fn rollback_refuses_a_pending_freeze_then_lands() {
   assert!(!ep.merge_freeze_active());
 }
 
-/// THE MERGE-ORPHAN WEDGE, PREVENTED AT ADMISSION (the dual of the freeze-identity red-proof):
+/// THE MERGE-ORPHAN WEDGE, PREVENTED AT ADMISSION (the dual of the freeze-identity wedge):
 /// `commit_merge` must not dissolve a source until EVERY source voter has matched the freeze
 /// boundary. A source voter left log-behind below the boundary while the source leader is later
 /// lost is orphaned — the other hosts floor+dismantle the source out from under it (the
@@ -10052,7 +10052,8 @@ fn dissolution_rides_the_committed_commit_merge_after_source_leader_loss() {
   assert!(m.group(&1).unwrap().pending_merge().is_some(), "parked");
 
   // The source LEADER is lost: a higher-term vote request steps node 1's source down to a
-  // follower. Under the old resolve-last discipline this loss is what stranded stragglers.
+  // follower. A leader-local resolve-last discipline is defeated by exactly this loss, which is why
+  // the straggler strand has to be prevented at ADMISSION rather than at resolve order.
   {
     let (log, stable) = stores.0.get_mut(&2).unwrap();
     m.handle_message(

@@ -14,7 +14,7 @@ use crate::{
 /// and a DUPLICATE of it arrives before `handle_storage` drains. The immediate-ack clamp
 /// (`last_new.min(durable_index)`) must report 2 (the snapshot boundary), not the unflushed 3.
 ///
-/// MUTATION: revert FIX 1 to `self.durable.durable_index = self.durable.durable_index.max(meta.last_index())`.
+/// MUTATION: restore `self.durable.durable_index = self.durable.durable_index.max(meta.last_index())`.
 /// Then after install `durable_index` stays at the stale-high 3, the duplicate clamps to
 /// `min(3, 3) = 3`, and the assertion (duplicate acks 2) FAILS — the follower over-acks an
 /// unflushed entry, reopening the phantom-replica commit hole.
@@ -294,7 +294,7 @@ fn maybe_snapshot_does_not_refire_while_pending() {
 /// per-entry `wall + window` floor must fold NOTHING. The two floors are independent — a non-failover
 /// snapshot must never let `lease_window` alone masquerade as a wall-derived release floor.
 ///
-/// MUTATION (revert FIX 1 — drop the `e.wall_timestamp() != 0` guard in `submit_append`): each
+/// MUTATION (drop the `e.wall_timestamp() != 0` guard in `submit_append`): each
 /// `0`-wall entry then folds `0.saturating_add(lease_window) == lease_window` into
 /// `max_wall_plus_window`, so it rises to equal `max_lease_window` and the `== 0` assertion FAILS.
 #[test]
@@ -356,8 +356,9 @@ fn non_failover_leaseguard_snapshot_has_zero_wall_plus_window() {
     meta.max_lease_window() > 0,
     "a LeaseGuard snapshot must carry the inherited commit-wait window"
   );
-  // ... but the wall+window floor is ZERO: a `0`-wall entry folds nothing into it. Without FIX 1
-  // it would instead equal `max_lease_window` (the bug this regression pins).
+  // ... but the wall+window floor is ZERO: a `0`-wall entry folds nothing into it. Without the
+  // `wall_timestamp() != 0` guard it would instead equal `max_lease_window` — a lease window
+  // masquerading as a wall-derived release floor.
   assert_eq!(
     meta.max_wall_plus_window(),
     0,
@@ -683,7 +684,7 @@ fn normal_append_at_boundary_not_snapshot() {
 /// A HeartbeatResponse from a peer still stuck in Snapshot state (its
 /// InstallSnapshot was dropped) must RE-SEND the InstallSnapshot, carrying the same meta.
 ///
-/// FAILS-ON-OLD: without the resend hook the HeartbeatResponse produces NO InstallSnapshot
+/// Without the resend hook the HeartbeatResponse produces NO InstallSnapshot
 /// (maybe_send_append early-returns on the paused Snapshot peer), so the follower wedges.
 ///
 /// PACING (deadline armed AT each send): the initial install (sent at ORIGIN by the helper) arms
@@ -773,10 +774,10 @@ fn heartbeat_resend_snapshot_to_wedged_follower() {
   );
 }
 
-/// FAILS-ON-OLD: when the heartbeat-response PUMP is what opens the install window
+/// When the heartbeat-response PUMP is what opens the install window
 /// (a compacted Probe peer resumes on a heartbeat ack), the same response handling must not send
-/// the blob TWICE — once from the pump's compacted-hole branch and once from the resend hook,
-/// which previously saw "Snapshot state + no deadline" and fired immediately.
+/// the blob TWICE — once from the pump's compacted-hole branch and once from the resend hook, which
+/// would otherwise see "Snapshot state + no deadline" and fire immediately.
 #[test]
 fn heartbeat_pump_initial_install_is_not_double_sent() {
   use crate::{Index, Instant, Message, Term};
@@ -817,7 +818,7 @@ fn heartbeat_pump_initial_install_is_not_double_sent() {
   );
 }
 
-/// FAILS-ON-OLD: a pacing deadline left over from a PREVIOUS install window must not
+/// A pacing deadline left over from a PREVIOUS install window must not
 /// leak into a new one. The peer exits Snapshot via `maybe_update` (no heartbeat observation to
 /// clean the map), falls behind a fresh compaction, and re-enters Snapshot — the NEW install send
 /// must overwrite the stale (long-expired) deadline, so a response right after the new install
@@ -3152,7 +3153,7 @@ fn receipt_stale_above_watermark_records_durable_snapshot() {
   );
 }
 
-/// FAILS-ON-OLD: a peer REMOVED by a committed conf change while still in Snapshot
+/// A peer REMOVED by a committed conf change while still in Snapshot
 /// state can never be observed leaving it (its Progress is gone, and a dead peer sends no further
 /// responses), so its resend-pacing deadline would linger for the rest of the term — and
 /// add/remove churn of lagging peers would grow the map past the live peer set. The apply-time
@@ -3296,8 +3297,8 @@ fn migrated_snapshot_carries_explicit_read_mode() {
 
 /// A snapshot install whose LogStore::restore does NOT re-baseline (first_index != last_index + 1
 /// afterward) is a storage-contract violation: the read-view would be inconsistent with the advanced
-/// commit/applied. The install must fail-stop (poison), not silently serve off a torn boundary — a
-/// release-mode check, where the old debug_assert was a no-op.
+/// commit/applied. The install must fail-stop (poison), not silently serve off a torn boundary. The
+/// check is RELEASE-mode: a `debug_assert` compiles out exactly where the violation would ship.
 #[test]
 fn install_with_torn_rebaseline_poisons() {
   use crate::{Index, Instant, Message, PoisonReason, Term, conf::ConfState};
@@ -3638,8 +3639,9 @@ fn redundant_install_caught_up_mid_transfer_dropped_at_completion() {
 /// focuses on the `durable_index` RESET + the later ack-clamp; this one isolates the commit/applied/
 /// first_index/last_index advance for a boundary strictly above a non-zero `commit`.)
 ///
-/// MUTATION: this direction is unaffected by the redundancy test — both forms install — so it stays GREEN
-/// under the reverted guard; it fences the redundancy test against over-suppressing a divergent install.
+/// MUTATION: this direction is unaffected by the redundancy guard — both forms install — so the
+/// reverted guard does not surface here; it fences the redundancy test against over-suppressing a
+/// divergent install.
 #[test]
 fn divergent_install_below_durable_tip_still_rebaselines() {
   use crate::{AppendEntries, Entry, EntryKind, Index, Instant, Message, Term};

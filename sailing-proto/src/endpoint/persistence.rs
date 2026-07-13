@@ -572,7 +572,7 @@ where
     // already covers the pending boundary, the blob is durable, so run the install now (else a single
     // dropped `SnapshotWritten` would wedge `pending_install` forever, the follower never installing).
     // Durable evidence ONLY (`durable_snapshot()`): firing on the visible (pre-fsync) `snapshot()` slot
-    // would re-baseline the log ahead of a non-durable blob — the exact orphan this fix prevents.
+    // would re-baseline the log ahead of a non-durable blob — the exact orphan this gate prevents.
     if let Some((_pid, meta, ..)) = &self.snapshot.pending_install {
       // IDENTITY-aware, not merely boundary `>=`: a same-boundary supersede can leave a SUPERSEDED
       // snapshot's blob durable while the replacement is still in flight; firing on that evidence would

@@ -714,7 +714,7 @@ impl AsyncStable {
 
   /// Make `hard_state()` return the LAST-DURABLE value (strict `StableStore` contract) instead of the
   /// submit-visible one, so writers that rebuild from `hard_state()` see a stale floor while a raise is in
-  /// flight — the exact condition Finding 2 needs.
+  /// flight.
   pub(crate) fn set_last_durable_reads(&mut self, on: bool) {
     self.last_durable_reads = on;
   }

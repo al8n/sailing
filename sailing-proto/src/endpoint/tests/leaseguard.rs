@@ -1081,7 +1081,7 @@ fn leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease() {
   let d_mono_at = d0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 9); // 0.9 · 10s = 9s
   let s_mono_at = s0 + Duration::from_nanos(T_STAR_REAL_NS / 10 * 15); // 1.5 · 10s = 15s
 
-  // Witness guards (config-drift proofs, independent of the fix): t*'s S-mono (15s) is PAST S's RAW wait
+  // Witness guards (config-drift proofs, independent of the inflation): t*'s S-mono (15s) is PAST S's RAW wait
   // `w_d` (~12.2s) but BELOW the (1+ρ_S)-inflated wait `w_d + w_d/2` (~18.3s) — so a RAW wait would have
   // cleared S here (the stale read), while the inflation must still hold it.
   let s_mono_elapsed = T_STAR_REAL_NS / 10 * 15;
@@ -1105,9 +1105,9 @@ fn leaseguard_heterogeneous_drift_successor_must_not_undercut_deposed_lease() {
     d_lease_live,
     "the deposed leader's lease is still live at t* = 10s real (D-mono 9s < Δ_D 10s)"
   );
-  // The safety property the P0 falsifies: a live inherited lease forbids the successor committing past
-  // the anchor. RED before the successor-side inflation (S cleared the RAW wait at ~8.1s real); GREEN
-  // once the wait grows by (1+ρ_S) to ~12.2s real, strictly past D's ~11.1s real lease.
+  // THE SAFETY PROPERTY: a live inherited lease forbids the successor committing past the anchor.
+  // A RAW inherited wait clears on S at ~8.1s real — still inside D's lease — so the successor side
+  // must inflate it by (1+ρ_S) to ~12.2s real, strictly past D's ~11.1s real lease.
   assert!(
     !s_committed_past_anchor,
     "heterogeneous-drift stale read: the fast successor committed past the inherited anchor while the \
@@ -1267,9 +1267,9 @@ fn leaseguard_heterogeneous_drift_unwalled_precise_release_must_not_undercut_dep
     d_lease_live,
     "the deposed leader's lease is still live at t* = 10s real"
   );
-  // The unwalled fallback is the SOLE cover for the fail-closed inherited lease. Its RAW length would let
-  // S's precise release fire here (the stale read); the (1+ρ_S) inflation of the unwalled arm must still
-  // hold it. RED before the unwalled inflation, GREEN after.
+  // The unwalled fallback is the SOLE cover for the fail-closed inherited lease. Its RAW length lets
+  // S's precise release fire here (the stale read); the (1+ρ_S) inflation of the unwalled arm must
+  // still hold it.
   assert!(
     !s_would_precise_release,
     "heterogeneous-drift stale read (wall-absent tier): the fast failover successor's precise release \
@@ -3315,7 +3315,7 @@ fn failover_wall_veto_repoll_near_instant_max_fails_stop() {
 
   // Drive the CommitWait timer at a monotonic instant within one heartbeat of `Instant::MAX`, with the wall
   // STILL below the floor (S < S + 140ms) so the walled lease vetoes the clear. The re-arm `now.mono() + HB`
-  // would saturate to `Instant::MAX` (`MAX − 50ms + 100ms`); the fix FAIL-STOPS instead. `handle_timeout`
+  // would saturate to `Instant::MAX` (`MAX − 50ms + 100ms`); the re-arm FAIL-STOPS instead. `handle_timeout`
   // must NOT panic (no saturated, perpetually-due CommitWait timer left behind).
   let near_max = Now::synchronized(
     Instant::from_origin(Duration::MAX - Duration::from_millis(50)),
@@ -4326,10 +4326,10 @@ fn failover_non_passable_wall_horizon_bare_successor_fails_stop() {
 /// Regression (inconsistent recovered lease floors): a crafted/corrupt `SnapshotMeta` can carry a
 /// walled release floor (`max_wall_plus_window != 0`) with NO lease-window bound (`max_lease_window == 0`)
 /// — live folds can never separate them (a walled entry's window goes to BOTH). With `max_lease_window ==
-/// 0`, `failover_inflated_commit_wait` returns `Some(0)`, which (before the fix) marked the node
-/// E′-inflated with a ZERO wait and `commit_wait_until == None`, so the first commit passed IMMEDIATELY
-/// despite a walled lease to honor. The fix gates `inflated_candidate` on `max_lease_window > 0` AND
-/// fail-stops the inconsistency (`InconsistentLeaseFloor`), so the node poisons before any commit.
+/// 0`, `failover_inflated_commit_wait` returns `Some(0)`, which would mark the node E′-inflated with
+/// a ZERO wait and `commit_wait_until == None`, so the first commit passes IMMEDIATELY despite a
+/// walled lease to honor. `inflated_candidate` is therefore gated on `max_lease_window > 0` AND the
+/// inconsistency fail-stops (`InconsistentLeaseFloor`), so the node poisons before any commit.
 #[test]
 fn inconsistent_lease_floor_snapshot_fails_stop() {
   use crate::{
@@ -4620,8 +4620,8 @@ fn assert_inconsistent_lease_floor_fails_stop(
     Some(PoisonReason::InconsistentLeaseFloor)
   );
 
-  // A quorum ack must NOT advance commit — without the fix the commit-wait would clear (vacuously, or on the
-  // too-small floor's immediate wall expiry) and commit past the snapshot index before the window elapsed.
+  // A quorum ack must NOT advance commit — ungated, the commit-wait clears (vacuously, or on the
+  // too-small floor's immediate wall expiry) and commits past the snapshot index before the window elapsed.
   let before = ep.commit_index();
   ep.handle_message(
     at(0),

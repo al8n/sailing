@@ -116,9 +116,9 @@ fn conf_change_scopes_to_one_group() {
 /// A quorum mis-parked by the sweep must be able to UN-PARK once membership is re-derived.
 /// `complete_under_hosted` reads a parked replica as still-hosting (missing = ∅), so a leaderless
 /// group whose own voters were parked can never repair itself — the unpark arm must run on the
-/// leaderless path too, not only behind a leader. GREEN: reconcile un-parks the mis-parked
-/// majority and the group recovers a leader. RED (restore the leaderless early-return above the
-/// unpark arm): the parked voters stay parked and the group is leaderless forever.
+/// leaderless path too, not only behind a leader: reconcile un-parks the mis-parked majority and
+/// the group recovers a leader. With a leaderless early-return above the unpark arm the parked
+/// voters stay parked and the group is leaderless forever.
 #[test]
 fn a_mis_parked_quorum_un_parks_and_recovers() {
   let mut w = settled_world(43, 5, &[100]);
