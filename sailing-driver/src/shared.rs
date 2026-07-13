@@ -125,12 +125,14 @@ pub enum Pending<I, R> {
 /// Whether a query/failover completion DELIVERED its result or caught a user-closure panic. The
 /// completion runs the user closure under `catch_unwind`; a caught panic replies `QueryPanicked`
 /// to the caller AND reports `Panicked` here, so the invoking driver learns the read ran against —
-/// and interior mutability could have TORN — the replicated state machine, and fail-stops the
-/// addressed group rather than serve possibly-divergent state. The `Err`/`Ok(None)` arms do not
-/// CALL the closure, but they DROP it unused inside the same `catch_unwind` (`res.map(f)` on an
-/// `Err` consumes `f` without invoking it), so a captured guard's `Drop` runs there and can panic
-/// too — ANY arm, served or not, can report `Panicked`. The centralized completion latch folds
-/// every such report into the group's fail-stop.
+/// and interior mutability could have TORN — a replicated state machine, and fail-stops rather than
+/// serve possibly-divergent state. The `Err`/`Ok(None)` arms do not CALL the closure, but they DROP
+/// it unused inside the same `catch_unwind` (`res.map(f)` on an `Err` consumes `f` without invoking
+/// it), so a captured guard's `Drop` runs there and can panic too — ANY arm, served or not, can
+/// report `Panicked`. WHICH state machine the tear reached is unknowable: the closure captured
+/// arbitrary state, which may alias any hosted group's FSM. So on a multi-group host every such
+/// report is PLANE-fatal, and the centralized completion latch folds them into ONE fail-stop of
+/// every hosted group.
 ///
 /// `#[must_use]` is the ENFORCEMENT. A discarded outcome is a silently dropped fail-stop, so the
 /// COMPILER — not a convention, and not a grep that only ever matched one of the two call syntaxes —
@@ -431,10 +433,16 @@ pub struct Routing<I, R, F> {
   /// decline — catches a user-closure(-drop) panic. Such a completion never RUNS the user closure
   /// (an `Err`/`Ok(None)` short-circuits it), but it DROPS the closure unused, running any guard the
   /// closure captured; that guard's `Drop` can mutate shared FSM state and panic, caught by the
-  /// completion's `catch_unwind`. A caught panic means the state machine could be TORN, so the
-  /// addressed group must fail-stop rather than keep serving divergent state. Read AND cleared by
-  /// [`Self::take_completion_panicked`], which the driver folds into its per-group fail-stop tail
-  /// alongside the serve batches' returned panic — ONE fail-stop decision fed by every source.
+  /// completion's `catch_unwind`.
+  ///
+  /// A caught panic means A state machine could be TORN — and WHICH one is unknowable. The closure is
+  /// `Send + 'static` and captured whatever it liked; [`StateMachine`](sailing_proto::StateMachine)
+  /// imposes no isolation, so the guard can alias state ANY hosted group's replicated FSM shares, not
+  /// merely the addressed group's. The tear is UNATTRIBUTABLE, so the verdict is PLANE-FATAL: every
+  /// hosted group fail-stops. Read AND cleared by [`Self::take_completion_panicked`], which the driver
+  /// routes to that plane fail-stop alongside the serve batches' returned panic — ONE decision fed by
+  /// every source. The multi drivers harvest EVERY routing's latch before ANY group serves, so a tear
+  /// latched on one group can never be outrun by a sibling's serve.
   completion_panicked: bool,
 }
 
@@ -539,9 +547,9 @@ impl<I, R, F> Routing<I, R, F> {
   }
 
   /// Take AND clear whether any Routing completion caught a user-closure(-drop) panic since the last
-  /// read — the internal `completion_panicked` latch. The driver folds this into its per-group
-  /// fail-stop decision, reading it BEFORE serving parked queries so none is served against a state
-  /// machine an earlier-in-crank completion tore.
+  /// read — the internal `completion_panicked` latch. The driver routes this into its PLANE fail-stop
+  /// (the tear is unattributable — see the field), reading it BEFORE any group serves so no read runs
+  /// against a state machine an earlier-in-crank completion tore.
   #[must_use]
   pub fn take_completion_panicked(&mut self) -> bool {
     std::mem::replace(&mut self.completion_panicked, false)
@@ -550,7 +558,7 @@ impl<I, R, F> Routing<I, R, F> {
   /// Invoke ONE parked query's completion, latching a caught user-closure(-drop) panic. The SOLE
   /// invoker of a query completion outside [`serve_query_batch`]: no Routing method invokes a query
   /// completion raw, so every non-serving completion panic reaches
-  /// [`Self::take_completion_panicked`] and thus the group's fail-stop.
+  /// [`Self::take_completion_panicked`] and thus the plane's fail-stop.
   fn complete_query(&mut self, q: ParkedQuery<I, F>, res: Result<&F, DriverError<I>>) {
     if (q.complete)(res) == CompletionOutcome::Panicked {
       self.completion_panicked = true;
@@ -576,13 +584,16 @@ impl<I, R, F> Routing<I, R, F> {
 ///
 /// A DETACHED `Routing` (a merge fold's source teardown, `remove_group`, the shutdown sweep) sweeps its
 /// parked work as it dies, and a swept completion drops its unused closure — whose captured guard's
-/// `Drop` can tear a state machine and panic. Whether that tear MATTERS depends on who inherits the
-/// state machine, which only the detaching site knows. So every detaching site must decide, explicitly:
+/// `Drop` can tear a state machine and panic. WHICH state machine is unknowable: the guard aliases
+/// whatever the closure captured, which may be state any HOSTED group's FSM shares — a group the dying
+/// one never owned, never absorbed, and has no relationship to. There is no heir to reason about and no
+/// group to name. So a fired latch on a detached `Routing` means the same thing it means everywhere
+/// else: route it to `fail_stop_plane_unattributable_panic()` and stop the WHOLE plane.
 ///
-/// - an heir exists (a merge fold's `Merged`: the proto absorbed this group's FSM INTO the target) —
-///   take the latch and fail-stop the HEIR, which now owns the state the guard tore;
-/// - no heir (`Retired`, `remove_group`, shutdown: the endpoint is gone and no group inherited its
-///   FSM) — take the latch and discard it, saying why the tear needs no fail-stop.
+/// The ONE sound discard is a plane that is TERMINATING — the shutdown sweep, run after the driver's
+/// loop has exited. Nothing serves again, so a tear has no serve left to corrupt and there is nothing to
+/// fail-stop. That is a property of the plane's lifecycle, not of who inherited an FSM; any detach on a
+/// LIVE plane (`remove_group`, a merge fold's `Merged` or `Retired`) is plane-fatal, siblings included.
 ///
 /// Either way the verdict is CONSUMED before the drop. Reaching this assert means a detach site did
 /// neither, and a caught panic that could have torn replicated state was silently dropped: call
@@ -592,11 +603,11 @@ impl<I, R, F> Drop for Routing<I, R, F> {
     debug_assert!(
       !self.completion_panicked,
       "a Routing was dropped with its completion-panic latch SET: a completion caught a \
-       user-closure(-drop) panic that could have torn a replicated state machine, and no group was \
-       ever fail-stopped for it. Every site that detaches a Routing must take_completion_panicked() \
-       and route the verdict — fail-stop the group that INHERITED this one's state machine (a merge \
-       target), or, when no group inherited it, drain the latch explicitly and document why the tear \
-       needs no fail-stop"
+       user-closure(-drop) panic that could have torn ANY hosted group's replicated state machine, \
+       and no group was ever fail-stopped for it. Every site that detaches a Routing must \
+       take_completion_panicked() and route the verdict — fail-stop the whole plane (the tear is \
+       unattributable), or, only when the plane is terminating and nothing can serve again, drain the \
+       latch explicitly and document why no serve is left to corrupt"
     );
   }
 }
@@ -1346,7 +1357,7 @@ mod tests {
 
     // The arm the old comments called panic-free: the closure is never CALLED, and the completion still
     // reports `Panicked` — `map` dropped it, it dropped the guard, the guard's `Drop` panicked inside
-    // the unwind boundary. A driver that discards this outcome silently drops the group's fail-stop.
+    // the unwind boundary. A driver that discards this outcome silently drops the fail-stop.
     assert_eq!(
       (completion())(Err(DriverError::Superseded)),
       CompletionOutcome::Panicked,
@@ -1367,8 +1378,8 @@ mod tests {
     // yet DROPS it unused, running any guard it captured — whose `Drop` can panic against shared FSM
     // state, caught by the completion's `catch_unwind` and reported `Panicked` (simulated here exactly
     // as `query_batch_stops_serving_at_the_first_caught_panic` does, without a real unwind). A panic
-    // dropped here would leave the group LIVE against possibly-torn state, so the latch carries it to
-    // the driver's per-group fail-stop tail.
+    // dropped here would leave a group LIVE against possibly-torn state, so the latch carries it to the
+    // driver's fail-stop — plane-wide on a multi host, since the tear is unattributable.
     let (mut r, _rx) = routing();
     let b = InflightBudget::new(8, 8);
     let ctx = r.mint_query_ctx();
