@@ -2706,6 +2706,149 @@ fn a_destructive_install_refuses_foreign_fork_provenance() {
   m.group_mut(&200).unwrap().seed_fork_id_for_test(f.clone());
 
   let (mut log200, mut stable200) = (VecLog::default(), AsyncStable::default());
+
+  // Drive the twin into the ASYNC-FOLLOWER shape the REDUNDANT short-circuit serves: a durable
+  // log (indices 1..=3 at term 3) that outran `commit` (held at 1). Now a snapshot at boundary 1
+  // is redundant-by-committed and one at boundary 3 is redundant-by-Log-Matching — both classify
+  // BEFORE the fork-provenance gate, the exact ordering a foreign leader can ride to be acked out
+  // of Snapshot state on state it does not own.
+  let cmd = {
+    let mut buf = Vec::new();
+    Bytes::from_static(b"c").encode(&mut buf);
+    Bytes::from(buf)
+  };
+  m.handle_message(
+    &200,
+    Instant::ORIGIN,
+    &mut log200,
+    &mut stable200,
+    2u64,
+    Message::AppendEntries(crate::AppendEntries::new(
+      Term::new(3),
+      2u64,
+      Index::ZERO,
+      Term::ZERO,
+      std::vec![
+        crate::Entry::new(
+          Term::new(3),
+          Index::new(1),
+          crate::EntryKind::Normal,
+          cmd.clone()
+        ),
+        crate::Entry::new(
+          Term::new(3),
+          Index::new(2),
+          crate::EntryKind::Normal,
+          cmd.clone()
+        ),
+        crate::Entry::new(Term::new(3), Index::new(3), crate::EntryKind::Normal, cmd),
+      ],
+      Index::new(1),
+    )),
+  )
+  .unwrap();
+  while matches!(
+    m.handle_storage(&200, Instant::ORIGIN, &mut log200, &mut stable200),
+    Some(StorageProgress::MorePending)
+  ) {}
+  assert_eq!(
+    m.group(&200).unwrap().commit_index(),
+    Index::new(1),
+    "async-follower setup: durable log outran commit, held at 1"
+  );
+  let applied_after_setup = m.group(&200).unwrap().applied_index();
+
+  // Drains group-200 outbound and reports whether a SnapshotResponse reached the foreign leader —
+  // the ack that would lift it out of Snapshot. It is the LAST effect of the redundant branch,
+  // right after the staging discard, so its absence witnesses that the branch never ran.
+  let foreign_acked = |m: &mut MultiRaft<u64, u64, SplitSm>, leader: u64| -> bool {
+    let mut acked = false;
+    while let Some((g, out)) = m.poll_message() {
+      let (to, msg) = out.into_parts();
+      if g == 200 && to == leader && matches!(msg, Message::SnapshotResponse(_)) {
+        acked = true;
+      }
+    }
+    acked
+  };
+  // Clear the setup's AppendResponse (destined for node 2) before probing for a foreign ack.
+  let _ = foreign_acked(&mut m, 9);
+
+  let alien_probe = ForkId::new(
+    Bytes::from_static(&[9u8]),
+    1,
+    Index::new(4),
+    Term::new(1),
+    Bytes::from_static(&[200u8]),
+    7,
+  );
+  // Token-less AND different-token, each at the committed boundary (1) AND the Log-Matching
+  // boundary (3): every arm reaches the redundant classifier first, so the gate must precede it
+  // or the foreign leader is acked and this replica's staging discarded before provenance is ever
+  // consulted.
+  for (probe, boundary, shape) in [
+    (None, Index::new(1), "token-less at a committed boundary"),
+    (None, Index::new(3), "token-less at a Log-Matching boundary"),
+    (
+      Some(alien_probe.clone()),
+      Index::new(1),
+      "alien-token at a committed boundary",
+    ),
+    (
+      Some(alien_probe.clone()),
+      Index::new(3),
+      "alien-token at a Log-Matching boundary",
+    ),
+  ] {
+    let mut meta = crate::SnapshotMeta::new(
+      boundary,
+      Term::new(3),
+      crate::ConfState::from_voters(std::vec![1u64]),
+    );
+    if let Some(tok) = probe {
+      meta = meta.with_fork_id(tok);
+    }
+    m.handle_message(
+      &200,
+      Instant::ORIGIN,
+      &mut log200,
+      &mut stable200,
+      9u64,
+      Message::InstallSnapshot(crate::InstallSnapshot::new(
+        Term::new(3),
+        9u64,
+        meta,
+        fork_blob(77),
+      )),
+    )
+    .unwrap();
+    while matches!(
+      m.handle_storage(&200, Instant::ORIGIN, &mut log200, &mut stable200),
+      Some(StorageProgress::MorePending)
+    ) {}
+    assert!(
+      !foreign_acked(&mut m, 9),
+      "{shape}: a redundant foreign install must not ack the foreign leader"
+    );
+    let child = m.group(&200).unwrap();
+    assert_eq!(
+      child.applied_index(),
+      applied_after_setup,
+      "{shape}: nothing installed"
+    );
+    assert_eq!(
+      child.commit_index(),
+      Index::new(1),
+      "{shape}: commit unmoved"
+    );
+    assert!(!child.is_poisoned(), "{shape}: refusal, not fail-stop");
+    assert_eq!(
+      child.fork_id(),
+      Some(f.clone()),
+      "{shape}: provenance intact"
+    );
+  }
+
   let applied_before = m.group(&200).unwrap().applied_index();
 
   // An authenticated foreign leader ships a TOKEN-LESS destructive install. Landing it would

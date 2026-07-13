@@ -459,6 +459,43 @@ where
       .max_unwalled_lease_window
       .max(meta.max_unwalled_lease_window());
 
+    // FORK-PROVENANCE gate: this replica's lineage token rides every snapshot of its own lineage
+    // — the manufactured fork baseline carries it, own captures re-stamp it (the forced absorb
+    // capture included), and a sibling twin's transfer repeats it — and the handshake fences
+    // pre-token peers, so absence is meaningful: an authenticated leader shipping a token-less
+    // (or other-token) DESTRUCTIVE install is foreign lineage for this id, not an older version.
+    // Landing it would replace this child's state wholesale while the keep-if-set adoption below
+    // retains the token — the replica would impersonate the fork on foreign state (a parked
+    // parent could resolve its fork redundant against it), and a restart would re-derive
+    // provenance from the foreign durable meta and silently shed the token. REFUSE at receipt —
+    // BEFORE the redundancy short-circuit below (which on an already-committed OR Log-Matching
+    // boundary would ack a foreign leader out of Snapshot and discard this replica's staging
+    // WITHOUT ever consulting provenance), and before any staging — so a foreign leader is never
+    // released, the foreign blob never becomes durable, and restart re-derivation stays coherent
+    // with the live token. The pre-gate steps left above are provenance-neutral: the lease-bound
+    // fold is a monotone raise (only lengthens commit-wait), and `reclaim_stale_snapshot_recv`
+    // frees only THIS replica's own already-recoverable staging (no ack, no foreign effect).
+    // Refusal, not fail-stop: the sender is authenticated, merely mis-lineaged — dropping the
+    // message leaves it pinned in Snapshot state, the same standing-conflict posture as a parked
+    // fork, resolved by placement (removal / the genuine twin's transfer). A token-less self
+    // adopts freely (the fresh-joiner leg); a matching token re-installs freely (the twin
+    // retransfer leg).
+    //
+    // EXACT match only — no cross-mint supersession arm exists, by design. A genuine re-mint of
+    // the same child (a later split episode) can never repeat this token's coordinates: every
+    // committed split bumps the parent's lineage counter (the apply arm demands
+    // `parent_gen_after == shape_gen + 1`), so a re-mint carries a strictly higher parent
+    // incarnation — and the coordinator's admission floor retires the stale incarnation, tearing
+    // its replicas down, BEFORE the re-mint is admissible at all. A replica still advertising a
+    // stale mint against a re-minted lineage is therefore a lifecycle breach resolved by
+    // placement, never by letting an authenticated leader destructively replace a token-bearing
+    // replica — which is exactly the loss this gate exists to prevent.
+    if let Some(existing) = &self.split.fork_id
+      && meta.fork_id() != Some(existing)
+    {
+      return;
+    }
+
     // Redundancy short-circuit: skip the staging+install entirely when this follower ALREADY holds the
     // snapshot's prefix durably, and ack a position at/above the boundary so the leader advances `match`
     // and leaves `ProgressState::Snapshot`. Redundant two ways:
@@ -517,37 +554,6 @@ where
     }
 
     // meta.last_index() > self.commit: a genuinely-newer snapshot.
-
-    // FORK-PROVENANCE gate: this replica's lineage token rides every snapshot of its own lineage
-    // — the manufactured fork baseline carries it, own captures re-stamp it (the forced absorb
-    // capture included), and a sibling twin's transfer repeats it — and the handshake fences
-    // pre-token peers, so absence is meaningful: an authenticated leader shipping a token-less
-    // (or other-token) DESTRUCTIVE install is foreign lineage for this id, not an older version.
-    // Landing it would replace this child's state wholesale while the keep-if-set adoption below
-    // retains the token — the replica would impersonate the fork on foreign state (a parked
-    // parent could resolve its fork redundant against it), and a restart would re-derive
-    // provenance from the foreign durable meta and silently shed the token. REFUSE at receipt,
-    // BEFORE any staging, so the foreign blob never becomes durable and restart re-derivation
-    // stays coherent with the live token. Refusal, not fail-stop: the sender is authenticated,
-    // merely mis-lineaged — dropping the message leaves it pinned in Snapshot state, the same
-    // standing-conflict posture as a parked fork, resolved by placement (removal / the genuine
-    // twin's transfer). A token-less self adopts freely (the fresh-joiner leg); a matching token
-    // re-installs freely (the twin retransfer leg).
-    //
-    // EXACT match only — no cross-mint supersession arm exists, by design. A genuine re-mint of
-    // the same child (a later split episode) can never repeat this token's coordinates: every
-    // committed split bumps the parent's lineage counter (the apply arm demands
-    // `parent_gen_after == shape_gen + 1`), so a re-mint carries a strictly higher parent
-    // incarnation — and the coordinator's admission floor retires the stale incarnation, tearing
-    // its replicas down, BEFORE the re-mint is admissible at all. A replica still advertising a
-    // stale mint against a re-minted lineage is therefore a lifecycle breach resolved by
-    // placement, never by letting an authenticated leader destructively replace a token-bearing
-    // replica — which is exactly the loss this gate exists to prevent.
-    if let Some(existing) = &self.split.fork_id
-      && meta.fork_id() != Some(existing)
-    {
-      return;
-    }
 
     // Duplicate-install guard: a deferred install for the SAME snapshot identity (or one at a
     // strictly-NEWER boundary) is completing — do NOT re-stage or re-decode (that would orphan the
