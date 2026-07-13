@@ -492,7 +492,7 @@ impl Checker {
   }
 
   /// Seed the quorum-durability floor at a FORK CHILD's manufactured snapshot baseline `index`,
-  /// so [`commit_is_quorum_durable`] judges only commits strictly above it. Called once at child
+  /// so `commit_is_quorum_durable` judges only commits strictly above it. Called once at child
   /// registration, before the first view is checked; a normally-created group's checker is never
   /// seeded and keeps the full axiom from index 0.
   ///

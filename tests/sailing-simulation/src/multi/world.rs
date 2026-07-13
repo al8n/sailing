@@ -523,7 +523,7 @@ impl MultiWorld {
 
   /// True if every hosting node's ORACLE-ALIGNED applied sequence for `gid` agrees as a prefix
   /// of the longest — the State Machine Safety core, scoped to one group. Alignment (see
-  /// [`aligned_applied`](Self::aligned_applied)) is what keeps the prefix NOTION valid across a
+  /// `aligned_applied`) is what keeps the prefix NOTION valid across a
   /// split: raw records stop being prefix-related the moment one replica's `fsm.split` removes
   /// the moved cells mid-record while a lagging peer still holds them; a group that never split
   /// is compared byte-for-byte as before.
