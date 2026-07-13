@@ -1225,19 +1225,27 @@ async fn a_higher_id_completion_panic_skips_the_lower_id_siblings_serve() {
   }
 }
 
-/// The HARVEST's red-proof: a latch already SET when the tails begin.
+/// THE PHASING's red-proof: a latch already SET when the per-group steps begin stops EVERY group from
+/// serving that crank — including a sibling that sorts BEFORE the latched group and latched nothing.
 ///
 /// `route_event`'s `LeaderChanged` arm sweeps the changed group's parked work with `fail_all(Superseded)`
 /// — in the pump, ahead of every tail — so a swept closure's dropped guard can tear a state machine while
 /// every group's confirmed reads are still parked. A tail that reads only its OWN latch cannot see that:
 /// a sibling sorting EARLIER than the torn group finds a clear latch and an unpoisoned endpoint, serves
 /// its query against the ALREADY-torn FSM, and the torn group's fail-stop arrives a step too late. The
-/// plane-wide harvest closes it — every routing's latch is taken before any group's step, so the plane is
-/// poisoned before the first serve gate is reached.
+/// phased crank closes it — the tear becomes a plane-wide poison before ANY group's serve step, so the
+/// lower-id sibling's confirmed query completes `Poisoned` instead of reading torn state.
 ///
 /// The sweep is invoked exactly as `route_event`'s arm invokes it (as
 /// `a_swept_completion_panic_fail_stops_the_whole_plane` does), which is what leaves the latch standing
-/// BEFORE the crank's tails — the state a routed `LeaderChanged` leaves behind.
+/// BEFORE the crank's per-group steps — the state a routed `LeaderChanged` leaves behind.
+///
+/// WHAT THIS DOES NOT PIN: the `harvest_completion_panics` CALL. Either phase can route THIS latch — the
+/// plane-wide harvest, or the latched group's OWN pre-serve step, which still precedes every group's
+/// phase-3 serve — so removing the harvest leaves this test green. The harvest is uniquely load-bearing
+/// for a PHASE-2 failover serve by a group sorting before the latched one, an arm that is inert on this
+/// host (see `harvest_completion_panics`, which explains why no crank-level test can reach it); its body
+/// is pinned directly by `a_harvest_of_one_latched_routing_fail_stops_every_hosted_group`.
 #[tokio::test]
 async fn a_latch_set_before_the_tails_stops_every_group_from_serving() {
   use std::sync::atomic::{AtomicBool, Ordering};
@@ -1441,4 +1449,81 @@ async fn a_normal_remove_group_does_not_fail_stop_the_siblings() {
   )
   .await
   .expect("a plane with no fail-stop keeps committing");
+}
+
+/// The HARVEST's own contract, invoked DIRECTLY — the one part of it a test on this host can hold.
+///
+/// The serve `harvest_completion_panics` uniquely guards is a PHASE-2 failover serve by a group sorting
+/// before the latched one, and it needs a window `failover_read_window` never opens without the wall-clock
+/// failover tier — so the CALL cannot be red-proofed through the crank here (delete it and every crank
+/// test stays green; see the fn's docs). Its BODY can be, and this pins it: ONE latched routing must
+/// fail-stop EVERY hosted group — the sibling that latched nothing and sorts FIRST above all, since that
+/// is the group the plane-fatal verdict exists to stop — and it must drain EVERY routing rather than stop
+/// at the first to fire, or a `Routing` outlives its verdict.
+#[tokio::test]
+async fn a_harvest_of_one_latched_routing_fail_stops_every_hosted_group() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2, 3] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+  }
+  // Groups 2 and 3 latch a caught guard-`Drop` panic by the mechanism a routed `LeaderChanged` uses: a
+  // query that can never run (`ready_at` stays `None`) is completed by a `fail_all` sweep, which drops the
+  // closure UNUSED and runs the captured guard's panicking `Drop` inside the completion's unwind boundary.
+  // Group 1 latches NOTHING and sorts FIRST — it is the sibling the verdict has to reach.
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  for gid in [2u64, 3] {
+    let routing = driver.routing.get_mut(&gid).expect("the group routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: drop_panic_completion(),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.fail_all(&sailing_driver::DriverError::Superseded);
+  }
+  // The LATCH alone poisons nothing: the plane stop is the harvest's doing, not the sweep's — which is
+  // what makes the assertions after it evidence about the harvest.
+  for gid in [1u64, 2, 3] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| !ep.is_poisoned()),
+      "group {gid} is poisoned before the harvest ran: a latch on its own must not fail-stop anything"
+    );
+  }
+
+  driver.harvest_completion_panics();
+
+  // Read the latches back FIRST, unconditionally. It is the drain half of the contract — a harvest that
+  // stopped at group 2 would leave group 3's verdict unconsumed — and taking them here also leaves the
+  // driver droppable when this test FAILS, so a regression reports the assertion below instead of
+  // aborting the run by unwinding through `Routing`'s dropped-while-latched assert.
+  let mut survived = Vec::new();
+  for gid in [2u64, 3] {
+    if driver
+      .routing
+      .get_mut(&gid)
+      .expect("the group routes")
+      .take_completion_panicked()
+    {
+      survived.push(gid);
+    }
+  }
+
+  for gid in [1u64, 2, 3] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| ep.is_poisoned()),
+      "group {gid} survived a harvested tear: the swept guard aliases state ANY hosted group's FSM may \
+       share, so the verdict is PLANE-fatal — and group 1, which latched nothing, is precisely the \
+       sibling that would otherwise go on serving reads against it"
+    );
+  }
+  assert!(
+    survived.is_empty(),
+    "the harvest left a latch standing on {survived:?}: it must drain EVERY routing, not stop at the \
+     first to fire — no Routing may outlive its verdict"
+  );
 }

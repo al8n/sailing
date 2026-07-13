@@ -530,6 +530,14 @@ impl<I, R, F> Routing<I, R, F> {
     for (_, q) in std::mem::take(&mut self.queries) {
       self.complete_query(q, Err(err.clone()));
     }
+    // TAKING the failovers is load-bearing, not merely a way to iterate them. The multi drivers'
+    // leadership-loss backstop calls `fail_all(Superseded)` inside a group's pre-serve step, BEFORE that
+    // same group's `run_failover_serve`, and reads the latch this sweep may set only at the END of the
+    // step — which reads like a same-group tear-then-serve window. THIS take is what closes it: it empties
+    // `failovers`, and `run_failover_serve` early-returns on an empty batch, so a sweep that could have
+    // torn an FSM always leaves the serve it precedes with nothing to serve. Drain and empty-check are one
+    // invariant spanning two files; iterate this by reference, or drop that check, and the window re-opens
+    // inside a single group's step, where no plane-wide phase can see it.
     for p in std::mem::take(&mut self.failovers) {
       self.complete_failover(p, Err(err.clone()));
     }

@@ -1708,6 +1708,13 @@ where
     let Some(routing) = self.routing.get_mut(gid) else {
       return false;
     };
+    // Nothing parked — and this check is also THE OTHER HALF of the leadership-backstop coupling. The
+    // backstop's `fail_all(Superseded)` runs EARLIER in this same group's pre-serve step and can latch a
+    // tear the step only reads AFTERWARDS, which reads like a same-group tear-then-serve window. It is
+    // closed by construction: `Routing::fail_all` DRAINS `failovers` with `mem::take`, so whenever the
+    // backstop could have latched, the batch this serve would run is ALREADY EMPTY and this returns before
+    // any FSM is touched. Break either half — this check, or that drain — and the window re-opens inside
+    // one group's step, where no plane-wide phase of the crank can see it.
     if routing.failovers.is_empty() {
       return false;
     }
@@ -1976,6 +1983,24 @@ where
   /// (above all a `route_event` sweep) poisons the plane while every group's parked reads are still
   /// parked. Draining every routing — not stopping at the first — keeps the `Drop` invariant: no
   /// `Routing` outlives its verdict.
+  ///
+  /// WHAT ONLY THIS CALL CAN STOP. A latch already SET when the per-group steps begin — `route_event`'s
+  /// `LeaderChanged` arm sweeps the changed group with `fail_all(Superseded)` during the event drain above
+  /// — must poison the plane before any group's PHASE-2 failover SERVE, not merely before the phase-3
+  /// query serves. Without this call, a group sorting BEFORE the latched one reaches `run_failover_serve`
+  /// in its own pre-serve step with its latch clear and its endpoint unpoisoned, and serves inherited
+  /// reads against the FSM the sibling's swept guard already tore; the latched group's own pre-serve does
+  /// route its latch, but one step too late. The phase-3 QUERY serves are covered WITHOUT this call — the
+  /// latched group's pre-serve poisons the plane before any tail runs — so they are not what it is for.
+  ///
+  /// THAT PATH IS UNREACHABLE ON THIS HOST, so nothing can red-proof the CALL: delete it and the suite
+  /// stays green. `run_failover_serve`'s serve arm is inert here — `failover_read_window` returns `None`
+  /// without the LeaseGuard failover tier, so the pass can only DECLINE — and that inertness is a property
+  /// of this monotonic-only v1 host, not of this code. The moment the synchronized-`WallClock` failover
+  /// tier reaches the multi drivers (the generalization `run_failover_serve` is kept whole for), the serve
+  /// arm arms and this call becomes the only thing between a sibling's tear and an inherited read. It must
+  /// therefore NOT be deleted on the strength of a green suite. Its BODY is pinned directly, by the
+  /// reactor stream twin's `a_harvest_of_one_latched_routing_fail_stops_every_hosted_group`.
   fn harvest_completion_panics(&mut self) {
     let mut torn = false;
     for routing in self.routing.values_mut() {
@@ -2182,10 +2207,14 @@ where
     // FRESH: a group whose serve step ran earlier in this loop may have fail-stopped the plane after the
     // harvest — this read is what makes that stop bind here, before this group serves.
     let poisoned = ep.is_poisoned();
-    // The last thing between a caught panic and a serve. The harvest and the pre-serve steps drained
-    // every latch that could have fired before this loop, so this can only catch one set after them —
-    // and when it is set, the serve is SKIPPED: the fail-stop and the `fail_all(Poisoned)` below fail
-    // the parked queries `Poisoned` instead. A query that panics DURING the serve still reports through
+    // A DEFENSIVE BELT — provably clear under the current phasing, NOT a live path. The harvest took
+    // EVERY routing's latch at the top of the crank, this group's own pre-serve step took whatever its
+    // completions latched, and no group's step touches a SIBLING's routing — so nothing between that take
+    // and this one can set this latch, and it always reads `false` today. It is kept because it is the
+    // last read before the serve: a future latch source inside the tail (a new completion here, a
+    // tear-capable step reordered into it) needs exactly this gate and must not have to reinvent it. When
+    // it IS set the serve is SKIPPED: the fail-stop and the `fail_all(Poisoned)` below fail the parked
+    // queries `Poisoned` instead. A query that panics DURING the serve still reports through
     // `query_panicked`; one read-and-clear both gates and decides.
     let completion_panicked = self
       .routing
