@@ -339,6 +339,30 @@ pub fn serve_failover_batch<I, F>(
   panicked
 }
 
+/// Serve a drained batch of runnable linearizable queries against `fsm`, stopping at the first
+/// caught user-closure panic. `take_runnable_queries` already removed the WHOLE batch from routing,
+/// so a bare `break` on the first panic would strand the rest — their completions never run, their
+/// reply channels close, and the caller's `fail_all` can no longer reach them (a caller gets a
+/// closed-channel `ShuttingDown` instead of the true verdict). The remaining drained queries
+/// instead complete `Poisoned` WITHOUT running their closures against the possibly-torn FSM — the
+/// same verdict the caller's fail-stop gives the group's parked siblings. Returns whether any
+/// completion caught a panic; the caller fail-stops the group the batch read against. The
+/// normal-query sibling of [`serve_failover_batch`], sharing the drain-the-remainder rule so it
+/// cannot drift.
+#[must_use]
+pub fn serve_query_batch<I, F>(queries: Vec<ParkedQuery<I, F>>, fsm: &F) -> bool {
+  let mut panicked = false;
+  for q in queries {
+    if panicked {
+      // An `Err` completion never runs the user closure (see `CompletionOutcome`).
+      let _ = (q.complete)(Err(DriverError::Poisoned));
+      continue;
+    }
+    panicked = (q.complete)(Ok(fsm)) == CompletionOutcome::Panicked;
+  }
+  panicked
+}
+
 /// A linearizable query's lifecycle: confirmed by `ReadState` (which fixes `ready_at`), then run
 /// against the state machine once `applied >= ready_at`. The completion is type-erased and
 /// carries its own reply channel; `F` is the driver's state-machine type.
@@ -885,6 +909,56 @@ mod tests {
     let window = FailoverReadWindow::new(Index::new(4), Index::new(7));
     assert!(
       serve_failover_batch(batch, &(), &[], window, || true),
+      "the panic indication reaches the caller, which fail-stops the group"
+    );
+    assert!(
+      !second_served.load(Ordering::Relaxed),
+      "no later user closure may run against the possibly-torn FSM"
+    );
+    assert!(
+      second_poisoned.load(Ordering::Relaxed),
+      "the remaining item completes Poisoned without its closure running"
+    );
+    assert_eq!(b.in_flight(), (0, 0), "every reservation released");
+  }
+
+  #[test]
+  fn query_batch_stops_serving_at_the_first_caught_panic() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let b = InflightBudget::new(8, 8);
+    let second_served = Arc::new(AtomicBool::new(false));
+    let second_poisoned = Arc::new(AtomicBool::new(false));
+    let mut batch: Vec<ParkedQuery<u64, ()>> = Vec::new();
+    // Item 1's user closure panics (caught inside the completion): only the SERVED arm (`Ok(&fsm)`)
+    // runs the closure, so only it can report the caught panic.
+    batch.push(ParkedQuery {
+      ready_at: None,
+      complete: Box::new(|res: Result<&(), DriverError<u64>>| {
+        CompletionOutcome::caught(res.is_ok())
+      }),
+      _reservation: b.try_reserve::<u64>(0).unwrap(),
+    });
+    // Item 2 must NEVER be served after the batch caught a panic — the FSM may be torn — and must
+    // NOT be dropped (a dropped completion closes its channel, the `ShuttingDown`/closed-channel the
+    // bug produced). It must complete with the poisoned-group verdict its parked siblings receive.
+    {
+      let served = second_served.clone();
+      let poisoned = second_poisoned.clone();
+      batch.push(ParkedQuery {
+        ready_at: None,
+        complete: Box::new(move |res: Result<&(), DriverError<u64>>| {
+          match res {
+            Ok(_) => served.store(true, Ordering::Relaxed),
+            Err(DriverError::Poisoned) => poisoned.store(true, Ordering::Relaxed),
+            Err(_) => {}
+          }
+          CompletionOutcome::Delivered
+        }),
+        _reservation: b.try_reserve::<u64>(0).unwrap(),
+      });
+    }
+    assert!(
+      serve_query_batch(batch, &()),
       "the panic indication reaches the caller, which fail-stops the group"
     );
     assert!(

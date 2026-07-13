@@ -1983,17 +1983,14 @@ where
       && let Some(ep) = self.coord.group(gid)
       && let Some(routing) = self.routing.get_mut(gid)
     {
-      for q in routing.take_runnable_queries() {
-        // A caught user-closure panic fail-stops THIS group: interior mutability could have torn its
-        // replicated FSM mid-read. Stop serving more reads off it; the fail-stop runs once the `ep`
-        // borrow releases below. Siblings keep serving.
-        if (q.complete)(Ok(ep.state_machine()))
-          == sailing_driver::shared::CompletionOutcome::Panicked
-        {
-          query_panicked = true;
-          break;
-        }
-      }
+      // A caught user-closure panic fail-stops THIS group: interior mutability could have torn its
+      // replicated FSM mid-read. The batch completes its remainder `Poisoned` (already drained from
+      // routing, so the `fail_all` below cannot reach them); the fail-stop runs once the `ep` borrow
+      // releases. Siblings keep serving.
+      query_panicked = sailing_driver::shared::serve_query_batch(
+        routing.take_runnable_queries(),
+        ep.state_machine(),
+      );
     }
     if query_panicked {
       // Poison + latch the group (surfaces once on the lifecycle tail via `poll_poisoned`), then

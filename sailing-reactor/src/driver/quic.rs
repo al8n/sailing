@@ -1028,18 +1028,16 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    if run_queries {
-      for q in self.routing.take_runnable_queries() {
-        // A caught user-closure panic fail-stops the endpoint: interior mutability could have torn
-        // the replicated FSM mid-read, so stop before serving any more reads off it. The poison
-        // check below fails the remaining parked work typed and stops the driver.
-        if (q.complete)(Ok(self.coord.state_machine()))
-          == sailing_driver::shared::CompletionOutcome::Panicked
-        {
-          self.coord.fail_stop_query_panicked();
-          break;
-        }
-      }
+    if run_queries
+      && sailing_driver::shared::serve_query_batch(
+        self.routing.take_runnable_queries(),
+        self.coord.state_machine(),
+      )
+    {
+      // A caught user-closure panic fail-stops the endpoint: interior mutability could have torn
+      // the replicated FSM mid-read. The batch completed its remainder `Poisoned` rather than
+      // stranding it; the poison check below fails any still-parked work typed and stops the driver.
+      self.coord.fail_stop_query_panicked();
     }
     // The fail-stop check: a poisoned endpoint suppresses poll_event and poll_timeout by design, so
     // anything parked would otherwise wait forever holding its reservation. Fail it all with the
