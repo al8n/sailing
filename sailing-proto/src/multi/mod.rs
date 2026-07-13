@@ -3230,6 +3230,14 @@ where
           };
           let fsm = sep.into_state_machine();
           let Some(tep) = self.groups.get_mut(&tgid) else {
+            // Unreachable: `tgid` was iterated from `self.groups` and only `source` (a DISTINCT id)
+            // was removed above. The assert pins the post-removal invariant a future refactor could
+            // break — the source endpoint is already consumed, so any post-removal path that fails
+            // to push a resolution strands the source's parked work (the capture-failed hole).
+            debug_assert!(
+              false,
+              "the merge target vanished between iteration and resolution"
+            );
             continue;
           };
           let merged = tep.resolve_pending_merge(fsm);
