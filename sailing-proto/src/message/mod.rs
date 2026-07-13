@@ -559,17 +559,23 @@ pub struct SnapshotMeta<I> {
   /// counter for incarnation and shape (a split's `parent_gen_after`, a fork child's `child_gen`,
   /// a reshaping catalog's incarnation). Carried so a node restoring this snapshot knows its
   /// lineage without replaying the split entries the snapshot subsumed. `0` (an unreshaped id) is
-  /// absent on the wire — byte-identical to a pre-P6 peer's meta. Like the lease/read-mode
-  /// bounds, EXCLUDED from [`identity_eq`](Self::identity_eq): boundary metadata, not transfer
-  /// identity.
+  /// absent on the wire — byte-identical to a pre-P6 peer's meta. Like the lease/read-mode bounds —
+  /// and UNLIKE [`fork_id`](Self::fork_id) — EXCLUDED from [`identity_eq`](Self::identity_eq): it is
+  /// the boundary's POSITION within a lineage, folded from the same subsumed prefix, so it can
+  /// neither separate two snapshots that already agree on lineage and coordinate nor join two that
+  /// disagree. The token, not the counter, is the lineage discriminator.
   shape_gen: u64,
   /// The forked child's provenance token when this snapshot IS (or descends from) a fork baseline —
   /// the durable [`ForkId`] a manufactured fork install writes, preserved by the child's own later
   /// snapshots and adopted by a peer that installs one. `None` for every non-fork snapshot, so it is
-  /// absent on the wire (byte-identical to a pre-provenance peer's meta). Like the lease/read-mode
-  /// bounds and `shape_gen`, EXCLUDED from [`identity_eq`](Self::identity_eq): provenance metadata,
-  /// not transfer identity. BOXED because it is present only on the rare fork baseline, so it must
-  /// not inflate every `SnapshotMeta` (and thus every `Message::InstallSnapshot`) by its full size.
+  /// absent on the wire (byte-identical to a pre-provenance peer's meta). UNLIKE the lease/read-mode
+  /// bounds and `shape_gen`, it IS part of [`identity_eq`](Self::identity_eq) — the LINEAGE
+  /// DISCRIMINATOR. `(last_index, last_term, conf)` is NOT a content-identity across a fork boundary:
+  /// Log Matching holds only WITHIN one lineage, so a manufactured fork baseline and a colliding
+  /// tokenless (or differently-forked) snapshot are DIFFERENT bytes at the SAME coordinate. They must
+  /// never share a transfer, a staging buffer, or a durability verdict. BOXED because it is present
+  /// only on the rare fork baseline, so it must not inflate every `SnapshotMeta` (and thus every
+  /// `Message::InstallSnapshot`) by its full size.
   fork_id: Option<Box<ForkId>>,
 }
 
@@ -665,12 +671,26 @@ impl<I> SnapshotMeta<I> {
     &self.conf
   }
 
-  /// Whether two snapshots share the same TRANSFER IDENTITY — equal `(last_index, last_term, conf)`. The
-  /// LeaseGuard / read-mode bounds are EXCLUDED: a later snapshot at the same boundary may carry a higher
-  /// monotone bound yet is the same underlying snapshot, so it must CONTINUE an in-flight transfer, not
-  /// restart it. Used by the receiver and the store staging to key a chunked transfer by its real identity
-  /// rather than the boundary index alone (so a different snapshot at the same `last_index` cannot reuse a
-  /// prior transfer's staged bytes).
+  /// Whether two snapshots share the same TRANSFER IDENTITY — equal `(last_index, last_term, conf)` AND the
+  /// same lineage token ([`fork_id`](Self::fork_id)). This is the "are these the same BYTES" question every
+  /// snapshot-identity boundary asks: the receiver's pending-install dedup, the chunk continuation, the store
+  /// staging's ownership, the sender's re-read consistency check, and the deferred install's durable-evidence
+  /// fallback. A different snapshot must never reuse a prior transfer's staged bytes, dedup against a pending
+  /// install, or be declared durable on another snapshot's fsync.
+  ///
+  /// The LINEAGE TOKEN is identity because `(last_index, last_term, conf)` is NOT a content-identity ACROSS a
+  /// fork boundary: Log Matching holds only WITHIN one lineage, so a manufactured fork baseline and a
+  /// colliding tokenless (or differently-forked) snapshot are DIFFERENT state with DIFFERENT bytes at the same
+  /// coordinate. `None` vs `Some` differ for that same reason — an independent collider that happened to commit
+  /// the coordinates is a distinct lineage, not the fork. Within one lineage the token is STABLE (a child's own
+  /// later captures preserve it), so requiring it never splits a transfer that ought to continue.
+  ///
+  /// EXCLUDED, and why neither can make two DIFFERENT states look identical:
+  /// - the LeaseGuard / read-mode bounds are MONOTONE folds over the subsumed entries: two captures of the
+  ///   SAME state at the SAME boundary may legitimately carry DIFFERENT bounds (a later one folds higher), so
+  ///   including them would RESTART an in-flight transfer that must CONTINUE.
+  /// - `shape_gen` is the boundary's POSITION in the lineage, folded from that same subsumed prefix — it
+  ///   cannot separate two snapshots that already agree on lineage and coordinate.
   pub fn identity_eq(&self, other: &Self) -> bool
   where
     I: PartialEq,
@@ -678,6 +698,7 @@ impl<I> SnapshotMeta<I> {
     self.last_index == other.last_index
       && self.last_term == other.last_term
       && self.conf == other.conf
+      && self.fork_id == other.fork_id
   }
 
   /// The max LeaseGuard commit-wait window (nanos) over the subsumed entries, or `0` if unset.

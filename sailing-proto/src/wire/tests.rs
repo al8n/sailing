@@ -1004,7 +1004,7 @@ fn encoder_is_byte_identical_to_encode_message() {
     Term::new(6),
     ConfState::new([1u64, 2, 3, 4, 5], [9u64], [1u64, 2, 3], [7u64], true),
   );
-  // SAME identity as `meta_a` (equal last_index/last_term/conf) but DIFFERENT bounds: `identity_eq`
+  // SAME identity as `meta_a` (equal coordinate, both tokenless) but DIFFERENT bounds: `identity_eq`
   // matches yet the encoded body differs, so the cache (keyed on the FULL meta) must miss and re-encode.
   let meta_a_bounded = meta_a.clone().with_max_lease_window(123_456);
   // A genuinely different (superseding) meta.

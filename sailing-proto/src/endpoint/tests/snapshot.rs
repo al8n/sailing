@@ -5142,3 +5142,332 @@ fn deferred_install_off_follower_preserves_log_and_campaign() {
     "no SnapshotInstalled event for a dropped off-follower install"
   );
 }
+
+/// A fork token for a child at the given `child` id — the lineage discriminator that makes a manufactured
+/// baseline distinguishable from an independently-committed snapshot at the same coordinate.
+fn fork_token(child: u8) -> crate::ForkId {
+  use crate::{ForkId, Index, Term};
+  ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::copy_from_slice(&[child]),
+    1,
+  )
+}
+
+/// PERSIST-BEFORE-ACK across a fork boundary. The deferred install's durable-evidence fallback must key on
+/// THIS install's OWN snapshot — lineage included. A colliding coordinate is NOT evidence of durability:
+/// `(index, term, conf)` is not a content-identity across a fork boundary, so an old durable TOKENLESS
+/// snapshot and an in-flight fork BASELINE at the same coordinate are different bytes.
+///
+/// Setup: the store durably holds a tokenless snapshot at (10, 2, conf) whose install this follower never
+/// ran. The genuine fork baseline arrives at the SAME coordinate carrying the fork's real state (count 777),
+/// and its fsync is still IN FLIGHT — so `durable_snapshot()` keeps reporting the OLD tokenless blob.
+///
+/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fallback reads the tokenless blob's
+/// durability as the fork baseline's, installs it, and ACKS boundary 10 while the fork's bytes are NOT on
+/// disk. A crash in that window recovers the divergent tokenless state under an ack the leader already
+/// counted toward `match`, and replication continues over the wrong state. The withheld-ack assertions FAIL.
+#[test]
+fn a_deferred_install_is_not_acked_on_a_colliding_lineages_durability() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // An OLD tokenless snapshot at (10, 2) is DURABLE in the store — a lineage this follower never installed.
+  stable.force_snapshot(
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()),
+    encode_count_snapshot(111),
+  );
+
+  // The genuine fork baseline: the SAME coordinate, a fork TOKEN, and the fork's real state. Its fsync is
+  // held in flight, so the durable slot still reports the tokenless blob.
+  stable.hold_snapshot_fsync(true);
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "the fork baseline's install is deferred behind its fsync"
+  );
+  assert!(
+    stable
+      .durable_snapshot()
+      .expect("the old blob is durable")
+      .fork_id()
+      .is_none(),
+    "the DURABLE slot still holds the TOKENLESS snapshot — the fork's fsync has not landed"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Drain storage: the fork baseline's own `SnapshotWritten` has NOT arrived, and the only durable evidence
+  // belongs to a DIFFERENT lineage. Nothing destructive may run, and NOTHING may be acked.
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.snapshot.pending_install.is_some(),
+    "another lineage's fsync is not this install's durability"
+  );
+  assert_eq!(ep.commit, Index::new(3), "no commit advance");
+  assert_eq!(
+    log.last_index(),
+    Index::new(3),
+    "no re-baseline over a non-durable blob"
+  );
+  assert_ne!(
+    ep.state_machine().count(),
+    777,
+    "the fork's state was not restored"
+  );
+  let msgs: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  assert!(
+    !msgs
+      .iter()
+      .any(|o| matches!(o.message(), Message::SnapshotResponse(_))),
+    "PERSIST-BEFORE-ACK: no ack may leave this node until the fork baseline's OWN bytes are durable"
+  );
+
+  // The ack is DEFERRED, not lost: once the fork baseline's own fsync lands, the install completes and acks.
+  // (This leg is also the same-lineage no-regression check — a matching token still satisfies the fallback.)
+  stable.flush_held_snapshots();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the install completes on its OWN durability"
+  );
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(
+    ep.state_machine().count(),
+    777,
+    "the FORK's state is what landed"
+  );
+  assert_eq!(
+    ep.fork_id(),
+    Some(token),
+    "the installing node adopts the fork's token"
+  );
+  let acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
+    .filter(|o| matches!(o.message(), Message::SnapshotResponse(_)))
+    .collect();
+  assert_eq!(acks.len(), 1, "exactly one ack, once the bytes are durable");
+  match acks[0].message() {
+    Message::SnapshotResponse(r) => {
+      assert!(!r.reject());
+      assert_eq!(r.match_index(), Index::new(10));
+    }
+    _ => unreachable!(),
+  }
+}
+
+/// The duplicate-install guard keys on the snapshot's IDENTITY, lineage included. A fork baseline arriving at
+/// the coordinate of an in-flight TOKENLESS install is a DIFFERENT snapshot — it must SUPERSEDE that install,
+/// never be deduped away as "already in flight".
+///
+/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fork baseline is swallowed by the pending
+/// tokenless install. The follower then installs the OTHER lineage's state and acks boundary 10, telling the
+/// leader its fork snapshot landed while the state machine holds different bytes — permanent divergence under
+/// a counted ack. The superseded-state assertions FAIL (count 10, no token, instead of the fork's 777).
+#[test]
+fn a_cross_lineage_install_supersedes_a_pending_one_at_the_same_coordinate() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // A TOKENLESS install at (10, 2) is in flight (fsync held): `install_at` carries state count 10.
+  stable.hold_snapshot_fsync(true);
+  ep.handle_message(d, &mut log, &mut stable, 1u64, install_at(10));
+  assert!(
+    ep.snapshot
+      .pending_install
+      .as_ref()
+      .expect("the tokenless install is pending")
+      .1
+      .fork_id()
+      .is_none(),
+    "the in-flight install is the tokenless lineage"
+  );
+
+  // The genuine fork baseline arrives at the SAME coordinate with the fork's real state.
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .pending_install
+      .as_ref()
+      .expect("an install is pending")
+      .1
+      .fork_id(),
+    Some(&token),
+    "the fork baseline SUPERSEDED the colliding tokenless install — it was not deduped away"
+  );
+
+  // Drive both fsyncs to completion: the state that lands is the FORK's, not the displaced lineage's.
+  stable.flush_held_snapshots();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the install completed"
+  );
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(
+    ep.state_machine().count(),
+    777,
+    "the FORK's state landed — not the superseded tokenless lineage's (count 10)"
+  );
+  assert_eq!(ep.fork_id(), Some(token), "and its token was adopted");
+}
+
+/// Two chunked transfers with the SAME coordinate AND the same `total_len` but DIFFERENT lineages must never
+/// COMBINE their chunks into one blob. The sender term cannot see this collision — both arrive under the SAME
+/// leader term — so the LINEAGE TOKEN is the only thing standing between the receiver and a Frankenstein blob
+/// spliced from two lineages' bytes.
+///
+/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fork's chunk CONTINUES the tokenless
+/// partial (contiguous_staged 6 — a mixed [0,6) blob that would then decode and INSTALL) instead of replacing
+/// it (contiguous_staged 0 — its own [3,6) with a gap).
+#[test]
+fn cross_lineage_chunks_never_combine_into_one_blob() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // A TOKENLESS transfer at (10, 2), total_len 6: stage [0,3).
+  let tokenless = SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      tokenless,
+      bytes::Bytes::from_static(b"AAA"),
+      0,
+      6,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| r.contiguous_staged),
+    Some(3),
+    "the tokenless transfer staged [0,3)"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The fork baseline: SAME coordinate, SAME total_len, SAME sender term — ONLY the lineage differs.
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      baseline,
+      bytes::Bytes::from_static(b"BBB"),
+      3,
+      6,
+    )),
+  );
+  let recv = ep
+    .snapshot
+    .snapshot_recv
+    .as_ref()
+    .expect("a transfer is in progress");
+  assert_eq!(
+    recv.meta.fork_id(),
+    Some(&token),
+    "the fork's transfer REPLACED the tokenless partial"
+  );
+  assert_eq!(
+    recv.contiguous_staged, 0,
+    "the tokenless [0,3) was discarded — the fork's [3,6) leaves a gap, NOT a mixed [0,6) blob"
+  );
+}
+
+/// The lineage key must not OVER-reject: a fork child's own chunked transfer (every chunk carrying the SAME
+/// token) still continues one transfer and installs, exactly as a tokenless transfer does.
+///
+/// MUTATION: compare `fork_id` by identity rather than value (e.g. reject whenever a token is present) → the
+/// second chunk restarts the transfer, contiguous_staged stays 3, and the install never completes.
+#[test]
+fn same_lineage_chunks_still_continue_one_transfer() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  // The fork's blob, split across two chunks of ONE transfer.
+  let blob = encode_count_snapshot(500);
+  let total = blob.len() as u64;
+  let cut = 1usize;
+
+  for (offset, data) in [
+    (0u64, blob.slice(0..cut)),
+    (cut as u64, blob.slice(cut..blob.len())),
+  ] {
+    ep.handle_message(
+      d,
+      &mut log,
+      &mut stable,
+      1u64,
+      Message::InstallSnapshot(InstallSnapshot::new_chunk(
+        Term::new(2),
+        1u64,
+        baseline.clone(),
+        data,
+        offset,
+        total,
+      )),
+    );
+  }
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "the completed transfer left no staged receive"
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.state_machine().count(),
+    500,
+    "a same-lineage chunked transfer continues one transfer and installs the fork's state"
+  );
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(ep.fork_id(), Some(token));
+}

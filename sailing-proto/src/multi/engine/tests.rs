@@ -1,5 +1,5 @@
 use super::*;
-use crate::{ConfState, EntryKind, FloorStore, NoFloors};
+use crate::{ConfState, EntryKind, FloorStore, ForkId, NoFloors};
 
 fn empty_entry(term: u64, index: u64) -> Entry {
   Entry::new(
@@ -412,6 +412,63 @@ fn snapshot_staging_round_trips() {
     stable.accept_snapshot_chunk(&meta, 6, 0, &Bytes::from_static(b"ab")),
     Ok(0),
     "an older boundary is ignored while newer staging is in flight"
+  );
+}
+
+/// The staging slot is owned by ONE snapshot identity, LINEAGE included. Two transfers colliding on
+/// `(last_index, last_term, conf)` AND `total_len` but belonging to DIFFERENT lineages are different bytes —
+/// `(index, term)` is not a content-identity across a fork boundary — so the second must RESET the slot, and
+/// a staged blob must never be handed out for another lineage's meta. Within one lineage, chunks still
+/// accumulate normally.
+///
+/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fork's chunk EXTENDS the tokenless
+/// staging (`Ok(6)` instead of `Ok(0)`), and `take_staged_snapshot` hands the resulting MIXED blob
+/// (b"AAABBB" — half one lineage, half another) to whichever meta asks. Both assertions FAIL.
+#[test]
+fn snapshot_staging_never_mixes_two_lineages() {
+  let mut eng = GroupEngine::<u64, u64>::new();
+  assert!(eng.add_group(1));
+  let (_, stable) = eng.stores(&1).unwrap();
+
+  let tokenless = voter_meta(10, 2);
+  let token = ForkId::new(
+    Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    Bytes::from_static(&[9u8]),
+    1,
+  );
+  let forked = voter_meta(10, 2).with_fork_id(token);
+
+  assert_eq!(
+    stable.accept_snapshot_chunk(&tokenless, 6, 0, &Bytes::from_static(b"AAA")),
+    Ok(3),
+    "the tokenless transfer stages [0,3)"
+  );
+  assert_eq!(
+    stable.accept_snapshot_chunk(&forked, 6, 3, &Bytes::from_static(b"BBB")),
+    Ok(0),
+    "the fork's chunk RESETS the slot — it must never extend another lineage's staged bytes"
+  );
+  assert!(
+    stable.take_staged_snapshot(&tokenless).is_none(),
+    "the displaced lineage owns nothing"
+  );
+  assert!(
+    stable.take_staged_snapshot(&forked).is_none(),
+    "and the fork's own staging is still incomplete — no blob is fabricated from the other's bytes"
+  );
+
+  // The fork completes on its OWN bytes alone: same-lineage chunks accumulate exactly as before.
+  assert_eq!(
+    stable.accept_snapshot_chunk(&forked, 6, 0, &Bytes::from_static(b"BBB")),
+    Ok(6)
+  );
+  assert_eq!(
+    stable.take_staged_snapshot(&forked),
+    Some(Bytes::from_static(b"BBBBBB")),
+    "the installed blob is ONE lineage's bytes end to end"
   );
 }
 

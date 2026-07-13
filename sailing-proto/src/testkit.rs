@@ -634,6 +634,13 @@ pub(crate) struct AsyncStable {
   /// completion from a LATER write whose durability has not landed.
   hold_writes: bool,
   held_writes: VecDeque<StableDone>,
+  /// The snapshot mirror of [`hold_writes`](Self::hold_writes): `submit_snapshot` makes the blob VISIBLE
+  /// but HOLDS its `SnapshotWritten` until `flush_held_snapshots()`, so `durable_snapshot()` keeps
+  /// reporting the PREVIOUS durable snapshot while the new blob's fsync is in flight — the real state of
+  /// any async store mid-write, and the window in which a durability verdict keyed on a colliding
+  /// coordinate would ack a snapshot whose bytes are not yet on disk.
+  hold_snapshot_fsync: bool,
+  held_snapshots: VecDeque<StableDone>,
   /// The `lease_support` of every HardState actually handed to `submit_write` (post choke-point
   /// stamp). Lets a test assert the durable floor is monotone non-decreasing across all writes.
   submitted_lease: Vec<Option<Duration>>,
@@ -664,6 +671,8 @@ impl Default for AsyncStable {
       last_durable_reads: false,
       hold_writes: false,
       held_writes: VecDeque::new(),
+      hold_snapshot_fsync: false,
+      held_snapshots: VecDeque::new(),
       submitted_lease: Vec::new(),
       snapshot_staging: None,
       cold_snapshot: false,
@@ -708,6 +717,8 @@ impl AsyncStable {
     self.completions.clear();
     // A held (un-fsync'd) write is the crash's canonical casualty.
     self.held_writes.clear();
+    // As is a held (un-fsync'd) snapshot blob: the visible slot already rolled back to the durable one.
+    self.held_snapshots.clear();
     // An in-RAM store loses chunk staging on a crash — the transfer restarts from offset 0.
     self.snapshot_staging = None;
   }
@@ -736,6 +747,21 @@ impl AsyncStable {
   /// How many `submit_write`s currently have their completion held (fsync still in flight).
   pub(crate) fn held_write_count(&self) -> usize {
     self.held_writes.len()
+  }
+
+  /// Hold the `SnapshotWritten` completion of every subsequent `submit_snapshot` (an fsync still in
+  /// flight) until [`flush_held_snapshots`](Self::flush_held_snapshots). The blob is VISIBLE
+  /// immediately, but `durable_snapshot()` keeps reporting the PREVIOUS durable snapshot.
+  pub(crate) fn hold_snapshot_fsync(&mut self, on: bool) {
+    self.hold_snapshot_fsync = on;
+  }
+
+  /// Release all held `SnapshotWritten` completions in submit order (the deferred fsyncs land); polling
+  /// one then folds the visible blob into the durable slot, exactly as an unheld submit does.
+  pub(crate) fn flush_held_snapshots(&mut self) {
+    while let Some(done) = self.held_snapshots.pop_front() {
+      self.completions.push_back(done);
+    }
   }
 
   /// The `lease_support` of every HardState handed to `submit_write`, in order.
@@ -800,6 +826,12 @@ impl StableStore for AsyncStable {
     if self.fail_next_snapshot_durability {
       // Torn/failed fsync: visible but NOT durable, NO completion. `durable_snapshot()` stays None.
       self.fail_next_snapshot_durability = false;
+    } else if self.hold_snapshot_fsync {
+      // The fsync is IN FLIGHT: the blob is visible, but the durable slot still holds the PREVIOUS
+      // snapshot until `flush_held_snapshots` releases the completion.
+      self
+        .held_snapshots
+        .push_back(StableDone::SnapshotWritten(id));
     } else if self.drop_next_snapshot_completion {
       // Models a store that fsync'd the blob (durable) but coalesced/lost the completion: advance the
       // durable slot NOW but enqueue NO `SnapshotWritten`, so only `durable_snapshot()` reveals it.
