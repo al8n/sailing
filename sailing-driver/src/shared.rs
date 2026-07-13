@@ -148,15 +148,17 @@ pub enum Pending<I, R> {
 /// safety outranks availability there; a plane of fail-stopped groups restarts from durable state,
 /// while a group serving torn committed state cannot be recovered at all.
 #[must_use = "a completion reports the fail-stop verdict: `Panicked` means the user closure — or the \
-              guard it captured, dropped unused inside the same `catch_unwind` — could have torn the \
-              group's replicated state machine, and discarding it leaves the group serving \
-              possibly-divergent state"]
+              guard it captured, dropped unused inside the same `catch_unwind` — could have torn SOME \
+              hosted group's replicated state machine (the container cannot attribute WHICH), and \
+              discarding it leaves a group serving possibly-divergent state"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionOutcome {
   /// The completion ran to normal delivery — no user-closure panic was caught.
   Delivered,
-  /// A user-closure panic was caught; the caller received `QueryPanicked`. The driver must
-  /// fail-stop the group the closure read against.
+  /// A user-closure panic was caught; the caller received `QueryPanicked`. On a multi-group host the
+  /// driver must fail-stop the WHOLE plane — the closure (or its captured guard's `Drop`) can alias
+  /// and tear ANY hosted group's state machine, not only the addressed one, so the tear is
+  /// unattributable; a single-group host's one endpoint IS its plane.
   Panicked,
 }
 

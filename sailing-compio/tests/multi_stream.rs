@@ -459,10 +459,10 @@ async fn restore_without_stored_state_fails_closed() {
 }
 
 /// A query closure that PANICS is caught at the handle seam — the caller gets `QueryPanicked` and the
-/// driver task does NOT unwind and take every co-located group down. But the group it read against
-/// FAIL-STOPS: interior mutability could have torn the replicated FSM mid-read, so fail-stop beats
-/// risking silent divergence. The poison surfaces on the best-effort lifecycle tail; a SIBLING group
-/// on the same plane keeps committing throughout (plane survival, no auto-teardown).
+/// driver task does NOT unwind. But the caught panic is UNATTRIBUTABLE: the closure captured arbitrary
+/// state that can alias ANY hosted group's FSM, so it FAIL-STOPS THE WHOLE PLANE — the group it read
+/// against AND every co-located group poison. Each surfaces on the best-effort lifecycle tail; the
+/// driver survives (a fail-stop, never an unwind).
 #[compio::test]
 async fn a_panicking_query_fails_typed_and_the_driver_survives() {
   let addr: SocketAddr = "127.0.0.1:45340".parse().unwrap();
@@ -516,12 +516,12 @@ async fn a_panicking_query_fails_typed_and_the_driver_survives() {
     "the query-panicked group fail-stopped and surfaced on the lifecycle tail"
   );
 
-  // Plane survival: the panic took ONLY group 100. Sibling group 200 keeps committing (the ticks
-  // above already cranked it), and a fresh submit still lands.
-  assert!(
-    submit_anywhere(std::slice::from_ref(&g200), b"z").await >= 1,
-    "the sibling group keeps committing after the co-located fail-stop"
-  );
+  // Plane-fatal, not group-scoped: the caught panic is unattributable, so the co-located sibling 200
+  // fail-stops too — a submit to it now reports `Poisoned`, not a fresh commit.
+  match g200.submit(Bytes::from_static(b"z")).await {
+    Err(DriverError::Poisoned) => {}
+    other => panic!("the sibling must fail-stop on the plane-fatal panic, got {other:?}"),
+  }
 
   handle.shutdown().await.expect("the multi host tears down");
 }

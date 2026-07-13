@@ -269,12 +269,14 @@ async fn a_merged_event_surfaces_only_after_its_barrier() {
 
 /// A completion swept by `fail_all` (a `LeaderChanged`) can catch a user-closure(-drop) panic: the
 /// swept closure is dropped unused, its captured guard's `Drop` mutates shared FSM state and panics,
-/// caught by the handle's `catch_unwind`. Discarding that `Panicked` outcome would leave the group LIVE
-/// against possibly-torn state, so `fail_all` latches it and the panic routes through the group's routing
-/// to the per-group fail-stop tail. The panicked group poisons; a co-located sibling keeps committing. The parked query reports the caught-panic outcome directly (as
-/// `shared::query_batch_stops_serving_at_the_first_caught_panic` does), avoiding a real unwind.
+/// caught by the handle's `catch_unwind`. Discarding that `Panicked` outcome would leave a group LIVE
+/// against possibly-torn state, so `fail_all` latches it and the per-group tail folds the latch. The
+/// tear is UNATTRIBUTABLE — the swept closure captured arbitrary aliasing state — so the fold is
+/// PLANE-FATAL: every hosted group poisons, the co-located sibling included. The parked query reports
+/// the caught-panic outcome directly (as `shared::query_batch_stops_serving_at_the_first_caught_panic`
+/// does), avoiding a real unwind.
 #[tokio::test]
-async fn a_swept_completion_panic_fail_stops_only_its_group() {
+async fn a_swept_completion_panic_fail_stops_the_whole_plane() {
   let (mut driver, handle) = bind_host().await;
   for gid in [1u64, 2] {
     let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
@@ -311,21 +313,19 @@ async fn a_swept_completion_panic_fail_stops_only_its_group() {
     // identical, and the discarded-`Panicked` defect lived entirely in `fail_all`.)
     routing.fail_all(&sailing_driver::DriverError::Superseded);
   }
-  // The next crank's per-group tail folds the latched completion panic into the group fail-stop.
+  // The next crank's per-group tail folds the latched completion panic into a PLANE-FATAL fail-stop.
   crank(&mut driver).await;
-  assert!(
-    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
-    "the swept completion's caught panic fail-stopped group 1"
-  );
-  assert!(
-    driver.coord.group(&2).is_some_and(|ep| !ep.is_poisoned()),
-    "the co-located sibling was not poisoned"
-  );
-  // The sibling still accepts and commits a proposal.
-  let g2 = handle.group(2);
-  drive(&mut driver, g2.submit(Bytes::from_static(b"x")))
-    .await
-    .expect("the co-located sibling keeps committing");
+  for gid in [1u64, 2] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| ep.is_poisoned()),
+      "the swept completion's caught panic is unattributable: group {gid} must fail-stop"
+    );
+  }
+  // The co-located sibling can no longer serve — the whole plane fail-stopped, not just group 1.
+  match drive(&mut driver, handle.group(2).query(|sm: &MergeSm| sm.0)).await {
+    Err(sailing_driver::DriverError::Poisoned) => {}
+    other => panic!("the sibling must fail-stop on the plane-fatal panic, got {other:?}"),
+  }
 }
 
 /// The regression guard: a WELL-BEHAVED `fail_all(Superseded)` sweep (its completion `Delivered`)
@@ -370,12 +370,14 @@ async fn a_normal_supersede_sweep_does_not_poison_the_group() {
 /// completion(-drop) panic — its dropped closure's captured guard `Drop` tore the FSM — and the
 /// still-parked NORMAL query must NOT then be served against that torn FSM before the tail fail-stops.
 /// The tail reads the completion latch BEFORE serving, so a pre-serve latch SKIPS the serve: the parked
-/// query completes `Poisoned` from the fail-stop sweep (its served `Ok(&fsm)` arm never runs), the group
-/// fail-stops, and a co-located sibling's runnable query still serves normally the same crank. Without the
-/// pre-serve read the query is served against the torn FSM. The decline's caught panic is reported
-/// directly, as `a_swept_completion_panic_fail_stops_only_its_group` does, avoiding a real unwind.
+/// query completes `Poisoned` from the fail-stop sweep (its served `Ok(&fsm)` arm never runs). The tear
+/// is UNATTRIBUTABLE, so the fail-stop is PLANE-FATAL: the co-located sibling poisons too, and because
+/// the sorted per-group tail fires the plane fail-stop before it reaches the sibling, the sibling's
+/// runnable query is likewise skipped and completes `Poisoned` — not served. Without the pre-serve read
+/// the torn group's query is served against the torn FSM. The decline's caught panic is reported
+/// directly, as `a_swept_completion_panic_fail_stops_the_whole_plane` does, avoiding a real unwind.
 #[tokio::test]
-async fn a_pre_serve_completion_panic_skips_the_torn_query_serve() {
+async fn a_pre_serve_completion_panic_skips_the_serve_and_fail_stops_the_plane() {
   use std::sync::atomic::{AtomicBool, Ordering};
   let (mut driver, handle) = bind_host().await;
   for gid in [1u64, 2] {
@@ -440,8 +442,9 @@ async fn a_pre_serve_completion_panic_skips_the_torn_query_serve() {
     );
     routing.applied = Index::ZERO;
   }
-  // A co-located sibling's runnable query with NO failover decline: it must serve normally this crank,
-  // proving the skip is scoped to the torn group, not a blanket stall.
+  // A co-located sibling's runnable query with NO failover decline: under the OLD group-scoped policy it
+  // served this crank; under the plane-fatal policy the sorted tail poisons it (group 1 fires the plane
+  // fail-stop before the tail reaches group 2), so its runnable query is skipped and completes `Poisoned`.
   let served_2 = Arc::new(AtomicBool::new(false));
   {
     let served = served_2.clone();
@@ -480,24 +483,25 @@ async fn a_pre_serve_completion_panic_skips_the_torn_query_serve() {
     "the pre-serve completion panic fail-stopped group 1"
   );
   assert!(
-    served_2.load(Ordering::Relaxed),
-    "the co-located sibling's runnable query serves normally the same crank"
+    !served_2.load(Ordering::Relaxed),
+    "the co-located sibling's runnable query is skipped too — the plane fail-stopped before its tail ran"
   );
   assert!(
-    driver.coord.group(&2).is_some_and(|ep| !ep.is_poisoned()),
-    "the sibling was not poisoned"
+    driver.coord.group(&2).is_some_and(|ep| ep.is_poisoned()),
+    "the sibling poisons on the plane-fatal fail-stop"
   );
 }
 
 /// The immediate-refusal arm. `read_index` on a group that is not a leader refuses IMMEDIATELY, and the
 /// refusal completes with `Err`: it never CALLS the user closure, but it DROPS it unused inside the
 /// completion's `catch_unwind`, so a guard the closure captured runs its `Drop` there and a panicking
-/// `Drop` is caught and reported `Panicked`. A refusal path that discards that outcome leaves the group
+/// `Drop` is caught and reported `Panicked`. A refusal path that discards that outcome leaves a group
 /// LIVE against state the guard could have torn — the reason the outcome is `#[must_use]`, so the
-/// compiler (not a convention) enumerates the sites. The refusal must fail-stop instead, group-scoped:
-/// the co-located sibling keeps committing.
+/// compiler (not a convention) enumerates the sites. The guard captured arbitrary state, so the tear is
+/// UNATTRIBUTABLE: the refusal fail-stops the WHOLE plane — the addressed group AND its co-located
+/// sibling — each surfacing its own `Poisoned` on the lifecycle tail.
 #[tokio::test]
-async fn an_immediate_refusal_drop_panic_fail_stops_only_its_group() {
+async fn an_immediate_refusal_drop_panic_fail_stops_the_whole_plane() {
   let (mut driver, handle) = bind_host().await;
   // Neither group is elected — `crank` never fires timeouts — so each is a fresh follower that knows no
   // leader, and `read_index` refuses with `NoLeader`. That is the HOSTED-group refusal arm, reached with
@@ -523,16 +527,21 @@ async fn an_immediate_refusal_drop_panic_fail_stops_only_its_group() {
     matches!(refused, Err(sailing_driver::DriverError::QueryPanicked)),
     "the caller learns its closure panicked, not the read's refusal reason"
   );
-  assert!(
-    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
-    "the refused query's dropped guard panicked: group 1 must fail-stop, not keep serving torn state"
-  );
-  assert!(
-    driver.coord.group(&2).is_some_and(|ep| !ep.is_poisoned()),
-    "the co-located sibling must not be poisoned"
-  );
-  // The fail-stop surfaces once on the lifecycle tail, exactly as a served read's panic does.
-  let poisoned: Vec<u64> = handle
+  // EVERY hosted group fail-stops: the dropped guard's tear is unattributable, so the refusal is
+  // plane-fatal — group 1 the addressed one AND group 2 the co-located sibling.
+  for gid in [1u64, 2] {
+    assert!(
+      driver.coord.group(&gid).is_some_and(|ep| ep.is_poisoned()),
+      "group {gid} must fail-stop on the unattributable plane-fatal refusal"
+    );
+  }
+  // The sibling can no longer serve — the whole plane fail-stopped, never a group-scoped stop.
+  match drive(&mut driver, handle.group(2).query(|sm: &MergeSm| sm.0)).await {
+    Err(sailing_driver::DriverError::Poisoned) => {}
+    other => panic!("the co-located sibling must fail-stop, got {other:?}"),
+  }
+  // Each fail-stop surfaces once on the lifecycle tail — the plane fails LOUDLY, never silently.
+  let mut poisoned: Vec<u64> = handle
     .lifecycle()
     .try_iter()
     .filter_map(|ev| match ev {
@@ -540,15 +549,12 @@ async fn an_immediate_refusal_drop_panic_fail_stops_only_its_group() {
       _ => None,
     })
     .collect();
-  assert_eq!(poisoned, vec![1], "the fail-stopped group surfaces once");
-  // The sibling still elects and commits: a group-scoped fail-stop, never a driver stop.
-  elect(&mut driver, 2).await;
-  drive(
-    &mut driver,
-    handle.group(2).submit(Bytes::from_static(b"x")),
-  )
-  .await
-  .expect("the co-located sibling keeps committing");
+  poisoned.sort_unstable();
+  assert_eq!(
+    poisoned,
+    vec![1, 2],
+    "every hosted group surfaces its poison on the lifecycle tail"
+  );
 }
 
 /// The no-over-fail-stop guard for the immediate-refusal arm: a WELL-BEHAVED closure refused the same way
@@ -580,14 +586,14 @@ async fn a_normal_immediate_refusal_does_not_poison_the_group() {
   .expect("a refused (not poisoned) group keeps committing");
 }
 
-/// The merge teardown routes the source's DYING latch to the absorbing target. The fold DETACHES the
-/// source's routing (`self.routing.remove(&source)`) and only then sweeps its parked work, so a
-/// completion(-drop) panic in that sweep latches into a `Routing` that is about to be DROPPED — and the
-/// pump's per-group tail can never read a latch for a group that no longer routes. By that point the proto
-/// has absorbed the source's state machine INTO the target and staged the target's capture, so the state
-/// the guard tore is the TARGET's: a merged target left LIVE would serve a possibly divergent union. The
-/// fold therefore keeps the target from `Merged { source, target }` and fail-stops it with the latch, in
-/// the storage crank, ahead of the pump.
+/// The merge teardown drains the source's DYING latch. The fold DETACHES the source's routing
+/// (`self.routing.remove(&source)`) and only then sweeps its parked work, so a completion(-drop) panic in
+/// that sweep latches into a `Routing` that is about to be DROPPED — and the pump's per-group tail can
+/// never read a latch for a group that no longer routes. Drain it HERE or lose it. The panic is
+/// UNATTRIBUTABLE (the swept closure captured arbitrary aliasing state), so the drained latch fires a
+/// PLANE-FATAL fail-stop, in the storage crank, ahead of the pump. Here the source is already gone from
+/// the container, so the sole remaining hosted group — the absorbing target, which absorbed the source's
+/// state machine INTO itself — poisons: a merged target left LIVE would serve a possibly divergent union.
 #[tokio::test]
 async fn a_merge_teardown_drop_panic_fail_stops_the_absorbing_target() {
   let (mut driver, handle) = bind_host().await;

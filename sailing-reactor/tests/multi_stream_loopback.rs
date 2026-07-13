@@ -215,6 +215,21 @@ where
   }
 }
 
+/// Poll `group`'s status until it reports poisoned (fail-stopped), within 15s.
+async fn await_poisoned(group: &GroupHandle<u64, u64, CountSm>, what: &str) {
+  let deadline = std::time::Instant::now() + Duration::from_secs(15);
+  loop {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "{what}: the group never fail-stopped"
+    );
+    if group.status().await.is_ok_and(|s| s.is_poisoned) {
+      return;
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+  }
+}
+
 /// Group 100's current leader index among `groups` (status-polled, deadline-bounded).
 async fn find_leader(groups: &[GroupHandle<u64, u64, CountSm>], what: &str) -> usize {
   let deadline = std::time::Instant::now() + Duration::from_secs(10);
@@ -4224,10 +4239,10 @@ async fn prepare_merge_refuses_an_inverted_claim() {
 }
 
 /// A query closure that PANICS is caught at the handle seam — the caller gets `QueryPanicked` and the
-/// driver task does NOT unwind and take every co-located group down. But the group it read against
-/// FAIL-STOPS: interior mutability could have torn the replicated FSM mid-read, so fail-stop beats
-/// risking silent divergence. The poison surfaces on the lifecycle tail; a SIBLING group on the same
-/// plane keeps committing (plane survival, no auto-teardown).
+/// driver task does NOT unwind. But the caught panic is UNATTRIBUTABLE: the closure captured arbitrary
+/// state that can alias ANY hosted group's FSM, so it FAIL-STOPS THE WHOLE PLANE — the group it read
+/// against AND every co-located group poison, rather than risk one serving silently-divergent state.
+/// Each poison surfaces on the lifecycle tail; the driver survives (a fail-stop, never an unwind).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_panicking_query_fails_typed_and_the_driver_survives() {
   let addr: SocketAddr = "127.0.0.1:44800".parse().unwrap();
@@ -4254,19 +4269,13 @@ async fn a_panicking_query_fails_typed_and_the_driver_survives() {
     other => panic!("expected QueryPanicked, got {other:?}"),
   }
 
-  // The read ran against group 100's FSM, so the caught panic FAIL-STOPS group 100 — surfaced on the
-  // best-effort lifecycle tail. RED before the fail-stop wiring (a caught panic kept the group serving,
-  // no poison event). The sibling group 200 keeps the driver cranking so the observation drains.
-  await_lifecycle(handle.lifecycle(), "the query-panicked group", |ev| {
-    matches!(ev, LifecycleEvent::Poisoned { group: 100 })
-  })
-  .await;
-
-  // Plane survival: the panic took ONLY group 100. Sibling group 200 still commits.
-  assert!(
-    submit_anywhere(std::slice::from_ref(&g200), b"z").await >= 1,
-    "the sibling group keeps committing after the co-located fail-stop"
-  );
+  // Plane-fatal, not group-scoped: the caught panic is UNATTRIBUTABLE, so BOTH the read's group AND the
+  // co-located sibling fail-stop. Poll status (which cranks the spawned driver) until each reports
+  // poisoned — RED before the fail-stop wiring (a caught panic kept the groups serving, no poison). The
+  // driver survives the panic; every hosted group poisons (the reactor unit tests pin the matching
+  // `LifecycleEvent::Poisoned` surfacing for both groups).
+  await_poisoned(&g100, "the query-panicked group 100").await;
+  await_poisoned(&g200, "the co-located sibling group 200").await;
 }
 
 /// A caught factory panic QUARANTINES the factory — permanently removed, so the plane then behaves
@@ -4280,8 +4289,10 @@ async fn a_panicking_query_fails_typed_and_the_driver_survives() {
 /// authority: `materialize` bumps a counter then panics on the FIRST group-100 solicitation, and
 /// every SUBSEQUENT call returns a full-voter blueprint naming the solicitor that WOULD admit. After
 /// the caught panic the factory is never consulted again (the counter stays 1), group 100 stays
-/// un-hosted, its solicitation surfaces as `UnknownGroup`, and the co-hosted sibling keeps
-/// committing. RED before the quarantine: the retained factory's second call admits group 100.
+/// un-hosted, and its solicitation surfaces as `UnknownGroup`. The panic is ALSO plane-fatal — a torn
+/// factory could have aliased a hosted FSM — so node 2's co-hosted sibling fail-stops (quarantine
+/// prevents reuse; the plane fail-stop covers the tear). RED before the quarantine: the retained
+/// factory's second call admits group 100.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_materialize_panic_quarantines_the_factory_and_falls_through() {
   let addrs = addrs(44_820, 2);
@@ -4360,17 +4371,20 @@ async fn a_materialize_panic_quarantines_the_factory_and_falls_through() {
     "the factory was consulted again after a caught panic — not quarantined"
   );
 
-  // Node 2's driver survived the panic: the co-hosted sibling keeps committing.
-  assert_eq!(submit_anywhere(&g900, b"after").await, 2);
+  // The panic is PLANE-FATAL: node 2's driver survives, but its co-hosted sibling fail-stops (a torn
+  // factory could have aliased the sibling's FSM). Node 1's replica stays alive — only node 2's plane
+  // poisoned.
+  await_poisoned(&handles[1].group(900), "node 2's co-hosted sibling").await;
 }
 
 /// The build-phase twin of the materialize quarantine. This factory's cheap `materialize` always
 /// returns a valid blueprint naming the solicitor, but its `build` (the resource phase) bumps a
 /// counter then panics on the FIRST admitted solicitation. A caught build panic quarantines the
 /// factory exactly as a materialize panic does — the torn `&mut` admission authority is the same —
-/// so `build` is never reached again (the counter stays 1), group 100 never materializes, the
-/// solicitation surfaces as `UnknownGroup`, and the sibling keeps committing. RED before the
-/// quarantine: the retained factory's second solicitation builds and admits.
+/// so `build` is never reached again (the counter stays 1), group 100 never materializes, and the
+/// solicitation surfaces as `UnknownGroup`. The panic is ALSO plane-fatal — a torn factory could have
+/// aliased a hosted FSM — so node 2's co-hosted sibling fail-stops. RED before the quarantine: the
+/// retained factory's second solicitation builds and admits.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_build_panic_quarantines_the_factory_and_falls_through() {
   let addrs = addrs(45_400, 2);
@@ -4446,6 +4460,8 @@ async fn a_build_panic_quarantines_the_factory_and_falls_through() {
     "the build phase ran again after a caught panic — the factory was not quarantined"
   );
 
-  // Node 2's driver survived the panic: the co-hosted sibling keeps committing.
-  assert_eq!(submit_anywhere(&g900, b"after").await, 2);
+  // The panic is PLANE-FATAL: node 2's driver survives, but its co-hosted sibling fail-stops (a torn
+  // factory could have aliased the sibling's FSM). Node 1's replica stays alive — only node 2's plane
+  // poisoned.
+  await_poisoned(&handles[1].group(900), "node 2's co-hosted sibling").await;
 }

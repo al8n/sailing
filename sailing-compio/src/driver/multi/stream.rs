@@ -14,9 +14,11 @@
 //! drain. Groups arrive via [`MultiCommand`] lifecycle commands — the driver binds EMPTY, and
 //! the host identity latches from the first admitted group.
 //!
-//! Fault scope is PER GROUP: a poisoned group fails its own parked work with the typed verdict
-//! and the driver keeps serving the co-located groups; only driver-level events (shutdown, every
-//! handle dropping) end `run()`.
+//! Fault scope is PER GROUP for an apply/storage poison: it fails its own parked work with the typed
+//! verdict and the co-located groups keep serving. The exception is a caught user-closure (completion
+//! or factory) panic — UNATTRIBUTABLE, since the closure can alias any group's FSM — which fail-stops
+//! the whole plane. Either way the driver survives: only driver-level events (shutdown, every handle
+//! dropping) end `run()`.
 
 use std::{
   cell::Cell,
@@ -753,14 +755,14 @@ where
       // them vanished with the endpoint), drain its completion latch to fail-stop the absorbing target
       // when it fired, and surface a lifecycle signal so the embedder restarts.
       //
-      // The absorbing TARGET is bound, not `..`-discarded: the teardown sweep below runs the source's
-      // parked completions, and by then the proto has already absorbed the source's state machine
-      // INTO the target and staged the target's capture. A completion(-drop) panic in that sweep tore
-      // state the TARGET now owns, so the target — not the source being destroyed — is the group that
-      // must fail-stop.
-      let (source, target) = match r {
-        sailing_proto::MergeResolution::Merged { source, target } => (source, Some(target)),
-        sailing_proto::MergeResolution::Retired { source } => (source, None),
+      // A completion(-drop) panic in the teardown sweep below is UNATTRIBUTABLE: the source's parked
+      // completion captured arbitrary state whose `Drop` can alias ANY hosted group's replicated FSM,
+      // not only the absorbing target's, so the tear could be anywhere on the plane. The reaction is
+      // the same plane-fatal fail-stop the refusals raise — there is no group to name — so the target
+      // is `..`-discarded and the `Merged`/`Retired` split no longer carries it.
+      let source = match r {
+        sailing_proto::MergeResolution::Merged { source, .. } => source,
+        sailing_proto::MergeResolution::Retired { source } => source,
         sailing_proto::MergeResolution::Aborted { .. } => continue,
         sailing_proto::MergeResolution::CaptureFailed { source, target } => {
           self.was_leader.remove(&source);
@@ -770,10 +772,11 @@ where
           self.election.remove(&source);
           if let Some(mut routing) = self.routing.remove(&source) {
             routing.fail_all(&DriverError::Poisoned);
-            // The source's DYING latch routes to the absorbing target — it now owns the FSM the
-            // swept completion's dropped guard could have torn — mirroring the `Merged` arm below.
+            // The source's DYING latch fires PLANE-FATAL: the swept completion's dropped guard could
+            // have torn ANY hosted group's FSM, not only the absorbing target's, so every hosted group
+            // fail-stops — the same UNATTRIBUTABLE reaction the refusals raise.
             if routing.take_completion_panicked() {
-              self.coord.fail_stop_query_panicked(&target);
+              self.coord.fail_stop_plane_unattributable_panic();
             }
           }
           let _ = self
@@ -795,16 +798,15 @@ where
         routing.fail_all(&DriverError::ShuttingDown);
         // The DETACHED routing dies at the end of this block, and its completion-panic latch with it:
         // the pump's per-group tail reads latches through `self.routing`, which no longer holds this
-        // source. Drain it HERE or lose it. A `Merged` routes it to the target, in the storage crank —
-        // ahead of the pump — so the target is fail-stopped before anything can serve or pump it this
-        // crank (the tail's `is_poisoned` gate then skips its query serve and fails its parked work
-        // `Poisoned`). A `Retired` has no absorbing target: the panic tore only the husk being
-        // destroyed, whose state machine no group inherits, so there is nothing to fail-stop and the
-        // drained latch is correctly dropped.
-        if routing.take_completion_panicked()
-          && let Some(target) = &target
-        {
-          self.coord.fail_stop_query_panicked(target);
+        // source. Drain it HERE or lose it — and a fired latch is PLANE-FATAL. The swept completion's
+        // dropped guard captured arbitrary state that can alias ANY hosted group's FSM: a `Merged`
+        // target that absorbed the source, OR any live sibling — a `Retired` husk's completion is no
+        // exception, since its guard can tear a group the husk never owned. The tear is UNATTRIBUTABLE,
+        // so every hosted group fail-stops. Raised in the storage crank, ahead of the pump, so each is
+        // poisoned before anything serves or pumps it this crank (the tail's `is_poisoned` gate then
+        // skips its query serve and fails its parked work `Poisoned`).
+        if routing.take_completion_panicked() {
+          self.coord.fail_stop_plane_unattributable_panic();
         }
       }
     }
@@ -1411,13 +1413,13 @@ where
           }
           // An immediate refusal on a group this host DOES hold. The `Err` arm does not CALL the
           // user closure — it DROPS it unused inside the completion's `catch_unwind` — so a guard
-          // the closure captured runs its `Drop` there, and that `Drop` can mutate state aliased
-          // into this group's replicated FSM and panic. A caught panic therefore fail-stops THIS
-          // group, exactly as a served read's panic does: the closure was addressed to it, so it is
-          // the group whose state machine could now be torn.
+          // the closure captured runs its `Drop` there. That `Drop` captured arbitrary state and can
+          // alias state ANY hosted group's replicated FSM shares, not only this addressed one, so a
+          // caught panic is UNATTRIBUTABLE and fail-stops the WHOLE plane (uniform policy) — the same
+          // reaction the not-hosted refusal below raises.
           Some(Err(e)) => {
             if complete(Err(map_read_err(e))) == CompletionOutcome::Panicked {
-              self.coord.fail_stop_query_panicked(&group);
+              self.coord.fail_stop_plane_unattributable_panic();
             }
           }
           // The coordinator does not hold the group: the third not-hosted refusal, plane-fatal on a
@@ -1722,10 +1724,10 @@ where
                   .is_some_and(|e| e.failover_read_window(self.clock.now()).is_some())
               });
             if panicked {
-              // A served inherited-read's user closure panicked: fail-stop THIS group (interior
-              // mutability could have torn its FSM) and latch it; the caller fails its parked work
-              // `Poisoned` group-scoped. Siblings keep serving.
-              self.coord.fail_stop_query_panicked(gid);
+              // A served inherited-read's user closure panicked: interior mutability could have torn
+              // its FSM, and the closure's captured guard can alias state ANY hosted group shares, so
+              // the caught panic is UNATTRIBUTABLE and fail-stops the WHOLE plane (uniform policy).
+              self.coord.fail_stop_plane_unattributable_panic();
               return true;
             }
           }
@@ -1909,7 +1911,13 @@ where
         }
       }
       if quarantine {
+        // A caught factory panic QUARANTINES the factory AND fail-stops the whole plane: the factory
+        // is arbitrary user code with no group isolation, so its panic (or a captured guard's `Drop`)
+        // could have torn an aliased hosted FSM. Quarantine prevents REUSE but cannot UNDO a tear, so
+        // consensus safety fail-stops every hosted group; the signal still falls through to
+        // `UnknownGroup` below.
         self.factory = None;
+        self.coord.fail_stop_plane_unattributable_panic();
       }
       if admitted {
         continue;
@@ -2111,19 +2119,21 @@ where
       && let Some(ep) = self.coord.group(gid)
       && let Some(routing) = self.routing.get_mut(gid)
     {
-      // A caught user-closure panic fail-stops THIS group: interior mutability could have torn its
-      // replicated FSM mid-read. The batch completes its remainder `Poisoned` (already drained from
-      // routing, so the `fail_all` below cannot reach them); the fail-stop runs once the `ep` borrow
-      // releases. Siblings keep serving.
+      // A caught user-closure panic fail-stops the WHOLE plane (the closure captured arbitrary state
+      // aliasing any group's FSM, so the tear is unattributable): the batch completes its remainder
+      // `Poisoned` (already drained from routing, so the `fail_all` below cannot reach them); the
+      // fail-stop runs once the `ep` borrow releases.
       query_panicked = sailing_driver::shared::serve_query_batch(
         routing.take_runnable_queries(),
         ep.state_machine(),
       );
     }
     if query_panicked || completion_panicked {
-      // Poison + latch the group (surfaces once on the lifecycle tail via `poll_poisoned`), then
-      // fail its parked work `Poisoned` group-scoped — `poisoned` above predates this fail-stop.
-      self.coord.fail_stop_query_panicked(gid);
+      // A query that panicked mid-serve, or a completion(-drop) panic latched before it, is
+      // UNATTRIBUTABLE — the closure and its captured guard can alias ANY hosted group's FSM — so the
+      // WHOLE plane fail-stops (uniform policy). Each group poisons and surfaces once on the lifecycle
+      // tail via `poll_poisoned`, then fails its parked work `Poisoned`.
+      self.coord.fail_stop_plane_unattributable_panic();
     }
     if (poisoned || query_panicked || completion_panicked)
       && let Some(routing) = self.routing.get_mut(gid)

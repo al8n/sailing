@@ -273,12 +273,12 @@ where
   /// The closure MUST NOT capture state aliased with a replicated state machine such that its
   /// destructor can tear that state, and MUST NOT panic in `Drop`. The driver runs the closure — and
   /// drops it, used or not — under `catch_unwind`, so a `Drop` that mutates FSM-aliased state and
-  /// panics is CAUGHT: on a single-group host it fail-stops this endpoint. The panic is
-  /// [`QueryPanicked`](DriverError::QueryPanicked) to this caller. (On a multi host the same panic on
-  /// a NOT-HOSTED group cannot be attributed to any group, so it fail-stops the WHOLE plane — see the
-  /// multi `query` — which is why the contract is stated for the whole read family, not just this
-  /// endpoint.) A panicking `Drop` is an abort-level Rust anti-pattern regardless; well-behaved
-  /// closures never trip this.
+  /// panics is CAUGHT: on a single-group host it fail-stops this endpoint (its one endpoint IS its
+  /// plane). The panic is [`QueryPanicked`](DriverError::QueryPanicked) to this caller. (On a multi
+  /// host ANY such caught panic — for a hosted group OR a not-hosted one — cannot be attributed to a
+  /// single group, so it fail-stops the WHOLE plane — see the multi `query` — which is why the contract
+  /// is stated for the whole read family, not just this endpoint.) A panicking `Drop` is an abort-level
+  /// Rust anti-pattern regardless; well-behaved closures never trip this.
   pub async fn query<Out, Q>(&self, f: Q) -> Result<Out, DriverError<I>>
   where
     Out: Send + 'static,
