@@ -1250,17 +1250,20 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
       return true;
     }
-    let query_panicked = run_queries
+    // Read the completion-panic latch ONCE, BEFORE the serve. A `fail_all` sweep (the routed
+    // `LeaderChanged` or the leadership backstop) or a failover decline earlier THIS crank drops an
+    // unused user closure whose captured guard's `Drop` can tear the FSM and latch here; serving the
+    // parked queries against that torn FSM is the ordering window this read closes. When the latch is
+    // already set, SKIP the serve — `fail_stop_query_panicked` poisons the endpoint and the poison
+    // sweep below fails those queries `Poisoned`, never run against the torn state. A query that panics
+    // DURING the serve still reports through `query_panicked`; one read-and-clear both gates and decides.
+    let completion_panicked = self.routing.take_completion_panicked();
+    let query_panicked = !completion_panicked
+      && run_queries
       && sailing_driver::shared::serve_query_batch(
         self.routing.take_runnable_queries(),
         self.coord.state_machine(),
       );
-    // ONE fail-stop decision fed by EVERY completion source this crank: the served query batch above,
-    // plus any caught user-closure(-drop) panic latched in routing by a `fail_all` sweep (the routed
-    // `LeaderChanged` or the leadership backstop) or a failover decline. A caught panic means interior
-    // mutability could have torn the replicated FSM mid-read, so fail-stop rather than keep serving;
-    // the poison check below fails any still-parked work typed and stops the driver.
-    let completion_panicked = self.routing.take_completion_panicked();
     if query_panicked || completion_panicked {
       self.coord.fail_stop_query_panicked();
     }

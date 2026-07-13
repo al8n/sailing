@@ -1698,8 +1698,20 @@ where
       }
       return;
     }
+    // Read this group's completion-panic latch ONCE, BEFORE the serve. A `fail_all` sweep (the routed
+    // `LeaderChanged` or the leadership backstop) or a failover decline earlier THIS crank drops an
+    // unused user closure whose captured guard's `Drop` can tear this group's FSM and latch here;
+    // serving the parked queries against that torn FSM is the ordering window this read closes. When it
+    // is already set, SKIP the serve so no query runs against the torn state — the fail-stop and the
+    // `fail_all(Poisoned)` below fail the parked queries `Poisoned` instead. A query that panics DURING
+    // the serve still reports through `query_panicked`; one read-and-clear both gates and decides.
+    let completion_panicked = self
+      .routing
+      .get_mut(gid)
+      .is_some_and(|routing| routing.take_completion_panicked());
     let mut query_panicked = false;
-    if run_queries
+    if !completion_panicked
+      && run_queries
       && let Some(ep) = self.coord.group(gid)
       && let Some(routing) = self.routing.get_mut(gid)
     {
@@ -1712,14 +1724,6 @@ where
         ep.state_machine(),
       );
     }
-    // Fold EVERY completion-panic source for this group into ONE fail-stop decision: the served query
-    // batch above, plus any caught user-closure(-drop) panic latched in this group's routing by a
-    // `fail_all` sweep (the routed `LeaderChanged` or the leadership backstop) or a failover decline.
-    // A caught panic means interior mutability could have torn the FSM.
-    let completion_panicked = self
-      .routing
-      .get_mut(gid)
-      .is_some_and(|routing| routing.take_completion_panicked());
     if query_panicked || completion_panicked {
       // Poison + latch the group (surfaces once on the lifecycle tail via `poll_poisoned`), then
       // fail its parked work `Poisoned` group-scoped — `poisoned` above predates this fail-stop.

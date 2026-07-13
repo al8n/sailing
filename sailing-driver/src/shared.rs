@@ -126,8 +126,10 @@ pub enum Pending<I, R> {
 /// completion runs the user closure under `catch_unwind`; a caught panic replies `QueryPanicked`
 /// to the caller AND reports `Panicked` here, so the invoking driver learns the read ran against —
 /// and interior mutability could have TORN — the replicated state machine, and fail-stops the
-/// addressed group rather than serve possibly-divergent state. `Delivered` on the normal path and
-/// on every non-serving completion (an `Err` or `Ok(None)` never runs the user closure).
+/// addressed group rather than serve possibly-divergent state. The `Err`/`Ok(None)` arms do not
+/// CALL the closure, but they DROP it unused inside the same `catch_unwind`, so a captured guard's
+/// `Drop` can panic there too — ANY arm, served or not, can report `Panicked`. The centralized
+/// completion latch folds every such report into the group's fail-stop.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionOutcome {
   /// The completion ran to normal delivery — no user-closure panic was caught.
@@ -307,13 +309,14 @@ fn contiguous_normal_entries(
 /// window live when the batch started can expire mid-batch — a completion past expiry must fall back
 /// (`Ok(None)`) rather than serve a stale inherited read. Shared by both drivers so the freshness rule
 /// cannot drift.
-/// Returns whether ANY served completion caught a user-closure panic — the caller fail-stops the
-/// group the batch read against (interior mutability could have torn its replicated state). The
-/// batch stops SERVING at the first caught panic, exactly like the normal query drain: the
-/// remaining items complete `Poisoned` — the verdict the caller's fail-stop sweep gives the
-/// group's parked siblings — without their user closures ever running against the possibly-torn
-/// FSM. A declined completion (`Ok(None)`, past the live window) never runs the user closure, so
-/// only the served arm can report `Panicked`.
+/// Returns whether ANY completion — served OR declined — caught a user-closure(-drop) panic; the
+/// caller fail-stops the group the batch read against (interior mutability could have torn its
+/// replicated state). The batch stops SERVING at the first caught panic, exactly like the normal
+/// query drain: the remaining items complete `Poisoned` — the verdict the caller's fail-stop sweep
+/// gives the group's parked siblings — without their user closures ever running against the
+/// possibly-torn FSM. A declined completion (`Ok(None)`, past the live window) does not CALL the
+/// closure, but it DROPS it unused inside the completion's `catch_unwind`, so a captured guard's
+/// `Drop` can report `Panicked` on the decline arm too — this fold captures either arm.
 #[must_use]
 pub fn serve_failover_batch<I, F>(
   parked: Vec<ParkedFailover<I, F>>,
@@ -325,7 +328,7 @@ pub fn serve_failover_batch<I, F>(
   let mut panicked = false;
   for p in parked {
     if panicked {
-      // An `Err` completion never runs the user closure (see `CompletionOutcome`).
+      // An `Err` completion does not CALL the user closure (see `CompletionOutcome`).
       let _ = (p.complete)(Err(DriverError::Poisoned));
       continue;
     }
@@ -354,7 +357,7 @@ pub fn serve_query_batch<I, F>(queries: Vec<ParkedQuery<I, F>>, fsm: &F) -> bool
   let mut panicked = false;
   for q in queries {
     if panicked {
-      // An `Err` completion never runs the user closure (see `CompletionOutcome`).
+      // An `Err` completion does not CALL the user closure (see `CompletionOutcome`).
       let _ = (q.complete)(Err(DriverError::Poisoned));
       continue;
     }

@@ -303,3 +303,126 @@ async fn a_normal_supersede_sweep_does_not_poison_the_group() {
     .await
     .expect("a superseded (not poisoned) group keeps committing");
 }
+
+/// The same-crank ordering window: a failover DECLINE processed earlier in a crank latches a caught
+/// completion(-drop) panic — its dropped closure's captured guard `Drop` tore the FSM — and the
+/// still-parked NORMAL query must NOT then be served against that torn FSM before the tail fail-stops.
+/// The tail reads the completion latch BEFORE serving, so a pre-serve latch SKIPS the serve: the parked
+/// query completes `Poisoned` from the fail-stop sweep (its served `Ok(&fsm)` arm never runs), the group
+/// fail-stops, and a co-located sibling's runnable query still serves normally the same crank. RED
+/// before the fix (the query was served against the torn FSM). The decline's caught panic is reported
+/// directly, as `a_swept_completion_panic_fail_stops_only_its_group` does, avoiding a real unwind.
+#[tokio::test]
+async fn a_pre_serve_completion_panic_skips_the_torn_query_serve() {
+  use std::sync::atomic::{AtomicBool, Ordering};
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+    // Commit one entry so each endpoint's applied index is past zero: resetting a group's routing
+    // watermark to zero below then makes `sync_applied` advance it this crank, which is exactly what
+    // sets `run_queries` — the query serve runs only when the watermark moved.
+    drive(
+      &mut driver,
+      handle.group(gid).submit(Bytes::from_static(b"warm")),
+    )
+    .await
+    .expect("warm-up commit");
+  }
+
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  let served_1 = Arc::new(AtomicBool::new(false));
+  let poisoned_1 = Arc::new(AtomicBool::new(false));
+  {
+    let routing = driver.routing.get_mut(&1).expect("group 1 routes");
+    // A parked failover the crank DECLINES (`failover_read_window` is `None` off the failover tier),
+    // whose dropped closure reports `Panicked` — the outcome the handle's `catch_unwind` returns when a
+    // decline drops a captured guard whose `Drop` panics. This latches BEFORE the query serve.
+    routing
+      .failovers
+      .push(sailing_driver::shared::ParkedFailover {
+        complete: Box::new(
+          |res: sailing_driver::shared::FailoverOutcome<'_, u64, MergeSm>| {
+            if matches!(res, Ok(None)) {
+              sailing_driver::shared::CompletionOutcome::Panicked
+            } else {
+              sailing_driver::shared::CompletionOutcome::Delivered
+            }
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      });
+    // A RUNNABLE normal query on the SAME group: its served arm (`Ok(&fsm)`) must never run against the
+    // FSM the decline tore — it must instead complete `Poisoned` from the fail-stop sweep.
+    let served = served_1.clone();
+    let poisoned = poisoned_1.clone();
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: Some(Index::ZERO),
+        complete: Box::new(
+          move |res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+            match res {
+              Ok(_) => served.store(true, Ordering::Relaxed),
+              Err(sailing_driver::DriverError::Poisoned) => poisoned.store(true, Ordering::Relaxed),
+              Err(_) => {}
+            }
+            sailing_driver::shared::CompletionOutcome::Delivered
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.applied = Index::ZERO;
+  }
+  // A co-located sibling's runnable query with NO failover decline: it must serve normally this crank,
+  // proving the skip is scoped to the torn group, not a blanket stall.
+  let served_2 = Arc::new(AtomicBool::new(false));
+  {
+    let served = served_2.clone();
+    let routing = driver.routing.get_mut(&2).expect("group 2 routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: Some(Index::ZERO),
+        complete: Box::new(
+          move |res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+            if res.is_ok() {
+              served.store(true, Ordering::Relaxed);
+            }
+            sailing_driver::shared::CompletionOutcome::Delivered
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    routing.applied = Index::ZERO;
+  }
+
+  crank(&mut driver).await;
+
+  assert!(
+    !served_1.load(Ordering::Relaxed),
+    "the parked query must NOT be served against the FSM the same-crank decline tore"
+  );
+  assert!(
+    poisoned_1.load(Ordering::Relaxed),
+    "the skipped query completes Poisoned from the group fail-stop instead"
+  );
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "the pre-serve completion panic fail-stopped group 1"
+  );
+  assert!(
+    served_2.load(Ordering::Relaxed),
+    "the co-located sibling's runnable query serves normally the same crank"
+  );
+  assert!(
+    driver.coord.group(&2).is_some_and(|ep| !ep.is_poisoned()),
+    "the sibling was not poisoned"
+  );
+}
