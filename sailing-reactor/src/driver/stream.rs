@@ -721,6 +721,11 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
     }
     self.routing.fail_all(&DriverError::ShuttingDown);
+    // Nothing survives to fail-stop: the driver is stopping, the sweeps above have failed all parked work
+    // with its typed verdict, and the endpoint dies with the driver — a swept completion's dropped guard
+    // can have torn only the state machine going down with it. Drain the latch the sweeps may have set; a
+    // dropped `Routing` still carrying one is the un-routed-verdict bug its `Drop` asserts against.
+    let _ = self.routing.take_completion_panicked();
     // Dropping every Conn aborts its tasks WITHOUT joining them — deliberately, and unlike the QUIC
     // driver's teardown, which JOINS its recv task. The asymmetry is by design: each stream Conn
     // owns its OWN per-peer TCP fd, so dropping the Conn closes that fd on the spot, and the

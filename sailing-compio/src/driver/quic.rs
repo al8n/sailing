@@ -632,6 +632,11 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
     }
     self.routing.fail_all(&DriverError::ShuttingDown);
+    // Nothing survives to fail-stop: the driver is stopping, the sweeps above have failed all parked work
+    // with its typed verdict, and the endpoint dies with the driver — a swept completion's dropped guard
+    // can have torn only the state machine going down with it. Drain the latch the sweeps may have set; a
+    // dropped `Routing` still carrying one is the un-routed-verdict bug its `Drop` asserts against.
+    let _ = self.routing.take_completion_panicked();
     drop(recv_task);
     drop(recv_rx);
     // Drain everything already buffered, then DROP the receiver: a racing `try_send` then sees a

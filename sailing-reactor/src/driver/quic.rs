@@ -685,6 +685,11 @@ where
       self.routing.fail_all(&DriverError::Poisoned);
     }
     self.routing.fail_all(&DriverError::ShuttingDown);
+    // Nothing survives to fail-stop: the driver is stopping, the sweeps above have failed all parked work
+    // with its typed verdict, and the endpoint dies with the driver — a swept completion's dropped guard
+    // can have torn only the state machine going down with it. Drain the latch the sweeps may have set; a
+    // dropped `Routing` still carrying one is the un-routed-verdict bug its `Drop` asserts against.
+    let _ = self.routing.take_completion_panicked();
     // Stop the recv task and AWAIT its join so its socket-Arc clone is released BEFORE we drop ours:
     // `AbortOnDrop`'s abort only SCHEDULES cancellation, so a `recv_from` parked in the task could
     // otherwise outlive `drop(self.socket)` and keep the fd bound past `shutdown().await` — an

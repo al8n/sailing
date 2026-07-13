@@ -555,6 +555,41 @@ impl<I, R, F> Routing<I, R, F> {
   }
 }
 
+/// The latch's other half, which no return type can enforce.
+///
+/// [`CompletionOutcome`]'s `#[must_use]` makes the COMPILER enumerate every site that invokes a
+/// completion and discards its verdict. It cannot see the second way the verdict is lost: a `Routing`
+/// whose latch is SET is simply DROPPED, and the driver's fail-stop tail — which reads latches through
+/// the routing map — can never read a latch for a group the map no longer holds. [`Self::fail_all`]
+/// returns `()`, so the type system has nothing to hold onto; only this assert does.
+///
+/// A DETACHED `Routing` (a merge fold's source teardown, `remove_group`, the shutdown sweep) sweeps its
+/// parked work as it dies, and a swept completion drops its unused closure — whose captured guard's
+/// `Drop` can tear a state machine and panic. Whether that tear MATTERS depends on who inherits the
+/// state machine, which only the detaching site knows. So every detaching site must decide, explicitly:
+///
+/// - an heir exists (a merge fold's `Merged`: the proto absorbed this group's FSM INTO the target) —
+///   take the latch and fail-stop the HEIR, which now owns the state the guard tore;
+/// - no heir (`Retired`, `remove_group`, shutdown: the endpoint is gone and no group inherited its
+///   FSM) — take the latch and discard it, saying why the tear needs no fail-stop.
+///
+/// Either way the verdict is CONSUMED before the drop. Reaching this assert means a detach site did
+/// neither, and a caught panic that could have torn replicated state was silently dropped: call
+/// [`Self::take_completion_panicked`] at that site and route the verdict.
+impl<I, R, F> Drop for Routing<I, R, F> {
+  fn drop(&mut self) {
+    debug_assert!(
+      !self.completion_panicked,
+      "a Routing was dropped with its completion-panic latch SET: a completion caught a \
+       user-closure(-drop) panic that could have torn a replicated state machine, and no group was \
+       ever fail-stopped for it. Every site that detaches a Routing must take_completion_panicked() \
+       and route the verdict — fail-stop the group that INHERITED this one's state machine (a merge \
+       target), or, when no group inherited it, drain the latch explicitly and document why the tear \
+       needs no fail-stop"
+    );
+  }
+}
+
 impl<I: sailing_proto::NodeId, R: Clone, F> Routing<I, R, F> {
   /// Route one coordinator event: complete the matching pending waiter, advance the apply
   /// watermark, mark confirmed queries ready, sweep on leadership changes — and forward a copy

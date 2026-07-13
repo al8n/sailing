@@ -450,6 +450,12 @@ where
     }
     for routing in self.routing.values_mut() {
       routing.fail_all(&DriverError::ShuttingDown);
+      // No heir, and no survivor: the driver is stopping, this sweep has just failed the group's parked
+      // work with its typed verdict, and no group outlives the loop to serve a state machine a swept
+      // completion's dropped guard could have torn — so there is nothing to fail-stop. Drain the latch
+      // the sweep may have just set; a dropped `Routing` still carrying one is the un-routed-verdict bug
+      // its `Drop` asserts against.
+      let _ = routing.take_completion_panicked();
     }
     let _ = recv_shutdown_tx.send(());
     drop(recv_rx);
@@ -939,12 +945,15 @@ where
     self.quiesce_pending.remove(gid);
     self.activity.remove(gid);
     self.election.remove(gid);
-    // The detached routing's completion-panic latch dies with it, correctly: the coordinator has
-    // already dropped this endpoint and no other group inherited its state machine, so a sweep's
-    // drop-panic tore only the group being destroyed and there is nothing left to fail-stop. (The
-    // merge fold's source teardown is the case that DOES have an heir — see `storage_crank`.)
+    // NO HEIR: the coordinator has already dropped this endpoint and no other group inherited its
+    // state machine, so a sweep's drop-panic tore only the group being destroyed and there is nothing
+    // left to fail-stop. DRAIN the latch rather than let it die with the routing — a dropped `Routing`
+    // whose latch is still set is the un-routed-verdict bug its `Drop` asserts against, and only the
+    // detaching site can tell "no heir" from "forgot to route it". (The merge fold's source teardown is
+    // the case that DOES have an heir — see `storage_crank`.)
     if let Some(mut routing) = self.routing.remove(gid) {
       routing.fail_all(&DriverError::ShuttingDown);
+      let _ = routing.take_completion_panicked();
     }
     Ok(existed || had_storage)
   }

@@ -621,6 +621,172 @@ async fn a_merge_teardown_drop_panic_fail_stops_the_absorbing_target() {
   );
 }
 
+/// A fail-stopped group must never SERVE a query that was already confirmed and runnable when the
+/// fail-stop landed — the poison gate on the tail's query serve, which the merge teardown is the
+/// reachable producer of.
+///
+/// The target absorbs the source's state machine, so a drop-panic in the source's teardown sweep tore
+/// state the TARGET now owns; the fold fail-stops the target for it, in the storage crank, ahead of the
+/// pump. But that fail-stop lands on the ENDPOINT, not on the target's routing: the panic latched in the
+/// SOURCE's routing, which the fold drained and dropped. The target's own completion latch is therefore
+/// CLEAR (asserted below), and `is_poisoned()` is the only thing left standing between a confirmed
+/// (`ready_at: Some(..)`, apply watermark reached) parked query and a serve against the possibly-torn
+/// absorbed union.
+///
+/// The tail is driven directly with `run_queries` set, which is the state the pump's own set produces
+/// for a group whose routed event advanced its watermark this pass — `route_event` never consults
+/// poison. (Through the real pump the state is currently double-covered: a poisoned endpoint also
+/// suppresses `poll_event`, so the pump's set cannot name this group and the serve short-circuits on
+/// `run_queries` before reaching the poison gate. That suppression is a PROTO property; this gate is
+/// the driver's own, and this test pins it independently of the proto's.)
+///
+/// RED without the poison gate: the confirmed query is served `Ok(&fsm)` against the absorbed union
+/// (`observed` = the merged total) instead of completing `Poisoned`.
+#[tokio::test]
+async fn a_fail_stopped_merge_target_never_serves_its_confirmed_parked_query() {
+  use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+    // One commit per group, so the union the target absorbs is a value a served read could OBSERVE
+    // (1 + 1 = 2) — a serve against torn state is then visible, not merely inferred.
+    drive(
+      &mut driver,
+      handle.group(gid).submit(Bytes::from_static(b"warm")),
+    )
+    .await
+    .expect("warm-up commit");
+  }
+
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  // The SOURCE's parked query: never runnable (`ready_at` stays `None`), so only the teardown's
+  // `fail_all` sweep can complete it — dropping its closure unused, and with it the panicking guard.
+  {
+    let routing = driver.routing.get_mut(&2).expect("the source routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: drop_panic_completion(),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+  }
+  // The TARGET's parked query: CONFIRMED and RUNNABLE (`ready_at` at or below the watermark), the
+  // exact shape a read-index confirmation leaves parked while its apply watermark is already past it.
+  let served = Arc::new(AtomicBool::new(false));
+  let observed = Arc::new(AtomicU64::new(0));
+  let poisoned_verdict = Arc::new(AtomicBool::new(false));
+  {
+    let routing = driver.routing.get_mut(&1).expect("the target routes");
+    let ctx = routing.mint_query_ctx();
+    let served = served.clone();
+    let observed = observed.clone();
+    let verdict = poisoned_verdict.clone();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: Some(Index::ZERO),
+        complete: Box::new(
+          move |res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+            match res {
+              Ok(sm) => {
+                served.store(true, Ordering::Relaxed);
+                observed.store(sm.0, Ordering::Relaxed);
+              }
+              Err(sailing_driver::DriverError::Poisoned) => verdict.store(true, Ordering::Relaxed),
+              Err(_) => {}
+            }
+            sailing_driver::shared::CompletionOutcome::Delivered
+          },
+        ),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+    // Pin the driver watermark where nothing can ADVANCE it: an advance is what sets `run_queries`, and
+    // the still-healthy target would then serve this query in one of the cranks the merge itself takes.
+    // The query has to reach the teardown still parked — that is the state the gate protects — and it
+    // stays RUNNABLE throughout (`ready_at` is at the floor, the watermark at the ceiling).
+    routing.applied = Index::new(u64::MAX);
+  }
+
+  // 1 absorbs 2: the encoding-minimal id survives, so 2 is the source that dissolves.
+  drive(&mut driver, handle.prepare_merge(2, 1))
+    .await
+    .expect("freeze proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while !driver.coord.group(&2).is_some_and(|ep| ep.is_frozen()) {
+    assert!(std::time::Instant::now() < deadline, "no freeze in time");
+    crank(&mut driver).await;
+  }
+  drive(&mut driver, handle.commit_merge(1, 2))
+    .await
+    .expect("commit proposed");
+
+  // Step the crank halves apart and STOP at the resolving storage crank: the fold has torn the source
+  // down and fail-stopped the target, and the target's confirmed query is still parked. That is the
+  // instant the tail must not serve.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  let mut resolved = false;
+  for _ in 0..64 {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the parked merge never resolved"
+    );
+    let source_hosted = hosts(&driver, 2);
+    let now = driver.clock.now();
+    while let Ok(cmd) = driver.commands.try_recv() {
+      driver.handle_command(now, cmd);
+    }
+    driver.storage_crank(now);
+    if source_hosted && !hosts(&driver, 2) {
+      resolved = true;
+      break;
+    }
+    driver.pump(now).await;
+  }
+  assert!(resolved, "the parked merge never resolved");
+
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "the source teardown's drop-panic tore state the TARGET absorbed: the target must fail-stop"
+  );
+  // The mechanism the gate rests on: the panic latched in the SOURCE's routing, which the fold drained
+  // and dropped, so the TARGET's own completion latch never fired. The take is a no-op on a clear latch
+  // (and leaves the tail below reading the same `false`) — it asserts that `is_poisoned` is the SOLE
+  // barrier here, not a redundant second one behind the completion latch.
+  assert!(
+    !driver
+      .routing
+      .get_mut(&1)
+      .expect("the target routes")
+      .take_completion_panicked(),
+    "the target's own completion latch is clear: the poison is the only signal it carries"
+  );
+
+  // The tail with `run_queries` SET — a routed event advancing this group's watermark produces exactly
+  // this call, and `route_event` does not consult poison.
+  driver.pump_group_tail(&1, true);
+
+  assert!(
+    !served.load(Ordering::Relaxed),
+    "the fail-stopped target served a confirmed parked query against the absorbed union it may have torn"
+  );
+  assert_eq!(
+    observed.load(Ordering::Relaxed),
+    0,
+    "the query's closure never ran, so it observed no union at all"
+  );
+  assert!(
+    poisoned_verdict.load(Ordering::Relaxed),
+    "the confirmed query completes Poisoned from the fail-stop sweep instead of being served"
+  );
+}
+
 /// The no-over-fail-stop guard for RED-PROOF 2: a WELL-BEHAVED source teardown (its swept completion
 /// `Delivered`) must NOT poison the absorbing target. The merge is the common path — it must stay clean,
 /// and the target must still serve the union it absorbed.
