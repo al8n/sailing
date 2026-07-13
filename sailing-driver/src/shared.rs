@@ -499,9 +499,10 @@ impl<I, R, F> Routing<I, R, F> {
   }
 
   /// Complete every parked failover inherited-read with `Ok(None)` — decline to serve, so the caller
-  /// falls back to a normal read — routing each through [`Self::complete_failover`] so a caught
-  /// drop-panic latches the completion-panic signal. The drivers' failover serve calls this on its
-  /// decline arms instead of invoking the completion raw, so no decline can silently swallow a panic.
+  /// falls back to a normal read — routing each through the internal `complete_failover` chokepoint
+  /// so a caught drop-panic latches the completion-panic signal. The drivers' failover serve calls
+  /// this on its decline arms instead of invoking the completion raw, so no decline can silently
+  /// swallow a panic.
   pub fn decline_failovers(&mut self) {
     for p in std::mem::take(&mut self.failovers) {
       self.complete_failover(p, Ok(None));
@@ -509,8 +510,9 @@ impl<I, R, F> Routing<I, R, F> {
   }
 
   /// Take AND clear whether any Routing completion caught a user-closure(-drop) panic since the last
-  /// read. The driver folds this into its per-group fail-stop decision (see
-  /// [`Self::completion_panicked`]).
+  /// read — the internal `completion_panicked` latch. The driver folds this into its per-group
+  /// fail-stop decision, reading it BEFORE serving parked queries so none is served against a state
+  /// machine an earlier-in-crank completion tore.
   #[must_use]
   pub fn take_completion_panicked(&mut self) -> bool {
     std::mem::replace(&mut self.completion_panicked, false)
