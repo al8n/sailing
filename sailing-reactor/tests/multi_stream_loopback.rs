@@ -4269,13 +4269,23 @@ async fn a_panicking_query_fails_typed_and_the_driver_survives() {
   );
 }
 
-/// A factory whose `materialize` PANICS declines like any other refusal instead of unwinding the
-/// plane: node 1's group-100 solicitation falls through to node 2's lifecycle tail as
-/// `UnknownGroup`, nothing materializes, and node 2's driver survives — the co-hosted sibling group
-/// keeps committing.
+/// A caught factory panic QUARANTINES the factory — permanently removed, so the plane then behaves
+/// exactly as a driver with no factory — rather than mapping to a one-shot decline that leaves the
+/// SAME `&mut` factory installed for the next solicitation. WHY the stronger cure: the factory is
+/// the admission authority for a group's consensus voter set, and `&mut GroupFactory` is not
+/// unwind-safe. A factory that mutates internal state and THEN panics can, on a LATER call, return a
+/// valid-LOOKING blueprint that names the solicitor but carries a wrong voter set — which clears
+/// every downstream gate (solicitor-naming, floors, split-reservation, the create admission, none
+/// of which check voter-set semantics) and admits a broken quorum. This factory models the torn
+/// authority: `materialize` bumps a counter then panics on the FIRST group-100 solicitation, and
+/// every SUBSEQUENT call returns a full-voter blueprint naming the solicitor that WOULD admit. After
+/// the caught panic the factory is never consulted again (the counter stays 1), group 100 stays
+/// un-hosted, its solicitation surfaces as `UnknownGroup`, and the co-hosted sibling keeps
+/// committing. RED before the quarantine: the retained factory's second call admits group 100.
 #[tokio::test(flavor = "multi_thread")]
-async fn a_panicking_factory_declines_and_the_plane_survives() {
+async fn a_materialize_panic_quarantines_the_factory_and_falls_through() {
   let addrs = addrs(44_820, 2);
+  let materialized = Arc::new(AtomicUsize::new(0));
   let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
   for id in 1u64..=2 {
     let peers: Vec<_> = (1u64..=2)
@@ -4284,12 +4294,20 @@ async fn a_panicking_factory_declines_and_the_plane_survives() {
       .collect();
     let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
     if id == 2 {
+      let materialized = materialized.clone();
       let driver = driver.with_group_factory(factory_fn(
-        move |group: &u64, _from: &u64| -> Option<GroupBlueprint<u64>> {
-          if *group == 100 {
+        move |group: &u64, from: &u64| -> Option<GroupBlueprint<u64>> {
+          if *group != 100 {
+            return None;
+          }
+          // Mutate, THEN tear: the first solicitation bumps the counter and panics; a RETAINED
+          // factory's later call returns a valid-looking blueprint naming the solicitor and admits.
+          if materialized.fetch_add(1, Ordering::SeqCst) == 0 {
             panic!("boom in materialize");
           }
-          None
+          [1u64, 2]
+            .contains(from)
+            .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2))
         },
         |_group: &u64| Some(CountSm::default()),
       ));
@@ -4304,8 +4322,8 @@ async fn a_panicking_factory_declines_and_the_plane_survives() {
   let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
   assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
 
-  // Group 100 exists only on node 1; its solicitation makes node 2's factory materialize PANIC,
-  // caught as a decline, so the signal falls through to the lifecycle tail and nothing materializes.
+  // Group 100 exists only on node 1; its first solicitation makes node 2's materialize panic —
+  // caught, quarantining the factory — so the signal falls through to the lifecycle tail.
   handles[0]
     .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
     .await
@@ -4324,10 +4342,109 @@ async fn a_panicking_factory_declines_and_the_plane_survives() {
     },
   )
   .await;
-  match handles[1].group(100).status().await {
-    Err(DriverError::Rejected { .. }) => {}
-    other => panic!("a panicked factory must materialize nothing, got {other:?}"),
+
+  // The quarantine holds across every retry: node 1 keeps soliciting, but a removed factory is
+  // never consulted again, so group 100 never materializes. A RETAINED factory admits here on its
+  // second call — which is exactly the RED this asserts against.
+  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  while std::time::Instant::now() < deadline {
+    assert!(
+      handles[1].group(100).status().await.is_err(),
+      "a quarantined factory must materialize nothing"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
   }
+  assert_eq!(
+    materialized.load(Ordering::SeqCst),
+    1,
+    "the factory was consulted again after a caught panic — not quarantined"
+  );
+
+  // Node 2's driver survived the panic: the co-hosted sibling keeps committing.
+  assert_eq!(submit_anywhere(&g900, b"after").await, 2);
+}
+
+/// The build-phase twin of the materialize quarantine. This factory's cheap `materialize` always
+/// returns a valid blueprint naming the solicitor, but its `build` (the resource phase) bumps a
+/// counter then panics on the FIRST admitted solicitation. A caught build panic quarantines the
+/// factory exactly as a materialize panic does — the torn `&mut` admission authority is the same —
+/// so `build` is never reached again (the counter stays 1), group 100 never materializes, the
+/// solicitation surfaces as `UnknownGroup`, and the sibling keeps committing. RED before the
+/// quarantine: the retained factory's second solicitation builds and admits.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_build_panic_quarantines_the_factory_and_falls_through() {
+  let addrs = addrs(45_400, 2);
+  let built = Arc::new(AtomicUsize::new(0));
+  let mut handles: Vec<MultiHandle<u64, u64, CountSm>> = Vec::new();
+  for id in 1u64..=2 {
+    let peers: Vec<_> = (1u64..=2)
+      .filter(|&p| p != id)
+      .map(|p| Node::new(p, addrs[(p - 1) as usize]))
+      .collect();
+    let (driver, handle) = bind_node::<CountSm>(id, addrs[(id - 1) as usize], peers).await;
+    if id == 2 {
+      let built = built.clone();
+      let driver = driver.with_group_factory(factory_fn(
+        move |group: &u64, from: &u64| {
+          (*group == 100 && [1u64, 2].contains(from))
+            .then(|| GroupBlueprint::new(config(2, vec![1, 2]), 2))
+        },
+        move |_group: &u64| -> Option<CountSm> {
+          // Mutate, THEN tear: the first admitted solicitation bumps the counter and panics in the
+          // resource phase; a RETAINED factory's later build succeeds and admits.
+          if built.fetch_add(1, Ordering::SeqCst) == 0 {
+            panic!("boom in build");
+          }
+          Some(CountSm::default())
+        },
+      ));
+      tokio::spawn(driver.run());
+    } else {
+      tokio::spawn(driver.run());
+    }
+    handles.push(handle);
+  }
+  // The sibling group binds the mesh and proves node 2 is alive throughout.
+  create_group_everywhere(&handles, 900, &[1, 2]).await;
+  let g900: Vec<_> = handles.iter().map(|h| h.group(900)).collect();
+  assert_eq!(submit_anywhere(&g900, b"seed").await, 1);
+
+  // Group 100 exists only on node 1; its first solicitation admits the blueprint, then node 2's
+  // build panics — caught, quarantining the factory — so the signal falls through to the tail.
+  handles[0]
+    .create_group(100, config(1, vec![1, 2]), 1, CountSm::default(), 0)
+    .await
+    .expect("group 100 admitted on node 1");
+  await_lifecycle(
+    handles[1].lifecycle(),
+    "the build-panicked solicitation",
+    |ev| {
+      matches!(
+        ev,
+        LifecycleEvent::UnknownGroup {
+          group: 100,
+          from: 1
+        }
+      )
+    },
+  )
+  .await;
+
+  // The quarantine holds across every retry: a removed factory's build is never reached again, so
+  // group 100 never materializes. A RETAINED factory builds and admits on its second solicitation.
+  let deadline = std::time::Instant::now() + Duration::from_secs(3);
+  while std::time::Instant::now() < deadline {
+    assert!(
+      handles[1].group(100).status().await.is_err(),
+      "a quarantined factory must materialize nothing"
+    );
+    tokio::time::sleep(Duration::from_millis(50)).await;
+  }
+  assert_eq!(
+    built.load(Ordering::SeqCst),
+    1,
+    "the build phase ran again after a caught panic — the factory was not quarantined"
+  );
 
   // Node 2's driver survived the panic: the co-hosted sibling keeps committing.
   assert_eq!(submit_anywhere(&g900, b"after").await, 2);

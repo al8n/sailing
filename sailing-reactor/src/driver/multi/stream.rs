@@ -1774,43 +1774,70 @@ where
     // fail-closed) falls through to the lifecycle tail, so the embedder sees what the factory
     // could not place; without a factory every signal falls through, exactly as before.
     while let Some((group, from)) = self.coord.poll_unknown_group() {
-      if let Some(factory) = self.factory.as_mut()
-        // A panicking factory DECLINES (maps to `None`) instead of unwinding the plane and taking
-        // every co-located group down; the signal then falls through to the lifecycle tail like
-        // any other refusal. AssertUnwindSafe: the driver acts only on the returned Option, and a
-        // factory decline is always safe. Decline (not fail-stop) is sufficient here because a
-        // factory is NOT replicated state — unlike a query against a group's FSM, which fail-stops:
-        // the trust gates below (solicitor-naming, floors, split-reservation, the create admission)
-        // make a torn factory availability-only, never a divergence of committed state.
-        && let Some(blueprint) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      // A caught factory panic — `catch_unwind` returns `Err`, distinct from a legitimate `Ok(None)`
+      // decline — QUARANTINES the factory: `self.factory` is permanently removed, so this signal and
+      // every later one falls through to `UnknownGroup` exactly as on a driver that never had a
+      // factory. WHY the panic (not a plain decline) is quarantined: the factory is the admission
+      // authority for a group's consensus voter set, and `&mut GroupFactory` is not unwind-safe — one
+      // that mutates internal state then panics could, on a LATER call, return a valid-LOOKING
+      // blueprint that names the solicitor but carries a WRONG voter set, which clears every gate
+      // below (none checks voter-set semantics) and admits a broken quorum. AssertUnwindSafe is sound
+      // because the driver acts only on the returned Option and a torn factory is never reached
+      // again. A legitimate `Ok(None)` decline keeps the factory; `Ok(Some(bp))` runs the gates.
+      let mut quarantine = false;
+      let mut admitted = false;
+      let blueprint = match self.factory.as_mut() {
+        Some(factory) => match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
           factory.materialize(&group, &from)
-        }))
-        .ok()
-        .flatten()
+        })) {
+          Ok(blueprint) => blueprint,
+          Err(_) => {
+            quarantine = true;
+            None
+          }
+        },
+        None => None,
+      };
+      // The gates run on the same seams the create below consults authoritatively, in the
+      // resource-safety order: solicitor-naming first (BEFORE build, so an unauthorized valid-cert
+      // solicitor never forces state-machine construction), then floors, then split-reservation.
+      if let Some(blueprint) = blueprint
         && blueprint_names(&blueprint, &from)
-        // The floors gate, on the same seam the create below consults authoritatively: the
-        // cheap PRE-BUILD refusal keeps the resource-phase ordering — a fenced id (or the
-        // reserved `u64::MAX` sentinel, never a working incarnation) is refused before the
-        // factory's build phase can be asked for a state machine.
+        // The floors gate: a fenced id (or the reserved `u64::MAX` sentinel, never a working
+        // incarnation) is refused before the factory's build phase can be asked for a state machine.
         && floor_admits(self.engine.floor(&group), blueprint.generation())
-        // The split-reservation gate, same seam: a solicited id that an in-flight split
-        // reserves declines BEFORE build, so the local fork stays the id's one materializer
-        // (the solicitation falls to the lifecycle tail and the sender retries).
+        // The split-reservation gate: a solicited id that an in-flight split reserves declines
+        // BEFORE build, so the local fork stays the id's one materializer (the solicitation falls to
+        // the lifecycle tail and the sender retries).
         && !self.coord.is_split_reserved(&group)
-        && let Some(fsm) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-          factory.build(&group)
-        }))
-        .ok()
-        .flatten()
       {
-        let generation = blueprint.generation();
-        let (config, seed) = blueprint.into_parts();
-        if self
-          .create_group(now, group.cheap_clone(), config, seed, fsm, generation)
-          .is_ok()
-        {
-          continue;
+        // The resource phase, on a fresh borrow so a caught build panic can quarantine the factory
+        // released above. Reached only after the blueprint cleared every gate.
+        let fsm = match self.factory.as_mut() {
+          Some(factory) => {
+            match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| factory.build(&group))) {
+              Ok(fsm) => fsm,
+              Err(_) => {
+                quarantine = true;
+                None
+              }
+            }
+          }
+          None => None,
+        };
+        if let Some(fsm) = fsm {
+          let generation = blueprint.generation();
+          let (config, seed) = blueprint.into_parts();
+          admitted = self
+            .create_group(now, group.cheap_clone(), config, seed, fsm, generation)
+            .is_ok();
         }
+      }
+      if quarantine {
+        self.factory = None;
+      }
+      if admitted {
+        continue;
       }
       let _ = self
         .lifecycle_tx
