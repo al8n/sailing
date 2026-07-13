@@ -284,6 +284,9 @@ pub struct MultiVoprReport {
   pub merges_resolved: u64,
   /// Per-host abort resolutions across the run (the race/duplicate no-op arm).
   pub merges_aborted: u64,
+  /// Per-host capture-failed resolutions across the run — a consumed source whose union could not be
+  /// made durable. Expected zero under the sim FSM; a non-zero value is a wedge to report.
+  pub merges_capture_failed: u64,
   /// Live groups at run end.
   pub final_groups: usize,
   /// Client commands accepted by some leader (tracked per group for the quiesce check).
@@ -521,6 +524,7 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   report.merges_registered = w.merges_registered();
   report.merges_resolved = w.merges_resolved();
   report.merges_aborted = w.merges_aborted();
+  report.merges_capture_failed = w.merges_capture_failed();
   report.membership_oracle_comparisons = w.membership_oracle_comparisons();
   report.skipped_unwitnessed_installs = w.skipped_unwitnessed_installs();
   report.kind_unobservable_installs = w.kind_unobservable_installs();

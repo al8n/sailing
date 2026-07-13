@@ -4708,9 +4708,17 @@ fn capture_failure_withholds_merged_and_keeps_the_source_recoverable() {
   // durable anchor for the union can ever stage.
   fail.store(true, core::sync::atomic::Ordering::Relaxed);
   let resolutions = m.service_merge_applies(Instant::ORIGIN, &mut stores);
-  assert!(
-    resolutions.is_empty(),
-    "a failed absorb capture must not surface a Merged teardown resolution: {resolutions:?}"
+  // The failed capture surfaces a CaptureFailed resolution — NOT a Merged teardown (that would floor
+  // and drop the source) and NOT nothing (the source endpoint is already consumed, so its parked
+  // callers would hang without a resolution telling the driver to fail them). CaptureFailed is the
+  // driver's cue to fail the source routing typed while PRESERVING its stores/floor.
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::CaptureFailed {
+      source: 2,
+      target: 1
+    }],
+    "a failed absorb capture surfaces CaptureFailed, never a Merged teardown: {resolutions:?}"
   );
   let tep = m.group(&1).unwrap();
   assert!(
@@ -4718,8 +4726,9 @@ fn capture_failure_withholds_merged_and_keeps_the_source_recoverable() {
     "the failed capture fail-stops the target rather than advertising a phantom merge"
   );
   assert_eq!(tep.poison_reason(), Some(PoisonReason::SnapshotCapture));
-  // The source stays recoverable: its stores are untouched and its id was never floored, so a
-  // restart re-parks against the restored source and the merge re-resolves.
+  // The source endpoint is consumed, but it stays recoverable: its stores are untouched and its id
+  // was never floored, so a restart re-parks against the restored source and the merge re-resolves.
+  assert!(!m.contains_group(&2), "the source endpoint was consumed");
   assert!(stores.0.contains_key(&2), "the source's stores are intact");
   assert_eq!(stores.floor(&2), 0, "the source id was never floored");
   // The gated event: a withheld resolution must surface NO `Event::Merged`. The driver folds a
@@ -10260,9 +10269,16 @@ fn poisoned_absorb_surfaces_no_resolution() {
     drain(&mut m, 1, now, log, stable);
   }
   let resolutions = m.service_merge_applies(now, &mut stores);
-  assert!(
-    resolutions.is_empty(),
-    "a poisoned absorb must not hand the driver a Merged to floor and tear down: {resolutions:?}"
+  // A refused absorb consumes the source endpoint too, so it surfaces CaptureFailed — the driver's
+  // cue to fail the stranded source routing typed while PRESERVING its stores — never a Merged (which
+  // would floor and drop the source) and never nothing (which would hang the source's callers).
+  assert_eq!(
+    resolutions,
+    std::vec![MergeResolution::CaptureFailed {
+      source: 2,
+      target: 1
+    }],
+    "a poisoned absorb surfaces CaptureFailed, never a Merged teardown: {resolutions:?}"
   );
   let tep = m.group(&1).unwrap();
   assert!(tep.is_poisoned(), "the deterministic fail-stop stands");

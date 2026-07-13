@@ -906,11 +906,16 @@ where
     let resolutions = self.multi.service_merge_applies(now, stores);
     for r in &resolutions {
       // A `Merged` source (absorbed) and a `Retired` source (husk dissolved) both LEAVE the container
-      // terminally floored — tombstone each id. `Aborted` leaves both groups live.
+      // terminally floored — tombstone each id. `Aborted` leaves both groups live. `CaptureFailed`
+      // also removed the source endpoint, but does NOT floor it — its stores are preserved for a
+      // restart re-park — so it is NOT tombstoned here: a terminal refusal would fence exactly the
+      // incarnation the restart must restore.
       let source = match r {
         crate::MergeResolution::Merged { source, .. }
         | crate::MergeResolution::Retired { source } => source,
-        crate::MergeResolution::Aborted { .. } => continue,
+        crate::MergeResolution::Aborted { .. } | crate::MergeResolution::CaptureFailed { .. } => {
+          continue;
+        }
       };
       self.quiesce_intents.remove(source);
       self.controls.retain(|(g, _)| g != source);

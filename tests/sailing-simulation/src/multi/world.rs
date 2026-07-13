@@ -215,6 +215,10 @@ pub struct MultiWorld {
   merges_resolved: u64,
   /// Aborted resolutions observed across all hosts.
   merges_aborted: u64,
+  /// CaptureFailed resolutions observed across all hosts: a consumed source whose union could not be
+  /// made durable (absorb refused, or capture faulted). The absorb-capable/non-faulting sim FSM never
+  /// produces one; a non-zero count is the wedge worth reporting, not chasing.
+  merges_capture_failed: u64,
   /// Per-`(target, source)` MONOTONE count of `Event::MergeAborted` observations drained across
   /// the run — the abort clock the fuzzer's pending-merge book retires against: a pair booked at
   /// clock `c` is resolved-by-abort once the clock reads past `c` (the absorb side retires via
@@ -317,6 +321,7 @@ impl MultiWorld {
       active_freezes: BTreeMap::new(),
       merges_resolved: 0,
       merges_aborted: 0,
+      merges_capture_failed: 0,
       merge_aborts_observed: BTreeMap::new(),
       teardown_tie_streak: BTreeMap::new(),
       store_mode: StoreMode::Sync,

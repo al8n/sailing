@@ -8,6 +8,30 @@ use super::*;
 const ELECTION: Duration = Duration::from_millis(100);
 const HEARTBEAT: Duration = Duration::from_millis(20);
 
+thread_local! {
+  /// When armed, `MergeSm::absorb` REFUSES — the deterministic `MergeUnsupported` fail-stop the merge
+  /// resolve arm turns into a `CaptureFailed` resolution (a post-removal failure: the source endpoint
+  /// is already consumed). Thread-local so a `#[tokio::test]` running on its own libtest thread arms
+  /// it in isolation; a guard disarms it even on panic, so a single-threaded test run stays clean.
+  static FAIL_ABSORB: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Arms [`FAIL_ABSORB`] for its lifetime, disarming on drop (panic included).
+struct FailAbsorbGuard;
+
+impl FailAbsorbGuard {
+  fn arm() -> Self {
+    FAIL_ABSORB.with(|f| f.set(true));
+    FailAbsorbGuard
+  }
+}
+
+impl Drop for FailAbsorbGuard {
+  fn drop(&mut self) {
+    FAIL_ABSORB.with(|f| f.set(false));
+  }
+}
+
 /// A counter with absorb support: the merged union's total is the two counters' sum.
 #[derive(Default)]
 struct MergeSm(u64);
@@ -33,6 +57,9 @@ impl StateMachine for MergeSm {
   }
 
   fn absorb(&mut self, source: Self) -> bool {
+    if FAIL_ABSORB.with(|f| f.get()) {
+      return false;
+    }
     self.0 += source.0;
     true
   }
@@ -952,4 +979,108 @@ async fn a_normal_unhosted_refusal_does_not_fail_stop_the_plane() {
     .await
     .expect("a plane with no fail-stop keeps committing");
   }
+}
+
+/// A merge whose absorb cannot be made durable CONSUMES the source endpoint before it fails — so the
+/// source's parked client work is stranded on oneshots the vanished endpoint can never answer. Without
+/// the `CaptureFailed` fold the resolve arm returns NO resolution, the driver never learns the source
+/// left, its routing (and the parked oneshot) linger, and the caller hangs FOREVER. The fold fails that
+/// routing with a typed error instead — a strictly better answer than an eternal hang — while PRESERVING
+/// the source's stores and floor (the union's only copy, restored on the restart the poison forces), and
+/// the absorbing target surfaces its poison. The absorb is forced to refuse (the `MergeUnsupported` arm,
+/// one of the two post-removal failure paths that fold `CaptureFailed`).
+#[tokio::test]
+async fn a_capture_failed_merge_fails_the_source_routing_instead_of_hanging() {
+  let _fail_absorb = FailAbsorbGuard::arm();
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+
+  // A PENDING SUBMIT parked on the SOURCE (group 2): a committed-but-unrouted client op — the shape a
+  // teardown that consumes the source endpoint strands. Nothing routes an `Applied` to its index, so
+  // only the teardown's typed `fail_all` can answer it; without the fix, nothing does and it hangs.
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  let (tx, mut rx) =
+    futures_channel::oneshot::channel::<Result<u64, sailing_driver::DriverError<u64>>>();
+  {
+    let routing = driver.routing.get_mut(&2).expect("the source routes");
+    routing.pending.insert(
+      Index::new(999),
+      sailing_driver::shared::Pending::Submit {
+        reply: tx,
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+  }
+
+  // 1 absorbs 2: the encoding-minimal id survives, so 2 is the source that dissolves.
+  drive(&mut driver, handle.prepare_merge(2, 1))
+    .await
+    .expect("freeze proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while !driver.coord.group(&2).is_some_and(|ep| ep.is_frozen()) {
+    assert!(std::time::Instant::now() < deadline, "no freeze in time");
+    crank(&mut driver).await;
+  }
+  drive(&mut driver, handle.commit_merge(1, 2))
+    .await
+    .expect("commit proposed");
+  // Resolve: the source endpoint is CONSUMED (removed from the container) regardless of the fold, so
+  // its disappearance is the fix-independent signal that the resolve arm ran.
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while driver.coord.group(&2).is_some() {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the parked merge never resolved"
+    );
+    crank(&mut driver).await;
+  }
+  // A couple more cranks so the target's poison drains onto the lifecycle tail (via `poll_poisoned`).
+  crank(&mut driver).await;
+  crank(&mut driver).await;
+
+  // THE FIX: the stranded source submit received a TYPED error instead of hanging forever.
+  assert!(
+    matches!(
+      rx.try_recv(),
+      Ok(Some(Err(sailing_driver::DriverError::Poisoned)))
+    ),
+    "the source's parked submit must be failed typed, not left hanging on the vanished endpoint"
+  );
+  // The source's stores and floor are PRESERVED — the union's only copy, restored on restart.
+  assert!(
+    hosts(&driver, 2),
+    "the source's stores must be preserved, not dropped"
+  );
+  assert_ne!(
+    driver.engine.group_floor(&2),
+    sailing_proto::MERGED_FLOOR,
+    "the source must NOT be terminally floored — that would bury the union"
+  );
+  // The absorbing target poisoned and surfaces it.
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "the absorbing target fail-stops on the failed absorb"
+  );
+  let lifecycle: Vec<LifecycleEvent<u64, u64>> = handle.lifecycle().try_iter().collect();
+  assert!(
+    lifecycle.iter().any(|ev| matches!(
+      ev,
+      LifecycleEvent::MergeCaptureFailed {
+        source: 2,
+        target: 1
+      }
+    )),
+    "the embedder learns the source is gone and a restart is needed: {lifecycle:?}"
+  );
+  assert!(
+    lifecycle
+      .iter()
+      .any(|ev| matches!(ev, LifecycleEvent::Poisoned { group: 1 })),
+    "the poisoned target surfaces on the lifecycle tail: {lifecycle:?}"
+  );
 }

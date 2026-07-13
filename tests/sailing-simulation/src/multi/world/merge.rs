@@ -205,6 +205,14 @@ impl MultiWorld {
           sailing_proto::MergeResolution::Aborted { .. } => {
             self.merges_aborted += 1;
           }
+          sailing_proto::MergeResolution::CaptureFailed { .. } => {
+            // The absorb consumed the source endpoint but the union could not be made durable (the
+            // target refused the absorb, or its forced capture faulted). UNLIKE `Merged`/`Retired`,
+            // PRESERVE the source: do NOT floor it and do NOT drop its replica — its stores hold the
+            // union's only copy and a restart re-parks the merge against them. The absorb-capable,
+            // non-faulting sim FSM never reaches here; count it so a real occurrence is visible.
+            self.merges_capture_failed += 1;
+          }
           sailing_proto::MergeResolution::Retired { source } => {
             // A hosted frozen husk of a terminally-absorbed lineage dissolved locally — no absorbing
             // target and no capture. Fold the SAME source half as `Merged` MINUS the capture: record
@@ -419,6 +427,11 @@ impl MultiWorld {
   /// Per-host `Aborted` resolutions across the run.
   pub fn merges_aborted(&self) -> u64 {
     self.merges_aborted
+  }
+
+  /// Per-host `CaptureFailed` resolutions across the run (expected zero under the sim FSM).
+  pub fn merges_capture_failed(&self) -> u64 {
+    self.merges_capture_failed
   }
 
   /// Whether `gid` has ever ABSORBED another group — the agreement oracle's mode switch (see

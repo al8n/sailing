@@ -384,6 +384,20 @@ pub enum LifecycleEvent<G, I> {
     /// The fail-stopped group.
     group: G,
   },
+  /// A committed merge reached the point of NO RETURN — the `source` endpoint was consumed and its
+  /// state machine extracted into `target` — but the union could not be made durable: the target's
+  /// FSM refused the absorb, or its forced capture faulted. The `target` is POISONED (and surfaces
+  /// its own [`Poisoned`](Self::Poisoned) signal); the `source` endpoint is GONE and its parked
+  /// callers have been failed with [`DriverError::Poisoned`] rather than left hanging on oneshots the
+  /// vanished endpoint can never answer. The source's stores and floor are DELIBERATELY preserved —
+  /// they hold the union's only copy — so the recovery is a RESTART: it restores the source and
+  /// re-parks the merge, which re-resolves once the target's fault is cleared. NO auto-teardown.
+  MergeCaptureFailed {
+    /// The consumed source group, whose durable state a restart restores.
+    source: G,
+    /// The poisoned absorbing target.
+    target: G,
+  },
 }
 
 /// A cheaply-cloneable, `Send + Sync` handle to a MULTI-GROUP driver: group lifecycle, the

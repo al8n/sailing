@@ -383,6 +383,27 @@ pub enum MergeResolution<G> {
     /// The dissolved husk's source group.
     source: G,
   },
+  /// The absorb reached the point of NO RETURN — the source endpoint was consumed and its state
+  /// machine extracted — but the union could not be made durable: the target's FSM REFUSED the
+  /// absorb (a deterministic [`MergeUnsupported`](crate::PoisonReason::MergeUnsupported) fail-stop)
+  /// or the forced capture FAULTED. The target is POISONED and no teardown is safe.
+  ///
+  /// The crucial asymmetry versus `Merged`/`Retired`: the source id is gone from the container, yet
+  /// its stores and floor MUST be PRESERVED — they are the union's ONLY surviving copy, and the
+  /// documented recovery is a restart that re-parks the merge against the restored source. Flooring
+  /// or dropping them would bury the union behind a torn-down source no durable target snapshot
+  /// covers. The driver folds this by FAILING the source's parked routing with a typed error (its
+  /// callers park on the removed endpoint's oneshots and would otherwise hang forever, since the
+  /// queued events that would have answered them vanished with the endpoint) and surfacing a
+  /// lifecycle signal so the embedder restarts. The driver mirrors the `Merged` latch discipline:
+  /// draining the source routing's completion latch fail-stops the TARGET when it fired, because the
+  /// target absorbed the source's FSM.
+  CaptureFailed {
+    /// The consumed source group, whose stores and floor the driver MUST keep for the restart.
+    source: G,
+    /// The poisoned absorbing target.
+    target: G,
+  },
 }
 
 /// The outcome of one head-fork examination (see `MultiRaft::poll_pending_fork`): the parent's
@@ -3215,21 +3236,23 @@ where
           // An FSM that refuses the absorb POISONED the target (deterministic on every
           // replica — MergeUnsupported is the SplitUnsupported class). Nothing was absorbed:
           // surfacing `Merged` here would have the driver floor the source terminally and
-          // tear its stores down, destroying the union's only copy behind a fail-stop. The
-          // fail-stop stands alone instead — the source's stores and floor stay untouched,
-          // and a restart re-parks against the restored source deterministically.
+          // tear its stores down, destroying the union's only copy behind a fail-stop. Emit
+          // `CaptureFailed` instead — the source endpoint is already CONSUMED, so the driver
+          // must fail its stranded routing (its callers would hang forever) while PRESERVING
+          // its stores and floor, and a restart re-parks against the restored source.
           if tep.is_poisoned() {
             self.mark_dirty(&tgid);
+            resolutions.push(MergeResolution::CaptureFailed {
+              source,
+              target: tgid,
+            });
             continue;
           }
           // The absorb happened in memory; the union is durable ONLY once the forced capture
           // STAGES its snapshot/compaction. Emit `Merged` — the driver's permission to floor the
           // source terminally and drop its stores — solely on a staged capture. A `snapshot()` or
-          // log fault poisons and stages nothing: fail-stop with the source's stores untouched, so
-          // a restart re-parks against the restored source rather than losing the union behind a
-          // floored, torn-down source no durable target snapshot covers. A store gone between the
-          // window read and here (unreachable through a stable seam within one crank) fail-stops
-          // the same way — never a teardown resolution without a proven staged capture.
+          // log fault poisons and stages nothing. A store gone between the window read and here
+          // (unreachable through a stable seam within one crank) faults the same way.
           let staged = match stores.stores(&tgid) {
             Some((log, stable)) => self
               .groups
@@ -3245,13 +3268,23 @@ where
           self.mark_dirty(&tgid);
           if staged {
             // The capture staged: the union is durable, so `Merged` may now surface. The event
-            // rides ONLY this arm — a withheld resolution (a poisoned target above) drains none.
+            // rides ONLY this arm — a withheld resolution (a failed capture below) drains none.
             if let Some(m) = merged
               && let Some(tep) = self.groups.get_mut(&tgid)
             {
               tep.emit_merged(m);
             }
             resolutions.push(MergeResolution::Merged {
+              source,
+              target: tgid,
+            });
+          } else {
+            // The capture faulted (or the stores vanished): the target is POISONED and no union
+            // teardown is safe. The source endpoint is already CONSUMED, so its parked routing is
+            // stranded — emit `CaptureFailed` so the driver fails those callers typed while
+            // PRESERVING the source's stores and floor, and a restart re-parks against the restored
+            // source rather than losing the union behind a floored, torn-down source.
+            resolutions.push(MergeResolution::CaptureFailed {
               source,
               target: tgid,
             });

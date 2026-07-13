@@ -744,6 +744,15 @@ where
       // `FloorStore` may serve a STAGED floor, and dropping the stores off it before the flush would
       // re-admit the id below its gen. `Aborted` needs nothing — the source is still live.
       //
+      // `CaptureFailed` is the crucial ASYMMETRY: the absorb consumed the source endpoint but the
+      // union could not be made durable (the target refused the absorb, or its forced capture
+      // faulted), so the target is POISONED and the source's stores and floor MUST be PRESERVED —
+      // they hold the union's only copy, and a restart re-parks the merge against the restored source.
+      // Fail the source's stranded routing with the typed `Poisoned` (its callers park on the vanished
+      // endpoint's oneshots and would otherwise HANG FOREVER — the events that would have answered
+      // them vanished with the endpoint), drain its completion latch to fail-stop the absorbing target
+      // when it fired, and surface a lifecycle signal so the embedder restarts.
+      //
       // The absorbing TARGET is bound, not `..`-discarded: the teardown sweep below runs the source's
       // parked completions, and by then the proto has already absorbed the source's state machine
       // INTO the target and staged the target's capture. A completion(-drop) panic in that sweep tore
@@ -753,6 +762,25 @@ where
         sailing_proto::MergeResolution::Merged { source, target } => (source, Some(target)),
         sailing_proto::MergeResolution::Retired { source } => (source, None),
         sailing_proto::MergeResolution::Aborted { .. } => continue,
+        sailing_proto::MergeResolution::CaptureFailed { source, target } => {
+          self.was_leader.remove(&source);
+          self.quiesced.remove(&source);
+          self.quiesce_pending.remove(&source);
+          self.activity.remove(&source);
+          self.election.remove(&source);
+          if let Some(mut routing) = self.routing.remove(&source) {
+            routing.fail_all(&DriverError::Poisoned);
+            // The source's DYING latch routes to the absorbing target — it now owns the FSM the
+            // swept completion's dropped guard could have torn — mirroring the `Merged` arm below.
+            if routing.take_completion_panicked() {
+              self.coord.fail_stop_query_panicked(&target);
+            }
+          }
+          let _ = self
+            .lifecycle_tx
+            .try_send(LifecycleEvent::MergeCaptureFailed { source, target });
+          continue;
+        }
       };
       self
         .engine
