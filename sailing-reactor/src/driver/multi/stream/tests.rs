@@ -242,10 +242,9 @@ async fn a_merged_event_surfaces_only_after_its_barrier() {
 
 /// A completion swept by `fail_all` (a `LeaderChanged`) can catch a user-closure(-drop) panic: the
 /// swept closure is dropped unused, its captured guard's `Drop` mutates shared FSM state and panics,
-/// caught by the handle's `catch_unwind`. Before the fix `fail_all` DISCARDED that `Panicked`
-/// outcome and the group stayed LIVE against possibly-torn state; now the panic routes through the
-/// group's routing to the per-group fail-stop tail. The panicked group poisons; a co-located sibling
-/// keeps committing. The parked query reports the caught-panic outcome directly (as
+/// caught by the handle's `catch_unwind`. Discarding that `Panicked` outcome would leave the group LIVE
+/// against possibly-torn state, so `fail_all` latches it and the panic routes through the group's routing
+/// to the per-group fail-stop tail. The panicked group poisons; a co-located sibling keeps committing. The parked query reports the caught-panic outcome directly (as
 /// `shared::query_batch_stops_serving_at_the_first_caught_panic` does), avoiding a real unwind.
 #[tokio::test]
 async fn a_swept_completion_panic_fail_stops_only_its_group() {
@@ -303,7 +302,7 @@ async fn a_swept_completion_panic_fail_stops_only_its_group() {
 }
 
 /// The regression guard: a WELL-BEHAVED `fail_all(Superseded)` sweep (its completion `Delivered`)
-/// must NOT poison the group — a superseded group is not a poisoned one. Pins that the fix does not
+/// must NOT poison the group — a superseded group is not a poisoned one. Pins that the latch does not
 /// over-fail-stop on the common leadership-change sweep.
 #[tokio::test]
 async fn a_normal_supersede_sweep_does_not_poison_the_group() {
@@ -345,8 +344,8 @@ async fn a_normal_supersede_sweep_does_not_poison_the_group() {
 /// still-parked NORMAL query must NOT then be served against that torn FSM before the tail fail-stops.
 /// The tail reads the completion latch BEFORE serving, so a pre-serve latch SKIPS the serve: the parked
 /// query completes `Poisoned` from the fail-stop sweep (its served `Ok(&fsm)` arm never runs), the group
-/// fail-stops, and a co-located sibling's runnable query still serves normally the same crank. RED
-/// before the fix (the query was served against the torn FSM). The decline's caught panic is reported
+/// fail-stops, and a co-located sibling's runnable query still serves normally the same crank. Without the
+/// pre-serve read the query is served against the torn FSM. The decline's caught panic is reported
 /// directly, as `a_swept_completion_panic_fail_stops_only_its_group` does, avoiding a real unwind.
 #[tokio::test]
 async fn a_pre_serve_completion_panic_skips_the_torn_query_serve() {
@@ -463,13 +462,13 @@ async fn a_pre_serve_completion_panic_skips_the_torn_query_serve() {
   );
 }
 
-/// RED-PROOF 1 — the immediate-refusal arm. `read_index` on a group that is not a leader refuses
-/// IMMEDIATELY, and the refusal completes with `Err`: it never CALLS the user closure, but it DROPS it
-/// unused inside the completion's `catch_unwind`, so a guard the closure captured runs its `Drop` there
-/// and a panicking `Drop` is caught and reported `Panicked`. Every driver's refusal path DISCARDED that
-/// outcome (the call is a bare `complete(...)` on a destructured field, which the enforcement grep never
-/// matched), leaving the group LIVE against state the guard could have torn. It must fail-stop instead —
-/// group-scoped: the co-located sibling keeps committing. RED before: group 1 is not poisoned.
+/// The immediate-refusal arm. `read_index` on a group that is not a leader refuses IMMEDIATELY, and the
+/// refusal completes with `Err`: it never CALLS the user closure, but it DROPS it unused inside the
+/// completion's `catch_unwind`, so a guard the closure captured runs its `Drop` there and a panicking
+/// `Drop` is caught and reported `Panicked`. A refusal path that discards that outcome leaves the group
+/// LIVE against state the guard could have torn — the reason the outcome is `#[must_use]`, so the
+/// compiler (not a convention) enumerates the sites. The refusal must fail-stop instead, group-scoped:
+/// the co-located sibling keeps committing.
 #[tokio::test]
 async fn an_immediate_refusal_drop_panic_fail_stops_only_its_group() {
   let (mut driver, handle) = bind_host().await;
@@ -525,8 +524,8 @@ async fn an_immediate_refusal_drop_panic_fail_stops_only_its_group() {
   .expect("the co-located sibling keeps committing");
 }
 
-/// The no-over-fail-stop guard for RED-PROOF 1: a WELL-BEHAVED closure refused the same way must NOT
-/// poison its group. A refusal is not a torn state machine — the caller simply gets the read's refusal
+/// The no-over-fail-stop guard for the immediate-refusal arm: a WELL-BEHAVED closure refused the same way
+/// must NOT poison its group. A refusal is not a torn state machine — the caller simply gets the read's refusal
 /// reason and the group goes on to elect and commit.
 #[tokio::test]
 async fn a_normal_immediate_refusal_does_not_poison_the_group() {
@@ -554,14 +553,14 @@ async fn a_normal_immediate_refusal_does_not_poison_the_group() {
   .expect("a refused (not poisoned) group keeps committing");
 }
 
-/// RED-PROOF 2 — the merge-teardown hole. The merge fold DETACHES the source's routing
-/// (`self.routing.remove(&source)`) and only then sweeps its parked work, so a completion(-drop) panic in
-/// that sweep latched into a `Routing` that was immediately DROPPED: the latch died with it, and the
-/// pump's per-group tail can never read a latch for a group that no longer routes. By that point the
-/// proto has already absorbed the source's state machine INTO the target and staged the target's capture,
-/// so the state the guard tore is the TARGET's — and the merged target stayed LIVE, serving a possibly
-/// divergent union. The fold now keeps the target from `Merged { source, target }` and routes the dying
-/// latch to it, in the storage crank, ahead of the pump. RED before: group 1 is not poisoned.
+/// The merge teardown routes the source's DYING latch to the absorbing target. The fold DETACHES the
+/// source's routing (`self.routing.remove(&source)`) and only then sweeps its parked work, so a
+/// completion(-drop) panic in that sweep latches into a `Routing` that is about to be DROPPED — and the
+/// pump's per-group tail can never read a latch for a group that no longer routes. By that point the proto
+/// has absorbed the source's state machine INTO the target and staged the target's capture, so the state
+/// the guard tore is the TARGET's: a merged target left LIVE would serve a possibly divergent union. The
+/// fold therefore keeps the target from `Merged { source, target }` and fail-stops it with the latch, in
+/// the storage crank, ahead of the pump.
 #[tokio::test]
 async fn a_merge_teardown_drop_panic_fail_stops_the_absorbing_target() {
   let (mut driver, handle) = bind_host().await;
@@ -787,8 +786,8 @@ async fn a_fail_stopped_merge_target_never_serves_its_confirmed_parked_query() {
   );
 }
 
-/// The no-over-fail-stop guard for RED-PROOF 2: a WELL-BEHAVED source teardown (its swept completion
-/// `Delivered`) must NOT poison the absorbing target. The merge is the common path — it must stay clean,
+/// The no-over-fail-stop guard for the merge teardown: a WELL-BEHAVED source teardown (its swept
+/// completion `Delivered`) must NOT poison the absorbing target. The merge is the common path — it must stay clean,
 /// and the target must still serve the union it absorbed.
 #[tokio::test]
 async fn a_normal_merge_teardown_does_not_poison_the_target() {

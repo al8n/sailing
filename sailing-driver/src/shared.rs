@@ -1295,13 +1295,16 @@ mod tests {
     );
   }
 
-  /// THE ROOT CAUSE, pinned executably. Six review rounds patched this class while every refusal site
-  /// carried a comment asserting that "an `Err` completion never invokes the user closure, so it cannot
-  /// panic". The premise is true and the conclusion is false: `res.map(f)` on an `Err` CONSUMES `f`
-  /// without calling it, so `f` — and any guard `f` captured — is DROPPED right there, INSIDE the
-  /// completion's `catch_unwind`. A panicking `Drop` is therefore caught and reported `Panicked` from
-  /// the very arm the comments called panic-free. Built in the exact shape the handles build a
-  /// completion, so it is the real mechanism rather than a synthesized outcome.
+  /// THE ROOT MECHANISM, pinned executably: an `Err` completion CAN report `Panicked`.
+  ///
+  /// "An `Err` completion never invokes the user closure, so it cannot panic" is the tempting
+  /// inference, and its premise is true while its conclusion is false: `res.map(f)` on an `Err`
+  /// CONSUMES `f` without calling it, so `f` — and any guard `f` captured — is DROPPED right there,
+  /// INSIDE the completion's `catch_unwind`. A panicking `Drop` is therefore caught and reported
+  /// `Panicked` from the very arm that never ran a line of user code. Every refusal, sweep, and decline
+  /// arm in the drivers rests on this, which is why none of them may discard its outcome. Built in the
+  /// exact shape the handles build a completion, so it is the real mechanism rather than a synthesized
+  /// outcome.
   #[test]
   fn an_err_completion_drops_its_unused_closure_and_catches_the_guards_panic() {
     /// A stand-in for a guard whose `Drop` mutates state aliased into the replicated FSM (a `Cell`, a
@@ -1348,13 +1351,13 @@ mod tests {
 
   #[test]
   fn fail_all_latches_a_caught_completion_panic() {
-    // The defect this closes: `fail_all` invoked the query/failover completions but DISCARDED their
-    // `CompletionOutcome`. A swept completion never runs the user closure (the `Err` short-circuits
-    // it) yet DROPS it unused, running any guard it captured — whose `Drop` can panic against shared
-    // FSM state, caught by the completion's `catch_unwind` and reported `Panicked` (simulated here
-    // exactly as `query_batch_stops_serving_at_the_first_caught_panic` does, without a real unwind).
-    // The discarded panic left the group LIVE against possibly-torn state; now `fail_all` latches it
-    // for the driver's per-group fail-stop tail.
+    // The contract: `fail_all` LATCHES a swept completion's caught panic rather than discarding its
+    // `CompletionOutcome`. A swept completion never runs the user closure (the `Err` short-circuits it)
+    // yet DROPS it unused, running any guard it captured — whose `Drop` can panic against shared FSM
+    // state, caught by the completion's `catch_unwind` and reported `Panicked` (simulated here exactly
+    // as `query_batch_stops_serving_at_the_first_caught_panic` does, without a real unwind). A panic
+    // dropped here would leave the group LIVE against possibly-torn state, so the latch carries it to
+    // the driver's per-group fail-stop tail.
     let (mut r, _rx) = routing();
     let b = InflightBudget::new(8, 8);
     let ctx = r.mint_query_ctx();
