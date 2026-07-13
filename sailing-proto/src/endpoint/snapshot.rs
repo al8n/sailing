@@ -517,7 +517,19 @@ where
     // acking it lifts the leader's `match` past `pending`. Persist-before-RESPOND: a non-durable term defers
     // the ack (this path runs no install; the term write is the post-dispatch catch-all in `handle_message`)
     // and `flush_term_gated_acks` releases it.
-    let redundant = if meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark()) {
+    let redundant = if meta.fork_id().is_some() && self.split.fork_id.as_ref() != meta.fork_id() {
+      // CROSS-LINEAGE fork snapshot: `(index, term)` is NOT a content-identity across a fork boundary.
+      // Log Matching holds only WITHIN one lineage, so a manufactured fork baseline and an independent
+      // group's colliding `(index, term)` are DIFFERENT content — the token is the lineage discriminator,
+      // and a token-bearing snapshot is redundant only against a matching-token holder. Reaching here with
+      // a token means a NONE-self endpoint (the `Some`-self + different-token case already returned at the
+      // provenance gate above): a collider that INDEPENDENTLY committed the boundary coordinates must not
+      // false-ack the genuine fork as "already present" while retaining its own divergent state — the
+      // leader would advance `match` and execute later entries over permanent divergence. Fall through to
+      // install, which adopts the token and lands the fork's real state (a virgin observer installs anyway,
+      // the snapshot not being redundant against an empty log; the dangerous case is the non-virgin collider).
+      false
+    } else if meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark()) {
       true
     } else if meta.last_index() <= self.durable.durable_index {
       // Log-Matching proof read. A fatal `term` Err is a STORAGE FAILURE, not a mismatch: funnel it
@@ -846,7 +858,14 @@ where
     // (`PoisonReason::LogTerm`) and returns `None`. Treating an Err as "not redundant" would instead fall
     // through to the destructive `log.restore` on unreadable state — discarding a durable tail that may
     // actually match the snapshot prefix (the very hole this guard closes).
-    let redundant = if meta.last_index() <= self.commit {
+    let redundant = if meta.fork_id().is_some() && self.split.fork_id.as_ref() != meta.fork_id() {
+      // Cross-lineage fork snapshot: `(index, term)` is NOT a content-identity across a fork boundary
+      // (see the receipt-time gate), so a token-bearing snapshot is redundant only against a
+      // matching-token holder. `self.split.fork_id` is still None here — adoption is below — so this
+      // reaches only a NONE-self collider, which must INSTALL the fork's real state, never drop it as
+      // "already durable" against its own divergent tail.
+      false
+    } else if meta.last_index() <= self.commit {
       true
     } else if meta.last_index() <= self.durable.durable_index {
       match self.log_term(log, meta.last_index()) {

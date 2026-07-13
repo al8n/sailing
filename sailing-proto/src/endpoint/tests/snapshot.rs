@@ -3492,6 +3492,227 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
   );
 }
 
+/// A token-bearing snapshot is redundant only against its OWN lineage. `(index, term)` is NOT a
+/// content-identity across a fork boundary — Log Matching holds only WITHIN one lineage — so a NONE-self
+/// endpoint (no local `ForkId`) that INDEPENDENTLY committed a colliding baseline must not ack a genuine
+/// fork snapshot as "already present" while retaining its own DIVERGENT state; it must install the fork's
+/// real state and adopt the token, or the leader advances `match` and later entries execute over permanent
+/// divergence (the coordinate-fusion hazard).
+///
+/// Setup: a fresh (None-self) follower makes an async-follower tail [1..=9] at term 2 durable with commit
+/// held at 2 — its OWN lineage. A fork snapshot then arrives at boundary 5 term 2 (5 > commit 2, 5 <=
+/// durable 9, term matches at 5 — the Log-Matching redundancy coordinates) carrying a fork TOKEN and the
+/// fork's real state (count 500).
+///
+/// MUTATION: drop the cross-lineage guard so the token-bearing snapshot takes the Log-Matching branch. Then
+/// it acks redundant, installs nothing, keeps its own state, and adopts no token — so the install/adopt
+/// assertions FAIL.
+#[test]
+fn a_token_bearing_fork_snapshot_installs_over_a_colliding_none_self_lineage() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, ForkId, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  assert!(
+    ep.fork_id().is_none(),
+    "the follower boots None-self: no local ForkId"
+  );
+
+  // The endpoint's OWN independent lineage: durable [1..=9] at term 2, leader_commit = 2 (the tail outran
+  // commit — an async follower). Its state machine holds its OWN state (count 0), distinct from the fork's.
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(9),
+    "tail flushed → durable=9"
+  );
+  assert_eq!(ep.commit, Index::new(2), "leader_commit held commit at 2");
+  assert_eq!(
+    log.term(Index::new(5)).unwrap(),
+    Term::new(2),
+    "the durable entry at the boundary carries term 2 — the Log-Matching collision"
+  );
+  let own = ep.state_machine().count();
+  assert_ne!(
+    own, 500,
+    "the endpoint holds its OWN state, distinct from the fork's"
+  );
+
+  // A genuine fork snapshot COLLIDING at (index 5, term 2) — the Log-Matching coordinates — but carrying a
+  // fork TOKEN and the fork's real state (count 500), shipped by a foreign leader (node 9).
+  let token = ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[9u8]),
+    1,
+  );
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  )
+  .with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    9u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      9u64,
+      meta,
+      encode_count_snapshot(500),
+    )),
+  );
+  // Boundary 5 > commit 2 → the install is DEFERRED; drive storage so the blob turns durable and
+  // `install_snapshot_now` runs the destructive re-baseline.
+  for _ in 0..8 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+  }
+
+  // WITH the fix: the token-bearing snapshot is NOT redundant against this colliding None-self lineage, so
+  // it INSTALLS — the log re-baselines onto the boundary (the endpoint's OWN divergent tail discarded), the
+  // fork's state replaces its own, and the token is ADOPTED. A redundant ack with no install (the mutation)
+  // could do none of these.
+  assert_eq!(
+    log.last_index(),
+    Index::new(5),
+    "the log re-baselined onto the fork boundary — installed, not short-circuited"
+  );
+  assert_eq!(
+    ep.state_machine().count(),
+    500,
+    "the endpoint holds the FORK's state, not its own divergent state"
+  );
+  assert_eq!(
+    ep.fork_id(),
+    Some(token),
+    "the None-self endpoint adopted the fork's token — its own later snapshots now carry the lineage"
+  );
+}
+
+/// The no-over-install regression: the cross-lineage guard changes ONLY the token-vs-None-self collision. A
+/// SAME-lineage snapshot — a `Some`-self endpoint whose token MATCHES the incoming — still takes the
+/// Log-Matching short-circuit: no install, the durable tail preserved, the token unchanged. (The NON-fork
+/// short-circuit is `redundant_install_below_durable_tip_keeps_the_log`, unaffected by the guard.)
+#[test]
+fn a_same_lineage_matching_token_snapshot_still_short_circuits() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, ForkId, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // The SAME async-follower shape as the collider test: durable [1..=9] term 2, commit held at 2.
+  let tail: Vec<Entry> = (1u64..=9)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+  assert_eq!(
+    ep.durable.durable_index,
+    Index::new(9),
+    "tail flushed → durable=9"
+  );
+
+  // This endpoint IS the fork: seed its own token, then receive a snapshot carrying the SAME token at the
+  // Log-Matching boundary. Same lineage ⇒ `(index, term)` IS a content-identity here ⇒ still redundant.
+  let token = ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[9u8]),
+    1,
+  );
+  ep.seed_fork_id_for_test(token.clone());
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  )
+  .with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      meta,
+      encode_count_snapshot(500),
+    )),
+  );
+  for _ in 0..8 {
+    ep.handle_storage(d, &mut log, &mut stable);
+    while ep.poll_message().is_some() {}
+  }
+
+  assert_eq!(
+    log.last_index(),
+    Index::new(9),
+    "a same-lineage (matching-token) redundant snapshot still short-circuits — the durable tail is preserved"
+  );
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "a redundant same-lineage snapshot stages no install"
+  );
+  assert_eq!(ep.fork_id(), Some(token), "the matching token is unchanged");
+}
+
 /// Completion-time Log-Matching redundancy (the IN-WINDOW catch-up case the receipt guard cannot see):
 /// the snapshot's boundary is ABOVE the follower's durable tip AT RECEIPT, so the receipt short-circuit
 /// does NOT fire and the install is STAGED. Then in-window AppendEntries make the matching prefix durable
