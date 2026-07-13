@@ -727,9 +727,14 @@ where
       // `FloorStore` may serve a STAGED floor, and dropping the stores off it before the flush would
       // re-admit the id below its gen. `Aborted` needs nothing — the source is still live.
       //
-      let source = match r {
-        sailing_proto::MergeResolution::Merged { source, .. }
-        | sailing_proto::MergeResolution::Retired { source } => source,
+      // The absorbing TARGET is bound, not `..`-discarded: the teardown sweep below runs the source's
+      // parked completions, and by then the proto has already absorbed the source's state machine
+      // INTO the target and staged the target's capture. A completion(-drop) panic in that sweep tore
+      // state the TARGET now owns, so the target — not the source being destroyed — is the group that
+      // must fail-stop.
+      let (source, target) = match r {
+        sailing_proto::MergeResolution::Merged { source, target } => (source, Some(target)),
+        sailing_proto::MergeResolution::Retired { source } => (source, None),
         sailing_proto::MergeResolution::Aborted { .. } => continue,
       };
       self
@@ -743,6 +748,19 @@ where
       self.election.remove(&source);
       if let Some(mut routing) = self.routing.remove(&source) {
         routing.fail_all(&DriverError::ShuttingDown);
+        // The DETACHED routing dies at the end of this block, and its completion-panic latch with it:
+        // the pump's per-group tail reads latches through `self.routing`, which no longer holds this
+        // source. Drain it HERE or lose it. A `Merged` routes it to the target, in the storage crank —
+        // ahead of the pump — so the target is fail-stopped before anything can serve or pump it this
+        // crank (the tail's `is_poisoned` gate then skips its query serve and fails its parked work
+        // `Poisoned`). A `Retired` has no absorbing target: the panic tore only the husk being
+        // destroyed, whose state machine no group inherits, so there is nothing to fail-stop and the
+        // drained latch is correctly dropped.
+        if routing.take_completion_panicked()
+          && let Some(target) = &target
+        {
+          self.coord.fail_stop_query_panicked(target);
+        }
       }
     }
     // Completions drained above can STAGE follow-up writes (a commit's HardState write submitted

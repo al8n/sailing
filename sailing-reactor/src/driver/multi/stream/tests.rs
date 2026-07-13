@@ -144,6 +144,29 @@ impl Drop for PanicOnDrop {
   }
 }
 
+/// A parked query's completion in the exact shape the handle builds one (`res.map(f)` under
+/// `catch_unwind`), whose user closure captures a [`PanicOnDrop`]. Used where the query must survive,
+/// parked, until a sweep completes it — which no public API can arrange, since a leader confirms and
+/// serves a real query within the same crank it is issued.
+fn drop_panic_completion() -> sailing_driver::shared::QueryComplete<u64, MergeSm> {
+  let guard = PanicOnDrop;
+  Box::new(
+    move |res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+      let f = move |sm: &MergeSm| {
+        let _guard = guard;
+        sm.0
+      };
+      // The handle reports this through the crate-private `CompletionOutcome::caught`; spelled out
+      // here because a completion built outside `sailing-driver` cannot reach it.
+      if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.map(f))).is_err() {
+        sailing_driver::shared::CompletionOutcome::Panicked
+      } else {
+        sailing_driver::shared::CompletionOutcome::Delivered
+      }
+    },
+  )
+}
+
 /// The `Merged` event is the application's permission to retire the source's external state —
 /// so it must not surface while the absorb's capture, the terminal floor, and the source's
 /// removal are only STAGED. The crank that resolves the merge stages those writes AFTER its own
@@ -529,4 +552,136 @@ async fn a_normal_immediate_refusal_does_not_poison_the_group() {
   )
   .await
   .expect("a refused (not poisoned) group keeps committing");
+}
+
+/// RED-PROOF 2 — the merge-teardown hole. The merge fold DETACHES the source's routing
+/// (`self.routing.remove(&source)`) and only then sweeps its parked work, so a completion(-drop) panic in
+/// that sweep latched into a `Routing` that was immediately DROPPED: the latch died with it, and the
+/// pump's per-group tail can never read a latch for a group that no longer routes. By that point the
+/// proto has already absorbed the source's state machine INTO the target and staged the target's capture,
+/// so the state the guard tore is the TARGET's — and the merged target stayed LIVE, serving a possibly
+/// divergent union. The fold now keeps the target from `Merged { source, target }` and routes the dying
+/// latch to it, in the storage crank, ahead of the pump. RED before: group 1 is not poisoned.
+#[tokio::test]
+async fn a_merge_teardown_drop_panic_fail_stops_the_absorbing_target() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+  }
+  // Park a query on the SOURCE that can never become runnable (`ready_at` stays `None`), so only the
+  // teardown's `fail_all` sweep can complete it — dropping its closure, and with it the guard.
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  {
+    let routing = driver.routing.get_mut(&2).expect("the source routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: drop_panic_completion(),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+  }
+
+  // 1 absorbs 2: the encoding-minimal id survives, so 2 is the source that dissolves.
+  drive(&mut driver, handle.prepare_merge(2, 1))
+    .await
+    .expect("freeze proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while !driver.coord.group(&2).is_some_and(|ep| ep.is_frozen()) {
+    assert!(std::time::Instant::now() < deadline, "no freeze in time");
+    crank(&mut driver).await;
+  }
+  drive(&mut driver, handle.commit_merge(1, 2))
+    .await
+    .expect("commit proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while hosts(&driver, 2) {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the parked merge never resolved"
+    );
+    crank(&mut driver).await;
+  }
+
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "the source teardown's drop-panic tore state the TARGET absorbed: the target must fail-stop"
+  );
+  // And it must not SERVE: a fail-stopped target refuses the read rather than answer from a union the
+  // guard's `Drop` could have diverged.
+  let served: Result<u64, _> = drive(&mut driver, handle.group(1).query(|sm: &MergeSm| sm.0)).await;
+  assert!(
+    matches!(served, Err(sailing_driver::DriverError::Poisoned)),
+    "the fail-stopped target must not serve a read against the possibly-divergent union"
+  );
+}
+
+/// The no-over-fail-stop guard for RED-PROOF 2: a WELL-BEHAVED source teardown (its swept completion
+/// `Delivered`) must NOT poison the absorbing target. The merge is the common path — it must stay clean,
+/// and the target must still serve the union it absorbed.
+#[tokio::test]
+async fn a_normal_merge_teardown_does_not_poison_the_target() {
+  let (mut driver, handle) = bind_host().await;
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+    elect(&mut driver, gid).await;
+    // One commit per group, so the absorbed union is observable (1 + 1 = 2).
+    drive(
+      &mut driver,
+      handle.group(gid).submit(Bytes::from_static(b"warm")),
+    )
+    .await
+    .expect("warm-up commit");
+  }
+  let budget = sailing_driver::shared::InflightBudget::new(8, 8);
+  {
+    let routing = driver.routing.get_mut(&2).expect("the source routes");
+    let ctx = routing.mint_query_ctx();
+    routing.queries.insert(
+      ctx,
+      sailing_driver::shared::ParkedQuery {
+        ready_at: None,
+        complete: Box::new(|_res: Result<&MergeSm, sailing_driver::DriverError<u64>>| {
+          sailing_driver::shared::CompletionOutcome::Delivered
+        }),
+        _reservation: budget.try_reserve::<u64>(0).unwrap(),
+      },
+    );
+  }
+
+  drive(&mut driver, handle.prepare_merge(2, 1))
+    .await
+    .expect("freeze proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while !driver.coord.group(&2).is_some_and(|ep| ep.is_frozen()) {
+    assert!(std::time::Instant::now() < deadline, "no freeze in time");
+    crank(&mut driver).await;
+  }
+  drive(&mut driver, handle.commit_merge(1, 2))
+    .await
+    .expect("commit proposed");
+  let deadline = std::time::Instant::now() + Duration::from_secs(10);
+  while hosts(&driver, 2) {
+    assert!(
+      std::time::Instant::now() < deadline,
+      "the parked merge never resolved"
+    );
+    crank(&mut driver).await;
+  }
+
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| !ep.is_poisoned()),
+    "a well-behaved source teardown must not poison the absorbing target"
+  );
+  let total: u64 = drive(&mut driver, handle.group(1).query(|sm: &MergeSm| sm.0))
+    .await
+    .expect("the merged target still serves the union it absorbed");
+  assert_eq!(total, 2, "the union is both groups' commits");
 }
