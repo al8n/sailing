@@ -33,7 +33,7 @@ use sailing_proto::{
 use sailing_driver::{
   BoxedGroupFactory, GroupFactory, LifecycleEvent, MultiCommand, MultiHandle, Node, Status,
   jittered,
-  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  shared::{CompletionOutcome, InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
 
@@ -631,6 +631,7 @@ where
       // down the routing. A `Retired` has no capture, but the floor re-write is STILL mandatory: a
       // `FloorStore` may serve a STAGED floor, and dropping the stores off it before the flush would
       // re-admit the id below its gen. `Aborted` needs nothing — the source is still live.
+      //
       let source = match r {
         sailing_proto::MergeResolution::Merged { source, .. }
         | sailing_proto::MergeResolution::Retired { source } => source,
@@ -920,6 +921,10 @@ where
     self.quiesce_pending.remove(gid);
     self.activity.remove(gid);
     self.election.remove(gid);
+    // The detached routing's completion-panic latch dies with it, correctly: the coordinator has
+    // already dropped this endpoint and no other group inherited its state machine, so a sweep's
+    // drop-panic tore only the group being destroyed and there is nothing left to fail-stop. (The
+    // merge fold's source teardown is the case that DOES have an heir — see `storage_crank`.)
     if let Some(mut routing) = self.routing.remove(gid) {
       routing.fail_all(&DriverError::ShuttingDown);
     }
@@ -1050,13 +1055,16 @@ where
         complete,
         reservation,
       } => {
+        // The two NOT-HOSTED refusals below (no routing, no stores) handed the closure nothing: the
+        // library never exposed a state machine to it, so a caught drop-panic here has no group to
+        // address a fail-stop to. Catch it — the driver must survive — and let the refusal stand.
         let Some(routing) = self.routing.get_mut(&group) else {
-          complete(Err(no_such_group()));
+          let _ = complete(Err(no_such_group()));
           return false;
         };
         let ctx = routing.mint_query_ctx();
         let Some((log, stable)) = self.engine.stores(&group) else {
-          complete(Err(no_such_group()));
+          let _ = complete(Err(no_such_group()));
           return false;
         };
         match self.coord.read_index(
@@ -1076,13 +1084,22 @@ where
               },
             );
           }
-          // An immediate refusal completes with `Err`, which never invokes the user closure, so it
-          // cannot panic — discard the (always `Delivered`) outcome.
+          // An immediate refusal on a group this host DOES hold. The `Err` arm does not CALL the
+          // user closure — it DROPS it unused inside the completion's `catch_unwind` — so a guard
+          // the closure captured runs its `Drop` there, and that `Drop` can mutate state aliased
+          // into this group's replicated FSM and panic. A caught panic therefore fail-stops THIS
+          // group, exactly as a served read's panic does: the closure was addressed to it, so it is
+          // the group whose state machine could now be torn.
           Some(Err(e)) => {
-            complete(Err(map_read_err(e)));
+            if complete(Err(map_read_err(e))) == CompletionOutcome::Panicked {
+              self.coord.fail_stop_query_panicked(&group);
+            }
           }
+          // The coordinator does not hold the group: there is no endpoint, hence no state machine
+          // the library ever exposed to this closure and no group to address a fail-stop to. Catch
+          // the outcome (the driver must survive the caught panic) and let the refusal stand.
           None => {
-            complete(Err(no_such_group()));
+            let _ = complete(Err(no_such_group()));
           }
         }
       }
@@ -1097,7 +1114,9 @@ where
             _reservation: reservation,
           });
         } else {
-          complete(Err(no_such_group()));
+          // Not hosted: no state machine was ever handed to this closure (see the `Query` arm) — a
+          // `Drop` that tears an FSM the library never exposed to it is outside the contract.
+          let _ = complete(Err(no_such_group()));
         }
       }
       MultiCommand::Transfer {
@@ -1710,7 +1729,14 @@ where
       .get_mut(gid)
       .is_some_and(|routing| routing.take_completion_panicked());
     let mut query_panicked = false;
-    if !completion_panicked
+    // A POISONED group never serves a parked read, and this gate is what makes a fail-stop raised
+    // EARLIER in the crank actually stop the serve: an immediate refusal's dropped closure panicked
+    // in `handle_command`, or a merge teardown fail-stopped this group as the absorbing target in
+    // `storage_crank` — both precede the pump with this group's confirmed queries still parked, and
+    // neither routes through this group's completion latch. `is_poisoned` is the one surface every
+    // fail-stop funnels through, so gating on it covers every present and future poison source.
+    if !poisoned
+      && !completion_panicked
       && run_queries
       && let Some(ep) = self.coord.group(gid)
       && let Some(routing) = self.routing.get_mut(gid)

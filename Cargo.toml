@@ -42,6 +42,10 @@ sailing-reactor = { version = "0.0.0", path = "sailing-reactor", default-feature
 [workspace.lints.rust]
 missing_docs = "warn"
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(docsrs)'] }
+# A `#[must_use]` marks a value whose loss is a BUG, not a style slip — a driver discarding a
+# `CompletionOutcome` silently drops a group's fail-stop verdict. Deny rather than warn so the
+# enforcement holds in a plain `cargo build` too, not only under CI's global `-D warnings`.
+unused_must_use = "deny"
 
 # A workspace release profile: it speeds up the benches/examples/tests built in release here and
 # makes the openraft comparison fairer (openraft's benches build with the same optimizations). A

@@ -127,9 +127,21 @@ pub enum Pending<I, R> {
 /// to the caller AND reports `Panicked` here, so the invoking driver learns the read ran against —
 /// and interior mutability could have TORN — the replicated state machine, and fail-stops the
 /// addressed group rather than serve possibly-divergent state. The `Err`/`Ok(None)` arms do not
-/// CALL the closure, but they DROP it unused inside the same `catch_unwind`, so a captured guard's
-/// `Drop` can panic there too — ANY arm, served or not, can report `Panicked`. The centralized
-/// completion latch folds every such report into the group's fail-stop.
+/// CALL the closure, but they DROP it unused inside the same `catch_unwind` (`res.map(f)` on an
+/// `Err` consumes `f` without invoking it), so a captured guard's `Drop` runs there and can panic
+/// too — ANY arm, served or not, can report `Panicked`. The centralized completion latch folds
+/// every such report into the group's fail-stop.
+///
+/// `#[must_use]` is the ENFORCEMENT. A discarded outcome is a silently dropped fail-stop, so the
+/// COMPILER — not a convention, and not a grep that only ever matched one of the two call syntaxes —
+/// enumerates every invocation that fails to consume its verdict. Ignoring one is correct in exactly
+/// two shapes, and each must say so at the site: the addressed group is not hosted here (the library
+/// handed that closure no state machine, so there is nothing to fail-stop), or the fail-stop is
+/// already decided and a second report cannot change it.
+#[must_use = "a completion reports the fail-stop verdict: `Panicked` means the user closure — or the \
+              guard it captured, dropped unused inside the same `catch_unwind` — could have torn the \
+              group's replicated state machine, and discarding it leaves the group serving \
+              possibly-divergent state"]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CompletionOutcome {
   /// The completion ran to normal delivery — no user-closure panic was caught.
@@ -328,7 +340,10 @@ pub fn serve_failover_batch<I, F>(
   let mut panicked = false;
   for p in parked {
     if panicked {
-      // An `Err` completion does not CALL the user closure (see `CompletionOutcome`).
+      // This `Err` arm does not CALL the user closure, but it DROPS it unused inside the completion's
+      // `catch_unwind`, so it CAN report `Panicked` (see [`CompletionOutcome`]). Discarding that report
+      // is sound HERE and nowhere else: `panicked` is already latched and is what this function returns,
+      // so the caller's fail-stop for this group is already decided and a second report cannot change it.
       let _ = (p.complete)(Err(DriverError::Poisoned));
       continue;
     }
@@ -357,7 +372,10 @@ pub fn serve_query_batch<I, F>(queries: Vec<ParkedQuery<I, F>>, fsm: &F) -> bool
   let mut panicked = false;
   for q in queries {
     if panicked {
-      // An `Err` completion does not CALL the user closure (see `CompletionOutcome`).
+      // This `Err` arm does not CALL the user closure, but it DROPS it unused inside the completion's
+      // `catch_unwind`, so it CAN report `Panicked` (see [`CompletionOutcome`]). Discarding that report
+      // is sound HERE and nowhere else: `panicked` is already latched and is what this function returns,
+      // so the caller's fail-stop for this group is already decided and a second report cannot change it.
       let _ = (q.complete)(Err(DriverError::Poisoned));
       continue;
     }
@@ -1239,6 +1257,57 @@ mod tests {
       b.in_flight(),
       (0, 0),
       "the sweep released both reservations"
+    );
+  }
+
+  /// THE ROOT CAUSE, pinned executably. Six review rounds patched this class while every refusal site
+  /// carried a comment asserting that "an `Err` completion never invokes the user closure, so it cannot
+  /// panic". The premise is true and the conclusion is false: `res.map(f)` on an `Err` CONSUMES `f`
+  /// without calling it, so `f` — and any guard `f` captured — is DROPPED right there, INSIDE the
+  /// completion's `catch_unwind`. A panicking `Drop` is therefore caught and reported `Panicked` from
+  /// the very arm the comments called panic-free. Built in the exact shape the handles build a
+  /// completion, so it is the real mechanism rather than a synthesized outcome.
+  #[test]
+  fn an_err_completion_drops_its_unused_closure_and_catches_the_guards_panic() {
+    /// A stand-in for a guard whose `Drop` mutates state aliased into the replicated FSM (a `Cell`, a
+    /// lock, an `Arc<Mutex<_>>` the closure shares with the state machine) and panics doing so.
+    struct PanicOnDrop;
+
+    impl Drop for PanicOnDrop {
+      fn drop(&mut self) {
+        panic!("the captured guard's Drop ran and tore the state machine");
+      }
+    }
+
+    /// `Handle::query`'s completion, verbatim in shape: the user closure is applied as `res.map(f)`
+    /// under `catch_unwind`, and a caught unwind reports `Panicked`.
+    fn completion() -> QueryComplete<u64, u64> {
+      let guard = PanicOnDrop;
+      Box::new(move |res: Result<&u64, DriverError<u64>>| {
+        let f = move |fsm: &u64| {
+          // The guard is OWNED by the user closure, so it dies with the closure — whether the closure
+          // is CALLED (a served read) or merely DROPPED (every refusal/decline arm).
+          let _guard = guard;
+          *fsm
+        };
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| res.map(f)));
+        CompletionOutcome::caught(caught.is_err())
+      })
+    }
+
+    // The arm the old comments called panic-free: the closure is never CALLED, and the completion still
+    // reports `Panicked` — `map` dropped it, it dropped the guard, the guard's `Drop` panicked inside
+    // the unwind boundary. A driver that discards this outcome silently drops the group's fail-stop.
+    assert_eq!(
+      (completion())(Err(DriverError::Superseded)),
+      CompletionOutcome::Panicked,
+      "an `Err` refusal DROPS its unused closure inside the catch_unwind: the guard's Drop panics there"
+    );
+    // The served arm reports it too (the closure runs, then dies) — the outcome is arm-independent.
+    assert_eq!(
+      (completion())(Ok(&7u64)),
+      CompletionOutcome::Panicked,
+      "the served arm drops the closure after calling it: same guard, same caught panic"
     );
   }
 

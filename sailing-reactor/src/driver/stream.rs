@@ -31,7 +31,7 @@ use sailing_proto::{
 
 use sailing_driver::{
   Command, Handle, Node, Status, jittered,
-  shared::{InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
+  shared::{CompletionOutcome, InflightBudget, ParkedFailover, ParkedQuery, Pending, Routing},
   validate_and_capture_eps,
 };
 
@@ -1068,10 +1068,16 @@ where
               },
             );
           }
-          // An immediate read-index refusal: the completion runs with `Err`, which never invokes
-          // the user closure, so it cannot panic — discard the (always `Delivered`) outcome.
+          // An immediate read-index refusal. The `Err` arm does not CALL the user closure — it DROPS
+          // it unused inside the completion's `catch_unwind` (`res.map(f)` on an `Err` consumes `f`
+          // without invoking it) — so a guard the closure captured runs its `Drop` there, and that
+          // `Drop` can mutate state aliased into the replicated FSM and panic. A caught panic
+          // therefore fail-stops the endpoint, exactly as a served read's panic does; the pump's
+          // poison check then fails the parked work `Poisoned` and stops the driver.
           Err(e) => {
-            complete(Err(map_read_err(e)));
+            if complete(Err(map_read_err(e))) == CompletionOutcome::Panicked {
+              self.coord.fail_stop_query_panicked();
+            }
           }
         }
       }
@@ -1258,7 +1264,13 @@ where
     // sweep below fails those queries `Poisoned`, never run against the torn state. A query that panics
     // DURING the serve still reports through `query_panicked`; one read-and-clear both gates and decides.
     let completion_panicked = self.routing.take_completion_panicked();
+    // A POISONED endpoint never serves a parked read, and this gate is what makes a fail-stop raised
+    // EARLIER in the crank actually stop the serve: an immediate read-index refusal whose dropped
+    // closure panicked fail-stops back in `handle_command`, ahead of this pump, with the confirmed
+    // queries still parked and nothing latched in `routing`. `is_poisoned` is the one surface every
+    // fail-stop funnels through, so gating on it covers every present and future poison source.
     let query_panicked = !completion_panicked
+      && !self.coord.endpoint().is_poisoned()
       && run_queries
       && sailing_driver::shared::serve_query_batch(
         self.routing.take_runnable_queries(),

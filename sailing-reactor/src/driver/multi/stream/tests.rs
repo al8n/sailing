@@ -131,6 +131,19 @@ fn hosts(driver: &Driver, gid: u64) -> bool {
   driver.engine.group_ids().any(|g| *g == gid)
 }
 
+/// A stand-in for a guard whose `Drop` mutates state aliased into a group's replicated FSM (a `Cell`, a
+/// lock the closure shares with the state machine) and panics doing so. A query closure that captures
+/// one is dropped UNUSED on every arm that does not serve — `res.map(f)` on an `Err` consumes `f`
+/// without calling it — so the guard's `Drop` runs INSIDE the completion's `catch_unwind` and the
+/// completion reports `Panicked`. This is the mechanism, not a synthesized outcome.
+struct PanicOnDrop;
+
+impl Drop for PanicOnDrop {
+  fn drop(&mut self) {
+    panic!("the captured guard's Drop ran and tore the state machine");
+  }
+}
+
 /// The `Merged` event is the application's permission to retire the source's external state —
 /// so it must not surface while the absorb's capture, the terminal floor, and the source's
 /// removal are only STAGED. The crank that resolves the merge stages those writes AFTER its own
@@ -425,4 +438,95 @@ async fn a_pre_serve_completion_panic_skips_the_torn_query_serve() {
     driver.coord.group(&2).is_some_and(|ep| !ep.is_poisoned()),
     "the sibling was not poisoned"
   );
+}
+
+/// RED-PROOF 1 — the immediate-refusal arm. `read_index` on a group that is not a leader refuses
+/// IMMEDIATELY, and the refusal completes with `Err`: it never CALLS the user closure, but it DROPS it
+/// unused inside the completion's `catch_unwind`, so a guard the closure captured runs its `Drop` there
+/// and a panicking `Drop` is caught and reported `Panicked`. Every driver's refusal path DISCARDED that
+/// outcome (the call is a bare `complete(...)` on a destructured field, which the enforcement grep never
+/// matched), leaving the group LIVE against state the guard could have torn. It must fail-stop instead —
+/// group-scoped: the co-located sibling keeps committing. RED before: group 1 is not poisoned.
+#[tokio::test]
+async fn an_immediate_refusal_drop_panic_fail_stops_only_its_group() {
+  let (mut driver, handle) = bind_host().await;
+  // Neither group is elected — `crank` never fires timeouts — so each is a fresh follower that knows no
+  // leader, and `read_index` refuses with `NoLeader`. That is the HOSTED-group refusal arm, reached with
+  // the group fully alive and its state machine fully exposed to the closure.
+  for gid in [1u64, 2] {
+    let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+    let fut = handle.create_group(gid, cfg, 7, MergeSm::default(), 0);
+    drive(&mut driver, fut).await.expect("group admission");
+  }
+
+  let guard = PanicOnDrop;
+  let refused: Result<u64, _> = drive(
+    &mut driver,
+    handle.group(1).query(move |sm: &MergeSm| {
+      // Owned by this closure, so it dies with it: on the refusal arm the closure is dropped unused,
+      // inside the completion's unwind boundary, and the guard's `Drop` panics THERE.
+      let _guard = guard;
+      sm.0
+    }),
+  )
+  .await;
+  assert!(
+    matches!(refused, Err(sailing_driver::DriverError::QueryPanicked)),
+    "the caller learns its closure panicked, not the read's refusal reason"
+  );
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| ep.is_poisoned()),
+    "the refused query's dropped guard panicked: group 1 must fail-stop, not keep serving torn state"
+  );
+  assert!(
+    driver.coord.group(&2).is_some_and(|ep| !ep.is_poisoned()),
+    "the co-located sibling must not be poisoned"
+  );
+  // The fail-stop surfaces once on the lifecycle tail, exactly as a served read's panic does.
+  let poisoned: Vec<u64> = handle
+    .lifecycle()
+    .try_iter()
+    .filter_map(|ev| match ev {
+      LifecycleEvent::Poisoned { group } => Some(group),
+      _ => None,
+    })
+    .collect();
+  assert_eq!(poisoned, vec![1], "the fail-stopped group surfaces once");
+  // The sibling still elects and commits: a group-scoped fail-stop, never a driver stop.
+  elect(&mut driver, 2).await;
+  drive(
+    &mut driver,
+    handle.group(2).submit(Bytes::from_static(b"x")),
+  )
+  .await
+  .expect("the co-located sibling keeps committing");
+}
+
+/// The no-over-fail-stop guard for RED-PROOF 1: a WELL-BEHAVED closure refused the same way must NOT
+/// poison its group. A refusal is not a torn state machine — the caller simply gets the read's refusal
+/// reason and the group goes on to elect and commit.
+#[tokio::test]
+async fn a_normal_immediate_refusal_does_not_poison_the_group() {
+  let (mut driver, handle) = bind_host().await;
+  let cfg = Config::try_new(1u64, vec![1], ELECTION, HEARTBEAT).unwrap();
+  let fut = handle.create_group(1u64, cfg, 7, MergeSm::default(), 0);
+  drive(&mut driver, fut).await.expect("group admission");
+
+  let refused: Result<u64, _> =
+    drive(&mut driver, handle.group(1).query(|sm: &MergeSm| sm.0)).await;
+  assert!(
+    matches!(refused, Err(sailing_driver::DriverError::NotLeader { .. })),
+    "a well-behaved refusal reports the read's refusal reason"
+  );
+  assert!(
+    driver.coord.group(&1).is_some_and(|ep| !ep.is_poisoned()),
+    "a well-behaved refusal must not fail-stop the group"
+  );
+  elect(&mut driver, 1).await;
+  drive(
+    &mut driver,
+    handle.group(1).submit(Bytes::from_static(b"y")),
+  )
+  .await
+  .expect("a refused (not poisoned) group keeps committing");
 }
