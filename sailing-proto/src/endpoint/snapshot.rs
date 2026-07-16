@@ -477,9 +477,9 @@ where
     // frees only THIS replica's own already-recoverable staging (no ack, no foreign effect).
     // Refusal, not fail-stop: the sender is authenticated, merely mis-lineaged — dropping the
     // message leaves it pinned in Snapshot state, the same standing-conflict posture as a parked
-    // fork, resolved by placement (removal / the genuine twin's transfer). A token-less self
-    // adopts freely (the fresh-joiner leg); a matching token re-installs freely (the twin
-    // retransfer leg).
+    // fork, resolved by placement (removal / the genuine twin's transfer). A matching token
+    // re-installs freely (the twin retransfer leg); a token-less self adopts — but only from
+    // NOTHING (the second leg below).
     //
     // EXACT match only — no cross-mint supersession arm exists, by design. A genuine re-mint of
     // the same child (a later split episode) can never repeat this token's coordinates: every
@@ -493,7 +493,43 @@ where
     if let Some(existing) = &self.split.fork_id
       && meta.fork_id() != Some(existing)
     {
+      self.snapshot.refused_cross_lineage_installs = self
+        .snapshot
+        .refused_cross_lineage_installs
+        .saturating_add(1);
       return;
+    }
+    // A token-less self ADOPTS a lineage only from NOTHING. `(last_index, last_term, conf)` is a
+    // content-identity only WITHIN one lineage (Log Matching), so every coordinate proof downstream
+    // — the redundancy short-circuit, the reclaim proof, the progress-ack watermark, restart's
+    // log-vs-snapshot reconciliation — is sound only when snapshot and receiver share a lineage. A
+    // populated replica that accepted a foreign baseline would hold two lineages' artifacts in one
+    // durable state (its own committed log and the foreign blob); no later predicate can untangle
+    // that, because the log carries no token. So the invariant is held where it is still cheap:
+    // a token-bearing snapshot lands only on a replica with NO committed content — empty log,
+    // nothing committed, and a durable slot that is either empty or already holds EXACTLY this
+    // snapshot. The kin-slot arm is load-bearing: an adoption interrupted after the blob's fsync
+    // but before the install (a crash, or a role flip dropping the deferred body) leaves the blob
+    // durable with the log still virgin, and the leader's retransfer of the SAME identity must
+    // complete the adoption, not wedge on its own leftover evidence. The manufactured fork
+    // baseline's contract has always been the zero-progress joiner (see `FORK_BASE_INDEX`); this
+    // enforces it. A populated squatter at the id is the same standing conflict the parked fork
+    // surfaces — resolved by placement (remove, tombstone, recreate pristine), never by
+    // destructive replacement, now uniformly on the relay and the wire.
+    if self.split.fork_id.is_none() && meta.fork_id().is_some() {
+      let pristine_or_kin = log.last_index() == Index::ZERO
+        && log.first_index() == Index::new(1)
+        && self.commit == Index::ZERO
+        && stable
+          .durable_snapshot()
+          .is_none_or(|m| m.identity_eq(meta));
+      if !pristine_or_kin {
+        self.snapshot.refused_cross_lineage_installs = self
+          .snapshot
+          .refused_cross_lineage_installs
+          .saturating_add(1);
+        return;
+      }
     }
 
     // Redundancy short-circuit: skip the staging+install entirely when this follower ALREADY holds the

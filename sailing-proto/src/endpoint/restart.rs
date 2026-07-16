@@ -452,6 +452,7 @@ where
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
         unsendable_meta_frames: 0,
+        refused_cross_lineage_installs: 0,
       },
       rng,
       votes: BTreeMap::new(),

@@ -1104,6 +1104,13 @@ where
   /// should never advance in native operation; a CLIMBING value flags a peer permanently wedged in
   /// `Snapshot` on an oversized meta (e.g. a config that predates the gate). Saturating.
   unsendable_meta_frames: u64,
+  /// Diagnostic: how many `InstallSnapshot`s the fork-provenance gate refused — a foreign-lineage
+  /// snapshot into a token-bearing replica, or a token-bearing snapshot into a replica that already
+  /// holds committed content of another (token-less) lineage. Refusals are silent on the wire (the
+  /// sender is authenticated, merely mis-lineaged — the standing-conflict posture, resolved by
+  /// placement), so a CLIMBING value is the local signal distinguishing a lineage conflict from a
+  /// slow transfer. Saturating.
+  refused_cross_lineage_installs: u64,
 }
 
 // Hand-written so the impl does not require `F::Snapshot: Debug` (its only bound is `Data`, which is
@@ -1128,6 +1135,10 @@ where
       .field("pending_compact", &self.pending_compact)
       .field("snapshot_resend_after", &self.snapshot_resend_after)
       .field("unsendable_meta_frames", &self.unsendable_meta_frames)
+      .field(
+        "refused_cross_lineage_installs",
+        &self.refused_cross_lineage_installs,
+      )
       .finish()
   }
 }
@@ -1384,6 +1395,7 @@ where
         pending_compact: None,
         snapshot_resend_after: BTreeMap::new(),
         unsendable_meta_frames: 0,
+        refused_cross_lineage_installs: 0,
       },
       rng,
       votes: BTreeMap::new(),
@@ -1650,6 +1662,15 @@ where
   #[inline]
   pub const fn unsendable_snapshot_meta_count(&self) -> u64 {
     self.snapshot.unsendable_meta_frames
+  }
+
+  /// Diagnostic count of `InstallSnapshot`s refused by the fork-provenance gate (a cross-lineage
+  /// snapshot into a replica that is token-bearing, or that already holds committed content of
+  /// another lineage). Refusals are silent on the wire, so a CLIMBING value is what distinguishes a
+  /// standing lineage conflict — resolved by placement — from a merely slow transfer.
+  #[inline]
+  pub const fn refused_cross_lineage_install_count(&self) -> u64 {
+    self.snapshot.refused_cross_lineage_installs
   }
 
   /// Next outbound message, if any.

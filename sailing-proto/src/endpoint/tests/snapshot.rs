@@ -3492,23 +3492,26 @@ fn redundant_install_below_durable_tip_keeps_the_log() {
   );
 }
 
-/// A token-bearing snapshot is redundant only against its OWN lineage. `(index, term)` is NOT a
+/// A token-bearing snapshot lands on a token-less replica only from NOTHING. `(index, term)` is NOT a
 /// content-identity across a fork boundary — Log Matching holds only WITHIN one lineage — so a NONE-self
-/// endpoint (no local `ForkId`) that INDEPENDENTLY committed a colliding baseline must not ack a genuine
-/// fork snapshot as "already present" while retaining its own DIVERGENT state; it must install the fork's
-/// real state and adopt the token, or the leader advances `match` and later entries execute over permanent
-/// divergence (the coordinate-fusion hazard).
+/// endpoint that INDEPENDENTLY committed a colliding baseline can neither ack the fork snapshot as
+/// "already present" (its own state diverges from the fork's — the coordinate-fusion hazard) nor let it
+/// install destructively (wholesale replacement of a populated replica's committed state on the wire,
+/// which placement, not replacement, resolves). It REFUSES: no ack, no staging, no state change — the
+/// sender stays pinned in Snapshot state, the standing-conflict posture, and the refusal counter is the
+/// local signal.
 ///
 /// Setup: a fresh (None-self) follower makes an async-follower tail [1..=9] at term 2 durable with commit
 /// held at 2 — its OWN lineage. A fork snapshot then arrives at boundary 5 term 2 (5 > commit 2, 5 <=
 /// durable 9, term matches at 5 — the Log-Matching redundancy coordinates) carrying a fork TOKEN and the
 /// fork's real state (count 500).
 ///
-/// MUTATION: drop the cross-lineage guard so the token-bearing snapshot takes the Log-Matching branch. Then
-/// it acks redundant, installs nothing, keeps its own state, and adopts no token — so the install/adopt
-/// assertions FAIL.
+/// MUTATION 1: drop the populated-receiver leg of the fork-provenance gate → the snapshot stages and
+/// installs over the squatter (the untouched-state assertions FAIL). MUTATION 2: additionally drop the
+/// cross-lineage redundancy guard → it acks redundant at the colliding coordinates (the no-ack assertion
+/// FAILS).
 #[test]
-fn a_token_bearing_fork_snapshot_installs_over_a_colliding_none_self_lineage() {
+fn a_populated_none_self_lineage_refuses_a_colliding_fork_snapshot() {
   use crate::{
     AppendEntries, Entry, EntryKind, ForkId, Index, InstallSnapshot, Instant, Message,
     SnapshotMeta, Term, conf::ConfState,
@@ -3593,31 +3596,35 @@ fn a_token_bearing_fork_snapshot_installs_over_a_colliding_none_self_lineage() {
       encode_count_snapshot(500),
     )),
   );
-  // Boundary 5 > commit 2 → the install is DEFERRED; drive storage so the blob turns durable and
-  // `install_snapshot_now` runs the destructive re-baseline.
+  // Drive storage as a driver would; a refused install must leave nothing to complete.
   for _ in 0..8 {
     ep.handle_storage(d, &mut log, &mut stable);
-    while ep.poll_message().is_some() {}
   }
 
-  // WITH the fix: the token-bearing snapshot is NOT redundant against this colliding None-self lineage, so
-  // it INSTALLS — the log re-baselines onto the boundary (the endpoint's OWN divergent tail discarded), the
-  // fork's state replaces its own, and the token is ADOPTED. A redundant ack with no install (the mutation)
-  // could do none of these.
+  // REFUSED at the door: no staging, no deferred install, no state change, no token — and above all
+  // NO ack in either direction (neither redundant-at-coordinates nor installed).
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "a refused cross-lineage install acks NOTHING — the sender stays pinned in Snapshot state"
+  );
+  assert!(ep.snapshot.pending_install.is_none(), "nothing deferred");
+  assert!(ep.snapshot.snapshot_recv.is_none(), "nothing staged");
   assert_eq!(
     log.last_index(),
-    Index::new(5),
-    "the log re-baselined onto the fork boundary — installed, not short-circuited"
+    Index::new(9),
+    "the squatter's own log is untouched — placement resolves the conflict, not replacement"
   );
-  assert_eq!(
+  assert_ne!(
     ep.state_machine().count(),
     500,
-    "the endpoint holds the FORK's state, not its own divergent state"
+    "the endpoint keeps its OWN state"
   );
+  assert!(ep.fork_id().is_none(), "no token adopted");
   assert_eq!(
-    ep.fork_id(),
-    Some(token),
-    "the None-self endpoint adopted the fork's token — its own later snapshots now carry the lineage"
+    ep.refused_cross_lineage_install_count(),
+    1,
+    "the refusal is counted — the local signal distinguishing a lineage conflict from a slow transfer"
   );
 }
 
@@ -5157,21 +5164,17 @@ fn fork_token(child: u8) -> crate::ForkId {
   )
 }
 
-/// PERSIST-BEFORE-ACK across a fork boundary. The deferred install's durable-evidence fallback must key on
-/// THIS install's OWN snapshot — lineage included. A colliding coordinate is NOT evidence of durability:
-/// `(index, term, conf)` is not a content-identity across a fork boundary, so an old durable TOKENLESS
-/// snapshot and an in-flight fork BASELINE at the same coordinate are different bytes.
+/// PERSIST-BEFORE-ACK across a fork boundary, held one layer earlier than the durable-evidence fallback:
+/// a replica whose store already holds ANOTHER lineage's durable blob (an old tokenless snapshot it never
+/// installed) is not a pristine adopter, so a colliding fork baseline is REFUSED at the door — it is never
+/// staged, never submitted, and never deferred, so no fallback can ever mistake the tokenless blob's
+/// durability for the fork's. The colliding-durability window is unrepresentable, not merely guarded.
 ///
-/// Setup: the store durably holds a tokenless snapshot at (10, 2, conf) whose install this follower never
-/// ran. The genuine fork baseline arrives at the SAME coordinate carrying the fork's real state (count 777),
-/// and its fsync is still IN FLIGHT — so `durable_snapshot()` keeps reporting the OLD tokenless blob.
-///
-/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fallback reads the tokenless blob's
-/// durability as the fork baseline's, installs it, and ACKS boundary 10 while the fork's bytes are NOT on
-/// disk. A crash in that window recovers the divergent tokenless state under an ack the leader already
-/// counted toward `match`, and replication continues over the wrong state. The withheld-ack assertions FAIL.
+/// MUTATION: drop the durable-slot arm from the gate's pristine check → the fork baseline defers behind
+/// the held fsync while `durable_snapshot()` reports the colliding tokenless blob — the exact ambiguity
+/// the identity-keyed fallback then has to disarm (and the refusal assertions below FAIL).
 #[test]
-fn a_deferred_install_is_not_acked_on_a_colliding_lineages_durability() {
+fn a_populated_slot_refuses_a_colliding_fork_baseline() {
   use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
   let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
   let d = Instant::ORIGIN;
@@ -5183,8 +5186,54 @@ fn a_deferred_install_is_not_acked_on_a_colliding_lineages_durability() {
     encode_count_snapshot(111),
   );
 
-  // The genuine fork baseline: the SAME coordinate, a fork TOKEN, and the fork's real state. Its fsync is
-  // held in flight, so the durable slot still reports the tokenless blob.
+  // The genuine fork baseline: the SAME coordinate, a fork TOKEN, the fork's real state.
+  stable.hold_snapshot_fsync(true);
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "a replica holding another lineage's committed content or durable blob never defers a foreign install"
+  );
+  assert_eq!(ep.commit, Index::new(3), "no commit advance");
+  assert_eq!(log.last_index(), Index::new(3), "no re-baseline");
+  assert_ne!(ep.state_machine().count(), 777, "no foreign state restored");
+  assert!(ep.fork_id().is_none(), "no token adopted");
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "PERSIST-BEFORE-ACK: nothing was accepted, so nothing may be acked"
+  );
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
+}
+
+/// A pristine joiner's adoption acks ONLY on its own durability. The fork baseline's install is deferred
+/// behind its fsync; while the blob is in flight nothing destructive runs and nothing is acked, and once
+/// its OWN `SnapshotWritten` lands the install completes, the token is adopted, and exactly one ack goes
+/// out — deferred, not lost.
+///
+/// MUTATION: ack at receipt instead of completion (or run the destructive body before the fsync) → the
+/// withheld-ack / no-re-baseline assertions FAIL.
+#[test]
+fn an_adoption_acks_only_on_its_own_durability() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
   stable.hold_snapshot_fsync(true);
   let token = fork_token(9);
   let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
@@ -5202,63 +5251,30 @@ fn a_deferred_install_is_not_acked_on_a_colliding_lineages_durability() {
   );
   assert!(
     ep.snapshot.pending_install.is_some(),
-    "the fork baseline's install is deferred behind its fsync"
-  );
-  assert!(
-    stable
-      .durable_snapshot()
-      .expect("the old blob is durable")
-      .fork_id()
-      .is_none(),
-    "the DURABLE slot still holds the TOKENLESS snapshot — the fork's fsync has not landed"
+    "a pristine joiner adopts: the install is deferred behind its fsync"
   );
   while ep.poll_message().is_some() {}
 
-  // Drain storage: the fork baseline's own `SnapshotWritten` has NOT arrived, and the only durable evidence
-  // belongs to a DIFFERENT lineage. Nothing destructive may run, and NOTHING may be acked.
+  // The blob's own fsync has not landed: nothing destructive, nothing acked.
   ep.handle_storage(d, &mut log, &mut stable);
   assert!(
     ep.snapshot.pending_install.is_some(),
-    "another lineage's fsync is not this install's durability"
+    "no durability evidence yet — the install stays deferred"
   );
-  assert_eq!(ep.commit, Index::new(3), "no commit advance");
-  assert_eq!(
-    log.last_index(),
-    Index::new(3),
-    "no re-baseline over a non-durable blob"
-  );
-  assert_ne!(
-    ep.state_machine().count(),
-    777,
-    "the fork's state was not restored"
-  );
-  let msgs: Vec<_> = core::iter::from_fn(|| ep.poll_message()).collect();
+  assert_ne!(ep.state_machine().count(), 777, "no restore before fsync");
   assert!(
-    !msgs
-      .iter()
-      .any(|o| matches!(o.message(), Message::SnapshotResponse(_))),
-    "PERSIST-BEFORE-ACK: no ack may leave this node until the fork baseline's OWN bytes are durable"
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "PERSIST-BEFORE-ACK: no ack may leave before the blob's own bytes are durable"
   );
 
-  // The ack is DEFERRED, not lost: once the fork baseline's own fsync lands, the install completes and acks.
-  // (This leg is also the same-lineage no-regression check — a matching token still satisfies the fallback.)
+  // The ack is DEFERRED, not lost: the blob's own fsync completes the adoption.
   stable.flush_held_snapshots();
   ep.handle_storage(d, &mut log, &mut stable);
-  assert!(
-    ep.snapshot.pending_install.is_none(),
-    "the install completes on its OWN durability"
-  );
+  assert!(ep.snapshot.pending_install.is_none(), "install completed");
   assert_eq!(ep.commit, Index::new(10));
-  assert_eq!(
-    ep.state_machine().count(),
-    777,
-    "the FORK's state is what landed"
-  );
-  assert_eq!(
-    ep.fork_id(),
-    Some(token),
-    "the installing node adopts the fork's token"
-  );
+  assert_eq!(ep.state_machine().count(), 777, "the fork's state landed");
+  assert_eq!(ep.fork_id(), Some(token), "the joiner adopted the token");
   let acks: Vec<_> = core::iter::from_fn(|| ep.poll_message())
     .filter(|o| matches!(o.message(), Message::SnapshotResponse(_)))
     .collect();
@@ -5272,16 +5288,16 @@ fn a_deferred_install_is_not_acked_on_a_colliding_lineages_durability() {
   }
 }
 
-/// The duplicate-install guard keys on the snapshot's IDENTITY, lineage included. A fork baseline arriving at
-/// the coordinate of an in-flight TOKENLESS install is a DIFFERENT snapshot — it must SUPERSEDE that install,
-/// never be deduped away as "already in flight".
+/// A fork baseline arriving at the coordinate of an in-flight TOKENLESS install on a POPULATED replica is
+/// a different snapshot from a different lineage — and the replica is not a pristine adopter, so it is
+/// REFUSED outright: never deduped against the pending install (the coordinate-fusion hazard), and never
+/// allowed to displace it either. The replica's own in-flight native install completes undisturbed on its
+/// own durability.
 ///
-/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fork baseline is swallowed by the pending
-/// tokenless install. The follower then installs the OTHER lineage's state and acks boundary 10, telling the
-/// leader its fork snapshot landed while the state machine holds different bytes — permanent divergence under
-/// a counted ack. The superseded-state assertions FAIL (count 10, no token, instead of the fork's 777).
+/// MUTATION: drop the populated-receiver leg of the gate → the fork baseline displaces the pending native
+/// install and lands its state on a populated squatter (the count/token assertions FAIL).
 #[test]
-fn a_cross_lineage_install_supersedes_a_pending_one_at_the_same_coordinate() {
+fn a_pending_install_on_a_populated_lineage_is_not_displaced_by_a_fork_baseline() {
   use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
   let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
   let d = Instant::ORIGIN;
@@ -5300,10 +5316,12 @@ fn a_cross_lineage_install_supersedes_a_pending_one_at_the_same_coordinate() {
       .is_none(),
     "the in-flight install is the tokenless lineage"
   );
+  while ep.poll_message().is_some() {}
 
-  // The genuine fork baseline arrives at the SAME coordinate with the fork's real state.
+  // The fork baseline arrives at the SAME coordinate: REFUSED — this replica holds committed content
+  // (and a visible blob) of another lineage.
   let token = fork_token(9);
-  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token);
   ep.handle_message(
     d,
     &mut log,
@@ -5316,18 +5334,19 @@ fn a_cross_lineage_install_supersedes_a_pending_one_at_the_same_coordinate() {
       encode_count_snapshot(777),
     )),
   );
-  assert_eq!(
+  assert!(
     ep.snapshot
       .pending_install
       .as_ref()
-      .expect("an install is pending")
+      .expect("the native install is still pending")
       .1
-      .fork_id(),
-    Some(&token),
-    "the fork baseline SUPERSEDED the colliding tokenless install — it was not deduped away"
+      .fork_id()
+      .is_none(),
+    "the refused fork baseline neither deduped against nor displaced the in-flight native install"
   );
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
 
-  // Drive both fsyncs to completion: the state that lands is the FORK's, not the displaced lineage's.
+  // The native install completes undisturbed on its own durability.
   stable.flush_held_snapshots();
   for _ in 0..4 {
     ep.handle_storage(d, &mut log, &mut stable);
@@ -5339,20 +5358,19 @@ fn a_cross_lineage_install_supersedes_a_pending_one_at_the_same_coordinate() {
   assert_eq!(ep.commit, Index::new(10));
   assert_eq!(
     ep.state_machine().count(),
-    777,
-    "the FORK's state landed — not the superseded tokenless lineage's (count 10)"
+    10,
+    "the NATIVE lineage's state landed — the refused fork never displaced it"
   );
-  assert_eq!(ep.fork_id(), Some(token), "and its token was adopted");
+  assert!(ep.fork_id().is_none(), "no token adopted");
 }
 
 /// Two chunked transfers with the SAME coordinate AND the same `total_len` but DIFFERENT lineages must never
-/// COMBINE their chunks into one blob. The sender term cannot see this collision — both arrive under the SAME
-/// leader term — so the LINEAGE TOKEN is the only thing standing between the receiver and a Frankenstein blob
-/// spliced from two lineages' bytes.
+/// COMBINE their chunks into one blob. On a POPULATED replica the door refuses the foreign chunk before any
+/// staging exists to mix into: the native partial survives untouched and the foreign transfer never begins.
 ///
-/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the fork's chunk CONTINUES the tokenless
-/// partial (contiguous_staged 6 — a mixed [0,6) blob that would then decode and INSTALL) instead of replacing
-/// it (contiguous_staged 0 — its own [3,6) with a gap).
+/// MUTATION: drop the populated-receiver leg of the gate → the fork's chunk reaches the staging identity;
+/// the native partial is displaced on a squatter the fork may never convert (the staged-intact assertions
+/// FAIL).
 #[test]
 fn cross_lineage_chunks_never_combine_into_one_blob() {
   use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
@@ -5387,8 +5405,9 @@ fn cross_lineage_chunks_never_combine_into_one_blob() {
   while ep.poll_message().is_some() {}
 
   // The fork baseline: SAME coordinate, SAME total_len, SAME sender term — ONLY the lineage differs.
+  // REFUSED at the door: this replica holds committed content of the tokenless lineage.
   let token = fork_token(9);
-  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token);
   ep.handle_message(
     d,
     &mut log,
@@ -5408,26 +5427,99 @@ fn cross_lineage_chunks_never_combine_into_one_blob() {
     .snapshot_recv
     .as_ref()
     .expect("a transfer is in progress");
+  assert!(
+    recv.meta.fork_id().is_none(),
+    "the native partial survives — the refused foreign chunk never reached staging"
+  );
+  assert_eq!(recv.contiguous_staged, 3, "the native [0,3) is intact");
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
+}
+
+/// The pristine face of the same property: two lineages RACING into one pristine joiner supersede — the
+/// staging identity keys on the lineage token, so the second lineage's chunk REPLACES the first's partial
+/// rather than continuing it. Never a mixed blob, in either receiver state.
+///
+/// MUTATION: drop `fork_id` from `SnapshotMeta::identity_eq` → the second lineage's chunk CONTINUES the
+/// first's partial (contiguous_staged 6 — a mixed [0,6) blob that would then decode and INSTALL) instead
+/// of replacing it (contiguous_staged 0 — its own [3,6) with a gap).
+#[test]
+fn two_lineages_racing_into_a_pristine_joiner_never_mix() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // Lineage A stages [0,3) of a transfer at (10, 2), total_len 6 — the joiner is pristine, so it adopts.
+  let a = SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(fork_token(8));
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      a,
+      bytes::Bytes::from_static(b"AAA"),
+      0,
+      6,
+    )),
+  );
+  assert_eq!(
+    ep.snapshot
+      .snapshot_recv
+      .as_ref()
+      .map(|r| r.contiguous_staged),
+    Some(3),
+    "lineage A staged [0,3)"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Lineage B: SAME coordinate, SAME total_len, SAME sender term — only the token differs. Still a
+  // pristine joiner (staging is not content), so B is admitted and SUPERSEDES A's partial.
+  let b_token = fork_token(9);
+  let b = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(b_token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      b,
+      bytes::Bytes::from_static(b"BBB"),
+      3,
+      6,
+    )),
+  );
+  let recv = ep
+    .snapshot
+    .snapshot_recv
+    .as_ref()
+    .expect("a transfer is in progress");
   assert_eq!(
     recv.meta.fork_id(),
-    Some(&token),
-    "the fork's transfer REPLACED the tokenless partial"
+    Some(&b_token),
+    "lineage B's transfer REPLACED lineage A's partial"
   );
   assert_eq!(
     recv.contiguous_staged, 0,
-    "the tokenless [0,3) was discarded — the fork's [3,6) leaves a gap, NOT a mixed [0,6) blob"
+    "A's [0,3) was discarded — B's [3,6) leaves a gap, NOT a mixed [0,6) blob"
   );
 }
 
-/// The lineage key must not OVER-reject: a fork child's own chunked transfer (every chunk carrying the SAME
-/// token) still continues one transfer and installs, exactly as a tokenless transfer does.
+/// The lineage machinery must not OVER-reject: a pristine joiner taking the fork's chunked baseline (every
+/// chunk carrying the SAME token) continues ONE transfer to completion and adopts — the designed twin
+/// catch-up. This is the green fence for both the door gate (a pristine adopter is admitted) and the
+/// staging identity (same token continues, never restarts).
 ///
-/// MUTATION: compare `fork_id` by identity rather than value (e.g. reject whenever a token is present) → the
-/// second chunk restarts the transfer, contiguous_staged stays 3, and the install never completes.
+/// MUTATION: refuse whenever a token is present (an over-broad gate), or compare `fork_id` by identity
+/// rather than value → the transfer refuses or restarts, and the install never completes.
 #[test]
 fn same_lineage_chunks_still_continue_one_transfer() {
   use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
-  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let (mut ep, mut log, mut stable) = make_follower();
   let d = Instant::ORIGIN;
   let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
   let token = fork_token(9);
@@ -5694,5 +5786,121 @@ fn a_progress_ack_never_lifts_a_peer_out_of_snapshot_state() {
   assert!(
     !ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
     "the final install ack still lifts the peer out of Snapshot state"
+  );
+}
+
+/// The EOF empty-chunk re-ack is behind the door too: a foreign lineage's EOF probe into a populated
+/// replica is refused outright — not answered with a true-watermark progress ack. Every ack arm, the EOF
+/// echo included, speaks only for transfers this replica could legitimately hold.
+///
+/// MUTATION: hoist the EOF arm above the fork-provenance gate → the foreign EOF elicits a progress ack
+/// from a replica that refuses the transfer itself (the no-ack assertion FAILS).
+#[test]
+fn a_foreign_lineage_eof_probe_is_refused_not_acked() {
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable, _cfg) = follower_committed_to_3();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(fork_token(9));
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      baseline,
+      bytes::Bytes::new(),
+      6,
+      6,
+    )),
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "a refused lineage's EOF probe is not acked"
+  );
+  assert_eq!(ep.refused_cross_lineage_install_count(), 1);
+}
+
+/// An adoption interrupted between the blob's fsync and the install must COMPLETE on the leader's
+/// retransfer of the same snapshot, not wedge on its own leftover evidence. A deferred install dropped
+/// off-follower (the blob durable, the log still virgin, no token adopted) leaves the durable slot
+/// holding the fork baseline; the retransfer arrives on a now-tokenless, still-virgin replica whose slot
+/// is occupied — occupied by EXACTLY this snapshot, which is the one durable state a token-bearing
+/// install may land on besides emptiness.
+///
+/// MUTATION: tighten the gate's slot arm to `durable_snapshot().is_none()` → the retransfer is refused
+/// forever and the joiner wedges (the completion assertions FAIL).
+#[test]
+fn an_interrupted_adoption_completes_on_the_same_identity_retransfer() {
+  use super::super::Role;
+  use crate::{Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState};
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  let token = fork_token(9);
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(token.clone());
+  let install = InstallSnapshot::new(Term::new(2), 1u64, baseline, encode_count_snapshot(777));
+
+  // The adoption begins: pristine joiner, install deferred behind the fsync.
+  stable.hold_snapshot_fsync(true);
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(install.clone()),
+  );
+  assert!(ep.snapshot.pending_install.is_some());
+  while ep.poll_message().is_some() {}
+
+  // The node campaigns while the fsync is in flight; the blob then turns durable and the deferred
+  // install is DROPPED off-follower — leaving {durable fork blob, virgin log, no token}.
+  ep.role = Role::Candidate;
+  stable.flush_held_snapshots();
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the off-follower drop consumed the deferred install"
+  );
+  assert!(
+    ep.fork_id().is_none(),
+    "no token adopted — the install never ran"
+  );
+  assert_eq!(log.last_index(), Index::ZERO, "the log is still virgin");
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("the blob outlived the dropped install")
+      .fork_id(),
+    Some(&token),
+    "the fork baseline occupies the durable slot"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The leader retransfers the SAME snapshot (its match never advanced). The kin-slot arm admits it —
+  // the slot holds exactly this snapshot — and the adoption completes.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(install),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(ep.snapshot.pending_install.is_none(), "install completed");
+  assert_eq!(ep.commit, Index::new(10));
+  assert_eq!(ep.state_machine().count(), 777, "the fork's state landed");
+  assert_eq!(ep.fork_id(), Some(token), "the token was adopted");
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    0,
+    "the same-identity retransfer is kin, not a refusal"
   );
 }
