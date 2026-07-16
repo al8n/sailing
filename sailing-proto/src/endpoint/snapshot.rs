@@ -558,22 +558,27 @@ where
     // durable state (its own committed log and the foreign blob); no later predicate can untangle
     // that, because the log carries no token. So the invariant is held where it is still cheap:
     // a token-bearing snapshot lands only on a replica with NO committed content — empty log,
-    // nothing committed, and a durable slot that is either empty or already holds EXACTLY this
-    // snapshot. The kin-slot arm is load-bearing: an adoption interrupted after the blob's fsync
-    // but before the install (a crash, or a role flip dropping the deferred body) leaves the blob
-    // durable with the log still virgin, and the leader's retransfer of the SAME identity must
-    // complete the adoption, not wedge on its own leftover evidence. The manufactured fork
-    // baseline's contract has always been the zero-progress joiner (see `FORK_BASE_INDEX`); this
-    // enforces it. A populated squatter at the id is the same standing conflict the parked fork
-    // surfaces — resolved by placement (remove, tombstone, recreate pristine), never by
-    // destructive replacement, now uniformly on the relay and the wire.
+    // nothing committed, and a durable slot that is either empty or holds THIS SAME LINEAGE. The
+    // kin-slot arm is load-bearing: an adoption interrupted after the blob's fsync but before the
+    // install (a crash, or a role flip dropping the deferred body) leaves the blob durable with the
+    // log still virgin, and the leader must be able to COMPLETE the adoption. It keys on lineage,
+    // NOT exact identity: a leader that snapshotted at a different boundary than the orphaned blob
+    // — the norm after a leadership change, since replicas compact at their own points — sends its
+    // own snapshot (possibly at a LOWER index, plus the tail it will replicate afterward), and from
+    // a single latest-snapshot slot it cannot resend the exact orphan. On a virgin receiver that
+    // replacement is harmless: nothing is committed, so the incoming install just re-baselines onto
+    // its own boundary. Requiring exact identity here would refuse every retry and wedge the joiner
+    // out of the group. A DIFFERENT-lineage orphan still blocks — the same standing conflict a
+    // populated squatter poses, resolved by placement (remove, tombstone, recreate pristine), never
+    // by destructive replacement. The manufactured fork baseline's contract has always been the
+    // zero-progress joiner (see `FORK_BASE_INDEX`); this enforces it, uniformly on relay and wire.
     if self.split.fork_id.is_none() && meta.fork_id().is_some() {
       let pristine_or_kin = log.last_index() == Index::ZERO
         && log.first_index() == Index::new(1)
         && self.commit == Index::ZERO
         && stable
           .durable_snapshot()
-          .is_none_or(|m| m.identity_eq(meta));
+          .is_none_or(|m| m.fork_id() == meta.fork_id());
       if !pristine_or_kin {
         self.snapshot.refused_cross_lineage_installs = self
           .snapshot

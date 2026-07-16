@@ -6420,3 +6420,204 @@ fn a_stale_snapshot_in_the_capture_fsync_window_is_refused() {
   assert!(!ep2.poison.poisoned, "{:?}", ep2.poison_reason());
   assert_eq!(ep2.applied, Index::new(6));
 }
+
+/// A same-lineage snapshot at ANY boundary completes an interrupted adoption on a pristine receiver
+/// — the kin arm keys on LINEAGE, not exact identity. A joiner fsyncs snapshot N (token B) but
+/// crashes before the install; restart leaves N durable-but-unadopted and boots the joiner virgin.
+/// A leader that snapshotted EARLIER can offer only a LOWER same-lineage snapshot K (plus the tail
+/// it replicates after) — and from its single latest-snapshot slot it cannot resend N. The joiner
+/// must adopt K, or it is wedged out of the group through a normal crash window.
+///
+/// MUTATION: require `identity_eq` in the kin clause → K (boundary != N) is refused forever, the
+/// joiner never adopts, and the refusal counter climbs (the adoption assertions FAIL).
+#[test]
+fn a_lower_same_lineage_snapshot_completes_an_interrupted_adoption() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg = || {
+    Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+  let token = fork_token(9);
+
+  // Post-crash durable state: N = 10 (token B) fsynced in the slot, log virgin, no lineage stamp
+  // (the install never ran). Restart ignores the slot and boots the joiner virgin + tokenless.
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  stable.force_snapshot(
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(token.clone()),
+    encode_count_snapshot(777),
+  );
+  let mut ep = Endpoint::restart(
+    cfg(),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.poison.poisoned);
+  assert!(ep.fork_id().is_none(), "the unadopted N confers no lineage");
+  assert_eq!(log.last_index(), Index::ZERO, "booted virgin");
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("N outlives the ignore")
+      .last_index(),
+    Index::new(10),
+    "the orphan is still in the slot"
+  );
+
+  // A same-lineage leader offers a LOWER snapshot K = 5 (token B): admitted (kin by lineage), and
+  // installed over the orphan.
+  let d = Instant::ORIGIN;
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      SnapshotMeta::new(Index::new(5), Term::new(2), conf.clone()).with_fork_id(token.clone()),
+      encode_count_snapshot(500),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    0,
+    "a same-lineage completion never refuses"
+  );
+  assert_eq!(
+    ep.fork_id(),
+    Some(token.clone()),
+    "the joiner adopted the lineage at K"
+  );
+  assert_eq!(ep.state_machine().count(), 500, "K's state landed");
+  assert_eq!(
+    log.first_index(),
+    Index::new(6),
+    "the log re-baselined onto K"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Catch up the tail K+1..=10 via AppendEntries (prev at the K boundary).
+  let tail: Vec<Entry> = (6u64..=10)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(5),
+      Term::new(2),
+      tail,
+      Index::new(10),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.commit_index(),
+    Index::new(10),
+    "caught up the committed tail"
+  );
+  while ep.poll_message().is_some() {}
+
+  // Final crash-restart proof: adopted-at-K-plus-tail recovers cleanly (the lineage is now stamped).
+  let ep2 = Endpoint::restart(
+    cfg(),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep2.poison.poisoned, "{:?}", ep2.poison_reason());
+  assert_eq!(ep2.fork_id(), Some(token), "the lineage survives restart");
+  assert_eq!(ep2.commit_index(), Index::new(10));
+}
+
+/// The kin arm rejects a DIFFERENT lineage: a virgin joiner holding lineage C's orphaned blob
+/// refuses lineage B's snapshot — the standing cross-lineage conflict placement resolves, never a
+/// destructive replacement. (The complement of the same-lineage completion above.)
+#[test]
+fn a_different_lineage_orphan_still_blocks_adoption() {
+  use crate::{
+    Config, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  stable.force_snapshot(
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(fork_token(8)),
+    encode_count_snapshot(777),
+  );
+  let mut ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  let d = Instant::ORIGIN;
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      SnapshotMeta::new(Index::new(5), Term::new(2), conf).with_fork_id(fork_token(9)),
+      encode_count_snapshot(500),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    1,
+    "a different-lineage orphan blocks adoption — placement resolves it"
+  );
+  assert!(ep.fork_id().is_none(), "no adoption");
+  assert_ne!(ep.state_machine().count(), 500, "no foreign state landed");
+}
