@@ -646,7 +646,7 @@ where
         }
         _ => 0,
       };
-      self.send_snapshot_progress_ack(is.leader(), staged);
+      self.send_snapshot_progress_ack(is.leader(), staged, meta.last_index());
       return;
     }
 
@@ -741,9 +741,9 @@ where
 
     if staged < total_len {
       // Mid-transfer: a PROGRESS ack carrying the contiguous-staged offset — drives the leader's next
-      // chunk but does NOT advance `match_index` (the peer stays in Snapshot state).
+      // chunk but can never advance `match_index` to the boundary (the peer stays in Snapshot state).
       let leader = is.leader();
-      self.send_snapshot_progress_ack(leader, staged);
+      self.send_snapshot_progress_ack(leader, staged, boundary);
       return;
     }
 
@@ -770,15 +770,22 @@ where
   }
 
   /// Send a mid-transfer PROGRESS ack for a chunked snapshot: carries the contiguous-staged byte offset
-  /// (`acked_through`) so the leader sends the next chunk, with `match_index = min(commit, ack_watermark)`
-  /// — the persist-before-ack-safe RECOVERABLE watermark, which past the staleness guard is strictly
-  /// below the snapshot boundary, so the leader's `maybe_update` does NOT lift the peer out of Snapshot
-  /// state (counting a phantom replica before the blob is durably installed). UNGATED (unlike the final
-  /// install ack): it makes no NEW durable commitment — the watermark is already durable and
-  /// `acked_through` is a transfer-progress hint — so a crash that loses it merely restarts the transfer.
-  fn send_snapshot_progress_ack(&mut self, to: I, acked_through: u64) {
+  /// (`acked_through`) so the leader sends the next chunk, with `match_index` = the persist-before-ack-safe
+  /// RECOVERABLE watermark `min(commit, ack_watermark)` CLAMPED strictly below the transfer's boundary.
+  ///
+  /// The clamp is what keeps a progress ack from lifting the peer out of Snapshot state on the leader
+  /// (`maybe_update` exits at `match >= pending`, counting a phantom replica before the blob is durably
+  /// installed). The watermark alone is NOT strictly below the boundary for every transfer that stages:
+  /// the receipt-time redundancy short-circuit guarantees it only for a snapshot COVERED by this replica's
+  /// own history — a snapshot from a different lineage legitimately stages at a boundary the local
+  /// coordinates appear to cover, so the invariant must hold by value, not by handler ordering. UNGATED
+  /// (unlike the final install ack): it makes no NEW durable commitment — the watermark is already durable
+  /// and `acked_through` is a transfer-progress hint — so a crash that loses it merely restarts the
+  /// transfer.
+  pub(crate) fn send_snapshot_progress_ack(&mut self, to: I, acked_through: u64, boundary: Index) {
     let (term, me) = (self.term, self.config.id());
-    let match_index = self.commit.min(self.ack_watermark());
+    let below_boundary = Index::new(boundary.get().saturating_sub(1));
+    let match_index = self.commit.min(self.ack_watermark()).min(below_boundary);
     self.send(
       to,
       Message::SnapshotResponse(

@@ -5471,3 +5471,168 @@ fn same_lineage_chunks_still_continue_one_transfer() {
   assert_eq!(ep.commit, Index::new(10));
   assert_eq!(ep.fork_id(), Some(token));
 }
+
+/// A transfer-progress ack must never carry a `match_index` at or above its own transfer's boundary —
+/// the leader exits Snapshot state at `match >= pending`, so an at-boundary progress ack would count the
+/// peer as a full replica while it holds none of the snapshot's bytes. The recoverable watermark alone
+/// does not guarantee the strict inequality: a snapshot from a different lineage stages at a boundary the
+/// local coordinates appear to cover, so the property must hold by value.
+///
+/// MUTATION: drop the boundary clamp in `send_snapshot_progress_ack` → the first ack reads the raw
+/// watermark (3) instead of 0.
+#[test]
+fn a_progress_ack_is_clamped_below_its_transfer_boundary() {
+  use crate::{Index, Message};
+  let (mut ep, _log, _stable, _cfg) = follower_committed_to_3();
+
+  // A boundary at/below the recoverable watermark: the clamp is load-bearing.
+  ep.send_snapshot_progress_ack(1u64, 50, Index::new(1));
+  let ack = core::iter::from_fn(|| ep.poll_message())
+    .find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(*r),
+      _ => None,
+    })
+    .expect("a progress ack must be emitted");
+  assert!(!ack.reject());
+  assert_eq!(ack.acked_through(), 50);
+  assert_eq!(
+    ack.match_index(),
+    Index::ZERO,
+    "the ack must sit strictly below the boundary, not at the raw watermark"
+  );
+
+  // A boundary far above the watermark: the clamp is inert — the honest watermark flows unchanged.
+  ep.send_snapshot_progress_ack(1u64, 60, Index::new(10));
+  let ack = core::iter::from_fn(|| ep.poll_message())
+    .find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(*r),
+      _ => None,
+    })
+    .expect("a progress ack must be emitted");
+  assert_eq!(ack.match_index(), Index::new(3));
+}
+
+/// When the recoverable prefix catches up past an in-flight transfer's boundary, the exit signal is the
+/// FULL redundancy ack on the next chunk — at/above the boundary, so the leader leaves Snapshot state
+/// within one round-trip — never a progress ack. This is the liveness face of the boundary clamp: a
+/// covered transfer still terminates promptly even though progress acks can no longer reach the boundary.
+#[test]
+fn commit_catchup_mid_transfer_exits_via_a_full_ack() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+
+  // Durable [1..=4] term 2, commit 2: boundary 5 is uncovered, so a partial chunk stages.
+  let head: Vec<Entry> = (1u64..=4)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      head,
+      Index::new(2),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  let blob = encode_count_snapshot(5);
+  let half = blob.len() / 2;
+  let meta = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2, 3]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta.clone(),
+      blob.slice(0..half),
+      0,
+      blob.len() as u64,
+    )),
+  );
+  assert!(ep.snapshot.snapshot_recv.is_some(), "the partial staged");
+  while ep.poll_message().is_some() {}
+
+  // In-window appends commit THROUGH the boundary and become durable.
+  let tail: Vec<Entry> = (5u64..=6)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::new(4),
+      Term::new(2),
+      tail,
+      Index::new(5),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  while ep.poll_message().is_some() {}
+
+  // The next chunk of the now-covered transfer answers with a FULL ack at/above the boundary.
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      meta,
+      blob.slice(half..),
+      half as u64,
+      blob.len() as u64,
+    )),
+  );
+  let ack = core::iter::from_fn(|| ep.poll_message())
+    .find_map(|o| match o.message() {
+      Message::SnapshotResponse(r) => Some(*r),
+      _ => None,
+    })
+    .expect("the covered transfer must answer, not stall");
+  assert!(!ack.reject());
+  assert!(
+    ack.match_index() >= Index::new(5),
+    "a covered transfer exits via the full redundancy ack at/above the boundary"
+  );
+  assert!(
+    ep.snapshot.snapshot_recv.is_none(),
+    "the redundant transfer's staging is reclaimed"
+  );
+}
