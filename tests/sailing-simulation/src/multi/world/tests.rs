@@ -728,6 +728,147 @@ fn stranded_fork_child_completes_from_the_holder() {
   );
 }
 
+/// CRASH inside the baseline-transfer WINDOW: the stranded child's empty joiner is being caught
+/// up by the holder's manufactured-baseline snapshot — the transfer is ADMITTED (the holder's
+/// progress to the joiner is `Snapshot`, the install in flight on the latencied bus) — when the
+/// joiner crash-restarts from its still-virgin durable stores. The crash devours the in-flight
+/// install, so the redrive must RE-RUN the transfer to full adoption: token, inherited state,
+/// commit at/past the manufactured baseline, no wedge (the holder exits `Snapshot`), no poison.
+/// A second crash AFTER adoption then pins the durable half: the restart reconciles
+/// lineage-first off the joiner's own baseline slot, so the token and record survive without any
+/// re-transfer.
+///
+/// The narrower sub-window — blob durable but the install not yet run — is intra-settle-atomic
+/// under the world's stores (a submitted blob completes and installs within one settle), so no
+/// tick-boundary crash can land inside it; the endpoint tier owns that sub-window (the kin-slot
+/// arm of the fork-provenance gate, which completes an interrupted adoption on the retransfer).
+/// The world-reachable window pinned here is the ADMITTED, in-flight transfer.
+#[test]
+fn stranded_joiner_crash_inside_the_transfer_window_completes_on_redrive() {
+  let (mut w, holder, joiner) = world_with_stranded_child(13, 200);
+  // Latency keeps the install in flight across tick boundaries — on the zero-latency bus the
+  // whole transfer settles within one tick and no boundary falls inside the window.
+  w.set_network_faults(
+    crate::NetworkFaults {
+      latency: Duration::from_millis(20),
+      ..crate::NetworkFaults::none()
+    },
+    13,
+  );
+  w.reconcile_membership(200);
+  assert_eq!(w.hosting_nodes(200), std::vec![0, 1]);
+  assert!(
+    w.applied_of(joiner, 200).is_empty(),
+    "the completion arm wires the joiner EMPTY"
+  );
+
+  // Run until the transfer is ADMITTED: the holder leads and its progress to the joiner is
+  // `Snapshot` at a tick boundary, with the joiner still un-adopted.
+  let mut admitted = false;
+  for _ in 0..6_000 {
+    w.reconcile_membership(200);
+    let in_snapshot = w.hosts[&holder].group(&200).is_some_and(|ep| {
+      ep.role().is_leader()
+        && ep
+          .peer_progress(&joiner)
+          .is_some_and(|p| matches!(p.state, sailing_proto::ProgressState::Snapshot { .. }))
+    });
+    if in_snapshot
+      && w.hosts[&joiner]
+        .group(&200)
+        .is_some_and(|ep| ep.fork_id().is_none())
+    {
+      admitted = true;
+      break;
+    }
+    w.tick();
+  }
+  assert!(
+    admitted,
+    "the transfer was never observed admitted: {}",
+    w.dbg_group(200)
+  );
+
+  // Crash the joiner INSIDE the window: durable stores are still virgin, the in-flight install
+  // dies with the bus purge, and the restart re-wires an empty replica.
+  w.crash(joiner);
+  assert!(
+    w.applied_of(joiner, 200).is_empty(),
+    "an interrupted transfer leaves no partial state"
+  );
+  assert!(
+    w.hosts[&joiner]
+      .group(&200)
+      .is_some_and(|ep| ep.fork_id().is_none()),
+    "no token before the durable adoption"
+  );
+
+  // The redrive: the holder re-sends and the transfer completes to full adoption.
+  assert!(
+    w.run_until(6_000, |w| {
+      w.hosts[&joiner]
+        .group(&200)
+        .is_some_and(|ep| ep.fork_id().is_some())
+        && !w.applied_of(joiner, 200).is_empty()
+        && w.applied_of(joiner, 200) == w.applied_of(holder, 200)
+    }),
+    "the joiner never adopted after the crash: {}",
+    w.dbg_group(200)
+  );
+  assert!(
+    w.hosts[&joiner]
+      .group(&200)
+      .is_some_and(|ep| ep.commit_index() >= sailing_proto::FORK_BASE_INDEX),
+    "the adopted commit sits at/past the manufactured baseline"
+  );
+  assert!(
+    w.snapshot_lineage.contains(&(joiner, 200)),
+    "the adoption arrived by snapshot transfer"
+  );
+  // No wedge: the holder exited `Snapshot` toward the joiner.
+  assert!(
+    w.run_until(2_000, |w| {
+      w.hosts[&holder].group(&200).is_some_and(|ep| {
+        ep.peer_progress(&joiner)
+          .is_none_or(|p| !matches!(p.state, sailing_proto::ProgressState::Snapshot { .. }))
+      })
+    }),
+    "the transfer never terminated: {}",
+    w.dbg_group(200)
+  );
+  assert!(w.poisoned_nodes().is_empty(), "no poison anywhere");
+
+  // The durable half: a crash AFTER adoption restores the lineage from the joiner's own baseline
+  // slot — no re-transfer needed for the token to survive.
+  w.crash(joiner);
+  assert!(
+    w.hosts[&joiner]
+      .group(&200)
+      .is_some_and(|ep| ep.fork_id().is_some()),
+    "the restart reconciles lineage-first off the durable baseline"
+  );
+  assert!(
+    w.run_until(4_000, |w| {
+      !w.applied_of(holder, 200).is_empty()
+        && w.applied_of(joiner, 200) == w.applied_of(holder, 200)
+    }),
+    "the restarted adopter never re-converged: {}",
+    w.dbg_group(200)
+  );
+  assert!(w.agreement_holds(200));
+
+  // Fresh keyed load commits on the completed group, and the run-end verdicts hold.
+  propose_until_accepted(&mut w, 200, &crate::multi::encode_gkv(200, 6, 901));
+  assert!(w.run_until(2_000, |w| (0..2).all(|n| {
+    w.applied_of(n, 200)
+      .iter()
+      .any(|(_, c)| crate::multi::decode_gkv(c) == Some((200, 6, 901)))
+  })));
+  w.check_now();
+  w.finalize_conservation_or_panic(13);
+  w.finalize_membership_or_panic(13);
+}
+
 /// With a LIVE leader the completion arm is out of the path entirely: an under-hosted child
 /// that can elect (two of three voters materialized) heals its missing voter through the
 /// standing leader-gated resurrect arm — a catching-up OBSERVER whose bootstrap excludes
