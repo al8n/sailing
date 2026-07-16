@@ -191,6 +191,49 @@ where
     // <= meta.last_index, so the SM baseline comes from the snapshot; we then replay only
     // the durable post-snapshot committed tail.
     let snapshot = stable.snapshot();
+    // LINEAGE-FIRST reconciliation, decided BEFORE any coordinate arm: `hs.lineage()` records which
+    // lineage the durable LOG belongs to, and `(index, term)` proofs are content proofs only WITHIN
+    // one lineage — so which artifacts to trust is settled here, and everything below (the FSM
+    // restore, the boundary reconciliation, the split-state seed) sees a coherent view.
+    //  - Lineages AGREE (`None`/`None` included): both artifacts are one lineage's — proceed.
+    //  - Log token-less, slot token-bearing: the slot holds an ADOPTION this node never completed.
+    //    If the log is re-baselined EXACTLY to the slot's boundary, the destructive `log.restore`
+    //    already ran — the adoption is a fact, only its hard-state stamp is missing (the crash hit
+    //    between the restore and the next write) — so COMPLETE it: trust the slot. That shape is
+    //    unforgeable by any token-less log: its own compaction to the boundary would have put its
+    //    OWN snapshot in the slot, and the fork-provenance gate refuses a foreign overwrite of an
+    //    occupied slot. Otherwise the blob is an UNADOPTED leftover (the install never ran) — IGNORE
+    //    the slot and boot from (hard state, log) alone: a virgin log comes up empty and the
+    //    transfer re-runs (the leader's match never advanced; the gate's kin arm re-admits the
+    //    retransfer against the leftover blob), and a populated log boots as the token-less node it
+    //    truly is (re-sent foreign snapshots stay refused; the conflict resolves by placement).
+    //  - Log token-bearing, slot absent or mismatched: self-contradictory durable state — the
+    //    adopted log's baseline evidence is gone or foreign. Unreachable through the receive path;
+    //    fail-stop (`LineageMismatch`) rather than reconcile coordinates across two lineages.
+    let snapshot = match snapshot {
+      Some((meta, data)) => {
+        if hs.lineage() == meta.fork_id() {
+          Some((meta, data))
+        } else if hs.lineage().is_none() {
+          if restore_rebaselined(log, meta.last_index(), meta.last_term()) {
+            Some((meta, data))
+          } else {
+            None
+          }
+        } else {
+          poisoned = true;
+          poison_reason = Some(PoisonReason::LineageMismatch);
+          None
+        }
+      }
+      None => {
+        if hs.lineage().is_some() {
+          poisoned = true;
+          poison_reason = Some(PoisonReason::LineageMismatch);
+        }
+        None
+      }
+    };
     // The snapshot boundary `(N, last_term)` is captured before the blob is consumed below so the
     // log/snapshot boundary reconciliation can run afterward for both the present and absent cases.
     let snap_nt: Option<(Index, Term)> = snapshot

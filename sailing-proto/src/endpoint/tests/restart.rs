@@ -2627,3 +2627,272 @@ fn restart_scan_poisons_on_cold_read() {
     "a cold (Pending) read during the restart lease-floor scan must fail-stop, not defer"
   );
 }
+
+fn restart_fork_token() -> crate::ForkId {
+  use crate::{ForkId, Index, Term};
+  ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[9u8]),
+    1,
+  )
+}
+
+/// A durable fork blob beside a POPULATED token-less log is an ADOPTION THAT NEVER RAN — restart must
+/// boot from (hard state, log) alone and ignore the slot, never reconcile coordinates across the
+/// lineage mismatch. The camouflage coordinate (boundary 1, term 1 — the first entry of essentially
+/// every log) makes the coordinate table's Compact arm "prove" the foreign blob is this log's own
+/// baseline; the lineage record is what knows better.
+///
+/// MUTATION: drop the lineage pre-pass → the boundary term matches at index 1, the log "continues" the
+/// foreign snapshot, and restart replays this log's own committed suffix over the fork's restored
+/// state under an adopted token (the count/token assertions FAIL).
+#[test]
+fn restart_ignores_an_unadopted_foreign_blob_beside_a_populated_log() {
+  use crate::{
+    Config, Entry, EntryKind, HardState, Index, Instant, SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+
+  let entries: Vec<Entry> = (1u64..=3)
+    .map(|i| {
+      Entry::new(
+        Term::new(1),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  log.force_append(&entries);
+  stable.force_hard_state(
+    HardState::initial()
+      .with_term(Term::new(1))
+      .with_commit(Index::new(3)),
+  );
+  let token = restart_fork_token();
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      Index::new(1),
+      Term::new(1),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_fork_id(token),
+    encode_count_snapshot(777),
+  );
+
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.poison.poisoned, "a coherent (hs, log) pair boots");
+  assert!(
+    ep.fork_id().is_none(),
+    "an unadopted blob confers no lineage"
+  );
+  assert_ne!(
+    ep.state_machine().count(),
+    777,
+    "the foreign blob was not restored under this log"
+  );
+  assert_eq!(ep.applied, Index::new(3), "own committed suffix replayed");
+  assert_eq!(log.last_index(), Index::new(3), "the log is untouched");
+}
+
+/// The same unadopted leftover beside a VIRGIN log — the crash window between the blob's fsync and the
+/// deferred install — boots EMPTY: the adoption happens only through the live install path (the
+/// leader's match never advanced, so the transfer re-runs, and the gate's kin arm re-admits it against
+/// the leftover blob), never by restart inference from an uninstalled slot.
+///
+/// MUTATION: drop the lineage pre-pass → restart adopts the blob it never installed (the empty-boot
+/// assertions FAIL).
+#[test]
+fn restart_ignores_an_unadopted_foreign_blob_beside_a_virgin_log() {
+  use crate::{Config, Index, Instant, SnapshotMeta, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  let token = restart_fork_token();
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_fork_id(token),
+    encode_count_snapshot(777),
+  );
+
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.poison.poisoned);
+  assert!(ep.fork_id().is_none(), "no adoption by restart inference");
+  assert_eq!(ep.state_machine().count(), 0, "boots empty");
+  assert_eq!(ep.applied, Index::ZERO);
+  assert_eq!(ep.commit, Index::ZERO);
+}
+
+/// The destructive `log.restore` already ran but the crash hit before any post-adoption hard-state
+/// write: the log re-baselined EXACTLY to the slot's boundary is the durable adoption marker — a shape
+/// no token-less log can produce (its own compaction would have put its own snapshot in the slot, and
+/// the receive gate refuses a foreign overwrite of an occupied one) — so restart COMPLETES the
+/// adoption from the slot.
+///
+/// MUTATION: treat the token-less hard state as always-unadopted (drop the re-baselined-shape arm) →
+/// restart ignores the slot beside a log whose baseline lives IN that slot, and the node comes up
+/// unable to serve its own content (the completion assertions FAIL).
+#[test]
+fn restart_completes_an_adoption_whose_stamp_is_missing() {
+  use crate::{Config, HardState, Index, Instant, SnapshotMeta, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.restore(Index::new(10), Term::new(2));
+  stable.force_hard_state(
+    HardState::initial()
+      .with_term(Term::new(2))
+      .with_commit(Index::new(3)),
+  );
+  let token = restart_fork_token();
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_fork_id(token.clone()),
+    encode_count_snapshot(777),
+  );
+
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.poison.poisoned);
+  assert_eq!(
+    ep.fork_id(),
+    Some(token),
+    "the re-baselined shape completes the adoption"
+  );
+  assert_eq!(ep.state_machine().count(), 777, "the fork's state restored");
+  assert_eq!(ep.applied, Index::new(10));
+  assert_eq!(ep.commit, Index::new(10));
+}
+
+/// A hard state that CLAIMS a lineage the slot contradicts — a token-less or absent snapshot beside an
+/// adopted log — is self-contradictory durable state: the adopted log's baseline evidence is gone or
+/// foreign. Unreachable through the receive path; restart fail-stops rather than reconcile coordinates
+/// across two lineages.
+#[test]
+fn restart_fail_stops_a_lineage_the_slot_contradicts() {
+  use crate::{Config, HardState, Index, Instant, SnapshotMeta, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = || {
+    Config::try_new(
+      2u64,
+      std::vec![1u64, 2u64, 3u64],
+      Duration::from_millis(1000),
+      Duration::from_millis(100),
+    )
+    .unwrap()
+  };
+  let token = restart_fork_token();
+
+  // (a) adopted hard state, token-less snapshot in the slot.
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  stable.force_hard_state(
+    HardState::initial()
+      .with_term(Term::new(2))
+      .with_commit(Index::new(10))
+      .with_lineage(Some(token.clone())),
+  );
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    ),
+    encode_count_snapshot(10),
+  );
+  let ep = Endpoint::restart(
+    cfg(),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert_eq!(
+    ep.poison_reason().map(|r| r.as_str()),
+    Some("lineage_mismatch"),
+    "an adopted log beside a token-less snapshot fail-stops"
+  );
+
+  // (b) adopted hard state, EMPTY slot.
+  let mut log2 = VecLog::default();
+  let mut stable2 = AsyncStable::default();
+  stable2.force_hard_state(
+    HardState::initial()
+      .with_term(Term::new(2))
+      .with_commit(Index::new(1))
+      .with_lineage(Some(token)),
+  );
+  let ep2 = Endpoint::restart(
+    cfg(),
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log2,
+    &mut stable2,
+  );
+  assert_eq!(
+    ep2.poison_reason().map(|r| r.as_str()),
+    Some("lineage_mismatch"),
+    "an adopted log whose baseline evidence is gone fail-stops"
+  );
+}

@@ -253,6 +253,15 @@ pub enum PoisonReason {
   /// snapshot blob, so this is a durability-contract violation or disk corruption; fail-stop rather
   /// than bootstrap from the static config and serve a log whose committed prefix is gone.
   OrphanedLog,
+  /// On restart the durable hard state claims a lineage ([`crate::HardState::lineage`]) that the durable
+  /// snapshot slot contradicts — an adopted/forked log beside a token-less or differently-forked
+  /// snapshot, or beside no snapshot at all (the log's baseline evidence is gone). Coordinate
+  /// reconciliation across that mismatch would marry two lineages' artifacts into one state, so
+  /// fail-stop. Unreachable through the receive path (the fork-provenance gate refuses every write
+  /// that could produce it); reaching it means storage corruption, a store durability-order
+  /// violation, or a crash inside the fork constructor's two-write window — all resolved by
+  /// placement (re-materialize the replica), which the fork's durability barrier keeps safe.
+  LineageMismatch,
   /// Recovered LeaseGuard floors are STRUCTURALLY self-contradictory — a cheap defense-in-depth fail-stop
   /// against a BUG in our own fold (CFT model: a `SnapshotMeta` from a correct leader over reliable storage
   /// is FAITHFUL, so this never fires in correct operation; forged-but-consistent floors are a Byzantine /
@@ -356,6 +365,7 @@ impl PoisonReason {
       Self::InvalidConfState => "invalid_conf_state",
       Self::SnapshotRebaseline => "snapshot_rebaseline",
       Self::OrphanedLog => "orphaned_log",
+      Self::LineageMismatch => "lineage_mismatch",
       Self::InconsistentLeaseFloor => "inconsistent_lease_floor",
       Self::WallHorizonUnrepresentable => "wall_horizon_unrepresentable",
       Self::CommitWaitUnrepresentable => "commit_wait_unrepresentable",
