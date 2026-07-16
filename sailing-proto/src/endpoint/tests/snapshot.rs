@@ -6144,3 +6144,279 @@ fn the_compaction_fallback_ignores_a_foreign_blobs_durability() {
     "the pending capture stays pending (its own completion never arrived)"
   );
 }
+
+/// A local capture's durability makes its boundary a RECOVERABLE prefix, and the ack watermark must
+/// say so the moment the compaction fires — the durable LOG tip alone is about to be stranded below
+/// the boundary. An async replica (applied ran ahead of its lagging disk) that captures at N and
+/// compacts must ack N, and — the safety face — a stale same-lineage snapshot at M in (K, N] must
+/// read as covered at receipt, resolving redundant instead of reaching the store's one snapshot
+/// slot, where its submit would REPLACE the only baseline for the compacted prefix.
+///
+/// MUTATION: drop the `durable_snapshot_index` raise from the capture-completion arm → the watermark
+/// stays at the stranded log tip (first assert) and the stale snapshot submits, so a crash-restart
+/// recovers to M with the log baselined at N+1 — an orphaned log (the restart asserts fail).
+#[test]
+fn a_local_captures_durability_covers_its_boundary() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg_low = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(2);
+  let mut ep = Endpoint::new(cfg_low, Instant::ORIGIN, 7, CountSm::default());
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let d = Instant::ORIGIN;
+
+  // The replica's own committed history 1..=6 at term 2: appended, drained durable, applied.
+  let entries: Vec<Entry> = (1u64..=6)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(6),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+  assert_eq!(ep.applied, Index::new(6));
+  // The drain also fired the local capture at N = 6 (the lowered threshold), turned it durable, and
+  // compacted through 6 — the whole own-capture lifecycle.
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(log.first_index(), Index::new(7), "the compaction fired");
+
+  // The async-disk shape: the durable APPEND tip honestly lags the boundary the capture now
+  // underwrites. The watermark must ride the capture, not the stranded tip — this is what a stale
+  // leader's picture of this replica is built from.
+  ep.durable.durable_index = Index::new(3);
+  assert_eq!(
+    ep.ack_watermark(),
+    Index::new(6),
+    "the durable capture's boundary is the recoverable prefix — not the stranded log tip"
+  );
+
+  // A stale same-lineage snapshot at M = 5 (a leader with an older compaction point, honestly
+  // believing this replica sits at 3): covered at receipt — resolves redundant, never submitted.
+  let stale = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      stale,
+      encode_count_snapshot(5),
+    )),
+  );
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("the capture occupies the slot")
+      .last_index(),
+    Index::new(6),
+    "the stale snapshot never replaced the capture in the slot"
+  );
+
+  // The proof of the stakes: a crash-restart recovers the full committed prefix from the slot.
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let ep2 = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(
+    !ep2.poison.poisoned,
+    "the compacted prefix stays recoverable: {:?}",
+    ep2.poison_reason()
+  );
+  assert_eq!(
+    ep2.applied,
+    Index::new(6),
+    "recovered at the capture, not the stale offer"
+  );
+}
+
+/// The capture-fsync WINDOW: the capture at N is submitted but not yet durable, so the ack
+/// watermark cannot cover it yet — the receipt coverage test is blind, and slot monotonicity is the
+/// only guard. A stale lower snapshot arriving in the window must be dropped silently (no ack — the
+/// boundary is not yet recoverable, and the store's FIFO completions would otherwise leave the
+/// LOWER blob as the final durable slot). Once the capture fsyncs, the retry resolves redundant.
+///
+/// MUTATION: drop the visible-slot monotonicity check → the stale snapshot submits behind the held
+/// capture, the FIFO flush leaves the slot at M, and the crash-restart orphans the log.
+#[test]
+fn a_stale_snapshot_in_the_capture_fsync_window_is_refused() {
+  use crate::{
+    AppendEntries, Config, Entry, EntryKind, Index, InstallSnapshot, Instant, Message,
+    SnapshotMeta, Term, conf::ConfState,
+  };
+  use core::time::Duration;
+  let cfg_low = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap()
+  .with_snapshot_threshold(2);
+  let mut ep = Endpoint::new(cfg_low, Instant::ORIGIN, 7, CountSm::default());
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  let d = Instant::ORIGIN;
+
+  let entries: Vec<Entry> = (1u64..=6)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      entries,
+      Index::new(6),
+    )),
+  );
+  stable.hold_snapshot_fsync(true);
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  while ep.poll_message().is_some() {}
+  assert_eq!(ep.applied, Index::new(6));
+  assert!(
+    ep.pending_compact().is_some(),
+    "the drain fired the capture; its fsync is HELD, so no compaction and no coverage yet"
+  );
+  assert_eq!(
+    log.first_index(),
+    Index::new(1),
+    "no compaction before the fsync"
+  );
+
+  // The async-disk shape, inside the window: the watermark covers neither the stranded tail nor the
+  // held capture.
+  ep.durable.durable_index = Index::new(3);
+  assert_eq!(
+    ep.ack_watermark(),
+    Index::new(3),
+    "the held capture covers nothing yet"
+  );
+
+  // The stale offer at M = 5 lands INSIDE the window: dropped silently — no submit, no ack.
+  let stale = SnapshotMeta::new(
+    Index::new(5),
+    Term::new(2),
+    ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+  );
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      stale,
+      encode_count_snapshot(5),
+    )),
+  );
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the stale offer never became a deferred install"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "no ack for a boundary that is not yet recoverable"
+  );
+
+  // The capture's fsync lands: the compaction fires and the slot holds the capture, not the offer.
+  stable.flush_held_snapshots();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert_eq!(log.first_index(), Index::new(7), "the compaction fired");
+  assert_eq!(
+    stable
+      .durable_snapshot()
+      .expect("the capture occupies the slot")
+      .last_index(),
+    Index::new(6),
+    "FIFO completions ended with the CAPTURE durable — the stale offer never entered the store"
+  );
+
+  // And the crash-restart proof, as above.
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let ep2 = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep2.poison.poisoned, "{:?}", ep2.poison_reason());
+  assert_eq!(ep2.applied, Index::new(6));
+}

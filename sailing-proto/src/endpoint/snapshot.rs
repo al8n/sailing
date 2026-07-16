@@ -652,6 +652,43 @@ where
       return;
     }
 
+    // SLOT MONOTONICITY: the store keeps ONE latest snapshot, so a submit is destructive — it
+    // REPLACES whatever the slot holds. An inbound snapshot strictly below the slot's boundary must
+    // therefore never reach `submit_snapshot`: the slot may be the only baseline for a prefix the
+    // log has already compacted (a local capture at N compacts through N; a stale leader with an
+    // older compaction point then legitimately offers M < N because this replica's ack watermark
+    // honestly lagged), and replacing it with M leaves (M, N] recoverable NOWHERE — a crash then
+    // restarts into an orphaned log. The VISIBLE slot boundary, tracked endpoint-side so no store
+    // read is needed: the max of the durable boundary and both submitted-awaiting-fsync boundaries
+    // (a submitted-but-unfsynced higher capture must not be clobbered either — store completions
+    // are FIFO, so a later lower submit would end up the durable slot). Checked HERE, after the
+    // coverage short-circuit — which already answers most stale offers with a redundant ack once
+    // the watermark covers them — because in the capture-fsync window the watermark does NOT yet
+    // cover the visible slot, and this drop is the only guard. Silent, no ack: the boundary may not
+    // be recoverable yet, so acking would over-claim; the sender's heartbeat-paced resend re-drives,
+    // and once the capture fsyncs the retry resolves redundant at the coverage arm. Strictly LOWER
+    // only — an equal-boundary different-identity snapshot is the documented re-snapshot supersede.
+    let visible_slot = self
+      .durable
+      .durable_snapshot_index
+      .max(
+        self
+          .snapshot
+          .pending_compact
+          .as_ref()
+          .map_or(Index::ZERO, |(_, m)| m.last_index()),
+      )
+      .max(
+        self
+          .snapshot
+          .pending_install
+          .as_ref()
+          .map_or(Index::ZERO, |(_, m, ..)| m.last_index()),
+      );
+    if visible_slot > meta.last_index() {
+      return;
+    }
+
     let total_len = is.total_len();
     if total_len == 0 {
       // LEGACY single-shot: `data` IS the whole blob — decode + submit directly (the pre-chunking path,

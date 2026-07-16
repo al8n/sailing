@@ -524,6 +524,17 @@ where
           if let Some((pid, m)) = &self.snapshot.pending_compact
             && *pid == opid
           {
+            // The capture is durable, so its boundary is now a RECOVERABLE prefix (a crash restores
+            // from the slot) — record it exactly as the install path does. Without this,
+            // `ack_watermark()` stays at the durable LOG tip, which the compaction below is about to
+            // strand: an async replica whose disk lagged its applied index (capture at N, log durable
+            // only through K < N) would under-ack K — and, worse, under-COVER: a stale same-lineage
+            // snapshot at M in (K, N] would pass the receipt coverage test and its submit would
+            // REPLACE this capture in the store's one snapshot slot, destroying the only baseline for
+            // the prefix the compaction just discarded (a crash then recovers to M with first_index
+            // N+1 — an orphaned log).
+            self.durable.durable_snapshot_index =
+              core::cmp::max(self.durable.durable_snapshot_index, m.last_index());
             log.compact(m.last_index());
             self.snapshot.pending_compact = None;
           }
@@ -574,6 +585,10 @@ where
     if let Some((_pid, m)) = &self.snapshot.pending_compact
       && matches!(stable.durable_snapshot(), Some(d) if d.identity_eq(m))
     {
+      // The capture's boundary is a recoverable prefix now — record it exactly as the in-loop
+      // completion arm does, for the same reason (the compaction below strands the durable log tip).
+      self.durable.durable_snapshot_index =
+        core::cmp::max(self.durable.durable_snapshot_index, m.last_index());
       log.compact(m.last_index());
       self.snapshot.pending_compact = None;
     }
