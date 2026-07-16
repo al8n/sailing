@@ -310,6 +310,6 @@ snapshot traffic alone).
 
 Reserved rather than landed: the field's ENFORCEMENT semantics — the comparator, tolerance for
 same-lineage generation skew (a mid-split replica legitimately trails by one), and per-message-class
-policy — are the hardening milestone's design, and a field whose semantics later change would burn a
-version byte for nothing. The hello's version fence (§4) makes the eventual bump safe: mixed-version
+policy — are settled by the enforcement design that lands the bump, and a field whose semantics later
+change would burn a version byte for nothing. The hello's version fence (§4) makes the eventual bump safe: mixed-version
 peers reject at the handshake, never mis-parse the header.

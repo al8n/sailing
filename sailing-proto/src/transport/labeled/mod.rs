@@ -34,8 +34,8 @@ const LABEL_MAGIC: u8 = 0xCA;
 /// because lineage is group-plane metadata (the payload is deliberately group-unaware) — and it is
 /// the append/vote-plane counterpart of the snapshot door gate, which token-discriminates snapshot
 /// traffic alone. Enforcement semantics (the comparator, same-lineage skew tolerance, per-class
-/// policy) are the hardening milestone's design; landing the field is one version bump under this
-/// same contract, which the hello fences.
+/// policy) are settled by the enforcement design that lands the bump; the field costs one version
+/// byte under this same contract, which the hello fences.
 const LABEL_VERSION: u8 = 3;
 /// magic(1) + version(1) + cluster(16) + peer_id_len(2).
 pub(super) const HELLO_HEADER: usize = 1 + 1 + 16 + 2;
