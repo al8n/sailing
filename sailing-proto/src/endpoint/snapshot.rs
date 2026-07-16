@@ -903,6 +903,29 @@ where
     if !self.role.is_follower() {
       return;
     }
+    // A lineage-ADOPTING install (token-less self, token-bearing snapshot) lands only on the
+    // content-emptiness the door gate demanded — re-checked HERE because admission was deferred
+    // behind the blob's fsync while the gate's check ran at receipt, and the window between them
+    // admits appends. Any content that filled the window is ANOTHER lineage's: this replica's own
+    // lineage cannot reach it (a fork member's log starts past the manufactured baseline, so it
+    // cannot append below the boundary to a zero-progress joiner — the joiner is structurally
+    // forced onto the snapshot path), so re-baselining over it would silently destroy a foreign
+    // group's durably-acked entries — replacement, where the doctrine demands placement. REFUSE:
+    // count and drop; the filled log stands, the conflict stays visible (every retransfer now
+    // refuses at receipt — the receiver is populated), and the sender resolves by placement. The
+    // `durable_snapshot_index` raise below is skipped with the same reasoning as the role gate's
+    // skip: a refused adoption's boundary is NOT recoverable (restart ignores the unadopted
+    // leftover), so raising the watermark would over-claim the recoverable prefix.
+    if self.split.fork_id.is_none()
+      && meta.fork_id().is_some()
+      && !(log.last_index() == Index::ZERO && self.commit == Index::ZERO)
+    {
+      self.snapshot.refused_cross_lineage_installs = self
+        .snapshot
+        .refused_cross_lineage_installs
+        .saturating_add(1);
+      return;
+    }
     // this runs ONLY once the blob is durable (the matching `SnapshotWritten` or `durable_snapshot()`
     // evidence), so the snapshot boundary is now a durable RECOVERABLE prefix — a crash would
     // `reconcile_restart_log::Restore` to it. Record it BEFORE the stale-drop below, so `ack_watermark()`
@@ -951,12 +974,11 @@ where
     // actually match the snapshot prefix (the very hole this guard closes).
     // The shared coverage proof (`covered_by_local_history`), with bare `commit` as the committed
     // bound — durable evidence is already established here (the blob is durable and
-    // `durable_snapshot_index` was raised above). The lineage clause is LOAD-BEARING at this site even
-    // behind the door gate: an adoption admitted onto a pristine joiner can race in-window
-    // AppendEntries from the joiner's other conf members, so by completion the local coordinates may
-    // "cover" the boundary — with FOREIGN content. The adoption must still install, never drop itself
-    // as "already durable" against bytes that are not the fork's. A fatal `term` Err poisons and bails
-    // (treating it as "not redundant" would `log.restore` over unreadable state).
+    // `durable_snapshot_index` was raised above). The lineage clause is defensive at this site: a
+    // lineage-ADOPTING install reaching here proved the receiver still content-empty above, so its
+    // coordinates cover nothing — the clause simply keeps the answer exact if either gate ever
+    // weakens (foreign coverage must never read as "already durable"). A fatal `term` Err poisons
+    // and bails (treating it as "not redundant" would `log.restore` over unreadable state).
     let redundant = match self.covered_by_local_history(log, &meta, self.commit) {
       Some(r) => r,
       None => return,

@@ -5912,16 +5912,21 @@ fn an_interrupted_adoption_completes_on_the_same_identity_retransfer() {
   );
 }
 
-/// An adoption admitted onto a pristine joiner can race in-window AppendEntries from the joiner's other
-/// conf members: by the time the blob is durable, the local coordinates "cover" the boundary — with
-/// FOREIGN content. The completion re-check's lineage clause keeps the adoption honest: it must still
-/// INSTALL (re-baselining over the raced-in bytes), never drop itself as "already durable" and false-ack
-/// the boundary against bytes that are not the fork's.
+/// An adoption admitted onto a pristine joiner can race in-window AppendEntries: by the time the blob
+/// is durable, the once-empty log is populated and committed. That content can only be ANOTHER
+/// lineage's — the joiner's own lineage cannot append below the boundary (a fork member's log starts
+/// past the manufactured baseline; the zero-progress joiner is structurally forced onto the snapshot
+/// path) — so the completion re-runs the door gate's emptiness demand and REFUSES: no re-baseline over
+/// durably-acked foreign entries (replacement), no false-ack of the raced-in coverage as "already
+/// durable" (the lineage clause), no ack at all. The filled log stands; every retransfer now refuses
+/// at receipt (the receiver is populated); the conflict resolves by placement.
 ///
-/// MUTATION: drop the lineage clause from `covered_by_local_history` → the completion re-check reads the
-/// raced-in commit as coverage, drops the install, and acks — the count/token assertions FAIL.
+/// MUTATION 1: drop the completion pristine re-check → the install re-baselines to 10, destroying
+/// committed-and-acked entries 11..=12 and regressing commit (the untouched-log assertions FAIL).
+/// MUTATION 2: drop the lineage clause from `covered_by_local_history` → the re-check reads the
+/// raced-in commit as coverage and ACKS the boundary redundantly (the no-ack assertion FAILS).
 #[test]
-fn a_mid_adoption_append_race_still_completes_the_adoption() {
+fn a_mid_adoption_append_race_refuses_the_adoption() {
   use crate::{
     AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
     conf::ConfState,
@@ -5981,25 +5986,46 @@ fn a_mid_adoption_append_race_still_completes_the_adoption() {
     Index::new(12),
     "the race committed past the boundary"
   );
-  while ep.poll_message().is_some() {}
+  assert!(
+    core::iter::from_fn(|| ep.poll_message()).any(|o| matches!(
+      o.message(),
+      Message::AppendResponse(r) if !r.reject() && r.match_index() == Index::new(12)
+    )),
+    "the raced entries were durably ACKED — the destruction the refusal prevents would be of \
+     acked-and-counted entries"
+  );
 
-  // The blob turns durable: the adoption must still INSTALL — the raced-in coordinates cover the
-  // boundary, but with content that is not the fork's.
+  // The blob turns durable: the completion finds the receiver no longer content-empty and REFUSES —
+  // nothing destructive, nothing acked, the refusal counted.
   stable.flush_held_snapshots();
   for _ in 0..4 {
     ep.handle_storage(d, &mut log, &mut stable);
   }
-  assert!(ep.snapshot.pending_install.is_none(), "install completed");
-  assert_eq!(
+  assert!(
+    ep.snapshot.pending_install.is_none(),
+    "the refused install is consumed, not left pending"
+  );
+  assert_ne!(
     ep.state_machine().count(),
     777,
-    "the FORK's state landed — the raced-in foreign bytes were not read as coverage"
+    "no foreign state restored over the filled log"
   );
-  assert_eq!(ep.fork_id(), Some(token), "the token was adopted");
+  assert!(ep.fork_id().is_none(), "no token adopted");
   assert_eq!(
     log.last_index(),
-    Index::new(10),
-    "the log re-baselined onto the fork boundary"
+    Index::new(12),
+    "the durably-acked entries survive — no re-baseline over them"
+  );
+  assert_eq!(ep.commit, Index::new(12), "commit never regresses");
+  assert_eq!(
+    ep.refused_cross_lineage_install_count(),
+    1,
+    "the completion-time refusal is counted"
+  );
+  assert!(
+    core::iter::from_fn(|| ep.poll_message())
+      .all(|o| !matches!(o.message(), Message::SnapshotResponse(_))),
+    "a refused adoption acks NOTHING — neither installed nor redundant"
   );
 }
 
