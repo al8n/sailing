@@ -832,7 +832,7 @@ impl MultiWorld {
 
   /// The run-end LINEAGE LEDGER verdict — chimera, phantom-quorum, and wedge — panicking with the
   /// oracle detail + seed for replay. Run beside the membership and conservation finalizers so
-  /// every VOPR seed faces it. See [`oracles::LineageLedger`].
+  /// every VOPR seed faces it. See `oracles::LineageLedger`.
   pub fn finalize_lineage_or_panic(&self, seed: u64) {
     self.lineage.finalize_or_panic(seed);
   }
