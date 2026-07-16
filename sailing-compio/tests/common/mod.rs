@@ -267,7 +267,7 @@ impl StableStore for MemStable {
   type Error = std::convert::Infallible;
 
   fn hard_state(&self) -> HardState<u64> {
-    self.hs
+    self.hs.clone()
   }
 
   fn submit_write(&mut self, id: OpId, hard_state: HardState<u64>) {

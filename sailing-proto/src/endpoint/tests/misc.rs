@@ -1637,3 +1637,38 @@ fn mint_op_id_fail_stops_on_exhaustion() {
   );
   assert_eq!(ep.poison_reason(), Some(PoisonReason::OpIdExhausted));
 }
+
+/// Every hard-state write carries the endpoint's CURRENT lineage, stamped at the durable choke-point:
+/// `None` until the node forks or adopts, its token thereafter — so no builder can persist a hard
+/// state that disowns the log's lineage, and restart reconciliation always has the record to compare
+/// against the durable snapshot's token.
+///
+/// MUTATION: drop the lineage stamp from `stamp_floors` → the adopted endpoint's writes carry `None`
+/// (the second assert FAILS).
+#[test]
+fn every_hard_state_write_carries_the_current_lineage() {
+  use crate::{ForkId, HardState, Index, Term};
+  let (mut ep, _log, _stable) = make_follower();
+
+  let hs = ep.stamp_floors(HardState::initial());
+  assert!(
+    hs.lineage().is_none(),
+    "a never-forked endpoint stamps None"
+  );
+
+  let token = ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[9u8]),
+    1,
+  );
+  ep.seed_fork_id_for_test(token.clone());
+  let hs = ep.stamp_floors(HardState::initial());
+  assert_eq!(
+    hs.lineage(),
+    Some(&token),
+    "an adopted endpoint stamps its token on every write"
+  );
+}

@@ -351,6 +351,12 @@ pub trait StableStore {
   /// blob as `Recorded(None)` would assert "promised nothing" and reopen the disruptive-vote-inside-a-live-
   /// lease hole for one post-upgrade restart of a previously-enforcing node. In-tree impls store `HardState`
   /// by value (no serialization), so they preserve all three cases automatically.
+  ///
+  /// [`HardState::lineage`] must round-trip VERBATIM as well — restart reconciliation compares it against
+  /// the durable snapshot's token to decide whether the surviving log belongs to the snapshot's lineage,
+  /// so dropping it turns an adopted node's restart into a lineage mismatch. An ABSENT field in a
+  /// pre-`lineage` blob decodes to `None` — exact, not merely conservative: no pre-`lineage` writer could
+  /// ever have forked or adopted, so its log is unconditionally the token-less lineage's.
   fn hard_state(&self) -> HardState<Self::NodeId>;
 
   /// Queue a hard-state write. Durable on the matching `poll` (completions are ordered).

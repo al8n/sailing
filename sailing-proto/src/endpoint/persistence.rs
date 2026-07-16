@@ -227,6 +227,11 @@ where
   pub(crate) fn stamp_floors(&self, hs: HardState<I>) -> HardState<I> {
     let raised = hs.lease_support().raise(self.durable.lease_support_floor);
     hs.with_lease_support(raised)
+      // The lineage is a LATCH, not a monotone floor: stamped from the endpoint's current identity on
+      // every write, `None` until the node forks or adopts and that token thereafter. Stamping at the
+      // choke-point means no builder can accidentally persist a hard state that disowns the log's
+      // lineage — the record restart reconciliation compares against the durable snapshot's token.
+      .with_lineage(self.split.fork_id.clone())
   }
 
   pub(crate) fn submit_write<S: StableStore<NodeId = I>>(

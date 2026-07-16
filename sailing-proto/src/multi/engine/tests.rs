@@ -189,7 +189,7 @@ fn reads_are_visible_before_durability() {
   }
 
   let hs = HardState::initial().with_term(Term::new(3));
-  stable.submit_write(OpId::new(2), hs);
+  stable.submit_write(OpId::new(2), hs.clone());
   assert_eq!(
     stable.hard_state(),
     HardState::initial(),

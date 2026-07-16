@@ -219,11 +219,16 @@ fn write_fork_baseline<I, L, S>(
   S: StableStore<NodeId = I>,
 {
   let opid = OpId::first_of_epoch(boot_epoch.saturating_sub(1));
+  // The manufactured hard state records the child's lineage from birth: restart reconciliation
+  // compares it against the durable snapshot's token, and a baseline written WITHOUT it would read
+  // as a token-less log beside a token-bearing snapshot — the exact ambiguity the record exists to
+  // remove.
   stable.submit_write(
     opid,
     HardState::initial()
       .with_term(FORK_BASE_TERM)
-      .with_commit(FORK_BASE_INDEX),
+      .with_commit(FORK_BASE_INDEX)
+      .with_lineage(fork_id.clone()),
   );
   let conf = ConfState::from_voters(config.voters().iter().map(CheapClone::cheap_clone));
   // The baseline meta carries the child's own lineage (its incarnation under the unified

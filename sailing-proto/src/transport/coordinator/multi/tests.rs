@@ -2782,3 +2782,77 @@ fn coordinator_teardown_inherits_the_participant_gate_without_tombstoning() {
     "the parked target is left intact and un-tombstoned"
   );
 }
+
+/// A forked group's manufactured hard state records its lineage FROM BIRTH — alongside the baseline
+/// snapshot's token, never trailing it. Restart reconciliation compares the two, so a baseline written
+/// with a token-less hard state would read as another lineage's log beside a token-bearing snapshot:
+/// the exact ambiguity the record exists to remove. An untokened fork records `None` for the same
+/// reason — the record is exact, not conservative.
+#[test]
+fn a_forked_groups_hard_state_records_its_lineage_from_birth() {
+  use crate::{ForkId, Index, Term};
+  let mut c = MultiCoord::new();
+  let now = Instant::ORIGIN;
+
+  let token = ForkId::new(
+    bytes::Bytes::from_static(&[7u8]),
+    1,
+    Index::new(4),
+    Term::new(2),
+    bytes::Bytes::from_static(&[100u8]),
+    1,
+  );
+  let (mut log, mut stable) = (VecLog::default(), AsyncStable::default());
+  c.create_group_from_fork(
+    100,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    fork_blob(3),
+    None,
+    Some(token.clone()),
+    1,
+    0,
+    &NoFloors,
+    &mut log,
+    &mut stable,
+  )
+  .unwrap();
+  assert_eq!(
+    stable.hard_state().lineage(),
+    Some(&token),
+    "the manufactured hard state carries the child's token"
+  );
+  assert_eq!(
+    stable
+      .snapshot()
+      .expect("the baseline occupies the slot")
+      .0
+      .fork_id(),
+    Some(&token),
+    "hard state and baseline agree on the lineage"
+  );
+
+  let (mut log2, mut stable2) = (VecLog::default(), AsyncStable::default());
+  c.create_group_from_fork(
+    101,
+    single_voter(1),
+    now,
+    1,
+    CountSm::default(),
+    fork_blob(3),
+    None,
+    None,
+    1,
+    0,
+    &NoFloors,
+    &mut log2,
+    &mut stable2,
+  )
+  .unwrap();
+  assert!(
+    stable2.hard_state().lineage().is_none(),
+    "an untokened fork records None — exact, not conservative"
+  );
+}

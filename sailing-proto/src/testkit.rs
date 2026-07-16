@@ -689,7 +689,7 @@ impl AsyncStable {
       .with_term(term)
       .with_vote(vote)
       .with_commit(commit);
-    self.hard_state = hs;
+    self.hard_state = hs.clone();
     self.durable_hard_state = hs;
   }
 
@@ -703,7 +703,7 @@ impl AsyncStable {
   /// Seed the store with an arbitrary durable `HardState` (e.g. one carrying a `lease_support` floor).
   /// Used by the lease-promise restart tests.
   pub(crate) fn force_hard_state(&mut self, hs: HardState<u64>) {
-    self.hard_state = hs;
+    self.hard_state = hs.clone();
     self.durable_hard_state = hs;
   }
 
@@ -712,7 +712,7 @@ impl AsyncStable {
   /// pending completions are discarded. A snapshot submitted but not yet flushed (its `SnapshotWritten`
   /// unpolled) therefore vanishes, modelling the snapshot-install fsync window.
   pub(crate) fn discard_inflight(&mut self) {
-    self.hard_state = self.durable_hard_state;
+    self.hard_state = self.durable_hard_state.clone();
     self.snapshot.clone_from(&self.durable_snapshot);
     self.completions.clear();
     // A held (un-fsync'd) write is the crash's canonical casualty.
@@ -801,9 +801,9 @@ impl StableStore for AsyncStable {
   fn hard_state(&self) -> HardState<u64> {
     // A strict store returns the LAST-DURABLE state; the default models a submit-visible store.
     if self.last_durable_reads {
-      self.durable_hard_state
+      self.durable_hard_state.clone()
     } else {
-      self.hard_state
+      self.hard_state.clone()
     }
   }
 
@@ -938,7 +938,7 @@ impl StableStore for AsyncStable {
     // A polled completion means that write reached stable storage — fold it into the durable value so a
     // later `discard_inflight` (crash) no longer rolls it back.
     match done {
-      Some(StableDone::Wrote(_)) => self.durable_hard_state = self.hard_state,
+      Some(StableDone::Wrote(_)) => self.durable_hard_state = self.hard_state.clone(),
       Some(StableDone::SnapshotWritten(_)) => self.durable_snapshot.clone_from(&self.snapshot),
       _ => {}
     }
