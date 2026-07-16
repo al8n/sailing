@@ -146,6 +146,14 @@ fn default_band_is_nonvacuous() {
       Some(library_default),
       "seed {seed}: the default profile must leave the library default threshold in place: {r:?}"
     );
+    // The lineage ledger's content leg is non-vacuous on every profile that commits load: the
+    // phantom-quorum map judged real cells (the run-end lineage verdict was not an empty pass).
+    // Installs are structurally near-zero at fast budgets (no compaction), so the install leg's
+    // non-vacuity lives with the Mini-harness adoption scenario instead.
+    assert!(
+      r.lineage_cells_judged > 0,
+      "seed {seed}: the lineage ledger judged no cells: {r:?}"
+    );
   }
 }
 

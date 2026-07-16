@@ -35,6 +35,7 @@
 
 #![cfg(test)]
 
+use super::oracles::LineageLedger;
 use crate::{LogSm, MemLog, MemStable};
 use core::time::Duration;
 use sailing_proto::{
@@ -908,4 +909,107 @@ fn a_second_fork_onto_a_live_gid_is_refused_before_minting() {
     ),
     "a split onto a live child id must refuse before minting a second lineage"
   );
+}
+
+/// The LINEAGE LEDGER over the squatter transfer, fed exactly as the world's per-tick sweep
+/// feeds it: installs drained since the previous sweep FIRST (each happened before the content
+/// state now visible, so a destructive install is judged against the lineage the replica held
+/// BEFORE it), then every hosted replica's applied record under its live `fork_id`. With the
+/// receive path holding the fork-provenance gate, the refusal leaves no install to observe and
+/// the ledger finalizes GREEN over real content; a receive path that ever LANDED a token-bearing
+/// snapshot on this populated token-less occupant surfaces as a CHIMERA at finalize — the
+/// mechanical catch for the coordinate-fusion family, independent of the behavioral pins above.
+#[test]
+fn squatter_transfer_keeps_the_lineage_ledger_green() {
+  let mut ledger = LineageLedger::new();
+  let mut fed = 0usize;
+  let mut m = stage_parent(Mini::new());
+  stage_term_contradicting_squatter(&mut m);
+  // The squatter's committed token-less lineage goes on record before any transfer can land.
+  sweep_ledger(&m, &mut ledger, &mut fed, 0);
+
+  m.propose_split(100, 0, 200, 4);
+  m.elect(200, 0);
+  let mut tick = 1u64;
+  for _ in 0..400 {
+    sweep_ledger(&m, &mut ledger, &mut fed, tick);
+    tick += 1;
+    // Resolution under EITHER receive-path behavior: the gate refuses (counted), or a
+    // destructive install lands on the occupant (observed — the chimera finalize trips on).
+    if m.refused(2, 200) >= 1 || m.installs().iter().any(|o| o.node == 2 && o.gid == 200) {
+      break;
+    }
+    m.advance();
+  }
+  sweep_ledger(&m, &mut ledger, &mut fed, tick);
+
+  // The ledger's verdict SPEAKS FIRST: a destructive cross-lineage landing is the chimera it
+  // trips on, before any behavioral pin can mask it. Green here, the behavioral pins follow.
+  ledger.finalize_or_panic(0);
+  assert!(
+    ledger.cells_judged() > 0,
+    "the ledger judged real committed content (non-vacuous)"
+  );
+  assert!(
+    m.refused(2, 200) >= 1,
+    "the transfer must resolve by refusal at the door"
+  );
+}
+
+/// The ledger's INSTALL leg over the pristine adopter: the joiner's adoption is a real
+/// token-bearing install, observed by the chimera detector (non-vacuous) and judged legitimate —
+/// a lineage adopted from nothing. Green finalize over a run that installed.
+#[test]
+fn empty_joiner_adoption_feeds_the_ledger_install_leg() {
+  let mut ledger = LineageLedger::new();
+  let mut fed = 0usize;
+  let mut m = stage_parent(Mini::new());
+  m.create_group(200, &[2], &[2]);
+  m.freeze_timer(2, 200);
+  sweep_ledger(&m, &mut ledger, &mut fed, 0);
+
+  m.propose_split(100, 0, 200, 4);
+  m.elect(200, 0);
+  let mut tick = 1u64;
+  for _ in 0..400 {
+    sweep_ledger(&m, &mut ledger, &mut fed, tick);
+    tick += 1;
+    if m.fork_id(2, 200).is_some() && !m.applied(2, 200).is_empty() {
+      break;
+    }
+    m.advance();
+  }
+  sweep_ledger(&m, &mut ledger, &mut fed, tick);
+
+  assert!(
+    ledger.installs_observed() >= 1,
+    "the chimera detector observed the joiner's real install (non-vacuous)"
+  );
+  assert!(ledger.cells_judged() > 0, "content was judged too");
+  ledger.finalize_or_panic(0);
+}
+
+/// Feed `ledger` one sweep of the Mini's `g200` state, in the world sweep's order: installs
+/// drained since the previous sweep first, then every hosted replica's content under its live
+/// `fork_id`. `fed` is the install cursor across sweeps.
+fn sweep_ledger(m: &Mini, ledger: &mut LineageLedger, fed: &mut usize, tick: u64) {
+  for o in &m.installs()[*fed..] {
+    if o.gid == 200 {
+      ledger.observe_install(0, tick, (o.node, 200, 0), o.lineage.as_ref(), o.boundary);
+    }
+  }
+  *fed = m.installs().len();
+  for node in 0..4u64 {
+    if !m.hosts_group(node, 200) {
+      continue;
+    }
+    let lineage = m.fork_id(node, 200);
+    ledger.observe_content(
+      0,
+      tick,
+      (node, 200, 0),
+      lineage.as_ref(),
+      &m.applied(node, 200),
+    );
+  }
 }

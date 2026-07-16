@@ -356,6 +356,14 @@ pub struct MultiVoprReport {
   pub crashes_with_log_inflight: u64,
   /// Crashes that rolled back a NON-EMPTY stable-store fsync window. `0` under the sync store mode.
   pub crashes_with_stable_inflight: u64,
+  /// Applied cells the LINEAGE LEDGER's phantom-quorum leg judged across the run — its non-vacuity
+  /// witness. Nonzero on any run that committed keyed load: the lineage-keyed agreement leg ran on
+  /// real records rather than an empty world.
+  pub lineage_cells_judged: u64,
+  /// Snapshot installs the LINEAGE LEDGER's chimera leg examined across the run. `0` under a
+  /// no-compaction default band (no transfer installs); nonzero under the snapshot/reshape/merge
+  /// families where fork baselines and compaction snapshots transfer.
+  pub lineage_installs_observed: u64,
 }
 
 /// One accepted-freeze entry in the fuzzer's pending-merge book.
@@ -521,6 +529,13 @@ pub fn run_multi_vopr(seed: u64, ticks: usize, profile: MultiProfile) -> MultiVo
   // (see `MultiWorld::finalize_merge_conservation_or_panic`). Vacuously green under profiles
   // that never merge — zero records, zero cost.
   w.finalize_merge_conservation_or_panic(seed);
+  // The LINEAGE VERDICT: durable state stayed single-lineage (chimera), every within-lineage
+  // quorum agreed byte-for-byte (phantom), and every admitted snapshot transfer terminated
+  // (wedge) — see `MultiWorld::finalize_lineage_or_panic`. Fed by the per-tick lineage sweep and
+  // the install-event drain, so every seed of every profile faces it.
+  w.finalize_lineage_or_panic(seed);
+  report.lineage_cells_judged = w.lineage_cells_judged();
+  report.lineage_installs_observed = w.lineage_installs_observed();
   report.merges_registered = w.merges_registered();
   report.merges_resolved = w.merges_resolved();
   report.merges_aborted = w.merges_aborted();

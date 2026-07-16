@@ -17,7 +17,8 @@ use crate::{
 };
 use core::time::Duration;
 use sailing_proto::{
-  Config, Event, Instant, LogStore, Message, MultiRaft, Outgoing, ReadState, StableStore,
+  Config, Event, ForkId, Instant, LogStore, Message, MultiRaft, Outgoing, ProgressState, ReadState,
+  StableStore,
 };
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
@@ -264,6 +265,12 @@ pub struct MultiWorld {
   /// arbitrary instant, not only at the fully-durable tick boundary an ordinary [`crash`](Self::crash)
   /// models. Consumed (taken) by the next tick. `None` for a between-ticks (durable-window) crash.
   pending_mid_crash: Option<u64>,
+  /// The per-`(node, gid)` LINEAGE LEDGER (see [`oracles::LineageLedger`]): attributes every applied
+  /// command, installed snapshot, and endpoint `fork_id` to a lineage and holds the durable state
+  /// single-lineage (chimera), the within-lineage quorum byte-identical (phantom), and every
+  /// admitted transfer terminating (wedge). Fed by the per-tick lineage sweep and the install-event
+  /// drain, judged at run end by [`finalize_lineage_or_panic`](Self::finalize_lineage_or_panic).
+  lineage: oracles::LineageLedger,
 }
 
 impl MultiWorld {
@@ -331,6 +338,7 @@ impl MultiWorld {
       crashes_with_log_inflight: 0,
       crashes_with_stable_inflight: 0,
       pending_mid_crash: None,
+      lineage: oracles::LineageLedger::new(),
     }
   }
 
@@ -721,7 +729,122 @@ impl MultiWorld {
       self.pending_new_installs.entry(gid).or_default().clear();
       self.cross_talk_sweep(gid);
       self.conserve_sweep(gid);
+      self.lineage_sweep(gid);
     }
+  }
+
+  /// Feed the [`LineageLedger`](oracles::LineageLedger) this group's observable lineage state:
+  /// every live replica's aligned committed record under its endpoint `fork_id` (content +
+  /// phantom-quorum), and every in-flight snapshot transfer's liveness cursor (wedge). A parked
+  /// replica is a reaped non-participant (the `leader_of`/quorum-denominator rule), so it is not a
+  /// witness here either. Installs are fed separately at the `SnapshotInstalled` event (the chimera
+  /// decision point). Pure observer — reads only public accessors and world bookkeeping.
+  fn lineage_sweep(&mut self, gid: u64) {
+    let (seed, tick, generation) = (self.seed, self.tick_count, self.generation_of(gid));
+    let nodes = self.node_ids.clone();
+    // Content + phantom-quorum: only for a group whose FSM applied record is APPEND-ONLY, and
+    // collect first (immutable reads) before feeding (mutates the ledger). A MERGE absorb re-bases
+    // the target's record non-monotonically — the same index's committed bytes change as the union
+    // folds in — so `(index → bytes)` is not a stable committed history there and the per-index
+    // leg would read a legitimate re-base as a phantom; a merge-involved group's cross-replica
+    // agreement is the positional/equal-applied agreement oracle's business
+    // (`ClusterView::positional_agreement`). A SPLIT is phantom-safe: it only REMOVES a moved key's
+    // cells from the aligned record and re-tags inherited cells under the CHILD's DISTINCT lineage
+    // key. One-gid-one-lineage holds in the world, so the lineage key never partitions here — its
+    // teeth are the two-lineage squatter scenario, which feeds the ledger directly.
+    if self.record_is_append_only(gid) {
+      let mut content: Vec<(u64, Option<ForkId>, AppliedLog)> = Vec::new();
+      for &node in &nodes {
+        if self.parked.contains(&(node, gid)) {
+          continue;
+        }
+        let Some(ep) = self.hosts[&node].group(&gid) else {
+          continue;
+        };
+        let lineage = ep.fork_id();
+        content.push((node, lineage, self.aligned_applied(node, gid)));
+      }
+      for (node, lineage, applied) in &content {
+        self.lineage.observe_content(
+          seed,
+          tick,
+          (*node, gid, generation),
+          lineage.as_ref(),
+          applied,
+        );
+      }
+    }
+    // Wedge: the highest-term leader's in-flight snapshot transfers. Feed EVERY candidate peer each
+    // sweep — `Some` for a reachable peer in the leader's `Snapshot` state, `None` otherwise — so a
+    // leader change, an election gap, or a partition clears a stale cursor instead of accruing a
+    // false wedge (a partition is not a wedge).
+    let leader = self.leader_of(gid);
+    // One wedge observation per peer: `(peer, in-flight (match, chunk cursor), refusal count)`.
+    type TransferObs = (u64, Option<(u64, u64)>, u64);
+    let mut xfers: Vec<TransferObs> = Vec::new();
+    for &peer in &nodes {
+      let in_flight = leader.and_then(|l| {
+        if l == peer {
+          return None;
+        }
+        let lep = self.hosts.get(&l)?.group(&gid)?;
+        let pr = lep.peer_progress(&peer)?;
+        match pr.state {
+          ProgressState::Snapshot { acked_through, .. } => {
+            // A parked replica is delivery-isolated for its group (the departed sweep's
+            // patient-observation model), so a transfer toward it cannot progress and is not a
+            // wedge — the same exemption as a partitioned or muted peer.
+            let reachable = !self.isolated.contains(&l)
+              && !self.isolated.contains(&peer)
+              && !self.parked.contains(&(peer, gid))
+              && !self.muted.contains(&(l, peer, gid))
+              && !self.muted.contains(&(peer, l, gid));
+            reachable.then_some((pr.match_index.get(), acked_through))
+          }
+          _ => None,
+        }
+      });
+      let refused = self
+        .hosts
+        .get(&peer)
+        .and_then(|h| h.group(&gid))
+        .map_or(0, |e| e.refused_cross_lineage_install_count());
+      xfers.push((peer, in_flight, refused));
+    }
+    for (peer, in_flight, refused) in xfers {
+      self
+        .lineage
+        .observe_transfer(seed, tick, gid, peer, in_flight, refused);
+    }
+  }
+
+  /// Whether `gid`'s FSM applied record is APPEND-ONLY this instant — the precondition for the
+  /// lineage ledger's per-index phantom-quorum leg (see `lineage_sweep`). A merge (freeze, park,
+  /// absorb, or a merged-away husk) re-bases or folds records non-monotonically, so `(index →
+  /// bytes)` stops being a stable committed history; a split is phantom-safe and is NOT excluded.
+  fn record_is_append_only(&self, gid: u64) -> bool {
+    !(self.group_absorbed(gid)
+      || self.is_merged(gid)
+      || self.group_frozen(gid)
+      || self.merge_choreography_active(gid)
+      || self.group_merge_parked(gid))
+  }
+
+  /// The run-end LINEAGE LEDGER verdict — chimera, phantom-quorum, and wedge — panicking with the
+  /// oracle detail + seed for replay. Run beside the membership and conservation finalizers so
+  /// every VOPR seed faces it. See [`oracles::LineageLedger`].
+  pub fn finalize_lineage_or_panic(&self, seed: u64) {
+    self.lineage.finalize_or_panic(seed);
+  }
+
+  /// Applied cells the lineage ledger's phantom-quorum leg judged — its non-vacuity witness.
+  pub fn lineage_cells_judged(&self) -> u64 {
+    self.lineage.cells_judged()
+  }
+
+  /// Snapshot installs the lineage ledger's chimera leg examined — its non-vacuity witness.
+  pub fn lineage_installs_observed(&self) -> u64 {
+    self.lineage.installs_observed()
   }
 
   /// Render the membership oracle's run-end VERDICT for every checker this world ever built:
@@ -1066,6 +1189,19 @@ impl MultiWorld {
             || cs.learners().contains(&node)
             || cs.learners_next().contains(&node);
           self.member_view.insert((node, gid), is_member);
+          // The lineage ledger's install observation — the chimera decision point: a fork-lineage
+          // snapshot installing over a replica that already holds committed content of ANOTHER
+          // lineage is the cross-lineage fusion the door gate refuses. A pristine adopter or a
+          // same-token retransfer is legitimate and does not trip.
+          let (seed, tick) = (self.seed, self.tick_count);
+          let generation = self.generation_of(gid);
+          self.lineage.observe_install(
+            seed,
+            tick,
+            (node, gid, generation),
+            meta.fork_id(),
+            meta.last_index().get(),
+          );
           self.pending_new_installs.entry(gid).or_default().push((
             node,
             meta.last_index().get(),

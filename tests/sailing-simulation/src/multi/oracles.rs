@@ -14,6 +14,9 @@
 use sailing_proto::Term;
 use std::{collections::BTreeMap, vec::Vec};
 
+mod lineage;
+pub(crate) use lineage::LineageLedger;
+
 /// Encode a gid-tagged keyed-value client command: `gid` (8 bytes LE) ++ `key` (2 bytes LE) ++
 /// `value` (8 bytes LE) — 18 bytes exactly.
 pub(crate) fn encode_gkv(gid: u64, key: u16, value: u64) -> Vec<u8> {
