@@ -2896,3 +2896,136 @@ fn restart_fail_stops_a_lineage_the_slot_contradicts() {
     "an adopted log whose baseline evidence is gone fail-stops"
   );
 }
+
+/// The lineage stamp rides the NEXT stable write after an adoption, and the log and stable stores
+/// have no cross-store fsync barrier — so a post-adoption append can durably outrun the stamp. A
+/// crash in that skew leaves {token-bearing slot, token-less hard state, log baselined at the
+/// boundary WITH a tail}. The tail is the adopted lineage's ordinary replication, not evidence
+/// against the adoption: restart completes it and the child's committed work survives.
+///
+/// MUTATION: require `last_index == boundary` in the pre-pass marker → the advanced tail defeats
+/// the marker, the slot is ignored, and the re-baselined log (first_index > 1, no snapshot)
+/// poisons OrphanedLog — a fork child bricked by an ordinary crash on its first replicated entry.
+#[test]
+fn restart_completes_an_adoption_whose_log_outran_the_stamp() {
+  use crate::{Config, HardState, Index, Instant, SnapshotMeta, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let token = restart_fork_token();
+
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.restore(Index::new(10), Term::new(2));
+  log.force_append(&[
+    crate::Entry::new(
+      Term::new(2),
+      Index::new(11),
+      crate::EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+    crate::Entry::new(
+      Term::new(2),
+      Index::new(12),
+      crate::EntryKind::Empty,
+      bytes::Bytes::new(),
+    ),
+  ]);
+  stable.force_hard_state(
+    HardState::initial()
+      .with_term(Term::new(2))
+      .with_commit(Index::ZERO),
+  );
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      Index::new(10),
+      Term::new(2),
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_fork_id(token.clone()),
+    encode_count_snapshot(777),
+  );
+
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(
+    !ep.poison.poisoned,
+    "an advanced tail is ordinary replication, never a brick: {:?}",
+    ep.poison_reason()
+  );
+  assert_eq!(ep.fork_id(), Some(token), "the adoption completed");
+  assert_eq!(ep.state_machine().count(), 777, "the fork's state restored");
+  assert_eq!(ep.applied, Index::new(10));
+  assert_eq!(
+    log.last_index(),
+    Index::new(12),
+    "the post-adoption tail survives for the leader to re-drive"
+  );
+}
+
+/// The same skew on the manufactured baseline itself: the child's FIRST replicated entry durably
+/// outran the lineage stamp, then a crash. The baseline coordinate (1, 1) plus one entry must
+/// recover as the fork child it is — the exact lifecycle this machinery ships.
+#[test]
+fn restart_completes_a_fork_childs_first_append_over_a_lost_stamp() {
+  use crate::{Config, HardState, Index, Instant, SnapshotMeta, Term, conf::ConfState};
+  use core::time::Duration;
+  let cfg = Config::try_new(
+    2u64,
+    std::vec![1u64, 2u64, 3u64],
+    Duration::from_millis(1000),
+    Duration::from_millis(100),
+  )
+  .unwrap();
+  let token = restart_fork_token();
+
+  let mut log = VecLog::default();
+  let mut stable = AsyncStable::default();
+  log.restore(crate::FORK_BASE_INDEX, crate::FORK_BASE_TERM);
+  log.force_append(&[crate::Entry::new(
+    Term::new(2),
+    Index::new(2),
+    crate::EntryKind::Empty,
+    bytes::Bytes::new(),
+  )]);
+  stable.force_hard_state(
+    HardState::initial()
+      .with_term(Term::new(2))
+      .with_commit(crate::FORK_BASE_INDEX),
+  );
+  stable.force_snapshot(
+    SnapshotMeta::new(
+      crate::FORK_BASE_INDEX,
+      crate::FORK_BASE_TERM,
+      ConfState::from_voters(std::vec![1u64, 2u64, 3u64]),
+    )
+    .with_fork_id(token.clone()),
+    encode_count_snapshot(500),
+  );
+
+  let ep = Endpoint::restart(
+    cfg,
+    Instant::ORIGIN,
+    7,
+    CountSm::default(),
+    1,
+    &mut log,
+    &mut stable,
+  );
+  assert!(!ep.poison.poisoned, "{:?}", ep.poison_reason());
+  assert_eq!(ep.fork_id(), Some(token));
+  assert_eq!(ep.state_machine().count(), 500);
+  assert_eq!(log.last_index(), Index::new(2), "the first entry survives");
+}

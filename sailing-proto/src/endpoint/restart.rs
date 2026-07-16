@@ -197,16 +197,22 @@ where
     // restore, the boundary reconciliation, the split-state seed) sees a coherent view.
     //  - Lineages AGREE (`None`/`None` included): both artifacts are one lineage's — proceed.
     //  - Log token-less, slot token-bearing: the slot holds an ADOPTION this node never completed.
-    //    If the log is re-baselined EXACTLY to the slot's boundary, the destructive `log.restore`
-    //    already ran — the adoption is a fact, only its hard-state stamp is missing (the crash hit
-    //    between the restore and the next write) — so COMPLETE it: trust the slot. That shape is
-    //    unforgeable by any token-less log: its own compaction to the boundary would have put its
-    //    OWN snapshot in the slot, and the fork-provenance gate refuses a foreign overwrite of an
-    //    occupied slot. Otherwise the blob is an UNADOPTED leftover (the install never ran) — IGNORE
-    //    the slot and boot from (hard state, log) alone: a virgin log comes up empty and the
-    //    transfer re-runs (the leader's match never advanced; the gate's kin arm re-admits the
-    //    retransfer against the leftover blob), and a populated log boots as the token-less node it
-    //    truly is (re-sent foreign snapshots stay refused; the conflict resolves by placement).
+    //    If the log is BASELINED AT the slot's boundary — its prefix below the boundary gone
+    //    (`first_index == boundary + 1`) and the retained boundary term the slot's — the
+    //    destructive `log.restore` already ran: the adoption is a fact, only its hard-state stamp
+    //    is missing (the lineage stamp rides the NEXT stable write, and the log and stable stores
+    //    have no cross-store fsync barrier, so any post-adoption append can durably outrun the
+    //    stamp — the tail above the boundary is the adopted lineage's ordinary replication, NOT
+    //    evidence against the adoption). COMPLETE it: trust the slot; the coordinate arms below
+    //    handle the tail exactly as any snapshot-plus-committed-tail restart. The baselined shape
+    //    is unforgeable by any token-less log: reaching `first_index == boundary + 1` by its own
+    //    compaction requires its OWN snapshot durable in the slot, and the fork-provenance gate
+    //    refuses a foreign overwrite of an occupied slot. Otherwise the blob is an UNADOPTED
+    //    leftover (the install never ran) — IGNORE the slot and boot from (hard state, log) alone:
+    //    a virgin log comes up empty and the transfer re-runs (the leader's match never advanced;
+    //    the gate's kin arm re-admits the retransfer against the leftover blob), and a populated
+    //    log boots as the token-less node it truly is (re-sent foreign snapshots stay refused; the
+    //    conflict resolves by placement).
     //  - Log token-bearing, slot absent or mismatched: self-contradictory durable state — the
     //    adopted log's baseline evidence is gone or foreign. Unreachable through the receive path;
     //    fail-stop (`LineageMismatch`) rather than reconcile coordinates across two lineages.
@@ -215,7 +221,9 @@ where
         if hs.lineage() == meta.fork_id() {
           Some((meta, data))
         } else if hs.lineage().is_none() {
-          if restore_rebaselined(log, meta.last_index(), meta.last_term()) {
+          let baselined_at_boundary = log.first_index() == meta.last_index().next()
+            && log.term(meta.last_index()).ok() == Some(meta.last_term());
+          if baselined_at_boundary {
             Some((meta, data))
           } else {
             None
