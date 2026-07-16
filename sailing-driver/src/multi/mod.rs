@@ -367,7 +367,11 @@ pub enum LifecycleEvent<G, I> {
   /// The embedder resolves it BY THE OCCUPANT'S STATE. A hosted replica with NO committed
   /// content of its own (a fresh, empty joiner) catches up from a sibling: the transfer adopts
   /// the fork's lineage, and once it carries it at-or-past the manufactured baseline the parked
-  /// fork resolves as redundant. A POPULATED occupant — an older incarnation's replica, or an
+  /// fork resolves as redundant. (One empty sub-case still needs placement: a joiner whose
+  /// durable snapshot slot holds a DIFFERENT lineage's never-installed leftover refuses the
+  /// fork's transfer too — the leftover is the surviving evidence of a lifecycle breach, so it
+  /// resolves by re-materializing the joiner, not by overwriting the evidence.) A POPULATED
+  /// occupant — an older incarnation's replica, or an
   /// unrelated group at the id — can only be resolved by PLACEMENT: remove the hosted child
   /// (the fork then materializes and [`SplitApplied`](Self::SplitApplied) fires — removal
   /// tombstones the id, so pair it with [`MultiHandle::clear_tombstone`] before the next drain,
