@@ -292,3 +292,24 @@ see the decoder obligations documented on `src/hard_state.rs`. Note that `ConfCh
 THE LOG carry the §1 envelope encoding (`sailing.v1.ConfChangeV2`): a log written before the
 envelope migration does not replay against this version (pre-release; no migration path is
 provided).
+
+## 6. Reserved: the group-header incarnation stamp (the generation fence)
+
+The next `LABEL_VERSION` bump grows the §3 group-demux header by one field:
+
+```
+[u16 group_len][group bytes][varint generation]
+```
+
+`generation` is the SENDER's incarnation counter for that gid (the unified lineage/shape counter;
+`0` for an unreshaped group). It gives the receiver a demux-time fence for retired incarnations —
+`floor_admits(floor(gid), generation)` fails ⇒ drop the frame, exactly as a tombstoned gid's frame
+is dropped today — the durable, generation-exact form of the volatile removal tombstone, and the
+append/vote-plane counterpart of the snapshot path's lineage gate (which token-discriminates
+snapshot traffic alone).
+
+Reserved rather than landed: the field's ENFORCEMENT semantics — the comparator, tolerance for
+same-lineage generation skew (a mid-split replica legitimately trails by one), and per-message-class
+policy — are the hardening milestone's design, and a field whose semantics later change would burn a
+version byte for nothing. The hello's version fence (§4) makes the eventual bump safe: mixed-version
+peers reject at the handshake, never mis-parse the header.
