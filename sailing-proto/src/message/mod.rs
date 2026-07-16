@@ -829,13 +829,15 @@ pub struct SnapshotResponse<I> {
   reject: bool,
   match_index: Index,
   acked_through: u64,
+  progress: bool,
 }
 
 impl<I: CheapClone> SnapshotResponse<I> {
-  /// Construct (with `acked_through == 0` — a legacy/final ack). Use [`with_acked_through`] for a
-  /// mid-transfer progress ack.
+  /// Construct (with `acked_through == 0` and `progress == false` — a legacy/final ack). Use
+  /// [`with_acked_through`] + [`with_progress`] for a mid-transfer progress ack.
   ///
   /// [`with_acked_through`]: Self::with_acked_through
+  /// [`with_progress`]: Self::with_progress
   pub const fn new(term: Term, from: I, reject: bool, match_index: Index) -> Self {
     Self {
       term,
@@ -843,6 +845,7 @@ impl<I: CheapClone> SnapshotResponse<I> {
       reject,
       match_index,
       acked_through: 0,
+      progress: false,
     }
   }
 
@@ -850,6 +853,16 @@ impl<I: CheapClone> SnapshotResponse<I> {
   #[must_use]
   pub const fn with_acked_through(mut self, acked_through: u64) -> Self {
     self.acked_through = acked_through;
+    self
+  }
+
+  /// Mark this ack as a mid-transfer PROGRESS report. A progress ack is MATCH-INERT on the leader:
+  /// it drives chunk pacing and the resume cursor, but never moves `match_index`, never exits
+  /// Snapshot state, and never feeds the commit quorum — only an install/redundancy ack (a durable
+  /// log-state assertion) may. `false` (absent on the wire) on every final/redundancy ack.
+  #[must_use]
+  pub const fn with_progress(mut self, progress: bool) -> Self {
+    self.progress = progress;
     self
   }
 
@@ -881,6 +894,13 @@ impl<I: CheapClone> SnapshotResponse<I> {
   #[inline(always)]
   pub const fn acked_through(&self) -> u64 {
     self.acked_through
+  }
+
+  /// Whether this is a mid-transfer PROGRESS ack — match-inert on the leader (see
+  /// [`with_progress`](Self::with_progress)).
+  #[inline(always)]
+  pub const fn progress(&self) -> bool {
+    self.progress
   }
 }
 

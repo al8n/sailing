@@ -790,7 +790,8 @@ where
       to,
       Message::SnapshotResponse(
         crate::SnapshotResponse::new(term, me, false, match_index)
-          .with_acked_through(acked_through),
+          .with_acked_through(acked_through)
+          .with_progress(true),
       ),
     );
   }
@@ -1062,21 +1063,30 @@ where
       // self.tracker). The pattern mirrors on_append_response's reject branch.
       self.maybe_send_append(now, from, log, stable);
     } else {
-      // Boundary check (shared with `on_append_response` via `match_within_log`): a successful snapshot
-      // ack must not report a match above the leader's own log, for the same reason — an over-run
-      // would corrupt `Progress` and could push the commit candidate off the log and poison the
-      // leader. Ignore the malformed ack; the peer stays in Snapshot and is re-probed normally.
-      if !Self::match_within_log(response.match_index(), log) {
-        return;
+      // A PROGRESS ack is match-inert BY TYPE: it drives the resume cursor and chunk pacing below,
+      // but never touches `match_index` — so it cannot exit Snapshot state or feed the commit
+      // quorum. Only an install/redundancy ack (a durable log-state assertion by the follower) may.
+      // Enforced HERE, on the leader, so the rule holds regardless of the peer's arithmetic — a
+      // version-skewed or malformed peer cannot mint replication progress from a transfer that has
+      // not durably installed.
+      if !response.progress() {
+        // Boundary check (shared with `on_append_response` via `match_within_log`): a successful
+        // snapshot ack must not report a match above the leader's own log, for the same reason — an
+        // over-run would corrupt `Progress` and could push the commit candidate off the log and
+        // poison the leader. Ignore the malformed ack; the peer stays in Snapshot and is re-probed
+        // normally.
+        if !Self::match_within_log(response.match_index(), log) {
+          return;
+        }
+        // maybe_update drives the Snapshot → Probe transition regardless of its return value
+        // ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never left
+        // un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_response).
+        pr.maybe_update(response.match_index());
       }
-      // Success: maybe_update drives the Snapshot → Probe transition regardless of its return
-      // value ("advanced" hint). We resume unconditionally so a peer leaving Snapshot is never
-      // left un-poked. Drop `pr` before the self.* calls (borrow discipline mirrors on_append_response).
-      pr.maybe_update(response.match_index());
       // Advance the resume cursor from the follower's contiguous watermark, then — if the peer is STILL
-      // mid-transfer (a progress ack did not lift it out of Snapshot via maybe_update above) AND this
+      // mid-transfer (a progress ack leaves Snapshot state untouched by construction) AND this
       // ack MOVED the cursor — send the next chunk. A single-chunk snapshot's FINAL ack lifts the peer
-      // out of Snapshot, so this no-ops.
+      // out of Snapshot via maybe_update above, so this no-ops.
       //
       // The moved-gate is the snapshot sibling of the append path's advance gate (`on_append_response`
       // pumps only when `maybe_update` ADVANCED the match): a DUPLICATED ack echoing the same watermark

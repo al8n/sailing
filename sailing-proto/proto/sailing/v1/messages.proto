@@ -298,6 +298,9 @@ message SnapshotResponse {
   bool reject = 3;
   uint64 match_index = 4;
   uint64 acked_through = 5;
+  // Mid-transfer progress ack: match-inert on the leader (drives chunk pacing only, never
+  // Progress). False (absent) on every final/redundancy ack.
+  bool progress = 6;
 }
 
 // Leader -> transfer target: campaign NOW (bypasses the pre-vote lease).

@@ -1728,3 +1728,37 @@ fn snapshot_meta_fork_id_round_trips() {
     "an absent ForkId decodes as None"
   );
 }
+
+#[test]
+fn snapshot_response_progress_flag_round_trips() {
+  let m = Message::SnapshotResponse(
+    SnapshotResponse::new(Term::new(2), 7, false, Index::new(0))
+      .with_acked_through(64)
+      .with_progress(true),
+  );
+  let mut buf = Vec::new();
+  encode_message(&m, &mut buf);
+  let Message::SnapshotResponse(back) = decode_message::<u64>(Bytes::from(buf)).expect("decode")
+  else {
+    panic!("variant")
+  };
+  assert!(back.progress(), "the progress flag must round-trip");
+  assert_eq!(back.acked_through(), 64);
+
+  let mut c = Vec::new();
+  let mut d = Vec::new();
+  encode_message(
+    &Message::SnapshotResponse(SnapshotResponse::new(Term::new(2), 7, false, Index::new(9))),
+    &mut c,
+  );
+  encode_message(
+    &Message::SnapshotResponse(
+      SnapshotResponse::new(Term::new(2), 7, false, Index::new(9)).with_progress(false),
+    ),
+    &mut d,
+  );
+  assert_eq!(
+    c, d,
+    "a false progress flag must be absent on the wire — final acks are byte-identical"
+  );
+}

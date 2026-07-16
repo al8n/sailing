@@ -5636,3 +5636,63 @@ fn commit_catchup_mid_transfer_exits_via_a_full_ack() {
     "the redundant transfer's staging is reclaimed"
   );
 }
+
+/// A mid-transfer PROGRESS ack is match-inert on the leader: it drives the resume cursor and chunk
+/// pacing, but never moves `match_index`, never exits Snapshot state, and never feeds the commit
+/// quorum — even when its `match_index` claims the pending boundary itself. Only an install or
+/// redundancy ack (a durable log-state assertion by the follower) may. The rule is enforced on the
+/// leader, so a version-skewed or malformed peer cannot mint replication progress from a transfer
+/// that has not durably installed.
+///
+/// MUTATION: feed progress acks to `maybe_update` in `on_snapshot_response` → the first assert sees
+/// the peer leave Snapshot state.
+#[test]
+fn a_progress_ack_never_lifts_a_peer_out_of_snapshot_state() {
+  use crate::{Instant, Message, Term};
+
+  let (mut ep, mut log, mut stable, pending) = wedged_snapshot_follower(5, 2);
+  while ep.poll_message().is_some() {}
+  let match_before = ep.tracker.progress(&2u64).unwrap().match_index();
+  let commit_before = ep.commit;
+
+  // A progress ack whose match claims the pending boundary itself.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(
+      SnapshotResponse::new(Term::new(1), 2u64, false, pending)
+        .with_acked_through(3)
+        .with_progress(true),
+    ),
+  );
+  let pr = ep.tracker.progress(&2u64).unwrap();
+  assert!(
+    pr.state().is_snapshot(),
+    "a progress ack must leave the peer in Snapshot state"
+  );
+  assert_eq!(
+    pr.match_index(),
+    match_before,
+    "a progress ack must not move match_index"
+  );
+  assert_eq!(
+    ep.commit, commit_before,
+    "a progress ack must not feed the commit quorum"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The FINAL ack (no flag) at the same match still exits — the flag, not the value, gates.
+  ep.handle_message(
+    Instant::ORIGIN,
+    &mut log,
+    &mut stable,
+    2u64,
+    Message::SnapshotResponse(SnapshotResponse::new(Term::new(1), 2u64, false, pending)),
+  );
+  assert!(
+    !ep.tracker.progress(&2u64).unwrap().state().is_snapshot(),
+    "the final install ack still lifts the peer out of Snapshot state"
+  );
+}

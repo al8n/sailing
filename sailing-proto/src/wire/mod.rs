@@ -913,6 +913,7 @@ fn pb_message<I: NodeId>(msg: &Message<I>) -> pb::Message {
       reject: m.reject(),
       match_index: m.match_index().get(),
       acked_through: m.acked_through(),
+      progress: m.progress(),
       ..Default::default()
     }),
     Message::TimeoutNow(m) => Body::from(pb::TimeoutNow {
@@ -1027,7 +1028,8 @@ fn message_from<I: NodeId>(wire: pb::Message) -> Result<Message<I>, DecodeError>
         m.reject,
         Index::new(m.match_index),
       )
-      .with_acked_through(m.acked_through),
+      .with_acked_through(m.acked_through)
+      .with_progress(m.progress),
     ),
     Body::TimeoutNow(m) => Message::TimeoutNow(crate::TimeoutNow::new(
       Term::new(m.term),
