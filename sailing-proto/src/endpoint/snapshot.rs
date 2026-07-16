@@ -355,38 +355,81 @@ where
   /// Returns `false` if the Log-Matching proof read hit a FATAL `term` error (the node is now poisoned via
   /// `log_term`): the caller MUST bail immediately rather than continue handler work on a poisoned node.
   #[must_use]
+  /// The ONE snapshot-coverage proof: is `meta`'s snapshot already COVERED by this replica's OWN
+  /// history? Shared by the receipt-time redundancy short-circuit, the completion-time re-check, and
+  /// the staged-receive reclaim — every "may I treat this snapshot as already-held?" decision asks
+  /// HERE, so the lineage clause cannot be forgotten at any one of them.
+  ///
+  /// The LINEAGE clause comes first and is decisive: `(index, term)` is a content-identity only WITHIN
+  /// one lineage (Log Matching §5.3), so a snapshot whose token differs from this replica's — either
+  /// direction, `None` included — is NEVER covered, no matter what the local coordinates claim. A
+  /// colliding replica that independently committed the boundary coordinates must not treat the fork's
+  /// real state as "already present" while holding different bytes: the leader would advance `match`
+  /// on a false ack and replicate later entries over permanent divergence.
+  ///
+  /// Within the lineage, two arms:
+  /// - `boundary <= committed_bound` — the caller's committed/recoverable bound (receipt and reclaim
+  ///   pass `min(commit, ack_watermark())`; the completion re-check passes bare `commit`, its durable
+  ///   evidence already established);
+  /// - `boundary <= durable_index` AND the durable entry at `boundary` carries the snapshot's term —
+  ///   Log Matching: the durable `[first..=boundary]` IS the snapshot's prefix entry-for-entry, the
+  ///   case the committed bound misses on an async follower whose durable log outran `commit`.
+  ///
+  /// Returns `None` when the Log-Matching term read hit a fatal storage error — the node is already
+  /// poisoned via `log_term`, and the caller must bail without acting.
+  fn covered_by_local_history<L: LogStore>(
+    &mut self,
+    log: &L,
+    meta: &SnapshotMeta<I>,
+    committed_bound: Index,
+  ) -> Option<bool> {
+    if meta.fork_id() != self.split.fork_id.as_ref() {
+      return Some(false);
+    }
+    if meta.last_index() <= committed_bound {
+      return Some(true);
+    }
+    if meta.last_index() <= self.durable.durable_index {
+      return self
+        .log_term(log, meta.last_index())
+        .map(|t| t == meta.last_term());
+    }
+    Some(false)
+  }
+
   pub(crate) fn reclaim_stale_snapshot_recv<L: LogStore, S: StableStore<NodeId = I>>(
     &mut self,
     log: &L,
     stable: &mut S,
   ) -> bool {
-    let Some((boundary, last_term)) = self
-      .snapshot
-      .snapshot_recv
-      .as_ref()
-      .map(|r| (r.meta.last_index(), r.meta.last_term()))
-    else {
+    // Free the staging buffer whenever the staged snapshot is COVERED by this replica's own history —
+    // the same proof as the ack-path short-circuit (`covered_by_local_history`, lineage clause
+    // included: a cross-lineage transfer staged on a then-pristine joiner is never "already held" by
+    // content this replica gained since, so it is pinned, not silently freed — the conflict stays
+    // visible). The committed-only bound alone missed the case where in-window appends made the
+    // durable log match through `boundary` while `commit` stayed lower — a later duplicate chunk would
+    // then ack the leader out of Snapshot but strand the full `total_len` allocation. Taken out and
+    // restored around the proof: `covered_by_local_history` needs `&mut self` for the poisoning term
+    // read.
+    let Some(r) = self.snapshot.snapshot_recv.take() else {
       return true;
     };
-    // Free the staging buffer whenever the staged snapshot is redundant by the SAME proof the ack-path
-    // short-circuit uses: committed-and-recoverable, OR the durable log matches through the boundary (Log
-    // Matching). The committed-only `min(commit, ack_watermark())` bound missed the case where in-window
-    // appends made the durable log match through `boundary` while `commit` stayed lower — a later duplicate
-    // chunk would then ack the leader out of Snapshot but strand the full `total_len` allocation. A fatal
-    // `term` Err poisons via `log_term`.
-    let committed_recoverable = core::cmp::min(self.commit, self.ack_watermark());
-    let durable_index = self.durable.durable_index;
-    let redundant = boundary <= committed_recoverable
-      || (boundary <= durable_index
-        && match self.log_term(log, boundary) {
-          Some(t) => t == last_term,
-          None => return false,
-        });
-    if redundant {
-      self.snapshot.snapshot_recv = None;
-      stable.discard_snapshot_staging();
+    let bound = core::cmp::min(self.commit, self.ack_watermark());
+    match self.covered_by_local_history(log, &r.meta, bound) {
+      // Fatal term read: poisoned via `log_term`. Restore the state the caller found and bail.
+      None => {
+        self.snapshot.snapshot_recv = Some(r);
+        false
+      }
+      Some(true) => {
+        stable.discard_snapshot_staging();
+        true
+      }
+      Some(false) => {
+        self.snapshot.snapshot_recv = Some(r);
+        true
+      }
     }
-    true
   }
 
   /// Receive an `InstallSnapshot` from the current leader (follower path). This VALIDATES, persists the
@@ -553,30 +596,16 @@ where
     // acking it lifts the leader's `match` past `pending`. Persist-before-RESPOND: a non-durable term defers
     // the ack (this path runs no install; the term write is the post-dispatch catch-all in `handle_message`)
     // and `flush_term_gated_acks` releases it.
-    let redundant = if meta.fork_id().is_some() && self.split.fork_id.as_ref() != meta.fork_id() {
-      // CROSS-LINEAGE fork snapshot: `(index, term)` is NOT a content-identity across a fork boundary.
-      // Log Matching holds only WITHIN one lineage, so a manufactured fork baseline and an independent
-      // group's colliding `(index, term)` are DIFFERENT content — the token is the lineage discriminator,
-      // and a token-bearing snapshot is redundant only against a matching-token holder. Reaching here with
-      // a token means a NONE-self endpoint (the `Some`-self + different-token case already returned at the
-      // provenance gate above): a collider that INDEPENDENTLY committed the boundary coordinates must not
-      // false-ack the genuine fork as "already present" while retaining its own divergent state — the
-      // leader would advance `match` and execute later entries over permanent divergence. Fall through to
-      // install, which adopts the token and lands the fork's real state (a virgin observer installs anyway,
-      // the snapshot not being redundant against an empty log; the dangerous case is the non-virgin collider).
-      false
-    } else if meta.last_index() <= core::cmp::min(self.commit, self.ack_watermark()) {
-      true
-    } else if meta.last_index() <= self.durable.durable_index {
-      // Log-Matching proof read. A fatal `term` Err is a STORAGE FAILURE, not a mismatch: funnel it
-      // through `log_term`, which poisons (`PoisonReason::LogTerm`) and returns `None` — never silently
-      // "not redundant", which here would STAGE a transfer of a snapshot the follower already holds.
-      match self.log_term(log, meta.last_index()) {
-        Some(t) => t == meta.last_term(),
-        None => return,
-      }
-    } else {
-      false
+    // The shared coverage proof (`covered_by_local_history`) decides — lineage clause first: past the
+    // door gate this reaches a cross-lineage meta only on a pristine adopter (never covered — a virgin
+    // log covers nothing, and the clause keeps that true even if content lands mid-adoption). A fatal
+    // `term` Err in the Log-Matching arm is a STORAGE FAILURE, not a mismatch: the node is poisoned and
+    // this handler bails — never silently "not redundant", which would STAGE a transfer of a snapshot
+    // the follower already holds.
+    let bound = core::cmp::min(self.commit, self.ack_watermark());
+    let redundant = match self.covered_by_local_history(log, meta, bound) {
+      Some(r) => r,
+      None => return,
     };
     if redundant {
       // Apply the SAME leader-aware staged-receive cleanup as the supersede path BEFORE acking, so the ack
@@ -910,22 +939,17 @@ where
     // (`PoisonReason::LogTerm`) and returns `None`. Treating an Err as "not redundant" would instead fall
     // through to the destructive `log.restore` on unreadable state — discarding a durable tail that may
     // actually match the snapshot prefix (the very hole this guard closes).
-    let redundant = if meta.fork_id().is_some() && self.split.fork_id.as_ref() != meta.fork_id() {
-      // Cross-lineage fork snapshot: `(index, term)` is NOT a content-identity across a fork boundary
-      // (see the receipt-time gate), so a token-bearing snapshot is redundant only against a
-      // matching-token holder. `self.split.fork_id` is still None here — adoption is below — so this
-      // reaches only a NONE-self collider, which must INSTALL the fork's real state, never drop it as
-      // "already durable" against its own divergent tail.
-      false
-    } else if meta.last_index() <= self.commit {
-      true
-    } else if meta.last_index() <= self.durable.durable_index {
-      match self.log_term(log, meta.last_index()) {
-        Some(t) => t == meta.last_term(),
-        None => return,
-      }
-    } else {
-      false
+    // The shared coverage proof (`covered_by_local_history`), with bare `commit` as the committed
+    // bound — durable evidence is already established here (the blob is durable and
+    // `durable_snapshot_index` was raised above). The lineage clause is LOAD-BEARING at this site even
+    // behind the door gate: an adoption admitted onto a pristine joiner can race in-window
+    // AppendEntries from the joiner's other conf members, so by completion the local coordinates may
+    // "cover" the boundary — with FOREIGN content. The adoption must still install, never drop itself
+    // as "already durable" against bytes that are not the fork's. A fatal `term` Err poisons and bails
+    // (treating it as "not redundant" would `log.restore` over unreadable state).
+    let redundant = match self.covered_by_local_history(log, &meta, self.commit) {
+      Some(r) => r,
+      None => return,
     };
     if redundant {
       // Release the leader from `ProgressState::Snapshot` NOW, without waiting for a heartbeat resend: a

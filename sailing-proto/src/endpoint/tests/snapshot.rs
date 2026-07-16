@@ -5904,3 +5904,165 @@ fn an_interrupted_adoption_completes_on_the_same_identity_retransfer() {
     "the same-identity retransfer is kin, not a refusal"
   );
 }
+
+/// An adoption admitted onto a pristine joiner can race in-window AppendEntries from the joiner's other
+/// conf members: by the time the blob is durable, the local coordinates "cover" the boundary — with
+/// FOREIGN content. The completion re-check's lineage clause keeps the adoption honest: it must still
+/// INSTALL (re-baselining over the raced-in bytes), never drop itself as "already durable" and false-ack
+/// the boundary against bytes that are not the fork's.
+///
+/// MUTATION: drop the lineage clause from `covered_by_local_history` → the completion re-check reads the
+/// raced-in commit as coverage, drops the install, and acks — the count/token assertions FAIL.
+#[test]
+fn a_mid_adoption_append_race_still_completes_the_adoption() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // The adoption begins on a PRISTINE joiner; the blob's fsync is held in flight.
+  stable.hold_snapshot_fsync(true);
+  let token = fork_token(9);
+  let baseline =
+    SnapshotMeta::new(Index::new(10), Term::new(2), conf.clone()).with_fork_id(token.clone());
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new(
+      Term::new(2),
+      1u64,
+      baseline,
+      encode_count_snapshot(777),
+    )),
+  );
+  assert!(ep.snapshot.pending_install.is_some(), "adoption deferred");
+  while ep.poll_message().is_some() {}
+
+  // In-window appends from another conf member land FOREIGN content through the boundary and commit it.
+  let tail: Vec<Entry> = (1u64..=12)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(12),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(
+    ep.commit,
+    Index::new(12),
+    "the race committed past the boundary"
+  );
+  while ep.poll_message().is_some() {}
+
+  // The blob turns durable: the adoption must still INSTALL — the raced-in coordinates cover the
+  // boundary, but with content that is not the fork's.
+  stable.flush_held_snapshots();
+  for _ in 0..4 {
+    ep.handle_storage(d, &mut log, &mut stable);
+  }
+  assert!(ep.snapshot.pending_install.is_none(), "install completed");
+  assert_eq!(
+    ep.state_machine().count(),
+    777,
+    "the FORK's state landed — the raced-in foreign bytes were not read as coverage"
+  );
+  assert_eq!(ep.fork_id(), Some(token), "the token was adopted");
+  assert_eq!(
+    log.last_index(),
+    Index::new(10),
+    "the log re-baselined onto the fork boundary"
+  );
+}
+
+/// The staged half of the same race: a chunked adoption staged on a then-pristine joiner is NOT
+/// reclaimed as "already held" when raced-in foreign appends cover its boundary — the staged transfer
+/// (and the leader's Snapshot pin) survive, keeping the conflict visible instead of silently freeing
+/// the fork's partial against bytes that are not the fork's.
+///
+/// MUTATION: drop the lineage clause from `covered_by_local_history` → the reclaim frees the staged
+/// receive on the raced-in coverage (the staged-intact assertion FAILS).
+#[test]
+fn a_mid_adoption_append_race_does_not_reclaim_the_staged_transfer() {
+  use crate::{
+    AppendEntries, Entry, EntryKind, Index, InstallSnapshot, Instant, Message, SnapshotMeta, Term,
+    conf::ConfState,
+  };
+  let (mut ep, mut log, mut stable) = make_follower();
+  let d = Instant::ORIGIN;
+  let conf = ConfState::from_voters(std::vec![1u64, 2u64, 3u64]);
+
+  // Chunk [0,3) of the fork's baseline stages on the PRISTINE joiner.
+  let baseline = SnapshotMeta::new(Index::new(10), Term::new(2), conf).with_fork_id(fork_token(9));
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::InstallSnapshot(InstallSnapshot::new_chunk(
+      Term::new(2),
+      1u64,
+      baseline,
+      bytes::Bytes::from_static(b"AAA"),
+      0,
+      6,
+    )),
+  );
+  assert!(ep.snapshot.snapshot_recv.is_some(), "the partial staged");
+  while ep.poll_message().is_some() {}
+
+  // Raced-in foreign appends commit through the boundary and become durable.
+  let tail: Vec<Entry> = (1u64..=12)
+    .map(|i| {
+      Entry::new(
+        Term::new(2),
+        Index::new(i),
+        EntryKind::Empty,
+        bytes::Bytes::new(),
+      )
+    })
+    .collect();
+  ep.handle_message(
+    d,
+    &mut log,
+    &mut stable,
+    1u64,
+    Message::AppendEntries(AppendEntries::new(
+      Term::new(2),
+      1u64,
+      Index::ZERO,
+      Term::ZERO,
+      tail,
+      Index::new(12),
+    )),
+  );
+  ep.handle_storage(d, &mut log, &mut stable);
+  assert_eq!(ep.commit, Index::new(12));
+
+  // The staged FORK transfer is not "already held" by the foreign coverage: reclaim leaves it pinned.
+  assert!(
+    ep.snapshot.snapshot_recv.is_some(),
+    "the cross-lineage partial survives foreign coverage — the conflict stays visible, never silently freed"
+  );
+}
